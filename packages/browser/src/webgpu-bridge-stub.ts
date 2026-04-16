@@ -13,6 +13,7 @@
  * and invoked via wasmTable.get(fnPtr)(...args).
  */
 
+import { roundUpBucket } from './buffer-bucket.js';
 import {
   RpcFn,
   CMD_OFFSET,
@@ -988,26 +989,50 @@ export function createBridgeStub(
       const mappedAtCreation = h[descPtr + 24] !== 0;
 
       if (!mappedAtCreation && size > 0) {
-        const key = poolKey(usage, size);
+        // Bucket the stub pool so that creates with slightly different
+        // logical sizes (e.g., 513 vs 512 bytes) can reuse each other.
+        // Use the SAME roundUpBucket as the gpu-worker — invariant: every
+        // handle in bucket B has physical allocation >= B (because every
+        // MISS below allocates exactly bucketSize via arg1).
+        const bucketSize = roundUpBucket(size);
+        const key = poolKey(usage, bucketSize);
         const stack = bufferPool.get(key);
         if (stack !== undefined && stack.length > 0) {
           const reused = stack.pop()!;
-          // Drop empty buckets so bufferPool doesn't accumulate dead (usage,size) keys.
+          // Drop empty buckets so bufferPool doesn't accumulate dead keys.
           if (stack.length === 0) bufferPool.delete(key);
           bufferPoolHits++;
           bumpPoolStat(POOL_STAT_HITS);
+          // Publish the caller's LOGICAL size via setBufferMeta — the stub
+          // fast path for wgpuBufferGetSize reads this and must return the
+          // size the caller actually asked for, not the bucket size.
           setBufferMeta(reused, size, usage);
           return reused;
         }
         bufferPoolMisses++;
         bumpPoolStat(POOL_STAT_MISSES);
+        // Pool miss: tell the gpu-worker to allocate the full bucketSize so
+        // the resulting handle can later be reused by any request that
+        // bucket-maps to the same bin. This is the piece that keeps the
+        // stub pool safe to pop-and-return without re-creating.
+        const h2 = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr, bucketSize);
+        if (h2 > 0 && h2 < FAKE_HANDLE_BASE) {
+          // Eager (size, usage) cache — drops BUFFER_GET_SIZE RPCs and gives
+          // the release path the data it needs to pool instead of falling
+          // through to queueRelease. Store LOGICAL size in the stub cache
+          // because that is what C++ callers expect from wgpuBufferGetSize.
+          setBufferMeta(h2, size, usage);
+        }
+        return h2;
       }
 
-      const h2 = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr);
+      // mappedAtCreation (with or without COPY_DST falling through to RPC):
+      // do NOT bucket. getMappedRange must return exactly `size` bytes —
+      // a bucket-sized shadow would either overrun on write-back or leak
+      // tail bytes. Pass arg1=0 to tell the gpu-worker to use the size
+      // from descPtr verbatim.
+      const h2 = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr, 0);
       if (h2 > 0 && h2 < FAKE_HANDLE_BASE) {
-        // Eager (size, usage) cache — drops BUFFER_GET_SIZE RPCs and gives
-        // the release path the data it needs to pool instead of falling
-        // through to queueRelease.
         setBufferMeta(h2, size, usage);
       }
       return h2;
@@ -1724,7 +1749,15 @@ export function createBridgeStub(
         bumpPoolStat(POOL_STAT_RELEASE_UNPOOLABLE);
       }
       if (size !== undefined && usage !== undefined && isPoolable(resolved, usage)) {
-        const key = poolKey(usage, size);
+        // Bucket the stub pool. `size` here is the LOGICAL size from
+        // setBufferMeta; converting through roundUpBucket yields the bucket
+        // key used on both create and release paths. Because every create
+        // MISS above passes bucketSize via arg1 (so the gpu-worker
+        // allocates exactly bucketSize), every buffer in this bucket has
+        // physical size >= the bucket — safe to pop and return on a later
+        // create for any logical size that maps to the same bucket.
+        const bucketSize = roundUpBucket(size);
+        const key = poolKey(usage, bucketSize);
         let stack = bufferPool.get(key);
         if (stack === undefined) {
           stack = [];

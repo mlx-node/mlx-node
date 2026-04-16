@@ -15,6 +15,7 @@
  * command buffer instead of being invoked via wasmTable.get().
  */
 
+import { roundUpBucket } from './buffer-bucket.js';
 import {
   RpcFn,
   CMD_OFFSET,
@@ -44,7 +45,16 @@ let gpuTotalRpcs = 0;
 // ---------- Handle Table (1H: sparse array for O(1) index lookup) ----------
 
 const handles: any[] = [null]; // index 0 unused — handles start at 1
+// Physical (bucketed) buffer size. This is what the pool keys on and what
+// device.createBuffer actually allocated. Used by the pool so that a buffer
+// released from bucket B rejoins bucket B on the next lookup.
 const bufferSizesArr: (number | undefined)[] = [undefined];
+// Logical buffer size as originally requested by the C++ caller (pre-bucket).
+// This is what BUFFER_GET_SIZE must return so C++ code that does
+// `elems = size / sizeof(dtype)` reads only the valid, initialized range.
+// When bucketing is not applied (mappedAtCreation, MAP_READ/MAP_WRITE), this
+// equals the physical size.
+const bufferLogicalSizesArr: (number | undefined)[] = [undefined];
 const bufferUsagesArr: (number | undefined)[] = [undefined];
 let nextHandle = 1;
 
@@ -67,37 +77,6 @@ function poolKey(usage: number, size: number): string {
   return `${usage}:${size}`;
 }
 
-// Size binning for the buffer pool. Exact-size keying misses when requests
-// differ by a few bytes (e.g., 513 vs 512). Bucketing coalesces near-size
-// requests into shared pool bins so they can reuse each other's buffers.
-//
-// Scheme:
-//   - size <= 4096:  round up to next multiple of 256  (waste <= 256 B)
-//   - size >  4096:  round up to next power of two     (waste <= 2x)
-//
-// Rationale:
-//   256-B granule caps small-buffer waste at 256 B (tight for uniforms, tiny
-//   params). Power-of-two for large buffers caps waste at 2x, which is fine
-//   on M3's 18 GB unified memory and gives broad coalescing across nearby
-//   allocation sizes (e.g., KV cache rows of various seq lengths).
-//
-// Correctness: pure function, no side effects. Always returns size >= input,
-// always a multiple of 4 (WebGPU minimum alignment). For size <= 0 returns 0
-// — callers already guard against pooling empty buffers.
-function roundUpBucket(size: number): number {
-  if (size <= 0) return 0;
-  if (size <= 4096) {
-    // Round up to next multiple of 256.
-    return (size + 255) & ~255;
-  }
-  // Round up to next power of two. For 32-bit sizes this is safe; WebGPU
-  // buffer size limits bound us well below 2^31. Math.clz32 returns the
-  // leading-zero count of size-1 when viewed as u32.
-  const v = size - 1;
-  const shift = 32 - Math.clz32(v);
-  return 1 << shift;
-}
-
 function addHandle(obj: any): number {
   const id = nextHandle++;
   handles[id] = obj;
@@ -113,6 +92,7 @@ function getHandle<T>(id: number): T {
 function releaseHandle(id: number): void {
   handles[id] = undefined;
   bufferSizesArr[id] = undefined;
+  bufferLogicalSizesArr[id] = undefined;
   bufferUsagesArr[id] = undefined;
 }
 
@@ -678,12 +658,16 @@ function dispatchFusedRecord(
         bufferPoolHitCount++;
         const pooled = handles[handle] as GPUBuffer;
         queue.writeBuffer(pooled, 0, uniformData);
+        // Update the logical size for this new owner — the previous owner's
+        // logical size could differ even though they share a bucket.
+        bufferLogicalSizesArr[handle] = uniformDataSize;
       } else {
         if (poolable) bufferPoolMissCount++;
         const buffer = device.createBuffer({ size: physicalSize, usage });
         queue.writeBuffer(buffer, 0, uniformData);
         handle = addHandle(buffer);
         bufferSizesArr[handle] = physicalSize;
+        bufferLogicalSizesArr[handle] = uniformDataSize;
         bufferUsagesArr[handle] = usage;
       }
       newBufferHandle = handle;
@@ -1138,8 +1122,16 @@ async function processCommand(fnId: number): Promise<void> {
     // Device
     // ================================================================
     case RpcFn.DEVICE_CREATE_BUFFER: {
-      // Args: descPtr
+      // Args:
+      //   arg0 = descPtr
+      //   arg1 = physicalSizeOverride (optional; 0 means "derive from descPtr")
+      //          When the bridge-stub already bucketed the request, it passes
+      //          bucketSize here so the gpu-worker allocates exactly that much.
+      //          This keeps the stub-side pool and gpu-worker-side pool in
+      //          agreement on physical sizes — a buffer released from bucket
+      //          B has physical >= B, so reuses from bucket B are safe.
       const descPtr = arg0();
+      const physicalOverride = arg1();
       const view = wasm();
       // WGPUBufferDescriptor (WASM32, 28 bytes):
       //   0: nextInChain (ptr4)
@@ -1160,12 +1152,19 @@ async function processCommand(fnId: number): Promise<void> {
       // that path MUST stay at logical `size` (a bucket-sized shadow would
       // cause an overrun on unmap copy-back).
       if (!mappedAtCreation && size > 0 && isPoolable(usage)) {
-        const bucketSize = roundUpBucket(size);
+        // Prefer the stub-supplied override (already bucketed by the stub's
+        // pool logic). Fall back to our own bucketing when the stub didn't
+        // pass one (older callers, tests, or non-pooled create paths).
+        const bucketSize = physicalOverride > 0 ? physicalOverride : roundUpBucket(size);
         const stack = bufferPool.get(poolKey(usage, bucketSize));
         if (stack !== undefined && stack.length > 0) {
           const reused = stack.pop()!;
           if (stack.length === 0) bufferPool.delete(poolKey(usage, bucketSize));
           bufferPoolHitCount++;
+          // Update the logical size so a subsequent BUFFER_GET_SIZE on the
+          // reused handle returns the NEW caller's logical size, not a
+          // stale value from the previous owner.
+          bufferLogicalSizesArr[reused] = size;
           setResult(reused);
           break;
         }
@@ -1178,6 +1177,7 @@ async function processCommand(fnId: number): Promise<void> {
           const buffer = device.createBuffer({ size: bucketSize, usage });
           const handle = addHandle(buffer);
           bufferSizesArr[handle] = bucketSize;
+          bufferLogicalSizesArr[handle] = size;
           bufferUsagesArr[handle] = usage;
           setResult(handle);
         } catch (e) {
@@ -1192,11 +1192,13 @@ async function processCommand(fnId: number): Promise<void> {
 
       // mappedAtCreation OR non-poolable (MAP_READ/MAP_WRITE) OR size<=0:
       // use logical size verbatim. These buffers never enter the pool, so
-      // bucketing buys nothing and would break mappedAtCreation semantics.
+      // bucketing buys nothing and would break mappedAtCreation semantics
+      // (getMappedRange must return exactly `size` bytes).
       try {
         const buffer = device.createBuffer({ size, usage, mappedAtCreation });
         const handle = addHandle(buffer);
         bufferSizesArr[handle] = size;
+        bufferLogicalSizesArr[handle] = size;
         bufferUsagesArr[handle] = usage;
         setResult(handle);
       } catch (e) {
@@ -1590,8 +1592,14 @@ async function processCommand(fnId: number): Promise<void> {
     case RpcFn.BUFFER_GET_SIZE: {
       // Args: bufferHandle
       // Returns: u64 size via RESULT + RESULT_HI
+      //
+      // MUST return the LOGICAL size (as originally requested by the C++
+      // caller), NOT the bucketed/physical allocation size. C++ code does
+      // `elems = size / sizeof(dtype)` to iterate the buffer — returning
+      // bucket size would cause it to read past the initialized range
+      // into the bucket's zero-padded tail (correctness bug).
       const bufferHandle = arg0();
-      const size = bufferSizesArr[bufferHandle] ?? 0;
+      const size = bufferLogicalSizesArr[bufferHandle] ?? bufferSizesArr[bufferHandle] ?? 0;
       setResultBig(size & 0xffffffff, Math.floor(size / 0x100000000));
       break;
     }
@@ -2003,6 +2011,9 @@ async function processCommand(fnId: number): Promise<void> {
           const buffer = getHandle<GPUBuffer>(handle);
           const data = wasmBytes().slice(wasmDataPtr, wasmDataPtr + size);
           queue.writeBuffer(buffer, 0, data);
+          // Update the logical size for the new owner. Previous owner may
+          // have had a smaller logical size within the same bucket.
+          bufferLogicalSizesArr[handle] = size;
         } else {
           if (poolable) bufferPoolMissCount++;
           // Allocate physicalSize so poolable buffers can be bucket-reused
@@ -2013,6 +2024,7 @@ async function processCommand(fnId: number): Promise<void> {
           queue.writeBuffer(buffer, 0, data);
           handle = addHandle(buffer);
           bufferSizesArr[handle] = physicalSize;
+          bufferLogicalSizesArr[handle] = size;
           bufferUsagesArr[handle] = usage;
         }
         setResult(handle);
