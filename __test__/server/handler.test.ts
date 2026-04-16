@@ -4656,30 +4656,32 @@ describe('createHandler', () => {
       expect(idAfterSpuriousRelease).not.toBe(idBefore);
     }, 5000);
 
-    it('iter-50: PendingResponseWrites.markHardTimedOut moves id to hard-timed-out marker without awaiting settlement', async () => {
+    it('iter-51: markHardTimedOut marker expires after TTL and is cleared on settlement', async () => {
       // Iter-49's first primitive was `evict(id)` — remove the
       // pending entry without waiting for settlement so a wedged
       // `store.store(...)` stops pinning tracker memory. But codex's
       // iter-49 review flagged that eviction ALSO erased the only
       // signal a `previous_response_id` continuation uses to
       // distinguish "slow-but-eventual persist across the breaker"
-      // from "genuinely missing chain". Continuations for
-      // hard-timed-out ids would fall through to permanent 404 even
-      // though the write was still running and could land moments
-      // later.
+      // from "genuinely missing chain".
       //
-      // Iter-50 replaces `evict` with a two-phase marker:
+      // Iter-50 replaced `evict` with a two-phase marker:
       //   * Phase 1 (active pending): `awaitPending(id)` returns the
       //     promise — existing behaviour.
       //   * Phase 2 (hard-timed-out): the pending entry is dropped
       //     (so `awaitPending` no longer hands out a wedged promise
       //     and memory is reclaimable), but the id stays in a
-      //     lightweight `hardTimedOut` marker so the continuation
-      //     path can return retryable 503 `storage_timeout` instead
-      //     of 404.
+      //     lightweight `hardTimedOut` marker.
       //
-      // This focused unit test pins the primitive before the
-      // end-to-end regression below drives it through the handler.
+      // Iter-51 (codex's iter-50 HIGH finding 1): the iter-50 marker
+      // cleanup relied SOLELY on the underlying write promise's
+      // `.finally(...)` handler — which never fires for a truly
+      // wedged store that never settles. That left unbounded marker
+      // accumulation under sustained traffic against a wedged
+      // backend. Fix: pair the fast settle-triggered cleanup with an
+      // independent TTL, lazily expired on read, so marker lifetime
+      // is bounded by min(write settlement, TTL expiry) in every
+      // scenario. This focused unit test pins both cleanup paths.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
       let resolveFn: (() => void) | undefined;
@@ -4691,8 +4693,10 @@ describe('createHandler', () => {
       expect(tracker.hardTimedOutSize).toBe(0);
       expect(tracker.isHardTimedOut('resp_1')).toBe(false);
 
-      // Transition to the hard-timed-out marker state.
-      const transitioned = tracker.markHardTimedOut('resp_1');
+      // Transition to the hard-timed-out marker state with a TTL.
+      // Iter-51 callers supply the TTL explicitly so this module
+      // stays env-free.
+      const transitioned = tracker.markHardTimedOut('resp_1', 60_000);
       expect(transitioned).toBe(true);
       // Pending drained — wedged promise closure is reclaimable.
       expect(tracker.size).toBe(0);
@@ -4706,14 +4710,35 @@ describe('createHandler', () => {
       // Idempotent: a second call with no backing pending entry
       // returns false (we do not add markers without a real
       // settlement signal to clear them).
-      expect(tracker.markHardTimedOut('resp_1')).toBe(false);
+      expect(tracker.markHardTimedOut('resp_1', 60_000)).toBe(false);
       expect(tracker.isHardTimedOut('resp_1')).toBe(true);
       expect(tracker.hardTimedOutSize).toBe(1);
 
-      // Resolving the original promise clears the marker via the
-      // `.finally(...)` cleanup inside `track`. The marker lifetime
-      // is bounded by the underlying write's lifetime — no manual
-      // cleanup required.
+      // Iter-51: TTL-based expiry. Install a fresh marker with a
+      // very short TTL, advance fake time past the expiry, and
+      // assert the marker reports as absent on the next read.
+      // Because `isHardTimedOut` lazily deletes expired entries,
+      // this also asserts the map drains via the slow path.
+      vi.useFakeTimers();
+      try {
+        tracker.track('resp_ttl', new Promise<void>(() => {}));
+        tracker.markHardTimedOut('resp_ttl', 100);
+        expect(tracker.isHardTimedOut('resp_ttl')).toBe(true);
+        expect(tracker.hardTimedOutSize).toBe(2);
+        vi.advanceTimersByTime(101);
+        expect(tracker.isHardTimedOut('resp_ttl')).toBe(false);
+        // `hardTimedOutSize` also lazy-drains expired entries so
+        // its reported count matches the next `isHardTimedOut` sweep.
+        expect(tracker.hardTimedOutSize).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+
+      // Iter-50 fast path: resolving the original promise clears
+      // the marker via the `.finally(...)` cleanup inside `track`.
+      // This path still fires in iter-51 when the wedged store
+      // eventually unwedges — TTL is the slow fallback, not a
+      // replacement.
       expect(resolveFn).toBeDefined();
       resolveFn!();
       await Promise.resolve();
@@ -4721,6 +4746,71 @@ describe('createHandler', () => {
       expect(tracker.size).toBe(0);
       expect(tracker.isHardTimedOut('resp_1')).toBe(false);
       expect(tracker.hardTimedOutSize).toBe(0);
+    });
+
+    it('iter-51: hardTimedOut markers expire after TTL under sustained wedged-store traffic (bounded memory)', async () => {
+      // Codex's iter-50 review HIGH finding 1: under a truly
+      // wedged store (`store.store(...)` never settles), the
+      // iter-50 `.finally(...)`-only cleanup left one marker per
+      // hard-timed-out request growing linearly with traffic.
+      // Under sustained traffic this reintroduced unbounded
+      // state growth AND incorrect eventual classification
+      // (retryable 503 forever for ids whose chain will never
+      // materialize).
+      //
+      // Iter-51 fix: markers carry an independent TTL, lazily
+      // expired on read. Steady-state memory is now bounded at
+      // O(requestRate × TTL) regardless of how long the store
+      // stays wedged. This regression drives N=100 never-settling
+      // markers with a 5s TTL; the fast `.finally(...)` path
+      // never fires because no write ever resolves, so the TTL is
+      // the ONLY cleanup path exercised here.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+
+      vi.useFakeTimers();
+      try {
+        const N = 100;
+        const ids: string[] = [];
+        for (let i = 0; i < N; i += 1) {
+          const id = `resp_${i}`;
+          ids.push(id);
+          // Never-settling promise — simulates a truly wedged
+          // SQLite writer. The `.finally(...)` cleanup in
+          // `track()` NEVER runs on these promises.
+          tracker.track(id, new Promise<void>(() => {}));
+          // 5000ms TTL — much shorter than the 5-minute default
+          // so we can prove the expiry path drains them.
+          tracker.markHardTimedOut(id, 5000);
+        }
+
+        // Pre-expiry: every marker is live, hardTimedOutSize is N,
+        // pending tracker is zero (wedged promises have been
+        // moved into the marker state so the tracker map is
+        // reclaimable — iter-49 memory bound preserved).
+        expect(tracker.hardTimedOutSize).toBe(N);
+        expect(tracker.size).toBe(0);
+        for (const id of ids) {
+          expect(tracker.isHardTimedOut(id)).toBe(true);
+        }
+
+        // Cross the TTL boundary. Every marker's `expiresAt`
+        // should now be <= Date.now(), so isHardTimedOut should
+        // lazily delete each entry and return false.
+        vi.advanceTimersByTime(5001);
+
+        for (const id of ids) {
+          expect(tracker.isHardTimedOut(id)).toBe(false);
+        }
+        // The lazy-expire pass via `isHardTimedOut` drained every
+        // entry. Final size is zero even though NO underlying
+        // promise ever settled — the TTL is the sole cleanup
+        // signal here, which is exactly the pathologically-wedged
+        // scenario iter-51 is designed for.
+        expect(tracker.hardTimedOutSize).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('iter-50: hard-timeout breaker moves pending-write tracker entries into hard-timed-out marker state', async () => {
@@ -5069,6 +5159,245 @@ describe('createHandler', () => {
         }
       }
     }, 10000);
+
+    it('iter-51: late-landing row during hard-timeout marker window is returned via final getChain probe, not 503', async () => {
+      // Codex's iter-50 review HIGH finding 2: the iter-50
+      // continuation path classified "miss + isHardTimedOut(id)"
+      // as 503 without re-probing `getChain`. Two windows were
+      // broken:
+      //
+      //   * Row lands in the narrow interval between the initial
+      //     `getChain` miss and the `isHardTimedOut` check — the
+      //     handler returns 503 for a chain that already exists.
+      //   * Write promise settles JUST BEFORE the marker check
+      //     (clearing the marker via `.finally(...)`) — the
+      //     handler emits 404 for a chain that now exists, even
+      //     though the row DID land.
+      //
+      // Iter-51 fix: before emitting 503 via the marker path, run
+      // one last `getChain` probe. If the probe finds the row
+      // (i.e. the write slipped in during the marker window), the
+      // continuation proceeds along the happy-path flow with the
+      // probed chain — NOT misclassified as 503 or 404.
+      //
+      // This end-to-end test:
+      //   1. Drives a POST with an unresolved store.store() so the
+      //      hard-timeout breaker fires and installs a marker.
+      //   2. Simulates a late-landing row by flipping the
+      //      `getChain` mock to return a synthetic stored record
+      //      just BEFORE the continuation request runs.
+      //   3. Asserts the continuation response is NOT 503 — the
+      //      handler picked up the late-landed row via the final
+      //      probe and proceeded normally.
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      try {
+        const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
+
+        // `storedRecords` is populated SYNCHRONOUSLY by
+        // `store.store(...)` using the real record shape the
+        // endpoint passes in. The promise returned by
+        // `store.store()` never resolves, forcing the
+        // hard-timeout breaker to fire; but the records map has
+        // the actual record so a later `getChain` sees a
+        // coherent `StoredResponseRecord`. This mirrors the iter-39
+        // late-land test's pattern — we reuse the production
+        // record shape rather than hand-rolling one in the test.
+        const storedRecords = new Map<string, any>();
+        // `firstGetChainMissed` gates the "late-land" flip:
+        // before it flips, `getChain` rejects with "not found"
+        // (the row has not landed yet). After it flips, the
+        // probe sees the record via the synchronously populated
+        // `storedRecords` map — simulating the wedged writer
+        // finally landing the row during the marker window.
+        let simulateLateLand = false;
+        const mockStore = {
+          store: vi.fn().mockImplementation((record: any) => {
+            storedRecords.set(record.id, record);
+            // Never resolves — forces the hard-timeout breaker
+            // and keeps the marker live.
+            return new Promise<void>(() => {});
+          }),
+          getChain: vi.fn().mockImplementation((id: string) => {
+            if (!simulateLateLand) {
+              return Promise.reject(new Error(`Response not found: ${id}`));
+            }
+            const rec = storedRecords.get(id);
+            if (!rec) return Promise.reject(new Error(`Response not found: ${id}`));
+            return Promise.resolve([rec]);
+          }),
+          cleanupExpired: vi.fn(),
+        };
+
+        const chatSessionStart = vi
+          .fn()
+          .mockResolvedValueOnce(makeChatResult({ text: 'first reply' }))
+          .mockResolvedValueOnce(makeChatResult({ text: 'continuation after late-land' }));
+        // The continuation path may go through either
+        // `chatSessionContinue` (hot session hit) OR
+        // `chatSessionStart` (cold replay via the stored chain).
+        // The iter-50 resolve test demonstrates the continuation
+        // flows through `chatSessionStart` in this setup
+        // (friendly-name match + cold replay); accept either
+        // path by returning a valid ChatResult from both.
+        const chatSessionContinue = vi.fn().mockResolvedValue(makeChatResult({ text: 'continuation after late-land' }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue,
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-51-late-land-probe';
+        registry.register(MODEL_NAME, mockModel);
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        // (1) Original POST — collect response_id A. The
+        // underlying `store.store()` is tracked as pending under A
+        // but never resolves (its record IS populated in
+        // `storedRecords` synchronously though).
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'original message',
+          stream: false,
+        });
+        const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+        const body1 = JSON.parse(getBody1());
+        expect(body1.status).toBe('completed');
+        const responseIdA: string = body1.id;
+
+        // Wait for the synchronous `store.store(...)` → tracker
+        // registration to have happened (it fires inside the
+        // handler's withExclusive block, typically one microtask
+        // after the response end hook).
+        while (mockStore.store.mock.calls.length === 0) {
+          await new Promise((r) => setImmediate(r));
+        }
+
+        // (2) Wait for the 50ms hard-timeout breaker. After this
+        // the pending tracker has drained (iter-49 memory bound)
+        // and A is in the hard-timed-out marker (iter-50).
+        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setImmediate(r));
+
+        const tracker = getPendingWritesFor(mockStore);
+        expect(tracker.size).toBe(0);
+        expect(tracker.isHardTimedOut(responseIdA)).toBe(true);
+
+        // (3) Simulate the wedged SQLite writer finally landing
+        // the row while the marker is still live. Flipping this
+        // flag makes `getChain` return the real record stored at
+        // step 1 — the late-land window iter-51 is designed to
+        // recover from. The marker is STILL LIVE, so under the
+        // iter-50 classification (no final probe) the handler
+        // would have emitted 503 for a chain that already exists.
+        simulateLateLand = true;
+
+        // (4) Continuation POST with previous_response_id = A.
+        // The marker is still live (isHardTimedOut returns true)
+        // but the row IS now present in the store. Iter-51 probes
+        // `getChain` one last time before emitting 503; since
+        // the probe finds the row the continuation must proceed
+        // normally — NOT return 503.
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation against late-landed row',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res2, getStatus: status2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+
+        // The response must not be 503 storage_timeout. Under
+        // the iter-50 classification (no final probe) this would
+        // have been 503 because the marker was still live at the
+        // moment of the continuation. Under iter-51 the final
+        // probe sees the late-landed row and the handler
+        // proceeds along the happy-path continuation flow.
+        expect(status2()).not.toBe(503);
+        const parsed2 = JSON.parse(getBody2());
+        expect(parsed2.error?.type).not.toBe('storage_timeout');
+        // The continuation dispatched successfully — status is
+        // `completed` and `previous_response_id` echoes A.
+        expect(parsed2.status).toBe('completed');
+        expect(parsed2.previous_response_id).toBe(responseIdA);
+
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+        warnSpy.mockRestore();
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+      }
+    }, 10000);
+
+    it('iter-51: MLX_HARD_TIMEOUT_MARKER_TTL_MS parsing mirrors hard-timeout parser (empty/whitespace -> default, 0 -> zero, valid -> parsed)', async () => {
+      // Iter-51 adds an independent TTL for hard-timed-out
+      // markers (codex's iter-50 HIGH finding 1). The parser
+      // mirrors `getPostCommitPersistHardTimeoutMs` exactly so
+      // operators have one consistent story across the two
+      // breaker knobs.
+      const { getHardTimedOutMarkerTtlMs } = await import('../../packages/server/src/endpoints/responses.js');
+      const originalTtl = process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
+      try {
+        // Empty string -> default.
+        process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = '';
+        expect(getHardTimedOutMarkerTtlMs()).toBe(300_000);
+
+        // Explicit '0' -> zero. Useful for tests that want markers
+        // to expire on the next read (effectively disables the
+        // retryable-503 classification).
+        process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = '0';
+        expect(getHardTimedOutMarkerTtlMs()).toBe(0);
+
+        // Valid numeric -> parsed.
+        process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = '100';
+        expect(getHardTimedOutMarkerTtlMs()).toBe(100);
+
+        // Non-numeric garbage -> default.
+        process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = 'bad';
+        expect(getHardTimedOutMarkerTtlMs()).toBe(300_000);
+
+        // Undefined -> default.
+        delete process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
+        expect(getHardTimedOutMarkerTtlMs()).toBe(300_000);
+
+        // Whitespace-only -> default.
+        process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = '   ';
+        expect(getHardTimedOutMarkerTtlMs()).toBe(300_000);
+        process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = '\n';
+        expect(getHardTimedOutMarkerTtlMs()).toBe(300_000);
+        process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = '\t';
+        expect(getHardTimedOutMarkerTtlMs()).toBe(300_000);
+
+        // Padded valid numeric -> trimmed and parsed.
+        process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = '  250  ';
+        expect(getHardTimedOutMarkerTtlMs()).toBe(250);
+      } finally {
+        if (originalTtl === undefined) {
+          delete process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
+        } else {
+          process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = originalTtl;
+        }
+      }
+    });
 
     it('iter-45/46: MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS parsing: empty/whitespace -> default, "0" -> disabled, valid -> parsed', async () => {
       // Codex's iter-44 review flagged a MEDIUM finding: the

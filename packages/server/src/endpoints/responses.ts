@@ -222,6 +222,64 @@ export function getPostCommitPersistHardTimeoutMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60_000;
 }
 
+/**
+ * TTL (in ms) for iter-50 hard-timed-out markers in the per-store
+ * `PendingResponseWrites` tracker. See `pending-writes.ts` for the
+ * full lifetime model.
+ *
+ * ## Why this exists (iter-51 codex HIGH finding 1)
+ *
+ * Iter-50 cleared hard-timed-out markers ONLY through the underlying
+ * `store.store(...)` promise's `.finally(...)` handler installed in
+ * `track()`. For a truly wedged SQLite writer or stuck native
+ * backend, that promise never settles — `.finally(...)` never runs —
+ * so the marker set accumulated one entry per hard-timed-out request
+ * forever. Under sustained traffic against such a wedged backend the
+ * iter-49 memory bound (pending tracker drained to zero) was
+ * preserved, but the marker map grew linearly with traffic and every
+ * one of those ids kept returning retryable 503 for a chain that the
+ * server had long since given up on. Both an unbounded memory leak
+ * AND an incorrect eventual classification.
+ *
+ * The fix is an independent TTL with lazy expiry on read. Marker
+ * entries carry an `expiresAt` timestamp, `isHardTimedOut(id)`
+ * treats any expired entry as absent and deletes it, and steady-state
+ * marker memory is bounded at O(requestRate × TTL) regardless of
+ * whether the underlying writes ever settle. A 5-minute default is
+ * an order of magnitude larger than the hard-timeout breaker (60s
+ * default) so a write that settles just after the breaker fires can
+ * still deliver the correct retryable-503 signal to a concurrent
+ * continuation; past 5 minutes the best-effort persist contract
+ * (iter-35) has long since failed and a permanent 404 is the right
+ * eventual outcome.
+ *
+ * ## Env override
+ *
+ * `MLX_HARD_TIMEOUT_MARKER_TTL_MS`. Semantics mirror
+ * `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS` exactly:
+ *
+ *   * Empty string or whitespace-only -> default (300_000ms).
+ *   * Non-numeric garbage -> default.
+ *   * Explicit `'0'` -> markers expire immediately on the next read
+ *     (effectively disables the iter-50 retryable-503 classification
+ *     and reverts to "hard-timed-out ids 404 immediately"). Useful
+ *     for tests that need to assert the 404 branch without racing
+ *     a long-lived marker.
+ *   * Any finite >= 0 numeric value -> parsed.
+ *
+ * Exported for direct unit testing in
+ * `__test__/server/handler.test.ts`. Not part of the public API —
+ * consumers should drive behavior via the env var, not this
+ * function.
+ */
+export function getHardTimedOutMarkerTtlMs(): number {
+  const raw = process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
+  const normalized = raw?.trim();
+  if (normalized == null || normalized === '') return 300_000;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300_000;
+}
+
 // ---------------------------------------------------------------------------
 // Non-streaming path
 // ---------------------------------------------------------------------------
@@ -2112,66 +2170,139 @@ export async function handleCreateResponse(
               }
             }
           } else if (firstAttemptError !== null) {
-            // Iter-50: before rethrowing the original "not found"
-            // error (which the outer catch at the end of this block
-            // turns into a permanent 404), check whether the id has
-            // a hard-timed-out marker from the post-commit persist
-            // breaker. If the hard-timeout breaker fired against an
-            // in-flight `store.store(...)` for this response id, the
-            // raw write promise is still running in the background
-            // and may yet land — classifying that as a permanent 404
+            // Iter-50 / iter-51: before rethrowing the original
+            // "not found" error (which the outer catch at the end
+            // of this block turns into a permanent 404), check
+            // whether the id has a hard-timed-out marker from the
+            // post-commit persist breaker. If the hard-timeout
+            // breaker fired against an in-flight
+            // `store.store(...)` for this response id, the raw
+            // write promise is still running in the background and
+            // may yet land — classifying that as a permanent 404
             // would cause clients to discard `previous_response_id`
             // as invalid and silently break the conversation chain.
-            // Return the same retryable 503 `storage_timeout` shape
-            // the normal `awaitPending` timeout branch above uses so
-            // the client retries with the same previous_response_id.
+            //
+            // Iter-51 (codex's iter-50 HIGH finding 2): before
+            // emitting the retryable 503, run ONE last `getChain`
+            // probe against the store. Mirrors the shape of the
+            // iter-39 last-probe in the `awaitPending` timeout
+            // branch above (lines ~2112-2142): a write landing at
+            // the thin window between "marker set" and "classify
+            // as 503" should be returned as the successful chain,
+            // NOT misclassified as retryable 503 for a chain that
+            // already exists. Only when the probe STILL misses is
+            // the breaker-classified id genuinely unresolved and we
+            // surface it as retryable 503 `storage_timeout`.
             if (getPendingWritesFor(store).isHardTimedOut(body.previous_response_id)) {
-              console.warn(
-                `[responses] previous_response_id "${body.previous_response_id}" missing from store, but its ` +
-                  `post-commit persist crossed the hard-timeout breaker and is still unresolved. Returning 503 ` +
-                  `storage_timeout so the client retries with the same id rather than discarding the chain as ` +
-                  `permanently invalid.`,
-              );
-              sendStorageTimeout(
-                res,
-                `Storage write for "${body.previous_response_id}" crossed the post-commit persist hard-timeout ` +
-                  `breaker and has not yet settled. This is a transient backend condition — retry the request ` +
-                  `with the same previous_response_id.`,
-              );
-              return;
+              let lastChance: StoredResponseRecord[] | null = null;
+              try {
+                lastChance = await store.getChain(body.previous_response_id);
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (!/not found/i.test(msg)) {
+                  throw err;
+                }
+                // Probe confirmed the row is still missing —
+                // genuine hard-timed-out persist. `lastChance`
+                // stays null and we emit 503 below.
+                lastChance = null;
+              }
+              if (lastChance !== null && lastChance.length > 0) {
+                // Iter-51: the write slipped in between marker-set
+                // and this probe. Log this so operators can still
+                // see the wedged-writer condition that triggered
+                // the slow path, even when the client got a
+                // coherent 200 via the probe. Mirror the analogous
+                // log in the `awaitPending` timeout branch above.
+                console.warn(
+                  `[responses] previous_response_id "${body.previous_response_id}" missing on first lookup and ` +
+                    `its post-commit persist crossed the hard-timeout breaker, but a last-probe getChain found ` +
+                    `the record. Continuing with the probed chain — likely a wedged SQLite writer that landed ` +
+                    `just after the marker was set.`,
+                );
+                chain = lastChance;
+                // Fall through into the happy-path continuation
+                // code below (chain.length > 0 skips the empty-
+                // chain branch and the outer hot-swap guard takes
+                // over).
+              } else {
+                console.warn(
+                  `[responses] previous_response_id "${body.previous_response_id}" missing from store, but its ` +
+                    `post-commit persist crossed the hard-timeout breaker and is still unresolved (last-probe ` +
+                    `getChain still missed). Returning 503 storage_timeout so the client retries with the same ` +
+                    `id rather than discarding the chain as permanently invalid.`,
+                );
+                sendStorageTimeout(
+                  res,
+                  `Storage write for "${body.previous_response_id}" crossed the post-commit persist hard-timeout ` +
+                    `breaker and has not yet settled. This is a transient backend condition — retry the request ` +
+                    `with the same previous_response_id.`,
+                );
+                return;
+              }
+            } else {
+              // First call threw "not found", no pending write is
+              // tracked for this id, and no hard-timed-out marker
+              // is live. Rethrow the original error so the outer
+              // catch turns it into the proper 404 response.
+              throw firstAttemptError;
             }
-            // First call threw "not found", no pending write is
-            // tracked for this id, and the mock-compatible empty
-            // branch does not apply because the native store
-            // would not return `[]` alongside a throw. Rethrow
-            // the original error so the outer catch turns it
-            // into the proper 404 response.
-            throw firstAttemptError;
           }
           if (chain.length === 0) {
-            // Iter-50: mirror the rethrow branch above. An empty
-            // chain coming back from a mock-compatible store that
-            // never threw still needs to route through the
-            // retryable-503 path when the id has a hard-timed-out
-            // marker — otherwise slow-but-eventual persists across
-            // the breaker misclassify as permanent 404 here too.
+            // Iter-50 / iter-51: mirror the rethrow branch above.
+            // An empty chain coming back from a mock-compatible
+            // store that never threw still needs to route through
+            // the retryable-503 path when the id has a
+            // hard-timed-out marker — otherwise slow-but-eventual
+            // persists across the breaker misclassify as permanent
+            // 404 here too.
+            //
+            // Iter-51: probe getChain one last time before emitting
+            // 503. A write landing during the narrow window between
+            // marker-set and this branch should resolve to the real
+            // chain via the probe, NOT be misclassified as retryable
+            // 503 for a chain that already exists.
             if (getPendingWritesFor(store).isHardTimedOut(body.previous_response_id)) {
-              console.warn(
-                `[responses] previous_response_id "${body.previous_response_id}" missing from store, but its ` +
-                  `post-commit persist crossed the hard-timeout breaker and is still unresolved. Returning 503 ` +
-                  `storage_timeout so the client retries with the same id rather than discarding the chain as ` +
-                  `permanently invalid.`,
-              );
-              sendStorageTimeout(
-                res,
-                `Storage write for "${body.previous_response_id}" crossed the post-commit persist hard-timeout ` +
-                  `breaker and has not yet settled. This is a transient backend condition — retry the request ` +
-                  `with the same previous_response_id.`,
-              );
+              let lastChance: StoredResponseRecord[] | null = null;
+              try {
+                lastChance = await store.getChain(body.previous_response_id);
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (!/not found/i.test(msg)) {
+                  throw err;
+                }
+                lastChance = null;
+              }
+              if (lastChance !== null && lastChance.length > 0) {
+                console.warn(
+                  `[responses] previous_response_id "${body.previous_response_id}" missing on first lookup and ` +
+                    `its post-commit persist crossed the hard-timeout breaker, but a last-probe getChain found ` +
+                    `the record. Continuing with the probed chain — likely a wedged SQLite writer that landed ` +
+                    `just after the marker was set.`,
+                );
+                chain = lastChance;
+                // Fall through: `chain.length > 0` so the empty-
+                // chain branch below is skipped and the outer hot-
+                // swap guard / normal continuation flow takes over.
+              } else {
+                console.warn(
+                  `[responses] previous_response_id "${body.previous_response_id}" missing from store, but its ` +
+                    `post-commit persist crossed the hard-timeout breaker and is still unresolved (last-probe ` +
+                    `getChain still missed). Returning 503 storage_timeout so the client retries with the same ` +
+                    `id rather than discarding the chain as permanently invalid.`,
+                );
+                sendStorageTimeout(
+                  res,
+                  `Storage write for "${body.previous_response_id}" crossed the post-commit persist hard-timeout ` +
+                    `breaker and has not yet settled. This is a transient backend condition — retry the request ` +
+                    `with the same previous_response_id.`,
+                );
+                return;
+              }
+            } else {
+              sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
               return;
             }
-            sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
-            return;
           }
         }
 
@@ -3086,10 +3217,16 @@ export async function handleCreateResponse(
                       // returns retryable 503 `storage_timeout`
                       // instead, so clients keep retrying rather
                       // than discarding the chain (iter-50 fix).
-                      // The marker self-clears when the underlying
-                      // store promise eventually settles via the
-                      // `.finally(...)` inside `track()`.
-                      getPendingWritesFor(store).markHardTimedOut(record.id);
+                      // The marker has two cleanup paths (iter-51):
+                      // (1) fast — the underlying store promise's
+                      // `.finally(...)` inside `track()` fires when
+                      // the wedged store unwedges; (2) slow — an
+                      // independent TTL (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`,
+                      // default 300s) bounds memory at O(requestRate ×
+                      // TTL) even against a truly wedged store that
+                      // NEVER settles. Marker lifetime =
+                      // min(settlement, TTL expiry).
+                      getPendingWritesFor(store).markHardTimedOut(record.id, getHardTimedOutMarkerTtlMs());
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the
                       // live id) then drop the retain, which may
@@ -3269,10 +3406,16 @@ export async function handleCreateResponse(
                       // returns retryable 503 `storage_timeout`
                       // instead, so clients keep retrying rather
                       // than discarding the chain (iter-50 fix).
-                      // The marker self-clears when the underlying
-                      // store promise eventually settles via the
-                      // `.finally(...)` inside `track()`.
-                      getPendingWritesFor(store).markHardTimedOut(record.id);
+                      // The marker has two cleanup paths (iter-51):
+                      // (1) fast — the underlying store promise's
+                      // `.finally(...)` inside `track()` fires when
+                      // the wedged store unwedges; (2) slow — an
+                      // independent TTL (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`,
+                      // default 300s) bounds memory at O(requestRate ×
+                      // TTL) even against a truly wedged store that
+                      // NEVER settles. Marker lifetime =
+                      // min(settlement, TTL expiry).
+                      getPendingWritesFor(store).markHardTimedOut(record.id, getHardTimedOutMarkerTtlMs());
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the
                       // live id) then drop the retain, which may
