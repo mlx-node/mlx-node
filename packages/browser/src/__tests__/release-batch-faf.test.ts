@@ -12,6 +12,21 @@
  * we observe SAB bytes and bridge stats, never reach into closures.
  */
 
+// Narrow ambient declaration for Atomics.waitAsync. The built-in type lives
+// in lib.es2024 only; rather than widen the project's lib target we augment
+// the Atomics interface here so the main-thread-safe wait used by the
+// dispatch-ordering fake gpu-worker below type-checks under our stock libs.
+declare global {
+  interface Atomics {
+    waitAsync(
+      typedArray: Int32Array,
+      index: number,
+      value: number,
+      timeout?: number,
+    ): { async: true; value: Promise<'ok' | 'timed-out'> } | { async: false; value: 'not-equal' | 'timed-out' };
+  }
+}
+
 import { describe, expect, it } from 'vitest';
 
 import { CMD_OFFSET, STATUS, STATUS_INDEX, RpcFn, MAX_RELEASE_BATCH } from '../rpc-protocol';

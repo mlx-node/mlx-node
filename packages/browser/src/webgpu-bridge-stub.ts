@@ -577,6 +577,11 @@ export function createBridgeStub(
 
   function flushDispatchBatchInner(): void {
     if (batchCount === 0) return;
+    // Throw fast if a prior F&F drain timed out. rpcCall below has its own
+    // assertNotPoisoned guard, but we check here too so re-entrant call sites
+    // (e.g. from flushPendingReleases) surface the poisoning even if they
+    // never reach the rpcCall inside.
+    assertNotPoisoned('flushDispatchBatchInner');
     const count = batchCount;
     const bytes = batchBytes;
     batchCount = 0;
@@ -674,7 +679,15 @@ export function createBridgeStub(
   // wait does), resets STATUS=IDLE to match the post-normal-RPC invariant,
   // and clears the flag. It is cheap when no F&F is in flight (single bool
   // check) so we can call it liberally at every cmd-SAB write site.
+  //
+  // On timeout, the bridge is poisoned — subsequent RPCs throw. The
+  // gpu-worker may still write late DONE into the orphaned SAB slot; a
+  // poisoned bridge cannot safely reuse that slot. Forcing STATUS=IDLE and
+  // clearing ffPending on a stuck gpu-worker would let the next RPC write
+  // fresh FN_ID / ARG* bytes into a slot the gpu-worker might later clobber
+  // with a late completion for the hung release, corrupting that RPC.
   let ffPending = false;
+  let ffPoisoned = false;
   function drainFireAndForget(): void {
     if (!ffPending) return;
     // Same wait pattern as rpcCall: 10s then 30s retry. If STATUS is already
@@ -688,18 +701,37 @@ export function createBridgeStub(
       } catch {}
       waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 30_000);
       if (waitResult === 'timed-out') {
-        console.error(`[RPC FATAL] BUFFER_RELEASE_BATCH (F&F) total 40s timeout — forcing IDLE`);
+        // Fail closed: poison the bridge rather than pretending success.
+        // Leave ffPending=true and STATUS=PENDING so any further cmd-SAB
+        // writer throws via assertNotPoisoned before touching the SAB.
+        const fatalMsg = `[RPC FATAL] BUFFER_RELEASE_BATCH (F&F) total 40s timeout — bridge poisoned, gpu-worker likely hung`;
+        console.error(fatalMsg);
+        try {
+          (self as any).postMessage({ type: 'error', message: fatalMsg });
+        } catch {}
+        ffPoisoned = true;
+        return;
       }
     }
-    // After drain, STATUS may be DONE (normal) or still PENDING (timeout
-    // fallback). Either way, reset to IDLE so the next RPC starts from the
-    // same invariant every other call site expects.
+    // After drain, STATUS is DONE. Reset to IDLE so the next RPC starts
+    // from the same invariant every other call site expects.
     Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
     ffPending = false;
   }
 
+  function assertNotPoisoned(context: string): void {
+    if (ffPoisoned) {
+      throw new Error(
+        `[bridge] poisoned by prior BUFFER_RELEASE_BATCH timeout — gpu-worker likely hung. Restart worker to recover. (context: ${context})`,
+      );
+    }
+  }
+
   function flushPendingReleases(): void {
     if (pendingReleases.length === 0) return;
+    // Throw fast before drainFireAndForget so we don't try to drain a
+    // poisoned state.
+    assertNotPoisoned('flushPendingReleases');
     // Ordering invariant: BUFFER_RELEASE_BATCH must be observed by the
     // gpu-worker AFTER any staged DISPATCH_BATCH and AFTER any prior F&F
     // release.
@@ -763,11 +795,16 @@ export function createBridgeStub(
     //     holds the handles WE own and will publish atomically.
     const batchToPublish = pendingReleases;
     pendingReleases = [];
-    // (6) Defensive cap. With the swap above, batchToPublish cannot exceed
-    //     MAX_RELEASE_BATCH under normal paths (queueRelease auto-flushes
-    //     AT that size before reassigning). But future edits or reordered
-    //     call sites could push the length past the cap — publishing more
-    //     than 64 entries would overrun UNIFORM_DATA. If that happens,
+    // (6) Defensive cap. Normally batchToPublish == pendingReleases.length
+    //     which queueRelease caps at MAX_RELEASE_BATCH. This path IS
+    //     reachable, though rare: drainCallbacks (invoked synchronously by
+    //     rpcCall(DISPATCH_BATCH) inside flushDispatchBatchInner above) can
+    //     re-enter wgpuBufferRelease → queueRelease. If many handles arrive
+    //     during that callback window AFTER the swap below would have run
+    //     but before we actually swap, the outer batchToPublish can grow
+    //     past the cap on re-entry through the very call sites that call
+    //     flushPendingReleases on the same `pendingReleases` reference.
+    //     Publishing more than 64 entries would overrun UNIFORM_DATA, so
     //     push the tail back onto the fresh pendingReleases for the next
     //     flush and publish only the first MAX_RELEASE_BATCH here.
     if (batchToPublish.length > MAX_RELEASE_BATCH) {
@@ -805,6 +842,10 @@ export function createBridgeStub(
   }
 
   function rpcCall(fnId: number, a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0): number {
+    // Throw fast before any cmd-SAB writes if a prior F&F drain timed out.
+    // Must come BEFORE drainFireAndForget so we don't try to drain a poisoned
+    // state.
+    assertNotPoisoned(`rpcCall(fn=${fnId})`);
     // Phase 2: flush any staged dispatch batch before *any* other RPC so
     // the gpu-worker observes the dispatches in program order relative to
     // subsequent BUFFER_RELEASE_BATCH / QUEUE_WRITE_BUFFER / FUSED_SUBMIT /
@@ -927,6 +968,10 @@ export function createBridgeStub(
    * hiArgs maps arg index -> high 32 bits.
    */
   function rpcCallWithHi(fnId: number, args: number[], hiArgs: Record<number, number>): number {
+    // Throw fast before any cmd-SAB writes if a prior F&F drain timed out.
+    // Must come BEFORE drainFireAndForget so we don't try to drain a poisoned
+    // state.
+    assertNotPoisoned(`rpcCallWithHi(fn=${fnId})`);
     // Phase 2: same ordering guard as rpcCall(). rpcCallWithHi is used by
     // wgpuCommandEncoderCopyBufferToBuffer and friends when an argument
     // needs the u64 high-bits slot — e.g. copies against 64-bit offsets or

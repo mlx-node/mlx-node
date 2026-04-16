@@ -48,7 +48,9 @@ self.onmessage = (e: MessageEvent) => {
     for (let i = 0; i < MAX_RELEASE_BATCH; i++) release(1 + i);
 
     if (cmdI32[STATUS_INDEX] !== STATUS.PENDING) {
-      (self as any).postMessage({ ok: false, error: 'F&F #1 did not flip STATUS to PENDING' });
+      // Terminal failure path: tag with type: 'done' so the harness fails
+      // fast instead of waiting for its 10s outer timeout.
+      (self as any).postMessage({ type: 'done', ok: false, error: 'F&F #1 did not flip STATUS to PENDING' });
       return;
     }
 
