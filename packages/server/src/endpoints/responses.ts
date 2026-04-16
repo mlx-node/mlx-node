@@ -280,6 +280,50 @@ export function getHardTimedOutMarkerTtlMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300_000;
 }
 
+/**
+ * Compute the `absoluteExpiresAt` (epoch-ms) for a hard-timed-out marker
+ * based on the record AND its resolved chain.
+ *
+ * ## Why this helper exists (iter-54 codex HIGH finding 1)
+ *
+ * Iter-53 capped the marker at `record.expiresAt * 1000` — the NEW
+ * response row's own TTL. But `ResponseStore.getChain()`
+ * (`crates/mlx-db/src/response_store/reader.rs:44-59`) walks the chain
+ * back via `previous_response_id` and aborts on the first row whose
+ * `expires_at <= unixepoch()`. So a child whose parent expires earlier
+ * becomes unrecoverable at the parent's expiry, NOT the child's. A
+ * marker capped only by the child's row expiry would keep emitting
+ * retryable 503 for a chain that has already aged out of `getChain()`.
+ *
+ * This helper clamps to the MINIMUM `expiresAt` across the whole
+ * resolved chain so the marker can never outlive the earliest link —
+ * which is exactly the row whose expiry fires the reader's abort.
+ *
+ * Returns epoch-ms (the unit `pending-writes.ts` expects for
+ * `absoluteExpiresAt`). Returns `Number.POSITIVE_INFINITY` when no
+ * chain-record carried an expiry (legacy rows that predate the
+ * `expiresAt` column) — the iter-53 safety rail for "row with no
+ * visible expiry falls back to TTL-only bounding".
+ */
+function computeChainEarliestExpiresAtMs(
+  record: StoredResponseRecord,
+  chain: StoredResponseRecord[] | undefined,
+): number {
+  const secondsCandidates: number[] = [];
+  if (record.expiresAt != null && Number.isFinite(record.expiresAt)) {
+    secondsCandidates.push(record.expiresAt);
+  }
+  if (chain !== undefined) {
+    for (const link of chain) {
+      if (link.expiresAt != null && Number.isFinite(link.expiresAt)) {
+        secondsCandidates.push(link.expiresAt);
+      }
+    }
+  }
+  if (secondsCandidates.length === 0) return Number.POSITIVE_INFINITY;
+  return Math.min(...secondsCandidates) * 1000;
+}
+
 // ---------------------------------------------------------------------------
 // Non-streaming path
 // ---------------------------------------------------------------------------
@@ -1994,6 +2038,23 @@ export async function handleCreateResponse(
     // `body.instructions`, when the continuation has no stored chain,
     // or when the trailing record did not carry an instructions field.
     let inheritedInstructions: string | null = null;
+    // Iter-54 (codex's iter-53 HIGH finding 1): the resolved ancestor
+    // chain is captured here so the post-commit hard-timeout breaker
+    // can clamp its marker at the EARLIEST `expiresAt` across the
+    // whole chain, not just the newly produced row's `expiresAt`. The
+    // native `ResponseStore.getChain()`
+    // (`crates/mlx-db/src/response_store/reader.rs:44-59`) aborts on
+    // the first expired ancestor, so a child whose parent expires
+    // sooner becomes unrecoverable at the parent's expiry — not at
+    // its own. Without this visibility the breaker capped only at
+    // `record.expiresAt * 1000`, which is arbitrarily in the future
+    // compared to an older parent that is about to age out.
+    //
+    // Captured only for continuations (`body.previous_response_id`
+    // with a `store`); stateless requests leave this as `undefined`
+    // and `computeChainEarliestExpiresAtMs` falls back to the
+    // record-only cap.
+    let resolvedChain: StoredResponseRecord[] | undefined;
 
     if (body.previous_response_id && store) {
       try {
@@ -2446,6 +2507,16 @@ export async function handleCreateResponse(
         }
         priorMessages = reconstructMessagesFromChain(chain);
         previousResponseId = body.previous_response_id;
+        // Iter-54: expose the resolved chain to the post-commit
+        // hard-timeout breaker so it can clamp its marker's absolute
+        // expiry at the earliest `expiresAt` across the whole chain
+        // (see `computeChainEarliestExpiresAtMs`). The chain array
+        // here is the authoritative one the request is about to
+        // dispatch against — by the time the breaker fires, any
+        // concurrent store mutation is irrelevant because
+        // `ResponseStore.getChain()` evaluates row expiries against
+        // `unixepoch()` at its OWN call time, not at store time.
+        resolvedChain = chain;
         // Inherit the trailing stored record's `instructions` when
         // the continuation request does NOT override it. Finding 4:
         // the iter-25 cold-replay path dropped stored instructions
@@ -3238,10 +3309,22 @@ export async function handleCreateResponse(
                       // the retryable-503 classification is factually
                       // wrong — the marker must flip to 404 regardless
                       // of ongoing client retries.
+                      //
+                      // Iter-54 (codex's iter-53 HIGH finding 1):
+                      // clamp at the MINIMUM `expiresAt` across the
+                      // resolved chain, not just the child record.
+                      // `ResponseStore.getChain()` walks ancestors
+                      // and aborts on the first expired link
+                      // (`crates/mlx-db/src/response_store/reader.rs:44-59`);
+                      // a child whose parent expires sooner becomes
+                      // unrecoverable at the parent's expiry, not
+                      // its own. `computeChainEarliestExpiresAtMs`
+                      // folds both record + resolved chain, so the
+                      // marker can never outlive the earliest link.
                       getPendingWritesFor(store).markHardTimedOut(
                         record.id,
                         getHardTimedOutMarkerTtlMs(),
-                        record.expiresAt != null ? record.expiresAt * 1000 : Number.POSITIVE_INFINITY,
+                        computeChainEarliestExpiresAtMs(record, resolvedChain),
                       );
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the
@@ -3443,10 +3526,22 @@ export async function handleCreateResponse(
                       // the retryable-503 classification is factually
                       // wrong — the marker must flip to 404 regardless
                       // of ongoing client retries.
+                      //
+                      // Iter-54 (codex's iter-53 HIGH finding 1):
+                      // clamp at the MINIMUM `expiresAt` across the
+                      // resolved chain, not just the child record.
+                      // `ResponseStore.getChain()` walks ancestors
+                      // and aborts on the first expired link
+                      // (`crates/mlx-db/src/response_store/reader.rs:44-59`);
+                      // a child whose parent expires sooner becomes
+                      // unrecoverable at the parent's expiry, not
+                      // its own. `computeChainEarliestExpiresAtMs`
+                      // folds both record + resolved chain, so the
+                      // marker can never outlive the earliest link.
                       getPendingWritesFor(store).markHardTimedOut(
                         record.id,
                         getHardTimedOutMarkerTtlMs(),
-                        record.expiresAt != null ? record.expiresAt * 1000 : Number.POSITIVE_INFINITY,
+                        computeChainEarliestExpiresAtMs(record, resolvedChain),
                       );
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the

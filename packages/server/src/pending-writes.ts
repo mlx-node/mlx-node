@@ -151,7 +151,32 @@
  *     reclaimed amortizedly (full drain across roughly ceil(N/64)
  *     subsequent inserts).
  *
- * Cleanup paths in effect after iter-53:
+ * Iter-54 (codex's iter-53 MEDIUM finding 2):
+ *
+ *   * `sweepExpired()` always starts from the Map head and stops
+ *     after MAX_SWEEP_PER_INSERT visits, but iter-52's
+ *     refresh-on-read updated entries in place — preserving their
+ *     original insertion position at the head. A fixed cohort of
+ *     64 actively-refreshed markers at the head could indefinitely
+ *     block every subsequent sweep from reaching expired markers
+ *     behind them, starving reclamation. Fix: `isHardTimedOut(id)`
+ *     now moves refreshed entries to the tail (O(1) `delete` +
+ *     re-`set` leveraging Map insertion-order semantics). The
+ *     sweep then makes forward progress across the whole map as
+ *     hot entries rotate back, producing natural LRU-eviction
+ *     behaviour under sustained hard-timeout traffic.
+ *
+ *   * Iter-54 also clamps the marker's `absoluteExpiresAt` at the
+ *     MINIMUM `expiresAt` across the whole resolved chain, not
+ *     just the child record (see `responses.ts`
+ *     `computeChainEarliestExpiresAtMs`). `ResponseStore.getChain()`
+ *     walks ancestors and aborts on the first expired link
+ *     (`crates/mlx-db/src/response_store/reader.rs:44-59`), so a
+ *     child whose parent expires sooner is unrecoverable at the
+ *     parent's expiry — not the child's. That change lives on the
+ *     caller side; this module just receives the min-clamped value.
+ *
+ * Cleanup paths in effect after iter-54:
  *
  *   1. Fast path — the underlying write promise's `.finally(...)`
  *      inside `track()` deletes the marker as soon as the wedged
@@ -159,7 +184,10 @@
  *   2. Read-refresh path — live continuations slide the TTL
  *      forward so the retryable-503 window stays open while the
  *      client is actively retrying, CLAMPED at the record's
- *      absolute row expiry (iter-53).
+ *      absolute row expiry (iter-53). The refreshed entry is
+ *      MOVED TO THE MAP TAIL on every live hit (iter-54) so the
+ *      bounded sweep is not starved by a stable head cohort of
+ *      hot entries.
  *   3. Read-expire path — a full TTL elapse without any refresh
  *      lazily deletes the entry and returns `false` (permanent
  *      404 classification).
@@ -169,7 +197,10 @@
  *      unrecoverable chains.
  *   5. Write-sweep path — `markHardTimedOut()` drains expired
  *      entries on insert, BOUNDED to MAX_SWEEP_PER_INSERT visits
- *      per call (iter-53) so each transition stays O(1).
+ *      per call (iter-53). Combined with iter-54's read-move,
+ *      the sweep now always makes forward progress — stale
+ *      head-of-map entries are reclaimed even under sustained
+ *      retry traffic against a fixed hot cohort.
  *
  * Marker lifetime is therefore bounded by:
  *
@@ -486,6 +517,21 @@ export class PendingResponseWrites {
    * `ResponseStore.getChain()` hides the row, so the classification
    * must flip to 404 at that bound. Every refresh is also clamped
    * at the absolute cap so the marker can never outlive the row.
+   *
+   * Iter-54 (codex's iter-53 MEDIUM finding 2): move refreshed
+   * live entries to the Map tail so the bounded write-path sweep
+   * can progress past them on subsequent `markHardTimedOut()`
+   * calls. Before iter-54, `sweepExpired()` always started from
+   * the Map head and stopped after MAX_SWEEP_PER_INSERT visits;
+   * because `isHardTimedOut()` refreshed entries in place, the
+   * oldest-by-insertion hot entries stayed at the head forever
+   * and the sweep could be starved — a fixed set of 64 live-but-
+   * refreshed entries at the head would block every subsequent
+   * sweep from reaching expired entries behind them. JavaScript
+   * `Map` preserves insertion order; `delete` + re-`set` is O(1)
+   * and re-inserts at the tail. Natural LRU-eviction semantics:
+   * hot entries rotate to the tail as they are refreshed,
+   * leaving stale entries at the head available for reclamation.
    */
   isHardTimedOut(id: string): boolean {
     const entry = this.hardTimedOut.get(id);
@@ -512,6 +558,16 @@ export class PendingResponseWrites {
     // both persisted on the entry at insertion time so the caller
     // doesn't need to re-thread either one here.
     entry.expiresAt = Math.min(now + entry.ttlMs, entry.absoluteExpiresAt);
+    // Iter-54 finding 2 fix: move this refreshed entry to the
+    // tail of the insertion-ordered Map so the bounded sweep
+    // (which always starts from the head) can make progress past
+    // actively-refreshed ids. O(1) — Map `delete` + `set` is
+    // constant-time. `set` on an existing key with an existing
+    // entry preserves the entry reference (we set the SAME
+    // entry object, which is already mutated with the refreshed
+    // `expiresAt` above), so no copy is made.
+    this.hardTimedOut.delete(id);
+    this.hardTimedOut.set(id, entry);
     return true;
   }
 

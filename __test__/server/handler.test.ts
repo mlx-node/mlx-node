@@ -5947,6 +5947,421 @@ describe('createHandler', () => {
       }
     }, 10000);
 
+    it('iter-54: hard-timeout marker clamps to earliest expiresAt across the resolved chain (not just the child record)', async () => {
+      // Codex's iter-53 review HIGH finding 1: iter-53 capped the
+      // marker at `record.expiresAt * 1000` — the newly produced
+      // child row's own TTL. But `ResponseStore.getChain()`
+      // (`crates/mlx-db/src/response_store/reader.rs:44-59`) walks
+      // the chain back via `previous_response_id` and aborts on the
+      // first row whose `expires_at <= unixepoch()` — so a child
+      // whose PARENT expires earlier becomes unrecoverable at the
+      // parent's expiry, not the child's. With iter-53's child-only
+      // cap the marker could keep emitting retryable 503 long after
+      // the chain had aged out of `getChain()`, because the child's
+      // own `expiresAt` might still be an hour in the future while
+      // the parent's had already passed.
+      //
+      // Iter-54 fix: `computeChainEarliestExpiresAtMs(record, chain)`
+      // folds the child's expiry with every ancestor's expiry and
+      // takes the minimum. The marker's `absoluteExpiresAt` is
+      // therefore clamped at whichever link would disappear from
+      // `getChain()` first, which is exactly the expiry at which
+      // the chain becomes unrecoverable.
+      //
+      // Shape:
+      //   1. POST #1 (no previous_response_id) → record A persisted
+      //      normally. Then we manually shrink A's `expiresAt` in
+      //      the mock store so the ancestor will age out quickly.
+      //   2. POST #2 (previous_response_id=A) → chain = [A], creates
+      //      record B. B's persist wedges, the hard-timeout breaker
+      //      fires, and the marker's `absoluteExpiresAt` is clamped
+      //      at A's shortened `expiresAt` (NOT B's default 30-min
+      //      value). Mock `getChain` emulates the Rust reader: if
+      //      any ancestor's expiresAt has passed, throw "not found"
+      //      so the chain is unrecoverable.
+      //   3. Continuation #1 immediately: marker is live (A still
+      //      valid), returns 503 storage_timeout — happy case.
+      //   4. Wait past A's shortened expiry (still inside B's
+      //      default 30-min TTL). Under iter-53's child-only cap
+      //      the marker would remain live indefinitely because B's
+      //      expiry is far in the future. Under iter-54 the marker
+      //      has already been clamped at A's expiry, so it ages
+      //      out naturally.
+      //   5. Continuation #2: marker is gone, getChain correctly
+      //      reports "not found" (A has aged out), handler emits
+      //      sendNotFound (404). NOT 503 — the chain is
+      //      unrecoverable and the client must start fresh.
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      try {
+        const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
+
+        // `storedRecords` is the authoritative backing store —
+        // only records whose `store()` promise has RESOLVED are
+        // visible via `getChain()`. This matches the real SQLite
+        // backend where an in-flight write is not yet queryable.
+        // `getChain(id)` walks `previousResponseId` links and
+        // replicates the Rust reader's ancestor-expiry check at
+        // line 44-59 of `response_store/reader.rs`: if any hop
+        // has `expiresAt <= nowSeconds` (or is missing entirely
+        // because its write is wedged) it aborts with "Response
+        // not found: <id>".
+        const storedRecords = new Map<string, any>();
+        // Hooks so POST #1's persist resolves (so record A enters
+        // the store cleanly) but POST #2's persist wedges (so the
+        // hard-timeout breaker fires against record B). B is
+        // deliberately NOT added to `storedRecords` — its write is
+        // still running in the background, so `getChain(B)` must
+        // miss, driving the marker-classified retryable-503 path.
+        const storeCallCount = { n: 0 };
+        const mockStore = {
+          store: vi.fn().mockImplementation((record: any) => {
+            storeCallCount.n += 1;
+            // First store() call (A) resolves immediately AND
+            // populates `storedRecords` so A becomes queryable via
+            // getChain BEFORE POST #2 runs. Second store() call
+            // (B) never resolves AND does not populate the store —
+            // simulates a wedged SQLite writer where the row has
+            // not committed, so a concurrent `getChain(B)` misses.
+            if (storeCallCount.n === 1) {
+              storedRecords.set(record.id, record);
+              return Promise.resolve();
+            }
+            return new Promise<void>(() => {});
+          }),
+          getChain: vi.fn().mockImplementation((id: string) => {
+            // Emulate reader.rs:44-59. Walk the chain via
+            // previousResponseId; abort on the first expired link.
+            const nowSeconds = Math.floor(Date.now() / 1000);
+            const chain: any[] = [];
+            let currentId: string | undefined = id;
+            while (currentId !== undefined) {
+              const rec = storedRecords.get(currentId);
+              if (rec === undefined) {
+                return Promise.reject(new Error(`Response not found: ${currentId}`));
+              }
+              if (rec.expiresAt != null && rec.expiresAt <= nowSeconds) {
+                return Promise.reject(new Error(`Response not found: ${currentId}`));
+              }
+              chain.push(rec);
+              currentId = rec.previousResponseId;
+            }
+            chain.reverse();
+            return Promise.resolve(chain);
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'iter-54 reply' }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue: vi.fn().mockResolvedValue(makeChatResult({ text: 'continuation reply' })),
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-54-chain-earliest-expiry';
+        registry.register(MODEL_NAME, mockModel);
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        // (1) POST #1 — no previous_response_id. Creates record A.
+        // The first store() call resolves normally, so A is a
+        // queryable ancestor for POST #2.
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'original message (ancestor)',
+          stream: false,
+        });
+        const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+        const body1 = JSON.parse(getBody1());
+        expect(body1.status).toBe('completed');
+        const responseIdA: string = body1.id;
+
+        // Wait for the post-commit persist to settle (A resolves
+        // immediately, but the handler's outer finally awaits it
+        // off-lock; giving the microtask queue a tick is enough).
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
+        expect(storedRecords.has(responseIdA)).toBe(true);
+
+        // Shrink A's `expiresAt` so it ages out within the test's
+        // wall-clock window. The record is already in the store,
+        // so we modify it in place — the mock's getChain() will
+        // observe the shortened expiry on subsequent reads.
+        //
+        // Target: A expires 1 second from now. Far enough that
+        // continuation #1 still sees A as live, but short enough
+        // that we can advance past it without waiting 30 minutes.
+        const recordA = storedRecords.get(responseIdA)!;
+        const shortenedExpiresAt = Math.floor(Date.now() / 1000) + 1;
+        recordA.expiresAt = shortenedExpiresAt;
+
+        // (2) POST #2 — previous_response_id = A. chain = [A]
+        // (still live). This creates record B and wedges B's
+        // persist, firing the hard-timeout breaker against B with
+        // resolvedChain = [A]. Under iter-54 the marker's
+        // absoluteExpiresAt is clamped at A.expiresAt * 1000 —
+        // a 1-second cap — NOT B's default ~30-minute cap.
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation (child)',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res2, waitForEnd: wait2, getBody: getBody2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+        const body2 = JSON.parse(getBody2());
+        expect(body2.status).toBe('completed');
+        const responseIdB: string = body2.id;
+
+        // Wait for the 50ms hard-timeout breaker to fire against B.
+        // A's own expiry is ~1 second in the future so the marker
+        // is still live at this point.
+        while (mockStore.store.mock.calls.length < 2) {
+          await new Promise((r) => setImmediate(r));
+        }
+        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setImmediate(r));
+
+        const tracker = getPendingWritesFor(mockStore);
+        expect(tracker.isHardTimedOut(responseIdB)).toBe(true);
+
+        // Verify the marker's absoluteExpiresAt is clamped at A's
+        // shortened expiry (epoch-ms), NOT B's default expiry. The
+        // two differ by ~30 minutes, which is the whole point of
+        // this regression.
+        const internalMap = tracker['hardTimedOut'] as Map<
+          string,
+          { expiresAt: number; ttlMs: number; absoluteExpiresAt: number }
+        >;
+        const entryB = internalMap.get(responseIdB);
+        expect(entryB).toBeDefined();
+        // absoluteExpiresAt should be clamped at A's expiry. A's
+        // expiresAt is in seconds; marker stores epoch-ms.
+        expect(entryB!.absoluteExpiresAt).toBe(shortenedExpiresAt * 1000);
+        // Under iter-53 this would have been ~30 minutes past now
+        // (B's default TTL). The assertion above pins that it is
+        // NOT — the cap matches A's expiry, the earliest link.
+        const thirtyMinutesFromNow = Date.now() + 25 * 60 * 1000;
+        expect(entryB!.absoluteExpiresAt).toBeLessThan(thirtyMinutesFromNow);
+
+        // (3) Continuation #1 against B — marker is live (A still
+        // valid, B's persist is still wedged), so continuation
+        // returns 503 storage_timeout — happy case.
+        const req3 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation while ancestor is still live',
+          previous_response_id: responseIdB,
+          stream: false,
+        });
+        const { res: res3, getStatus: status3, getBody: getBody3, waitForEnd: wait3 } = createMockRes();
+        await handler(req3, res3);
+        await wait3();
+        expect(status3()).toBe(503);
+        const parsed3 = JSON.parse(getBody3());
+        expect(parsed3.error.type).toBe('storage_timeout');
+
+        // (4) Wait past A's expiry. A was set to expire 1 second
+        // after POST #1. Give 1.5 seconds total wall-clock from
+        // that point — A is now invisible to getChain, which
+        // means B's chain is unrecoverable. Under iter-53's
+        // child-only cap the marker would still be live because
+        // B's own `expiresAt` is far in the future.
+        await new Promise((r) => setTimeout(r, 1200));
+
+        // (5) Continuation #2 against B — marker has hit its
+        // clamped absolute cap (A.expiresAt). `isHardTimedOut`
+        // returns false; the handler falls through to the real
+        // getChain which now throws "not found" because A has
+        // aged out. Result: 404 `sendNotFound`, NOT 503 for an
+        // unrecoverable chain.
+        const req4 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation past ancestor expiry',
+          previous_response_id: responseIdB,
+          stream: false,
+        });
+        const { res: res4, getStatus: status4, getBody: getBody4, waitForEnd: wait4 } = createMockRes();
+        await handler(req4, res4);
+        await wait4();
+        expect(status4()).toBe(404);
+        const parsed4 = JSON.parse(getBody4());
+        expect(parsed4.error.type).not.toBe('storage_timeout');
+
+        // Marker has been purged as a side effect of the
+        // absolute-cap read.
+        expect(tracker.isHardTimedOut(responseIdB)).toBe(false);
+
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+        warnSpy.mockRestore();
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
+        }
+      }
+    }, 15000);
+
+    it('iter-54: bounded sweep is not starved by a live head cohort (refreshed entries rotate to tail)', async () => {
+      // Codex's iter-53 review MEDIUM finding 2: iter-53's bounded
+      // sweep visits at most MAX_SWEEP_PER_INSERT=64 entries per
+      // `markHardTimedOut()` call and always starts from the Map
+      // head. Iter-52's refresh-on-read updated entries in place,
+      // preserving their original insertion position — so if the
+      // oldest 64 ids were clients that kept retrying continuations,
+      // every new `markHardTimedOut()` call re-visited the same 64
+      // live entries and never reached newer expired markers
+      // behind them. Starvation: stale entries behind the hot
+      // cohort were permanently unreclaimable by the write-path
+      // sweep.
+      //
+      // Iter-54 fix: `isHardTimedOut(id)` moves refreshed live
+      // entries to the Map tail (O(1) `delete` + re-`set`
+      // leveraging JavaScript Map insertion-order semantics).
+      // The bounded sweep then always makes forward progress:
+      // hot entries rotate to the tail as they refresh, leaving
+      // stale entries at the head available for reclamation.
+      //
+      // Shape:
+      //   1. Seed 64 "hot" markers with long TTL and long absolute
+      //      cap. These simulate actively-retried wedged ids.
+      //   2. Seed a further batch of "expired" markers with short
+      //      TTL so they're eligible for reclamation on the next
+      //      sweep.
+      //   3. "Refresh" the 64 hot markers (call isHardTimedOut)
+      //      — under iter-54 this moves them to the tail; under
+      //      iter-53 they stay at the head.
+      //   4. Drive a new `markHardTimedOut()` — the sweep starts
+      //      from the head and visits up to 64 entries. Under
+      //      iter-54 the head is now populated by expired
+      //      entries (the hot cohort moved to the tail), so the
+      //      sweep reclaims them. Under iter-53 the head still
+      //      has the hot cohort and the sweep returns with zero
+      //      reclamations.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const MAX_SWEEP_PER_INSERT = 64;
+
+      vi.useFakeTimers();
+      try {
+        const tracker = new PendingResponseWrites();
+        const farFuture = () => Date.now() + 10 * 60 * 1000;
+
+        // (1) Seed 64 hot markers with long TTL and long absolute
+        // cap. Each one has a backing pending entry (required by
+        // `markHardTimedOut` to transition). Insertion order is
+        // hot_0, hot_1, ..., hot_63.
+        const HOT_COUNT = MAX_SWEEP_PER_INSERT;
+        for (let i = 0; i < HOT_COUNT; i += 1) {
+          const id = `hot_${i}`;
+          tracker.track(id, new Promise<void>(() => {}));
+          tracker.markHardTimedOut(id, 60_000, farFuture());
+        }
+
+        // (2) Seed 200 "cold" markers with short TTL (they'll
+        // expire after time advances below). These are inserted
+        // AFTER the hot markers, so in insertion order they sit
+        // at the tail of the Map.
+        const COLD_COUNT = 200;
+        for (let i = 0; i < COLD_COUNT; i += 1) {
+          const id = `cold_${i}`;
+          tracker.track(id, new Promise<void>(() => {}));
+          tracker.markHardTimedOut(id, 1, Date.now() + 1);
+        }
+
+        const internalMap = tracker['hardTimedOut'] as Map<string, unknown>;
+        // All HOT_COUNT + COLD_COUNT entries are in the map
+        // before we advance time (the first insert drained zero
+        // expired entries; subsequent inserts had at most the
+        // freshly-inserted cold markers to consider, but none
+        // were expired at insert time).
+        expect(internalMap.size).toBe(HOT_COUNT + COLD_COUNT);
+
+        // (3) Advance time past the cold markers' short TTL.
+        // Hot markers still have 60s TTL / 10-min absolute cap,
+        // so they stay live.
+        vi.advanceTimersByTime(100);
+
+        // (4) "Refresh" every hot marker — simulate the client
+        // retry pattern that iter-52's refresh-on-read extends.
+        // Under iter-54 this moves them to the tail. Under
+        // iter-53 they stayed at the head.
+        for (let i = 0; i < HOT_COUNT; i += 1) {
+          expect(tracker.isHardTimedOut(`hot_${i}`)).toBe(true);
+        }
+
+        // After the refresh round, hot markers should be at the
+        // tail of the map (iter-54 move-to-tail contract). Verify
+        // by iterating the private map: the first HOT_COUNT-ish
+        // entries should now be cold_* (which have expired), and
+        // the hot cohort should be at the back.
+        //
+        // Iteration order is insertion order. After iter-54's
+        // delete+set on each hot_i, the hot cohort re-inserts at
+        // the tail — so the head is now cold_0 .. cold_{COLD_COUNT-1}
+        // followed by hot_0 .. hot_{HOT_COUNT-1}.
+        //
+        // Without the move-to-tail change, iteration would yield
+        // hot_* first (starving the sweep from reaching cold_*
+        // behind them).
+        const keys = Array.from(internalMap.keys());
+        // First HOT_COUNT entries of the *new* order must NOT be
+        // hot_* — if they are, the move-to-tail didn't happen.
+        const firstHotAtHead = keys.slice(0, HOT_COUNT).every((k) => k.startsWith('cold_'));
+        expect(firstHotAtHead).toBe(true);
+        // And the tail should contain every hot_* key (their
+        // relative order among themselves is preserved by the
+        // refresh loop above).
+        const tail = new Set(keys.slice(-HOT_COUNT));
+        for (let i = 0; i < HOT_COUNT; i += 1) {
+          expect(tail.has(`hot_${i}`)).toBe(true);
+        }
+
+        // (5) Drive a new `markHardTimedOut()` — the sweep now
+        // starts from the head (cold_* entries). Since they are
+        // all expired, the first MAX_SWEEP_PER_INSERT visits
+        // reclaim 64 entries. Under iter-53 the head would still
+        // have been hot_* and the sweep would have reclaimed zero.
+        tracker.track('new_probe', new Promise<void>(() => {}));
+        tracker.markHardTimedOut('new_probe', 60_000, farFuture());
+
+        // After the sweep: up to MAX_SWEEP_PER_INSERT cold
+        // entries have been reclaimed. Total map size drops by
+        // that amount and a fresh `new_probe` entry is added.
+        // Final size = HOT_COUNT + COLD_COUNT + 1 - reclaimed,
+        // where reclaimed is between 1 and MAX_SWEEP_PER_INSERT
+        // (bounded by the visit budget).
+        //
+        // The regression assertion: reclaimed > 0. Under iter-53
+        // starvation the map size would be HOT_COUNT + COLD_COUNT + 1
+        // exactly — no reclamation because the sweep's visit budget
+        // was entirely consumed by still-live hot_* entries.
+        const sizeAfterOneSweep = internalMap.size;
+        const expectedCeiling = HOT_COUNT + COLD_COUNT + 1; // no-reclaim case
+        expect(sizeAfterOneSweep).toBeLessThan(expectedCeiling);
+        // And specifically at least one cold_* has been deleted.
+        // Check by counting remaining cold_* keys.
+        const coldRemaining = Array.from(internalMap.keys()).filter((k) => k.startsWith('cold_')).length;
+        expect(coldRemaining).toBeLessThan(COLD_COUNT);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('iter-51: MLX_HARD_TIMEOUT_MARKER_TTL_MS parsing mirrors hard-timeout parser (empty/whitespace -> default, 0 -> zero, valid -> parsed)', async () => {
       // Iter-51 adds an independent TTL for hard-timed-out
       // markers (codex's iter-50 HIGH finding 1). The parser
