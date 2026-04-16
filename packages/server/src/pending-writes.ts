@@ -51,7 +51,7 @@
  * `getChain()`, because the tracker promise's rejection is already
  * surfaced through the registering handler's separate awaiter.
  *
- * ## Hard-timeout marker state (iter-50 / iter-51 / iter-52)
+ * ## Hard-timeout marker state (iter-50 / iter-51 / iter-52 / iter-53)
  *
  * Iter-49 added a `PendingResponseWrites.evict(id)` primitive so the
  * hard-timeout breaker in `responses.ts` could drop a wedged persist's
@@ -118,24 +118,62 @@
  *     no eventual settlement) age out. Each entry stores its
  *     original `ttlMs` so the refresh knows the interval.
  *
- * Cleanup paths in effect after iter-52:
+ * Iter-53 (codex's iter-52 HIGH finding 1 + MEDIUM finding 2):
+ *
+ *   * Finding 1 — the iter-52 refresh-on-read extended the marker
+ *     expiry unboundedly as long as clients kept retrying, even
+ *     though the response record itself expires at a FIXED absolute
+ *     wall-clock bound (`RESPONSE_TTL_SECONDS`, currently 30 min).
+ *     After that absolute bound passes, `ResponseStore.getChain()`
+ *     hides the row — no late persist can ever become visible — but
+ *     the refresh-on-read kept classifying the id as retryable
+ *     `storage_timeout` indefinitely as long as the client kept
+ *     pinging before each marker TTL elapsed. Result: permanent 503
+ *     loop for an unrecoverable chain. Fix: the caller threads in
+ *     the record's `absoluteExpiresAt` (epoch-ms), and both the
+ *     initial insert and every read-refresh clamp to that value.
+ *     Once `Date.now() >= absoluteExpiresAt`, `isHardTimedOut(id)`
+ *     deletes the marker and returns `false` unconditionally — the
+ *     row is unrecoverable regardless of retries.
+ *
+ *   * Finding 2 — `sweepExpired()` was an UNBOUNDED linear walk of
+ *     the full marker map on every new hard-timeout insert. With
+ *     iter-52's refresh-on-read keeping actively-retried ids alive
+ *     for arbitrarily long, the map could grow to N wedged writes
+ *     and every new transition paid O(N) on the main event loop,
+ *     amortized O(N²) across N inserts. Fix: a bounded per-insert
+ *     visit budget (`MAX_SWEEP_PER_INSERT = 64`). The sweep
+ *     iterates at most 64 entries per call and deletes expired
+ *     entries it finds. JavaScript `Map` preserves insertion
+ *     order, so the sweep naturally drains the oldest markers
+ *     first — which is where same-TTL expiries cluster. Steady-
+ *     state cost per transition is now O(1) and memory is still
+ *     reclaimed amortizedly (full drain across roughly ceil(N/64)
+ *     subsequent inserts).
+ *
+ * Cleanup paths in effect after iter-53:
  *
  *   1. Fast path — the underlying write promise's `.finally(...)`
  *      inside `track()` deletes the marker as soon as the wedged
  *      store unwedges.
  *   2. Read-refresh path — live continuations slide the TTL
  *      forward so the retryable-503 window stays open while the
- *      client is actively retrying.
+ *      client is actively retrying, CLAMPED at the record's
+ *      absolute row expiry (iter-53).
  *   3. Read-expire path — a full TTL elapse without any refresh
  *      lazily deletes the entry and returns `false` (permanent
  *      404 classification).
- *   4. Write-sweep path — `markHardTimedOut()` drains expired
- *      entries on insert, so memory is bounded even without
- *      read traffic.
+ *   4. Read-absolute-cap path (iter-53) — once `Date.now() >=
+ *      absoluteExpiresAt`, the marker is deleted and `false` is
+ *      returned regardless of TTL refreshes. Hard stop for
+ *      unrecoverable chains.
+ *   5. Write-sweep path — `markHardTimedOut()` drains expired
+ *      entries on insert, BOUNDED to MAX_SWEEP_PER_INSERT visits
+ *      per call (iter-53) so each transition stays O(1).
  *
  * Marker lifetime is therefore bounded by:
  *
- *   min(write settlement, last continuation + TTL, next write-sweep after expiry)
+ *   min(write settlement, last continuation + TTL, absoluteExpiresAt)
  *
  * ## Scope
  *
@@ -161,10 +199,12 @@ export class PendingResponseWrites {
    * Ids that crossed the hard-timeout breaker in responses.ts while
    * their `store.store(...)` promise was still unresolved (iter-50,
    * TTL-bounded in iter-51, sweep-on-write + refresh-on-read in
-   * iter-52).
+   * iter-52, absolute-cap + bounded-sweep in iter-53).
    *
-   * Each entry records `{ expiresAt, ttlMs }` in epoch-ms. Four
-   * cleanup/refresh paths:
+   * Each entry records `{ expiresAt, ttlMs, absoluteExpiresAt }` in
+   * epoch-ms. `expiresAt` is the TTL-based sliding window;
+   * `absoluteExpiresAt` is the record row's own wall-clock expiry
+   * (`record.expiresAt * 1000`). Five cleanup/refresh paths:
    *
    *   1. Fast path — the underlying write promise's `.finally(...)`
    *      inside `track()` deletes the entry as soon as the wedged
@@ -172,18 +212,24 @@ export class PendingResponseWrites {
    *      itself settles.
    *   2. Read-refresh path (iter-52) — `isHardTimedOut(id)` pushes
    *      `expiresAt` forward by the original `ttlMs` on every live
-   *      hit. Continuations that keep retrying keep the
-   *      retryable-503 window open; only abandoned markers age
-   *      out. This addresses iter-51 finding 2 (permanent 404 for
-   *      slow-but-eventual persists crossing the fixed TTL).
+   *      hit, CLAMPED at `absoluteExpiresAt` (iter-53).
+   *      Continuations that keep retrying keep the retryable-503
+   *      window open while the row is still visible to
+   *      `ResponseStore.getChain()`.
    *   3. Read-expire path — `isHardTimedOut(id)` lazily deletes any
    *      entry whose `expiresAt` has already passed at call time
    *      (no refresh on a dead entry). Returns false.
-   *   4. Write-sweep path (iter-52) — `markHardTimedOut()` calls
-   *      `sweepExpired()` BEFORE inserting a new marker, so even a
-   *      workload with zero continuation reads bounds memory on
-   *      every new hard-timeout event. This addresses iter-51
-   *      finding 1 (leak when no retries ever arrive).
+   *   4. Read-absolute-cap path (iter-53) — once
+   *      `Date.now() >= absoluteExpiresAt`, the entry is deleted
+   *      and false is returned unconditionally. Hard stop: the
+   *      row has aged out of `getChain()`, so no late persist
+   *      can make this id chainable again.
+   *   5. Write-sweep path (iter-52, bounded in iter-53) —
+   *      `markHardTimedOut()` calls `sweepExpired()` BEFORE
+   *      inserting a new marker, but visits at most
+   *      `MAX_SWEEP_PER_INSERT` entries so every transition is
+   *      O(1) amortized even under sustained wedged-store
+   *      traffic.
    *
    * Invariant: a marker is only meaningful for the SPECIFIC write
    * that was live when `markHardTimedOut` was called. If a later
@@ -191,12 +237,40 @@ export class PendingResponseWrites {
    * set, the original promise's `.finally(...)` will still clear the
    * marker on its settlement (clearing the wrong state for the new
    * promise). Callers that mix hard-timed-out ids with brand-new
-   * writes under the same id MUST call `markHardTimedOut(id, ttlMs)`
-   * again after the new `track(id, ...)` if they want the marker to
-   * persist — in practice the responses endpoint scopes response ids
-   * to a single persist each, so this collision cannot arise.
+   * writes under the same id MUST call
+   * `markHardTimedOut(id, ttlMs, absoluteExpiresAt)` again after
+   * the new `track(id, ...)` if they want the marker to persist —
+   * in practice the responses endpoint scopes response ids to a
+   * single persist each, so this collision cannot arise.
    */
-  private readonly hardTimedOut: Map<string, { expiresAt: number; ttlMs: number }> = new Map();
+  private readonly hardTimedOut: Map<string, { expiresAt: number; ttlMs: number; absoluteExpiresAt: number }> =
+    new Map();
+
+  /**
+   * Iter-53 finding 2 fix: per-call budget for the opportunistic
+   * sweep invoked from `markHardTimedOut()`. Iter-52 walked the
+   * full marker map on every insert; with iter-52's refresh-on-read
+   * keeping actively-retried ids alive for arbitrarily long, that
+   * was an O(N) operation on the main event loop per transition,
+   * amortized O(N²) across N wedged writes.
+   *
+   * Capping the per-insert visit count at 64 makes each transition
+   * O(1) with a small constant. JavaScript `Map` iterates in
+   * insertion order, so the sweep naturally drains the oldest
+   * markers first — which is where same-TTL expiries cluster. A
+   * backlog of K expired markers drains fully across ceil(K / 64)
+   * subsequent inserts, which is adequate because the marker map
+   * is a best-effort reclamation layer; the read-path deletions
+   * (paths 2-4 above) are the authoritative cleanup signals for
+   * ids that actually receive continuation traffic.
+   *
+   * NOTE: the budget is a VISIT limit, not a delete limit. We stop
+   * after visiting MAX_SWEEP_PER_INSERT entries regardless of how
+   * many of them were expired, so the cost stays bounded even in
+   * the degenerate case where none of the first 64 entries are
+   * expired.
+   */
+  private static readonly MAX_SWEEP_PER_INSERT = 64;
 
   /**
    * Register an in-flight write under `id`. The caller must pass the
@@ -305,40 +379,77 @@ export class PendingResponseWrites {
    * `isHardTimedOut()` can refresh the window without the caller
    * re-threading the interval.
    *
+   * Iter-53 finding 1 fix: the caller also threads in
+   * `absoluteExpiresAt` — the response record's row expiry
+   * (`record.expiresAt * 1000`). On insert we compute
+   * `expiresAt = min(Date.now() + ttlMs, absoluteExpiresAt)` so a
+   * short-lived record cannot have its marker outlive its row.
+   * `isHardTimedOut()` also consults `absoluteExpiresAt` on every
+   * read and hard-stops at that bound regardless of refreshes — once
+   * `ResponseStore.getChain()` will hide the row, the retryable
+   * `storage_timeout` classification is factually wrong and must
+   * flip to 404.
+   *
+   * Iter-53 finding 2 fix: `sweepExpired()` is now bounded to
+   * `MAX_SWEEP_PER_INSERT` visited entries per call so this
+   * transition stays O(1) amortized even when the marker map is
+   * large (e.g. actively-retried ids that iter-52's refresh-on-read
+   * keeps alive).
+   *
    * Returns true if the id was an active pending entry (and has
    * been moved into the hard-timed-out marker), false if no pending
    * entry existed at call time. A false return does NOT add the id
    * to the marker — a marker without a backing promise has no
-   * cleanup signal (beyond the TTL) and could leak if the caller
-   * mis-routes ids. The TTL would eventually drain it, but in the
-   * meantime continuations would see a spurious retryable-503
-   * signal.
+   * cleanup signal (beyond the TTL and absolute cap) and could leak
+   * if the caller mis-routes ids. The TTL and absolute cap would
+   * eventually drain it, but in the meantime continuations would
+   * see a spurious retryable-503 signal.
    */
-  markHardTimedOut(id: string, ttlMs: number): boolean {
+  markHardTimedOut(id: string, ttlMs: number, absoluteExpiresAt: number): boolean {
     // Iter-52 finding 1 fix: drain expired entries on the write path
     // so bounded memory does not depend on any continuation ever
     // reading this map. Runs BEFORE the insert so the new entry is
     // not considered for expiry (its `expiresAt` is in the future by
-    // construction).
+    // construction). Iter-53 bounds this sweep's cost — see
+    // `sweepExpired()`.
     this.sweepExpired();
     const wasPending = this.pending.delete(id);
     if (wasPending) {
-      this.hardTimedOut.set(id, { expiresAt: Date.now() + ttlMs, ttlMs });
+      // Iter-53 finding 1 fix: clamp initial expiry at the record's
+      // absolute row expiry. If the row will disappear from
+      // `getChain()` before `now + ttlMs`, shrink the marker to
+      // match so we never return retryable-503 for a window past
+      // the point where the row could be recovered.
+      const expiresAt = Math.min(Date.now() + ttlMs, absoluteExpiresAt);
+      this.hardTimedOut.set(id, { expiresAt, ttlMs, absoluteExpiresAt });
     }
     return wasPending;
   }
 
   /**
-   * Drain every marker whose `expiresAt` is at or before `Date.now()`.
-   * Private helper used by `markHardTimedOut()` (iter-52 finding 1
-   * fix: opportunistic sweep on the write path so memory is bounded
-   * without continuation traffic) and by `hardTimedOutSize` (keeps
-   * the reported count consistent with the next read-path sweep).
+   * Drain expired marker entries (entries whose `expiresAt` is at
+   * or before `Date.now()` OR whose `absoluteExpiresAt` is at or
+   * before `Date.now()`).
+   *
+   * Iter-53 finding 2 fix: visits at most
+   * `MAX_SWEEP_PER_INSERT` entries per call so a caller cannot
+   * trigger an unbounded linear walk. JavaScript `Map` iterates in
+   * insertion order, so the sweep naturally drains the oldest
+   * markers first — which is where same-TTL expiries cluster. The
+   * budget is a VISIT limit, not a delete limit (we count each
+   * entry we examine, not just the ones we delete).
+   *
+   * Private helper used by `markHardTimedOut()` and
+   * `hardTimedOutSize` — see the class-level docstring for the full
+   * cleanup-path inventory.
    */
   private sweepExpired(): void {
     const now = Date.now();
+    let visited = 0;
     for (const [id, entry] of this.hardTimedOut) {
-      if (entry.expiresAt <= now) {
+      if (visited >= PendingResponseWrites.MAX_SWEEP_PER_INSERT) break;
+      visited += 1;
+      if (entry.absoluteExpiresAt <= now || entry.expiresAt <= now) {
         this.hardTimedOut.delete(id);
       }
     }
@@ -366,20 +477,41 @@ export class PendingResponseWrites {
    * this refresh a slow-but-eventual persist that crossed the fixed
    * 300s default TTL would flip to a permanent 404 even though the
    * write was still running — an irreversible chain break.
+   *
+   * Iter-53 finding 1 fix: on every read we first check the
+   * ABSOLUTE cap (`entry.absoluteExpiresAt` — the record row's
+   * wall-clock expiry). If that has passed, the marker is deleted
+   * and false is returned unconditionally — further refreshes would
+   * extend the retryable-503 window into a period where
+   * `ResponseStore.getChain()` hides the row, so the classification
+   * must flip to 404 at that bound. Every refresh is also clamped
+   * at the absolute cap so the marker can never outlive the row.
    */
   isHardTimedOut(id: string): boolean {
     const entry = this.hardTimedOut.get(id);
     if (entry === undefined) return false;
     const now = Date.now();
+    // Iter-53 finding 1 fix: absolute cap is authoritative. Once
+    // the row's own TTL has passed, refreshing the marker would
+    // lie to the client (retryable 503 for an unrecoverable chain).
+    // Delete unconditionally and let the continuation path fall
+    // through to the real 404.
+    if (now >= entry.absoluteExpiresAt) {
+      this.hardTimedOut.delete(id);
+      return false;
+    }
     if (entry.expiresAt <= now) {
       this.hardTimedOut.delete(id);
       return false;
     }
-    // Iter-52 finding 2 fix: refresh the expiry on every live hit so
-    // active continuations slide the retryable window forward. The
-    // original `ttlMs` was persisted on the entry at insertion time
-    // so we don't need the caller to re-thread it here.
-    entry.expiresAt = now + entry.ttlMs;
+    // Iter-52 finding 2 fix + iter-53 finding 1 clamp: refresh the
+    // TTL-based expiry on every live hit so active continuations
+    // slide the retryable window forward, but clamp at the
+    // absolute cap so the marker can never outlive the row that
+    // backs it. The original `ttlMs` and `absoluteExpiresAt` were
+    // both persisted on the entry at insertion time so the caller
+    // doesn't need to re-thread either one here.
+    entry.expiresAt = Math.min(now + entry.ttlMs, entry.absoluteExpiresAt);
     return true;
   }
 
@@ -404,6 +536,16 @@ export class PendingResponseWrites {
    *
    * Iter-52: delegates to the shared `sweepExpired()` helper so
    * read-count and write-sweep stay in lockstep.
+   *
+   * Iter-53 caveat: because the sweep is now bounded
+   * (`MAX_SWEEP_PER_INSERT` visits per call), the reported size may
+   * include still-live entries whose `expiresAt` has passed but
+   * that sit past the per-call visit budget. Callers that need
+   * exact reclaimed-count semantics should drive subsequent
+   * `markHardTimedOut()` inserts (each of which drains another
+   * batch) or call `isHardTimedOut(id)` directly on the ids of
+   * interest — the read-path deletion is authoritative and
+   * unbounded per-id.
    */
   get hardTimedOutSize(): number {
     this.sweepExpired();

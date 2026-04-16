@@ -3226,7 +3226,23 @@ export async function handleCreateResponse(
                       // TTL) even against a truly wedged store that
                       // NEVER settles. Marker lifetime =
                       // min(settlement, TTL expiry).
-                      getPendingWritesFor(store).markHardTimedOut(record.id, getHardTimedOutMarkerTtlMs());
+                      //
+                      // Iter-53: pass the record's absolute row
+                      // expiry as a hard cap on the marker. The
+                      // record's `expiresAt` field is epoch-seconds
+                      // (see `buildResponseRecord` — it adds
+                      // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now()
+                      // / 1000)`), so convert to ms for the marker
+                      // map. Once the absolute bound passes,
+                      // `ResponseStore.getChain()` hides the row and
+                      // the retryable-503 classification is factually
+                      // wrong — the marker must flip to 404 regardless
+                      // of ongoing client retries.
+                      getPendingWritesFor(store).markHardTimedOut(
+                        record.id,
+                        getHardTimedOutMarkerTtlMs(),
+                        record.expiresAt != null ? record.expiresAt * 1000 : Number.POSITIVE_INFINITY,
+                      );
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the
                       // live id) then drop the retain, which may
@@ -3415,7 +3431,23 @@ export async function handleCreateResponse(
                       // TTL) even against a truly wedged store that
                       // NEVER settles. Marker lifetime =
                       // min(settlement, TTL expiry).
-                      getPendingWritesFor(store).markHardTimedOut(record.id, getHardTimedOutMarkerTtlMs());
+                      //
+                      // Iter-53: pass the record's absolute row
+                      // expiry as a hard cap on the marker. The
+                      // record's `expiresAt` field is epoch-seconds
+                      // (see `buildResponseRecord` — it adds
+                      // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now()
+                      // / 1000)`), so convert to ms for the marker
+                      // map. Once the absolute bound passes,
+                      // `ResponseStore.getChain()` hides the row and
+                      // the retryable-503 classification is factually
+                      // wrong — the marker must flip to 404 regardless
+                      // of ongoing client retries.
+                      getPendingWritesFor(store).markHardTimedOut(
+                        record.id,
+                        getHardTimedOutMarkerTtlMs(),
+                        record.expiresAt != null ? record.expiresAt * 1000 : Number.POSITIVE_INFINITY,
+                      );
                       // Iter-45: retire the id FIRST (binding is
                       // still alive here — retirement reads the
                       // live id) then drop the retain, which may

@@ -4656,7 +4656,7 @@ describe('createHandler', () => {
       expect(idAfterSpuriousRelease).not.toBe(idBefore);
     }, 5000);
 
-    it('iter-52: markHardTimedOut sweeps expired markers on the write path (no continuation-read required)', async () => {
+    it('iter-52/53: markHardTimedOut sweeps expired markers on the write path (bounded budget per call)', async () => {
       // Codex's iter-51 review HIGH finding 1: expired markers were
       // only reclaimed when something later called `isHardTimedOut(id)`
       // or `hardTimedOutSize`. For a wedged backend serving new
@@ -4666,21 +4666,26 @@ describe('createHandler', () => {
       //
       // Iter-52 fix: `markHardTimedOut()` calls `sweepExpired()`
       // BEFORE its insert so every new hard-timeout event drains
-      // the expired entries left by previous events. This is the
-      // write-path cleanup that complements iter-51's read-path
-      // expiry. Memory is bounded even when zero continuations
-      // arrive.
+      // the expired entries left by previous events. Iter-53
+      // bounds the sweep to MAX_SWEEP_PER_INSERT=64 entries per
+      // call (codex's iter-52 MEDIUM finding 2 — unbounded linear
+      // walk became amortized O(N^2) across N wedged writes).
+      // This test stages only a couple of small entries so the
+      // bounded budget is never hit; a separate regression below
+      // drives the budget boundary with N=200.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
 
       vi.useFakeTimers();
       try {
         // Stage two wedged writes A and B. Mark both hard-timed-out
-        // with a short TTL.
+        // with a short TTL and an absolute cap far in the future so
+        // the TTL is the only expiry.
+        const farFuture = Date.now() + 10 * 60 * 1000; // 10 min
         tracker.track('A', new Promise<void>(() => {}));
         tracker.track('B', new Promise<void>(() => {}));
-        tracker.markHardTimedOut('A', 100);
-        tracker.markHardTimedOut('B', 100);
+        tracker.markHardTimedOut('A', 100, farFuture);
+        tracker.markHardTimedOut('B', 100, farFuture);
         // Pre-expiry: both markers are live.
         expect(tracker.isHardTimedOut('A')).toBe(true);
         expect(tracker.isHardTimedOut('B')).toBe(true);
@@ -4691,16 +4696,13 @@ describe('createHandler', () => {
         // forever.
         vi.advanceTimersByTime(10_000);
 
-        // Now stage C and mark it hard-timed-out. Iter-52's
-        // `sweepExpired()` on the write path should drain A and B
-        // during this call, so the final `hardTimedOutSize` is 1
-        // (only C remains).
+        // Now stage C and mark it hard-timed-out. The write-path
+        // sweep drains A and B during this call (both well within
+        // the 64-entry visit budget) so the final `hardTimedOutSize`
+        // is 1 (only C remains).
         tracker.track('C', new Promise<void>(() => {}));
-        tracker.markHardTimedOut('C', 100);
+        tracker.markHardTimedOut('C', 100, Date.now() + 10 * 60 * 1000);
 
-        // The iter-52 invariant: write-path sweep drained the
-        // expired tail, so memory is bounded even though no
-        // continuation has ever retried A or B.
         expect(tracker.hardTimedOutSize).toBe(1);
         expect(tracker.isHardTimedOut('A')).toBe(false);
         expect(tracker.isHardTimedOut('B')).toBe(false);
@@ -4710,56 +4712,150 @@ describe('createHandler', () => {
       }
     });
 
-    it('iter-52: isHardTimedOut refreshes TTL on live hits so active continuations keep the retryable window open', async () => {
-      // Codex's iter-51 review HIGH finding 2: the fixed TTL turned
-      // unresolved writes into permanent 404s. Once the default
-      // 300s TTL elapsed, the retryable-503 classification flipped
-      // to 404 even though the underlying `store.store(...)` was
-      // still running and might still land — an irreversible chain
-      // break caused by pure marker GC timing.
+    it('iter-53: isHardTimedOut refresh-on-read is clamped at the record\u2019s absolute row expiry', async () => {
+      // Codex's iter-52 review HIGH finding 1: the iter-52
+      // refresh-on-read extended the marker expiry unboundedly as
+      // long as clients kept retrying, even though the response
+      // record itself has a FIXED absolute wall-clock expiry
+      // (RESPONSE_TTL_SECONDS, currently 30 min). After that
+      // absolute bound passes, `ResponseStore.getChain()` hides the
+      // row, so the retryable-503 classification is factually wrong
+      // — but the refresh-on-read kept it live indefinitely under
+      // active retry traffic. Result: permanent 503 loop for an
+      // unrecoverable chain.
       //
-      // Iter-52 fix: `isHardTimedOut(id)` REFRESHES `expiresAt =
-      // now + ttlMs` on every live hit. Active continuations slide
-      // the retryable window forward; only genuinely abandoned
-      // markers age out.
+      // Iter-53 fix: the caller threads in `absoluteExpiresAt` (the
+      // record row's own expiry). The marker's initial `expiresAt`
+      // is `min(now + ttlMs, absoluteExpiresAt)`, every refresh is
+      // clamped at `absoluteExpiresAt`, and an explicit check on
+      // read deletes the marker once `Date.now() >= absoluteExpiresAt`
+      // regardless of refreshes.
       //
-      // This focused unit test pins the refresh semantics:
-      //   - t=80ms: read while live → returns true AND refreshes
-      //     `expiresAt` to 180 (80 + 100).
-      //   - t=150ms: read — would have expired at 100 with no
-      //     refresh, but the t=80 refresh pushed expiry to 180.
-      //     Returns true AND refreshes to 250.
-      //   - t=280ms: read — previous refresh expired at 250.
-      //     Returns false and lazily deletes the entry.
+      // This focused unit test exercises the clamp at each stage:
+      //   TTL = 100ms, absoluteExpiresAt = now + 250ms
+      //   - t=0:    live, expiresAt = min(100, 250) = 100.
+      //   - t=50:   live, refresh = min(50+100, 250) = 150.
+      //   - t=140:  live, refresh = min(140+100, 250) = 250 (clamped).
+      //   - t=260:  past absolute cap. Marker gone even though it was
+      //             refreshed moments ago.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
 
       vi.useFakeTimers();
       try {
+        const t0 = Date.now();
+        const absoluteExpiresAt = t0 + 250;
         tracker.track('X', new Promise<void>(() => {}));
-        tracker.markHardTimedOut('X', 100);
-        // t=0: live, no refresh needed.
+        tracker.markHardTimedOut('X', 100, absoluteExpiresAt);
+
+        // t=0: live on the original insert.
         expect(tracker.isHardTimedOut('X')).toBe(true);
 
-        // t=80: still live. The refresh pushes expiresAt to 180
-        // (now + ttlMs = 80 + 100). Without iter-52 the next
-        // read at t=150 would already be past the t=100 expiry.
-        vi.advanceTimersByTime(80);
+        // t=50: inside the first TTL window. Refresh pushes to
+        // min(150, 250) = 150.
+        vi.advanceTimersByTime(50);
         expect(tracker.isHardTimedOut('X')).toBe(true);
 
-        // t=150: beyond the ORIGINAL t=100 expiry but inside the
-        // t=180 refreshed expiry. Iter-52 refresh makes this still
-        // return true (and refreshes again to t=250).
-        vi.advanceTimersByTime(70);
+        // t=140: the t=50 refresh pushed expiresAt to 150, so a
+        // naive expiry would have triggered at t=150. Here we
+        // read at t=140 (still live) and the refresh clamps to
+        // min(240, 250) = 250 — the record row's hard ceiling.
+        vi.advanceTimersByTime(90);
         expect(tracker.isHardTimedOut('X')).toBe(true);
 
-        // t=280: beyond the last refresh (t=250). The marker is
-        // now genuinely stale — no read has touched it in a full
-        // TTL window — so `isHardTimedOut` returns false and
-        // deletes the entry lazily.
-        vi.advanceTimersByTime(130);
+        // t=260: past absoluteExpiresAt. Iter-52's refresh-on-read
+        // would keep this alive (the t=140 read extended expiresAt
+        // to 250 rather than 240, but even without the clamp the
+        // chain of refreshes could stretch past t=260). Iter-53's
+        // absolute-cap check in isHardTimedOut() hard-stops here.
+        vi.advanceTimersByTime(120);
         expect(tracker.isHardTimedOut('X')).toBe(false);
         expect(tracker.hardTimedOutSize).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('iter-53: bounded sweep reclaims in amortized batches (MAX_SWEEP_PER_INSERT budget)', async () => {
+      // Codex's iter-52 review MEDIUM finding 2: sweepExpired()
+      // was an unbounded linear walk of the marker map on every
+      // `markHardTimedOut()` insert. With iter-52's
+      // refresh-on-read keeping actively-retried ids alive for
+      // arbitrarily long, the map could grow to N and every new
+      // transition paid O(N) on the main event loop — amortized
+      // O(N^2) across N wedged writes.
+      //
+      // Iter-53 fix: bounded visit budget (MAX_SWEEP_PER_INSERT =
+      // 64). Each `markHardTimedOut()` call visits at most 64
+      // entries of the marker map; a K-entry backlog therefore
+      // drains across roughly ceil(K / 64) subsequent inserts.
+      //
+      // This test seeds N=200 entries with BOTH their TTL expiry
+      // AND their absolute cap already in the past (so every
+      // entry is expired and eligible for reclamation on the
+      // first pass), then drives successive `markHardTimedOut()`
+      // inserts and asserts:
+      //   - The first insert reclaims at most MAX_SWEEP_PER_INSERT
+      //     entries (+1 for the new insert). Size drops by bounded
+      //     amount, not all 200.
+      //   - Subsequent inserts continue draining in batches, so
+      //     after ~ceil(200/64) + 1 inserts the backlog is fully
+      //     gone.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const MAX_SWEEP_PER_INSERT = 64;
+
+      vi.useFakeTimers();
+      try {
+        const tracker = new PendingResponseWrites();
+        const N = 200;
+
+        // Stage N markers with a very short TTL and a very short
+        // absolute cap, then advance time past both so every entry
+        // is eligible for reclamation on the next sweep.
+        for (let i = 0; i < N; i += 1) {
+          const id = `seed_${i}`;
+          tracker.track(id, new Promise<void>(() => {}));
+          // TTL = 1ms, absoluteExpiresAt = now + 1 (both trivially
+          // in the past after the vi.advanceTimersByTime below).
+          tracker.markHardTimedOut(id, 1, Date.now() + 1);
+        }
+        expect(tracker['hardTimedOut'].size).toBe(N);
+
+        // Advance past both TTL and absolute cap for every seeded
+        // entry.
+        vi.advanceTimersByTime(100);
+
+        // First insert — should reclaim at most MAX_SWEEP_PER_INSERT
+        // entries (visit budget). `hardTimedOutSize` itself calls
+        // `sweepExpired()` once more before returning, which could
+        // reclaim another budget's worth — but the combined total
+        // we assert on is `hardTimedOut.size` BEFORE any read path
+        // runs, probed via the direct private-map handle.
+        tracker.track('new_1', new Promise<void>(() => {}));
+        tracker.markHardTimedOut('new_1', 60_000, Date.now() + 60 * 60 * 1000);
+        const internalMap = tracker['hardTimedOut'] as Map<string, unknown>;
+        // One new entry inserted, at most MAX_SWEEP_PER_INSERT
+        // seeded entries reclaimed during the sweep. Final size
+        // should be no less than N + 1 - MAX_SWEEP_PER_INSERT.
+        expect(internalMap.size).toBeLessThanOrEqual(N + 1);
+        expect(internalMap.size).toBeGreaterThanOrEqual(N + 1 - MAX_SWEEP_PER_INSERT);
+
+        // Drive enough additional inserts to fully drain the
+        // backlog. ceil(N / MAX_SWEEP_PER_INSERT) = ceil(200/64) = 4
+        // further inserts should be enough to reclaim every seeded
+        // entry. Add some margin.
+        const extraInserts = Math.ceil(N / MAX_SWEEP_PER_INSERT) + 2;
+        for (let i = 0; i < extraInserts; i += 1) {
+          const id = `new_extra_${i}`;
+          tracker.track(id, new Promise<void>(() => {}));
+          tracker.markHardTimedOut(id, 60_000, Date.now() + 60 * 60 * 1000);
+        }
+
+        // Final assertion: all seeded entries have been reclaimed.
+        // Only the fresh inserts remain.
+        for (let i = 0; i < N; i += 1) {
+          expect(internalMap.has(`seed_${i}`)).toBe(false);
+        }
       } finally {
         vi.useRealTimers();
       }
@@ -4804,8 +4900,11 @@ describe('createHandler', () => {
 
       // Transition to the hard-timed-out marker state with a TTL.
       // Iter-51 callers supply the TTL explicitly so this module
-      // stays env-free.
-      const transitioned = tracker.markHardTimedOut('resp_1', 60_000);
+      // stays env-free; iter-53 callers also pass the record's
+      // absolute row expiry (a far-future value here so only the
+      // TTL path is exercised in this block).
+      const farFuture = Date.now() + 60 * 60 * 1000;
+      const transitioned = tracker.markHardTimedOut('resp_1', 60_000, farFuture);
       expect(transitioned).toBe(true);
       // Pending drained — wedged promise closure is reclaimable.
       expect(tracker.size).toBe(0);
@@ -4819,7 +4918,7 @@ describe('createHandler', () => {
       // Idempotent: a second call with no backing pending entry
       // returns false (we do not add markers without a real
       // settlement signal to clear them).
-      expect(tracker.markHardTimedOut('resp_1', 60_000)).toBe(false);
+      expect(tracker.markHardTimedOut('resp_1', 60_000, farFuture)).toBe(false);
       expect(tracker.isHardTimedOut('resp_1')).toBe(true);
       expect(tracker.hardTimedOutSize).toBe(1);
 
@@ -4831,7 +4930,7 @@ describe('createHandler', () => {
       vi.useFakeTimers();
       try {
         tracker.track('resp_ttl', new Promise<void>(() => {}));
-        tracker.markHardTimedOut('resp_ttl', 100);
+        tracker.markHardTimedOut('resp_ttl', 100, Date.now() + 60 * 60 * 1000);
         expect(tracker.isHardTimedOut('resp_ttl')).toBe(true);
         expect(tracker.hardTimedOutSize).toBe(2);
         vi.advanceTimersByTime(101);
@@ -4889,8 +4988,10 @@ describe('createHandler', () => {
           // `track()` NEVER runs on these promises.
           tracker.track(id, new Promise<void>(() => {}));
           // 5000ms TTL — much shorter than the 5-minute default
-          // so we can prove the expiry path drains them.
-          tracker.markHardTimedOut(id, 5000);
+          // so we can prove the expiry path drains them. Iter-53:
+          // pass a far-future absoluteExpiresAt so only the TTL
+          // is exercised here.
+          tracker.markHardTimedOut(id, 5000, Date.now() + 60 * 60 * 1000);
         }
 
         // Pre-expiry: every marker is live, hardTimedOutSize is N,
@@ -5688,6 +5789,160 @@ describe('createHandler', () => {
           delete process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
         } else {
           process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = originalTtl;
+        }
+      }
+    }, 10000);
+
+    it('iter-53: persist landing past the record\u2019s absolute row expiry flips marker from 503 to 404 (no indefinite retry loop)', async () => {
+      // Codex's iter-52 review HIGH finding 1: iter-52's
+      // refresh-on-read slid the marker's TTL forward on every
+      // live hit with NO absolute cap. Response records themselves
+      // have a fixed `expiresAt` (RESPONSE_TTL_SECONDS, currently
+      // 30 min); past that bound `ResponseStore.getChain()` hides
+      // the row, so the retryable-503 classification is factually
+      // wrong — but iter-52 kept returning 503 for as long as the
+      // client kept retrying within each TTL window. Result:
+      // permanent 503 loop for an unrecoverable chain.
+      //
+      // Iter-53 fix: `markHardTimedOut(id, ttlMs, absoluteExpiresAt)`
+      // takes the record's row expiry as a hard cap. Every read
+      // checks `Date.now() >= absoluteExpiresAt` first and deletes
+      // the marker unconditionally once it has passed. The
+      // continuation then falls through to the real getChain miss
+      // and emits `sendNotFound`, NOT `sendStorageTimeout`.
+      //
+      // Shape: drive the normal hard-timeout breaker to install a
+      // marker naturally, then surgically shrink that specific
+      // marker's `absoluteExpiresAt` via the private map so the
+      // cap fires on the next read without having to wait
+      // RESPONSE_TTL_SECONDS worth of wall clock. This is the
+      // cleanest way to exercise the absolute-cap path end-to-end
+      // because RESPONSE_TTL_SECONDS is not env-configurable.
+      const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+      process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      try {
+        const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
+        const mockStore = {
+          store: vi.fn().mockImplementation(() => new Promise<void>(() => {})),
+          getChain: vi.fn().mockImplementation((id: string) => {
+            return Promise.reject(new Error(`Response not found: ${id}`));
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'absolute-cap reply' }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue: vi.fn().mockResolvedValue(makeChatResult({ text: 'continuation reply' })),
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        const registry = new ModelRegistry();
+        const MODEL_NAME = 'iter-53-absolute-cap';
+        registry.register(MODEL_NAME, mockModel);
+
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+          unhandled.push(reason);
+        };
+        process.on('unhandledRejection', onUnhandled);
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        // (1) Original POST — collect response_id A. The persist
+        // is wedged (never settles) so the hard-timeout breaker
+        // fires and installs a marker with the default
+        // RESPONSE_TTL_SECONDS * 1000 absolute cap.
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'original message',
+          stream: false,
+        });
+        const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+        const body1 = JSON.parse(getBody1());
+        expect(body1.status).toBe('completed');
+        const responseIdA: string = body1.id;
+
+        // Wait for the hard-timeout breaker to fire (~50ms +
+        // margin). Marker is now live with a 30-minute absolute
+        // cap — continuation #1 should take the retryable-503
+        // branch.
+        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setImmediate(r));
+
+        const tracker = getPendingWritesFor(mockStore);
+        expect(tracker.isHardTimedOut(responseIdA)).toBe(true);
+
+        // (2) Continuation #1 — absolute cap still far in the
+        // future (30 min). Marker is live, so this returns 503
+        // storage_timeout (verifies the marker still classifies
+        // correctly in the happy case).
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation within absolute cap',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res2, getStatus: status2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+        expect(status2()).toBe(503);
+        const parsed2 = JSON.parse(getBody2());
+        expect(parsed2.error.type).toBe('storage_timeout');
+
+        // (3) Now shrink the marker's `absoluteExpiresAt` so the
+        // next read crosses the cap. This simulates a response
+        // that has lived past RESPONSE_TTL_SECONDS — the row
+        // would no longer be visible via `getChain`, and iter-52
+        // would have kept returning 503 forever on continued
+        // retries. Access the private marker map directly via
+        // bracket notation.
+        const internalMap = tracker['hardTimedOut'] as Map<
+          string,
+          { expiresAt: number; ttlMs: number; absoluteExpiresAt: number }
+        >;
+        const entry = internalMap.get(responseIdA);
+        expect(entry).toBeDefined();
+        // Put absolute cap firmly in the past. TTL remains large
+        // so we prove the cap (not the TTL) is what flips the
+        // classification.
+        entry!.absoluteExpiresAt = Date.now() - 1;
+
+        // (4) Continuation #2 — absolute cap has crossed. Iter-53
+        // must return 404 (sendNotFound) rather than 503 — no
+        // matter how many times the client retries, the chain is
+        // unrecoverable because the row itself has aged out.
+        const req3 = createMockReq('POST', '/v1/responses', {
+          model: MODEL_NAME,
+          input: 'continuation past absolute cap',
+          previous_response_id: responseIdA,
+          stream: false,
+        });
+        const { res: res3, getStatus: status3, getBody: getBody3, waitForEnd: wait3 } = createMockRes();
+        await handler(req3, res3);
+        await wait3();
+        expect(status3()).toBe(404);
+        const parsed3 = JSON.parse(getBody3());
+        expect(parsed3.error.type).not.toBe('storage_timeout');
+
+        // Marker has been purged as a side effect of the
+        // absolute-cap read.
+        expect(tracker.isHardTimedOut(responseIdA)).toBe(false);
+        expect(internalMap.has(responseIdA)).toBe(false);
+
+        expect(unhandled).toHaveLength(0);
+        process.off('unhandledRejection', onUnhandled);
+        warnSpy.mockRestore();
+      } finally {
+        if (originalHard === undefined) {
+          delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
+        } else {
+          process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = originalHard;
         }
       }
     }, 10000);
