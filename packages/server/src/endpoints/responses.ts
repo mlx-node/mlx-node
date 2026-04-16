@@ -20,7 +20,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
-import { sendBadRequest, sendInternalError, sendNotFound } from '../errors.js';
+import { sendBadRequest, sendInternalError, sendNotFound, sendStorageTimeout } from '../errors.js';
 import { mapRequest, reconstructMessagesFromChain } from '../mappers/request.js';
 import {
   buildPartialResponse,
@@ -56,19 +56,71 @@ const RESPONSE_TTL_SECONDS = 1800; // 30 minutes
 
 /**
  * Upper bound on how long the native-miss recovery path will wait for
- * an in-flight `store.store(...)` write to land before giving up and
- * returning a 404. Iter-38 finding 1: the iter-37 recovery path called
- * `awaitPending(id)` with no timeout, so a wedged SQLite write (or any
- * never-settling write promise) would pin the continuation request
- * forever — no cancellation, no observability, a silent request hang.
+ * an in-flight `store.store(...)` write to land before giving up.
+ * Iter-38 finding 1: the iter-37 recovery path called `awaitPending(id)`
+ * with no timeout, so a wedged SQLite write (or any never-settling
+ * write promise) would pin the continuation request forever — no
+ * cancellation, no observability, a silent request hang.
  *
- * 2000ms is short enough that a stuck native backend fails fast from
- * the client's perspective (a 404 is better than a hang) and long
- * enough that a healthy SQLite write — which ordinarily completes in
- * single-digit milliseconds on warm disks — has ample headroom to
- * resolve before the timer fires.
+ * Iter-39 finding 1: on timeout we no longer fall straight through to
+ * 404. We first run one last `getChain` probe — a write landing at
+ * (timeout + epsilon) would have succeeded for the client but the
+ * iter-38 path spuriously reported 404 and permanently poisoned the
+ * client's chain state. The probe catches that race. Only when the
+ * probe STILL misses do we surface the condition to the client, and
+ * even then as HTTP 503 `storage_timeout` (a retryable transient
+ * error) rather than 404 (permanent / non-retryable).
+ *
+ * 2000ms default is short enough that a stuck native backend fails
+ * fast from the client's perspective and long enough that a healthy
+ * SQLite write — which ordinarily completes in single-digit
+ * milliseconds on warm disks — has ample headroom to resolve before
+ * the timer fires. Operators running on slower storage (e.g. encrypted
+ * volumes, heavy WAL checkpoint contention) can override via
+ * `MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS`; non-positive / non-finite /
+ * empty values fall back to the default.
  */
-const CHAIN_WRITE_WAIT_TIMEOUT_MS = 2000;
+const CHAIN_WRITE_WAIT_TIMEOUT_MS: number = (() => {
+  const raw = process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS;
+  if (raw == null || raw === '') return 2000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 2000;
+  return parsed;
+})();
+
+/**
+ * Upper bound on how long the outer handler's `finally` block will
+ * await the off-lock `store.store(...)` write before detaching.
+ *
+ * Iter-35 moved persistence OFF the per-model mutex but still `await`ed
+ * the write in the outer `finally`, so any wedged `store.store(...)`
+ * pinned the request's socket/abort listeners and its dispatch lease
+ * until the promise settled. A never-settling write would leak
+ * listeners, keep the binding's `inFlight` counter elevated, and
+ * block `releaseBinding()` from finalising teardown after a
+ * hot-swap.
+ *
+ * Iter-39 finding 2: decouples post-commit persist from the request
+ * lifetime. Abort listeners are removed and `releaseDispatchLease` is
+ * called IMMEDIATELY after the terminal bytes go out; the persist
+ * await is wrapped in a `Promise.race` against this timeout and, on
+ * timeout, the handler returns control to the caller while the
+ * promise continues running in the background (the pending-writes
+ * tracker still holds its reference so chained continuations can
+ * still observe it).
+ *
+ * Default 5000ms is intentionally larger than `CHAIN_WRITE_WAIT_TIMEOUT_MS`
+ * because this bound is not client-facing — the client has already
+ * received its terminal response by this point. Override via
+ * `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS`.
+ */
+const POST_COMMIT_PERSIST_TIMEOUT_MS: number = (() => {
+  const raw = process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS;
+  if (raw == null || raw === '') return 5000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 5000;
+  return parsed;
+})();
 
 // ---------------------------------------------------------------------------
 // Non-streaming path
@@ -1746,6 +1798,14 @@ export async function handleCreateResponse(
     abortController.abort();
   };
   let abortListenersAttached = false;
+  // Iter-39 finding 2: the outer `try/finally` below runs
+  // `runPostDispatchCleanup` eagerly after `withExclusive` returns
+  // (so the post-commit persist wait does not pin abort listeners or
+  // the dispatch lease) and ALSO idempotently from the finally on the
+  // early-return / pre-dispatch-error path. These guards keep the
+  // cleanup a no-op when it has already run on the eager path.
+  let cleanupPerformed = false;
+  let leaseReleased = false;
   try {
     // Capture an initial snapshot of the live binding for `body.model`.
     // These values are the INITIAL observation — on a
@@ -1874,26 +1934,65 @@ export async function handleCreateResponse(
               }
             }
             if (timedOut) {
-              console.warn(
-                `[responses] timed out after ${CHAIN_WRITE_WAIT_TIMEOUT_MS}ms waiting for pending store write ` +
-                  `for previous_response_id "${body.previous_response_id}"; returning 404 instead of hanging. ` +
-                  `The underlying store.store(...) promise did not settle in time — likely a wedged SQLite ` +
-                  `writer or stuck native backend.`,
-              );
-              sendNotFound(res, `Previous response "${body.previous_response_id}" not found`);
-              return;
-            }
-            try {
-              chain = await store.getChain(body.previous_response_id);
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              if (!/not found/i.test(msg)) {
-                throw err;
+              // Iter-39 finding 1: before declaring the write
+              // stuck, run ONE last `getChain` probe. A write
+              // landing at (CHAIN_WRITE_WAIT_TIMEOUT_MS + epsilon)
+              // would have succeeded for the client but the
+              // iter-38 code flipped to 404 the moment the timer
+              // fired — permanently poisoning the client's chain
+              // (404 is non-retryable, so the client discards
+              // `previous_response_id`). The probe closes that
+              // race: if the write slipped in during the thin
+              // window between timer-fire and this check, we use
+              // its result and continue normally. Only when the
+              // probe STILL misses is the write genuinely wedged,
+              // and we surface it as retryable 503 storage_timeout
+              // so the client can try again with the same
+              // `previous_response_id` instead of treating it as a
+              // permanent miss.
+              let probed: StoredResponseRecord[] | null = null;
+              try {
+                probed = await store.getChain(body.previous_response_id);
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (!/not found/i.test(msg)) {
+                  throw err;
+                }
+                // Probe confirmed the row is still missing —
+                // genuine storage timeout. `probed` stays null and
+                // we emit 503 below.
+                probed = null;
               }
-              // Retry also missed the row — this is a genuine
-              // 404. Fall through to the empty-chain handler
-              // below.
-              chain = [];
+              if (probed !== null && probed.length > 0) {
+                chain = probed;
+              } else {
+                console.warn(
+                  `[responses] timed out after ${CHAIN_WRITE_WAIT_TIMEOUT_MS}ms waiting for pending store write ` +
+                    `for previous_response_id "${body.previous_response_id}"; last-probe getChain still missed. ` +
+                    `Returning 503 storage_timeout — the underlying store.store(...) promise did not settle in time, ` +
+                    `likely a wedged SQLite writer or stuck native backend. The client may retry with the same ` +
+                    `previous_response_id.`,
+                );
+                sendStorageTimeout(
+                  res,
+                  `Storage write for "${body.previous_response_id}" did not settle within ${CHAIN_WRITE_WAIT_TIMEOUT_MS}ms. ` +
+                    `This is a transient backend condition — retry the request with the same previous_response_id.`,
+                );
+                return;
+              }
+            } else {
+              try {
+                chain = await store.getChain(body.previous_response_id);
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (!/not found/i.test(msg)) {
+                  throw err;
+                }
+                // Retry also missed the row — this is a genuine
+                // 404. Fall through to the empty-chain handler
+                // below.
+                chain = [];
+              }
             }
           } else if (firstAttemptError !== null) {
             // First call threw "not found", no pending write is
@@ -2850,36 +2949,113 @@ export async function handleCreateResponse(
       }
     });
 
+    // Iter-39 finding 2: RELEASE the dispatch lease and DETACH the
+    // abort listeners IMMEDIATELY now that `withExclusive` returned
+    // and the terminal bytes have either been flushed or the outer
+    // catch has emitted its error frame. The post-commit persist
+    // wait that follows must NOT pin the request's lifecycle — a
+    // wedged `store.store(...)` would otherwise leak socket/abort
+    // listeners, keep the binding's `inFlight` counter elevated,
+    // and block `releaseBinding()` from finalising teardown after a
+    // hot-swap for the lifetime of the wedged write.
+    //
+    // The outer `finally` below re-runs both cleanups idempotently
+    // so an early-return validation failure (before the
+    // `withExclusive` site) still cleans up; `cleanupPerformed` is
+    // the guard.
+    cleanupPerformed = runPostDispatchCleanup();
+
     // Iter-35 finding 2 (part b) / iter-36 finding 1: the persist
     // write was INITIATED synchronously inside `withExclusive` via
     // `initiatePersist` — which registers the in-flight promise
     // in the per-store pending-write tracker BEFORE the mutex
-    // releases. Here we only await the same promise off-lock to
-    // surface errors to the log. The SQLite flush is already on
-    // its way; a back-to-back continuation observing the tracker
-    // will block on the same promise instead of spuriously
-    // returning 404 under `getChain` (see the `getChain`-empty
-    // retry at the top of this handler).
+    // releases. The SQLite flush is already on its way; a
+    // back-to-back continuation observing the tracker will block
+    // on the same promise instead of spuriously returning 404
+    // under `getChain` (see the `getChain`-empty retry at the top
+    // of this handler).
+    //
+    // Iter-39 finding 2: BOUND the wait on the persist promise
+    // with `POST_COMMIT_PERSIST_TIMEOUT_MS`. A wedged native
+    // backend can return a promise that never settles, and with
+    // the iter-36 code an unconditional `await` would pin this
+    // handler forever — leaking abort listeners and the dispatch
+    // lease (now fixed above by running cleanup before this
+    // wait). On timeout we leave the promise running in the
+    // background: the pending-writes tracker still holds its
+    // reference so chained continuations can still observe it,
+    // and its `.finally(...)` handler will clear the tracker
+    // entry whenever the write eventually settles (or stays
+    // wedged until the process exits).
     //
     // Persistence is best-effort — a failed write demotes to a
     // log line. The pending-write tracker's `.finally(...)`
     // handler removes the entry regardless of fulfill / reject,
     // so a rejected write correctly leaves the store empty AND
     // clears the tracker, and a subsequent `getChain()` then
-    // returns empty legitimately.
+    // returns empty legitimately. A `.catch(...)` is attached
+    // synchronously so an eventual rejection from the
+    // backgrounded promise does not trigger an
+    // unhandled-rejection diagnostic after this handler returns.
     if (pendingPersistOuter != null) {
+      // The local narrowed reference convinces the type-aware
+      // lint that we're awaiting a real Promise; assigning
+      // through `let` loses that narrowing because the closure
+      // above could (in principle) reassign it.
+      const promise: Promise<void> = pendingPersistOuter;
+      // Attach terminal error handling FIRST. The tracker's own
+      // `.finally(...)` is already attached and surfaces nothing
+      // to Node's unhandled-rejection detector; this catch arm
+      // logs the rejection and suppresses it locally so the
+      // raced-against `Promise.race` sees a plain fulfillment
+      // (`'settled' | 'timeout'`) rather than a rejection that
+      // would otherwise require per-branch handling below.
+      const capturedMode = persistMode;
+      const settled: Promise<'settled'> = promise
+        .then(() => 'settled' as const)
+        .catch((err: unknown) => {
+          console.error(`[responses] post-commit persistence failed (${capturedMode ?? 'unknown'}, off-lock):`, err);
+          return 'settled' as const;
+        });
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise: Promise<'timeout'> = new Promise<'timeout'>((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          resolve('timeout');
+        }, POST_COMMIT_PERSIST_TIMEOUT_MS);
+      });
       try {
-        // The local narrowed reference convinces the type-aware
-        // lint that we're awaiting a real Promise; assigning
-        // through `let` loses that narrowing because the closure
-        // above could (in principle) reassign it.
-        const promise: Promise<void> = pendingPersistOuter;
-        await promise;
-      } catch (err) {
-        console.error(`[responses] post-commit persistence failed (${persistMode ?? 'unknown'}, off-lock):`, err);
+        const outcome = await Promise.race([settled, timeoutPromise]);
+        if (outcome === 'timeout') {
+          console.warn(
+            `[responses] post-commit persistence did not settle within ${POST_COMMIT_PERSIST_TIMEOUT_MS}ms ` +
+              `(${capturedMode ?? 'unknown'}, off-lock); detaching the handler and leaving the write in the ` +
+              `background. The pending-writes tracker still holds a reference so chained continuations can ` +
+              `observe the in-flight write; this condition usually signals a wedged SQLite writer or stuck ` +
+              `native backend.`,
+          );
+        }
+      } finally {
+        if (timeoutHandle !== undefined) {
+          clearTimeout(timeoutHandle);
+        }
       }
     }
   } finally {
+    // Idempotent fallback: if the post-dispatch cleanup above
+    // never ran (early-return validation failure, or an exception
+    // raised inside the outer `try` block between lease
+    // acquisition and the `withExclusive` call), make sure the
+    // abort listeners are detached and the dispatch lease is
+    // released here. `runPostDispatchCleanup` is safe to re-invoke
+    // — the `abortListenersAttached` check and
+    // `releaseDispatchLease`'s `inFlight < 0` floor make it a
+    // no-op when the happy-path already fired it.
+    if (!cleanupPerformed) {
+      runPostDispatchCleanup();
+    }
+  }
+
+  function runPostDispatchCleanup(): true {
     // Iter-35 finding 1: drop the AbortController's socket/request
     // listeners so they do not keep the request object alive past
     // the handler's return. Only detach when listeners were actually
@@ -2896,6 +3072,7 @@ export async function handleCreateResponse(
         httpReq.removeListener('close', onAbortClose);
         httpReq.removeListener('error', onAbortError);
       }
+      abortListenersAttached = false;
     }
     // Release the dispatch lease on the ORIGINAL model object the
     // lease was acquired against (not a re-read of `body.model`,
@@ -2903,6 +3080,15 @@ export async function handleCreateResponse(
     // pending teardown — `releaseBinding()` called concurrently
     // while this dispatch held the lease — finalises here once the
     // in-flight counter drops to zero.
-    registry.releaseDispatchLease(leaseModel);
+    //
+    // Iter-39 finding 2: this now runs BEFORE the post-commit
+    // persist wait, not after, so a wedged `store.store(...)` no
+    // longer pins the lease and `releaseBinding` can finalise
+    // teardown while the write continues in the background.
+    if (!leaseReleased) {
+      leaseReleased = true;
+      registry.releaseDispatchLease(leaseModel);
+    }
+    return true;
   }
 }

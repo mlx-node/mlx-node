@@ -67,6 +67,30 @@ export function sendInternalError(res: ServerResponse, message: string): void {
 }
 
 /**
+ * Send a 503 Service Unavailable with a `storage_timeout` error type.
+ *
+ * Used by the responses endpoint when an in-flight `store.store(...)`
+ * write that gates a `previous_response_id` continuation fails to
+ * settle within `CHAIN_WRITE_WAIT_TIMEOUT_MS` AND a final `getChain`
+ * probe still cannot find the chain. 503 is deliberately chosen over
+ * 404 here because:
+ *
+ *   * The condition is transient — the write may yet land, so a later
+ *     retry with the same `previous_response_id` could succeed.
+ *   * 404 is non-retryable from the client's perspective and would
+ *     cause clients to discard the response id as permanently invalid,
+ *     silently breaking the conversation chain on storage backpressure.
+ *
+ * `type: 'storage_timeout'` is a fresh error type (no existing
+ * `type: "..."` in the server emits it) so clients can disambiguate
+ * it from the true 404 shape and classify it as a retryable storage
+ * condition.
+ */
+export function sendStorageTimeout(res: ServerResponse, message: string): void {
+  sendError(res, 503, 'storage_timeout', message);
+}
+
+/**
  * Send an Anthropic-compatible JSON error response.
  */
 export function sendAnthropicError(res: ServerResponse, status: number, type: string, message: string): void {
