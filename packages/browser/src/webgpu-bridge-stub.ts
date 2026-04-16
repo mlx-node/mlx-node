@@ -648,14 +648,87 @@ export function createBridgeStub(
   // MUST be called before any non-batch RPC so the gpu-worker processes the
   // releases in the correct order relative to subsequent creates/dispatches.
   const I_UNIFORM = CMD_OFFSET.UNIFORM_DATA >>> 2; // 48
+
+  // Task B: BUFFER_RELEASE_BATCH fire-and-forget (F&F).
+  //
+  // BUFFER_RELEASE_BATCH has no return value the bridge cares about — the
+  // gpu-worker writes setResult(0) and the caller drops it. So we skip the
+  // Atomics.wait round-trip: after staging args + flipping STATUS=PENDING we
+  // return immediately, leaving the gpu-worker to process the release batch
+  // in the background.
+  //
+  // The single-slot cmd SAB means only ONE F&F can be in flight at a time,
+  // and the bridge MUST drain any prior F&F before it touches cmd SAB again
+  // (writes FN_ID / ARG* / UNIFORM_DATA / CALLBACK_COUNT, or flips STATUS).
+  //
+  // `ffPending` tracks that state. `drainFireAndForget()` waits for the
+  // gpu-worker to flip STATUS PENDING -> DONE (exactly what a normal rpcCall
+  // wait does), resets STATUS=IDLE to match the post-normal-RPC invariant,
+  // and clears the flag. It is cheap when no F&F is in flight (single bool
+  // check) so we can call it liberally at every cmd-SAB write site.
+  let ffPending = false;
+  function drainFireAndForget(): void {
+    if (!ffPending) return;
+    // Same wait pattern as rpcCall: 10s then 30s retry. If STATUS is already
+    // DONE, Atomics.wait returns 'not-equal' immediately — no round-trip.
+    let waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 10_000);
+    if (waitResult === 'timed-out') {
+      const msg = `[RPC TIMEOUT] BUFFER_RELEASE_BATCH (F&F) drain timed out after 10s`;
+      console.error(msg);
+      try {
+        (self as any).postMessage({ type: 'error', message: msg });
+      } catch {}
+      waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 30_000);
+      if (waitResult === 'timed-out') {
+        console.error(`[RPC FATAL] BUFFER_RELEASE_BATCH (F&F) total 40s timeout — forcing IDLE`);
+      }
+    }
+    // After drain, STATUS may be DONE (normal) or still PENDING (timeout
+    // fallback). Either way, reset to IDLE so the next RPC starts from the
+    // same invariant every other call site expects.
+    Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
+    ffPending = false;
+  }
+
   function flushPendingReleases(): void {
     const count = pendingReleases.length;
     if (count === 0) return;
+    // Ordering invariant: BUFFER_RELEASE_BATCH must be observed by the
+    // gpu-worker after any staged DISPATCH_BATCH and after any prior F&F
+    // release. We do NOT need to flush a pending DISPATCH_BATCH here: the
+    // existing ordering rule (see rpcCall's top-of-function flush) sends
+    // releases BEFORE the next non-release RPC but AFTER any pending
+    // dispatches, and this helper is only called via that path or via
+    // queueRelease's auto-flush at MAX_RELEASE_BATCH. In the auto-flush case
+    // we're already past the dispatch (a release happens after the call that
+    // freed a buffer), so any staged batch is serialized naturally by the
+    // drain: the next dispatch site will flush the batch before its own
+    // writes. Releases themselves do not interact with DISPATCH_BATCH state.
+    //
+    // We DO need to drain any prior F&F: only one F&F can be in flight at a
+    // time, and we're about to clobber UNIFORM_DATA + FN_ID + ARG0 for the
+    // next one.
+    drainFireAndForget();
+    // Count the F&F release in the bridge histogram — keeps stats parity
+    // with the old rpcCall(BUFFER_RELEASE_BATCH) path so diagnostics don't
+    // spuriously drop after this optimization lands.
+    bumpBridgeStats(RpcFn.BUFFER_RELEASE_BATCH);
     for (let i = 0; i < count; i++) {
       cmdU32[I_UNIFORM + i] = pendingReleases[i]! >>> 0;
     }
-    pendingReleases.length = 0; // clear BEFORE rpcCall to avoid re-entrant flush
-    rpcCall(RpcFn.BUFFER_RELEASE_BATCH, count);
+    pendingReleases.length = 0; // clear BEFORE firing to avoid re-entrant flush
+    cmdU32[I_FN] = RpcFn.BUFFER_RELEASE_BATCH;
+    cmdU32[I_ARG0] = count >>> 0;
+    // Match rpcCall's "don't leak entry counts into next call" invariant —
+    // BUFFER_RELEASE_BATCH produces no callbacks, but flushCallbacks() on
+    // the gpu-worker writes I_CB_COUNT=0 when done, and a drain that lands
+    // on STATUS=DONE will see that value. Clearing here keeps the SAB in a
+    // known state even if drain aborts early on timeout.
+    cmdU32[I_CB_COUNT] = 0;
+    Atomics.store(cmdView, STATUS_INDEX, STATUS.PENDING);
+    Atomics.notify(cmdView, STATUS_INDEX);
+    ffPending = true;
+    // DO NOT wait — fire-and-forget. The next cmd-SAB-write site drains.
   }
   function queueRelease(handle: number): void {
     pendingReleases.push(handle);
@@ -709,6 +782,14 @@ export function createBridgeStub(
     ) {
       flushPendingReleases();
     }
+    // Task B: drain any F&F BUFFER_RELEASE_BATCH before clobbering cmd SAB.
+    // flushPendingReleases() above may have fired F&F; flushDispatchBatchInner
+    // and earlier call sites may also have left ffPending=true. This drain is
+    // a cheap no-op when ffPending=false and must stay BELOW the flushes (so
+    // those flushes can themselves issue a new F&F without pre-draining) and
+    // ABOVE the cmd-SAB writes (so we don't race the gpu-worker still reading
+    // UNIFORM_DATA from the prior release batch).
+    drainFireAndForget();
     // Phase 0: exclude GET_STATS from the bridge histogram so a profile
     // readback does not skew its own numbers.
     if (fnId !== RpcFn.GET_STATS) {
@@ -792,6 +873,8 @@ export function createBridgeStub(
     if (pendingReleases.length > 0) {
       flushPendingReleases();
     }
+    // Task B: drain F&F before clobbering cmd SAB. See matching comment in rpcCall.
+    drainFireAndForget();
     bumpBridgeStats(fnId);
     cmdDataView.setUint32(CMD_OFFSET.FN_ID, fnId, true);
 
@@ -1395,6 +1478,13 @@ export function createBridgeStub(
               bgDesc.entries[i].bufferHandle = resolveBufferHandle(bufHandle);
             }
           }
+
+          // Task B: drain any F&F BUFFER_RELEASE_BATCH before clobbering cmd
+          // SAB (UNIFORM_DATA overlaps with the release-batch handle list).
+          // The flush at the top of this function may have fired F&F; if no
+          // subsequent materialize/flushPendingWrites happened, ffPending is
+          // still set here. Cheap no-op when false.
+          drainFireAndForget();
 
           // Write entry data into the callback ring space BEFORE rpcCall
           cmdU32[I_CB_COUNT] = entryCount;
