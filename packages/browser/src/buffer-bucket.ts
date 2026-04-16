@@ -1,52 +1,40 @@
 /**
- * Buffer size bucketing — SHARED by gpu-worker and webgpu-bridge-stub.
+ * Buffer size keying — SHARED by gpu-worker and webgpu-bridge-stub.
  *
- * Exact-size keying misses when requests differ by a few bytes (e.g., 513 vs 512).
- * Bucketing coalesces near-size requests into shared pool bins so they can
- * reuse each other's buffers.
+ * History:
+ *   Task D (commits 9ec0e28, 573c34d, 7c4f451, 3cdf682) introduced 256B /
+ *   PO2 bucketing under the hypothesis that near-size requests would share
+ *   pool bins and coalesce into shared buffers. Empirical data from the
+ *   `[profile] bridge-hist` / `[profile] gpu-hist` instrumentation (commit
+ *   6f15a3f) falsified that hypothesis: the MLX allocator emits a small
+ *   number of EXACT sizes (driven by `mx::compile`'s deterministic kernel
+ *   shapes), so exact-size keying would hit just as often while avoiding
+ *   the per-miss over-allocation. Worse, the small-size bucket `bucket=256`
+ *   combined four distinct workloads (size=8, 32, 64, 256) with only
+ *   ~7% hit rate, meaning bucketing ACTIVELY HURT reuse on the hot tiny-
+ *   uniform stream while wasting up to 32x memory per allocation.
  *
- * Scheme:
- *   - size <= 4096:  round up to next multiple of 256  (waste <= 256 B)
- *   - size >  4096:  round up to next power of two     (waste <= 2x)
+ *   Measurements on 2026-04-16 Qwen3.5-0.8B decode (M3):
+ *   - Bucketed (3cdf682):    18.6–18.8 tok/s, pool hit 63.6% / gpu-pool 45.8%
+ *   - Baseline (pre-Task-D): 20.9 tok/s,      pool hit 62.4%
  *
- * Rationale:
- *   256-B granule caps small-buffer waste at 256 B (tight for uniforms, tiny
- *   params). Power-of-two for large buffers caps waste at 2x, which is fine
- *   on M3's 18 GB unified memory and gives broad coalescing across nearby
- *   allocation sizes (e.g., KV cache rows of various seq lengths).
+ *   Decision: revert to exact-size keying. The bucket module is retained as
+ *   the shared source of truth so both pools stay in agreement on keying;
+ *   if a future workload shift ever warrants bucketing, this is the single
+ *   place to change.
  *
- * INVARIANT: gpu-worker and webgpu-bridge-stub MUST use this same function
- * so that a release in one bucket always matches a create lookup in the
- * same bucket. Diverging implementations would cause pool lookups to miss
- * buffers that are already parked — or worse, return a physically-undersized
- * buffer from a bucket with a larger logical request.
+ * Semantics:
+ *   - size <= 0: returns 0 (callers already guard against pooling empty).
+ *   - size >  0: returns size unchanged (identity).
  *
- * Correctness: pure function, no side effects. Always returns size >= input,
- * always a multiple of 4 (WebGPU minimum alignment). For size <= 0 returns 0
- * — callers already guard against pooling empty buffers.
+ * INVARIANT: gpu-worker and webgpu-bridge-stub MUST share this function so
+ * that a release in bucket B always matches a create lookup in bucket B.
+ * Diverging implementations would cause pool lookups to miss buffers that
+ * are already parked.
  *
- * 64-bit-safety: buffers CAN exceed 2^31 bytes (KV caches, large weight
- * tensors, > 4 GiB allocations). The large-size branch uses non-bitwise
- * arithmetic (iterative doubling starting at 8192) so it is correct for all
- * finite JS integer sizes up to Number.MAX_SAFE_INTEGER (2^53). Bitwise
- * operators must NOT be used on values that may exceed 2^31, since JS
- * coerces them to int32 and silently truncates.
+ * Correctness: pure function, no side effects. Always returns size >= input.
  */
 export function roundUpBucket(size: number): number {
   if (size <= 0) return 0;
-  if (size <= 4096) {
-    // Round up to next multiple of 256. `(size + 255) & ~255` is safe here
-    // because size <= 4096 is well within int32 range.
-    return (size + 255) & ~255;
-  }
-  // Round up to next power of two via iterative doubling. 4096 is the
-  // small-branch ceiling, so the first large bucket is 8192. Max ~41
-  // iterations to reach 2^53 — negligible cost vs. a GPU RPC. Uses plain
-  // multiplication to avoid the 32-bit overflow that `1 << shift` would
-  // incur for shifts >= 31 (e.g., a 2 GiB buffer would wrap to 1 byte).
-  let bucket = 8192;
-  while (bucket < size) {
-    bucket *= 2;
-  }
-  return bucket;
+  return size;
 }
