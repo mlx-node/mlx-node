@@ -45,6 +45,43 @@ import type {
 /** How long stored responses live (seconds). */
 const RESPONSE_TTL_SECONDS = 1800; // 30 minutes
 
+/**
+ * Mutable visibility flags shared between the per-handler
+ * (non-streaming / streaming) path and the outer
+ * `handleCreateResponse` error block. Distinct from `res.headersSent`
+ * because Node's `ServerResponse.writeHead()` flips `headersSent`
+ * synchronously BEFORE any body bytes leave the buffer. A handler
+ * that throws inside `res.end()` after `writeHead()` has a
+ * `headersSent === true` but the client never actually observed the
+ * response — adopting the committed session under that unseen
+ * responseId would leak a warm session into the registry that no
+ * caller can ever reach.
+ *
+ * Each handler flips the flag that corresponds to "the client has
+ * actually seen a terminal artefact for this responseId" on its own
+ * success path:
+ *
+ *   * `responseBodyWritten` — non-streaming: set ONLY after
+ *     `res.end(JSON.stringify(response))` completes without throwing.
+ *   * `terminalEmitted` — streaming: set ONLY after a terminal SSE
+ *     event (`response.completed` on the success path, or
+ *     `response.failed` on the failure epilogue) has been written to
+ *     the wire without throwing.
+ *
+ * The outer catch computes `safeToSuppress = responseBodyWritten ||
+ * terminalEmitted`. A committed turn whose handler threw WITHOUT
+ * setting either flag is NOT adopted and the handler error is
+ * rethrown (so the outer `sendInternalError` path sends a 500 the
+ * client can parse, and the registry stays in sync with the client's
+ * view of the world).
+ */
+interface ResponseVisibility {
+  /** Non-streaming: `res.end(body)` returned without throwing. */
+  responseBodyWritten: boolean;
+  /** Streaming: a terminal SSE event was written to the wire. */
+  terminalEmitted: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Non-streaming path
 // ---------------------------------------------------------------------------
@@ -58,6 +95,7 @@ async function handleNonStreaming(
   store: ResponseStore | null,
   newInputMessages: ChatMessage[],
   modelInstanceId: number | undefined,
+  visibility: ResponseVisibility,
 ): Promise<void> {
   const response = buildResponseObject(result, req, responseId, previousResponseId);
 
@@ -73,8 +111,16 @@ async function handleNonStreaming(
     }
   }
 
+  // `writeHead` flips `res.headersSent` synchronously, but the client
+  // has not actually received the JSON body yet — if `res.end()`
+  // below throws, `res.headersSent` alone cannot tell the outer
+  // handler whether the response made it to the wire. Only flip
+  // `responseBodyWritten` AFTER `res.end()` returns cleanly, so the
+  // adopt-on-visibility gate treats an end-time crash the same way
+  // as a writeHead-time crash (no adopt, rethrow).
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(response));
+  visibility.responseBodyWritten = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +257,7 @@ async function handleStreamingNative(
   wasCommitted: () => boolean,
   modelInstanceId: number | undefined,
   httpReq: IncomingMessage | undefined,
+  visibility: ResponseVisibility,
 ): Promise<void> {
   beginSSE(res);
 
@@ -744,6 +791,13 @@ async function handleStreamingNative(
       }
     }
     writeSSEEvent(res, 'response.completed', { response: terminal });
+    // Flip only AFTER the terminal event successfully left the wire.
+    // `writeSSEEvent` forwards to `res.write`, which throws
+    // synchronously on a dead socket / aborted stream; if the throw
+    // escapes here, the outer handler catch must still see
+    // `terminalEmitted === false` so it does NOT adopt a session the
+    // client never got a terminal event for.
+    visibility.terminalEmitted = true;
     endSSE(res);
     return;
   }
@@ -852,6 +906,12 @@ async function handleStreamingNative(
 
   const failedTerminal = buildFailedTerminal(partial, finalOutput, reason, usage);
   writeSSEEvent(res, 'response.failed', { response: failedTerminal });
+  // Flip only AFTER `response.failed` successfully left the wire.
+  // An SSE write that throws against a dead socket must NOT count
+  // as a terminal the client saw; in that case the outer catch
+  // rethrows so the request fails loudly instead of silently
+  // suppressing an uncommitted error under a responseId no one saw.
+  visibility.terminalEmitted = true;
   endSSE(res);
 }
 
@@ -2198,10 +2258,26 @@ export async function handleCreateResponse(
         // themselves (handleNonStreaming / handleStreamingNative) and
         // demoted to log-only. A handlerError at this level therefore
         // comes from non-persistence failures (response construction,
-        // SSE write, res.writeHead/end crash). Adopt/rethrow logic
-        // below uses res.headersSent to distinguish "response already
-        // on the wire" from "client never saw the responseId".
+        // SSE write, res.writeHead/end crash).
+        //
+        // Iter-32 finding 1 & 2: the adopt/rethrow decision used to
+        // key on `res.headersSent`, which is a LIE for "the client
+        // received the response". Node's `ServerResponse.writeHead()`
+        // flips `headersSent = true` synchronously before any body
+        // bytes leave the buffer, so a throw from `res.end()` on the
+        // non-streaming path (or a throw from `writeSSEEvent` before
+        // any terminal SSE event on the streaming path) looked like
+        // the happy "already on the wire" case under the old gate
+        // and silently adopted / swallowed the error. The handlers
+        // now flip explicit visibility flags (`responseBodyWritten`
+        // / `terminalEmitted`) strictly AFTER the terminal artefact
+        // the client depends on is known to have left the wire, and
+        // the gate below keys on those flags instead.
         let handlerError: Error | null = null;
+        const visibility: ResponseVisibility = {
+          responseBodyWritten: false,
+          terminalEmitted: false,
+        };
 
         if (mappedBody.stream) {
           const outcome = await runSessionStreaming(session, messages, newInputMessages, config);
@@ -2218,6 +2294,7 @@ export async function handleCreateResponse(
               streamingWasCommitted,
               currentInstanceId,
               httpReq,
+              visibility,
             );
           } catch (err) {
             handlerError = err instanceof Error ? err : new Error(String(err));
@@ -2235,6 +2312,7 @@ export async function handleCreateResponse(
               store,
               newInputMessages,
               currentInstanceId,
+              visibility,
             );
           } catch (err) {
             handlerError = err instanceof Error ? err : new Error(String(err));
@@ -2242,31 +2320,48 @@ export async function handleCreateResponse(
           committed = outcome.committed;
         }
 
+        // "Safe to suppress" collapses to: did the client observe a
+        // terminal artefact for this responseId? On the non-
+        // streaming path that is the JSON body landing cleanly on
+        // the wire; on the streaming path it is a terminal SSE
+        // event (`response.completed` or `response.failed`) landing
+        // cleanly on the wire. In either case the client can see
+        // the responseId and knows the turn is over, so adopting
+        // the committed session under that id is safe and
+        // swallowing the (already-surfaced-via-failed-event)
+        // handler error is the only option that does not produce a
+        // malformed double-response.
+        const safeToSuppress = visibility.responseBodyWritten || visibility.terminalEmitted;
+
         if (previousResponseId) {
           sessionReg.drop(previousResponseId);
         }
         // Only adopt if the turn committed AND either the handler
-        // succeeded or the response is already on the wire. A
-        // committed turn where the handler threw before writing
-        // any response bytes must NOT be adopted — the client
-        // never saw the responseId, so caching the session under
-        // that id creates an unreachable committed turn.
-        if (committed && (handlerError == null || res.headersSent)) {
+        // succeeded or a terminal artefact is already on the wire.
+        // A committed turn whose handler threw before the client
+        // saw anything it can chain off of must NOT be adopted —
+        // the responseId is unreachable from the client, so caching
+        // the session under it creates a permanently dangling warm
+        // session.
+        if (committed && (handlerError == null || safeToSuppress)) {
           sessionReg.adopt(responseId, session, requestedInstructions);
         }
 
-        // Rethrow handler errors when the client hasn't received
-        // a response yet, regardless of commit state. The outer
-        // catch will send a proper 500.
-        if (handlerError && !res.headersSent) {
+        // Rethrow handler errors when the client hasn't seen a
+        // terminal yet, regardless of commit state. The outer
+        // catch will send a proper 500 (non-streaming) or a last-
+        // ditch SSE `error` event (streaming, after `beginSSE` but
+        // before any terminal). Without this the request would
+        // hang from the client's perspective.
+        if (handlerError && !safeToSuppress) {
           throw handlerError;
         }
-        // If headersSent but handlerError: the response is partially
-        // or fully on the wire. Rethrowing would produce a malformed
-        // double-response. Log and move on — the client already has
-        // what they need.
+        // If a terminal is on the wire but the handler still
+        // threw: log only. Rethrowing would produce a malformed
+        // double-response; the client already has a terminal event
+        // it can parse.
         if (handlerError) {
-          console.error('[responses] handler error after response headers already sent:', handlerError);
+          console.error('[responses] handler error after terminal response already delivered:', handlerError);
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error during inference';

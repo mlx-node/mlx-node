@@ -65,7 +65,13 @@ function createMockRes(): {
     },
   });
 
-  // Attach ServerResponse-like methods
+  // Attach ServerResponse-like methods. `writeHead` mirrors Node's
+  // `ServerResponse.writeHead`: it flips `headersSent = true`
+  // synchronously, BEFORE any body bytes leave the buffer. The
+  // production code relies on this being honest for the
+  // iter-32-finding-1 regression tests below — a mock that waited
+  // until `end()` to flip `headersSent` would hide the lie that the
+  // finding fixed.
   writable.writeHead = (s: number, h?: Record<string, string>) => {
     status = s;
     if (h) {
@@ -73,6 +79,7 @@ function createMockRes(): {
         headers[k.toLowerCase()] = v;
       }
     }
+    writable.headersSent = true;
     return writable;
   };
 
@@ -90,6 +97,9 @@ function createMockRes(): {
   // @ts-expect-error
   writable.end = (chunk: string | Uint8Array, encoding: BufferEncoding, cb?: () => void) => {
     if (chunk) body += chunk.toString();
+    // Node flips `headersSent` inside `writeHead`, but `end()` may
+    // be called without an explicit `writeHead` (the implicit-header
+    // path), so set it here defensively too.
     writable.headersSent = true;
     origEnd(undefined, encoding, cb);
     endResolve();
@@ -5154,6 +5164,193 @@ describe('createHandler', () => {
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(0);
+    });
+
+    it('committed non-streaming handler crash AFTER writeHead but before end does not adopt under unseen id', async () => {
+      // Iter-32 finding 1 regression: Node's
+      // `ServerResponse.writeHead()` flips `headersSent = true`
+      // synchronously BEFORE any body bytes leave the buffer. The
+      // iter-29 adopt gate keyed on `res.headersSent`, so a throw
+      // from `res.end()` on the non-streaming path — after
+      // `writeHead` had already flipped the flag — looked like the
+      // happy "already on the wire" case and silently adopted the
+      // committed session under a responseId the client never
+      // actually received a body for. The fix threads an explicit
+      // `responseBodyWritten` visibility flag set only AFTER
+      // `res.end()` returns cleanly, and the adopt gate keys on
+      // that instead.
+      //
+      // This test drives exactly the regression shape: `writeHead`
+      // succeeds (flipping `headersSent` like real Node), but the
+      // very first `res.end()` throws synchronously. The handler
+      // must NOT adopt, the error must propagate to the outer
+      // catch, and the client must see a 500.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
+      registry.register('test-model', mockModel);
+
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'trigger a committed turn with end crash',
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      // `writeHead` succeeds — `headersSent` flips to `true` per
+      // Node's real semantics (now mirrored in `createMockRes`). The
+      // FIRST `res.end()` throws, simulating a socket crash between
+      // headers and body. Subsequent `end()` calls (from the outer
+      // `sendInternalError`) succeed so the client still gets a 500
+      // and `waitForEnd()` resolves.
+      let endCallCount = 0;
+      const originalEnd = res.end.bind(res);
+      // @ts-expect-error overriding the narrow overload signature
+      res.end = (...args: Parameters<ServerResponse['end']>) => {
+        endCallCount++;
+        if (endCallCount === 1) {
+          throw new Error('simulated res.end crash after writeHead');
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+        return originalEnd(...args);
+      };
+
+      await handler(req, res);
+      await waitForEnd();
+
+      // The model was called and committed.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(mockModel.chatSessionStart).toHaveBeenCalledTimes(1);
+
+      // The PRIMARY invariant: the session registry must NOT have
+      // adopted the session under the unseen responseId. Under the
+      // old `headersSent`-keyed gate this assertion failed — the
+      // handler saw `headersSent === true` (flipped synchronously
+      // by `writeHead`), took the "already on the wire" branch,
+      // adopted, and size became 1. That left a warm session
+      // cached under a responseId the client never actually
+      // received a body for, so the next chained request would
+      // hot-resume through an unreachable id. The new
+      // `responseBodyWritten` flag is NOT set (because `end()`
+      // threw before returning), so the adopt gate refuses.
+      const sessionReg = registry.getSessionRegistry('test-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(0);
+
+      // Secondary: the error propagated to the outer catch. Since
+      // `writeHead` already flushed 200 headers before `end` threw,
+      // the outer catch has no way to undo that — it falls through
+      // to the SSE-style error epilogue (`writeSSEEvent(res,
+      // 'error', ...)`). The exact wire shape there is a pre-
+      // existing non-streaming quirk, but we can still prove the
+      // outer catch ran by looking for the `server_error` marker
+      // in whatever landed on the wire.
+      const body = getBody();
+      expect(body).toMatch(/server_error/);
+    });
+
+    it('streaming early SSE write crash before any terminal rethrows and does not adopt', async () => {
+      // Iter-32 finding 2 regression: `beginSSE()` sends SSE
+      // headers (flipping `res.headersSent = true`) BEFORE any
+      // terminal SSE event (`response.created` is not a terminal —
+      // terminals are `response.completed` / `response.failed`). The
+      // iter-29 gate `handlerError && !res.headersSent` therefore
+      // swallowed any throw from an early `writeSSEEvent` as "safe
+      // to suppress, client already has headers" — but all the
+      // client saw was SSE headers and an abruptly-closed stream
+      // with no terminal event.
+      //
+      // The fix introduces `terminalEmitted`, which is flipped ONLY
+      // after a terminal SSE event (success or failure) has been
+      // written to the wire. Before that, any uncommitted throw
+      // from inside the streaming helper must propagate out to the
+      // outer catch so it can emit a last-ditch `error` event
+      // rather than hanging the request.
+      //
+      // This test drives exactly that shape: `beginSSE` succeeds
+      // (writeHead flushes SSE headers), but the very first
+      // `res.write` inside `writeSSEEvent` throws — before
+      // `response.created` even lands. The session did not commit,
+      // so the registry must stay empty; the outer catch sees
+      // `safeToSuppress === false` and either rethrows (triggering
+      // the outer last-ditch SSE error epilogue) or takes the
+      // equivalent error path.
+      async function* stream() {
+        yield { done: false, text: 'never emitted', isReasoning: false };
+      }
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionStart')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('streaming should not use chatSessionContinue')),
+        chatSessionContinueTool: vi
+          .fn()
+          .mockRejectedValue(new Error('streaming should not use chatSessionContinueTool')),
+        chatStreamSessionStart: vi.fn(() => stream()),
+        chatStreamSessionContinue: vi.fn(() => stream()),
+        chatStreamSessionContinueTool: vi.fn(() => stream()),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('stream-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, waitForEnd } = createMockRes();
+
+      // `writeHead` (inside `beginSSE`) succeeds. The FIRST
+      // `res.write` — which `writeSSEEvent` uses to emit
+      // `response.created` — throws. All subsequent writes succeed
+      // so the outer `sendInternalError`-equivalent SSE `error`
+      // epilogue can land (otherwise the test would hang on
+      // `waitForEnd`).
+      let writeCallCount = 0;
+      const originalWrite = res.write.bind(res);
+      res.write = ((chunk: Uint8Array | string, ...rest: unknown[]) => {
+        writeCallCount++;
+        if (writeCallCount === 1) {
+          throw new Error('simulated SSE write crash before response.created');
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+        return (originalWrite as unknown as (...a: unknown[]) => boolean)(chunk, ...rest);
+      }) as ServerResponse['write'];
+
+      await handler(req, res);
+      await waitForEnd();
+
+      // Adopt gate: the session did not commit (the stream threw
+      // before any delta was consumed, and `ChatSession` only
+      // advances `turns` on a successful non-error final chunk).
+      // Even if it HAD committed, `terminalEmitted === false` so
+      // the new safe-to-suppress gate would still refuse to adopt.
+      const sessionReg = registry.getSessionRegistry('stream-model');
+      expect(sessionReg).toBeDefined();
+      expect(sessionReg!.size).toBe(0);
+
+      // Persist gate: never called.
+      expect(mockStore.store).not.toHaveBeenCalled();
     });
 
     it('streaming post-commit store failure still emits response.completed', async () => {
