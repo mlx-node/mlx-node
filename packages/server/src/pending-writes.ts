@@ -494,11 +494,69 @@ export class PendingResponseWrites {
    * marker TTL elapses + `sweepExpired()` / `isHardTimedOut()`
    * reap it), this method returns `undefined` as before — the
    * iter-55 leak fix is not resurrected.
+   *
+   * Iter-58 (codex's iter-57 MEDIUM finding): the raw
+   * `hardTimedOut.get(id)?.absoluteExpiresAt` fallback bypassed
+   * the TTL + absolute-expiry liveness checks that
+   * `isHardTimedOut()` applies. With a short
+   * `MLX_HARD_TIMEOUT_MARKER_TTL_MS` (or `0`), a marker whose TTL
+   * had already lapsed — or whose `absoluteExpiresAt` had been
+   * crossed — would still hand back the future scalar, driving
+   * `responses.ts` down the retryable-503 branch even though
+   * `isHardTimedOut()` reported the id as cleared. That produced
+   * a 503-now-then-404-on-next-retry flip-flop for the same
+   * unrecoverable chain and broke the documented "TTL=0 disables
+   * the retryable classification" contract.
+   *
+   * Fix: gate the fallback on a shared liveness predicate
+   * (`isMarkerLive`) that mirrors the `expiresAt` / `absoluteExpiresAt`
+   * checks used in `isHardTimedOut()` and `sweepExpired()` — a
+   * marker is live iff `now < entry.expiresAt` AND
+   * `now < entry.absoluteExpiresAt`. `isHardTimedOut()` keeps its
+   * refresh-on-read + move-to-tail side effects (polling-side
+   * semantics from iter-52/iter-54); this getter stays purely
+   * read-only — `sweepExpired()` remains the authoritative
+   * reaper and we simply refuse to expose the scalar for a
+   * marker that would fail liveness. A proactive eviction here
+   * would introduce hidden mutation on a read path used by the
+   * classification branch, and the bounded sweep already
+   * reclaims the entry on the next `markHardTimedOut()`.
    */
   getEarliestExpiresAtMs(id: string): number | undefined {
     const pendingValue = this.earliestExpiresByPending.get(id);
     if (pendingValue !== undefined) return pendingValue;
-    return this.hardTimedOut.get(id)?.absoluteExpiresAt;
+    const entry = this.hardTimedOut.get(id);
+    if (entry === undefined) return undefined;
+    if (!PendingResponseWrites.isMarkerLive(entry, Date.now())) {
+      return undefined;
+    }
+    return entry.absoluteExpiresAt;
+  }
+
+  /**
+   * Shared, side-effect-free liveness predicate for hard-timeout
+   * markers. A marker is live iff the current wall-clock is
+   * strictly before BOTH the TTL-based sliding `expiresAt` AND
+   * the row's absolute `absoluteExpiresAt`.
+   *
+   * Iter-58: extracted so the `getEarliestExpiresAtMs()` fallback
+   * and the mutating `isHardTimedOut()` poll can agree on liveness
+   * without either having to invoke the other (`isHardTimedOut()`
+   * has refresh + move-to-tail side effects that are only correct
+   * for the polling-side caller; the classification-path getter
+   * must stay read-only).
+   *
+   * Comparison convention matches the rest of the module:
+   *   * `sweepExpired()` deletes when `entry.expiresAt <= now` or
+   *     `entry.absoluteExpiresAt <= now`.
+   *   * `isHardTimedOut()` uses `now >= entry.absoluteExpiresAt` and
+   *     `entry.expiresAt <= now` to mark the entry dead.
+   *
+   * Both reduce to "live iff `now < expiresAt` AND
+   * `now < absoluteExpiresAt`", which is what this helper encodes.
+   */
+  private static isMarkerLive(entry: { expiresAt: number; absoluteExpiresAt: number }, nowMs: number): boolean {
+    return nowMs < entry.expiresAt && nowMs < entry.absoluteExpiresAt;
   }
 
   /**

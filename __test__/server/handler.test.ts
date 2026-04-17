@@ -6883,6 +6883,107 @@ describe('createHandler', () => {
       }
     });
 
+    it('iter-58 regression: getEarliestExpiresAtMs returns undefined for TTL=0 expired marker', async () => {
+      // Codex's iter-57 MEDIUM finding: the iter-57 fallback read
+      // `hardTimedOut.get(id)?.absoluteExpiresAt` without going
+      // through the TTL + absolute-expiry liveness checks that
+      // `isHardTimedOut()` applies. A marker inserted with
+      // `ttlMs === 0` is dead-on-arrival (its `expiresAt` clamps
+      // to `min(Date.now() + 0, absoluteExpiresAt)`, i.e.
+      // `Date.now()`, which already fails the `now < expiresAt`
+      // liveness test) but the pre-iter-58 fallback would still
+      // hand the future `absoluteExpiresAt` scalar back to
+      // `responses.ts`, sending the caller down the retryable-503
+      // branch while `isHardTimedOut()` reported `false`. That
+      // produced the documented 503-now-then-404-on-next-retry
+      // flip-flop for the same unrecoverable write.
+      //
+      // Fix: gate the fallback on the shared `isMarkerLive`
+      // helper — a dead-on-arrival marker must not leak its
+      // scalar.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+      const id = 'resp_test_58a';
+
+      // Simulate the `initiatePersist` wiring: register the
+      // pending promise so `markHardTimedOut()` can transition
+      // it. After the transition the pending-side scalar has
+      // been drained (iter-56 invariant) and the only remaining
+      // source of the earliest-expiry value is the marker map.
+      const neverSettles = new Promise<void>(() => {});
+      const earliestMs = Date.now() + 60_000;
+      tracker.track(id, neverSettles, earliestMs);
+
+      // TTL=0 marker. `markHardTimedOut()` clamps `expiresAt =
+      // min(Date.now() + 0, absoluteExpiresAt) === Date.now()`,
+      // which fails the strict `now < expiresAt` liveness check
+      // on the very next read.
+      expect(tracker.markHardTimedOut(id, 0, earliestMs)).toBe(true);
+
+      // Read the classification-path getter FIRST so it is
+      // directly reproducing the codex scenario: a caller that
+      // reaches the `Promise.race(...)` timeout branch and reads
+      // the scalar to decide 404 vs. retryable 503 without
+      // having first consulted `isHardTimedOut()` on the same
+      // tick. Pre-iter-58 this returned `earliestMs` (a future
+      // scalar) even though the marker was already dead, which
+      // is exactly the flip-flop codex flagged.
+      expect(tracker.getEarliestExpiresAtMs(id)).toBeUndefined();
+      // And `isHardTimedOut()` agrees the marker is dead.
+      expect(tracker.isHardTimedOut(id)).toBe(false);
+    });
+
+    it('iter-58 regression: getEarliestExpiresAtMs returns undefined when absoluteExpiresAt is past', async () => {
+      // Companion scenario: the marker was inserted with a long
+      // TTL but its `absoluteExpiresAt` (the record row's own
+      // wall-clock expiry) was already in the past at insert
+      // time. The row is already invisible to
+      // `ResponseStore.getChain()`, so any retryable-503
+      // classification is factually wrong — `isHardTimedOut()`
+      // correctly returns `false` in this case, and the
+      // `getEarliestExpiresAtMs()` fallback must agree.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+      const id = 'resp_test_58b';
+
+      const neverSettles = new Promise<void>(() => {});
+      const pastMs = Date.now() - 1000;
+      tracker.track(id, neverSettles, pastMs);
+      // Even with a generous 60s TTL, the absolute cap is
+      // already in the past so the marker is non-live from the
+      // moment it lands in the map.
+      expect(tracker.markHardTimedOut(id, 60_000, pastMs)).toBe(true);
+
+      // Read the classification-path getter FIRST so the
+      // assertion directly pins the iter-58 liveness gate:
+      // even though `absoluteExpiresAt` is a valid `number` the
+      // fallback must refuse to return it because the marker
+      // is already past its absolute cap.
+      expect(tracker.getEarliestExpiresAtMs(id)).toBeUndefined();
+      expect(tracker.isHardTimedOut(id)).toBe(false);
+    });
+
+    it('iter-58 regression: getEarliestExpiresAtMs returns absoluteExpiresAt for a live marker (iter-57 invariant preserved)', async () => {
+      // Pinning test: for a genuinely live marker (TTL in the
+      // future AND absolute cap in the future), the iter-57
+      // pending -> hardTimedOut fallback must still hand back
+      // the `absoluteExpiresAt` scalar. The iter-58 liveness
+      // gate is SUBTRACTIVE — it removes the dead-marker leak
+      // but preserves the intended iter-57 straddle-case
+      // behaviour verbatim.
+      const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
+      const tracker = new PendingResponseWrites();
+      const id = 'resp_test_58c';
+
+      const neverSettles = new Promise<void>(() => {});
+      const earliestMs = Date.now() + 60_000;
+      tracker.track(id, neverSettles, earliestMs);
+      expect(tracker.markHardTimedOut(id, 30_000, earliestMs)).toBe(true);
+
+      expect(tracker.isHardTimedOut(id)).toBe(true);
+      expect(tracker.getEarliestExpiresAtMs(id)).toBe(earliestMs);
+    });
+
     it('iter-51: MLX_HARD_TIMEOUT_MARKER_TTL_MS parsing mirrors hard-timeout parser (empty/whitespace -> default, 0 -> zero, valid -> parsed)', async () => {
       // Iter-51 adds an independent TTL for hard-timed-out
       // markers (codex's iter-50 HIGH finding 1). The parser
