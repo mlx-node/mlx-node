@@ -7,11 +7,11 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { Gemma4Model, HarrierModel, QianfanOCRModel } from '@mlx-node/core';
+import { HarrierModel, QianfanOCRModel } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
 import type { LoadableModel, TrainableModel } from '../interfaces.js';
-import { Lfm2Model, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
+import { Gemma4Model, Lfm2Model, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
 export type ModelType =
   | 'qwen3'
