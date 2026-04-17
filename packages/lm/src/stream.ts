@@ -109,7 +109,10 @@ const _nativeQwen3ChatStreamSessionContinueTool = Qwen3ModelNative.prototype.cha
  *      until the next native chunk arrived, which on a fast-abort
  *      path (client disconnect before first token) never happens.
  *   3. The generator sees the marker, breaks out of its loop, and the
- *      finally block runs a second idempotent `handle.cancel()`.
+ *      finally block runs `cancelOnce()` — which is a no-op because
+ *      `triggerAbort` already flipped the `cancelled` flag. Some
+ *      backends throw on double-cancel, so routing every cancel site
+ *      through `cancelOnce` keeps abort behavior deterministic.
  *
  * The finally block is also the landing site for the consumer calling
  * `.return()` on the outer generator — the existing `yield` cleanup
@@ -150,6 +153,26 @@ export async function* _runChatStream(
 
   const handle = await startCall(callback);
 
+  // Guard against double-cancel. Some native backends throw on a
+  // second `cancel()`; we route every cancel site through this
+  // helper so the abort path (via `triggerAbort`) and the unwind
+  // path (via the `finally` block) don't cancel twice and so any
+  // backend that does throw is swallowed rather than escaping as
+  // an error out of an otherwise-clean early termination.
+  let cancelled = false;
+  const cancelOnce = (): void => {
+    if (cancelled) return;
+    cancelled = true;
+    try {
+      handle.cancel();
+    } catch {
+      // Native backend threw on cancel — nothing actionable here.
+      // Swallow so aborted streams still surface as a clean early
+      // termination via the synthetic `aborted` marker rather than
+      // as an unexpected error out of the generator.
+    }
+  };
+
   // Signal-driven fast-abort. If the signal is already aborted at
   // attach time we still arm the listener so the synchronous abort
   // dispatch path runs below (calling `handle.cancel()` after the
@@ -160,14 +183,10 @@ export async function* _runChatStream(
   if (signal != null) {
     const triggerAbort = (): void => {
       // Cancel the native side first so any work-in-flight winds
-      // down ASAP. `handle.cancel()` is idempotent — the finally
-      // block will call it again after the generator unwinds.
-      try {
-        handle.cancel();
-      } catch {
-        // A double-cancel can throw on some backends; swallow so
-        // the wake-up still runs.
-      }
+      // down ASAP. `cancelOnce` is idempotent — the finally block
+      // will invoke it again after the generator unwinds, but the
+      // second call becomes a no-op.
+      cancelOnce();
       // Push a synthetic abort marker so the consumer-visible
       // generator breaks out of its loop at the next iteration
       // rather than waiting for a native chunk that will never
@@ -229,7 +248,7 @@ export async function* _runChatStream(
         // a misbehaving signal must not leak out of the finally.
       }
     }
-    handle.cancel();
+    cancelOnce();
   }
 }
 

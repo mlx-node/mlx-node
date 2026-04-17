@@ -1,7 +1,7 @@
 import type { ChatMessage, ChatStreamChunk, ChatStreamHandle } from '@mlx-node/core';
 import type { ChatStreamEvent } from '@mlx-node/lm';
 import { _runChatStream } from '@mlx-node/lm';
-import { describe, it, expect } from 'vite-plus/test';
+import { describe, it, expect, vi } from 'vite-plus/test';
 
 /**
  * Creates a fake native chatStream callback method that emits `numTokens`
@@ -118,6 +118,86 @@ describe.sequential('_runChatStream bridge', () => {
 
     expect(events).toHaveLength(3);
     expect(cancelCalled).toBe(true);
+  });
+
+  it('aborting a stream does not double-cancel the native handle', async () => {
+    const cancelSpy = vi.fn();
+    const native = (
+      _messages: unknown[],
+      _config: unknown,
+      callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    ): Promise<ChatStreamHandle> => {
+      const handle = { cancel: cancelSpy } as unknown as ChatStreamHandle;
+      // Drip tokens slowly so the abort fires mid-stream.
+      const interval = setInterval(() => {
+        callback(null, { text: 't', done: false } as ChatStreamChunk);
+      }, 5);
+      // Unref isn't available on the returned Timeout in all envs, but
+      // the clearInterval hook below handles teardown deterministically.
+      (handle as unknown as { _stop: () => void })._stop = () => clearInterval(interval);
+      return Promise.resolve(handle);
+    };
+
+    const controller = new AbortController();
+    const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];
+    const gen = _runChatStream((callback) => native(messages, null, callback), controller.signal);
+
+    const events: ChatStreamEvent[] = [];
+    const collect = (async () => {
+      for await (const event of gen) {
+        events.push(event);
+        if (events.length === 1) controller.abort();
+      }
+    })();
+
+    await collect;
+    // Stop the native "decode" loop now that the stream has unwound.
+    // (Safe even if the handle type-cast didn't carry `_stop` — we only
+    // assert on cancelSpy call count here.)
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborted stream completes cleanly when native cancel throws on second call', async () => {
+    let cancelCalls = 0;
+    const native = (
+      _messages: unknown[],
+      _config: unknown,
+      callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    ): Promise<ChatStreamHandle> => {
+      const handle = {
+        cancel: () => {
+          cancelCalls++;
+          if (cancelCalls >= 2) {
+            throw new Error('double-cancel: native backend already torn down');
+          }
+        },
+      } as ChatStreamHandle;
+      setTimeout(() => {
+        // Emit one token so the consumer can trigger abort after receiving it.
+        callback(null, { text: 'hello', done: false } as ChatStreamChunk);
+      }, 0);
+      return Promise.resolve(handle);
+    };
+
+    const controller = new AbortController();
+    const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];
+    const events: ChatStreamEvent[] = [];
+
+    // The generator must complete cleanly — no unexpected error — even
+    // if the cancelOnce guard is bypassed and the second cancel throws.
+    await (async () => {
+      for await (const event of _runChatStream((callback) => native(messages, null, callback), controller.signal)) {
+        events.push(event);
+        if (events.length === 1) controller.abort();
+      }
+    })();
+
+    // Exactly one `cancel()` should have reached the native handle; the
+    // second call site routes through `cancelOnce` and becomes a no-op.
+    expect(cancelCalls).toBe(1);
+    // The delta we received before the abort must still surface.
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({ text: 'hello', done: false });
   });
 
   it('should propagate errors from callback', async () => {
