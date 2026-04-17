@@ -18,6 +18,14 @@ export interface HandlerOptions {
   cors?: boolean;
   /** Response store for previous_response_id support. */
   store?: ResponseStore | null;
+  /**
+   * Retention for persisted response rows, in seconds — stamped as
+   * `expires_at` when committing. When omitted, the endpoint falls
+   * back to its own default (see `responses.ts`). See
+   * `ServerConfig.responseRetentionSec` for the resolution chain that
+   * `createServer` uses.
+   */
+  responseRetentionSec?: number;
 }
 
 /**
@@ -33,6 +41,7 @@ export function createHandler(
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   const cors = options?.cors ?? true;
   const store = options?.store ?? null;
+  const responseRetentionSec = options?.responseRetentionSec;
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (cors) {
@@ -53,7 +62,7 @@ export function createHandler(
     // `http.createServer` ignores the return value, so this change is
     // transparent to production callers.
     try {
-      await routeRequest(req, res, registry, store);
+      await routeRequest(req, res, registry, store, responseRetentionSec);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';
       if (!res.headersSent) {

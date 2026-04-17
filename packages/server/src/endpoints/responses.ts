@@ -51,7 +51,18 @@ import type {
   ResponsesAPIRequest,
 } from '../types.js';
 
-/** How long stored responses live (seconds). */
+/**
+ * Fallback retention stamped on a stored response row when the caller
+ * does not thread an explicit `responseRetentionSec` in — used only by
+ * legacy call sites (tests, direct endpoint invocation without going
+ * through `createServer`). The production path wires retention through
+ * `ServerConfig.responseRetentionSec` (default 7 days), which is NOT
+ * this constant — see `packages/server/src/server.ts`.
+ *
+ * Kept at the historical 30-minute value so existing test fixtures and
+ * any external caller that constructs the endpoint directly observe
+ * unchanged behaviour until they opt in to the new knob.
+ */
 const RESPONSE_TTL_SECONDS = 1800; // 30 minutes
 
 /**
@@ -1795,7 +1806,16 @@ function buildResponseRecord(
   newInputMessages: ChatMessage[],
   previousResponseId: string | undefined,
   modelInstanceId: number | undefined,
+  retentionSec?: number,
 ): StoredResponseRecord {
+  // Retention is decoupled from the warm `SessionRegistry` TTL: the
+  // session sheds its GPU KV cache after 30 min, but the row must
+  // survive long enough (default 7 days via `createServer`) for a
+  // later `previous_response_id` request to cold-replay from SQLite.
+  // Falls back to `RESPONSE_TTL_SECONDS` for legacy callers that
+  // bypass the server config path (see constant comment).
+  const effectiveRetention =
+    retentionSec != null && Number.isFinite(retentionSec) && retentionSec > 0 ? retentionSec : RESPONSE_TTL_SECONDS;
   return {
     id: response.id,
     createdAt: response.created_at,
@@ -1815,7 +1835,7 @@ function buildResponseRecord(
       reasoning: response.reasoning,
       modelInstanceId,
     }),
-    expiresAt: Math.floor(Date.now() / 1000) + RESPONSE_TTL_SECONDS,
+    expiresAt: Math.floor(Date.now() / 1000) + effectiveRetention,
   };
 }
 
@@ -1916,6 +1936,7 @@ export async function handleCreateResponse(
   registry: ModelRegistry,
   store: ResponseStore | null,
   httpReq?: IncomingMessage,
+  responseRetentionSec?: number,
 ): Promise<void> {
   // Validate required fields
   if (body == null || typeof body !== 'object') {
@@ -3194,6 +3215,7 @@ export async function handleCreateResponse(
                 newInputMessages,
                 previousResponseId,
                 currentInstanceId,
+                responseRetentionSec,
               );
               // Iter-40 finding 1: pair a `retainBinding` against
               // the persist promise so the binding's
@@ -3465,6 +3487,7 @@ export async function handleCreateResponse(
                 newInputMessages,
                 previousResponseId,
                 currentInstanceId,
+                responseRetentionSec,
               );
               // Iter-40 finding 1: see the streaming branch for
               // the retain/release rationale — a same-model

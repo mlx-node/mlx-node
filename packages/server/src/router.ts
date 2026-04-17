@@ -52,6 +52,7 @@ export async function routeRequest(
   res: ServerResponse,
   registry: ModelRegistry,
   store: ResponseStore | null,
+  responseRetentionSec?: number,
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
@@ -84,7 +85,7 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateResponse(res, body, registry, store, req);
+    await handleCreateResponse(res, body, registry, store, req, responseRetentionSec);
     return;
   }
 

@@ -595,6 +595,68 @@ describe('createHandler', () => {
       expect(inputMessages[0].content).toBe('Hello');
     });
 
+    it('stamps custom responseRetentionSec on stored row expiresAt', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+
+      let storedRecord: any = null;
+      const mockStore = {
+        getChain: vi.fn(),
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecord = record;
+          return Promise.resolve();
+        }),
+        cleanupExpired: vi.fn(),
+      };
+
+      const retention = 123; // seconds
+      const handler = createHandler(registry, { store: mockStore as any, responseRetentionSec: retention });
+      const req = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'Hello' });
+      const { res, waitForEnd } = createMockRes();
+
+      const beforeSec = Math.floor(Date.now() / 1000);
+      await handler(req, res);
+      await waitForEnd();
+      const afterSec = Math.floor(Date.now() / 1000);
+
+      expect(mockStore.store).toHaveBeenCalledTimes(1);
+      expect(storedRecord.expiresAt).toBeGreaterThanOrEqual(beforeSec + retention);
+      expect(storedRecord.expiresAt).toBeLessThanOrEqual(afterSec + retention);
+    });
+
+    it('falls back to 1800s retention when responseRetentionSec is omitted', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+
+      let storedRecord: any = null;
+      const mockStore = {
+        getChain: vi.fn(),
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecord = record;
+          return Promise.resolve();
+        }),
+        cleanupExpired: vi.fn(),
+      };
+
+      // `createHandler` without `responseRetentionSec` — legacy behaviour,
+      // falls through to the endpoint's `RESPONSE_TTL_SECONDS = 1800`
+      // constant. The production server (`createServer`) resolves a
+      // 7-day default before reaching this path; this guards the
+      // direct-endpoint / legacy-test surface.
+      const handler = createHandler(registry, { store: mockStore as any });
+      const req = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'Hello' });
+      const { res, waitForEnd } = createMockRes();
+
+      const beforeSec = Math.floor(Date.now() / 1000);
+      await handler(req, res);
+      await waitForEnd();
+      const afterSec = Math.floor(Date.now() / 1000);
+
+      expect(mockStore.store).toHaveBeenCalledTimes(1);
+      expect(storedRecord.expiresAt).toBeGreaterThanOrEqual(beforeSec + 1800);
+      expect(storedRecord.expiresAt).toBeLessThanOrEqual(afterSec + 1800);
+    });
+
     it('passes mapped messages and config to chatSessionStart on cold path', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel();
