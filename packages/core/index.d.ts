@@ -2670,6 +2670,85 @@ export interface VlmChatMessage {
 }
 
 /**
+ * Read the current state of the Phase 6e GDN compute_g compile flag.
+ * Useful for the demo profile UI and for the TS test harness.
+ */
+export declare function wgpuGetGdnGCompileEnabled(): boolean;
+
+/**
+ * Read the current state of the Phase 6d GDN postfusion compile flag.
+ * Useful for the demo profile UI and for the TS test harness.
+ */
+export declare function wgpuGetGdnPostCompileEnabled(): boolean;
+
+/**
+ * Read the current state of the Phase 6c GDN prefusion compile flag.
+ * Useful for the demo profile UI and for the TS test harness.
+ */
+export declare function wgpuGetGdnPreCompileEnabled(): boolean;
+
+/**
+ * Retrieve the last-error message stashed by the Phase 6b/6c dispatch
+ * A/B test functions (set when their underlying C++ call throws). The
+ * browser test worker calls this on rc != 0 to include the C++ exception
+ * text in the vitest failure output instead of an opaque numeric code.
+ */
+export declare function wgpuGetLastTestError(): string;
+
+/**
+ * Read the current state of the Phase 6b SwiGLU compile flag. Useful for
+ * the demo profile UI to display whether the run is on the compiled or
+ * eager path.
+ */
+export declare function wgpuGetSwigluCompileEnabled(): boolean;
+
+/**
+ * Phase 6e: toggle the GDN decay-gate (compute_g) `mlx::core::compile`
+ * fast path.
+ *
+ * When enabled, `mlx_gdn_compute_g_forward` routes the 9-op exp / add /
+ * log / where / negative / multiply chain through the compile pass so
+ * the whole softplus / exp tape collapses into one fused Compiled
+ * element-wise kernel. Across Qwen3.5-0.8B's 18 linear-attention layers
+ * this saves ~144 dispatches per decode token — the biggest single
+ * lever remaining after Phase 6b/6c/6d.
+ *
+ * Default OFF. Plumbed from the `?compile_gdn_g=1` demo URL param and
+ * the TS test harness. The C++ side also reads `MLX_WGPU_COMPILE_GDN_G=1`
+ * from the env on first use for native builds.
+ */
+export declare function wgpuSetGdnGCompileEnabled(enabled: boolean): void;
+
+/**
+ * Phase 6d: toggle the GDN post-recurrence `mlx::core::compile` fast path.
+ *
+ * When enabled, `mlx_gdn_postfusion_forward` routes the no-bias Qwen3.5
+ * GDN post-tail through the compile pass so the sigmoid + two multiplies
+ * between `fast::rms_norm` and the out-proj matmul collapse into a single
+ * fused Compiled kernel — saving ~3 dispatches per layer per token.
+ *
+ * Default OFF. Plumbed from the `?compile_gdn_post=1` demo URL param and
+ * the TS test harness. The C++ side also reads `MLX_WGPU_COMPILE_GDN_POST=1`
+ * from the env on first use for native builds.
+ */
+export declare function wgpuSetGdnPostCompileEnabled(enabled: boolean): void;
+
+/**
+ * Phase 6c: toggle the GDN pre-recurrence `mlx::core::compile` fast path.
+ *
+ * When enabled, `mlx_gdn_prefusion_forward` routes the steady-state decode
+ * shape (mask absent, conv_state present, Tq=1) through the compile pass
+ * so the 15+ element-wise ops between the matmuls, slices, and rms_norms
+ * collapse into fused Compiled kernels — the biggest single lever in the
+ * Phase 6 plan.
+ *
+ * Default OFF. Plumbed from the `?compile_gdn_pre=1` demo URL param and
+ * the TS test harness. The C++ side also reads `MLX_WGPU_COMPILE_GDN_PRE=1`
+ * from the env on first use for native builds.
+ */
+export declare function wgpuSetGdnPreCompileEnabled(enabled: boolean): void;
+
+/**
  * Toggle the WebGPU backend's packed-bf16 weight storage path at runtime.
  * Called from the TS worker init with the value of the `?pack_bf16=1`
  * query param so the browser demos can A/B the packed kernel without a
@@ -2685,3 +2764,55 @@ export declare function wgpuSetPackedBf16Enabled(enabled: boolean): void;
  * rebuild. No-op on non-WebGPU builds.
  */
 export declare function wgpuSetSdpaFallbackForced(enabled: boolean): void;
+
+/**
+ * Phase 6b: toggle the SwiGLU MLP `mlx::core::compile` fast path.
+ *
+ * When enabled, `mlx_swiglu_mlp_forward` routes the matmul → matmul →
+ * sigmoid → multiply → multiply → matmul chain through the compile pass
+ * so the three element-wise ops collapse into a single fused Compiled
+ * kernel — saving 2 dispatches per MLP layer per token.
+ *
+ * Default OFF. Plumbed from the `?compile_mlp=1` demo URL param and the
+ * TS test harness so the browser can A/B without a rebuild. The C++ side
+ * also reads `MLX_WGPU_COMPILE_MLP=1` from the env on first use, so a
+ * native build can opt in via the shell environment.
+ */
+export declare function wgpuSetSwigluCompileEnabled(enabled: boolean): void;
+
+/**
+ * Phase 6e dispatch-count A/B test. Runs the GDN compute_g forward N
+ * times eagerly, then N times through `mlx::core::compile`, and returns
+ * `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`. Gate:
+ * delta must be at least the Phase 6e spec floor (see the TS harness for
+ * the exact threshold) and `max_abs_err` must be zero.
+ */
+export declare function wgpuTestCompileGdnGDispatchDelta(): Array<number>;
+
+/**
+ * Phase 6d dispatch-count A/B test. Runs the GDN postfusion forward N
+ * times eagerly, then N times through `mlx::core::compile`, and returns
+ * `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`. Gate:
+ * delta must be at least the Phase 6d spec floor (see the TS harness for
+ * the exact threshold) and `max_abs_err` must be zero.
+ */
+export declare function wgpuTestCompileGdnPostDispatchDelta(): Array<number>;
+
+/**
+ * Phase 6c dispatch-count A/B test. Runs the GDN prefusion forward N
+ * times eagerly, then N times through `mlx::core::compile`, and returns
+ * `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`.
+ * Gate: delta must be at least the Phase 6c spec floor (see the TS
+ * harness for the exact threshold) and `max_abs_err` must be zero.
+ */
+export declare function wgpuTestCompileGdnPreDispatchDelta(): Array<number>;
+
+/**
+ * Phase 6b dispatch-count A/B test. Runs the SwiGLU MLP forward N times
+ * eagerly, then N times through `mlx::core::compile`, and returns
+ * `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`. Used
+ * by the browser test suite to gate the phase: dispatch count must drop
+ * by at least 40 between the two paths and `max_abs_err` must stay near
+ * zero. Returns an empty vec if the underlying C++ test fails.
+ */
+export declare function wgpuTestCompileMlpDispatchDelta(): Array<number>;
