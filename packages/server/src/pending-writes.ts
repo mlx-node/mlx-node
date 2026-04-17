@@ -521,6 +521,13 @@ export class PendingResponseWrites {
    * would introduce hidden mutation on a read path used by the
    * classification branch, and the bounded sweep already
    * reclaims the entry on the next `markHardTimedOut()`.
+   *
+   * Dead markers return `0` as a sentinel meaning "already expired".
+   * The consumer's `Date.now() >= earliestMs` guard always trips
+   * for `0`, producing a permanent 404 instead of falling through
+   * to the retryable-503 branch. Returning `undefined` for dead
+   * markers (pre-iter-59) caused the consumer to skip the guard
+   * entirely, producing an incorrect 503 for an unrecoverable chain.
    */
   getEarliestExpiresAtMs(id: string): number | undefined {
     const pendingValue = this.earliestExpiresByPending.get(id);
@@ -528,7 +535,7 @@ export class PendingResponseWrites {
     const entry = this.hardTimedOut.get(id);
     if (entry === undefined) return undefined;
     if (!PendingResponseWrites.isMarkerLive(entry, Date.now())) {
-      return undefined;
+      return 0;
     }
     return entry.absoluteExpiresAt;
   }

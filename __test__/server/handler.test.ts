@@ -6928,7 +6928,7 @@ describe('createHandler', () => {
       // tick. Pre-iter-58 this returned `earliestMs` (a future
       // scalar) even though the marker was already dead, which
       // is exactly the flip-flop codex flagged.
-      expect(tracker.getEarliestExpiresAtMs(id)).toBeUndefined();
+      expect(tracker.getEarliestExpiresAtMs(id)).toBe(0);
       // And `isHardTimedOut()` agrees the marker is dead.
       expect(tracker.isHardTimedOut(id)).toBe(false);
     });
@@ -6959,7 +6959,7 @@ describe('createHandler', () => {
       // even though `absoluteExpiresAt` is a valid `number` the
       // fallback must refuse to return it because the marker
       // is already past its absolute cap.
-      expect(tracker.getEarliestExpiresAtMs(id)).toBeUndefined();
+      expect(tracker.getEarliestExpiresAtMs(id)).toBe(0);
       expect(tracker.isHardTimedOut(id)).toBe(false);
     });
 
