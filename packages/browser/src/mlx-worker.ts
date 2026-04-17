@@ -25,7 +25,7 @@ TextDecoder.prototype.decode = function (input?: BufferSource | null, options?: 
 
 import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
-import { CMD_OFFSET, READBACK_BUFFER_SIZE, DISPATCH_BATCH_BUFFER_SIZE } from './rpc-protocol.js';
+import { CMD_OFFSET, READBACK_BUFFER_SIZE, DISPATCH_BATCH_BUFFER_SIZE, STATS_BUFFER_SIZE } from './rpc-protocol.js';
 import { parseSafeTensorsHeader, dtypeToCode } from './safetensors.js';
 import {
   createBridgeStub,
@@ -107,6 +107,14 @@ async function handleInit(data: {
     // lookup came up empty. Sized for ~35 back-to-back Qwen3.5-0.8B
     // decodes; see webgpu-bridge-stub.ts for the capacity calculation.
     const bufferMetadataBuffer = new SharedArrayBuffer(BUFFER_METADATA_SIZE_BYTES);
+    // JS-F010: dedicated 1 KiB stats SAB for the gpu-worker's per-opcode
+    // RPC histogram. Replaces the old scheme that striped the histogram
+    // across the cmd SAB's CALLBACK_BASE / UNIFORM_DATA / reserved regions
+    // (which was "safe by serialization" — one loosening of cmd-SAB
+    // single-slot and a fused dispatch would silently lose its UNIFORM_DATA
+    // bytes). Plumbed into both the gpu-worker init message and every
+    // createBridgeStub call so main + child workers share the same view.
+    const statsBuffer = new SharedArrayBuffer(STATS_BUFFER_SIZE);
     // WASM module requires min 1002 pages (~66 MB). We use 4096 (~268 MB)
     // for headroom during WASM init (thread stacks, emnapi, etc.) and let
     // memory.grow expand as needed — keeps total well under the 2 GB JS
@@ -133,6 +141,7 @@ async function handleInit(data: {
         readbackBuffer,
         wasmMemory: sharedMemory, // Send Memory object, not .buffer — .buffer getter always returns current byteLength after grow()
         dispatchBatchBuffer,
+        statsBuffer,
       });
     });
     post({ type: 'progress', step: 'gpu', message: 'WebGPU ready' });
@@ -153,6 +162,7 @@ async function handleInit(data: {
       dispatchBatchBuffer,
       dispatchBatch,
       bufferMetadataBuffer,
+      statsBuffer,
     );
     // Retain for ?profile=1 readback (resetBridgeStats / fetchGpuWorkerStats
     // need the same BridgeStub instance that owns the SAB cmdBuffer view).
@@ -241,6 +251,7 @@ async function handleInit(data: {
           dispatchBatchBuffer,
           dispatchBatch: false,
           bufferMetadataBuffer,
+          statsBuffer,
           handles: {
             instanceHandle: gpuReady.instanceHandle,
             adapterHandle: gpuReady.adapterHandle,

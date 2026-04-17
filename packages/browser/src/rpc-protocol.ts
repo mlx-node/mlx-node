@@ -113,20 +113,18 @@ export const enum RpcFn {
   // Returns: new compute pass handle
   FUSED_COPY_BUFFER = 98,
   // Phase 0 stats readback. Reads the gpu-worker's per-opcode RPC histogram
-  // (maintained at the top of the main dispatch switch) into the SAB and
-  // returns the total RPC count via RESULT.
+  // (maintained at the top of the main dispatch switch) into the dedicated
+  // stats SAB and returns the total RPC count via RESULT.
   //   ARG0: reset flag (1 = zero the histogram after readback, 0 = leave as-is)
   //   RESULT (u32): total RPCs seen by gpu-worker since last reset
-  // SAB layout for the histogram readback (written by gpu-worker):
-  //   offsets 64..64 + 4*STATS_OPCODE_SLOTS hold one u32 per RpcFn slot
-  //   (slot index = RpcFn value; only slots 0..99 are used).
-  // This uses the CALLBACK_BASE region (64..187), which is 124 bytes =
-  // 31 u32 slots. 100 opcodes * 4 bytes = 400 bytes would overrun that
-  // region, so we reuse the inline-uniform area (192..447, 256 bytes = 64
-  // slots) *plus* the callback area (31 slots) for a total of 95 slots. We
-  // stripe opcode counts into a contiguous u32 array starting at offset
-  // CALLBACK_COUNT+0 for the first STATS_OPCODE_SLOTS_A slots, then the
-  // inline-uniform area for the remainder. See wasm-worker `readStatsFromSab`.
+  //
+  // JS-F010: the histogram lives in a dedicated 1 KiB SharedArrayBuffer
+  // (see STATS_BUFFER_SIZE / STATS_OPCODE_SLOTS). Both the gpu-worker and
+  // every bridge stub instantiated against the same session are handed the
+  // same stats SAB so the write and read happen entirely outside the cmd
+  // SAB — no UNIFORM_DATA / CALLBACK_BASE overlap. The cmd SAB's RESULT
+  // field still carries the scalar total RPC count; everything else moves
+  // out.
   GET_STATS = 99,
   // Batched buffer release. Lets the bridge accumulate wgpuBufferRelease calls
   // and flush them in one RPC instead of one-per-buffer. This is the biggest
@@ -187,19 +185,40 @@ export const DISPATCH_BATCH_HEADER_BYTES = 40;
 export const DISPATCH_BATCH_MAX_RECORD_BYTES =
   DISPATCH_BATCH_HEADER_BYTES + MAX_DISPATCH_BATCH_ENTRIES * 12 + MAX_DISPATCH_BATCH_UNIFORM;
 
-// Phase 0: total number of RpcFn histogram slots readable via GET_STATS.
-// We split the storage across three regions of the SAB:
-//   - callback-ring region (64..187)   → 31 u32 slots  (slots 0..30)
-//   - inline-uniform region (192..447) → 64 u32 slots  (slots 31..94)
-//   - reserved region       (448..511) → 16 u32 slots  (slots 95..110)
-// This covers every RpcFn currently defined (max id = 99 including the
-// FUSED_FULL_DISPATCH=96 / FUSED_DISPATCH_WITH_UNIFORM=97 / FUSED_COPY_BUFFER=98
-// opcodes that issue real compute work).
-export const STATS_OPCODE_SLOTS = 111;
+// JS-F010: dedicated stats SAB — no longer overlaps cmd-SAB regions.
+//
+// Originally GET_STATS stored the per-opcode histogram in three regions of
+// the cmd SAB (callback ring, inline-uniform area, and reserved tail). This
+// was "safe by serialization" — the single cmd-SAB slot forced GET_STATS to
+// never race with a fused dispatch — but it clobbered the CALLBACK_BASE
+// region AND the UNIFORM_DATA region the moment any other call site wrote
+// there. Anyone who loosened the cmd-SAB single-slot invariant would silently
+// corrupt in-flight dispatch state.
+//
+// Fix: store the histogram in its own 1 KiB SharedArrayBuffer passed into
+// both the gpu-worker (as stats-SAB) and every bridge stub. All slots 0..N
+// are a flat u32 array — no region math.
+//
+// Sizing: 256 u32 slots = 1024 bytes. Covers every RpcFn opcode (max 103)
+// plus the smuggled pool/cache/spin counters at 100..108 with headroom.
+// 4x the historical footprint, trivially cheap (one SAB allocation per
+// worker lifetime), and leaves room for future histogram additions.
+export const STATS_OPCODE_SLOTS = 256;
+export const STATS_BUFFER_SIZE = STATS_OPCODE_SLOTS * 4; // 1024 bytes
+//
+// Legacy layout constants for the pre-JS-F010 cmd-SAB overlap path. They are
+// no longer used by gpu-worker / bridge-stub — kept as `deprecated` so any
+// external reader still importing them compiles. Remove once there are no
+// more importers.
+/** @deprecated JS-F010: opcode histogram lives in a dedicated stats SAB. */
 export const STATS_CALLBACK_SLOTS = 31;
+/** @deprecated JS-F010: opcode histogram lives in a dedicated stats SAB. */
 export const STATS_INLINE_OFFSET = 192;
+/** @deprecated JS-F010: opcode histogram lives in a dedicated stats SAB. */
 export const STATS_INLINE_SLOTS = 64;
+/** @deprecated JS-F010: opcode histogram lives in a dedicated stats SAB. */
 export const STATS_RESERVED_OFFSET = 448;
+/** @deprecated JS-F010: opcode histogram lives in a dedicated stats SAB. */
 export const STATS_RESERVED_SLOTS = 16;
 
 // ---- Command Buffer Layout (SharedArrayBuffer) ----

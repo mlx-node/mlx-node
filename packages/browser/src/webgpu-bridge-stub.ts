@@ -23,11 +23,7 @@ import {
   MAX_CALLBACKS_PER_CALL,
   MAX_RELEASE_BATCH,
   STATS_OPCODE_SLOTS,
-  STATS_CALLBACK_SLOTS,
-  STATS_INLINE_OFFSET,
-  STATS_INLINE_SLOTS,
-  STATS_RESERVED_OFFSET,
-  STATS_RESERVED_SLOTS,
+  STATS_BUFFER_SIZE,
   DISPATCH_BATCH_BUFFER_SIZE,
   MAX_DISPATCH_BATCH,
   MAX_DISPATCH_BATCH_ENTRIES,
@@ -182,11 +178,28 @@ export function createBridgeStub(
    * to the legacy per-instance Record-based cache.
    */
   bufferMetadataBuffer?: SharedArrayBuffer,
+  /**
+   * JS-F010: dedicated stats SAB (1 KiB = 256 u32 slots) the gpu-worker
+   * writes its per-opcode RPC histogram into during GET_STATS. When
+   * undefined, `fetchGpuWorkerStats` still returns the scalar `totalRpcs`
+   * from the cmd SAB's RESULT field but the per-opcode histogram is empty.
+   * Must be the same SAB the gpu-worker received in its init message.
+   */
+  statsBuffer?: SharedArrayBuffer,
 ): BridgeStub {
   const cmdView = new Int32Array(cmdBuffer);
   const cmdDataView = new DataView(cmdBuffer);
   const cmdU32 = new Uint32Array(cmdBuffer); // fast unsigned writes (avoids DataView overhead)
   const readbackView = readbackBuffer ? new Uint8Array(readbackBuffer) : null;
+  // JS-F010: typed view over the dedicated stats SAB. GET_STATS readback
+  // reads the per-opcode histogram from here rather than from the cmd SAB's
+  // CALLBACK_BASE / UNIFORM_DATA / reserved regions. Null when the caller
+  // didn't supply one (legacy test harnesses); the histogram is empty in
+  // that case but `totalRpcs` still comes back via the RESULT field.
+  const statsU32: Uint32Array | null =
+    statsBuffer && statsBuffer.byteLength >= STATS_BUFFER_SIZE
+      ? new Uint32Array(statsBuffer, 0, STATS_OPCODE_SLOTS)
+      : null;
 
   // WASM exports -- set via setInstance() after WASM instantiation
   let wasmTable: WebAssembly.Table;
@@ -935,10 +948,10 @@ export function createBridgeStub(
     cmdU32[I_ARG0 + 6] = a6 >>> 0;
     // Don't clear CALLBACK_COUNT for FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM —
     // it holds entryCount (written by the caller before rpcCall).
-    // Also skip for GET_STATS because the gpu-worker writes histogram data
-    // into the CALLBACK_COUNT region and we do NOT want rpcCall to
-    // interpret that as a pending-callback count.
-    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM && fnId !== RpcFn.GET_STATS) {
+    // JS-F010: GET_STATS no longer repurposes CALLBACK_COUNT — histogram
+    // data lives in the dedicated stats SAB. Clearing it here is now safe
+    // (and matches every other non-fused RPC).
+    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
       cmdU32[I_CB_COUNT] = 0;
     }
 
@@ -968,9 +981,11 @@ export function createBridgeStub(
 
     // Process pending callbacks only when present (95%+ of calls have 0).
     // Skip for FUSED_FULL_DISPATCH / FUSED_DISPATCH_WITH_UNIFORM — CALLBACK_COUNT
-    // holds entryCount, not callbacks. Also skip for GET_STATS where the
-    // gpu-worker repurposes the callback-ring region for histogram storage.
-    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM && fnId !== RpcFn.GET_STATS) {
+    // holds entryCount, not callbacks.
+    // JS-F010: GET_STATS used to also be excluded here because it clobbered
+    // CALLBACK_COUNT. The dedicated stats SAB makes that moot — CALLBACK_COUNT
+    // is zero after the call, so the fast-path check naturally short-circuits.
+    if (fnId !== RpcFn.FUSED_FULL_DISPATCH && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
       if (cmdU32[I_CB_COUNT] > 0) {
         try {
           drainCallbacks(fnId);
@@ -2171,28 +2186,21 @@ export function createBridgeStub(
 
   function fetchGpuWorkerStats(resetAfter: boolean): GpuWorkerStats {
     const totalRpcs = rpcCall(RpcFn.GET_STATS, resetAfter ? 1 : 0) >>> 0;
-    // Three-region layout — see GET_STATS handler in gpu-worker.ts for the
-    // writer side and rpc-protocol.ts for the rationale.
+    // JS-F010: flat read from the dedicated stats SAB — no region math, no
+    // overlap with UNIFORM_DATA / CALLBACK_BASE. When statsU32 is null
+    // (legacy test harness that didn't plumb the SAB), the histogram is
+    // empty and callers still get a valid totalRpcs + zeroed counters.
     const byFn: Record<number, number> = {};
-    const cbBase = CMD_OFFSET.CALLBACK_COUNT >>> 2;
-    for (let i = 0; i < STATS_CALLBACK_SLOTS; i++) {
-      const v = cmdU32[cbBase + i];
-      if (v > 0) byFn[i] = v;
+    if (statsU32) {
+      for (let i = 0; i < STATS_OPCODE_SLOTS; i++) {
+        const v = statsU32[i];
+        if (v > 0) byFn[i] = v;
+      }
     }
-    const inlineBase = STATS_INLINE_OFFSET >>> 2;
-    for (let i = 0; i < STATS_INLINE_SLOTS; i++) {
-      const v = cmdU32[inlineBase + i];
-      if (v > 0) byFn[STATS_CALLBACK_SLOTS + i] = v;
-    }
-    const reservedBase = STATS_RESERVED_OFFSET >>> 2;
-    for (let i = 0; i < STATS_RESERVED_SLOTS; i++) {
-      const v = cmdU32[reservedBase + i];
-      if (v > 0) byFn[STATS_CALLBACK_SLOTS + STATS_INLINE_SLOTS + i] = v;
-    }
-    // Pool hit/miss counters smuggled by the gpu-worker into reserved slots
-    // 100 and 101 (max real RpcFn opcode is 99). Task C also smuggles bind-
-    // group cache hits/misses into 102/103. Remove them from byFn so they
-    // don't render as fake opcodes in the histogram.
+    // Smuggled counters living above the real RpcFn opcode range. They
+    // share the stats SAB with actual opcode histograms but correspond to
+    // no RpcFn — pull them out and surface on the returned record so the
+    // demo doesn't render phantom opcodes.
     const gpuPoolHits = byFn[100] ?? 0;
     const gpuPoolMisses = byFn[101] ?? 0;
     const bindGroupCacheHits = byFn[102] ?? 0;

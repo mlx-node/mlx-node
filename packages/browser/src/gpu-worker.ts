@@ -24,11 +24,7 @@ import {
   MAX_CALLBACKS_PER_CALL,
   CALLBACK_ENTRY_SIZE,
   STATS_OPCODE_SLOTS,
-  STATS_CALLBACK_SLOTS,
-  STATS_INLINE_OFFSET,
-  STATS_INLINE_SLOTS,
-  STATS_RESERVED_OFFSET,
-  STATS_RESERVED_SLOTS,
+  STATS_BUFFER_SIZE,
   DISPATCH_BATCH_HEADER_BYTES,
 } from './rpc-protocol.js';
 
@@ -290,6 +286,15 @@ let dispatchBatchU32: Uint32Array | null = null;
 let dispatchBatchU8: Uint8Array | null = null;
 let dispatchBatchBuffer: SharedArrayBuffer | null = null;
 
+// JS-F010: dedicated stats SAB. When the mlx-worker passes `statsBuffer` in
+// the init message, GET_STATS writes the per-opcode histogram there instead
+// of overlapping the cmd-SAB's CALLBACK_BASE / UNIFORM_DATA regions. Falls
+// back to null on older inits (e.g. test harnesses that don't plumb it) —
+// GET_STATS then degrades to writing only cmdU32[I_RESULT] = gpuTotalRpcs
+// with no per-opcode histogram, which is harmless for tests that don't
+// inspect the histogram.
+let statsU32: Uint32Array | null = null;
+
 // Pending callbacks: accumulated during async operations (mapAsync, adapter/device request).
 // Written to the callback ring in the command buffer when the current RPC call completes.
 interface PendingCallback {
@@ -345,6 +350,14 @@ self.onmessage = async (e: MessageEvent) => {
       dispatchBatchBuffer = e.data.dispatchBatchBuffer as SharedArrayBuffer;
       dispatchBatchU32 = new Uint32Array(dispatchBatchBuffer);
       dispatchBatchU8 = new Uint8Array(dispatchBatchBuffer);
+    }
+
+    // JS-F010: dedicated stats SAB (1 KiB = 256 u32 slots). Optional —
+    // when absent, GET_STATS still returns the scalar total via RESULT but
+    // the per-opcode histogram is a no-op. Every production init (mlx-worker)
+    // supplies this; test harnesses may not.
+    if (e.data.statsBuffer && (e.data.statsBuffer as SharedArrayBuffer).byteLength >= STATS_BUFFER_SIZE) {
+      statsU32 = new Uint32Array(e.data.statsBuffer as SharedArrayBuffer, 0, STATS_OPCODE_SLOTS);
     }
 
     // Create GPU device
@@ -2270,24 +2283,24 @@ async function processCommand(fnId: number): Promise<void> {
 
     // ================================================================
     // Phase 0 stats (?profile=1 observability). Write the per-opcode
-    // histogram into the SAB so the wasm-worker can post it up to the
-    // main thread. Storage layout (see rpc-protocol.ts for the rationale):
-    //   - cmdU32[I_RESULT]  := gpuTotalRpcs (u32, since last reset)
-    //   - SAB bytes 64..64+STATS_CALLBACK_SLOTS*4:
-    //       opcode counts for slots 0..30
-    //   - SAB bytes STATS_INLINE_OFFSET..+STATS_INLINE_SLOTS*4:
-    //       opcode counts for slots 31..94
-    //   - SAB bytes STATS_RESERVED_OFFSET..+STATS_RESERVED_SLOTS*4:
-    //       opcode counts for slots 95..110 (covers FUSED_*_DISPATCH=96/97/98)
+    // histogram into the dedicated stats SAB so the wasm-worker can post
+    // it up to the main thread.
+    //
+    // JS-F010: storage moved out of the cmd SAB's CALLBACK_BASE /
+    // UNIFORM_DATA / reserved regions and into a dedicated 1 KiB SAB
+    // (statsU32, 256 u32 slots) plumbed through the init message. The cmd
+    // SAB only carries the scalar total via cmdU32[I_RESULT] now. This
+    // removes the "safe by serialization" tripwire where any loosening of
+    // cmd-SAB single-slot would let GET_STATS silently clobber a fused
+    // dispatch's UNIFORM_DATA bytes.
     //
     // ARG0 = reset flag: 1 = zero the histogram after readback.
     // ================================================================
     case RpcFn.GET_STATS: {
       const resetAfter = arg0();
-      // Smuggle pool hit/miss into two unused reserved-region slots so the
-      // bridge's existing histogram readback picks them up with no protocol
-      // change. Slot 100 = hits, slot 101 = misses. Neither corresponds to
-      // a real RpcFn opcode (max opcode is 99 = GET_STATS).
+      // Smuggle pool hit/miss and related counters into reserved slots so
+      // the bridge's existing histogram readback picks them up with no
+      // protocol change. Slots start at 100 (above any real RpcFn opcode).
       const POOL_HITS_SLOT = 100;
       const POOL_MISSES_SLOT = 101;
       const BG_CACHE_HITS_SLOT = 102;
@@ -2310,17 +2323,10 @@ async function processCommand(fnId: number): Promise<void> {
       gpuRpcCounts[SPIN_HITS_SLOT] = spinHitTotal;
       gpuRpcCounts[SPIN_MISSES_SLOT] = spinMissTotal;
       gpuRpcCounts[SPIN_BUDGET_SLOT] = spinDispatchBudget;
-      const cbBase = CMD_OFFSET.CALLBACK_COUNT >>> 2;
-      for (let i = 0; i < STATS_CALLBACK_SLOTS; i++) {
-        cmdU32[cbBase + i] = gpuRpcCounts[i];
-      }
-      const inlineBase = STATS_INLINE_OFFSET >>> 2;
-      for (let i = 0; i < STATS_INLINE_SLOTS; i++) {
-        cmdU32[inlineBase + i] = gpuRpcCounts[STATS_CALLBACK_SLOTS + i];
-      }
-      const reservedBase = STATS_RESERVED_OFFSET >>> 2;
-      for (let i = 0; i < STATS_RESERVED_SLOTS; i++) {
-        cmdU32[reservedBase + i] = gpuRpcCounts[STATS_CALLBACK_SLOTS + STATS_INLINE_SLOTS + i];
+      if (statsU32) {
+        // Flat copy into the dedicated stats SAB — no region math. Both
+        // arrays are sized to STATS_OPCODE_SLOTS.
+        statsU32.set(gpuRpcCounts);
       }
       setResult(gpuTotalRpcs);
       if (resetAfter) {

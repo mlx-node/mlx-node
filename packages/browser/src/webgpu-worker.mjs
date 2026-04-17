@@ -36,6 +36,7 @@ const handler = new MessageHandler({
       rpcConfig.dispatchBatchBuffer, // Phase 2 — may be undefined
       rpcConfig.dispatchBatch === true,
       rpcConfig.bufferMetadataBuffer, // Task 3 — shared (size, usage) table
+      rpcConfig.statsBuffer, // JS-F010 — shared GET_STATS histogram SAB
     );
 
     const wasi = new WASI({
