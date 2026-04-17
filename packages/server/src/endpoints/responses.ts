@@ -1176,10 +1176,19 @@ async function runSessionNonStreaming(
   }
 
   // Hot path — session's KV cache is already warmed for this chain.
+  // Single-message continuations whose role is `user` or `tool` take
+  // the cheap delta paths (`send` / `sendToolResult`). Any other single
+  // role (`assistant`, `system`) is still accepted by `mapRequest` —
+  // `reconstructMessagesFromChain` + `primeHistory` tolerate a tail of
+  // either — but the chat-session delta API has no entry point for
+  // them, so fall through to reset + cold re-prime against the fully
+  // rebuilt history. Returning 500 here would regress the pre-session-
+  // API full-history path, making valid continuation payloads fail
+  // nondeterministically based on cache state.
   if (newInputMessages.length === 1) {
     const last = newInputMessages[0]!;
-    const initialTurns = session.turns;
     if (last.role === 'user') {
+      const initialTurns = session.turns;
       const images = last.images ?? undefined;
       const result = await session.send(last.content, images ? { images, config } : { config });
       return { result, committed: session.turns > initialTurns };
@@ -1188,16 +1197,20 @@ async function runSessionNonStreaming(
       if (!last.toolCallId) {
         throw new Error('tool message missing toolCallId');
       }
+      const initialTurns = session.turns;
       const result = await session.sendToolResult(last.toolCallId, last.content, { config });
       return { result, committed: session.turns > initialTurns };
     }
-    throw new Error(`unsupported last message role on hot path: ${last.role}`);
+    // Non-user / non-tool single-message continuation (assistant /
+    // system) falls through to the multi-message reset + cold re-prime
+    // branch below.
   }
 
-  // Multi-message hot path: reset + cold re-prime. `initialTurns` MUST
-  // be captured AFTER `session.reset()` zeroes `turns`, otherwise the
-  // committed check reads stale. Amortized: the caller re-keys this
-  // session under the new responseId on success.
+  // Multi-message (or single non-user/non-tool) hot path: reset + cold
+  // re-prime. `initialTurns` MUST be captured AFTER `session.reset()`
+  // zeroes `turns`, otherwise the committed check reads stale.
+  // Amortized: the caller re-keys this session under the new
+  // responseId on success.
   await session.reset();
   session.primeHistory(messages);
   const initialTurns = session.turns;
@@ -1222,10 +1235,14 @@ async function runSessionStreaming(
     };
   }
 
+  // See {@link runSessionNonStreaming} for the routing contract. A
+  // single assistant/system continuation falls through to the
+  // multi-message reset + cold re-prime branch below rather than
+  // crashing with 500.
   if (newInputMessages.length === 1) {
     const last = newInputMessages[0]!;
-    const initialTurns = session.turns;
     if (last.role === 'user') {
+      const initialTurns = session.turns;
       const images = last.images ?? undefined;
       return {
         stream: session.sendStream(last.content, images ? { images, config, signal } : { config, signal }),
@@ -1236,16 +1253,19 @@ async function runSessionStreaming(
       if (!last.toolCallId) {
         throw new Error('tool message missing toolCallId');
       }
+      const initialTurns = session.turns;
       return {
         stream: session.sendToolResultStream(last.toolCallId, last.content, { config, signal }),
         wasCommitted: () => session.turns > initialTurns,
       };
     }
-    throw new Error(`unsupported last message role on hot path: ${last.role}`);
+    // Non-user / non-tool single-message continuation falls through to
+    // the reset + cold re-prime branch below.
   }
 
-  // Multi-message hot path: same reset + cold re-prime as the
-  // non-streaming variant. `initialTurns` must be captured AFTER reset.
+  // Multi-message (or single non-user/non-tool) hot path: same reset +
+  // cold re-prime as the non-streaming variant. `initialTurns` must be
+  // captured AFTER reset.
   await session.reset();
   session.primeHistory(messages);
   const initialTurns = session.turns;
@@ -1832,9 +1852,20 @@ export async function handleCreateResponse(
         // full-chain walk is required. The effective value is also
         // threaded into the `SessionRegistry` cache key so a hot hit
         // under stale system context forces a cold replay.
+        //
+        // Empty-string stored instructions MUST be inherited as `""`,
+        // not dropped to `null`: a chain that intentionally cleared
+        // instructions with an explicit empty string was adopted
+        // against the registry under `requestedInstructions = ""`, so
+        // resolving a later no-instructions turn to `null` would
+        // silently flip the byte-for-byte comparison in
+        // `SessionRegistry.getOrCreate` and force a cold replay on
+        // every follow-up. Gate on `typeof === 'string'` so only a
+        // genuinely absent stored value (legacy rows, or rows whose
+        // turn had no instructions in force) short-circuits inheritance.
         if (typeof body.instructions !== 'string') {
           const storedInstructions = chain[chain.length - 1]!.instructions;
-          if (typeof storedInstructions === 'string' && storedInstructions.length > 0) {
+          if (typeof storedInstructions === 'string') {
             inheritedInstructions = storedInstructions;
           }
         }
@@ -2073,19 +2104,44 @@ export async function handleCreateResponse(
         // cached session out of the registry (single-use — the entry is
         // removed on hit so overlapping requests against the same prior id
         // cannot race on the same single-flight ChatSession).
-        const lookup = sessionReg.getOrCreate(previousResponseId ?? null, requestedInstructions);
+        //
+        // Hot-path eligibility gate: the chat-session delta API only
+        // serves a SINGLE `user` or `tool` continuation message — the
+        // `send` / `sendToolResult` entry points cover exactly that
+        // shape. A single `assistant` / `system` continuation cannot
+        // be advanced incrementally against the warm KV cache and
+        // must be handled via reset + cold re-prime. Consuming a warm
+        // lease only to immediately `session.reset()` would destroy
+        // the cached prefix for no benefit (and mislabel the turn as
+        // `hit` when the client actually paid a full cold-replay
+        // prefill), so detect the case up front and force a fresh
+        // session lookup by passing `null` into `getOrCreate`. The
+        // subsequent `ResponseStore` reconstruction + `primeHistory` +
+        // `startFromHistory*` path below handles the rebuild. Multi-
+        // message continuations are left to the existing reset + cold
+        // re-prime fall-through inside `runSession*` (see comments
+        // there).
+        const hotPathIneligible =
+          previousResponseId != null &&
+          newInputMessages.length === 1 &&
+          newInputMessages[0]!.role !== 'user' &&
+          newInputMessages[0]!.role !== 'tool';
+        const lookup = hotPathIneligible
+          ? sessionReg.getOrCreate(null, requestedInstructions)
+          : sessionReg.getOrCreate(previousResponseId ?? null, requestedInstructions);
         const session = lookup.session;
         // `X-Session-Cache` observability header: classify this turn as
         // `fresh` (no `previous_response_id` on the request), `hit`
         // (warm-cache lease consumed), or `cold_replay` (request carried
         // `previous_response_id` but the warm entry was missing / expired
-        // / instructions-mismatched / already leased — the endpoint will
-        // rebuild the session from the `ResponseStore` below). Set before
-        // any `writeHead` / SSE `beginSSE` so both JSON and SSE responses
-        // carry it. See `endpoints/messages.ts` for the matching
-        // always-`fresh` emission on `/v1/messages`.
+        // / instructions-mismatched / already leased, OR the request
+        // shape is ineligible for the hot path — the endpoint will
+        // rebuild the session from the `ResponseStore` below). Set
+        // before any `writeHead` / SSE `beginSSE` so both JSON and SSE
+        // responses carry it. See `endpoints/messages.ts` for the
+        // matching always-`fresh` emission on `/v1/messages`.
         const sessionCacheStatus: SessionCacheStatus =
-          previousResponseId == null ? 'fresh' : lookup.hit ? 'hit' : 'cold_replay';
+          previousResponseId == null ? 'fresh' : lookup.hit && !hotPathIneligible ? 'hit' : 'cold_replay';
         res.setHeader('X-Session-Cache', sessionCacheStatus);
 
         // Multi-tool-call fan-out gate.

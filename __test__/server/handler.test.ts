@@ -10751,6 +10751,306 @@ describe('createHandler', () => {
       // SSE headers still committed: content-type is text/event-stream.
       expect(getHeaders()['content-type']).toBe('text/event-stream');
     });
+
+    it('warm-session continuation with single assistant-role input falls back to cold replay instead of 500', async () => {
+      // Regression: prior to the hot-path eligibility gate, a warm hit
+      // plus a single assistant continuation threw
+      // `unsupported last message role on hot path`. `mapRequest`
+      // explicitly accepts role=assistant / role=system continuation
+      // items (they just append to the rebuilt history), so the fallback
+      // is to reset + cold re-prime through `primeHistory` +
+      // `startFromHistory*`. The header flips from `hit` to
+      // `cold_replay` so operators can distinguish the two paths on the
+      // wire.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'first' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'cold reply after assistant continuation' }));
+      const chatSessionContinue = vi
+        .fn()
+        .mockRejectedValue(new Error('chatSessionContinue must not be reached on assistant continuation'));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+
+      // Warm entry is still live at this point — no manual `sessionReg.clear()`.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: resp1.id,
+        input: [{ type: 'message', role: 'assistant', content: 'recall: I already said X' }],
+      });
+      const { res: res2, getStatus: getStatus2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      expect(getStatus2()).toBe(200);
+      expect(getHeaders2()['x-session-cache']).toBe('cold_replay');
+      // Cold-path proof: `chatSessionStart` invoked twice (turn 1 +
+      // cold-replay for turn 2), `chatSessionContinue` never reached.
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+    });
+
+    it('warm-session continuation with single system-role input falls back to cold replay instead of 500', async () => {
+      // Same regression shape as the assistant-role case — a single
+      // `system` continuation is accepted by `mapRequest` and must flow
+      // through cold replay rather than crash with 500.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'first' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'cold reply after system continuation' }));
+      const chatSessionContinue = vi
+        .fn()
+        .mockRejectedValue(new Error('chatSessionContinue must not be reached on system continuation'));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: resp1.id,
+        input: [{ type: 'message', role: 'system', content: 'follow-up system note' }],
+      });
+      const { res: res2, getStatus: getStatus2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      expect(getStatus2()).toBe(200);
+      expect(getHeaders2()['x-session-cache']).toBe('cold_replay');
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+    });
+
+    it('warm-session streaming continuation with single assistant-role input falls back to cold replay instead of 500', async () => {
+      // Streaming variant of the same regression. The `runSessionStreaming`
+      // guard mirrored the non-streaming one, so both modes must take the
+      // cold-replay fallback.
+      const streamEvents = [
+        { done: false, text: 'part', isReasoning: false },
+        {
+          done: true,
+          text: 'part',
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 1,
+          reasoningTokens: 0,
+          rawText: 'part',
+        },
+      ];
+      async function* makeStream() {
+        for (const event of streamEvents) {
+          yield event;
+        }
+      }
+      const chatStreamSessionStart = vi.fn(() => makeStream());
+      const chatStreamSessionContinue = vi.fn(() => {
+        throw new Error('chatStreamSessionContinue must not be reached on assistant continuation');
+      });
+      const chatSessionStart = vi.fn().mockResolvedValue(makeChatResult({ text: 'first' }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(),
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart,
+        chatStreamSessionContinue,
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('stream-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: non-streaming to seed the registry. Use the cheaper path.
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'stream-model', input: 'hi' });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+
+      // Turn 2: streaming continuation whose sole input is assistant-role.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        previous_response_id: resp1.id,
+        input: [{ type: 'message', role: 'assistant', content: 'recall' }],
+        stream: true,
+      });
+      const { res: res2, getStatus: getStatus2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      expect(getStatus2()).toBe(200);
+      expect(getHeaders2()['x-session-cache']).toBe('cold_replay');
+      // Cold-path proof: streaming start invoked for turn 2, continue not reached.
+      expect(chatStreamSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatStreamSessionContinue).not.toHaveBeenCalled();
+    });
+
+    it('empty-string stored instructions survive inheritance on continuation (no cold replay)', async () => {
+      // Regression (B2): the inheritance gate used to only carry
+      // instructions forward when `storedInstructions.length > 0`. A
+      // chain that intentionally cleared instructions with an explicit
+      // `""` therefore resolved the next no-instructions turn to `null`,
+      // and `SessionRegistry.getOrCreate`'s byte-for-byte compare
+      // (`""` vs `null`) forced a cold replay on every follow-up. The
+      // fix treats any stored string — including `""` — as the
+      // inherited effective value.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'first' }));
+      const chatSessionContinue = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'second' }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: explicit empty-string `instructions`, which gets adopted
+      // into the session registry as `""`.
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        instructions: '',
+        input: 'hi',
+      });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+
+      // Turn 2: omits `instructions`. Inheritance must resolve to `""`
+      // (not `null`) so the byte-for-byte cache-key compare matches and
+      // the session stays warm.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: resp1.id,
+        input: 'follow up',
+      });
+      const { res: res2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      expect(getHeaders2()['x-session-cache']).toBe('hit');
+      // Hot-path proof: `chatSessionContinue` reached, `chatSessionStart`
+      // only called once (for turn 1).
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+    });
   });
 
   // -----------------------------------------------------------------------
