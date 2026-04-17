@@ -34,12 +34,14 @@ const PROMPT = process.env.PROMPT ?? 'Write a short haiku about atoms.';
 
 // Regexes matched against the demo's log panel output.
 // Source: packages/browser/demo/app.ts 'profile' case.
-const RE_DECODE_LINE = /^\[profile\] Decode (\d+) tok \| dispatches=(\d+) .* gpuRPCs=(\d+) \(([\d.]+)\/tok\)/;
-const RE_POOL = /^\[profile\] pool: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
-const RE_GPU_POOL = /^\[profile\] gpu-pool: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
-const RE_BG_CACHE = /^\[profile\] bg-cache: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
-const RE_SPIN = /^\[profile\] spin: hits=(\d+) misses=(\d+) hitRate=([\d.]+)% budget=(\d+)/;
-const RE_OPCODES = /^\[profile\] opcodes: (.+)$/;
+// Demo prefixes every log line with `[HH:MM:SS AM|PM] ` (app.ts log()). We
+// search anywhere in the line rather than anchoring at start.
+const RE_DECODE_LINE = /\[profile\] Decode (\d+) tok \| dispatches=(\d+) .* gpuRPCs=(\d+) \(([\d.]+)\/tok\)/;
+const RE_POOL = /\[profile\] pool: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
+const RE_GPU_POOL = /\[profile\] gpu-pool: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
+const RE_BG_CACHE = /\[profile\] bg-cache: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
+const RE_SPIN = /\[profile\] spin: hits=(\d+) misses=(\d+) hitRate=([\d.]+)% budget=(\d+)/;
+const RE_OPCODES = /\[profile\] opcodes: (.+)$/;
 // Status bar reports tok/s via setStatus('... | Decode XX.X tok/s', 'ready')
 // — keep a second source in case the profile line is truncated.
 const RE_TOKPS_STATUS = /Decode ([\d.]+) tok\/s/;
@@ -195,6 +197,11 @@ async function main() {
   });
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
+  // Playwright's per-call `{ timeout }` on waitForFunction is sometimes
+  // overridden by the context default. Set both explicitly so 30s isn't a
+  // ceiling during cold WASM + model load + warmup.
+  page.setDefaultTimeout(TIMEOUT_MS);
+  page.setDefaultNavigationTimeout(TIMEOUT_MS);
   page.on('pageerror', (e) => console.error('pageerror:', e.message));
 
   const results = [];
