@@ -299,6 +299,21 @@ function readString(ptr: number): string {
   return new TextDecoder().decode(bytes.slice(ptr, end));
 }
 
+// JS-F005: zero-copy source for queue.writeBuffer on engines that accept
+// Uint8Array over SharedArrayBuffer (Chromium today). Falls back to the
+// slice path on engines that reject shared views (historically Safari).
+// `ptr`/`size` are WASM byte offsets. Callers must NOT mutate WASM memory
+// until the next Atomics.waitAsync yield — queue.writeBuffer snapshots
+// the bytes synchronously inside the call, after which the shared view
+// is no longer load-bearing.
+function wasmBytesForWrite(ptr: number, size: number): Uint8Array {
+  const base = getWasmBytes();
+  if (queueWriteBufferSupportsSharedView) {
+    return new Uint8Array(base.buffer, base.byteOffset + ptr, size);
+  }
+  return base.slice(ptr, ptr + size);
+}
+
 // ---------- GPU State ----------
 
 let device: GPUDevice;
@@ -352,6 +367,15 @@ let dispatchBatchBuffer: SharedArrayBuffer | null = null;
 // with no per-opcode histogram, which is harmless for tests that don't
 // inspect the histogram.
 let statsU32: Uint32Array | null = null;
+
+// JS-F005: runtime-probed flag — is this WebGPU implementation happy to
+// accept a Uint8Array over SharedArrayBuffer as the data argument to
+// queue.writeBuffer? Chromium-based browsers (Chrome, Edge, Opera) do;
+// Safari's WebKit has historically rejected shared views, forcing a slice
+// into a fresh non-shared ArrayBuffer. Set once in init after the device
+// is up (see the probe block) and read by QUEUE_WRITE_BUFFER /
+// CREATE_BUFFER_FROM_DATA / BUFFER_UNMAP on the hot path.
+let queueWriteBufferSupportsSharedView = false;
 
 // Pending callbacks: accumulated during async operations (mapAsync, adapter/device request).
 // Written to the callback ring in the command buffer when the current RPC call completes.
@@ -469,6 +493,35 @@ self.onmessage = async (e: MessageEvent) => {
       const error = (event as GPUUncapturedErrorEvent).error;
       console.error('[GPU Worker] Uncaptured error:', error.constructor.name, '-', error.message);
     };
+
+    // JS-F005: feature-probe `queue.writeBuffer` for shared-memory view support.
+    //
+    // QUEUE_WRITE_BUFFER (~146/tok on Qwen3.5-0.8B decode) and
+    // CREATE_BUFFER_FROM_DATA (~37/tok) used to do
+    //   `wasmBytes().slice(dataPtr, dataPtr + size)`
+    // which fully copies source bytes into a fresh non-shared ArrayBuffer
+    // just to hand a writable view to queue.writeBuffer. Chromium accepts
+    // a Uint8Array over SharedArrayBuffer directly (so the slice is pure
+    // overhead); Safari / Firefox historically rejected shared views.
+    //
+    // Probe once at init: create a tiny GPU buffer and try writing a
+    // 4-byte shared view to it. If the call lands without throwing, cache
+    // the result and let the hot-path sites pass shared views directly.
+    // If it throws, keep the slice path — the probe itself is cheap (one
+    // 4-byte createBuffer + one queue.writeBuffer that Chromium elides
+    // when no compute work references the buffer).
+    try {
+      const probeBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+      const sharedU8 = new Uint8Array(wasmMemoryObj.buffer, 0, 4);
+      queue.writeBuffer(probeBuf, 0, sharedU8);
+      queueWriteBufferSupportsSharedView = true;
+      probeBuf.destroy();
+    } catch (err) {
+      console.log(
+        `[GPU Worker] queue.writeBuffer probe: shared-view path disabled (${err instanceof Error ? err.message : String(err)})`,
+      );
+      queueWriteBufferSupportsSharedView = false;
+    }
 
     // Pre-register handles for pre-created objects
     instanceHandle = addHandle({ __brand: 'instance' });
@@ -1697,9 +1750,11 @@ async function processCommand(fnId: number): Promise<void> {
       const size = arg4();
       const buffer = getHandle<GPUBuffer>(bufferHandle);
       const offset = offsetLo + offsetHi * 0x100000000;
-      // Copy data from WASM memory using DataView (growable SAB safe)
-      const data = wasmBytes().slice(dataPtr, dataPtr + size);
-      queue.writeBuffer(buffer, offset, data);
+      // JS-F005: zero-copy shared view when supported; slice fallback
+      // otherwise. Caller cannot mutate WASM between this call and
+      // queue.writeBuffer returning — fine here, we're single-threaded
+      // inside the dispatch switch.
+      queue.writeBuffer(buffer, offset, wasmBytesForWrite(dataPtr, size));
       setResult(0);
       break;
     }
@@ -1945,8 +2000,14 @@ async function processCommand(fnId: number): Promise<void> {
       const mapping = activeMappings.get(bufferHandle);
 
       if (mapping?.writeBack) {
-        // Write path: copy from WASM shadow into JS ArrayBuffer before unmap
-        const src = wasmBytes().slice(mapping.wasmPtr, mapping.wasmPtr + mapping.size);
+        // Write path: copy from WASM shadow into JS ArrayBuffer before unmap.
+        // JS-F005: `dst.set(src)` already copies byte-by-byte, so there's no
+        // benefit from slicing the source first — hand it a shared view and
+        // skip one full memcpy. Unlike queue.writeBuffer, TypedArray.set is
+        // spec-required to work across SharedArrayBuffer sources, so no
+        // feature probe is needed here.
+        const base = getWasmBytes();
+        const src = new Uint8Array(base.buffer, base.byteOffset + mapping.wasmPtr, mapping.size);
         const dst = new Uint8Array(mapping.jsRange);
         dst.set(src);
       }
@@ -2312,9 +2373,9 @@ async function processCommand(fnId: number): Promise<void> {
           // Overwrite the pooled buffer's contents with the new data (only
           // the first `size` bytes; the tail of physicalSize is don't-care
           // padding — no read path is allowed to touch beyond logical size).
+          // JS-F005: shared view on Chromium, slice fallback elsewhere.
           const buffer = getHandle<GPUBuffer>(handle);
-          const data = wasmBytes().slice(wasmDataPtr, wasmDataPtr + size);
-          queue.writeBuffer(buffer, 0, data);
+          queue.writeBuffer(buffer, 0, wasmBytesForWrite(wasmDataPtr, size));
           // Update the logical size for the new owner. Previous owner may
           // have had a smaller logical size within the same bucket.
           bufferLogicalSizesArr[handle] = size;
@@ -2323,9 +2384,9 @@ async function processCommand(fnId: number): Promise<void> {
           // Allocate physicalSize so poolable buffers can be bucket-reused
           // on release. The data write below copies only logical `size`
           // bytes — any tail padding stays as the initial zero contents.
+          // JS-F005: shared view on Chromium, slice fallback elsewhere.
           const buffer = device.createBuffer({ size: physicalSize, usage });
-          const data = wasmBytes().slice(wasmDataPtr, wasmDataPtr + size);
-          queue.writeBuffer(buffer, 0, data);
+          queue.writeBuffer(buffer, 0, wasmBytesForWrite(wasmDataPtr, size));
           handle = addHandle(buffer);
           bufferSizesArr[handle] = physicalSize;
           bufferLogicalSizesArr[handle] = size;
