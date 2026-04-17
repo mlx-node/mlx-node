@@ -47,6 +47,27 @@ function parseEnvPositiveInt(name: string): number | undefined {
   return Math.floor(parsed);
 }
 
+/**
+ * Validate a caller-supplied positive-integer config knob.
+ *
+ * Mirrors the reject-invalid semantics of {@link parseEnvPositiveInt} /
+ * {@link parseEnvSeconds} but fails fast with a descriptive error when
+ * the caller explicitly passes a bogus value. Silent coercion would hide
+ * a config bug that can take the model offline (e.g. a
+ * `maxQueueDepthPerModel: 0` makes `queuedCount >= limit` true for every
+ * request, immediately returning HTTP 429; a `responseRetentionSec: 0`
+ * stamps `expires_at = now` on every row and the next cleanup sweep
+ * deletes it). `undefined` falls through so the env/default path still
+ * applies.
+ */
+function normalizePositiveIntConfig(value: number | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer; received ${String(value)}`);
+  }
+  return value;
+}
+
 export interface ServerConfig {
   /** Port to listen on (default: 8080). */
   port?: number;
@@ -105,14 +126,18 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   const host = config?.host ?? '127.0.0.1';
   const cors = config?.cors ?? true;
   const disableStore = config?.disableStore ?? false;
+  // Validate caller-supplied numeric knobs BEFORE consulting env fallbacks
+  // so a bogus explicit value surfaces as a descriptive error instead of
+  // silently falling through to env / default. See
+  // `normalizePositiveIntConfig` for the failure modes we're guarding.
+  const configRetentionSec = normalizePositiveIntConfig(config?.responseRetentionSec, 'responseRetentionSec');
   const responseRetentionSec =
-    config?.responseRetentionSec ??
-    parseEnvSeconds('MLX_RESPONSE_RETENTION_SECONDS') ??
-    DEFAULT_RESPONSE_RETENTION_SECONDS;
+    configRetentionSec ?? parseEnvSeconds('MLX_RESPONSE_RETENTION_SECONDS') ?? DEFAULT_RESPONSE_RETENTION_SECONDS;
   // Opt-in queue-depth cap; resolved exactly once at server construction
   // so the registry (and its per-model `SessionRegistry` instances
   // allocated on `register()`) all share a single effective value.
-  const maxQueueDepthPerModel = config?.maxQueueDepthPerModel ?? parseEnvPositiveInt('MLX_MAX_QUEUE_DEPTH_PER_MODEL');
+  const configMaxQueueDepth = normalizePositiveIntConfig(config?.maxQueueDepthPerModel, 'maxQueueDepthPerModel');
+  const maxQueueDepthPerModel = configMaxQueueDepth ?? parseEnvPositiveInt('MLX_MAX_QUEUE_DEPTH_PER_MODEL');
 
   const registry = new ModelRegistry({ maxQueueDepth: maxQueueDepthPerModel });
 
