@@ -42,6 +42,30 @@ import {
 const gpuRpcCounts = new Uint32Array(STATS_OPCODE_SLOTS);
 let gpuTotalRpcs = 0;
 
+// ---------- Adaptive spin budget (P6 / JS-F001 + JS-F002) ----------
+//
+// commandLoop spins on Atomics.load before falling back to Atomics.waitAsync.
+// Spin budget used to be a fixed 2000 — empirically the sweet spot on M3 Chrome
+// but it's a perf cliff: a missed spin falls through to a macrotask via
+// `setTimeout(0)` which costs milliseconds and is the suspected root cause of
+// the bimodal 15-21 tok/s variance.
+//
+// Fix:
+//   1. Never `setTimeout(0)` — loop back on Atomics.waitAsync instead.
+//   2. Re-check status atomically before awaiting so a status that flipped
+//      between the spin and the waitAsync call short-circuits without a tick.
+//   3. Adapt the budget: after SPIN_ADAPT_K consecutive hits, double (up to
+//      SPIN_MAX); after SPIN_ADAPT_K consecutive misses, halve (down to
+//      SPIN_MIN). Starts at the historical 2000 value.
+const SPIN_MIN = 500;
+const SPIN_MAX = 8000;
+const SPIN_ADAPT_K = 8;
+let spinDispatchBudget = 2000;
+let spinConsecutiveHits = 0;
+let spinConsecutiveMisses = 0;
+let spinHitTotal = 0;
+let spinMissTotal = 0;
+
 // ---------- Handle Table (1H: sparse array for O(1) index lookup) ----------
 
 const handles: any[] = [null]; // index 0 unused — handles start at 1
@@ -729,7 +753,7 @@ function dispatchFusedRecord(
         // pipeline. Use exactly the same usage the pool-miss path used to
         // pick so the bind group layout's UNIFORM / STORAGE requirement is
         // satisfied identically.
-        const usage = uniformUsage || (0x0080 | 0x0008); // STORAGE | COPY_DST fallback
+        const usage = uniformUsage || 0x0080 | 0x0008; // STORAGE | COPY_DST fallback
         const buf = device.createBuffer({ size: 256, usage });
         const h = addHandle(buf);
         bufferSizesArr[h] = 256;
@@ -990,12 +1014,11 @@ function handleFusedCopyBuffer(): void {
 }
 
 async function commandLoop(): Promise<void> {
-  // Adaptive spin: after dispatch commands (likely followed by another dispatch),
-  // spin longer to catch back-to-back commands without V8 event loop overhead.
-  // After submit/readback, skip spin (long gap expected).
-  const SPIN_DISPATCH = 2000; // optimal: 500→13.3, 1000→14.0, 1500→16.4, 2000→17.5, 4000→17.6
-  const SPIN_NONE = 0;
-  let spinBudget = SPIN_NONE; // set after each command based on type
+  // Adaptive spin: after dispatch commands (likely followed by another
+  // dispatch), spin up to spinDispatchBudget iterations before falling back
+  // to Atomics.waitAsync. After submit/readback, skip spin (long gap expected).
+  // Budget adapts — see SPIN_MIN/SPIN_MAX/SPIN_ADAPT_K at module scope.
+  let spinBudget = 0; // set after each command based on expected follow-up
 
   let currentStatus = Atomics.load(cmdView, STATUS_INDEX);
 
@@ -1014,16 +1037,45 @@ async function commandLoop(): Promise<void> {
         }
       }
 
+      // Adapt the budget only when we actually attempted a dispatch-style spin.
+      if (spinBudget > 0) {
+        if (spun) {
+          spinHitTotal++;
+          spinConsecutiveHits++;
+          spinConsecutiveMisses = 0;
+          if (spinConsecutiveHits >= SPIN_ADAPT_K && spinDispatchBudget < SPIN_MAX) {
+            spinDispatchBudget = Math.min(SPIN_MAX, spinDispatchBudget * 2);
+            spinConsecutiveHits = 0;
+          }
+        } else {
+          spinMissTotal++;
+          spinConsecutiveMisses++;
+          spinConsecutiveHits = 0;
+          if (spinConsecutiveMisses >= SPIN_ADAPT_K && spinDispatchBudget > SPIN_MIN) {
+            spinDispatchBudget = Math.max(SPIN_MIN, spinDispatchBudget >>> 1);
+            spinConsecutiveMisses = 0;
+          }
+        }
+      }
+
       if (!spun) {
-        // Fall back to async wait
+        // Fall back to async wait. Never setTimeout(0) — that's a macrotask
+        // hop costing 4-10ms; loop on Atomics.waitAsync instead so a late
+        // wake-up between spin and wait collapses to a fresh atomic re-read.
         let waitLoops = 0;
         while (currentStatus !== STATUS.PENDING) {
+          // Re-check atomically in case the wasm-worker flipped STATUS during
+          // the spin-adapt work above. Cheap and avoids a waitAsync round-trip.
+          currentStatus = Atomics.load(cmdView, STATUS_INDEX);
+          if (currentStatus === STATUS.PENDING) break;
+
           const result = Atomics.waitAsync(cmdView, STATUS_INDEX, currentStatus);
           if (result.async) {
+            // Real wait — resolves when notify fires or timeout elapses.
             await result.value;
-          } else {
-            await new Promise((r) => setTimeout(r, 0));
           }
+          // result.async === false means the cell already moved off
+          // `currentStatus` — re-read below and re-try without yielding.
           currentStatus = Atomics.load(cmdView, STATUS_INDEX);
           waitLoops++;
           if (waitLoops % 1000 === 0) {
@@ -1054,7 +1106,7 @@ async function commandLoop(): Promise<void> {
         console.error(`[GPU Worker] Error in FUSED_DISPATCH_WITH_UNIFORM:`, err);
         cmdU32[I_RESULT] = 0;
       }
-      spinBudget = SPIN_DISPATCH;
+      spinBudget = spinDispatchBudget;
     } else if (fnId === RpcFn.FUSED_FULL_DISPATCH) {
       try {
         handleFusedFullDispatch();
@@ -1062,7 +1114,7 @@ async function commandLoop(): Promise<void> {
         console.error(`[GPU Worker] Error in FUSED_FULL_DISPATCH:`, err);
         cmdU32[I_RESULT] = 0;
       }
-      spinBudget = SPIN_DISPATCH;
+      spinBudget = spinDispatchBudget;
     } else if (fnId === RpcFn.DISPATCH_BATCH) {
       try {
         handleDispatchBatch();
@@ -1070,7 +1122,7 @@ async function commandLoop(): Promise<void> {
         console.error(`[GPU Worker] Error in DISPATCH_BATCH:`, err);
         cmdU32[I_RESULT] = 0;
       }
-      spinBudget = SPIN_DISPATCH;
+      spinBudget = spinDispatchBudget;
     } else if (fnId === RpcFn.FUSED_COPY_BUFFER) {
       try {
         handleFusedCopyBuffer();
@@ -1078,7 +1130,7 @@ async function commandLoop(): Promise<void> {
         console.error(`[GPU Worker] Error in FUSED_COPY_BUFFER:`, err);
         cmdU32[I_RESULT] = 0;
       }
-      spinBudget = SPIN_DISPATCH; // copy is followed by dispatches
+      spinBudget = spinDispatchBudget; // copy is followed by dispatches
     } else if (fnId === RpcFn.FUSED_SUBMIT) {
       try {
         handleFusedSubmit();
@@ -1086,7 +1138,7 @@ async function commandLoop(): Promise<void> {
         console.error(`[GPU Worker] Error in FUSED_SUBMIT:`, err);
         cmdU32[I_RESULT] = 0;
       }
-      spinBudget = SPIN_NONE;
+      spinBudget = 0;
     } else {
       try {
         await processCommand(fnId);
@@ -1103,7 +1155,7 @@ async function commandLoop(): Promise<void> {
         cmdU32[I_RESULT] = 0;
       }
       flushCallbacks();
-      spinBudget = SPIN_NONE;
+      spinBudget = 0;
     }
 
     // Signal completion
@@ -2202,12 +2254,22 @@ async function processCommand(fnId: number): Promise<void> {
       const BG_CACHE_MISSES_SLOT = 103;
       const UNIFORM_HOT_HITS_SLOT = 104;
       const UNIFORM_HOT_MISSES_SLOT = 105;
+      // P6 observability: spin-loop hit/miss and current adaptive budget.
+      // Used to confirm the bimodal-variance fix is actually keeping us in-spin
+      // and to watch the budget adapt over a session. Budget capped at SPIN_MAX
+      // which fits in u32.
+      const SPIN_HITS_SLOT = 106;
+      const SPIN_MISSES_SLOT = 107;
+      const SPIN_BUDGET_SLOT = 108;
       gpuRpcCounts[POOL_HITS_SLOT] = bufferPoolHitCount;
       gpuRpcCounts[POOL_MISSES_SLOT] = bufferPoolMissCount;
       gpuRpcCounts[BG_CACHE_HITS_SLOT] = bindGroupCacheHits;
       gpuRpcCounts[BG_CACHE_MISSES_SLOT] = bindGroupCacheMisses;
       gpuRpcCounts[UNIFORM_HOT_HITS_SLOT] = uniformHotHits;
       gpuRpcCounts[UNIFORM_HOT_MISSES_SLOT] = uniformHotMisses;
+      gpuRpcCounts[SPIN_HITS_SLOT] = spinHitTotal;
+      gpuRpcCounts[SPIN_MISSES_SLOT] = spinMissTotal;
+      gpuRpcCounts[SPIN_BUDGET_SLOT] = spinDispatchBudget;
       const cbBase = CMD_OFFSET.CALLBACK_COUNT >>> 2;
       for (let i = 0; i < STATS_CALLBACK_SLOTS; i++) {
         cmdU32[cbBase + i] = gpuRpcCounts[i];
@@ -2230,6 +2292,11 @@ async function processCommand(fnId: number): Promise<void> {
         bindGroupCacheMisses = 0;
         uniformHotHits = 0;
         uniformHotMisses = 0;
+        spinHitTotal = 0;
+        spinMissTotal = 0;
+        // Budget intentionally preserved — it's adaptive session state,
+        // not a per-window counter. Resetting it would throw away the
+        // equilibrium we just learned.
       }
       break;
     }
