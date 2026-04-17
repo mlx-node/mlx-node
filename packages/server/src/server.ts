@@ -25,26 +25,43 @@ const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
  */
 const DEFAULT_RESPONSE_RETENTION_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
-/** Parse a positive integer seconds value; returns undefined for unset/invalid so caller can apply its own default. */
-function parseEnvSeconds(name: string): number | undefined {
+/**
+ * Parse a positive integer seconds value; returns undefined for unset/invalid so caller can apply its own default.
+ *
+ * Non-integer positive values (e.g. `"1.5"`) are rejected rather than
+ * silently truncated — a typo like `"1.5"` meant as `"15"` would otherwise
+ * be accepted as 1 second, expiring persisted response rows almost
+ * immediately and breaking `previous_response_id` continuity. We prefer
+ * falling through to the caller's default over crashing on startup so a
+ * config-template typo in a Dockerfile / CI manifest does not take the
+ * service down.
+ *
+ * Exported for unit tests.
+ */
+export function parseEnvSeconds(name: string): number | undefined {
   const raw = process.env[name];
   if (raw == null || raw === '') return undefined;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
-  return Math.floor(parsed);
+  if (!Number.isInteger(parsed)) return undefined;
+  return parsed;
 }
 
 /**
  * Parse a positive integer count from env; shares the reject-unset-or-invalid
- * semantics used by {@link parseEnvSeconds} so callers can fall back to their
- * own default when the var is missing or malformed.
+ * semantics used by {@link parseEnvSeconds} (including the non-integer
+ * reject) so callers can fall back to their own default when the var is
+ * missing or malformed.
+ *
+ * Exported for unit tests.
  */
-function parseEnvPositiveInt(name: string): number | undefined {
+export function parseEnvPositiveInt(name: string): number | undefined {
   const raw = process.env[name];
   if (raw == null || raw === '') return undefined;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
-  return Math.floor(parsed);
+  if (!Number.isInteger(parsed)) return undefined;
+  return parsed;
 }
 
 /**

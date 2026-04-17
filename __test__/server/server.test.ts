@@ -1,4 +1,4 @@
-import { createServer } from '@mlx-node/server';
+import { __parseEnvPositiveInt, __parseEnvSeconds, createServer } from '@mlx-node/server';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 /**
@@ -139,6 +139,153 @@ describe('createServer config validation', () => {
       const srv = await createServer({ responseRetentionSec: undefined, disableStore: true, port: 0 });
       openedServers.push(srv);
       expect(srv.registry).toBeDefined();
+    });
+  });
+});
+
+/**
+ * Env-var parser validation.
+ *
+ * `parseEnvSeconds` and `parseEnvPositiveInt` back `MLX_RESPONSE_RETENTION_SECONDS`
+ * and `MLX_MAX_QUEUE_DEPTH_PER_MODEL` respectively. A prior implementation
+ * applied `Math.floor` to the parsed number, so a typo like
+ * `MLX_RESPONSE_RETENTION_SECONDS="1.5"` (intended as `"15"`) was silently
+ * truncated to 1 — persisted response rows then expired almost immediately
+ * and `previous_response_id` continuity broke across turns. Same class of
+ * bug on queue depth: `"1.5"` clamped to 1 instead of being rejected.
+ *
+ * Fix: reject non-integer positive values by returning `undefined` so the
+ * caller falls through to its documented default (7 days retention /
+ * unbounded queue). We deliberately do NOT throw on bad env — env vars
+ * are routinely set by orchestrators and CI templates, and a
+ * startup-crash-on-typo is harsher than falling through to a safe
+ * default.
+ */
+describe('env var parsing', () => {
+  const RETENTION_VAR = 'MLX_RESPONSE_RETENTION_SECONDS';
+  const QUEUE_VAR = 'MLX_MAX_QUEUE_DEPTH_PER_MODEL';
+
+  // Snapshot and restore originals so these tests do not leak env state
+  // to sibling test files (especially important for queue-depth, which
+  // affects registry construction elsewhere).
+  let origRetention: string | undefined;
+  let origQueue: string | undefined;
+
+  beforeEach(() => {
+    origRetention = process.env[RETENTION_VAR];
+    origQueue = process.env[QUEUE_VAR];
+    delete process.env[RETENTION_VAR];
+    delete process.env[QUEUE_VAR];
+  });
+
+  afterEach(() => {
+    if (origRetention === undefined) delete process.env[RETENTION_VAR];
+    else process.env[RETENTION_VAR] = origRetention;
+    if (origQueue === undefined) delete process.env[QUEUE_VAR];
+    else process.env[QUEUE_VAR] = origQueue;
+  });
+
+  describe('parseEnvSeconds (MLX_RESPONSE_RETENTION_SECONDS)', () => {
+    it('rejects fractional MLX_RESPONSE_RETENTION_SECONDS and falls back to default', () => {
+      // A `"1.5"` typo intended as `"15"` must NOT silently truncate to 1s.
+      // Returning undefined lets the caller apply its 7-day default.
+      process.env[RETENTION_VAR] = '1.5';
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBeUndefined();
+    });
+
+    it('accepts integer MLX_RESPONSE_RETENTION_SECONDS', () => {
+      process.env[RETENTION_VAR] = '15';
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBe(15);
+    });
+
+    it('accepts a large valid integer without coercion drift', () => {
+      // 7 days in seconds — the documented default. Sanity check that
+      // the common production value round-trips cleanly.
+      process.env[RETENTION_VAR] = '604800';
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBe(604800);
+    });
+
+    it('rejects MLX_RESPONSE_RETENTION_SECONDS=0', () => {
+      process.env[RETENTION_VAR] = '0';
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBeUndefined();
+    });
+
+    it('rejects negative MLX_RESPONSE_RETENTION_SECONDS', () => {
+      process.env[RETENTION_VAR] = '-5';
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBeUndefined();
+    });
+
+    it('rejects MLX_RESPONSE_RETENTION_SECONDS=NaN', () => {
+      process.env[RETENTION_VAR] = 'NaN';
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBeUndefined();
+    });
+
+    it('rejects MLX_RESPONSE_RETENTION_SECONDS=Infinity', () => {
+      process.env[RETENTION_VAR] = 'Infinity';
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBeUndefined();
+    });
+
+    it('rejects non-numeric MLX_RESPONSE_RETENTION_SECONDS', () => {
+      process.env[RETENTION_VAR] = 'abc';
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBeUndefined();
+    });
+
+    it('returns undefined when MLX_RESPONSE_RETENTION_SECONDS is unset', () => {
+      // No env assignment — parseEnvSeconds should report absent.
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBeUndefined();
+    });
+
+    it('returns undefined for empty MLX_RESPONSE_RETENTION_SECONDS', () => {
+      process.env[RETENTION_VAR] = '';
+      expect(__parseEnvSeconds(RETENTION_VAR)).toBeUndefined();
+    });
+  });
+
+  describe('parseEnvPositiveInt (MLX_MAX_QUEUE_DEPTH_PER_MODEL)', () => {
+    it('rejects fractional MLX_MAX_QUEUE_DEPTH_PER_MODEL and leaves queue unbounded', () => {
+      // `"1.5"` must NOT silently coerce to 1 — that would clamp the
+      // queue to depth=1 and return 429 for every second request.
+      process.env[QUEUE_VAR] = '1.5';
+      expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
+    });
+
+    it('accepts integer MLX_MAX_QUEUE_DEPTH_PER_MODEL', () => {
+      process.env[QUEUE_VAR] = '8';
+      expect(__parseEnvPositiveInt(QUEUE_VAR)).toBe(8);
+    });
+
+    it('rejects MLX_MAX_QUEUE_DEPTH_PER_MODEL=0', () => {
+      process.env[QUEUE_VAR] = '0';
+      expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
+    });
+
+    it('rejects negative MLX_MAX_QUEUE_DEPTH_PER_MODEL', () => {
+      process.env[QUEUE_VAR] = '-2';
+      expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
+    });
+
+    it('rejects MLX_MAX_QUEUE_DEPTH_PER_MODEL=NaN', () => {
+      process.env[QUEUE_VAR] = 'NaN';
+      expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
+    });
+
+    it('rejects MLX_MAX_QUEUE_DEPTH_PER_MODEL=Infinity', () => {
+      process.env[QUEUE_VAR] = 'Infinity';
+      expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
+    });
+
+    it('rejects non-numeric MLX_MAX_QUEUE_DEPTH_PER_MODEL', () => {
+      process.env[QUEUE_VAR] = 'lots';
+      expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
+    });
+
+    it('returns undefined when MLX_MAX_QUEUE_DEPTH_PER_MODEL is unset', () => {
+      expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
+    });
+
+    it('returns undefined for empty MLX_MAX_QUEUE_DEPTH_PER_MODEL', () => {
+      process.env[QUEUE_VAR] = '';
+      expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
     });
   });
 });

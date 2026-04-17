@@ -8,6 +8,12 @@
 export { createServer } from './server.js';
 export type { ServerConfig, ServerInstance } from './server.js';
 
+/**
+ * Internal helpers re-exported for unit testing only. Not part of the
+ * supported public API — names may change without notice.
+ */
+export { parseEnvSeconds as __parseEnvSeconds, parseEnvPositiveInt as __parseEnvPositiveInt } from './server.js';
+
 export { createHandler } from './handler.js';
 export type { HandlerOptions } from './handler.js';
 
