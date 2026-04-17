@@ -163,14 +163,18 @@ export class SessionRegistry {
    * running inside `fn()` is NOT counted here, so a cap of
    * `maxQueueDepth = N` means "1 running + up to N waiting".
    *
-   * Mutated strictly inside `withExclusive`: incremented at entry
-   * (after the cap check, before chaining) and decremented exactly
-   * once per successful entry — either when the caller transitions
-   * from waiting to running (after `await prev`), or when it is
-   * rejected before ever reaching that point. The counter is
-   * intentionally NEVER touched on cap-reject paths (the caller
-   * never queued) so the cap check is stable across concurrent
-   * entries.
+   * Mutated strictly inside `withExclusive`: the admitting caller is
+   * counted as a waiter ONLY when the execution chain is already
+   * non-idle (i.e. some earlier caller still holds the mutex). The
+   * first caller into an idle chain is admitted directly as the
+   * runner slot and never contributes to `queuedCount`. Waiters
+   * decrement exactly once as they transition from waiting to
+   * running (after `await prev`). The counter is intentionally
+   * NEVER touched on cap-reject paths (the caller never queued) so
+   * the cap check is stable across concurrent entries, and runner-
+   * slot admissions leave it alone so a synchronous burst
+   * (e.g. `Promise.all([fn, fn])`) does not spuriously bill the
+   * runner-slot caller against the waiter cap.
    */
   private queuedCount = 0;
   /**
@@ -182,16 +186,30 @@ export class SessionRegistry {
    */
   private readonly entries: Map<string, SessionEntry> = new Map();
   /**
+   * Shared sentinel representing "the execution chain is idle" — a
+   * pre-resolved promise. `execLock` starts at this value and is
+   * reset to it whenever the last holder releases without a
+   * successor chained behind it. `withExclusive` uses reference
+   * equality against this sentinel (`execLock === initialLock`) to
+   * tell "I am the runner slot on an idle chain" apart from "I am a
+   * waiter behind someone else", which is how the burst
+   * (`Promise.all([fn, fn])`) admission bug is avoided.
+   */
+  private readonly initialLock: Promise<void> = Promise.resolve();
+  /**
    * Tail of the per-model execution FIFO. Every `withExclusive` call
    * captures this value as its predecessor, then overwrites it with
    * its own pending promise so the next waiter chains after it. The
    * chain is resolved only when the current holder's `fn` has
    * settled (success or failure), guaranteeing that at most one
    * dispatch runs through this registry's native model at a time.
-   * Initialized to `Promise.resolve()` so the first caller proceeds
-   * without waiting.
+   * Initialized to `initialLock` so the first caller proceeds
+   * without waiting AND is recognised as the runner slot (no waiter
+   * increment). When a holder releases as the current chain tail it
+   * restores `execLock` to `initialLock` so the next burst starts
+   * cleanly from the idle state.
    */
-  private execLock: Promise<void> = Promise.resolve();
+  private execLock: Promise<void> = this.initialLock;
 
   constructor(opts: SessionRegistryOptions) {
     this.model = opts.model;
@@ -346,23 +364,46 @@ export class SessionRegistry {
    * The cap is "waiters-only" — a cap of N permits one running
    * dispatch plus N queued ones, rejecting the (N+1)th waiter. The
    * default (undefined) preserves the original unbounded behaviour.
+   *
+   * **Runner-slot admission.** Whether a given caller counts as the
+   * runner slot or as a waiter is decided up front by comparing
+   * `execLock` against the idle sentinel `initialLock`. If they are
+   * identical, nobody is currently in-flight and this caller wins
+   * the runner slot: it is not counted against the waiter cap and
+   * never touches `queuedCount`. Otherwise it is a waiter and the
+   * normal cap check / increment / decrement cycle applies. This is
+   * what keeps a synchronous burst such as `Promise.all([fn, fn])`
+   * admissible under `maxQueueDepth = 1` — Call 1 is the runner,
+   * Call 2 is the one allowed waiter, Call 3 would throw.
    */
   withExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    // Distinguish runner-slot from waiter admission. If the chain is
+    // idle (`execLock === initialLock`) the current caller is about
+    // to become the active holder on its very first `await prev`
+    // microtask — it must NOT be billed against the waiter cap and
+    // must NOT touch `queuedCount`. Only chained callers (someone
+    // else still holds or is ahead in the FIFO) count as waiters.
+    const asWaiter = this.execLock !== this.initialLock;
+
     // Admission check — raised synchronously so endpoint handlers
     // can reliably catch `QueueFullError` without racing any
-    // `await`. The counter is NOT mutated on the reject path; the
-    // request never queued.
-    if (this.maxQueueDepth !== undefined && this.queuedCount >= this.maxQueueDepth) {
+    // `await`. Only waiters can trip the cap; the runner slot is
+    // always admitted. The counter is NOT mutated on the reject
+    // path; the request never queued.
+    if (asWaiter && this.maxQueueDepth !== undefined && this.queuedCount >= this.maxQueueDepth) {
       throw new QueueFullError(this.queuedCount, this.maxQueueDepth);
     }
-    this.queuedCount += 1;
 
     const prev = this.execLock;
     let release!: () => void;
-    this.execLock = new Promise<void>((resolve) => {
+    const myLock = new Promise<void>((resolve) => {
       release = resolve;
     });
-    return this._runExclusive(prev, fn, release);
+    this.execLock = myLock;
+    if (asWaiter) {
+      this.queuedCount += 1;
+    }
+    return this._runExclusive(prev, myLock, release, fn, asWaiter);
   }
 
   /**
@@ -371,14 +412,24 @@ export class SessionRegistry {
    * throw lands on the caller's stack synchronously. This helper
    * owns the post-acceptance bookkeeping: awaiting the predecessor
    * lock, transitioning from waiter to holder (`queuedCount`
-   * decrement), running `fn`, and releasing the FIFO tail.
+   * decrement for waiters only), running `fn`, releasing the FIFO
+   * tail, and resetting the chain to `initialLock` when this caller
+   * is still the tail (so a future burst admits its first entry as
+   * a runner-slot rather than as a waiter).
    */
-  private async _runExclusive<T>(prev: Promise<void>, fn: () => Promise<T>, release: () => void): Promise<T> {
+  private async _runExclusive<T>(
+    prev: Promise<void>,
+    myLock: Promise<void>,
+    release: () => void,
+    fn: () => Promise<T>,
+    asWaiter: boolean,
+  ): Promise<T> {
     // Track whether the waiting-counter has already been balanced so
     // an error raised by `await prev` (should never happen today but
     // is cheap to defend against) cannot double-decrement via the
-    // outer `finally` below.
-    let waitingDecremented = false;
+    // outer `finally` below. Runner-slot admissions never touch the
+    // counter, so the flag starts already-balanced for them.
+    let waitingDecremented = !asWaiter;
     try {
       try {
         await prev;
@@ -405,6 +456,14 @@ export class SessionRegistry {
         waitingDecremented = true;
       }
       release();
+      // Reset the chain to the idle sentinel ONLY when this caller
+      // is still the tail — if someone else has already extended the
+      // FIFO behind us, leave their tail in place. Reference-equality
+      // gate here is what lets the next burst see `execLock ===
+      // initialLock` and admit its first caller as a runner slot.
+      if (this.execLock === myLock) {
+        this.execLock = this.initialLock;
+      }
     }
   }
 }

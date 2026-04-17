@@ -656,6 +656,180 @@ describe('SessionRegistry', () => {
       await dispatchD;
     });
 
+    it('burst Promise.all([fn, fn]) with maxQueueDepth=1 admits both (runner + 1 waiter)', async () => {
+      // Synchronous-burst regression: two callers entering `withExclusive`
+      // in the same microtask under `maxQueueDepth=1`. The first is the
+      // runner slot (idle chain), the second is the single allowed waiter —
+      // neither should see `QueueFullError`.
+      const model = makeMockModel();
+      const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+      const events: string[] = [];
+      const runSlot = async () => {
+        events.push('start');
+        await Promise.resolve();
+        events.push('end');
+      };
+
+      await expect(Promise.all([reg.withExclusive(runSlot), reg.withExclusive(runSlot)])).resolves.toEqual([
+        undefined,
+        undefined,
+      ]);
+
+      // FIFO order preserved — the second call only starts after the first
+      // finishes.
+      expect(events).toEqual(['start', 'end', 'start', 'end']);
+      expect(reg.queueDepth).toBe(0);
+    });
+
+    it('burst Promise.all([fn, fn, fn]) with maxQueueDepth=1 throws QueueFullError on the 3rd', async () => {
+      // The cap bites on the second waiter, not the first. With cap=1,
+      // runner + 1 waiter is fine; adding a third caller in the same burst
+      // rejects synchronously — `withExclusive` is not async so the throw
+      // lands on the caller's stack before the array literal finishes.
+      const model = makeMockModel();
+      const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+      const noop = async () => {};
+
+      // Admit runner (A) + one waiter (B) first — these are the legitimate
+      // slots under `maxQueueDepth = 1`.
+      const dispatchA = reg.withExclusive(noop);
+      const dispatchB = reg.withExclusive(noop);
+
+      // The third synchronous admission exceeds the cap.
+      let caught: unknown;
+      try {
+        void reg.withExclusive(noop);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(QueueFullError);
+      expect((caught as QueueFullError).queuedCount).toBe(1);
+      expect((caught as QueueFullError).limit).toBe(1);
+
+      // A and B still drain cleanly; the rejected 3rd never entered the
+      // chain and therefore left no bookkeeping to unwind.
+      await dispatchA;
+      await dispatchB;
+      expect(reg.queueDepth).toBe(0);
+    });
+
+    it('burst Promise.all([fn]) with maxQueueDepth=1 admits as runner (queuedCount stays 0)', async () => {
+      // A lone caller into an idle chain is the runner slot — it does not
+      // touch `queuedCount` even while it is in the middle of running.
+      const model = makeMockModel();
+      const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+      let releaseA!: () => void;
+      const aDone = new Promise<void>((r) => {
+        releaseA = r;
+      });
+
+      const dispatchA = reg.withExclusive(async () => {
+        // Runner slot: queueDepth stays 0 while A is in flight.
+        expect(reg.queueDepth).toBe(0);
+        await aDone;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(reg.queueDepth).toBe(0);
+
+      releaseA();
+      await dispatchA;
+      expect(reg.queueDepth).toBe(0);
+    });
+
+    it('under unbounded maxQueueDepth, burst Promise.all of N calls all succeed', async () => {
+      // No cap means no ceiling on waiters — a synchronous burst of 32
+      // should admit every one without throwing. One runner + 31 waiters.
+      const model = makeMockModel();
+      const reg = new SessionRegistry({ model });
+
+      const order: number[] = [];
+      const dispatches = Array.from({ length: 32 }, (_, i) =>
+        reg.withExclusive(async () => {
+          order.push(i);
+        }),
+      );
+
+      // Snapshot queue depth before any of them have had a chance to run —
+      // the runner-slot caller is index 0 (not queued), the other 31 are
+      // queued behind it.
+      expect(reg.queueDepth).toBe(31);
+
+      await Promise.all(dispatches);
+
+      // FIFO across the whole burst.
+      expect(order).toEqual(Array.from({ length: 32 }, (_, i) => i));
+      expect(reg.queueDepth).toBe(0);
+    });
+
+    it('after chain drains, next call is admitted as runner again (execLock reset to initialLock)', async () => {
+      // Without the `execLock === myLock` reset, a subsequent call after
+      // full drain would observe a non-idle chain and admit itself as a
+      // waiter — burning the cap for a slot it should own outright. This
+      // test pins the reset by checking two separate bursts at cap=1.
+      const model = makeMockModel();
+      const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+      // First burst: runner + waiter, both succeed.
+      await Promise.all([reg.withExclusive(async () => {}), reg.withExclusive(async () => {})]);
+      expect(reg.queueDepth).toBe(0);
+
+      // Chain drained — next burst must also be admissible (runner +
+      // waiter). If the reset failed, the second burst's first call would
+      // be billed as a waiter and `Promise.all([fn, fn])` would reject.
+      await Promise.all([reg.withExclusive(async () => {}), reg.withExclusive(async () => {})]);
+      expect(reg.queueDepth).toBe(0);
+
+      // And a single call after drain must be admitted as the runner
+      // (queueDepth stays 0 throughout).
+      const single = reg.withExclusive(async () => {
+        expect(reg.queueDepth).toBe(0);
+      });
+      await single;
+      expect(reg.queueDepth).toBe(0);
+    });
+
+    it('within-lifetime runner + waiter serialization order matches FIFO', async () => {
+      // The fix must not weaken FIFO: the waiter's `fn` must not start
+      // until the runner's `fn` has fully returned. Use a gate inside the
+      // runner to pin that ordering explicitly.
+      const model = makeMockModel();
+      const reg = new SessionRegistry({ model, maxQueueDepth: 4 });
+
+      const events: string[] = [];
+      let releaseRunner!: () => void;
+      const runnerDone = new Promise<void>((r) => {
+        releaseRunner = r;
+      });
+
+      const runnerPromise = reg.withExclusive(async () => {
+        events.push('runner:start');
+        await runnerDone;
+        events.push('runner:end');
+      });
+
+      const waiterPromise = reg.withExclusive(async () => {
+        events.push('waiter:start');
+        events.push('waiter:end');
+      });
+
+      // Give both callers several microtask ticks to settle — the waiter
+      // must still be parked behind `runnerDone`.
+      for (let i = 0; i < 8; i += 1) {
+        await Promise.resolve();
+      }
+      expect(events).toEqual(['runner:start']);
+
+      releaseRunner();
+      await runnerPromise;
+      await waiterPromise;
+
+      expect(events).toEqual(['runner:start', 'runner:end', 'waiter:start', 'waiter:end']);
+    });
+
     it('unbounded mode (maxQueueDepth === undefined) never throws', async () => {
       // The default behaviour: with no cap configured, no amount of
       // queued waiters ever triggers `QueueFullError`. This pins the
