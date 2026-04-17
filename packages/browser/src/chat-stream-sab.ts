@@ -56,6 +56,23 @@ export const MAX_PAYLOAD_BYTES = 0xffff;
  */
 export const MIN_SAB_BYTES = SAB_HEADER_BYTES + RECORD_HEADER_BYTES + 1 + 1;
 
+/**
+ * Reader wake-up poll interval in ms. Producer `SabSink::bump_seq_and_notify`
+ * (sab_sink.rs) calls `memory.atomic.notify(seq_addr, u32::MAX)` on every
+ * record, which is supposed to wake this reader's `Atomics.waitAsync(seq)`
+ * via microtask — under 1 ms when it works. In practice, cross-worker notify
+ * to a main-thread `waitAsync` is unreliable in current browsers: a non-zero
+ * fraction of wakes are lost, and the reader sits parked on the stale `seq`
+ * until the timeout fires. With the original 1000 ms timeout the missed-wake
+ * path produced a visible "lag burst every ~1 s" artifact in streaming
+ * output. 100 ms hides the artifact (≤10 hz polling on a loop that exits
+ * the moment the stream's done-chunk lands, so idle cost is zero). The real
+ * fix is a reliable notify path; revisit once browsers improve cross-thread
+ * waitAsync delivery, or if we move the reader back into a dedicated worker
+ * where same-thread notify is reliable.
+ */
+export const READER_WAIT_TIMEOUT_MS = 100;
+
 // ---------------------------------------------------------------------------
 // Shared TextDecoder (module-level — avoid per-call construction cost)
 // ---------------------------------------------------------------------------
@@ -226,7 +243,8 @@ async function runLoopHeap(
     const headerI32 = headerView();
     const currentSeq = Atomics.load(headerI32, SEQ_IDX);
     if (currentSeq === lastSeq) {
-      const { async, value } = Atomics.waitAsync(headerI32, SEQ_IDX, lastSeq, 1000);
+      // Timeout-polled wait — see READER_WAIT_TIMEOUT_MS for rationale.
+      const { async, value } = Atomics.waitAsync(headerI32, SEQ_IDX, lastSeq, READER_WAIT_TIMEOUT_MS);
       const _result = async ? await value : (value as string);
     }
     lastSeq = Atomics.load(headerView(), SEQ_IDX);
@@ -293,12 +311,15 @@ async function runLoop(
 
     // -----------------------------------------------------------------------
     // Wait phase: sleep until the producer increments seq.
-    // We use a 1000 ms timeout so the loop can periodically re-check
-    // cancellation even if the notify is missed or the producer stalls.
+    // The timeout is READER_WAIT_TIMEOUT_MS (see that constant for rationale) —
+    // short enough to hide lost cross-worker notifies, long enough that the
+    // idle-polling cost is negligible. A reliable notify would wake us much
+    // faster than the timeout; the timeout only dominates when the wake
+    // was dropped by the browser's waitAsync delivery path.
     // -----------------------------------------------------------------------
     const currentSeq = Atomics.load(headerI32, SEQ_IDX);
     if (currentSeq === lastSeq) {
-      const { async, value } = Atomics.waitAsync(headerI32, SEQ_IDX, lastSeq, 1000);
+      const { async, value } = Atomics.waitAsync(headerI32, SEQ_IDX, lastSeq, READER_WAIT_TIMEOUT_MS);
       // value is a Promise<string> when async=true, or a string when async=false
       // ("not-equal" means seq already changed before the wait).
       const _result = async ? await value : (value as string);
