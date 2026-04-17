@@ -3984,6 +3984,15 @@ describe('createHandler', () => {
         // return. Stop BEFORE the 100ms hard timer so the pin-
         // until-hard-timeout invariant can be asserted first.
         const handlerPromise = handler(req, res);
+        // Wait until the wedged store.store() call has been initiated —
+        // at this point the handler is inside the post-commit
+        // Promise.race and the soft/hard-timeout setTimeouts are
+        // registered. Polling is deterministic even under heavy
+        // microtask pressure, so the subsequent fake-clock advance
+        // will always find the timers to fire.
+        while (mockStore.store.mock.calls.length < 1) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         await vi.advanceTimersByTimeAsync(60);
         await handlerPromise;
         await waitForEnd();
@@ -4103,6 +4112,12 @@ describe('createHandler', () => {
         });
         const { res, waitForEnd, getBody } = createMockRes();
         const handlerPromise = handler(req, res);
+        // Wait until the wedged store.store() call has been initiated
+        // before advancing so the soft/hard-timeout setTimeouts are
+        // registered. Deterministic under any microtask pressure.
+        while (mockStore.store.mock.calls.length < 1) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // Advance past the 50ms soft timeout so the handler
         // returns, then advance past the 100ms hard timeout.
         await vi.advanceTimersByTimeAsync(200);
@@ -4231,6 +4246,12 @@ describe('createHandler', () => {
         const { res, waitForEnd, getBody } = createMockRes();
 
         const handlerPromise = handler(req, res);
+        // Wait until the pending store.store() call has been initiated
+        // before advancing so the soft/hard-timeout setTimeouts are
+        // registered. Deterministic under any microtask pressure.
+        while (mockStore.store.mock.calls.length < 1) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // Advance past the 50ms soft timeout so the handler
         // returns, then past the 100ms hard timer so the
         // breaker installs the tombstone.
@@ -4846,6 +4867,12 @@ describe('createHandler', () => {
           });
           const { res, waitForEnd, getBody } = createMockRes();
           const handlerPromise = handler(req, res);
+          // Wait until THIS iteration's wedged store.store() call has
+          // been initiated before advancing the fake clock. Cumulative
+          // call count after iteration `i` (0-based) is `i + 1`.
+          while (mockStore.store.mock.calls.length < i + 1) {
+            await vi.advanceTimersByTimeAsync(0);
+          }
           // Advance past the 50ms soft timeout so the handler
           // returns. The hard timer is also 50ms so it fires on
           // this same advance.
@@ -5004,6 +5031,12 @@ describe('createHandler', () => {
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
         const handlerPromise1 = handler(req1, res1);
+        // Wait until the pending store.store() call has been initiated
+        // before advancing so the soft/hard-timeout setTimeouts are
+        // registered. Deterministic under any microtask pressure.
+        while (mockStore.store.mock.calls.length < 1) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // Advance past the 50ms soft timeout so the handler
         // returns, AND past the 50ms hard timer so the breaker
         // fires and transitions A into the marker state.
@@ -5201,6 +5234,12 @@ describe('createHandler', () => {
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
         const handlerPromise1 = handler(req1, res1);
+        // Wait until the pending store.store() call has been initiated
+        // before advancing so the soft/hard-timeout setTimeouts are
+        // registered. Deterministic under any microtask pressure.
+        while (mockStore.store.mock.calls.length < 1) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // Advance past the 50ms soft timeout so the handler
         // returns AND past the 50ms hard-timeout breaker so A is
         // in the hard-timed-out marker state.
@@ -5238,6 +5277,12 @@ describe('createHandler', () => {
         });
         const { res: res2, getStatus: status2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
         const handlerPromise2 = handler(req2, res2);
+        // Wait until the continuation's own wedged store.store() call
+        // has been initiated before advancing. Cumulative count after
+        // POST #2 is >= 2 (POST #1 already counted toward the total).
+        while (mockStore.store.mock.calls.length < 2) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // The continuation dispatches a new chat and then
         // persists record B, which arms a fresh 50ms soft
         // timeout + 50ms hard timer. Advance past both so the
@@ -5378,6 +5423,12 @@ describe('createHandler', () => {
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
         const handlerPromise1 = handler(req1, res1);
+        // Wait until the pending store.store() call has been initiated
+        // before advancing so the soft/hard-timeout setTimeouts are
+        // registered. Deterministic under any microtask pressure.
+        while (mockStore.store.mock.calls.length < 1) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // Advance past the 50ms soft timeout so the handler
         // returns AND past the 50ms hard-timeout breaker so A is
         // in the marker state. Total 130ms (~80ms past the hard
@@ -5475,6 +5526,13 @@ describe('createHandler', () => {
         });
         const { res: res5, getStatus: status5, getBody: getBody5, waitForEnd: wait5 } = createMockRes();
         const handlerPromise5 = handler(req5, res5);
+        // Wait until continuation #4's own store.store() call has
+        // been initiated — prior continuations #1-#3 short-circuited
+        // on the hard-timeout marker BEFORE dispatch and did not
+        // call store.store, so this POST's call is #2 total.
+        while (mockStore.store.mock.calls.length < 2) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // Continuation #4 dispatches a new chat and persists a
         // child record, which arms a fresh 50ms soft timeout +
         // 50ms hard timer. Advance past both so the handler
@@ -5571,6 +5629,12 @@ describe('createHandler', () => {
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
         const handlerPromise1 = handler(req1, res1);
+        // Wait until the pending store.store() call has been initiated
+        // before advancing so the soft/hard-timeout setTimeouts are
+        // registered. Deterministic under any microtask pressure.
+        while (mockStore.store.mock.calls.length < 1) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // Advance past the 50ms soft timeout so the handler
         // returns AND past the 50ms hard-timeout breaker so A is
         // in the marker state with a 30-minute absolute cap.
@@ -5801,11 +5865,18 @@ describe('createHandler', () => {
         // so we modify it in place — the mock's getChain() will
         // observe the shortened expiry on subsequent reads.
         //
-        // Fake timers make this deterministic: 1s is enough margin
-        // between the "marker-live" assertion (step 5) and the
-        // clock advance.
+        // `Math.ceil` (not `Math.floor`) guarantees the subsecond
+        // component rounds UP to the next second boundary, so the
+        // actual wall-clock margin between "now" and
+        // `shortenedExpiresAt * 1000` is at least 1000ms (not
+        // potentially ~0ms as `floor` produced). Without the
+        // `ceil` the 200ms post-commit advance below would
+        // sometimes cross the marker's absolute cap before the
+        // `isHardTimedOut(...)` read fires — the marker DID
+        // install but auto-expired on the read-path cleanup, a
+        // ~20% flake rate on this test in CI.
         const recordA = storedRecords.get(responseIdA)!;
-        const shortenedExpiresAt = Math.floor(Date.now() / 1000) + 1;
+        const shortenedExpiresAt = Math.ceil(Date.now() / 1000) + 1;
         recordA.expiresAt = shortenedExpiresAt;
 
         // (2) POST #2 — previous_response_id = A. chain = [A]
@@ -5822,6 +5893,16 @@ describe('createHandler', () => {
         });
         const { res: res2, waitForEnd: wait2, getBody: getBody2 } = createMockRes();
         const handlerPromise2 = handler(req2, res2);
+        // Wait until POST #2's wedged store.store() call has been
+        // initiated so the handler has reached the post-commit
+        // Promise.race and the soft/hard-timeout setTimeouts are
+        // registered. Cumulative count is >= 2 (POST #1 resolved
+        // cleanly and counted). Polling against a mock signal is
+        // deterministic even under heavy microtask pressure, which
+        // guards the subsequent hard-timeout marker install.
+        while (mockStore.store.mock.calls.length < 2) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // POST #2 wedges B's persist, so the handler returns
         // after the 50ms soft timeout; advancing past the 50ms
         // hard-timeout breaker also fires the marker install.
@@ -5875,11 +5956,14 @@ describe('createHandler', () => {
         const parsed3 = JSON.parse(getBody3());
         expect(parsed3.error.type).toBe('storage_timeout');
 
-        // (4) Advance past A's expiry. A was set to expire 1s
-        // after POST #1. 1200ms of fake-clock advance pushes
-        // past that so A ages out of getChain and B's chain
-        // becomes unrecoverable.
-        await vi.advanceTimersByTimeAsync(1200);
+        // (4) Advance past A's expiry. A was set to expire ~1-2s
+        // after POST #1 (`Math.ceil(Date.now() / 1000) + 1`
+        // guarantees a minimum 1s margin; the ceil rounding can
+        // push it up to just under 2s). 2200ms of fake-clock
+        // advance pushes past even the worst-case ceiling so A
+        // ages out of getChain and B's chain becomes
+        // unrecoverable.
+        await vi.advanceTimersByTimeAsync(2200);
 
         // (5) Continuation #2 against B — marker has hit its
         // clamped absolute cap (A.expiresAt). `isHardTimedOut`
@@ -6179,6 +6263,14 @@ describe('createHandler', () => {
         });
         const { res: res2, waitForEnd: wait2, getBody: getBody2 } = createMockRes();
         const handlerPromise2 = handler(req2, res2);
+        // Wait until POST #2's wedged store.store() call has been
+        // initiated so the handler has reached the post-commit
+        // Promise.race and the soft-timeout setTimeout is registered.
+        // Cumulative count is >= 2 (POST #1 resolved cleanly and
+        // counted).
+        while (mockStore.store.mock.calls.length < 2) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
         // B's persist wedges (soft timeout 50ms then detach).
         // Advance enough to fire the soft timeout but stay WELL
         // short of the 5s hard breaker — the pre-breaker path
@@ -6221,9 +6313,16 @@ describe('createHandler', () => {
         const { res: res3, getStatus: status3, getBody: getBody3, waitForEnd: wait3 } = createMockRes();
         const handlerPromise3 = handler(req3, res3);
         // Continuation runs awaitPending which arms a 50ms
-        // chain-wait setTimeout. Advance past that so the race
-        // resolves to 'timeout' and the handler falls through to
-        // the pre-breaker earliest-expiry short-circuit.
+        // chain-wait setTimeout. This continuation does NOT make a
+        // fresh store.store() call (it short-circuits on the marker
+        // / pre-breaker path), so we have no call-count signal to
+        // poll on — fall back to a pre-advance-of-zero to guarantee
+        // the microtask queue has drained far enough to register the
+        // setTimeout before the 100ms advance fires.
+        await vi.advanceTimersByTimeAsync(0);
+        // Advance past that so the race resolves to 'timeout' and
+        // the handler falls through to the pre-breaker earliest-
+        // expiry short-circuit.
         await vi.advanceTimersByTimeAsync(100);
         await handlerPromise3;
         await wait3();
