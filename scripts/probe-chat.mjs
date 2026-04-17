@@ -26,7 +26,10 @@ await page.goto(URL, { waitUntil: 'domcontentloaded' });
 await page.waitForFunction(() => document.getElementById('status')?.textContent?.includes('Ready'));
 console.log('Ready. Firing chat.');
 
-await page.fill('#prompt', 'Write a short haiku about atoms.');
+await page.fill(
+  '#prompt',
+  'Explain in careful detail how an atom is structured. Cover the nucleus with protons and neutrons, the electron cloud and orbitals, isotopes, chemical bonding, and the periodic table. Be precise, specific, and give at least five distinct paragraphs of content.',
+);
 await page.click('#send');
 
 const deadline = Date.now() + 120_000;

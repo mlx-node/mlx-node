@@ -74,48 +74,28 @@ async function runOnce(page, runIdx, isWarmup) {
     timeout: TIMEOUT_MS,
   });
 
-  // Capture all log lines appended after we hit send.
-  const logLines = [];
-  const statusLines = [];
-  let tokPerSec = NaN;
-
-  await page.exposeFunction('__benchOnLog', (line) => {
-    logLines.push(line);
-  });
-  await page.exposeFunction('__benchOnStatus', (text) => {
-    statusLines.push(text);
-    const m = RE_TOKPS_STATUS.exec(text);
-    if (m) tokPerSec = Number(m[1]);
-  });
-
-  // Install observers for the log panel and status bar.
-  await page.evaluate(() => {
-    const logEl = document.getElementById('log');
-    const statusEl = document.getElementById('status');
-    const logObs = new MutationObserver(() => {
-      const children = Array.from(logEl?.children ?? []);
-      const last = children[children.length - 1];
-      if (last?.textContent) window.__benchOnLog(last.textContent);
-    });
-    if (logEl) logObs.observe(logEl, { childList: true });
-    const statusObs = new MutationObserver(() => {
-      window.__benchOnStatus(statusEl?.textContent ?? '');
-    });
-    if (statusEl) statusObs.observe(statusEl, { childList: true, characterData: true, subtree: true });
-  });
-
   // Fire the prompt.
   await page.fill('#prompt', PROMPT);
   await page.click('#send');
 
-  // Wait for the profile line to arrive (emitted after decode completes).
+  // Poll the log panel directly. MutationObserver→exposeFunction drops
+  // updates under rapid DOM changes; direct page.evaluate polling is
+  // reliable and simpler.
   const deadline = Date.now() + TIMEOUT_MS;
-  let profileLine = null;
+  let logLines = [];
+  let tokPerSec = NaN;
   while (Date.now() < deadline) {
-    profileLine = logLines.find((l) => RE_DECODE_LINE.test(l));
-    if (profileLine) break;
-    await page.waitForTimeout(250);
+    const snapshot = await page.evaluate(() => ({
+      lines: Array.from(document.getElementById('log')?.children ?? []).map((c) => c.textContent),
+      status: document.getElementById('status')?.textContent ?? '',
+    }));
+    logLines = snapshot.lines;
+    const m = RE_TOKPS_STATUS.exec(snapshot.status);
+    if (m) tokPerSec = Number(m[1]);
+    if (logLines.find((l) => RE_DECODE_LINE.test(l))) break;
+    await page.waitForTimeout(500);
   }
+  const profileLine = logLines.find((l) => RE_DECODE_LINE.test(l));
   if (!profileLine) throw new Error(`${tag}: no [profile] line within ${TIMEOUT_MS}ms`);
 
   // Parse.
