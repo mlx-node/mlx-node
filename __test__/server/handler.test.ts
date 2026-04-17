@@ -3928,6 +3928,7 @@ describe('createHandler', () => {
       //     inherit).
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '100';
+      vi.useFakeTimers();
       try {
         const mockStore = {
           // Promise that NEVER resolves. This simulates a
@@ -3978,7 +3979,13 @@ describe('createHandler', () => {
 
         // Handler itself returns around the SOFT timeout
         // (~50ms). It must not wait for the 100ms hard timer.
-        await handler(req, res);
+        // Kick off the handler, then advance the fake clock past
+        // the 50ms soft-timeout Promise.race so the handler can
+        // return. Stop BEFORE the 100ms hard timer so the pin-
+        // until-hard-timeout invariant can be asserted first.
+        const handlerPromise = handler(req, res);
+        await vi.advanceTimersByTimeAsync(60);
+        await handlerPromise;
         await waitForEnd();
         const body = JSON.parse(getBody());
         expect(body.status).toBe('completed');
@@ -3994,12 +4001,10 @@ describe('createHandler', () => {
         const idImmediately = registry.getInstanceId(MODEL_NAME);
         expect(idImmediately).toBe(idBefore);
 
-        // Wait for the hard timeout (100ms from dispatch) plus
-        // a macrotask drain so the `setTimeout` callback runs.
-        // 150ms is enough margin to prove the breaker fired
-        // without being flaky on CI.
-        await new Promise((r) => setTimeout(r, 150));
-        await new Promise((r) => setImmediate(r));
+        // Advance the fake clock past the 100ms hard timer (we
+        // already consumed 60ms above) and flush microtasks so
+        // the `setTimeout` callback runs.
+        await vi.advanceTimersByTimeAsync(100);
 
         // Primary invariant: the hard timer fired, retired the
         // id via the tombstone, THEN force-released the retain.
@@ -4023,6 +4028,7 @@ describe('createHandler', () => {
         expect(unhandled).toHaveLength(0);
         process.off('unhandledRejection', onUnhandled);
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
@@ -4053,6 +4059,7 @@ describe('createHandler', () => {
       // and the fresh-id path runs.
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '100';
+      vi.useFakeTimers();
       try {
         const mockStore = {
           store: vi.fn().mockImplementation(() => new Promise<void>(() => {})),
@@ -4095,14 +4102,14 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res, waitForEnd, getBody } = createMockRes();
-        await handler(req, res);
+        const handlerPromise = handler(req, res);
+        // Advance past the 50ms soft timeout so the handler
+        // returns, then advance past the 100ms hard timeout.
+        await vi.advanceTimersByTimeAsync(200);
+        await handlerPromise;
         await waitForEnd();
         const body = JSON.parse(getBody());
         expect(body.status).toBe('completed');
-
-        // Wait for the hard timeout to fire and retire the id.
-        await new Promise((r) => setTimeout(r, 150));
-        await new Promise((r) => setImmediate(r));
 
         // Hot-swap to a DIFFERENT model object under the same
         // name. The tombstone is keyed on `originalModel`, not
@@ -4121,6 +4128,7 @@ describe('createHandler', () => {
         expect(unhandled).toHaveLength(0);
         process.off('unhandledRejection', onUnhandled);
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
@@ -4176,6 +4184,7 @@ describe('createHandler', () => {
       // id.
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '100';
+      vi.useFakeTimers();
       try {
         let resolvePersist: (() => void) | undefined;
         const persistPromise = new Promise<void>((resolve) => {
@@ -4221,27 +4230,25 @@ describe('createHandler', () => {
         });
         const { res, waitForEnd, getBody } = createMockRes();
 
-        await handler(req, res);
+        const handlerPromise = handler(req, res);
+        // Advance past the 50ms soft timeout so the handler
+        // returns, then past the 100ms hard timer so the
+        // breaker installs the tombstone.
+        await vi.advanceTimersByTimeAsync(200);
+        await handlerPromise;
         await waitForEnd();
         const body = JSON.parse(getBody());
         expect(body.status).toBe('completed');
-
-        // Wait for the hard timer (100ms from dispatch) to fire
-        // and install the tombstone. 150ms is enough margin to
-        // prove the breaker fired without being flaky on CI.
-        await new Promise((r) => setTimeout(r, 150));
-        await new Promise((r) => setImmediate(r));
 
         // NOW settle the pending persist. The persist's
         // `.finally(...)` releases the tombstone via
         // `releaseTombstone`; since this is the only pending
         // retire, its refcount drains to zero and the entry
-        // is dropped. Drain microtasks + one macrotask so the
-        // `.finally` body has definitely executed.
+        // is dropped. Drain microtasks so the `.finally` body
+        // has definitely executed.
         expect(resolvePersist).toBeDefined();
         resolvePersist!();
-        await Promise.resolve();
-        await new Promise((r) => setImmediate(r));
+        await vi.advanceTimersByTimeAsync(0);
 
         // Primary invariant: the tombstone has been cleared by
         // the persist's `.finally(...)`, so a fresh `unregister`
@@ -4258,6 +4265,7 @@ describe('createHandler', () => {
         expect(unhandled).toHaveLength(0);
         process.off('unhandledRejection', onUnhandled);
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
@@ -4793,6 +4801,7 @@ describe('createHandler', () => {
       //     (retryable signal preserved).
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      vi.useFakeTimers();
       try {
         const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
         const mockStore = {
@@ -4836,7 +4845,12 @@ describe('createHandler', () => {
             stream: false,
           });
           const { res, waitForEnd, getBody } = createMockRes();
-          await handler(req, res);
+          const handlerPromise = handler(req, res);
+          // Advance past the 50ms soft timeout so the handler
+          // returns. The hard timer is also 50ms so it fires on
+          // this same advance.
+          await vi.advanceTimersByTimeAsync(60);
+          await handlerPromise;
           await waitForEnd();
           const body = JSON.parse(getBody());
           expect(body.status).toBe('completed');
@@ -4858,12 +4872,11 @@ describe('createHandler', () => {
         // marker.
         expect(mockStore.store).toHaveBeenCalledTimes(N);
 
-        // Wait for any pending hard timers to fire on every
-        // wedged persist. 200ms is enough margin for every 50ms
-        // timer to elapse plus a macrotask drain so the
-        // `setTimeout` callback runs.
-        await new Promise((r) => setTimeout(r, 200));
-        await new Promise((r) => setImmediate(r));
+        // Advance the fake clock so any remaining hard timers
+        // fire on every wedged persist. 200ms is enough margin
+        // for every 50ms timer to elapse and flush microtasks
+        // so the `setTimeout` callback runs.
+        await vi.advanceTimersByTimeAsync(200);
 
         // Primary invariant A: every hard-timeout breaker
         // dropped its pending-write tracker entry. The pending
@@ -4892,6 +4905,7 @@ describe('createHandler', () => {
         expect(unhandled).toHaveLength(0);
         process.off('unhandledRejection', onUnhandled);
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
@@ -4935,6 +4949,7 @@ describe('createHandler', () => {
       //      which is the correct behaviour.
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      vi.useFakeTimers();
       try {
         const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
 
@@ -4988,23 +5003,18 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
-        await handler(req1, res1);
+        const handlerPromise1 = handler(req1, res1);
+        // Advance past the 50ms soft timeout so the handler
+        // returns, AND past the 50ms hard timer so the breaker
+        // fires and transitions A into the marker state.
+        await vi.advanceTimersByTimeAsync(200);
+        await handlerPromise1;
         await wait1();
         const body1 = JSON.parse(getBody1());
         expect(body1.status).toBe('completed');
         const responseIdA: string = body1.id;
 
-        // Sanity: A is currently tracked as pending.
         const tracker = getPendingWritesFor(mockStore);
-        // Note: by the time the handler returns the hard timer
-        // (50ms) may or may not have fired yet depending on test
-        // wall-clock, so we don't assert the exact pending size
-        // here. We only care about the post-timeout steady state.
-
-        // (2) Let the hard timer fire. 200ms is plenty of margin
-        // for the 50ms timer plus a macrotask drain.
-        await new Promise((r) => setTimeout(r, 200));
-        await new Promise((r) => setImmediate(r));
 
         // Invariant: the breaker fired and transitioned A into
         // the hard-timed-out marker. Pending drained, marker set.
@@ -5040,9 +5050,8 @@ describe('createHandler', () => {
         expect(resolveStore).toBeDefined();
         resolveStore!();
         // Drain microtasks so the `.finally(...)` runs.
-        await Promise.resolve();
-        await new Promise((r) => setImmediate(r));
-        await new Promise((r) => setImmediate(r));
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(0);
 
         // Invariant: marker cleared — the retryable window closed
         // because the underlying write finally settled.
@@ -5080,6 +5089,7 @@ describe('createHandler', () => {
         expect(unhandled).toHaveLength(0);
         process.off('unhandledRejection', onUnhandled);
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
@@ -5111,6 +5121,7 @@ describe('createHandler', () => {
       //      probe and proceeded normally.
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      vi.useFakeTimers();
       try {
         const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
 
@@ -5189,25 +5200,18 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
-        await handler(req1, res1);
+        const handlerPromise1 = handler(req1, res1);
+        // Advance past the 50ms soft timeout so the handler
+        // returns AND past the 50ms hard-timeout breaker so A is
+        // in the hard-timed-out marker state.
+        await vi.advanceTimersByTimeAsync(200);
+        await handlerPromise1;
         await wait1();
         const body1 = JSON.parse(getBody1());
         expect(body1.status).toBe('completed');
         const responseIdA: string = body1.id;
 
-        // Wait for the synchronous `store.store(...)` → tracker
-        // registration to have happened (it fires inside the
-        // handler's withExclusive block, typically one microtask
-        // after the response end hook).
-        while (mockStore.store.mock.calls.length === 0) {
-          await new Promise((r) => setImmediate(r));
-        }
-
-        // (2) Wait for the 50ms hard-timeout breaker. After this
-        // the pending tracker has drained and A is in the hard-
-        // timed-out marker.
-        await new Promise((r) => setTimeout(r, 200));
-        await new Promise((r) => setImmediate(r));
+        expect(mockStore.store.mock.calls.length).toBeGreaterThan(0);
 
         const tracker = getPendingWritesFor(mockStore);
         expect(tracker.size).toBe(0);
@@ -5233,7 +5237,13 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res2, getStatus: status2, getBody: getBody2, waitForEnd: wait2 } = createMockRes();
-        await handler(req2, res2);
+        const handlerPromise2 = handler(req2, res2);
+        // The continuation dispatches a new chat and then
+        // persists record B, which arms a fresh 50ms soft
+        // timeout + 50ms hard timer. Advance past both so the
+        // handler can complete.
+        await vi.advanceTimersByTimeAsync(200);
+        await handlerPromise2;
         await wait2();
 
         // The response must not be 503 storage_timeout. Without
@@ -5254,6 +5264,7 @@ describe('createHandler', () => {
         process.off('unhandledRejection', onUnhandled);
         warnSpy.mockRestore();
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
@@ -5304,6 +5315,7 @@ describe('createHandler', () => {
       const originalTtl = process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
       process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS = '200';
+      vi.useFakeTimers();
       try {
         const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
 
@@ -5365,33 +5377,29 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
-        await handler(req1, res1);
+        const handlerPromise1 = handler(req1, res1);
+        // Advance past the 50ms soft timeout so the handler
+        // returns AND past the 50ms hard-timeout breaker so A is
+        // in the marker state. Total 130ms (~80ms past the hard
+        // timer) puts the marker with an expiresAt at ~330ms
+        // from "now" (TTL=200).
+        await vi.advanceTimersByTimeAsync(130);
+        await handlerPromise1;
         await wait1();
         const body1 = JSON.parse(getBody1());
         expect(body1.status).toBe('completed');
         const responseIdA: string = body1.id;
 
-        // Wait for the hard-timeout breaker to fire (50ms + margin)
-        // so A is now in the marker state. The initial check here
-        // ALSO refreshes the marker, but the refresh only extends
-        // it by the configured TTL (200ms) — the retryable-503
-        // window is indefinite by chain-of-refreshes, not by any
-        // single read.
-        while (mockStore.store.mock.calls.length === 0) {
-          await new Promise((r) => setImmediate(r));
-        }
-        await new Promise((r) => setTimeout(r, 80));
-        await new Promise((r) => setImmediate(r));
+        expect(mockStore.store.mock.calls.length).toBeGreaterThan(0);
 
         const tracker = getPendingWritesFor(mockStore);
         expect(tracker.size).toBe(0);
         expect(tracker.isHardTimedOut(responseIdA)).toBe(true);
 
-        // Continuation #1 — well within the ORIGINAL 200ms TTL
-        // (marker set at ~50ms, checked at ~130ms). The refresh
-        // here pushes the expiry forward to ~330, which is what
-        // keeps continuation #2 alive.
-        await new Promise((r) => setTimeout(r, 50));
+        // Continuation #1 — well within the ORIGINAL 200ms TTL.
+        // The refresh here pushes the expiry forward, which is
+        // what keeps continuation #2 alive.
+        await vi.advanceTimersByTimeAsync(50);
         const req2 = createMockReq('POST', '/v1/responses', {
           model: MODEL_NAME,
           input: 'continuation #1 at TTL boundary',
@@ -5410,7 +5418,7 @@ describe('createHandler', () => {
         // refresh-on-read the marker would already be gone and
         // this would 404. The refresh at continuation #1 kept it
         // alive, and this read extends it again.
-        await new Promise((r) => setTimeout(r, 180));
+        await vi.advanceTimersByTimeAsync(180);
         const req3 = createMockReq('POST', '/v1/responses', {
           model: MODEL_NAME,
           input: 'continuation #2 past original TTL',
@@ -5428,7 +5436,7 @@ describe('createHandler', () => {
         // expiry. The refresh chain keeps the window open. With
         // a fixed 200ms TTL and no refresh, we're now hundreds of
         // ms past the would-be-absent-without-refresh expiry.
-        await new Promise((r) => setTimeout(r, 180));
+        await vi.advanceTimersByTimeAsync(180);
         const req4 = createMockReq('POST', '/v1/responses', {
           model: MODEL_NAME,
           input: 'continuation #3 many refreshes later',
@@ -5450,9 +5458,8 @@ describe('createHandler', () => {
         // `.finally(...)` inside `track()` clears the marker.
         expect(resolveStore).toBeDefined();
         resolveStore!();
-        await Promise.resolve();
-        await new Promise((r) => setImmediate(r));
-        await new Promise((r) => setImmediate(r));
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(0);
 
         expect(tracker.isHardTimedOut(responseIdA)).toBe(false);
 
@@ -5467,7 +5474,13 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res5, getStatus: status5, getBody: getBody5, waitForEnd: wait5 } = createMockRes();
-        await handler(req5, res5);
+        const handlerPromise5 = handler(req5, res5);
+        // Continuation #4 dispatches a new chat and persists a
+        // child record, which arms a fresh 50ms soft timeout +
+        // 50ms hard timer. Advance past both so the handler
+        // completes.
+        await vi.advanceTimersByTimeAsync(200);
+        await handlerPromise5;
         await wait5();
         expect(status5()).not.toBe(503);
         expect(status5()).not.toBe(404);
@@ -5480,6 +5493,7 @@ describe('createHandler', () => {
         process.off('unhandledRejection', onUnhandled);
         warnSpy.mockRestore();
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
@@ -5513,6 +5527,7 @@ describe('createHandler', () => {
       // configurable).
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      vi.useFakeTimers();
       try {
         const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
         const mockStore = {
@@ -5555,18 +5570,16 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
-        await handler(req1, res1);
+        const handlerPromise1 = handler(req1, res1);
+        // Advance past the 50ms soft timeout so the handler
+        // returns AND past the 50ms hard-timeout breaker so A is
+        // in the marker state with a 30-minute absolute cap.
+        await vi.advanceTimersByTimeAsync(200);
+        await handlerPromise1;
         await wait1();
         const body1 = JSON.parse(getBody1());
         expect(body1.status).toBe('completed');
         const responseIdA: string = body1.id;
-
-        // Wait for the hard-timeout breaker to fire (~50ms +
-        // margin). Marker is now live with a 30-minute absolute
-        // cap — continuation #1 should take the retryable-503
-        // branch.
-        await new Promise((r) => setTimeout(r, 200));
-        await new Promise((r) => setImmediate(r));
 
         const tracker = getPendingWritesFor(mockStore);
         expect(tracker.isHardTimedOut(responseIdA)).toBe(true);
@@ -5631,6 +5644,7 @@ describe('createHandler', () => {
         process.off('unhandledRejection', onUnhandled);
         warnSpy.mockRestore();
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
@@ -5676,6 +5690,7 @@ describe('createHandler', () => {
       //      unrecoverable and the client must start fresh.
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
+      vi.useFakeTimers();
       try {
         const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
 
@@ -5766,27 +5781,29 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
-        await handler(req1, res1);
+        const handlerPromise1 = handler(req1, res1);
+        // POST #1 resolves synchronously (first store.store()
+        // resolves) so no fake-clock advance is needed to unblock
+        // the soft-timeout race. A couple of microtask ticks let
+        // the off-lock persist finally run.
+        await vi.advanceTimersByTimeAsync(0);
+        await handlerPromise1;
         await wait1();
         const body1 = JSON.parse(getBody1());
         expect(body1.status).toBe('completed');
         const responseIdA: string = body1.id;
 
-        // Wait for the post-commit persist to settle (A resolves
-        // immediately, but the handler's outer finally awaits it
-        // off-lock; giving the microtask queue a tick is enough).
-        await new Promise((r) => setImmediate(r));
-        await new Promise((r) => setImmediate(r));
+        await vi.advanceTimersByTimeAsync(0);
         expect(storedRecords.has(responseIdA)).toBe(true);
 
         // Shrink A's `expiresAt` so it ages out within the test's
-        // wall-clock window. The record is already in the store,
+        // fake-clock window. The record is already in the store,
         // so we modify it in place — the mock's getChain() will
         // observe the shortened expiry on subsequent reads.
         //
-        // Target: A expires 1 second from now. Far enough that
-        // continuation #1 still sees A as live, but short enough
-        // that we can advance past it without waiting 30 minutes.
+        // Fake timers make this deterministic: 1s is enough margin
+        // between the "marker-live" assertion (step 5) and the
+        // clock advance.
         const recordA = storedRecords.get(responseIdA)!;
         const shortenedExpiresAt = Math.floor(Date.now() / 1000) + 1;
         recordA.expiresAt = shortenedExpiresAt;
@@ -5804,20 +5821,20 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res2, waitForEnd: wait2, getBody: getBody2 } = createMockRes();
-        await handler(req2, res2);
+        const handlerPromise2 = handler(req2, res2);
+        // POST #2 wedges B's persist, so the handler returns
+        // after the 50ms soft timeout; advancing past the 50ms
+        // hard-timeout breaker also fires the marker install.
+        // A's own expiry is ~1 second in the future so the marker
+        // is still live at this point.
+        await vi.advanceTimersByTimeAsync(200);
+        await handlerPromise2;
         await wait2();
         const body2 = JSON.parse(getBody2());
         expect(body2.status).toBe('completed');
         const responseIdB: string = body2.id;
 
-        // Wait for the 50ms hard-timeout breaker to fire against B.
-        // A's own expiry is ~1 second in the future so the marker
-        // is still live at this point.
-        while (mockStore.store.mock.calls.length < 2) {
-          await new Promise((r) => setImmediate(r));
-        }
-        await new Promise((r) => setTimeout(r, 200));
-        await new Promise((r) => setImmediate(r));
+        expect(mockStore.store.mock.calls.length).toBeGreaterThanOrEqual(2);
 
         const tracker = getPendingWritesFor(mockStore);
         expect(tracker.isHardTimedOut(responseIdB)).toBe(true);
@@ -5858,11 +5875,11 @@ describe('createHandler', () => {
         const parsed3 = JSON.parse(getBody3());
         expect(parsed3.error.type).toBe('storage_timeout');
 
-        // (4) Wait past A's expiry. A was set to expire 1 second
-        // after POST #1. Give 1.5 seconds total wall-clock from
-        // that point — A is now invisible to getChain, which
-        // means B's chain is unrecoverable.
-        await new Promise((r) => setTimeout(r, 1200));
+        // (4) Advance past A's expiry. A was set to expire 1s
+        // after POST #1. 1200ms of fake-clock advance pushes
+        // past that so A ages out of getChain and B's chain
+        // becomes unrecoverable.
+        await vi.advanceTimersByTimeAsync(1200);
 
         // (5) Continuation #2 against B — marker has hit its
         // clamped absolute cap (A.expiresAt). `isHardTimedOut`
@@ -5891,6 +5908,7 @@ describe('createHandler', () => {
         process.off('unhandledRejection', onUnhandled);
         warnSpy.mockRestore();
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
@@ -6061,6 +6079,7 @@ describe('createHandler', () => {
       // `awaitPending` race resolves to `timeout` quickly.
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '5000';
       process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS = '50';
+      vi.useFakeTimers();
       try {
         const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
 
@@ -6130,12 +6149,15 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res1, waitForEnd: wait1, getBody: getBody1 } = createMockRes();
-        await handler(req1, res1);
+        const handlerPromise1 = handler(req1, res1);
+        // POST #1 resolves cleanly (first store.store() resolves);
+        // drain microtasks so the off-lock persist's finally runs.
+        await vi.advanceTimersByTimeAsync(0);
+        await handlerPromise1;
         await wait1();
         const body1 = JSON.parse(getBody1());
         const responseIdA: string = body1.id;
-        await new Promise((r) => setImmediate(r));
-        await new Promise((r) => setImmediate(r));
+        await vi.advanceTimersByTimeAsync(0);
         expect(storedRecords.has(responseIdA)).toBe(true);
 
         // Shrink A's expiresAt to 1 second from now. The pre-
@@ -6156,16 +6178,18 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res2, waitForEnd: wait2, getBody: getBody2 } = createMockRes();
-        await handler(req2, res2);
+        const handlerPromise2 = handler(req2, res2);
+        // B's persist wedges (soft timeout 50ms then detach).
+        // Advance enough to fire the soft timeout but stay WELL
+        // short of the 5s hard breaker — the pre-breaker path
+        // is what this test exercises.
+        await vi.advanceTimersByTimeAsync(100);
+        await handlerPromise2;
         await wait2();
         const body2 = JSON.parse(getBody2());
         const responseIdB: string = body2.id;
 
-        // Wait for the pending tracker to be populated with B's
-        // wedged promise.
-        while (mockStore.store.mock.calls.length < 2) {
-          await new Promise((r) => setImmediate(r));
-        }
+        expect(mockStore.store.mock.calls.length).toBeGreaterThanOrEqual(2);
         const tracker = getPendingWritesFor(mockStore);
         const earliestB = tracker.getEarliestExpiresAtMs(responseIdB);
         expect(earliestB).toBeDefined();
@@ -6173,10 +6197,10 @@ describe('createHandler', () => {
         // 30-min default.
         expect(earliestB).toBe(shortenedExpiresAt * 1000);
 
-        // (3) Wait past A's shortened expiry (1.2 seconds). A now
+        // (3) Advance past A's shortened expiry (1.2s). A now
         // ages out of getChain(); the pending earliest-expiry for B
         // has been crossed.
-        await new Promise((r) => setTimeout(r, 1300));
+        await vi.advanceTimersByTimeAsync(1300);
 
         // (4) Continuation against B. `getChain(B)` throws "not
         // found" (B isn't persisted). `awaitPending(B)` returns
@@ -6195,7 +6219,13 @@ describe('createHandler', () => {
           stream: false,
         });
         const { res: res3, getStatus: status3, getBody: getBody3, waitForEnd: wait3 } = createMockRes();
-        await handler(req3, res3);
+        const handlerPromise3 = handler(req3, res3);
+        // Continuation runs awaitPending which arms a 50ms
+        // chain-wait setTimeout. Advance past that so the race
+        // resolves to 'timeout' and the handler falls through to
+        // the pre-breaker earliest-expiry short-circuit.
+        await vi.advanceTimersByTimeAsync(100);
+        await handlerPromise3;
         await wait3();
         expect(status3()).toBe(404);
         const parsed3 = JSON.parse(getBody3());
@@ -6205,6 +6235,7 @@ describe('createHandler', () => {
         process.off('unhandledRejection', onUnhandled);
         warnSpy.mockRestore();
       } finally {
+        vi.useRealTimers();
         if (originalHard === undefined) {
           delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         } else {
