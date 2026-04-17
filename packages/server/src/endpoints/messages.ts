@@ -1,16 +1,10 @@
 /**
- * POST /v1/messages endpoint
+ * POST /v1/messages — stateless Anthropic Messages API.
  *
- * Implements the Anthropic Messages API, dispatching to loaded models
- * via the ModelRegistry. Supports both streaming (SSE) and non-streaming
- * (JSON) response modes.
- *
- * The Anthropic Messages API is stateless — every request carries the
- * full conversation in `req.messages`, and no response store is
- * consulted. We therefore allocate a brand-new `ChatSession` for each
- * request (via `SessionRegistry.getOrCreate(null)`), prime it with the
- * mapped messages, and run `startFromHistory` / `startFromHistoryStream`.
- * No `adopt()` / `drop()` — the session's lifetime is this single call.
+ * Every request carries the full conversation in `req.messages`. We allocate
+ * a fresh `ChatSession` per request via `SessionRegistry.getOrCreate(null)`,
+ * prime with the mapped history, and run `startFromHistory[Stream]`. No
+ * adopt/drop: the session's lifetime is this single call.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -46,9 +40,7 @@ import {
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 import { validateAndCanonicalizeHistoryToolOrder } from './responses.js';
 
-// ---------------------------------------------------------------------------
 // Non-streaming path
-// ---------------------------------------------------------------------------
 
 async function handleNonStreaming(
   res: ServerResponse,
@@ -59,36 +51,15 @@ async function handleNonStreaming(
   const messageId = genId('msg_');
   const response = buildAnthropicResponse(result, body, messageId);
 
-  // Iter-35 finding 2 (part a): the non-streaming Anthropic path
-  // has no AbortSignal surface on `chatSession*`, so a client that
-  // disconnects mid-decode still burns every token under the per-
-  // model mutex — we only learn about the peer loss once native
-  // decode resolves. TODO(iter35): add a native cancellation
-  // surface for `chatSession*` so the dispatch can bail at the
-  // next safepoint rather than running to completion.
-  //
-  // Disconnect-aware handling is delegated to `endJson`'s own
-  // pre-entry destroyed check (iter-34): on a dead peer it rejects
-  // synchronously after `writeHead` has already flipped
-  // `responseMode = 'json'`, which is exactly the shape the outer
-  // catch expects — the JSON-mode branch destroys the socket
-  // cleanly. Short-circuiting here with an early return would
-  // leave `responseMode === null`, routing the error through the
-  // clean-500 path instead, which tests (and production
-  // expectations) rely on destroying the socket.
-
-  // `endJson` commits `responseMode = 'json'` synchronously and
-  // only flips `responseBodyWritten` once the kernel has
-  // acknowledged the final chunk. The outer catch branches on
-  // `responseMode`, so a crash between `writeHead` and the end-
-  // callback routes to the JSON error path (or a socket destroy)
-  // rather than emitting SSE frames into a JSON-declared response.
+  // Native `chatSession*` has no AbortSignal surface yet, so a client that
+  // disconnects mid-decode still burns every remaining token under the
+  // per-model mutex. Disconnect handling is delegated to `endJson`'s
+  // pre-entry destroyed check, which rejects synchronously after `responseMode`
+  // has been committed to 'json' — the outer catch then destroys the socket.
   await endJson(res, JSON.stringify(response), visibility);
 }
 
-// ---------------------------------------------------------------------------
 // Streaming path
-// ---------------------------------------------------------------------------
 
 async function handleStreamingNative(
   res: ServerResponse,
@@ -100,10 +71,8 @@ async function handleStreamingNative(
 ): Promise<void> {
   const messageId = genId('msg_');
   beginSSE(res);
-  // Commit to SSE wire format synchronously. The outer catch branches
-  // on `responseMode` — any throw from `writeSSEEvent` between here
-  // and the terminal event routes to the streaming `error` epilogue
-  // instead of corrupting the JSON path.
+  // Commit SSE wire format now so any throw before the terminal event routes
+  // to the streaming error epilogue instead of corrupting the JSON path.
   markSSEMode(visibility);
 
   writeSSEEvent(res, 'message_start', buildMessageStartEvent(body, messageId, 0));
@@ -114,56 +83,22 @@ async function handleStreamingNative(
   let emittedTextLength = 0;
   const tagBuffer = new ToolCallTagBuffer();
 
-  // Terminal state captured inside the done branch (or left null if
-  // the iterator exhausts without a done event). The actual
-  // `message_stop` / streaming `error` emission is deferred until
-  // AFTER the loop drains so `wasCommitted()` can read an
-  // authoritative `session.turns` — otherwise we would emit a
-  // terminal event while the producer's finally has not yet run.
-  //
-  // Iter-27 finding 3: the previous implementation emitted
-  // `message_stop` unconditionally the moment a `done` event arrived,
-  // even when the final chunk carried `finishReason: 'error'`. That
-  // reported a failed generation as a successful one to Anthropic
-  // clients: no `error` SSE event, no way to distinguish a real
-  // completion from a mid-decode failure. Mirror the
-  // `/v1/responses` commit gate — on a committed (non-error) done
-  // chunk we emit `message_delta` + `message_stop`; on an
-  // uncommitted terminal (error finish or iterator exhaustion) we
-  // emit a single streaming `error` event in the Anthropic shape.
+  // Terminal emission is deferred until after the loop drains so `wasCommitted()`
+  // reads an authoritative `session.turns`. On a committed done chunk we emit
+  // `message_delta` + `message_stop`; on an uncommitted terminal (finishReason=error,
+  // mid-decode throw, client abort, iterator exhaustion) we emit a single streaming
+  // `error` event and withhold `message_stop`.
   let sawDone = false;
   let terminalStopReason: string | null = null;
   let terminalNumTokens = 0;
   let terminalPromptTokens: number | undefined;
   let terminalErrorMessage: string | null = null;
 
-  // Iter-28 finding 2: fault state. A mid-decode throw from the
-  // underlying generator used to escape into the outer generic
-  // catch, bypassing the commit gate and emitting an `error` event
-  // AFTER SSE headers had already been flushed. A client disconnect
-  // (HTTP `close`/`error`) had no signal at all, so the consumer
-  // would happily keep streaming deltas to a dead socket and the
-  // post-loop block would run the success branch.
-  //
-  // `thrownError` sticks on a generator throw; `clientAborted`
-  // sticks on an HTTP request `close`/`error`. Either one diverts
-  // the post-loop block to the failure epilogue (single Anthropic
-  // streaming `error` SSE event, no `message_stop`). The underlying
-  // `chatStreamSessionStart` does not yet accept an AbortSignal, so
-  // on a client disconnect we can only stop consuming deltas and
-  // break out of the loop — the native decode runs to completion
-  // under the per-model mutex but nothing it emits reaches the
-  // client side.
-  //
-  // Iter-34: also listen on `res` and `res.socket`. Non-terminal
-  // Anthropic SSE writes (`message_start`, `content_block_delta`,
-  // etc.) are fire-and-forget through `writeSSEEvent` — on a
-  // destroyed socket they can silently "succeed" while decode keeps
-  // burning work under the per-model mutex. Attaching the listener
-  // here lets the next loop iteration observe the disconnect and
-  // break out; native decode still runs to completion (no
-  // AbortSignal plumbed yet) but nothing it emits reaches a dead
-  // socket and the post-loop block routes to the failure epilogue.
+  // `thrownError` sticks on a generator throw; `clientAborted` sticks on
+  // HTTP `close`/`error` on req, res, or res.socket. Either one routes the
+  // post-loop block to the failure epilogue. Native decode has no
+  // AbortSignal yet, so on a client disconnect we can only stop consuming
+  // deltas — the native decode still runs to completion under the mutex.
   let thrownError: Error | null = null;
   let clientAborted = false;
   const onClientClose = () => {
@@ -194,25 +129,18 @@ async function handleStreamingNative(
       if (clientAborted) break;
       if (event.done) {
         sawDone = true;
-        // Final event
 
-        // Iter-27 finding 3: if the terminal chunk reports an error,
-        // short-circuit the content-flush/close sequence and hand off
-        // to the post-loop block. Emitting tool_use blocks or closing
-        // content blocks here would (a) race with the post-loop
-        // `content_block_stop` close on the error path and (b)
-        // advertise a clean tool-call fan-out to the client even
-        // though the session rolled back everything.
+        // An error terminal must NOT flush content blocks — doing so would race
+        // with the post-loop close and advertise a clean fan-out that the
+        // session rolled back.
         if (event.finishReason === 'error') {
           terminalErrorMessage = 'model reported finishReason=error';
           break;
         }
 
-        // Flush any remaining pending text
         const remainingText = tagBuffer.flush();
         if (!tagBuffer.suppressed && remainingText) {
           if (!hasEmittedText) {
-            // Close thinking block if open
             if (hasEmittedThinking) {
               writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
             }
@@ -231,22 +159,17 @@ async function handleStreamingNative(
           );
         }
 
-        // Close thinking block if open and text was never emitted
         if (hasEmittedThinking && !hasEmittedText) {
           writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
         }
 
-        // Handle final text
         const finalText = event.text;
         const okToolCalls = event.toolCalls.filter((t) => t.status === 'ok');
         const hasToolCalls = okToolCalls.length > 0;
 
-        // Recovery: if tool-call suppression was triggered but no tool calls were parsed,
-        // create a text block from the final event text (no text was streamed before suppression)
+        // Recovery: suppression triggered but no tool calls parsed — emit final text as a text block.
         if (tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedText) {
-          if (hasEmittedThinking) {
-            // Thinking block already closed above
-          }
+          // Thinking block (if any) was already closed above.
           hasEmittedText = true;
           writeSSEEvent(
             res,
@@ -260,8 +183,7 @@ async function handleStreamingNative(
             buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
           );
         } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedText) {
-          // Recovery: text was already being streamed but got cut off by a false-alarm <tool_call>
-          // tag. Emit the portion of the final text that was never sent as a delta.
+          // Recovery: streaming text was cut off by a false-alarm `<tool_call>` tag. Emit the unsent suffix.
           const unsent = finalText.slice(emittedTextLength);
           if (unsent) {
             emittedTextLength += unsent.length;
@@ -273,7 +195,7 @@ async function handleStreamingNative(
           }
         }
 
-        // Emit any unsent suffix when final text is longer than what was streamed
+        // Emit any unsent suffix when final text is longer than what was streamed.
         if (hasEmittedText && finalText && finalText.length > emittedTextLength) {
           const unsent = finalText.slice(emittedTextLength);
           emittedTextLength += unsent.length;
@@ -288,10 +210,9 @@ async function handleStreamingNative(
           writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
           contentBlockIndex++;
         } else if (!finalText && hasToolCalls) {
-          // No text at all and tool calls present -- skip text block entirely
+          // Pure tool-call turn — no text block.
         } else if (finalText) {
-          // Text was never emitted during streaming but final has text
-          // (possible if all text arrived in the final event somehow)
+          // All text arrived in the final event; emit it as a single block.
           writeSSEEvent(
             res,
             'content_block_start',
@@ -307,7 +228,6 @@ async function handleStreamingNative(
           contentBlockIndex++;
         }
 
-        // Emit tool_use blocks
         for (const tc of okToolCalls) {
           const toolId = tc.id ?? genId('toolu_');
           const parsedInput =
@@ -332,13 +252,9 @@ async function handleStreamingNative(
           contentBlockIndex++;
         }
 
-        // Capture terminal state and break out of the loop. We do NOT
-        // emit `message_delta` / `message_stop` here — both are gated
-        // on the session's commit signal, which only becomes
-        // authoritative after the outer generator's finally has run.
-        // The post-loop block below reads `wasCommitted()` and emits
-        // the right terminal event (success: message_delta +
-        // message_stop; failure: a single `error` SSE event).
+        // Capture terminal state and break — actual `message_delta` / `message_stop` /
+        // `error` emission is deferred until after the loop so `wasCommitted()` reads
+        // an authoritative `session.turns` (the producer's finally runs on break).
         terminalStopReason = mapStopReason(event.finishReason, hasToolCalls);
         terminalNumTokens = event.numTokens;
         terminalPromptTokens = event.promptTokens;
@@ -347,7 +263,6 @@ async function handleStreamingNative(
 
       // Delta event
       if (event.isReasoning) {
-        // Filter out </think> tag
         const deltaText = event.text.replace(/<\/think>/g, '');
         if (!deltaText) continue;
 
@@ -366,7 +281,7 @@ async function handleStreamingNative(
           buildContentBlockDelta(contentBlockIndex - 1, { type: 'thinking_delta', thinking: deltaText }),
         );
       } else {
-        // Text delta with tool_call tag buffering
+        // Text delta with `<tool_call>` buffering.
         const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
         if (tagFound) {
           if (cleanPrefix.trim()) {
@@ -410,14 +325,8 @@ async function handleStreamingNative(
       }
     }
   } catch (err: unknown) {
-    // Iter-28 finding 2: a mid-decode throw from the underlying async
-    // generator used to escape out into the outer catch in
-    // `handleCreateMessage`, which emitted the error frame AFTER SSE
-    // headers were already flushed but without the commit-gate
-    // post-loop check. Capture the error into a sticky flag so the
-    // post-loop block below routes through the failure epilogue
-    // (single Anthropic streaming `error` SSE event, no
-    // `message_stop`).
+    // Capture into a sticky flag so the post-loop block routes through the failure
+    // epilogue (single streaming `error` event, no `message_stop`).
     thrownError = err instanceof Error ? err : new Error(String(err));
   } finally {
     if (httpReq) {
@@ -431,37 +340,19 @@ async function handleStreamingNative(
     }
   }
 
-  // Post-loop terminal emission. The producer's finally has now run
-  // (either via the `break` after a done event, via natural iterator
-  // exhaustion, via a mid-decode throw surfaced through the
-  // try/catch above, or via a client disconnect that flipped
-  // `clientAborted`), so `wasCommitted()` reads an authoritative
-  // `session.turns` baseline. Success requires ALL of: sawDone,
-  // committed, no thrown error, no client abort. Every failure path
-  // emits a single Anthropic streaming `error` SSE event and
-  // withholds `message_stop` so the client can distinguish a real
-  // completion from a mid-decode failure.
-  //
-  // The Anthropic `/v1/messages` endpoint is stateless and never
-  // calls `sessionReg.adopt()`, so the registry cannot leak a
-  // cached session on failure. This gate's sole job is to make the
-  // client-visible event stream report failures accurately.
+  // Success requires ALL of: sawDone, wasCommitted, no thrown error, no client abort.
+  // Every failure path emits a streaming `error` and withholds `message_stop`.
   const committed = wasCommitted();
   const successful = sawDone && committed && thrownError == null && !clientAborted;
 
   if (successful) {
     const stopReason = terminalStopReason ?? 'end_turn';
     writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens));
-    // `flushTerminalSSE` gates `terminalEmitted` on the write
-    // callback firing without error — proving the kernel accepted
-    // `message_stop`, not just that ServerResponse buffered it.
     await flushTerminalSSE(res, 'message_stop', buildMessageStop(), visibility);
   } else {
-    // Uncommitted terminal. Close any dangling content block so the
-    // error frame arrives at a well-defined stream state, then emit
-    // the Anthropic streaming error event. We do NOT emit
-    // `message_stop` — pairing `message_stop` with an error would
-    // tell the client the turn completed cleanly.
+    // Close any dangling content block so the error frame lands at a clean state,
+    // then emit the streaming error. Never emit `message_stop` here — pairing it
+    // with an error would tell the client the turn completed cleanly.
     if (hasEmittedThinking && !hasEmittedText) {
       writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
     } else if (hasEmittedText) {
@@ -479,26 +370,15 @@ async function handleStreamingNative(
     } else {
       message = 'stream ended without a done event';
     }
-    // The streaming `error` event IS the Anthropic terminal on the
-    // failure path. Gate `terminalEmitted` on its kernel-ack so the
-    // outer catch can correctly distinguish "client already got a
-    // terminal, log-only" from "early write crash, emit fallback".
+    // The streaming `error` event is the Anthropic terminal on the failure path.
     await flushTerminalSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } }, visibility);
   }
   endSSE(res);
 }
 
-// ---------------------------------------------------------------------------
 // Session routing
-// ---------------------------------------------------------------------------
 
-/**
- * Run a stateless Anthropic request through a fresh `ChatSession`.
- *
- * The Anthropic API carries the full conversation in `req.messages`,
- * so there's no cache hit path. Every request primes a new session
- * and runs `startFromHistory`.
- */
+/** Prime a fresh session with the full history and run a single turn. */
 async function runSessionNonStreaming(
   session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
@@ -509,13 +389,10 @@ async function runSessionNonStreaming(
 }
 
 /**
- * Outcome of a streaming session dispatch. `wasCommitted()` is a
- * closure that reports the commit signal AFTER the stream has been
- * consumed by the SSE writer — it compares `session.turns` against
- * the baseline captured AFTER `primeHistory`, mirroring the
- * `/v1/responses` streaming commit gate. The SSE writer reads this
- * post-drain to decide whether to emit `message_stop` (committed) or
- * an `error` SSE event (uncommitted, e.g. finishReason=error).
+ * Streaming dispatch outcome. `wasCommitted()` compares `session.turns` against
+ * the baseline captured AFTER `primeHistory`, matching the `/v1/responses`
+ * streaming commit gate. Called post-drain by the SSE writer to pick the
+ * terminal event (success → `message_stop`, failure → streaming `error`).
  */
 interface MessagesStreamingOutcome {
   stream: AsyncGenerator<ChatStreamEvent>;
@@ -536,9 +413,7 @@ function runSessionStreaming(
   };
 }
 
-// ---------------------------------------------------------------------------
 // Public handler
-// ---------------------------------------------------------------------------
 
 export async function handleCreateMessage(
   res: ServerResponse,
@@ -546,7 +421,6 @@ export async function handleCreateMessage(
   registry: ModelRegistry,
   httpReq?: IncomingMessage,
 ): Promise<void> {
-  // Validate required fields
   if (body == null || typeof body !== 'object') {
     sendAnthropicBadRequest(res, 'Request body must be a JSON object');
     return;
@@ -564,7 +438,6 @@ export async function handleCreateMessage(
     return;
   }
 
-  // Validate message items are non-null objects
   for (const msg of body.messages) {
     if (msg == null || typeof msg !== 'object') {
       sendAnthropicBadRequest(res, 'Each message must be a non-null object');
@@ -572,36 +445,26 @@ export async function handleCreateMessage(
     }
   }
 
-  // Look up model
   const model = registry.get(body.model);
   if (!model) {
     sendAnthropicNotFound(res, `Model "${body.model}" not found`);
     return;
   }
 
-  // Acquire a dispatch lease on `body.model`'s session-registry
-  // binding. The lease keeps the binding (and its FIFO `execLock`
-  // mutex chain) alive across every await in this handler — crucial
-  // because a concurrent `unregister()` + `register(sameModel)`
-  // sequence would otherwise tear the old `SessionRegistry` down and
-  // allocate a fresh one, and the new request's `withExclusive`
-  // would race against this in-flight dispatch on one shared native
-  // model with two independent mutex chains. The lease MUST be
-  // released in a `finally` below so the binding's teardown (if
-  // deferred by a concurrent `unregister()`) completes once the last
-  // dispatch lease finishes.
+  // The lease keeps the binding's FIFO `execLock` chain alive across every
+  // await — a concurrent `unregister()` + `register(sameModel)` would otherwise
+  // tear down the old `SessionRegistry` and race two independent mutex chains
+  // against one shared native model. Must be released in the `finally` below.
   const lease = registry.acquireDispatchLease(body.model);
   if (!lease) {
     sendAnthropicInternalError(res, 'session registry missing for registered model');
     return;
   }
   const leaseModel = lease.model;
-  // Iter-35 finding 1: AbortController wired to the HTTP request's
-  // disconnect events, declared at function scope so the outer
-  // `finally` can always detach listeners even on an early `return`.
-  // Listeners attach only after we pass pre-lock validation — the
-  // holder variables default to the no-op state so the detach loop
-  // safely skips on the early-return path.
+  // AbortController wired to disconnect events. Declared at function scope
+  // so the outer `finally` can detach listeners on early returns; the
+  // `abortListenersAttached` flag gates the detach so pre-validation exits
+  // skip it safely.
   const abortController = new AbortController();
   const abortSocket = res.socket;
   const onAbortClose = (): void => {
@@ -612,19 +475,13 @@ export async function handleCreateMessage(
   };
   let abortListenersAttached = false;
   try {
-    // Fetch the per-model session registry. The Anthropic API is
-    // stateless — we allocate a fresh session for every request via
-    // `getOrCreate(null)` and never adopt it into the cache.
     const sessionReg: SessionRegistry = lease.registry;
-    // Capture the monotonic instance id alongside the session registry
-    // so the in-mutex re-read can detect a hot-swap that lands after
-    // this read but before we acquire the per-model execution mutex.
-    // Unlike `/v1/responses`, the Anthropic handler has no stored
-    // identity check later in the pipeline to catch a mismatch, so this
-    // is the only defence against the race.
+    // Snapshot the monotonic instance id so the in-mutex re-read can detect a
+    // hot-swap that lands between lease acquisition and mutex entry. Unlike
+    // `/v1/responses`, the Anthropic handler has no stored-identity check
+    // downstream to catch the race later.
     const preLockInstanceId: number = lease.instanceId;
 
-    // Map request
     let messages: ChatMessage[];
     let config: ChatConfig;
     try {
@@ -634,50 +491,21 @@ export async function handleCreateMessage(
       return;
     }
 
-    // Walk the stateless history and canonicalize every assistant
-    // fan-out's trailing tool block against its declared sibling order.
-    //
-    // The Anthropic `/v1/messages` endpoint is ALWAYS a stateless
-    // cold-start — there is no continuation gate, no stored prior
-    // chain, no `previous_response_id`. The caller ships a full
-    // self-contained conversation in `req.messages` and
-    // `mapAnthropicRequest` produces the `ChatMessage[]` verbatim.
-    // That leaves caller-supplied tool_result ordering flowing
-    // straight into `primeHistory()`, so a caller can reverse two
-    // sibling tool outputs inside one fan-out's `tool_result` block
-    // and silently bind each output to the wrong call because several
-    // native session backends pair tool results to fan-out calls
-    // POSITIONALLY (not by id). Run the same helper the `/v1/responses`
-    // endpoint uses so a malformed block is rejected with a clear 400
-    // and a reversed-but-valid block is rewritten to canonical
-    // sibling order before dispatch.
-    //
-    // Pass `'anthropic'` so the helper's error strings reference
-    // `tool_result` / `tool_use_id` — the vocabulary the Anthropic
-    // caller actually posted — instead of OpenAI's
-    // `function_call_output` / `call_id`. See iter-23 finding 4.
+    // Canonicalize every assistant fan-out's trailing tool block against its
+    // declared sibling order. Several native session backends pair tool results
+    // to fan-out calls POSITIONALLY (not by id), so caller-reversed sibling
+    // results would silently bind to the wrong call. `'anthropic'` selects
+    // error-message vocabulary (`tool_result` / `tool_use_id`).
     const historyError = validateAndCanonicalizeHistoryToolOrder(messages, 'anthropic');
     if (historyError !== null) {
       sendAnthropicBadRequest(res, historyError);
       return;
     }
 
-    // The Anthropic endpoint is stateless — every request allocates a
-    // fresh `ChatSession` (via `getOrCreate(null, ...)`) and never
-    // adopts it back into the cache. The `system` prompt is baked into
-    // `messages` by `mapAnthropicRequest` and replayed via
-    // `startFromHistory`, so there is no session-reuse path where a
-    // stale system context could leak across requests. We still pass
-    // the canonicalized system string to `getOrCreate` to keep the
-    // registry API contract uniform across both OpenAI and Anthropic
-    // endpoints — it is the caller's single "prefix/system state"
-    // identity field.
-    //
-    // Anthropic's `system` field may be a string OR an array of content
-    // blocks. We canonicalize to a deterministic JSON-stringified form
-    // when it is structured so the equality check on a hypothetical
-    // hit path would be stable across requests. Simple strings are
-    // passed through unchanged to keep the common case readable.
+    // The system prompt is baked into `messages` and replayed via `startFromHistory`,
+    // so it cannot leak across requests. We still pass a canonicalized form to
+    // `getOrCreate` to keep the registry API uniform with `/v1/responses`. Arrays
+    // are JSON-stringified; plain strings pass through.
     let requestedSystem: string | null;
     if (typeof body.system === 'string') {
       requestedSystem = body.system;
@@ -687,28 +515,18 @@ export async function handleCreateMessage(
       requestedSystem = null;
     }
 
-    // Per-model execution mutex. Every dispatch through `/v1/messages`
-    // serializes with every dispatch through `/v1/responses` for the
-    // same model binding. The native `SessionCapableModel` is a single
-    // mutable resource — one shared `cached_token_history` / one
-    // `caches` vector per instance — so two concurrent `primeHistory`
-    // + `startFromHistory` calls would clobber each other's KV state
-    // even though each caller holds a distinct `ChatSession` wrapper.
-    // Holding the registry's exclusive lock across the full dispatch
-    // closes the race: at most one request at a time drives native
-    // decode on this model, and the `finally` inside `withExclusive`
-    // releases the lock regardless of whether the closure threw, so a
-    // failed dispatch cannot leave the next waiter stuck.
-    // Iter-35 finding 1: arm the AbortController now — we are past
-    // every validation gate, so listeners have a matching detach in
-    // the outer `finally` guarded by `abortListenersAttached`. The
-    // streaming wrappers in `@mlx-node/lm` plumb this signal into
-    // `_runChatStream`, which calls `handle.cancel()` on the native
-    // ChatStreamHandle AND pushes a synthetic abort marker so the
-    // pending `await waitForItem()` unblocks immediately on a dead
-    // peer. Without the signal a client that dropped mid-eval would
-    // pin this handler (and the per-model mutex) until the next
-    // native chunk arrived.
+    // Per-model execution mutex. Every dispatch through `/v1/messages` serializes
+    // with every dispatch through `/v1/responses` for the same model binding.
+    // The native `SessionCapableModel` is a single mutable resource (shared
+    // `cached_token_history` / `caches`), so two concurrent `primeHistory` +
+    // `startFromHistory` would clobber each other's KV state.
+    //
+    // Arm the AbortController now — past all validation gates, so the
+    // matching detach in the outer `finally` is guarded by
+    // `abortListenersAttached`. Streaming wrappers in `@mlx-node/lm` plumb
+    // this signal through `_runChatStream` to cancel the native
+    // `ChatStreamHandle` and unblock the pending `waitForItem()` on
+    // disconnect.
     res.once('close', onAbortClose);
     res.once('error', onAbortError);
     if (abortSocket != null) {
@@ -722,26 +540,10 @@ export async function handleCreateMessage(
     const streamSignal: AbortSignal = abortController.signal;
 
     await sessionReg.withExclusive(async () => {
-      // Hot-swap race guard inside the mutex.
-      //
-      // `withExclusive` can park this waiter behind a long-running
-      // dispatch on the same model, and `ModelRegistry.register()` is
-      // NOT coordinated with that lock — a concurrent
-      // `registry.register(body.model, newModel)` can re-point the
-      // friendly name while we are parked. Without this in-lock
-      // re-read the closure would dispatch through the already-
-      // captured `sessionReg`, running a session turn on a model
-      // object that `body.model` no longer resolves to. Unlike
-      // `/v1/responses` the Anthropic endpoint has no stored-identity
-      // check later in the pipeline to catch the mismatch — two
-      // requests for the same model name could silently be serviced
-      // by different underlying models based purely on queue timing.
-      //
-      // Compare the live binding to the pre-lock snapshot captured
-      // just before entering the mutex. Any drift — missing session
-      // registry, missing instance id, session registry identity
-      // change, or instance id change — is fatal and rejected with a
-      // 400 so the caller can retry against the new binding.
+      // Hot-swap race guard. `ModelRegistry.register()` is not coordinated with
+      // `withExclusive`, so a concurrent re-register of the same friendly name
+      // could silently dispatch this request through a stale model. Any drift
+      // from the pre-lock snapshot is fatal.
       const lockedSessionReg = registry.getSessionRegistry(body.model);
       const lockedInstanceId = registry.getInstanceId(body.model);
       if (
@@ -764,18 +566,9 @@ export async function handleCreateMessage(
 
       const session = sessionReg.getOrCreate(null, requestedSystem);
 
-      // Visibility / wire-format tracker shared between the handler
-      // body and the outer catch. The catch branches on
-      // `responseMode` (JSON vs SSE) instead of `res.headersSent`,
-      // which flips synchronously in `writeHead` before the body
-      // lands and therefore lies about whether the client is
-      // actually consuming JSON or SSE. Iter-33 finding 3: this is
-      // the same wire-contract fix as `/v1/responses`; the
-      // Anthropic handler is stateless so there is no session to
-      // adopt, but the outer catch can still corrupt the response
-      // by emitting an SSE frame into a JSON-declared body (or
-      // hang the request by misclassifying an early SSE-write
-      // crash).
+      // Outer catch branches on `responseMode` (not `res.headersSent`, which
+      // flips in `writeHead` before the body lands) so a crash after
+      // `writeHead(application/json)` cannot leak SSE frames into a JSON body.
       const visibility = createVisibility();
 
       try {
@@ -783,15 +576,8 @@ export async function handleCreateMessage(
           const outcome = runSessionStreaming(session, messages, config, streamSignal);
           await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq, visibility);
         } else {
-          // Iter-35 finding 2 (part a): the non-streaming Anthropic
-          // path has NO AbortSignal surface (native
-          // `chatSessionStart` is a plain Promise, no cancel), so a
-          // client that disconnects mid-generation still burns every
-          // remaining token under this mutex. TODO(iter35): native
-          // cancellation for `chatSession*` — until then the
-          // disconnect-aware skip inside `handleNonStreaming`
-          // short-circuits the JSON write on a dead peer so the
-          // handler exits the mutex as soon as native decode returns.
+          // Native `chatSessionStart` has no AbortSignal yet — disconnect handling
+          // lives inside `handleNonStreaming` / `endJson`.
           const result = await runSessionNonStreaming(session, messages, config);
           await handleNonStreaming(res, result, body, visibility);
         }
@@ -800,36 +586,29 @@ export async function handleCreateMessage(
         if (visibility.responseMode === null) {
           sendAnthropicInternalError(res, message);
         } else if (visibility.responseMode === 'json') {
-          // Already committed to JSON on the wire; emitting anything
-          // else would corrupt the response. Destroy the socket so
-          // the client sees a truncated JSON body instead of a
-          // mismatched-MIME-type frame.
+          // Already committed to JSON — destroy the socket rather than corrupt the body.
           try {
             res.destroy(err instanceof Error ? err : new Error(message));
           } catch {
             // Socket may already be gone.
           }
         } else {
-          // `responseMode === 'sse'`: best-effort streaming `error`
-          // event, but only if no terminal already landed. A double
-          // terminal would confuse the client's event-stream state
-          // machine.
+          // SSE: best-effort streaming `error`, but only if no terminal landed
+          // (a double terminal would confuse the client state machine).
           if (!visibility.terminalEmitted) {
             writeFallbackErrorSSE(res, 'error', { error: { type: 'api_error', message } });
           }
           try {
             endSSE(res);
           } catch {
-            // Already closed / destroyed.
+            // Already closed.
           }
         }
       }
     });
   } finally {
-    // Iter-35 finding 1: drop the AbortController's socket/request
-    // listeners so they do not keep the request object alive past
-    // handler return. Only detach if we reached the installation
-    // site — early-return validation gates exit before that point.
+    // Drop disconnect listeners so they don't pin the request past handler
+    // return. Only detach if we actually attached (gated by the flag).
     if (abortListenersAttached) {
       res.removeListener('close', onAbortClose);
       res.removeListener('error', onAbortError);
@@ -841,14 +620,10 @@ export async function handleCreateMessage(
         httpReq.removeListener('error', onAbortError);
       }
     }
-    // Release the dispatch lease on the ORIGINAL model object the
-    // lease was acquired against (not a re-read of `body.model`,
-    // which may have been hot-swapped while we held the mutex). A
-    // pending teardown — `unregister()` called concurrently while
-    // this dispatch held the lease — finalises here once the
-    // in-flight counter drops to zero (the messages endpoint is
-    // stateless, so it takes no `retainBinding` against the
-    // post-commit persist counter).
+    // Release against the ORIGINAL lease model — re-reading `body.model`
+    // would resolve to a possibly hot-swapped binding. A concurrent
+    // `unregister()` held against this lease finalises its teardown here
+    // when the in-flight counter drops to zero.
     registry.releaseDispatchLease(leaseModel);
   }
 }

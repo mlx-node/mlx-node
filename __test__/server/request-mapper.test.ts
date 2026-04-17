@@ -382,15 +382,10 @@ describe('mapRequest', () => {
 
   describe('assistant message + function_call coalescing (Finding 3)', () => {
     it('coalesces assistant message followed by function_call into a single assistant turn', () => {
-      // Finding 3: a single assistant turn that produced both text
-      // and tool calls is serialised by the OpenAI Responses API
-      // as `[message(assistant, text), function_call, ...]`. The
-      // mapper must coalesce that run into ONE `assistant`
-      // ChatMessage carrying both text and `toolCalls`, matching
-      // the hot-path `ChatSession` shape exactly. Splitting the
-      // run into two assistant messages would corrupt cold replay
-      // (different model output) and trip the history walker
-      // (orphaned leading assistant turn).
+      // A single assistant turn that produced both text and tool calls is serialised by
+      // the OpenAI Responses API as `[message(assistant, text), function_call, ...]`.
+      // The mapper must coalesce that run into ONE `assistant` ChatMessage carrying
+      // both text and `toolCalls`, matching the hot-path `ChatSession` shape exactly.
       const { messages } = mapRequest({
         model: 'test-model',
         input: [
@@ -629,14 +624,9 @@ describe('reconstructMessagesFromChain', () => {
   });
 
   it('preserves assistant turn when empty text accompanies reasoning', () => {
-    // Iter-24 finding 3: an empty assistant `message` item
-    // alongside a non-empty `reasoning` item must reconstruct
-    // the assistant turn. The iter-23 predicate
-    // (`assistantText || toolCalls.length > 0`) dropped the
-    // turn entirely, silently reconstructing a different
-    // conversation on cold replay after the session's TTL
-    // expired — downstream gates that walk the reconstructed
-    // trailing assistant would see the wrong structure.
+    // An empty assistant `message` item alongside a non-empty `reasoning` item must
+    // still reconstruct the assistant turn, otherwise cold replay after TTL expiry
+    // silently rebuilds a different conversation than the live session saw.
     const chain = [
       {
         inputJson: JSON.stringify([{ role: 'user', content: 'Hello' }]),
@@ -661,11 +651,8 @@ describe('reconstructMessagesFromChain', () => {
   });
 
   it('preserves assistant turn with reasoning even when no message item is present', () => {
-    // Stronger variant of the iter-24 finding 3 regression:
-    // some stored records carry ONLY a `reasoning` item (no
-    // `message`). The reconstruction must still re-emit the
-    // assistant turn, carrying the reasoning summary through
-    // to any cold-replay path.
+    // Some stored records carry ONLY a `reasoning` item (no `message`); reconstruction
+    // must still re-emit the assistant turn, carrying the reasoning summary through.
     const chain = [
       {
         inputJson: JSON.stringify([{ role: 'user', content: 'Tell me a secret' }]),
@@ -690,13 +677,9 @@ describe('reconstructMessagesFromChain', () => {
   });
 
   it('skips assistant message when output has no text, no reasoning, and no tool calls', () => {
-    // Counter-test for iter-24 finding 3: a stored record with
-    // NO assistant-facing items at all (no message, no
-    // reasoning, no function_call) still produces no assistant
-    // turn on reconstruction. Legitimate no-op turns — e.g. a
-    // tool-result continuation where the model emitted
-    // nothing — would otherwise clutter the replayed history
-    // with an empty assistant.
+    // A stored record with NO assistant-facing items at all (no message, no reasoning,
+    // no function_call) must produce no assistant turn on reconstruction — otherwise
+    // legitimate no-op turns clutter the replayed history with an empty assistant.
     const chain = [
       {
         inputJson: JSON.stringify([{ role: 'user', content: 'Hello' }]),
@@ -710,11 +693,8 @@ describe('reconstructMessagesFromChain', () => {
   });
 
   it('preserves assistant turn driven purely by tool calls', () => {
-    // Counter-test for the iter-24 finding 3 fix: the new
-    // predicate still preserves tool-call-only assistant
-    // turns — the `toolCalls.length > 0` branch is the
-    // original behavior and MUST keep working after the
-    // predicate was widened to include reasoning.
+    // Tool-call-only assistant turns must remain reconstructible after the predicate
+    // was widened to also accept reasoning-only / empty-text turns.
     const chain = [
       {
         inputJson: JSON.stringify([{ role: 'user', content: 'Get weather' }]),
@@ -739,18 +719,11 @@ describe('reconstructMessagesFromChain', () => {
   });
 
   it('preserves assistant turn when only an empty-text message item is present', () => {
-    // Iter-25 finding 3: the server deliberately emits a
-    // `message` item with empty text when a turn completes with no
-    // tool calls and no output (e.g. a tool-result continuation
-    // where the model acknowledged the result but produced
-    // nothing). `ChatSession` hot-path history always appends an
-    // assistant message for every completed turn. The iter-24
-    // predicate (`assistantText.length > 0 || thinkingText.length
-    // > 0 || toolCalls.length > 0`) silently dropped this shape
-    // on cold replay, so the reconstructed history primed a
-    // DIFFERENT conversation than the live session saw. The new
-    // predicate keys on item PRESENCE, not accumulated content,
-    // so the blank assistant turn is preserved verbatim.
+    // The server deliberately emits a `message` item with empty text when a turn
+    // completes with no tool calls and no output (e.g. a tool-result continuation
+    // where the model acknowledged and produced nothing). `ChatSession` hot-path
+    // history always appends an assistant message for every completed turn — the
+    // reconstruction predicate keys on item PRESENCE, not accumulated content.
     const chain = [
       {
         inputJson: JSON.stringify([{ role: 'user', content: 'thanks' }]),
@@ -771,12 +744,10 @@ describe('reconstructMessagesFromChain', () => {
   });
 
   it('preserves assistant turn when an empty message item accompanies an empty reasoning item', () => {
-    // Iter-25 finding 3 counterpart: the stored record carries
-    // BOTH a `message` item with empty text and a `reasoning`
-    // item with empty summary. The assistant turn must still be
-    // reconstructed (empty content, NO reasoningContent field —
-    // we omit empty reasoning so the reconstructed shape matches
-    // a plain blank successful turn byte-for-byte).
+    // A stored record carrying BOTH a `message` item with empty text and a `reasoning`
+    // item with empty summary must reconstruct the assistant turn with empty content
+    // and NO reasoningContent field — we omit empty reasoning so the reconstructed
+    // shape matches a plain blank successful turn byte-for-byte.
     const chain = [
       {
         inputJson: JSON.stringify([{ role: 'user', content: 'thanks' }]),
@@ -794,16 +765,12 @@ describe('reconstructMessagesFromChain', () => {
     ];
 
     const messages = reconstructMessagesFromChain(chain);
-    // Assistant turn preserved, reasoningContent omitted because
-    // the stored reasoning summary was empty.
     expect(messages).toEqual([
       { role: 'user', content: 'thanks' },
       { role: 'assistant', content: '' },
     ]);
-    // Defensive: explicitly pin that `reasoningContent` is
-    // absent, not present-but-empty. Some downstream code paths
-    // distinguish `undefined` from `''` when deciding whether to
-    // emit a <think> block.
+    // Pin that `reasoningContent` is absent, not present-but-empty — some downstream
+    // paths distinguish `undefined` from `''` when deciding whether to emit <think>.
     expect(messages[1]).not.toHaveProperty('reasoningContent');
   });
 });

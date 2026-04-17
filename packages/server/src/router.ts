@@ -1,6 +1,4 @@
-/**
- * Simple path-based router for /v1/* endpoints.
- */
+/** Path-based router for /v1/* endpoints. */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
@@ -20,12 +18,9 @@ import type { ModelRegistry } from './registry.js';
 import type { AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';
 
-/** Maximum request body size: 10 MB. */
+/** Max request body size (10 MB). */
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
-/**
- * Read the request body as a UTF-8 string, rejecting if it exceeds the size limit.
- */
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -44,9 +39,6 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-/**
- * Route an incoming request to the appropriate endpoint handler.
- */
 export async function routeRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -57,7 +49,6 @@ export async function routeRequest(
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
 
-  // GET /v1/models
   if (path === '/v1/models') {
     if (req.method !== 'GET') {
       sendMethodNotAllowed(res, 'GET');
@@ -67,7 +58,6 @@ export async function routeRequest(
     return;
   }
 
-  // POST /v1/responses
   if (path === '/v1/responses') {
     if (req.method !== 'POST') {
       sendMethodNotAllowed(res, 'POST');
@@ -89,7 +79,6 @@ export async function routeRequest(
     return;
   }
 
-  // POST /v1/messages (Anthropic Messages API)
   if (path === '/v1/messages') {
     if (req.method !== 'POST') {
       sendAnthropicMethodNotAllowed(res, 'POST');
@@ -111,7 +100,6 @@ export async function routeRequest(
     return;
   }
 
-  // Health check
   if (path === '/health' || path === '/v1/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok' }));

@@ -1,6 +1,4 @@
-/**
- * Maps ChatResult / ChatStreamEvent to Anthropic Messages API output.
- */
+/** ChatResult / ChatStreamEvent → Anthropic Messages API output. */
 
 import type { ChatResult } from '@mlx-node/core';
 
@@ -18,11 +16,6 @@ import type {
 } from '../types-anthropic.js';
 import { genId } from './response.js';
 
-/**
- * Parse tool call arguments into an object.
- * If the arguments are already an object, use them directly.
- * If they are a string, JSON.parse them.
- */
 function parseArguments(args: Record<string, unknown> | string): Record<string, unknown> {
   if (typeof args === 'string') {
     return JSON.parse(args) as Record<string, unknown>;
@@ -30,9 +23,6 @@ function parseArguments(args: Record<string, unknown> | string): Record<string, 
   return args;
 }
 
-/**
- * Map the internal finishReason to the Anthropic stop_reason.
- */
 export function mapStopReason(finishReason: string, hasToolCalls: boolean): 'end_turn' | 'max_tokens' | 'tool_use' {
   if (finishReason === 'length') {
     return 'max_tokens';
@@ -43,21 +33,16 @@ export function mapStopReason(finishReason: string, hasToolCalls: boolean): 'end
   return 'end_turn';
 }
 
-/**
- * Build the content array from a ChatResult for the Anthropic Messages API.
- */
 export function buildAnthropicContent(result: ChatResult): AnthropicResponseContent[] {
   const content: AnthropicResponseContent[] = [];
 
-  // Thinking block
   if (result.thinking) {
     content.push({ type: 'thinking', thinking: result.thinking });
   }
 
-  // Tool use blocks (only successfully parsed tool calls)
   const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
 
-  // Text block (present if text is non-empty, or if there are no ok tool calls)
+  // Emit a text block unless tool calls exist and there is no text.
   if (result.text || okToolCalls.length === 0) {
     content.push({ type: 'text', text: result.text });
   }
@@ -74,9 +59,6 @@ export function buildAnthropicContent(result: ChatResult): AnthropicResponseCont
   return content;
 }
 
-/**
- * Build a full AnthropicMessagesResponse from a ChatResult and the original request.
- */
 export function buildAnthropicResponse(
   result: ChatResult,
   req: AnthropicMessagesRequest,
@@ -100,14 +82,9 @@ export function buildAnthropicResponse(
   };
 }
 
-// ---------------------------------------------------------------------------
 // Streaming helpers
-// ---------------------------------------------------------------------------
 
-/**
- * Build a message_start event.
- * The embedded message has empty content and zero output_tokens at this point.
- */
+/** Embedded message has empty content and zero output_tokens at start. */
 export function buildMessageStartEvent(
   req: AnthropicMessagesRequest,
   messageId: string,
@@ -131,9 +108,6 @@ export function buildMessageStartEvent(
   };
 }
 
-/**
- * Build a content_block_start event.
- */
 export function buildContentBlockStart(
   index: number,
   block: AnthropicResponseContent,
@@ -145,9 +119,6 @@ export function buildContentBlockStart(
   };
 }
 
-/**
- * Build a content_block_delta event.
- */
 export function buildContentBlockDelta(index: number, delta: AnthropicDelta): AnthropicContentBlockDeltaEvent {
   return {
     type: 'content_block_delta',
@@ -156,9 +127,6 @@ export function buildContentBlockDelta(index: number, delta: AnthropicDelta): An
   };
 }
 
-/**
- * Build a content_block_stop event.
- */
 export function buildContentBlockStop(index: number): AnthropicContentBlockStopEvent {
   return {
     type: 'content_block_stop',
@@ -166,9 +134,6 @@ export function buildContentBlockStop(index: number): AnthropicContentBlockStopE
   };
 }
 
-/**
- * Build a message_delta event with the final stop_reason and token count.
- */
 export function buildMessageDelta(
   stopReason: string,
   outputTokens: number,
@@ -187,9 +152,6 @@ export function buildMessageDelta(
   };
 }
 
-/**
- * Build a message_stop event.
- */
 export function buildMessageStop(): AnthropicMessageStopEvent {
   return {
     type: 'message_stop',

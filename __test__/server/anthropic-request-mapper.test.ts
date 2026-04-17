@@ -128,13 +128,8 @@ describe('mapAnthropicRequest', () => {
   });
 
   it('accepts tool_result followed by trailing text and emits a tool block + user turn', () => {
-    // Finding 2: the common Anthropic shape
-    // `[tool_result, text("now do X")]` was rejected as "cannot
-    // mix tool_result with text" even though the text clearly
-    // follows the tool result and is the same user turn answering
-    // with a follow-up instruction. Accept the prefix shape: emit
-    // the tool message(s) first, then a trailing user message
-    // carrying the text/image content.
+    // Accept the common Anthropic shape `[tool_result, text("now do X")]`: emit the
+    // tool message(s) first, then a trailing user message carrying text/image content.
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -182,18 +177,11 @@ describe('mapAnthropicRequest', () => {
   });
 
   it('rejects a tool_result whose content array carries a nested image block', () => {
-    // Iter-27 finding 2: Anthropic allows `tool_result.content` to
-    // be an array mixing text and image blocks, but the internal
-    // `ChatMessage` shape is a NAPI-generated Rust struct with no
-    // `images` field on `role: 'tool'` messages. The iter-26
-    // "hoist to trailing user message" workaround silently
-    // reordered images relative to the caller's declaration AND
-    // lost the per-tool association once downstream
-    // canonicalization reordered the tool rows. We now refuse
-    // the shape outright. Callers who need to send a screenshot
-    // as a tool result should serialize a text reference inside
-    // the tool_result and then send the raw image as a top-level
-    // image block in a separate user turn.
+    // Anthropic allows `tool_result.content` to mix text and image blocks, but the
+    // internal `ChatMessage` shape is a NAPI-generated Rust struct with no `images`
+    // field on `role: 'tool'`. Refuse this shape outright — hoisting the image onto
+    // a trailing user turn would reorder images relative to the caller's declaration
+    // and lose the per-tool association after canonicalization reorders tool rows.
     const imageData =
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
     expect(() =>
@@ -220,11 +208,9 @@ describe('mapAnthropicRequest', () => {
   });
 
   it('rejects a tool_result nested image even when another tool_result in the same turn is plain text', () => {
-    // Iter-27 finding 2 regression: when the caller mixes a
-    // plain-text tool_result with one that carries a nested image,
-    // we must reject the whole turn rather than silently hoisting
-    // the image onto a trailing user message that no longer has a
-    // clear owner after canonicalization reorders the tool rows.
+    // When the caller mixes a plain-text tool_result with one that carries a nested
+    // image, reject the whole turn rather than silently hoisting the image onto a
+    // trailing user message that loses its owner after canonicalization.
     const imageData =
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
     expect(() =>
@@ -251,18 +237,10 @@ describe('mapAnthropicRequest', () => {
     ).toThrow(/nested image content in tool_result blocks is not representable/i);
   });
 
-  // Iter-28 finding 4: the iter-27 mapper silently concatenated
-  // trailing text blocks and bucketed trailing image blocks after a
-  // tool_result prefix, which reordered interleaved shapes like
-  // `[tool_result, text, image, text, image]` into a flat
-  // `content="AB", images=[X, Y]` user message that lost BOTH the
-  // caller-declared text/image interleaving and any
-  // image-immediately-before-text vs image-immediately-after-text
-  // distinction. The flat NAPI `ChatMessage` shape cannot represent
-  // the caller's intent, so the mapper now rejects ambiguous
-  // shapes outright. The tests below pin the narrow accepted set
-  // (pure trailing text, single trailing image) and pin rejection
-  // for every interleaved / multi-image shape.
+  // The flat NAPI `ChatMessage` shape cannot represent interleaved text/image blocks
+  // after a tool_result prefix, so the mapper rejects ambiguous shapes. These tests
+  // pin the narrow accepted set (pure trailing text, single trailing image) and pin
+  // rejection for every interleaved / multi-image shape.
   const iter28Png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 
   it('rejects trailing text followed by an image after a tool_result prefix', () => {
@@ -387,11 +365,9 @@ describe('mapAnthropicRequest', () => {
   });
 
   it('maps a pure-tool_result user turn to a contiguous tool block (counter-test)', () => {
-    // Positive counter-test for iter-23 finding 3: a user turn
-    // whose blocks are ALL tool_result still maps cleanly to a
-    // contiguous `tool` ChatMessage block in caller-supplied
-    // order. Downstream canonicalization reorders against the
-    // assistant's declared sibling order.
+    // A user turn whose blocks are ALL tool_result maps cleanly to contiguous `tool`
+    // ChatMessage blocks in caller-supplied order (downstream canonicalization then
+    // reorders against the assistant's declared sibling order).
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -413,9 +389,8 @@ describe('mapAnthropicRequest', () => {
   });
 
   it('maps a pure text/image user turn to a single user message (counter-test)', () => {
-    // Positive counter-test for iter-23 finding 3: a user turn
-    // containing only text and image blocks still maps to a
-    // single `user` ChatMessage with both fields populated.
+    // A user turn containing only text and image blocks maps to a single `user`
+    // ChatMessage with both fields populated.
     const imageData =
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
     const { messages } = mapAnthropicRequest({
@@ -439,19 +414,10 @@ describe('mapAnthropicRequest', () => {
   });
 
   it('wraps tool_result.is_error=true content in a JSON envelope', () => {
-    // Iter-24 finding 2: `ChatMessage.content` is a string and
-    // `ChatMessage` is a NAPI-generated struct with no `isError`
-    // field. The iter-23 encoding prefixed errored content with
-    // a `[tool error] ` marker, but that mutated the payload:
-    // JSON outputs became invalid JSON, successful outputs
-    // starting with `[tool error] ` were indistinguishable from
-    // errors, and errored outputs already carrying the prefix
-    // got double-prefixed. The mapper now wraps errored content
-    // in a JSON envelope — `{ "is_error": true, "content":
-    // <original> }` — so the encoding is unambiguous, lossless,
-    // and non-colliding: JSON escaping preserves the raw
-    // payload verbatim, and a successful tool_result is passed
-    // through untouched.
+    // `ChatMessage.content` is a string with no `isError` field, so errored
+    // tool_result content is wrapped as `{"is_error":true,"content":<original>}` —
+    // an unambiguous, lossless, non-colliding encoding that preserves the raw
+    // payload verbatim. Successful tool_result is passed through untouched.
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -480,14 +446,9 @@ describe('mapAnthropicRequest', () => {
   });
 
   it('preserves a JSON tool_result payload losslessly inside the is_error envelope', () => {
-    // Iter-24 finding 2 regression: a JSON payload would be
-    // shredded by the iter-23 `[tool error] ` prefix because
-    // prepending literal text to `{...}` produces a string
-    // that no longer parses as JSON. The envelope preserves
-    // the raw payload verbatim as the `content` field, so a
-    // downstream reader can either pass the whole envelope
-    // through or `JSON.parse` it and recover both the flag
-    // and the original JSON text.
+    // The envelope preserves the raw payload verbatim as the `content` field, so a
+    // downstream reader can either pass the whole envelope through or `JSON.parse`
+    // it and recover both the flag and the original JSON text.
     const jsonPayload = '{"error_code":500,"message":"upstream unavailable"}';
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
@@ -511,19 +472,15 @@ describe('mapAnthropicRequest', () => {
     const toolMsg = messages[0]!;
     expect(toolMsg.role).toBe('tool');
     expect(toolMsg.toolCallId).toBe('call_json_fail');
-    // The encoded content is itself valid JSON and `content` inside
-    // equals the untouched original payload.
+    // Encoded content is itself valid JSON and `content` inside equals the original.
     const parsed = JSON.parse(toolMsg.content) as { is_error: boolean; content: string };
     expect(parsed).toEqual({ is_error: true, content: jsonPayload });
   });
 
   it('does not wrap successful tool_result content that looks like a JSON envelope', () => {
-    // Iter-24 finding 2 counter-test: a successful tool_result
-    // whose content happens to be a JSON object — including one
-    // structurally resembling `{"is_error":true,"content":...}`
-    // — MUST NOT be rewrapped. Successful payloads are passed
-    // through verbatim, so the envelope shape is reserved
-    // exclusively for `is_error === true` on the mapper output.
+    // A successful tool_result whose content happens to be a JSON object — even one
+    // structurally resembling `{"is_error":true,"content":...}` — MUST NOT be
+    // rewrapped. The envelope shape is reserved exclusively for `is_error === true`.
     const suspicious = '{"is_error":true,"content":"this was supplied by a tool that returned success"}';
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
@@ -540,11 +497,8 @@ describe('mapAnthropicRequest', () => {
   });
 
   it('leaves tool_result content untouched when is_error is absent or false', () => {
-    // Counter-test for iter-24 finding 2: the envelope MUST NOT
-    // leak into successful tool_result content — including
-    // content that starts with `[tool error] `, which under
-    // the iter-23 prefix encoding would have been
-    // indistinguishable from a real failure.
+    // The envelope MUST NOT leak into successful tool_result content — including
+    // content that literally starts with `[tool error] `.
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,

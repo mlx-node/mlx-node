@@ -132,10 +132,8 @@ describe('SessionRegistry', () => {
   });
 
   it('getOrCreate with mismatched instructions evicts and returns a fresh session', () => {
-    // Finding 1 regression: a cache hit with new `instructions` must
-    // fall through to cold replay. Returning the warmed session would
-    // silently reuse the stale system context while a cold miss would
-    // replay the new one — making output depend on LRU state.
+    // A cache hit with new `instructions` must fall through to cold replay; otherwise
+    // a warmed session reuses stale system context while a cold miss replays the new one.
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -363,13 +361,10 @@ describe('SessionRegistry', () => {
     });
 
     it('serializes two overlapping dispatches against the same registry', async () => {
-      // Iter-24 finding 1 regression: `/v1/responses` and
-      // `/v1/messages` can both arrive for the same model in
-      // overlapping ticks, and each dispatch holds a
-      // `ChatSession` pointing at the SAME shared native model.
-      // Two concurrent `primeHistory` / `send*` calls would
-      // clobber each other's KV state — the mutex must serialize
-      // them so at most one dispatch owns the model at a time.
+      // `/v1/responses` and `/v1/messages` can arrive in overlapping ticks for the same
+      // model; both dispatches hold a `ChatSession` pointing at the SAME shared native
+      // model. The mutex must serialize them so at most one dispatch owns the model at
+      // a time — otherwise concurrent primeHistory/send* calls clobber KV state.
       const model = makeMockModel();
       const reg = new SessionRegistry({ model });
 

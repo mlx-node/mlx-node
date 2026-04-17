@@ -314,23 +314,18 @@ describe('ModelRegistry', () => {
 
   describe('persist retention (iter-40 Finding 1)', () => {
     it('retainBinding defers teardown across unregister/re-register so the instance id survives', () => {
-      // The persist retention counter is ORTHOGONAL to the
-      // dispatch lease. Iter-39 releases the dispatch lease
-      // eagerly after `withExclusive` returns so a wedged
-      // `store.store(...)` cannot pin abort listeners or the
-      // lease; iter-40 adds retainBinding so the binding's
-      // `modelInstanceId` still survives until every row the
-      // persist stamped has landed. This is the behaviour
-      // under test.
+      // Persist retention is ORTHOGONAL to the dispatch lease: the lease releases
+      // eagerly after `withExclusive` returns so a wedged `store.store(...)` cannot
+      // pin abort listeners, and retainBinding keeps the binding's `modelInstanceId`
+      // alive until every row the persist stamped has landed.
       const registry = new ModelRegistry();
       const model = createMockSessionModel();
       registry.register('foo', model);
       const originalId = registry.getInstanceId('foo');
       expect(typeof originalId).toBe('number');
 
-      // Acquire + release the dispatch lease to model the
-      // iter-39 eager-release path: the dispatch is done, but
-      // retainBinding was called from the persist initiation
+      // Acquire + release the dispatch lease to model the eager-release path: the
+      // dispatch is done, but retainBinding was called from the persist initiation
       // and we still hold a pending persist against the binding.
       const lease = registry.acquireDispatchLease('foo');
       expect(lease).toBeDefined();

@@ -9,14 +9,12 @@
 // same code paths — only the wall-clock wait shrinks.
 process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS = '50';
 process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS = '50';
-// Iter-44: the second-stage hard-timeout breaker defaults to 60s
-// production-wide. For the test suite the default is DISABLED
-// (`'0'`) so the iter-43 pin-forever invariant — the retain
-// stays elevated past the soft timeout until the persist's own
-// `.finally(...)` releases it — can be asserted without racing
-// the hard-timeout timer. The iter-44 regression test that
-// specifically exercises the breaker flips this to a small
-// value locally via save/restore.
+// The second-stage hard-timeout breaker defaults to 60s production-wide. For the
+// test suite the default is DISABLED (`'0'`) so the pin-forever invariant (the
+// retain stays elevated past the soft timeout until the persist's own
+// `.finally(...)` releases it) can be asserted without racing the hard-timeout
+// timer. The specific breaker test below flips this to a small value via
+// save/restore.
 process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '0';
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -90,13 +88,10 @@ function createMockRes(): {
     },
   });
 
-  // Attach ServerResponse-like methods. `writeHead` mirrors Node's
-  // `ServerResponse.writeHead`: it flips `headersSent = true`
-  // synchronously, BEFORE any body bytes leave the buffer. The
-  // production code relies on this being honest for the
-  // iter-32-finding-1 regression tests below — a mock that waited
-  // until `end()` to flip `headersSent` would hide the lie that the
-  // finding fixed.
+  // `writeHead` mirrors Node's `ServerResponse.writeHead`: flips `headersSent = true`
+  // synchronously BEFORE any body bytes leave the buffer. Production code (and the
+  // SSE-header-flip visibility tests below) rely on this being honest — a mock that
+  // waited until `end()` to flip `headersSent` would hide real bugs.
   writable.writeHead = (s: number, h?: Record<string, string>) => {
     status = s;
     if (h) {
@@ -119,12 +114,10 @@ function createMockRes(): {
   writable.headersSent = false;
 
   const origEnd = writable.end.bind(writable);
-  // Mirrors Node's overloaded `end()` signature
-  // (chunk?, encoding? | cb?, cb?): the callback slot floats
-  // depending on whether `encoding` was passed. Iter-33 regression
-  // tests call `res.end(body, cb)` via `endJson`, so the mock MUST
-  // hoist the callback out of the `encoding` slot when it is a
-  // function — otherwise the cb never fires and `endJson` hangs.
+  // Mirror Node's overloaded `end()` signature (chunk?, encoding? | cb?, cb?): the
+  // callback slot floats depending on whether `encoding` was passed. The `endJson`
+  // helper calls `res.end(body, cb)`, so the mock MUST hoist the callback out of
+  // the `encoding` slot when it is a function — otherwise cb never fires.
   (writable as unknown as { end: (...args: unknown[]) => unknown }).end = (
     chunkArg?: unknown,
     encodingArg?: unknown,
@@ -160,16 +153,12 @@ function createMockRes(): {
     return writable;
   };
 
-  // Track `res.destroy()` calls from the outer catch. The iter-33
-  // fix replaces the SSE-fallback-on-JSON-failure path with a
-  // `res.destroy(err)`, so the JSON-request end-callback-error
-  // regression test needs a signal for "the request was torn down"
-  // that is distinct from `end()` being called. Resolve `endPromise`
-  // here too so `waitForEnd()` returns even on the destroy path.
-  // Swallow any `'error'` emitted by the underlying Writable's
-  // destroy path. Node's real `ServerResponse` handles its own
-  // socket error listeners; the mock has none, so a bare
-  // `writable.destroy(err)` would blow up as an uncaught error.
+  // Track `res.destroy()` calls from the outer catch. The outer catch destroys the
+  // socket on JSON-mode failure (instead of emitting SSE into a JSON body), so
+  // tests need a signal for "torn down" distinct from `end()`. Resolve `endPromise`
+  // on destroy too so `waitForEnd()` returns on the destroy path. Swallow any
+  // `'error'` emitted by the Writable's destroy path — Node's real `ServerResponse`
+  // handles socket error listeners, this mock has none.
   writable.on('error', () => {});
   const origDestroy = writable.destroy.bind(writable);
   writable.destroy = (err?: Error) => {
@@ -179,9 +168,8 @@ function createMockRes(): {
     try {
       origDestroy(err);
     } catch {
-      // Destroying a writable that is already being torn down is
-      // fine; the iter-33 outer catch already swallows secondary
-      // throws here.
+      // Destroying an already-being-torn-down writable is fine; the outer catch
+      // swallows secondary throws here.
     }
     endResolve();
     return writable;
@@ -1653,24 +1641,11 @@ describe('createHandler', () => {
     });
 
     it('cold-replays an assistant turn whose text is empty but reasoning is present', async () => {
-      // Iter-24 finding 3 integration regression: a stored
-      // response record containing a non-empty `reasoning`
-      // item and an empty `message` item MUST survive
-      // reconstruction on cold replay. With the iter-23
-      // predicate the assistant turn was dropped from the
-      // reconstructed chain entirely, so a subsequent
-      // `previous_response_id` continuation that fell through
-      // to the cold-replay path primed the model with a
-      // history that silently skipped the reasoning — a
-      // different conversation from the hot-path resume of
-      // the same chain.
-      //
-      // Force the cold-replay path by clearing the session
-      // registry between turns so the hot session cannot be
-      // reused. The second turn then reconstructs the chain
-      // from the store, and we inspect the primed history
-      // passed to `chatSessionStart` to confirm the assistant
-      // turn (with its reasoning) is present.
+      // A stored record with a non-empty `reasoning` item and empty `message` item
+      // must survive cold-replay reconstruction — dropping the turn would prime the
+      // model with a history that silently skips the reasoning, making the cold
+      // replay diverge from a hot-path resume of the same chain. Clearing the
+      // session registry between turns forces the cold-replay path.
       const registry = new ModelRegistry();
       const chatSessionStart = vi
         .fn()
@@ -1768,12 +1743,9 @@ describe('createHandler', () => {
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       expect(chatSessionContinue).not.toHaveBeenCalled();
 
-      // Inspect the history primed for the cold-replay call.
-      // The reconstructed chain MUST include the assistant turn
-      // with its reasoning summary, even though the message
-      // item's text was empty — otherwise the iter-23 predicate
-      // would have dropped the turn entirely and the model
-      // would see a silently different conversation.
+      // The reconstructed cold-replay history MUST include the assistant turn with
+      // its reasoning summary even though the message item's text was empty —
+      // otherwise the model sees a silently different conversation.
       const [primedMessages2] = chatSessionStart.mock.calls[1] as [
         Array<{ role: string; content: string; reasoningContent?: string }>,
       ];
@@ -1784,23 +1756,11 @@ describe('createHandler', () => {
     });
 
     it('serializes two overlapping /v1/responses dispatches on the same model', async () => {
-      // Iter-24 finding 1 integration regression: two
-      // concurrent requests against the same model — whether
-      // via `/v1/responses`, `/v1/messages`, or a mix — both
-      // receive a `ChatSession` pointing at the SAME underlying
-      // native model. The per-model execution mutex in
-      // `SessionRegistry` must serialize the entire dispatch
-      // span so their `primeHistory` / `send*` calls cannot
-      // clobber each other's KV state.
-      //
-      // To observe serialization through the real endpoint
-      // code path, gate the first mocked `chatSessionStart`
-      // behind an external promise and fire the second request
-      // while the first is still pending. If the mutex is
-      // present, the second dispatch does NOT record its own
-      // `chatSessionStart` invocation until the first has
-      // released — we assert that by inspecting the mock's
-      // invocation count from outside the gate.
+      // Two concurrent requests against the same model both receive a `ChatSession`
+      // pointing at the SAME underlying native model. `SessionRegistry`'s per-model
+      // execution mutex must serialize the entire dispatch span. We gate the first
+      // `chatSessionStart` behind a promise and assert the second `chatSessionStart`
+      // invocation does NOT appear until the first releases.
       const registry = new ModelRegistry();
 
       let releaseFirst!: () => void;
@@ -2100,28 +2060,11 @@ describe('createHandler', () => {
     });
 
     it('does not adopt the session when a streaming generator throws mid-decode', async () => {
-      // Iter-28 finding 2 regression: before the fix, a throw from
-      // the underlying async generator escaped out of the
-      // `for await` loop in `handleStreamingNative` straight into
-      // the outer generic error catch in `handleCreateResponse`.
-      // That bypassed the commit gate entirely — the writer never
-      // called `wasCommitted()`, so the session's adopt decision
-      // defaulted to the happy path and (on the iter-22+ adopt
-      // gate) could leak a committed state for a session the
-      // client never received a terminal event for. Worse, the
-      // outer catch tried to send a JSON error after SSE headers
-      // had already been flushed, producing a wire shape that no
-      // client could parse. The fix wraps the `for await` loop in
-      // a try/catch/finally that captures the throw into a
-      // sticky `thrownError` flag, routes the post-loop block
-      // through the failure epilogue, and emits a well-formed
-      // `response.failed` terminal event.
-      //
-      // Model a generator that yields a couple of deltas then
-      // throws. Every Finding 2 invariant must hold: the session
-      // is not adopted, the store is not written, the terminal
-      // event is `response.failed`, and `response.completed` is
-      // never emitted.
+      // A mid-decode throw from the native async generator must route through the
+      // failure epilogue and emit a well-formed `response.failed` terminal. Every
+      // invariant: the session is not adopted, the store is not written, no
+      // `response.completed` is emitted, and nested message items are normalised
+      // to `status: 'incomplete'`.
       async function* throwingStream() {
         yield { done: false, text: 'par', isReasoning: false };
         yield { done: false, text: 'tial', isReasoning: false };
@@ -2197,8 +2140,7 @@ describe('createHandler', () => {
       expect(failedResponse.status).toBe('failed');
       const incomplete = failedResponse.incomplete_details as { reason?: string } | null;
       expect(incomplete?.reason).toBe('error');
-      // Every nested message item (the partial we streamed) must
-      // now be `status: 'incomplete'` — Finding 3 normalisation.
+      // Every nested message item (the partial we streamed) must be `'incomplete'`.
       for (const item of (failedResponse.output as Array<{ type?: string; status?: string }>) ?? []) {
         if (item.type === 'message') {
           expect(item.status).toBe('incomplete');
@@ -2207,27 +2149,11 @@ describe('createHandler', () => {
     });
 
     it('does not adopt the session when the HTTP request aborts mid-stream', async () => {
-      // Iter-28 finding 2 regression, client-abort half. Before
-      // the fix, a client disconnect produced no signal inside
-      // the streaming helper: the `for await` loop kept pulling
-      // deltas, the writer kept calling `writeSSEEvent` into a
-      // dead socket, and the post-loop commit gate ran the
-      // success branch (which either adopted the session or
-      // emitted `response.completed` depending on whether the
-      // native generator eventually drained a done chunk). The
-      // fix installs `close`/`error` listeners on the HTTP
-      // request that flip a `clientAborted` flag checked at the
-      // top of every loop iteration. When the flag flips, the
-      // helper `break`s out of the loop and routes through the
-      // failure epilogue with `reason: 'client_abort'`.
-      //
-      // We cannot drive a true HTTP close from inside the
-      // `IncomingMessage` mock, so we simulate it by emitting a
-      // synthetic `close` event after the generator yields its
-      // first delta. The native stream is shaped so that the
-      // second iteration of the for-await loop sees the flag set
-      // and breaks out — exactly the shape the production code
-      // handles.
+      // A client disconnect must flip `clientAborted` via close/error listeners on
+      // `httpReq`; the loop-top guard then `break`s into the failure epilogue with
+      // `reason: 'client_abort'`. We simulate the disconnect by emitting a synthetic
+      // `close` event after the first delta, shaped so the second loop iteration
+      // sees the flag set.
       let proceedResolve: (() => void) | undefined;
       const proceed = new Promise<void>((r) => {
         proceedResolve = r;
@@ -2339,25 +2265,13 @@ describe('createHandler', () => {
     });
 
     it('iter-35 finding 1: AbortSignal is propagated through the session to the streaming entry point on client disconnect', async () => {
-      // Iter-35 finding 1 fix: the outer handler installs an
-      // `AbortController` on `res.once('close', …)` /
-      // `httpReq.once('close', …)` and plumbs its signal through
-      // `ChatSession.sendStream` → `chatStreamSession*` → the
-      // `_runChatStream` adapter. In the real-model path the
-      // adapter calls `handle.cancel()` on the native stream
-      // handle the moment the signal fires and wakes the pending
-      // `await waitForItem()` with a synthetic abort marker, so a
-      // client drop mid-eval unwinds within milliseconds instead
-      // of waiting for the next native chunk.
-      //
-      // This test verifies the plumbing contract end-to-end: the
-      // native streaming entry point receives an AbortSignal whose
-      // `aborted` flag flips the moment the request's `'close'`
-      // event fires. We use a mock that observes the third
-      // argument (signal) and yields a completion event the
-      // moment the signal aborts — modelling the real adapter's
-      // fast-abort behaviour without depending on the native
-      // addon.
+      // The outer handler installs an `AbortController` on `res`/`httpReq` close
+      // events and plumbs the signal through `ChatSession.sendStream` →
+      // `chatStreamSession*` → `_runChatStream`. The native streaming entry point
+      // must therefore receive an AbortSignal whose `aborted` flag flips the
+      // moment the request's `'close'` event fires. The mock observes the signal
+      // and yields a completion the moment abort fires — modelling the real
+      // adapter's fast-abort without the native addon.
       let observedSignal: AbortSignal | undefined;
       let resolveAbortSeen: (() => void) | undefined;
       const abortSeen = new Promise<void>((r) => {
@@ -2444,17 +2358,12 @@ describe('createHandler', () => {
     });
 
     it('iter-35 finding 2: non-streaming skips endJson and persistResponse on a dead peer', async () => {
-      // The non-streaming native path has no AbortSignal surface
-      // (plain `chatSession*` resolves with a full result), so a
-      // client that disconnects mid-generation still burns every
-      // remaining token under the per-model mutex. Once native
-      // decode returns, though, the handler must NOT try to write
-      // the JSON body to a dead socket and must NOT persist a
-      // response record the client never saw — persisting would
-      // leave a dangling store entry that a later
-      // `previous_response_id` continuation could resurrect. The
-      // iter-35 fix checks `res.destroyed || res.socket?.destroyed`
-      // in `handleNonStreaming` before both calls.
+      // The non-streaming native path has no AbortSignal surface, so a mid-generation
+      // client disconnect still burns every remaining token under the per-model
+      // mutex. Once decode returns, the handler must NOT write JSON to a dead socket
+      // and must NOT persist a record the client never saw — persistence would leave
+      // a dangling entry that a later `previous_response_id` could resurrect.
+      // `handleNonStreaming` checks `res.destroyed || res.socket?.destroyed` first.
       const model = createMockModel(makeChatResult({ text: 'late reply' }));
       const registry = new ModelRegistry();
       registry.register('nonstream-model', model);
@@ -2491,18 +2400,11 @@ describe('createHandler', () => {
     });
 
     it('iter-35 finding 2: persistResponse runs OUTSIDE the per-model mutex', async () => {
-      // Before iter-35 the `/v1/responses` handlers called
-      // `persistResponse()` from inside `withExclusive`, so a
-      // slow SQLite write pinned the per-model mutex on the next
-      // waiter. The fix captures the terminal ResponseObject
-      // inside the handler, returns it to the outer body, and
-      // writes it to the store AFTER `withExclusive` releases.
-      //
-      // This test serialises two back-to-back non-streaming
-      // requests on the same model and asserts the second
-      // request's native dispatch STARTS before the first
-      // request's slow `store.store()` call resolves — proving
-      // the persist write is off the mutex.
+      // `persistResponse()` must run OUTSIDE `withExclusive` — the handler captures
+      // the terminal ResponseObject inside the mutex, returns it, and writes to the
+      // store after the mutex releases. Two back-to-back non-streaming requests: the
+      // second's native dispatch must START before the first's slow `store.store()`
+      // resolves.
       let persistReleaseB: (() => void) | undefined;
       const persistGate = new Promise<void>((r) => {
         persistReleaseB = r;
@@ -2582,34 +2484,12 @@ describe('createHandler', () => {
     });
 
     it('iter-36 finding 1: a back-to-back previous_response_id continuation does not race the off-lock store.store() into a spurious 404', async () => {
-      // Iter-35 moved `store.store(record)` OUTSIDE `withExclusive`
-      // so a slow SQLite flush would not pin the per-model mutex
-      // on the next waiter. That opened a window: a client that
-      // received `response.completed` with `responseId = A` could
-      // immediately fire a follow-up request carrying
-      // `previous_response_id: A`. Request B reaches
-      // `store.getChain(A)` BEFORE request A's off-lock
-      // `store.store` write has landed in SQLite — the chain is
-      // empty, and the old code returned 404 on a response id the
-      // client was just handed.
-      //
-      // Iter-36 fix: `initiatePersist` registers the in-flight
-      // `store.store(record)` promise in a per-store pending-write
-      // tracker SYNCHRONOUSLY inside `withExclusive`, so the
-      // tracker is populated before the mutex releases. Request
-      // B's chain-lookup gate, on seeing an empty `getChain(A)`,
-      // consults the tracker; if a write is in flight it awaits
-      // the same promise and retries `getChain`. The retry is
-      // guaranteed to see the row because the pending-write
-      // promise only resolves after SQLite has accepted the
-      // insert.
-      //
-      // This test holds the first request's `store.store()` in a
-      // gated async state (so from the store's point of view the
-      // write is in flight), fires request B immediately after
-      // the mutex releases, and asserts B does NOT 404 — instead
-      // it observes the just-landed chain entry and cold-replays
-      // through it, producing a clean `response.completed`.
+      // Moving `store.store(record)` OUTSIDE `withExclusive` opens a window: a client
+      // that received A can fire a follow-up with `previous_response_id: A` before
+      // A's off-lock write has landed. `initiatePersist` registers the in-flight
+      // write in a per-store pending-write tracker SYNCHRONOUSLY inside the mutex;
+      // B's chain-lookup gate consults the tracker on empty `getChain(A)` and awaits
+      // the same promise before retrying — so B must NOT 404 on a just-issued id.
       let releasePersistA: (() => void) | undefined;
       const persistAGate = new Promise<void>((r) => {
         releasePersistA = r;
@@ -2678,18 +2558,11 @@ describe('createHandler', () => {
       const responseIdA: string = responseA.id;
       expect(responseIdA).toMatch(/^resp_/);
 
-      // Spin the event loop until A's `initiatePersist` has
-      // actually run (observed via `store.store` being called).
-      // This is the point at which the per-store pending-write
-      // tracker has registered A's in-flight promise — exactly
-      // the state under which B must observe a pending write
-      // instead of a plain empty-chain 404. Polling
-      // `mockStore.store` is the simplest proxy for "the
-      // producer reached the tracker registration site"; A's
-      // mutex may not be released yet (the outer finally is
-      // still blocking on `persistAGate`), but that is fine —
-      // B's chain-lookup gate is BEFORE `withExclusive`, so it
-      // is not gated on A's mutex.
+      // Spin the event loop until A's `initiatePersist` has actually run (observed
+      // via `store.store`). This is the point at which the per-store pending-write
+      // tracker has registered A's in-flight promise — exactly the state B must
+      // observe. B's chain-lookup gate runs BEFORE `withExclusive`, so A's still-
+      // held mutex doesn't block the race we're exercising.
       while (mockStore.store.mock.calls.length === 0) {
         await new Promise((r) => setImmediate(r));
       }
@@ -2698,17 +2571,13 @@ describe('createHandler', () => {
       // mock would mask the race.
       expect(storedRecords.has(responseIdA)).toBe(false);
 
-      // Sibling evict: the single-warm registry would let the
-      // second request's `previous_response_id` miss anyway. That
-      // is not the scenario iter-36 is testing — we are testing
-      // that the CHAIN LOOKUP GATE (which runs BEFORE session
-      // cache lookup) no longer 404s when a write is in flight.
-      // Drop the adopted session so the cold-replay path runs.
+      // Sibling evict: drop the adopted session so the cold-replay path runs. The
+      // scenario under test is the CHAIN LOOKUP GATE (which runs BEFORE session
+      // cache lookup) — the gate must not 404 when a write is in flight.
       registry.getSessionRegistry('persist-model')!.drop(responseIdA);
 
-      // Request B: continuation with previous_response_id = A.
-      // Under the iter-35 race this would 404 because the off-lock
-      // write has not yet landed.
+      // Request B: continuation with previous_response_id = A. Without the in-flight
+      // write tracker this would 404 because the off-lock write has not yet landed.
       const reqB = createMockReq('POST', '/v1/responses', {
         model: 'persist-model',
         input: 'hello B',
@@ -2744,59 +2613,19 @@ describe('createHandler', () => {
     });
 
     it('iter-36 finding 2: close-after-final-chunk does not adopt the session despite committed=true', async () => {
-      // Iter-35 landed an adopt gate of
-      // `committed && (handlerError == null || safeToSuppress)`.
-      // That turned out to be wrong when the client drops the
-      // connection AFTER the producer has committed its final
-      // chunk but BEFORE the post-loop success branch runs:
-      //
-      //   1. decode loop emits its final chunk → native session
-      //      advances `turns` → `committed = true`
-      //   2. the client closes the connection synchronously;
-      //      `res.once('close')` fires and flips `clientAborted`
-      //   3. handler takes the FAILURE epilogue (because
-      //      `successful = sawDone && committed && !clientAborted`),
-      //      flushes `response.failed` cleanly (kernel ack →
-      //      `terminalEmitted = true`)
-      //   4. outer gate sees `committed && safeToSuppress` → the
-      //      OLD code would adopt under a responseId the client
-      //      explicitly abandoned, evicting whatever good hot
-      //      session was previously cached for this model (the
-      //      single-warm registry holds exactly one entry).
-      //
-      // Iter-36 fix: the streaming handler returns a
-      // `failureMode` signal. The outer adopt gate refuses to
-      // adopt when `failureMode === 'client_abort'` regardless of
-      // the committed / safeToSuppress combination.
-      //
-      // We shape the stream so that its final chunk is emitted
-      // and its producer's finally has run (so `wasCommitted()`
-      // returns true in the post-loop block) — but we fire a
-      // `close` event on `res` immediately after the final
-      // yield so `clientAborted` flips before the post-loop
-      // branch picks a path.
+      // When a client drops AFTER the producer commits its final chunk but BEFORE
+      // the post-loop success branch runs, `committed && safeToSuppress` alone is
+      // not enough to adopt — the streaming handler returns a `failureMode` signal
+      // and the adopt gate refuses when `failureMode === 'client_abort'`, regardless
+      // of committed/safeToSuppress. The stream emits its final chunk, then fires a
+      // `close` event on `res` so `clientAborted` flips before the post-loop branch.
       const abortSignal = { emit: false };
-      // The stream emits its `done` chunk with `finishReason:
-      // 'stop'` — this is what flips the ChatSession wrapper's
-      // `turnCount` in the wrapper's own `finally` block (see
-      // `startFromHistoryStream`). The wrapper runs the finally
-      // ONLY after the consumer breaks / returns; at that point
-      // it sets `turnCount++`, so `wasCommitted()` reads `true`
-      // in the post-loop block.
-      //
-      // To trigger the race we need the HTTP peer to drop
-      // AFTER `committed = true` but BEFORE the post-loop
-      // `successful = sawDone && committed && … && !clientAborted`
-      // gate runs. The cleanest way is to fire `res.emit('close')`
-      // from the generator's FINALLY — which the outer for-await
-      // loop unwinds after processing the done event's `break`.
-      // `ChatSession.startFromHistoryStream`'s finally runs
-      // BEFORE our generator's finally (the outer generator's
-      // unwind happens last), so by the time our close fires the
-      // wrapper has already done `turnCount++`. The post-loop
-      // block then reads `committed = true` AND
-      // `clientAborted = true`, exactly the race iter-36
-      // finding 2 describes.
+      // The `done` chunk with `finishReason: 'stop'` flips the ChatSession wrapper's
+      // `turnCount` in the wrapper's own `finally`. We fire `res.emit('close')` from
+      // the generator's FINALLY so the post-loop block reads `committed = true` AND
+      // `clientAborted = true` — `ChatSession.startFromHistoryStream`'s finally runs
+      // BEFORE our generator's finally (outer unwinds last), so turnCount has
+      // already been bumped by the time our close fires.
       async function* committingAbortedStream(onClose: () => void) {
         try {
           yield {
@@ -2856,9 +2685,8 @@ describe('createHandler', () => {
           // which runs AFTER the consumer's `break` from the
           // done branch and AFTER the ChatSession wrapper's
           // finally has set `turnCount++`. At that point the
-          // post-loop block will observe `committed = true`
-          // AND `clientAborted = true` — the exact race
-          // iter-36 finding 2 describes.
+          // post-loop block observes `committed = true` AND
+          // `clientAborted = true` — the race this test exercises.
           (res as unknown as NodeJS.EventEmitter).emit('close');
         }),
       );
@@ -2866,13 +2694,11 @@ describe('createHandler', () => {
       await handler(req, res);
       await waitForEnd();
 
-      // Primary assertion: the registry is empty. Under the
-      // buggy iter-35 gate, the post-commit abort path would
-      // have called `sessionReg.adopt(responseId, session, …)`
-      // — the new session would then sit under a responseId
-      // the client has explicitly abandoned, occupying the
-      // single hot-slot for the model and blocking any genuinely
-      // useful session from being cached later.
+      // Primary assertion: the registry is empty. If the post-
+      // commit abort path called `sessionReg.adopt(responseId,
+      // session, …)` the new session would sit under a responseId
+      // the client has abandoned, occupying the single hot-slot
+      // for the model and blocking a useful session from caching.
       //
       // The `getOrCreate(null, …)` call at the top of the
       // handler clears the map unconditionally (single-warm
@@ -2895,14 +2721,9 @@ describe('createHandler', () => {
       // The production `ResponseStore` is the native mlx-db
       // implementation; its `get_chain` throws
       // `"Response not found: <id>"` on a miss (see
-      // `crates/mlx-db/src/response_store/reader.rs:57-59`). The
-      // iter-36 retry path only fired when `getChain` returned an
-      // empty array, so against the real native contract the
-      // pending-writes retry was dead — the outer catch's
-      // `/not found/i` check turned every native miss into a 404
-      // immediately, never consulting the pending-writes tracker.
+      // `crates/mlx-db/src/response_store/reader.rs:57-59`).
       //
-      // Iter-37 fix: the continuation lookup now wraps the first
+      // Invariant: the continuation lookup wraps the first
       // `getChain` call in a try/catch. On a thrown "not found"
       // it consults the pending-writes tracker; if a write is in
       // flight the handler awaits it and retries `getChain`. The
@@ -3029,66 +2850,30 @@ describe('createHandler', () => {
     });
 
     it('iter-38 finding 1: native-miss retry aborts in bounded time when pending write never settles', async () => {
-      // Iter-37 finding 1 added a retry path that awaits the
-      // raw `store.store(...)` promise registered in the
-      // pending-writes tracker. That unconditional await had
-      // no upper bound: a wedged SQLite writer (or any other
-      // never-settling write promise) would pin the
-      // continuation request forever. No timeout, no
-      // cancellation, no observability — the request just
-      // hung.
+      // A wedged `store.store(...)` promise must not pin a continuation request
+      // forever. The retry `awaitPending` is wrapped in `Promise.race` against
+      // `CHAIN_WRITE_WAIT_TIMEOUT_MS`; on timeout the handler runs ONE last
+      // `getChain` probe (to close the late-landing-write race), and on still-miss
+      // emits retryable 503 `storage_timeout` (NOT 404 — a wedged writer is a
+      // transient backend condition).
       //
-      // Iter-38 fix: the retry `awaitPending` is wrapped in
-      // `Promise.race` against a short timer
-      // (`CHAIN_WRITE_WAIT_TIMEOUT_MS = 2000ms`). On timeout
-      // the handler originally fell through to a clean 404.
-      //
-      // Iter-39 finding 1: the timeout path now runs ONE last
-      // `getChain` probe before giving up (closing the
-      // late-landing-write race) and, when the probe still
-      // misses, surfaces the condition as HTTP 503
-      // `storage_timeout` (retryable transient) instead of 404
-      // (permanent / non-retryable). A wedged writer is a
-      // transient backend condition — the client should be
-      // allowed to retry with the same `previous_response_id`.
-      //
-      // Shape of the test:
-      //   1. Mock store's `getChain` throws "Response not
-      //      found: <id>" on every call (so the retry path
-      //      is entered on the first miss).
-      //   2. Mock store's `store(...)` returns a promise
-      //      built from `new Promise(() => {})` — i.e. it
-      //      NEVER resolves and NEVER rejects. This is the
-      //      wedged-writer shape.
-      //   3. We kick off request A (which will register its
-      //      never-settling write in the tracker), then fire
-      //      request B with `previous_response_id` pointing
-      //      at A's id. Under the pre-iter-38 shape, B's
-      //      `awaitPending` would block forever; under the
-      //      iter-38 fix, it times out within
-      //      `CHAIN_WRITE_WAIT_TIMEOUT_MS`; under the
-      //      iter-39 fix it runs one last `getChain` probe
-      //      (which still misses because our mock's
-      //      `getChain` unconditionally rejects) and then
-      //      emits a clean 503 `storage_timeout`.
-      //   4. We wrap the whole interaction in a sanity-check
-      //      `Promise.race` against 5000ms so the test
-      //      itself cannot hang indefinitely if the fix
-      //      regresses.
+      // Shape: `store.store` returns `new Promise(() => {})` (never-settling),
+      // `getChain` always throws "Response not found". Request A registers the
+      // wedged write; request B hits `awaitPending`, times out, probe misses,
+      // returns 503. The outer `Promise.race` against 5s is a sanity cap so a
+      // regression surfaces as a test-level timeout rather than a suite hang.
       const neverSettling: Promise<void> = new Promise<void>(() => {
-        // Intentionally never resolve/reject — models a wedged
-        // SQLite writer. The pending-writes tracker's own
-        // `.finally(...)` registers but also never fires.
+        // Models a wedged SQLite writer: neither resolves nor rejects. The pending-
+        // writes tracker's own `.finally(...)` registers but also never fires.
       });
-      // Silence the `console.warn` the fix emits on timeout
-      // so the test output stays clean. The assertion below
-      // verifies it was invoked.
+      // Silence `console.warn` for clean test output; assertion below verifies the
+      // warning was emitted.
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       try {
         const mockStore = {
           store: vi.fn().mockReturnValue(neverSettling),
-          // Always throw the native "Response not found"
-          // contract so the iter-37 retry path is entered.
+          // Always throw the native "Response not found" contract so the retry path
+          // is entered.
           getChain: vi.fn().mockImplementation((id: string) => {
             return Promise.reject(new Error(`Response not found: ${id}`));
           }),
@@ -3108,13 +2893,10 @@ describe('createHandler', () => {
         registry.register('wedged-persist-model', mockModel);
         const handler = createHandler(registry, { store: mockStore as any });
 
-        // Request A: ordinary POST. Its `store.store(...)`
-        // call returns `neverSettling`, so the tracker gets
-        // an id→never-resolving-promise entry. `handler`
-        // itself returns as soon as the off-lock persist is
-        // kicked off (the outer catch for iter-35 finding 2
-        // explicitly does not await the write), so A's
-        // response body lands normally.
+        // Request A: ordinary POST. Its `store.store(...)` returns `neverSettling`,
+        // so the tracker gets an id→never-resolving-promise entry. The handler
+        // returns as soon as the off-lock persist kicks off, so A's response body
+        // lands normally.
         const reqA = createMockReq('POST', '/v1/responses', {
           model: 'wedged-persist-model',
           input: 'hello A',
@@ -3140,8 +2922,7 @@ describe('createHandler', () => {
         expect(responseA.status).toBe('completed');
         const responseIdA: string = responseA.id;
 
-        // Spin until A's persist has registered with the
-        // tracker — mirrors the iter-37 test's setup.
+        // Spin until A's persist has registered with the tracker.
         while (mockStore.store.mock.calls.length === 0) {
           await new Promise((r) => setImmediate(r));
         }
@@ -3190,12 +2971,9 @@ describe('createHandler', () => {
         // up here as `outcome === SANITY_TIMED_OUT`.
         expect(outcome).toBe('ok');
 
-        // Error shape: clean bounded 503 storage_timeout, not
-        // a 404 (permanent) or an unhandled-rejection blow-up.
-        // Iter-39 finding 1: the timeout path's final
-        // `getChain` probe still misses (our mock's `getChain`
-        // unconditionally rejects), so the handler surfaces a
-        // retryable 503 with `type: 'storage_timeout'`.
+        // Error shape: clean bounded 503 `storage_timeout` (retryable), NOT a 404
+        // (permanent) or an unhandled-rejection blow-up. The timeout path's final
+        // `getChain` probe still misses here, so the handler surfaces 503.
         expect(statusB()).toBe(503);
         const parsed = JSON.parse(bodyB());
         expect(parsed.error.type).toBe('storage_timeout');
@@ -3215,39 +2993,15 @@ describe('createHandler', () => {
     });
 
     it('iter-39 finding 1: write landing just after timeout fires returns successful continuation (not 503)', async () => {
-      // Iter-38 racetrack: once `CHAIN_WRITE_WAIT_TIMEOUT_MS`
-      // fired, the handler flipped straight to an error
-      // response. A healthy write landing at
-      // `(CHAIN_WRITE_WAIT_TIMEOUT_MS + epsilon)` — for
-      // example on an encrypted disk under WAL checkpoint
-      // pressure — would have populated the store a few
-      // milliseconds later, but the iter-38 code never
-      // re-checked. The client received a false error,
-      // which is especially toxic when the error is 404
-      // (non-retryable).
+      // SUCCESSFUL-probe arm of the timeout→probe branch: on `awaitPending`
+      // timeout the handler runs ONE last `getChain` probe before giving up. If
+      // the write landed between the timeout firing and the probe running, the
+      // continuation must return a coherent chained 200 (not 503, not 404).
       //
-      // Iter-39 finding 1 fix: on timeout the handler runs
-      // ONE last `getChain` probe before giving up. If the
-      // probe succeeds, the continuation proceeds through
-      // the normal happy path; if it still misses, the
-      // handler now returns retryable 503 storage_timeout
-      // instead of the original 404.
-      //
-      // This test covers the SUCCESSFUL-probe arm: the
-      // write lands AFTER the 2s timeout fires but BEFORE
-      // the probe runs, so the continuation must return a
-      // coherent chained 200 response (not 503, not 404).
-      //
-      // Iter-40 finding 2 — timing determinism. The iter-39
-      // original test used `setTimeout(resolveStore, 2100)`
-      // against real timers and raced the whole handler
-      // interaction under a 6-second sanity cap. On a loaded
-      // CI machine the handler could reach `awaitPending`
-      // more than 100ms late, at which point the test would
-      // silently exercise the "pending settled before
-      // timeout" fast path and never hit the timeout→probe
-      // branch the finding is actually testing. The test
-      // still passed either way — invisible regression risk.
+      // Timing: we do NOT use real-wall-clock timers to schedule the write
+      // resolution — on loaded CI the handler can reach `awaitPending` late
+      // enough that the test silently hits the "pending settled before timeout"
+      // fast path, which still passes but never exercises the probe branch.
       //
       // Timing determinism here is enforced via the
       // call-count invariant: `getChain` must be called
@@ -3284,12 +3038,12 @@ describe('createHandler', () => {
           });
         }),
         getChain: vi.fn().mockImplementation((id: string) => {
-          // First getChain call for a continuation must MISS
-          // so the iter-37 retry path is entered (and then
-          // the iter-38 timeout-timer fires because the
-          // write has not settled yet). After the timeout
-          // fires, the probe call sees the record via the
-          // synchronously populated `storedRecords` map.
+          // First getChain call for a continuation must MISS so
+          // the throw-retry path is entered (and then the
+          // timeout-timer fires because the write has not
+          // settled yet). After the timeout fires, the probe
+          // call sees the record via the synchronously populated
+          // `storedRecords` map.
           if (!firstGetChainMissed) {
             firstGetChainMissed = true;
             return Promise.reject(new Error(`Response not found: ${id}`));
@@ -3327,13 +3081,9 @@ describe('createHandler', () => {
         registry.register('late-landing-model', mockModel);
         const handler = createHandler(registry, { store: mockStore as any });
 
-        // Request A: ordinary POST. Its `store.store(...)` call
-        // returns a never-settling promise registered in the
-        // pending-writes tracker; the tracker retains its
-        // reference so B's retry path can observe the pending
-        // write. `storedRecords` is populated synchronously so
-        // the post-timeout probe in B's handler finds the
-        // record via `getChain`.
+        // Request A: ordinary POST. `store.store(...)` returns a never-settling
+        // promise (tracked so B's retry path can observe it), but `storedRecords`
+        // is populated synchronously so B's post-timeout probe finds the record.
         const reqA = createMockReq('POST', '/v1/responses', {
           model: 'late-landing-model',
           input: 'hello A',
@@ -3347,31 +3097,22 @@ describe('createHandler', () => {
         expect(responseA.status).toBe('completed');
         const responseIdA: string = responseA.id;
 
-        // Wait until A's persist has registered its
-        // never-settling write with the pending-writes
-        // tracker. `waitA()` resolves on the mock's
-        // synchronous `end()` hook but `initiatePersist`
-        // runs a few microtasks later — if we fired B
-        // before the tracker was populated, B's
-        // `awaitPending` would return undefined and the
-        // handler would 404 instead of entering the
-        // timeout→probe branch the test is exercising.
+        // Wait until A's persist has registered its never-settling write with the
+        // tracker. `waitA()` resolves on the mock's synchronous `end()` hook, but
+        // `initiatePersist` runs a few microtasks later — firing B before the
+        // tracker was populated would make `awaitPending` return undefined and the
+        // handler would 404 instead of entering the timeout→probe branch.
         while (mockStore.store.mock.calls.length === 0) {
           await new Promise((r) => setImmediate(r));
         }
 
-        // Drop the hot session so B has to go through the
-        // cold-replay chain-lookup path (the path under
-        // test — otherwise the session would already be
-        // cached by response id).
+        // Drop the hot session so B has to go through the cold-replay chain-lookup
+        // path (the path under test).
         registry.getSessionRegistry('late-landing-model')!.drop(responseIdA);
 
-        // Snapshot the getChain call count after A has run.
-        // We assert below that B's cold-replay path drove
-        // the count up by EXACTLY 2 — one initial miss +
-        // one post-timeout probe. Any other count means the
-        // handler's flow diverged from the timeout→probe
-        // branch under test.
+        // Snapshot getChain count; below we assert B's cold-replay path drove the
+        // count up by EXACTLY 2 (initial miss + post-timeout probe) — any other
+        // count means flow diverged from the timeout→probe branch.
         const getChainCallsAfterA = mockStore.getChain.mock.calls.length;
 
         // Request B: continuation pointing at A. Fire it and
@@ -3389,35 +3130,18 @@ describe('createHandler', () => {
         const handlerPromise = handler(reqB, resB);
         void handlerPromise.catch(() => {});
 
-        // Wait until B's handler has called getChain once
-        // (the initial cold lookup that MUST miss). At that
-        // point the handler is committed to the
-        // `awaitPending` retry branch — the next step is
-        // `Promise.race` against the bounded timer.
-        // NOTE: we yield via `setImmediate` (a macrotask)
-        // rather than `Promise.resolve()` (a microtask) so
-        // the poll loop cannot starve the event loop — a
-        // microtask-only spin would block every pending
-        // `setTimeout`, including the handler's own
-        // `CHAIN_WRITE_WAIT_TIMEOUT_MS` / `POST_COMMIT_PERSIST_TIMEOUT_MS`
-        // timers, and the handler would never advance past
-        // its bounded-wait race.
+        // Wait until B's handler has called getChain once (the initial cold miss).
+        // Yield via `setImmediate` (macrotask) rather than `Promise.resolve()`
+        // (microtask) so the poll loop cannot starve `setTimeout` timers — a
+        // microtask-only spin would block the handler's bounded-wait race.
         while (mockStore.getChain.mock.calls.length === getChainCallsAfterA) {
           await new Promise((r) => setImmediate(r));
         }
         expect(mockStore.getChain.mock.calls.length).toBe(getChainCallsAfterA + 1);
 
-        // The client-visible outcome is fully observable via
-        // `waitB()` — status code + body are set by the
-        // handler BEFORE it enters the post-commit persist
-        // wait. We deliberately do NOT await `handlerPromise`
-        // here: the handler's backgrounded
-        // `Promise.race([settled, timeoutPromise])` fires on
-        // its own 50ms real-timer and detaches the handler
-        // without blocking the test, so awaiting `waitB()`
-        // alone is enough. If this test ever hangs
-        // regressively, the `it(..., 10000)` timeout catches
-        // it.
+        // Status + body are set BEFORE the handler enters its post-commit persist
+        // wait, so `waitB()` alone is enough — the backgrounded
+        // `Promise.race([settled, timeoutPromise])` detaches on its 50ms timer.
         await waitB();
 
         // Primary assertion: B completes successfully and
@@ -3431,18 +3155,13 @@ describe('createHandler', () => {
         expect(parsed.previous_response_id).toBe(responseIdA);
         expect(parsed.output_text).toBe('chained reply');
 
-        // Explicit invariant: `getChain` was called EXACTLY
-        // twice during B's flow — the initial cold-replay
-        // miss + the post-timeout probe. Anything else
-        // (e.g. only one call) means the handler skipped
-        // the probe branch the finding is actually
-        // exercising, and the test would be silently
-        // covering a different path.
+        // Pin that `getChain` was called EXACTLY twice: initial cold-replay miss +
+        // post-timeout probe. Any other count means flow diverged from the probe
+        // branch and the test would be silently covering a different path.
         expect(mockStore.getChain.mock.calls.length).toBe(getChainCallsAfterA + 2);
 
-        // The fix must log the timeout-warning so operators
-        // can see the wedged-writer condition even on the
-        // successful-probe branch.
+        // The timeout warning must still be logged on the successful-probe branch
+        // so operators see the wedged-writer condition.
         const warnCall = warnSpy.mock.calls.find(
           (args) => typeof args[0] === 'string' && (args[0] as string).includes(responseIdA),
         );
@@ -3453,54 +3172,17 @@ describe('createHandler', () => {
     }, 10000);
 
     it('iter-40 finding 1: same-model unregister+re-register during slow persist keeps chain valid', async () => {
-      // Iter-39 finding 2 released the dispatch lease
-      // EAGERLY after `withExclusive` returns so a wedged
-      // `store.store(...)` could no longer pin abort
-      // listeners or the dispatch lease. But that release
-      // also dropped the binding's `inFlight` counter to
-      // zero while the off-lock persist was still pending,
-      // and `buildResponseRecord` had already stamped the
-      // row with the binding's current `modelInstanceId`.
+      // A same-model unregister+re-register during an in-flight persist must not
+      // invalidate the row's `modelInstanceId`: the responses endpoint pairs
+      // `registry.retainBinding(...)` around every in-flight persist (released in
+      // the persist's `.finally(...)`), so teardown is gated on
+      // `pendingPersists === 0 && inFlight === 0`. The re-registration reuses the
+      // still-live instance id, so B's continuation passes the instance-id guard.
       //
-      // Adversarial sequence (iter-40 finding 1):
-      //   1. Request A completes the terminal JSON and
-      //      kicks off `store.store(A)` off-lock.
-      //   2. The eager `releaseDispatchLease` drops
-      //      `inFlight` to 0 before the write lands.
-      //   3. An operator unregisters and then re-registers
-      //      the SAME model instance under the SAME name
-      //      (e.g. a rolling reload picks up a renamed
-      //      variant but is pointed at the identical
-      //      object). `dropNameReference` sees
-      //      `inFlight == 0` and finalises teardown,
-      //      deleting the instance id. The re-registration
-      //      mints a FRESH id.
-      //   4. A's `store.store(...)` eventually lands,
-      //      stamping a row whose `modelInstanceId`
-      //      references the NOW-DEAD id.
-      //   5. A legitimate continuation request (B) carrying
-      //      `previous_response_id: A.id` hits the
-      //      instance-id guard and is rejected with 400
-      //      "instance-mismatch" — even though the client
-      //      saw a clean `response.completed` for A.
-      //
-      // Fix: the responses endpoint pairs a
-      // `registry.retainBinding(...)` around every in-flight
-      // persist, and the matching `releaseBinding(...)` runs
-      // in the persist promise's `.finally(...)`. Teardown is
-      // now gated on `pendingPersists === 0` alongside
-      // `inFlight === 0`, so a same-model unregister during
-      // the persist window is DEFERRED, the re-registration
-      // reuses the still-live instance id, and the row's
-      // stored identity matches the live id when B's
-      // continuation arrives.
-      //
-      // Shape of the test:
-      //   - `store.store(A)` returns a controllable pending
-      //     promise so the test can hold the persist in
-      //     flight through the full unregister+re-register.
-      //   - The test drives the sequence exactly as above
-      //     and asserts B returns 200 (not 400, not 404).
+      // Sequence: A completes → eager lease release drops `inFlight` → operator
+      // unregisters+re-registers the SAME object → A's persist lands → B arrives
+      // with `previous_response_id: A.id`. Without retain the re-registration
+      // would mint a fresh id and B would see 400 "instance-mismatch".
       const storedRecords = new Map<string, any>();
       let resolveStoreA: (() => void) | undefined;
       // Only the FIRST persist (A's) returns a controllable
@@ -3573,19 +3255,15 @@ describe('createHandler', () => {
       expect(responseA.status).toBe('completed');
       const responseIdA: string = responseA.id;
 
-      // Wait until A's persist has registered with the
-      // tracker. This also proves `initiatePersist` ran and
-      // (under the iter-40 fix) `retainBinding` has already
-      // bumped `pendingPersists` to 1 — without which the
-      // `unregister` below would finalise teardown.
+      // Wait until A's persist has registered with the tracker. This proves
+      // `initiatePersist` ran and `retainBinding` has bumped `pendingPersists` to 1
+      // — without which the `unregister` below would finalise teardown.
       while (mockStore.store.mock.calls.length === 0) {
         await new Promise((r) => setImmediate(r));
       }
 
-      // Capture the instance id PRE-unregister. Under the
-      // fix this should survive the unregister+re-register
-      // cycle because the persist retention defers
-      // `finalizeBindingTeardown`. Without the fix, the
+      // Capture the instance id PRE-unregister; persist retention must defer
+      // `finalizeBindingTeardown` so this id survives the swap. Without retention,
       // re-register would mint a fresh id.
       const idPreSwap = registry.getInstanceId('rebind-during-persist');
       expect(typeof idPreSwap).toBe('number');
@@ -3597,15 +3275,11 @@ describe('createHandler', () => {
       // the finding protects).
       registry.getSessionRegistry('rebind-during-persist')!.drop(responseIdA);
 
-      // Simulate an operator hot-reload: unregister, then
-      // re-register the SAME model object under the SAME
-      // name. Under the iter-40 fix, the in-flight persist
-      // retention defers teardown so the re-registration
-      // reuses the still-live binding and its instance id;
-      // without the fix, `dropNameReference` would
-      // finalise immediately (inFlight == 0) and the
-      // re-register would mint a fresh id, invalidating A's
-      // stored row.
+      // Simulate an operator hot-reload: unregister, then re-register the SAME
+      // model object under the SAME name. Persist retention defers teardown so the
+      // re-registration reuses the still-live binding and its instance id;
+      // without retention, `dropNameReference` would finalise immediately
+      // (inFlight == 0) and the re-register would mint a fresh id.
       expect(registry.unregister('rebind-during-persist')).toBe(true);
       registry.register('rebind-during-persist', mockModel);
 
@@ -3622,11 +3296,8 @@ describe('createHandler', () => {
       // binding's id still matches.
       if (resolveStoreA) resolveStoreA();
 
-      // Request B: continuation against A. Under the fix
-      // this must return a coherent 200 response; without
-      // the fix B would be rejected with 400 "instance
-      // mismatch" because A's stored id no longer matches
-      // the live id.
+      // Request B: continuation against A. Must return a coherent 200 — without
+      // retention this would be rejected 400 "instance mismatch".
       const reqB = createMockReq('POST', '/v1/responses', {
         model: 'rebind-during-persist',
         input: 'hello B',
@@ -3660,27 +3331,13 @@ describe('createHandler', () => {
     }, 8000);
 
     it('iter-39 finding 2: wedged post-commit persist does not pin dispatch lease', async () => {
-      // Iter-35 moved persistence OFF the per-model mutex
-      // but still `await`ed the write in the outer
-      // `finally`, so any wedged `store.store(...)` pinned
-      // the request's socket/abort listeners and its
-      // dispatch lease until the promise settled. A
-      // never-settling write would leak listeners and keep
-      // the binding's `inFlight` counter elevated,
-      // blocking `releaseBinding()` from finalising
-      // teardown after a hot-swap.
-      //
-      // Iter-39 finding 2 fix: abort listeners are
-      // detached and `releaseDispatchLease` is called
-      // IMMEDIATELY after `withExclusive` returns; the
-      // post-commit persist wait is bounded by
-      // `POST_COMMIT_PERSIST_TIMEOUT_MS` (default 5000ms)
-      // and, on timeout, the handler returns while the
-      // write continues in the background. This test
-      // asserts that within ~500ms of the terminal bytes
-      // going out (well under the 5s post-commit timeout),
-      // the dispatch lease has been released and the abort
-      // listeners have been removed.
+      // Abort listeners detach and `releaseDispatchLease` fires IMMEDIATELY after
+      // `withExclusive` returns; the post-commit persist wait is bounded by
+      // `POST_COMMIT_PERSIST_TIMEOUT_MS` and on timeout the handler returns while
+      // the write continues backgrounded. Within ~500ms of terminal flush (well
+      // under the 5s default timeout) the lease must be released and listeners
+      // detached — otherwise a wedged writer would leak listeners and keep
+      // `inFlight` elevated, blocking teardown after a hot-swap.
       // Controllable pending persist. The test body exercises
       // the handler under a wedged-store condition and
       // asserts the lease releases promptly. At teardown we
@@ -3755,14 +3412,9 @@ describe('createHandler', () => {
       const responseA = JSON.parse(bodyA());
       expect(responseA.status).toBe('completed');
 
-      // Spin briefly until `releaseDispatchLease` has
-      // fired. In the fixed code this happens on the
-      // synchronous path immediately after `withExclusive`
-      // returns — typically within a single microtask.
-      // We give it up to 500ms to cover CI scheduling jitter;
-      // if the fix regresses, the lease won't release
-      // until the 5s post-commit timeout, and this spin
-      // will hit its own timeout and fail the test.
+      // Spin up to 500ms for `releaseDispatchLease` — typically within a single
+      // microtask after `withExclusive` returns. If the release regresses behind
+      // the post-commit wait, this spin times out and fails.
       const t0 = Date.now();
       while (releaseLeaseSpy.mock.calls.length === 0 && Date.now() - t0 < 500) {
         await new Promise((r) => setTimeout(r, 10));
@@ -3804,45 +3456,20 @@ describe('createHandler', () => {
     }, 10000);
 
     it('iter-43: wedged post-commit persist keeps binding pinned so same-object re-register preserves instance id', async () => {
-      // Iter-40 finding 1 introduced a `retainBinding` /
-      // `releaseBinding` counter around the off-lock persist
-      // so the binding's `modelInstanceId` survives a
-      // same-model unregister + re-register that races a slow
-      // `store.store(...)`.
+      // When post-commit persist has not settled by the time the handler returns,
+      // a same-object unregister+re-register must reuse the SAME binding and
+      // instance id: `pendingPersists > 0` pins the binding, and
+      // `register(name, sameModel)` on a binding flagged `pendingTeardown` clears
+      // the flag and keeps the existing id.
       //
-      // Iter-42 tried to bound the worst case of a TRULY
-      // never-settling persist by FORCE-RELEASING the retain
-      // from the post-commit-persist timeout arm. That was
-      // reverted in iter-43 (see the corresponding comment in
-      // `responses.ts`): a slow-but-eventual write can still
-      // land AFTER the timeout, and force-releasing the retain
-      // during the window between timeout and actual
-      // settlement reopens the iter-40 user-visible chain
-      // break.
-      //
-      // Iter-43 invariant (this test): when the post-commit
-      // persist has not settled by the time the handler
-      // returns, a same-object unregister + re-register must
-      // reuse the SAME binding and the SAME instance id
-      // (because `pendingPersists > 0` pins the binding and
-      // `register(name, sameModel)` on a binding flagged
-      // `pendingTeardown` clears the flag and keeps the
-      // existing id — see `ModelRegistry.register`).
-      //
-      // Shape:
-      //   - `store.store(...)` returns a promise that never
-      //     resolves (simulating a pathologically wedged
-      //     SQLite writer).
-      //   - The file-wide `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS=50`
-      //     shrinks the post-commit wait to 50ms so the
-      //     handler returns without wedging the test.
-      //   - After the handler returns, `registry.unregister`
-      //     plus a same-model `register` MUST preserve the
-      //     instance id — this is the iter-40 invariant
-      //     iter-43 reaffirms.
+      // Shape: `store.store(...)` returns a never-resolving promise (pathologically
+      // wedged writer). The file-wide `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS=50`
+      // shrinks the post-commit wait to 50ms so the handler returns. After that,
+      // unregister+re-register must preserve the instance id. Force-releasing the
+      // retain from the timeout arm is explicitly NOT done — see the slow-but-
+      // eventual test below for why.
       const mockStore = {
-        // Promise that NEVER resolves. This simulates a
-        // wedged SQLite writer or a stuck native backend.
+        // Never-resolving promise: simulates a wedged SQLite writer / stuck backend.
         store: vi.fn().mockImplementation(() => new Promise<void>(() => {})),
         getChain: vi.fn().mockImplementation((id: string) => {
           return Promise.reject(new Error(`Response not found: ${id}`));
@@ -3862,9 +3489,8 @@ describe('createHandler', () => {
       const registry = new ModelRegistry();
       const MODEL_NAME = 'iter-43-wedged-persist';
       registry.register(MODEL_NAME, mockModel);
-      // Sanity-verify the suite-wide env var is in effect so
-      // the handler doesn't sit on a 5s default timeout — a
-      // regression here would make this test appear to hang.
+      // Verify the suite-wide env var is in effect so the handler doesn't sit on
+      // the 5s default timeout.
       expect(process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS).toBe('50');
 
       // Capture the pre-swap instance id.
@@ -3904,13 +3530,10 @@ describe('createHandler', () => {
       // synchronous teardown work has a chance to run.
       await new Promise((r) => setImmediate(r));
 
-      // Primary iter-43 invariant: `unregister` followed by a
-      // fresh `register` on the SAME model object preserves
-      // the instance id, because `pendingPersists > 0` keeps
-      // the binding alive in `pendingTeardown` state and
-      // same-object `register` clears the flag and reuses the
-      // existing binding (see `ModelRegistry.register` at
-      // `packages/server/src/registry.ts:190-192`).
+      // Primary invariant: `unregister` then same-object `register` preserves the
+      // instance id — `pendingPersists > 0` keeps the binding alive in
+      // `pendingTeardown`, and `ModelRegistry.register` clears that flag on
+      // same-object re-registration.
       expect(registry.unregister(MODEL_NAME)).toBe(true);
       registry.register(MODEL_NAME, mockModel);
       const idAfter = registry.getInstanceId(MODEL_NAME);
@@ -3927,23 +3550,13 @@ describe('createHandler', () => {
     }, 5000);
 
     it('iter-43: slow-but-eventual persist across unregister+re-register preserves chain continuity', async () => {
-      // This is the exact failure codex flagged against the
-      // iter-42 force-release. A persist that simply takes
-      // longer than `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS` is
-      // the realistic common case (slow SQLite I/O, back-
-      // pressure, cold cache), NOT the pathologically wedged
-      // case. Under iter-42's force-release, the timeout arm
-      // would drop `pendingPersists` to 0 before the write
-      // actually lands. If a same-object unregister +
-      // register happened in that window, `ModelRegistry`
-      // would finalise the old binding and mint a fresh
-      // instance id, then the late write would record the
-      // OLD `modelInstanceId` that `buildResponseRecord`
-      // stamped in — and the next `previous_response_id`
-      // continuation would hit the instance-mismatch guard.
+      // A persist that simply takes longer than
+      // `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS` is the realistic
+      // common case (slow SQLite I/O, back-pressure, cold
+      // cache), NOT the pathologically wedged case. The retain
+      // stays pinned until actual settlement.
       //
-      // Iter-43 closes that window by leaving the retain
-      // pinned until actual settlement. This test asserts:
+      // This test asserts:
       //   1. The handler returns around ~timeout (not
       //      around ~settlement).
       //   2. After unregister+re-register, the instance id is
@@ -4037,12 +3650,9 @@ describe('createHandler', () => {
       // synchronous teardown work runs.
       await new Promise((r) => setImmediate(r));
 
-      // Iter-43 invariant: even though the timeout arm fired,
-      // `pendingPersists` is still > 0 (the write is pending,
-      // its `.finally(...)` has not run yet). So
-      // `unregister` flags the binding `pendingTeardown` but
-      // does NOT finalise, and a same-object `register`
-      // immediately reuses the still-live binding.
+      // Even though the timeout arm fired, `pendingPersists` is still > 0, so
+      // `unregister` flags the binding `pendingTeardown` but does NOT finalise,
+      // and a same-object `register` immediately reuses the still-live binding.
       expect(registry.unregister(MODEL_NAME)).toBe(true);
       registry.register(MODEL_NAME, mockModel);
       const idAfterReregister = registry.getInstanceId(MODEL_NAME);
@@ -4056,13 +3666,9 @@ describe('createHandler', () => {
       }
       expect(storeSettledAt).not.toBeNull();
 
-      // Post-settlement assertion: the row that landed
-      // carries the ORIGINAL instance id (the one in effect
-      // at dispatch), and that id still matches the live
-      // binding because the retain kept it pinned across the
-      // unregister+re-register dance. If iter-42's force-
-      // release had stayed in place, the re-register would
-      // have minted a fresh id and this assertion would fail.
+      // Post-settlement: the row carries the ORIGINAL instance id (the one in
+      // effect at dispatch), and that id still matches the live binding because
+      // the retain kept it pinned across the unregister+re-register dance.
       expect(storedRecords).toHaveLength(1);
       expect(storedRecords[0].modelInstanceId).toBe(idAtDispatch);
       expect(registry.getInstanceId(MODEL_NAME)).toBe(storedRecords[0].modelInstanceId);
@@ -4074,61 +3680,40 @@ describe('createHandler', () => {
     }, 10000);
 
     it('iter-44/45: hard timeout force-releases retain but tombstones instance id for same-model re-registration', async () => {
-      // Iter-43 left the iter-40 `retainBinding` pinned past
-      // the soft `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS` so that a
-      // slow-but-eventual write could still land its row
-      // against the live `modelInstanceId`. Codex's iter-43
-      // review pointed out that this left a HIGH-severity leak
-      // behind: for a TRULY wedged write (promise that never
-      // settles), the retain is pinned for the lifetime of the
-      // process. `unregister()` can only park the binding in
-      // `pendingTeardown` and never reaches final teardown —
-      // pinning the model object, its `SessionRegistry`, and
-      // native KV/cache state indefinitely.
+      // Context: the soft `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS`
+      // leaves the retain pinned so that a slow-but-eventual
+      // write can still land its row against the live
+      // `modelInstanceId`. But for a TRULY wedged write (promise
+      // that never settles) a pin-forever leak is unacceptable —
+      // `unregister()` can only park the binding in
+      // `pendingTeardown`, pinning the model object, its
+      // `SessionRegistry`, and native KV/cache state indefinitely.
       //
-      // Iter-44 added a SECOND-STAGE hard-timeout breaker
-      // alongside the soft timeout. The hard timer is armed at
-      // the same moment as the persist, independently of the
-      // handler's await path, and fires only if the persist has
-      // not settled by a much longer bound. On fire it force-
-      // releases the iter-40 retain via the existing idempotent
-      // `persistRetainBox` so the binding can unwind.
-      //
-      // But codex's iter-44 review flagged that dropping the
-      // retain on elapsed TIME alone is not enough: a slow-but-
-      // eventual persist could still settle AFTER the hard
-      // bound, and if an `unregister + register(same_model)`
-      // fired in that window, the fresh register would mint a
-      // NEW instance id while the pending write still carries
-      // the OLD id — silently breaking `previous_response_id`
-      // continuations.
-      //
-      // Iter-45 fix: the breaker pairs the force-release with
+      // Invariant: a SECOND-STAGE hard-timeout breaker runs
+      // alongside the soft timeout. It tombstones the current id
+      // on the model object via
       // `registry.retireInstanceIdForForceRelease(leaseModel)`
-      // FIRST, which tombstones the current id on the model
-      // object. A subsequent `register()` of the SAME model
-      // object inherits the retired id from the tombstone
-      // instead of minting fresh — so a late-landing persist
-      // (stamped with the retired id) stays chainable.
+      // FIRST, then force-releases the retain. A subsequent
+      // `register()` of the SAME model object inherits the
+      // retired id from the tombstone instead of minting fresh —
+      // so a late-landing persist (stamped with the retired id)
+      // stays chainable.
       //
-      // Iter-45 invariant (this test): when the persist is
-      // TRULY wedged (never settles) and the hard timeout has
-      // fired, a same-object `unregister` + `register` MUST
-      // INHERIT the retired `modelInstanceId` — NOT mint a
-      // fresh one. This is exactly the property that keeps a
-      // slow-but-eventual write chainable past the hard bound.
-      // The companion hot-swap test below covers the other
-      // side: re-register with a DIFFERENT model object MUST
-      // mint a fresh id.
+      // This test: persist is TRULY wedged (never settles) and
+      // the hard timeout has fired. Same-object `unregister` +
+      // `register` MUST INHERIT the retired `modelInstanceId`.
+      // The companion hot-swap test below covers the other side:
+      // re-register with a DIFFERENT model object MUST mint a
+      // fresh id.
       //
       // Shape:
       //   - `store.store(...)` returns a promise that NEVER
       //     settles (truly wedged backend).
       //   - The file-wide default is
       //     `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS=0`
-      //     (disabled) so every other test observes the
-      //     iter-43 pin-forever contract. This test flips it to
-      //     `'100'` locally and restores on exit.
+      //     (disabled) so every other test observes the pin-
+      //     forever contract. This test flips it to `'100'`
+      //     locally and restores on exit.
       //   - After the handler returns and the hard timeout
       //     fires (~100ms), `unregister` + same-object
       //     `register` must REUSE the retired id (tombstone
@@ -4160,9 +3745,9 @@ describe('createHandler', () => {
         registry.register(MODEL_NAME, mockModel);
 
         // Sanity: the local override is in effect (else this
-        // test silently reverts to iter-43 pin-forever and the
-        // final id-inherit assertion would still pass but for
-        // the wrong reason).
+        // test silently reverts to pin-forever and the final
+        // id-inherit assertion would still pass but for the
+        // wrong reason).
         expect(process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS).toBe('100');
         expect(process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS).toBe('50');
 
@@ -4193,10 +3778,9 @@ describe('createHandler', () => {
         // Sanity check #1: immediately after the handler
         // returns, the hard timer has NOT yet fired (50ms soft
         // < 100ms hard). A same-object `unregister` + register
-        // here should still reuse the binding — this is the
-        // iter-43 invariant on the slow-but-eventual side of
-        // the hard bound, and it must continue to hold under
-        // iter-44 until the hard timer fires.
+        // here should still reuse the binding — the pin-until-
+        // hard-timeout invariant on the slow-but-eventual side
+        // of the hard bound.
         expect(registry.unregister(MODEL_NAME)).toBe(true);
         registry.register(MODEL_NAME, mockModel);
         const idImmediately = registry.getInstanceId(MODEL_NAME);
@@ -4209,17 +3793,14 @@ describe('createHandler', () => {
         await new Promise((r) => setTimeout(r, 150));
         await new Promise((r) => setImmediate(r));
 
-        // Primary iter-45 invariant: the hard timer fired,
-        // retired the id via the tombstone, THEN force-released
-        // the retain. `pendingPersists` dropped to 0 so a fresh
-        // `unregister` tears the binding down — but the next
-        // `register` on the SAME model object reads the retired
-        // id from the tombstone and INHERITS it. The late-
-        // landing persist's record (still carrying the old id)
-        // thus remains chainable. This is the opposite of the
-        // broken iter-44 behaviour where the same register
-        // would have minted a fresh id and silently broken
-        // chains.
+        // Primary invariant: the hard timer fired, retired the
+        // id via the tombstone, THEN force-released the retain.
+        // `pendingPersists` dropped to 0 so a fresh `unregister`
+        // tears the binding down — but the next `register` on
+        // the SAME model object reads the retired id from the
+        // tombstone and INHERITS it. The late-landing persist's
+        // record (still carrying the old id) thus remains
+        // chainable.
         expect(registry.unregister(MODEL_NAME)).toBe(true);
         registry.register(MODEL_NAME, mockModel);
         const idAfterBreaker = registry.getInstanceId(MODEL_NAME);
@@ -4243,7 +3824,7 @@ describe('createHandler', () => {
     }, 5000);
 
     it('iter-45 hot-swap: hard timeout retires id but a DIFFERENT model object on re-registration mints fresh id (semantic mismatch)', async () => {
-      // Iter-45 tombstone-inherit ONLY applies to same-object
+      // Tombstone-inherit ONLY applies to same-object
       // re-registration. When the operator hot-swaps the name
       // to a genuinely DIFFERENT model object (different
       // tokenizer, different KV layout, different chat template)
@@ -4254,8 +3835,8 @@ describe('createHandler', () => {
       // that produced the record.
       //
       // This test drives the wedged-persist + hard-timeout
-      // sequence exactly like the iter-44/45 same-model test
-      // above, then AFTER the breaker fires does:
+      // sequence exactly like the same-model test above, then
+      // AFTER the breaker fires does:
       //   - `unregister(MODEL_NAME)`
       //   - `register(MODEL_NAME, /* different model object */)`
       // and asserts the new instance id is FRESH — NOT
@@ -4341,35 +3922,24 @@ describe('createHandler', () => {
     }, 5000);
 
     it('iter-46: tombstone is cleared when the slow-but-eventual persist eventually settles', async () => {
-      // Codex's iter-45 review flagged a HIGH finding: the
-      // iter-45 tombstone is installed by the breaker but
-      // removed ONLY when a future `register()` inherits it.
-      // There is no settlement-path cleanup. A truly pathological
-      // case is the `SLOW-BUT-EVENTUAL` persist: the hard timer
-      // fires and installs the tombstone, but the underlying
-      // `store.store(...)` still fulfils (or rejects) some time
-      // later. Under iter-45 the tombstone then stays in the
-      // `WeakMap` indefinitely — so a LATER `unregister()` +
-      // `register(sameModel)` that happens long after the late
-      // write has already landed (i.e. an unrelated subsequent
-      // lifecycle) inherits the old id instead of minting fresh.
-      // That reopens stale-chain replay across what should be
-      // logically dead bindings: reload/rollback safety now
-      // depends on whether a past hard-timeout event ever
-      // occurred.
-      //
-      // Iter-46 fix: scope the tombstone's lifetime to the
+      // Invariant: the tombstone's lifetime is scoped to the
       // PENDING persist that installed it. The breaker captures
       // the `{ instanceId }` returned by
       // `retireInstanceIdForForceRelease` in a local variable,
-      // and the persist's `.finally(...)` releases the
-      // tombstone via `registry.releaseTombstone(model)`.
-      // Iter-48 stores one refcounted entry per model so
-      // overlapping breakers on the same live instance id
-      // share one slot — each retire increments, each release
-      // decrements, and the entry survives until every pending
-      // persist has released (bounded memory under wedged
-      // stores).
+      // and the persist's `.finally(...)` releases the tombstone
+      // via `registry.releaseTombstone(model)`. One refcounted
+      // entry per model, so overlapping breakers on the same
+      // live instance id share one slot — each retire
+      // increments, each release decrements, and the entry
+      // survives until every pending persist has released
+      // (bounded memory under wedged stores).
+      //
+      // The SLOW-BUT-EVENTUAL scenario: hard timer fires and
+      // installs the tombstone, but `store.store(...)` still
+      // fulfils (or rejects) some time later. The release must
+      // run so a LATER `unregister()` + `register(sameModel)`
+      // that happens long after the late write has already
+      // landed mints a FRESH id, not the stale one.
       //
       // Shape (Deferred<void> pattern):
       //   - `store.store(...)` returns a promise we control —
@@ -4389,15 +3959,13 @@ describe('createHandler', () => {
       //   - `unregister(MODEL_NAME)` + `register(MODEL_NAME, sameModel)`
       //     — because the tombstone is gone, the fresh
       //     `register()` MUST mint a fresh id (different from
-      //     `idBefore`). Under iter-45 the tombstone would
-      //     still be present and the id would be inherited,
-      //     which is the exact bug iter-46 fixes.
+      //     `idBefore`).
       //
-      // The iter-45 same-object inherit test above is NOT
-      // affected by this fix: in that test the persist NEVER
-      // settles, so the tombstone is never cleared, and the
-      // same-model re-registration still correctly inherits
-      // the retired id.
+      // The same-object inherit test above is NOT affected by
+      // this fix: in that test the persist NEVER settles, so
+      // the tombstone is never cleared, and the same-model
+      // re-registration still correctly inherits the retired
+      // id.
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '100';
       try {
@@ -4456,8 +4024,8 @@ describe('createHandler', () => {
         await new Promise((r) => setTimeout(r, 150));
         await new Promise((r) => setImmediate(r));
 
-        // NOW settle the pending persist. Under iter-46/48 the
-        // persist's `.finally(...)` releases the tombstone via
+        // NOW settle the pending persist. The persist's
+        // `.finally(...)` releases the tombstone via
         // `releaseTombstone`; since this is the only pending
         // retire, its refcount drains to zero and the entry
         // is dropped. Drain microtasks + one macrotask so the
@@ -4467,20 +4035,12 @@ describe('createHandler', () => {
         await Promise.resolve();
         await new Promise((r) => setImmediate(r));
 
-        // Primary iter-46 invariant: the tombstone has been
-        // cleared by the persist's `.finally(...)`, so a fresh
-        // `unregister` + same-object `register` MUST mint a
-        // FRESH instance id — NOT inherit the retired one.
-        // This matches the pre-iter-45 teardown semantics for
-        // non-wedged cases: once the persist has settled the
-        // binding is treated as logically dead and any
-        // subsequent re-registration gets a fresh id.
-        //
-        // Under iter-45 the tombstone would still be present
-        // at this point (no settlement-path cleanup) and this
-        // assertion would fail — the new id would equal
-        // `idBefore`. That is the exact stale-chain hazard
-        // iter-46 eliminates.
+        // Primary invariant: the tombstone has been cleared by
+        // the persist's `.finally(...)`, so a fresh `unregister`
+        // + same-object `register` MUST mint a FRESH instance
+        // id — NOT inherit the retired one. Once the persist has
+        // settled the binding is treated as logically dead and
+        // any subsequent re-registration gets a fresh id.
         expect(registry.unregister(MODEL_NAME)).toBe(true);
         registry.register(MODEL_NAME, mockModel);
         const idAfterSettle = registry.getInstanceId(MODEL_NAME);
@@ -4499,27 +4059,7 @@ describe('createHandler', () => {
     }, 5000);
 
     it('iter-47/48: overlapping hard-timeouts are reference-counted; tombstone survives until all outstanding persists release', async () => {
-      // Codex's iter-46 review flagged a HIGH finding: the
-      // iter-46 tombstone storage keyed retired ids by
-      // `WeakMap<Model, number>`, so two overlapping hard-
-      // timeouts on the SAME live binding both retired the
-      // SAME numeric instance id and the second breaker simply
-      // overwrote the first with the identical value. Whichever
-      // persist settled first ran `clearTombstoneIfMatches`,
-      // matched, and DELETED the only tombstone entry — wiping
-      // out the tombstone that the OTHER still-hung persist was
-      // relying on to keep its late-landing row chainable.
-      //
-      // Iter-47 addressed that by minting a unique `symbol`
-      // token per breaker fire and keeping one map entry per
-      // token. Codex's iter-47 review then flagged a follow-up:
-      // under a truly wedged store, persists never settle, so
-      // each hard-timeout appends a new Symbol slot that is
-      // never cleared — memory grows O(timeouts) per wedged
-      // model and the retired id stays pinned across
-      // subsequent unregister/re-register cycles indefinitely.
-      //
-      // Iter-48 fix: store ONE
+      // Invariant: store ONE
       // `{ instanceId, outstandingCount }` entry per model.
       // Overlapping breakers on the same live binding target
       // the SAME retired id (the register-inherit path keeps
@@ -4565,13 +4105,9 @@ describe('createHandler', () => {
       expect(tombstoneA!.instanceId).toBe(idBefore);
       expect(tombstoneB!.instanceId).toBe(idBefore);
 
-      // Persist A "settles" -> releases its retire. The
-      // shared refcount drops to 1 so the tombstone survives.
-      // Under iter-46 the numeric-keyed
-      // `clearTombstoneIfMatches` would have wiped the sole
-      // entry here, so the register-inherit path below would
-      // have missed. Under iter-48 refcounting keeps the
-      // entry alive while B is still outstanding.
+      // Persist A "settles" -> releases its retire. The shared
+      // refcount drops to 1 so the tombstone survives while B
+      // is still outstanding.
       registry.releaseTombstone(mockModel);
 
       // Unregister + re-register the SAME model object. With
@@ -4592,15 +4128,10 @@ describe('createHandler', () => {
       // Now unregister + re-register the SAME model object
       // AGAIN. With every tombstone released, this is a
       // logically dead binding and re-registration MUST mint
-      // a FRESH id (different from `idBefore`) — matching the
-      // pre-iter-45 teardown semantics for non-wedged cases.
-      // Under iter-46 the single shared slot was already gone
-      // by now (cleared by A's settlement above) and B's
-      // settlement would be a no-op; the iter-46 bug was the
-      // INTERMEDIATE state, not this final one. The pair of
+      // a FRESH id (different from `idBefore`). The pair of
       // assertions together (idAfterASettled === idBefore AND
-      // idAfterBSettled !== idBefore) is what fingerprints
-      // the shared refcount's drain semantics.
+      // idAfterBSettled !== idBefore) fingerprints the shared
+      // refcount's drain semantics.
       expect(registry.unregister(MODEL_NAME)).toBe(true);
       registry.register(MODEL_NAME, mockModel);
       const idAfterBSettled = registry.getInstanceId(MODEL_NAME);
@@ -4609,34 +4140,22 @@ describe('createHandler', () => {
     }, 5000);
 
     it('iter-48: wedged-store tombstone state stays O(1); N unreleased retires share one entry', async () => {
-      // Codex's iter-47 review flagged that the iter-47
-      // WeakMap<Model, Map<symbol, number>> layout — one
-      // Symbol entry per breaker fire — was only bounded by
-      // persist settlements. Under a truly wedged store the
-      // persists never settle, so each fresh hard-timeout
-      // appended a new Symbol slot that stayed live for the
-      // process lifetime. Memory grew O(timeouts) per wedged
-      // model and the retired id stayed pinned across
-      // unregister/re-register cycles indefinitely.
-      //
-      // Iter-48 replaces that with a single refcounted
+      // Invariant: a single refcounted
       // `{ instanceId, outstandingCount }` entry per model.
       // Every retire increments the counter; every release
       // decrements it. The entry is dropped once the count
       // drains to zero. Regardless of how many hard-timeouts
-      // have fired (even thousands, against a wedged store),
+      // have fired (even thousands against a wedged store),
       // the tombstone's memory footprint is O(1) per model.
       //
-      // This test exercises the wedged-store shape directly
-      // against the registry's public API. We fire N retires
-      // WITHOUT releasing any of them, confirm every retire
+      // This test exercises the wedged-store shape: fire N
+      // retires WITHOUT releasing any, confirm every retire
       // reports the same `instanceId`, confirm the tombstone
       // stays alive across unregister/re-register (same id
       // inherited), release only K of the N, confirm the
       // tombstone STILL survives, then release the remaining
       // (N - K) and confirm the next teardown mints fresh.
-      // Observable outcomes only — we don't peek into the
-      // registry's internal WeakMap shape; the O(1) bound is
+      // Observable outcomes only — the O(1) bound is
       // established by the behavior contract (all retires
       // collapse into one shared refcount).
       const mockModel = {
@@ -4673,8 +4192,7 @@ describe('createHandler', () => {
 
       // Tombstone alive with N outstanding retires -> an
       // unregister + same-object register inherits the
-      // retired id. Under iter-47 this would also pass, but
-      // at the cost of an N-entry Symbol map.
+      // retired id.
       expect(registry.unregister(MODEL_NAME)).toBe(true);
       registry.register(MODEL_NAME, mockModel);
       expect(registry.getInstanceId(MODEL_NAME)).toBe(idBefore);
@@ -4719,19 +4237,10 @@ describe('createHandler', () => {
     }, 5000);
 
     it('iter-52/53: markHardTimedOut sweeps expired markers on the write path (bounded budget per call)', async () => {
-      // Codex's iter-51 review HIGH finding 1: expired markers were
-      // only reclaimed when something later called `isHardTimedOut(id)`
-      // or `hardTimedOutSize`. For a wedged backend serving new
-      // top-level traffic (zero continuation retries), the map grew
-      // one entry per hard-timed-out response forever because no
-      // reader ever drained the tail.
-      //
-      // Iter-52 fix: `markHardTimedOut()` calls `sweepExpired()`
+      // Invariant: `markHardTimedOut()` calls `sweepExpired()`
       // BEFORE its insert so every new hard-timeout event drains
-      // the expired entries left by previous events. Iter-53
-      // bounds the sweep to MAX_SWEEP_PER_INSERT=64 entries per
-      // call (codex's iter-52 MEDIUM finding 2 — unbounded linear
-      // walk became amortized O(N^2) across N wedged writes).
+      // the expired entries left by previous events. Sweep is
+      // bounded to MAX_SWEEP_PER_INSERT=64 entries per call.
       // This test stages only a couple of small entries so the
       // bounded budget is never hit; a separate regression below
       // drives the budget boundary with N=200.
@@ -4752,10 +4261,10 @@ describe('createHandler', () => {
         expect(tracker.isHardTimedOut('A')).toBe(true);
         expect(tracker.isHardTimedOut('B')).toBe(true);
 
-        // Advance time past the TTL. Both markers have expired but
-        // neither has been explicitly read — in iter-51 this was
-        // the leak: without a read, the entries sat in the map
-        // forever.
+        // Advance time past the TTL. Both markers have expired
+        // but neither has been explicitly read — without a write-
+        // path sweep, entries without a reader would sit in the
+        // map forever.
         vi.advanceTimersByTime(10_000);
 
         // Now stage C and mark it hard-timed-out. The write-path
@@ -4775,23 +4284,15 @@ describe('createHandler', () => {
     });
 
     it('iter-53: isHardTimedOut refresh-on-read is clamped at the record\u2019s absolute row expiry', async () => {
-      // Codex's iter-52 review HIGH finding 1: the iter-52
-      // refresh-on-read extended the marker expiry unboundedly as
-      // long as clients kept retrying, even though the response
-      // record itself has a FIXED absolute wall-clock expiry
-      // (RESPONSE_TTL_SECONDS, currently 30 min). After that
-      // absolute bound passes, `ResponseStore.getChain()` hides the
-      // row, so the retryable-503 classification is factually wrong
-      // — but the refresh-on-read kept it live indefinitely under
-      // active retry traffic. Result: permanent 503 loop for an
-      // unrecoverable chain.
-      //
-      // Iter-53 fix: the caller threads in `absoluteExpiresAt` (the
+      // Invariant: the caller threads in `absoluteExpiresAt` (the
       // record row's own expiry). The marker's initial `expiresAt`
       // is `min(now + ttlMs, absoluteExpiresAt)`, every refresh is
       // clamped at `absoluteExpiresAt`, and an explicit check on
       // read deletes the marker once `Date.now() >= absoluteExpiresAt`
-      // regardless of refreshes.
+      // regardless of refreshes. Without the clamp a refresh-on-
+      // read chain could keep the marker alive indefinitely under
+      // active retry traffic, producing a permanent 503 loop for
+      // a chain whose row has already expired.
       //
       // This focused unit test exercises the clamp at each stage:
       //   TTL = 100ms, absoluteExpiresAt = now + 250ms
@@ -4825,11 +4326,9 @@ describe('createHandler', () => {
         vi.advanceTimersByTime(90);
         expect(tracker.isHardTimedOut('X')).toBe(true);
 
-        // t=260: past absoluteExpiresAt. Iter-52's refresh-on-read
-        // would keep this alive (the t=140 read extended expiresAt
-        // to 250 rather than 240, but even without the clamp the
-        // chain of refreshes could stretch past t=260). Iter-53's
-        // absolute-cap check in isHardTimedOut() hard-stops here.
+        // t=260: past absoluteExpiresAt. A refresh-on-read chain
+        // alone could stretch the marker past t=260; the absolute-
+        // cap check in isHardTimedOut() hard-stops here.
         vi.advanceTimersByTime(120);
         expect(tracker.isHardTimedOut('X')).toBe(false);
         expect(tracker.hardTimedOutSize).toBe(0);
@@ -4839,18 +4338,13 @@ describe('createHandler', () => {
     });
 
     it('iter-53: bounded sweep reclaims in amortized batches (MAX_SWEEP_PER_INSERT budget)', async () => {
-      // Codex's iter-52 review MEDIUM finding 2: sweepExpired()
-      // was an unbounded linear walk of the marker map on every
-      // `markHardTimedOut()` insert. With iter-52's
-      // refresh-on-read keeping actively-retried ids alive for
-      // arbitrarily long, the map could grow to N and every new
-      // transition paid O(N) on the main event loop — amortized
-      // O(N^2) across N wedged writes.
-      //
-      // Iter-53 fix: bounded visit budget (MAX_SWEEP_PER_INSERT =
+      // Invariant: bounded visit budget (MAX_SWEEP_PER_INSERT =
       // 64). Each `markHardTimedOut()` call visits at most 64
       // entries of the marker map; a K-entry backlog therefore
       // drains across roughly ceil(K / 64) subsequent inserts.
+      // Without the budget, refresh-on-read could keep actively-
+      // retried ids alive for arbitrarily long and sweep would
+      // become amortized O(N^2) across N wedged writes.
       //
       // This test seeds N=200 entries with BOTH their TTL expiry
       // AND their absolute cap already in the past (so every
@@ -4924,31 +4418,20 @@ describe('createHandler', () => {
     });
 
     it('iter-51: markHardTimedOut marker expires after TTL and is cleared on settlement', async () => {
-      // Iter-49's first primitive was `evict(id)` — remove the
-      // pending entry without waiting for settlement so a wedged
-      // `store.store(...)` stops pinning tracker memory. But codex's
-      // iter-49 review flagged that eviction ALSO erased the only
-      // signal a `previous_response_id` continuation uses to
-      // distinguish "slow-but-eventual persist across the breaker"
-      // from "genuinely missing chain".
+      // Invariant: the hard-timed-out state uses a two-phase
+      // marker:
+      //   * Phase 1 (active pending): `awaitPending(id)` returns
+      //     the promise.
+      //   * Phase 2 (hard-timed-out): the pending entry is
+      //     dropped (so `awaitPending` no longer hands out a
+      //     wedged promise and memory is reclaimable), but the
+      //     id stays in a lightweight `hardTimedOut` marker.
       //
-      // Iter-50 replaced `evict` with a two-phase marker:
-      //   * Phase 1 (active pending): `awaitPending(id)` returns the
-      //     promise — existing behaviour.
-      //   * Phase 2 (hard-timed-out): the pending entry is dropped
-      //     (so `awaitPending` no longer hands out a wedged promise
-      //     and memory is reclaimable), but the id stays in a
-      //     lightweight `hardTimedOut` marker.
-      //
-      // Iter-51 (codex's iter-50 HIGH finding 1): the iter-50 marker
-      // cleanup relied SOLELY on the underlying write promise's
-      // `.finally(...)` handler — which never fires for a truly
-      // wedged store that never settles. That left unbounded marker
-      // accumulation under sustained traffic against a wedged
-      // backend. Fix: pair the fast settle-triggered cleanup with an
-      // independent TTL, lazily expired on read, so marker lifetime
-      // is bounded by min(write settlement, TTL expiry) in every
-      // scenario. This focused unit test pins both cleanup paths.
+      // The marker's cleanup pairs the fast settle-triggered
+      // `.finally(...)` path with an independent TTL, lazily
+      // expired on read, so marker lifetime is bounded by
+      // min(write settlement, TTL expiry) in every scenario.
+      // This focused unit test pins both cleanup paths.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
       let resolveFn: (() => void) | undefined;
@@ -4961,10 +4444,9 @@ describe('createHandler', () => {
       expect(tracker.isHardTimedOut('resp_1')).toBe(false);
 
       // Transition to the hard-timed-out marker state with a TTL.
-      // Iter-51 callers supply the TTL explicitly so this module
-      // stays env-free; iter-53 callers also pass the record's
-      // absolute row expiry (a far-future value here so only the
-      // TTL path is exercised in this block).
+      // Callers supply the TTL explicitly (this module stays env-
+      // free) AND the record's absolute row expiry (a far-future
+      // value here so only the TTL path is exercised).
       const farFuture = Date.now() + 60 * 60 * 1000;
       const transitioned = tracker.markHardTimedOut('resp_1', 60_000, farFuture);
       expect(transitioned).toBe(true);
@@ -4984,11 +4466,11 @@ describe('createHandler', () => {
       expect(tracker.isHardTimedOut('resp_1')).toBe(true);
       expect(tracker.hardTimedOutSize).toBe(1);
 
-      // Iter-51: TTL-based expiry. Install a fresh marker with a
-      // very short TTL, advance fake time past the expiry, and
-      // assert the marker reports as absent on the next read.
-      // Because `isHardTimedOut` lazily deletes expired entries,
-      // this also asserts the map drains via the slow path.
+      // TTL-based expiry. Install a fresh marker with a very
+      // short TTL, advance fake time past the expiry, and assert
+      // the marker reports as absent on the next read. Because
+      // `isHardTimedOut` lazily deletes expired entries, this
+      // also asserts the map drains via the slow path.
       vi.useFakeTimers();
       try {
         tracker.track('resp_ttl', new Promise<void>(() => {}));
@@ -5004,11 +4486,10 @@ describe('createHandler', () => {
         vi.useRealTimers();
       }
 
-      // Iter-50 fast path: resolving the original promise clears
-      // the marker via the `.finally(...)` cleanup inside `track`.
-      // This path still fires in iter-51 when the wedged store
-      // eventually unwedges — TTL is the slow fallback, not a
-      // replacement.
+      // Fast path: resolving the original promise clears the
+      // marker via the `.finally(...)` cleanup inside `track`.
+      // This path fires when the wedged store eventually
+      // unwedges — TTL is the slow fallback, not a replacement.
       expect(resolveFn).toBeDefined();
       resolveFn!();
       await Promise.resolve();
@@ -5019,22 +4500,13 @@ describe('createHandler', () => {
     });
 
     it('iter-51: hardTimedOut markers expire after TTL under sustained wedged-store traffic (bounded memory)', async () => {
-      // Codex's iter-50 review HIGH finding 1: under a truly
-      // wedged store (`store.store(...)` never settles), the
-      // iter-50 `.finally(...)`-only cleanup left one marker per
-      // hard-timed-out request growing linearly with traffic.
-      // Under sustained traffic this reintroduced unbounded
-      // state growth AND incorrect eventual classification
-      // (retryable 503 forever for ids whose chain will never
-      // materialize).
-      //
-      // Iter-51 fix: markers carry an independent TTL, lazily
-      // expired on read. Steady-state memory is now bounded at
+      // Invariant: markers carry an independent TTL, lazily
+      // expired on read, so steady-state memory is bounded at
       // O(requestRate × TTL) regardless of how long the store
       // stays wedged. This regression drives N=100 never-settling
       // markers with a 5s TTL; the fast `.finally(...)` path
-      // never fires because no write ever resolves, so the TTL is
-      // the ONLY cleanup path exercised here.
+      // never fires because no write ever resolves, so the TTL
+      // is the ONLY cleanup path exercised here.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
 
@@ -5050,16 +4522,16 @@ describe('createHandler', () => {
           // `track()` NEVER runs on these promises.
           tracker.track(id, new Promise<void>(() => {}));
           // 5000ms TTL — much shorter than the 5-minute default
-          // so we can prove the expiry path drains them. Iter-53:
-          // pass a far-future absoluteExpiresAt so only the TTL
-          // is exercised here.
+          // so we can prove the expiry path drains them.
+          // Far-future absoluteExpiresAt so only the TTL is
+          // exercised here.
           tracker.markHardTimedOut(id, 5000, Date.now() + 60 * 60 * 1000);
         }
 
-        // Pre-expiry: every marker is live, hardTimedOutSize is N,
-        // pending tracker is zero (wedged promises have been
+        // Pre-expiry: every marker is live, hardTimedOutSize is
+        // N, pending tracker is zero (wedged promises have been
         // moved into the marker state so the tracker map is
-        // reclaimable — iter-49 memory bound preserved).
+        // reclaimable).
         expect(tracker.hardTimedOutSize).toBe(N);
         expect(tracker.size).toBe(0);
         for (const id of ids) {
@@ -5078,7 +4550,7 @@ describe('createHandler', () => {
         // entry. Final size is zero even though NO underlying
         // promise ever settled — the TTL is the sole cleanup
         // signal here, which is exactly the pathologically-wedged
-        // scenario iter-51 is designed for.
+        // sustained-wedged-store scenario.
         expect(tracker.hardTimedOutSize).toBe(0);
       } finally {
         vi.useRealTimers();
@@ -5086,25 +4558,15 @@ describe('createHandler', () => {
     });
 
     it('iter-50: hard-timeout breaker moves pending-write tracker entries into hard-timed-out marker state', async () => {
-      // Codex's iter-48 review flagged the leak fixed by iter-49 —
-      // under a wedged `store.store(...)` the pending-write
-      // tracker's settlement-only cleanup left one entry per
-      // hard-timed-out request, growing O(N) with traffic. Codex's
-      // iter-49 review then flagged that `evict`-on-breaker
-      // regressed `previous_response_id` recovery: slow-but-eventual
-      // persists crossing the hard timeout had their tracker entry
-      // evicted too, leaving continuations with no signal to
-      // distinguish "retryable storage slowness" from "permanent
-      // 404".
-      //
-      // Iter-50 fix: the hard-timeout breaker calls
+      // Invariant: the hard-timeout breaker calls
       // `markHardTimedOut(record.id)` BEFORE releasing the binding
-      // retain. The pending entry is dropped (iter-49 memory bound
-      // preserved — the raw store promise keeps running in the
-      // background but the tracker no longer holds a reference, so
-      // the closure chain is reclaimable) AND the id is added to a
-      // lightweight `hardTimedOut` marker so the continuation path
-      // can return retryable 503 `storage_timeout` instead of 404.
+      // retain. The pending entry is dropped (raw store promise
+      // keeps running in the background but the tracker no longer
+      // holds a reference, so the closure chain is reclaimable)
+      // AND the id is added to a lightweight `hardTimedOut`
+      // marker so the continuation path can return retryable 503
+      // `storage_timeout` instead of 404 — distinguishing
+      // "retryable storage slowness" from "permanent 404".
       //
       // Shape:
       //   - `store.store(...)` returns a promise that NEVER
@@ -5118,9 +4580,9 @@ describe('createHandler', () => {
       //     response to the hard-timed-out marker state.
       //   - Sleep long enough for every hard timer to fire.
       //   - Assert: `getPendingWritesFor(mockStore).size === 0`
-      //     (pending drained — iter-49 memory bound preserved)
-      //     AND `isHardTimedOut(id) === true` for every response id
-      //     (iter-50 retryable signal preserved).
+      //     (pending drained — memory bounded) AND
+      //     `isHardTimedOut(id) === true` for every response id
+      //     (retryable signal preserved).
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
       try {
@@ -5176,16 +4638,16 @@ describe('createHandler', () => {
 
         // The store was called exactly N times — every request
         // synchronously populated a tracker entry under
-        // `record.id` before the mutex released (iter-36/48
-        // invariant via `initiatePersist`). We can't assert
-        // `size === N` between requests because the hard timer
-        // is 50ms and the soft-timeout detach path inside the
-        // handler already elapses ~50ms per request, so by the
-        // time we reach this point some earlier entries may have
-        // already transitioned to the hard-timed-out marker. The
-        // observable contract we care about is the FINAL steady
-        // state: after every hard timer has fired, the pending
-        // map has drained AND every id has a live marker.
+        // `record.id` before the mutex released (via
+        // `initiatePersist`). We can't assert `size === N`
+        // between requests because the hard timer is 50ms and
+        // the soft-timeout detach path inside the handler
+        // already elapses ~50ms per request, so by the time we
+        // reach this point some earlier entries may have already
+        // transitioned to the hard-timed-out marker. The
+        // observable contract: after every hard timer has fired,
+        // the pending map has drained AND every id has a live
+        // marker.
         expect(mockStore.store).toHaveBeenCalledTimes(N);
 
         // Wait for any pending hard timers to fire on every
@@ -5195,22 +4657,19 @@ describe('createHandler', () => {
         await new Promise((r) => setTimeout(r, 200));
         await new Promise((r) => setImmediate(r));
 
-        // Primary iter-50 invariant A: every hard-timeout breaker
-        // dropped its pending-write tracker entry. The pending map
-        // has drained to zero even though not a single
+        // Primary invariant A: every hard-timeout breaker
+        // dropped its pending-write tracker entry. The pending
+        // map has drained to zero even though not a single
         // `store.store(...)` promise has settled — the raw
         // promises are still hanging in the background but no
-        // longer pinned through the tracker. Under iter-48 (before
-        // iter-49) this would be N (5) and growing linearly with
-        // future wedged requests.
+        // longer pinned through the tracker.
         const tracker = getPendingWritesFor(mockStore);
         expect(tracker.size).toBe(0);
 
-        // Primary iter-50 invariant B: every hard-timed-out id is
-        // now in the marker set so a concurrent `previous_response_id`
-        // continuation can return retryable 503 instead of
-        // permanent 404. Under iter-49's `evict`-outright policy
-        // this set would not exist and continuations would 404.
+        // Primary invariant B: every hard-timed-out id is now in
+        // the marker set so a concurrent `previous_response_id`
+        // continuation can return retryable 503 instead of a
+        // premature permanent 404.
         expect(tracker.hardTimedOutSize).toBe(N);
         for (const id of responseIds) {
           expect(tracker.isHardTimedOut(id)).toBe(true);
@@ -5234,24 +4693,14 @@ describe('createHandler', () => {
     }, 10000);
 
     it('iter-50: hard-timed-out persist that later resolves — continuations get retryable 503 in window, then succeed after settle', async () => {
-      // Codex's iter-49 review flagged that `evict`-on-breaker
-      // regressed slow-but-eventual persist recovery: once the
-      // breaker evicted the tracker entry, a concurrent
-      // `previous_response_id` continuation for that id had no
-      // signal to distinguish "write is still running, retry" from
-      // "genuinely 404". The continuation took the 404 branch and
-      // the client discarded `previous_response_id` as invalid,
-      // permanently breaking the conversation chain even though
-      // the write was ~50-100ms from landing.
-      //
-      // Iter-50 fix: the breaker calls `markHardTimedOut(id)`
-      // instead. The pending entry is dropped (iter-49 memory
-      // bound preserved) but the id stays in a lightweight
-      // `hardTimedOut` marker. The continuation path consults
-      // `isHardTimedOut(id)` before falling through to
-      // `sendNotFound(...)` and returns the same retryable 503
-      // `storage_timeout` shape the normal `awaitPending` timeout
-      // branch above uses, so clients keep retrying.
+      // Invariant: the breaker calls `markHardTimedOut(id)`.
+      // The pending entry is dropped (memory bounded) but the
+      // id stays in a lightweight `hardTimedOut` marker. The
+      // continuation path consults `isHardTimedOut(id)` before
+      // falling through to `sendNotFound(...)` and returns the
+      // same retryable 503 `storage_timeout` shape the normal
+      // `awaitPending` timeout branch uses, so clients keep
+      // retrying.
       //
       // This end-to-end regression drives:
       //   1. A write whose completion is controlled by an
@@ -5416,9 +4865,8 @@ describe('createHandler', () => {
         expect(status3()).toBe(404);
         const parsed3 = JSON.parse(getBody3());
         // Accept either 404 copy — both indicate the retryable
-        // window is closed. The iter-50 contract we are pinning
-        // is "retryable 503 WHILE the marker is live, then NOT
-        // 503 once it drains".
+        // window is closed. The contract: "retryable 503 WHILE
+        // the marker is live, then NOT 503 once it drains".
         expect(parsed3.error.type).not.toBe('storage_timeout');
 
         expect(unhandled).toHaveLength(0);
@@ -5433,24 +4881,16 @@ describe('createHandler', () => {
     }, 10000);
 
     it('iter-51: late-landing row during hard-timeout marker window is returned via final getChain probe, not 503', async () => {
-      // Codex's iter-50 review HIGH finding 2: the iter-50
-      // continuation path classified "miss + isHardTimedOut(id)"
-      // as 503 without re-probing `getChain`. Two windows were
-      // broken:
-      //
-      //   * Row lands in the narrow interval between the initial
-      //     `getChain` miss and the `isHardTimedOut` check — the
-      //     handler returns 503 for a chain that already exists.
-      //   * Write promise settles JUST BEFORE the marker check
-      //     (clearing the marker via `.finally(...)`) — the
-      //     handler emits 404 for a chain that now exists, even
-      //     though the row DID land.
-      //
-      // Iter-51 fix: before emitting 503 via the marker path, run
+      // Invariant: before emitting 503 via the marker path, run
       // one last `getChain` probe. If the probe finds the row
       // (i.e. the write slipped in during the marker window), the
       // continuation proceeds along the happy-path flow with the
-      // probed chain — NOT misclassified as 503 or 404.
+      // probed chain — NOT misclassified as 503 or 404. Covers
+      // two races:
+      //   * Row lands in the narrow interval between the initial
+      //     `getChain` miss and the `isHardTimedOut` check.
+      //   * Write promise settles JUST BEFORE the marker check
+      //     (clearing the marker via `.finally(...)`).
       //
       // This end-to-end test:
       //   1. Drives a POST with an unresolved store.store() so the
@@ -5472,9 +4912,7 @@ describe('createHandler', () => {
         // `store.store()` never resolves, forcing the
         // hard-timeout breaker to fire; but the records map has
         // the actual record so a later `getChain` sees a
-        // coherent `StoredResponseRecord`. This mirrors the iter-39
-        // late-land test's pattern — we reuse the production
-        // record shape rather than hand-rolling one in the test.
+        // coherent `StoredResponseRecord`.
         const storedRecords = new Map<string, any>();
         // `firstGetChainMissed` gates the "late-land" flip:
         // before it flips, `getChain` rejects with "not found"
@@ -5508,10 +4946,8 @@ describe('createHandler', () => {
         // The continuation path may go through either
         // `chatSessionContinue` (hot session hit) OR
         // `chatSessionStart` (cold replay via the stored chain).
-        // The iter-50 resolve test demonstrates the continuation
-        // flows through `chatSessionStart` in this setup
-        // (friendly-name match + cold replay); accept either
-        // path by returning a valid ChatResult from both.
+        // Accept either path by returning a valid ChatResult
+        // from both.
         const chatSessionContinue = vi.fn().mockResolvedValue(makeChatResult({ text: 'continuation after late-land' }));
         const mockModel = {
           chatSessionStart,
@@ -5560,8 +4996,8 @@ describe('createHandler', () => {
         }
 
         // (2) Wait for the 50ms hard-timeout breaker. After this
-        // the pending tracker has drained (iter-49 memory bound)
-        // and A is in the hard-timed-out marker (iter-50).
+        // the pending tracker has drained and A is in the hard-
+        // timed-out marker.
         await new Promise((r) => setTimeout(r, 200));
         await new Promise((r) => setImmediate(r));
 
@@ -5572,18 +5008,16 @@ describe('createHandler', () => {
         // (3) Simulate the wedged SQLite writer finally landing
         // the row while the marker is still live. Flipping this
         // flag makes `getChain` return the real record stored at
-        // step 1 — the late-land window iter-51 is designed to
-        // recover from. The marker is STILL LIVE, so under the
-        // iter-50 classification (no final probe) the handler
-        // would have emitted 503 for a chain that already exists.
+        // step 1. The marker is STILL LIVE — without a final
+        // getChain probe the handler would emit 503 for a chain
+        // that already exists.
         simulateLateLand = true;
 
         // (4) Continuation POST with previous_response_id = A.
         // The marker is still live (isHardTimedOut returns true)
-        // but the row IS now present in the store. Iter-51 probes
-        // `getChain` one last time before emitting 503; since
-        // the probe finds the row the continuation must proceed
-        // normally — NOT return 503.
+        // but the row IS now present in the store. The final
+        // `getChain` probe before emitting 503 finds the row, so
+        // the continuation must proceed normally — NOT return 503.
         const req2 = createMockReq('POST', '/v1/responses', {
           model: MODEL_NAME,
           input: 'continuation against late-landed row',
@@ -5594,12 +5028,12 @@ describe('createHandler', () => {
         await handler(req2, res2);
         await wait2();
 
-        // The response must not be 503 storage_timeout. Under
-        // the iter-50 classification (no final probe) this would
-        // have been 503 because the marker was still live at the
-        // moment of the continuation. Under iter-51 the final
-        // probe sees the late-landed row and the handler
-        // proceeds along the happy-path continuation flow.
+        // The response must not be 503 storage_timeout. Without
+        // a final probe this would have been 503 because the
+        // marker was still live at the moment of the
+        // continuation. The final probe sees the late-landed row
+        // and the handler proceeds along the happy-path
+        // continuation flow.
         expect(status2()).not.toBe(503);
         const parsed2 = JSON.parse(getBody2());
         expect(parsed2.error?.type).not.toBe('storage_timeout');
@@ -5621,21 +5055,16 @@ describe('createHandler', () => {
     }, 10000);
 
     it('iter-52: slow-but-eventual persist across the marker TTL keeps 503 via refresh-on-read, then succeeds once it lands', async () => {
-      // Codex's iter-51 review HIGH finding 2: with a fixed TTL,
-      // once enough wall-clock elapsed the marker flipped to
-      // `false` and the same request path returned permanent 404
-      // even though the underlying `store.store(...)` was still
-      // running. A backend stall longer than the default 300s TTL
-      // therefore became an irreversible chain break — purely a
-      // marker-GC timing artefact, not a real error.
-      //
-      // Iter-52 fix: `isHardTimedOut(id)` refreshes `expiresAt` on
+      // Invariant: `isHardTimedOut(id)` refreshes `expiresAt` on
       // every live hit. As long as continuations keep arriving,
-      // the retryable-503 window slides forward indefinitely. When
-      // the write eventually settles, `.finally(...)` inside
-      // `track()` clears the marker AND (in this end-to-end shape)
-      // the row is now queryable via `getChain`, so the next
-      // continuation proceeds along the happy path.
+      // the retryable-503 window slides forward indefinitely.
+      // When the write eventually settles, `.finally(...)` inside
+      // `track()` clears the marker AND (in this end-to-end
+      // shape) the row is now queryable via `getChain`, so the
+      // next continuation proceeds along the happy path.
+      // Without refresh-on-read, a backend stall longer than the
+      // TTL would produce an irreversible chain break from a
+      // pure marker-GC timing artefact.
       //
       // Shape (condensed into wall-clock units we can actually
       // exercise — TTL=200ms, hard-timeout=50ms, so the total
@@ -5659,9 +5088,10 @@ describe('createHandler', () => {
       //            the chain lookup now succeeds. Returns 200
       //            completed.
       //
-      // Under iter-51 (no refresh): the marker would have EXPIRED
-      // at t=250ms exactly, so continuation #2 at t=300 would have
-      // flipped to 404 and the chain would be permanently broken.
+      // Without refresh-on-read: the marker would have EXPIRED
+      // at t=250ms exactly, so continuation #2 at t=300 would
+      // have flipped to 404 and the chain would be permanently
+      // broken.
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       const originalTtl = process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
@@ -5769,7 +5199,7 @@ describe('createHandler', () => {
 
         // Continuation #2 — past the original 250ms expiry
         // (store call + 50ms breaker + 200ms TTL). Without
-        // iter-52 refresh the marker would already be gone and
+        // refresh-on-read the marker would already be gone and
         // this would 404. The refresh at continuation #1 kept it
         // alive, and this read extends it again.
         await new Promise((r) => setTimeout(r, 180));
@@ -5856,30 +5286,23 @@ describe('createHandler', () => {
     }, 10000);
 
     it('iter-53: persist landing past the record\u2019s absolute row expiry flips marker from 503 to 404 (no indefinite retry loop)', async () => {
-      // Codex's iter-52 review HIGH finding 1: iter-52's
-      // refresh-on-read slid the marker's TTL forward on every
-      // live hit with NO absolute cap. Response records themselves
-      // have a fixed `expiresAt` (RESPONSE_TTL_SECONDS, currently
-      // 30 min); past that bound `ResponseStore.getChain()` hides
-      // the row, so the retryable-503 classification is factually
-      // wrong — but iter-52 kept returning 503 for as long as the
-      // client kept retrying within each TTL window. Result:
-      // permanent 503 loop for an unrecoverable chain.
-      //
-      // Iter-53 fix: `markHardTimedOut(id, ttlMs, absoluteExpiresAt)`
+      // Invariant: `markHardTimedOut(id, ttlMs, absoluteExpiresAt)`
       // takes the record's row expiry as a hard cap. Every read
       // checks `Date.now() >= absoluteExpiresAt` first and deletes
       // the marker unconditionally once it has passed. The
       // continuation then falls through to the real getChain miss
-      // and emits `sendNotFound`, NOT `sendStorageTimeout`.
+      // and emits `sendNotFound`, NOT `sendStorageTimeout`. Without
+      // the cap, refresh-on-read could keep the marker alive past
+      // RESPONSE_TTL_SECONDS (30 min) even though the row itself
+      // has aged out of `getChain()` — producing a permanent 503
+      // loop for an unrecoverable chain.
       //
       // Shape: drive the normal hard-timeout breaker to install a
       // marker naturally, then surgically shrink that specific
       // marker's `absoluteExpiresAt` via the private map so the
       // cap fires on the next read without having to wait
-      // RESPONSE_TTL_SECONDS worth of wall clock. This is the
-      // cleanest way to exercise the absolute-cap path end-to-end
-      // because RESPONSE_TTL_SECONDS is not env-configurable.
+      // RESPONSE_TTL_SECONDS worth of wall clock (it is not env-
+      // configurable).
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '50';
       try {
@@ -5960,10 +5383,8 @@ describe('createHandler', () => {
         // (3) Now shrink the marker's `absoluteExpiresAt` so the
         // next read crosses the cap. This simulates a response
         // that has lived past RESPONSE_TTL_SECONDS — the row
-        // would no longer be visible via `getChain`, and iter-52
-        // would have kept returning 503 forever on continued
-        // retries. Access the private marker map directly via
-        // bracket notation.
+        // would no longer be visible via `getChain`. Access the
+        // private marker map directly via bracket notation.
         const internalMap = tracker['hardTimedOut'] as Map<
           string,
           { expiresAt: number; ttlMs: number; absoluteExpiresAt: number }
@@ -5975,10 +5396,11 @@ describe('createHandler', () => {
         // classification.
         entry!.absoluteExpiresAt = Date.now() - 1;
 
-        // (4) Continuation #2 — absolute cap has crossed. Iter-53
-        // must return 404 (sendNotFound) rather than 503 — no
-        // matter how many times the client retries, the chain is
-        // unrecoverable because the row itself has aged out.
+        // (4) Continuation #2 — absolute cap has crossed. The
+        // handler must return 404 (sendNotFound) rather than 503
+        // — no matter how many times the client retries, the
+        // chain is unrecoverable because the row itself has aged
+        // out.
         const req3 = createMockReq('POST', '/v1/responses', {
           model: MODEL_NAME,
           input: 'continuation past absolute cap',
@@ -6010,25 +5432,18 @@ describe('createHandler', () => {
     }, 10000);
 
     it('iter-54: hard-timeout marker clamps to earliest expiresAt across the resolved chain (not just the child record)', async () => {
-      // Codex's iter-53 review HIGH finding 1: iter-53 capped the
-      // marker at `record.expiresAt * 1000` — the newly produced
-      // child row's own TTL. But `ResponseStore.getChain()`
-      // (`crates/mlx-db/src/response_store/reader.rs:44-59`) walks
-      // the chain back via `previous_response_id` and aborts on the
-      // first row whose `expires_at <= unixepoch()` — so a child
-      // whose PARENT expires earlier becomes unrecoverable at the
-      // parent's expiry, not the child's. With iter-53's child-only
-      // cap the marker could keep emitting retryable 503 long after
-      // the chain had aged out of `getChain()`, because the child's
-      // own `expiresAt` might still be an hour in the future while
-      // the parent's had already passed.
-      //
-      // Iter-54 fix: `computeChainEarliestExpiresAtMs(record, chain)`
+      // Invariant: `computeChainEarliestExpiresAtMs(record, chain)`
       // folds the child's expiry with every ancestor's expiry and
       // takes the minimum. The marker's `absoluteExpiresAt` is
-      // therefore clamped at whichever link would disappear from
+      // clamped at whichever link would disappear from
       // `getChain()` first, which is exactly the expiry at which
       // the chain becomes unrecoverable.
+      // `ResponseStore.getChain()`
+      // (`crates/mlx-db/src/response_store/reader.rs:44-59`) walks
+      // the chain back via `previous_response_id` and aborts on
+      // the first row whose `expires_at <= unixepoch()`, so a
+      // child-only cap would keep emitting retryable 503 long
+      // after the parent had aged out of `getChain()`.
       //
       // Shape:
       //   1. POST #1 (no previous_response_id) → record A persisted
@@ -6044,11 +5459,9 @@ describe('createHandler', () => {
       //   3. Continuation #1 immediately: marker is live (A still
       //      valid), returns 503 storage_timeout — happy case.
       //   4. Wait past A's shortened expiry (still inside B's
-      //      default 30-min TTL). Under iter-53's child-only cap
-      //      the marker would remain live indefinitely because B's
-      //      expiry is far in the future. Under iter-54 the marker
-      //      has already been clamped at A's expiry, so it ages
-      //      out naturally.
+      //      default 30-min TTL). The marker has been clamped at
+      //      A's expiry (the earliest link), so it ages out
+      //      naturally.
       //   5. Continuation #2: marker is gone, getChain correctly
       //      reports "not found" (A has aged out), handler emits
       //      sendNotFound (404). NOT 503 — the chain is
@@ -6173,9 +5586,9 @@ describe('createHandler', () => {
         // (2) POST #2 — previous_response_id = A. chain = [A]
         // (still live). This creates record B and wedges B's
         // persist, firing the hard-timeout breaker against B with
-        // resolvedChain = [A]. Under iter-54 the marker's
-        // absoluteExpiresAt is clamped at A.expiresAt * 1000 —
-        // a 1-second cap — NOT B's default ~30-minute cap.
+        // resolvedChain = [A]. The marker's absoluteExpiresAt is
+        // clamped at A.expiresAt * 1000 — a 1-second cap — NOT
+        // B's default ~30-minute cap.
         const req2 = createMockReq('POST', '/v1/responses', {
           model: MODEL_NAME,
           input: 'continuation (child)',
@@ -6214,9 +5627,10 @@ describe('createHandler', () => {
         // absoluteExpiresAt should be clamped at A's expiry. A's
         // expiresAt is in seconds; marker stores epoch-ms.
         expect(entryB!.absoluteExpiresAt).toBe(shortenedExpiresAt * 1000);
-        // Under iter-53 this would have been ~30 minutes past now
-        // (B's default TTL). The assertion above pins that it is
-        // NOT — the cap matches A's expiry, the earliest link.
+        // Without chain-earliest clamping this would have been
+        // ~30 minutes past now (B's default TTL). The assertion
+        // pins that it is NOT — the cap matches A's expiry, the
+        // earliest link.
         const thirtyMinutesFromNow = Date.now() + 25 * 60 * 1000;
         expect(entryB!.absoluteExpiresAt).toBeLessThan(thirtyMinutesFromNow);
 
@@ -6239,9 +5653,7 @@ describe('createHandler', () => {
         // (4) Wait past A's expiry. A was set to expire 1 second
         // after POST #1. Give 1.5 seconds total wall-clock from
         // that point — A is now invisible to getChain, which
-        // means B's chain is unrecoverable. Under iter-53's
-        // child-only cap the marker would still be live because
-        // B's own `expiresAt` is far in the future.
+        // means B's chain is unrecoverable.
         await new Promise((r) => setTimeout(r, 1200));
 
         // (5) Continuation #2 against B — marker has hit its
@@ -6280,24 +5692,15 @@ describe('createHandler', () => {
     }, 15000);
 
     it('iter-54: bounded sweep is not starved by a live head cohort (refreshed entries rotate to tail)', async () => {
-      // Codex's iter-53 review MEDIUM finding 2: iter-53's bounded
-      // sweep visits at most MAX_SWEEP_PER_INSERT=64 entries per
-      // `markHardTimedOut()` call and always starts from the Map
-      // head. Iter-52's refresh-on-read updated entries in place,
-      // preserving their original insertion position — so if the
-      // oldest 64 ids were clients that kept retrying continuations,
-      // every new `markHardTimedOut()` call re-visited the same 64
-      // live entries and never reached newer expired markers
-      // behind them. Starvation: stale entries behind the hot
-      // cohort were permanently unreclaimable by the write-path
-      // sweep.
-      //
-      // Iter-54 fix: `isHardTimedOut(id)` moves refreshed live
+      // Invariant: `isHardTimedOut(id)` moves refreshed live
       // entries to the Map tail (O(1) `delete` + re-`set`
       // leveraging JavaScript Map insertion-order semantics).
-      // The bounded sweep then always makes forward progress:
-      // hot entries rotate to the tail as they refresh, leaving
+      // The bounded sweep always makes forward progress: hot
+      // entries rotate to the tail as they refresh, leaving
       // stale entries at the head available for reclamation.
+      // Without move-to-tail, refresh-on-read would preserve
+      // insertion order and hot clients retrying continuations
+      // could starve the bounded sweep indefinitely.
       //
       // Shape:
       //   1. Seed 64 "hot" markers with long TTL and long absolute
@@ -6306,15 +5709,11 @@ describe('createHandler', () => {
       //      TTL so they're eligible for reclamation on the next
       //      sweep.
       //   3. "Refresh" the 64 hot markers (call isHardTimedOut)
-      //      — under iter-54 this moves them to the tail; under
-      //      iter-53 they stay at the head.
+      //      — move-to-tail repositions them past the expired
+      //      cohort.
       //   4. Drive a new `markHardTimedOut()` — the sweep starts
-      //      from the head and visits up to 64 entries. Under
-      //      iter-54 the head is now populated by expired
-      //      entries (the hot cohort moved to the tail), so the
-      //      sweep reclaims them. Under iter-53 the head still
-      //      has the hot cohort and the sweep returns with zero
-      //      reclamations.
+      //      from the head (now populated by expired entries)
+      //      and visits up to 64 entries, reclaiming them.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const MAX_SWEEP_PER_INSERT = 64;
 
@@ -6359,23 +5758,22 @@ describe('createHandler', () => {
         vi.advanceTimersByTime(100);
 
         // (4) "Refresh" every hot marker — simulate the client
-        // retry pattern that iter-52's refresh-on-read extends.
-        // Under iter-54 this moves them to the tail. Under
-        // iter-53 they stayed at the head.
+        // retry pattern that refresh-on-read extends. Move-to-
+        // tail repositions them past the expired cold cohort.
         for (let i = 0; i < HOT_COUNT; i += 1) {
           expect(tracker.isHardTimedOut(`hot_${i}`)).toBe(true);
         }
 
         // After the refresh round, hot markers should be at the
-        // tail of the map (iter-54 move-to-tail contract). Verify
-        // by iterating the private map: the first HOT_COUNT-ish
+        // tail of the map (move-to-tail contract). Verify by
+        // iterating the private map: the first HOT_COUNT-ish
         // entries should now be cold_* (which have expired), and
         // the hot cohort should be at the back.
         //
-        // Iteration order is insertion order. After iter-54's
-        // delete+set on each hot_i, the hot cohort re-inserts at
-        // the tail — so the head is now cold_0 .. cold_{COLD_COUNT-1}
-        // followed by hot_0 .. hot_{HOT_COUNT-1}.
+        // Iteration order is insertion order. The delete+set on
+        // each hot_i re-inserts at the tail — so the head is now
+        // cold_0 .. cold_{COLD_COUNT-1} followed by
+        // hot_0 .. hot_{HOT_COUNT-1}.
         //
         // Without the move-to-tail change, iteration would yield
         // hot_* first (starving the sweep from reaching cold_*
@@ -6396,8 +5794,7 @@ describe('createHandler', () => {
         // (5) Drive a new `markHardTimedOut()` — the sweep now
         // starts from the head (cold_* entries). Since they are
         // all expired, the first MAX_SWEEP_PER_INSERT visits
-        // reclaim 64 entries. Under iter-53 the head would still
-        // have been hot_* and the sweep would have reclaimed zero.
+        // reclaim 64 entries.
         tracker.track('new_probe', new Promise<void>(() => {}));
         tracker.markHardTimedOut('new_probe', 60_000, farFuture());
 
@@ -6408,10 +5805,11 @@ describe('createHandler', () => {
         // where reclaimed is between 1 and MAX_SWEEP_PER_INSERT
         // (bounded by the visit budget).
         //
-        // The regression assertion: reclaimed > 0. Under iter-53
-        // starvation the map size would be HOT_COUNT + COLD_COUNT + 1
-        // exactly — no reclamation because the sweep's visit budget
-        // was entirely consumed by still-live hot_* entries.
+        // The regression assertion: reclaimed > 0. Without move-
+        // to-tail the map size would be
+        // HOT_COUNT + COLD_COUNT + 1 exactly — no reclamation
+        // because the sweep's visit budget was entirely consumed
+        // by still-live hot_* entries.
         const sizeAfterOneSweep = internalMap.size;
         const expectedCeiling = HOT_COUNT + COLD_COUNT + 1; // no-reclaim case
         expect(sizeAfterOneSweep).toBeLessThan(expectedCeiling);
@@ -6425,24 +5823,15 @@ describe('createHandler', () => {
     });
 
     it('iter-55: pre-breaker awaitPending path returns 404 (not 503) once chain earliest expiry has been crossed', async () => {
-      // Codex's iter-54 review HIGH finding 1: iter-54's chain-
-      // earliest cap only applied once the hard-timeout breaker
-      // converted the pending write to a marker. The pre-breaker
-      // `awaitPending` timeout/probe branch in `responses.ts` still
-      // classified any unresolved pending write as transient
-      // `storage_timeout` — even when the resolved chain's earliest
-      // ancestor had already expired and `getChain()` could never
-      // succeed. Result: continuations whose parent had aged out
-      // got retryable 503 for up to
-      // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS` (60s default)
-      // before the hard breaker converted to a marker with the
-      // correct absolute cap.
-      //
-      // Iter-55 fix: `track()` now accepts an optional
+      // Invariant: `track()` accepts an optional
       // `earliestExpiresAtMs`; the pre-breaker path consults
-      // `getEarliestExpiresAtMs(id)` after the final probe miss and
-      // short-circuits to 404 once `Date.now() >=
-      // earliestExpiresAtMs`. No hard-breaker involvement needed.
+      // `getEarliestExpiresAtMs(id)` after the final probe miss
+      // and short-circuits to 404 once
+      // `Date.now() >= earliestExpiresAtMs`. Without the pre-
+      // breaker check, continuations whose parent had aged out
+      // would receive retryable 503 for up to the hard-breaker
+      // window (default 60s) before the marker path took over
+      // with the correct absolute cap.
       //
       // Shape:
       //   1. POST #1 (no previous_response_id) → record A persisted
@@ -6467,9 +5856,9 @@ describe('createHandler', () => {
       try {
         const { getPendingWritesFor } = await import('../../packages/server/src/pending-writes.js');
 
-        // See iter-54 test for the mock-store shape; same walk of
-        // previousResponseId with the reader.rs:44-59 ancestor-
-        // expiry semantics.
+        // See the chain-earliest-expiry test above for the mock-
+        // store shape; same walk of previousResponseId with
+        // reader.rs:44-59 ancestor-expiry semantics.
         const storedRecords = new Map<string, any>();
         const storeCallCount = { n: 0 };
         const mockStore = {
@@ -6541,8 +5930,8 @@ describe('createHandler', () => {
         await new Promise((r) => setImmediate(r));
         expect(storedRecords.has(responseIdA)).toBe(true);
 
-        // Shrink A's expiresAt to 1 second from now. The iter-55
-        // pre-breaker path uses `earliestExpiresAtMs` captured when
+        // Shrink A's expiresAt to 1 second from now. The pre-
+        // breaker path uses `earliestExpiresAtMs` captured when
         // `track(B, ...)` is called, which folds A's (modified)
         // expiry into `chainEarliestExpiresAtMs`.
         const shortenedExpiresAt = Math.floor(Date.now() / 1000) + 1;
@@ -6582,15 +5971,15 @@ describe('createHandler', () => {
         await new Promise((r) => setTimeout(r, 1300));
 
         // (4) Continuation against B. `getChain(B)` throws "not
-        // found" (B isn't persisted). `awaitPending(B)` returns the
-        // wedged promise, the race against the 50ms chain-wait
-        // timer resolves to 'timeout', the last-probe `getChain(B)`
-        // still misses, and the iter-55 check consults
-        // `getEarliestExpiresAtMs(B)`: `Date.now() >= earliestB`
-        // → `sendNotFound` (404), NOT `sendStorageTimeout` (503).
-        //
-        // Under iter-54 this would have returned 503 for up to the
-        // 5s hard-breaker window — the regression this test pins.
+        // found" (B isn't persisted). `awaitPending(B)` returns
+        // the wedged promise, the race against the 50ms chain-
+        // wait timer resolves to 'timeout', the last-probe
+        // `getChain(B)` still misses, and the pre-breaker check
+        // consults `getEarliestExpiresAtMs(B)`: `Date.now() >=
+        // earliestB` → `sendNotFound` (404), NOT
+        // `sendStorageTimeout` (503). Without the pre-breaker
+        // check this would have returned 503 for up to the 5s
+        // hard-breaker window.
         const req3 = createMockReq('POST', '/v1/responses', {
           model: MODEL_NAME,
           input: 'continuation past earliest expiry',
@@ -6622,12 +6011,11 @@ describe('createHandler', () => {
     }, 10000);
 
     it('iter-55: PendingResponseWrites exposes getEarliestExpiresAtMs; track() records the scalar and settlement clears it', async () => {
-      // Codex's iter-54 review MEDIUM finding 2 regression unit:
-      // the scalar side map is the mechanism that both (a) lets
+      // The scalar side map is the mechanism that both (a) lets
       // the pre-breaker short-circuit to 404 and (b) keeps the
-      // hard-timeout background closure from capturing full chain
-      // transcripts. Pin the contract directly so future refactors
-      // to either path cannot drift.
+      // hard-timeout background closure from capturing full
+      // chain transcripts. Pin the contract directly so future
+      // refactors to either path cannot drift.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
 
@@ -6693,18 +6081,16 @@ describe('createHandler', () => {
     });
 
     it('iter-56: markHardTimedOut drains earliestExpiresByPending so late-settling wedged writes do not leak (fulfill + reject paths)', async () => {
-      // Codex's iter-55 HIGH finding: `track()` records
-      // `earliestExpiresAtMs` in `earliestExpiresByPending`, but
-      // the `.finally(...)` cleanup inside `track()` only deletes
-      // the side-map entry when `pending.get(id) === writePromise`.
-      // `markHardTimedOut()` removes the pending entry synchronously
-      // when the breaker fires, so by the time the original wedged
-      // write eventually settles, the guard is already false and
-      // the side map is never drained. Under sustained traffic
-      // against a wedged backend this reintroduces the exact
-      // unbounded tracker growth the hard-timeout breaker is
-      // meant to bound. Fix: drain the side map authoritatively
-      // inside `markHardTimedOut()` itself.
+      // Invariant: `markHardTimedOut()` drains
+      // `earliestExpiresByPending` authoritatively. The
+      // `.finally(...)` cleanup inside `track()` only deletes
+      // the side-map entry when `pending.get(id) === writePromise`,
+      // but `markHardTimedOut()` removes the pending entry
+      // synchronously — so the authoritative drain must happen
+      // in the breaker itself. Without it, sustained traffic
+      // against a wedged backend reintroduces the unbounded
+      // tracker growth the hard-timeout breaker is meant to
+      // bound.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
 
@@ -6719,15 +6105,15 @@ describe('createHandler', () => {
 
       const farFuture = Date.now() + 60 * 60 * 1000;
       expect(tracker.markHardTimedOut('resp_fulfill', 60_000, farFuture)).toBe(true);
-      // Iter-57 update: `getEarliestExpiresAtMs()` now falls back
-      // to the marker's `absoluteExpiresAt` so the
-      // classification-signal stays live across the pending ->
-      // hardTimedOut transition. To validate the underlying
-      // iter-56 leak fix we probe the pending-side map size
-      // directly via the test-only `earliestExpiresByPendingSize`
-      // getter: zero means the side map has been drained
-      // authoritatively inside `markHardTimedOut()`, independent
-      // of eventual promise settlement.
+      // Note: `getEarliestExpiresAtMs()` falls back to the
+      // marker's `absoluteExpiresAt` so the classification
+      // signal stays live across the pending -> hardTimedOut
+      // transition. To validate the underlying drain we probe
+      // the pending-side map size directly via the test-only
+      // `earliestExpiresByPendingSize` getter: zero means the
+      // side map has been drained authoritatively inside
+      // `markHardTimedOut()`, independent of eventual promise
+      // settlement.
       expect(tracker.earliestExpiresByPendingSize).toBe(0);
       // And after the original wedged write finally fulfills, the
       // pending-side map remains drained (the `.finally` guard
@@ -6757,15 +6143,12 @@ describe('createHandler', () => {
     });
 
     it('iter-56: earliestExpiresByPending stays drained for a never-settling wedged write across the marker TTL window', async () => {
-      // Codex's iter-55 HIGH finding (second half): for a truly
-      // never-settling `store.store(...)` the `.finally(...)` fork
-      // in `track()` never fires at all, so the side map would
-      // survive past the hard-timeout marker's TTL expiry and
-      // grow without bound. Fix: `markHardTimedOut()` drains the
-      // side map synchronously, so the earliest-expiry metadata
-      // is already gone before the TTL window opens, and remains
-      // gone after a subsequent `markHardTimedOut()` fires its
-      // bounded `sweepExpired()` sweep.
+      // Invariant: for a truly never-settling `store.store(...)`
+      // the `.finally(...)` fork in `track()` never fires, so
+      // `markHardTimedOut()` must drain the side map
+      // synchronously — otherwise the earliest-expiry metadata
+      // would survive past the hard-timeout marker's TTL expiry
+      // and grow without bound.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
 
@@ -6781,13 +6164,13 @@ describe('createHandler', () => {
         // Cross the hard-timeout breaker with a short TTL. The
         // pending-side map must drop the entry immediately, not
         // at TTL expiry — the .finally() guard would never fire
-        // for a never-settling promise. Iter-57 update: we probe
+        // for a never-settling promise. We probe
         // `earliestExpiresByPendingSize` directly because
-        // `getEarliestExpiresAtMs()` now falls back to the
-        // marker's `absoluteExpiresAt` (which is still live
-        // here) and thus would return a value. The leak-fix
-        // invariant is about the pending-side map being drained,
-        // not about the getter returning undefined.
+        // `getEarliestExpiresAtMs()` falls back to the marker's
+        // `absoluteExpiresAt` (still live here) and thus would
+        // return a value. The drain invariant is about the
+        // pending-side map being drained, not about the getter
+        // returning undefined.
         tracker.markHardTimedOut('resp_wedged', 100, Date.now() + 60 * 60 * 1000);
         expect(tracker.earliestExpiresByPendingSize).toBe(0);
 
@@ -6840,26 +6223,17 @@ describe('createHandler', () => {
     });
 
     it('iter-57: getEarliestExpiresAtMs survives the pending -> hardTimedOut transition by falling back to the marker absoluteExpiresAt', async () => {
-      // Codex's iter-56 MEDIUM finding: `responses.ts` does not
-      // snapshot the earliest-expiry scalar when it grabs
-      // `awaitPending(id)`; it re-reads it from the tracker in
-      // the post-`Promise.race(...)` timeout branch to decide
-      // 404 vs. retryable 503. Iter-56's authoritative drain
-      // inside `markHardTimedOut()` fixed the iter-55 leak but
-      // also erased the scalar for any continuation that
-      // straddled the `pending` -> `hardTimedOut` transition —
-      // a waiter entered `awaitPending()` while pending, the
-      // breaker fired mid-wait, the waiter then timed out and
-      // looked the scalar up, saw `undefined`, and fell through
-      // to retryable 503 on an unrecoverable chain.
-      //
-      // Fix: `getEarliestExpiresAtMs()` falls back to the
-      // marker's `absoluteExpiresAt`. Both sites receive the
-      // same `min(recordExpiresAtMs, chainEarliestExpiresAtMs)`
-      // scalar from `initiatePersist` in `responses.ts`, so the
-      // fallback is lossless. After promise settlement the
-      // fallback returns `undefined` again — the iter-55 leak
-      // fix is not resurrected.
+      // Invariant: `getEarliestExpiresAtMs()` falls back to the
+      // marker's `absoluteExpiresAt` so a continuation straddling
+      // the `pending` -> `hardTimedOut` transition keeps a
+      // recoverable scalar — a waiter that entered
+      // `awaitPending()` while pending and timed out after the
+      // breaker fired mid-wait can still classify the failure
+      // correctly. Both sites receive the same
+      // `min(recordExpiresAtMs, chainEarliestExpiresAtMs)`
+      // scalar from `initiatePersist`, so the fallback is
+      // lossless. After promise settlement the fallback returns
+      // `undefined` again — the drain leak is not resurrected.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
 
@@ -6881,23 +6255,22 @@ describe('createHandler', () => {
       expect(tracker.markHardTimedOut('resp_iter57_a', 60_000, earliestMs)).toBe(true);
 
       // Post-transition lookup: the pending side-map entry is
-      // gone (iter-56 drains it authoritatively — verified
-      // directly via the test-only size getter), but the scalar
-      // is still recoverable from the marker. A waiter that
-      // entered `awaitPending()` before the breaker fired and
-      // now hits its `Promise.race` timeout can still classify
-      // the failure correctly.
+      // gone (drained authoritatively — verified directly via
+      // the test-only size getter), but the scalar is still
+      // recoverable from the marker. A waiter that entered
+      // `awaitPending()` before the breaker fired and now hits
+      // its `Promise.race` timeout can still classify the
+      // failure correctly.
       expect(tracker.earliestExpiresByPendingSize).toBe(0);
       expect(tracker.getEarliestExpiresAtMs('resp_iter57_a')).toBe(earliestMs);
 
       // After the original write eventually settles, the
       // `.finally(...)` inside `track()` unconditionally clears
-      // the hard-timeout marker (this is the pre-existing
-      // settlement-clears-marker invariant — the retryable-503
-      // window closes the moment the wedged store unwedges).
-      // Once the marker is gone, iter-57's fallback returns
-      // `undefined` too, so the end-state matches the pre-iter-57
-      // contract for a settled chain.
+      // the hard-timeout marker (settlement-clears-marker
+      // invariant — the retryable-503 window closes the moment
+      // the wedged store unwedges). Once the marker is gone the
+      // fallback returns `undefined`, matching the contract for
+      // a settled chain.
       resolveFn();
       await promise;
       await new Promise((r) => setImmediate(r));
@@ -6909,10 +6282,10 @@ describe('createHandler', () => {
       // Companion to the previous test: after both maps drain
       // (here via the marker TTL + the bounded `sweepExpired()`
       // pass that every `markHardTimedOut()` triggers), the
-      // fallback must return `undefined`. This pins the
-      // invariant that iter-57's fallback is a PASSTHROUGH —
-      // it mirrors whatever the marker map says, and doesn't
-      // keep a separate shadow of the scalar after reclamation.
+      // fallback must return `undefined`. The fallback is a
+      // PASSTHROUGH — it mirrors whatever the marker map says,
+      // and doesn't keep a separate shadow of the scalar after
+      // reclamation.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
 
@@ -6923,7 +6296,7 @@ describe('createHandler', () => {
         tracker.track('resp_iter57_b', neverSettles, earliestMs);
         tracker.markHardTimedOut('resp_iter57_b', 1000, earliestMs);
         // Still live — both the hard-timeout classification
-        // and the iter-57 fallback scalar agree the chain is
+        // and the fallback scalar agree the chain is
         // recoverable-retry.
         expect(tracker.isHardTimedOut('resp_iter57_b')).toBe(true);
         expect(tracker.getEarliestExpiresAtMs('resp_iter57_b')).toBe(earliestMs);
@@ -6946,23 +6319,15 @@ describe('createHandler', () => {
     });
 
     it('iter-58 regression: getEarliestExpiresAtMs returns undefined for TTL=0 expired marker', async () => {
-      // Codex's iter-57 MEDIUM finding: the iter-57 fallback read
-      // `hardTimedOut.get(id)?.absoluteExpiresAt` without going
-      // through the TTL + absolute-expiry liveness checks that
-      // `isHardTimedOut()` applies. A marker inserted with
+      // Invariant: the marker-fallback read in
+      // `getEarliestExpiresAtMs()` is gated on the shared
+      // `isMarkerLive` helper. A marker inserted with
       // `ttlMs === 0` is dead-on-arrival (its `expiresAt` clamps
-      // to `min(Date.now() + 0, absoluteExpiresAt)`, i.e.
-      // `Date.now()`, which already fails the `now < expiresAt`
-      // liveness test) but the pre-iter-58 fallback would still
-      // hand the future `absoluteExpiresAt` scalar back to
-      // `responses.ts`, sending the caller down the retryable-503
-      // branch while `isHardTimedOut()` reported `false`. That
-      // produced the documented 503-now-then-404-on-next-retry
-      // flip-flop for the same unrecoverable write.
-      //
-      // Fix: gate the fallback on the shared `isMarkerLive`
-      // helper — a dead-on-arrival marker must not leak its
-      // scalar.
+      // to `Date.now()`, failing the strict `now < expiresAt`
+      // liveness check); without the gate, the fallback would
+      // still hand the future `absoluteExpiresAt` scalar back
+      // to `responses.ts`, producing a 503-now-then-404-on-next-
+      // retry flip-flop for the same unrecoverable write.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
       const id = 'resp_test_58a';
@@ -6970,8 +6335,8 @@ describe('createHandler', () => {
       // Simulate the `initiatePersist` wiring: register the
       // pending promise so `markHardTimedOut()` can transition
       // it. After the transition the pending-side scalar has
-      // been drained (iter-56 invariant) and the only remaining
-      // source of the earliest-expiry value is the marker map.
+      // been drained and the only remaining source of the
+      // earliest-expiry value is the marker map.
       const neverSettles = new Promise<void>(() => {});
       const earliestMs = Date.now() + 60_000;
       tracker.track(id, neverSettles, earliestMs);
@@ -6982,14 +6347,14 @@ describe('createHandler', () => {
       // on the very next read.
       expect(tracker.markHardTimedOut(id, 0, earliestMs)).toBe(true);
 
-      // Read the classification-path getter FIRST so it is
-      // directly reproducing the codex scenario: a caller that
-      // reaches the `Promise.race(...)` timeout branch and reads
-      // the scalar to decide 404 vs. retryable 503 without
-      // having first consulted `isHardTimedOut()` on the same
-      // tick. Pre-iter-58 this returned `earliestMs` (a future
-      // scalar) even though the marker was already dead, which
-      // is exactly the flip-flop codex flagged.
+      // Read the classification-path getter FIRST so it
+      // directly reproduces the flip-flop scenario: a caller
+      // that reaches the `Promise.race(...)` timeout branch and
+      // reads the scalar to decide 404 vs. retryable 503
+      // without having first consulted `isHardTimedOut()` on
+      // the same tick. Without the liveness gate this would
+      // return `earliestMs` (a future scalar) even though the
+      // marker was already dead.
       expect(tracker.getEarliestExpiresAtMs(id)).toBe(0);
       // And `isHardTimedOut()` agrees the marker is dead.
       expect(tracker.isHardTimedOut(id)).toBe(false);
@@ -7017,22 +6382,22 @@ describe('createHandler', () => {
       expect(tracker.markHardTimedOut(id, 60_000, pastMs)).toBe(true);
 
       // Read the classification-path getter FIRST so the
-      // assertion directly pins the iter-58 liveness gate:
-      // even though `absoluteExpiresAt` is a valid `number` the
-      // fallback must refuse to return it because the marker
-      // is already past its absolute cap.
+      // assertion directly pins the liveness gate: even though
+      // `absoluteExpiresAt` is a valid `number` the fallback
+      // must refuse to return it because the marker is already
+      // past its absolute cap.
       expect(tracker.getEarliestExpiresAtMs(id)).toBe(0);
       expect(tracker.isHardTimedOut(id)).toBe(false);
     });
 
     it('iter-58 regression: getEarliestExpiresAtMs returns absoluteExpiresAt for a live marker (iter-57 invariant preserved)', async () => {
       // Pinning test: for a genuinely live marker (TTL in the
-      // future AND absolute cap in the future), the iter-57
-      // pending -> hardTimedOut fallback must still hand back
-      // the `absoluteExpiresAt` scalar. The iter-58 liveness
-      // gate is SUBTRACTIVE — it removes the dead-marker leak
-      // but preserves the intended iter-57 straddle-case
-      // behaviour verbatim.
+      // future AND absolute cap in the future), the pending ->
+      // hardTimedOut fallback must still hand back the
+      // `absoluteExpiresAt` scalar. The liveness gate is
+      // SUBTRACTIVE — it removes the dead-marker leak but
+      // preserves the intended straddle-case behaviour
+      // verbatim.
       const { PendingResponseWrites } = await import('../../packages/server/src/pending-writes.js');
       const tracker = new PendingResponseWrites();
       const id = 'resp_test_58c';
@@ -7047,11 +6412,10 @@ describe('createHandler', () => {
     });
 
     it('iter-51: MLX_HARD_TIMEOUT_MARKER_TTL_MS parsing mirrors hard-timeout parser (empty/whitespace -> default, 0 -> zero, valid -> parsed)', async () => {
-      // Iter-51 adds an independent TTL for hard-timed-out
-      // markers (codex's iter-50 HIGH finding 1). The parser
-      // mirrors `getPostCommitPersistHardTimeoutMs` exactly so
-      // operators have one consistent story across the two
-      // breaker knobs.
+      // The independent TTL for hard-timed-out markers is
+      // parsed with the same rules as
+      // `getPostCommitPersistHardTimeoutMs` — one consistent
+      // story across the two breaker knobs.
       const { getHardTimedOutMarkerTtlMs } = await import('../../packages/server/src/endpoints/responses.js');
       const originalTtl = process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
       try {
@@ -7098,44 +6462,30 @@ describe('createHandler', () => {
     });
 
     it('iter-45/46: MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS parsing: empty/whitespace -> default, "0" -> disabled, valid -> parsed', async () => {
-      // Codex's iter-44 review flagged a MEDIUM finding: the
-      // original parser accepted any finite >= 0 value, so
-      // `Number('')` returned `0` and silently disabled the
-      // breaker. In deployments where config templating renders
-      // absent values as empty strings (e.g. `${UNSET_VAR}`)
-      // this reintroduced iter-41's unreclaimable leak without
-      // surfacing any error.
+      // Parser contract:
+      //   - Empty string -> UNSET (falls back to 60000ms default).
+      //     Prevents config templating (`${UNSET_VAR}`) from
+      //     silently disabling the breaker.
+      //   - Explicit '0' -> disables the breaker (operator
+      //     escape hatch for pin-forever semantics).
+      //   - Non-numeric -> falls back to default (typos cannot
+      //     silently disable the safety breaker).
+      //   - Whitespace is trimmed before parsing: whitespace-
+      //     only falls back to default, padded valid numerics
+      //     parse correctly.
       //
-      // Iter-45 parser change: empty string is treated as
-      // UNSET (falls back to the 60000ms default). Explicit
-      // `'0'` still disables. Any non-numeric value also falls
-      // back to the default — deliberate so a typo cannot
-      // silently disable the safety breaker.
-      //
-      // Iter-46 (codex's iter-45 MEDIUM finding): the iter-45
-      // parser only treated the LITERAL empty string as unset.
-      // `Number(' ')` is `0`, so padded values (`' '`, `'\n'`,
-      // `'\t'`, config-templating artefacts like a trailing
-      // `\r` on Windows) still silently disabled the breaker.
-      // Iter-46 trims whitespace first, so any whitespace-only
-      // input falls back to the default and any valid numeric
-      // padded with whitespace parses correctly.
-      //
-      // We test via the exported `getPostCommitPersistHardTimeoutMs`
-      // directly (cleanest, most readable). Env state is saved
-      // and restored around each case so the file-level
-      // `'0'` default doesn't bleed into other tests.
+      // Env state is saved and restored around each case so
+      // the file-level `'0'` default doesn't bleed into other
+      // tests.
       const { getPostCommitPersistHardTimeoutMs } = await import('../../packages/server/src/endpoints/responses.js');
       const originalHard = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
       try {
-        // Empty string -> default (NOT 0). This is the iter-45
-        // fix's primary invariant.
+        // Empty string -> default (NOT 0). Primary invariant.
         process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '';
         expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
 
-        // Explicit '0' -> disabled (returns 0). This stays the
-        // operator's escape hatch for strict iter-43
-        // pin-forever semantics.
+        // Explicit '0' -> disabled (returns 0). Operator escape
+        // hatch for pin-forever semantics.
         process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '0';
         expect(getPostCommitPersistHardTimeoutMs()).toBe(0);
 
@@ -7151,10 +6501,8 @@ describe('createHandler', () => {
         delete process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
         expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
 
-        // Iter-46 whitespace cases: whitespace-only input is
-        // treated as unset and falls back to the default. Under
-        // the iter-45 parser `Number(' ')` was `0` and silently
-        // disabled the breaker.
+        // Whitespace-only input is treated as unset and falls
+        // back to the default.
         process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = ' ';
         expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
         process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '\n';
@@ -7164,8 +6512,8 @@ describe('createHandler', () => {
         process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '   ';
         expect(getPostCommitPersistHardTimeoutMs()).toBe(60_000);
 
-        // Iter-46: padding around a valid numeric is trimmed
-        // before parsing, so the valid number survives.
+        // Padding around a valid numeric is trimmed before
+        // parsing, so the valid number survives.
         process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '  100  ';
         expect(getPostCommitPersistHardTimeoutMs()).toBe(100);
       } finally {
@@ -7178,21 +6526,12 @@ describe('createHandler', () => {
     });
 
     it('iter-37 finding 2: adopt gate rejects streaming turns whose post-final teardown threw (failureMode === "error")', async () => {
-      // Iter-36 finding 2 closed the `client_abort` hole but the
-      // `committed && safeToSuppress && failureMode !== 'client_abort'`
-      // gate still adopted sessions when `failureMode === 'error'`
-      // — the path triggered when the stream adapter's `finally`
-      // (or any post-final teardown) throws AFTER the decode loop
-      // has committed. In that scenario `terminalToPersist` is
-      // null, the client saw `response.failed`, and the
-      // responseId is unreachable from the client's perspective;
-      // adopting the session under it would evict the single
-      // warm hot slot for no useful reason.
-      //
-      // Iter-37 fix: the adopt gate now requires
-      // `failureMode === null` outright. Any non-null failure
-      // mode (`client_abort`, `error`, `finish_reason_error`,
-      // `stream_exhausted`) blocks adoption.
+      // Invariant: the adopt gate requires `failureMode === null`
+      // outright. Any non-null failure mode (`client_abort`,
+      // `error`, `finish_reason_error`, `stream_exhausted`)
+      // blocks adoption. Adopting a session under an unreachable
+      // responseId would evict the single warm hot slot for no
+      // useful reason.
       //
       // Shape: emit a successful `done: true` chunk so the
       // ChatSession wrapper's finally runs and flips
@@ -7279,15 +6618,10 @@ describe('createHandler', () => {
       expect(body).toContain('event: response.failed');
       expect(body).not.toContain('event: response.completed');
 
-      // Primary assertion: adopt was never called. Under the
-      // buggy iter-36 gate
-      // (`failureMode !== 'client_abort'`), a committed-but-
-      // error turn still passed through `sessionReg.adopt(
-      // responseId, session, instructions)` even though the
-      // responseId is unreachable from the client. The iter-37
-      // fix ANDs the gate with `failureMode === null`, so any
-      // non-null failure mode — including `'error'` — blocks
-      // adoption.
+      // Primary assertion: adopt was never called. The adopt
+      // gate ANDs `failureMode === null`, so any non-null
+      // failure mode — including `'error'` — blocks adoption
+      // (the responseId would be unreachable from the client).
       expect(adoptSpy).not.toHaveBeenCalled();
 
       // Secondary assertion: the hot slot is empty (no session
@@ -7296,21 +6630,7 @@ describe('createHandler', () => {
     });
 
     it('normalises nested message items to incomplete when a streaming turn fails mid-decode', async () => {
-      // Iter-28 finding 3 regression: the iter-27 writer built
-      // the failed terminal via `{ ...terminal, status: 'failed' }`,
-      // which re-used the object the happy-path done branch had
-      // already finalised. On the finishReason=error path that
-      // branch walked every message item through
-      // `mapFinishReasonToStatus`, which returns `'completed'` for
-      // anything other than `'length'` — including `'error'`. So
-      // a failed turn shipped `{ status: 'failed', output: [{
-      // status: 'completed' }, ...] }` on the wire: a contradiction
-      // between the top-level failure status and the nested
-      // success status. On the exhaust path the nested items
-      // never got closed at all, so they stayed `'in_progress'`
-      // inside a `failed` envelope.
-      //
-      // The fix routes every failure path through
+      // Invariant: every failure path routes through
       // `buildFailedTerminal`, which maps `in_progress` and
       // `completed` message-item statuses to `incomplete`. This
       // regression exercises the finishReason=error flavour: a
@@ -7397,16 +6717,14 @@ describe('createHandler', () => {
     });
 
     it('forces cold replay when two chains are interleaved (A -> B -> A)', async () => {
-      // Iteration-18 finding 1 regression: the `SessionRegistry`
-      // holds AT MOST one entry. Native KV state (cached token
-      // history, `caches` vector) is a single mutable resource per
-      // model, so any `ChatSession` wrapper other than the most
-      // recently used one is pointing at stomped state. Caching
-      // multiple wrappers per model is therefore an illusion — the
-      // registry enforces the invariant by clearing the map in both
-      // `getOrCreate` and `adopt`, which forces interleaved chains
-      // to cold-replay through `ResponseStore` rather than resume
-      // warm.
+      // Invariant: the `SessionRegistry` holds AT MOST one
+      // entry. Native KV state (cached token history, `caches`
+      // vector) is a single mutable resource per model, so any
+      // `ChatSession` wrapper other than the most recently used
+      // one is pointing at stomped state. The registry enforces
+      // this by clearing the map in both `getOrCreate` and
+      // `adopt`, forcing interleaved chains to cold-replay
+      // through `ResponseStore` rather than resume warm.
       //
       // Chain A is started (adopt #1), then chain B stomps it by
       // starting a new session (adopt #2 clears the map first), then
@@ -7602,19 +6920,14 @@ describe('createHandler', () => {
     });
 
     it('inherits stored instructions on cold replay when the continuation omits them (Finding 4)', async () => {
-      // Finding 4 regression: the iter-25 cold-replay path dropped
-      // stored `instructions` entirely. A caller who originally set
-      // `instructions: "You are a pirate"` on turn 1 and then omitted
-      // `instructions` on turn 2 would see the pirate persona
-      // silently disappear — the hot path still carried the warmed
-      // system context, but on TTL expiry / process restart /
-      // lease-on-hit miss the cold replay reconstructed history from
-      // the stored chain WITHOUT the original system message and
-      // primed the new turn against a blank system context. The fix
-      // reads the trailing stored record's `instructions` field and
-      // inherits it when the caller omits its own, so both the cold
-      // replay and the roundtripped response carry the original
-      // prefix state.
+      // Invariant: the cold-replay path reads the trailing
+      // stored record's `instructions` field and inherits it
+      // when the caller omits its own, so the original system
+      // context survives across TTL expiry / process restart /
+      // lease-on-hit miss. Without this, a caller who set
+      // `instructions: "You are a pirate"` on turn 1 and omitted
+      // `instructions` on turn 2 would see the persona silently
+      // disappear on cold replay.
       const registry = new ModelRegistry();
       const chatSessionStart = vi
         .fn()
@@ -7904,20 +7217,20 @@ describe('createHandler', () => {
     });
 
     it('commits the session through the multi-message cold-restart branch', async () => {
-      // Latent bug fix for finding 3: when a chained request on an
-      // already-warmed session carries a multi-message delta, the
-      // runSession* helpers reset the session and cold-replay the
-      // full history. The commit signal must still be honest after
-      // the internal reset — a pre-reset snapshot would compare
-      // against e.g. `turns=1` and report uncommitted, skipping the
-      // `sessionReg.adopt` call. Fixed by capturing the initialTurns
-      // baseline AFTER `session.reset()` inside the helper.
+      // Invariant: when a chained request on an already-warmed
+      // session carries a multi-message delta, the runSession*
+      // helpers reset the session and cold-replay the full
+      // history. The commit signal must stay honest after the
+      // internal reset — the `initialTurns` baseline is captured
+      // AFTER `session.reset()` inside the helper so the commit
+      // check doesn't compare against pre-reset `turns` and
+      // skip the `sessionReg.adopt` call.
       //
-      // Regression recipe: force a multi-message hot-path input by
-      // echoing the prior assistant turn (which mapRequest appends as
-      // a synthetic assistant message) alongside a fresh user turn.
-      // The trailing delta now has length > 1, hitting the reset +
-      // cold-restart branch.
+      // Regression recipe: force a multi-message hot-path input
+      // by echoing the prior assistant turn (which mapRequest
+      // appends as a synthetic assistant message) alongside a
+      // fresh user turn. The trailing delta now has length > 1,
+      // hitting the reset + cold-restart branch.
       const registry = new ModelRegistry();
       const chatSessionStart = vi
         .fn()
@@ -7991,20 +7304,14 @@ describe('createHandler', () => {
     });
 
     it('shares one SessionRegistry across two names that alias the same model instance', async () => {
-      // Iteration-19 finding 1 regression: registering the same
-      // `SessionCapableModel` object under two friendly names must
-      // yield ONE shared `SessionRegistry`, not two. The
-      // single-warm-session invariant is a property of the
-      // underlying native KV cache (one per model instance), so
-      // if each alias got its own registry, each would enforce
-      // single-warm LOCALLY while the shared native state was
-      // silently stomped across alias boundaries. A turn through
-      // alias A would warm wrapper A in A's registry; a turn
-      // through alias B would warm wrapper B in B's (different)
-      // registry without evicting wrapper A; the next turn through
-      // A would hand back wrapper A, whose assumed native state
-      // has since been overwritten by B. The fix keys registries
-      // by model-object identity.
+      // Invariant: registering the same `SessionCapableModel`
+      // object under two friendly names yields ONE shared
+      // `SessionRegistry`, keyed by model-object identity.
+      // The single-warm-session invariant is a property of the
+      // underlying native KV cache (one per model instance),
+      // so per-alias registries would enforce single-warm
+      // LOCALLY while shared native state got stomped across
+      // alias boundaries.
       //
       // Walk A -> B -> A using the `previous_response_id` chains
       // routed through different alias names. All three turns must
@@ -8132,12 +7439,11 @@ describe('createHandler', () => {
     });
 
     it('rejects a stateless history whose trailing assistant is an unresolved fan-out', async () => {
-      // Iteration-19 finding 2: the chat-session API cannot
-      // continue from an unresolved trailing fan-out in a
-      // stateless cold-start request — there is no mechanism to
-      // feed tool results back into a mid-turn state. The helper
-      // must reject with 400 rather than silently advancing into
-      // the model.
+      // Invariant: the chat-session API cannot continue from an
+      // unresolved trailing fan-out in a stateless cold-start
+      // request (no mechanism to feed tool results back into
+      // mid-turn state). The helper must reject with 400 rather
+      // than silently advancing into the model.
       const registry = new ModelRegistry();
       const mockModel = createMockModel();
       registry.register('test-model', mockModel);
@@ -8164,36 +7470,34 @@ describe('createHandler', () => {
     });
 
     it('canonicalizes an earlier stored fan-out block on a multi-turn previous_response_id replay', async () => {
-      // Iteration-20 regression (finding 1): before the fix,
-      // `canonicalizeToolMessageOrder` scanned all the way to
-      // `messages.length`, so the full-history walker's per-fan-out
-      // invocation would pull in tool messages from EVERY later
-      // block. For a reconstructed chain with two resolved
-      // multi-tool fan-outs, the first call would see tool messages
-      // from both blocks, the count gate
-      // (`toolPositions.length !== expectedOrder.length`) would
-      // bail, and a stored first block in non-canonical order would
-      // pass straight through to `primeHistory()` uncorrected.
+      // Invariant: `canonicalizeToolMessageOrder` scans only
+      // through the current fan-out's tool messages. For a
+      // reconstructed chain with two resolved multi-tool fan-
+      // outs, per-fan-out invocation must not pull in tool
+      // messages from later blocks — otherwise the count gate
+      // (`toolPositions.length !== expectedOrder.length`) bails
+      // and a stored first block in non-canonical order passes
+      // straight through to `primeHistory()` uncorrected.
       //
-      // The only way this bug surfaces on `/v1/responses` is via
+      // The only way this surfaces on `/v1/responses` is via
       // `previous_response_id` + `reconstructMessagesFromChain`
-      // grouping stored output items into one assistant message per
-      // stored record. We seed the store directly with two such
-      // records — the first one's stored `inputJson` contains the
-      // previous turn's tool results in REVERSED sibling order —
-      // and then submit a canonical continuation that fully resolves
-      // the trailing fan-out. The walker's defense-in-depth sweep
-      // must rewrite the stored first block into canonical sibling
-      // order before dispatch.
+      // grouping stored output items into one assistant message
+      // per stored record. We seed the store directly with two
+      // such records — the first one's stored `inputJson`
+      // contains the previous turn's tool results in REVERSED
+      // sibling order — and submit a canonical continuation
+      // that fully resolves the trailing fan-out. The walker's
+      // defense-in-depth sweep must rewrite the stored first
+      // block into canonical sibling order before dispatch.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'all fetched' }));
       registry.register('test-model', mockModel);
       // Seed `configJson.modelInstanceId` with the SAME id the
-      // live registry assigned to `test-model` so the iter-21
-      // cross-chain guard accepts the continuation. Without this
-      // the hand-seeded records would look like a pre-iter-21
-      // write (no id in configJson) and the guard would reject
-      // the replay with 400 before the walker under test runs.
+      // live registry assigned to `test-model` so the cross-
+      // chain guard accepts the continuation. Without this the
+      // hand-seeded records would look like legacy writes
+      // (no id in configJson) and the guard would reject the
+      // replay with 400 before the walker under test runs.
       const testModelInstanceId = registry.getInstanceId('test-model');
       expect(testModelInstanceId).toBeDefined();
       const seededConfigJson = JSON.stringify({ modelInstanceId: testModelInstanceId });
@@ -8313,26 +7617,21 @@ describe('createHandler', () => {
     });
 
     it('rejects previous_response_id continuation when the stored chain was produced by a different model', async () => {
-      // Iteration-20 regression (finding 2) / iter-21 rewrite: the
-      // cross-model guard is now keyed on the monotonic
-      // `modelInstanceId` that `ModelRegistry` assigns to each
-      // distinct model object (persisted into the stored record's
-      // `configJson` blob), NOT the friendly `model` name. See the
-      // module rustdoc on `ModelRegistry` and the guard block in
-      // `responses.ts` for the motivation.
+      // Invariant: the cross-model guard is keyed on the
+      // monotonic `modelInstanceId` that `ModelRegistry`
+      // assigns to each distinct model object (persisted into
+      // the stored record's `configJson` blob), NOT the
+      // friendly `model` name. See the module rustdoc on
+      // `ModelRegistry` and the guard block in `responses.ts`
+      // for motivation.
       //
-      // Register two DIFFERENT mock models under `model-alpha` and
-      // `model-beta` — two distinct model objects, two distinct
-      // instance ids. Persist a chain produced by `model-alpha`,
-      // then POST a continuation that targets `model-beta`. The
-      // stored id (alpha's) and the live id for `body.model`
-      // (beta's) differ, so the guard must reject 400 before any
-      // dispatch. Companion tests `rejects previous_response_id
-      // continuation when the named binding has been hot-swapped
-      // to a different model instance` and `accepts
-      // previous_response_id continuation through a different name
-      // that aliases the same model instance` cover the two cases
-      // the iter-20 name-based check couldn't express.
+      // Register two DIFFERENT mock models under `model-alpha`
+      // and `model-beta`. Persist a chain produced by alpha,
+      // then POST a continuation that targets beta. The stored
+      // id and the live id for `body.model` differ, so the
+      // guard must reject 400 before any dispatch. Companion
+      // tests cover hot-swap and aliasing — the two cases a
+      // name-based check cannot express.
       const registry = new ModelRegistry();
       const alphaModel = createMockModel(makeChatResult({ text: 'alpha reply' }));
       const betaModel = createMockModel(makeChatResult({ text: 'beta reply' }));
@@ -8418,22 +7717,20 @@ describe('createHandler', () => {
     });
 
     it('rejects previous_response_id continuation when the named binding has been hot-swapped to a different model instance', async () => {
-      // Iter-21 (finding 1 / test A): the iter-20 friendly-name
-      // check passed when `body.model` happened to string-match
-      // the stored record's `model` field — but `ModelRegistry`
-      // supports hot-swapping a name to a DIFFERENT model object,
-      // so a chain produced by the OLD binding would still pass a
-      // name check after the swap and be silently replayed
-      // through the new tokenizer / chat template / KV layout.
-      // The instance-id guard catches this: after `register("foo",
-      // modelB)` the live id for `"foo"` is fresh, and the stored
+      // Hot-swap test: `ModelRegistry` supports swapping a name
+      // to a DIFFERENT model object. A chain produced by the
+      // OLD binding must not be silently replayed through the
+      // new tokenizer / chat template / KV layout. The instance-
+      // id guard catches this: after `register("foo", modelB)`
+      // the live id for `"foo"` is fresh, and the stored
       // record's id (modelA's) is the dead id dropped by
       // `releaseBinding`.
       //
       // Register `modelA` under the name `my-model`, persist a
       // chain, then re-register `my-model` pointing at `modelB`
       // (a DIFFERENT object). Turn 2 continues against the same
-      // friendly name. Expect 400 and no dispatch on either model.
+      // friendly name. Expect 400 and no dispatch on either
+      // model.
       const registry = new ModelRegistry();
       const modelA = createMockModel(makeChatResult({ text: 'A reply' }));
       const modelB = createMockModel(makeChatResult({ text: 'B reply' }));
@@ -8519,16 +7816,15 @@ describe('createHandler', () => {
     });
 
     it('accepts previous_response_id continuation through a different name that aliases the same model instance', async () => {
-      // Iter-21 (finding 1 / test B): iter-19's per-instance
-      // `SessionRegistry` sharing already makes two names that
-      // alias the SAME model object safe — they route through one
-      // registry and one warm session. The iter-20 friendly-name
-      // check nevertheless REJECTED such a continuation because
-      // the stored record's `model` field didn't string-match
-      // `body.model`. The iter-21 instance-id guard recognises
-      // the shared binding and lets it through.
+      // Aliasing test: per-instance `SessionRegistry` sharing
+      // makes two names that alias the SAME model object safe —
+      // they route through one registry and one warm session.
+      // The instance-id guard recognises the shared binding and
+      // lets such continuations through (a friendly-name check
+      // would reject because the stored `model` field wouldn't
+      // string-match `body.model`).
       //
-      // Register one `sharedModel` object under both `alpha` and
+      // Register one `sharedModel` under both `alpha` and
       // `beta`. Persist a chain via `body.model = 'alpha'`, then
       // continue via `body.model = 'beta'`. Expect 200 and
       // dispatch on `sharedModel`.
@@ -8602,15 +7898,12 @@ describe('createHandler', () => {
     });
 
     it('round-trips a stateless multi-call replay without previous_response_id', async () => {
-      // Iter-21 (finding 2): the OpenAI Responses API serialises a
-      // multi-call assistant turn as a RUN of sibling
-      // `function_call` input items. `mapRequest` must coalesce
-      // that run into ONE assistant message with multi-element
-      // `toolCalls`, otherwise the iter-20 full-history walker
-      // (`validateAndCanonicalizeHistoryToolOrder`) rejects the
-      // first assistant turn as orphaned — its next message is
-      // another assistant, not a tool — so stateless multi-call
-      // histories fail even when the caller ships them correctly.
+      // Invariant: `mapRequest` coalesces a run of sibling
+      // `function_call` input items into ONE assistant message
+      // with multi-element `toolCalls`, otherwise the full-
+      // history walker rejects the first assistant turn as
+      // orphaned (its next message would be another assistant,
+      // not a tool).
       //
       // Send a well-formed replay with two sibling function_call
       // items followed by their tool outputs in REVERSED order
@@ -8672,18 +7965,15 @@ describe('createHandler', () => {
     });
 
     it('uses OpenAI vocabulary in history validation errors on /v1/responses', async () => {
-      // Iter-23 finding 4 symmetry: the
-      // `validateAndCanonicalizeHistoryToolOrder` helper takes
-      // an `apiSurface` parameter that selects between
+      // Invariant: `validateAndCanonicalizeHistoryToolOrder`
+      // takes an `apiSurface` parameter that selects between
       // OpenAI-flavored (`function_call_output` / `call_id` /
       // `assistant fan-out`) and Anthropic-flavored
       // (`tool_result` / `tool_use_id` / `assistant turn with
       // tool_use blocks`) error strings. `/v1/responses` calls
       // the helper with the OpenAI default; `/v1/messages`
       // passes `'anthropic'` explicitly. Pin the OpenAI default
-      // here by sending a stateless history with an orphan
-      // `function_call_output` (no preceding `function_call`)
-      // and asserting the error text is OpenAI-flavored.
+      // here.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'should not fire' }));
       registry.register('test-model', mockModel);
@@ -8758,12 +8048,10 @@ describe('createHandler', () => {
     });
 
     it('rejects a previous_response_id continuation when the stored record lacks modelInstanceId (same name)', async () => {
-      // Iter-29 finding 2: legacy rows (no `modelInstanceId` in
-      // the stored config blob) are now rejected outright, even
-      // when the friendly model name matches. The iter-27/28
-      // compat window that allowed same-name cold replay has been
-      // closed because friendly-name equality is insufficient
-      // against hot-swap during TTL.
+      // Invariant: legacy rows (no `modelInstanceId` in the
+      // stored config blob) are rejected outright, even when
+      // the friendly model name matches — friendly-name
+      // equality is insufficient against hot-swap during TTL.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'legacy continuation reply' }));
       registry.register('test-model', mockModel);
@@ -8826,9 +8114,9 @@ describe('createHandler', () => {
     });
 
     it('rejects a legacy previous_response_id continuation when the friendly model name differs', async () => {
-      // Iter-29 finding 2: legacy rows (no `modelInstanceId`) are
-      // rejected outright regardless of friendly-name match. This
-      // test verifies the cross-name case also gets the same 400.
+      // Legacy rows are rejected regardless of friendly-name
+      // match. This test verifies the cross-name case also gets
+      // the same 400.
       const registry = new ModelRegistry();
       const modelA = createMockModel(makeChatResult({ text: 'model A reply' }));
       const modelB = createMockModel(makeChatResult({ text: 'model B reply' }));
@@ -8837,7 +8125,7 @@ describe('createHandler', () => {
       const storedRecords = new Map<string, any>();
       // Seed a legacy row whose `model` is `"model-A"`. The
       // `configJson` deliberately carries NO `modelInstanceId`
-      // (the pre-iter-21 shape).
+      // (legacy shape).
       storedRecords.set('resp_legacy_A', {
         id: 'resp_legacy_A',
         createdAt: Math.floor(Date.now() / 1000),
@@ -8897,15 +8185,11 @@ describe('createHandler', () => {
     });
 
     it('rejects a previous_response_id continuation when the stored configJson is malformed', async () => {
-      // Iter-28 finding 1 regression: the iter-27 legacy compat
-      // path silently classified a stored row whose `configJson`
-      // blob failed to JSON-parse as "absent" (kind==='absent'),
-      // which meant the narrow friendly-name-equality cold-replay
-      // window happily serviced a row whose stored config state
-      // we cannot read at all. Surface the parse failure as its
-      // own kind==='malformed' variant and reject with 400 so
-      // the caller has to start a new chain rather than silently
-      // cold-replay against an unreadable prior turn.
+      // Invariant: a stored row whose `configJson` blob fails
+      // to JSON-parse is surfaced as kind==='malformed' and
+      // rejected with 400 — the caller has to start a new chain
+      // rather than silently cold-replay against an unreadable
+      // prior turn.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'unused reply' }));
       registry.register('test-model', mockModel);
@@ -8967,22 +8251,18 @@ describe('createHandler', () => {
     });
 
     it('rejects previous_response_id continuation when the model binding is re-registered during store.getChain', async () => {
-      // Iter-22 finding 3 regression: the handler captured
-      // `sessionReg = registry.getSessionRegistry(body.model)` and
-      // `currentInstanceId = registry.getInstanceId(body.model)`
-      // BEFORE awaiting `store.getChain(previous_response_id)`.
-      // A concurrent `registry.register(body.model,
-      // differentModel)` during that await would leave the
-      // post-await code using the STALE session registry and
-      // STALE instance id — the stored identity would still
-      // match the dead id, the request would lease a session
-      // from the old registry, and the new record would be
-      // persisted under the old binding even though `body.model`
-      // now resolves to a different instance.
+      // Invariant: `sessionReg` and `currentInstanceId` must
+      // be re-read AFTER awaiting
+      // `store.getChain(previous_response_id)`. If the handler
+      // captures them before the await, a concurrent
+      // `registry.register(body.model, differentModel)` during
+      // that await would leave the post-await code using a
+      // stale session registry / instance id and persist the
+      // new record under the old binding.
       //
       // Simulate the race by injecting the `register()` call
-      // inside the mock store's `getChain` resolution. This is a
-      // deliberate race simulation — the test establishes the
+      // inside the mock store's `getChain` resolution. This is
+      // a deliberate race simulation — the test establishes the
       // invariant, it does not need to be physically
       // concurrent. The handler must detect the mismatch on the
       // post-await re-read and reject with 400.
@@ -9091,16 +8371,13 @@ describe('createHandler', () => {
     });
 
     it('rejects previous_response_id continuation when the binding is re-registered while the mutex holds a prior dispatch', async () => {
-      // Iter-25 finding 1 regression: the handler snapshots
-      // `sessionReg` / `currentInstanceId` before entering
-      // `await sessionReg.withExclusive(...)`, and
-      // `ModelRegistry.register()` is NOT coordinated with that
-      // lock. A waiter queued behind a long-running dispatch
-      // for the same model would therefore execute against a
-      // stale `sessionReg` reference even if `register()` has
-      // already rebound the name mid-wait. The in-mutex re-read
-      // introduced for this finding catches the drift and
-      // rejects the request BEFORE any native dispatch runs.
+      // Invariant: the in-mutex re-read of
+      // `sessionReg` / `currentInstanceId` detects drift
+      // between the pre-lock snapshot and the live registry
+      // binding. `ModelRegistry.register()` is NOT coordinated
+      // with `withExclusive(...)`, so a waiter queued behind a
+      // long-running dispatch for the same model can otherwise
+      // execute against a stale reference.
       //
       // Simulate the race by making the blocker's dispatch
       // resolve only after we have both:
@@ -9228,22 +8505,20 @@ describe('createHandler', () => {
     });
 
     it('cold-replays a previous_response_id chain whose prior turn produced a successful blank assistant message', async () => {
-      // Iter-25 finding 3 integration regression: the server
-      // deliberately emits a `message` item with empty text
-      // when a turn completes with no tool calls and no
-      // output. Until iter-25, `reconstructMessagesFromChain`
-      // would silently drop that blank assistant turn on cold
-      // replay, so a `previous_response_id` continuation after
-      // TTL expiry / process restart would prime a DIFFERENT
-      // conversation than the live session saw.
+      // Invariant: `reconstructMessagesFromChain` preserves
+      // blank assistant turns on cold replay, matching the
+      // server's wire-format behaviour of emitting a `message`
+      // item with empty text when a turn completes with no
+      // tool calls and no output. Otherwise a
+      // `previous_response_id` continuation after TTL expiry /
+      // process restart would prime a DIFFERENT conversation
+      // than the live session saw.
       //
-      // Drive turn 1 through the handler normally (mock model
-      // returns empty text). Persist it into the store. Force
-      // cold replay on turn 2 by clearing the warm
-      // `SessionRegistry` entry via the public `clear()`
-      // method. Then verify that `chatSessionStart` on the
-      // cold-replay path receives a primed history containing
-      // the blank assistant turn.
+      // Drive turn 1 through the handler (mock returns empty
+      // text). Persist. Force cold replay on turn 2 by
+      // clearing the warm `SessionRegistry` entry. Verify
+      // `chatSessionStart` on the cold-replay path receives a
+      // primed history containing the blank assistant turn.
       const registry = new ModelRegistry();
       // Turn 1 resolves with empty text: a legitimate
       // successful-blank completion.
@@ -9298,9 +8573,9 @@ describe('createHandler', () => {
       expect(resp1.output_text).toBe('');
 
       // Verify the persisted output really does contain a
-      // `message` item (with empty text). This is the stored
-      // shape the iter-24 predicate silently dropped on cold
-      // replay; the integration assertion below rides on it.
+      // `message` item (with empty text). The integration
+      // assertion below rides on the cold-replay predicate
+      // preserving this blank message item.
       const stored1 = storedRecords.get(resp1.id);
       expect(stored1).toBeDefined();
       const stored1Output = JSON.parse(stored1.outputJson) as Array<{
@@ -9347,9 +8622,8 @@ describe('createHandler', () => {
       expect(startSpy).toHaveBeenCalledTimes(2);
       const [primedMessages] = startSpy.mock.calls[1] as [ChatMessage[], unknown];
       // Expected shape: [user 'hello', assistant '' (blank),
-      // user 'follow up']. Without the iter-25 fix the blank
-      // assistant would be missing and the array would be
-      // length 2, not 3.
+      // user 'follow up']. If cold replay dropped the blank
+      // assistant turn the array would be length 2, not 3.
       expect(primedMessages.map((m: ChatMessage) => m.role)).toEqual(['user', 'assistant', 'user']);
       expect(primedMessages[0]!.content).toBe('hello');
       expect(primedMessages[1]!.content).toBe('');
@@ -10026,18 +9300,15 @@ describe('createHandler', () => {
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Iter-29 finding regressions
-  // ---------------------------------------------------------------------------
-
   describe('iter-29 findings', () => {
     it('streaming failed response normalizes function_call items to incomplete', async () => {
-      // Iter-29 finding 1: when the stream emits a done event with
-      // finishReason: 'error' and toolCalls, the function_call items
-      // collected in the done branch must be normalized to
-      // status: 'incomplete' in the response.failed terminal, and
-      // NO function_call SSE events should have been emitted before
-      // the commit gate checked (since the session did not commit).
+      // Invariant: when the stream emits a done event with
+      // finishReason: 'error' and toolCalls, the function_call
+      // items collected in the done branch must be normalized
+      // to status: 'incomplete' in the response.failed
+      // terminal, and NO function_call SSE events should be
+      // emitted before the commit gate checked (the session
+      // did not commit).
       const streamEvents = [
         {
           done: true,
@@ -10114,10 +9385,10 @@ describe('createHandler', () => {
     });
 
     it('rejects legacy previous_response_id with absent modelInstanceId', async () => {
-      // Iter-29 finding 2: store a response record WITHOUT
-      // modelInstanceId in configJson. A continuation request
-      // pointing at it must be rejected with 400 regardless of
-      // whether the friendly model name matches.
+      // Store a response record WITHOUT modelInstanceId in
+      // configJson. A continuation request pointing at it must
+      // be rejected with 400 regardless of whether the friendly
+      // model name matches.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'should not be reached' }));
       registry.register('test-model', mockModel);
@@ -10269,22 +9540,20 @@ describe('createHandler', () => {
     });
 
     it('committed non-streaming handler crash AFTER writeHead but before end does not adopt under unseen id', async () => {
-      // Iter-32 finding 1 regression: Node's
-      // `ServerResponse.writeHead()` flips `headersSent = true`
-      // synchronously BEFORE any body bytes leave the buffer. The
-      // iter-29 adopt gate keyed on `res.headersSent`, so a throw
-      // from `res.end()` on the non-streaming path — after
-      // `writeHead` had already flipped the flag — looked like the
-      // happy "already on the wire" case and silently adopted the
-      // committed session under a responseId the client never
-      // actually received a body for. The fix threads an explicit
-      // `responseBodyWritten` visibility flag set only AFTER
-      // `res.end()` returns cleanly, and the adopt gate keys on
-      // that instead.
+      // Invariant: the adopt gate keys on the explicit
+      // `responseBodyWritten` flag (set only AFTER `res.end()`
+      // returns cleanly), NOT `res.headersSent`. Node's
+      // `writeHead()` flips `headersSent` synchronously before
+      // any body bytes leave the buffer, so a throw from
+      // `res.end()` after `writeHead` would look like the happy
+      // "already on the wire" case under a headersSent-keyed
+      // gate — silently adopting a committed session under a
+      // responseId the client never actually received a body
+      // for.
       //
-      // This test drives exactly the regression shape: `writeHead`
-      // succeeds (flipping `headersSent` like real Node), but the
-      // very first `res.end()` throws synchronously. The handler
+      // This test drives that shape: `writeHead` succeeds
+      // (flipping `headersSent` like real Node), but the very
+      // first `res.end()` throws synchronously. The handler
       // must NOT adopt, the error must propagate to the outer
       // catch, and the client must see a 500.
       const registry = new ModelRegistry();
@@ -10299,13 +9568,14 @@ describe('createHandler', () => {
       });
       const { res, getBody, waitForEnd, wasDestroyed } = createMockRes();
 
-      // `writeHead` succeeds — `headersSent` flips to `true` per
-      // Node's real semantics (now mirrored in `createMockRes`). The
-      // FIRST `res.end()` throws, simulating a socket crash between
-      // headers and body. Under iter-33 the outer catch destroys
-      // the socket instead of emitting SSE frames into a JSON body,
-      // so later `end()` calls are not expected on this path; the
-      // mock's `destroy()` resolves `waitForEnd()` for us.
+      // `writeHead` succeeds — `headersSent` flips to `true`
+      // per Node's real semantics (now mirrored in
+      // `createMockRes`). The FIRST `res.end()` throws,
+      // simulating a socket crash between headers and body.
+      // The outer catch destroys the socket instead of emitting
+      // SSE frames into a JSON body, so later `end()` calls are
+      // not expected on this path; the mock's `destroy()`
+      // resolves `waitForEnd()` for us.
       let endCallCount = 0;
       const originalEnd = res.end.bind(res);
       // @ts-expect-error overriding the narrow overload signature
@@ -10325,29 +9595,24 @@ describe('createHandler', () => {
       // eslint-disable-next-line @typescript-eslint/unbound-method
       expect(mockModel.chatSessionStart).toHaveBeenCalledTimes(1);
 
-      // The PRIMARY invariant: the session registry must NOT have
-      // adopted the session under the unseen responseId. Under the
-      // old `headersSent`-keyed gate this assertion failed — the
-      // handler saw `headersSent === true` (flipped synchronously
-      // by `writeHead`), took the "already on the wire" branch,
-      // adopted, and size became 1. That left a warm session
-      // cached under a responseId the client never actually
-      // received a body for, so the next chained request would
-      // hot-resume through an unreachable id. The new
-      // `responseBodyWritten` flag is NOT set (because `end()`
-      // threw before returning), so the adopt gate refuses.
+      // PRIMARY invariant: the session registry must NOT adopt
+      // the session under the unseen responseId. The adopt
+      // gate keys on `responseBodyWritten`, NOT `headersSent` —
+      // `end()` threw before returning so
+      // `responseBodyWritten` stays false, and the gate
+      // refuses. A `headersSent`-keyed gate would have seen
+      // `true` (flipped synchronously by `writeHead`), adopted,
+      // and left a warm session cached under an unreachable id.
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(0);
 
-      // Iter-33 finding 2 tightening: the outer catch used to
-      // `writeSSEEvent(res, 'error', ...)` when `res.headersSent`
-      // was true, which emitted SSE-formatted frames INTO a
-      // `Content-Type: application/json` body. The new outer catch
-      // branches on `responseMode` (committed by `endJson`), not
-      // `headersSent`, and destroys the socket on a JSON-mode
-      // failure instead of corrupting the wire format. Verify the
-      // socket was torn down and no SSE frame leaked into the body.
+      // Invariant: the outer catch branches on `responseMode`
+      // (committed by `endJson`), not `headersSent`, and
+      // destroys the socket on a JSON-mode failure instead of
+      // emitting SSE frames into a `Content-Type: application/
+      // json` body. Verify the socket was torn down and no SSE
+      // frame leaked into the body.
       expect(wasDestroyed()).toBe(true);
       const body = getBody();
       expect(body).not.toContain('event: error');
@@ -10355,31 +9620,24 @@ describe('createHandler', () => {
     });
 
     it('streaming early SSE write crash before any terminal rethrows and does not adopt', async () => {
-      // Iter-32 finding 2 regression: `beginSSE()` sends SSE
-      // headers (flipping `res.headersSent = true`) BEFORE any
-      // terminal SSE event (`response.created` is not a terminal —
-      // terminals are `response.completed` / `response.failed`). The
-      // iter-29 gate `handlerError && !res.headersSent` therefore
-      // swallowed any throw from an early `writeSSEEvent` as "safe
-      // to suppress, client already has headers" — but all the
-      // client saw was SSE headers and an abruptly-closed stream
-      // with no terminal event.
+      // Invariant: `terminalEmitted` flips ONLY after a
+      // terminal SSE event (success or failure) has been
+      // written to the wire. Before that, any uncommitted
+      // throw from inside the streaming helper must propagate
+      // out to the outer catch so it can emit a last-ditch
+      // `error` event rather than hanging the request.
+      // `res.headersSent` alone is insufficient because
+      // `beginSSE()` sends SSE headers BEFORE any terminal
+      // event (`response.created` is not a terminal).
       //
-      // The fix introduces `terminalEmitted`, which is flipped ONLY
-      // after a terminal SSE event (success or failure) has been
-      // written to the wire. Before that, any uncommitted throw
-      // from inside the streaming helper must propagate out to the
-      // outer catch so it can emit a last-ditch `error` event
-      // rather than hanging the request.
-      //
-      // This test drives exactly that shape: `beginSSE` succeeds
-      // (writeHead flushes SSE headers), but the very first
-      // `res.write` inside `writeSSEEvent` throws — before
-      // `response.created` even lands. The session did not commit,
-      // so the registry must stay empty; the outer catch sees
-      // `safeToSuppress === false` and either rethrows (triggering
-      // the outer last-ditch SSE error epilogue) or takes the
-      // equivalent error path.
+      // This test drives exactly that shape: `beginSSE`
+      // succeeds (writeHead flushes SSE headers), but the very
+      // first `res.write` inside `writeSSEEvent` throws —
+      // before `response.created` even lands. The session did
+      // not commit, so the registry must stay empty; the outer
+      // catch sees `safeToSuppress === false` and either
+      // rethrows (triggering the last-ditch SSE error
+      // epilogue) or takes the equivalent error path.
       async function* stream() {
         yield { done: false, text: 'never emitted', isReasoning: false };
       }
@@ -10525,20 +9783,17 @@ describe('createHandler', () => {
     });
 
     it('non-streaming: async res.end callback error does NOT adopt or corrupt the wire', async () => {
-      // Iter-33 finding 1 regression: `responseBodyWritten` used to
-      // flip the moment `res.end()` returned synchronously, but
-      // that only proves Node buffered the bytes — NOT that the
-      // kernel accepted them. An async socket failure surfaced via
-      // `res.end`'s write callback (err != null) meant the client
-      // never received the JSON body, yet the gate saw
-      // `responseBodyWritten === true` and happily adopted the
-      // committed session under an unseen responseId.
-      //
-      // Also covers finding 2: the outer catch used to branch on
-      // `res.headersSent` and would therefore emit SSE frames into
-      // a `Content-Type: application/json` response on this same
-      // failure shape. The fix destroys the socket instead, so the
-      // wire contract is honoured regardless of which mode failed.
+      // Invariant (non-streaming):
+      //   1. `responseBodyWritten` flips only AFTER `res.end()`'s
+      //      write callback fires without an error — not on the
+      //      synchronous return. Buffer acceptance is not kernel
+      //      acceptance; an async socket failure via the `end`
+      //      callback must keep the adopt gate closed.
+      //   2. The outer catch branches on `responseMode` and
+      //      destroys the socket instead of emitting SSE frames
+      //      into a `Content-Type: application/json` response,
+      //      so the wire contract is honoured regardless of
+      //      which mode failed.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
       registry.register('test-model', mockModel);
@@ -10553,8 +9808,7 @@ describe('createHandler', () => {
 
       // Override `res.end` so the write callback fires with an
       // Error — the classic shape of a late socket failure that
-      // `end()` itself returns from synchronously. This is the
-      // specific bug iter-33 finding 1 calls out.
+      // `end()` itself returns from synchronously.
       let endCallCount = 0;
       const originalEnd = res.end.bind(res);
       (res as unknown as { end: (...args: unknown[]) => unknown }).end = (
@@ -10588,8 +9842,7 @@ describe('createHandler', () => {
       expect(sessionReg!.size).toBe(0);
 
       // Outer catch on a JSON-mode failure destroys the socket
-      // (finding 2). No SSE frame leaked into the JSON-declared
-      // response.
+      // — no SSE frame leaked into the JSON-declared response.
       expect(wasDestroyed()).toBe(true);
       const body = getBody();
       expect(body).not.toContain('event: error');
@@ -10597,17 +9850,13 @@ describe('createHandler', () => {
     });
 
     it('streaming: async terminal-SSE write-callback error keeps terminalEmitted false', async () => {
-      // Iter-33 finding 1 regression on the streaming path. The
-      // old code flipped `terminalEmitted = true` the moment
-      // `writeSSEEvent` returned synchronously from emitting
-      // `response.completed`. If the underlying socket failed
-      // asynchronously (write returned but the callback later
-      // reported an error), the gate thought a terminal had landed
-      // and adopted — even though the client never got an ack.
-      //
-      // The fix writes the terminal through `flushTerminalSSE`,
-      // which gates the flag on the write callback firing without
-      // an error. This test drives exactly that shape.
+      // Invariant (streaming): the terminal SSE write flows
+      // through `flushTerminalSSE`, which gates
+      // `terminalEmitted` on the write CALLBACK firing without
+      // an error — not on the synchronous return. This prevents
+      // an async socket failure (write returns but the callback
+      // later reports an error) from flipping the gate and
+      // adopting a turn the client never acked.
       const registry = new ModelRegistry();
       const streamEvents = [
         { done: false, text: 'hi' },
@@ -10685,20 +9934,19 @@ describe('createHandler', () => {
     });
 
     it('non-streaming: destroyed socket before end rejects endJson and does not hang', async () => {
-      // Iter-34 regression. `ServerResponse.end(payload, cb)` does
-      // NOT invoke the callback when `socket.destroyed === true`
-      // but `res.destroyed === false` — Node's internal
-      // `_writeRaw()` returns without queuing the write. The iter-
-      // 33 helper awaited that callback forever, pinning the per-
-      // model `withExclusive` mutex on a dead client.
+      // Invariant: the endJson helper pre-checks
+      // `res.destroyed || res.socket?.destroyed` and rejects
+      // synchronously if either is destroyed. Without the pre-
+      // check, `ServerResponse.end(payload, cb)` would NOT
+      // invoke the callback when `socket.destroyed === true`
+      // but `res.destroyed === false` (Node's `_writeRaw()`
+      // returns without queuing the write) — pinning the per-
+      // model `withExclusive` mutex on a dead client forever.
       //
-      // The fix pre-checks `res.destroyed || res.socket?.destroyed`
-      // and rejects the endJson promise synchronously if either is
-      // already destroyed. This test drives exactly that shape:
-      // mark the underlying socket destroyed before the handler
-      // runs, then verify the handler completes within a timeout
-      // bound (no hang), no session is adopted, and no SSE frame
-      // leaks into the JSON-declared body.
+      // This test marks the underlying socket destroyed before
+      // the handler runs, then verifies the handler completes
+      // within a timeout bound (no hang), no session is
+      // adopted, and no SSE frame leaks into the JSON body.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
       registry.register('test-model', mockModel);
@@ -10749,18 +9997,18 @@ describe('createHandler', () => {
     });
 
     it('non-streaming: socket close event during end rejects endJson and does not hang', async () => {
-      // Iter-34 regression. If the peer disconnects AFTER
-      // `res.end()` returns but BEFORE the kernel acks, Node emits
-      // `'close'` on the response (or its socket) and the end
-      // callback is NEVER invoked. The iter-33 helper awaited that
-      // callback forever.
+      // Invariant: the endJson helper attaches
+      // `res.once('close', …)` (and the socket's equivalent)
+      // to reject the promise on peer disconnect. Without this,
+      // a peer disconnect AFTER `res.end()` returns but BEFORE
+      // the kernel acks would emit `'close'` with the end
+      // callback never invoked, and the helper would wait
+      // forever.
       //
-      // The fix attaches `res.once('close', …)` (and the socket's
-      // equivalent) to reject the promise on peer disconnect. This
-      // test drives exactly that shape: replace `res.end` with an
-      // implementation that never fires the callback, emit
-      // `'close'` on the next tick, and verify the handler
-      // completes within a timeout bound.
+      // This test replaces `res.end` with an implementation
+      // that never fires the callback, emits `'close'` on the
+      // next tick, and verifies the handler completes within a
+      // timeout bound.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
       registry.register('test-model', mockModel);

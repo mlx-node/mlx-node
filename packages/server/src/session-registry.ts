@@ -4,124 +4,80 @@
  *
  * Design notes:
  *
- *   - **One registry per model.** The server composes a fresh
- *     `SessionRegistry` alongside each registered `ServableModel` in
- *     the `ModelRegistry`. Sessions are keyed purely by the response
- *     id allocated after a turn completes — there is no secondary
- *     keying on model name because the registry itself is already
- *     scoped.
+ *   - **One registry per model.** Composed alongside each registered
+ *     `ServableModel` in `ModelRegistry`. Sessions are keyed purely
+ *     by response id — no secondary keying on model name because the
+ *     registry is already scoped per model.
  *
  *   - **Single-warm-session invariant.** `ChatSession<M>` is a thin
  *     JS wrapper — it does NOT own any native KV cache. The cache
- *     lives on the underlying `SessionCapableModel` (a single
- *     mutable resource: one `cached_token_history` / one `caches`
- *     vector per model instance). Any call that runs a turn through
- *     a `ChatSession` overwrites that shared native state, which
- *     silently invalidates every other `ChatSession` wrapper pointing
- *     at the same model.
+ *     lives on the underlying `SessionCapableModel` (one shared
+ *     `cached_token_history` / `caches` vector per model instance).
+ *     Any call that runs a turn overwrites that shared native state,
+ *     silently invalidating every other `ChatSession` wrapper
+ *     pointing at the same model. Caching multiple wrappers per
+ *     model is therefore an illusion: at most ONE matches real
+ *     native state (whichever ran most recently). To prevent
+ *     cross-session corruption this registry holds at most ONE
+ *     entry — both `getOrCreate` and `adopt` clear the map before
+ *     returning or inserting.
  *
- *     Caching multiple wrappers per model is therefore an illusion:
- *     at most ONE of them ever matches the real native state
- *     (whichever wrapper ran most recently), and every other cached
- *     wrapper is stale and will produce wrong output on the next
- *     `send`. To prevent that cross-session corruption, this registry
- *     guarantees it holds at most ONE entry at a time:
- *
- *     * `getOrCreate` clears the map on every call. The caller is
- *       about to run a turn that overwrites native state, so any
- *       OTHER cached entry is about to become stale — we drop it
- *       now so a later lookup cannot accidentally hand out a
- *       wrapper whose assumed state has been stomped. On a hit we
- *       return the single existing entry (whose native state is
- *       still valid) and the clear is a no-op; on a miss we return
- *       a fresh `ChatSession` after evicting whatever was left.
- *     * `adopt` also clears before inserting. Under the invariant
- *       there is at most one leftover entry at that point, but the
- *       belt-and-braces clear keeps the invariant explicit
- *       regardless of caller ordering.
- *
- *   - **Lease semantics on hit.** The clear-on-hit also gives us
- *     single-flight lease semantics for free: two overlapping
- *     requests that both reference the same `previous_response_id`
- *     cannot share the same live `ChatSession`. The first caller
- *     wins the cleared entry; the second caller finds the map empty
- *     and cold-replays from the `ResponseStore` on a fresh session.
- *     Without this, the second caller would hit `ChatSession`'s
- *     single-flight "concurrent send() not allowed" guard.
+ *   - **Lease semantics on hit.** Clear-on-hit also gives single-
+ *     flight lease semantics: two overlapping requests referencing
+ *     the same `previous_response_id` cannot share the same live
+ *     `ChatSession`. The first wins the cleared entry; the second
+ *     finds the map empty and cold-replays from `ResponseStore` on
+ *     a fresh session. Without this, the second would hit
+ *     `ChatSession`'s single-flight "concurrent send() not allowed"
+ *     guard.
  *
  *   - **Instructions / prefix-state change also misses.** Each entry
- *     records the `instructions` string that was used to adopt it.
- *     On `getOrCreate` we compare the caller's `requestedInstructions`
- *     against the cached entry's value. On mismatch we clear and
- *     return a fresh session — the caller falls through to the
- *     cold-replay path, which re-primes the new instructions via
- *     the full message list. Without this check, a hit would
- *     silently keep using the stale warmed system context while a
- *     cold miss would replay the new one, making output depend on
- *     cache state instead of request contents.
+ *     records the `instructions` string used to adopt it.
+ *     `getOrCreate` compares the caller's `requestedInstructions`
+ *     against the cached value; mismatch forces cold replay so the
+ *     new prefix state is re-primed instead of silently reusing a
+ *     stale warmed prompt. The OpenAI `instructions` field and the
+ *     Anthropic `system` field both flow through the same parameter
+ *     — the registry does not care which is which.
  *
- *     The Anthropic endpoint passes its `system` field through the
- *     same parameter, and the OpenAI endpoint passes its
- *     `instructions` field. The registry does not care which is
- *     which — it is the caller's single "prefix/system state"
- *     identity field.
- *
- *   - **Cache miss fallback.** If a client request arrives with a
- *     `previous_response_id` that the server does not have a cached
- *     session for (eviction, interleaved turn on a different chain,
- *     restart, or the lease-on-hit semantics above), the endpoint
- *     layer falls back to reconstructing the conversation from the
- *     `ResponseStore` history, priming it onto a fresh
- *     `ChatSession` via `primeHistory()`, and then resuming the turn
- *     through `startFromHistory()` (or `startFromHistoryStream()`
- *     for streaming). That pair internally dispatches one
+ *   - **Cache miss fallback.** On a miss (eviction, interleaved turn
+ *     on a different chain, restart, lease-on-hit) the endpoint
+ *     layer reconstructs the conversation from the `ResponseStore`
+ *     history, primes a fresh `ChatSession` via `primeHistory()`,
+ *     and resumes through `startFromHistory()` /
+ *     `startFromHistoryStream()`. That pair dispatches one
  *     `chatSessionStart*` call that rebuilds the full KV cache and
  *     atomically appends the new user turn, so cold replay is
- *     indistinguishable from a hot hit as far as the model is
- *     concerned.
+ *     indistinguishable from a hot hit.
  *
- *   - **TTL.** The default TTL of 1800 seconds mirrors
- *     `RESPONSE_TTL_SECONDS` in `packages/server/src/endpoints/responses.ts`,
- *     so the cached entry ages out alongside its stored response
- *     metadata. Because the registry holds at most one entry at a
- *     time, there is no LRU bookkeeping — only a single expiry
- *     check on lookup.
+ *   - **TTL.** Default 1800 seconds mirrors `RESPONSE_TTL_SECONDS`
+ *     in `packages/server/src/endpoints/responses.ts` so the cached
+ *     entry ages out alongside its stored response metadata. With
+ *     at most one entry there is no LRU bookkeeping — just a single
+ *     expiry check on lookup.
  *
- *   - **Thread safety.** Node.js is single-threaded within one event
- *     loop tick, so the internal `Map` is safe against concurrent
- *     mutation by design. `sweep()` can be scheduled via
- *     `setInterval` and will synchronously walk the map (which holds
- *     at most one entry) without colliding with in-flight
- *     `getOrCreate`/`adopt`/`drop` calls.
+ *   - **Thread safety.** Node.js is single-threaded within one
+ *     event-loop tick, so the internal `Map` is safe against
+ *     concurrent mutation by design. `sweep()` can be scheduled
+ *     via `setInterval` without colliding with in-flight calls.
  *
- *   - **Per-model execution mutex.** The internal `Map` is safe
- *     within one event loop tick, but a dispatch that spans multiple
- *     awaits (map → prefill → decode → map → persist → adopt) is NOT
- *     atomic from the registry's point of view. Two requests that
- *     reach `getOrCreate` for the same model in overlapping ticks —
- *     either under the same `previous_response_id` or with different
- *     ids (or `null`) — both receive a `ChatSession` pointing at the
- *     SAME underlying native model. Even though the lease-on-hit
- *     clear prevents two callers from ever sharing one `ChatSession`
- *     object, the underlying native KV cache is a single mutable
- *     resource: if both dispatches run in parallel the second
- *     request's prefill clobbers the first's KV state, and whichever
- *     request finishes last wins the `adopt()` — poisoning the hot
- *     path for every subsequent chained turn.
+ *   - **Per-model execution mutex.** A dispatch that spans multiple
+ *     awaits (map -> prefill -> decode -> persist -> adopt) is NOT
+ *     atomic from the registry's POV. Two requests against the
+ *     same model would both receive a `ChatSession` pointing at
+ *     the same native model; even though the lease-on-hit clear
+ *     prevents sharing one `ChatSession` object, the native KV
+ *     cache is a single mutable resource and two parallel
+ *     `primeHistory()` / `send*()` calls would race. Whichever
+ *     finished last would win `adopt()`, poisoning the hot path
+ *     for every subsequent chained turn.
  *
- *     `withExclusive(fn)` serializes every per-model dispatch. The
- *     `/v1/responses` and `/v1/messages` endpoints each wrap the full
- *     `getOrCreate → run → adopt/drop` span in a single `withExclusive`
- *     so at most one request at a time holds the model. The lock
- *     chain is FIFO: each call captures the current tail, publishes
- *     a new pending promise as the new tail, and awaits the old tail
- *     before running `fn`. Errors are caught in a `try/finally` so a
- *     rejected dispatch still releases the lock for the next waiter.
- *     This is semantically correct — the native model is a single
- *     mutable resource anyway — and it is the only fix that
- *     prevents concurrent native-state clobbering. A weaker
- *     epoch-token scheme would let the losing dispatch's
- *     `adopt()` no-op, but the native KV would already be wrong.
+ *     `withExclusive(fn)` serializes every per-model dispatch via
+ *     a FIFO `execLock` chain. `/v1/responses` and `/v1/messages`
+ *     wrap the full `getOrCreate -> run -> adopt/drop` span in one
+ *     `withExclusive` so at most one request holds the model at a
+ *     time. A weaker epoch-token scheme would let the losing
+ *     `adopt()` no-op but the native KV would already be wrong.
  */
 
 import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
@@ -188,44 +144,33 @@ export class SessionRegistry {
 
   /**
    * Look up or allocate a session for the given previous response id.
+   * Always returns a `ChatSession` and always leaves the cache empty
+   * after return (single-warm invariant).
    *
-   * Always returns a `ChatSession` and always leaves the cache
-   * empty after return (see the module-level rustdoc for the
-   * single-warm invariant).
+   * On a null id, missing key, expired entry, or prefix-state
+   * mismatch: clear and return `new ChatSession(model)`. The caller
+   * primes / cold-replays from the `ResponseStore` and re-adopts
+   * after the turn commits.
    *
-   * On a null id, a missing key, an expired entry, or a prefix-state
-   * mismatch: clears the cache and returns a fresh
-   * `new ChatSession(model)`. The caller is responsible for priming
-   * / cold-replaying from the `ResponseStore` and then adopting the
-   * session back under the freshly allocated response id after the
-   * turn commits.
+   * On a hit: the entry is removed and its live session is returned.
+   * Overlapping requests against the same `previous_response_id`
+   * cannot share the same live `ChatSession` — the first wins, the
+   * second misses and cold-replays.
    *
-   * On a hit: the entry is removed from the cache and its live
-   * session is returned. Overlapping requests against the same
-   * `previous_response_id` therefore cannot share the same live
-   * `ChatSession`: the first caller wins the entry, the second
-   * misses and cold-replays. This is required because `ChatSession`
-   * is single-flight and concurrent dispatch throws.
-   *
-   * `requestedInstructions` is the caller's current prefix/system
-   * state (OpenAI `instructions`, Anthropic `system`, or `null` if
-   * the caller did not supply any). It is compared byte-for-byte
-   * against the cached entry's `instructions`; mismatch is treated
-   * as a miss so the caller falls through to cold replay and the
-   * new instructions are re-primed into the fresh session.
+   * `requestedInstructions` is the caller's prefix/system state
+   * (OpenAI `instructions`, Anthropic `system`, or `null`); byte-for-
+   * byte mismatch against the cached entry forces cold replay so
+   * the new prefix is re-primed.
    */
   getOrCreate(
     previousResponseId: string | null,
     requestedInstructions: string | null,
   ): ChatSession<SessionCapableModel> {
-    // The single-warm invariant: every call is about to hand a
-    // `ChatSession` to the caller, who will run a turn that overwrites
-    // the model's shared native KV cache. Any OTHER cached entry is
-    // therefore about to become stale — drop the whole map now so a
-    // later `getOrCreate` cannot accidentally hand out a wrapper
-    // whose assumed native state has been stomped. Under the
-    // invariant there is at most ONE entry in the map at this point,
-    // so the common case is either "the entry we want" or "nothing".
+    // Every call is about to overwrite native KV state, so drop any
+    // other cached entry now — a later `getOrCreate` must not hand
+    // out a wrapper whose assumed state has been stomped. Under the
+    // single-warm invariant the map holds at most one entry, so the
+    // common case is either "the entry we want" or "nothing".
     if (previousResponseId === null) {
       this.entries.clear();
       return new ChatSession(this.model);
@@ -239,40 +184,28 @@ export class SessionRegistry {
       this.entries.clear();
       return new ChatSession(this.model);
     }
-    // Instructions / prefix-state mismatch: evict and force cold
-    // replay so the new instructions are re-primed. Without this
-    // guard, a hit would silently keep using the stale warmed
-    // system context while a cold miss would replay the new one,
-    // making output depend on cache state instead of request
-    // contents.
+    // Prefix-state mismatch forces cold replay so the new
+    // instructions are re-primed; without this guard, output would
+    // silently depend on cache state instead of request contents.
     if (entry.instructions !== requestedInstructions) {
       this.entries.clear();
       return new ChatSession(this.model);
     }
-    // Hit: clear the entry (under the invariant it is the only
-    // entry) and hand the session out as a single-use lease. A
-    // concurrent second request against the same id will miss on
-    // the now-empty map and cold-replay, so we never hand the same
-    // live ChatSession to two overlapping callers.
+    // Hit: clear and hand the session out as a single-use lease so
+    // a concurrent second request against the same id cold-replays
+    // instead of sharing this live ChatSession.
     this.entries.clear();
     return entry.session;
   }
 
   /**
-   * Insert a session under a newly allocated response id.
+   * Insert a session under a newly allocated response id. Clears the
+   * map before inserting to keep the single-warm invariant explicit
+   * regardless of caller ordering.
    *
-   * Under the single-warm invariant there is at most one leftover
-   * entry in the map at call time (from a prior `adopt` that has not
-   * been leased out again). We clear the map before inserting to
-   * keep the invariant explicit regardless of caller ordering — it
-   * is a no-op in the common case but guards against future
-   * refactors that might allow more than one entry to linger.
-   *
-   * `instructions` is the prefix/system state the caller used for
-   * this turn (OpenAI `instructions`, Anthropic `system`, or `null`).
-   * It is stored on the entry and compared on the next
-   * `getOrCreate` to detect prefix-state changes that must force a
-   * cold replay.
+   * `instructions` is the prefix/system state used for this turn;
+   * stored on the entry and compared on the next `getOrCreate` to
+   * detect prefix changes that must force a cold replay.
    */
   adopt(responseId: string, session: ChatSession<SessionCapableModel>, instructions: string | null): void {
     this.entries.clear();
@@ -292,14 +225,8 @@ export class SessionRegistry {
 
   /**
    * Walk the map and drop the entry if its TTL has expired.
-   *
-   * Intended to be scheduled via `setInterval` for periodic cleanup.
-   * Under the single-warm invariant the map holds at most one entry,
-   * so this is effectively "check if the one entry is stale and
-   * drop it if so". Kept as a for-loop for shape symmetry with the
-   * previous bounded-cache implementation. Safe to call at any time
-   * — everything is synchronous within one event loop tick so there
-   * is no concurrent-mutation hazard.
+   * Intended for periodic cleanup via `setInterval`. Under the
+   * single-warm invariant the map holds at most one entry.
    */
   sweep(): void {
     const cutoff = nowSec();
@@ -316,31 +243,18 @@ export class SessionRegistry {
   }
 
   /**
-   * Serialize `fn` against every other dispatch that runs through
-   * this registry's model.
+   * Serialize `fn` against every other dispatch through this
+   * registry's model. The caller must hold the lock across the
+   * entire per-model dispatch span — `getOrCreate` ->
+   * `primeHistory`/`send*` -> `adopt`/`drop`. Without it, two
+   * concurrent `primeHistory()` / `send*()` calls would race on
+   * the single mutable native KV cache and whichever finished last
+   * would corrupt the other's chain.
    *
-   * The caller must hold the lock across the entire per-model
-   * dispatch span — `getOrCreate` → `primeHistory`/`send*` →
-   * `adopt`/`drop`. Two overlapping `/v1/responses` and `/v1/messages`
-   * requests targeting the same model both allocate a `ChatSession`
-   * that points at the SAME underlying native `SessionCapableModel`;
-   * the lease-on-hit clear prevents two callers from ever sharing
-   * one `ChatSession` object, but the native KV cache is a single
-   * mutable resource and two concurrent `primeHistory()` /
-   * `send*()` calls against it would race — whichever finished last
-   * would win, corrupting the hot path for the chain the other
-   * dispatch was supposed to service. The mutex restores correctness
-   * by making every dispatch exclusive: at most one request at a
-   * time holds the model, and the adopt/drop bookkeeping that runs
-   * just after the dispatch body cannot see a stale native state
-   * because no other dispatch can slip in between `fn`'s resolve
-   * and the `finally` that releases the lock.
-   *
-   * Implementation: FIFO chaining via a rolling `execLock` promise.
-   * Each caller captures the current tail, publishes a fresh pending
-   * promise as the new tail, awaits the old tail, then runs `fn`.
-   * The `finally` releases regardless of whether `fn` threw, so a
-   * rejected dispatch cannot leave the lock permanently held.
+   * FIFO chaining via a rolling `execLock` promise: each caller
+   * captures the current tail, publishes a fresh pending promise as
+   * the new tail, awaits the old tail, then runs `fn`. The
+   * `finally` releases regardless of whether `fn` threw.
    */
   async withExclusive<T>(fn: () => Promise<T>): Promise<T> {
     const prev = this.execLock;

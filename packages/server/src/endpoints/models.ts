@@ -1,6 +1,4 @@
-/**
- * GET /v1/models endpoint
- */
+/** GET /v1/models endpoint. */
 
 import type { ServerResponse } from 'node:http';
 

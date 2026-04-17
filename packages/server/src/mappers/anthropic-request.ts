@@ -1,6 +1,4 @@
-/**
- * Maps Anthropic Messages API request to internal ChatMessage[] + ChatConfig.
- */
+/** Anthropic Messages API request → internal `ChatMessage[]` + `ChatConfig`. */
 
 import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
@@ -19,41 +17,12 @@ export interface MappedAnthropicRequest {
 }
 
 /**
- * Resolve the text content of a `tool_result` block. Anthropic's
- * Messages API allows `tool_result.content` to carry a plain string,
- * an array of text blocks, or an array that mixes text and image
- * blocks. The internal `ChatMessage` shape is a NAPI-generated Rust
- * struct: a `role: 'tool'` message has no `images` field, and
- * altering the struct is out of scope for the TypeScript server
- * layer. Iter-26 attempted to "hoist" nested images onto a trailing
- * user message so they would at least reach the model, but that
- * approach lost two invariants:
- *
- *   1. **Order.** `[tool_result(content=[image=1]), image=2]` produced
- *      a user message whose `images` array was `[image=2, image=1]`
- *      because the mapper appended top-level trailing images BEFORE
- *      the hoisted tool images. Even a single-tool single-image
- *      shape silently swapped image order relative to the caller's
- *      declaration.
- *   2. **Per-tool association.** When multiple `tool_result` blocks
- *      each carried their own nested image, all of the hoisted
- *      images flowed onto a single trailing user message. A
- *      downstream canonicalization step that reorders the `tool`
- *      messages (see `validateAndCanonicalizeHistoryToolOrder`) would
- *      rearrange the tool-row order WITHOUT touching the hoisted
- *      image list, so each image ended up bound to the wrong tool.
- *
- * Because neither issue is fixable without changing the NAPI
- * `ChatMessage` shape, we refuse the shape outright (iter-27
- * finding 2). Callers who need to send a screenshot as the result
- * of a tool call should either (a) serialise the image into a
- * `text` block — data URL, captioned reference, etc. — inside
- * `tool_result.content` and then send the raw image as a
- * `top-level` image block in a subsequent user turn that follows
- * the tool_result prefix, or (b) send the image in a separate
- * follow-up user turn altogether. Plain-text `tool_result.content`
- * (single string, or an array of text blocks) remains fully
- * supported.
+ * Resolve the text content of a `tool_result` block. The internal `ChatMessage`
+ * shape (NAPI-generated) has no `images` field on `role: 'tool'`, so nested
+ * images are rejected outright — any hoist-to-trailing-user workaround loses
+ * both declared order and per-tool association once downstream canonicalization
+ * reorders the tool rows. Callers must send images as a top-level image block
+ * in a separate user turn.
  */
 function resolveToolResultContent(content?: string | (AnthropicTextContentBlock | AnthropicImageContentBlock)[]): {
   text: string;
@@ -77,12 +46,7 @@ function resolveToolResultContent(content?: string | (AnthropicTextContentBlock 
   return { text: parts.join('') };
 }
 
-/**
- * Map an Anthropic tool definition to the internal ToolDefinition format.
- *
- * The NAPI layer requires `parameters.properties` to be a JSON string,
- * so we stringify the properties object here.
- */
+/** NAPI `ToolDefinition` requires `parameters.properties` to be a JSON string. */
 function mapTool(tool: AnthropicToolDefinition): ToolDefinition {
   const schema = tool.input_schema;
   return {
@@ -99,18 +63,13 @@ function mapTool(tool: AnthropicToolDefinition): ToolDefinition {
   };
 }
 
-/**
- * Convert the Anthropic Messages API request into internal ChatMessage[] + ChatConfig.
- */
 export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthropicRequest {
   const messages: ChatMessage[] = [];
 
-  // System prompt goes first
   if (req.system != null) {
     if (typeof req.system === 'string') {
       messages.push({ role: 'system', content: req.system });
     } else {
-      // Array of SystemBlock — concatenate all text blocks
       const systemParts: string[] = [];
       for (const b of req.system as SystemBlock[]) {
         if (b.type === 'text') {
@@ -119,12 +78,10 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
           throw new Error(`Unsupported system block type: "${(b as { type: string }).type}"`);
         }
       }
-      const systemText = systemParts.join('');
-      messages.push({ role: 'system', content: systemText });
+      messages.push({ role: 'system', content: systemParts.join('') });
     }
   }
 
-  // Map each message in turn
   for (const msg of req.messages) {
     const { role, content } = msg;
 
@@ -132,39 +89,13 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
       if (typeof content === 'string') {
         messages.push({ role: 'user', content });
       } else {
-        // A single Anthropic user turn may carry either
-        //
-        //   (a) ONLY text/image blocks — mapped to a single `user`
-        //       ChatMessage, OR
-        //   (b) a contiguous PREFIX of `tool_result` blocks,
-        //       optionally followed by trailing text/image blocks —
-        //       mapped to a contiguous `tool` ChatMessage run that
-        //       sits immediately after the preceding assistant
-        //       fan-out, optionally followed by a trailing `user`
-        //       ChatMessage carrying the text/images.
-        //
-        // Shapes that interleave text/image BEFORE a tool_result
-        // (e.g. `[text("ignore"), tool_result(...)]`) remain
-        // rejected: we cannot preserve both author intent and
-        // fan-out ordering without silently reordering the caller's
-        // blocks. A text-or-image suffix after the tool_result
-        // block is unambiguous (it belongs to the SAME user turn
-        // that just answered the tool call) and is the shape the
-        // iter-25 mapper was over-eagerly rejecting.
-        //
-        // Nested image blocks inside `tool_result.content` are
-        // rejected outright (iter-27 finding 2): the internal
-        // `ChatMessage` shape cannot represent images on a
-        // `role: 'tool'` message, and the iter-26 hoist-to-trailing-
-        // user workaround lost both relative order and per-tool
-        // association once downstream canonicalization reordered
-        // the tool rows. See `resolveToolResultContent` for the
-        // full rationale.
-        //
-        // Within a tool_result prefix we preserve the caller's
-        // relative order. Downstream
-        // `validateAndCanonicalizeHistoryToolOrder` will reorder
-        // against the assistant's declared sibling order if needed.
+        // An Anthropic user turn may carry either pure text/image blocks,
+        // or a contiguous prefix of `tool_result` blocks optionally followed
+        // by trailing text/image blocks. Interleaving text/image BEFORE a
+        // tool_result is rejected — we cannot preserve author intent and
+        // fan-out ordering without silently reordering the caller's blocks.
+        // Caller-relative order within a tool_result prefix is preserved;
+        // `validateAndCanonicalizeHistoryToolOrder` reorders later if needed.
         const toolResults: {
           toolCallId: string;
           content: string;
@@ -204,34 +135,13 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
         }
 
         if (seenToolResult) {
-          // Emit the tool block. `ChatMessage` has no `isError`
-          // field — it is a NAPI-generated struct owned by Rust
-          // and cannot carry an extra boolean without a schema
-          // change. Encoding the Anthropic `tool_result.is_error`
-          // flag into `content` is therefore unavoidable, but the
-          // iter-23 `[tool error] ` prefix (iter-24 finding 2)
-          // was ambiguous and lossy:
-          //
-          //   * A JSON tool payload is mutated into an invalid
-          //     JSON string by the prefix (`[tool error] {"err":1}`
-          //     parses as literal text, not an object).
-          //   * A successful payload that naturally starts with
-          //     `[tool error] ` is indistinguishable from an
-          //     errored one.
-          //   * An errored payload that already carries the
-          //     prefix gets double-prefixed on round-trip.
-          //
-          // Replace the prefix with a JSON envelope when
-          // `is_error === true`: `{ "is_error": true, "content":
-          // <original> }`. JSON escaping makes the encoding
-          // unambiguous and preserves the raw payload verbatim,
-          // and a successful tool_result whose content is already
-          // a JSON-shaped string is passed through untouched so
-          // callers that stream structured data keep exact
-          // fidelity. The encoding convention is: `is_error` is
-          // represented on tool messages ONLY when true, ONLY via
-          // this envelope shape; every other shape on the wire is
-          // a successful tool result.
+          // `ChatMessage` (NAPI-generated) has no `isError` field, so
+          // Anthropic's `tool_result.is_error=true` is encoded as a JSON
+          // envelope `{ "is_error": true, "content": <original> }`. The
+          // envelope preserves the raw payload verbatim (unlike a text
+          // prefix, which would corrupt JSON payloads and collide with
+          // strings that legitimately start with the prefix). Every other
+          // wire shape is a successful tool result.
           for (const tr of toolResults) {
             const encoded = tr.isError ? JSON.stringify({ is_error: true, content: tr.content }) : tr.content;
             messages.push({
@@ -240,45 +150,10 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
               toolCallId: tr.toolCallId,
             });
           }
-          // Append a trailing user message when the caller supplied
-          // additional text/image content after the tool_result
-          // prefix.
-          //
-          // Iter-28 finding 4: the iter-27 mapper allowed an
-          // arbitrary mix of trailing text and image blocks by
-          // concatenating every text block into one string and
-          // bucketing every image block into a single `images`
-          // array. That silently lost two ordering invariants:
-          //
-          //   1. A shape like `[tool_result, text="A", image=X,
-          //      text="B", image=Y]` produced a user message whose
-          //      `content` was `"AB"` and `images` were
-          //      `[X, Y]` — the interleaved text between the two
-          //      images was hoisted BEFORE both of them, and
-          //      there is no way to reconstruct "text A precedes
-          //      image X, which precedes text B, which precedes
-          //      image Y" from the flat NAPI `ChatMessage` shape.
-          //   2. A shape like `[tool_result, image=X, text="A"]`
-          //      produced a user message whose text appeared
-          //      BEFORE the image in the internal ordering, even
-          //      though the caller declared the image first.
-          //
-          // Neither issue is fixable without changing the NAPI
-          // `ChatMessage` shape, so we refuse the ambiguous
-          // shapes outright. The narrow set of trailing suffix
-          // shapes we still accept is:
-          //
-          //   * One or more trailing `text` blocks (concatenated
-          //     into a single `content` string, no images)
-          //   * Exactly one trailing `image` block (hoisted onto
-          //     `images`, no text)
-          //
-          // A tool-submitting turn that needs to also deliver a
-          // textual comment plus a new screenshot should send the
-          // comment as part of the tool_result's text content
-          // (already supported) and the screenshot as a separate
-          // follow-up user turn. The error message below spells
-          // this out for the caller.
+          // Trailing suffix after a tool_result prefix: accept either
+          // (a) text-only (concatenated) or (b) exactly one image block.
+          // Mixing text+image or multiple images would silently reorder
+          // content in the flat NAPI `ChatMessage` shape.
           const hasTrailingText = trailingText.length > 0;
           const hasTrailingImages = trailingImages.length > 0;
           if (hasTrailingText && hasTrailingImages) {
@@ -306,10 +181,7 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
             messages.push(trailingMsg);
           }
         } else {
-          // Pure text/image user turn. Always emit exactly one
-          // `user` message, even when both arrays are empty
-          // (matches the pre-iter-23 behavior for an empty
-          // content array).
+          // Pure text/image user turn — always emit exactly one `user` message, even if empty.
           const userMsg: ChatMessage = { role: 'user', content: trailingText.join('') };
           if (trailingImages.length > 0) {
             userMsg.images = trailingImages;
@@ -321,9 +193,8 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
       if (typeof content === 'string') {
         messages.push({ role: 'assistant', content });
       } else {
-        // Combine all blocks into a single assistant message.
-        // The internal ChatMessage format does not support mixed text/tool_use
-        // ordering, so reject interleaved blocks rather than silently reordering.
+        // Collapse into a single assistant message. The internal shape does not
+        // support text-after-tool_use ordering, so interleaved shapes are rejected.
         let text = '';
         let reasoningContent: string | undefined;
         const toolCalls: { id: string; name: string; arguments: string }[] = [];
@@ -363,7 +234,6 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
     }
   }
 
-  // Build ChatConfig
   const config: ChatConfig = {
     reportPerformance: true,
   };
@@ -381,17 +251,14 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
     config.topK = req.top_k;
   }
 
-  // Tool definition and choice mapping
   if (req.tools && req.tools.length > 0) {
     const toolChoice = req.tool_choice;
     if (toolChoice?.type === 'tool' && toolChoice.name) {
-      // Only the named tool
       const matched = req.tools.filter((t) => t.name === toolChoice.name);
       if (matched.length > 0) {
         config.tools = matched.map(mapTool);
       }
     } else {
-      // auto, any, or unspecified → pass all tools
       config.tools = req.tools.map(mapTool);
     }
   }

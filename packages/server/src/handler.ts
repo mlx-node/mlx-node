@@ -1,9 +1,4 @@
-/**
- * createHandler() -- composable (req, res) handler for node:http.
- *
- * Can be used standalone with `http.createServer(handler)` or composed
- * into an existing server.
- */
+/** Composable `(req, res)` handler for node:http — usable standalone or mounted into an existing server. */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
@@ -19,22 +14,13 @@ export interface HandlerOptions {
   /** Response store for previous_response_id support. */
   store?: ResponseStore | null;
   /**
-   * Retention for persisted response rows, in seconds — stamped as
-   * `expires_at` when committing. When omitted, the endpoint falls
-   * back to its own default (see `responses.ts`). See
-   * `ServerConfig.responseRetentionSec` for the resolution chain that
-   * `createServer` uses.
+   * Retention (seconds) stamped as `expires_at` when committing a response row.
+   * When omitted, the endpoint falls back to its own default (see `responses.ts`
+   * and `ServerConfig.responseRetentionSec`).
    */
   responseRetentionSec?: number;
 }
 
-/**
- * Create a composable request handler.
- *
- * @param registry - The model registry to serve.
- * @param options - Optional configuration.
- * @returns An async (req, res) handler suitable for `http.createServer()`.
- */
 export function createHandler(
   registry: ModelRegistry,
   options?: HandlerOptions,
@@ -56,11 +42,9 @@ export function createHandler(
       }
     }
 
-    // Returning the promise lets tests await the full request lifecycle —
-    // including the post-`res.end()` synchronous bookkeeping that runs in
-    // the `routeRequest` async continuation (e.g. `SessionRegistry.adopt`).
-    // `http.createServer` ignores the return value, so this change is
-    // transparent to production callers.
+    // Returning the promise lets tests await the full lifecycle including
+    // post-`res.end()` bookkeeping (e.g. `SessionRegistry.adopt`). `http.createServer`
+    // ignores the return value, so this is transparent to production callers.
     try {
       await routeRequest(req, res, registry, store, responseRetentionSec);
     } catch (err: unknown) {

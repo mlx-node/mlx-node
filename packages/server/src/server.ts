@@ -1,9 +1,4 @@
-/**
- * createServer() -- full HTTP server lifecycle.
- *
- * Creates an `http.Server`, wires up the handler, and manages a ResponseStore
- * with periodic cleanup of expired entries.
- */
+/** Full HTTP server lifecycle: wires up the handler and periodically sweeps expired `ResponseStore` rows and sessions. */
 
 import { mkdir } from 'node:fs/promises';
 import { createServer as httpCreateServer } from 'node:http';
@@ -22,20 +17,15 @@ const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 /**
  * Default retention for persisted response rows in SQLite, in seconds.
  *
- * Decoupled from the in-memory `SessionRegistry` TTL (30 min) so that a
- * client sending `previous_response_id` after the warm KV cache has
- * been evicted can still cold-replay the conversation from disk via
- * `reconstructMessagesFromChain` + `ChatSession.startFromHistory`.
- * Recovery pays a one-time prefill cost; rows surviving for 7 days by
- * default is a deliberate trade of disk for continuity.
+ * Decoupled from the in-memory `SessionRegistry` TTL (30 min) so a client
+ * sending `previous_response_id` after the warm KV cache has been evicted
+ * can still cold-replay from disk via `reconstructMessagesFromChain` +
+ * `ChatSession.startFromHistory`. 7 days trades disk for continuity at the
+ * cost of a one-time prefill on recovery.
  */
 const DEFAULT_RESPONSE_RETENTION_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
-/**
- * Parse a positive integer number of seconds from an env var. Returns
- * `undefined` for unset/empty/non-finite/non-positive values so the
- * caller can fall through to its own default.
- */
+/** Parse a positive integer seconds value; returns undefined for unset/invalid so caller can apply its own default. */
 function parseEnvSeconds(name: string): number | undefined {
   const raw = process.env[name];
   if (raw == null || raw === '') return undefined;
@@ -56,48 +46,34 @@ export interface ServerConfig {
   /** Enable CORS headers (default: true). */
   cors?: boolean;
   /**
-   * Retention for persisted response rows, in seconds. Controls the
-   * `expires_at` column stamped on each committed response, which
-   * governs how long `previous_response_id` cold-replay from SQLite
-   * remains possible after the in-memory warm session is evicted.
+   * Retention for persisted response rows, in seconds. Stamped as `expires_at`
+   * on each committed response; controls how long `previous_response_id`
+   * cold-replay from SQLite remains possible after the warm session is evicted.
    *
-   * Default: 7 days (`DEFAULT_RESPONSE_RETENTION_SECONDS`). Env var
-   * override: `MLX_RESPONSE_RETENTION_SECONDS`. Ignored when
-   * `disableStore` is true.
+   * Default: 7 days. Env override: `MLX_RESPONSE_RETENTION_SECONDS`. Ignored
+   * when `disableStore` is true.
    */
   responseRetentionSec?: number;
 }
 
 export interface ServerInstance {
-  /** The underlying `http.Server`. */
   server: Server;
-  /** The model registry -- register models before or after starting. */
+  /** Register models before or after starting. */
   registry: ModelRegistry;
-  /** The response store (null if disabled). */
+  /** Null when disabled. */
   store: ResponseStore | null;
-  /** Gracefully close the server and cleanup resources. */
+  /** Graceful shutdown. */
   close(): Promise<void>;
 }
 
 /**
- * Create and start an MLX-Node HTTP server exposing the Responses API and Messages API.
- *
- * Endpoints:
- * - `POST /v1/responses` — OpenAI Responses API
- * - `POST /v1/messages` — Anthropic Messages API
- * - `GET /v1/models` — List registered models
+ * Start an MLX-Node HTTP server exposing `POST /v1/responses`,
+ * `POST /v1/messages`, and `GET /v1/models`.
  *
  * @example
  * ```typescript
- * import { createServer } from '@mlx-node/server';
- * import { Qwen35Model } from '@mlx-node/lm';
- *
  * const { registry, close } = await createServer({ port: 8080 });
- * const model = await Qwen35Model.load('./models/qwen3.5-3b');
- * registry.register('qwen3.5-3b', model);
- *
- * // Server is now accepting requests at POST /v1/responses and POST /v1/messages
- * // Ctrl-C or call close() to stop.
+ * registry.register('qwen3.5-3b', await Qwen35Model.load('./models/qwen3.5-3b'));
  * ```
  */
 export async function createServer(config?: ServerConfig): Promise<ServerInstance> {
@@ -112,7 +88,6 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
 
   const registry = new ModelRegistry();
 
-  // Initialize response store
   let store: ResponseStore | null = null;
   if (!disableStore) {
     const storePath = config?.storePath ?? join(homedir(), '.mlx-node', 'responses.db');
@@ -121,20 +96,15 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     store = await ResponseStore.open(storePath);
   }
 
-  // Periodic cleanup — always scheduled, regardless of whether a
-  // ResponseStore is configured. Sessions need periodic TTL sweeps
-  // even when responses are not persisted.
+  // Always schedule the sweep — sessions need TTL sweeps even without a store.
   const cleanupTimer: ReturnType<typeof setInterval> = setInterval(() => {
     if (store) {
-      store.cleanupExpired().catch(() => {
-        // Silently ignore cleanup errors
-      });
+      store.cleanupExpired().catch(() => {});
     }
     for (const sessReg of registry.listSessionRegistries()) {
       sessReg.sweep();
     }
   }, CLEANUP_INTERVAL_MS);
-  // Allow the process to exit even if the timer is still active
   cleanupTimer.unref();
 
   const handler = createHandler(registry, { cors, store, responseRetentionSec });

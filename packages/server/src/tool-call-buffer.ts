@@ -1,29 +1,23 @@
 /**
- * Buffers streaming text to detect and suppress <tool_call> tags.
- *
- * The buffer accumulates incoming text tokens and detects the '<tool_call>'
- * tag. Text that is safe to emit (i.e. cannot be part of a partial tag) is
- * released immediately. Once a full tag is detected, subsequent text is
- * suppressed until the stream ends.
+ * Buffers streaming text to detect and suppress `<tool_call>` tags. Text
+ * that cannot be part of a partial tag is released immediately; once a
+ * full tag is seen, everything after it is suppressed until the stream
+ * ends.
  */
 export class ToolCallTagBuffer {
   private static readonly TAG = '<tool_call>';
   private pendingText = '';
   private _suppressed = false;
 
-  /** Whether a tool-call tag has been detected and text is being suppressed. */
   get suppressed(): boolean {
     return this._suppressed;
   }
 
   /**
-   * Feed new text into the buffer.
-   *
-   * Returns an object with:
-   * - `safeText`: text that can be safely emitted as a delta (empty string if none)
-   * - `tagFound`: true if a full `<tool_call>` tag was detected in this call
-   * - `cleanPrefix`: when `tagFound` is true, the text before the tag (may contain
-   *   whitespace -- use `.trim()` only for emptiness checks, not for emission)
+   * Feed text in. Returns `safeText` (emit as delta), `tagFound` (a full
+   * `<tool_call>` was just seen), and `cleanPrefix` (text before the tag
+   * when `tagFound` — may contain whitespace; use `.trim()` only for
+   * emptiness checks, never for emission).
    */
   push(text: string): { safeText: string; tagFound: boolean; cleanPrefix: string } {
     if (this._suppressed) {
@@ -32,7 +26,6 @@ export class ToolCallTagBuffer {
 
     this.pendingText += text;
 
-    // Check for full tool-call tag
     const tagIdx = this.pendingText.indexOf(ToolCallTagBuffer.TAG);
     if (tagIdx >= 0) {
       const cleanPrefix = this.pendingText.slice(0, tagIdx);
@@ -41,7 +34,7 @@ export class ToolCallTagBuffer {
       return { safeText: '', tagFound: true, cleanPrefix };
     }
 
-    // Check if pendingText ends with a partial prefix of '<tool_call>'
+    // Hold back any suffix that could be the start of the tag.
     let safeLen = this.pendingText.length;
     for (let i = 1; i <= Math.min(this.pendingText.length, ToolCallTagBuffer.TAG.length - 1); i++) {
       const suffix = this.pendingText.slice(-i);
@@ -56,10 +49,7 @@ export class ToolCallTagBuffer {
     return { safeText, tagFound: false, cleanPrefix: '' };
   }
 
-  /**
-   * Flush any remaining pending text. Call this when the stream ends
-   * without a tool-call tag being found, or when suppression was not triggered.
-   */
+  /** Release any held-back text at stream end. */
   flush(): string {
     const text = this.pendingText;
     this.pendingText = '';

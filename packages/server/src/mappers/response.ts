@@ -1,6 +1,4 @@
-/**
- * Maps ChatResult / ChatStreamEvent to OpenAI Responses API output.
- */
+/** ChatResult / ChatStreamEvent → OpenAI Responses API output. */
 
 import { randomUUID } from 'node:crypto';
 
@@ -16,16 +14,10 @@ import type {
   ResponseUsage,
 } from '../types.js';
 
-/**
- * Generate a prefixed unique ID.
- */
 export function genId(prefix: string): string {
   return `${prefix}${randomUUID().replaceAll('-', '')}`;
 }
 
-/**
- * Map the internal finishReason to the Responses API status.
- */
 export function mapFinishReasonToStatus(finishReason: string): 'completed' | 'incomplete' {
   switch (finishReason) {
     case 'length':
@@ -35,13 +27,9 @@ export function mapFinishReasonToStatus(finishReason: string): 'completed' | 'in
   }
 }
 
-/**
- * Build the output items array from a ChatResult.
- */
 export function buildOutputItems(result: ChatResult): OutputItem[] {
   const items: OutputItem[] = [];
 
-  // Reasoning item
   if (result.thinking) {
     const reasoningItem: ReasoningOutputItem = {
       id: genId('rs_'),
@@ -51,10 +39,9 @@ export function buildOutputItems(result: ChatResult): OutputItem[] {
     items.push(reasoningItem);
   }
 
-  // Function call items (only successfully parsed tool calls)
   const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
 
-  // Message item (always present even if text is empty, as long as there is content)
+  // Always emit a message item (possibly with empty text) unless there are tool calls and no text.
   if (result.text || okToolCalls.length === 0) {
     const messageItem: MessageOutputItem = {
       id: genId('msg_'),
@@ -82,9 +69,6 @@ export function buildOutputItems(result: ChatResult): OutputItem[] {
   return items;
 }
 
-/**
- * Build the usage object from a ChatResult.
- */
 export function buildUsage(result: ChatResult): ResponseUsage {
   return {
     input_tokens: result.promptTokens,
@@ -94,9 +78,7 @@ export function buildUsage(result: ChatResult): ResponseUsage {
   };
 }
 
-/**
- * Compute `output_text` from output items (concatenate all output_text parts).
- */
+/** Concatenate all `output_text` parts from message items. */
 export function computeOutputText(items: OutputItem[]): string {
   const parts: string[] = [];
   for (const item of items) {
@@ -109,9 +91,6 @@ export function computeOutputText(items: OutputItem[]): string {
   return parts.join('');
 }
 
-/**
- * Build a full ResponseObject from a ChatResult and the original request.
- */
 export function buildResponseObject(
   result: ChatResult,
   req: ResponsesAPIRequest,
@@ -143,11 +122,7 @@ export function buildResponseObject(
   };
 }
 
-/**
- * Build a partial (in-progress) ResponseObject for streaming.
- * This is emitted at response.created / response.in_progress before
- * any output is available.
- */
+/** Build an in-progress ResponseObject for `response.created` / `response.in_progress`, before any output exists. */
 export function buildPartialResponse(
   req: ResponsesAPIRequest,
   responseId: string,

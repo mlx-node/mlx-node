@@ -1,13 +1,4 @@
-/**
- * OpenAI Responses API type definitions
- *
- * Covers the request/response shapes for POST /v1/responses
- * and the SSE streaming event protocol.
- */
-
-// ---------------------------------------------------------------------------
-// Content parts
-// ---------------------------------------------------------------------------
+/** OpenAI Responses API types: request/response shapes and SSE streaming events for POST /v1/responses. */
 
 export interface InputTextPart {
   type: 'input_text';

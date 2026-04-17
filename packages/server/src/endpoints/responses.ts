@@ -1,18 +1,11 @@
 /**
- * POST /v1/responses endpoint
+ * POST /v1/responses — OpenAI Responses API, streaming (SSE) and non-streaming (JSON).
  *
- * Implements the OpenAI Responses API, dispatching to loaded models
- * via the ModelRegistry. Supports both streaming (SSE) and non-streaming
- * (JSON) response modes.
- *
- * All inference goes through a per-model `ChatSession` looked up or
- * allocated via the model's `SessionRegistry`. Sessions are keyed by
- * `previous_response_id`: on a cache hit the session's live KV cache
- * is reused via `session.send()` / `sendStream()` / `sendToolResult()`.
- * On a cache miss (no prior response, eviction, or restart) the full
- * conversation is reconstructed from the `ResponseStore`, primed into
- * a fresh session via `primeHistory()`, and replayed through
- * `startFromHistory()` / `startFromHistoryStream()`.
+ * Dispatches to loaded models via `ModelRegistry`. Inference goes through a per-model
+ * `ChatSession` looked up by `previous_response_id` in the model's `SessionRegistry`: a
+ * hit reuses the live KV cache (`send` / `sendStream` / `sendToolResult`); a miss
+ * reconstructs the full conversation from `ResponseStore` and cold-replays via
+ * `primeHistory` + `startFromHistory[Stream]`.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -52,44 +45,20 @@ import type {
 } from '../types.js';
 
 /**
- * Fallback retention stamped on a stored response row when the caller
- * does not thread an explicit `responseRetentionSec` in — used only by
- * legacy call sites (tests, direct endpoint invocation without going
- * through `createServer`). The production path wires retention through
- * `ServerConfig.responseRetentionSec` (default 7 days), which is NOT
- * this constant — see `packages/server/src/server.ts`.
- *
- * Kept at the historical 30-minute value so existing test fixtures and
- * any external caller that constructs the endpoint directly observe
- * unchanged behaviour until they opt in to the new knob.
+ * Fallback retention for stored response rows when no explicit
+ * `responseRetentionSec` is threaded in. Production wires retention via
+ * `ServerConfig.responseRetentionSec` (default 7 days, see `server.ts`);
+ * this 30-minute fallback is only used by legacy direct-invocation callers.
  */
-const RESPONSE_TTL_SECONDS = 1800; // 30 minutes
+const RESPONSE_TTL_SECONDS = 1800;
 
 /**
- * Upper bound on how long the native-miss recovery path will wait for
- * an in-flight `store.store(...)` write to land before giving up.
- * Iter-38 finding 1: the iter-37 recovery path called `awaitPending(id)`
- * with no timeout, so a wedged SQLite write (or any never-settling
- * write promise) would pin the continuation request forever — no
- * cancellation, no observability, a silent request hang.
- *
- * Iter-39 finding 1: on timeout we no longer fall straight through to
- * 404. We first run one last `getChain` probe — a write landing at
- * (timeout + epsilon) would have succeeded for the client but the
- * iter-38 path spuriously reported 404 and permanently poisoned the
- * client's chain state. The probe catches that race. Only when the
- * probe STILL misses do we surface the condition to the client, and
- * even then as HTTP 503 `storage_timeout` (a retryable transient
- * error) rather than 404 (permanent / non-retryable).
- *
- * 2000ms default is short enough that a stuck native backend fails
- * fast from the client's perspective and long enough that a healthy
- * SQLite write — which ordinarily completes in single-digit
- * milliseconds on warm disks — has ample headroom to resolve before
- * the timer fires. Operators running on slower storage (e.g. encrypted
- * volumes, heavy WAL checkpoint contention) can override via
- * `MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS`; non-positive / non-finite /
- * empty values fall back to the default.
+ * Upper bound (ms) on how long the recovery path waits for an in-flight
+ * `store.store(...)` to land. On timeout we re-probe `getChain` once to
+ * catch a late-landing write, then surface HTTP 503 (retryable) rather
+ * than 404 (permanent). Default 2000ms — short enough to fail fast on a
+ * wedged backend, long enough that healthy SQLite writes complete well
+ * within it. Override via `MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS`.
  */
 function getChainWriteWaitTimeoutMs(): number {
   const raw = process.env.MLX_CHAIN_WRITE_WAIT_TIMEOUT_MS;
@@ -100,28 +69,12 @@ function getChainWriteWaitTimeoutMs(): number {
 }
 
 /**
- * Upper bound on how long the outer handler's `finally` block will
- * await the off-lock `store.store(...)` write before detaching.
- *
- * Iter-35 moved persistence OFF the per-model mutex but still `await`ed
- * the write in the outer `finally`, so any wedged `store.store(...)`
- * pinned the request's socket/abort listeners and its dispatch lease
- * until the promise settled. A never-settling write would leak
- * listeners, keep the binding's `inFlight` counter elevated, and
- * block teardown from finalising after a hot-swap.
- *
- * Iter-39 finding 2: decouples post-commit persist from the request
- * lifetime. Abort listeners are removed and `releaseDispatchLease` is
- * called IMMEDIATELY after the terminal bytes go out; the persist
- * await is wrapped in a `Promise.race` against this timeout and, on
- * timeout, the handler returns control to the caller while the
- * promise continues running in the background (the pending-writes
- * tracker still holds its reference so chained continuations can
- * still observe it).
- *
- * Default 5000ms is intentionally larger than `CHAIN_WRITE_WAIT_TIMEOUT_MS`
- * because this bound is not client-facing — the client has already
- * received its terminal response by this point. Override via
+ * Soft timeout (ms) on how long the outer handler awaits the off-lock
+ * `store.store(...)` before detaching and letting the write run in the
+ * background. The pending-writes tracker still holds a reference so
+ * chained continuations can observe it. Default 5000ms (larger than the
+ * chain-write wait because this bound is not client-facing — the client
+ * already has its terminal response). Override via
  * `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS`.
  */
 function getPostCommitPersistTimeoutMs(): number {
@@ -133,97 +86,24 @@ function getPostCommitPersistTimeoutMs(): number {
 }
 
 /**
- * Second-stage ("hard") timeout for the off-lock post-commit persist.
+ * Hard timeout (ms) for the off-lock post-commit persist — the
+ * second-stage breaker that force-releases the `retainBinding` paired
+ * with `initiatePersist` when the write is truly wedged (never settles).
  *
- * Iter-43 intentionally left the iter-40 `retainBinding` pinned past
- * the soft `MLX_POST_COMMIT_PERSIST_TIMEOUT_MS` so that a SLOW-BUT-
- * EVENTUAL `store.store(...)` — the common case under SQLite back-
- * pressure — could still land its row against the live
- * `modelInstanceId` even if the handler returned first. That fix
- * closed iter-42's chain-break regression, but codex's iter-43
- * adversarial review flagged the corollary HIGH-severity leak: a
- * TRULY wedged write (promise that never settles) pins the retain
- * for the lifetime of the process, so `unregister()` can only park
- * the binding in `pendingTeardown` and never reaches final
- * teardown — pinning the model object, its `SessionRegistry`, and
- * the native KV/cache state until the server restarts.
+ * The soft persist timeout above only detaches the handler; the retain
+ * stays pinned so a slow-but-eventual write still lands against the
+ * live `modelInstanceId`. This hard breaker bounds the leak for a
+ * genuinely wedged promise at this value instead of process lifetime.
+ * On fire, it also retires the instance id via a refcounted tombstone
+ * so a same-object re-registration inherits the id and the late write
+ * remains chainable — a true hot-swap to a different object still
+ * mints a fresh id and correctly fails stale chains with 400.
  *
- * The fix is a second-stage breaker: start a hard-timeout timer at
- * the same moment we start waiting on the persist, armed OFF the
- * handler's await path so the response is never delayed by it. If
- * the persist settles naturally, the `.finally(...)` cancels the
- * timer via `clearTimeout`. If the persist is still wedged past
- * this much longer bound, the timer fires and force-releases the
- * iter-40 retain via the existing idempotent `persistRetainBox`.
- * The bounded leak duration is capped at this value instead of
- * process lifetime.
- *
- * Iter-45 (codex's iter-44 HIGH finding): dropping the retain on
- * elapsed time alone is not enough. A SLOW-BUT-EVENTUAL persist
- * whose wall-clock exceeds the hard bound could still settle
- * naturally, and if an `unregister + register(same_model)` fires
- * between the force-release and that late settlement, the fresh
- * `register()` would mint a NEW instance id while the pending
- * write still carries the OLD id — silently breaking
- * `previous_response_id` continuations. The iter-45 fix pairs the
- * force-release with
- * `registry.retireInstanceIdForForceRelease(leaseModel)` (called
- * FIRST, while the binding is still alive). The retired id is
- * tombstoned keyed on the model object, and a subsequent
- * `register()` of the SAME model object inherits it from the
- * tombstone — so the late-landing persist remains chainable. A
- * true hot-swap (re-register with a DIFFERENT model object) still
- * mints a fresh id, and its stale stored record is correctly
- * rejected with 400 instance-mismatch — the right semantic
- * outcome for a genuinely different model.
- *
- * The default is intentionally an order of magnitude larger than
- * any realistic SQLite commit window and well past the soft
- * timeout: the slow-but-eventual case iter-42 broke has to be
- * well-separated from the pathologically-wedged case that triggers
- * this breaker. Setting the value to `'0'` disables the hard
- * timeout entirely and reverts to strict iter-43 pin-forever
- * semantics — useful for tests that want to assert the iter-40
- * invariant without the second-stage safety net.
- *
- * Override via `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`. An EMPTY
- * string is treated as unset (falls back to the 60000ms default).
- * Explicit `'0'` disables. Any non-numeric value also falls back
- * to the default with no error — this is deliberate so a config-
- * templating typo (e.g. `${SOME_UNSET_VAR}` rendering to empty or
- * garbage) cannot silently disable the safety breaker and
- * reintroduce iter-41's unreclaimable leak.
- *
- * Iter-46 (codex's iter-45 MEDIUM finding): empty string AND any
- * whitespace-only input (`' '`, `'\n'`, `'\t'`, `'   '`) are
- * treated as unset and fall back to the 60000ms default —
- * padded/templated env values (e.g. `"${UNSET_VAR} "` rendering
- * to a single space, or Windows line-ending artefacts
- * introducing a trailing `\r`) cannot silently disable the
- * breaker the way pre-iter-46 `Number(' ')` -> `0` did. Any
- * leading/trailing whitespace around an otherwise-valid numeric
- * value is trimmed before parsing (`'  100  '` -> 100).
- *
- * Iter-46/48 also scopes the hard-timeout tombstone's lifetime
- * to the pending persists that installed it: the tombstone
- * installed by a breaker is released by the same persist's
- * `.finally(...)` via `registry.releaseTombstone(model)` —
- * inheritance is scoped to the narrow window where a late-
- * landing write is still unresolved; after every outstanding
- * persist settles the tombstone entry drains and
- * re-registrations mint fresh ids. Iter-48 stores one
- * refcounted `{ instanceId, outstandingCount }` entry per
- * model (each retire increments, each release decrements) so
- * overlapping hard-timeouts on the same live instance id share
- * one slot — keeping memory bounded at O(1) per model even
- * under a truly wedged store that never settles, and keeping
- * the tombstone alive as long as ANY outstanding persist
- * still needs it.
- *
- * Exported for direct unit testing in `__test__/server/handler.test.ts`
- * (iter-45 env-parsing coverage). Not part of the public API —
- * consumers should drive behavior via the env var, not this
- * function.
+ * Default 60000ms — well past the soft timeout so slow-but-eventual
+ * writes are unaffected. Override via `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`:
+ * empty/whitespace-only falls back to default (so a config-templating
+ * typo cannot silently disable the breaker); `'0'` explicitly disables;
+ * non-numeric garbage falls back to default. Exported for unit tests.
  */
 export function getPostCommitPersistHardTimeoutMs(): number {
   const raw = process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS;
@@ -234,54 +114,17 @@ export function getPostCommitPersistHardTimeoutMs(): number {
 }
 
 /**
- * TTL (in ms) for iter-50 hard-timed-out markers in the per-store
- * `PendingResponseWrites` tracker. See `pending-writes.ts` for the
- * full lifetime model.
+ * TTL (ms) for hard-timed-out markers in the per-store pending-writes
+ * tracker. See `pending-writes.ts` for the full lifetime model.
  *
- * ## Why this exists (iter-51 codex HIGH finding 1)
- *
- * Iter-50 cleared hard-timed-out markers ONLY through the underlying
- * `store.store(...)` promise's `.finally(...)` handler installed in
- * `track()`. For a truly wedged SQLite writer or stuck native
- * backend, that promise never settles — `.finally(...)` never runs —
- * so the marker set accumulated one entry per hard-timed-out request
- * forever. Under sustained traffic against such a wedged backend the
- * iter-49 memory bound (pending tracker drained to zero) was
- * preserved, but the marker map grew linearly with traffic and every
- * one of those ids kept returning retryable 503 for a chain that the
- * server had long since given up on. Both an unbounded memory leak
- * AND an incorrect eventual classification.
- *
- * The fix is an independent TTL with lazy expiry on read. Marker
- * entries carry an `expiresAt` timestamp, `isHardTimedOut(id)`
- * treats any expired entry as absent and deletes it, and steady-state
- * marker memory is bounded at O(requestRate × TTL) regardless of
- * whether the underlying writes ever settle. A 5-minute default is
- * an order of magnitude larger than the hard-timeout breaker (60s
- * default) so a write that settles just after the breaker fires can
- * still deliver the correct retryable-503 signal to a concurrent
- * continuation; past 5 minutes the best-effort persist contract
- * (iter-35) has long since failed and a permanent 404 is the right
- * eventual outcome.
- *
- * ## Env override
- *
- * `MLX_HARD_TIMEOUT_MARKER_TTL_MS`. Semantics mirror
- * `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS` exactly:
- *
- *   * Empty string or whitespace-only -> default (300_000ms).
- *   * Non-numeric garbage -> default.
- *   * Explicit `'0'` -> markers expire immediately on the next read
- *     (effectively disables the iter-50 retryable-503 classification
- *     and reverts to "hard-timed-out ids 404 immediately"). Useful
- *     for tests that need to assert the 404 branch without racing
- *     a long-lived marker.
- *   * Any finite >= 0 numeric value -> parsed.
- *
- * Exported for direct unit testing in
- * `__test__/server/handler.test.ts`. Not part of the public API —
- * consumers should drive behavior via the env var, not this
- * function.
+ * An independent TTL with lazy expiry on read bounds marker memory at
+ * O(requestRate × TTL) even when the underlying wedged writes never
+ * settle (and their `.finally(...)` cleanup therefore never fires).
+ * Default 300000ms (5 min) — past this, the best-effort persist
+ * contract has long since failed and permanent 404 is the correct
+ * eventual outcome. Override via `MLX_HARD_TIMEOUT_MARKER_TTL_MS`
+ * (same parse semantics as the hard-timeout env var above). Exported
+ * for unit tests.
  */
 export function getHardTimedOutMarkerTtlMs(): number {
   const raw = process.env.MLX_HARD_TIMEOUT_MARKER_TTL_MS;
@@ -291,29 +134,16 @@ export function getHardTimedOutMarkerTtlMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300_000;
 }
 
-// Iter-55: the iter-54 `computeChainEarliestExpiresAtMs` helper was
-// removed in favour of inline scalar computation at the per-request
-// site (see `chainEarliestExpiresAtMs` in the request handler
-// below). The scalar is computed ONCE when `getChain()` resolves and
-// threaded through both the pending-write tracker and the hard-
-// timeout marker, so no further helper is needed and the background
-// hard-timeout closure no longer has to re-walk the resolved chain
-// at breaker-fire time.
-
 // ---------------------------------------------------------------------------
 // Non-streaming path
 // ---------------------------------------------------------------------------
 
 /**
- * Outcome of the non-streaming handler. `response` is the committed
- * response object (non-null when `committed` — always, since the
- * non-streaming path only runs after `runSessionNonStreaming` resolves)
- * that the outer handler will persist AFTER releasing the per-model
- * mutex. Persistence is deliberately kept off the critical path so a
- * slow store does not pin the mutex on the next waiter.
+ * Outcome of the non-streaming handler. The outer handler persists
+ * `response` AFTER releasing the per-model mutex — keeping persistence
+ * off the critical path so a slow store does not pin the next waiter.
  */
 interface NonStreamingHandlerOutcome {
-  /** Response object to persist once the outer `withExclusive` block exits. */
   response: ResponseObject;
 }
 
@@ -327,35 +157,15 @@ async function handleNonStreaming(
 ): Promise<NonStreamingHandlerOutcome> {
   const response = buildResponseObject(result, req, responseId, previousResponseId);
 
-  // Iter-35 finding 2 (part a): the non-streaming native path has
-  // no AbortSignal surface on `chatSession*`, so a client that
-  // disconnects mid-decode still burns every token under the per-
-  // model mutex — we only learn about the peer loss once native
-  // decode resolves. TODO(iter35): add a native cancellation
-  // surface for `chatSession*` so the dispatch can bail at the
-  // next safepoint rather than running to completion.
-  //
-  // Disconnect-aware handling is delegated to `endJson`'s own
-  // pre-entry `isSocketGone(res)` check (iter-34): on a dead peer
-  // it synchronously rejects after `writeHead` has already flipped
-  // `responseMode = 'json'`, which is exactly the shape the outer
-  // catch expects — the JSON-mode branch destroys the socket, the
-  // adopt gate refuses to cache the session under an unreachable
-  // responseId (because the handler threw before
-  // `responseBodyWritten` flipped), and the persist-initiator
-  // path inside `withExclusive` never runs (`handlerError` set,
-  // no `initiatePersist` call) so no store record gets written
-  // for a turn the client never observed.
-  //
-  // `endJson` commits `responseMode = 'json'` synchronously so the
-  // outer catch knows to emit a clean JSON error (or destroy the
-  // socket) rather than an SSE frame if anything below throws. The
-  // `responseBodyWritten` flag is flipped only from inside `res.end`'s
-  // write callback — proving the kernel accepted the final chunk,
-  // not just that ServerResponse buffered it. An async socket
-  // failure surfaced through the callback rejects this promise so
-  // the caller's catch can refuse to adopt the committed session
-  // under an unreachable responseId.
+  // `chatSession*` has no AbortSignal surface yet, so a mid-decode
+  // client disconnect still burns the full decode budget — peer loss
+  // is only observable when native decode resolves. Disconnect
+  // detection is delegated to `endJson`'s `isSocketGone(res)` check:
+  // on a dead peer it rejects AFTER committing `responseMode = 'json'`
+  // so the outer catch routes to the JSON error / socket-destroy
+  // shape; `responseBodyWritten` flips only from `res.end`'s write
+  // callback (proving the kernel accepted the chunk) so the adopt
+  // gate refuses to cache the session under an unreachable responseId.
   await endJson(res, JSON.stringify(response), visibility);
   return { response };
 }
@@ -365,33 +175,12 @@ async function handleNonStreaming(
 // ---------------------------------------------------------------------------
 
 /**
- * Build a dedicated failure terminal ResponseObject from an
- * in-progress partial + the deltas captured so far. The returned
- * object has:
- *
- *   * `status: 'failed'`
- *   * `incomplete_details: { reason }` — the string passed by the
- *     caller (`error`, `client_abort`, `stream_exhausted`, etc.).
- *   * Every nested output item whose `status` is still `in_progress`
- *     or `completed` normalized to `incomplete`, so a client that
- *     inspects `response.output` on `response.failed` cannot see a
- *     success-shaped item inside a failed envelope. Iter-28
- *     finding 3: the previous implementation did `{ ...terminal,
- *     status: 'failed' }`, which left nested messages marked
- *     `completed` (on the finishReason=error path where the done
- *     branch finalized them) or `in_progress` (on the exhaust path
- *     where no item-closing ran at all). Both shapes contradicted
- *     the top-level failure status.
- *
+ * Build a failure terminal `ResponseObject`: `status: 'failed'`,
+ * `incomplete_details: { reason }`, and every nested message /
+ * function_call item with `status` `in_progress` or `completed`
+ * normalized to `incomplete` so a client inspecting `response.output`
+ * on a failed envelope cannot see success-shaped items inside it.
  * `ReasoningOutputItem` has no `status` field and is left alone.
- * `FunctionCallOutputItem` items whose `status` is `completed` or
- * `in_progress` are also downgraded to `incomplete` — iter-29
- * finding 1 concluded that the previous exemption (leaving
- * function_call items untouched because the type was narrow) was
- * incorrect: streaming tool_call items can now be collected into
- * `outputItems` before the commit gate passes, and a failed
- * terminal that reports them as `completed` contradicts the
- * top-level `status: 'failed'` envelope.
  */
 function buildFailedTerminal(
   partial: ResponseObject,
@@ -426,108 +215,22 @@ function buildFailedTerminal(
 }
 
 /**
- * Stream a chat session's events to the SSE writer, gated on the
- * session's commit signal.
+ * Outcome of the streaming handler.
  *
- * `wasCommitted` is a closure that reads `session.turns` at call
- * time. On the streaming path the session only advances `turns` on a
- * successful non-error final chunk (see `ChatSession.sendStream`'s
- * `sawFinal` gate), so this closure returns `false` when the native
- * stream emits `done: true, finishReason: 'error'`, when the async
- * iterator exhausts without a `done` event, when a mid-decode throw
- * propagates through (caught by the try/catch added in iter-28
- * finding 2), or when the client disconnect flag fires mid-iteration.
- * In every non-committed case we MUST skip `initiatePersist()` and
- * emit `response.failed` instead of `response.completed`, otherwise
- * a later `previous_response_id` continuation would cold-replay a
- * turn the session never committed — silently resurrecting failed
- * or partial output as authoritative history.
+ * `terminalToPersist` is non-null only on the committed-success path
+ * (the outer handler writes it to the `ResponseStore` after releasing
+ * the per-model mutex). Every failure path leaves it null — the turn
+ * never committed, so there is nothing authoritative to persist or
+ * cold-replay.
  *
- * The closure is called AFTER the `for await` loop has fully drained
- * (either via a `break` inside the done branch or because the
- * iterator exhausted). Draining is load-bearing: `ChatSession`
- * increments `turns` in the generator's `finally` block, which only
- * runs once the consumer's `.return()` / natural-exhaust cascade
- * reaches the outer generator. A pre-drain `wasCommitted()` would
- * read a stale baseline and falsely report "not committed" even on a
- * successful turn. The `runSessionStreaming` helper captures its
- * baseline AFTER any internal `session.reset()` too, so the signal is
- * honest for the multi-message reset-and-cold-restart branch as well.
- *
- * Iter-28 finding 2 — fault plumbing:
- *
- *   1. The `for await` loop is wrapped in try/catch/finally so a
- *      mid-decode throw from the underlying generator no longer
- *      escapes out into the outer handler's generic error catch.
- *      Instead control reaches the post-loop block with a sticky
- *      `thrownError` flag; the block routes the request through the
- *      same failure epilogue that handles finishReason=error and
- *      iterator exhaustion, so the session is NEVER adopted via
- *      `wasCommitted()` on a faulted stream.
- *   2. When the caller passes `httpReq`, we install `close`/`error`
- *      listeners that flip a `clientAborted` flag checked at the
- *      top of every loop iteration. The underlying
- *      `chatStreamSessionStart` does not yet accept an AbortSignal,
- *      so we cannot cancel the native decode in-flight — but we
- *      CAN stop consuming deltas and route to the failure
- *      epilogue, which prevents a disconnected client from keeping
- *      the session under the adopt gate's happy path. Once the
- *      native generator exposes an AbortSignal surface this hook
- *      can be upgraded to plumb the controller through; until
- *      then the flag-based opt-out is sufficient to keep the
- *      registry and store in agreement with the client's view.
- *   3. A single `buildFailedTerminal` helper normalizes every
- *      failure path's payload so clients see a consistent envelope:
- *      top-level status=failed, nested items with `in_progress` or
- *      `completed` flipped to `incomplete`, and `incomplete_details`
- *      populated with the specific reason (`error`, `client_abort`,
- *      `stream_exhausted`, `finish_reason_error`, `not_committed`).
- */
-/**
- * Outcome of the streaming handler. `terminalToPersist` is non-null
- * only on the committed-success path — the outer handler writes it to
- * the `ResponseStore` AFTER releasing the per-model mutex so a slow
- * store write does not pin the lock on the next waiter. Every failure
- * path (mid-decode throw, finishReason=error, iterator exhaustion,
- * client disconnect) leaves `terminalToPersist` null — the turn never
- * committed in the session, so there is nothing authoritative to
- * persist and nothing for a later `previous_response_id` continuation
- * to cold-replay.
+ * `failureMode` carries the reason out to the adopt gate, which must
+ * refuse to cache under an unreachable responseId — in particular, a
+ * `res.close` that fires AFTER the final chunk can commit the session
+ * while the client will never chain off that id, so the gate keys on
+ * `failureMode === null`, not on `committed` alone.
  */
 interface StreamingHandlerOutcome {
-  /**
-   * Terminal response object captured on the committed-success
-   * branch. The outer handler persists this once `withExclusive`
-   * exits. `null` on every failure path — the commit gate already
-   * decided not to advertise this turn to future continuations.
-   */
   terminalToPersist: ResponseObject | null;
-  /**
-   * Which failure epilogue the handler took, or `null` on the
-   * committed-success path. Iter-36 finding 2: the outer adopt gate
-   * used to key purely on `committed && (handlerError == null ||
-   * safeToSuppress)`, but `committed` only reports whether the
-   * underlying session's turn counter advanced — it does NOT report
-   * whether the response is safe to advertise as the new chain
-   * head. A `res.close` that fires AFTER the final chunk has been
-   * emitted (client dropped the last byte but the producer already
-   * committed) takes the `client_abort` failure epilogue and
-   * flushes `response.failed` successfully, which flips
-   * `safeToSuppress = true` via `visibility.terminalEmitted` — and
-   * the previous gate would then call `sessionReg.adopt(responseId,
-   * …)` on a responseId the client will never chain off of,
-   * evicting the last good hot session for the model in the
-   * process. The outer gate now checks this signal explicitly and
-   * refuses to adopt when the handler took the `client_abort`
-   * branch even if the session committed.
-   *
-   * Legal values:
-   *  - `null`                   success path (`response.completed`)
-   *  - `'client_abort'`         HTTP peer dropped mid or post stream
-   *  - `'error'`                underlying generator threw
-   *  - `'finish_reason_error'`  terminal chunk carried `finishReason: 'error'`
-   *  - `'stream_exhausted'`     iterator ended without a done event
-   */
   failureMode: 'client_abort' | 'error' | 'finish_reason_error' | 'stream_exhausted' | null;
 }
 
@@ -542,10 +245,9 @@ async function handleStreamingNative(
   visibility: TransportVisibility,
 ): Promise<StreamingHandlerOutcome> {
   beginSSE(res);
-  // Commit to SSE wire format synchronously. The outer catch branches
-  // on `responseMode` — not on `headersSent` — so an early throw from
-  // `writeSSEEvent` below (e.g. socket died between `beginSSE` and
-  // the first event) routes to the streaming `error` epilogue
+  // Commit to SSE wire format synchronously so the outer catch
+  // branches on `responseMode` (not `headersSent`) and routes an
+  // early `writeSSEEvent` failure to the streaming error epilogue
   // instead of corrupting the JSON path.
   markSSEMode(visibility);
 
@@ -566,29 +268,17 @@ async function handleStreamingNative(
   let suppressedMessageIndex = -1;
   const tagBuffer = new ToolCallTagBuffer();
 
-  // Terminal response captured inside the done branch (or synthesized
-  // in the fallback after the loop if the iterator exhausted). The
-  // actual `response.completed` / `response.failed` emission is
-  // deferred until AFTER the loop drains so `wasCommitted()` can read
-  // an authoritative `session.turns` — otherwise we would emit the
-  // terminal event while the producer's finally has not yet run.
+  // Terminal response is captured in the done branch but emitted AFTER
+  // the loop drains — `wasCommitted()` only reads authoritative
+  // `session.turns` once the producer's finally has run.
   let completedResponse: ResponseObject | null = null;
   let sawDone = false;
 
-  // Iter-28 finding 2: fault state. `thrownError` sticks when the
-  // underlying async generator throws; `clientAborted` sticks when
-  // the HTTP request OR the response socket emits `close`/`error`
-  // while we're mid-iteration. Either one diverts the post-loop
-  // block to the failure epilogue.
-  //
-  // Iter-34: also listen on `res` and `res.socket`. Non-terminal
-  // SSE writes are fire-and-forget through `writeSSEEvent` — on a
-  // destroyed socket they can silently "succeed" while decode keeps
-  // burning work under the per-model mutex. Attaching the listener
-  // here lets the next loop iteration observe the disconnect and
-  // break out, so native decode still runs to completion (no
-  // AbortSignal plumbed yet) but nothing it emits reaches a dead
-  // socket and the post-loop block routes to the failure epilogue.
+  // Fault state. `thrownError` sticks on a generator throw;
+  // `clientAborted` sticks on any `close`/`error` from `httpReq`, `res`,
+  // or `res.socket`. Either flips the post-loop block to the failure
+  // epilogue. Listening on `res` and `res.socket` matters because
+  // non-terminal SSE writes can silently "succeed" on a dead socket.
   let thrownError: Error | null = null;
   let clientAborted = false;
   const onClientClose = () => {
@@ -616,15 +306,10 @@ async function handleStreamingNative(
 
   try {
     for await (const event of chatStream) {
-      // Iter-28 finding 2: honor a client disconnect at loop-top. The
-      // native generator does not yet accept an AbortSignal, so we
-      // cannot cancel in-flight decode; the best we can do is stop
-      // consuming deltas so the writer does not emit content to a
-      // dead socket and the post-loop failure epilogue runs instead
-      // of the commit/adopt path. Dropping the generator reference
-      // via `break` also triggers the producer's `finally`, which
-      // releases any per-model locks and lets the next dispatch in
-      // the mutex queue proceed.
+      // Honor client disconnect at loop-top. Native decode has no
+      // AbortSignal yet; `break` drops the generator reference so
+      // the producer's `finally` releases per-model locks and the
+      // post-loop block routes to the failure epilogue.
       if (clientAborted) break;
       if (event.done) {
         sawDone = true;
@@ -861,10 +546,9 @@ async function handleStreamingNative(
           }
         }
 
-        // Collect function call items but defer SSE emission until
-        // after the commit gate — emitting them inside the done
-        // branch would let clients see completed tool calls from a
-        // turn the session later refuses to commit (iter-29 finding 1).
+        // Collect function_call items but defer SSE emission until
+        // after the commit gate — otherwise clients can see completed
+        // tool calls from a turn the session later refuses to commit.
         for (const tc of event.toolCalls.filter((t) => t.status === 'ok')) {
           const callId = tc.id ?? genId('call_');
           const fcItem: FunctionCallOutputItem = {
@@ -878,13 +562,10 @@ async function handleStreamingNative(
           outputItems.push(fcItem);
         }
 
-        // Build the terminal response object but do NOT persist or emit
-        // `response.completed` yet — both actions are gated on the
-        // session's commit signal, which only becomes authoritative
-        // after the outer generator's finally has run. We `break` out
-        // of the loop so the for-await's cleanup runs the producer's
-        // finally (setting `turnCount` if the session committed), then
-        // defer persistence + emission to the post-loop block below.
+        // Build the terminal but do NOT emit `response.completed` yet:
+        // commit signal only becomes authoritative after the producer's
+        // finally runs. Break so for-await cleanup triggers that finally,
+        // then the post-loop block handles emission + persistence.
         const promptTokens = event.promptTokens ?? 0;
         const reasoningTokens = event.reasoningTokens ?? 0;
         const usage = {
@@ -1007,16 +688,10 @@ async function handleStreamingNative(
       }
     }
   } catch (err: unknown) {
-    // Iter-28 finding 2: a mid-decode throw from the underlying async
-    // generator (native model crash, tool-call parse throw, etc.)
-    // used to escape out into the outer generic handler catch,
-    // which sent a JSON error *after* SSE headers had been flushed
-    // — producing a partially-streamed response with no terminal
-    // event. Capture the error into a sticky flag so the post-loop
-    // block below routes the request through the failure epilogue
-    // and emits a proper `response.failed` terminal, and so the
-    // registry-level `adopt()` gate never sees a committed state
-    // for this session.
+    // Capture mid-decode throws so the post-loop block routes to the
+    // failure epilogue and emits `response.failed` — otherwise the
+    // error would escape into the outer JSON error path with SSE
+    // headers already on the wire.
     thrownError = err instanceof Error ? err : new Error(String(err));
   } finally {
     if (httpReq) {
@@ -1030,51 +705,21 @@ async function handleStreamingNative(
     }
   }
 
-  // Post-loop terminal emission.
-  //
-  // The producer's finally has now run (either via the `break` after
-  // a done event, via natural iterator exhaustion, via a mid-decode
-  // throw surfaced through the try/catch above, or via a client
-  // disconnect that flipped `clientAborted`), so `wasCommitted()`
-  // reads an authoritative `session.turns` baseline. Four cases:
-  //
-  //  1. sawDone && committed && !thrownError && !clientAborted:
-  //     happy path. Persist the terminal response and emit
-  //     `response.completed`. Future `previous_response_id`
-  //     continuations can hot-resume through the registry or
-  //     cold-replay from the store.
-  //  2. sawDone && !committed: the final chunk carried
-  //     `finishReason: 'error'` (the ChatSession gates `turnCount`
-  //     on a non-error final chunk, so the session never
-  //     committed). Route through the failure epilogue with reason
-  //     `finish_reason_error`.
-  //  3. thrownError != null: the underlying generator threw. Route
-  //     through the failure epilogue with reason `error`.
-  //  4. clientAborted: HTTP request emitted `close`/`error` mid
-  //     stream. Route through the failure epilogue with reason
-  //     `client_abort`. We still emit `response.failed` so a tee /
-  //     proxy that remains connected sees a terminal event rather
-  //     than a hung stream.
-  //  5. !sawDone && none of the above: the iterator exhausted
-  //     before a terminal chunk arrived. Reason `stream_exhausted`.
-  //
-  // In all non-committed paths the registry-level `adopt()` gate in
-  // `handleCreateResponse` already skipped caching this session, so
-  // the in-memory and persisted views agree: there is no authoritative
-  // record of this turn anywhere.
+  // Post-loop terminal emission. The producer's finally has run so
+  // `wasCommitted()` reads an authoritative baseline. On success emit
+  // `response.completed`; otherwise route through the failure epilogue
+  // with one of `finish_reason_error` / `error` / `client_abort` /
+  // `stream_exhausted`. `response.failed` is emitted even on
+  // `client_abort` so a tee/proxy that stays connected sees a terminal.
   const committed = wasCommitted();
   const successful = sawDone && committed && thrownError == null && !clientAborted;
 
   if (successful) {
-    // `completedResponse` is non-null on the success path (the done
-    // branch set it before breaking out of the loop). Assert for the
-    // type checker.
     const terminal = completedResponse!;
 
-    // Emit deferred function_call item events. These were collected
-    // in the done branch but their SSE emission was held until the
-    // commit gate passed, so clients never see completed tool calls
-    // from an uncommitted turn (iter-29 finding 1).
+    // Emit deferred function_call events now that the commit gate
+    // passed — held until here so clients never see completed tool
+    // calls from an uncommitted turn.
     for (const item of terminal.output) {
       if (item.type === 'function_call') {
         const fcIndex = outputItems.indexOf(item);
@@ -1094,48 +739,22 @@ async function handleStreamingNative(
       }
     }
 
-    // Iter-35 finding 2: persistence moved OUT of the per-model
-    // mutex. The terminal `response.completed` event still flushes
-    // inside this critical section (the client expects it ordered
-    // against the prior SSE deltas), but the `ResponseStore` write
-    // that lets a future `previous_response_id` continuation cold-
-    // replay this turn is deferred to the outer `handleCreateResponse`
-    // body — AFTER `withExclusive` releases. Persistence is
-    // best-effort (store failures are log-only) and does not touch
-    // native model state, so holding the mutex across a slow SQLite
-    // write only pins the next waiter for no reason.
-    //
-    // Gate `terminalEmitted` on the terminal SSE event's write
-    // callback firing without error — `flushTerminalSSE` only flips
-    // the flag once the kernel has accepted the frame. A synchronous
-    // `res.write` return does not prove the client saw it (backpressure
-    // can defer flushing, and a socket error surfaces via the callback
-    // AFTER the write returned). An early throw or a callback-reported
-    // error here rejects the promise so the outer catch refuses to
+    // The terminal SSE flushes inside the per-model mutex (client
+    // expects it ordered against prior deltas); the `ResponseStore`
+    // write is deferred to the outer handler so a slow SQLite write
+    // does not pin the next waiter. `flushTerminalSSE` flips
+    // `terminalEmitted` only once the kernel acks the frame — a
+    // callback-reported error rejects so the outer catch refuses to
     // adopt under an unseen responseId.
     await flushTerminalSSE(res, 'response.completed', { response: terminal }, visibility);
     endSSE(res);
     return { terminalToPersist: terminal, failureMode: null };
   }
 
-  // Failure epilogue.
-  //
-  // Build the failure terminal through `buildFailedTerminal` so
-  // every nested message item is normalized to `status: 'incomplete'`
-  // (iter-28 finding 3 — the previous code did `{ ...terminal,
-  // status: 'failed' }`, which left nested items marked
-  // `completed`/`in_progress` inside a `failed` envelope).
-  //
-  // Emit `response.output_item.done` for any nested message items
-  // that are still dangling (the producer threw before the done
-  // branch closed them), so clients that track output_index state
-  // see a matching close for each open item BEFORE the terminal
-  // `response.failed`. Function-call items are NOT emitted on the
-  // failure path — their SSE emission is deferred to the post-commit
-  // success path (iter-29 finding 1), so on failure they only exist
-  // in outputItems for the terminal payload, normalized to
-  // `incomplete` by `buildFailedTerminal`. Reasoning items have no
-  // `status` field so they are left untouched.
+  // Failure epilogue. Close any dangling message items BEFORE the
+  // terminal so clients tracking `output_index` see matching closes.
+  // Function_call items are never emitted on failure (their SSE is
+  // deferred to the success path); reasoning items have no `status`.
   const reason: 'error' | 'client_abort' | 'finish_reason_error' | 'stream_exhausted' = thrownError
     ? 'error'
     : clientAborted
@@ -1144,10 +763,9 @@ async function handleStreamingNative(
         ? 'finish_reason_error'
         : 'stream_exhausted';
 
-  // Build a synthetic usage block when we never reached a done
-  // event: no token counts are available. When we DID reach a done
-  // event but the session refused to commit, prefer the captured
-  // `completedResponse.usage` so clients still see what was spent.
+  // Prefer captured usage on a finish_reason_error path so clients
+  // still see what was spent; synthesize zero-usage only when no done
+  // event was ever observed.
   const usage: ResponseObject['usage'] = completedResponse?.usage ?? {
     input_tokens: 0,
     output_tokens: 0,
@@ -1157,15 +775,9 @@ async function handleStreamingNative(
 
   const finalOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
 
-  // Flush still-open message items before the terminal event. A
-  // message item is considered still-open if it was started
-  // (`hasEmittedMessage && messageItemId != null`) but the done
-  // branch never ran (sawDone === false, or sawDone === true but
-  // the done branch broke out before emitting the item's close
-  // events on the finishReason=error path). We only emit the
-  // closing events on the non-sawDone path because the done branch
-  // already emits matching closes on the sawDone path before
-  // `break` fires.
+  // Flush still-open message items before the terminal. Only on the
+  // non-sawDone path — the done branch emits its own closes before
+  // breaking out.
   if (!sawDone && hasEmittedMessage && messageItemId != null) {
     const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
     writeSSEEvent(res, 'response.output_text.done', {
@@ -1198,9 +810,8 @@ async function handleStreamingNative(
     });
   }
   if (!sawDone && hasEmittedReasoning && reasoningItemId != null) {
-    // Reasoning items have no `status` field; just emit the closing
-    // events so output_index bookkeeping stays consistent on the
-    // client side. The reasoning item shape is preserved verbatim.
+    // No `status` field on reasoning items — just emit closes so
+    // client-side output_index bookkeeping stays consistent.
     writeSSEEvent(res, 'response.reasoning_summary_text.done', {
       item_id: reasoningItemId,
       output_index: outputItems.findIndex((i) => i.id === reasoningItemId),
@@ -1221,27 +832,11 @@ async function handleStreamingNative(
   }
 
   const failedTerminal = buildFailedTerminal(partial, finalOutput, reason, usage);
-  // `flushTerminalSSE` only flips `terminalEmitted` after
-  // `response.failed` is acknowledged by the kernel. If the write
-  // callback reports a socket error the promise rejects here, the
-  // flag stays false, and the outer catch refuses to adopt under an
-  // unseen responseId.
   await flushTerminalSSE(res, 'response.failed', { response: failedTerminal }, visibility);
   endSSE(res);
-  // Uncommitted terminal — the registry-level adopt gate already
-  // skips caching this session, and the store must not be written
-  // either. A later `previous_response_id` continuation that landed
-  // on this record would cold-replay a turn the session rolled back,
-  // silently resurrecting failed output as authoritative history.
-  //
-  // Iter-36 finding 2: `failureMode` carries the reason out to the
-  // outer adopt gate, which uses `client_abort` specifically to
-  // veto adoption even when the session's internal `turns`
-  // counter advanced (a final-chunk commit followed by a post-
-  // terminal `res.close`). Carrying every reason — not just the
-  // abort case — keeps the signal complete for future gating that
-  // might want to distinguish e.g. a stream-exhausted turn from a
-  // finish_reason-error turn at the adopt site.
+  // No terminalToPersist on an uncommitted turn: a later continuation
+  // that cold-replayed this record would silently resurrect failed
+  // output as authoritative history.
   return { terminalToPersist: null, failureMode: reason };
 }
 
@@ -1250,21 +845,11 @@ async function handleStreamingNative(
 // ---------------------------------------------------------------------------
 
 /**
- * Walk a mapped message list backward to the most recent assistant
- * turn and, when that turn fanned out to more than one named tool
- * call, return the array of sibling call ids. Returns `null`
- * otherwise. The caller uses this set as the authoritative "pending
- * outstanding tool calls" to validate a submitted continuation
- * against — comparing exact ids instead of just counts catches
- * duplicate / wrong / partial replays that would otherwise satisfy
- * a count-only check.
- *
- * Should be invoked on the STORED prior chain (via
- * `reconstructMessagesFromChain`) when available, never on the
- * already-augmented `messages` list — otherwise a caller that
- * echoes `function_call` items in the new input could overwrite the
- * trailing assistant with a forged single-call turn and slip past
- * the guard.
+ * Return the ordered sibling call ids for the trailing assistant
+ * fan-out (if any calls remain unresolved), else `null`. MUST be
+ * invoked on the STORED prior chain, never on the augmented `messages`
+ * list — otherwise an echoed `function_call` could overwrite the
+ * trailing assistant with a forged single-call turn.
  */
 function extractOutstandingToolCallIds(messages: ChatMessage[]): string[] | null {
   let lastAssistantWithCallsIdx = -1;
@@ -1305,25 +890,12 @@ function extractOutstandingToolCallIds(messages: ChatMessage[]): string[] | null
 }
 
 /**
- * Build a set of `call_id`s owned by the trailing assistant turn's
- * tool calls. Used to authenticate echoed `function_call` items in a
- * `previous_response_id` continuation against the stored authoritative
- * state: a client that round-trips `response.output` into the next
- * request will re-send its tool calls verbatim, and the server needs
- * to distinguish that legitimate shape from a forgery attempt.
- *
- * Ownership check only — `name` and `arguments` are NOT compared
- * against the stored payload. A client that parses and reserializes
- * its own prior arguments (different JSON whitespace, key order,
- * number formatting) would otherwise fail continuation even though
- * the server never consumes the echoed payload. Any `call_id` absent
- * from the returned set is still rejected as an unambiguous forgery
- * attempt by the caller.
- *
- * Returns `null` when the trailing message is not an assistant turn
- * with any tool calls — callers treat `null` the same as "no echoed
- * function_call allowed" because there is no stored call to own the
- * echo.
+ * Set of `call_id`s owned by the trailing assistant turn, used to
+ * authenticate echoed `function_call` items in a `previous_response_id`
+ * continuation. Ownership check only — `name` / `arguments` are not
+ * compared against the stored payload (clients commonly reserialize
+ * their own arguments with different whitespace). Returns `null` when
+ * the trailing message is not an assistant fan-out.
  */
 function buildTrailingAssistantToolCallIds(messages: ChatMessage[]): Set<string> | null {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -1342,36 +914,16 @@ function buildTrailingAssistantToolCallIds(messages: ChatMessage[]): Set<string>
 }
 
 /**
- * Reorder the tool messages in `messages` across the half-open range
- * `[startOffset, blockEnd)` so their relative positions match
- * `expectedOrder`.
+ * Reorder tool messages in `messages[startOffset, blockEnd)` to match
+ * `expectedOrder`. Replay correctness for a multi-call fan-out depends
+ * on POSITION — several native backends drop the id on the wire and
+ * pair results to calls by sibling index, so a reordered submission
+ * would silently bind results to the wrong calls even after the
+ * id-set gate passes.
  *
- * Replay correctness for a multi-tool-call fan-out depends on POSITION,
- * not `tool_call_id` — several backends drop the id on the wire and
- * pair tool responses to the trailing assistant calls by sibling index.
- * A caller that submits `function_call_output` items in the wrong order
- * would therefore silently bind results to the wrong calls even after
- * the id-set gate passes. This helper canonicalizes the submitted
- * ordering to the stored sibling order before the replay runs.
- *
- * The `blockEnd` bound is load-bearing: callers MUST size it to a
- * single contiguous tool block (i.e. the run of `role === 'tool'`
- * messages that immediately follow one assistant fan-out). A history
- * with multiple resolved fan-outs has several such blocks, and
- * walking past the first block's end would pull in tool messages from
- * a later, unrelated fan-out — the id-set gate below would then bail
- * on `toolPositions.length !== expectedOrder.length` without
- * reordering anything, silently leaving the first block misordered.
- * The full-history walker at `validateAndCanonicalizeHistoryToolOrder`
- * computes a `blockEnd` per fan-out and invokes this helper once per
- * block; the `previous_response_id` continuation path computes its
- * own `blockEnd` by scanning forward while the next message is a
- * `tool` turn.
- *
- * Assumes the call-id SET has already been validated against
- * `expectedOrder`; this helper is a no-op when any precondition does
- * not hold (missing id, count mismatch, etc.) so callers are safe to
- * invoke it unconditionally after the gate passes.
+ * `blockEnd` MUST be sized to a single contiguous tool block; the
+ * full-history walker computes one per fan-out. No-op when any
+ * precondition fails.
  */
 function canonicalizeToolMessageOrder(
   messages: ChatMessage[],
@@ -1406,69 +958,25 @@ function canonicalizeToolMessageOrder(
 }
 
 /**
- * Walk `messages` and canonicalize every assistant fan-out's
- * trailing tool-result block against the assistant's declared
- * `toolCalls` order. Mutates `messages` in place.
+ * Walk the full `messages` history, validate each assistant fan-out's
+ * tool-result block, and canonicalize each block to sibling order in
+ * place. Invoked on stateless cold-start histories and on the
+ * Anthropic `/v1/messages` endpoint (both feed caller-supplied tool
+ * order straight into `primeHistory()` without the continuation gate).
  *
- * The existing `canonicalizeToolMessageOrder` only handles a single
- * contiguous tool block at a known offset against a precomputed
- * `expectedOrder` — it was built for the `previous_response_id`
- * continuation path, where the stored prior chain supplies the
- * trailing assistant's outstanding ids and only the caller's new
- * delta needs to be reordered. This helper, by contrast, walks the
- * FULL history and canonicalizes EVERY fan-out block in it, so it
- * can be invoked on stateless cold-start histories (no
- * `previous_response_id`) and on the Anthropic `/v1/messages`
- * endpoint, both of which feed caller-supplied tool-message order
- * straight into `primeHistory()` without the continuation gate
- * running.
+ * Validation rejects: orphan tool messages, unknown `toolCallId`s,
+ * missing/duplicate resolutions, and a trailing unresolved fan-out in
+ * a stateless history. Returns `null` on success or a human-readable
+ * error string (sent as 400 `invalid_request_error`).
  *
- * Validation rules (checked BEFORE any reorder):
- *
- *   - Every `role === 'tool'` message in the history must appear
- *     inside a contiguous block immediately following an assistant
- *     fan-out turn. An orphan tool message (no preceding assistant,
- *     or the preceding assistant has no `toolCalls`) is a violation.
- *   - Inside a fan-out's tool block, every submitted `toolCallId`
- *     must appear in the assistant's declared sibling-id set.
- *   - The tool block must contain exactly one message per declared
- *     sibling id — no missing ids, no extras, no duplicates.
- *   - The final assistant turn in the history is not allowed to be
- *     an unresolved fan-out: if the last assistant carries tool
- *     calls and no resolutions follow it, the caller is submitting
- *     a self-contained history whose trailing turn the chat-session
- *     API cannot express as a continuation seed. Reject the request
- *     rather than silently advancing into the model. (The
- *     continuation path has its own gate for this shape — we do NOT
- *     run the helper on the previous_response_id branch's delta,
- *     see the call site for the invocation condition.)
- *
- * Canonicalization only runs once every precondition passes. The
- * reorder is in place: `messages[i]` entries are swapped to match
- * the sibling order, nothing is inserted or deleted.
- *
- * @param apiSurface Controls the vocabulary used in error
- *   strings. Defaults to `'openai'` so the `/v1/responses`
- *   endpoint returns `function_call_output` / `call_id`
- *   wording. Pass `'anthropic'` from the `/v1/messages` endpoint
- *   so callers who posted `tool_result` / `tool_use_id` get
- *   remediation advice in their own request vocabulary (iter-23
- *   finding 4). The validation logic and canonicalization are
- *   identical between surfaces — only the error text differs.
- *
- * @returns `null` on success, or a human-readable error string
- *   describing the first violation. Callers send the string back as
- *   a 400 `invalid_request_error`.
+ * @param apiSurface controls error-string vocabulary (`openai` default
+ *   uses `function_call_output` / `call_id`; `anthropic` uses
+ *   `tool_result` / `tool_use_id`). Validation logic is identical.
  */
 export function validateAndCanonicalizeHistoryToolOrder(
   messages: ChatMessage[],
   apiSurface: 'openai' | 'anthropic' = 'openai',
 ): string | null {
-  // Map surface-specific names so every error string below reads
-  // in the caller's own vocabulary. The OpenAI responses surface
-  // uses `function_call_output` / `call_id` / "assistant fan-out";
-  // the Anthropic messages surface uses `tool_result` /
-  // `tool_use_id` / "assistant turn with tool_use blocks".
   const vocab =
     apiSurface === 'anthropic'
       ? {
@@ -1482,10 +990,6 @@ export function validateAndCanonicalizeHistoryToolOrder(
           fanOut: 'assistant fan-out',
         };
 
-  // Walk forward. When we see an assistant fan-out, read the
-  // contiguous tool block that follows and canonicalize it.
-  // When we see a tool message outside such a block, that's an
-  // orphan and we reject.
   let i = 0;
   while (i < messages.length) {
     const m = messages[i]!;
@@ -1507,10 +1011,6 @@ export function validateAndCanonicalizeHistoryToolOrder(
     for (const tc of m.toolCalls) {
       const id = typeof tc.id === 'string' ? tc.id : null;
       if (id === null || id.length === 0) {
-        // Assistant tool call without an id — the server should never
-        // have produced one, but be defensive. Skip canonicalization
-        // for this fan-out; without an id we cannot reorder
-        // positionally by id.
         return (
           `${vocab.fanOut} at index ${i} declares a tool call with no id, which cannot be paired ` +
           `with its ${vocab.toolResult} positionally.`
@@ -1558,12 +1058,9 @@ export function validateAndCanonicalizeHistoryToolOrder(
 
     const blockLength = blockEnd - blockStart;
     if (blockLength === 0) {
-      // No resolutions at all. Allowed ONLY when the fan-out is the
-      // trailing assistant turn AND the caller intends to submit
-      // tool results in a follow-up request. In a self-contained
-      // stateless history (which is what this helper is invoked
-      // against) the chain cannot end with an unresolved fan-out —
-      // the chat-session API would have nothing to continue from.
+      // Trailing unresolved fan-out is rejected — a stateless history
+      // has nothing for the model to continue from. Mid-history the
+      // next non-tool turn orphans the fan-out.
       if (blockEnd === messages.length) {
         return (
           `${vocab.fanOut} at index ${i} is the trailing turn of the history but has no ` +
@@ -1571,8 +1068,6 @@ export function validateAndCanonicalizeHistoryToolOrder(
           `unresolved tool-call fan-out because there is nothing for the model to continue from.`
         );
       }
-      // Mid-history assistant fan-out followed directly by another
-      // assistant/user/system message. This shape orphans the fan-out.
       return (
         `${vocab.fanOut} at index ${i} declares ${declaredIds.length} tool call${declaredIds.length === 1 ? '' : 's'} ` +
         `but the next message at index ${blockEnd} is a ${messages[blockEnd]!.role} turn. Every fan-out ` +
@@ -1586,19 +1081,10 @@ export function validateAndCanonicalizeHistoryToolOrder(
         `Every declared tool call must be answered by a ${vocab.toolResult} before the next turn.`
       );
     }
-    // blockLength > declaredIds.length is impossible: every entry in
-    // the block must have an id in declaredSet, and seenInBlock
-    // deduplicates by id, so seen.size == blockLength ≤ declaredIds.length.
+    // blockLength > declaredIds.length is impossible (every id is in
+    // declaredSet and seenInBlock dedupes).
 
-    // Canonicalize. The existing canonicalizeToolMessageOrder handles
-    // a single block cleanly — reuse it so the reorder logic lives
-    // in one place. Pass `blockEnd` so the helper only inspects THIS
-    // fan-out's contiguous tool block and doesn't accidentally scan
-    // into a later fan-out's tool messages (which would cause the
-    // helper's count gate to bail without reordering anything).
     canonicalizeToolMessageOrder(messages, blockStart, blockEnd, declaredIds);
-
-    // Advance past the resolved block.
     i = blockEnd;
   }
 
@@ -1606,55 +1092,31 @@ export function validateAndCanonicalizeHistoryToolOrder(
 }
 
 /**
- * Outcome of a non-streaming session dispatch. `committed` is the
- * honest "did the session actually advance" signal, accounting for
- * any internal `session.reset()` the helper may have performed
- * before dispatch.
+ * Non-streaming dispatch outcome. `committed` is measured against a
+ * baseline captured AFTER any internal `session.reset()` so it is
+ * honest across the multi-message reset-and-restart branch — a
+ * pre-helper snapshot would be stale. Uncommitted dispatches must
+ * never be adopted: their KV state is out of sync with persistence.
  */
 interface NonStreamingOutcome {
   result: ChatResult;
-  /**
-   * `true` if the session's turn counter advanced past its
-   * post-helper-reset baseline. The endpoint uses this to decide
-   * whether to adopt the session under the freshly allocated
-   * response id — uncommitted dispatches must NOT be adopted
-   * because their in-memory KV state is out of sync with whatever
-   * the endpoint layer persists.
-   */
   committed: boolean;
 }
 
-/**
- * Outcome of a streaming session dispatch. `wasCommitted()` is a
- * closure that reports the commit signal AFTER the stream has been
- * consumed by the SSE writer — it compares `session.turns` against
- * the baseline the helper captured AFTER any internal
- * `session.reset()`, so the signal is honest regardless of which
- * dispatch path ran.
- */
+/** Streaming dispatch outcome. `wasCommitted()` is valid only AFTER
+ *  the SSE writer has drained the stream. */
 interface StreamingOutcome {
   stream: AsyncGenerator<ChatStreamEvent>;
   wasCommitted(): boolean;
 }
 
 /**
- * Route a non-streaming request through a `ChatSession`.
- *
- * Cold path (fresh session): prime with the full mapped history and
- * run `startFromHistory`. Hot path (cached session with a live KV
- * cache): send only the last new input message via `send` or
- * `sendToolResult`. Multi-message hot-path requests fall back to a
- * reset + cold re-prime.
- *
- * The caller is responsible for rejecting partial tool-result
- * submissions against a session whose prior assistant turn fanned
- * out to multiple tool calls — see `handleCreateResponse` for the
- * `pendingUnresolvedToolCallCount` gate that guards against this.
- *
- * Returns an explicit `{ result, committed }` so the endpoint's
- * `sessionReg.adopt()` step can honor `ChatSession`'s commit
- * semantics even across the multi-message reset-and-restart branch
- * (where a pre-helper snapshot of `session.turns` would be stale).
+ * Route a non-streaming request through `ChatSession`. Cold path
+ * (fresh session) runs `primeHistory` + `startFromHistory`; hot path
+ * uses `send` / `sendToolResult` for a single new message, or falls
+ * back to reset + cold re-prime on multi-message input. The caller
+ * is responsible for rejecting partial tool-result submissions
+ * against a fan-out (`handleCreateResponse` fan-out gate).
  */
 async function runSessionNonStreaming(
   session: ChatSession<SessionCapableModel>,
@@ -1688,16 +1150,10 @@ async function runSessionNonStreaming(
     throw new Error(`unsupported last message role on hot path: ${last.role}`);
   }
 
-  // Multi-message hot-path input: drop the cached session state and
-  // re-run as a cold path. Correct but pays the full prefill cost.
-  // The caller re-keys this session under the newly allocated response
-  // id on success, so subsequent turns will resume from the cache that
-  // `startFromHistory` just warmed — the reset is amortized.
-  //
-  // NOTE: the commit baseline MUST be captured AFTER `session.reset()`
-  // (which zeroes `turns`), otherwise a pre-reset snapshot — taken e.g.
-  // by the endpoint before calling this helper — would read as
-  // "post > pre" only if the old turn count happened to be zero.
+  // Multi-message hot path: reset + cold re-prime. `initialTurns` MUST
+  // be captured AFTER `session.reset()` zeroes `turns`, otherwise the
+  // committed check reads stale. Amortized: the caller re-keys this
+  // session under the new responseId on success.
   await session.reset();
   session.primeHistory(messages);
   const initialTurns = session.turns;
@@ -1705,14 +1161,7 @@ async function runSessionNonStreaming(
   return { result, committed: session.turns > initialTurns };
 }
 
-/**
- * Streaming counterpart to {@link runSessionNonStreaming}. Returns
- * the session's underlying async generator plus a `wasCommitted()`
- * closure that the endpoint calls after the SSE writer has finished
- * consuming the stream. The closure compares `session.turns` against
- * a baseline captured AFTER any internal `session.reset()`, so the
- * signal is honest for the reset-and-cold-restart branch as well.
- */
+/** Streaming counterpart to {@link runSessionNonStreaming}. */
 async function runSessionStreaming(
   session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
@@ -1751,10 +1200,8 @@ async function runSessionStreaming(
     throw new Error(`unsupported last message role on hot path: ${last.role}`);
   }
 
-  // Multi-message hot-path input: same reset-and-cold-restart as the
-  // non-streaming variant. See `runSessionNonStreaming` for the
-  // reasoning behind the post-success re-keying — and why the
-  // initialTurns snapshot lives AFTER the reset.
+  // Multi-message hot path: same reset + cold re-prime as the
+  // non-streaming variant. `initialTurns` must be captured AFTER reset.
   await session.reset();
   session.primeHistory(messages);
   const initialTurns = session.turns;
@@ -1769,37 +1216,17 @@ async function runSessionStreaming(
 // ---------------------------------------------------------------------------
 
 /**
- * Build the `StoredResponseRecord` for a committed response.
+ * Build the `StoredResponseRecord` for a committed response. Pure
+ * function, split out from `initiatePersist` so the caller can build
+ * the record synchronously inside `withExclusive`, register the
+ * in-flight write in the tracker before the mutex releases, and await
+ * off-lock purely for error logging. See `pending-writes.ts` for the
+ * tracker contract.
  *
- * Pure function — constructs the record payload from the inputs and
- * does not touch the store. Split out from the initiate-persist site
- * so `handleCreateResponse` can (a) construct the record SYNCHRONOUSLY
- * inside `withExclusive`, (b) kick off the SQLite write through
- * `initiatePersist` on the in-lock side so the in-flight write is
- * registered in the per-store pending tracker BEFORE the mutex
- * releases, and (c) await the write off-lock just to surface errors
- * to the log. This closes the iter-35 race window where a
- * back-to-back continuation could fire `store.getChain(id)` before
- * the off-lock `await store.store(id)` had landed in SQLite —
- * returning 404 on a response id the client had just received in
- * `response.completed`. See `initiatePersist` and
- * `packages/server/src/pending-writes.ts` for the full rationale.
- *
- * Store only the NEW input messages from this request, not the full
- * expanded conversation. Chain reconstruction re-derives the full
- * history by following previous_response_id links.
- *
- * `modelInstanceId` is the monotonic id `ModelRegistry` assigned to
- * the model object that serviced this request. It is stashed inside
- * the `configJson` blob so the Rust-side schema stays untouched; on
- * a later `previous_response_id` continuation the responses endpoint
- * reads it back out of the trailing chain record and compares it
- * against the live id for `body.model`. See the endpoint's
- * `readStoredModelIdentity` helper and the guard block in
- * `handleCreateResponse` — records without this field are rejected
- * outright per iter-23 finding 1 (the iter-22 friendly-name
- * compat fallback silently reopened same-name hot-swap corruption
- * and has been removed).
+ * Only NEW input messages are stored — chain reconstruction re-derives
+ * full history via `previous_response_id` links. `modelInstanceId` is
+ * stashed in `configJson` (leaving the Rust-side schema untouched) and
+ * re-validated on continuation by `readStoredModelIdentity`.
  */
 function buildResponseRecord(
   response: ResponseObject,
@@ -1808,12 +1235,9 @@ function buildResponseRecord(
   modelInstanceId: number | undefined,
   retentionSec?: number,
 ): StoredResponseRecord {
-  // Retention is decoupled from the warm `SessionRegistry` TTL: the
-  // session sheds its GPU KV cache after 30 min, but the row must
-  // survive long enough (default 7 days via `createServer`) for a
-  // later `previous_response_id` request to cold-replay from SQLite.
-  // Falls back to `RESPONSE_TTL_SECONDS` for legacy callers that
-  // bypass the server config path (see constant comment).
+  // Retention is decoupled from the warm `SessionRegistry` TTL (30 min
+  // KV cache) — the row must outlive the session so a later cold
+  // replay can rebuild from SQLite. Default 7 days via `createServer`.
   const effectiveRetention =
     retentionSec != null && Number.isFinite(retentionSec) && retentionSec > 0 ? retentionSec : RESPONSE_TTL_SECONDS;
   return {
@@ -1840,26 +1264,18 @@ function buildResponseRecord(
 }
 
 /**
- * Initiate an off-lock `store.store(record)` write.
+ * Kick off an off-lock `store.store(record)` write and register it in
+ * the per-store pending-write tracker. MUST be called synchronously
+ * inside `withExclusive` so the tracker registration happens before
+ * the mutex releases — a back-to-back continuation that slips in
+ * observes the in-flight write via `awaitPending(previous_response_id)`
+ * and retries `getChain` rather than 404-ing on a fresh responseId.
  *
- * SYNCHRONOUSLY kicks off the native `store.store(record)` promise,
- * registers it in the per-store pending-write tracker under the
- * record's id, and returns the promise to the caller. The caller
- * MUST await the returned promise off-lock — the caller is
- * responsible for catching errors and logging them.
+ * `absoluteExpiresAtMs` = min(record expiry, chain earliest expiry) —
+ * once crossed, the `awaitPending` path can short-circuit to 404
+ * rather than keep emitting retryable 503 for an unrecoverable chain.
  *
- * The crucial property for iter-36 finding 1 is that this function
- * is called SYNCHRONOUSLY from inside `withExclusive` so that the
- * tracker registration happens before the per-model mutex releases.
- * Any back-to-back continuation that slips in immediately after the
- * mutex release will observe the in-flight write through
- * `getPendingWritesFor(store).awaitPending(previous_response_id)`
- * and can await it before retrying `store.getChain(...)`, closing
- * the 404-before-store-landed race window.
- *
- * Even though `store.store(...)` returns an already-pending promise,
- * we never await it here — the whole point of this function is to
- * keep the SQLite flush off the critical path.
+ * Caller awaits the returned promise off-lock purely for error logging.
  */
 function initiatePersist(
   store: ResponseStore,
@@ -1867,48 +1283,15 @@ function initiatePersist(
   absoluteExpiresAtMs?: number,
 ): Promise<void> {
   const writePromise = store.store(record);
-  // Iter-55: thread the scalar earliest-recoverable expiry through
-  // to the tracker so the pre-breaker `awaitPending` timeout/probe
-  // path in the responses endpoint can short-circuit to 404 once
-  // `Date.now() >= absoluteExpiresAtMs` rather than keep emitting
-  // retryable 503 for a chain whose earliest ancestor has already
-  // aged out. `absoluteExpiresAtMs` is computed by the caller as
-  // `min(record.expiresAt * 1000, chainEarliestExpiresAtMs)`; when
-  // the caller passes `undefined` (e.g. legacy call site, no
-  // finite expiry available) the tracker simply does not record a
-  // bound and the pre-iter-55 retryable-503 behaviour is
-  // preserved.
   getPendingWritesFor(store).track(record.id, writePromise, absoluteExpiresAtMs);
   return writePromise;
 }
 
 /**
- * Identity signal extracted from a stored chain record's
- * `configJson` blob:
- *
- *   - `{ kind: 'present', instanceId }` — the record carries an
- *     explicit `modelInstanceId`. The caller runs the strict
- *     instance-id comparison and rejects any mismatch as a
- *     hot-swap / rebind.
- *   - `{ kind: 'absent' }` — the record has a parseable (or empty)
- *     `configJson` blob that simply does not carry a well-formed
- *     `modelInstanceId` field. This is the LEGACY shape written by
- *     branches before iter-21 stamped an explicit instance id into
- *     every row. Iter-28 finding 1: the caller services this shape
- *     by cold-replaying under a narrow "trust on first use"
- *     window — but ONLY when the stored `record.model` friendly
- *     name exactly matches the incoming `body.model`, so a caller
- *     cannot redirect a legacy chain through an unrelated model.
- *     A legacy row whose friendly name differs from the incoming
- *     request is rejected outright.
- *   - `{ kind: 'malformed' }` — the `configJson` blob failed to
- *     JSON-parse. Iter-28 finding 1: the iter-27 legacy compat
- *     path silently classified malformed blobs as `absent`, which
- *     meant the narrow friendly-name-equality check below would
- *     happily cold-replay through a row whose stored config state
- *     we cannot verify at all. Surface the parse failure as a
- *     distinct variant so the caller can reject it with a clean
- *     400 without opening the legacy window.
+ * Identity signal from a stored record's `configJson` blob:
+ * `present` (with a well-formed `modelInstanceId`), `absent` (legacy
+ * rows written before instance ids were stamped — rejected outright),
+ * or `malformed` (blob failed to JSON-parse — rejected with 400).
  */
 type StoredModelIdentity = { kind: 'present'; instanceId: number } | { kind: 'absent' } | { kind: 'malformed' };
 
@@ -1969,29 +1352,21 @@ export async function handleCreateResponse(
     return;
   }
 
-  // Acquire a dispatch lease on `body.model`'s session-registry
-  // binding. The lease keeps the binding (and its FIFO `execLock`
-  // mutex chain) alive across every await in this handler — crucial
-  // because a concurrent `unregister()` + `register(sameModel)`
-  // sequence would otherwise tear the old `SessionRegistry` down and
-  // allocate a fresh one, and the new request's `withExclusive`
-  // would race against this in-flight dispatch on one shared native
-  // model with two independent mutex chains. The lease MUST be
-  // released in a `finally` below so the binding's teardown (if
-  // deferred by a concurrent `unregister()`) completes once the last
-  // dispatch lease AND the last persist retention releases.
+  // Dispatch lease keeps the binding (and its FIFO `execLock` chain)
+  // alive across every await in this handler — required because a
+  // concurrent `unregister()` + `register(sameModel)` would otherwise
+  // allocate a fresh `SessionRegistry` and race two independent mutex
+  // chains against one native model. Released in `finally` below.
   const lease = registry.acquireDispatchLease(body.model);
   if (!lease) {
     sendInternalError(res, 'session registry missing for registered model');
     return;
   }
   const leaseModel = lease.model;
-  // Iter-35 finding 1: AbortController wired to the HTTP request's
-  // disconnect events, declared at this scope so the outer `finally`
-  // can always detach the listeners even on an early `return` from
-  // inside the try. Listeners are attached only after we pass the
-  // pre-lock validation gates — the `let` holders default to `null`
-  // so the detach loop safely no-ops on the early-return path.
+  // AbortController wired to disconnect events, declared at handler
+  // scope so the outer `finally` can always detach even on early
+  // return. Listeners attach only after the pre-lock validation gates
+  // pass; `abortListenersAttached` guards the detach.
   const abortController = new AbortController();
   const abortSocket = res.socket;
   const onAbortClose = (): void => {
@@ -2001,111 +1376,62 @@ export async function handleCreateResponse(
     abortController.abort();
   };
   let abortListenersAttached = false;
-  // Iter-39 finding 2: the outer `try/finally` below runs
-  // `runPostDispatchCleanup` eagerly after `withExclusive` returns
-  // (so the post-commit persist wait does not pin abort listeners or
-  // the dispatch lease) and ALSO idempotently from the finally on the
-  // early-return / pre-dispatch-error path. These guards keep the
-  // cleanup a no-op when it has already run on the eager path.
+  // `runPostDispatchCleanup` runs eagerly after `withExclusive` returns
+  // (so a wedged post-commit persist does not pin abort listeners or
+  // the lease) and also idempotently from the outer `finally` for the
+  // early-return path. These flags keep it a no-op when already run.
   let cleanupPerformed = false;
   let leaseReleased = false;
   try {
-    // Capture an initial snapshot of the live binding for `body.model`.
-    // These values are the INITIAL observation — on a
-    // `previous_response_id` continuation we re-read them after
-    // `await store.getChain(...)` and reject the request if the
-    // binding moved under us (see the hot-swap race guard below).
-    // Stateless requests never hit the store so the re-read is a
-    // no-op for them.
+    // Initial snapshot of the live binding. On a continuation we
+    // re-read after `await store.getChain()` and reject if the
+    // binding moved (hot-swap race guard below). Stateless requests
+    // keep the snapshot unchanged.
     const initialSessionReg: SessionRegistry = lease.registry;
     const initialInstanceId: number = lease.instanceId;
 
-    // Mutable handles for the registry binding that actually gets
-    // used for dispatch / persistence. For stateless requests these
-    // stay equal to the initial snapshot. For a `previous_response_id`
-    // continuation they are re-read after `await store.getChain()`
-    // and, if they match the initial snapshot, are used as the
-    // canonical current-binding values from that point forward.
     let sessionReg: SessionRegistry = initialSessionReg;
     let currentInstanceId: number | undefined = initialInstanceId;
 
     const responseId = genId('resp_');
 
-    // Resolve previous_response_id chain
     let priorMessages: ChatMessage[] | undefined;
     let previousResponseId: string | undefined;
-    // Inherited instructions from the trailing stored chain record —
-    // see Finding 4. Null when either the caller supplied their own
-    // `body.instructions`, when the continuation has no stored chain,
-    // or when the trailing record did not carry an instructions field.
+    // Trailing-record inherited instructions, applied when the caller
+    // omits `body.instructions` (empty string still counts as an
+    // explicit override). Keeps `instructions: "You are a pirate"`
+    // alive across cold replays.
     let inheritedInstructions: string | null = null;
-    // Iter-55 (codex's iter-54 HIGH finding 1 + MEDIUM finding 2):
-    // precompute the EARLIEST wall-clock expiry (epoch-ms) across
-    // the resolved ancestor chain as a scalar, rather than
-    // retaining the full `StoredResponseRecord[]` on the outer
-    // scope. The native `ResponseStore.getChain()`
-    // (`crates/mlx-db/src/response_store/reader.rs:44-59`) aborts
-    // on the first expired ancestor, so a child whose parent
-    // expires sooner becomes unrecoverable at the parent's expiry.
-    // Threading only the scalar through `track()` and the hard-
-    // timeout marker avoids capturing each `StoredResponseRecord`
-    // (with its full stored JSON payload) in the background
-    // closures — heap growth stays bounded even under a wedged
-    // backend with many pending continuations.
-    //
-    // The scalar is populated only for continuations
-    // (`body.previous_response_id` with a `store`); stateless
-    // requests leave it as `undefined` and the downstream
-    // `track()` / `markHardTimedOut` fall back to the record-only
-    // cap.
+    // Precomputed scalar = earliest wall-clock expiry across the
+    // resolved chain (epoch-ms). `ResponseStore.getChain()` aborts on
+    // the first expired ancestor (see
+    // `crates/mlx-db/src/response_store/reader.rs:44-59`), so once
+    // this bound is crossed the chain is unrecoverable and we can
+    // short-circuit the retryable-503 path to permanent 404. Threading
+    // only the scalar (not the record array) keeps background
+    // hard-timeout closures O(1) per pending continuation.
     let chainEarliestExpiresAtMs: number | undefined = undefined;
 
     if (body.previous_response_id && store) {
       try {
-        // Iter-36 finding 1 / iter-37 finding 1: iter-35 moved the
-        // `store.store(...)` write OUT of `withExclusive` so a slow
-        // SQLite flush would not pin the per-model mutex on the next
-        // waiter. That opened a 404 window: a client that received
-        // `response.completed` with `responseId = A` and
-        // immediately fires a follow-up request carrying
-        // `previous_response_id: A` can reach this `getChain`
-        // BEFORE the off-lock write for A has landed in SQLite —
-        // the chain is missing and we would spuriously 404 on a
-        // response id the client was just handed.
+        // Persist-before-getChain race: a client firing back-to-back
+        // `previous_response_id: A` can reach `getChain(A)` before
+        // the producer's off-lock `store.store(A)` has landed. The
+        // pending-writes tracker is registered synchronously inside
+        // `withExclusive` (see `initiatePersist`) so we can observe
+        // the in-flight write and retry.
         //
-        // The production `ResponseStore` is the native mlx-db
-        // implementation; its `get_chain` THROWS `"Response not
-        // found: <id>"` on a miss rather than returning `[]` (see
-        // `crates/mlx-db/src/response_store/reader.rs`). The
-        // in-memory mock used by tests returns `[]`. Handle BOTH
-        // shapes: a thrown "not found" AND an empty array both
-        // drop through the pending-writes retry path.
-        //
-        // `initiatePersist` registers every in-flight write in a
-        // per-store pending-write tracker synchronously, BEFORE
-        // the producing request's mutex releases. If the tracker
-        // reports a pending write for the requested id, await it
-        // and retry `getChain`. The retry is guaranteed to see
-        // the row because the tracked promise only resolves after
-        // the store's own serialization queue has accepted the
-        // insert. Swallow any rejection from the tracked promise —
-        // the producer's own awaiter already surfaces write
-        // failures to the log, and a failed write correctly
-        // leaves the store empty so the second `getChain` still
-        // throws / returns `[]` and we fall through to the
-        // original 404.
+        // Native mlx-db throws `"Response not found: <id>"` on miss
+        // (`crates/mlx-db/src/response_store/reader.rs`); in-memory
+        // mocks return `[]`. Handle both — the lenient /not found/
+        // match routes both into the retry path while letting real
+        // infrastructure errors bubble to the outer catch.
         let chain: StoredResponseRecord[];
         let firstAttemptError: unknown = null;
         try {
           chain = await store.getChain(body.previous_response_id);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          // Case-insensitive substring match is intentionally
-          // lenient: we only want to route "the row is not
-          // present" throws into the retry path. A genuine
-          // infrastructure error (connection refused, SQL parse
-          // error, etc.) should still bubble out to the outer
-          // catch as an internal error.
           if (!/not found/i.test(msg)) {
             throw err;
           }
@@ -2116,25 +1442,10 @@ export async function handleCreateResponse(
         if (chain.length === 0) {
           const pending = getPendingWritesFor(store).awaitPending(body.previous_response_id);
           if (pending !== undefined) {
-            // Iter-38 finding 1: bound the wait. `awaitPending`
-            // returns the raw `store.store(...)` promise, and if
-            // the native backend is wedged (SQLite lock held by
-            // a stuck writer, FFI hang, etc.) that promise may
-            // never settle. Without a ceiling the continuation
-            // request pins forever. Race it against a short
-            // timer; on timeout, log a warning and fall through
-            // to the 404 path — a clean bounded error is always
-            // better than a silent hang.
-            //
-            // TIMED_OUT is a unique sentinel so callers can
-            // distinguish "pending wait timed out" from "pending
-            // wait rejected" without relying on exception text.
-            // A rejection from the pending promise propagates
-            // naturally through the `await` and the subsequent
-            // catch below (the tracker's `.finally(...)` has
-            // already cleared the entry, so the retry `getChain`
-            // will see the store's true post-failure state and
-            // 404 cleanly).
+            // Bound the wait — `awaitPending` returns the raw
+            // `store.store` promise which can hang indefinitely on a
+            // wedged backend. On timeout fall through to the
+            // last-probe branch below.
             type PendingOutcome = 'landed' | 'timeout';
             const chainWriteWaitTimeoutMs = getChainWriteWaitTimeoutMs();
             let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -2149,31 +1460,20 @@ export async function handleCreateResponse(
               const outcome = await Promise.race([pendingOutcome, timeoutPromise]);
               timedOut = outcome === 'timeout';
             } catch {
-              // Write failure is the producer's problem; proceed
-              // with the retry so the 404 epilogue matches the
-              // true store state.
+              // Write rejection is the producer's problem; the
+              // tracker's .finally() already cleared the entry so
+              // the retry below sees the true post-failure state.
             } finally {
               if (timeoutHandle !== undefined) {
                 clearTimeout(timeoutHandle);
               }
             }
             if (timedOut) {
-              // Iter-39 finding 1: before declaring the write
-              // stuck, run ONE last `getChain` probe. A write
-              // landing at (CHAIN_WRITE_WAIT_TIMEOUT_MS + epsilon)
-              // would have succeeded for the client but the
-              // iter-38 code flipped to 404 the moment the timer
-              // fired — permanently poisoning the client's chain
-              // (404 is non-retryable, so the client discards
-              // `previous_response_id`). The probe closes that
-              // race: if the write slipped in during the thin
-              // window between timer-fire and this check, we use
-              // its result and continue normally. Only when the
-              // probe STILL misses is the write genuinely wedged,
-              // and we surface it as retryable 503 storage_timeout
-              // so the client can try again with the same
-              // `previous_response_id` instead of treating it as a
-              // permanent miss.
+              // Last-probe race closer: a write landing at
+              // (timeout + epsilon) would have succeeded but 404-ing
+              // here is non-retryable and permanently poisons the
+              // client's chain. If the probe misses too, surface 503
+              // storage_timeout (retryable) instead of 404.
               let probed: StoredResponseRecord[] | null = null;
               try {
                 probed = await store.getChain(body.previous_response_id);
@@ -2182,22 +1482,12 @@ export async function handleCreateResponse(
                 if (!/not found/i.test(msg)) {
                   throw err;
                 }
-                // Probe confirmed the row is still missing —
-                // genuine storage timeout. `probed` stays null and
-                // we emit 503 below.
                 probed = null;
               }
               if (probed !== null && probed.length > 0) {
-                // Iter-39 finding 1: the write slipped in between
-                // timer-fire and the probe. Log this so operators
-                // can still see the wedged-writer condition that
-                // triggered the slow path, even when the client
-                // got a coherent 200 via the probe. Without this
-                // log the only observable signal for "the bounded
-                // wait fired" is the `sendStorageTimeout` 503
-                // branch below, which fires on a legitimate miss;
-                // the successful-probe path would otherwise be
-                // silent.
+                // Log the wedged-writer condition even on a
+                // successful probe so operators see the slow path
+                // fired.
                 console.warn(
                   `[responses] pending store write for previous_response_id "${body.previous_response_id}" did ` +
                     `not settle within ${chainWriteWaitTimeoutMs}ms, but a last-probe getChain found the record. ` +
@@ -2206,21 +1496,11 @@ export async function handleCreateResponse(
                 );
                 chain = probed;
               } else {
-                // Iter-55 (codex's iter-54 HIGH finding 1): before
-                // declaring this a transient storage slowdown,
-                // consult the tracker's per-pending earliest-
-                // recoverable expiry. When `track()` was called we
-                // stored the scalar `min(record.expiresAt * 1000,
-                // chainEarliestExpiresAtMs)` for the still-pending
-                // write under this id. If `Date.now()` has crossed
-                // that bound, `ResponseStore.getChain()` can never
-                // succeed (the earliest ancestor has aged out of
-                // the reader's ancestor-expiry walk at
-                // `crates/mlx-db/src/response_store/reader.rs:44-59`),
-                // so looping the client on retryable 503 for up to
-                // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS` before
-                // the hard breaker fires is wasted. Short-circuit
-                // to permanent 404 so the client stops retrying an
+                // Once the chain's earliest-recoverable expiry has
+                // passed, `getChain()` can never succeed (the reader
+                // aborts on the first expired ancestor, see
+                // `reader.rs:44-59`). Short-circuit to permanent 404
+                // rather than loop the client on retryable 503 for an
                 // unrecoverable chain.
                 const earliestMs = getPendingWritesFor(store).getEarliestExpiresAtMs(body.previous_response_id);
                 if (earliestMs !== undefined && Date.now() >= earliestMs) {
@@ -2255,36 +1535,15 @@ export async function handleCreateResponse(
                 if (!/not found/i.test(msg)) {
                   throw err;
                 }
-                // Retry also missed the row — this is a genuine
-                // 404. Fall through to the empty-chain handler
-                // below.
                 chain = [];
               }
             }
           } else if (firstAttemptError !== null) {
-            // Iter-50 / iter-51: before rethrowing the original
-            // "not found" error (which the outer catch at the end
-            // of this block turns into a permanent 404), check
-            // whether the id has a hard-timed-out marker from the
-            // post-commit persist breaker. If the hard-timeout
-            // breaker fired against an in-flight
-            // `store.store(...)` for this response id, the raw
-            // write promise is still running in the background and
-            // may yet land — classifying that as a permanent 404
-            // would cause clients to discard `previous_response_id`
-            // as invalid and silently break the conversation chain.
-            //
-            // Iter-51 (codex's iter-50 HIGH finding 2): before
-            // emitting the retryable 503, run ONE last `getChain`
-            // probe against the store. Mirrors the shape of the
-            // iter-39 last-probe in the `awaitPending` timeout
-            // branch above (lines ~2112-2142): a write landing at
-            // the thin window between "marker set" and "classify
-            // as 503" should be returned as the successful chain,
-            // NOT misclassified as retryable 503 for a chain that
-            // already exists. Only when the probe STILL misses is
-            // the breaker-classified id genuinely unresolved and we
-            // surface it as retryable 503 `storage_timeout`.
+            // Hard-timed-out marker path: the post-commit persist
+            // hit the hard breaker but the raw write may still land.
+            // Classify as retryable 503 (not 404) so clients keep
+            // the chain alive; re-probe once first to catch a write
+            // that slipped in between marker-set and now.
             if (getPendingWritesFor(store).isHardTimedOut(body.previous_response_id)) {
               let lastChance: StoredResponseRecord[] | null = null;
               try {
@@ -2294,18 +1553,9 @@ export async function handleCreateResponse(
                 if (!/not found/i.test(msg)) {
                   throw err;
                 }
-                // Probe confirmed the row is still missing —
-                // genuine hard-timed-out persist. `lastChance`
-                // stays null and we emit 503 below.
                 lastChance = null;
               }
               if (lastChance !== null && lastChance.length > 0) {
-                // Iter-51: the write slipped in between marker-set
-                // and this probe. Log this so operators can still
-                // see the wedged-writer condition that triggered
-                // the slow path, even when the client got a
-                // coherent 200 via the probe. Mirror the analogous
-                // log in the `awaitPending` timeout branch above.
                 console.warn(
                   `[responses] previous_response_id "${body.previous_response_id}" missing on first lookup and ` +
                     `its post-commit persist crossed the hard-timeout breaker, but a last-probe getChain found ` +
@@ -2313,10 +1563,6 @@ export async function handleCreateResponse(
                     `just after the marker was set.`,
                 );
                 chain = lastChance;
-                // Fall through into the happy-path continuation
-                // code below (chain.length > 0 skips the empty-
-                // chain branch and the outer hot-swap guard takes
-                // over).
               } else {
                 console.warn(
                   `[responses] previous_response_id "${body.previous_response_id}" missing from store, but its ` +
@@ -2333,27 +1579,15 @@ export async function handleCreateResponse(
                 return;
               }
             } else {
-              // First call threw "not found", no pending write is
-              // tracked for this id, and no hard-timed-out marker
-              // is live. Rethrow the original error so the outer
-              // catch turns it into the proper 404 response.
+              // Genuine 404: first call missed, no pending write, no
+              // hard-timed-out marker. Rethrow so outer catch emits 404.
               throw firstAttemptError;
             }
           }
           if (chain.length === 0) {
-            // Iter-50 / iter-51: mirror the rethrow branch above.
-            // An empty chain coming back from a mock-compatible
-            // store that never threw still needs to route through
-            // the retryable-503 path when the id has a
-            // hard-timed-out marker — otherwise slow-but-eventual
-            // persists across the breaker misclassify as permanent
-            // 404 here too.
-            //
-            // Iter-51: probe getChain one last time before emitting
-            // 503. A write landing during the narrow window between
-            // marker-set and this branch should resolve to the real
-            // chain via the probe, NOT be misclassified as retryable
-            // 503 for a chain that already exists.
+            // Mirror the rethrow branch: a mock-compatible store that
+            // returned `[]` rather than throwing still needs the
+            // hard-timed-out marker retryable-503 classification.
             if (getPendingWritesFor(store).isHardTimedOut(body.previous_response_id)) {
               let lastChance: StoredResponseRecord[] | null = null;
               try {
@@ -2373,9 +1607,6 @@ export async function handleCreateResponse(
                     `just after the marker was set.`,
                 );
                 chain = lastChance;
-                // Fall through: `chain.length > 0` so the empty-
-                // chain branch below is skipped and the outer hot-
-                // swap guard / normal continuation flow takes over.
               } else {
                 console.warn(
                   `[responses] previous_response_id "${body.previous_response_id}" missing from store, but its ` +
@@ -2398,19 +1629,11 @@ export async function handleCreateResponse(
           }
         }
 
-        // Hot-swap race guard (iter-22 finding 3).
-        //
-        // Between the pre-await snapshot above and this point a
-        // concurrent `registry.register(body.model, differentModel)`
-        // can re-point the friendly name at a new object. If we
-        // kept using `initialSessionReg` / `initialInstanceId` the
-        // request would dispatch through the stale session
-        // registry, compare the stored identity against the dead
-        // instance id, and persist the new record under the old
-        // binding — even though `body.model` now resolves to a
-        // different live model. Re-read the current binding and
-        // reject the request when anything changed so the caller
-        // can retry against the new identity.
+        // Hot-swap race guard (getChain await window): re-read the
+        // binding and reject if `registry.register(body.model, …)`
+        // re-pointed the name while we awaited. The in-lock guard
+        // below covers the mutex-wait window; this one covers the
+        // getChain window.
         const refreshedSessionReg = registry.getSessionRegistry(body.model);
         const refreshedInstanceId = registry.getInstanceId(body.model);
         if (
@@ -2434,42 +1657,13 @@ export async function handleCreateResponse(
         sessionReg = refreshedSessionReg;
         currentInstanceId = refreshedInstanceId;
 
-        // Cross-model continuation guard, keyed on MODEL-INSTANCE
-        // IDENTITY, not friendly name. The stored trailing record
-        // carries a monotonic `modelInstanceId` assigned by
-        // `ModelRegistry` when the model object that serviced the
-        // original turn was first registered; we compare that id
-        // against the CURRENT instance id for `body.model`.
-        //
-        // A plain string comparison on the friendly name is not
-        // sufficient:
-        //
-        //  * `ModelRegistry.register(name, model)` explicitly supports
-        //    replacing the object bound to a name. A chain produced
-        //    by the OLD instance of `foo` would still pass a name
-        //    check after `foo` is hot-swapped to a different model,
-        //    and the continuation would silently replay through the
-        //    wrong tokenizer / chat template / KV layout.
-        //  * Conversely, two names aliasing the SAME model instance
-        //    are already safe because iter-19's per-instance
-        //    `SessionRegistry` sharing routes them through one
-        //    binding — but a name check would spuriously reject
-        //    `body.model = "beta"` against a chain stored under
-        //    `"alpha"`.
-        //
-        // Legacy-row handling (iter-29 finding 2). Stored rows that
-        // lack an explicit `modelInstanceId` are the pre-iter-21
-        // shape. The iter-27 compat code serviced them via cold
-        // replay gated on friendly-name equality, and iter-28
-        // narrowed the window further — but the iter-29 review
-        // concluded that friendly-name equality is insufficient:
-        // an operator who hot-swaps the same friendly name to a
-        // different model during the TTL window can still silently
-        // replay through the wrong tokenizer, chat template, or KV
-        // layout. Legacy rows are now rejected outright. The
-        // 30-minute TTL migration window from iter-27 has expired
-        // in any production deployment by now; any remaining legacy
-        // rows will flush naturally on TTL expiry.
+        // Cross-model continuation guard keyed on MODEL-INSTANCE
+        // IDENTITY (not friendly name): friendly-name equality would
+        // accept a chain produced by the pre-hot-swap instance and
+        // silently replay through a different tokenizer / chat
+        // template / KV layout. Aliases to the same instance are
+        // handled transparently by shared `SessionRegistry` routing.
+        // Legacy rows without `modelInstanceId` are rejected outright.
         const trailingRecord = chain[chain.length - 1]!;
         const storedIdentity = readStoredModelIdentity(trailingRecord);
         if (
@@ -2489,21 +1683,6 @@ export async function handleCreateResponse(
           );
           return;
         }
-        // Iter-28 finding 1 — malformed configJson.
-        //
-        // `readStoredModelIdentity` now distinguishes a row with a
-        // parseable-but-instance-id-less `configJson` (legacy shape,
-        // kind=absent) from a row whose `configJson` failed to
-        // JSON-parse (kind=malformed). The iter-27 compat code
-        // silently folded both into the `absent` bucket and routed
-        // them through the legacy cold-replay path — but a row whose
-        // stored config state we cannot even parse has no trustable
-        // fields at all. Any cold replay would rebuild the chain
-        // against an unreadable prior turn, so reject the request
-        // outright with a clean 400 instead of opening the legacy
-        // window on a row we cannot verify. An admin tool can purge
-        // malformed rows on its own schedule; the endpoint layer
-        // does not assume one exists.
         if (storedIdentity.kind === 'malformed') {
           sendBadRequest(
             res,
@@ -2516,14 +1695,6 @@ export async function handleCreateResponse(
           );
           return;
         }
-        // Iter-29 finding 2 — reject ALL legacy (absent-identity) rows.
-        //
-        // The iter-28 gate narrowed legacy rows to friendly-name
-        // equality, but iter-29 concluded that is still insufficient:
-        // an operator hot-swapping the same friendly name to a
-        // different model during the TTL window silently replays
-        // through the wrong model. Reject outright so the caller
-        // must start a fresh chain.
         if (storedIdentity.kind === 'absent') {
           sendBadRequest(
             res,
@@ -2538,54 +1709,23 @@ export async function handleCreateResponse(
         }
         priorMessages = reconstructMessagesFromChain(chain);
         previousResponseId = body.previous_response_id;
-        // Iter-55: precompute the EARLIEST wall-clock expiry across
-        // the resolved chain as a scalar (epoch-ms). We fold the
-        // minimum over `link.expiresAt` here — the chain array is
-        // the authoritative one the request will dispatch against.
-        // By the time the hard-timeout breaker fires, any concurrent
-        // store mutation is irrelevant because
-        // `ResponseStore.getChain()` evaluates row expiries against
-        // its own wall-clock at read time, not at store time.
-        //
-        // Iter-55 capture-scope fix: the full `chain` is NOT
-        // retained on outer scope — only the scalar — so the
-        // background hard-timeout closure below no longer holds a
-        // reference to every ancestor record's stored JSON payload.
-        // `link.expiresAt` is epoch-seconds (see
-        // `buildResponseRecord`), so the scalar must be multiplied
-        // by 1000. `Number.isFinite(...)` guards legacy rows whose
-        // `expiresAt` column is missing or malformed — those rows
-        // are skipped entirely (they do not contribute a finite
-        // bound, and an all-missing chain leaves the scalar as
-        // `undefined`, matching the pre-iter-55 record-only cap
-        // behaviour at the call site).
+        // Fold chain expiries (epoch-seconds → ms) into a single
+        // scalar. The full chain is NOT retained on outer scope, so
+        // the hard-timeout closure below does not capture ancestor
+        // JSON payloads. Rows with missing/malformed `expiresAt` are
+        // skipped; all-missing chains leave the scalar `undefined`.
         const chainExpirySeconds =
           chain.length > 0
             ? Math.min(...chain.map((r) => r.expiresAt).filter((v): v is number => v != null && Number.isFinite(v)))
             : Number.POSITIVE_INFINITY;
         chainEarliestExpiresAtMs = Number.isFinite(chainExpirySeconds) ? chainExpirySeconds * 1000 : undefined;
-        // Inherit the trailing stored record's `instructions` when
-        // the continuation request does NOT override it. Finding 4:
-        // the iter-25 cold-replay path dropped stored instructions
-        // entirely — the caller who originally sent the first turn
-        // with `instructions: "You are a pirate"` would see the
-        // pirate persona disappear on any cold-replay continuation
-        // (TTL expiry, process restart, lease-on-hit miss), because
-        // `reconstructMessagesFromChain()` only walked inputJson /
-        // outputJson and the endpoint re-read `body.instructions`
-        // from the fresh request. An `undefined` body.instructions
-        // means "keep the existing system context", not "forget it".
-        //
-        // The trailing record carries the effective instructions
-        // that were in force for that turn (either the caller's
-        // original value or a previously inherited one), so reading
-        // from it gives us the full prefix state without walking the
-        // whole chain. We apply the inheritance only when
-        // `body.instructions` is absent — any explicit value (even
-        // an empty string) means the caller is deliberately
-        // overriding the prefix state, and we surface that change to
-        // the `SessionRegistry` cache key below so a hot hit under
-        // the stale system context forces a cold replay.
+        // Inherit the trailing record's `instructions` when the
+        // request omits `body.instructions` (empty string still counts
+        // as explicit override). The trailing record carries the
+        // effective instructions in force for that turn, so no
+        // full-chain walk is required. The effective value is also
+        // threaded into the `SessionRegistry` cache key so a hot hit
+        // under stale system context forces a cold replay.
         if (typeof body.instructions !== 'string') {
           const storedInstructions = chain[chain.length - 1]!.instructions;
           if (typeof storedInstructions === 'string' && storedInstructions.length > 0) {
@@ -2606,28 +1746,12 @@ export async function handleCreateResponse(
       return;
     }
 
-    // Echoed `function_call` items on a `previous_response_id` continuation
-    // are validated for ownership (call_id must belong to the stored
-    // trailing assistant turn) and then stripped unconditionally.
-    //
-    // Motivation: the common "round-trip `response.output` into the next
-    // `input`" shape sends the prior assistant's `function_call` items
-    // back alongside the new `function_call_output` results, which is a
-    // legitimate client pattern. But `mapRequest` rebuilds each echoed
-    // item into a synthetic assistant message at the tail of the
-    // augmented `messages` list, which would both duplicate stored state
-    // and (crucially) let a forged echo rewrite the trailing assistant
-    // turn — poisoning `primeHistory()` and bypassing the multi-tool gate
-    // below. Since `priorMessages` is the authoritative copy, the
-    // correct response is to verify ownership by `call_id`, then drop
-    // the echo so the stored view is used downstream.
-    //
-    // Name/arguments are NOT compared against stored — a client that
-    // parses and reserializes its own prior arguments (different JSON
-    // whitespace, key order, number formatting) would otherwise fail
-    // continuation even though the server never consumes the echoed
-    // payload. Any `call_id` absent from the stored index is still
-    // rejected as an unambiguous forgery attempt.
+    // Echoed `function_call` items on a continuation are validated
+    // for ownership (call_id in stored trailing assistant turn) then
+    // stripped. `mapRequest` would otherwise rebuild each echo into a
+    // synthetic assistant message at the tail of `messages`, letting
+    // a forged echo rewrite the trailing assistant turn and bypass
+    // the fan-out gate. `priorMessages` is the authoritative copy.
     let effectiveInput = body.input;
     if (previousResponseId && priorMessages && Array.isArray(body.input)) {
       const storedCallIds = buildTrailingAssistantToolCallIds(priorMessages);
@@ -2647,8 +1771,8 @@ export async function handleCreateResponse(
             );
             return;
           }
-          // Stored state is authoritative — drop the echo regardless of
-          // whether the client's `name`/`arguments` match byte-for-byte.
+          // Stored state is authoritative — drop the echo regardless
+          // of whether `name`/`arguments` match byte-for-byte.
           continue;
         }
         filtered.push(item);
@@ -2656,25 +1780,14 @@ export async function handleCreateResponse(
       effectiveInput = filtered;
     }
 
-    // Compute the effective instructions for this turn. The caller's
-    // explicit `body.instructions` wins; otherwise we inherit the
-    // trailing stored record's value (Finding 4). The effective
-    // value is then used for mapping (prepends the system message
-    // via `mapRequest`'s existing logic), for the session-registry
-    // cache key (so a hot hit under the stale prefix still matches),
-    // for `buildResponseObject` (so the new response roundtrips the
-    // prefix), and for persistence (so the next cold replay can
-    // re-inherit).
-    //
-    // We fold the inherited value into a fresh mapped body rather
-    // than mutating `body` so the mutation cannot leak to any other
-    // code path that still holds the original reference.
+    // Effective instructions = caller's explicit `body.instructions`
+    // or the trailing record's inherited value. Threaded through
+    // `mapRequest` (prepends system msg), the registry cache key,
+    // `buildResponseObject`, and persistence. Applied via a fresh
+    // mapped body rather than mutating `body`.
     const effectiveInstructions: string | null =
       typeof body.instructions === 'string' ? body.instructions : inheritedInstructions;
 
-    // Map request — full messages include prior + new input.
-    // Feed mapRequest the echo-stripped input so no forged function_call
-    // item can sneak through into the augmented trailing assistant turn.
     let messages: ChatMessage[];
     let config: ChatConfig;
     const mappedBody: ResponsesAPIRequest =
@@ -2692,38 +1805,19 @@ export async function handleCreateResponse(
       return;
     }
 
-    // Compute the new-only messages (what this request added, excluding prior history
-    // and instructions). Instructions are stored separately and should not be persisted
-    // as input messages — otherwise chained calls replay stale system messages.
-    //
-    // Use `mappedBody.instructions` (not `body.instructions`) so an
-    // inherited system message also contributes one offset — the
-    // reconstruction path prepended it via `mapRequest` above.
-    // Mirror `mapRequest`'s truthy check (an empty-string override
-    // does NOT push a system message and therefore contributes
-    // zero offset, matching the mapper's behavior byte-for-byte).
+    // New-only messages (what this request added). Instructions are
+    // stored separately — persisting them as input messages would
+    // replay stale system messages on cold chain. Mirror `mapRequest`'s
+    // truthy check (empty string contributes zero offset).
     const instructionsOffset = mappedBody.instructions ? 1 : 0;
     const priorOffset = instructionsOffset + (priorMessages?.length ?? 0);
     let newInputMessages = messages.slice(priorOffset);
 
-    // Client-shape validation: every tool message in the continuation delta
-    // must carry a non-empty `tool_call_id`. Catching this up front gives a
-    // clean 400 instead of letting `runSession*()` throw and be mapped to a
-    // generic 500, but the real reason is correctness: the multi-tool-call
-    // fan-out gate below authenticates submitted tool outputs against the
-    // stored outstanding call-id set, and `submittedIds` / the set gate
-    // silently ignores any tool message whose id is missing or empty. A
-    // malicious client can otherwise submit `[tool(call_a), tool(call_b),
-    // tool(/* anonymous */)]` against an outstanding pair `{call_a, call_b}`
-    // — the id-set check would pass because both expected ids are present,
-    // canonicalizeToolMessageOrder would also ignore the anonymous entry,
-    // and the extra tool turn would slip through into native dispatch /
-    // cold replay / persistence. Several native session backends identify
-    // tool responses positionally or drop the id on the wire, so the extra
-    // turn reopens tool-response injection despite the id-set gate. Reject
-    // every anonymous tool message here so the gate can safely assume
-    // every `role === 'tool'` item in `newInputMessages` carries a
-    // well-formed id.
+    // Every tool message in the continuation delta must carry a
+    // non-empty `tool_call_id`. Correctness-critical: the id-set gate
+    // below silently ignores anonymous tool messages, and native
+    // backends that pair results positionally would bind the
+    // anonymous entry to the wrong call.
     for (const m of newInputMessages) {
       if (m.role === 'tool' && (typeof m.toolCallId !== 'string' || m.toolCallId.length === 0)) {
         sendBadRequest(res, 'tool message missing tool_call_id', 'input');
@@ -2731,62 +1825,24 @@ export async function handleCreateResponse(
       }
     }
 
-    // Extract the EFFECTIVE `instructions` (caller-supplied OR
-    // inherited from the trailing stored record; see the block at
-    // `effectiveInstructions` above). The session registry uses this
-    // as its prefix/system state cache key — a hot hit against a
-    // session warmed with different instructions would silently keep
-    // using the stale system context, so we pass the effective value
-    // to `getOrCreate` and let the registry force a cold replay on
-    // mismatch. Inheriting the stored value on a continuation means a
-    // cold replay and a warm hit both converge on the SAME prefix
-    // state as the original turn, matching what the caller expects
-    // when they omit `instructions` on a follow-up request.
+    // `SessionRegistry` cache key — passing the effective value lets
+    // the registry force a cold replay on instructions mismatch.
     const requestedInstructions: string | null = effectiveInstructions;
 
-    // Per-model execution mutex. Every dispatch through this endpoint
-    // serializes with every dispatch through `/v1/messages` for the
-    // same model binding. The native model is a single mutable
-    // resource — one `cached_token_history` / one `caches` vector per
-    // `SessionCapableModel` instance — so two concurrent `primeHistory`
-    // / `send*` calls would clobber each other's KV state even though
-    // `getOrCreate` hands out distinct `ChatSession` wrappers. The
-    // mutex restores correctness by making the entire
-    // `getOrCreate → dispatch → adopt/drop` span exclusive for this
-    // model, and the `finally` inside `withExclusive` releases the
-    // lock on both success and failure so a rejected dispatch cannot
-    // leave the next waiter stuck.
-    //
-    // Validation inside the exclusive block runs synchronously before
-    // any native work begins, so a 400 early return under the lock
-    // releases it immediately for the next waiter — the fan-out
-    // gate's `return` statements exit the closure without calling
-    // any native decode entry points.
-    // Snapshot the pre-lock binding state. For stateless requests these
-    // are `initialSessionReg` / `initialInstanceId` (never updated). For
-    // `previous_response_id` continuations they were refreshed by the
-    // iter-22 re-read that fires after `store.getChain()`. The in-lock
-    // re-check compares against THIS snapshot so the guard catches a
-    // hot-swap that lands strictly between the pre-lock read and the
-    // moment this waiter wins the mutex.
+    // The native model is a single mutable resource (one
+    // `cached_token_history`, one `caches` vector) so every dispatch
+    // through `/v1/responses` and `/v1/messages` for the same binding
+    // serializes through `sessionReg.withExclusive`. The mutex spans
+    // `getOrCreate → dispatch → adopt/drop`.
     const preLockSessionReg = sessionReg;
     const preLockInstanceId = currentInstanceId;
 
-    // Iter-35 finding 1: arm the AbortController wired at function
-    // scope above. The streaming wrappers in `@mlx-node/lm` plumb
-    // this signal into `_runChatStream`, which calls
-    // `handle.cancel()` on the native ChatStreamHandle AND pushes a
-    // synthetic abort marker into the queue so the
-    // `await waitForItem()` blocking on the NEXT native chunk
-    // unblocks immediately. Without the signal a client that dropped
-    // mid-eval would still keep this handler (and the per-model
-    // mutex) pinned until the next token arrived from native decode
-    // — on a long eval that can be hundreds of milliseconds, during
-    // which no other request on the same model makes any forward
-    // progress. Listeners are attached HERE (not at function
-    // entry) so early-return validation gates above do not need to
-    // pair an install with a detach — the outer `finally` detaches
-    // unconditionally, gated on `abortListenersAttached`.
+    // Arm the abort listeners. `@mlx-node/lm`'s streaming wrappers
+    // plumb the signal into `_runChatStream`, which calls
+    // `handle.cancel()` on the native stream handle AND pushes a
+    // synthetic marker to unblock the next `waitForItem()`. Attached
+    // here (not at function entry) so early-return validation gates
+    // above don't need paired detach calls.
     res.once('close', onAbortClose);
     res.once('error', onAbortError);
     if (abortSocket != null) {
@@ -2799,7 +1855,7 @@ export async function handleCreateResponse(
     abortListenersAttached = true;
     const streamSignal: AbortSignal = abortController.signal;
 
-    // Iter-36 finding 1: persistence is a two-step dance.
+    // Persistence is a two-step dance.
     //
     //   (1) INSIDE the per-model mutex (on the happy path only):
     //       synchronously kick off `store.store(record)` via
@@ -2817,41 +1873,33 @@ export async function handleCreateResponse(
     // between mutex release and SQLite land observes the pending
     // write through the tracker (see the `getChain`-empty retry at
     // the top of this handler) and awaits it before falling
-    // through to the 404 epilogue. That closes the iter-35 race
-    // where a fresh response id on the wire could transiently
-    // 404 under `getChain`.
+    // through to the 404 epilogue. This closes the race where a
+    // fresh response id on the wire could transiently 404 under
+    // `getChain`.
     //
     // `pendingPersistOuter` is the in-flight promise captured
     // inside the lock; the out-of-lock awaiter just catches errors
     // and logs them. `persistMode` is populated alongside so the
-    // log line keeps the streaming / non-streaming discrimination
-    // the iter-35 code had.
+    // log line keeps the streaming / non-streaming discrimination.
     let pendingPersistOuter: Promise<void> | null = null;
     let persistMode: 'streaming' | 'non-streaming' | null = null;
-    // Iter-43: structural scaffolding for the binding retain paired
-    // with the in-flight persist. The persist's `.finally(...)`
-    // still calls this closure on settlement to balance the
-    // iter-40 `retainBinding` — the closure's idempotency flag
-    // matters only to that one call site today.
+    // Structural scaffolding for the binding retain paired with the
+    // in-flight persist. The persist's `.finally(...)` calls this
+    // closure on settlement to balance the `retainBinding` taken at
+    // dispatch time — the closure's idempotency flag matters only
+    // to that one call site today.
     //
-    // The box shape is retained from iter-42 deliberately even
-    // though the post-commit timeout arm no longer invokes it:
-    //   - Iter-42 introduced a force-release in the timeout arm
-    //     to prevent a wedged `store.store(...)` from pinning
-    //     `pendingPersists` forever. That force-release was
-    //     reverted in iter-43 (see the timeout arm below) because
-    //     it reopened iter-40: a slow-but-eventual persist could
-    //     still land after timeout, and releasing the retain
-    //     before the write actually settled let an intervening
-    //     same-object `unregister()` + `register()` finalise the
-    //     old binding and mint a fresh instance id, so the late
-    //     write recorded a stale id and broke the next
-    //     `previous_response_id` continuation.
-    //   - The scaffolding stays so a future iteration can
-    //     reintroduce a surgical "split teardown" (e.g. release
-    //     heavy resources on timeout while keeping identity
-    //     pinned until settlement) without rewiring the retain
-    //     wrappers in both dispatch branches.
+    // The box shape is kept deliberately so a future iteration can
+    // reintroduce a surgical "split teardown" (e.g. release heavy
+    // resources on timeout while keeping identity pinned until
+    // settlement) without rewiring the retain wrappers in both
+    // dispatch branches. Do NOT force-release on post-commit
+    // timeout: a slow-but-eventual persist can still land after
+    // the timer fires, and releasing the retain before the write
+    // settles lets an intervening same-object `unregister()` +
+    // `register()` finalise the old binding and mint a fresh
+    // instance id, causing the late write to record a stale id and
+    // break the next `previous_response_id` continuation.
     //
     // Held in a box because TypeScript's control-flow analysis
     // otherwise narrows the in-closure assignment to `never`
@@ -2859,13 +1907,12 @@ export async function handleCreateResponse(
     const persistRetainBox: { release: (() => void) | null } = { release: null };
     // `failureMode` carries the streaming failure-epilogue reason
     // from `handleStreamingNative` out to the outer adopt gate.
-    // Iter-36 finding 2: a final-chunk commit followed by a
-    // post-terminal `res.close` takes the `client_abort` branch
-    // and flushes `response.failed` successfully, which would
-    // otherwise flip `safeToSuppress = true` and let the adopt
-    // gate cache a session under a response id the client will
-    // never chain off of. The gate now refuses to adopt when
-    // `failureMode === 'client_abort'` regardless of how
+    // A final-chunk commit followed by a post-terminal `res.close`
+    // takes the `client_abort` branch and flushes `response.failed`
+    // successfully, which would otherwise flip `safeToSuppress =
+    // true` and let the adopt gate cache a session under a response
+    // id the client will never chain off of. The gate refuses to
+    // adopt when `failureMode === 'client_abort'` regardless of how
     // `committed` / `safeToSuppress` landed.
     let streamFailureMode: StreamingHandlerOutcome['failureMode'] = null;
 
@@ -2880,15 +1927,15 @@ export async function handleCreateResponse(
       // the closure would still lease a session out of the already-
       // captured `preLockSessionReg`, adopt under the dead
       // `preLockInstanceId`, and persist the new chain under a binding
-      // that `body.model` no longer resolves to. The iter-22 pre-lock
+      // that `body.model` no longer resolves to. The pre-lock
       // re-read only covered the `store.getChain()` await window; the
       // mutex-wait window is strictly later and equally unsafe.
       //
       // Compare the live binding to the pre-lock snapshot (captured
-      // just before entering the mutex — already iter-22-refreshed on
-      // the continuation path, identical to the handler-top snapshot
+      // just before entering the mutex — already refreshed on the
+      // continuation path, identical to the handler-top snapshot
       // on the stateless path). Any drift — nullable or value — is
-      // fatal and rejected with the same 400 envelope the iter-22
+      // fatal and rejected with the same 400 envelope the pre-lock
       // guard uses, so clients see a consistent "binding changed"
       // error regardless of which await window caught the race.
       const lockedSessionReg = registry.getSessionRegistry(body.model);
@@ -3149,7 +2196,8 @@ export async function handleCreateResponse(
         // Pass `mappedBody` (not the raw `body`) so the response
         // object and the persisted record carry the EFFECTIVE
         // instructions, including any value inherited from the
-        // trailing stored record via Finding 4. Using `body` here
+        // trailing stored record via instruction inheritance.
+        // Using `body` here
         // would re-drop the inherited value on the wire — the
         // client's response would report `instructions: null` even
         // though the turn was run against the inherited system
@@ -3163,31 +2211,27 @@ export async function handleCreateResponse(
         // comes from non-persistence failures (response construction,
         // SSE write, res.writeHead/end crash).
         //
-        // Iter-32 finding 1 & 2 / iter-33 adversarial review:
+        // `res.headersSent` is NOT a reliable proxy for "the client
+        // received the response": Node's `writeHead` flips
+        // `headersSent = true` synchronously before any body bytes
+        // leave the buffer, and the sync return of `res.end()` /
+        // `writeSSEEvent` only proves the bytes were queued — an
+        // async socket failure after the queue could still leave
+        // the client with no terminal. Picking JSON-vs-SSE fallback
+        // from `res.headersSent` is also unsafe because a
+        // `writeHead(200, 'application/json')` → `res.end()` crash
+        // would otherwise emit SSE frames into a JSON-declared
+        // response.
         //
-        //   * The "safe to suppress" gate used to key on
-        //     `res.headersSent`, which is a LIE for "the client
-        //     received the response". Node's `writeHead` flips
-        //     `headersSent = true` synchronously before any body
-        //     bytes leave the buffer, and the sync return of
-        //     `res.end()` / `writeSSEEvent` only proves the bytes
-        //     were queued — an async socket failure after the queue
-        //     could still leave the client with no terminal.
-        //   * The outer catch used to pick "JSON vs SSE fallback"
-        //     from `res.headersSent`, so a `writeHead(200,
-        //     'application/json')` → `res.end()` crash would emit
-        //     SSE frames into a JSON-declared response.
-        //
-        // The fix threads a `TransportVisibility` record that
-        // tracks both the wire format the handler committed to
-        // (`responseMode`) AND whether the client observed a
-        // terminal artefact (`responseBodyWritten` /
-        // `terminalEmitted`). Both flags are flipped only from the
-        // kernel-ack callback of the underlying `res.end` /
-        // `res.write` — synchronous return is NOT treated as proof
-        // of visibility. The outer catch branches on
-        // `responseMode` to choose the clean-up shape (JSON error,
-        // SSE `error` frame, or socket destroy).
+        // The `TransportVisibility` record instead tracks both the
+        // wire format the handler committed to (`responseMode`)
+        // AND whether the client observed a terminal artefact
+        // (`responseBodyWritten` / `terminalEmitted`). Both flags
+        // are flipped only from the kernel-ack callback of the
+        // underlying `res.end` / `res.write` — synchronous return
+        // is NOT treated as proof of visibility. The outer catch
+        // branches on `responseMode` to choose the clean-up shape
+        // (JSON error, SSE `error` frame, or socket destroy).
         let handlerError: Error | null = null;
 
         if (mappedBody.stream) {
@@ -3206,10 +2250,10 @@ export async function handleCreateResponse(
             );
             streamFailureMode = handlerOutcome.failureMode;
             if (handlerOutcome.terminalToPersist != null && store && body.store !== false) {
-              // Iter-36 finding 1: initiate the write SYNCHRONOUSLY
-              // inside the mutex so the pending-write tracker
-              // observes it before the mutex releases. The promise
-              // is awaited off-lock in the outer finally block.
+              // Initiate the write SYNCHRONOUSLY inside the mutex so
+              // the pending-write tracker observes it before the
+              // mutex releases. The promise is awaited off-lock in
+              // the outer finally block.
               const record = buildResponseRecord(
                 handlerOutcome.terminalToPersist,
                 newInputMessages,
@@ -3217,85 +2261,65 @@ export async function handleCreateResponse(
                 currentInstanceId,
                 responseRetentionSec,
               );
-              // Iter-40 finding 1: pair a `retainBinding` against
-              // the persist promise so the binding's
-              // `modelInstanceId` survives a concurrent same-model
-              // unregister + re-register that races the
-              // post-commit write. `releaseBinding` runs in the
-              // persist's `.finally(...)` regardless of outcome,
-              // so the retention counter stays balanced whether
-              // the write fulfils or rejects.
+              // Pair a `retainBinding` against the persist promise
+              // so the binding's `modelInstanceId` survives a
+              // concurrent same-model unregister + re-register that
+              // races the post-commit write. `releaseBinding` runs
+              // in the persist's `.finally(...)` regardless of
+              // outcome, so the retention counter stays balanced
+              // whether the write fulfils or rejects.
               //
-              // Iter-43: the idempotent wrapper is kept from
-              // iter-42 as structural scaffolding, but the
-              // post-commit-persist SOFT timeout arm no longer
-              // force-fires it — see the timeout handler below
-              // for the rationale (short version: force-releasing
-              // on the soft timeout reopens iter-40 for the slow-
-              // but-eventual case, which is strictly more common
-              // than the truly-wedged case iter-42 was trying to
-              // bound).
+              // Leaving the retain pinned forever on a wedged write
+              // would make the binding unreclaimable until process
+              // restart, so an INDEPENDENT hard-timeout timer is
+              // armed alongside the persist (see
+              // `getPostCommitPersistHardTimeoutMs` for the default).
+              // If the persist settles naturally the timer is
+              // cancelled via `clearTimeout` inside the same
+              // `.finally(...)` — slow-but-eventual writes are
+              // unaffected. If the persist is still wedged past the
+              // hard bound, the timer fires and force-releases the
+              // retain via the idempotent `persistRetainBox`. The
+              // hard timer is armed off the handler's await path, so
+              // the response is never delayed by it.
               //
-              // Iter-44 second-stage breaker: codex's iter-43
-              // review called out that leaving the retain pinned
-              // forever on a wedged write makes the binding
-              // unreclaimable until process restart. We arm an
-              // INDEPENDENT hard-timeout timer alongside the
-              // persist (see `getPostCommitPersistHardTimeoutMs`
-              // for the rationale on the default). If the persist
-              // settles naturally the timer is cancelled via
-              // `clearTimeout` inside the same `.finally(...)` —
-              // so slow-but-eventual writes are unaffected. If
-              // the persist is still wedged past the hard bound,
-              // the timer fires and force-releases the iter-40
-              // retain via the existing idempotent
-              // `persistRetainBox`. The hard timer is ALSO armed
-              // off the handler's await path, so the response is
-              // never delayed by it.
-              //
-              // Iter-45: before the hard timeout force-releases
-              // the retain (which unblocks binding teardown), we
-              // also call
+              // Before the hard timeout force-releases the retain
+              // (which unblocks binding teardown), it calls
               // `registry.retireInstanceIdForForceRelease(leaseModel)`
               // to tombstone the binding's current instance id on
-              // the model object. A subsequent `register()` of
-              // the SAME model object inherits that retired id
-              // rather than minting fresh — so the late-landing
-              // persist's record (stamped with the retired id)
-              // still matches the live binding and stays
-              // chainable through `previous_response_id`. Only a
-              // true hot-swap (re-register with a DIFFERENT model
-              // object) mints a fresh id, and the 400 instance-
-              // mismatch that results is the correct semantic
-              // outcome because the new model is semantically
-              // different from the one that produced the stored
-              // record. Retirement MUST happen BEFORE release so
-              // `instanceIds.get(model)` still returns the live
-              // id the record carries.
+              // the model object. A subsequent `register()` of the
+              // SAME model object inherits that retired id rather
+              // than minting fresh — so the late-landing persist's
+              // record (stamped with the retired id) still matches
+              // the live binding and stays chainable through
+              // `previous_response_id`. Only a true hot-swap
+              // (re-register with a DIFFERENT model object) mints a
+              // fresh id, and the 400 instance-mismatch that results
+              // is the correct semantic outcome because the new
+              // model is semantically different from the one that
+              // produced the stored record. Retirement MUST happen
+              // BEFORE release so `instanceIds.get(model)` still
+              // returns the live id the record carries.
               //
-              // Iter-46/48 (codex's iter-45/46/47 findings):
-              // the tombstone's lifetime is scoped to the
-              // pending persists that installed it — the
-              // `.finally(...)` calls
-              // `registry.releaseTombstone(leaseModel)` so that
-              // when the late write eventually settles
-              // (fulfills or rejects), the shared refcount
-              // drops and, once every outstanding persist has
-              // released, any subsequent re-registration
-              // correctly mints a fresh id. Without this
-              // scoping, a past hard-timeout event would
-              // permanently re-enable id inheritance across
-              // unrelated later lifecycles — reopening stale-
-              // chain replay across what should be logically
-              // dead bindings. Iter-48's refcounted single-
-              // entry layout handles OVERLAPPING hard-timeouts
-              // on the same live instance id in bounded space:
-              // every breaker targets the SAME retired id (the
-              // register-inherit path keeps using it while the
-              // tombstone is alive) so one shared refcount
-              // safely collapses every in-flight retire, and
-              // memory stays O(1) per model even under a truly
-              // wedged store that never settles.
+              // The tombstone's lifetime is scoped to the pending
+              // persists that installed it — the `.finally(...)`
+              // calls `registry.releaseTombstone(leaseModel)` so
+              // that when the late write eventually settles
+              // (fulfills or rejects), the shared refcount drops
+              // and, once every outstanding persist has released,
+              // any subsequent re-registration correctly mints a
+              // fresh id. Without this scoping, a past hard-timeout
+              // event would permanently re-enable id inheritance
+              // across unrelated later lifecycles — reopening
+              // stale-chain replay across what should be logically
+              // dead bindings. The refcounted single-entry layout
+              // handles OVERLAPPING hard-timeouts on the same live
+              // instance id in bounded space: every breaker targets
+              // the SAME retired id (the register-inherit path
+              // keeps using it while the tombstone is alive) so one
+              // shared refcount safely collapses every in-flight
+              // retire, and memory stays O(1) per model even under
+              // a truly wedged store that never settles.
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -3306,15 +2330,15 @@ export async function handleCreateResponse(
               const streamingPersistMode = 'streaming' as const;
               const streamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
               let retiredTombstone: { instanceId: number } | undefined;
-              // Iter-55: compute the scalar `absoluteExpiresAtMs`
-              // ONCE up front — the MINIMUM of the newly produced
-              // record's own row expiry and the earliest expiry
-              // across any resolved ancestor chain. This value is
-              // threaded into both the pending-write tracker at
+              // Compute the scalar `absoluteExpiresAtMs` ONCE up
+              // front — the MINIMUM of the newly produced record's
+              // own row expiry and the earliest expiry across any
+              // resolved ancestor chain. This value is threaded
+              // into both the pending-write tracker at
               // `initiatePersist()` time (so the pre-breaker
               // `awaitPending` path can short-circuit to 404 once
               // the bound is crossed) AND the hard-timeout marker
-              // at breaker-fire time (iter-53 absolute cap). The
+              // at breaker-fire time (absolute cap). The
               // hard-timeout closure captures ONLY this scalar —
               // NOT the full resolved chain — so the closure's
               // retained heap stays O(1) under sustained pending
@@ -3327,7 +2351,7 @@ export async function handleCreateResponse(
               // the record and the chain lack a finite expiry
               // (legacy rows), fall back to
               // `Number.POSITIVE_INFINITY` at the marker call site
-              // so the pre-iter-55 TTL-only bounding still holds.
+              // so TTL-only bounding still holds.
               const recordExpiresAtMs =
                 record.expiresAt != null && Number.isFinite(record.expiresAt) ? record.expiresAt * 1000 : undefined;
               const absoluteExpiresAtMs =
@@ -3341,20 +2365,19 @@ export async function handleCreateResponse(
                       console.error(
                         `[responses] post-commit persist HARD timeout (${streamingHardTimeoutMs}ms, ` +
                           `${streamingPersistMode}): underlying store.store(...) has not settled; assuming ` +
-                          `wedged backend, force-releasing the iter-40 retain so the binding can be torn ` +
+                          `wedged backend, force-releasing the binding retain so the binding can be torn ` +
                           `down. Retiring the current instance id via tombstone so a same-object ` +
                           `re-registration inherits it and a late-landing persist remains chainable; a ` +
                           `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
                           `will correctly fail with 400 instance-mismatch.`,
                       );
-                      // Iter-49/50: move the pending-write tracker
-                      // entry into the hard-timed-out marker state
-                      // for this response id. The pending entry is
-                      // dropped so a wedged store.store(...) does
-                      // not pin one promise closure + tracker
-                      // entry per hard-timed-out request (iter-49
-                      // memory bound), AND the id is added to the
-                      // `hardTimedOut` marker so a concurrent
+                      // Move the pending-write tracker entry into
+                      // the hard-timed-out marker state for this
+                      // response id. The pending entry is dropped
+                      // so a wedged store.store(...) does not pin
+                      // one promise closure + tracker entry per
+                      // hard-timed-out request, AND the id is added
+                      // to the `hardTimedOut` marker so a concurrent
                       // `previous_response_id` continuation can
                       // tell the difference between a permanent
                       // 404 and a slow-but-eventual persist that
@@ -3363,21 +2386,21 @@ export async function handleCreateResponse(
                       // falling through to `sendNotFound(...)` and
                       // returns retryable 503 `storage_timeout`
                       // instead, so clients keep retrying rather
-                      // than discarding the chain (iter-50 fix).
-                      // The marker has two cleanup paths (iter-51):
-                      // (1) fast — the underlying store promise's
-                      // `.finally(...)` inside `track()` fires when
-                      // the wedged store unwedges; (2) slow — an
-                      // independent TTL (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`,
-                      // default 300s) bounds memory at O(requestRate ×
-                      // TTL) even against a truly wedged store that
+                      // than discarding the chain. The marker has
+                      // two cleanup paths: (1) fast — the underlying
+                      // store promise's `.finally(...)` inside
+                      // `track()` fires when the wedged store
+                      // unwedges; (2) slow — an independent TTL
+                      // (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`, default
+                      // 300s) bounds memory at O(requestRate × TTL)
+                      // even against a truly wedged store that
                       // NEVER settles. Marker lifetime =
                       // min(settlement, TTL expiry).
                       //
-                      // Iter-53: pass the record's absolute row
-                      // expiry as a hard cap on the marker. The
-                      // record's `expiresAt` field is epoch-seconds
-                      // (see `buildResponseRecord` — it adds
+                      // Pass the record's absolute row expiry as a
+                      // hard cap on the marker. The record's
+                      // `expiresAt` field is epoch-seconds (see
+                      // `buildResponseRecord` — it adds
                       // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now()
                       // / 1000)`), so convert to ms for the marker
                       // map. Once the absolute bound passes,
@@ -3386,8 +2409,7 @@ export async function handleCreateResponse(
                       // wrong — the marker must flip to 404 regardless
                       // of ongoing client retries.
                       //
-                      // Iter-55 (codex's iter-54 MEDIUM finding 2):
-                      // capture ONLY the precomputed scalar
+                      // Capture ONLY the precomputed scalar
                       // `absoluteExpiresAtMs` in this closure — NOT
                       // the full resolved chain. The scalar is
                       // `min(record.expiresAt * 1000,
@@ -3395,8 +2417,8 @@ export async function handleCreateResponse(
                       // when the hard-timeout handle was armed
                       // above. `ResponseStore.getChain()` walks
                       // ancestors and aborts on the first expired
-                      // link
-                      // (`crates/mlx-db/src/response_store/reader.rs:44-59`),
+                      // link (see
+                      // `crates/mlx-db/src/response_store/reader.rs:44-59`),
                       // so clamping the marker at whichever link
                       // would disappear from `getChain()` first is
                       // the authoritative bound. Capturing only
@@ -3410,22 +2432,20 @@ export async function handleCreateResponse(
                         getHardTimedOutMarkerTtlMs(),
                         absoluteExpiresAtMs ?? Number.POSITIVE_INFINITY,
                       );
-                      // Iter-45: retire the id FIRST (binding is
-                      // still alive here — retirement reads the
-                      // live id) then drop the retain, which may
-                      // trigger the deferred teardown. Iter-46:
-                      // capture the retired id so the persist's
-                      // `.finally(...)` can release the
-                      // tombstone once the late write eventually
-                      // settles. Iter-48: the registry stores
-                      // one refcounted tombstone per model
-                      // regardless of how many hard-timeouts
-                      // overlap — each retire increments the
-                      // shared counter and each release decrements
-                      // it — so we just capture the returned
-                      // `{ instanceId }` as a presence flag and
-                      // call `releaseTombstone(leaseModel)` in
-                      // the persist's `.finally(...)`.
+                      // Retire the id FIRST (binding is still alive
+                      // here — retirement reads the live id) then
+                      // drop the retain, which may trigger the
+                      // deferred teardown. Capture the retired id so
+                      // the persist's `.finally(...)` can release
+                      // the tombstone once the late write eventually
+                      // settles. The registry stores one refcounted
+                      // tombstone per model regardless of how many
+                      // hard-timeouts overlap — each retire
+                      // increments the shared counter and each
+                      // release decrements it — so the returned
+                      // `{ instanceId }` is captured as a presence
+                      // flag and `releaseTombstone(leaseModel)` is
+                      // called in the persist's `.finally(...)`.
                       retiredTombstone = registry.retireInstanceIdForForceRelease(leaseModel);
                       persistRetainBox.release?.();
                     }, streamingHardTimeoutMs)
@@ -3434,14 +2454,13 @@ export async function handleCreateResponse(
                 if (streamingHardTimeoutHandle !== null) {
                   clearTimeout(streamingHardTimeoutHandle);
                 }
-                // Iter-46/48: if the hard-timeout breaker fired
-                // and installed a tombstone on `leaseModel`,
-                // decrement the shared refcount now that this
-                // persist has settled. Iter-48's single-entry
-                // refcount layout means overlapping breakers
-                // share one slot — releasing one balances one
-                // retire, and the entry survives until the last
-                // outstanding persist releases.
+                // If the hard-timeout breaker fired and installed a
+                // tombstone on `leaseModel`, decrement the shared
+                // refcount now that this persist has settled. The
+                // single-entry refcount layout means overlapping
+                // breakers share one slot — releasing one balances
+                // one retire, and the entry survives until the
+                // last outstanding persist releases.
                 if (retiredTombstone !== undefined) {
                   registry.releaseTombstone(leaseModel);
                 }
@@ -3454,13 +2473,12 @@ export async function handleCreateResponse(
           }
           committed = streamingWasCommitted();
         } else {
-          // Iter-35 finding 2 (part a): the non-streaming native
-          // path has NO AbortSignal surface (plain
-          // `chatSession*` returns a Promise, no cancel), so a
-          // client that disconnects mid-generation still burns
-          // the full decode budget under this mutex. TODO(iter35):
-          // native cancellation for `chatSession*` — until then
-          // the best we can do is the disconnect-aware skip inside
+          // The non-streaming native path has NO AbortSignal surface
+          // (plain `chatSession*` returns a Promise, no cancel), so a
+          // client that disconnects mid-generation still burns the
+          // full decode budget under this mutex. TODO: native
+          // cancellation for `chatSession*` — until then the best we
+          // can do is the disconnect-aware skip inside
           // `handleNonStreaming` (short-circuits `endJson` and
           // signals the outer persist gate) plus this documented
           // limitation.
@@ -3475,13 +2493,13 @@ export async function handleCreateResponse(
               visibility,
             );
             if (store && body.store !== false) {
-              // Iter-36 finding 1: same in-lock-initiate /
-              // off-lock-await split as the streaming branch. The
-              // non-streaming handler only returns when the JSON
-              // body's `res.end()` callback has fired, so reaching
-              // this point means the client observed the turn —
-              // the pending-write tracker protects a back-to-back
-              // continuation from a transient 404.
+              // Same in-lock-initiate / off-lock-await split as the
+              // streaming branch. The non-streaming handler only
+              // returns when the JSON body's `res.end()` callback
+              // has fired, so reaching this point means the client
+              // observed the turn — the pending-write tracker
+              // protects a back-to-back continuation from a
+              // transient 404.
               const record = buildResponseRecord(
                 handlerOutcome.response,
                 newInputMessages,
@@ -3489,67 +2507,56 @@ export async function handleCreateResponse(
                 currentInstanceId,
                 responseRetentionSec,
               );
-              // Iter-40 finding 1: see the streaming branch for
-              // the retain/release rationale — a same-model
-              // unregister + re-register during the slow persist
-              // must not mint a fresh `modelInstanceId` that
-              // invalidates the row this write is about to land.
+              // See the streaming branch for the retain/release
+              // rationale — a same-model unregister + re-register
+              // during the slow persist must not mint a fresh
+              // `modelInstanceId` that invalidates the row this
+              // write is about to land. The idempotent-release
+              // scaffolding is a structural hook for a future split
+              // teardown; the post-commit SOFT timeout arm does not
+              // force-fire it.
               //
-              // Iter-43: see the streaming branch — the
-              // idempotent-release scaffolding is retained from
-              // iter-42 as a structural hook for a future split
-              // teardown, but the post-commit SOFT timeout arm no
-              // longer force-fires it.
-              //
-              // Iter-44 second-stage breaker: see the streaming
-              // branch for the full rationale — a wedged persist
-              // would otherwise leak the iter-40 retain for the
-              // lifetime of the process. The hard-timeout timer
-              // is armed here in the same shape, cancelled from
-              // the persist's own `.finally(...)` when the write
-              // settles naturally, and fires a force-release
-              // through the idempotent `persistRetainBox`
-              // otherwise. Default 60s, override via
+              // A wedged persist would otherwise leak the binding
+              // retain for the lifetime of the process, so the
+              // hard-timeout timer is armed here in the same shape
+              // as the streaming branch, cancelled from the
+              // persist's own `.finally(...)` when the write settles
+              // naturally, and fires a force-release through the
+              // idempotent `persistRetainBox` otherwise. Default
+              // 60s, override via
               // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`, `'0'`
               // disables. Empty string is treated as unset (falls
-              // back to the 60000ms default) so a config-
-              // templating typo cannot silently disable the
-              // breaker.
+              // back to the 60000ms default) so a config-templating
+              // typo cannot silently disable the breaker.
               //
-              // Iter-45: the force-release path also calls
+              // The force-release path also calls
               // `registry.retireInstanceIdForForceRelease(leaseModel)`
               // BEFORE releasing the retain so a same-object
-              // re-registration AFTER teardown inherits the
-              // retired instance id from the tombstone — a late-
-              // landing persist against the retired id stays
-              // chainable. A hot-swap to a DIFFERENT model object
-              // mints fresh id and the 400 instance-mismatch is
-              // correct. See the streaming branch for the full
-              // rationale.
+              // re-registration AFTER teardown inherits the retired
+              // instance id from the tombstone — a late-landing
+              // persist against the retired id stays chainable. A
+              // hot-swap to a DIFFERENT model object mints a fresh
+              // id and the 400 instance-mismatch is correct.
               //
-              // Iter-46/48 (codex's iter-45/46/47 findings):
-              // the tombstone's lifetime is scoped to the
-              // pending persists that installed it — the
-              // `.finally(...)` calls
-              // `registry.releaseTombstone(leaseModel)` so that
-              // when the late write eventually settles
-              // (fulfills or rejects), the shared refcount
-              // drops and, once every outstanding persist has
-              // released, any subsequent re-registration
-              // correctly mints a fresh id. Without this
-              // scoping, a past hard-timeout event would
+              // The tombstone's lifetime is scoped to the pending
+              // persists that installed it — the `.finally(...)`
+              // calls `registry.releaseTombstone(leaseModel)` so
+              // that when the late write eventually settles, the
+              // shared refcount drops and, once every outstanding
+              // persist has released, any subsequent
+              // re-registration correctly mints a fresh id. Without
+              // this scoping, a past hard-timeout event would
               // permanently re-enable id inheritance across
-              // unrelated later lifecycles — reopening stale-
-              // chain replay across what should be logically
-              // dead bindings. Iter-48's refcounted single-
-              // entry layout handles OVERLAPPING hard-timeouts
-              // on the same live instance id in bounded space:
-              // every breaker targets the SAME retired id (the
-              // register-inherit path keeps using it while the
-              // tombstone is alive) so one shared refcount
-              // safely collapses every in-flight retire, and
-              // memory stays O(1) per model even under a truly
-              // wedged store that never settles.
+              // unrelated later lifecycles — reopening stale-chain
+              // replay across what should be logically dead
+              // bindings. The refcounted single-entry layout
+              // handles OVERLAPPING hard-timeouts on the same live
+              // instance id in bounded space: every breaker targets
+              // the SAME retired id (the register-inherit path
+              // keeps using it while the tombstone is alive) so one
+              // shared refcount safely collapses every in-flight
+              // retire, and memory stays O(1) per model even under
+              // a truly wedged store that never settles.
               registry.retainBinding(leaseModel);
               let persistRetainReleased = false;
               persistRetainBox.release = () => {
@@ -3560,8 +2567,8 @@ export async function handleCreateResponse(
               const nonStreamingPersistMode = 'non-streaming' as const;
               const nonStreamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
               let retiredTombstone: { instanceId: number } | undefined;
-              // Iter-55: see the matching streaming-path comment
-              // above — precompute the scalar `absoluteExpiresAtMs`
+              // See the matching streaming-path comment above —
+              // precompute the scalar `absoluteExpiresAtMs`
               // (`min(record.expiresAt * 1000,
               // chainEarliestExpiresAtMs)`) ONCE, thread it into
               // the tracker at `initiatePersist()` time, and capture
@@ -3579,20 +2586,19 @@ export async function handleCreateResponse(
                       console.error(
                         `[responses] post-commit persist HARD timeout (${nonStreamingHardTimeoutMs}ms, ` +
                           `${nonStreamingPersistMode}): underlying store.store(...) has not settled; ` +
-                          `assuming wedged backend, force-releasing the iter-40 retain so the binding can ` +
+                          `assuming wedged backend, force-releasing the binding retain so the binding can ` +
                           `be torn down. Retiring the current instance id via tombstone so a same-object ` +
                           `re-registration inherits it and a late-landing persist remains chainable; a ` +
                           `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
                           `will correctly fail with 400 instance-mismatch.`,
                       );
-                      // Iter-49/50: move the pending-write tracker
-                      // entry into the hard-timed-out marker state
-                      // for this response id. The pending entry is
-                      // dropped so a wedged store.store(...) does
-                      // not pin one promise closure + tracker
-                      // entry per hard-timed-out request (iter-49
-                      // memory bound), AND the id is added to the
-                      // `hardTimedOut` marker so a concurrent
+                      // Move the pending-write tracker entry into
+                      // the hard-timed-out marker state for this
+                      // response id. The pending entry is dropped
+                      // so a wedged store.store(...) does not pin
+                      // one promise closure + tracker entry per
+                      // hard-timed-out request, AND the id is added
+                      // to the `hardTimedOut` marker so a concurrent
                       // `previous_response_id` continuation can
                       // tell the difference between a permanent
                       // 404 and a slow-but-eventual persist that
@@ -3601,21 +2607,21 @@ export async function handleCreateResponse(
                       // falling through to `sendNotFound(...)` and
                       // returns retryable 503 `storage_timeout`
                       // instead, so clients keep retrying rather
-                      // than discarding the chain (iter-50 fix).
-                      // The marker has two cleanup paths (iter-51):
-                      // (1) fast — the underlying store promise's
-                      // `.finally(...)` inside `track()` fires when
-                      // the wedged store unwedges; (2) slow — an
-                      // independent TTL (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`,
-                      // default 300s) bounds memory at O(requestRate ×
-                      // TTL) even against a truly wedged store that
-                      // NEVER settles. Marker lifetime =
-                      // min(settlement, TTL expiry).
+                      // than discarding the chain. The marker has
+                      // two cleanup paths: (1) fast — the
+                      // underlying store promise's `.finally(...)`
+                      // inside `track()` fires when the wedged
+                      // store unwedges; (2) slow — an independent
+                      // TTL (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`,
+                      // default 300s) bounds memory at
+                      // O(requestRate × TTL) even against a truly
+                      // wedged store that NEVER settles. Marker
+                      // lifetime = min(settlement, TTL expiry).
                       //
-                      // Iter-53: pass the record's absolute row
-                      // expiry as a hard cap on the marker. The
-                      // record's `expiresAt` field is epoch-seconds
-                      // (see `buildResponseRecord` — it adds
+                      // Pass the record's absolute row expiry as a
+                      // hard cap on the marker. The record's
+                      // `expiresAt` field is epoch-seconds (see
+                      // `buildResponseRecord` — it adds
                       // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now()
                       // / 1000)`), so convert to ms for the marker
                       // map. Once the absolute bound passes,
@@ -3624,8 +2630,7 @@ export async function handleCreateResponse(
                       // wrong — the marker must flip to 404 regardless
                       // of ongoing client retries.
                       //
-                      // Iter-55 (codex's iter-54 MEDIUM finding 2):
-                      // capture ONLY the precomputed scalar
+                      // Capture ONLY the precomputed scalar
                       // `absoluteExpiresAtMs` in this closure — see
                       // the matching streaming-path comment for the
                       // full rationale. The scalar was computed
@@ -3636,22 +2641,20 @@ export async function handleCreateResponse(
                         getHardTimedOutMarkerTtlMs(),
                         absoluteExpiresAtMs ?? Number.POSITIVE_INFINITY,
                       );
-                      // Iter-45: retire the id FIRST (binding is
-                      // still alive here — retirement reads the
-                      // live id) then drop the retain, which may
-                      // trigger the deferred teardown. Iter-46:
-                      // capture the retired id so the persist's
-                      // `.finally(...)` can release the
-                      // tombstone once the late write eventually
-                      // settles. Iter-48: the registry stores
-                      // one refcounted tombstone per model
-                      // regardless of how many hard-timeouts
-                      // overlap — each retire increments the
-                      // shared counter and each release decrements
-                      // it — so we just capture the returned
-                      // `{ instanceId }` as a presence flag and
-                      // call `releaseTombstone(leaseModel)` in
-                      // the persist's `.finally(...)`.
+                      // Retire the id FIRST (binding is still alive
+                      // here — retirement reads the live id) then
+                      // drop the retain, which may trigger the
+                      // deferred teardown. Capture the retired id so
+                      // the persist's `.finally(...)` can release
+                      // the tombstone once the late write eventually
+                      // settles. The registry stores one refcounted
+                      // tombstone per model regardless of how many
+                      // hard-timeouts overlap — each retire
+                      // increments the shared counter and each
+                      // release decrements it — so the returned
+                      // `{ instanceId }` is captured as a presence
+                      // flag and `releaseTombstone(leaseModel)` is
+                      // called in the persist's `.finally(...)`.
                       retiredTombstone = registry.retireInstanceIdForForceRelease(leaseModel);
                       persistRetainBox.release?.();
                     }, nonStreamingHardTimeoutMs)
@@ -3660,14 +2663,13 @@ export async function handleCreateResponse(
                 if (nonStreamingHardTimeoutHandle !== null) {
                   clearTimeout(nonStreamingHardTimeoutHandle);
                 }
-                // Iter-46/48: if the hard-timeout breaker fired
-                // and installed a tombstone on `leaseModel`,
-                // decrement the shared refcount now that this
-                // persist has settled. Iter-48's single-entry
-                // refcount layout means overlapping breakers
-                // share one slot — releasing one balances one
-                // retire, and the entry survives until the last
-                // outstanding persist releases.
+                // If the hard-timeout breaker fired and installed a
+                // tombstone on `leaseModel`, decrement the shared
+                // refcount now that this persist has settled. The
+                // single-entry refcount layout means overlapping
+                // breakers share one slot — releasing one balances
+                // one retire, and the entry survives until the
+                // last outstanding persist releases.
                 if (retiredTombstone !== undefined) {
                   registry.releaseTombstone(leaseModel);
                 }
@@ -3705,9 +2707,8 @@ export async function handleCreateResponse(
         // the session under it creates a permanently dangling warm
         // session.
         //
-        // Iter-36 finding 2 / iter-37 finding 2: refuse to adopt
-        // whenever the streaming handler took ANY failure
-        // epilogue, not just `client_abort`. The streaming
+        // Refuse to adopt whenever the streaming handler took ANY
+        // failure epilogue, not just `client_abort`. The streaming
         // handler writes `failureMode` for every path that does
         // not produce a clean `response.completed`:
         //
@@ -3760,8 +2761,8 @@ export async function handleCreateResponse(
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error during inference';
-        // Iter-33 finding 2: branch on `responseMode` (the wire
-        // format the handler committed to), NOT `res.headersSent`
+        // Branch on `responseMode` (the wire format the handler
+        // committed to), NOT `res.headersSent`
         // (which flips synchronously in `writeHead` and lies about
         // which format the client is consuming). Each branch
         // produces output that matches the Content-Type the client
@@ -3807,8 +2808,8 @@ export async function handleCreateResponse(
       }
     });
 
-    // Iter-39 finding 2: RELEASE the dispatch lease and DETACH the
-    // abort listeners IMMEDIATELY now that `withExclusive` returned
+    // RELEASE the dispatch lease and DETACH the abort listeners
+    // IMMEDIATELY now that `withExclusive` returned
     // and the terminal bytes have either been flushed or the outer
     // catch has emitted its error frame. The post-commit persist
     // wait that follows must NOT pin the request's lifecycle — a
@@ -3817,13 +2818,13 @@ export async function handleCreateResponse(
     // and block teardown after a hot-swap for the lifetime of the
     // wedged write.
     //
-    // Iter-40 finding 1: the binding's `modelInstanceId` still needs
-    // to survive until the post-commit write has actually landed —
-    // otherwise a same-model unregister + re-register sequence
-    // during a slow persist would mint a fresh id, and the row
-    // (when it finally lands) would reference a dead id that the
-    // very next `previous_response_id` continuation would reject.
-    // That lifetime is covered by the ORTHOGONAL `retainBinding` /
+    // The binding's `modelInstanceId` still needs to survive until
+    // the post-commit write has actually landed — otherwise a
+    // same-model unregister + re-register sequence during a slow
+    // persist would mint a fresh id, and the row (when it finally
+    // lands) would reference a dead id that the very next
+    // `previous_response_id` continuation would reject. That
+    // lifetime is covered by the ORTHOGONAL `retainBinding` /
     // `releaseBinding` retention counter paired around
     // `initiatePersist` below, so the eager dispatch-lease release
     // here stays lossless.
@@ -3834,28 +2835,26 @@ export async function handleCreateResponse(
     // the guard.
     cleanupPerformed = runPostDispatchCleanup();
 
-    // Iter-35 finding 2 (part b) / iter-36 finding 1: the persist
-    // write was INITIATED synchronously inside `withExclusive` via
-    // `initiatePersist` — which registers the in-flight promise
-    // in the per-store pending-write tracker BEFORE the mutex
-    // releases. The SQLite flush is already on its way; a
-    // back-to-back continuation observing the tracker will block
-    // on the same promise instead of spuriously returning 404
-    // under `getChain` (see the `getChain`-empty retry at the top
-    // of this handler).
+    // The persist write was INITIATED synchronously inside
+    // `withExclusive` via `initiatePersist` — which registers the
+    // in-flight promise in the per-store pending-write tracker
+    // BEFORE the mutex releases. The SQLite flush is already on
+    // its way; a back-to-back continuation observing the tracker
+    // will block on the same promise instead of spuriously
+    // returning 404 under `getChain` (see the `getChain`-empty
+    // retry at the top of this handler).
     //
-    // Iter-39 finding 2: BOUND the wait on the persist promise
-    // with `POST_COMMIT_PERSIST_TIMEOUT_MS`. A wedged native
-    // backend can return a promise that never settles, and with
-    // the iter-36 code an unconditional `await` would pin this
-    // handler forever — leaking abort listeners and the dispatch
-    // lease (now fixed above by running cleanup before this
-    // wait). On timeout we leave the promise running in the
-    // background: the pending-writes tracker still holds its
-    // reference so chained continuations can still observe it,
-    // and its `.finally(...)` handler will clear the tracker
-    // entry whenever the write eventually settles (or stays
-    // wedged until the process exits).
+    // BOUND the wait on the persist promise with
+    // `POST_COMMIT_PERSIST_TIMEOUT_MS`. A wedged native backend
+    // can return a promise that never settles, and an
+    // unconditional `await` would pin this handler forever —
+    // leaking abort listeners and the dispatch lease (handled
+    // above by running cleanup before this wait). On timeout we
+    // leave the promise running in the background: the
+    // pending-writes tracker still holds its reference so chained
+    // continuations can still observe it, and its `.finally(...)`
+    // handler will clear the tracker entry whenever the write
+    // eventually settles (or stays wedged until the process exits).
     //
     // Persistence is best-effort — a failed write demotes to a
     // log line. The pending-write tracker's `.finally(...)`
@@ -3900,29 +2899,25 @@ export async function handleCreateResponse(
             `[responses] post-commit persistence did not settle within ${postCommitPersistTimeoutMs}ms ` +
               `(${capturedMode ?? 'unknown'}, off-lock); detaching the handler and leaving the write in the ` +
               `background. The pending-writes tracker still holds a reference so chained continuations can ` +
-              `observe the in-flight write, and the iter-40 binding retain stays live until the write truly ` +
+              `observe the in-flight write, and the binding retain stays live until the write truly ` +
               `settles so the binding's modelInstanceId cannot be recycled under the late write. This ` +
               `condition usually signals a wedged SQLite writer or stuck native backend.`,
           );
-          // Iter-43: do NOT force-release the iter-40
-          // `retainBinding` here. Iter-42 added a
-          // `persistRetainBox.release?.()` on this branch to
-          // bound the worst case of a truly never-settling
-          // `store.store(...)` so a later `unregister()` +
-          // `register()` could reclaim the binding. That fix was
-          // wrong: `Promise.race` treats any write that EXCEEDS
-          // the timeout as "safe to unpin", but most timeouts in
-          // practice are slow-but-eventual writes — the promise
-          // still fulfils later, and the iter-40 invariant has
-          // to hold for the entire interval until it does. If a
-          // same-object unregister + re-register happens in the
-          // window between timeout and actual settlement, force-
-          // releasing the retain lets `pendingPersists` drop to
-          // 0, the binding fully tears down, the re-register
-          // mints a fresh `modelInstanceId`, and the late write
-          // lands with the stale id that `buildResponseRecord`
-          // stamped into `configJson` — exactly the iter-40
-          // chain-break the retain was introduced to prevent.
+          // Do NOT force-release the `retainBinding` here on the
+          // soft timeout. `Promise.race` treats any write that
+          // EXCEEDS the timeout as "safe to unpin", but most
+          // timeouts in practice are slow-but-eventual writes —
+          // the promise still fulfils later, and the retain
+          // invariant has to hold for the entire interval until
+          // it does. If a same-object unregister + re-register
+          // happens in the window between timeout and actual
+          // settlement, force-releasing the retain lets
+          // `pendingPersists` drop to 0, the binding fully tears
+          // down, the re-register mints a fresh
+          // `modelInstanceId`, and the late write lands with the
+          // stale id that `buildResponseRecord` stamped into
+          // `configJson` — exactly the chain-break the retain
+          // was introduced to prevent.
           //
           // We accept the bounded cost of a TRULY wedged persist
           // leaking one binding (counters + registry reference)
@@ -3933,7 +2928,10 @@ export async function handleCreateResponse(
           // idempotent `release` stays wired from the persist's
           // own `.finally(...)`, so the moment the slow write
           // actually settles — even minutes later — the retain
-          // drops and teardown proceeds normally.
+          // drops and teardown proceeds normally. The
+          // independent hard-timeout breaker (armed at
+          // `initiatePersist` time) bounds the truly-wedged case
+          // via tombstoned id retirement.
           //
           // The pending-writes tracker keeps its own reference
           // to the detached promise, so chained continuations
@@ -3962,8 +2960,8 @@ export async function handleCreateResponse(
   }
 
   function runPostDispatchCleanup(): true {
-    // Iter-35 finding 1: drop the AbortController's socket/request
-    // listeners so they do not keep the request object alive past
+    // Drop the AbortController's socket/request listeners so they
+    // do not keep the request object alive past
     // the handler's return. Only detach when listeners were actually
     // installed — early-return validation failures exit the outer
     // try before the installation site, so an unconditional detach
@@ -3986,14 +2984,14 @@ export async function handleCreateResponse(
     // pending teardown — `unregister()` called concurrently while
     // this dispatch held the lease — finalises here once the
     // in-flight counter drops to zero AND the post-commit persist
-    // retention has also released (see iter-40 below).
+    // retention has also released (see `retainBinding` below).
     //
-    // Iter-39 finding 2: this now runs BEFORE the post-commit
-    // persist wait, not after, so a wedged `store.store(...)` no
-    // longer pins the lease. Teardown of a same-model unregister is
-    // still deferred by the iter-40 `retainBinding` counter so the
-    // binding's `modelInstanceId` survives until the pending write
-    // has stamped its row durably — see `initiatePersist`.
+    // This runs BEFORE the post-commit persist wait, not after, so
+    // a wedged `store.store(...)` no longer pins the lease.
+    // Teardown of a same-model unregister is still deferred by the
+    // `retainBinding` counter so the binding's `modelInstanceId`
+    // survives until the pending write has stamped its row
+    // durably — see `initiatePersist`.
     if (!leaseReleased) {
       leaseReleased = true;
       registry.releaseDispatchLease(leaseModel);

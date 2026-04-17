@@ -60,11 +60,9 @@ function createMockRes(): {
   writable.headersSent = false;
 
   const origEnd = writable.end.bind(writable);
-  // Mirror Node's overloaded `end()` signature (chunk?, encoding? |
-  // cb?, cb?). Iter-33 regression tests call `res.end(body, cb)`
-  // via `endJson`, so the mock MUST hoist the callback out of the
-  // `encoding` slot when it is a function — otherwise the cb never
-  // fires and `endJson` hangs.
+  // Mirror Node's overloaded `end()` signature (chunk?, encoding? | cb?, cb?). The
+  // `endJson` helper calls `res.end(body, cb)`, so the mock MUST hoist the callback
+  // out of the `encoding` slot when it is a function — otherwise cb never fires.
   writable.end = (chunkArg?: unknown, encodingArg?: unknown, cbArg?: unknown) => {
     let chunk: string | Uint8Array | undefined;
     let encoding: unknown;
@@ -848,42 +846,13 @@ describe('handleCreateMessage', () => {
     });
 
     it('routes a mid-decode throw through the failure epilogue without adopting the session', async () => {
-      // Iter-28 finding 2 regression (Anthropic half): before the
-      // fix, a mid-decode throw from the underlying async
-      // generator escaped out of the `for await` loop in
-      // `handleStreamingNative` straight into the outer generic
-      // catch in `handleCreateMessage`. The outer catch emitted a
-      // single Anthropic `error` event AFTER SSE headers had been
-      // flushed, but did so WITHOUT consulting the commit gate
-      // or running the failure epilogue. The consequences were:
-      //
-      //   1. `message_stop` was sometimes still emitted by the
-      //      pre-break write path (labelling a crashed turn as
-      //      a clean completion).
-      //   2. The `content_block_stop` frame that pairs with any
-      //      open `content_block_start` was never emitted, so
-      //      clients tracking content_block_index state saw a
-      //      dangling in-progress block.
-      //   3. There was no signal the session had failed — the
-      //      commit gate's `wasCommitted()` was never read, so
-      //      the happy path's post-loop flow ran uninspected.
-      //
-      // The fix wraps the loop in a try/catch that captures the
-      // throw into a sticky `thrownError` flag and routes the
-      // post-loop block through the failure epilogue. Every
-      // invariant below pins that epilogue:
-      //
+      // A mid-decode throw from the native async generator must route through the
+      // failure epilogue, not the generic outer catch. Invariants pinned below:
       //   * `message_stop` / `message_delta` MUST NOT appear.
-      //   * A single Anthropic `error` event MUST be present
-      //     with `type: 'api_error'` and a message that cites
-      //     the thrown error.
-      //   * Any content block that was opened before the throw
-      //     MUST be closed with `content_block_stop` before the
-      //     error frame (so clients aren't left with dangling
-      //     state).
-      //   * The session registry stays empty (the Anthropic
-      //     endpoint never adopts, and the commit gate skips the
-      //     success branch on a throw).
+      //   * Exactly one `error` event with `type: 'api_error'` citing the thrown error.
+      //   * Any `content_block_start` opened before the throw MUST be closed with
+      //     `content_block_stop` before the error frame (no dangling block state).
+      //   * The session registry stays empty — Anthropic never adopts on failure.
       async function* throwingStream() {
         yield { text: 'par', done: false, isReasoning: false };
         yield { text: 'tial', done: false, isReasoning: false };
@@ -944,24 +913,10 @@ describe('handleCreateMessage', () => {
     });
 
     it('routes a client disconnect through the failure epilogue without adopting the session', async () => {
-      // Iter-28 finding 2 regression (Anthropic half, client
-      // abort path). Before the fix, a client disconnect while
-      // streaming had no signal inside the helper: the
-      // `for await` loop kept pulling deltas and the writer kept
-      // calling `writeSSEEvent` into a dead socket until the
-      // native generator drained a done chunk, at which point
-      // the commit gate ran the success branch and the writer
-      // emitted `message_delta` + `message_stop` into the void.
-      //
-      // The fix installs `close`/`error` listeners on the HTTP
-      // request that flip a `clientAborted` flag checked at
-      // loop-top. When the flag flips, the helper `break`s out
-      // of the loop and routes through the failure epilogue. We
-      // cannot physically close a socket in this unit test, so
-      // we emit a synthetic `close` event on a lightweight
-      // IncomingMessage-shaped mock after the generator yields
-      // its first delta. The helper's loop-top guard must fire
-      // on the next iteration and break out.
+      // A client disconnect mid-stream must flip `clientAborted` via close/error
+      // listeners on `httpReq`; the loop-top guard then `break`s into the failure
+      // epilogue. We simulate the disconnect by emitting a synthetic `close` event
+      // on a lightweight IncomingMessage-shaped mock after the first delta.
       let proceedResolve: (() => void) | undefined;
       const proceed = new Promise<void>((r) => {
         proceedResolve = r;
@@ -1045,24 +1000,12 @@ describe('handleCreateMessage', () => {
     });
 
     it('iter-35 finding 1: AbortSignal is propagated through the session to the streaming entry point on client disconnect', async () => {
-      // Iter-35 finding 1 fix: the outer handler installs an
-      // `AbortController` on `res.once('close', …)` /
-      // `httpReq.once('close', …)` and plumbs its signal through
-      // `ChatSession.startFromHistoryStream` →
-      // `chatStreamSessionStart` → `_runChatStream`. On the real
-      // model path, `_runChatStream` calls `handle.cancel()` on
-      // the native stream the instant the signal flips AND wakes
-      // the pending `waitForItem()` with a synthetic abort marker
-      // so the consumer breaks out at the next iteration boundary
-      // instead of waiting for the next native chunk.
-      //
-      // This test verifies the plumbing contract end-to-end: the
-      // streaming entry point receives an AbortSignal whose
-      // `aborted` flag flips the moment `httpReq`'s `'close'`
-      // event fires. We use a mock that observes the third
-      // argument (signal) and completes the instant the signal
-      // aborts — modelling the real adapter's fast-abort
-      // behaviour without depending on the native addon.
+      // The outer handler installs an `AbortController` on `res`/`httpReq` close
+      // events and plumbs the signal through `ChatSession.startFromHistoryStream` →
+      // `chatStreamSessionStart` → `_runChatStream`. The streaming entry point must
+      // therefore receive an AbortSignal whose `aborted` flag flips the moment
+      // `httpReq` fires `'close'`. The mock observes the signal and completes on
+      // abort — modelling `_runChatStream`'s fast-abort without the native addon.
       let observedSignal: AbortSignal | undefined;
       let resolveAbortSeen: (() => void) | undefined;
       const abortSeen = new Promise<void>((r) => {
@@ -1216,17 +1159,10 @@ describe('handleCreateMessage', () => {
     });
 
     it('emits a streaming error event (not message_stop) when the final chunk reports finishReason=error', async () => {
-      // Iter-27 finding 3 regression: the previous implementation
-      // emitted `message_stop` unconditionally as soon as a `done`
-      // event arrived, even when `finishReason: 'error'`. That
-      // reported a failed generation as a clean completion to the
-      // client — no `error` SSE frame, no way to distinguish a
-      // real success from a mid-decode failure. Mirror the
-      // `/v1/responses` commit gate: on an uncommitted terminal
-      // (ChatSession's `sawFinal` filter rolls back `turnCount`
-      // whenever `finishReason === 'error'`, so the post-drain
-      // `wasCommitted()` reads false), emit a single `error` SSE
-      // event in the Anthropic shape and omit `message_stop`.
+      // On an uncommitted terminal (`ChatSession.sawFinal` rolls back `turnCount`
+      // when `finishReason === 'error'`, so `wasCommitted()` reads false), emit a
+      // single Anthropic-shaped `error` SSE event and omit `message_stop` — mirroring
+      // the `/v1/responses` commit gate so a failed turn isn't labelled clean.
       const streamEvents = [
         { text: 'partial', done: false, isReasoning: false },
         {
@@ -1258,19 +1194,13 @@ describe('handleCreateMessage', () => {
 
       const events = parseSSE(getBody());
 
-      // Primary assertion: `message_stop` MUST NOT appear. Pairing
-      // `message_stop` with a failed turn is the bug we are fixing.
+      // `message_stop` and its paired `message_delta` MUST NOT appear on a failed turn.
       const msgStop = events.find((e) => e.event === 'message_stop');
       expect(msgStop).toBeUndefined();
-
-      // And a `message_delta` with a non-error stop_reason must
-      // NOT appear either — `message_delta` is the
-      // usage/stop-reason announcement paired with `message_stop`.
       const msgDelta = events.find((e) => e.event === 'message_delta');
       expect(msgDelta).toBeUndefined();
 
-      // Primary assertion: an Anthropic streaming `error` event
-      // MUST be present with the conventional envelope shape.
+      // A single Anthropic streaming `error` event with the conventional envelope.
       const errorEvent = events.find((e) => e.event === 'error');
       expect(errorEvent).toBeDefined();
       expect(errorEvent!.data['type']).toBe('error');
@@ -1278,28 +1208,15 @@ describe('handleCreateMessage', () => {
       expect(errorBody.type).toBe('api_error');
       expect(errorBody.message).toMatch(/finishReason=error|did not commit/i);
 
-      // The registry stayed empty — no adopt call leaked. The
-      // Anthropic endpoint never adopts, but this pins the
-      // invariant: no cached session ever reaches the registry on
-      // a failed streaming turn.
+      // No cached session ever reaches the registry on a failed streaming turn.
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg!.size).toBe(0);
     });
 
     it('emits a streaming error event when the underlying async iterator exhausts without a done event', async () => {
-      // Iter-27 finding 3 regression: if the native stream
-      // exhausts mid-flight (producer throws, native crash, etc.)
-      // the session's `sawFinal` finally runs without a commit,
-      // so `wasCommitted()` reads false. Before the fix, the
-      // post-loop safety net emitted `message_delta('end_turn')`
-      // + `message_stop` unconditionally — again labelling a
-      // failed turn as a clean completion. The new code emits an
-      // Anthropic `error` SSE event instead.
-      //
-      // Use a stream that yields one delta and then exits cleanly
-      // without a `done: true` chunk (the iterator exhausts with
-      // no final frame). This simulates the producer terminating
-      // early without signalling completion.
+      // If the native iterator exhausts mid-flight without a `done: true` frame, the
+      // session's `sawFinal` runs without commit and `wasCommitted()` reads false.
+      // The handler emits an Anthropic `error` SSE event instead of `message_stop`.
       const streamEvents = [{ text: 'partial', done: false, isReasoning: false }];
       const registry = new ModelRegistry();
       registry.register('test-model', createMockStreamModel(streamEvents));
@@ -1338,12 +1255,8 @@ describe('handleCreateMessage', () => {
     });
 
     it('still emits message_delta + message_stop on a clean streaming completion (counter-test)', async () => {
-      // Positive counter-test for iter-27 finding 3: a happy-path
-      // streaming turn — one that commits with a non-error
-      // `finishReason` — still produces `message_delta` +
-      // `message_stop` and NOT an `error` event. Pins the
-      // commit-gate's success branch so the new uncommitted
-      // handling can't accidentally swallow clean completions.
+      // A happy-path streaming turn (commits with a non-error `finishReason`) must
+      // still produce `message_delta` + `message_stop` and NOT an `error` event.
       const streamEvents = [
         { text: 'hello', done: false, isReasoning: false },
         { text: ' world', done: false, isReasoning: false },
@@ -1389,30 +1302,17 @@ describe('handleCreateMessage', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Iter-19 finding 2: canonicalize stateless fan-out tool order
+  // Stateless fan-out tool order canonicalization
   // -----------------------------------------------------------------------
 
   describe('stateless fan-out tool order', () => {
     it('canonicalizes reversed sibling tool_result order to match the assistant fan-out', async () => {
-      // Iteration-19 finding 2 regression: the `/v1/messages`
-      // endpoint is ALWAYS a stateless cold-start. The caller
-      // ships a full conversation in `req.messages`, including
-      // `tool_use`/`tool_result` blocks that the Anthropic mapper
-      // folds into assistant fan-outs + subsequent `tool`
-      // ChatMessages. Without the new
-      // `validateAndCanonicalizeHistoryToolOrder` gate, caller-
-      // supplied tool_result ordering flowed straight into
-      // `primeHistory()`, and several native backends pair tool
-      // results to fan-out calls POSITIONALLY — so reversing two
-      // sibling tool_result blocks silently bound each output to
-      // the WRONG sibling call.
-      //
-      // Construct an assistant fan-out with tool_use ids
-      // [call_a, call_b], then submit reversed tool_result blocks
-      // [call_b, call_a] in the follow-up user turn. Spy on
-      // `chatSessionStart` to assert the handler reordered the
-      // tool messages to match the sibling declaration order
-      // BEFORE dispatching the primed history.
+      // `/v1/messages` is ALWAYS a stateless cold-start; the caller ships a full
+      // conversation including tool_use/tool_result blocks. Several native backends
+      // pair tool results to fan-out calls POSITIONALLY, so
+      // `validateAndCanonicalizeHistoryToolOrder` must reorder caller-supplied
+      // tool_result messages to match the assistant's declared sibling order before
+      // they reach `primeHistory()` — otherwise each output binds to the wrong call.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'both fetched' }));
       registry.register('test-model', mockModel);
@@ -1469,25 +1369,11 @@ describe('handleCreateMessage', () => {
     });
 
     it('canonicalizes a reversed tool-result block when an earlier fan-out is already resolved', async () => {
-      // Iteration-20 regression (finding 1), Anthropic variant:
-      // before the fix `canonicalizeToolMessageOrder` scanned to
-      // `messages.length`, so when the full-history walker invoked
-      // it for the first fan-out in a history with multiple
-      // resolved fan-outs, the helper would see tool messages from
-      // every later block, fail its count gate
-      // (`toolPositions.length !== expectedOrder.length`), and
-      // silently leave a reversed first block uncorrected. The
-      // `/v1/messages` endpoint is the same user-facing risk
-      // surface as `/v1/responses` — both run the walker over a
-      // full self-contained history on every request — so the
-      // regression needs a twin assertion here.
-      //
-      // Build a two-fan-out Anthropic history where the FIRST
-      // fan-out's `tool_result` blocks are reversed and the
-      // SECOND fan-out is canonical. Assert that
-      // `chatSessionStart` is primed with both blocks in sibling
-      // order and that each output's content stayed bound to its
-      // call id through the swap.
+      // `canonicalizeToolMessageOrder` must scan only to the next assistant boundary;
+      // scanning to `messages.length` lets it see tool messages from later blocks,
+      // trip its count gate, and silently leave a reversed earlier block uncorrected.
+      // Two fan-outs: the first's tool_result blocks are reversed, the second's are
+      // canonical — both must end up in sibling order with contents tracking ids.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'all fetched' }));
       registry.register('test-model', mockModel);
@@ -1611,16 +1497,11 @@ describe('handleCreateMessage', () => {
     });
 
     it('returns 400 on a malformed fan-out missing a sibling tool_result', async () => {
-      // The helper must reject a history with a declared
-      // sibling that has no matching tool_result. Submitting only
-      // `call_a`'s result when the assistant fanned out to both
-      // [call_a, call_b] would orphan `call_b`. Reject with 400.
-      //
-      // The follow-up user turn carries a second `user` message
-      // with plain text AFTER the tool_result turn — a legal
-      // iter-23 shape (no mixing inside a single user turn) that
-      // still trips the validator because the assistant fan-out
-      // is never fully resolved.
+      // A declared sibling with no matching tool_result must be rejected — submitting
+      // only `call_a`'s result when the fan-out was [call_a, call_b] orphans call_b.
+      // The follow-up user turn adds a plain-text user message after the tool_result
+      // turn (a legal non-mixed shape) that still trips the validator because the
+      // assistant fan-out is never fully resolved.
       const registry = new ModelRegistry();
       const mockModel = createMockModel();
       registry.register('test-model', mockModel);
@@ -1660,10 +1541,8 @@ describe('handleCreateMessage', () => {
       const parsed = JSON.parse(getBody());
       expect(parsed.type).toBe('error');
       expect(parsed.error.type).toBe('invalid_request_error');
-      // Iter-23 finding 4: error vocabulary is Anthropic-flavored
-      // on `/v1/messages`, so the text references `tool_result`
-      // and `assistant turn with tool_use blocks`, not
-      // `function_call_output` or `assistant fan-out`.
+      // Error vocabulary on `/v1/messages` is Anthropic-flavoured: `tool_result` and
+      // `assistant turn with tool_use blocks`, NOT `function_call_output`/`fan-out`.
       expect(parsed.error.message).toMatch(/unresolved sibling tool calls|tool_result/);
       expect(parsed.error.message).not.toMatch(/function_call_output|\bcall_id\b/);
       // eslint-disable-next-line @typescript-eslint/unbound-method
@@ -1702,22 +1581,16 @@ describe('handleCreateMessage', () => {
 
       expect(getStatus()).toBe(400);
       const parsed = JSON.parse(getBody());
-      // Iter-23 finding 4: Anthropic vocabulary — the validator
-      // returns "assistant turn with tool_use blocks" and
-      // `tool_use_id` for /v1/messages callers.
+      // Anthropic vocabulary: `assistant turn with tool_use blocks` and `tool_use_id`.
       expect(parsed.error.message).toMatch(/not declared by the preceding assistant turn with tool_use blocks/);
       expect(parsed.error.message).toMatch(/tool_use_id/);
       expect(parsed.error.message).not.toMatch(/function_call_output|\bcall_id\b/);
     });
 
     it('rejects mixed text + tool_result in a single user turn with 400', async () => {
-      // Iter-23 finding 3: the iter-22 mapper silently hoisted
-      // tool_result blocks to the front of a mixed turn and
-      // emitted residual text/image content as a synthetic
-      // trailing user message — lossy reordering of
-      // caller-supplied blocks. The mapper now rejects the
-      // mixed shape; this test pins the 400 + guarantees no
-      // dispatch happens.
+      // The mapper rejects the mixed-shape turn outright rather than silently
+      // hoisting tool_result blocks and emitting residual text as a synthetic
+      // trailing user message — that earlier behaviour was lossy reordering.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'should not fire' }));
       registry.register('test-model', mockModel);
@@ -1754,11 +1627,9 @@ describe('handleCreateMessage', () => {
       const parsed = JSON.parse(getBody());
       expect(parsed.type).toBe('error');
       expect(parsed.error.type).toBe('invalid_request_error');
-      // Iter-26 finding 2: the mapper now accepts tool_result blocks
-      // as a contiguous PREFIX of a user turn (followed by trailing
-      // text/image), but still rejects the inverse shape where a
-      // text/image block precedes a tool_result. This test pins the
-      // non-prefix rejection.
+      // The mapper accepts tool_result blocks as a contiguous PREFIX (followed by
+      // trailing text/image) but rejects the inverse shape where text/image precedes
+      // a tool_result. This pins the non-prefix rejection.
       expect(parsed.error.message).toMatch(/tool_result blocks must appear as a contiguous prefix/i);
       // eslint-disable-next-line @typescript-eslint/unbound-method
       const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
@@ -1766,12 +1637,10 @@ describe('handleCreateMessage', () => {
     });
 
     it('accepts split turns: tool_result-only user turn followed by a separate text user turn', async () => {
-      // Positive counter-test for iter-23 finding 3: a caller
-      // that splits the mixed turn into two legal user turns
-      // (one carrying ONLY tool_result blocks, one carrying the
-      // follow-up text) must dispatch cleanly. Reversed tool
-      // order on the first turn verifies the canonicalization
-      // pass still runs end-to-end.
+      // A caller that splits the mixed turn into two legal user turns (one carrying
+      // ONLY tool_result blocks, one carrying the follow-up text) must dispatch
+      // cleanly. Reversed tool order on the first turn verifies canonicalization
+      // still runs end-to-end.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'followup ok' }));
       registry.register('test-model', mockModel);
@@ -1835,15 +1704,9 @@ describe('handleCreateMessage', () => {
     });
 
     it('primes tool_result.is_error=true content with a JSON envelope through the full /v1/messages dispatch', async () => {
-      // Iter-24 finding 2 smoke test: the Anthropic mapper now
-      // wraps `tool_result.is_error === true` content in a JSON
-      // envelope — `{"is_error":true,"content":<original>}` —
-      // instead of the iter-23 `[tool error] ` prefix. Exercise
-      // the full /v1/messages handler end-to-end so the primed
-      // history passed to `chatSessionStart` reflects the
-      // envelope. Without the fix `ChatMessage.content` would
-      // carry either the raw tool output (losing the flag) or
-      // the ambiguous prefix (corrupting JSON payloads).
+      // End-to-end smoke test: the Anthropic mapper wraps `tool_result.is_error ===
+      // true` content as `{"is_error":true,"content":<original>}`, and the primed
+      // history passed to `chatSessionStart` carries exactly that envelope.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'ack' }));
       registry.register('test-model', mockModel);
@@ -1900,20 +1763,11 @@ describe('handleCreateMessage', () => {
 
   describe('in-mutex binding re-read (iter-25 finding 2)', () => {
     it('rejects a queued request when the binding is re-registered while the mutex holds a prior dispatch', async () => {
-      // Iter-25 finding 2 regression: the Anthropic handler
-      // captured `sessionReg = registry.getSessionRegistry(body.model)`
-      // once and then waited on
-      // `sessionReg.withExclusive(...)` with NO post-acquisition
-      // binding check. A request queued behind a long decode on
-      // the old registry would still execute through that stale
-      // registry even if `registry.register(body.model, newModel)`
-      // had already rebound the name mid-wait. Unlike
-      // `/v1/responses`, the Anthropic path has no stored
-      // identity check later to catch the mismatch — two
-      // requests for the same model name could silently be
-      // serviced by different underlying models based purely on
-      // queue timing. The in-mutex re-read added for this
-      // finding catches the drift and rejects 400.
+      // The Anthropic handler must re-read the binding INSIDE `withExclusive`: a
+      // request queued behind a long decode would otherwise execute through a stale
+      // `SessionRegistry` captured pre-lock if `register()` rebinds the name mid-wait.
+      // Unlike `/v1/responses`, the Anthropic path has no later stored-identity check,
+      // so the in-mutex re-read is the only line of defence — it rejects 400 on drift.
       const registry = new ModelRegistry();
       const originalModel = createMockModel(makeChatResult({ text: 'original' }));
       const swappedModel = createMockModel(makeChatResult({ text: 'swapped' }));
@@ -2006,25 +1860,16 @@ describe('handleCreateMessage', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Iter-33 finding 3: wire-contract / visibility fixes on /v1/messages
+  // Wire-contract / visibility fixes on /v1/messages
   // -----------------------------------------------------------------------
 
   describe('transport visibility (iter-33 finding 3)', () => {
     it('non-streaming: JSON-mode async end-callback failure destroys the socket instead of emitting SSE', async () => {
-      // Iter-33 finding 3 regression. The Anthropic handler is
-      // stateless (no session to adopt) but its outer catch still
-      // keyed "JSON vs SSE fallback" on `res.headersSent`. A JSON
-      // request whose `res.end()` reported an async callback
-      // failure — happens when the underlying socket breaks AFTER
-      // Node queued the payload but BEFORE the flush completes —
-      // would then emit an SSE frame INTO a `Content-Type:
-      // application/json` body.
-      //
-      // The fix commits the wire format in `endJson` via
-      // `responseMode = 'json'` and switches the outer catch to
-      // branch on that. On a JSON-mode failure we destroy the
-      // socket so the client sees a truncated JSON body rather
-      // than a malformed document with unexpected MIME frames.
+      // The outer catch must NOT emit an SSE frame into a `Content-Type:
+      // application/json` body when `res.end()` reports an async callback failure
+      // (socket breaks after Node queued the payload). `endJson` commits the wire
+      // format via `responseMode = 'json'`; on a JSON-mode failure we destroy the
+      // socket so the client sees a truncated JSON body, never mixed MIME frames.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'hi' }));
       registry.register('test-model', mockModel);
@@ -2064,9 +1909,8 @@ describe('handleCreateMessage', () => {
       // Allow the queued microtask to fire.
       await new Promise((r) => setTimeout(r, 0));
 
-      // Wire contract: socket destroyed, body contains NO SSE
-      // frame. `event: error` or `data: ` in a JSON response is
-      // exactly the corruption finding 3 prevents.
+      // Wire contract: socket destroyed, body contains NO SSE frame. `event: error`
+      // or `data: ` in a JSON response is exactly the corruption this test prevents.
       expect(wasDestroyed()).toBe(true);
       const body = getBody();
       expect(body).not.toContain('event: error');
@@ -2074,17 +1918,10 @@ describe('handleCreateMessage', () => {
     });
 
     it('streaming: early SSE write crash before any terminal emits an error frame and does not hang', async () => {
-      // Iter-33 finding 3 regression on the streaming path. A
-      // mid-decode `res.write` crash BEFORE any terminal
-      // (`message_stop` / streaming `error`) used to land in the
-      // old outer-catch branch that keyed on `headersSent` — which
-      // would STILL try to emit an SSE error frame but would NOT
-      // know whether a terminal had already arrived, so a race
-      // could leak a double terminal. The fix gates
-      // `terminalEmitted` on the actual terminal write callback
-      // and branches the outer catch on `responseMode` +
-      // `terminalEmitted`, so the fallback frame only fires when
-      // the client has not already observed a terminal.
+      // `terminalEmitted` gates off the actual terminal write callback; the outer
+      // catch branches on `responseMode` + `terminalEmitted`, so a mid-decode
+      // `res.write` crash before any terminal emits a fallback `error` SSE frame
+      // without risking a double terminal when a real one was already delivered.
       const registry = new ModelRegistry();
       async function* stream() {
         yield { done: false, text: 'never emitted', isReasoning: false };
@@ -2136,13 +1973,10 @@ describe('handleCreateMessage', () => {
     });
 
     it('non-streaming: destroyed socket before end rejects endJson and does not hang', async () => {
-      // Iter-34 regression on /v1/messages. `res.end(payload, cb)`
-      // does not invoke the callback when the underlying socket is
-      // already destroyed. The iter-33 helper awaited that
-      // callback forever, pinning the per-model `withExclusive`
-      // mutex on a dead client. The fix pre-checks
-      // `res.destroyed || res.socket?.destroyed` and rejects
-      // synchronously.
+      // `res.end(payload, cb)` does not invoke the callback on an already-destroyed
+      // socket — awaiting it would pin the per-model `withExclusive` mutex on a
+      // dead client. `endJson` pre-checks `res.destroyed || res.socket?.destroyed`
+      // and rejects synchronously.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'hi' }));
       registry.register('test-model', mockModel);
@@ -2183,12 +2017,10 @@ describe('handleCreateMessage', () => {
     });
 
     it('non-streaming: close event during end rejects endJson and does not hang', async () => {
-      // Iter-34 regression on /v1/messages. If the peer
-      // disconnects AFTER `res.end()` returns but BEFORE the
-      // kernel acks, Node emits `'close'` on the response (or its
-      // socket) and the end callback is never invoked. The fix
-      // attaches `res.once('close', …)` so peer disconnect
-      // rejects the helper's promise.
+      // If the peer disconnects AFTER `res.end()` returns but BEFORE the kernel acks,
+      // Node emits `'close'` on the response (or socket) and the end callback never
+      // fires. `endJson` attaches `res.once('close', …)` so peer disconnect rejects
+      // the helper's promise.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'hi' }));
       registry.register('test-model', mockModel);
