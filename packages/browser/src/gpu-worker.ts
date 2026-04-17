@@ -78,6 +78,48 @@ const bufferLogicalSizesArr: (number | undefined)[] = [undefined];
 const bufferUsagesArr: (number | undefined)[] = [undefined];
 let nextHandle = 1;
 
+// JS-F007: handle recycling.
+//
+// Previously `addHandle` only did `nextHandle++`. Released slots were never
+// reused — long sessions marched nextHandle toward the bridge's
+// BUFFER_METADATA_MAX_HANDLES=2^20 ceiling. Qwen3.5-0.8B at ~120 fresh
+// buffer creates/tok × 224 tokens ≈ 27k handles per generation, so the
+// bridge metadata SAB blows its capacity around generation 35 and every
+// stub silently falls back to stub-local Maps, losing cross-worker release
+// visibility.
+//
+// The cache invariants that make recycling safe:
+//   (a) bindGroupCache is keyed by pipelineHandle. Pipelines are never
+//       pooled; on PIPELINE_RELEASE we delete the cache entry before
+//       releasing the handle. A recycled pipeline handle starts with no
+//       cache entry.
+//   (b) passEncoderMap is keyed by passHandle. Passes are released in the
+//       dispatch submit cycle (endAndRestartPass deletes the old entry
+//       before re-adding the replacement).
+//   (c) activeMappings is keyed by bufferHandle. Mapped buffers carry
+//       MAP_READ / MAP_WRITE usage which `isPoolable` rejects, so these
+//       handles skip the pool stack entirely and hit `releaseHandle`
+//       directly. The bridge stub clears bufferMetadata on release.
+//   (d) The buffer pool keeps `handles[h]` alive while parked. Only when
+//       the pool bucket is full does `releaseHandle` actually run — at
+//       which point the handle is gone from every bookkeeping map.
+//
+// So pure monotonic recycling is correct today. To harden against future
+// cache additions that might capture a handle integer and read it across
+// a release/recycle boundary, we delay recycling by a small generation
+// window: a freed handle only becomes eligible after RECYCLE_DELAY other
+// handles have been freed since it. This preserves realistic LRU-cache
+// patterns (which would miss on the delayed handle rather than hit a
+// stale entry) and gives the bridge stub's metadata SAB time to see the
+// release land before the same integer is re-issued.
+//
+// Versioning (upper-bits generation counter) would be cleaner but is an
+// invasive change — ~100 call sites read handles as plain integers and
+// index `handles[h]` directly. Tail-delay is a ~20-LOC local change that
+// fixes the leak without risking correctness regressions.
+const freeHandleList: number[] = [];
+const RECYCLE_DELAY = 256;
+
 // Buffer pool: (usage, size) → stack of free GPUBuffer handles. MLX's allocator
 // churns ~870 transient buffers/tok; reusing them eliminates Chrome's
 // createBuffer validation cost on the hot path.
@@ -152,6 +194,15 @@ function poolKey(usage: number, size: number): string {
 }
 
 function addHandle(obj: any): number {
+  // JS-F007: prefer recycling a delayed-free slot before bumping nextHandle.
+  // `freeHandleList` is a FIFO (shift from head) so a slot must accumulate
+  // at least RECYCLE_DELAY subsequent frees before it's reissued. This
+  // matches the heuristic documented at the freeHandleList declaration.
+  if (freeHandleList.length >= RECYCLE_DELAY) {
+    const id = freeHandleList.shift()!;
+    handles[id] = obj;
+    return id;
+  }
   const id = nextHandle++;
   handles[id] = obj;
   return id;
@@ -164,10 +215,17 @@ function getHandle<T>(id: number): T {
 }
 
 function releaseHandle(id: number): void {
+  // Clear every bookkeeping slot BEFORE adding to the free list so a racing
+  // read via getHandle observes "undefined" (which throws "Invalid handle")
+  // rather than a stale object. The free list is FIFO with a delay window
+  // of RECYCLE_DELAY (see freeHandleList comment), so even if a cache
+  // somewhere captured this integer it has the delay to notice the release
+  // before the same id reappears.
   handles[id] = undefined;
   bufferSizesArr[id] = undefined;
   bufferLogicalSizesArr[id] = undefined;
   bufferUsagesArr[id] = undefined;
+  freeHandleList.push(id);
 }
 
 // Pool-aware buffer release — shared by BUFFER_RELEASE and BUFFER_RELEASE_BATCH.
