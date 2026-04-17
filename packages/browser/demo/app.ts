@@ -542,6 +542,23 @@ worker.onmessage = (e) => {
         activeReaderAbort = null;
       }
       break;
+
+    case 'bridge-poisoned': {
+      // JS-F008: distinct from 'error' — this is specifically "the RPC
+      // bridge timed out draining a BUFFER_RELEASE_BATCH fire-and-forget
+      // and is now dead until the worker restarts". A generic 'error'
+      // also fires; this message exists so the UI can distinguish a hung
+      // gpu-worker from a chat-level failure and steer the user to reload
+      // the page rather than retrying in-place (which would throw on
+      // every subsequent RPC).
+      const reason = (data as any).reason ?? 'unknown';
+      log(`Bridge poisoned (${reason}). The GPU worker is unresponsive — reload the page to recover.`);
+      setStatus('Bridge poisoned — reload required', 'error');
+      sendBtn.disabled = true;
+      promptEl.disabled = true;
+      imageBtn.disabled = true;
+      break;
+    }
   }
 };
 

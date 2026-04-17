@@ -512,6 +512,7 @@ function postProfileSnapshot(numTokens: number): void {
         diagReleaseAll: 0,
         diagReleaseUnknownHandle: 0,
         diagReleaseUnpoolable: 0,
+        poisonedRpcCount: 0,
       } as any);
     const gpuStats = bridgeRef?.fetchGpuWorkerStats(false) ?? {
       totalRpcs: 0,
@@ -564,6 +565,10 @@ function postProfileSnapshot(numTokens: number): void {
         diagBatchStaged: (bridgeStats as any).diagBatchStaged ?? 0,
         diagBatchDeferredBlock: (bridgeStats as any).diagBatchDeferredBlock ?? 0,
         diagBatchStageRefused: (bridgeStats as any).diagBatchStageRefused ?? 0,
+        // JS-F008: RPCs dropped because the bridge was poisoned by an
+        // earlier BUFFER_RELEASE_BATCH F&F drain timeout. Non-zero here
+        // means the demo should treat the bridge as dead and reload.
+        poisonedRpcCount: (bridgeStats as any).poisonedRpcCount ?? 0,
       },
     });
   } catch (e) {

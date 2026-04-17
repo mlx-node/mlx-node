@@ -60,6 +60,14 @@ export interface BridgeStats {
   diagBatchDeferredBlock: number;
   /** DIAG: dispatches where stageDispatchBatchRecord returned false. */
   diagBatchStageRefused: number;
+  /**
+   * JS-F008: RPCs attempted after the bridge was poisoned by a
+   * BUFFER_RELEASE_BATCH fire-and-forget drain timeout. Each one threw
+   * through assertNotPoisoned; this counter exists so a post-generation
+   * profile readout can surface "N dropped after poison" without
+   * instrumenting every caller with try/catch.
+   */
+  poisonedRpcCount: number;
 }
 
 export interface GpuWorkerStats {
@@ -722,6 +730,11 @@ export function createBridgeStub(
   // with a late completion for the hung release, corrupting that RPC.
   let ffPending = false;
   let ffPoisoned = false;
+  // JS-F008: diagnostic counter for RPCs attempted after poisoning. Incremented
+  // by assertNotPoisoned before it throws so the demo can surface
+  // "X RPCs dropped after poison" in the profile readout without depending on
+  // try/catch counters in every caller.
+  let poisonedRpcCount = 0;
   function drainFireAndForget(): void {
     if (!ffPending) return;
     // Same wait pattern as rpcCall: 10s then 30s retry. If STATUS is already
@@ -731,6 +744,12 @@ export function createBridgeStub(
       const msg = `[RPC TIMEOUT] BUFFER_RELEASE_BATCH (F&F) drain timed out after 10s`;
       console.error(msg);
       try {
+        // JS-F008: keep the legacy `error` post so existing demo error
+        // handlers still react (chat UI surfaces the message and tears
+        // down the stream). The dedicated `bridge-poisoned` post below
+        // only fires on FINAL poisoning so consumers can tell a recoverable
+        // timeout (the gpu-worker eventually caught up) from a hard hang
+        // (bridge is unusable until the worker restarts).
         (self as any).postMessage({ type: 'error', message: msg });
       } catch {}
       waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 30_000);
@@ -742,6 +761,16 @@ export function createBridgeStub(
         console.error(fatalMsg);
         try {
           (self as any).postMessage({ type: 'error', message: fatalMsg });
+          // JS-F008: dedicated message type so the demo (and tests) can
+          // differentiate "gpu-worker hung, restart required" from "chat
+          // errored mid-generation" — both previously posted as {type:'error'}.
+          // `reason` names the timing source so a future multi-stage
+          // poison path can supply a different value.
+          (self as any).postMessage({
+            type: 'bridge-poisoned',
+            reason: 'buffer-release-batch-timeout',
+            message: fatalMsg,
+          });
         } catch {}
         ffPoisoned = true;
         return;
@@ -755,6 +784,13 @@ export function createBridgeStub(
 
   function assertNotPoisoned(context: string): void {
     if (ffPoisoned) {
+      // JS-F008: bump the diagnostic counter BEFORE throwing. The bridge
+      // stats fetch exposes poisonedRpcCount so the demo can show
+      // "N RPCs dropped after poison" without relying on a try/catch chain
+      // in every caller. Throwing stays the default behavior because
+      // rpcCall / rpcCallWithHi return handles that callers dereference —
+      // silently returning 0 would trade a loud crash for a silent corruption.
+      poisonedRpcCount++;
       throw new Error(
         `[bridge] poisoned by prior BUFFER_RELEASE_BATCH timeout — gpu-worker likely hung. Restart worker to recover. (context: ${context})`,
       );
@@ -2161,6 +2197,7 @@ export function createBridgeStub(
       diagBatchStaged,
       diagBatchDeferredBlock,
       diagBatchStageRefused,
+      poisonedRpcCount,
     };
   }
 
@@ -2179,6 +2216,7 @@ export function createBridgeStub(
     diagBatchStaged = 0;
     diagBatchDeferredBlock = 0;
     diagBatchStageRefused = 0;
+    poisonedRpcCount = 0;
     if (poolStatsArr) {
       for (let i = 0; i < POOL_STATS_SLOTS; i++) Atomics.store(poolStatsArr, i, 0);
     }
