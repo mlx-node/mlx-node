@@ -83,6 +83,12 @@ export interface GpuWorkerStats {
   uniformHotHits: number;
   /** Task E: deferred-uniform dispatches that had to allocate the pipeline's dedicated uniform buffer for the first time. */
   uniformHotMisses: number;
+  /** P6: commandLoop spin attempts that caught the next command before falling back to waitAsync. */
+  spinHits: number;
+  /** P6: commandLoop spin attempts that exhausted their budget and had to waitAsync. */
+  spinMisses: number;
+  /** P6: current adaptive spin budget at snapshot time (iterations per dispatch-follow-up). */
+  spinBudget: number;
 }
 
 export interface BridgeStub {
@@ -2154,12 +2160,19 @@ export function createBridgeStub(
     const bindGroupCacheMisses = byFn[103] ?? 0;
     const uniformHotHits = byFn[104] ?? 0;
     const uniformHotMisses = byFn[105] ?? 0;
+    // P6: spin hit/miss + current adaptive budget live in slots 106-108.
+    const spinHits = byFn[106] ?? 0;
+    const spinMisses = byFn[107] ?? 0;
+    const spinBudget = byFn[108] ?? 0;
     delete byFn[100];
     delete byFn[101];
     delete byFn[102];
     delete byFn[103];
     delete byFn[104];
     delete byFn[105];
+    delete byFn[106];
+    delete byFn[107];
+    delete byFn[108];
     return {
       totalRpcs,
       byFn,
@@ -2169,6 +2182,9 @@ export function createBridgeStub(
       bindGroupCacheMisses,
       uniformHotHits,
       uniformHotMisses,
+      spinHits,
+      spinMisses,
+      spinBudget,
     };
   }
 

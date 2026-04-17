@@ -429,6 +429,9 @@ worker.onmessage = (e) => {
         bindGroupCacheMisses?: number;
         uniformHotHits?: number;
         uniformHotMisses?: number;
+        spinHits?: number;
+        spinMisses?: number;
+        spinBudget?: number;
         diagCreateAll?: number;
         diagCreateMappedCopyDst?: number;
         diagCreateMappedNoCopyDst?: number;
@@ -492,6 +495,14 @@ worker.onmessage = (e) => {
         log(
           `[profile] uniform-hot: hits=${uhh} (${(uhh / n).toFixed(1)}/tok) misses=${uhm} (${(uhm / n).toFixed(1)}/tok) hitRate=${uhhRate}%`,
         );
+      }
+      if (s.spinHits != null && s.spinMisses != null) {
+        const sh = s.spinHits;
+        const sm = s.spinMisses;
+        const st = sh + sm;
+        const shRate = st > 0 ? ((sh / st) * 100).toFixed(1) : '0.0';
+        const sb = s.spinBudget ?? 0;
+        log(`[profile] spin: hits=${sh} misses=${sm} hitRate=${shRate}% budget=${sb}`);
       }
       log(
         `[profile] diag: createAll=${s.diagCreateAll ?? 0} (mappedCopyDst=${s.diagCreateMappedCopyDst ?? 0}, mappedNoCopyDst=${s.diagCreateMappedNoCopyDst ?? 0}) | releaseAll=${s.diagReleaseAll ?? 0} (unknownHandle=${s.diagReleaseUnknownHandle ?? 0}, unpoolable=${s.diagReleaseUnpoolable ?? 0})`,

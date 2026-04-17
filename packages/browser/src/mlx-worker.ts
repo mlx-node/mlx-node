@@ -511,6 +511,9 @@ function postProfileSnapshot(numTokens: number): void {
       bindGroupCacheMisses: 0,
       uniformHotHits: 0,
       uniformHotMisses: 0,
+      spinHits: 0,
+      spinMisses: 0,
+      spinBudget: 0,
     };
     let totalDispatches = 0;
     let totalPassEnds = 0;
@@ -535,6 +538,9 @@ function postProfileSnapshot(numTokens: number): void {
         bindGroupCacheMisses: gpuStats.bindGroupCacheMisses,
         uniformHotHits: gpuStats.uniformHotHits,
         uniformHotMisses: gpuStats.uniformHotMisses,
+        spinHits: gpuStats.spinHits,
+        spinMisses: gpuStats.spinMisses,
+        spinBudget: gpuStats.spinBudget,
         poolHits: bridgeStats.poolHits,
         poolMisses: bridgeStats.poolMisses,
         diagCreateAll: (bridgeStats as any).diagCreateAll ?? 0,
