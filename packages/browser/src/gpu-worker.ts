@@ -202,26 +202,32 @@ function releaseBufferHandle(handle: number): void {
 // ---------- Memory Helpers (1J: cached WASM DataView) ----------
 
 let cachedWasmBuffer: ArrayBuffer | null = null;
+let cachedWasmByteLength = 0;
 let cachedWasmView: DataView | null = null;
 let cachedWasmU8: Uint8Array | null = null;
 
+// JS-F019: rebuild views when either the buffer identity changes (non-shared
+// memory grow path) OR the byteLength changes (Chromium's shared-memory grow
+// preserves identity but still grows byteLength; a Uint8Array constructed
+// against the pre-grow SAB captures the old length and becomes undersized).
+// Without the length tiebreaker, accesses past the old end read undefined on
+// U8 or throw on DataView.
+function refreshCacheIfGrew(buf: ArrayBuffer): void {
+  const len = buf.byteLength;
+  if (buf === cachedWasmBuffer && len === cachedWasmByteLength) return;
+  cachedWasmBuffer = buf;
+  cachedWasmByteLength = len;
+  cachedWasmView = new DataView(buf);
+  cachedWasmU8 = new Uint8Array(buf);
+}
+
 function getWasmView(): DataView {
-  const buf = wasmMemoryObj.buffer;
-  if (buf !== cachedWasmBuffer) {
-    cachedWasmBuffer = buf;
-    cachedWasmView = new DataView(buf);
-    cachedWasmU8 = new Uint8Array(buf);
-  }
+  refreshCacheIfGrew(wasmMemoryObj.buffer);
   return cachedWasmView!;
 }
 
 function getWasmBytes(): Uint8Array {
-  const buf = wasmMemoryObj.buffer;
-  if (buf !== cachedWasmBuffer) {
-    cachedWasmBuffer = buf;
-    cachedWasmView = new DataView(buf);
-    cachedWasmU8 = new Uint8Array(buf);
-  }
+  refreshCacheIfGrew(wasmMemoryObj.buffer);
   return cachedWasmU8!;
 }
 
