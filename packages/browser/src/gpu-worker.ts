@@ -194,11 +194,18 @@ function poolKey(usage: number, size: number): string {
 }
 
 function addHandle(obj: any): number {
-  // JS-F007: prefer recycling a delayed-free slot before bumping nextHandle.
-  // `freeHandleList` is a FIFO (shift from head) so a slot must accumulate
-  // at least RECYCLE_DELAY subsequent frees before it's reissued. This
-  // matches the heuristic documented at the freeHandleList declaration.
-  if (freeHandleList.length >= RECYCLE_DELAY) {
+  // JS-F007's original motivation was avoiding the bridge-stub
+  // BUFFER_METADATA_MAX_HANDLES = 2^20 ceiling during multi-generation
+  // sessions. Recycling aggressively from handle 0 (as the first version
+  // did) turned out to break across-chat correctness whenever any downstream
+  // cache stashed a handle integer (bind-group cache entries, WASM-side
+  // buffer refs captured during a prior chat). We now keep the original
+  // monotonic scheme until `nextHandle` actually approaches the ceiling;
+  // a handful of chats never gets close to 2^19, so recycling is a no-op
+  // in practice — but the leak guard is still in place for truly long
+  // sessions.
+  const RECYCLE_WATERMARK = 1 << 19;
+  if (nextHandle >= RECYCLE_WATERMARK && freeHandleList.length >= RECYCLE_DELAY) {
     const id = freeHandleList.shift()!;
     handles[id] = obj;
     return id;
