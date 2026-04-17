@@ -83,9 +83,74 @@
  * await session.reset();
  * ```
  */
-import type { ChatConfig, ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
+import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult } from '@mlx-node/core';
 
 import type { ChatStreamEvent } from './stream.js';
+
+/**
+ * Convert the parsed `ToolCallResult[]` emitted by the native chat
+ * pipeline into the `ToolCall[]` shape expected by
+ * `ChatMessage.toolCalls` (and, by extension, the jinja chat
+ * templates on cold replay).
+ *
+ * Two shape differences to bridge:
+ *
+ *   1. `ToolCallResult.arguments` is `Record<string, unknown> | string`
+ *      (already parsed by the native parser when status is "ok",
+ *      preserved as the original string on parse failure). The
+ *      `ChatMessage.toolCalls` contract is `arguments: string`, and
+ *      the native tokenizer's `render_chat_template` pre-parses that
+ *      string back into a `serde_json::Value` before handing it to
+ *      jinja. We therefore `JSON.stringify` any non-string argument
+ *      so the round-trip is lossless. Strings are passed through
+ *      verbatim so a failed-to-parse payload retains its original
+ *      bytes (the template then sees it as a quoted string, which is
+ *      the safest available fallback).
+ *   2. Only `status === "ok"` calls carry a well-formed
+ *      `(name, arguments)` pair — the other statuses (`invalid_json`,
+ *      `missing_name`, `parse_error`) are informational diagnostics
+ *      that the native parser emits for observability and that the
+ *      downstream chat template has no way to render. Preserving them
+ *      on the replay path would inject garbage tool-call tags into
+ *      the jinja output. We filter to `ok` entries only — matching the
+ *      filter every other consumer (server response mapper, tool-use
+ *      examples, README guidance) already applies.
+ *
+ * Returns `undefined` when the input is absent or yields no `ok`
+ * entries so the assistant `ChatMessage` stays minimal (no empty
+ * `toolCalls: []` field polluting the history).
+ */
+function toAssistantToolCalls(toolCalls: readonly ToolCallResult[] | undefined): ToolCall[] | undefined {
+  if (!toolCalls || toolCalls.length === 0) return undefined;
+  const out: ToolCall[] = [];
+  for (const tc of toolCalls) {
+    if (tc.status !== 'ok') continue;
+    const argsStr = typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments);
+    out.push({ id: tc.id, name: tc.name, arguments: argsStr });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Build an assistant `ChatMessage` from a just-completed turn's
+ * decoded text + tool-call list. The assistant entry is appended to
+ * `this.history` after every successful turn and is later read back
+ * by the native `chatSessionStart` cold-replay path (image-change
+ * mid-session restart, `startFromHistory*`, server-side
+ * `SessionRegistry` cache-miss rebuild). Dropping the `toolCalls`
+ * field here would orphan any subsequent `{role: 'tool', ...}`
+ * entries on replay — the jinja template would render a
+ * `<tool_response>` for a call that was never declared on the
+ * preceding assistant turn, corrupting the conversation structure
+ * and changing model behavior after a restart.
+ */
+function buildAssistantMessage(text: string, toolCalls: readonly ToolCallResult[] | undefined): ChatMessage {
+  const calls = toAssistantToolCalls(toolCalls);
+  if (calls) {
+    return { role: 'assistant', content: text, toolCalls: calls };
+  }
+  return { role: 'assistant', content: text };
+}
 
 /**
  * Count the `ok`-status tool calls in a `ChatResult.toolCalls` /
@@ -418,7 +483,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // user string.
       const result = await this.model.chatSessionContinue(userMessage, null, mergedConfig);
       this.history.push({ role: 'user', content: userMessage });
-      this.history.push({ role: 'assistant', content: result.text });
+      this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
       this.recordToolCallFanout(result.toolCalls);
       return result;
@@ -497,7 +562,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // save_cache_state path on its own.
         if (sawFinal) {
           this.history.push({ role: 'user', content: userMessage });
-          this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
+          this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
           this.turnCount++;
           this.recordToolCallFanout(finalToolCalls);
         }
@@ -533,7 +598,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const mergedConfig = this.mergeConfig(opts.config);
       const result = await this.model.chatSessionContinueTool(toolCallId, content, mergedConfig);
       this.history.push({ role: 'tool', content, toolCallId });
-      this.history.push({ role: 'assistant', content: result.text });
+      this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
       this.recordToolCallFanout(result.toolCalls);
       return result;
@@ -584,7 +649,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // history until commit, so the rollback branch is a no-op.
         if (sawFinal) {
           this.history.push({ role: 'tool', content, toolCallId });
-          this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
+          this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
           this.turnCount++;
           this.recordToolCallFanout(finalToolCalls);
         }
@@ -681,7 +746,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const mergedConfig = this.mergeConfig(config);
       const result = await this.model.chatSessionStart(this.history.slice(), mergedConfig);
-      this.history.push({ role: 'assistant', content: result.text });
+      this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
       this.lastImagesKey = this.computeTrailingImagesKey();
       this.recordToolCallFanout(result.toolCalls);
@@ -739,7 +804,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // mutated on a successful commit — on any non-success exit,
         // the primed state is left intact so the caller can retry.
         if (sawFinal) {
-          this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
+          this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
           this.turnCount++;
           this.lastImagesKey = this.computeTrailingImagesKey();
           this.recordToolCallFanout(finalToolCalls);
@@ -900,7 +965,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // what the native side / any mock observed as its `messages`
       // argument.
       const result = await this.model.chatSessionStart(this.history.slice(), config);
-      this.history.push({ role: 'assistant', content: result.text });
+      this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
       this.lastImagesKey = newImagesKey;
       this.recordToolCallFanout(result.toolCalls);
@@ -972,7 +1037,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // generator was wound down. Mid-stream throws still propagate
       // naturally — finally runs first, then the error continues up.
       if (sawFinal) {
-        this.history.push({ role: 'assistant', content: finalRaw ?? accumulated });
+        this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
         this.turnCount++;
         this.lastImagesKey = newImagesKey;
         this.recordToolCallFanout(finalToolCalls);

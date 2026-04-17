@@ -305,7 +305,16 @@ describe('ChatSession', () => {
       expect(restartMessages).toEqual([
         { role: 'system', content: 'You are helpful.' },
         { role: 'user', content: 'describe A', images: [imgA] },
-        { role: 'assistant', content: 'start-reply' },
+        // The assistant turn that emitted the `call-1` tool call must
+        // carry `toolCalls` through to the replayed history so the
+        // subsequent `role: 'tool'` message remains paired with a
+        // declaring assistant turn on the jinja render. Dropping it
+        // would corrupt the replayed conversation structure.
+        {
+          role: 'assistant',
+          content: 'start-reply',
+          toolCalls: [{ id: 'call-1', name: 'tool_fn', arguments: '{}' }],
+        },
         { role: 'tool', content: 'tool-output', toolCallId: 'call-1' },
         { role: 'assistant', content: 'tool-reply' },
         { role: 'user', content: 'describe B', images: [imgB] },
@@ -1700,6 +1709,219 @@ describe('ChatSession', () => {
       session.primeHistory([{ role: 'user', content: 'describe', images: [img] }]);
       for await (const _e of session.startFromHistoryStream()) void _e;
       expect(session.hasImages).toBe(true);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // Assistant toolCalls preservation on history commit
+  // -------------------------------------------------------------------
+  //
+  // Regression coverage for the cold-replay structural bug: every
+  // assistant history commit path must carry the turn's `toolCalls`
+  // through to `ChatMessage.toolCalls` so subsequent `tool` messages
+  // remain paired with a declaring assistant turn. Dropping them leads
+  // to `chatSessionStart(history)` replays where a `tool_response`
+  // delta renders against a preceding assistant turn that never
+  // emitted a `tool_call`, silently corrupting the conversation and
+  // changing model behavior after image-change restarts and
+  // cache-miss cold starts. The assertions check the exact shape the
+  // native tokenizer expects (`{id, name, arguments: string}`) and
+  // that an ok-only filter applies (non-`ok` entries cannot be
+  // rendered by the template).
+
+  describe('assistant toolCalls preservation', () => {
+    const makeToolCallResult = (id: string, name: string, args: Record<string, unknown> | string, status = 'ok') =>
+      ({
+        id,
+        name,
+        arguments: args,
+        status,
+        rawContent: '',
+      }) as unknown as import('@mlx-node/core').ToolCallResult;
+
+    it('preserves toolCalls on the non-streaming send() delta commit', async () => {
+      const { model, chatSessionContinue, chatSessionStart } = makeMockModel();
+      // turn 0 starts clean; the delta path on turn 1 carries the tool calls.
+      chatSessionContinue.mockResolvedValueOnce({
+        ...makeChatResult(''),
+        toolCalls: [makeToolCallResult('call_1', 'foo', { a: 1 })],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('turn-0');
+      await session.send('turn-1-with-tool-call');
+      // Resolve the outstanding call so the next plain send() is legal.
+      await session.sendToolResult('call_1', 'tool-out');
+
+      // Force a reshuffle through chatSessionStart by changing the
+      // image set so we can observe the replayed history entries.
+      await session.send('turn-2-img', { images: [new Uint8Array([9, 9, 9])] });
+
+      // chatSessionStart.mock.calls[1] — the second call is the
+      // image-change restart with the full replayed history.
+      const restartMessages = chatSessionStart.mock.calls[1][0];
+      // Find the assistant entry for the tool-call turn.
+      const toolCallAssistant = restartMessages.find((m) => m.role === 'assistant' && m.toolCalls !== undefined) as
+        | ChatMessage
+        | undefined;
+      expect(toolCallAssistant).toBeDefined();
+      expect(toolCallAssistant?.toolCalls).toEqual([{ id: 'call_1', name: 'foo', arguments: '{"a":1}' }]);
+    });
+
+    it('preserves toolCalls on the streaming sendStream() delta commit', async () => {
+      const { model, chatStreamSessionContinue, chatSessionStart } = makeMockModel();
+      chatStreamSessionContinue.mockImplementationOnce(async function* () {
+        yield { text: '', done: false } as ChatStreamEvent;
+        yield {
+          ...finalChunk(''),
+          toolCalls: [makeToolCallResult('call_stream', 'bar', { q: 'x' })],
+        } as unknown as ChatStreamFinal;
+      });
+
+      const session = new ChatSession(model);
+      await session.send('turn-0');
+      for await (const _e of session.sendStream('turn-1-stream-tool-call')) void _e;
+      // Resolve the outstanding call so the next plain send() is legal.
+      await session.sendToolResult('call_stream', 'tool-out');
+
+      // Image-change restart to observe the replayed history.
+      await session.send('turn-2-img', { images: [new Uint8Array([7, 7, 7])] });
+
+      const restartMessages = chatSessionStart.mock.calls[1][0];
+      const toolCallAssistant = restartMessages.find((m) => m.role === 'assistant' && m.toolCalls !== undefined) as
+        | ChatMessage
+        | undefined;
+      expect(toolCallAssistant).toBeDefined();
+      expect(toolCallAssistant?.toolCalls).toEqual([{ id: 'call_stream', name: 'bar', arguments: '{"q":"x"}' }]);
+    });
+
+    it('preserves toolCalls on the turn-0 start path commit', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult(''),
+        toolCalls: [makeToolCallResult('call_start', 'baz', { k: true })],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('turn-0-with-tool-call');
+      // Resolve the outstanding call so the next plain send() is legal.
+      await session.sendToolResult('call_start', 'tool-out');
+      // Force a restart via image change so we can inspect the
+      // replayed history passed to chatSessionStart.
+      await session.send('turn-1-img', { images: [new Uint8Array([3, 3, 3])] });
+
+      const restartMessages = chatSessionStart.mock.calls[1][0];
+      const toolCallAssistant = restartMessages.find((m) => m.role === 'assistant' && m.toolCalls !== undefined) as
+        | ChatMessage
+        | undefined;
+      expect(toolCallAssistant).toBeDefined();
+      expect(toolCallAssistant?.toolCalls).toEqual([{ id: 'call_start', name: 'baz', arguments: '{"k":true}' }]);
+    });
+
+    it('preserves toolCalls on sendToolResult() commit', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      // Turn 0 emits an outstanding ok tool call so sendToolResult is
+      // legal. The tool-result turn then emits ANOTHER tool call —
+      // the model chaining tool use — and the preceding assistant
+      // entry for that reply must retain its toolCalls on history.
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('start-reply', 'call-A'));
+      chatSessionContinueTool.mockResolvedValueOnce({
+        ...makeChatResult('mid-reply'),
+        toolCalls: [makeToolCallResult('call-B', 'second_tool', { n: 2 })],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('turn-0');
+      await session.sendToolResult('call-A', 'result-A');
+      // Resolve the chained call so we can make a plain send() next.
+      await session.sendToolResult('call-B', 'result-B');
+
+      // Force a restart via image change so we can inspect the
+      // replayed history passed to chatSessionStart.
+      await session.send('turn-img', { images: [new Uint8Array([5, 5, 5])] });
+
+      const restartMessages = chatSessionStart.mock.calls[1][0];
+      const toolCallAssistants = restartMessages.filter((m) => m.role === 'assistant' && m.toolCalls !== undefined);
+      // Two assistant turns carried tool calls: the initial start
+      // (call-A) and the post-result chained reply (call-B).
+      expect(toolCallAssistants).toHaveLength(2);
+      expect(toolCallAssistants[0].toolCalls).toEqual([{ id: 'call-A', name: 'tool_fn', arguments: '{}' }]);
+      expect(toolCallAssistants[1].toolCalls).toEqual([{ id: 'call-B', name: 'second_tool', arguments: '{"n":2}' }]);
+    });
+
+    it('preserves toolCalls on startFromHistory() commit', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResult(''),
+        toolCalls: [makeToolCallResult('call_cold', 'cold_tool', { p: 7 })],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      session.primeHistory([{ role: 'user', content: 'cold-prime' }]);
+      await session.startFromHistory();
+      // Resolve the outstanding call so the next plain send() is legal.
+      await session.sendToolResult('call_cold', 'tool-out');
+
+      // Force a restart via image change so we can inspect the
+      // replayed history passed to chatSessionStart.
+      await session.send('img-turn', { images: [new Uint8Array([2, 2, 2])] });
+
+      const restartMessages = chatSessionStart.mock.calls[1][0];
+      const toolCallAssistant = restartMessages.find((m) => m.role === 'assistant' && m.toolCalls !== undefined) as
+        | ChatMessage
+        | undefined;
+      expect(toolCallAssistant).toBeDefined();
+      expect(toolCallAssistant?.toolCalls).toEqual([{ id: 'call_cold', name: 'cold_tool', arguments: '{"p":7}' }]);
+    });
+
+    it('filters non-ok tool call results out of the history entry', async () => {
+      const { model, chatSessionContinue, chatSessionStart } = makeMockModel();
+      // A mix: one ok call plus one parse_error entry. The parse_error
+      // cannot be re-rendered by the jinja template (no well-formed
+      // name/arguments pair) and must be dropped from the history
+      // entry — only the ok call should survive.
+      chatSessionContinue.mockResolvedValueOnce({
+        ...makeChatResult(''),
+        toolCalls: [
+          makeToolCallResult('call_ok', 'ok_tool', { x: 1 }),
+          makeToolCallResult('call_bad', 'bad_tool', 'unparsed raw', 'parse_error'),
+        ],
+      } as unknown as ChatResult);
+
+      const session = new ChatSession(model);
+      await session.send('turn-0');
+      // Turn 1 produces the mixed-status tool calls. The session's
+      // fan-out invariant rejects a plain send while those calls are
+      // outstanding, so drive through sendToolResult against the one
+      // ok call to clear the obligation before forcing a restart.
+      await session.send('turn-1-mixed');
+      await session.sendToolResult('call_ok', 'ok-result');
+      await session.send('turn-img', { images: [new Uint8Array([6, 6, 6])] });
+
+      const restartMessages = chatSessionStart.mock.calls[1][0];
+      const toolCallAssistant = restartMessages.find((m) => m.role === 'assistant' && m.toolCalls !== undefined) as
+        | ChatMessage
+        | undefined;
+      expect(toolCallAssistant).toBeDefined();
+      // Only the ok entry survives; the parse_error one is filtered.
+      expect(toolCallAssistant?.toolCalls).toEqual([{ id: 'call_ok', name: 'ok_tool', arguments: '{"x":1}' }]);
+    });
+
+    it('omits toolCalls field when the turn produced none', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      const session = new ChatSession(model);
+      await session.send('turn-0');
+      await session.send('turn-1');
+      // Force a restart to inspect the history shape.
+      await session.send('turn-img', { images: [new Uint8Array([8, 8, 8])] });
+
+      const restartMessages = chatSessionStart.mock.calls[1][0];
+      const assistantEntries = restartMessages.filter((m) => m.role === 'assistant');
+      expect(assistantEntries.length).toBeGreaterThan(0);
+      for (const entry of assistantEntries) {
+        // The key is either absent or undefined — never an empty array.
+        expect(entry.toolCalls).toBeUndefined();
+      }
     });
   });
 });
