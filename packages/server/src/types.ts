@@ -62,6 +62,21 @@ export interface ResponsesAPIRequest {
   reasoning?: { effort?: string; summary?: string };
   previous_response_id?: string;
   store?: boolean;
+  /**
+   * OpenAI-reserved `metadata` slot, repurposed here to carry MLX-Node
+   * extensions. Today this only exposes `retention_seconds` as a
+   * per-request override of `ServerConfig.responseRetentionSec`;
+   * unrelated keys are accepted and ignored (additive, forward-compat).
+   */
+  metadata?: {
+    /**
+     * Per-request retention override for the stored response row, in
+     * seconds. Must be a finite positive integer in `[60, 90 * 86400]`
+     * (1 minute … 90 days). Out-of-range or non-integer values return
+     * 400. When omitted, the server-wide default applies.
+     */
+    retention_seconds?: number;
+  };
 }
 
 // ---------------------------------------------------------------------------

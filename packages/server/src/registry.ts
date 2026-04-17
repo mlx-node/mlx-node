@@ -92,7 +92,22 @@ interface SessionRegistryBinding {
   pendingTeardown: boolean;
 }
 
+/**
+ * Constructor options for {@link ModelRegistry}.
+ */
+export interface ModelRegistryOptions {
+  /**
+   * Maximum queue depth (waiters-only) per-model for the session
+   * registry's execution mutex. Forwarded into every
+   * `SessionRegistry` this registry allocates. See
+   * {@link SessionRegistryOptions.maxQueueDepth}. Default: `undefined`
+   * (unbounded — current behaviour).
+   */
+  maxQueueDepth?: number;
+}
+
 export class ModelRegistry {
+  private readonly maxQueueDepth: number | undefined;
   private readonly models = new Map<string, ModelEntry>();
   /**
    * Identity-keyed (WeakMap semantics, but strong refs because the
@@ -143,6 +158,10 @@ export class ModelRegistry {
    */
   private readonly retiredInstanceIds = new WeakMap<ServableModel, { instanceId: number; outstandingCount: number }>();
 
+  constructor(opts?: ModelRegistryOptions) {
+    this.maxQueueDepth = opts?.maxQueueDepth;
+  }
+
   /**
    * Register a model under a given name.
    *
@@ -191,7 +210,7 @@ export class ModelRegistry {
     let binding = this.sessionRegistriesByModel.get(model);
     if (!binding) {
       binding = {
-        registry: new SessionRegistry({ model }),
+        registry: new SessionRegistry({ model, maxQueueDepth: this.maxQueueDepth }),
         refCount: 0,
         inFlight: 0,
         pendingPersists: 0,

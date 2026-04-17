@@ -12,7 +12,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
-import { sendAnthropicBadRequest, sendAnthropicInternalError, sendAnthropicNotFound } from '../errors.js';
+import {
+  sendAnthropicBadRequest,
+  sendAnthropicInternalError,
+  sendAnthropicNotFound,
+  sendAnthropicRateLimit,
+} from '../errors.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import {
   buildAnthropicResponse,
@@ -26,7 +31,7 @@ import {
 } from '../mappers/anthropic-response.js';
 import { genId } from '../mappers/response.js';
 import type { ModelRegistry } from '../registry.js';
-import type { SessionRegistry } from '../session-registry.js';
+import { QueueFullError, type SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
@@ -539,73 +544,103 @@ export async function handleCreateMessage(
     abortListenersAttached = true;
     const streamSignal: AbortSignal = abortController.signal;
 
-    await sessionReg.withExclusive(async () => {
-      // Hot-swap race guard. `ModelRegistry.register()` is not coordinated with
-      // `withExclusive`, so a concurrent re-register of the same friendly name
-      // could silently dispatch this request through a stale model. Any drift
-      // from the pre-lock snapshot is fatal.
-      const lockedSessionReg = registry.getSessionRegistry(body.model);
-      const lockedInstanceId = registry.getInstanceId(body.model);
-      if (
-        lockedSessionReg === undefined ||
-        lockedInstanceId === undefined ||
-        lockedSessionReg !== sessionReg ||
-        lockedInstanceId !== preLockInstanceId
-      ) {
-        sendAnthropicBadRequest(
-          res,
-          `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
-            `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
-            `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
-            `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
-            `service this request through a stale model object — a silent cross-model handoff. Retry the ` +
-            `request — if the swap was intentional, the new binding will service the retry cleanly.`,
-        );
-        return;
-      }
-
-      const session = sessionReg.getOrCreate(null, requestedSystem);
-
-      // Outer catch branches on `responseMode` (not `res.headersSent`, which
-      // flips in `writeHead` before the body lands) so a crash after
-      // `writeHead(application/json)` cannot leak SSE frames into a JSON body.
-      const visibility = createVisibility();
-
-      try {
-        if (body.stream === true) {
-          const outcome = runSessionStreaming(session, messages, config, streamSignal);
-          await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq, visibility);
-        } else {
-          // Native `chatSessionStart` has no AbortSignal yet — disconnect handling
-          // lives inside `handleNonStreaming` / `endJson`.
-          const result = await runSessionNonStreaming(session, messages, config);
-          await handleNonStreaming(res, result, body, visibility);
+    try {
+      await sessionReg.withExclusive(async () => {
+        // Hot-swap race guard. `ModelRegistry.register()` is not coordinated with
+        // `withExclusive`, so a concurrent re-register of the same friendly name
+        // could silently dispatch this request through a stale model. Any drift
+        // from the pre-lock snapshot is fatal.
+        const lockedSessionReg = registry.getSessionRegistry(body.model);
+        const lockedInstanceId = registry.getInstanceId(body.model);
+        if (
+          lockedSessionReg === undefined ||
+          lockedInstanceId === undefined ||
+          lockedSessionReg !== sessionReg ||
+          lockedInstanceId !== preLockInstanceId
+        ) {
+          sendAnthropicBadRequest(
+            res,
+            `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
+              `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
+              `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
+              `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
+              `service this request through a stale model object — a silent cross-model handoff. Retry the ` +
+              `request — if the swap was intentional, the new binding will service the retry cleanly.`,
+          );
+          return;
         }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unknown error during inference';
-        if (visibility.responseMode === null) {
-          sendAnthropicInternalError(res, message);
-        } else if (visibility.responseMode === 'json') {
-          // Already committed to JSON — destroy the socket rather than corrupt the body.
-          try {
-            res.destroy(err instanceof Error ? err : new Error(message));
-          } catch {
-            // Socket may already be gone.
+
+        const session = sessionReg.getOrCreate(null, requestedSystem).session;
+
+        // `X-Session-Cache` observability header: `/v1/messages` is
+        // stateless — every request allocates a fresh `ChatSession` via
+        // `getOrCreate(null, …)` — so the status is always `fresh`. Emit
+        // it anyway to keep the header contract uniform with
+        // `/v1/responses`, and set it before any `writeHead` / SSE
+        // `beginSSE` so it lands on both JSON and SSE responses.
+        res.setHeader('X-Session-Cache', 'fresh');
+
+        // Outer catch branches on `responseMode` (not `res.headersSent`, which
+        // flips in `writeHead` before the body lands) so a crash after
+        // `writeHead(application/json)` cannot leak SSE frames into a JSON body.
+        const visibility = createVisibility();
+
+        try {
+          if (body.stream === true) {
+            const outcome = runSessionStreaming(session, messages, config, streamSignal);
+            await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq, visibility);
+          } else {
+            // Native `chatSessionStart` has no AbortSignal yet — disconnect handling
+            // lives inside `handleNonStreaming` / `endJson`.
+            const result = await runSessionNonStreaming(session, messages, config);
+            await handleNonStreaming(res, result, body, visibility);
           }
-        } else {
-          // SSE: best-effort streaming `error`, but only if no terminal landed
-          // (a double terminal would confuse the client state machine).
-          if (!visibility.terminalEmitted) {
-            writeFallbackErrorSSE(res, 'error', { error: { type: 'api_error', message } });
-          }
-          try {
-            endSSE(res);
-          } catch {
-            // Already closed.
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Unknown error during inference';
+          if (visibility.responseMode === null) {
+            sendAnthropicInternalError(res, message);
+          } else if (visibility.responseMode === 'json') {
+            // Already committed to JSON — destroy the socket rather than corrupt the body.
+            try {
+              res.destroy(err instanceof Error ? err : new Error(message));
+            } catch {
+              // Socket may already be gone.
+            }
+          } else {
+            // SSE: best-effort streaming `error`, but only if no terminal landed
+            // (a double terminal would confuse the client state machine).
+            if (!visibility.terminalEmitted) {
+              writeFallbackErrorSSE(res, 'error', { error: { type: 'api_error', message } });
+            }
+            try {
+              endSSE(res);
+            } catch {
+              // Already closed.
+            }
           }
         }
+      });
+    } catch (err) {
+      // Admission-control rejection from the per-model queue cap
+      // (`SessionRegistry.withExclusive` threw before chaining into
+      // the FIFO). Emit Anthropic-shape HTTP 429 so clients back off
+      // instead of silently piling up more waiters. The outer
+      // `finally` below still detaches abort listeners and releases
+      // the dispatch lease, so no per-request resources are leaked.
+      //
+      // Any other error continues to propagate so an abnormal failure
+      // still routes through the handler's existing error paths.
+      if (err instanceof QueueFullError) {
+        if (!res.headersSent) {
+          sendAnthropicRateLimit(
+            res,
+            `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`,
+          );
+        }
+      } else {
+        throw err;
       }
-    });
+    }
   } finally {
     // Drop disconnect listeners so they don't pin the request past handler
     // return. Only detach if we actually attached (gated by the flag).

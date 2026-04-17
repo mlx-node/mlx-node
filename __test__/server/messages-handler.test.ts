@@ -2066,4 +2066,151 @@ describe('handleCreateMessage', () => {
       expect(body).not.toMatch(/^data: /m);
     });
   });
+
+  describe('X-Session-Cache observability header', () => {
+    // `/v1/messages` is stateless — every request calls
+    // `sessionReg.getOrCreate(null, …)` — so the header is always
+    // `fresh`. The assertion exists to keep the header contract
+    // uniform with `/v1/responses` so operator tooling can pin on
+    // it regardless of endpoint.
+
+    it('messages endpoint always emits X-Session-Cache: fresh on non-streaming', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const { res, getStatus, getHeaders } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      expect(getHeaders()['x-session-cache']).toBe('fresh');
+    });
+
+    it('messages endpoint always emits X-Session-Cache: fresh on streaming', async () => {
+      const streamEvents = [
+        { done: false, text: 'hi', isReasoning: false },
+        {
+          done: true,
+          text: 'hi',
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 1,
+          reasoningTokens: 0,
+          rawText: 'hi',
+        },
+      ];
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getHeaders } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      expect(getHeaders()['x-session-cache']).toBe('fresh');
+      // SSE headers are committed by `beginSSE`; the observability
+      // header lands alongside them because it was set BEFORE
+      // `writeHead` fired.
+      expect(getHeaders()['content-type']).toBe('text/event-stream');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Queue-depth backpressure (HTTP 429)
+  // -----------------------------------------------------------------------
+
+  describe('queue cap', () => {
+    it('POST /v1/messages returns 429 Anthropic-format when queue is full', async () => {
+      // Stateless Anthropic endpoint still serializes per-model through
+      // `SessionRegistry.withExclusive`, so the admission-control 429
+      // path applies here too. Shape matches Anthropic: 429 status,
+      // `Retry-After: 1` header, body `{ type: 'error', error: { type:
+      // 'rate_limit_error', message: '...' } }`.
+      let releaseFirst!: () => void;
+      const firstHold = new Promise<void>((r) => {
+        releaseFirst = r;
+      });
+      const model = {
+        chatSessionStart: vi.fn(async () => {
+          await firstHold;
+          return makeChatResult({ text: 'ok' });
+        }),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path not expected')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+
+      const registry = new ModelRegistry({ maxQueueDepth: 1 });
+      registry.register('cap-model', model);
+
+      // A: active holder.
+      const mockA = createMockRes();
+      const promiseA = handleCreateMessage(
+        mockA.res,
+        {
+          model: 'cap-model',
+          messages: [{ role: 'user', content: 'A' }],
+          max_tokens: 32,
+        },
+        registry,
+      );
+      await new Promise((r) => setImmediate(r));
+
+      // B: first waiter (within cap).
+      const mockB = createMockRes();
+      const promiseB = handleCreateMessage(
+        mockB.res,
+        {
+          model: 'cap-model',
+          messages: [{ role: 'user', content: 'B' }],
+          max_tokens: 32,
+        },
+        registry,
+      );
+      await new Promise((r) => setImmediate(r));
+
+      // C: second waiter, cap exceeded -> 429 Anthropic shape.
+      const mockC = createMockRes();
+      await handleCreateMessage(
+        mockC.res,
+        {
+          model: 'cap-model',
+          messages: [{ role: 'user', content: 'C' }],
+          max_tokens: 32,
+        },
+        registry,
+      );
+
+      expect(mockC.getStatus()).toBe(429);
+      expect(mockC.getHeaders()['retry-after']).toBe('1');
+      const parsed = JSON.parse(mockC.getBody());
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('rate_limit_error');
+      expect(parsed.error.message).toContain('Model queue full');
+
+      // Drain pending so the test tears down cleanly.
+      releaseFirst();
+      await promiseA;
+      await promiseB;
+    });
+  });
 });

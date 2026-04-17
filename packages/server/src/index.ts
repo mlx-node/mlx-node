@@ -12,10 +12,10 @@ export { createHandler } from './handler.js';
 export type { HandlerOptions } from './handler.js';
 
 export { ModelRegistry } from './registry.js';
-export type { ServableModel, ModelEntry } from './registry.js';
+export type { ServableModel, ModelEntry, ModelRegistryOptions } from './registry.js';
 
-export { SessionRegistry } from './session-registry.js';
-export type { SessionRegistryOptions } from './session-registry.js';
+export { QueueFullError, SessionRegistry } from './session-registry.js';
+export type { SessionLookupResult, SessionRegistryOptions } from './session-registry.js';
 
 export type {
   ResponsesAPIRequest,

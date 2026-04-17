@@ -34,6 +34,19 @@ function parseEnvSeconds(name: string): number | undefined {
   return Math.floor(parsed);
 }
 
+/**
+ * Parse a positive integer count from env; shares the reject-unset-or-invalid
+ * semantics used by {@link parseEnvSeconds} so callers can fall back to their
+ * own default when the var is missing or malformed.
+ */
+function parseEnvPositiveInt(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.floor(parsed);
+}
+
 export interface ServerConfig {
   /** Port to listen on (default: 8080). */
   port?: number;
@@ -54,6 +67,17 @@ export interface ServerConfig {
    * when `disableStore` is true.
    */
   responseRetentionSec?: number;
+  /**
+   * Maximum number of concurrent requests that may be WAITING for the
+   * per-model execution mutex (the one actively running does not count).
+   * When the cap is reached, further requests return HTTP 429 with a
+   * `Retry-After: 1` header so clients can back off instead of piling
+   * into an unbounded queue.
+   *
+   * Default: `undefined` (unbounded — current behaviour). Env override:
+   * `MLX_MAX_QUEUE_DEPTH_PER_MODEL` (positive integer).
+   */
+  maxQueueDepthPerModel?: number;
 }
 
 export interface ServerInstance {
@@ -85,8 +109,12 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     config?.responseRetentionSec ??
     parseEnvSeconds('MLX_RESPONSE_RETENTION_SECONDS') ??
     DEFAULT_RESPONSE_RETENTION_SECONDS;
+  // Opt-in queue-depth cap; resolved exactly once at server construction
+  // so the registry (and its per-model `SessionRegistry` instances
+  // allocated on `register()`) all share a single effective value.
+  const maxQueueDepthPerModel = config?.maxQueueDepthPerModel ?? parseEnvPositiveInt('MLX_MAX_QUEUE_DEPTH_PER_MODEL');
 
-  const registry = new ModelRegistry();
+  const registry = new ModelRegistry({ maxQueueDepth: maxQueueDepthPerModel });
 
   let store: ResponseStore | null = null;
   if (!disableStore) {

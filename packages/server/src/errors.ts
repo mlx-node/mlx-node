@@ -60,6 +60,28 @@ export function sendStorageTimeout(res: ServerResponse, message: string): void {
   sendError(res, 503, 'storage_timeout', message);
 }
 
+/**
+ * 429 with `type: 'rate_limit_error'` and `code: 'queue_full'`. Emitted by
+ * `/v1/responses` when the per-model execution queue is already holding
+ * `maxQueueDepth` waiters behind the current dispatch. Always sets
+ * `Retry-After: 1` (string seconds) so clients back off briefly before
+ * retrying — short enough to encourage a retry, long enough to avoid
+ * busy-looping the server.
+ */
+export function sendRateLimit(res: ServerResponse, message: string): void {
+  res.writeHead(429, { 'Retry-After': '1', 'Content-Type': 'application/json' });
+  res.end(
+    JSON.stringify({
+      error: {
+        type: 'rate_limit_error',
+        message,
+        code: 'queue_full',
+        param: null,
+      },
+    }),
+  );
+}
+
 export function sendAnthropicError(res: ServerResponse, status: number, type: string, message: string): void {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ type: 'error', error: { type, message } }));
@@ -80,4 +102,15 @@ export function sendAnthropicInternalError(res: ServerResponse, message: string)
 export function sendAnthropicMethodNotAllowed(res: ServerResponse, allowed: string): void {
   res.writeHead(405, { Allow: allowed, 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Method not allowed' } }));
+}
+
+/**
+ * 429 Anthropic-shape rate-limit response. Mirror of {@link sendRateLimit}
+ * for `/v1/messages`. Body uses the `{ type: 'error', error: { type, message } }`
+ * envelope the rest of the Anthropic error helpers use; `Retry-After: 1`
+ * is set verbatim so clients can wait one second before retrying.
+ */
+export function sendAnthropicRateLimit(res: ServerResponse, message: string): void {
+  res.writeHead(429, { 'Retry-After': '1', 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message } }));
 }

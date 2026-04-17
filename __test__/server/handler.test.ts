@@ -645,6 +645,213 @@ describe('createHandler', () => {
       expect(storedRecord.expiresAt).toBeLessThanOrEqual(afterSec + 1800);
     });
 
+    describe('metadata.retention_seconds per-request override', () => {
+      // Per-request retention override via the OpenAI-reserved
+      // `metadata` slot. The server-wide default still seeds the
+      // fallback when the override is absent; the override wins
+      // whenever present and valid. All out-of-range / malformed
+      // values short-circuit to 400 and MUST NOT persist anything.
+      function makeStoreCapture(): {
+        mockStore: {
+          getChain: ReturnType<typeof vi.fn>;
+          store: ReturnType<typeof vi.fn>;
+          cleanupExpired: ReturnType<typeof vi.fn>;
+        };
+        getStoredRecord: () => any;
+      } {
+        let storedRecord: any = null;
+        const mockStore = {
+          getChain: vi.fn(),
+          store: vi.fn().mockImplementation((record: any) => {
+            storedRecord = record;
+            return Promise.resolve();
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        return { mockStore, getStoredRecord: () => storedRecord };
+      }
+
+      it('accepts a valid retention_seconds override and stamps expiresAt = now + override', async () => {
+        const registry = new ModelRegistry();
+        registry.register('test-model', createMockModel());
+
+        const { mockStore, getStoredRecord } = makeStoreCapture();
+        // Server default is 1800s; override of 600s (10 min) must win.
+        const serverDefault = 1800;
+        const override = 600;
+        const handler = createHandler(registry, {
+          store: mockStore as any,
+          responseRetentionSec: serverDefault,
+        });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'Hello',
+          metadata: { retention_seconds: override },
+        });
+        const { res, waitForEnd } = createMockRes();
+
+        const beforeSec = Math.floor(Date.now() / 1000);
+        await handler(req, res);
+        await waitForEnd();
+        const afterSec = Math.floor(Date.now() / 1000);
+
+        expect(mockStore.store).toHaveBeenCalledTimes(1);
+        const storedRecord = getStoredRecord();
+        expect(storedRecord.expiresAt).toBeGreaterThanOrEqual(beforeSec + override);
+        expect(storedRecord.expiresAt).toBeLessThanOrEqual(afterSec + override);
+        // Guard: the override must NOT be clamped up to the server default.
+        expect(storedRecord.expiresAt).toBeLessThan(beforeSec + serverDefault);
+      });
+
+      it('falls back to server default when metadata.retention_seconds is omitted', async () => {
+        const registry = new ModelRegistry();
+        registry.register('test-model', createMockModel());
+
+        const { mockStore, getStoredRecord } = makeStoreCapture();
+        const serverDefault = 4242;
+        const handler = createHandler(registry, {
+          store: mockStore as any,
+          responseRetentionSec: serverDefault,
+        });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'Hello',
+          // No `metadata` field at all.
+        });
+        const { res, waitForEnd } = createMockRes();
+
+        const beforeSec = Math.floor(Date.now() / 1000);
+        await handler(req, res);
+        await waitForEnd();
+        const afterSec = Math.floor(Date.now() / 1000);
+
+        expect(mockStore.store).toHaveBeenCalledTimes(1);
+        const storedRecord = getStoredRecord();
+        expect(storedRecord.expiresAt).toBeGreaterThanOrEqual(beforeSec + serverDefault);
+        expect(storedRecord.expiresAt).toBeLessThanOrEqual(afterSec + serverDefault);
+      });
+
+      it('rejects retention_seconds <= 0 with 400', async () => {
+        const registry = new ModelRegistry();
+        registry.register('test-model', createMockModel());
+
+        const { mockStore } = makeStoreCapture();
+        const handler = createHandler(registry, {
+          store: mockStore as any,
+          responseRetentionSec: 1800,
+        });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'Hello',
+          metadata: { retention_seconds: 0 },
+        });
+        const { res, getStatus, getBody, waitForEnd } = createMockRes();
+        await handler(req, res);
+        await waitForEnd();
+
+        expect(getStatus()).toBe(400);
+        expect(getBody()).toContain('metadata.retention_seconds must be an integer in [60, 7776000]');
+        expect(mockStore.store).not.toHaveBeenCalled();
+      });
+
+      it('rejects retention_seconds > 7776000 with 400', async () => {
+        const registry = new ModelRegistry();
+        registry.register('test-model', createMockModel());
+
+        const { mockStore } = makeStoreCapture();
+        const handler = createHandler(registry, {
+          store: mockStore as any,
+          responseRetentionSec: 1800,
+        });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'Hello',
+          metadata: { retention_seconds: 7776001 },
+        });
+        const { res, getStatus, getBody, waitForEnd } = createMockRes();
+        await handler(req, res);
+        await waitForEnd();
+
+        expect(getStatus()).toBe(400);
+        expect(getBody()).toContain('metadata.retention_seconds must be an integer in [60, 7776000]');
+        expect(mockStore.store).not.toHaveBeenCalled();
+      });
+
+      it('rejects retention_seconds < 60 with 400', async () => {
+        const registry = new ModelRegistry();
+        registry.register('test-model', createMockModel());
+
+        const { mockStore } = makeStoreCapture();
+        const handler = createHandler(registry, {
+          store: mockStore as any,
+          responseRetentionSec: 1800,
+        });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'Hello',
+          metadata: { retention_seconds: 59 },
+        });
+        const { res, getStatus, getBody, waitForEnd } = createMockRes();
+        await handler(req, res);
+        await waitForEnd();
+
+        expect(getStatus()).toBe(400);
+        expect(getBody()).toContain('metadata.retention_seconds must be an integer in [60, 7776000]');
+        expect(mockStore.store).not.toHaveBeenCalled();
+      });
+
+      it('rejects non-numeric retention_seconds with 400', async () => {
+        const registry = new ModelRegistry();
+        registry.register('test-model', createMockModel());
+
+        const { mockStore } = makeStoreCapture();
+        const handler = createHandler(registry, {
+          store: mockStore as any,
+          responseRetentionSec: 1800,
+        });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'Hello',
+          metadata: { retention_seconds: 'forever' },
+        });
+        const { res, getStatus, getBody, waitForEnd } = createMockRes();
+        await handler(req, res);
+        await waitForEnd();
+
+        expect(getStatus()).toBe(400);
+        expect(getBody()).toContain('metadata.retention_seconds must be an integer in [60, 7776000]');
+        expect(mockStore.store).not.toHaveBeenCalled();
+      });
+
+      it('ignores unrelated metadata fields and uses server default', async () => {
+        const registry = new ModelRegistry();
+        registry.register('test-model', createMockModel());
+
+        const { mockStore, getStoredRecord } = makeStoreCapture();
+        const serverDefault = 900;
+        const handler = createHandler(registry, {
+          store: mockStore as any,
+          responseRetentionSec: serverDefault,
+        });
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'Hello',
+          metadata: { user_tag: 'foo' },
+        });
+        const { res, waitForEnd } = createMockRes();
+
+        const beforeSec = Math.floor(Date.now() / 1000);
+        await handler(req, res);
+        await waitForEnd();
+        const afterSec = Math.floor(Date.now() / 1000);
+
+        expect(mockStore.store).toHaveBeenCalledTimes(1);
+        const storedRecord = getStoredRecord();
+        expect(storedRecord.expiresAt).toBeGreaterThanOrEqual(beforeSec + serverDefault);
+        expect(storedRecord.expiresAt).toBeLessThanOrEqual(afterSec + serverDefault);
+      });
+    });
+
     it('passes mapped messages and config to chatSessionStart on cold path', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel();
@@ -1868,7 +2075,8 @@ describe('createHandler', () => {
       // now also leases the entry out (single-use semantics), so the
       // registry drops to size 0 afterwards.
       const resumed = sessionReg!.getOrCreate(resp.id, null);
-      expect(resumed.turns).toBeGreaterThan(0);
+      expect(resumed.session.turns).toBeGreaterThan(0);
+      expect(resumed.hit).toBe(true);
       expect(sessionReg!.size).toBe(0);
     });
 
@@ -7300,7 +7508,8 @@ describe('createHandler', () => {
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg!.size).toBe(1);
       const resumed = sessionReg!.getOrCreate(resp2.id, null);
-      expect(resumed.turns).toBeGreaterThan(0);
+      expect(resumed.session.turns).toBeGreaterThan(0);
+      expect(resumed.hit).toBe(true);
     });
 
     it('shares one SessionRegistry across two names that alias the same model instance', async () => {
@@ -8248,6 +8457,251 @@ describe('createHandler', () => {
       expect(mockModel.chatSessionStart).not.toHaveBeenCalled();
       // Nothing new persisted.
       expect(storedRecords.size).toBe(1);
+    });
+
+    it('rejects same-process cross-model continuation even after the boot-id gate (hot-swap protection preserved)', async () => {
+      // Restart-safe chain continuation (fix #1) must NOT weaken the
+      // in-process hot-swap guard. A stored row whose `serverBootId`
+      // matches the live boot id is in-process, so the strict
+      // `modelInstanceId` comparison MUST fire and reject a chain
+      // produced by a different model object bound to the same name.
+      //
+      // Sequence:
+      //   1. Install a deterministic live boot id.
+      //   2. Seed a row that carries `{serverBootId: LIVE, modelInstanceId: 1}`
+      //      — the same boot id as the live process.
+      //   3. Live registry has `my-model` bound to modelB, which has
+      //      been allocated `modelInstanceId: 2` by advancing through
+      //      an earlier registration. Continuation against resp must 400.
+      const { __setServerBootIdForTesting, getServerBootId } =
+        await import('../../packages/server/src/endpoints/responses.js');
+      const savedBootId = getServerBootId();
+      __setServerBootIdForTesting('live-boot-id-same-process');
+      try {
+        const registry = new ModelRegistry();
+        const modelA = createMockModel(makeChatResult({ text: 'A reply' }));
+        const modelB = createMockModel(makeChatResult({ text: 'B reply' }));
+        // Advance `nextInstanceId` by registering+unregistering modelA
+        // first so modelB gets instanceId = 2.
+        registry.register('my-model', modelA);
+        const idA = registry.getInstanceId('my-model');
+        expect(idA).toBe(1);
+        registry.register('my-model', modelB); // hot-swap to different object
+        const idB = registry.getInstanceId('my-model');
+        expect(idB).toBe(2);
+
+        const storedRecords = new Map<string, any>();
+        storedRecords.set('resp_hotswap_bootid', {
+          id: 'resp_hotswap_bootid',
+          createdAt: Math.floor(Date.now() / 1000),
+          model: 'my-model',
+          status: 'completed',
+          inputJson: JSON.stringify([{ role: 'user', content: 'first turn' }]),
+          outputJson: JSON.stringify([
+            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'A reply' }] },
+          ]),
+          outputText: 'A reply',
+          usageJson: '{}',
+          // Boot id matches the live process → strict instance-id
+          // guard must fire. Stored instance id = 1 (modelA), live = 2 (modelB).
+          configJson: JSON.stringify({ modelInstanceId: 1, serverBootId: 'live-boot-id-same-process' }),
+        });
+        const mockStore = {
+          store: vi.fn((record: any) => {
+            storedRecords.set(record.id, record);
+            return Promise.resolve();
+          }),
+          getChain: vi.fn((id: string) => {
+            const out: any[] = [];
+            let cursor: string | undefined = id;
+            while (cursor) {
+              const rec = storedRecords.get(cursor);
+              if (!rec) break;
+              out.unshift(rec);
+              cursor = rec.previousResponseId;
+            }
+            return Promise.resolve(out);
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'my-model',
+          previous_response_id: 'resp_hotswap_bootid',
+          input: 'second turn',
+        });
+        const { res, getStatus, getBody, waitForEnd } = createMockRes();
+        await handler(req, res);
+        await waitForEnd();
+
+        expect(getStatus()).toBe(400);
+        const err = JSON.parse(getBody());
+        expect(err.error.type).toBe('invalid_request_error');
+        expect(err.error.message).toMatch(/different model instance/i);
+        // Neither model's session APIs were invoked.
+        // eslint-disable-next-line @typescript-eslint/unbound-method
+        expect(modelA.chatSessionStart).not.toHaveBeenCalled();
+        // eslint-disable-next-line @typescript-eslint/unbound-method
+        expect(modelB.chatSessionStart).not.toHaveBeenCalled();
+      } finally {
+        __setServerBootIdForTesting(savedBootId);
+      }
+    });
+
+    it('accepts previous_response_id continuation across a server restart via name-based resume', async () => {
+      // Fix #1 main path: on restart, `ModelRegistry.nextInstanceId`
+      // starts at 1 again so the stored `modelInstanceId` is
+      // meaningless. The fresh `serverBootId` breaks strict
+      // identity; the handler must skip the instance-id guard and
+      // fall back to name-based resume, producing a 200.
+      const { __setServerBootIdForTesting, getServerBootId } =
+        await import('../../packages/server/src/endpoints/responses.js');
+      const savedBootId = getServerBootId();
+      // Seed the row while the "old" process is alive.
+      __setServerBootIdForTesting('old-boot-id-pre-restart');
+      const storedRecords = new Map<string, any>();
+      storedRecords.set('resp_restart', {
+        id: 'resp_restart',
+        createdAt: Math.floor(Date.now() / 1000),
+        model: 'test-model',
+        status: 'completed',
+        inputJson: JSON.stringify([{ role: 'user', content: 'pre-restart turn' }]),
+        outputJson: JSON.stringify([
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'pre-restart reply' }] },
+        ]),
+        outputText: 'pre-restart reply',
+        usageJson: '{}',
+        configJson: JSON.stringify({ modelInstanceId: 999, serverBootId: 'old-boot-id-pre-restart' }),
+        expiresAt: Math.floor(Date.now() / 1000) + 7 * 24 * 3600,
+      });
+
+      // Simulate restart: flip to a fresh boot id. The stored row's
+      // boot id no longer matches — strict instance-id check must
+      // be skipped. Live process has modelInstanceId = 1 (< 999).
+      __setServerBootIdForTesting('new-boot-id-post-restart');
+      try {
+        const registry = new ModelRegistry();
+        const postRestartModel = createMockModel(makeChatResult({ text: 'post-restart reply' }));
+        registry.register('test-model', postRestartModel);
+        expect(registry.getInstanceId('test-model')).toBe(1);
+
+        const mockStore = {
+          store: vi.fn((record: any) => {
+            storedRecords.set(record.id, record);
+            return Promise.resolve();
+          }),
+          getChain: vi.fn((id: string) => {
+            const out: any[] = [];
+            let cursor: string | undefined = id;
+            while (cursor) {
+              const rec = storedRecords.get(cursor);
+              if (!rec) break;
+              out.unshift(rec);
+              cursor = rec.previousResponseId;
+            }
+            return Promise.resolve(out);
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          previous_response_id: 'resp_restart',
+          input: 'continue after restart',
+        });
+        const { res, getStatus, getBody, waitForEnd } = createMockRes();
+        await handler(req, res);
+        await waitForEnd();
+
+        // Name-based resume succeeds — no 400.
+        expect(getStatus()).toBe(200);
+        const parsed = JSON.parse(getBody());
+        expect(parsed.status).toBe('completed');
+        expect(parsed.previous_response_id).toBe('resp_restart');
+        // Cold-replay dispatched through `chatSessionStart` (reconstructed
+        // history + new user turn), not `chatSessionContinue` — the session
+        // registry is empty after "restart".
+        // eslint-disable-next-line @typescript-eslint/unbound-method
+        expect(postRestartModel.chatSessionStart).toHaveBeenCalledTimes(1);
+      } finally {
+        __setServerBootIdForTesting(savedBootId);
+      }
+    });
+
+    it('treats a row with modelInstanceId but no serverBootId as cross-restart (pre-bootId rollout)', async () => {
+      // Compatibility path: rows written before `serverBootId` was
+      // added carry `modelInstanceId` alone. The handler must treat
+      // the missing boot id as "cannot verify against current
+      // process" — i.e. same rule as cross-restart — and fall back
+      // to name-based resume.
+      const { __setServerBootIdForTesting, getServerBootId } =
+        await import('../../packages/server/src/endpoints/responses.js');
+      const savedBootId = getServerBootId();
+      __setServerBootIdForTesting('live-boot-id-prebootid-row');
+      try {
+        const registry = new ModelRegistry();
+        const mockModel = createMockModel(makeChatResult({ text: 'post-reload reply' }));
+        registry.register('test-model', mockModel);
+        const storedRecords = new Map<string, any>();
+        // Pre-bootId-rollout row: modelInstanceId present, serverBootId absent.
+        // The stored instance id differs from the live one to prove the
+        // instance-id guard was skipped (not that it coincidentally matched).
+        storedRecords.set('resp_prebootid', {
+          id: 'resp_prebootid',
+          createdAt: Math.floor(Date.now() / 1000),
+          model: 'test-model',
+          status: 'completed',
+          inputJson: JSON.stringify([{ role: 'user', content: 'legacy-ish turn' }]),
+          outputJson: JSON.stringify([
+            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'legacy-ish reply' }] },
+          ]),
+          outputText: 'legacy-ish reply',
+          usageJson: '{}',
+          configJson: JSON.stringify({ modelInstanceId: 42 }),
+          expiresAt: Math.floor(Date.now() / 1000) + 7 * 24 * 3600,
+        });
+        expect(registry.getInstanceId('test-model')).toBe(1);
+
+        const mockStore = {
+          store: vi.fn((record: any) => {
+            storedRecords.set(record.id, record);
+            return Promise.resolve();
+          }),
+          getChain: vi.fn((id: string) => {
+            const out: any[] = [];
+            let cursor: string | undefined = id;
+            while (cursor) {
+              const rec = storedRecords.get(cursor);
+              if (!rec) break;
+              out.unshift(rec);
+              cursor = rec.previousResponseId;
+            }
+            return Promise.resolve(out);
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const handler = createHandler(registry, { store: mockStore as any });
+
+        const req = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          previous_response_id: 'resp_prebootid',
+          input: 'continue through a pre-bootId row',
+        });
+        const { res, getStatus, getBody, waitForEnd } = createMockRes();
+        await handler(req, res);
+        await waitForEnd();
+
+        expect(getStatus()).toBe(200);
+        const parsed = JSON.parse(getBody());
+        expect(parsed.status).toBe('completed');
+        expect(parsed.previous_response_id).toBe('resp_prebootid');
+        // eslint-disable-next-line @typescript-eslint/unbound-method
+        expect(mockModel.chatSessionStart).toHaveBeenCalledTimes(1);
+      } finally {
+        __setServerBootIdForTesting(savedBootId);
+      }
     });
 
     it('rejects previous_response_id continuation when the model binding is re-registered during store.getChain', async () => {
@@ -10066,6 +10520,330 @@ describe('createHandler', () => {
       const body = getBody();
       expect(body).not.toContain('event: ');
       expect(body).not.toMatch(/^data: /m);
+    });
+  });
+
+  describe('X-Session-Cache observability header', () => {
+    // Invariants: every `/v1/responses` reply carries `X-Session-Cache`
+    // so operators and clients can distinguish warm-hit (fast KV reuse),
+    // cold-replay (full prefill from SQLite), and fresh (new chain).
+    // The header is set BEFORE `writeHead` / `beginSSE` on every path —
+    // JSON and SSE alike.
+
+    it('emits X-Session-Cache: fresh on a request with no previous_response_id', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hello' });
+      const { res, getHeaders, getStatus, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+      expect(getHeaders()['x-session-cache']).toBe('fresh');
+    });
+
+    it('emits X-Session-Cache: hit on a continuation that warm-hits the session registry', async () => {
+      // Turn 1 seeds the registry on adopt; turn 2 references
+      // `previous_response_id=resp_1.id`. The in-process warm entry is
+      // still live, so `getOrCreate` leases it out and the header reads
+      // `hit`. `chatSessionContinue` is the hot-path NAPI — hitting it
+      // proves the KV cache was reused.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'first' }));
+      const chatSessionContinue = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'second' }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const { res: res1, getBody: getBody1, getHeaders: getHeaders1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      expect(getHeaders1()['x-session-cache']).toBe('fresh');
+      const resp1 = JSON.parse(getBody1());
+
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: resp1.id,
+        input: 'follow up',
+      });
+      const { res: res2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      // Hot-path proof: `chatSessionContinue` is only reached when the
+      // warm entry was leased out of the registry. The header tracks
+      // the same branch.
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(getHeaders2()['x-session-cache']).toBe('hit');
+    });
+
+    it('emits X-Session-Cache: cold_replay on a continuation that misses the warm cache and rebuilds from SQLite', async () => {
+      // After turn 1 adopts the session, `sessionReg.clear()` evicts
+      // the warm entry. Turn 2's `previous_response_id` lookup misses
+      // and the endpoint falls through to `store.getChain` +
+      // `primeHistory` + `startFromHistory*`, which dispatches via
+      // `chatSessionStart` again (NOT `chatSessionContinue`). The
+      // header tracks that miss.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'first' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'cold reply' }));
+      const chatSessionContinue = vi
+        .fn()
+        .mockRejectedValue(new Error('chatSessionContinue must not be reached on cold-replay path'));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hi' });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+
+      // Evict the warm entry so the next continuation cold-replays.
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+      sessionReg.clear();
+
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: resp1.id,
+        input: 'follow up',
+      });
+      const { res: res2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      // Cold-path proof: `chatSessionStart` was called twice (turn 1 +
+      // cold-replay on turn 2) and `chatSessionContinue` was never
+      // reached. The header tracks the same branch.
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+      expect(getHeaders2()['x-session-cache']).toBe('cold_replay');
+    });
+
+    it('emits X-Session-Cache on streaming SSE responses before writeHead', async () => {
+      // The header lands on the wire before `beginSSE(res)` commits
+      // the SSE content-type, so `getHeaders()` (which captures both
+      // `setHeader` and `writeHead` headers) sees it alongside the
+      // streaming headers. Verifies the streaming dispatch branch
+      // emits the header at all.
+      const streamEvents = [
+        { done: false, text: 'hi', isReasoning: false },
+        {
+          done: true,
+          text: 'hi',
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 1,
+          reasoningTokens: 0,
+          rawText: 'hi',
+        },
+      ];
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'go',
+        stream: true,
+      });
+      const { res, getHeaders, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getHeaders()['x-session-cache']).toBe('fresh');
+      // SSE headers still committed: content-type is text/event-stream.
+      expect(getHeaders()['content-type']).toBe('text/event-stream');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Queue-depth backpressure (HTTP 429)
+  // -----------------------------------------------------------------------
+
+  describe('POST /v1/responses queue cap', () => {
+    it('returns 429 with Retry-After when the model queue is full', async () => {
+      // Build a model whose `chatSessionStart` is gated on an
+      // externally-controlled promise so the first dispatch pins the
+      // mutex indefinitely. A configured `maxQueueDepth: 1` then
+      // permits exactly one waiter behind it — and the THIRD
+      // request (second waiter) must get rejected with 429, not
+      // silently pile up.
+      let releaseFirst!: () => void;
+      const firstHold = new Promise<void>((r) => {
+        releaseFirst = r;
+      });
+      const model = {
+        chatSessionStart: vi.fn(async () => {
+          await firstHold;
+          return makeChatResult({ text: 'ok' });
+        }),
+        chatSessionContinue: vi.fn().mockResolvedValue(makeChatResult()),
+        chatSessionContinueTool: vi.fn().mockResolvedValue(makeChatResult()),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+
+      const registry = new ModelRegistry({ maxQueueDepth: 1 });
+      registry.register('cap-model', model);
+      const handler = createHandler(registry);
+
+      // A is the active holder (parked inside `chatSessionStart`).
+      const reqA = createMockReq('POST', '/v1/responses', { model: 'cap-model', input: 'A' });
+      const mockA = createMockRes();
+      const promiseA = handler(reqA, mockA.res);
+      // Yield so A enters the mutex.
+      await new Promise((r) => setImmediate(r));
+
+      // B queues behind A — within cap.
+      const reqB = createMockReq('POST', '/v1/responses', { model: 'cap-model', input: 'B' });
+      const mockB = createMockRes();
+      const promiseB = handler(reqB, mockB.res);
+      await new Promise((r) => setImmediate(r));
+
+      // C is the second waiter — exceeds cap, should 429.
+      const reqC = createMockReq('POST', '/v1/responses', { model: 'cap-model', input: 'C' });
+      const { res: resC, getStatus, getBody, getHeaders, waitForEnd } = createMockRes();
+      await handler(reqC, resC);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(429);
+      expect(getHeaders()['retry-after']).toBe('1');
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('rate_limit_error');
+      expect(parsed.error.code).toBe('queue_full');
+      expect(parsed.error.message).toContain('Model queue full');
+      expect(parsed.error.message).toContain('Retry after 1s.');
+
+      // Drain A + B so the handler teardown runs cleanly.
+      releaseFirst();
+      await promiseA;
+      await promiseB;
+    });
+
+    it('under unbounded mode, no 429 is emitted even under load', async () => {
+      // Default behaviour (no `maxQueueDepth`): dozens of waiters all
+      // queue successfully, every request eventually completes with
+      // 200, and no 429 ever leaks onto the wire.
+      let releaseFirst!: () => void;
+      const firstHold = new Promise<void>((r) => {
+        releaseFirst = r;
+      });
+      let firstSeen = false;
+      const model = {
+        chatSessionStart: vi.fn(async () => {
+          if (!firstSeen) {
+            firstSeen = true;
+            await firstHold;
+          }
+          return makeChatResult({ text: 'ok' });
+        }),
+        chatSessionContinue: vi.fn().mockResolvedValue(makeChatResult()),
+        chatSessionContinueTool: vi.fn().mockResolvedValue(makeChatResult()),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+
+      // No cap configured — unbounded.
+      const registry = new ModelRegistry();
+      registry.register('unbounded-model', model);
+      const handler = createHandler(registry);
+
+      // Launch 10 requests concurrently — one holds the mutex via
+      // `firstHold`, the other 9 queue.
+      const pending: Promise<void>[] = [];
+      const results: Array<{ status: number; body: string }> = [];
+      for (let i = 0; i < 10; i += 1) {
+        const req = createMockReq('POST', '/v1/responses', { model: 'unbounded-model', input: `q${i}` });
+        const mock = createMockRes();
+        const p = handler(req, mock.res).then(() =>
+          mock.waitForEnd().then(() => {
+            results.push({ status: mock.getStatus(), body: mock.getBody() });
+          }),
+        );
+        pending.push(p);
+      }
+      // Yield so all 10 start queueing.
+      await new Promise((r) => setImmediate(r));
+
+      releaseFirst();
+      await Promise.all(pending);
+
+      // None of them were rejected with 429.
+      for (const r of results) {
+        expect(r.status).not.toBe(429);
+      }
+      // And at least the 10 we queued all landed.
+      expect(results).toHaveLength(10);
     });
   });
 });

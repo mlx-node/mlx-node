@@ -88,6 +88,49 @@ export interface SessionRegistryOptions {
   model: SessionCapableModel;
   /** TTL in seconds before an unused session is evicted. Default: 1800 (30 min). */
   ttlSec?: number;
+  /**
+   * Maximum number of requests that may be WAITING for the
+   * per-model execution mutex at the same time (the in-flight holder
+   * does NOT count toward this). When set and the cap is exceeded at
+   * `withExclusive` entry, the call throws {@link QueueFullError}
+   * synchronously so the endpoint layer can emit HTTP 429 and the
+   * client can retry later.
+   *
+   * Default: `undefined` (unbounded — current behaviour). Opt-in per
+   * {@link ServerConfig.maxQueueDepthPerModel} or the
+   * `MLX_MAX_QUEUE_DEPTH_PER_MODEL` env var.
+   */
+  maxQueueDepth?: number;
+}
+
+/**
+ * Thrown synchronously by {@link SessionRegistry.withExclusive} when
+ * the per-model queue cap (`maxQueueDepth`) is exceeded. The error is
+ * raised BEFORE awaiting the previous lock holder so endpoint handlers
+ * can reliably catch it without racing the chain.
+ */
+export class QueueFullError extends Error {
+  readonly queuedCount: number;
+  readonly limit: number;
+
+  constructor(queuedCount: number, limit: number) {
+    super(`Model queue full: ${queuedCount} waiting (limit ${limit})`);
+    this.name = 'QueueFullError';
+    this.queuedCount = queuedCount;
+    this.limit = limit;
+  }
+}
+
+/**
+ * Result of {@link SessionRegistry.getOrCreate}. `hit` reflects whether
+ * the call consumed a live warm entry (single-use lease) or returned a
+ * fresh `ChatSession` on a miss. The endpoint layer uses `hit` to
+ * classify the per-request session-cache status emitted to clients via
+ * the `X-Session-Cache` observability header.
+ */
+export interface SessionLookupResult {
+  session: ChatSession<SessionCapableModel>;
+  hit: boolean;
 }
 
 interface SessionEntry {
@@ -112,6 +155,24 @@ function nowSec(): number {
 export class SessionRegistry {
   private readonly model: SessionCapableModel;
   private readonly ttlSec: number;
+  private readonly maxQueueDepth: number | undefined;
+  /**
+   * Number of callers that are currently WAITING for the per-model
+   * execution mutex — i.e. have entered `withExclusive` but have not
+   * yet started running their closure. The caller that is actively
+   * running inside `fn()` is NOT counted here, so a cap of
+   * `maxQueueDepth = N` means "1 running + up to N waiting".
+   *
+   * Mutated strictly inside `withExclusive`: incremented at entry
+   * (after the cap check, before chaining) and decremented exactly
+   * once per successful entry — either when the caller transitions
+   * from waiting to running (after `await prev`), or when it is
+   * rejected before ever reaching that point. The counter is
+   * intentionally NEVER touched on cap-reject paths (the caller
+   * never queued) so the cap check is stable across concurrent
+   * entries.
+   */
+  private queuedCount = 0;
   /**
    * Holds AT MOST ONE entry under the single-warm invariant (see the
    * module-level rustdoc). `getOrCreate` and `adopt` both clear the
@@ -135,6 +196,16 @@ export class SessionRegistry {
   constructor(opts: SessionRegistryOptions) {
     this.model = opts.model;
     this.ttlSec = opts.ttlSec ?? 1800;
+    this.maxQueueDepth = opts.maxQueueDepth;
+  }
+
+  /**
+   * Number of requests currently WAITING to acquire the per-model
+   * execution mutex. Does NOT include the one actively running inside
+   * `fn`. Primarily for tests and diagnostics.
+   */
+  get queueDepth(): number {
+    return this.queuedCount;
   }
 
   /** Number of sessions currently cached. Primarily for tests and diagnostics. Always 0 or 1. */
@@ -144,28 +215,33 @@ export class SessionRegistry {
 
   /**
    * Look up or allocate a session for the given previous response id.
-   * Always returns a `ChatSession` and always leaves the cache empty
-   * after return (single-warm invariant).
+   * Always returns a `SessionLookupResult` and always leaves the cache
+   * empty after return (single-warm invariant).
    *
    * On a null id, missing key, expired entry, or prefix-state
-   * mismatch: clear and return `new ChatSession(model)`. The caller
-   * primes / cold-replays from the `ResponseStore` and re-adopts
-   * after the turn commits.
+   * mismatch: clear and return `{ session: new ChatSession(model), hit: false }`.
+   * The caller primes / cold-replays from the `ResponseStore` and
+   * re-adopts after the turn commits.
    *
-   * On a hit: the entry is removed and its live session is returned.
-   * Overlapping requests against the same `previous_response_id`
-   * cannot share the same live `ChatSession` — the first wins, the
-   * second misses and cold-replays.
+   * On a hit: the entry is removed and its live session is returned
+   * alongside `hit: true`. Overlapping requests against the same
+   * `previous_response_id` cannot share the same live `ChatSession` —
+   * the first wins, the second misses and cold-replays.
    *
    * `requestedInstructions` is the caller's prefix/system state
    * (OpenAI `instructions`, Anthropic `system`, or `null`); byte-for-
    * byte mismatch against the cached entry forces cold replay so
    * the new prefix is re-primed.
+   *
+   * The `hit` flag drives the `X-Session-Cache` observability header
+   * emitted by both `/v1/responses` and `/v1/messages`: when the caller
+   * supplied a `previous_response_id`, `hit === true` yields `hit` and
+   * `hit === false` yields `cold_replay` (the endpoint then rebuilds
+   * from the `ResponseStore` on a fresh session). Requests with no
+   * `previous_response_id` (or the stateless `/v1/messages` endpoint,
+   * which always passes `null`) yield `fresh` regardless of this flag.
    */
-  getOrCreate(
-    previousResponseId: string | null,
-    requestedInstructions: string | null,
-  ): ChatSession<SessionCapableModel> {
+  getOrCreate(previousResponseId: string | null, requestedInstructions: string | null): SessionLookupResult {
     // Every call is about to overwrite native KV state, so drop any
     // other cached entry now — a later `getOrCreate` must not hand
     // out a wrapper whose assumed state has been stomped. Under the
@@ -173,29 +249,29 @@ export class SessionRegistry {
     // common case is either "the entry we want" or "nothing".
     if (previousResponseId === null) {
       this.entries.clear();
-      return new ChatSession(this.model);
+      return { session: new ChatSession(this.model), hit: false };
     }
     const entry = this.entries.get(previousResponseId);
     if (entry === undefined) {
       this.entries.clear();
-      return new ChatSession(this.model);
+      return { session: new ChatSession(this.model), hit: false };
     }
     if (entry.expiresAt < nowSec()) {
       this.entries.clear();
-      return new ChatSession(this.model);
+      return { session: new ChatSession(this.model), hit: false };
     }
     // Prefix-state mismatch forces cold replay so the new
     // instructions are re-primed; without this guard, output would
     // silently depend on cache state instead of request contents.
     if (entry.instructions !== requestedInstructions) {
       this.entries.clear();
-      return new ChatSession(this.model);
+      return { session: new ChatSession(this.model), hit: false };
     }
     // Hit: clear and hand the session out as a single-use lease so
     // a concurrent second request against the same id cold-replays
     // instead of sharing this live ChatSession.
     this.entries.clear();
-    return entry.session;
+    return { session: entry.session, hit: true };
   }
 
   /**
@@ -255,17 +331,79 @@ export class SessionRegistry {
    * captures the current tail, publishes a fresh pending promise as
    * the new tail, awaits the old tail, then runs `fn`. The
    * `finally` releases regardless of whether `fn` threw.
+   *
+   * **Admission control.** When `maxQueueDepth` is configured and the
+   * current number of waiters (`queuedCount`, excluding the active
+   * holder) is already at or above the cap, the call throws
+   * {@link QueueFullError} synchronously — SYNCHRONOUSLY from the
+   * caller's perspective, not merely before `await prev`. The wrapper
+   * is deliberately NOT declared `async` so the admission gate
+   * throws on the caller's stack frame, letting endpoint handlers
+   * wrap the call site in a plain try/catch without racing promise
+   * microtasks. On acceptance the async body takes over via the
+   * returned `Promise<T>`.
+   *
+   * The cap is "waiters-only" — a cap of N permits one running
+   * dispatch plus N queued ones, rejecting the (N+1)th waiter. The
+   * default (undefined) preserves the original unbounded behaviour.
    */
-  async withExclusive<T>(fn: () => Promise<T>): Promise<T> {
+  withExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    // Admission check — raised synchronously so endpoint handlers
+    // can reliably catch `QueueFullError` without racing any
+    // `await`. The counter is NOT mutated on the reject path; the
+    // request never queued.
+    if (this.maxQueueDepth !== undefined && this.queuedCount >= this.maxQueueDepth) {
+      throw new QueueFullError(this.queuedCount, this.maxQueueDepth);
+    }
+    this.queuedCount += 1;
+
     const prev = this.execLock;
     let release!: () => void;
     this.execLock = new Promise<void>((resolve) => {
       release = resolve;
     });
+    return this._runExclusive(prev, fn, release);
+  }
+
+  /**
+   * Async tail of {@link withExclusive}. Kept separate so the public
+   * wrapper stays a plain (non-async) function whose admission-gate
+   * throw lands on the caller's stack synchronously. This helper
+   * owns the post-acceptance bookkeeping: awaiting the predecessor
+   * lock, transitioning from waiter to holder (`queuedCount`
+   * decrement), running `fn`, and releasing the FIFO tail.
+   */
+  private async _runExclusive<T>(prev: Promise<void>, fn: () => Promise<T>, release: () => void): Promise<T> {
+    // Track whether the waiting-counter has already been balanced so
+    // an error raised by `await prev` (should never happen today but
+    // is cheap to defend against) cannot double-decrement via the
+    // outer `finally` below.
+    let waitingDecremented = false;
     try {
-      await prev;
+      try {
+        await prev;
+      } finally {
+        // Transition from "waiting" to "running" — the counter must
+        // drop exactly here regardless of whether `prev` fulfilled
+        // or rejected, because from this point forward the caller is
+        // the active holder and no longer part of the queue depth.
+        if (!waitingDecremented) {
+          this.queuedCount -= 1;
+          if (this.queuedCount < 0) this.queuedCount = 0;
+          waitingDecremented = true;
+        }
+      }
       return await fn();
     } finally {
+      // Belt-and-suspenders: if `await prev` managed to throw before
+      // reaching the inner `finally` (extremely unlikely given the
+      // chain is always resolved with `undefined`), still balance the
+      // queued counter so a future cap check doesn't drift upward.
+      if (!waitingDecremented) {
+        this.queuedCount -= 1;
+        if (this.queuedCount < 0) this.queuedCount = 0;
+        waitingDecremented = true;
+      }
       release();
     }
   }
