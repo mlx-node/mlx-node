@@ -968,10 +968,8 @@ async fn run_standalone_mode(
 
         if let Some(Ok(event)) = event_stream.next().await {
             match event {
-                Event::Key(key) => {
-                    if handle_standalone_key(key, app) {
-                        return Ok(());
-                    }
+                Event::Key(key) if handle_standalone_key(key, app) => {
+                    return Ok(());
                 }
                 Event::Mouse(mouse) => {
                     handle_mouse(mouse, app);
@@ -1436,15 +1434,11 @@ async fn handle_key(
         }
 
         // Pause/Resume
-        (KeyCode::Char('p'), _) => {
-            if app.state == app::TrainingState::Running {
-                send_command(stdin, ControlCommand::Pause).await?;
-            }
+        (KeyCode::Char('p'), _) if app.state == app::TrainingState::Running => {
+            send_command(stdin, ControlCommand::Pause).await?;
         }
-        (KeyCode::Char('r'), _) => {
-            if app.state == app::TrainingState::Paused {
-                send_command(stdin, ControlCommand::Resume).await?;
-            }
+        (KeyCode::Char('r'), _) if app.state == app::TrainingState::Paused => {
+            send_command(stdin, ControlCommand::Resume).await?;
         }
 
         // Save checkpoint
@@ -1521,13 +1515,13 @@ async fn handle_key(
         }
 
         // Enter to open sample detail popup
-        (KeyCode::Enter, _) => {
-            if app.active_tab == app::ActiveTab::Samples && !app.samples.is_empty() {
-                let sample_idx = app.sample_scroll as usize;
-                if sample_idx < app.samples.len() {
-                    app.selected_sample = Some(sample_idx);
-                    app.sample_detail_scroll = 0;
-                }
+        (KeyCode::Enter, _)
+            if app.active_tab == app::ActiveTab::Samples && !app.samples.is_empty() =>
+        {
+            let sample_idx = app.sample_scroll as usize;
+            if sample_idx < app.samples.len() {
+                app.selected_sample = Some(sample_idx);
+                app.sample_detail_scroll = 0;
             }
         }
 

@@ -5314,8 +5314,7 @@ impl Qwen3Model {
         *cache_idx = out_cache_idx;
 
         // Update KV cache in place - reuse existing MxArray handles when possible
-        for (i, (existing, new_ptr)) in kv_keys.iter_mut().zip(out_kv_keys.into_iter()).enumerate()
-        {
+        for (i, (existing, new_ptr)) in kv_keys.iter_mut().zip(out_kv_keys).enumerate() {
             if new_ptr.is_null() {
                 continue;
             }
@@ -5336,11 +5335,7 @@ impl Qwen3Model {
             }
         }
 
-        for (i, (existing, new_ptr)) in kv_values
-            .iter_mut()
-            .zip(out_kv_values.into_iter())
-            .enumerate()
-        {
+        for (i, (existing, new_ptr)) in kv_values.iter_mut().zip(out_kv_values).enumerate() {
             if new_ptr.is_null() {
                 continue;
             }

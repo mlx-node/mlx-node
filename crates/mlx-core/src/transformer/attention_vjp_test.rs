@@ -533,10 +533,7 @@ mod tests {
             variance.sqrt()
         );
         println!("dV first 10: {:?}", &dv_slice[..10.min(dv_slice.len())]);
-        println!(
-            "dV last 10: {:?}",
-            &dv_slice[(dv_slice.len() - 10).max(0)..]
-        );
+        println!("dV last 10: {:?}", &dv_slice[(dv_slice.len() - 10)..]);
 
         // dV should have some variance (not all same value)
         // With random Q, K, different positions in P should have different sums

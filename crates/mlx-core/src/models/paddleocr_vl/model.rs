@@ -1369,7 +1369,7 @@ impl VLModelInner {
                 .collect();
 
             // Apply deactivations (reverse order)
-            to_deactivate.sort_by(|a, b| b.0.cmp(&a.0));
+            to_deactivate.sort_by_key(|b| std::cmp::Reverse(b.0));
             for (local_idx, reason) in to_deactivate {
                 let global_idx = active_indices[local_idx];
                 finish_reasons[global_idx] = Some(reason);

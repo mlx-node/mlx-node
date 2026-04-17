@@ -88,11 +88,7 @@ impl RMSprop {
 
         let mut updated_params = Vec::with_capacity(params.len());
 
-        for ((name, param), grad) in param_names
-            .into_iter()
-            .zip(params.into_iter())
-            .zip(grads.into_iter())
-        {
+        for ((name, param), grad) in param_names.into_iter().zip(params).zip(grads) {
             let updated = self.update_single_internal(name, param, grad)?;
             updated_params.push(updated);
         }

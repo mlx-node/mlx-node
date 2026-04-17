@@ -620,13 +620,12 @@ fn extract_storage_info(storage: &PickleValue, name: &str) -> Result<(String, St
                             dtype_str = dt.to_string();
                         }
                     }
-                    PickleValue::String(s) => {
+                    PickleValue::String(s)
                         // Could be storage_key or location
                         // Storage keys are typically numeric strings
-                        if s.chars().all(|c| c.is_ascii_digit()) {
+                        if s.chars().all(|c| c.is_ascii_digit()) => {
                             storage_key = s.clone();
                         }
-                    }
                     _ => {}
                 }
             }
@@ -1002,7 +1001,7 @@ fn load_paddle_inference_params(
     param_names.sort_by_key(|a| strip_deepcopy_suffix(a));
 
     let mut tensors = HashMap::new();
-    for (name, (_dims, array)) in param_names.into_iter().zip(tensors_ordered.into_iter()) {
+    for (name, (_dims, array)) in param_names.into_iter().zip(tensors_ordered) {
         if verbose {
             let shape = array.shape()?;
             eprintln!("  {name}  shape={:?}", shape.as_ref());
