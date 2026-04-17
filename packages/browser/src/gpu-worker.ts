@@ -115,7 +115,12 @@ let bufferPoolMissCount = 0;
 interface BindGroupCacheEntry {
   layoutHandle: number;
   entryCount: number;
-  sig: string;
+  // JS-F004: snapshot of entrySrc[0..entryCount*3] captured at insert time.
+  // Hit-check compares this element-by-element against the fresh entrySrc;
+  // no string concat on the hot dispatch path. Storage is a flat Uint32Array
+  // because entryCount ≤ MAX_DISPATCH_BATCH_ENTRIES (10), so max size is
+  // 10 × 3 u32s = 120 bytes per cache entry.
+  entries: Uint32Array;
   bindGroup: GPUBindGroup;
   // Task E: dedicated 256B uniform buffer owned by this cache entry. On the
   // first FUSED_DISPATCH_WITH_UNIFORM dispatch that would otherwise acquire a
@@ -792,32 +797,32 @@ function dispatchFusedRecord(
     }
   }
 
-  // Stage 2: probe the bind group cache. We compute sig *after* Stage 1 so the
+  // Stage 2: probe the bind group cache. We compare *after* Stage 1 so the
   // deferred-uniform handle patch at entries[uniformEntryIdx] is included —
-  // otherwise every pool-hit dispatch would spuriously cache-miss because sig
-  // would see "0" while the post-patch handle is the real pooled one.
+  // otherwise every pool-hit dispatch would spuriously cache-miss because the
+  // compare would see "0" while the post-patch handle is the real pooled one.
   //
-  // sig format: `${h0}:${sl0}:${sh0};${h1}:${sl1}:${sh1};...`
-  // Packed as a string because Map keys on string identity are fast in V8 and
-  // the whole concat is cheaper than allocating a per-entry descriptor array.
-  let sig = '';
-  {
-    let s = entrySrcBase;
-    for (let i = 0; i < entryCount; i++) {
-      sig += entrySrc[s] + ':' + entrySrc[s + 1] + ':' + entrySrc[s + 2] + ';';
-      s += 3;
+  // JS-F004: compare-by-integer against a cached Uint32Array snapshot instead
+  // of constructing a fresh string signature every dispatch. The per-dispatch
+  // string alloc (60-100 chars × 3-4 concat temporaries) is the dominant
+  // young-gen GC pressure on the hot path — hundreds of dispatches/token. The
+  // compare loop below is at most entryCount * 3 integer compares (≤ 30).
+  const cached = bindGroupCache.get(pipelineHandle);
+  const compareLen = entryCount * 3;
+  let bindGroup: GPUBindGroup;
+  let hit = false;
+  if (cached !== undefined && cached.layoutHandle === layoutHandle && cached.entryCount === entryCount) {
+    hit = true;
+    const cachedEntries = cached.entries;
+    for (let i = 0; i < compareLen; i++) {
+      if (cachedEntries[i] !== entrySrc[entrySrcBase + i]) {
+        hit = false;
+        break;
+      }
     }
   }
-
-  const cached = bindGroupCache.get(pipelineHandle);
-  let bindGroup: GPUBindGroup;
-  if (
-    cached !== undefined &&
-    cached.layoutHandle === layoutHandle &&
-    cached.entryCount === entryCount &&
-    cached.sig === sig
-  ) {
-    bindGroup = cached.bindGroup;
+  if (hit) {
+    bindGroup = cached!.bindGroup;
     bindGroupCacheHits++;
   } else {
     const entries: GPUBindGroupEntry[] = [];
@@ -847,10 +852,15 @@ function dispatchFusedRecord(
       newUniformBuffer = cached.uniformBuffer;
       newUniformHandle = cached.uniformHandle;
     }
+    // Snapshot the entries so the next dispatch can compare element-by-element.
+    // Using subarray + new Uint32Array copies just the live slice (entryCount*3)
+    // and is cheap relative to the createBindGroup above.
+    const snapshot = new Uint32Array(compareLen);
+    snapshot.set(entrySrc.subarray(entrySrcBase, entrySrcBase + compareLen));
     bindGroupCache.set(pipelineHandle, {
       layoutHandle,
       entryCount,
-      sig,
+      entries: snapshot,
       bindGroup,
       uniformBuffer: newUniformBuffer,
       uniformHandle: newUniformHandle,
