@@ -470,8 +470,14 @@ export function createBridgeStub(
   const pendingBgData = new Map<number, ParsedBgDesc>();
   let fakeBgCounter = 0x7e000000;
 
-  // Pipeline bind group layout cache: layouts are lightweight and never released
-  const layoutCache: Record<number, number> = {};
+  // Pipeline bind group layout cache (JS-F017). Map outperforms Record for
+  // integer keys and lets us drop entries cleanly on PIPELINE_RELEASE so the
+  // cache tracks pipeline lifetime. Pipelines die with the model so steady-
+  // state size is bounded, but clearing on release is correctness-cheap and
+  // keeps the cache tight if anyone rebuilds the pipeline cache mid-session.
+  // Key = pipelineHandle * 4 + layoutIndex (assumes ≤4 layouts per pipeline,
+  // matches current codegen).
+  const layoutCache = new Map<number, number>();
 
   // Deferred small wgpuQueueWriteBuffer: buffer uniform data locally.
   // When wgpuQueueWriteBuffer is called with <=256 bytes at offset 0,
@@ -1666,14 +1672,20 @@ export function createBridgeStub(
                 uniformEntryIdx,
               );
 
-              // Finalize deferred buffer creation: gpu-worker returns real handle
+              // Finalize deferred buffer creation: gpu-worker returns real handle.
+              // JS-F016: cleanup runs unconditionally even on RPC failure
+              // (result === 0) so wasmFree and the shadow-size scrub fire in
+              // every path. Previously the graceful-failure branch silently
+              // leaked the WASM heap alloc plus a stale meta-table entry.
               if (deferredInfo && deferredFakeHandle >= 0) {
                 if (result > 0) {
                   deferredBufferRemap.set(deferredFakeHandle, result);
                   setBufferMeta(result, deferredInfo.size, deferredInfo.usage);
                 }
-                // Scrub the fake handle's shadow size entry (set when the fake
-                // was created) so the metadata table doesn't leak stale keys.
+                // Scrub the fake handle's shadow size entry (set when the
+                // fake was created) so the metadata table doesn't leak
+                // stale keys. This ALWAYS runs — including the result === 0
+                // graceful-failure branch that previously skipped it.
                 clearBufferMeta(deferredFakeHandle);
                 wasmFree(deferredInfo.wasmPtr);
               }
@@ -1691,14 +1703,22 @@ export function createBridgeStub(
                 sizeHi,
                 deferredInfo.wasmPtr,
               );
-              deferredBufferRemap.set(deferredFakeHandle, realHandle);
-              setBufferMeta(realHandle, deferredInfo.size, deferredInfo.usage);
-              // Scrub the fake handle's shadow size entry.
+              // JS-F016: guard the remap against RPC-failure returns (0).
+              // Previously we stored `fake → 0`, which made resolveBufferHandle
+              // translate every later reference to the null handle — corrupting
+              // the dispatch silently.
+              if (realHandle > 0) {
+                deferredBufferRemap.set(deferredFakeHandle, realHandle);
+                setBufferMeta(realHandle, deferredInfo.size, deferredInfo.usage);
+                // Rewrite the entry with the real handle. Only valid when we
+                // actually got a real handle back.
+                const base = (CMD_OFFSET.CALLBACK_BASE + uniformEntryIdx * 12) >>> 2;
+                cmdU32[base] = realHandle;
+              }
+              // Scrub the fake handle's shadow size entry and release the WASM
+              // shadow unconditionally — the payload is consumed either way.
               clearBufferMeta(deferredFakeHandle);
               wasmFree(deferredInfo.wasmPtr);
-              // Rewrite the entry with the real handle
-              const base = (CMD_OFFSET.CALLBACK_BASE + uniformEntryIdx * 12) >>> 2;
-              cmdU32[base] = realHandle;
             }
             flushPendingWrites();
             // Write ARG fields for the staging path (same as rpcCall would).
@@ -1843,9 +1863,16 @@ export function createBridgeStub(
           const sizeLo = mapped.size & 0xffffffff;
           const sizeHi = Math.floor(mapped.size / 0x100000000);
           const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, mapped.usage, sizeLo, sizeHi, mapped.wasmPtr);
-          deferredBufferRemap.set(bufferHandle, realHandle);
-          setBufferMeta(realHandle, mapped.size, mapped.usage);
-          // Scrub the fake handle's shadow size entry.
+          // JS-F016: guard against RPC failure (realHandle === 0). Storing a
+          // 0-valued remap turns every future reference to the fake handle
+          // into a null dereference on the gpu-worker side.
+          if (realHandle > 0) {
+            deferredBufferRemap.set(bufferHandle, realHandle);
+            setBufferMeta(realHandle, mapped.size, mapped.usage);
+          }
+          // Scrub the fake handle's shadow size entry + release the WASM
+          // shadow in both paths — the payload is consumed by the RPC either
+          // way and re-attempting with the same wasmPtr would double-free.
           clearBufferMeta(bufferHandle);
           wasmFree(mapped.wasmPtr);
         }
@@ -2004,14 +2031,19 @@ export function createBridgeStub(
     // ===== Pipeline =====
     wgpuComputePipelineGetBindGroupLayout(pipelineHandle: number, index: number): number {
       const key = pipelineHandle * 4 + index;
-      const cached = layoutCache[key];
+      const cached = layoutCache.get(key);
       if (cached !== undefined) return cached;
       const handle = rpcCall(RpcFn.PIPELINE_GET_BIND_GROUP_LAYOUT, pipelineHandle, index);
-      layoutCache[key] = handle;
+      layoutCache.set(key, handle);
       return handle;
     },
 
     wgpuComputePipelineRelease(handle: number): void {
+      // Drop any cached layouts for this pipeline — assumes ≤4 layouts,
+      // matching the key scheme. Loop is cheap; pipeline releases are rare.
+      for (let i = 0; i < 4; i++) {
+        layoutCache.delete(handle * 4 + i);
+      }
       rpcCall(RpcFn.PIPELINE_RELEASE, handle);
     },
 

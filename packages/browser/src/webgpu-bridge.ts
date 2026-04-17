@@ -424,7 +424,12 @@ export function createWebGPUBridge(adapter: GPUAdapter, device: GPUDevice): WebG
         commandBuffers.push(getHandle<GPUCommandBuffer>(handle));
       }
       queue.submit(commandBuffers);
-      console.log(`[WebGPU Bridge] queue.submit(${count} cmd bufs), handles=${handles.size}`);
+      // Legacy direct-bridge debug log (JS-F009). Costs ~0.5-2ms per submit
+      // via DevTools I/O; gated so production builds don't pay. Set
+      // globalThis.__MLX_BRIDGE_DEBUG = true before first submit to re-enable.
+      if ((globalThis as { __MLX_BRIDGE_DEBUG?: boolean }).__MLX_BRIDGE_DEBUG) {
+        console.log(`[WebGPU Bridge] queue.submit(${count} cmd bufs), handles=${handles.size}`);
+      }
     },
 
     wgpuQueueWriteBuffer(
