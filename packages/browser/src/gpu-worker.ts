@@ -297,7 +297,15 @@ function pushCallback(cb: PendingCallback): void {
 // GPU-done callbacks: accumulated from QUEUE_ON_SUBMITTED_WORK_DONE (fn=22).
 // These must NOT fire until GPU work actually completes. They are moved to
 // pendingCallbacks only during POLL (fn=80) after queue.onSubmittedWorkDone() resolves.
-const gpuDoneCallbacks: PendingCallback[] = [];
+//
+// JS-F011: backing storage is a fixed Uint32Array (3 u32s per slot) instead
+// of an Array<PendingCallback>. Push is 3 u32 writes + cursor bump — no
+// object alloc. Drain still allocates a PendingCallback per entry to go
+// through pushCallback's existing contract; that is cheaper than pushing
+// objects on every QUEUE_ON_SUBMITTED_WORK_DONE in the first place.
+const GPU_DONE_CAPACITY = 512;
+const gpuDoneBuf = new Uint32Array(GPU_DONE_CAPACITY * 3);
+let gpuDoneCount = 0;
 
 // Track mapped buffer ranges for the shadow-copy pattern.
 // Key = buffer handle, value = { jsRange, offset, size }
@@ -1618,7 +1626,18 @@ async function processCommand(fnId: number): Promise<void> {
       // before the GPU has finished using the data.
       const callbackPtr = arg0();
       const userdataPtr = arg1();
-      gpuDoneCallbacks.push({ fnPtr: callbackPtr, status: 0, userdataPtr });
+      if (gpuDoneCount >= GPU_DONE_CAPACITY) {
+        console.error(
+          `[GPU Worker] gpuDoneBuf overflow at ${gpuDoneCount}; dropping callback. ` +
+            `This means queue.onSubmittedWorkDone() is being registered faster than POLL drains it.`,
+        );
+      } else {
+        const base = gpuDoneCount * 3;
+        gpuDoneBuf[base] = callbackPtr;
+        gpuDoneBuf[base + 1] = 0; // status
+        gpuDoneBuf[base + 2] = userdataPtr;
+        gpuDoneCount++;
+      }
       setResult(0);
       break;
     }
@@ -1984,11 +2003,16 @@ async function processCommand(fnId: number): Promise<void> {
       await queue.onSubmittedWorkDone();
       // NOW it's safe to fire GPU-done callbacks. Move them to the ring
       // so flushCallbacks() writes them to the callback ring for the wasm-worker.
-      if (gpuDoneCallbacks.length > 0) {
-        for (let i = 0; i < gpuDoneCallbacks.length; i++) {
-          pushCallback(gpuDoneCallbacks[i]);
+      if (gpuDoneCount > 0) {
+        for (let i = 0; i < gpuDoneCount; i++) {
+          const base = i * 3;
+          pushCallback({
+            fnPtr: gpuDoneBuf[base],
+            status: gpuDoneBuf[base + 1],
+            userdataPtr: gpuDoneBuf[base + 2],
+          });
         }
-        gpuDoneCallbacks.length = 0;
+        gpuDoneCount = 0;
       }
       setResult(cbTail - cbHead);
       break;

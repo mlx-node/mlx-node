@@ -569,6 +569,7 @@ export function createBridgeStub(
   const I_FN = CMD_OFFSET.FN_ID >>> 2; // 0
   const I_RESULT = CMD_OFFSET.RESULT >>> 2; // 2
   const I_ARG0 = CMD_OFFSET.ARG0 >>> 2; // 4
+  const I_ARG0_HI = CMD_OFFSET.ARG0_HI >>> 2; // 12 — rpcCallWithHi u64 high bits
   const I_CB_COUNT = CMD_OFFSET.CALLBACK_COUNT >>> 2; // 16
   const I_CB_BASE = CMD_OFFSET.CALLBACK_BASE >>> 2; // 17
 
@@ -1008,19 +1009,25 @@ export function createBridgeStub(
     // Task B: drain F&F before clobbering cmd SAB. See matching comment in rpcCall.
     drainFireAndForget();
     bumpBridgeStats(fnId);
-    cmdDataView.setUint32(CMD_OFFSET.FN_ID, fnId, true);
+    // JS-F018: use direct Uint32Array writes (cmdU32) to match rpcCall.
+    // DataView.setUint32 checks endianness on every call; Uint32Array is a
+    // plain integer store. Also keeps both call paths converging so a schema
+    // change only has to touch one set of constants.
+    cmdU32[I_FN] = fnId;
 
-    for (let i = 0; i < args.length && i < 8; i++) {
-      cmdDataView.setUint32(CMD_OFFSET.ARG0 + i * 4, args[i] >>> 0, true);
+    const argCount = args.length < 8 ? args.length : 8;
+    for (let i = 0; i < argCount; i++) {
+      cmdU32[I_ARG0 + i] = args[i] >>> 0;
     }
 
-    // Write high bits for u64 args
-    if (0 in hiArgs) cmdDataView.setUint32(CMD_OFFSET.ARG0_HI, hiArgs[0] >>> 0, true);
-    if (1 in hiArgs) cmdDataView.setUint32(CMD_OFFSET.ARG1_HI, hiArgs[1] >>> 0, true);
-    if (2 in hiArgs) cmdDataView.setUint32(CMD_OFFSET.ARG2_HI, hiArgs[2] >>> 0, true);
-    if (3 in hiArgs) cmdDataView.setUint32(CMD_OFFSET.ARG3_HI, hiArgs[3] >>> 0, true);
+    // Write high bits for u64 args. I_ARG0_HI through I_ARG0_HI+3 are
+    // contiguous element indices matching CMD_OFFSET.ARG0_HI..ARG3_HI.
+    if (0 in hiArgs) cmdU32[I_ARG0_HI] = hiArgs[0] >>> 0;
+    if (1 in hiArgs) cmdU32[I_ARG0_HI + 1] = hiArgs[1] >>> 0;
+    if (2 in hiArgs) cmdU32[I_ARG0_HI + 2] = hiArgs[2] >>> 0;
+    if (3 in hiArgs) cmdU32[I_ARG0_HI + 3] = hiArgs[3] >>> 0;
 
-    cmdDataView.setUint32(CMD_OFFSET.CALLBACK_COUNT, 0, true);
+    cmdU32[I_CB_COUNT] = 0;
 
     Atomics.store(cmdView, STATUS_INDEX, STATUS.PENDING);
     Atomics.notify(cmdView, STATUS_INDEX);
@@ -1045,8 +1052,8 @@ export function createBridgeStub(
       }
     }
 
-    const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
-    const cbCount = cmdDataView.getUint32(CMD_OFFSET.CALLBACK_COUNT, true);
+    const result = cmdU32[I_RESULT];
+    const cbCount = cmdU32[I_CB_COUNT];
     if (cbCount > 0) {
       try {
         drainCallbacks(fnId);
