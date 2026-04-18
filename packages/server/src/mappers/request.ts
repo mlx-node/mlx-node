@@ -22,11 +22,33 @@ function resolveMessageContent(
 
   const parts: string[] = [];
   const images: Uint8Array[] = [];
+  // The internal `ChatMessage` shape is `{ content: string, images: Uint8Array[] }`
+  // and the downstream Jinja serializer always emits `[{type:"text",...},
+  // {type:"image"}*N]` — it cannot represent a text part that appears AFTER
+  // an image part in the caller's content array. Detect and reject that
+  // shape rather than silently reordering it and changing user intent.
+  // Mirrors the existing rejection in `anthropic-request.ts` for the
+  // tool_result + trailing-mixed case.
+  let seenImage = false;
 
   for (const p of content) {
     if (p.type === 'input_text' || p.type === 'output_text' || p.type === 'summary_text') {
+      if (seenImage) {
+        throw new Error(
+          'Unsupported: text content part after an image part in the same message is not representable ' +
+            'in the internal message model. The flat ChatMessage shape and the Jinja serializer both place ' +
+            'all text before all images in a user turn, so any mapping would silently reorder your content. ' +
+            'Place all text parts before any image parts, or split across separate user turns.',
+        );
+      }
       parts.push(p.text);
     } else if (p.type === 'refusal') {
+      if (seenImage) {
+        throw new Error(
+          'Unsupported: refusal content part after an image part in the same message is not representable ' +
+            'in the internal message model; the flat ChatMessage shape would silently reorder it.',
+        );
+      }
       parts.push(p.refusal);
     } else if (p.type === 'input_image') {
       if (role !== 'user') {
@@ -46,6 +68,7 @@ function resolveMessageContent(
         );
       }
       images.push(Buffer.from(match[1], 'base64'));
+      seenImage = true;
     } else {
       throw new Error(`Unsupported content part type: "${(p as { type: string }).type}"`);
     }

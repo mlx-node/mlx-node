@@ -105,6 +105,14 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
         const trailingImages: Uint8Array[] = [];
         let seenNonToolResult = false;
         let seenToolResult = false;
+        // The flat `ChatMessage` shape cannot represent a text block that
+        // appears AFTER an image block in the same turn — the downstream
+        // Jinja serializer always places text before images. Reject that
+        // interleaving up front rather than silently reordering it and
+        // changing the caller's intent. This parallels the identical
+        // guard in `request.ts:resolveMessageContent` for the
+        // `/v1/responses` mapper.
+        let seenImage = false;
 
         for (const block of content as AnthropicContentBlock[]) {
           if (block.type === 'tool_result') {
@@ -124,10 +132,19 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
               isError: block.is_error === true,
             });
           } else if (block.type === 'text') {
+            if (seenImage) {
+              throw new Error(
+                'Unsupported: text block after an image block in the same user turn is not representable ' +
+                  'in the internal message model. The flat ChatMessage shape and the Jinja serializer both ' +
+                  'place all text before all images, so any mapping would silently reorder your content. ' +
+                  'Place all text blocks before any image blocks, or split across separate user turns.',
+              );
+            }
             seenNonToolResult = true;
             trailingText.push(block.text);
           } else if (block.type === 'image' && block.source.type === 'base64') {
             seenNonToolResult = true;
+            seenImage = true;
             trailingImages.push(Buffer.from(block.source.data, 'base64'));
           } else {
             throw new Error(`Unsupported content block type: "${block.type}"`);

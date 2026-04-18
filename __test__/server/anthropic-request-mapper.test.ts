@@ -263,6 +263,10 @@ describe('mapAnthropicRequest', () => {
   });
 
   it('rejects trailing image followed by text after a tool_result prefix', () => {
+    // The text-after-image guard fires during the main loop (before the
+    // trailing-mixed check) because the serializer cannot preserve text
+    // that follows an image in any turn, not just after a tool_result
+    // prefix. Either rejection is equivalent for the caller.
     expect(() =>
       mapAnthropicRequest({
         model: 'claude-3-5-sonnet-20241022',
@@ -278,7 +282,7 @@ describe('mapAnthropicRequest', () => {
           },
         ],
       }),
-    ).toThrow(/mixing trailing text and image blocks after a tool_result prefix/i);
+    ).toThrow(/text block after an image block in the same user turn/i);
   });
 
   it('rejects multiple trailing image blocks after a tool_result prefix', () => {
@@ -856,5 +860,113 @@ describe('mapAnthropicRequest', () => {
     });
 
     expect(messages).toEqual([{ role: 'tool', content: 'Result: success', toolCallId: 'call_789' }]);
+  });
+
+  describe('text/image ordering in pure user turns', () => {
+    // Existing tool_result-prefix rejection at line ~160 catches mixed
+    // trailing content after tool_result, but a PURE user turn (no
+    // tool_result blocks) was previously silently concatenating all text
+    // and stacking all images, reordering the caller's content. These
+    // tests pin the uniform rejection for both call patterns.
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    it('rejects [image, text] in a pure user turn', () => {
+      // Image-first-then-text gets reordered to text-first-then-image by
+      // the flat ChatMessage + Jinja serializer pipeline. Reject rather
+      // than silently rewrite the caller's intent.
+      expect(() =>
+        mapAnthropicRequest({
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 1024,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
+                { type: 'text', text: 'describe this' },
+              ],
+            },
+          ],
+        }),
+      ).toThrow(/text block after an image block in the same user turn/i);
+    });
+
+    it('rejects [text, image, text] in a pure user turn', () => {
+      expect(() =>
+        mapAnthropicRequest({
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 1024,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'before' },
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
+                { type: 'text', text: 'after' },
+              ],
+            },
+          ],
+        }),
+      ).toThrow(/text block after an image block/i);
+    });
+
+    it('accepts [text, image] in a pure user turn (representable by the flat ChatMessage)', () => {
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'what colour is this?' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
+            ],
+          },
+        ],
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].role).toBe('user');
+      expect(messages[0].content).toBe('what colour is this?');
+      expect(messages[0].images).toHaveLength(1);
+    });
+
+    it('accepts [text, text, image] (all text parts before the image)', () => {
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'part one. ' },
+              { type: 'text', text: 'part two.' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
+            ],
+          },
+        ],
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe('part one. part two.');
+      expect(messages[0].images).toHaveLength(1);
+    });
+
+    it('accepts multiple images with no text (no ordering ambiguity)', () => {
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
+            ],
+          },
+        ],
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe('');
+      expect(messages[0].images).toHaveLength(2);
+    });
   });
 });

@@ -691,6 +691,135 @@ describe('mapRequest', () => {
       ).toThrow(/only allowed on user messages/);
     });
   });
+
+  describe('text/image part ordering', () => {
+    // The flat internal `ChatMessage` shape cannot express a text part
+    // that appears AFTER an image part in the same message: the
+    // downstream Jinja serializer always renders text first, then all
+    // images. Reject ambiguous orderings rather than silently reorder
+    // them and change the caller's intent. Mirrors the rejection in
+    // `anthropic-request.ts` for its own user-turn shape.
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    it('rejects [input_text, input_image, input_text] (text after image)', () => {
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [
+                { type: 'input_text', text: 'before' },
+                { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+                { type: 'input_text', text: 'after' },
+              ],
+            },
+          ],
+        }),
+      ).toThrow(/text content part after an image part in the same message/i);
+    });
+
+    it('rejects [input_image, input_text] (image first, text after)', () => {
+      // Silently reordering `[image, text]` to `[text, image]` would flip
+      // caption-vs-question framing for VLM prompts.
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [
+                { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+                { type: 'input_text', text: 'what is this?' },
+              ],
+            },
+          ],
+        }),
+      ).toThrow(/text content part after an image part/i);
+    });
+
+    it('rejects [output_text, input_image, output_text] on replayed assistant messages', () => {
+      // `output_text` is a text-like part too. Reject text-after-image
+      // uniformly regardless of the text variant.
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [
+                { type: 'output_text', text: 'before', annotations: [] },
+                { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+                { type: 'output_text', text: 'after', annotations: [] },
+              ],
+            } as any,
+          ],
+        }),
+      ).toThrow(/text content part after an image part/i);
+    });
+
+    it('accepts [input_text, input_image] (text before image — representable)', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'what colour?' },
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+            ],
+          },
+        ],
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe('what colour?');
+      expect(messages[0].images).toHaveLength(1);
+    });
+
+    it('accepts [input_text, input_text, input_image, input_image] (all text before all images)', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'compare ' },
+              { type: 'input_text', text: 'these:' },
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+            ],
+          },
+        ],
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe('compare these:');
+      expect(messages[0].images).toHaveLength(2);
+    });
+
+    it('accepts images-only content (no ordering ambiguity)', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+              { type: 'input_image', image_url: `data:image/png;base64,${png}` },
+            ],
+          },
+        ],
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe('');
+      expect(messages[0].images).toHaveLength(2);
+    });
+  });
 });
 
 describe('reconstructMessagesFromChain', () => {
