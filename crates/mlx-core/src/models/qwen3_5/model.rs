@@ -461,6 +461,13 @@ pub(crate) struct ChatDecodeInputs {
     /// `true` when the VLM prefill has already run the compiled init.
     /// `false` for text-only paths and the session delta path.
     pub vlm_compiled_init_done: bool,
+    /// `true` when this invocation is a session DELTA continuation
+    /// (text-only append on top of the live KV cache). Drives the
+    /// post-decode save pathway: deltas keep `cached_image_key` sticky
+    /// so image attention state baked into the KV caches by a prior
+    /// prefill stays addressable; prefills (re)set the key based on
+    /// the fresh turn's `has_images`.
+    pub is_delta: bool,
 
     // --- Compiled-path state --------------------------------------------
     /// `true` when this model owns the compiled weights and the compiled
@@ -1179,6 +1186,7 @@ impl Qwen35Inner {
             last_logits,
             seq_len,
             vlm_compiled_init_done,
+            is_delta: false,
             use_compiled,
             has_images,
             cached_prefix_len,
@@ -1245,11 +1253,14 @@ impl Qwen35Inner {
                 "chat_tokens_delta_sync requires a non-empty delta",
             ));
         }
-        if self.cached_image_key.is_some() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync is text-only; session currently holds image state",
-            ));
-        }
+        // A populated `cached_image_key` means the live KV cache carries
+        // attention state for images seen on the preceding prefill. The
+        // delta path appends a text delta on top of that — the image
+        // context stays intact and the model can keep reasoning about
+        // it. We do NOT reject here; the outer `chat_session_continue_*`
+        // gate already rejects IMAGE-SET CHANGES (non-empty new images
+        // that don't match the cached key) with a prefixed error the TS
+        // `ChatSession` can catch and route through `chatSessionStart`.
 
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -1360,6 +1371,7 @@ impl Qwen35Inner {
             last_logits,
             seq_len: total_seq_len,
             vlm_compiled_init_done: false,
+            is_delta: true,
             use_compiled,
             has_images: false,
             cached_prefix_len,
@@ -1501,6 +1513,7 @@ impl Qwen35Inner {
             last_logits,
             seq_len,
             vlm_compiled_init_done,
+            is_delta,
             use_compiled,
             has_images,
             cached_prefix_len,
@@ -1716,20 +1729,37 @@ impl Qwen35Inner {
             );
         }
 
-        // Save cache state
-        save_cache_state_direct(
-            p.reuse_cache,
-            has_images,
-            &generated_tokens,
-            &finish_reason,
-            &save_tokens,
-            save_expanded_tokens.as_deref(),
-            save_image_cache_key,
-            &mut self.cached_token_history,
-            &mut self.cached_image_key,
-            &mut self.cached_rope_deltas,
-            &mut self.caches,
-        );
+        // Save cache state. Delta continuations preserve
+        // `cached_image_key` — the KV cache still holds the prior
+        // prefill's image attention state even though this turn was
+        // text-only. Prefill paths (re)set the key based on the fresh
+        // turn's `has_images`.
+        if is_delta {
+            chat_common::save_cache_state_after_delta(
+                p.reuse_cache,
+                &generated_tokens,
+                &finish_reason,
+                &save_tokens,
+                &mut self.cached_token_history,
+                &mut self.cached_image_key,
+                &mut self.cached_rope_deltas,
+                &mut self.caches,
+            );
+        } else {
+            save_cache_state_direct(
+                p.reuse_cache,
+                has_images,
+                &generated_tokens,
+                &finish_reason,
+                &save_tokens,
+                save_expanded_tokens.as_deref(),
+                save_image_cache_key,
+                &mut self.cached_token_history,
+                &mut self.cached_image_key,
+                &mut self.cached_rope_deltas,
+                &mut self.caches,
+            );
+        }
 
         let performance = compute_performance_metrics(
             generation_start,
@@ -1987,13 +2017,11 @@ impl Qwen35Inner {
             );
             return;
         }
-        if self.cached_image_key.is_some() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta is text-only; session currently holds image state",
-            );
-            return;
-        }
+        // Text-only deltas are allowed on sessions whose KV cache carries
+        // prior image attention state — see `chat_tokens_delta_sync` for
+        // the full rationale. The outer `chat_stream_session_continue`
+        // gate already filters IMAGE-SET CHANGES via the
+        // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix path.
 
         // All guards passed — enter the prefill+decode helper. Any error
         // returned from here propagates as an mpsc error, same as
@@ -2303,17 +2331,14 @@ impl Qwen35Inner {
 
         // Save cache state unconditionally — even on cancellation, the
         // partial generated_tokens must be appended so the session stays
-        // consistent for the next turn. `has_images` is always false on
-        // the delta path and we pass the full pre-decode snapshot as the
-        // text-only `save_tokens`.
-        save_cache_state_direct(
+        // consistent for the next turn. Delta continuations preserve
+        // `cached_image_key` so the next turn's cache-prefix verify
+        // still sees the prior prefill's image state.
+        chat_common::save_cache_state_after_delta(
             p.reuse_cache,
-            false,
             &generated_tokens,
             &finish_reason,
             &save_tokens,
-            None,
-            0,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
             &mut self.cached_rope_deltas,

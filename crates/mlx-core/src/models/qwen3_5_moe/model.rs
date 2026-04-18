@@ -1778,11 +1778,13 @@ impl Qwen35MoeInner {
                 "chat_tokens_delta_sync requires a non-empty delta",
             ));
         }
-        if self.cached_image_key.is_some() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync is text-only; session currently holds image state",
-            ));
-        }
+        // Text-only delta on image-bearing cache is intentional — the KV
+        // cache retains the image attention state from the prior prefill.
+        // See the sibling guard's doc in `qwen3_5/model.rs`. The outer
+        // `chat_session_continue_sync` gate filters real image-set
+        // changes with the `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`
+        // prefix so the TS `ChatSession` can route those through
+        // `chatSessionStart`.
 
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -2062,16 +2064,18 @@ impl Qwen35MoeInner {
             );
         }
 
-        // Save cache state. `has_images` is always false on the delta path
-        // and we pass the full pre-decode snapshot as the text-only save.
-        save_cache_state_direct(
+        // Save cache state. Delta continuations preserve
+        // `cached_image_key` — the live KV cache still encodes the prior
+        // prefill's image attention state even though this turn is
+        // text-only, and a subsequent cache-prefix verify needs that
+        // key to stay in place so a later image-bearing turn correctly
+        // flags an image-set change instead of being accepted on the
+        // delta path.
+        chat_common::save_cache_state_after_delta(
             p.reuse_cache,
-            false,
             &generated_tokens,
             &finish_reason,
             &save_tokens,
-            None,
-            0,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
             &mut self.cached_rope_deltas,
@@ -2379,13 +2383,10 @@ impl Qwen35MoeInner {
             );
             return;
         }
-        if self.cached_image_key.is_some() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta is text-only; session currently holds image state",
-            );
-            return;
-        }
+        // Text-only streaming deltas are allowed over image-bearing
+        // cache — see the sync sibling for the rationale. Real image-set
+        // changes are caught by the outer `chat_stream_session_continue`
+        // gate.
 
         let cb = StreamSender(stream_tx.clone());
         let result =
@@ -2700,15 +2701,13 @@ impl Qwen35MoeInner {
 
         // Save cache state unconditionally — even on cancellation, the
         // partial generated_tokens must be appended so the session stays
-        // consistent for the next turn.
-        save_cache_state_direct(
+        // consistent for the next turn. Delta stream preserves
+        // `cached_image_key` (see the sync sibling's rationale).
+        chat_common::save_cache_state_after_delta(
             p.reuse_cache,
-            false,
             &generated_tokens,
             &finish_reason,
             &save_tokens,
-            None,
-            0,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
             &mut self.cached_rope_deltas,
