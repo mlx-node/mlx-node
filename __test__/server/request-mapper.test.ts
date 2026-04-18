@@ -512,6 +512,185 @@ describe('mapRequest', () => {
       ]);
     });
   });
+
+  describe('assistant history replay (client-echoed input[])', () => {
+    it('accepts output_text content parts when a client replays an assistant message', () => {
+      // Clients that do not use `previous_response_id` (pi-ai, Codex) replay
+      // the prior assistant turn as `{type:"message",role:"assistant",content:[{type:"output_text",...}]}`.
+      // Rejecting output_text breaks cold-start multi-turn outright.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Remember 42.' }] },
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: "Got it. I'll remember 42.", annotations: [] }],
+          } as any,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'What number?' }] },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Remember 42.' },
+        { role: 'assistant', content: "Got it. I'll remember 42." },
+        { role: 'user', content: 'What number?' },
+      ]);
+    });
+
+    it('coalesces a replayed reasoning item onto the trailing assistant message', () => {
+      // Real pi-ai payload shape: user → reasoning → message(assistant) → user.
+      // The reasoning summary must land as `reasoningContent` on the assistant turn.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hi' }] },
+          {
+            type: 'reasoning',
+            id: 'rs_1',
+            summary: [{ type: 'summary_text', text: 'Let me think briefly.' }],
+          } as any,
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Hello!', annotations: [] }],
+          } as any,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Bye' }] },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Hi' },
+        { role: 'assistant', content: 'Hello!', reasoningContent: 'Let me think briefly.' },
+        { role: 'user', content: 'Bye' },
+      ]);
+    });
+
+    it('coalesces reasoning + function_call into one assistant turn', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Weather in SF?' }] },
+          {
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'Tool required.' }],
+          } as any,
+          {
+            type: 'function_call',
+            id: 'fc-1',
+            call_id: 'call_a',
+            name: 'get_weather',
+            arguments: '{"city":"SF"}',
+          },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Weather in SF?' },
+        {
+          role: 'assistant',
+          content: '',
+          reasoningContent: 'Tool required.',
+          toolCalls: [{ name: 'get_weather', arguments: '{"city":"SF"}', id: 'call_a' }],
+        },
+      ]);
+    });
+
+    it('emits reasoning-only turn as a standalone assistant message when no trailing content', () => {
+      // Turn 1 ran out of budget inside thinking → client replays a lone reasoning item.
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Think briefly.' }] },
+          {
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: 'thinking only.' }],
+          } as any,
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Continue.' }] },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'user', content: 'Think briefly.' },
+        { role: 'assistant', content: '', reasoningContent: 'thinking only.' },
+        { role: 'user', content: 'Continue.' },
+      ]);
+    });
+
+    it('treats a replayed refusal part as text for model re-ingestion', () => {
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'refusal', refusal: 'I cannot help with that.' }],
+          } as any,
+        ],
+      });
+
+      expect(messages).toEqual([{ role: 'assistant', content: 'I cannot help with that.' }]);
+    });
+  });
+
+  describe('input_image content parts', () => {
+    it('decodes a base64 data URL into raw image bytes attached to the user turn', () => {
+      // 2x2 red PNG.
+      const b64 =
+        'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8DwnwEDMGEKDQYxAEiRAP9t2B9IAAAAAElFTkSuQmCC';
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'What is in this image?' },
+              { type: 'input_image', image_url: `data:image/png;base64,${b64}` },
+            ],
+          },
+        ],
+      });
+
+      expect(messages).toHaveLength(1);
+      const u = messages[0];
+      expect(u.role).toBe('user');
+      expect(u.content).toBe('What is in this image?');
+      expect(u.images).toBeDefined();
+      expect(u.images).toHaveLength(1);
+      expect(Buffer.from(u.images![0]).subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    });
+
+    it('rejects input_image with a remote http(s) URL', () => {
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_image', image_url: 'https://example.com/cat.png' }],
+            },
+          ],
+        }),
+      ).toThrow(/base64 data URL/);
+    });
+
+    it('rejects input_image attached to a non-user message', () => {
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'input_image', image_url: 'data:image/png;base64,AA==' }],
+            } as any,
+          ],
+        }),
+      ).toThrow(/only allowed on user messages/);
+    });
+  });
 });
 
 describe('reconstructMessagesFromChain', () => {

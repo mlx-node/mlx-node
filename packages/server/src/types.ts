@@ -5,7 +5,50 @@ export interface InputTextPart {
   text: string;
 }
 
-export type ContentPart = InputTextPart;
+/**
+ * An image attached to a user message. `image_url` may be an `http(s)://` URL
+ * (not fetched by the mapper) or a `data:<mime>;base64,<payload>` URL
+ * (decoded and forwarded to the model as raw bytes).
+ */
+export interface InputImagePart {
+  type: 'input_image';
+  image_url?: string;
+  file_id?: string;
+  detail?: 'auto' | 'low' | 'high';
+}
+
+/**
+ * Echoed back by clients (Codex, pi-ai, etc.) when they replay prior
+ * assistant turns in `input[]` instead of using `previous_response_id`.
+ * Equivalent to `InputTextPart` for mapping purposes — we only need the text.
+ */
+export interface InputAssistantTextPart {
+  type: 'output_text';
+  text: string;
+  annotations?: never[];
+}
+
+/** Echoed back by clients when replaying a refusal block from a prior turn. */
+export interface InputRefusalPart {
+  type: 'refusal';
+  refusal: string;
+}
+
+/**
+ * Some clients inline a reasoning summary as a content part on an assistant
+ * message instead of as a top-level `reasoning` input item.
+ */
+export interface InputSummaryTextPart {
+  type: 'summary_text';
+  text: string;
+}
+
+export type ContentPart =
+  | InputTextPart
+  | InputImagePart
+  | InputAssistantTextPart
+  | InputRefusalPart
+  | InputSummaryTextPart;
 
 // ---------------------------------------------------------------------------
 // Input items
@@ -31,7 +74,19 @@ export interface InputFunctionCallOutput {
   output: string;
 }
 
-export type InputItem = InputMessage | InputFunctionCall | InputFunctionCallOutput;
+/**
+ * Top-level reasoning item replayed by clients that echo prior assistant
+ * reasoning summaries instead of using `previous_response_id`. The summary
+ * is coalesced onto the next assistant `ChatMessage` as `reasoningContent`.
+ */
+export interface InputReasoningItem {
+  type: 'reasoning';
+  id?: string;
+  summary?: { type?: 'summary_text'; text: string }[];
+  encrypted_content?: string;
+}
+
+export type InputItem = InputMessage | InputFunctionCall | InputFunctionCallOutput | InputReasoningItem;
 
 // ---------------------------------------------------------------------------
 // Tool definitions (Responses API shape)

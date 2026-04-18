@@ -4,17 +4,56 @@ import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
 import type { ContentPart, ResponsesAPIRequest, ResponsesToolDefinition } from '../types.js';
 
-function resolveContent(content: string | ContentPart[]): string {
-  if (typeof content === 'string') return content;
+/**
+ * Resolve a message's `content` array into text + optional image bytes.
+ *
+ * Accepts both input-side (`input_text`, `input_image`) and replay-side
+ * (`output_text`, `refusal`, `summary_text`) content parts. Clients that echo
+ * prior assistant turns in `input[]` instead of using `previous_response_id`
+ * (pi-ai, Codex) send `output_text` on assistant messages — rejecting those
+ * would break cold-start replay. `input_image` with a base64 `data:` URL is
+ * decoded to bytes; `http(s)://` URLs are not fetched (the mapper stays sync).
+ */
+function resolveMessageContent(
+  content: string | ContentPart[],
+  role: 'user' | 'assistant' | 'system',
+): { text: string; images?: Uint8Array[] } {
+  if (typeof content === 'string') return { text: content };
+
   const parts: string[] = [];
+  const images: Uint8Array[] = [];
+
   for (const p of content) {
-    if (p.type === 'input_text') {
+    if (p.type === 'input_text' || p.type === 'output_text' || p.type === 'summary_text') {
       parts.push(p.text);
+    } else if (p.type === 'refusal') {
+      parts.push(p.refusal);
+    } else if (p.type === 'input_image') {
+      if (role !== 'user') {
+        throw new Error(`input_image content parts are only allowed on user messages (got role="${role}")`);
+      }
+      if (p.file_id) {
+        throw new Error('input_image.file_id is not supported — inline the image as a data URL');
+      }
+      if (!p.image_url) {
+        throw new Error('input_image is missing image_url');
+      }
+      const match = /^data:[^;,]+;base64,(.+)$/s.exec(p.image_url);
+      if (!match) {
+        throw new Error(
+          'input_image.image_url must be a base64 data URL (data:<mime>;base64,<payload>); ' +
+            'remote http(s) URLs are not fetched by this server',
+        );
+      }
+      images.push(Buffer.from(match[1], 'base64'));
     } else {
-      throw new Error(`Unsupported content part type: "${p.type as string}"`);
+      throw new Error(`Unsupported content part type: "${(p as { type: string }).type}"`);
     }
   }
-  return parts.join('');
+
+  const out: { text: string; images?: Uint8Array[] } = { text: parts.join('') };
+  if (images.length > 0) out.images = images;
+  return out;
 }
 
 /** NAPI `ToolDefinition` requires `parameters.properties` to be a JSON string. */
@@ -55,22 +94,39 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
     messages.push(...priorMessages);
   }
 
-  // Coalesce a `message + function_call+` run (or a pure `function_call+` run)
-  // into ONE assistant `ChatMessage` carrying both `content` and `toolCalls`.
-  // `ChatSession.sendStream()` appends exactly one assistant message per turn,
-  // and `validateAndCanonicalizeHistoryToolOrder` requires each fan-out's
-  // `toolCalls` to pair 1:1 with the trailing tool block — splitting would
-  // reshape the conversation and make the walker reject the turn as orphaned.
-  // A `message` item immediately after a `function_call` starts a new turn.
+  // An assistant turn may serialise into any interleaving of `reasoning`,
+  // `message` (assistant), and `function_call` items. We coalesce that run
+  // into ONE assistant `ChatMessage` carrying `content` + `reasoningContent`
+  // + `toolCalls`, matching the hot-path `ChatSession` shape exactly. Any
+  // non-assistant item (user / system / function_call_output) flushes the
+  // current turn. An assistant `message` item that appears AFTER a
+  // `function_call` opens a fresh turn — preserving the pre-existing
+  // convention documented in the fan-out tests.
   if (typeof req.input === 'string') {
     messages.push({ role: 'user', content: req.input });
   } else {
-    let prevItemType: string | null = null;
+    let currentAssistant: ChatMessage | null = null;
+    let assistantHasToolCalls = false;
+
+    const flushAssistant = () => {
+      if (currentAssistant) {
+        messages.push(currentAssistant);
+        currentAssistant = null;
+        assistantHasToolCalls = false;
+      }
+    };
+    const ensureAssistant = (): ChatMessage => {
+      if (!currentAssistant) {
+        currentAssistant = { role: 'assistant', content: '' };
+      }
+      return currentAssistant;
+    };
+
     for (const item of req.input) {
       if (item == null || typeof item !== 'object') {
         throw new Error('Each input item must be a non-null object');
       }
-      const itemType = item.type ?? 'message';
+      const itemType = (item as { type?: string }).type ?? 'message';
 
       if (itemType === 'message') {
         const msg = item as { role: string; content: string | ContentPart[] };
@@ -79,32 +135,36 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
         if (role !== 'user' && role !== 'assistant' && role !== 'system') {
           throw new Error(`Unsupported message role: "${msg.role}"`);
         }
-        messages.push({
-          role,
-          content: resolveContent(msg.content),
-        });
-      } else if (itemType === 'function_call') {
-        // Coalesce onto the preceding assistant turn — see the loop header.
-        const fc = item as { name: string; arguments: string; call_id: string };
-        const last = messages[messages.length - 1];
-        const canCoalesce =
-          (prevItemType === 'function_call' || prevItemType === 'message') &&
-          last !== undefined &&
-          last.role === 'assistant';
-        if (canCoalesce) {
-          if (last!.toolCalls === undefined) {
-            last!.toolCalls = [];
+
+        if (role === 'assistant') {
+          // `message` after a `function_call` opens a new turn.
+          if (assistantHasToolCalls) {
+            flushAssistant();
           }
-          last!.toolCalls!.push({ name: fc.name, arguments: fc.arguments, id: fc.call_id });
+          const a = ensureAssistant();
+          const { text } = resolveMessageContent(msg.content, 'assistant');
+          a.content = (a.content ?? '') + text;
         } else {
-          messages.push({
-            role: 'assistant',
-            content: '',
-            toolCalls: [{ name: fc.name, arguments: fc.arguments, id: fc.call_id }],
-          });
+          flushAssistant();
+          const { text, images } = resolveMessageContent(msg.content, role);
+          const m: ChatMessage = { role, content: text };
+          if (images) m.images = images;
+          messages.push(m);
         }
+      } else if (itemType === 'reasoning') {
+        const r = item as { summary?: { text?: string }[] };
+        const summary = (r.summary ?? []).map((s) => s.text ?? '').join('');
+        const a = ensureAssistant();
+        a.reasoningContent = (a.reasoningContent ?? '') + summary;
+      } else if (itemType === 'function_call') {
+        const fc = item as { name: string; arguments: string; call_id: string };
+        const a = ensureAssistant();
+        a.toolCalls ??= [];
+        a.toolCalls.push({ name: fc.name, arguments: fc.arguments, id: fc.call_id });
+        assistantHasToolCalls = true;
       } else if (itemType === 'function_call_output') {
         const fco = item as { call_id: string; output: string };
+        flushAssistant();
         messages.push({
           role: 'tool',
           content: fco.output,
@@ -113,9 +173,9 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
       } else {
         throw new Error(`Unsupported input item type: "${itemType as string}"`);
       }
-
-      prevItemType = itemType;
     }
+
+    flushAssistant();
   }
 
   const config: ChatConfig = {
