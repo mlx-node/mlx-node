@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { mapRequest, reconstructMessagesFromChain } from '../../packages/server/src/mappers/request.js';
+import {
+  mapRequest,
+  reconstructMessagesFromChain,
+  stringifyStoredInputMessages,
+} from '../../packages/server/src/mappers/request.js';
 
 describe('mapRequest', () => {
   it('maps a string input to a single user message', () => {
@@ -1080,5 +1084,85 @@ describe('reconstructMessagesFromChain', () => {
     // Pin that `reasoningContent` is absent, not present-but-empty — some downstream
     // paths distinguish `undefined` from `''` when deciding whether to emit <think>.
     expect(messages[1]).not.toHaveProperty('reasoningContent');
+  });
+});
+
+describe('stored-input codec (images round-trip)', () => {
+  // `StoredResponseRecord.inputJson` is serialised with
+  // `stringifyStoredInputMessages` and re-parsed by
+  // `reconstructMessagesFromChain`. Plain `JSON.stringify` would turn
+  // `Uint8Array([1,2,3])` into `{"0":1,"1":2,"2":3}`, which fails the
+  // NAPI `Uint8Array` coercion on cold replay through
+  // `previous_response_id` chains that carry images. Guard that
+  // round-trip here.
+  it('encodes Uint8Array images as base64 in the stored JSON', () => {
+    const msgs = [
+      {
+        role: 'user' as const,
+        content: 'look',
+        images: [new Uint8Array([0xff, 0x00, 0x01, 0x02])],
+      },
+    ];
+    const json = stringifyStoredInputMessages(msgs);
+    const parsedRaw = JSON.parse(json);
+    expect(parsedRaw[0].images).toHaveLength(1);
+    expect(parsedRaw[0].images[0]).toEqual({ __u8__: Buffer.from([0xff, 0x00, 0x01, 0x02]).toString('base64') });
+    // Regression guard: the legacy numeric-keyed shape MUST NOT appear.
+    expect(parsedRaw[0].images[0]).not.toHaveProperty('0');
+  });
+
+  it('reconstructs images back to Uint8Array instances with identical bytes', () => {
+    const bytes = new Uint8Array([10, 20, 30, 40, 50]);
+    const inputJson = stringifyStoredInputMessages([
+      {
+        role: 'user',
+        content: 'round-trip me',
+        images: [bytes],
+      },
+    ]);
+    const [msg] = reconstructMessagesFromChain([{ inputJson, outputJson: '[]' }]);
+    expect(msg.role).toBe('user');
+    expect(msg.images).toBeDefined();
+    expect(msg.images).toHaveLength(1);
+    // `Buffer.from(_, 'base64')` returns a Uint8Array subclass — satisfies
+    // the NAPI `Array<Uint8Array>` type check downstream.
+    expect(msg.images![0]).toBeInstanceOf(Uint8Array);
+    expect(Array.from(msg.images![0])).toEqual(Array.from(bytes));
+  });
+
+  it('preserves multiple images across round-trip in order', () => {
+    const inputJson = stringifyStoredInputMessages([
+      {
+        role: 'user',
+        content: 'compare',
+        images: [new Uint8Array([1]), new Uint8Array([2, 2]), new Uint8Array([3, 3, 3])],
+      },
+    ]);
+    const [msg] = reconstructMessagesFromChain([{ inputJson, outputJson: '[]' }]);
+    expect(msg.images).toHaveLength(3);
+    expect(Array.from(msg.images![0])).toEqual([1]);
+    expect(Array.from(msg.images![1])).toEqual([2, 2]);
+    expect(Array.from(msg.images![2])).toEqual([3, 3, 3]);
+  });
+
+  it('leaves image-less messages unchanged (byte-for-byte parity with plain JSON.stringify)', () => {
+    const msgs = [
+      { role: 'user' as const, content: 'no images here' },
+      { role: 'assistant' as const, content: 'reply' },
+    ];
+    expect(stringifyStoredInputMessages(msgs)).toBe(JSON.stringify(msgs));
+  });
+
+  it('does not rehydrate unrelated objects that happen to carry a __u8__ key', () => {
+    // Defensive: the reviver keys on the exact sentinel shape
+    // `{__u8__: "<base64>"}`. A user-supplied message whose `content`
+    // is a literal JSON string containing that substring must not be
+    // transformed — the sentinel only appears inside the `images` array,
+    // and only via `stringifyStoredInputMessages`.
+    const inputJson = JSON.stringify([{ role: 'user', content: 'here is a fake sentinel: {"__u8__":"deadbeef"}' }]);
+    const [msg] = reconstructMessagesFromChain([{ inputJson, outputJson: '[]' }]);
+    expect(typeof msg.content).toBe('string');
+    expect(msg.content).toContain('__u8__');
+    expect(msg.images).toBeUndefined();
   });
 });

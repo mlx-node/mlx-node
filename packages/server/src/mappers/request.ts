@@ -238,15 +238,62 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
 }
 
 /**
+ * Sentinel key used to tag base64-encoded `Uint8Array` payloads in
+ * persisted `inputJson`. Plain `JSON.stringify` turns a `Uint8Array`
+ * into a numeric-keyed object (e.g. `{"0":1,"1":2,...}`), which
+ * (a) bloats the row ~8× vs base64 and (b) does not round-trip — the
+ * parsed object fails the NAPI `Uint8Array` type check on cold replay,
+ * breaking `previous_response_id` continuations that carry images.
+ */
+const UINT8_SENTINEL = '__u8__';
+
+interface EncodedUint8Array {
+  [UINT8_SENTINEL]: string;
+}
+
+function isEncodedUint8Array(value: unknown): value is EncodedUint8Array {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as Record<string, unknown>)[UINT8_SENTINEL] === 'string'
+  );
+}
+
+/**
+ * Serialise a `ChatMessage[]` snapshot for `StoredResponseRecord.inputJson`,
+ * preserving any `Uint8Array` image payloads as base64-encoded sentinels
+ * so a later `reconstructMessagesFromChain` can revive them into real
+ * `Uint8Array`s for the NAPI chat-session boundary.
+ */
+export function stringifyStoredInputMessages(messages: ChatMessage[]): string {
+  return JSON.stringify(messages, (_key, value: unknown) => {
+    if (value instanceof Uint8Array) {
+      return { [UINT8_SENTINEL]: Buffer.from(value).toString('base64') };
+    }
+    return value;
+  });
+}
+
+/**
  * Reconstruct `ChatMessage[]` from a stored response chain. Each record
  * stores `inputJson` (messages sent) and `outputJson` (output items); we
  * interleave them.
+ *
+ * Image payloads encoded as `{__u8__: "<base64>"}` by
+ * `stringifyStoredInputMessages` are rehydrated back into `Buffer`
+ * (a `Uint8Array` subclass) so replayed user turns carry the same
+ * runtime shape the native chat-session APIs expect.
  */
 export function reconstructMessagesFromChain(chain: { inputJson: string; outputJson: string }[]): ChatMessage[] {
   const messages: ChatMessage[] = [];
 
   for (const record of chain) {
-    const inputMessages = JSON.parse(record.inputJson) as ChatMessage[];
+    const inputMessages = JSON.parse(record.inputJson, (_key, value: unknown) => {
+      if (isEncodedUint8Array(value)) {
+        return Buffer.from(value[UINT8_SENTINEL], 'base64');
+      }
+      return value;
+    }) as ChatMessage[];
     messages.push(...inputMessages);
 
     const outputItems = JSON.parse(record.outputJson) as Array<{

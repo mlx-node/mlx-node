@@ -15,7 +15,7 @@ import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponse
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
 import { sendBadRequest, sendInternalError, sendNotFound, sendRateLimit, sendStorageTimeout } from '../errors.js';
-import { mapRequest, reconstructMessagesFromChain } from '../mappers/request.js';
+import { mapRequest, reconstructMessagesFromChain, stringifyStoredInputMessages } from '../mappers/request.js';
 import {
   buildPartialResponse,
   buildResponseObject,
@@ -1313,7 +1313,7 @@ function buildResponseRecord(
     model: response.model,
     status: response.status,
     instructions: response.instructions ?? undefined,
-    inputJson: JSON.stringify(newInputMessages),
+    inputJson: stringifyStoredInputMessages(newInputMessages),
     outputJson: JSON.stringify(response.output),
     outputText: response.output_text,
     usageJson: JSON.stringify(response.usage),
