@@ -11,7 +11,7 @@ use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
     ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache, VisionCacheInner,
-    compute_num_image_tokens, eval_layer_caches, extract_images_from_messages,
+    compute_image_token_counts_per_image, eval_layer_caches, extract_images_from_messages,
     inject_image_placeholders, vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
@@ -724,8 +724,9 @@ impl Qwen35MoeInner {
                 let all_images = extract_images_from_messages(&messages);
                 let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
-                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
                 let cache_key = compute_image_cache_key(&all_images);
                 (expanded, cache_key, Some(processed_pre))
             } else {
@@ -1223,8 +1224,9 @@ impl Qwen35MoeInner {
                 let all_images = extract_images_from_messages(&messages);
                 let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
-                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
                 let cache_key = compute_image_cache_key(&all_images);
                 (expanded, cache_key, Some(processed_pre))
             } else {

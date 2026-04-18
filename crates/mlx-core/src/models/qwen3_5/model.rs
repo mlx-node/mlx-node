@@ -998,8 +998,9 @@ impl Qwen35Inner {
                 let all_images = extract_images_from_messages(&messages);
                 let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
-                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
                 let cache_key = compute_image_cache_key(&all_images);
                 (expanded, cache_key, Some(processed_pre))
             } else {
@@ -2472,8 +2473,9 @@ impl Qwen35Inner {
                 let all_images = extract_images_from_messages(&messages);
                 let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
-                let num_image_tokens = compute_num_image_tokens(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, num_image_tokens);
+                let per_image_token_counts =
+                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
+                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
                 let cache_key = compute_image_cache_key(&all_images);
                 (expanded, cache_key, Some(processed_pre))
             } else {
@@ -5251,39 +5253,99 @@ pub(crate) fn extract_images_from_messages(messages: &[ChatMessage]) -> Vec<Vec<
     all_images
 }
 
-/// Compute the number of merged image tokens from a processed grid_thw array.
-pub(crate) fn compute_num_image_tokens(grid: &MxArray, spatial_merge_size: i32) -> Result<usize> {
+/// Compute the per-image merged-token count from a processed grid_thw
+/// array. Each entry is the number of `IMAGE_TOKEN_ID` slots that image
+/// must occupy in the prompt so the vision embeddings align 1:1 with the
+/// corresponding token positions.
+pub(crate) fn compute_image_token_counts_per_image(
+    grid: &MxArray,
+    spatial_merge_size: i32,
+) -> Result<Vec<usize>> {
     grid.eval();
     let grid_data = grid.to_int32()?;
     let merge_factor = spatial_merge_size * spatial_merge_size;
-    let mut num_tokens = 0usize;
+    let mut counts = Vec::with_capacity(grid_data.len() / 3);
     for i in 0..(grid_data.len() / 3) {
         let t = grid_data[i * 3];
         let h = grid_data[i * 3 + 1];
         let w = grid_data[i * 3 + 2];
-        num_tokens += ((t * h * w) / merge_factor) as usize;
+        counts.push(((t * h * w) / merge_factor) as usize);
     }
-    Ok(num_tokens)
+    Ok(counts)
 }
 
-/// Ensure image token placeholders are present in the tokenized output.
+/// Ensure the tokenized prompt contains the right number of
+/// `IMAGE_TOKEN_ID` placeholders — one per vision patch, in the order
+/// produced by the chat template.
 ///
-/// If the chat template didn't inject `IMAGE_TOKEN_ID` placeholders,
-/// splice `num_image_tokens` of them after position 0 (after BOS).
-/// Always returns an owned Vec.
-pub(crate) fn inject_image_placeholders(tokens: &[u32], num_image_tokens: usize) -> Vec<u32> {
+/// Three input shapes are accepted:
+///
+/// 1. **Template emitted one `<|image_pad|>` per image** (the proper
+///    Qwen VLM shape, produced by
+///    `tokenizer::serialize_message_for_jinja` when the user turn
+///    carries images). Each placeholder is expanded in-place to its
+///    image's grid count. This keeps the vision tokens inside the user
+///    turn — `get_rope_index` builds correct M-RoPE positions and the
+///    model attends to the image in-context.
+///
+/// 2. **Template already emitted the fully expanded count** (non-Qwen
+///    templates that inline the full patch run). Pass through unchanged.
+///
+/// 3. **Template emitted zero placeholders** (non-VLM template, or a
+///    VLM template that silently drops vision markers). Splice the
+///    total count right after BOS as a last-resort fallback. Vision
+///    tokens land outside the user turn; this usually still produces
+///    sensible output for simple prompts but M-RoPE position IDs are
+///    suboptimal.
+pub(crate) fn inject_image_placeholders(
+    tokens: &[u32],
+    per_image_token_counts: &[usize],
+) -> Vec<u32> {
+    let total: usize = per_image_token_counts.iter().sum();
+    if total == 0 {
+        return tokens.to_vec();
+    }
     let existing = tokens
         .iter()
         .filter(|&&t| t == IMAGE_TOKEN_ID as u32)
         .count();
-    if num_image_tokens > 0 && existing == 0 {
+
+    if existing == 0 {
+        // Case 3 — fallback splice after BOS.
         let mut new_tokens = tokens.to_vec();
-        let placeholders: Vec<u32> = vec![IMAGE_TOKEN_ID as u32; num_image_tokens];
+        let placeholders: Vec<u32> = vec![IMAGE_TOKEN_ID as u32; total];
         new_tokens.splice(1..1, placeholders);
-        new_tokens
-    } else {
-        tokens.to_vec()
+        return new_tokens;
     }
+
+    if existing == per_image_token_counts.len() {
+        // Case 1 — one placeholder per image; expand each in place to
+        // its grid count. Capacity pre-sized to the final length so no
+        // reallocations.
+        let mut new_tokens: Vec<u32> = Vec::with_capacity(tokens.len() + total - existing);
+        let mut img_iter = per_image_token_counts.iter().copied();
+        for &t in tokens {
+            if t == IMAGE_TOKEN_ID as u32 {
+                match img_iter.next() {
+                    Some(count) => {
+                        new_tokens.extend(std::iter::repeat_n(IMAGE_TOKEN_ID as u32, count));
+                    }
+                    None => {
+                        // More placeholders than images — preserve as-is
+                        // and let `get_rope_index` surface the mismatch.
+                        new_tokens.push(t);
+                    }
+                }
+            } else {
+                new_tokens.push(t);
+            }
+        }
+        return new_tokens;
+    }
+
+    // Case 2 (existing == total) or unknown shape — return as-is.
+    // `get_rope_index` will surface any mismatch.
+    tokens.to_vec()
 }
 
 /// Compute M-RoPE position IDs for VLM
@@ -5801,4 +5863,69 @@ pub(crate) fn vlm_prepare_vision_features(
     );
 
     Ok((inputs_embeds, position_ids, rope_deltas))
+}
+
+#[cfg(test)]
+mod image_placeholder_tests {
+    use super::*;
+
+    const BOS: u32 = 1;
+    const USER: u32 = 100;
+    const TEXT: u32 = 200;
+    const IMG: u32 = IMAGE_TOKEN_ID as u32;
+
+    #[test]
+    fn expands_single_placeholder_per_image_inline() {
+        // Template emitted: BOS, USER, <|image_pad|>, TEXT
+        // Expected: BOS, USER, <|image_pad|>×5, TEXT  (vision wrapper stays
+        // INSIDE the user turn instead of getting spliced after BOS).
+        let tokens = vec![BOS, USER, IMG, TEXT];
+        let out = inject_image_placeholders(&tokens, &[5]);
+        assert_eq!(out, vec![BOS, USER, IMG, IMG, IMG, IMG, IMG, TEXT]);
+    }
+
+    #[test]
+    fn expands_distinct_grid_counts_for_multiple_images_in_order() {
+        // Two images with different grid sizes — each placeholder must be
+        // replaced by its own image's count, not the other way around.
+        let tokens = vec![BOS, IMG, TEXT, IMG];
+        let out = inject_image_placeholders(&tokens, &[2, 3]);
+        assert_eq!(out, vec![BOS, IMG, IMG, TEXT, IMG, IMG, IMG]);
+    }
+
+    #[test]
+    fn empty_counts_is_passthrough() {
+        let tokens = vec![BOS, USER, TEXT];
+        let out = inject_image_placeholders(&tokens, &[]);
+        assert_eq!(out, tokens);
+    }
+
+    #[test]
+    fn fallback_splices_total_after_bos_when_template_emitted_none() {
+        // Case 3: template didn't emit any placeholder. Fallback splice
+        // preserved for non-VLM templates / silent vision-dropping
+        // templates.
+        let tokens = vec![BOS, USER, TEXT];
+        let out = inject_image_placeholders(&tokens, &[3]);
+        assert_eq!(out, vec![BOS, IMG, IMG, IMG, USER, TEXT]);
+    }
+
+    #[test]
+    fn fully_expanded_input_passes_through_unchanged() {
+        // Case 2: template already emitted the full 5-token run. `existing`
+        // (5) != `per_image.len()` (1) so the "one-per-image" branch
+        // doesn't fire; total (5) matches so no fallback splice either.
+        let tokens = vec![BOS, USER, IMG, IMG, IMG, IMG, IMG, TEXT];
+        let out = inject_image_placeholders(&tokens, &[5]);
+        assert_eq!(out, tokens);
+    }
+
+    #[test]
+    fn preserves_relative_position_of_surrounding_tokens() {
+        // Regression guard: every non-IMG token must survive in its
+        // original relative order.
+        let tokens = vec![BOS, USER, 10, 11, IMG, 12, 13];
+        let out = inject_image_placeholders(&tokens, &[4]);
+        assert_eq!(out, vec![BOS, USER, 10, 11, IMG, IMG, IMG, IMG, 12, 13]);
+    }
 }

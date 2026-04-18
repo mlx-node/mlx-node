@@ -662,7 +662,14 @@ impl Qwen3Tokenizer {
 
     /// Sanitize all messages (role validation + content injection prevention).
     /// Called once before any formatting path to ensure consistent security.
-    /// Note: images are not cloned as they are not used in template formatting.
+    ///
+    /// Images are preserved (cloned byte-for-byte) — VLM Jinja templates
+    /// need them to emit the `<|vision_start|><|image_pad|><|vision_end|>`
+    /// wrapper inline in the user turn via
+    /// [`serialize_message_for_jinja`]. `Uint8Array` has no `Clone` impl
+    /// (it holds a raw JS buffer reference), so we rebuild each array
+    /// with `with_data_copied` from its underlying slice. Byte content
+    /// is not subject to ChatML text sanitisation.
     fn sanitize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         messages
             .iter()
@@ -672,7 +679,11 @@ impl Qwen3Tokenizer {
                 tool_calls: msg.tool_calls.clone(),
                 tool_call_id: msg.tool_call_id.clone(),
                 reasoning_content: msg.reasoning_content.clone(),
-                images: None,
+                images: msg.images.as_ref().map(|imgs| {
+                    imgs.iter()
+                        .map(|img| Uint8Array::with_data_copied(img.as_ref()))
+                        .collect()
+                }),
             })
             .collect()
     }
@@ -1463,6 +1474,110 @@ mod tests {
         assert!(
             user_turn.contains("What is this?"),
             "user text missing from user turn: {user_turn}",
+        );
+    }
+
+    /// `sanitize_messages` sits between `apply_chat_template(_sync)` and
+    /// `render_chat_template_jinja2` on every production path. If it
+    /// zeroes `images`, `serialize_message_for_jinja` sees
+    /// `msg.images: None` and the VLM content-array branch never fires,
+    /// so the template falls back to the post-BOS `inject_image_placeholders`
+    /// splice (vision tokens outside the user turn). Guard against that
+    /// regression directly.
+    #[test]
+    fn sanitize_messages_preserves_user_images_byte_for_byte() {
+        let original = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "describe these".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                images: Some(vec![
+                    Uint8Array::new(vec![0x01, 0x02, 0x03, 0x04]),
+                    Uint8Array::new(vec![0xaa, 0xbb, 0xcc]),
+                ]),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "ok".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                images: None,
+            },
+        ];
+
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(&original);
+
+        assert_eq!(sanitized.len(), 2);
+        let user = &sanitized[0];
+        assert_eq!(user.role, "user");
+        let imgs = user
+            .images
+            .as_ref()
+            .expect("user images must survive sanitise");
+        assert_eq!(imgs.len(), 2);
+        assert_eq!(imgs[0].as_ref(), &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(imgs[1].as_ref(), &[0xaa, 0xbb, 0xcc]);
+
+        // assistant path unchanged: still None.
+        assert!(sanitized[1].images.is_none());
+    }
+
+    /// End-to-end: sanitize → serialize → Jinja render. Covers the exact
+    /// composition production runs every turn. The direct-serialize test
+    /// above only proves the helper itself is correct — this one proves
+    /// the production chain is correct.
+    #[test]
+    fn sanitize_then_render_emits_vision_wrapper_in_user_turn() {
+        let template = r#"{%- for message in messages -%}
+<|im_start|>{{ message.role }}
+{%- if message.content is string -%}
+{{ message.content }}
+{%- else -%}
+{%- for item in message.content -%}
+{%- if 'image' in item or item.type == 'image' -%}
+<|vision_start|><|image_pad|><|vision_end|>
+{%- elif 'text' in item -%}
+{{ item.text }}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+<|im_end|>
+{% endfor -%}"#;
+
+        let mut env = Environment::new();
+        env.add_template("chat", template).unwrap();
+        let tmpl = env.get_template("chat").unwrap();
+
+        let msgs = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "What is this?".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            images: Some(vec![Uint8Array::new(vec![0; 4])]),
+        }];
+
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(&msgs);
+        let messages_value: Vec<serde_json::Value> =
+            sanitized.iter().map(serialize_message_for_jinja).collect();
+
+        let rendered = tmpl
+            .render(context! { messages => messages_value })
+            .unwrap();
+
+        let start_idx = rendered.find("<|im_start|>user").unwrap();
+        let end_idx = rendered[start_idx..].find("<|im_end|>").unwrap() + start_idx;
+        let user_turn = &rendered[start_idx..end_idx];
+        assert!(
+            user_turn.contains("<|vision_start|><|image_pad|><|vision_end|>"),
+            "vision wrapper not inside user turn after sanitize: {user_turn}",
+        );
+        assert!(
+            user_turn.contains("What is this?"),
+            "user text missing from user turn after sanitize: {user_turn}",
         );
     }
 }
