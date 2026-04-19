@@ -1959,8 +1959,20 @@ impl Qwen35MoeInner {
                 );
             }
 
-            // Text-only delta path: clear stale rope deltas.
-            self.cached_rope_deltas = None;
+            // Re-apply the saved M-RoPE offset if the session carries
+            // image state. The delta prefill just ran against the live
+            // KV caches, which still encode the prior VLM prefill's
+            // image attention; without re-applying the offset here, the
+            // newly-built compiled graph would use a sequential M-RoPE
+            // position and misposition all decoded tokens relative to
+            // the cached image patches. `cached_rope_deltas` stays
+            // alive across deltas so chained text-only turns on the
+            // same image session keep the offset.
+            if let Some(delta) = self.cached_rope_deltas {
+                unsafe {
+                    mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                }
+            }
 
             profiler.set_label("moe_chat_delta_compiled");
 
@@ -2578,8 +2590,18 @@ impl Qwen35MoeInner {
                 );
             }
 
-            // Text-only delta path: clear stale rope deltas.
-            self.cached_rope_deltas = None;
+            // Re-apply the saved M-RoPE offset if the session carries
+            // image state. See the sync sibling for the full rationale:
+            // the live KV caches still encode the prior VLM prefill's
+            // image attention, so the offset must re-apply here for
+            // tokens to position correctly. `cached_rope_deltas` stays
+            // alive across deltas so chained streaming text-only turns
+            // on the same image session keep the offset.
+            if let Some(delta) = self.cached_rope_deltas {
+                unsafe {
+                    mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                }
+            }
 
             profiler.set_label("moe_chat_stream_delta_compiled");
 

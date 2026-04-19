@@ -1604,10 +1604,17 @@ impl Qwen35Inner {
                     );
                 }
 
-                // VLM cache reuse: apply saved rope_deltas
-                if has_images
-                    && cached_prefix_len > 0
-                    && let Some(delta) = self.cached_rope_deltas
+                // Re-apply the saved M-RoPE offset when the compiled
+                // state is being (re)initialized from a KV cache that
+                // encodes image attention — see
+                // `chat_common::should_reapply_rope_delta`.
+                if let Some(delta) = self.cached_rope_deltas
+                    && chat_common::should_reapply_rope_delta(
+                        true,
+                        is_delta,
+                        has_images,
+                        cached_prefix_len,
+                    )
                 {
                     unsafe {
                         mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
@@ -1615,8 +1622,9 @@ impl Qwen35Inner {
                 }
             }
 
-            // For text-only, clear stale rope deltas
-            if !has_images {
+            // Clear stale rope deltas only on fresh text-only prefills —
+            // see `chat_common::should_clear_rope_delta`.
+            if chat_common::should_clear_rope_delta(is_delta, has_images) {
                 self.cached_rope_deltas = None;
             }
 
@@ -2209,8 +2217,20 @@ impl Qwen35Inner {
                     prefill_len,
                 );
             }
-            // Text-only path: clear stale rope deltas.
-            self.cached_rope_deltas = None;
+            // Re-apply the saved M-RoPE offset if the session carries
+            // image state. The delta prefill just ran against the live
+            // KV caches, which still encode the prior VLM prefill's
+            // image attention; without re-applying the offset here, the
+            // newly-built compiled graph would use a sequential M-RoPE
+            // position and misposition all decoded tokens relative to
+            // the cached image patches. `cached_rope_deltas` stays
+            // alive across deltas so chained text-only turns on the
+            // same image session keep the offset.
+            if let Some(delta) = self.cached_rope_deltas {
+                unsafe {
+                    mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                }
+            }
 
             profiler.set_label("chat_stream_delta_compiled");
 

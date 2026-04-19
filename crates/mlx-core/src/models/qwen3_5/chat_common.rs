@@ -507,6 +507,48 @@ pub(crate) fn finalize_chat_result(
     })
 }
 
+/// Whether the compiled init should re-apply the saved M-RoPE offset
+/// (`cached_rope_deltas`) after building the decode graph.
+///
+/// The offset is saved only when a VLM prefill ran, so `has_saved_delta`
+/// is effectively "the live KV cache encodes image attention". Two
+/// callers need to re-apply it:
+///   - **Fresh VLM prefill reusing a cached prefix** (`has_images &&
+///     cached_prefix_len > 0`): the new turn shares its image grid with
+///     the cached one, and the saved offset carries the image-adjusted
+///     M-RoPE position forward into the rebuilt compiled graph.
+///   - **Session delta continuation** (`is_delta`): the delta prefill
+///     just ran on top of the live KV caches, which still encode the
+///     prior VLM prefill's image attention. Without re-applying the
+///     offset, the newly-built compiled graph would decode at a
+///     sequential M-RoPE position and misposition all generated tokens
+///     relative to the cached image patches.
+///
+/// Pure function — extracted so the decision can be unit-tested
+/// without instantiating the compiled decoder.
+pub(crate) fn should_reapply_rope_delta(
+    has_saved_delta: bool,
+    is_delta: bool,
+    has_images: bool,
+    cached_prefix_len: usize,
+) -> bool {
+    has_saved_delta && (is_delta || (has_images && cached_prefix_len > 0))
+}
+
+/// Whether the compiled init should clear `cached_rope_deltas` after
+/// building the decode graph.
+///
+/// Only fresh text-only prefills clear the offset: they signal that the
+/// non-delta cache-prefix verify dropped any prior image-bearing cache,
+/// so the stored offset is stale. Delta continuations preserve the
+/// offset so chained text-only turns on an image session keep the
+/// image-adjusted M-RoPE position.
+///
+/// Pure function — extracted so the decision can be unit-tested.
+pub(crate) fn should_clear_rope_delta(is_delta: bool, has_images: bool) -> bool {
+    !has_images && !is_delta
+}
+
 /// Direct-ownership version of `save_cache_state` for dedicated-thread models.
 ///
 /// Takes `&mut` refs instead of `Arc<RwLock<>>`. Used by Qwen3.5 Dense on
@@ -1064,5 +1106,118 @@ mod save_cache_state_after_delta_tests {
 
         assert_eq!(cached_image_key, None);
         assert_eq!(cached_history, vec![1, 2, 42]);
+    }
+}
+
+#[cfg(test)]
+mod rope_delta_gate_tests {
+    //! Guards the M-RoPE offset lifecycle across the compiled decode
+    //! init branch. The prior bug hard-coded `has_images: false` on the
+    //! delta path and unconditionally cleared `cached_rope_deltas`,
+    //! which caused the compiled graph to decode text-only deltas at a
+    //! sequential position instead of the image-adjusted position —
+    //! mispositioning every generated token relative to the cached
+    //! image patches baked in by the earlier VLM prefill.
+    use super::{should_clear_rope_delta, should_reapply_rope_delta};
+
+    // ---- should_reapply_rope_delta ----
+
+    #[test]
+    fn reapply_skipped_when_no_saved_delta() {
+        // Text-only session, nothing to re-apply.
+        assert!(!should_reapply_rope_delta(false, false, false, 0));
+        // Image session with delta, but saved offset missing (fresh VLM
+        // prefill clears it before setting — we never enter the gated
+        // branch without a saved offset).
+        assert!(!should_reapply_rope_delta(false, true, false, 0));
+        assert!(!should_reapply_rope_delta(false, false, true, 100));
+    }
+
+    #[test]
+    fn reapply_fires_on_fresh_vlm_cache_prefix_reuse() {
+        // Fresh VLM prefill reusing a cached prefix: both `has_images`
+        // AND a non-zero `cached_prefix_len` must be present. The saved
+        // offset was written on the prior turn's VLM prefill, so a
+        // matching key + prefix means we rebuild the compiled graph at
+        // the same image-adjusted position.
+        assert!(should_reapply_rope_delta(true, false, true, 100));
+    }
+
+    #[test]
+    fn reapply_skipped_on_fresh_vlm_without_prefix_match() {
+        // VLM prefill without prefix reuse (cached_prefix_len == 0):
+        // the compiled init already ran the fresh prefill path, which
+        // computed the offset from scratch via M-RoPE. No re-apply.
+        assert!(!should_reapply_rope_delta(true, false, true, 0));
+    }
+
+    #[test]
+    fn reapply_skipped_on_fresh_text_prefill() {
+        // Fresh text prefill with no image state: the cache-prefix
+        // verify already dropped any prior image-bearing cache, so the
+        // saved offset is stale. `should_clear_rope_delta` handles that
+        // case by nulling it; re-apply stays off.
+        assert!(!should_reapply_rope_delta(true, false, false, 50));
+        assert!(!should_reapply_rope_delta(true, false, false, 0));
+    }
+
+    #[test]
+    fn reapply_fires_on_delta_continuation_with_saved_offset() {
+        // THE invariant this fix introduces: delta continuations on an
+        // image-bearing session re-apply the saved offset regardless of
+        // `has_images` (which is always false on the delta path by
+        // construction — delta prefills are text-only) and regardless
+        // of `cached_prefix_len` (which is always 0 on the delta path
+        // because the live KV cache already contains the full prior
+        // history and the delta bypasses the prefix-match flow).
+        assert!(should_reapply_rope_delta(true, true, false, 0));
+    }
+
+    #[test]
+    fn reapply_fires_on_chained_delta_turns() {
+        // Chained text-only deltas on the same image session: each
+        // turn's compiled init must re-apply the offset so the session
+        // stays positioned correctly. The save helper preserves
+        // `cached_rope_deltas` on the reuse_cache branch, so the next
+        // turn sees `has_saved_delta=true`.
+        assert!(should_reapply_rope_delta(true, true, false, 0));
+    }
+
+    // ---- should_clear_rope_delta ----
+
+    #[test]
+    fn clear_fires_only_on_fresh_text_prefill() {
+        // The ONE case where the saved offset is stale: a non-delta
+        // text prefill. The cache-prefix verify already dropped any
+        // prior image cache, so the offset has nothing valid to apply
+        // to on the next turn.
+        assert!(should_clear_rope_delta(false, false));
+    }
+
+    #[test]
+    fn clear_skipped_on_delta_path() {
+        // Delta continuations (text-only by construction) preserve the
+        // offset — regression gate for the bug this fix addresses. The
+        // live KV cache still encodes the prior VLM prefill's image
+        // attention, so the next delta turn (and the one after that)
+        // must re-apply the same saved offset.
+        assert!(!should_clear_rope_delta(true, false));
+    }
+
+    #[test]
+    fn clear_skipped_on_vlm_prefill() {
+        // VLM prefill sets a fresh offset and must not nuke it after
+        // init. The `is_delta` axis is false on the non-delta prefill
+        // path; the `has_images` axis guards the clear.
+        assert!(!should_clear_rope_delta(false, true));
+    }
+
+    #[test]
+    fn clear_skipped_on_vlm_delta_combination() {
+        // Belt-and-suspenders: even if a future caller ever set
+        // `is_delta=true, has_images=true`, the clear stays off. No
+        // current caller does this — the delta path rejects images at
+        // entry — but the gate is written defensively.
+        assert!(!should_clear_rope_delta(true, true));
     }
 }
