@@ -5481,52 +5481,94 @@ pub(crate) fn get_rope_index(
             ));
         }
 
-        // One image → one contiguous run. If this doesn't hold, the
-        // prompt shape is ambiguous (either `inject_image_placeholders`
-        // merged two adjacent runs into one or the grid count split a
-        // single image across multiple runs). Bail rather than guess a
-        // pairing.
-        if image_runs.len() != num_images {
+        // Two token layouts are valid here:
+        //
+        //  (a) N runs, one per image — the proper Qwen VLM shape after
+        //      the tokenizer serialiser emits a `{type:"image"}` part
+        //      per image and `inject_image_placeholders` expands each
+        //      marker in place. Per-run length must match its grid.
+        //
+        //  (b) 1 big run whose length equals the grids' total —
+        //      the fallback layout for chat templates that emit no
+        //      `<|image_pad|>` markers, where
+        //      `inject_image_placeholders` crams every image's tokens
+        //      into a single splice after BOS. No text gap sits between
+        //      images in this layout, so the position walk collapses
+        //      consecutive sub-runs into one contiguous span without
+        //      emitting any interior text.
+        //
+        // We canonicalise both into a `per_image_offsets: Vec<(start,
+        // grid_info)>` list of length `num_images` and feed it to the
+        // position walk below. Any other shape is ambiguous (we'd have
+        // to guess which grid goes with which run) — reject it.
+        let per_image_offsets: Vec<(usize, (i64, i64, i64, usize))> = if image_runs.len()
+            == num_images
+        {
+            // Case (a): validate per-run length, then pair by ordinal.
+            for (run_idx, (run_start, run_end)) in image_runs.iter().enumerate() {
+                let expected = image_token_info[run_idx].3;
+                let actual = run_end - run_start;
+                if expected != actual {
+                    return Err(Error::new(
+                        Status::GenericFailure,
+                        format!(
+                            "Image run {run_idx} has {actual} placeholder tokens but its grid expects {expected}",
+                        ),
+                    ));
+                }
+            }
+            image_runs
+                .iter()
+                .zip(image_token_info.iter().copied())
+                .map(|((start, _), info)| (*start, info))
+                .collect()
+        } else if image_runs.len() == 1 {
+            // Case (b): fallback splice — synthesise per-image start
+            // offsets by walking `image_token_info` lengths from the
+            // single run's start. Total was already validated against
+            // `total_expected_tokens` above, so this just distributes
+            // the shared span across the grids.
+            let big_start = image_runs[0].0;
+            let mut offsets = Vec::with_capacity(num_images);
+            let mut cursor = big_start;
+            for info in image_token_info.iter().copied() {
+                offsets.push((cursor, info));
+                cursor += info.3;
+            }
+            offsets
+        } else {
             return Err(Error::new(
                 Status::GenericFailure,
                 format!(
                     "Image run layout mismatch: prompt carries {} contiguous image-token runs but {} images \
-                     were processed; expected one run per image. If you meant to send multiple images in the \
-                     same turn, place them adjacent to each other in the content array.",
+                     were processed; expected either one run per image or a single contiguous fallback run \
+                     containing every image's tokens.",
                     image_runs.len(),
                     num_images,
                 ),
             ));
-        }
+        };
 
-        // Per-run length must match the grid count for the image at
-        // the same ordinal position. Ordering is enforced by the
-        // tokenizer serialiser (images emitted in input array order)
-        // and by the image processor (grids returned in the same order).
-        for (run_idx, (run_start, run_end)) in image_runs.iter().enumerate() {
-            let expected = image_token_info[run_idx].3;
-            let actual = run_end - run_start;
-            if expected != actual {
-                return Err(Error::new(
-                    Status::GenericFailure,
-                    format!(
-                        "Image run {run_idx} has {actual} placeholder tokens but its grid expects {expected}",
-                    ),
-                ));
-            }
-        }
+        // End of the last image token in the token stream — everything
+        // beyond is trailing text. For case (a) this is the last run's
+        // end; for case (b) it's the shared run's end. In both cases
+        // it equals `image_runs.last().unwrap().1`.
+        let last_image_end = image_runs.last().expect("at least one run").1;
 
-        // Emit positions by walking the sequence: text gap, image run,
-        // text gap, image run, … final text gap. `current_pos` carries
-        // the M-RoPE counter forward across both text and image
-        // segments so every token gets a monotonically non-decreasing
-        // position id in each axis.
+        // Emit positions by walking the sequence: text gap, image,
+        // text gap, image, … final text gap. `current_pos` carries the
+        // M-RoPE counter forward across both text and image segments so
+        // every token gets a monotonically non-decreasing position id
+        // in each axis. Synthesised case-(b) sub-runs sit back-to-back
+        // so their text-gap loops iterate zero times between them —
+        // the walk collapses naturally.
         let mut cursor: usize = 0;
         let mut current_pos: i64 = 0;
 
-        for (run_idx, (run_start, run_end)) in image_runs.iter().enumerate() {
-            // Text gap before this image run
-            for _ in cursor..*run_start {
+        for (run_start, info) in per_image_offsets.iter().copied() {
+            // Text gap before this image run (zero-length for adjacent
+            // case-(b) sub-runs after the first).
+            for _ in cursor..run_start {
                 all_position_ids[0].push(current_pos);
                 all_position_ids[1].push(current_pos);
                 all_position_ids[2].push(current_pos);
@@ -5534,7 +5576,7 @@ pub(crate) fn get_rope_index(
             }
 
             // Spatial positions for the image at this run
-            let (llm_grid_t, llm_grid_h, llm_grid_w, _) = image_token_info[run_idx];
+            let (llm_grid_t, llm_grid_h, llm_grid_w, count) = info;
             let image_base = current_pos;
             for t_idx in 0..llm_grid_t {
                 for h_idx in 0..llm_grid_h {
@@ -5550,10 +5592,13 @@ pub(crate) fn get_rope_index(
                 std::cmp::max(llm_grid_h - 1, llm_grid_w - 1),
             );
             current_pos = image_base + max_axis + 1;
-            cursor = *run_end;
+            cursor = run_start + count;
         }
 
-        // Trailing text after the last image run
+        // Trailing text after the last image (run in case (a), sub-run
+        // end in case (b) — both resolve to `last_image_end`).
+        debug_assert_eq!(cursor, last_image_end);
+        let _ = last_image_end;
         for _ in cursor..seq_len as usize {
             all_position_ids[0].push(current_pos);
             all_position_ids[1].push(current_pos);
@@ -6207,5 +6252,58 @@ mod rope_index_tests {
             Err(e) => e,
         };
         assert!(err.reason.contains("Image run 0"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn multi_image_fallback_single_contiguous_run_is_accepted() {
+        // Fallback case (b): chat template emits zero `<|image_pad|>`
+        // markers and `inject_image_placeholders` crams every image's
+        // tokens into a single splice after BOS. For N images with
+        // distinct grids, the prompt carries ONE big contiguous run of
+        // `sum(per_image_counts)` image tokens. The old strict guard
+        // rejected this as "run layout mismatch" even though it was
+        // the legitimate fallback layout that previously worked via
+        // the old single-span position walk. The new path synthesises
+        // per-image sub-run offsets from the shared span and emits
+        // correct M-RoPE positions for each image.
+        let _g = mlx_lock().lock().unwrap();
+        // Two 1×2×2 grids → 4 image tokens each, 8 total.
+        let mut tokens = vec![TEXT_A];
+        tokens.extend(std::iter::repeat_n(IMG, 8));
+        tokens.push(TEXT_B);
+        let (ids, grid) = mk_inputs(&tokens, &[(1, 4, 4), (1, 4, 4)]);
+        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG)
+            .expect("fallback single-run layout for two images must be accepted");
+        let (t, _, _) = extract_positions(&pos);
+        assert_eq!(t.len(), tokens.len(), "every token must have a position");
+        // Leading text at 0.
+        assert_eq!(t[0], 0);
+        // First image base = 1, llm grid 1×2×2, max_axis=1 → current_pos
+        // after = 3. Next image base = 3, max_axis=1 → current_pos
+        // after = 5. Trailing TEXT_B at 5.
+        assert_eq!(*t.last().unwrap(), 5);
+    }
+
+    #[test]
+    fn multi_image_fallback_with_distinct_grids_preserves_per_image_offsets() {
+        // Same fallback shape but with DIFFERENT grid sizes per image —
+        // the synthesised sub-run offsets must distribute the shared
+        // span correctly (image[0] consumes its own count tokens,
+        // image[1] starts right after).
+        let _g = mlx_lock().lock().unwrap();
+        // image 0: 1×2×2 → 4 tokens. image 1: 1×4×4 → 16 tokens. Total 20.
+        let mut tokens = vec![TEXT_A];
+        tokens.extend(std::iter::repeat_n(IMG, 20));
+        tokens.push(TEXT_B);
+        let (ids, grid) = mk_inputs(&tokens, &[(1, 4, 4), (1, 8, 8)]);
+        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG)
+            .expect("fallback layout with distinct per-image grids must succeed");
+        let (t, _, _) = extract_positions(&pos);
+        assert_eq!(t.len(), tokens.len());
+        assert_eq!(t[0], 0);
+        // image 0 base=1, max_axis = max(0,1,1) = 1 → current_pos = 3
+        // image 1 base=3, max_axis = max(0,3,3) = 3 → current_pos = 7
+        // Trailing TEXT_B at 7.
+        assert_eq!(*t.last().unwrap(), 7);
     }
 }

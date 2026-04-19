@@ -67,7 +67,15 @@ function resolveMessageContent(
             'remote http(s) URLs are not fetched by this server',
         );
       }
-      images.push(Buffer.from(match[1], 'base64'));
+      // Wrap as a plain `Uint8Array` rather than storing the raw
+      // `Buffer`. `Buffer` is a `Uint8Array` subclass, but it defines
+      // its own `toJSON()` that `JSON.stringify` calls BEFORE any
+      // replacer runs — so a Buffer-backed value would serialise as
+      // `{type:"Buffer",data:[...]}` and skip the `__u8__` sentinel in
+      // `stringifyStoredInputMessages`, corrupting image round-trip
+      // through `previous_response_id` chains. A plain `Uint8Array`
+      // has no `toJSON`, so the replacer fires as intended.
+      images.push(new Uint8Array(Buffer.from(match[1], 'base64')));
       seenImage = true;
     } else {
       throw new Error(`Unsupported content part type: "${(p as { type: string }).type}"`);
@@ -264,11 +272,28 @@ function isEncodedUint8Array(value: unknown): value is EncodedUint8Array {
  * preserving any `Uint8Array` image payloads as base64-encoded sentinels
  * so a later `reconstructMessagesFromChain` can revive them into real
  * `Uint8Array`s for the NAPI chat-session boundary.
+ *
+ * The replacer runs AFTER `toJSON`, so a `Buffer` (which defines
+ * `Buffer.prototype.toJSON` returning `{type:"Buffer",data:[...]}`)
+ * would otherwise slip past the `instanceof Uint8Array` check. We
+ * match both shapes defensively — the production `resolveMessageContent`
+ * path now wraps with `new Uint8Array(...)` at decode time, but any
+ * future caller that sneaks a `Buffer` through still round-trips
+ * instead of silently corrupting image state.
  */
 export function stringifyStoredInputMessages(messages: ChatMessage[]): string {
   return JSON.stringify(messages, (_key, value: unknown) => {
     if (value instanceof Uint8Array) {
       return { [UINT8_SENTINEL]: Buffer.from(value).toString('base64') };
+    }
+    if (
+      value !== null &&
+      typeof value === 'object' &&
+      (value as { type?: unknown }).type === 'Buffer' &&
+      Array.isArray((value as { data?: unknown }).data)
+    ) {
+      const data = (value as { data: number[] }).data;
+      return { [UINT8_SENTINEL]: Buffer.from(data).toString('base64') };
     }
     return value;
   });

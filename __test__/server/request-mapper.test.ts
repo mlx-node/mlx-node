@@ -1165,4 +1165,33 @@ describe('stored-input codec (images round-trip)', () => {
     expect(msg.content).toContain('__u8__');
     expect(msg.images).toBeUndefined();
   });
+
+  it('round-trips images when they arrive as Node Buffer (matches mapRequest output)', () => {
+    // Regression guard: `resolveMessageContent` used to push raw `Buffer`
+    // instances into `msg.images`. `Buffer.prototype.toJSON` is invoked
+    // by `JSON.stringify` BEFORE the replacer, so a naive
+    // `value instanceof Uint8Array` check would skip the sentinel even
+    // though `Buffer extends Uint8Array` at the class level. The
+    // replacer must handle the `{type:"Buffer",data:[...]}` shape too
+    // so stored history stays rehydratable regardless of which producer
+    // built the ChatMessage.
+    const bytes = [0xde, 0xad, 0xbe, 0xef];
+    const inputJson = stringifyStoredInputMessages([
+      {
+        role: 'user',
+        content: 'buffer input',
+        images: [Buffer.from(bytes) as unknown as Uint8Array],
+      },
+    ]);
+    // Wire shape must be the sentinel, NOT `{type:"Buffer",data:[...]}`.
+    const wire = JSON.parse(inputJson);
+    expect(wire[0].images[0]).toEqual({ __u8__: Buffer.from(bytes).toString('base64') });
+    expect(wire[0].images[0]).not.toHaveProperty('type');
+    expect(wire[0].images[0]).not.toHaveProperty('data');
+
+    const [msg] = reconstructMessagesFromChain([{ inputJson, outputJson: '[]' }]);
+    expect(msg.images).toHaveLength(1);
+    expect(msg.images![0]).toBeInstanceOf(Uint8Array);
+    expect(Array.from(msg.images![0])).toEqual(bytes);
+  });
 });
