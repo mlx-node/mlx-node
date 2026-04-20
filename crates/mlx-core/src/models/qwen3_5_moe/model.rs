@@ -856,10 +856,13 @@ impl Qwen35MoeInner {
         // === VLM or text prefill branching ===
         profiler.begin_prefill();
         let (mut last_logits, seq_len) = if has_images && cached_prefix_len > 0 {
-            // VLM cache reuse: same images, incremental text-only prefill
+            // VLM cache reuse: same images, incremental text-only prefill.
+            // Routed through chunked_prefill — typically the delta is a
+            // small user turn so this is a one-iteration no-op, but a user
+            // pasting a long follow-up message still benefits.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
 
-            let logits = forward_inner(
+            let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
                 &mut self.layers,
@@ -868,6 +871,7 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 Some(&embedding_weight_t),
+                generation_stream,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -910,10 +914,11 @@ impl Qwen35MoeInner {
                 ));
             }
         } else {
-            // Standard text prefill
+            // Standard text prefill. Chunked to bound peak GPU memory for
+            // long prompts (e.g. 40k+ tokens) — see `chunked_prefill` docs.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
 
-            let logits = forward_inner(
+            let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
                 &mut self.layers,
@@ -922,6 +927,7 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 Some(&embedding_weight_t),
+                generation_stream,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -1361,9 +1367,11 @@ impl Qwen35MoeInner {
         // VLM or text prefill
         profiler.begin_prefill();
         let (mut last_logits, seq_len) = if has_images && cached_prefix_len > 0 {
+            // VLM cache reuse (streaming): same images, incremental text-only
+            // prefill. See the sync sibling for the rationale.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
 
-            let logits = forward_inner(
+            let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
                 &mut self.layers,
@@ -1372,6 +1380,7 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 Some(&embedding_weight_t),
+                generation_stream,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -1414,8 +1423,10 @@ impl Qwen35MoeInner {
                 ));
             }
         } else {
+            // Chunked to bound peak GPU memory for long prompts. See
+            // `chunked_prefill` docs for the memory rationale.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let logits = forward_inner(
+            let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
                 &mut self.layers,
@@ -1424,6 +1435,7 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 Some(&embedding_weight_t),
+                generation_stream,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -1919,9 +1931,11 @@ impl Qwen35MoeInner {
         profiler.snapshot_memory_before();
 
         // Text-only prefill of the delta on top of the existing caches.
+        // Usually tiny (a single user turn), but chunked defensively so a
+        // user pasting a long follow-up message doesn't blow memory.
         profiler.begin_prefill();
         let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-        let logits = forward_inner(
+        let logits = chunked_prefill(
             &prompt,
             &embedding_weight,
             &mut self.layers,
@@ -1930,6 +1944,7 @@ impl Qwen35MoeInner {
             &self.lm_head,
             fa_idx,
             Some(&embedding_weight_t),
+            generation_stream,
         )?;
         let prefill_out_seq_len = logits.shape_at(1)?;
         let mut last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
@@ -2557,9 +2572,10 @@ impl Qwen35MoeInner {
         profiler.snapshot_memory_before();
 
         // Text-only prefill of the delta on top of the existing caches.
+        // Chunked defensively — see the sync sibling for rationale.
         profiler.begin_prefill();
         let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-        let logits = forward_inner(
+        let logits = chunked_prefill(
             &prompt,
             &embedding_weight,
             &mut self.layers,
@@ -2568,6 +2584,7 @@ impl Qwen35MoeInner {
             &self.lm_head,
             fa_idx,
             Some(&embedding_weight_t),
+            generation_stream,
         )?;
         let prefill_out_seq_len = logits.shape_at(1)?;
         let mut last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
@@ -2901,21 +2918,21 @@ impl Qwen35MoeInner {
         let generation_stream = Stream::new(DeviceType::Gpu);
         let fa_idx = self.fa_idx;
 
-        // Prefill
+        // Prefill. Chunked to bound peak GPU memory for long prompts —
+        // see `chunked_prefill` docs. `chunked_prefill` internally manages
+        // the StreamContext per chunk so we don't need an outer one here.
         let prompt = prompt_tokens.reshape(&[1, -1])?;
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            forward_inner(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                fa_idx,
-                Some(&embedding_weight_t),
-            )?
-        };
+        let logits = chunked_prefill(
+            &prompt,
+            &embedding_weight,
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            &self.lm_head,
+            fa_idx,
+            Some(&embedding_weight_t),
+            generation_stream,
+        )?;
 
         let seq_len = logits.shape_at(1)?;
         let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
@@ -5229,6 +5246,135 @@ fn forward_inner(
             }
         },
     }
+}
+
+/// Default prefill chunk size (tokens per chunk).
+///
+/// Matches the Qwen3.5 Dense path and Python mlx-lm's `prefill_step_size`
+/// default of 2048. Long-context prompts (40k+ tokens) would otherwise
+/// allocate all per-layer activations concurrently (batch=1 × seq × hidden
+/// plus a full attention score tensor per FA layer), blowing past the 96 GB
+/// wired limit on an M3 Max 128 GB box. Chunking bounds the per-layer
+/// transient peak at `chunk × hidden_dim` and inserts a cache-eval +
+/// `clear_cache` barrier between chunks so the transient allocator state
+/// does not accumulate across chunks.
+pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
+
+/// Chunked prefill for Qwen3.5 MoE.
+///
+/// Processes `prompt` (shape `[1, seq_len]`) in chunks of `PREFILL_STEP_SIZE`
+/// tokens, evaluating all KV-cache arrays and clearing the MLX compute cache
+/// between chunks to bound peak GPU activation memory. Returns the logits
+/// from the **final** chunk, which share the same shape contract as a
+/// single-shot `forward_inner` call: `[1, last_chunk_len, vocab_size]`.
+///
+/// Invariants vs. single-shot `forward_inner`:
+/// - Identical numerical output at full precision (the KV caches thread
+///   through chunk N into chunk N+1 just like they would through
+///   successive `forward_inner(full_prompt)` calls during regular decode).
+/// - The linear-attention recurrent state advances chunk-by-chunk. This is
+///   the same forward direction as a single-shot call — chunking is a
+///   memory-only transformation, not a semantic one.
+/// - Compiled-path seeding (`mlx_qwen35_moe_init_from_prefill`) is the
+///   caller's responsibility and MUST happen **after** the full chunked
+///   prefill completes. Do NOT call `init_from_prefill` per chunk.
+///
+/// Small prompts (<= `PREFILL_STEP_SIZE` tokens) hit exactly one loop
+/// iteration and behave identically to a single `forward_inner` call — no
+/// extra evals, no extra cache clears.
+#[allow(clippy::too_many_arguments)]
+fn chunked_prefill(
+    prompt: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    fa_idx: usize,
+    embedding_weight_t: Option<&MxArray>,
+    generation_stream: Stream,
+) -> Result<MxArray> {
+    chunked_prefill_with_size(
+        prompt,
+        embedding_weight,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        fa_idx,
+        embedding_weight_t,
+        generation_stream,
+        PREFILL_STEP_SIZE,
+    )
+}
+
+/// Explicit-size variant of `chunked_prefill`.
+///
+/// Same semantics as `chunked_prefill` but the chunk size is an explicit
+/// parameter. Primarily used by tests to compare chunked vs single-shot
+/// (by passing a chunk size >= prompt length) without plumbing a config
+/// knob through every caller. Production callers should use
+/// `chunked_prefill` which hardcodes `PREFILL_STEP_SIZE`.
+#[allow(clippy::too_many_arguments)]
+fn chunked_prefill_with_size(
+    prompt: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    fa_idx: usize,
+    embedding_weight_t: Option<&MxArray>,
+    generation_stream: Stream,
+    chunk_size: i64,
+) -> Result<MxArray> {
+    debug_assert!(chunk_size > 0, "chunk_size must be positive");
+    let total_len = prompt.shape_at(1)?;
+    let mut offset: i64 = 0;
+
+    // All-but-last chunks: run forward, eval caches, clear compute cache.
+    // The returned logits from these chunks are thrown away because only
+    // the final chunk's logits are consumed by the sampler.
+    while total_len - offset > chunk_size {
+        let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
+        {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let _logits = forward_inner(
+                &chunk,
+                embedding_weight,
+                layers,
+                caches,
+                final_norm,
+                lm_head,
+                fa_idx,
+                embedding_weight_t,
+            )?;
+        }
+        // Materialize all cache arrays on GPU so the next chunk doesn't
+        // extend a giant lazy graph rooted at the prior chunk's inputs.
+        eval_layer_caches(caches);
+        crate::array::clear_cache();
+        offset += chunk_size;
+    }
+
+    // Final chunk: return logits to caller. No eval/clear here — the
+    // caller's next step (sampling / slicing last_logits) triggers eval
+    // naturally, and the outer decode loop clears cache on its own rhythm.
+    let remaining = prompt.slice_axis(1, offset, total_len)?;
+    let logits = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        forward_inner(
+            &remaining,
+            embedding_weight,
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            fa_idx,
+            embedding_weight_t,
+        )?
+    };
+    Ok(logits)
 }
 
 /// Single-token decode step using C++ MoE forward pass.
