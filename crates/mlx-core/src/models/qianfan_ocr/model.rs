@@ -187,6 +187,11 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             config,
             reply,
         } => {
+            // NOTE: no per-request cache drain here. On a multi-model
+            // server the MLX allocator free-pool is process-wide, so
+            // flushing after a request on model A discards blocks about
+            // to be reused by model B. The TS idle sweeper in
+            // `@mlx-node/server` handles between-turn drains.
             let _ = reply.send(inner.chat_session_start_sync(messages, config));
         }
         QianfanOCRCmd::ChatSessionContinue {
@@ -286,6 +291,10 @@ pub struct QianfanOCRModel {
     /// Whether the model was loaded with real weights. `false` for
     /// `new QianfanOCRModel(config)` calls that predate `load()`.
     initialized: bool,
+    /// RAII: unregisters this model's baseline from the cache-limit
+    /// coordinator on drop. `None` for instances constructed via
+    /// `new(config)` that never loaded weights.
+    _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
 }
 
 // ============================================================================
@@ -2110,6 +2119,7 @@ impl QianfanOCRModel {
             thread: None,
             config,
             initialized: false,
+            _cache_limit_guard: None,
         }
     }
 
@@ -2133,24 +2143,34 @@ impl QianfanOCRModel {
             async move {
                 let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
                     move || {
-                        let inner = load_qianfan_ocr_inner_from_dir(&model_path)?;
+                        // `load_qianfan_ocr_inner_from_dir` returns a
+                        // deterministic weight-byte total alongside
+                        // the inner; register it with the cache-limit
+                        // coordinator here. No active-memory sampling
+                        // — the deterministic path is race-free
+                        // against concurrent inference. See
+                        // `cache_limit.rs` module docs.
+                        let (inner, weight_bytes) = load_qianfan_ocr_inner_from_dir(&model_path)?;
+                        let cache_limit_guard =
+                            crate::cache_limit::coordinator().register(weight_bytes);
                         let config = inner.config.clone();
-                        Ok((inner, config))
+                        Ok((inner, (config, cache_limit_guard)))
                     },
                     handle_qianfan_ocr_cmd,
                 );
 
-                let config = init_rx
+                let (config, cache_limit_guard) = init_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
-                Ok((thread, config))
+                Ok((thread, config, cache_limit_guard))
             },
-            |_env, (thread, config)| {
+            |_env, (thread, config, cache_limit_guard)| {
                 Ok(QianfanOCRModel {
                     thread: Some(thread),
                     config,
                     initialized: true,
+                    _cache_limit_guard: Some(cache_limit_guard),
                 })
             },
         )
@@ -2544,7 +2564,7 @@ fn load_safetensors_weights(path: &Path) -> Result<HashMap<String, MxArray>> {
 /// variants, and `chat_session_continue_tool`) to work. The loader
 /// returns an error up front if `tokenizer.json` is missing rather
 /// than deferring the failure to the first session call.
-fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<QianfanOCRInner> {
+fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<(QianfanOCRInner, u64)> {
     let path = Path::new(model_path);
 
     if !path.exists() {
@@ -2635,7 +2655,15 @@ fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<QianfanOCRInner> 
         weights.len()
     );
 
-    Ok(QianfanOCRInner {
+    // Deterministic weight-byte total for the cache-limit coordinator.
+    // Computed while `weights` is still in scope — registration is
+    // performed in `QianfanOCRModel::load` using this value.
+    let weight_bytes: u64 = weights
+        .values()
+        .map(|a| a.nbytes() as u64)
+        .fold(0u64, |acc, v| acc.saturating_add(v));
+
+    let inner = QianfanOCRInner {
         config,
         vision,
         bridge,
@@ -2645,7 +2673,8 @@ fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<QianfanOCRInner> 
         cached_token_history: Vec::new(),
         cached_image_key: None,
         cached_cache_offset: 0,
-    })
+    };
+    Ok((inner, weight_bytes))
 }
 
 /// Merge vision features into text embeddings at image placeholder positions.

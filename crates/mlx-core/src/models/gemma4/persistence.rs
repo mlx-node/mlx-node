@@ -1003,7 +1003,13 @@ impl Gemma4Inner {
     /// Load a Gemma4Inner from a directory containing safetensors and config.json.
     ///
     /// All weight loading happens synchronously (designed to run on the model thread).
-    pub fn load_from_dir(model_path: &str) -> Result<Self> {
+    ///
+    /// Returns the constructed inner alongside a deterministic
+    /// weight-byte total (`sum(params.values().nbytes())`) for the
+    /// cache-limit coordinator. See `cache_limit.rs` module docs for
+    /// why this deterministic measurement is preferred over a
+    /// process-wide `get_active_memory()` delta.
+    pub fn load_from_dir(model_path: &str) -> Result<(Self, u64)> {
         let path = Path::new(model_path);
 
         // Parse config
@@ -1181,6 +1187,13 @@ impl Gemma4Inner {
         // Register weights with C++ compiled forward pass
         register_gemma4_weights_with_cpp(&params, inner.model_id);
 
+        // NOTE: the cache-limit coordinator registration happens in
+        // `Gemma4Model::load_from_dir` after this function returns,
+        // using the deterministic weight-byte total returned below
+        // (no active-memory sampling). The 1.75x multiplier on top of
+        // that baseline covers the warmup forward pass and any lazy
+        // post-load scratch. See `cache_limit.rs` module docs.
+
         // Load tokenizer
         let tokenizer_path = path.join("tokenizer.json");
         if tokenizer_path.exists() {
@@ -1205,7 +1218,17 @@ impl Gemma4Inner {
             );
         }
 
-        Ok(inner)
+        // Deterministic weight-byte total for the cache-limit
+        // coordinator. Computed from the still-live `params` map
+        // before it is dropped at end-of-function.
+        // `saturating_add` guards against overflow on a corrupted
+        // checkpoint.
+        let weight_bytes: u64 = params
+            .values()
+            .map(|a| a.nbytes() as u64)
+            .fold(0u64, |acc, v| acc.saturating_add(v));
+
+        Ok((inner, weight_bytes))
     }
 }
 
@@ -1219,22 +1242,32 @@ impl Gemma4Model {
 
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
             move || {
-                let inner = Gemma4Inner::load_from_dir(&model_path)?;
+                // `Gemma4Inner::load_from_dir` returns a deterministic
+                // weight-byte total alongside the inner; register it
+                // with the cache-limit coordinator here so the guard
+                // can be carried up to `Gemma4Model`. No active-memory
+                // sampling — the deterministic path is race-free
+                // against concurrent inference. See `cache_limit.rs`
+                // module docs.
+                let (inner, weight_bytes) = Gemma4Inner::load_from_dir(&model_path)?;
+                let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let model_id = inner.model_id;
                 let has_vision = inner.image_processor.is_some();
-                Ok((inner, (model_id, has_vision)))
+                Ok((inner, (model_id, has_vision, cache_limit_guard)))
             },
             super::model::handle_gemma4_cmd,
         );
 
-        let (model_id, has_vision) = init_rx
+        let (model_id, has_vision, cache_limit_guard) = init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
         Ok(Gemma4Model {
-            thread,
+            thread: Some(thread),
             model_id,
             has_vision,
+            initialized: true,
+            _cache_limit_guard: Some(cache_limit_guard),
         })
     }
 }

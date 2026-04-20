@@ -119,7 +119,40 @@ export declare class DocUnwarpModel {
  * commands via channels and await responses.
  */
 export declare class Gemma4Model {
+  /**
+   * Create an uninitialized `Gemma4Model` stub from a config.
+   *
+   * **Prefer [`Gemma4Model::load`]** for any real usage — `new(config)`
+   * is a config-only stub that matches the OCR-model pattern
+   * (`VLModel::new(config)`, `QianfanOCRModel::new(config)`) and is
+   * intentionally NOT runnable. It was introduced in the cache-limit
+   * coordinator work so that the coordinator's per-model delta is
+   * registered exclusively on the `load()` path, eliminating a
+   * baseline-registration gap where a no-op `new(config)` would have
+   * leaked an empty guard into the coordinator.
+   *
+   * This path does NOT spawn a model thread, NOT materialize any
+   * weights, and NOT register with the cache-limit coordinator. The
+   * returned instance is only useful for config inspection — every
+   * session method (`chatSessionStart` / `chatSessionContinue` /
+   * `chatSessionContinueTool` and their streaming variants) rejects
+   * with a `napi::Error` whose message is exactly
+   * `"Model not initialized. Call Gemma4Model.load() first."` until
+   * `load()` runs and installs the underlying model thread. The
+   * synchronous `resetCaches()` call is a silent no-op on the stub
+   * to keep `ChatSession.reset()` idempotent across both runnable
+   * and stub instances.
+   *
+   * Callers relying on the pre-round-2 behavior where `new(config)`
+   * returned a runnable model MUST migrate to `await
+   * Gemma4Model.load(path)`. The constructor signature is unchanged
+   * on purpose (NAPI-RS pins it), so this is a deliberate runtime
+   * behavior break covered by the regression tests in
+   * `__test__/models/model-loader-gemma4.test.ts`.
+   */
   constructor(config: Gemma4Config);
+  /** Returns true if weights have been loaded via `load()`. */
+  get isInitialized(): boolean;
   modelId(): number;
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string): Promise<Gemma4Model>;
@@ -3367,6 +3400,28 @@ export interface MemorySnapshot {
   cacheBytes: number;
 }
 
+/**
+ * Return a snapshot of the MLX allocator's memory counters. Primarily
+ * useful for dashboards and for debugging the `MLX_CACHE_LIMIT_GB`
+ * override. Read-only — does not mutate allocator state.
+ */
+export declare function memoryStats(): MemoryStats;
+
+/**
+ * Snapshot of the MLX Metal allocator's memory state. All values are in
+ * bytes and returned as `f64` to avoid forcing BigInt round-trips in JS.
+ */
+export interface MemoryStats {
+  /** Actively-used memory (excludes the cached free-pool). */
+  active: number;
+  /** Peak memory usage since load / the last `resetPeakMemory`. */
+  peak: number;
+  /** Cache / free-pool memory currently held by the allocator. */
+  cache: number;
+  /** Metal `max_recommended_working_set_size` snapshot (0 on non-Metal). */
+  wiredLimit: number;
+}
+
 /** Full model configuration */
 export interface ModelConfig {
   visionConfig: VisionConfig;
@@ -4223,4 +4278,28 @@ export interface VlmChatMessage {
   role: ChatRole;
   /** Text content of the message */
   content: string;
+}
+
+export declare namespace __internal__ {
+  /**
+   * Drain the MLX allocator's free-pool.
+   *
+   * @internal
+   *
+   * This is a process-wide drain routed through MLX's default-stream
+   * `mlx_synchronize()`, which does NOT wait on the custom generation
+   * streams that the per-model threads run on. Calling this from user
+   * code while a decode is in flight can race live Metal command buffers
+   * and risk use-after-free. The only safe caller today is
+   * `@mlx-node/server`'s idle sweeper, which only triggers after the
+   * in-flight request counter has returned to zero.
+   *
+   * Exposed under the `__internal__` NAPI namespace — reachable as
+   * `require('@mlx-node/core').__internal__.clearCache()` and NOT on
+   * the root `require('@mlx-node/core')` object. The namespace prefix
+   * is a deliberate speed-bump that forces any caller to acknowledge
+   * this is a private drain with custom-stream caveats; the root
+   * surface stays clean of the footgun.
+   */
+  export function clearCache(): void;
 }

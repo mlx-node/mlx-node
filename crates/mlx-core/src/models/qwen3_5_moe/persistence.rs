@@ -802,176 +802,211 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                 )));
             }
 
-            // Load config
-            let config_path = path.join("config.json");
-            let config_data = fs::read_to_string(&config_path)
-                .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
-            let raw: Value = serde_json::from_str(&config_data)
-                .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
+            // Load all weights (text + vision) and compute a
+            // deterministic weight-byte footprint for the cache-limit
+            // coordinator. No process-wide active-memory sampling —
+            // the sum of `params.values().nbytes()` is race-free and
+            // deterministic. Caveat: the MoE transpose cache
+            // `g_weight_transposes_3d` is built lazily on the FIRST
+            // compiled prefill, not at load time — the coordinator's
+            // 1.75x multiplier adds ~75% slack to cover that post-load
+            // growth without needing runtime measurements. See
+            // `cache_limit.rs` module docs.
+            let load_result: Result<(Qwen35MoeInner, u64)> =
+                (|| -> Result<(Qwen35MoeInner, u64)> {
+                    // Load config
+                    let config_path = path.join("config.json");
+                    let config_data = fs::read_to_string(&config_path)
+                        .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
+                    let raw: Value = serde_json::from_str(&config_data).map_err(|e| {
+                        Error::from_reason(format!("Failed to parse config: {}", e))
+                    })?;
 
-            let config = parse_config(&raw)?;
+                    let config = parse_config(&raw)?;
 
-            info!(
-                "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
-                config.num_layers,
-                config.hidden_size,
-                config.num_experts,
-                config.num_experts_per_tok
-            );
+                    info!(
+                        "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
+                        config.num_layers,
+                        config.hidden_size,
+                        config.num_experts,
+                        config.num_experts_per_tok
+                    );
 
-            // Load all weights
-            let raw_params = load_all_safetensors(path, false)?;
-            info!("Loaded {} raw tensors", raw_params.len());
+                    // Load all weights
+                    let raw_params = load_all_safetensors(path, false)?;
+                    info!("Loaded {} raw tensors", raw_params.len());
 
-            // Split vision/text weights
-            let has_vision = raw_params
-                .keys()
-                .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
+                    // Split vision/text weights
+                    let has_vision = raw_params
+                        .keys()
+                        .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
 
-            let (text_raw_params, vision_params) = if has_vision {
-                let mut vision_params: HashMap<String, MxArray> = HashMap::new();
-                let mut text_params: HashMap<String, MxArray> = HashMap::new();
-                for (name, array) in raw_params {
-                    if name.starts_with("vision_tower.") || name.starts_with("visual.") {
-                        let vkey = name
-                            .strip_prefix("vision_tower.")
-                            .or_else(|| name.strip_prefix("visual."))
-                            .unwrap_or(&name)
-                            .to_string();
-                        vision_params.insert(vkey, array);
+                    let (text_raw_params, vision_params) = if has_vision {
+                        let mut vision_params: HashMap<String, MxArray> = HashMap::new();
+                        let mut text_params: HashMap<String, MxArray> = HashMap::new();
+                        for (name, array) in raw_params {
+                            if name.starts_with("vision_tower.") || name.starts_with("visual.") {
+                                let vkey = name
+                                    .strip_prefix("vision_tower.")
+                                    .or_else(|| name.strip_prefix("visual."))
+                                    .unwrap_or(&name)
+                                    .to_string();
+                                vision_params.insert(vkey, array);
+                            } else {
+                                text_params.insert(name, array);
+                            }
+                        }
+                        info!(
+                            "Split: {} vision tensors, {} text tensors",
+                            vision_params.len(),
+                            text_params.len()
+                        );
+                        (text_params, Some(vision_params))
                     } else {
-                        text_params.insert(name, array);
-                    }
-                }
-                info!(
-                    "Split: {} vision tensors, {} text tensors",
-                    vision_params.len(),
-                    text_params.len()
-                );
-                (text_params, Some(vision_params))
-            } else {
-                (raw_params, None)
-            };
+                        (raw_params, None)
+                    };
 
-            // Sanitize weights
-            let params = sanitize_weights(text_raw_params, &config)?;
-            let quantized = is_quantized_checkpoint(&params);
-            info!(
-                "Sanitized to {} parameters (quantized={})",
-                params.len(),
-                quantized
-            );
+                    // Sanitize weights
+                    let params = sanitize_weights(text_raw_params, &config)?;
+                    let quantized = is_quantized_checkpoint(&params);
+                    info!(
+                        "Sanitized to {} parameters (quantized={})",
+                        params.len(),
+                        quantized
+                    );
 
-            // Parse quantization config
-            let quant_cfg = raw
-                .get("quantization")
-                .or_else(|| raw.get("quantization_config"));
-            let quant_bits = quant_cfg
-                .and_then(|q| q["bits"].as_i64())
-                .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
-            let quant_group_size = quant_cfg
-                .and_then(|q| q["group_size"].as_i64())
-                .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
-                as i32;
-            let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
-                .and_then(|q| q.as_object())
-                .map(|obj| {
-                    obj.iter()
-                        .filter(|(_, v)| v.is_object())
-                        .filter_map(|(k, v)| {
-                            let bits = v["bits"].as_i64()? as i32;
-                            let gs =
-                                v["group_size"].as_i64().unwrap_or(quant_group_size as i64) as i32;
-                            let normalized = k
-                                .strip_prefix("model.language_model.")
-                                .or_else(|| k.strip_prefix("language_model.model."))
-                                .or_else(|| k.strip_prefix("language_model."))
-                                .or_else(|| k.strip_prefix("model."))
-                                .unwrap_or(k)
-                                .to_string();
-                            Some((normalized, (bits, gs)))
+                    // Parse quantization config
+                    let quant_cfg = raw
+                        .get("quantization")
+                        .or_else(|| raw.get("quantization_config"));
+                    let quant_bits = quant_cfg
+                        .and_then(|q| q["bits"].as_i64())
+                        .unwrap_or(DEFAULT_QUANT_BITS as i64)
+                        as i32;
+                    let quant_group_size = quant_cfg
+                        .and_then(|q| q["group_size"].as_i64())
+                        .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
+                        as i32;
+                    let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
+                        .and_then(|q| q.as_object())
+                        .map(|obj| {
+                            obj.iter()
+                                .filter(|(_, v)| v.is_object())
+                                .filter_map(|(k, v)| {
+                                    let bits = v["bits"].as_i64()? as i32;
+                                    let gs =
+                                        v["group_size"].as_i64().unwrap_or(quant_group_size as i64)
+                                            as i32;
+                                    let normalized = k
+                                        .strip_prefix("model.language_model.")
+                                        .or_else(|| k.strip_prefix("language_model.model."))
+                                        .or_else(|| k.strip_prefix("language_model."))
+                                        .or_else(|| k.strip_prefix("model."))
+                                        .unwrap_or(k)
+                                        .to_string();
+                                    Some((normalized, (bits, gs)))
+                                })
+                                .collect()
                         })
-                        .collect()
-                })
-                .unwrap_or_default();
+                        .unwrap_or_default();
 
-            if quant_cfg.is_some() {
-                info!(
-                    "Using quantization config: bits={}, group_size={}, per_layer_overrides={}",
-                    quant_bits,
-                    quant_group_size,
-                    per_layer_quant.len()
-                );
-            }
+                    if quant_cfg.is_some() {
+                        info!(
+                            "Using quantization config: bits={}, group_size={}, per_layer_overrides={}",
+                            quant_bits,
+                            quant_group_size,
+                            per_layer_quant.len()
+                        );
+                    }
 
-            // Load tokenizer
-            let tokenizer_path = path.join("tokenizer.json");
-            let tokenizer = if tokenizer_path.exists() {
-                info!("Loading tokenizer from: {}", tokenizer_path.display());
-                Some(Qwen3Tokenizer::load_from_file_sync(
-                    tokenizer_path.to_str().ok_or_else(|| {
-                        Error::from_reason("Tokenizer path contains invalid UTF-8")
-                    })?,
-                )?)
-            } else {
-                None
-            };
+                    // Load tokenizer
+                    let tokenizer_path = path.join("tokenizer.json");
+                    let tokenizer = if tokenizer_path.exists() {
+                        info!("Loading tokenizer from: {}", tokenizer_path.display());
+                        Some(Qwen3Tokenizer::load_from_file_sync(
+                            tokenizer_path.to_str().ok_or_else(|| {
+                                Error::from_reason("Tokenizer path contains invalid UTF-8")
+                            })?,
+                        )?)
+                    } else {
+                        None
+                    };
 
-            // Create inner model
-            let mut inner = Qwen35MoeInner::new(config.clone())?;
+                    // Create inner model
+                    let mut inner = Qwen35MoeInner::new(config.clone())?;
 
-            // Apply weights directly to inner (no locks)
-            apply_weights_moe_inner(
-                &mut inner,
-                &params,
-                &config,
-                quant_bits,
-                quant_group_size,
-                &per_layer_quant,
-            )?;
+                    // Apply weights directly to inner (no locks)
+                    apply_weights_moe_inner(
+                        &mut inner,
+                        &params,
+                        &config,
+                        quant_bits,
+                        quant_group_size,
+                        &per_layer_quant,
+                    )?;
 
-            // Register weights with C++ MoE forward pass
-            register_moe_weights_with_cpp(&params, inner.model_id);
+                    // Register weights with C++ MoE forward pass
+                    register_moe_weights_with_cpp(&params, inner.model_id);
 
-            // Materialize mmap-backed weights
-            {
-                let arrays: Vec<&MxArray> = params.values().collect();
-                crate::array::memory::materialize_weights(&arrays);
-            }
+                    // Materialize mmap-backed weights
+                    {
+                        let arrays: Vec<&MxArray> = params.values().collect();
+                        crate::array::memory::materialize_weights(&arrays);
+                    }
 
-            // Set tokenizer
-            if let Some(tok) = tokenizer {
-                inner.set_tokenizer(Arc::new(tok));
-            }
+                    // Set tokenizer
+                    if let Some(tok) = tokenizer {
+                        inner.set_tokenizer(Arc::new(tok));
+                    }
 
-            // Load vision encoder if present
-            if let Some(ref vparams) = vision_params {
-                let vision_config = parse_vision_config(&raw);
-                info!(
-                    "Vision config: {} layers, hidden={}, heads={}, patch={}",
-                    vision_config.num_layers,
-                    vision_config.hidden_size,
-                    vision_config.num_heads,
-                    vision_config.patch_size,
-                );
+                    // Load vision encoder if present
+                    if let Some(ref vparams) = vision_params {
+                        let vision_config = parse_vision_config(&raw);
+                        info!(
+                            "Vision config: {} layers, hidden={}, heads={}, patch={}",
+                            vision_config.num_layers,
+                            vision_config.hidden_size,
+                            vision_config.num_heads,
+                            vision_config.patch_size,
+                        );
 
-                let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
-                load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
+                        let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
+                        load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
 
-                inner.init_mrope_layers(
-                    vec![11, 11, 10],
-                    config.rope_theta,
-                    config.max_position_embeddings,
-                )?;
+                        inner.init_mrope_layers(
+                            vec![11, 11, 10],
+                            config.rope_theta,
+                            config.max_position_embeddings,
+                        )?;
 
-                inner.set_vision_encoder(vision_encoder);
-                inner.set_image_processor(Qwen35VLImageProcessor::new(None));
-                inner.set_spatial_merge_size(vision_config.spatial_merge_size);
+                        inner.set_vision_encoder(vision_encoder);
+                        inner.set_image_processor(Qwen35VLImageProcessor::new(None));
+                        inner.set_spatial_merge_size(vision_config.spatial_merge_size);
 
-                info!("Qwen3.5 MoE-VL model loaded successfully (with vision encoder)");
-            } else {
-                info!("Qwen3.5 MoE model loaded successfully");
-            }
+                        info!("Qwen3.5 MoE-VL model loaded successfully (with vision encoder)");
+                    } else {
+                        info!("Qwen3.5 MoE model loaded successfully");
+                    }
+
+                    // Deterministic weight-byte total for the cache-limit
+                    // coordinator. Includes text + vision weights when a
+                    // vision encoder is loaded. `saturating_add` guards
+                    // against overflow on a corrupted checkpoint.
+                    let mut weight_bytes: u64 = params
+                        .values()
+                        .map(|a| a.nbytes() as u64)
+                        .fold(0u64, |acc, v| acc.saturating_add(v));
+                    if let Some(ref vparams) = vision_params {
+                        weight_bytes = vparams
+                            .values()
+                            .map(|a| a.nbytes() as u64)
+                            .fold(weight_bytes, |acc, v| acc.saturating_add(v));
+                    }
+
+                    Ok((inner, weight_bytes))
+                })();
+            let (inner, weight_bytes) = load_result?;
+            let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
 
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
@@ -980,13 +1015,19 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
             Ok((
                 inner,
-                (config_out, model_id, image_processor, tokenizer_out),
+                (
+                    config_out,
+                    model_id,
+                    image_processor,
+                    tokenizer_out,
+                    cache_limit_guard,
+                ),
             ))
         },
         handle_qwen35_moe_cmd,
     );
 
-    let (config, model_id, _image_processor, _tokenizer) = init_rx
+    let (config, model_id, _image_processor, _tokenizer, cache_limit_guard) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
@@ -994,6 +1035,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         thread,
         config,
         model_id,
+        _cache_limit_guard: cache_limit_guard,
     })
 }
 

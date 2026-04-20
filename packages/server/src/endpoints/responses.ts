@@ -15,6 +15,7 @@ import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponse
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
 import { sendBadRequest, sendInternalError, sendNotFound, sendRateLimit, sendStorageTimeout } from '../errors.js';
+import type { IdleSweeper } from '../idle-sweeper.js';
 import { mapRequest, reconstructMessagesFromChain, stringifyStoredInputMessages } from '../mappers/request.js';
 import {
   buildPartialResponse,
@@ -1399,6 +1400,7 @@ export async function handleCreateResponse(
   store: ResponseStore | null,
   httpReq?: IncomingMessage,
   responseRetentionSec?: number,
+  idleSweeper?: IdleSweeper | null,
 ): Promise<void> {
   // Validate required fields
   if (body == null || typeof body !== 'object') {
@@ -1493,6 +1495,37 @@ export async function handleCreateResponse(
   // early-return path. These flags keep it a no-op when already run.
   let cleanupPerformed = false;
   let leaseReleased = false;
+  // Idle-sweeper bracket flags. Hoisted to outer function scope so
+  // the `finalizeIdleRequest` helper below can see them even though
+  // the `beginRequest()` call lives inside the inner `try`.
+  // Pre-dispatch validation failures (early returns that never called
+  // `beginRequest`) observe `idleRequestStarted === false` and skip
+  // the matching `endRequest()` entirely. `idleRequestEnded` is the
+  // `done` flag that guarantees the decrement fires exactly once
+  // regardless of which of the several finalize paths — outer
+  // `finally`, `res.once('finish')`, `res.once('close')`,
+  // `res.once('error')` — wins the race.
+  //
+  // Listeners are attached EAGERLY at `beginRequest()` time (not
+  // lazily from the outer `finally`) to close the round-4 leak where
+  // a terminal socket event fired *before* the outer `finally` ran:
+  // the lazy attach saw `writableEnded === false && writableFinished
+  // === false` at check time, attached listeners on a socket whose
+  // final event had already been emitted, and `endRequest()` then
+  // never fired, leaving `inFlight` pinned above zero and the
+  // sweeper permanently armed.
+  let idleRequestStarted = false;
+  let idleRequestEnded = false;
+  let idleListenersAttached = false;
+  const finalizeIdleRequest = (): void => {
+    if (!idleRequestStarted) return;
+    if (idleRequestEnded) return;
+    idleRequestEnded = true;
+    idleSweeper?.endRequest();
+  };
+  const onFinalizeEvent = (): void => {
+    finalizeIdleRequest();
+  };
   try {
     // Initial snapshot of the live binding. On a continuation we
     // re-read after `await store.getChain()` and reject if the
@@ -2052,6 +2085,30 @@ export async function handleCreateResponse(
     // adopt when `failureMode === 'client_abort'` regardless of how
     // `committed` / `safeToSuppress` landed.
     let streamFailureMode: StreamingHandlerOutcome['failureMode'] = null;
+
+    // Bracket native-model dispatch with the idle-sweeper counter.
+    // Must happen AFTER request validation / store lookup but BEFORE
+    // any native prefill or decode runs — so the pending-drain timer
+    // is cancelled in time to avoid racing the allocator with a live
+    // decode, and the post-dispatch `endRequest` arms a fresh drain
+    // only after every native stream byte has been emitted.
+    // Only inference traffic participates; `/v1/models`, health, and
+    // CORS preflights intentionally do not touch the counter.
+    //
+    // Attach the terminal-event listeners BEFORE any `await` — this
+    // is the round-4 fix for a sweeper leak where a fast terminal
+    // event (e.g. `endJson()` rejecting after the socket already
+    // emitted `close`) fired before the outer `finally` got a chance
+    // to attach its listeners, leaving `inFlight` pinned above zero.
+    // `finalizeIdleRequest` is the idempotency barrier — whichever
+    // of the listener events, the outer `finally`, or a pre-dispatch
+    // path fires first wins and the rest are no-ops.
+    idleSweeper?.beginRequest();
+    idleRequestStarted = true;
+    res.once('finish', onFinalizeEvent);
+    res.once('close', onFinalizeEvent);
+    res.once('error', onFinalizeEvent);
+    idleListenersAttached = true;
 
     try {
       await sessionReg.withExclusive(async () => {
@@ -3146,11 +3203,16 @@ export async function handleCreateResponse(
     // never ran (early-return validation failure, or an exception
     // raised inside the outer `try` block between lease
     // acquisition and the `withExclusive` call), make sure the
-    // abort listeners are detached and the dispatch lease is
+    // abort listeners + idle-sweeper listeners are detached, the
+    // in-flight counter is decremented, and the dispatch lease is
     // released here. `runPostDispatchCleanup` is safe to re-invoke
-    // — the `abortListenersAttached` check and
-    // `releaseDispatchLease`'s `inFlight < 0` floor make it a
-    // no-op when the happy-path already fired it.
+    // — the `abortListenersAttached` / `idleListenersAttached` /
+    // `leaseReleased` flags make every sub-step idempotent on a
+    // second pass. `finalizeIdleRequest` inside the helper is also
+    // guarded by `idleRequestEnded`, so the decrement fires exactly
+    // once regardless of which path wins the race between the
+    // eagerly-attached terminal listener firing, the happy-path
+    // cleanup on `withExclusive` return, and this outer fallback.
     if (!cleanupPerformed) {
       runPostDispatchCleanup();
     }
@@ -3175,6 +3237,23 @@ export async function handleCreateResponse(
       }
       abortListenersAttached = false;
     }
+    // Drop the idle-sweeper's finalize listeners AND decrement the
+    // in-flight counter. Post-dispatch cleanup runs AFTER
+    // `handleStreamingNative` / `handleNonStreaming` have awaited
+    // their terminal `res.end()` — the native dispatch is done at
+    // this point, so the sweeper can safely arm a new pending
+    // drain. Firing here (rather than only in the outer `finally`)
+    // means the post-commit persist wait does not keep `inFlight`
+    // pinned above zero on a wedged store. `finalizeIdleRequest`
+    // is idempotent via the `done` flag so a subsequent fire from
+    // the outer finally / a stray listener is a no-op.
+    if (idleListenersAttached) {
+      res.removeListener('finish', onFinalizeEvent);
+      res.removeListener('close', onFinalizeEvent);
+      res.removeListener('error', onFinalizeEvent);
+      idleListenersAttached = false;
+    }
+    finalizeIdleRequest();
     // Release the dispatch lease on the ORIGINAL model object the
     // lease was acquired against (not a re-read of `body.model`,
     // which may have been hot-swapped while we held the mutex). A

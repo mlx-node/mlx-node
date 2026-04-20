@@ -13,6 +13,12 @@ export type { ServerConfig, ServerInstance } from './server.js';
  * supported public API — names may change without notice.
  */
 export { parseEnvSeconds as __parseEnvSeconds, parseEnvPositiveInt as __parseEnvPositiveInt } from './server.js';
+export {
+  createIdleSweeper as __createIdleSweeper,
+  parseIdleClearCacheEnv as __parseIdleClearCacheEnv,
+  DEFAULT_IDLE_CLEAR_CACHE_MS as __DEFAULT_IDLE_CLEAR_CACHE_MS,
+} from './idle-sweeper.js';
+export type { IdleSweeper } from './idle-sweeper.js';
 
 export { createHandler } from './handler.js';
 export type { HandlerOptions } from './handler.js';

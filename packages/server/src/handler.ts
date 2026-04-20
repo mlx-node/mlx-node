@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ResponseStore } from '@mlx-node/core';
 
 import { sendInternalError } from './errors.js';
+import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelRegistry } from './registry.js';
 import { routeRequest } from './router.js';
 
@@ -19,6 +20,17 @@ export interface HandlerOptions {
    * and `ServerConfig.responseRetentionSec`).
    */
   responseRetentionSec?: number;
+  /**
+   * Optional idle sweeper. Forwarded to `routeRequest` so that the
+   * inference endpoints (`/v1/responses` + `/v1/messages`) can bracket
+   * their native-model dispatch with `beginRequest()` / `endRequest()`.
+   *
+   * Note: the begin/end hooks are DELIBERATELY scoped to the inference
+   * endpoints — wrapping every HTTP call (OPTIONS preflights,
+   * `/v1/models`, `/v1/health`, 404s) would let purely observational
+   * traffic keep the allocator pinned forever.
+   */
+  idleSweeper?: IdleSweeper | null;
 }
 
 export function createHandler(
@@ -28,6 +40,7 @@ export function createHandler(
   const cors = options?.cors ?? true;
   const store = options?.store ?? null;
   const responseRetentionSec = options?.responseRetentionSec;
+  const idleSweeper = options?.idleSweeper ?? null;
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (cors) {
@@ -46,7 +59,7 @@ export function createHandler(
     // post-`res.end()` bookkeeping (e.g. `SessionRegistry.adopt`). `http.createServer`
     // ignores the return value, so this is transparent to production callers.
     try {
-      await routeRequest(req, res, registry, store, responseRetentionSec);
+      await routeRequest(req, res, registry, store, responseRetentionSec, idleSweeper);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';
       if (!res.headersSent) {

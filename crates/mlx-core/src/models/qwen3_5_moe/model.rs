@@ -267,6 +267,11 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
             config,
             reply,
         } => {
+            // NOTE: no per-request cache drain here. On a multi-model
+            // server the MLX allocator free-pool is process-wide, so
+            // flushing after a request on model A discards blocks about
+            // to be reused by model B. The TS idle sweeper in
+            // `@mlx-node/server` handles between-turn drains.
             let _ = reply.send(inner.chat_session_start_sync(messages, config));
         }
         Qwen35MoeCmd::ChatSessionContinue {
@@ -4463,6 +4468,9 @@ pub struct Qwen3_5MoeModel {
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5MoeConfig,
     pub(crate) model_id: u64,
+    /// RAII: unregisters this model's baseline from the cache-limit
+    /// coordinator on drop.
+    pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
 }
 
 #[napi]

@@ -18,6 +18,7 @@ import {
   sendAnthropicNotFound,
   sendAnthropicRateLimit,
 } from '../errors.js';
+import type { IdleSweeper } from '../idle-sweeper.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import {
   buildAnthropicResponse,
@@ -425,6 +426,7 @@ export async function handleCreateMessage(
   body: AnthropicMessagesRequest,
   registry: ModelRegistry,
   httpReq?: IncomingMessage,
+  idleSweeper?: IdleSweeper | null,
 ): Promise<void> {
   if (body == null || typeof body !== 'object') {
     sendAnthropicBadRequest(res, 'Request body must be a JSON object');
@@ -479,6 +481,34 @@ export async function handleCreateMessage(
     abortController.abort();
   };
   let abortListenersAttached = false;
+  // Idle-sweeper bracket flags — hoisted so the outer `finally` can
+  // observe whether the `beginRequest()` bump ever happened. Early
+  // validation-failure returns skip the bump and therefore also skip
+  // the matching `endRequest()`. `idleRequestEnded` is the `done`
+  // flag that guarantees the decrement fires exactly once regardless
+  // of which finalize path — outer `finally`, `finish`, `close`,
+  // `error` — wins the race.
+  //
+  // Listeners are attached EAGERLY at `beginRequest()` time, not
+  // lazily from the outer `finally`. The round-4 review surfaced a
+  // leak where a terminal socket event fired before the outer
+  // `finally` ran: the lazy attach saw `writableEnded === false` at
+  // check time, attached listeners on a socket whose terminal event
+  // had already been emitted, and `endRequest()` then never fired,
+  // leaving `inFlight` pinned above zero and the sweeper permanently
+  // armed.
+  let idleRequestStarted = false;
+  let idleRequestEnded = false;
+  let idleListenersAttached = false;
+  const finalizeIdleRequest = (): void => {
+    if (!idleRequestStarted) return;
+    if (idleRequestEnded) return;
+    idleRequestEnded = true;
+    idleSweeper?.endRequest();
+  };
+  const onFinalizeEvent = (): void => {
+    finalizeIdleRequest();
+  };
   try {
     const sessionReg: SessionRegistry = lease.registry;
     // Snapshot the monotonic instance id so the in-mutex re-read can detect a
@@ -543,6 +573,25 @@ export async function handleCreateMessage(
     }
     abortListenersAttached = true;
     const streamSignal: AbortSignal = abortController.signal;
+
+    // Bracket the native-model dispatch with the idle sweeper.
+    // Scoped here (past validation, before any native prefill /
+    // decode) so purely observational endpoints and pre-validation
+    // rejections do not push the sweeper's pending-drain timer out.
+    //
+    // Attach the terminal-event listeners BEFORE any `await` — the
+    // round-4 fix for a leak where a fast terminal event fired
+    // before the outer `finally` attached its listeners, leaving
+    // `inFlight` pinned above zero. `finalizeIdleRequest` is
+    // idempotent (guarded by `idleRequestEnded`) so whichever path
+    // wins — listeners, outer `finally`, or a pre-dispatch early
+    // return — the decrement fires exactly once.
+    idleSweeper?.beginRequest();
+    idleRequestStarted = true;
+    res.once('finish', onFinalizeEvent);
+    res.once('close', onFinalizeEvent);
+    res.once('error', onFinalizeEvent);
+    idleListenersAttached = true;
 
     try {
       await sessionReg.withExclusive(async () => {
@@ -660,5 +709,21 @@ export async function handleCreateMessage(
     // `unregister()` held against this lease finalises its teardown here
     // when the in-flight counter drops to zero.
     registry.releaseDispatchLease(leaseModel);
+    // Belt-and-suspenders: call `finalize()` unconditionally here.
+    // The eagerly-attached `finish`/`close`/`error` listeners almost
+    // always win the race, but we still fire here to cover
+    // pathological cases where the terminal event never arrives —
+    // e.g. a synthetic mock, or a pre-dispatch early return that
+    // skipped the attach entirely. `finalizeIdleRequest` is
+    // idempotent (guarded by `idleRequestEnded`) so the double-fire
+    // is a no-op. Detach afterwards so the listeners don't pin the
+    // handler scope past return.
+    finalizeIdleRequest();
+    if (idleListenersAttached) {
+      res.removeListener('finish', onFinalizeEvent);
+      res.removeListener('close', onFinalizeEvent);
+      res.removeListener('error', onFinalizeEvent);
+      idleListenersAttached = false;
+    }
   }
 }

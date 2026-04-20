@@ -245,13 +245,29 @@ pub(crate) enum Gemma4Cmd {
 /// commands via channels and await responses.
 #[napi]
 pub struct Gemma4Model {
-    pub(crate) thread: crate::model_thread::ModelThread<Gemma4Cmd>,
+    /// Dedicated model thread owning `Gemma4Inner`. `None` when the model
+    /// was constructed via `new(config)` without loading weights — in that
+    /// uninitialized state every session method returns an error and
+    /// only `isInitialized` is meaningful. Mirrors the same `Option<..>`
+    /// gate used by the OCR models (`VLModel`, `QianfanOCRModel`).
+    pub(crate) thread: Option<crate::model_thread::ModelThread<Gemma4Cmd>>,
     pub(crate) model_id: u64,
     /// Whether the loaded config includes `vision_config`. Mirrored here so
     /// the NAPI side can fail fast on image inputs to a text-only model
     /// without round-tripping to the model thread. The actual image
     /// processor lives on `Gemma4Inner` and runs on the model thread.
     pub(crate) has_vision: bool,
+    /// Whether the model was loaded with real weights. `false` for
+    /// `new Gemma4Model(config)` calls that never called `load()`.
+    /// Session methods check this and refuse to dispatch when false,
+    /// since the coordinator was never told about this model's delta
+    /// (its guard is `None`) — running inference on that stub would
+    /// under-cap the allocator.
+    pub(crate) initialized: bool,
+    /// RAII: unregisters this model's delta from the cache-limit
+    /// coordinator on drop. `None` for instances constructed via the
+    /// synchronous `new(config)` path that never loaded weights.
+    pub(crate) _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
 }
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2351,6 +2367,11 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
             config,
             reply,
         } => {
+            // NOTE: no per-request cache drain here. On a multi-model
+            // server the MLX allocator free-pool is process-wide, so
+            // flushing after a request on model A discards blocks about
+            // to be reused by model B. The TS idle sweeper in
+            // `@mlx-node/server` handles between-turn drains.
             let _ = reply.send(inner.chat_session_start_sync(messages, config));
         }
         Gemma4Cmd::ChatSessionContinue {
@@ -2417,28 +2438,51 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
 
 #[napi]
 impl Gemma4Model {
+    /// Create an uninitialized `Gemma4Model` stub from a config.
+    ///
+    /// **Prefer [`Gemma4Model::load`]** for any real usage — `new(config)`
+    /// is a config-only stub that matches the OCR-model pattern
+    /// (`VLModel::new(config)`, `QianfanOCRModel::new(config)`) and is
+    /// intentionally NOT runnable. It was introduced in the cache-limit
+    /// coordinator work so that the coordinator's per-model delta is
+    /// registered exclusively on the `load()` path, eliminating a
+    /// baseline-registration gap where a no-op `new(config)` would have
+    /// leaked an empty guard into the coordinator.
+    ///
+    /// This path does NOT spawn a model thread, NOT materialize any
+    /// weights, and NOT register with the cache-limit coordinator. The
+    /// returned instance is only useful for config inspection — every
+    /// session method (`chatSessionStart` / `chatSessionContinue` /
+    /// `chatSessionContinueTool` and their streaming variants) rejects
+    /// with a `napi::Error` whose message is exactly
+    /// `"Model not initialized. Call Gemma4Model.load() first."` until
+    /// `load()` runs and installs the underlying model thread. The
+    /// synchronous `resetCaches()` call is a silent no-op on the stub
+    /// to keep `ChatSession.reset()` idempotent across both runnable
+    /// and stub instances.
+    ///
+    /// Callers relying on the pre-round-2 behavior where `new(config)`
+    /// returned a runnable model MUST migrate to `await
+    /// Gemma4Model.load(path)`. The constructor signature is unchanged
+    /// on purpose (NAPI-RS pins it), so this is a deliberate runtime
+    /// behavior break covered by the regression tests in
+    /// `__test__/models/model-loader-gemma4.test.ts`.
     #[napi(constructor)]
-    pub fn new(config: Gemma4Config) -> Result<Self> {
+    pub fn new(config: Gemma4Config) -> Self {
         let has_vision = config.vision_config.is_some();
-
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
-            move || {
-                let inner = Gemma4Inner::new(config)?;
-                let model_id = inner.model_id;
-                Ok((inner, model_id))
-            },
-            handle_gemma4_cmd,
-        );
-
-        let model_id = init_rx
-            .blocking_recv()
-            .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
-
-        Ok(Self {
-            thread,
-            model_id,
+        Self {
+            thread: None,
+            model_id: 0,
             has_vision,
-        })
+            initialized: false,
+            _cache_limit_guard: None,
+        }
+    }
+
+    /// Returns true if weights have been loaded via `load()`.
+    #[napi(getter)]
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
     }
 
     #[napi]
@@ -2465,7 +2509,13 @@ impl Gemma4Model {
     /// `model.resetCaches()` without awaiting.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Gemma4Cmd::ResetCaches { reply })
+        let Some(thread) = self.thread.as_ref() else {
+            // Uninitialized stub (constructed via `new(config)` without
+            // `load()`): nothing to reset. Match the OCR models'
+            // silent no-op to keep `ChatSession.reset()` idempotent.
+            return Ok(());
+        };
+        crate::model_thread::send_and_block(thread, |reply| Gemma4Cmd::ResetCaches { reply })
     }
 
     /// Start a new chat session.
@@ -2481,6 +2531,9 @@ impl Gemma4Model {
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
         // Fast-fail: images on a text-only model.
@@ -2494,7 +2547,7 @@ impl Gemma4Model {
             ));
         }
 
-        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::ChatSessionStart {
+        crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::ChatSessionStart {
             messages,
             config,
             reply,
@@ -2527,9 +2580,12 @@ impl Gemma4Model {
         images: Option<Vec<Uint8Array>>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
-        crate::model_thread::send_and_await(&self.thread, |reply| Gemma4Cmd::ChatSessionContinue {
+        crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::ChatSessionContinue {
             user_message,
             images,
             config,
@@ -2559,15 +2615,16 @@ impl Gemma4Model {
         content: String,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
-        crate::model_thread::send_and_await(&self.thread, |reply| {
-            Gemma4Cmd::ChatSessionContinueTool {
-                tool_call_id,
-                content,
-                config,
-                reply,
-            }
+        crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::ChatSessionContinueTool {
+            tool_call_id,
+            content,
+            config,
+            reply,
         })
         .await
     }
@@ -2582,6 +2639,9 @@ impl Gemma4Model {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
         // Fast-fail: images on a text-only model.
@@ -2600,7 +2660,7 @@ impl Gemma4Model {
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
-        self.thread.send(Gemma4Cmd::ChatStreamSessionStart {
+        thread.send(Gemma4Cmd::ChatStreamSessionStart {
             messages,
             config,
             stream_tx,
@@ -2628,6 +2688,9 @@ impl Gemma4Model {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2635,7 +2698,7 @@ impl Gemma4Model {
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
-        self.thread.send(Gemma4Cmd::ChatStreamSessionContinue {
+        thread.send(Gemma4Cmd::ChatStreamSessionContinue {
             user_message,
             images,
             config,
@@ -2664,6 +2727,9 @@ impl Gemma4Model {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
         let config = config.unwrap_or_default();
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2671,7 +2737,7 @@ impl Gemma4Model {
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
-        self.thread.send(Gemma4Cmd::ChatStreamSessionContinueTool {
+        thread.send(Gemma4Cmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
             config,

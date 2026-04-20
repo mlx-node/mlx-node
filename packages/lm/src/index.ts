@@ -36,7 +36,28 @@ export { LFM2_CONFIGS, getLfm2Config } from './models/lfm2-configs.js';
 export { Qwen35MoeModel, Qwen35MoeModel as Qwen3_5MoeModel } from './stream.js';
 export type { Qwen35MoeConfig, Qwen35MoeGenerationConfig, Qwen35MoeGenerationResult } from '@mlx-node/core';
 
-// Note: Memory management is handled internally by Rust - not exposed to JS
+// Memory hygiene: most management is automatic — the decode loop
+// inside `@mlx-node/core` calls `mlx_clear_cache()` every 256 generated
+// tokens to prevent unbounded free-pool growth during long
+// generations, and `MLX_CACHE_LIMIT_GB` auto-tunes the Metal pool cap
+// at model load. Across-request drains are handled by the
+// `@mlx-node/server` idle sweeper (see `packages/server/src/idle-sweeper.ts`):
+// a single `clearCache()` fires after `idleClearCacheMs` of HTTP
+// inactivity once the in-flight request counter has returned to zero.
+// `memoryStats()` is re-exported as a read-only observability hook for
+// dashboards / debugging.
+//
+// `clearCache()` is DELIBERATELY not re-exported here: the native impl
+// routes through MLX's no-arg `synchronize()` which waits only on the
+// default stream, so calling it while a decode runs on a model's
+// custom stream risks racing live Metal command buffers. The only
+// safe caller today is `@mlx-node/server`'s idle sweeper (fires after
+// the in-flight request counter hits zero AND — for hot-load flows —
+// outside any `withSuspendedDrains()` bracket). Admin / cron code that
+// reaches for a manual drain should deep-import from `@mlx-node/core`
+// directly and read the `@internal` caveat there.
+export { memoryStats } from '@mlx-node/core';
+export type { MemoryStats } from '@mlx-node/core';
 
 // Types
 export type { DType } from '@mlx-node/core';

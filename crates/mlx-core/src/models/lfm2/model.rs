@@ -1575,6 +1575,11 @@ pub(crate) fn handle_lfm2_cmd(inner: &mut Lfm2Inner, cmd: Lfm2Cmd) {
             config,
             reply,
         } => {
+            // NOTE: no per-request cache drain here. On a multi-model
+            // server the MLX allocator free-pool is process-wide, so
+            // flushing after a request on model A discards blocks about
+            // to be reused by model B. The TS idle sweeper in
+            // `@mlx-node/server` handles between-turn drains.
             let _ = reply.send(inner.chat_session_start_sync(messages, config));
         }
         Lfm2Cmd::ChatSessionContinue {
@@ -1678,6 +1683,9 @@ fn eval_lfm2_caches(caches: &[Lfm2LayerCache]) {
 pub struct Lfm2Model {
     pub(crate) thread: crate::model_thread::ModelThread<Lfm2Cmd>,
     pub(crate) config: Lfm2Config,
+    /// RAII: unregisters this model's baseline from the cache-limit
+    /// coordinator on drop.
+    pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
 }
 
 #[napi]

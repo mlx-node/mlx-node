@@ -457,133 +457,167 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                 )));
             }
 
-            // Load config
-            let config_path = path.join("config.json");
-            if !config_path.exists() {
-                return Err(Error::from_reason(format!(
-                    "Config file not found: {}",
-                    config_path.display()
-                )));
-            }
-
-            let config_data = fs::read_to_string(&config_path)
-                .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
-            let raw_config: Value = serde_json::from_str(&config_data)
-                .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
-
-            let config = parse_config(&raw_config)?;
-
-            info!(
-                "Qwen3 config: {} layers, hidden={}, heads={}, kv_heads={}",
-                config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
-            );
-
-            // Load weights
-            let mapped_params = load_safetensors_mapped(path)?;
-
-            // Validate parameters
-            validate_loaded_parameters(&mapped_params, &config)?;
-
-            // Load tokenizer
-            let tokenizer_path = path.join("tokenizer.json");
-            if !tokenizer_path.exists() {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!("Tokenizer file not found: {}", tokenizer_path.display()),
-                ));
-            }
-            info!("Loading tokenizer from: {}", tokenizer_path.display());
-            let tokenizer = Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap())?;
-            info!("Tokenizer loaded successfully");
-
-            // Create Qwen3Inner
-            let mut inner = Qwen3Inner::new(config.clone())?;
-            inner.set_tokenizer(Arc::new(tokenizer.clone()));
-
-            // Load parameters into inner
-            let num_layers = config.num_layers as usize;
-            let _head_dim = config.head_dim as usize;
-
-            // Embedding
-            if let Some(arr) = mapped_params.get("embedding.weight") {
-                inner.embedding.set_weight(arr)?;
-            }
-
-            // Final norm
-            if let Some(arr) = mapped_params.get("final_norm.weight") {
-                inner.final_norm.set_weight(arr)?;
-            }
-
-            // LM head (only if not tied)
-            if !config.tie_word_embeddings
-                && let Some(arr) = mapped_params.get("lm_head.weight")
-            {
-                inner.lm_head.set_weight(arr)?;
-            }
-
-            // Per-layer weights
-            for i in 0..num_layers {
-                let prefix = format!("layers.{}", i);
-                let layer = &mut inner.layers[i];
-
-                if let Some(w) = mapped_params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
-                    layer.self_attn.set_q_proj_weight(w)?;
+            // Load the model and all its weights. The weight-byte
+            // footprint is computed deterministically inside and
+            // registered with the cache-limit coordinator after the
+            // load completes — no active-memory sampling, so no race
+            // with concurrent inference on the process-wide counter.
+            // See `cache_limit.rs` module docs.
+            let load_result: Result<(Qwen3Inner, Qwen3Config, Qwen3Tokenizer, u64)> = (|| {
+                // Load config
+                let config_path = path.join("config.json");
+                if !config_path.exists() {
+                    return Err(Error::from_reason(format!(
+                        "Config file not found: {}",
+                        config_path.display()
+                    )));
                 }
-                if let Some(w) = mapped_params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
-                    layer.self_attn.set_k_proj_weight(w)?;
+
+                let config_data = fs::read_to_string(&config_path)
+                    .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
+                let raw_config: Value = serde_json::from_str(&config_data)
+                    .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
+
+                let config = parse_config(&raw_config)?;
+
+                info!(
+                    "Qwen3 config: {} layers, hidden={}, heads={}, kv_heads={}",
+                    config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
+                );
+
+                // Load weights
+                let mapped_params = load_safetensors_mapped(path)?;
+
+                // Validate parameters
+                validate_loaded_parameters(&mapped_params, &config)?;
+
+                // Load tokenizer
+                let tokenizer_path = path.join("tokenizer.json");
+                if !tokenizer_path.exists() {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!("Tokenizer file not found: {}", tokenizer_path.display()),
+                    ));
                 }
-                if let Some(w) = mapped_params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
-                    layer.self_attn.set_v_proj_weight(w)?;
+                info!("Loading tokenizer from: {}", tokenizer_path.display());
+                let tokenizer =
+                    Qwen3Tokenizer::load_from_file_sync(tokenizer_path.to_str().unwrap())?;
+                info!("Tokenizer loaded successfully");
+
+                // Create Qwen3Inner
+                let mut inner = Qwen3Inner::new(config.clone())?;
+                inner.set_tokenizer(Arc::new(tokenizer.clone()));
+
+                // Load parameters into inner
+                let num_layers = config.num_layers as usize;
+                let _head_dim = config.head_dim as usize;
+
+                // Embedding
+                if let Some(arr) = mapped_params.get("embedding.weight") {
+                    inner.embedding.set_weight(arr)?;
                 }
-                if let Some(w) = mapped_params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
-                    layer.self_attn.set_o_proj_weight(w)?;
+
+                // Final norm
+                if let Some(arr) = mapped_params.get("final_norm.weight") {
+                    inner.final_norm.set_weight(arr)?;
                 }
-                if config.use_qk_norm {
-                    if let Some(w) =
-                        mapped_params.get(&format!("{}.self_attn.q_norm.weight", prefix))
-                    {
-                        layer.self_attn.set_q_norm_weight(w)?;
-                    }
-                    if let Some(w) =
-                        mapped_params.get(&format!("{}.self_attn.k_norm.weight", prefix))
-                    {
-                        layer.self_attn.set_k_norm_weight(w)?;
-                    }
-                }
-                if let Some(w) = mapped_params.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
-                    layer.mlp.set_gate_proj_weight(w)?;
-                }
-                if let Some(w) = mapped_params.get(&format!("{}.mlp.up_proj.weight", prefix)) {
-                    layer.mlp.set_up_proj_weight(w)?;
-                }
-                if let Some(w) = mapped_params.get(&format!("{}.mlp.down_proj.weight", prefix)) {
-                    layer.mlp.set_down_proj_weight(w)?;
-                }
-                if let Some(w) = mapped_params.get(&format!("{}.input_layernorm.weight", prefix)) {
-                    layer.set_input_layernorm_weight(w)?;
-                }
-                if let Some(w) =
-                    mapped_params.get(&format!("{}.post_attention_layernorm.weight", prefix))
+
+                // LM head (only if not tied)
+                if !config.tie_word_embeddings
+                    && let Some(arr) = mapped_params.get("lm_head.weight")
                 {
-                    layer.set_post_attention_layernorm_weight(w)?;
+                    inner.lm_head.set_weight(arr)?;
                 }
-            }
 
-            // Materialize all mmap-backed weight arrays
-            {
-                let arrays: Vec<&MxArray> = mapped_params.values().collect();
-                crate::array::memory::materialize_weights(&arrays);
-            }
+                // Per-layer weights
+                for i in 0..num_layers {
+                    let prefix = format!("layers.{}", i);
+                    let layer = &mut inner.layers[i];
 
+                    if let Some(w) =
+                        mapped_params.get(&format!("{}.self_attn.q_proj.weight", prefix))
+                    {
+                        layer.self_attn.set_q_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        mapped_params.get(&format!("{}.self_attn.k_proj.weight", prefix))
+                    {
+                        layer.self_attn.set_k_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        mapped_params.get(&format!("{}.self_attn.v_proj.weight", prefix))
+                    {
+                        layer.self_attn.set_v_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        mapped_params.get(&format!("{}.self_attn.o_proj.weight", prefix))
+                    {
+                        layer.self_attn.set_o_proj_weight(w)?;
+                    }
+                    if config.use_qk_norm {
+                        if let Some(w) =
+                            mapped_params.get(&format!("{}.self_attn.q_norm.weight", prefix))
+                        {
+                            layer.self_attn.set_q_norm_weight(w)?;
+                        }
+                        if let Some(w) =
+                            mapped_params.get(&format!("{}.self_attn.k_norm.weight", prefix))
+                        {
+                            layer.self_attn.set_k_norm_weight(w)?;
+                        }
+                    }
+                    if let Some(w) = mapped_params.get(&format!("{}.mlp.gate_proj.weight", prefix))
+                    {
+                        layer.mlp.set_gate_proj_weight(w)?;
+                    }
+                    if let Some(w) = mapped_params.get(&format!("{}.mlp.up_proj.weight", prefix)) {
+                        layer.mlp.set_up_proj_weight(w)?;
+                    }
+                    if let Some(w) = mapped_params.get(&format!("{}.mlp.down_proj.weight", prefix))
+                    {
+                        layer.mlp.set_down_proj_weight(w)?;
+                    }
+                    if let Some(w) =
+                        mapped_params.get(&format!("{}.input_layernorm.weight", prefix))
+                    {
+                        layer.set_input_layernorm_weight(w)?;
+                    }
+                    if let Some(w) =
+                        mapped_params.get(&format!("{}.post_attention_layernorm.weight", prefix))
+                    {
+                        layer.set_post_attention_layernorm_weight(w)?;
+                    }
+                }
+
+                // Materialize all mmap-backed weight arrays
+                {
+                    let arrays: Vec<&MxArray> = mapped_params.values().collect();
+                    crate::array::memory::materialize_weights(&arrays);
+                }
+
+                // Deterministic weight-byte total for the cache-limit
+                // coordinator. `saturating_add` over the per-tensor
+                // `nbytes()` so a pathological (corrupted) checkpoint
+                // can't overflow. See `cache_limit.rs` module docs.
+                let weight_bytes: u64 = mapped_params
+                    .values()
+                    .map(|a| a.nbytes() as u64)
+                    .fold(0u64, |acc, v| acc.saturating_add(v));
+
+                Ok((inner, config, tokenizer, weight_bytes))
+            })(
+            );
+            let (inner, config, tokenizer, weight_bytes) = load_result?;
+            let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
             let config_out = config.clone();
             let tokenizer_out = Some(Arc::new(tokenizer));
 
-            Ok((inner, (config_out, tokenizer_out)))
+            Ok((inner, (config_out, tokenizer_out, cache_limit_guard)))
         },
         handle_qwen3_cmd,
     );
 
-    let (config, tokenizer) = init_rx
+    let (config, tokenizer, cache_limit_guard) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
@@ -591,6 +625,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
         thread,
         config: config.clone(),
         tokenizer,
+        _cache_limit_guard: cache_limit_guard,
     })
 }
 

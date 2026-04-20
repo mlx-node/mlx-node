@@ -379,7 +379,13 @@ impl Lfm2Inner {
     /// Load an Lfm2Inner from a directory containing safetensors and config.json.
     ///
     /// All weight loading happens synchronously (designed to run on the model thread).
-    pub fn load_from_dir(model_path: &str) -> Result<Self> {
+    ///
+    /// Returns the constructed inner alongside a deterministic
+    /// weight-byte total (`sum(params.values().nbytes())`) for the
+    /// cache-limit coordinator. See `cache_limit.rs` module docs for
+    /// why this deterministic measurement is preferred over a
+    /// process-wide `get_active_memory()` delta.
+    pub fn load_from_dir(model_path: &str) -> Result<(Self, u64)> {
         let path = Path::new(model_path);
 
         // Parse config
@@ -424,6 +430,10 @@ impl Lfm2Inner {
             crate::array::memory::materialize_weights(&weight_refs);
         }
 
+        // NOTE: the cache-limit coordinator registration happens in
+        // `Lfm2Model::load_from_dir` after this returns so the guard
+        // can be carried out to the wrapper struct.
+
         // Load tokenizer
         let tokenizer_path = path.join("tokenizer.json");
         if tokenizer_path.exists() {
@@ -433,7 +443,15 @@ impl Lfm2Inner {
             info!("Tokenizer loaded");
         }
 
-        Ok(inner)
+        // Deterministic weight-byte total for the cache-limit
+        // coordinator, computed from the still-live `params` map
+        // before it is dropped at end-of-function.
+        let weight_bytes: u64 = params
+            .values()
+            .map(|a| a.nbytes() as u64)
+            .fold(0u64, |acc, v| acc.saturating_add(v));
+
+        Ok((inner, weight_bytes))
     }
 }
 
@@ -447,17 +465,28 @@ impl Lfm2Model {
 
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
             move || {
-                let inner = Lfm2Inner::load_from_dir(&model_path)?;
+                // `Lfm2Inner::load_from_dir` returns a deterministic
+                // weight-byte total alongside the inner; register it
+                // with the cache-limit coordinator here. No
+                // active-memory sampling — the deterministic path is
+                // race-free against concurrent inference. See
+                // `cache_limit.rs` module docs.
+                let (inner, weight_bytes) = Lfm2Inner::load_from_dir(&model_path)?;
+                let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let config = inner.config.clone();
-                Ok((inner, config))
+                Ok((inner, (config, cache_limit_guard)))
             },
             handle_lfm2_cmd,
         );
 
-        let config = init_rx
+        let (config, cache_limit_guard) = init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
-        Ok(Lfm2Model { thread, config })
+        Ok(Lfm2Model {
+            thread,
+            config,
+            _cache_limit_guard: cache_limit_guard,
+        })
     }
 }

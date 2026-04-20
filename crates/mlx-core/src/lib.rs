@@ -6,6 +6,7 @@
 
 pub mod array;
 pub mod autograd;
+pub mod cache_limit;
 pub mod convert;
 pub mod dataset;
 pub mod decode_profiler;

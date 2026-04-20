@@ -120,6 +120,11 @@ pub struct VLModel {
     initialized: bool,
     /// Whether a tokenizer has been set.
     has_tokenizer_flag: bool,
+    /// RAII: unregisters this model's baseline from the cache-limit
+    /// coordinator on drop. `None` for instances constructed via
+    /// `new(config)` that never loaded weights — there's no baseline
+    /// to release in that case.
+    _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,6 +1496,7 @@ impl VLModel {
             config: config_clone,
             initialized: false,
             has_tokenizer_flag: false,
+            _cache_limit_guard: None,
         })
     }
 
@@ -1800,26 +1806,36 @@ impl VLModel {
             async move {
                 let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
                     move || {
-                        let inner = load_vlmodel_inner_from_dir(&model_path)?;
+                        // `load_vlmodel_inner_from_dir` returns a
+                        // deterministic weight-byte total alongside
+                        // the inner; register it with the cache-limit
+                        // coordinator here. No active-memory sampling
+                        // — the deterministic path is race-free
+                        // against concurrent inference. See
+                        // `cache_limit.rs` module docs.
+                        let (inner, weight_bytes) = load_vlmodel_inner_from_dir(&model_path)?;
+                        let cache_limit_guard =
+                            crate::cache_limit::coordinator().register(weight_bytes);
                         let config = inner.config.clone();
                         let has_tokenizer = inner.tokenizer.is_some();
-                        Ok((inner, (config, has_tokenizer)))
+                        Ok((inner, (config, has_tokenizer, cache_limit_guard)))
                     },
                     handle_vlmodel_cmd,
                 );
 
-                let (config, has_tokenizer) = init_rx
+                let (config, has_tokenizer, cache_limit_guard) = init_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
-                Ok((thread, config, has_tokenizer))
+                Ok((thread, config, has_tokenizer, cache_limit_guard))
             },
-            |_, (thread, config, has_tokenizer)| {
+            |_, (thread, config, has_tokenizer, cache_limit_guard)| {
                 Ok(VLModel {
                     thread,
                     config,
                     initialized: true,
                     has_tokenizer_flag: has_tokenizer,
+                    _cache_limit_guard: Some(cache_limit_guard),
                 })
             },
         )
@@ -2271,7 +2287,7 @@ fn merge_input_ids_with_image_features(
 /// Load VLModelInner from a model directory.
 ///
 /// All weight loading happens synchronously (designed to run on the model thread).
-fn load_vlmodel_inner_from_dir(model_path: &str) -> Result<VLModelInner> {
+fn load_vlmodel_inner_from_dir(model_path: &str) -> Result<(VLModelInner, u64)> {
     let path = Path::new(model_path);
 
     // Check if path exists
@@ -2467,7 +2483,20 @@ fn load_vlmodel_inner_from_dir(model_path: &str) -> Result<VLModelInner> {
     let weights = load_paddleocr_vl_weights(all_weights)?;
     info!("  After transformation: {} tensors", weights.len());
 
-    build_vlmodel_inner_from_weights(config, weights, vision_config, text_config, model_path)
+    // Deterministic weight-byte total for the cache-limit
+    // coordinator, captured BEFORE `weights` is moved into
+    // `build_vlmodel_inner_from_weights`. Registration happens in
+    // the caller (`VLModel::load`) so the guard can be carried up
+    // to the wrapper struct.
+    let weight_bytes: u64 = weights
+        .values()
+        .map(|a| a.nbytes() as u64)
+        .fold(0u64, |acc, v| acc.saturating_add(v));
+
+    let inner =
+        build_vlmodel_inner_from_weights(config, weights, vision_config, text_config, model_path)?;
+
+    Ok((inner, weight_bytes))
 }
 
 /// Build VLModelInner from loaded weights

@@ -14,6 +14,7 @@ import {
   sendMethodNotAllowed,
   sendNotFound,
 } from './errors.js';
+import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelRegistry } from './registry.js';
 import type { AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';
@@ -45,6 +46,7 @@ export async function routeRequest(
   registry: ModelRegistry,
   store: ResponseStore | null,
   responseRetentionSec?: number,
+  idleSweeper?: IdleSweeper | null,
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
@@ -75,7 +77,7 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateResponse(res, body, registry, store, req, responseRetentionSec);
+    await handleCreateResponse(res, body, registry, store, req, responseRetentionSec, idleSweeper);
     return;
   }
 
@@ -96,7 +98,7 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateMessage(res, body, registry, req);
+    await handleCreateMessage(res, body, registry, req, idleSweeper);
     return;
   }
 

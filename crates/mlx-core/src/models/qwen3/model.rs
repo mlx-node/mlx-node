@@ -353,6 +353,11 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
             config,
             reply,
         } => {
+            // NOTE: no per-request cache drain here. On a multi-model
+            // server the MLX allocator free-pool is process-wide, so
+            // flushing after a request on model A discards blocks
+            // about to be reused by model B. Between-turn drain is
+            // handled by the TS idle sweeper in `@mlx-node/server`.
             let _ = reply.send(inner.chat_session_start_sync(messages, config));
         }
         Qwen3Cmd::ChatSessionContinue {
@@ -5031,6 +5036,11 @@ pub struct Qwen3Model {
     pub(crate) config: Qwen3Config,
     // Tokenizer for text-to-text generation (loaded via load)
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    /// RAII: on drop (JS GC'd the wrapper) unregister this model's
+    /// baseline from the cache-limit coordinator so the global cap can
+    /// shrink back. Held as a field rather than consumed because the
+    /// guard has no API — only its Drop does useful work.
+    pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
 }
 
 #[napi]

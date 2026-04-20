@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { ResponseStore } from '@mlx-node/core';
 
 import { createHandler } from './handler.js';
+import { createIdleSweeper, DEFAULT_IDLE_CLEAR_CACHE_MS, parseIdleClearCacheEnv } from './idle-sweeper.js';
 import { ModelRegistry } from './registry.js';
 
 /** Cleanup interval for expired responses (ms). */
@@ -116,6 +117,21 @@ export interface ServerConfig {
    * `MLX_MAX_QUEUE_DEPTH_PER_MODEL` (positive integer).
    */
   maxQueueDepthPerModel?: number;
+  /**
+   * Milliseconds of HTTP inactivity (no request arrivals or completions)
+   * before the server issues a single `clearCache()` to drain the MLX
+   * Metal allocator's free pool. Replaces the old per-request
+   * `ClearCacheOnDrop` guard in the Rust layer, which was unsafe on a
+   * multi-model server because the pool is process-wide.
+   *
+   * Default: 30_000 ms (30 seconds). `0` disables the sweeper. Env
+   * override: `MLX_IDLE_CLEAR_CACHE_MS` (non-negative integer; 0
+   * disables; unset falls through to default).
+   *
+   * The decode-loop drain every 256 tokens inside each generative
+   * model is untouched and covers in-flight memory churn.
+   */
+  idleClearCacheMs?: number;
 }
 
 export interface ServerInstance {
@@ -126,6 +142,51 @@ export interface ServerInstance {
   store: ResponseStore | null;
   /** Graceful shutdown. */
   close(): Promise<void>;
+  /**
+   * Run `fn` with the idle-drain timer suspended for the duration of
+   * an unbracketed, allocator-heavy operation — most commonly a hot
+   * `Model::load()` invoked AFTER the server has already served at
+   * least one request. In that scenario the post-request drain timer
+   * armed by `endRequest()` (at t+idleClearCacheMs) can otherwise
+   * fire MID-LOAD, racing the Metal allocator while weight
+   * materialization is still in progress.
+   *
+   * Handles try/finally bracketing so a thrown load never leaks the
+   * internal suspend counter. Accepts both sync and async functions;
+   * returns `fn`'s own return value (or resolved promise). When the
+   * bracket exits (normal or thrown) AND `inFlight === 0` with no
+   * other suspend active, a fresh drain timer is armed.
+   *
+   * Safe to nest — each call allocates its own token-scoped release
+   * so overlapping brackets unwind independently.
+   *
+   * The common `serve.ts` pattern (load all models BEFORE
+   * `createServer()`) does not need this API — there is no armed
+   * timer before the first request, so there is no race.
+   *
+   * Pass-through when the sweeper is disabled (`idleClearCacheMs: 0`
+   * or missing `__internal__.clearCache`): `fn` is invoked directly.
+   *
+   * @example
+   * ```ts
+   * await instance.withSuspendedDrains(async () => {
+   *   const model = await Qwen35Model.load(modelPath);
+   *   instance.registry.register('new-model', model);
+   * });
+   * ```
+   */
+  withSuspendedDrains<T>(fn: () => Promise<T>): Promise<T>;
+  withSuspendedDrains<T>(fn: () => T): T;
+  /**
+   * Low-level: suspend drains and return an idempotent, token-scoped
+   * disposer. Prefer {@link withSuspendedDrains} unless you need
+   * manual control over when the suspend is released. Safe to nest;
+   * calling the disposer more than once is a no-op.
+   *
+   * No-op when the sweeper is disabled (`idleClearCacheMs: 0` or
+   * missing `__internal__.clearCache`): returns a no-op disposer.
+   */
+  suspendDrains(): () => void;
 }
 
 /**
@@ -156,6 +217,16 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   const configMaxQueueDepth = normalizePositiveIntConfig(config?.maxQueueDepthPerModel, 'maxQueueDepthPerModel');
   const maxQueueDepthPerModel = configMaxQueueDepth ?? parseEnvPositiveInt('MLX_MAX_QUEUE_DEPTH_PER_MODEL');
 
+  // Idle sweeper wiring. `0` is a legal explicit "off" value so we
+  // cannot reuse `normalizePositiveIntConfig` (which rejects 0).
+  // Precedence: explicit config value wins over env wins over default.
+  const idleClearCacheMs = resolveIdleClearCacheMs(config?.idleClearCacheMs);
+  const idleSweeper = createIdleSweeper(idleClearCacheMs);
+  // The sweeper is driven exclusively by `endRequest()` calls in the
+  // inference endpoints (`/v1/responses`, `/v1/messages`). There is no
+  // cold-start drain: a process that loads models but never receives a
+  // request will not fire `clearCache()`. See the `idle-sweeper.ts`
+  // module doc (section "Drain is post-request only") for rationale.
   const registry = new ModelRegistry({ maxQueueDepth: maxQueueDepthPerModel });
 
   let store: ResponseStore | null = null;
@@ -177,7 +248,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   }, CLEANUP_INTERVAL_MS);
   cleanupTimer.unref();
 
-  const handler = createHandler(registry, { cors, store, responseRetentionSec });
+  const handler = createHandler(registry, { cors, store, responseRetentionSec, idleSweeper });
   const server = httpCreateServer(handler);
 
   await new Promise<void>((resolve, reject) => {
@@ -198,6 +269,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     store,
     async close() {
       clearInterval(cleanupTimer);
+      idleSweeper.close();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => {
           if (err) reject(err);
@@ -205,5 +277,33 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
         });
       });
     },
+    withSuspendedDrains<T>(fn: () => T | Promise<T>): T | Promise<T> {
+      return idleSweeper.withSuspendedDrains(fn as () => Promise<T>);
+    },
+    suspendDrains(): () => void {
+      return idleSweeper.suspendDrains();
+    },
   };
+}
+
+/**
+ * Resolve the effective idle-drain delay from (constructor value, env,
+ * default). Unlike the other knobs, `0` is a legal explicit opt-out —
+ * we must NOT fall through to env/default when the caller explicitly
+ * passes `0`. Returns a non-negative integer milliseconds value.
+ */
+function resolveIdleClearCacheMs(configValue: number | undefined): number {
+  if (configValue !== undefined) {
+    if (
+      typeof configValue !== 'number' ||
+      !Number.isFinite(configValue) ||
+      !Number.isInteger(configValue) ||
+      configValue < 0
+    ) {
+      throw new Error(`idleClearCacheMs must be a non-negative integer; received ${String(configValue)}`);
+    }
+    return configValue;
+  }
+  const envValue = parseIdleClearCacheEnv();
+  return envValue ?? DEFAULT_IDLE_CLEAR_CACHE_MS;
 }
