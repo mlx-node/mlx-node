@@ -2186,6 +2186,94 @@ describe('createHandler', () => {
       expect(failedResponse.status).toBe('failed');
     });
 
+    it('closes the reasoning output item BEFORE opening the message item (thinking-model round-trip regression)', async () => {
+      // Regression for a reasoning-replay bug that broke thinking-model
+      // agent loops. OpenAI Responses clients (e.g. pi-mono) drive a
+      // single `currentBlock` state machine over the SSE stream:
+      // `response.output_item.added` sets `currentBlock` to the new
+      // item's type, and `response.output_item.done` only stores
+      // `thinkingSignature` if the current block is still `thinking`.
+      //
+      // If the server emits `output_item.added` for the assistant
+      // `message` WHILE the `reasoning` item is still open, the client
+      // overwrites `currentBlock` from `thinking` to `text`, and when
+      // the deferred `output_item.done` for reasoning fires later, its
+      // guard fails and `thinkingSignature` never gets set. Without the
+      // signature, the next turn's history builder has nothing to
+      // re-echo the `reasoning` input item from, so the agent loses its
+      // chain of thought on every subsequent turn and loops on the same
+      // decision.
+      //
+      // The fix eagerly closes the reasoning item on the FIRST non-
+      // reasoning text delta, before opening the message item. This
+      // test feeds a stream that transitions from reasoning to text
+      // deltas and asserts the emitted SSE event order:
+      //   reasoning.added → reasoning_summary_text.delta* →
+      //   reasoning_summary_text.done → reasoning.done →
+      //   message.added → output_text.delta → message.done
+      const streamEvents = [
+        { done: false, text: 'I need to think.', isReasoning: true },
+        { done: false, text: ' Here is my answer.', isReasoning: false },
+        {
+          done: true,
+          text: ' Here is my answer.',
+          thinking: 'I need to think.',
+          isReasoning: false,
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          rawText: ' Here is my answer.',
+          numTokens: 4,
+          promptTokens: 1,
+          reasoningTokens: 3,
+          performance: undefined,
+          cachedTokens: 0,
+        },
+      ];
+      const registry = new ModelRegistry();
+      registry.register('stream-model', createMockStreamModel(streamEvents));
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      // Collect the event names in the exact order they were written.
+      const body = getBody();
+      const eventOrder: string[] = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          eventOrder.push(line.slice(7).trim());
+        }
+      }
+
+      // Find the indices we care about. We pin the relative ORDER —
+      // not exact positions — because other events (deltas, parts,
+      // in_progress, etc.) may be interleaved and their counts vary.
+      const firstReasoningAdded = eventOrder.indexOf('response.output_item.added');
+      const firstReasoningDone = eventOrder.findIndex(
+        (e, i) => i > firstReasoningAdded && e === 'response.output_item.done',
+      );
+      const messageAdded = eventOrder.findIndex(
+        (e, i) => i > firstReasoningAdded && e === 'response.output_item.added',
+      );
+
+      expect(firstReasoningAdded).toBeGreaterThanOrEqual(0);
+      expect(firstReasoningDone).toBeGreaterThan(firstReasoningAdded);
+      expect(messageAdded).toBeGreaterThan(firstReasoningAdded);
+      // The load-bearing invariant: the reasoning item's done event
+      // MUST fire before any subsequent output_item.added (the message
+      // or a function_call). Pre-fix the order was:
+      //   reasoning.added → message.added → ... → reasoning.done
+      // Post-fix:
+      //   reasoning.added → reasoning.done → message.added → ...
+      expect(firstReasoningDone).toBeLessThan(messageAdded);
+    });
+
     it('does not adopt the session when a streaming turn emits an error final chunk', async () => {
       // Iteration-16 adopt gate + iteration-18 persist/SSE gate:
       //

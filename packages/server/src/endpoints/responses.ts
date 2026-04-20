@@ -323,6 +323,13 @@ async function handleStreamingNative(
   let messageText = '';
   let hasEmittedMessage = false;
   let hasEmittedReasoning = false;
+  // Tracks whether the reasoning output item's `response.output_item.done`
+  // has already been emitted. We close it eagerly on the reasoning→text
+  // transition (before opening the message item) so OpenAI Responses
+  // clients can populate their `thinkingSignature` via the `done`
+  // event's `currentBlock?.type === 'thinking'` guard. The terminal and
+  // failure paths check this flag to avoid double-emitting.
+  let hasClosedReasoning = false;
   let suppressedMessageIndex = -1;
   const tagBuffer = new ToolCallTagBuffer();
 
@@ -415,18 +422,22 @@ async function handleStreamingNative(
           });
         }
 
-        // Close reasoning item if open
-        if (hasEmittedReasoning && reasoningItemId) {
+        // Close reasoning item if still open (already closed eagerly on
+        // reasoning→text transition for most turns — this branch covers
+        // the reasoning-only shape where no text deltas ever arrived).
+        if (hasEmittedReasoning && !hasClosedReasoning && reasoningItemId) {
+          hasClosedReasoning = true;
+          const finalReasoningText = event.thinking ?? reasoningText;
           writeSSEEvent(res, 'response.reasoning_summary_text.done', {
             item_id: reasoningItemId,
             output_index: outputItems.length - (hasEmittedMessage ? 1 : 0) - 1,
             summary_index: 0,
-            text: event.thinking ?? reasoningText,
+            text: finalReasoningText,
           });
           const reasoningItem: ReasoningOutputItem = {
             id: reasoningItemId,
             type: 'reasoning',
-            summary: [{ type: 'summary_text', text: event.thinking ?? reasoningText }],
+            summary: [{ type: 'summary_text', text: finalReasoningText }],
           };
           const riIndex = outputItems.findIndex((i) => i.id === reasoningItemId);
           if (riIndex >= 0) {
@@ -695,6 +706,39 @@ async function handleStreamingNative(
           delta: deltaText,
         });
       } else {
+        // Transition from reasoning to assistant text: close the reasoning
+        // output item BEFORE emitting any `response.output_item.added` for
+        // the message. OpenAI Responses clients (e.g. pi-mono) maintain a
+        // single `currentBlock` state — opening the message item while the
+        // reasoning item is still "in progress" overwrites that state, so
+        // the later `output_item.done` for reasoning fails its
+        // `currentBlock?.type === 'thinking'` guard and never sets
+        // `thinkingSignature`. Without the signature the next turn cannot
+        // echo the reasoning item back, and any thinking-model agent loses
+        // its chain of thought on each turn. Must run before the first
+        // message write on this branch.
+        if (hasEmittedReasoning && !hasClosedReasoning && reasoningItemId) {
+          hasClosedReasoning = true;
+          const riIndex = outputItems.findIndex((i) => i.id === reasoningItemId);
+          writeSSEEvent(res, 'response.reasoning_summary_text.done', {
+            item_id: reasoningItemId,
+            output_index: riIndex,
+            summary_index: 0,
+            text: reasoningText,
+          });
+          const reasoningItem: ReasoningOutputItem = {
+            id: reasoningItemId,
+            type: 'reasoning',
+            summary: [{ type: 'summary_text', text: reasoningText }],
+          };
+          if (riIndex >= 0) {
+            outputItems[riIndex] = reasoningItem;
+          }
+          writeSSEEvent(res, 'response.output_item.done', {
+            output_index: riIndex >= 0 ? riIndex : 0,
+            item: reasoningItem,
+          });
+        }
         // Text delta with tool_call tag buffering
         const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
         if (tagFound) {
@@ -889,9 +933,10 @@ async function handleStreamingNative(
       item: closedMessageItem,
     });
   }
-  if (!sawDone && hasEmittedReasoning && reasoningItemId != null) {
+  if (!sawDone && hasEmittedReasoning && !hasClosedReasoning && reasoningItemId != null) {
     // No `status` field on reasoning items — just emit closes so
     // client-side output_index bookkeeping stays consistent.
+    hasClosedReasoning = true;
     writeSSEEvent(res, 'response.reasoning_summary_text.done', {
       item_id: reasoningItemId,
       output_index: outputItems.findIndex((i) => i.id === reasoningItemId),
