@@ -58,20 +58,53 @@
 //! the formula depends on observing process-global state, so there is
 //! no race surface.
 //!
-//! ### Why 1.75× and not a tighter multiplier
+//! ## Budget-based cap formula
 //!
-//! The deterministic weight-byte baseline does NOT include allocations
-//! built lazily on the first prefill — the canonical example is the
-//! MoE weight-transpose cache `g_weight_transposes_3d` built inside
-//! `mlx_qwen35_moe_init_from_prefill`, not at load time. Compiled-graph
-//! scratch buffers and first-prefill activations add more.
+//! Earlier rounds computed the cap as `min(sum(weights) * 7/4, wired *
+//! 3/5)`. That expression did NOT model the actual memory budget: the
+//! `wired * 3/5` clamp scales only with the machine, not with how much
+//! of wired the weights already occupy. Two real failure modes:
 //!
-//! The 1.75× multiplier is empirical slack to cover that post-load
-//! scratch without requiring runtime measurements that race with
-//! concurrent inference. Rough sizing: a Q8 35B MoE ≈ 35 GB of weights
-//! → cap ≈ 61 GB; typical working set including transpose caches ≈
-//! 40–50 GB; headroom > 10 GB. The cap is further clamped by
-//! `wired * 3/5` so we never exceed 60% of the Metal wired limit.
+//!   - **96 GB wired, 36 GB weights** → `96 * 0.6 = 57.6 GB` cap, peak
+//!     memory ≈ `36 + 57.6 + ~10 driver` = 103 GB, which exceeds 96 GB
+//!     wired and makes the whole system laggy.
+//!   - **48 GB wired, 36 GB weights** → `48 * 0.6 = 28.8 GB` cap, peak
+//!     ≈ `36 + 28.8 + ~10` = 75 GB → OOM, the model literally can't
+//!     run.
+//!
+//! The new formula subtracts what is NOT the freelist from wired and
+//! gives the remainder to MLX:
+//!
+//! ```text
+//! cap = wired - weights - overhead - headroom      (if positive)
+//!     = MIN_FREELIST_BYTES (1 GiB)                 (otherwise)
+//! ```
+//!
+//! where
+//!
+//!   - **overhead** = `max(4 GiB, wired / 20)` — Metal driver state, MoE
+//!     transpose cache, command buffer pool, kernel pipelines. Scales
+//!     with system size with a floor for small-RAM hosts.
+//!   - **headroom** = `max(4 GiB, wired / 10)` — reserved for macOS and
+//!     other apps so the system stays responsive. Overridable via
+//!     `MLX_GPU_HEADROOM_GB`.
+//!
+//! If weights + overhead + headroom already exceed wired (tight-fit
+//! territory) we floor the freelist at 1 GiB so the allocator still
+//! has something to reuse — MLX will churn but the model at least
+//! runs.
+//!
+//! When wired is 0 (non-Metal machine or query failed) we fall back to
+//! `weights * 3/2`, the same flavour of fixed multiplier as the old
+//! formula's baseline term.
+//!
+//! ## Env overrides (precedence)
+//!
+//!   1. `MLX_CACHE_LIMIT_GB=N` — hard override, trumps everything. `=0`
+//!      skips the call and retains the MLX default.
+//!   2. `MLX_GPU_HEADROOM_GB=N` — tunes only the headroom term of the
+//!      auto formula. Does NOT affect the overhead term.
+//!   3. Otherwise: the budget formula above.
 //!
 //! ## Cache hygiene (no per-request RAII)
 //!
@@ -104,22 +137,21 @@ use crate::stream::WiredLimitContext;
 ///   - unset → use the auto formula.
 pub const CACHE_LIMIT_ENV: &str = "MLX_CACHE_LIMIT_GB";
 
+/// Name of the env var that tunes only the user-headroom term of the
+/// auto formula. Parsed as a non-negative floating-point GiB amount;
+/// invalid values are silently ignored and the default
+/// (`max(4 GiB, wired / 10)`) is used instead. Does NOT affect the
+/// driver-overhead term — use `MLX_CACHE_LIMIT_GB` for a hard override.
+pub const GPU_HEADROOM_ENV: &str = "MLX_GPU_HEADROOM_GB";
+
 const ONE_GIB: f64 = (1u64 << 30) as f64;
+const GIB: u64 = 1u64 << 30;
 
-/// Baseline-bytes multiplier numerator (`7/4 = 1.75`).
-///
-/// Rationale: the summed per-model weight-byte total misses allocations
-/// built lazily on the first prefill (e.g. the MoE weight-transpose
-/// cache in `mlx_qwen35_moe_init_from_prefill`, compiled-graph scratch,
-/// first-prefill activations). The 75% slack absorbs that post-load
-/// growth without pushing the cap above `wired * 3/5`.
-const BASELINE_MULT_NUM: u64 = 7;
-const BASELINE_MULT_DEN: u64 = 4;
-
-/// Wired-limit fraction (`3/5 = 0.6`). Headroom for OS, other GPU
-/// consumers, and the allocator's own fragmentation slack.
-const WIRED_FRAC_NUM: u64 = 3;
-const WIRED_FRAC_DEN: u64 = 5;
+/// Absolute floor on the freelist cap, in bytes. In tight-fit territory
+/// (weights + overhead + headroom ≥ wired) we still hand the allocator
+/// 1 GiB so it has something to reuse — MLX will churn but at least the
+/// model runs instead of thrashing the allocator on every step.
+const MIN_FREELIST_BYTES: u64 = GIB;
 
 struct CoordState {
     next_id: u64,
@@ -287,18 +319,8 @@ fn recompute_locked(state: &mut CoordState) {
         return;
     }
 
-    let wired = WiredLimitContext::get_max_working_set_size();
-    let by_baseline = summed_weights.saturating_mul(BASELINE_MULT_NUM) / BASELINE_MULT_DEN;
-    let by_wired = (wired as u64).saturating_mul(WIRED_FRAC_NUM) / WIRED_FRAC_DEN;
-
-    // If wired is 0 (Metal unavailable / query failed) fall back to the
-    // baseline term only. On a machine without Metal the setter is a
-    // no-op but we still record `last_applied` for idempotence.
-    let limit = if wired == 0 {
-        by_baseline
-    } else {
-        by_baseline.min(by_wired)
-    };
+    let wired = WiredLimitContext::get_max_working_set_size() as u64;
+    let limit = compute_cache_limit(summed_weights, wired);
 
     if limit == 0 {
         return;
@@ -309,18 +331,83 @@ fn recompute_locked(state: &mut CoordState) {
         return;
     }
 
-    apply_limit(
-        bytes,
-        &format!(
-            "auto (sum_weights={:.1}GB × {:.2}, wired={:.1}GB × {:.2}, live_guards={})",
+    // Build the `source` string so the operator can reconstruct the
+    // full budget breakdown from logs. The env-override path emits its
+    // own string at the top of `recompute_locked`.
+    let source = if wired == 0 {
+        format!(
+            "auto (weights={:.1}GB, wired=0 → fallback cap={:.1}GB (weights × 1.5), live_guards={})",
             summed_weights as f64 / ONE_GIB,
-            BASELINE_MULT_NUM as f64 / BASELINE_MULT_DEN as f64,
-            wired as f64 / ONE_GIB,
-            WIRED_FRAC_NUM as f64 / WIRED_FRAC_DEN as f64,
+            limit as f64 / ONE_GIB,
             state.profiles.len(),
-        ),
-    );
+        )
+    } else {
+        let overhead = estimate_metal_overhead(wired);
+        let headroom = estimate_user_headroom(wired);
+        format!(
+            "auto (weights={:.1}GB, overhead={:.1}GB, headroom={:.1}GB, wired={:.1}GB → cap={:.1}GB, live_guards={})",
+            summed_weights as f64 / ONE_GIB,
+            overhead as f64 / ONE_GIB,
+            headroom as f64 / ONE_GIB,
+            wired as f64 / ONE_GIB,
+            limit as f64 / ONE_GIB,
+            state.profiles.len(),
+        )
+    };
+
+    apply_limit(bytes, &source);
     state.last_applied = Some(bytes);
+}
+
+/// Estimate the Metal driver's own overhead footprint for the given
+/// wired limit. Covers driver state, MoE weight-transpose caches,
+/// command-buffer pool, kernel-pipeline state.
+///
+/// Scales at 5% of wired with a 4 GiB floor for small-RAM hosts where
+/// even a small driver footprint matters.
+fn estimate_metal_overhead(wired: u64) -> u64 {
+    core::cmp::max(4 * GIB, wired / 20)
+}
+
+/// Estimate the memory that should stay reserved for macOS and other
+/// user apps so the system remains responsive during inference.
+///
+/// Defaults to 10% of wired with a 4 GiB floor. If `MLX_GPU_HEADROOM_GB`
+/// is set and parses as a non-negative finite float, its value wins
+/// (in GiB). Non-parseable or negative values are ignored.
+fn estimate_user_headroom(wired: u64) -> u64 {
+    if let Ok(raw) = std::env::var(GPU_HEADROOM_ENV)
+        && let Ok(gib) = raw.trim().parse::<f64>()
+        && gib >= 0.0
+        && gib.is_finite()
+    {
+        return (gib * GIB as f64).round() as u64;
+    }
+    core::cmp::max(4 * GIB, wired / 10)
+}
+
+/// Compute the freelist cap from total weight bytes and the Metal
+/// wired limit, using the budget formula described at the top of this
+/// module.
+///
+/// Contract:
+///   - `wired == 0` → assume non-Metal or failed query, fall back to
+///     `weights * 3/2`.
+///   - `weights + overhead + headroom >= wired` → return
+///     [`MIN_FREELIST_BYTES`] (tight-fit floor).
+///   - otherwise → `wired - weights - overhead - headroom`, clamped to
+///     at least [`MIN_FREELIST_BYTES`].
+fn compute_cache_limit(weights: u64, wired: u64) -> u64 {
+    if wired == 0 {
+        return weights.saturating_mul(3) / 2;
+    }
+    let overhead = estimate_metal_overhead(wired);
+    let headroom = estimate_user_headroom(wired);
+    let reserved = weights.saturating_add(overhead).saturating_add(headroom);
+    if wired <= reserved {
+        return MIN_FREELIST_BYTES;
+    }
+    (wired - reserved).max(MIN_FREELIST_BYTES)
 }
 
 fn apply_limit(bytes: usize, source: &str) {
@@ -402,5 +489,212 @@ pub fn memory_stats() -> MemoryStats {
         peak: get_peak_memory(),
         cache: get_cache_memory(),
         wired_limit: WiredLimitContext::get_max_working_set_size() as f64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that touch process-global env vars so one test
+    /// never observes another's `MLX_GPU_HEADROOM_GB` setting.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that unsets the env var on drop. Any test that calls
+    /// `std::env::set_var(GPU_HEADROOM_ENV, ...)` should wrap the call
+    /// in one of these so a panic cannot leak the variable into the
+    /// next test.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests that invoke this serialize on `ENV_LOCK`,
+            // so no other test is concurrently reading or writing
+            // this var. Production code does not call `set_var` on
+            // either of the cache-limit env vars.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `EnvGuard::set`.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    const GB: u64 = 1u64 << 30;
+
+    /// Clear any stale `MLX_GPU_HEADROOM_GB` before asserting on the
+    /// auto formula. Must be called while holding `ENV_LOCK`.
+    fn clear_headroom_env() {
+        // SAFETY: callers hold `ENV_LOCK` so no concurrent access.
+        unsafe {
+            std::env::remove_var(GPU_HEADROOM_ENV);
+        }
+    }
+
+    /// Tolerance helper for GiB-level assertions: integer rounding in
+    /// the overhead/headroom derivations can shift the cap by a few
+    /// bytes, so we allow 0.1 GiB of slack.
+    fn approx_eq_gb(actual: u64, expected_gb: f64) {
+        let actual_gb = actual as f64 / ONE_GIB;
+        let diff = (actual_gb - expected_gb).abs();
+        assert!(
+            diff <= 0.1,
+            "expected cap ≈ {expected_gb:.2} GB, got {actual_gb:.4} GB (diff {diff:.4})",
+        );
+    }
+
+    // ── compute_cache_limit sanity cases ──────────────────────────
+
+    #[test]
+    fn case1_96gb_wired_36gb_weights() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        // overhead = max(4, 96/20=4.8) = 4.8 GB
+        // headroom = max(4, 96/10=9.6) = 9.6 GB
+        // cap = 96 - 36 - 4.8 - 9.6 = 45.6 GB
+        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        approx_eq_gb(cap, 45.6);
+    }
+
+    #[test]
+    fn case2_48gb_wired_36gb_weights() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        // overhead = max(4, 48/20=2.4) = 4 GB (floor)
+        // headroom = max(4, 48/10=4.8) = 4.8 GB
+        // cap = 48 - 36 - 4 - 4.8 = 3.2 GB
+        let cap = compute_cache_limit(36 * GB, 48 * GB);
+        approx_eq_gb(cap, 3.2);
+    }
+
+    #[test]
+    fn case3_48gb_wired_42gb_weights_hits_floor() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        // overhead = 4 GB, headroom = 4.8 GB
+        // reserved = 42 + 4 + 4.8 = 50.8 GB > 48 GB wired → floor
+        let cap = compute_cache_limit(42 * GB, 48 * GB);
+        assert_eq!(cap, MIN_FREELIST_BYTES);
+        approx_eq_gb(cap, 1.0);
+    }
+
+    #[test]
+    fn case4_192gb_wired_36gb_weights() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        // overhead = max(4, 192/20=9.6) = 9.6 GB
+        // headroom = max(4, 192/10=19.2) = 19.2 GB
+        // cap = 192 - 36 - 9.6 - 19.2 = 127.2 GB
+        let cap = compute_cache_limit(36 * GB, 192 * GB);
+        approx_eq_gb(cap, 127.2);
+    }
+
+    #[test]
+    fn case5_192gb_wired_10gb_weights() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        // overhead = 9.6 GB, headroom = 19.2 GB
+        // cap = 192 - 10 - 9.6 - 19.2 = 153.2 GB
+        let cap = compute_cache_limit(10 * GB, 192 * GB);
+        approx_eq_gb(cap, 153.2);
+    }
+
+    #[test]
+    fn wired_zero_falls_back_to_weights_times_one_and_a_half() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        let cap = compute_cache_limit(10 * GB, 0);
+        // 10 * 3 / 2 = 15 GB
+        approx_eq_gb(cap, 15.0);
+    }
+
+    // ── env override: MLX_GPU_HEADROOM_GB ─────────────────────────
+
+    #[test]
+    fn headroom_env_overrides_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(GPU_HEADROOM_ENV, "20");
+        // overhead (96/20=4.8) = 4.8 GB, headroom forced to 20 GB
+        // cap = 96 - 36 - 4.8 - 20 = 35.2 GB
+        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        approx_eq_gb(cap, 35.2);
+    }
+
+    #[test]
+    fn headroom_env_zero_is_honoured() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(GPU_HEADROOM_ENV, "0");
+        // overhead = 4.8, headroom forced to 0
+        // cap = 96 - 36 - 4.8 - 0 = 55.2 GB
+        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        approx_eq_gb(cap, 55.2);
+    }
+
+    #[test]
+    fn headroom_env_invalid_falls_back_to_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(GPU_HEADROOM_ENV, "not-a-number");
+        // Invalid → default 10% applies → same as case 1.
+        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        approx_eq_gb(cap, 45.6);
+    }
+
+    #[test]
+    fn headroom_env_negative_is_ignored() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(GPU_HEADROOM_ENV, "-5");
+        // Negative → rejected → default 10% applies.
+        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        approx_eq_gb(cap, 45.6);
+    }
+
+    // ── overhead / headroom helper sanity ─────────────────────────
+
+    #[test]
+    fn overhead_floor_applies_on_small_systems() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        // 16 / 20 = 0.8 GB → clamped up to 4 GB floor.
+        assert_eq!(estimate_metal_overhead(16 * GB), 4 * GB);
+    }
+
+    #[test]
+    fn overhead_scales_on_big_systems() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        // 192 / 20 = 9.6 GB > 4 GB floor.
+        assert_eq!(estimate_metal_overhead(192 * GB), 192 * GB / 20);
+    }
+
+    #[test]
+    fn headroom_floor_applies_on_small_systems() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        // 16 / 10 = 1.6 GB → clamped up to 4 GB floor.
+        assert_eq!(estimate_user_headroom(16 * GB), 4 * GB);
+    }
+
+    #[test]
+    fn headroom_scales_on_big_systems() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        // 192 / 10 = 19.2 GB > 4 GB floor.
+        assert_eq!(estimate_user_headroom(192 * GB), 192 * GB / 10);
     }
 }
