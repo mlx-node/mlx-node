@@ -966,11 +966,29 @@ impl Qwen3Tokenizer {
         // Note: enable_thinking defaults to true to allow model to think naturally.
         // Setting to false adds empty <think></think> tags which DISABLES thinking.
         // bos_token/eos_token: used by Gemma4 and other templates ({{ bos_token }}).
+        //
+        // `preserve_thinking=true` keeps `reasoning_content` rendered on
+        // EVERY prior assistant turn, not just on the most recent one after
+        // the last user query. Qwen3.5/3.6's template gate is
+        //   `preserve_thinking or loop.index0 > ns.last_query_index`
+        // which means when a NEW user message arrives mid-session,
+        // `last_query_index` jumps forward and all earlier assistant turns
+        // silently drop their `<think>…</think>` blocks on re-render. That
+        // flips the token prefix at the first reasoning boundary, so the
+        // server's tier-2 KV cache misses entirely and the next turn cold-
+        // prefills the full conversation. Pinning `preserve_thinking=true`
+        // keeps the rendered prompt byte-stable turn over turn so
+        // `verify_cache_prefix_direct` can reuse the prior cached prefix.
+        //
+        // Templates that don't read `preserve_thinking` (e.g. Qwen3
+        // non-thinking, LFM2, Gemma4) ignore the extra key — minijinja
+        // treats unknown variables in `context!` as a no-op on access.
         let ctx = context! {
             messages => messages_value,
             tools => tools_value,
             add_generation_prompt => add_generation_prompt,
             enable_thinking => enable_thinking.unwrap_or(true),
+            preserve_thinking => true,
             bos_token => bos_token,
             eos_token => eos_token,
         };
