@@ -2,6 +2,19 @@
  * SessionRegistry -- per-model cache holding AT MOST one live
  * `ChatSession` whose native KV state is currently valid.
  *
+ * **Single-tenant trust boundary.** The tier-2 `prompt_cache_key`
+ * reuse path (opted in via
+ * `MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT=1`) is SAFE ONLY for
+ * single-user / single-tenant deployments. The key is caller-
+ * controlled, so two clients that happen to pick the same raw key
+ * will lease each other's warm sessions — a session-hijack surface
+ * in any multi-tenant setting. Multi-tenant isolation (binding the
+ * key to an authenticated principal) is explicitly OUT OF SCOPE for
+ * this cache; operators who need it must front the server with an
+ * auth proxy that rewrites or namespaces `prompt_cache_key` per
+ * tenant before it reaches this process. See also the comments on
+ * {@link scopePromptCacheKey}.
+ *
  * Design notes:
  *
  *   - **One registry per model.** Composed alongside each registered
@@ -80,8 +93,242 @@
  *     `adopt()` no-op but the native KV would already be wrong.
  */
 
+import { createHash, createHmac, randomBytes } from 'node:crypto';
+
 import type { ChatConfig } from '@mlx-node/core';
 import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
+
+/**
+ * Tier-2 `prompt_cache_key` reuse is OPT-IN via the
+ * `MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT` environment variable.
+ * Default: disabled.
+ *
+ * **Single-tenant only.** The variable name is intentionally explicit:
+ * this flag is SAFE ONLY for deployments where every request that
+ * reaches this process is known to come from the same trusted
+ * principal (a single developer's laptop, a single agent talking to a
+ * local server, etc.). `prompt_cache_key` is a caller-chosen string
+ * with no binding to an authenticated identity — if two clients pick
+ * the same raw key (by accident or on purpose), the second will lease
+ * the first's warm `ChatSession`: same conversation history, same
+ * `cached_tokens` side channel, same sampling state. That is a
+ * session-hijack surface in any multi-tenant deployment.
+ *
+ * Multi-tenant key scoping (binding the key to a per-client principal
+ * or namespace) is EXPLICITLY OUT OF SCOPE for this registry. The
+ * HMAC-scoping applied below only hides the raw key from memory /
+ * dumps — it does not protect against two clients sharing the same
+ * raw input. Operators who need multi-tenant isolation must front
+ * this server with an auth proxy that rewrites `prompt_cache_key`
+ * per-tenant before it reaches the process.
+ *
+ * Read at call time (not cached at module load) so tests can flip the
+ * env via `vi.stubEnv()` between cases without re-importing the module.
+ * The check is a single env-var read plus a string compare — negligible
+ * against the rest of the lookup work.
+ */
+function isPromptCacheKeyEnabled(): boolean {
+  return process.env.MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT === '1';
+}
+
+/**
+ * Module-scoped flag tracking whether the single-tenant-only warning
+ * has been emitted to stderr. We emit ONCE per process to make the
+ * trust boundary impossible to miss during first onboarding without
+ * drowning logs on every request. Reset to `false` by
+ * {@link __resetPromptCacheKeyNonceForTests} so unit tests can re-
+ * exercise the once-per-process path across cases.
+ */
+let singleTenantWarningEmitted = false;
+
+/**
+ * Emit a once-per-process stderr warning the first time a caller
+ * supplies a `prompt_cache_key` while the single-tenant opt-in env is
+ * enabled. Callers MUST invoke this inside the tier-2 accept branch
+ * (after the opt-in gate + min-length gate have both passed) — that
+ * way disabled / too-short / absent keys never trip the warning at
+ * all.
+ *
+ * The message names the env variable explicitly so operators can
+ * `grep` logs → config. Stderr (`console.warn`) instead of stdout so
+ * the warning does not contaminate any JSON response pipeline
+ * redirected to stdout.
+ */
+function warnSingleTenantOnce(): void {
+  if (singleTenantWarningEmitted) return;
+  singleTenantWarningEmitted = true;
+  console.warn(
+    '[mlx-node] WARNING: prompt_cache_key tier-2 reuse is enabled via MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT. ' +
+      'This is SAFE ONLY for single-tenant deployments. In multi-tenant use, clients sharing the same ' +
+      'prompt_cache_key can lease each other\u2019s warm sessions. Do NOT enable in multi-tenant production.',
+  );
+}
+
+/**
+ * Minimum length accepted for a caller-supplied `prompt_cache_key`
+ * before tier-2 scoping. Short keys make trivial guessing collisions
+ * plausible; reject anything shorter than this as if the caller had
+ * not supplied a key at all. Chosen to reject one- / two- / few-byte
+ * values a client might accidentally pass through while still allowing
+ * any reasonable opaque id (UUID prefix, short client token, etc.).
+ */
+const PROMPT_CACHE_KEY_MIN_LENGTH = 8;
+
+/**
+ * Lazily-initialized boot-time nonce used to HMAC every caller-supplied
+ * `prompt_cache_key` before it is stored or looked up. Held in memory
+ * only — never persisted to disk. A process restart invalidates every
+ * tier-2 entry because the next module instance produces a fresh
+ * nonce.
+ *
+ * The nonce makes pre-existing entries unmatchable from outside the
+ * process: an attacker who knows a victim's raw `prompt_cache_key` but
+ * cannot read the nonce from the server's memory also cannot craft a
+ * lookup that collides with the stored HMAC'd key. Combined with the
+ * opt-in gate above, the tier-2 surface is off-by-default and bound to
+ * a server-instance secret when enabled.
+ *
+ * Populated lazily on first use so the cost is not paid when tier-2 is
+ * disabled. Module-scope so it is shared across every `SessionRegistry`
+ * in the process (each per-model registry's HMAC'd keys are still
+ * distinct via their per-registry `entries` map — there is no
+ * cross-model leakage).
+ */
+let cachedNonce: Buffer | null = null;
+
+/** Lazily obtain the module-scoped HMAC nonce. */
+function getNonce(): Buffer {
+  if (cachedNonce === null) {
+    cachedNonce = randomBytes(32);
+  }
+  return cachedNonce;
+}
+
+/**
+ * Test-only hook used by the scoping unit tests to simulate a
+ * server restart: resets both the module-scoped HMAC nonce (so every
+ * previously stored tier-2 key misses) AND the once-per-process
+ * single-tenant stderr warning flag (so a test can re-exercise the
+ * first-call warning path).
+ *
+ * **Not exported from the package's public `index.ts` surface** —
+ * exporting it there would let downstream consumers nuke tier-2
+ * state in production (every stored entry would go unreachable).
+ * Tests reach the function via the deep path
+ * `packages/server/src/session-registry.ts` instead; that import is
+ * deliberately noisy to signal "test-only, do not use from app
+ * code". The `__` prefix is a loud-enough convention for the
+ * ergonomic test path but NOT sufficient for a public package
+ * export.
+ */
+export function __resetPromptCacheKeyNonceForTests(): void {
+  cachedNonce = null;
+  singleTenantWarningEmitted = false;
+  loggedSilentMissKeys.clear();
+}
+
+/**
+ * Normalize and HMAC-scope a caller-supplied `prompt_cache_key` before
+ * it is stored or used for lookup.
+ *
+ * **Single-tenant trust boundary.** HMAC-scoping hides the raw key
+ * from memory dumps and keeps one process instance's stored keys
+ * unreachable from another instance (a restart rerolls the nonce),
+ * but it does NOT protect against two clients supplying the same raw
+ * key — by construction both lookups HMAC to the same scoped key and
+ * share the entry. Multi-tenant isolation is out of scope; see the
+ * module docstring.
+ *
+ * Returns `null` when:
+ *   - The tier-2 feature is disabled
+ *     (`MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT` is not `"1"`).
+ *   - `rawKey` is `null`, `undefined`, or the empty string (callers
+ *     that forget to thread the key must not accidentally opt into
+ *     tier-2 reuse).
+ *   - `rawKey` is shorter than {@link PROMPT_CACHE_KEY_MIN_LENGTH}
+ *     characters, which keeps trivial guessing collisions off the
+ *     table.
+ *
+ * Otherwise returns the first 32 hex chars of
+ * `HMAC-SHA256(cachedNonce, rawKey)` — opaque, server-instance-scoped,
+ * and long enough to preserve the 64-bit entropy floor that the
+ * pre-scoped path relied on for key uniqueness. The first time this
+ * path accepts a key in a given process, {@link warnSingleTenantOnce}
+ * prints a one-time stderr warning naming the env var — that way
+ * operators who flipped the flag during rollout cannot miss the
+ * trust-boundary caveat.
+ */
+function scopePromptCacheKey(rawKey: string | null | undefined): string | null {
+  if (!isPromptCacheKeyEnabled()) return null;
+  if (rawKey == null || rawKey.length < PROMPT_CACHE_KEY_MIN_LENGTH) return null;
+  warnSingleTenantOnce();
+  return createHmac('sha256', getNonce()).update(rawKey).digest('hex').slice(0, 32);
+}
+
+/**
+ * Bounded set of SHA-256-digest prefixes tracking which
+ * `prompt_cache_key` values have already had a silent-miss warning
+ * emitted in this process. Stored as 64-bit hex digests (not raw
+ * strings) so an attacker flooding the endpoint with distinct
+ * attacker-controlled keys cannot drive unbounded memory growth.
+ * FIFO-evicted at {@link LOGGED_SILENT_MISS_KEYS_MAX} entries via the
+ * Map insertion-order guarantee. Reset alongside the nonce / warning
+ * flag in {@link __resetPromptCacheKeyNonceForTests} so unit tests
+ * can re-exercise the once-per-key path.
+ */
+const LOGGED_SILENT_MISS_KEYS_MAX = 256;
+const loggedSilentMissKeys = new Map<string, true>();
+
+/** Hash a raw key to a bounded digest for dedupe storage. */
+function digestSilentMissKey(rawKey: string): string {
+  // 64-bit prefix is enough for dedupe across a 256-entry window.
+  return createHash('sha256').update(rawKey).digest('hex').slice(0, 16);
+}
+
+/**
+ * Emit a once-per-raw-key stderr debug warning when the caller
+ * supplies a non-empty `prompt_cache_key` but at least one tier-2
+ * prerequisite is missing — the env gate is off, or the key is
+ * shorter than {@link PROMPT_CACHE_KEY_MIN_LENGTH}. The silent-miss
+ * fallback (cold-start as if no key were supplied) is the documented
+ * behaviour but is easy to miss during integration; this nudge
+ * surfaces the cause once per distinct key so operators don't have
+ * to grep source to diagnose a flat `X-Session-Cache: fresh`.
+ *
+ * No-op when `rawKey` is null / undefined / empty (the caller did
+ * not ask for tier-2 at all) or when scoping would succeed (the
+ * gate already accepted the key). Called by the endpoint layer
+ * right after it has decided `effectivePromptCacheKey`.
+ */
+export function maybeWarnPromptCacheKeyIneligible(rawKey: string | null | undefined): void {
+  if (rawKey == null || rawKey.length === 0) return;
+  // Happy-path branch: scoping would succeed, no nudge needed.
+  if (isPromptCacheKeyEnabled() && rawKey.length >= PROMPT_CACHE_KEY_MIN_LENGTH) return;
+  const digest = digestSilentMissKey(rawKey);
+  if (loggedSilentMissKeys.has(digest)) return;
+  // FIFO eviction via Map insertion order — bounds memory under
+  // adversarial key flooding while preserving once-per-key semantics
+  // within the recent-key window.
+  if (loggedSilentMissKeys.size >= LOGGED_SILENT_MISS_KEYS_MAX) {
+    const oldest = loggedSilentMissKeys.keys().next().value;
+    if (oldest !== undefined) loggedSilentMissKeys.delete(oldest);
+  }
+  loggedSilentMissKeys.set(digest, true);
+  if (!isPromptCacheKeyEnabled()) {
+    console.warn(
+      `[mlx-node] prompt_cache_key supplied but tier-2 reuse is OFF ` +
+        `(MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT is not set to "1"). ` +
+        `The key will be ignored and this turn will cold-start. ` +
+        `This message is logged once per distinct key.`,
+    );
+    return;
+  }
+  console.warn(
+    `[mlx-node] prompt_cache_key is shorter than ${PROMPT_CACHE_KEY_MIN_LENGTH} chars; tier-2 reuse requires ` +
+      `at least ${PROMPT_CACHE_KEY_MIN_LENGTH} characters. The key will be ignored and this turn will ` +
+      `cold-start. This message is logged once per distinct key.`,
+  );
+}
 
 /** Constructor options for {@link SessionRegistry}. */
 export interface SessionRegistryOptions {
@@ -158,6 +405,23 @@ interface SessionEntry {
    * otherwise let a hit silently reuse a stale warmed prompt.
    */
   instructions: string | null;
+  /**
+   * Stable caller-supplied key identifying the logical conversation
+   * chain for warm-session reuse across stateless turns that do NOT
+   * carry a `previous_response_id`. `null` when the adopting caller
+   * supplied no key (or when the request came through an endpoint
+   * that does not honor the key, e.g. the chain terminated on an
+   * in-`previous_response_id` hop). See
+   * {@link SessionRegistry.getOrCreate} for the tier-2 lookup
+   * semantics.
+   *
+   * The distinction between `null` (no key supplied) and the empty
+   * string `""` (key explicitly set to empty) is load-bearing — tier-2
+   * lookup treats them as different keys so a client that forgets to
+   * thread the key does not accidentally collide with another client
+   * that did set it to empty.
+   */
+  promptCacheKey: string | null;
   /** Unix seconds at which this entry becomes eligible for eviction. */
   expiresAt: number;
 }
@@ -295,60 +559,126 @@ export class SessionRegistry {
    * Always returns a `SessionLookupResult` and always leaves the cache
    * empty after return (single-warm invariant).
    *
-   * On a null id, missing key, expired entry, or prefix-state
-   * mismatch: clear and return `{ session: new ChatSession(model), hit: false }`.
-   * The caller primes / cold-replays from the `ResponseStore` and
-   * re-adopts after the turn commits.
+   * Lookup proceeds in two tiers:
    *
-   * On a hit: the entry is removed and its live session is returned
-   * alongside `hit: true`. Overlapping requests against the same
-   * `previous_response_id` cannot share the same live `ChatSession` —
-   * the first wins, the second misses and cold-replays.
+   *   1. **Tier 1 — `previousResponseId`.** The existing hot path:
+   *      exact id match on a live, non-expired entry whose stored
+   *      `instructions` are byte-equal to `requestedInstructions`. On
+   *      a match the entry is leased out (single-use: removed from the
+   *      map so a concurrent second request cannot share the live
+   *      `ChatSession`). On a miss — unknown id, expired, or
+   *      instructions drift — the method falls through to a FRESH
+   *      session regardless of whether tier 2 would have hit.
    *
-   * `requestedInstructions` is the caller's prefix/system state
-   * (OpenAI `instructions`, Anthropic `system`, or `null`); byte-for-
-   * byte mismatch against the cached entry forces cold replay so
-   * the new prefix is re-primed.
+   *      `previousResponseId` wins unconditionally when supplied. The
+   *      two keys could legitimately identify different conversation
+   *      branches (e.g. a client fork where one arm chose the prev-id
+   *      path and the other arm chose to set `prompt_cache_key`
+   *      without one), so routing the prev-id branch through tier 2
+   *      on miss risks splicing the wrong warm state into the wrong
+   *      chain. Cold-replay is the safe default.
+   *
+   *   2. **Tier 2 — `promptCacheKey`.** Only runs when
+   *      `previousResponseId` is `null`. Stateless agent clients
+   *      (pi-mono, Aider, Codex CLI, Continue, etc.) never use
+   *      `previous_response_id` — they own the conversation history
+   *      client-side and resend the full transcript on every turn —
+   *      so the only way to reuse a warm session across those turns
+   *      is to key on the client-supplied `prompt_cache_key`. Scans
+   *      for any live, non-expired entry whose stored
+   *      `promptCacheKey` is non-null AND byte-equal to the caller's
+   *      `promptCacheKey` AND whose stored `instructions` are byte-
+   *      equal. Empty string is treated as a distinct key from
+   *      `null` — an opt-out sentinel from a client that forgot to
+   *      thread the key must NOT collide with another client that
+   *      did set it to empty. On a match the entry is leased out
+   *      (same single-use semantics as tier 1). On a miss, fall
+   *      through to a fresh session.
    *
    * The `hit` flag drives the `X-Session-Cache` observability header
    * emitted by both `/v1/responses` and `/v1/messages`: when the caller
    * supplied a `previous_response_id`, `hit === true` yields `hit` and
    * `hit === false` yields `cold_replay` (the endpoint then rebuilds
    * from the `ResponseStore` on a fresh session). Requests with no
-   * `previous_response_id` (or the stateless `/v1/messages` endpoint,
-   * which always passes `null`) yield `fresh` regardless of this flag.
+   * `previous_response_id` yield either `fresh` (tier-2 miss) or
+   * `prefix_hit` (tier-2 hit — only classified as such once the
+   * native `cachedTokens > 0` confirms the prefix-cache machinery
+   * actually reused the cached tokens).
    */
-  getOrCreate(previousResponseId: string | null, requestedInstructions: string | null): SessionLookupResult {
+  getOrCreate(
+    previousResponseId: string | null,
+    requestedInstructions: string | null,
+    promptCacheKey: string | null = null,
+  ): SessionLookupResult {
+    // Tier 1: previousResponseId exact match.
+    //
     // Every call is about to overwrite native KV state, so drop any
     // other cached entry now — a later `getOrCreate` must not hand
     // out a wrapper whose assumed state has been stomped. Under the
     // single-warm invariant the map holds at most one entry, so the
     // common case is either "the entry we want" or "nothing".
-    if (previousResponseId === null) {
+    if (previousResponseId !== null) {
+      const entry = this.entries.get(previousResponseId);
+      if (entry === undefined) {
+        this.entries.clear();
+        return { session: this.newSession(), hit: false };
+      }
+      if (entry.expiresAt < nowSec()) {
+        this.entries.clear();
+        return { session: this.newSession(), hit: false };
+      }
+      // Prefix-state mismatch forces cold replay so the new
+      // instructions are re-primed; without this guard, output would
+      // silently depend on cache state instead of request contents.
+      if (entry.instructions !== requestedInstructions) {
+        this.entries.clear();
+        return { session: this.newSession(), hit: false };
+      }
+      // Tier-1 hit: clear and hand the session out as a single-use
+      // lease so a concurrent second request against the same id
+      // cold-replays instead of sharing this live ChatSession. Note
+      // that even on a prev-id tier-1 MISS we do NOT fall through to
+      // tier 2 — see the docstring above for the precedence
+      // rationale.
       this.entries.clear();
-      return { session: this.newSession(), hit: false };
+      return { session: entry.session, hit: true };
     }
-    const entry = this.entries.get(previousResponseId);
-    if (entry === undefined) {
-      this.entries.clear();
-      return { session: this.newSession(), hit: false };
+
+    // Tier 2: promptCacheKey scan (only reached when previousResponseId is null).
+    //
+    // The registry holds at most one entry under the single-warm
+    // invariant, so the "scan" is actually a single lookup — walk the
+    // map, check the one entry if present, hit or miss. A non-null
+    // scoped key on both the request and the entry plus byte-equal
+    // instructions is the match condition.
+    //
+    // SECURITY: raw caller-supplied keys never touch the map. They
+    // are run through {@link scopePromptCacheKey}, which (a) returns
+    // `null` when the tier-2 opt-in env var is unset, (b) enforces a
+    // minimum length, and (c) HMACs the key with a boot-time nonce
+    // held only in this process's memory. Without the opt-in every
+    // tier-2 lookup below immediately misses; with the opt-in,
+    // attackers who cannot read the process-local nonce cannot craft
+    // a lookup that matches a stored entry by guessing the raw key.
+    const scopedKey = scopePromptCacheKey(promptCacheKey);
+    if (scopedKey !== null) {
+      for (const entry of this.entries.values()) {
+        if (entry.expiresAt < nowSec()) continue;
+        if (entry.promptCacheKey === null) continue;
+        if (entry.promptCacheKey !== scopedKey) continue;
+        if (entry.instructions !== requestedInstructions) continue;
+        // Tier-2 hit: clear and lease (same single-warm / single-use
+        // semantics as tier 1).
+        this.entries.clear();
+        return { session: entry.session, hit: true };
+      }
     }
-    if (entry.expiresAt < nowSec()) {
-      this.entries.clear();
-      return { session: this.newSession(), hit: false };
-    }
-    // Prefix-state mismatch forces cold replay so the new
-    // instructions are re-primed; without this guard, output would
-    // silently depend on cache state instead of request contents.
-    if (entry.instructions !== requestedInstructions) {
-      this.entries.clear();
-      return { session: this.newSession(), hit: false };
-    }
-    // Hit: clear and hand the session out as a single-use lease so
-    // a concurrent second request against the same id cold-replays
-    // instead of sharing this live ChatSession.
+
+    // Fall through: fresh session. Clear any leftover entry so a
+    // later lookup cannot hand out a wrapper whose assumed state has
+    // been overwritten by this dispatch.
     this.entries.clear();
-    return { session: entry.session, hit: true };
+    return { session: this.newSession(), hit: false };
   }
 
   /**
@@ -359,12 +689,33 @@ export class SessionRegistry {
    * `instructions` is the prefix/system state used for this turn;
    * stored on the entry and compared on the next `getOrCreate` to
    * detect prefix changes that must force a cold replay.
+   *
+   * `promptCacheKey` is the client-supplied conversation-chain key
+   * that enables the registry's tier-2 lookup for stateless agent
+   * turns that do not carry a `previous_response_id`. `null` /
+   * `undefined` means "no key supplied" — stored verbatim so a
+   * subsequent stateless lookup that also omits the key does NOT
+   * accidentally pick up this entry (only explicit non-null
+   * key-equality on both sides can hit tier 2). See
+   * {@link SessionRegistry.getOrCreate} for the precedence rules.
    */
-  adopt(responseId: string, session: ChatSession<SessionCapableModel>, instructions: string | null): void {
+  adopt(
+    responseId: string,
+    session: ChatSession<SessionCapableModel>,
+    instructions: string | null,
+    promptCacheKey: string | null | undefined = null,
+  ): void {
+    // Scope the caller-supplied key BEFORE storing so a later
+    // `getOrCreate` can only resolve entries via the same opt-in +
+    // HMAC path. When tier-2 reuse is disabled (or the key is too
+    // short / absent) `scopePromptCacheKey` returns `null`, which
+    // disables this entry from ever matching a tier-2 lookup — the
+    // raw caller-supplied key is NEVER stored.
     this.entries.clear();
     this.entries.set(responseId, {
       session,
       instructions,
+      promptCacheKey: scopePromptCacheKey(promptCacheKey ?? null),
       expiresAt: nowSec() + this.ttlSec,
     });
   }

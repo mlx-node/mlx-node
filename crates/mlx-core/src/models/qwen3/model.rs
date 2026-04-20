@@ -592,6 +592,35 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
     }
 }
 
+/// Pure prefix-match check — exposed for unit testing so the invariant
+/// "never returns an intermediate value" can be exercised without
+/// instantiating a full [`Qwen3Inner`] (which requires model weights).
+///
+/// See [`Qwen3Inner::verify_cache_prefix`] for the doc contract.
+fn verify_cache_prefix_pure(
+    tokens: &[u32],
+    cached_token_history: &[u32],
+    has_kv_caches: bool,
+    reuse_cache: bool,
+) -> usize {
+    if !reuse_cache {
+        return 0;
+    }
+    if cached_token_history.is_empty() {
+        return 0;
+    }
+    if tokens.len() < cached_token_history.len() {
+        return 0;
+    }
+    if !tokens.starts_with(cached_token_history) {
+        return 0;
+    }
+    if !has_kv_caches {
+        return 0;
+    }
+    cached_token_history.len()
+}
+
 // ========== Qwen3Inner implementation ==========
 // All these methods run on the dedicated model thread (synchronous, no locks).
 
@@ -721,6 +750,30 @@ impl Qwen3Inner {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         Ok(())
+    }
+
+    /// Check whether `tokens` shares a prefix with `self.cached_token_history`.
+    ///
+    /// Returns `0` on cache miss (caller must reset caches before prefill) or
+    /// `cached_token_history.len()` on exact-append hit (new prompt strictly
+    /// extends cached history). **Never returns an intermediate value.** This
+    /// invariant keeps the function safe to call on any cache type (including
+    /// hypothetical recurrent-state layers) because no mid-sequence rewind
+    /// ever happens. Qwen3 Dense is text-only, so there is no image-key gate.
+    ///
+    /// Also verifies that the parallel KV-handle vectors
+    /// (`cached_kv_keys` / `cached_kv_values`) are actually populated — an
+    /// empty `cached_token_history` is always paired with empty handle
+    /// vectors via [`Self::reset_kv_caches_sync`], but the extra length
+    /// check is cheap and future-proofs against any write-back path that
+    /// forgets to clear one side.
+    fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
+        verify_cache_prefix_pure(
+            tokens,
+            &self.cached_token_history,
+            !self.cached_kv_keys.is_empty() && !self.cached_kv_values.is_empty(),
+            reuse_cache,
+        )
     }
 
     fn paged_cache_stats_sync(&self) -> Option<PagedCacheStats> {
@@ -1408,52 +1461,46 @@ impl Qwen3Inner {
         )?;
 
         // === Cache reuse: prefix verification ===
+        //
+        // `verify_cache_prefix` returns 0 or the full cached length only —
+        // never an intermediate value. On a miss (0) we reset the KV
+        // caches here (moved in from the outer session-start reset) and
+        // prefill the whole prompt. On a hit we skip the reset entirely
+        // and prefill only the delta tail.
+        let cached_prefix_len = self.verify_cache_prefix(&token_ids_vec, reuse_cache);
         let (initial_kv_keys, initial_kv_values, initial_cache_idx, prefill_input_ids) =
-            if reuse_cache {
-                let cached = &self.cached_token_history;
-                let clen = cached.len();
-                let plen = if !cached.is_empty()
-                    && token_ids_vec.len() >= clen
-                    && token_ids_vec[..clen] == cached[..]
-                {
-                    clen
+            if cached_prefix_len > 0 {
+                let keys = self.cached_kv_keys.clone();
+                let vals = self.cached_kv_values.clone();
+                let idx = self.cached_cache_idx;
+                let delta_tokens = &token_ids_vec[cached_prefix_len..];
+                let delta_ids = if delta_tokens.is_empty() {
+                    None
                 } else {
-                    0
+                    Some(MxArray::from_uint32(
+                        delta_tokens,
+                        &[1, delta_tokens.len() as i64],
+                    )?)
                 };
-
-                if plen > 0 {
-                    let keys = self.cached_kv_keys.clone();
-                    let vals = self.cached_kv_values.clone();
-                    let idx = self.cached_cache_idx;
-                    let delta_tokens = &token_ids_vec[plen..];
-                    let delta_ids = if delta_tokens.is_empty() {
-                        None
-                    } else {
-                        Some(MxArray::from_uint32(
-                            delta_tokens,
-                            &[1, delta_tokens.len() as i64],
-                        )?)
-                    };
-                    info!(
-                        "Cache hit: prefix_len={}, delta_tokens={}, cache_idx={}",
-                        plen,
-                        delta_tokens.len(),
-                        idx
-                    );
-                    (Some(keys), Some(vals), idx, delta_ids)
-                } else {
-                    if clen > 0 {
-                        info!(
-                            "Cache miss: cached {} tokens, new {} tokens — full prefill",
-                            clen,
-                            token_ids_vec.len()
-                        );
-                    }
-                    let input_ids =
-                        MxArray::from_uint32(&token_ids_vec, &[1, token_ids_vec.len() as i64])?;
-                    (None, None, 0, Some(input_ids))
-                }
+                info!(
+                    "Cache hit: prefix_len={}, delta_tokens={}, cache_idx={}",
+                    cached_prefix_len,
+                    delta_tokens.len(),
+                    idx
+                );
+                (Some(keys), Some(vals), idx, delta_ids)
             } else {
+                // Cache miss — reset before full prefill. This is the
+                // reset that was previously done unconditionally at the
+                // outer `chat_session_start_sync` entry point.
+                if reuse_cache && !self.cached_token_history.is_empty() {
+                    info!(
+                        "Cache miss: cached {} tokens, new {} tokens — full prefill",
+                        self.cached_token_history.len(),
+                        token_ids_vec.len()
+                    );
+                }
+                self.reset_kv_caches_sync()?;
                 let input_ids =
                     MxArray::from_uint32(&token_ids_vec, &[1, token_ids_vec.len() as i64])?;
                 (None, None, 0, Some(input_ids))
@@ -1823,6 +1870,7 @@ impl Qwen3Inner {
             finish_reason,
             raw_text,
             performance,
+            cached_tokens: cached_prefix_len as u32,
         })
     }
 
@@ -1887,52 +1935,44 @@ impl Qwen3Inner {
         let mut first_token_instant: Option<std::time::Instant> = None;
 
         // === Cache reuse: prefix verification ===
+        //
+        // Mirrors `chat_sync_core`. `verify_cache_prefix` returns 0 or
+        // the full cached length only — never an intermediate value. On
+        // a miss (0) we reset the KV caches here (moved in from the
+        // outer `chat_stream_session_start_sync` reset) and prefill the
+        // whole prompt. On a hit we skip the reset entirely and prefill
+        // only the delta tail.
+        let cached_prefix_len = self.verify_cache_prefix(&token_ids_vec, reuse_cache);
         let (initial_kv_keys, initial_kv_values, initial_cache_idx, prefill_input_ids) =
-            if reuse_cache {
-                let cached = &self.cached_token_history;
-                let clen = cached.len();
-                let plen = if !cached.is_empty()
-                    && token_ids_vec.len() >= clen
-                    && token_ids_vec[..clen] == cached[..]
-                {
-                    clen
+            if cached_prefix_len > 0 {
+                let keys = self.cached_kv_keys.clone();
+                let vals = self.cached_kv_values.clone();
+                let idx = self.cached_cache_idx;
+                let delta_tokens = &token_ids_vec[cached_prefix_len..];
+                let delta_ids = if delta_tokens.is_empty() {
+                    None
                 } else {
-                    0
+                    Some(MxArray::from_uint32(
+                        delta_tokens,
+                        &[1, delta_tokens.len() as i64],
+                    )?)
                 };
-
-                if plen > 0 {
-                    let keys = self.cached_kv_keys.clone();
-                    let vals = self.cached_kv_values.clone();
-                    let idx = self.cached_cache_idx;
-                    let delta_tokens = &token_ids_vec[plen..];
-                    let delta_ids = if delta_tokens.is_empty() {
-                        None
-                    } else {
-                        Some(MxArray::from_uint32(
-                            delta_tokens,
-                            &[1, delta_tokens.len() as i64],
-                        )?)
-                    };
-                    info!(
-                        "Stream cache hit: prefix_len={}, delta_tokens={}, cache_idx={}",
-                        plen,
-                        delta_tokens.len(),
-                        idx
-                    );
-                    (Some(keys), Some(vals), idx, delta_ids)
-                } else {
-                    if clen > 0 {
-                        info!(
-                            "Stream cache miss: cached {} tokens, new {} tokens — full prefill",
-                            clen,
-                            token_ids_vec.len()
-                        );
-                    }
-                    let input_ids =
-                        MxArray::from_uint32(&token_ids_vec, &[1, token_ids_vec.len() as i64])?;
-                    (None, None, 0, Some(input_ids))
-                }
+                info!(
+                    "Stream cache hit: prefix_len={}, delta_tokens={}, cache_idx={}",
+                    cached_prefix_len,
+                    delta_tokens.len(),
+                    idx
+                );
+                (Some(keys), Some(vals), idx, delta_ids)
             } else {
+                if reuse_cache && !self.cached_token_history.is_empty() {
+                    info!(
+                        "Stream cache miss: cached {} tokens, new {} tokens — full prefill",
+                        self.cached_token_history.len(),
+                        token_ids_vec.len()
+                    );
+                }
+                self.reset_kv_caches_sync()?;
                 let input_ids =
                     MxArray::from_uint32(&token_ids_vec, &[1, token_ids_vec.len() as i64])?;
                 (None, None, 0, Some(input_ids))
@@ -2226,6 +2266,7 @@ impl Qwen3Inner {
                     prompt_tokens: None,
                     reasoning_tokens: None,
                     raw_text: None,
+                    cached_tokens: None,
                     performance: None,
                     is_reasoning: Some(last_is_reasoning),
                 }),
@@ -2269,6 +2310,10 @@ impl Qwen3Inner {
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
                 raw_text: Some(text),
+                // Start path: report the matched prefix length from
+                // `verify_cache_prefix`. Zero on a miss, full cached
+                // length on an exact-append hit.
+                cached_tokens: Some(cached_prefix_len as u32),
                 performance: perf_metrics,
                 is_reasoning: None,
             }),
@@ -2312,12 +2357,14 @@ impl Qwen3Inner {
             napi::Error::from_reason("Tokenizer missing <|im_end|> special token")
         })?;
 
-        // Full reset: the session-start path always begins from a clean
-        // state. This matches the documented contract that the session is
-        // owned end-to-end by the `chat_session_*` surface and
-        // intentionally invalidates any prior cache.
-        self.reset_kv_caches_sync()?;
-
+        // Prefix-reuse: do NOT reset caches here. `chat_sync_core`'s
+        // `verify_cache_prefix` decides per turn whether to (a) reuse
+        // the live KV cache when the new prompt strictly extends the
+        // previously cached token history, or (b) reset+reprefill on a
+        // divergence miss. This lets stateless agent clients that resend
+        // the full transcript on every turn (pi-mono, Aider, Codex CLI,
+        // Claude Code, etc.) hit the warm cache without the server
+        // maintaining `previous_response_id` bookkeeping.
         self.chat_sync_core(messages, config, im_end_id)
     }
 
@@ -2380,6 +2427,11 @@ impl Qwen3Inner {
         // Build full token history = cached_history + delta. Used for
         // penalty context AND to rebuild `cached_token_history` on save.
         let mut full_token_history = self.cached_token_history.clone();
+        // The entire cached history is reused on the delta path — this
+        // is the whole point of the session API. Record it for the
+        // `cached_tokens` NAPI field so callers (server + agents) can
+        // surface the prefix-hit savings.
+        let cached_prefix_len = self.cached_token_history.len();
         full_token_history.extend(delta_tokens.iter().copied());
 
         // Snapshot for save: the "prior history + delta" we prefilled.
@@ -2614,7 +2666,7 @@ impl Qwen3Inner {
 
         let reasoning_tokens = reasoning_tracker.reasoning_token_count();
 
-        chat_common::finalize_chat_result(
+        let mut result = chat_common::finalize_chat_result(
             &tokenizer,
             &generated_tokens,
             finish_reason,
@@ -2625,7 +2677,9 @@ impl Qwen3Inner {
             thinking_enabled,
             prompt_token_count,
             reasoning_tokens,
-        )
+        )?;
+        result.cached_tokens = cached_prefix_len as u32;
+        Ok(result)
     }
 
     /// Session-based chat continuation via a plain user message string.
@@ -2746,12 +2800,10 @@ impl Qwen3Inner {
             }
         };
 
-        // Full reset: the session-start path always begins clean.
-        if let Err(e) = self.reset_kv_caches_sync() {
-            let _ = stream_tx.send(Err(e));
-            return;
-        }
-
+        // Prefix-reuse: do NOT reset caches here. See the
+        // `chat_session_start_sync` comment — `chat_stream_sync_core`'s
+        // `verify_cache_prefix` decides per turn whether to reuse the
+        // live KV cache or reset+reprefill on divergence.
         let result = self.chat_stream_sync_core(messages, config, im_end_id, &cb, &cancelled);
         if let Err(e) = result {
             let _ = stream_tx.send(Err(e));
@@ -2946,6 +2998,11 @@ impl Qwen3Inner {
         let report_perf = p.report_performance;
 
         // Build full token history = cached_history + delta.
+        // Capture `prior_cached_len` BEFORE the extend — this is the
+        // reused-prefix length reported on the terminal ChatStreamChunk's
+        // `cached_tokens` field (mirrors the non-streaming delta path's
+        // `cached_tokens` in `ChatResult`).
+        let prior_cached_len = self.cached_token_history.len() as u32;
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
         let save_tokens = full_token_history.clone();
@@ -3178,6 +3235,7 @@ impl Qwen3Inner {
                     prompt_tokens: None,
                     reasoning_tokens: None,
                     raw_text: None,
+                    cached_tokens: None,
                     performance: None,
                     is_reasoning: Some(last_is_reasoning),
                 }),
@@ -3220,6 +3278,11 @@ impl Qwen3Inner {
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
                 raw_text: Some(full_text),
+                // Delta path reuses the full prior history by construction
+                // — report `prior_cached_len` (captured before the
+                // `self.cached_token_history` extend above) as the
+                // authoritative cached-prefix length.
+                cached_tokens: Some(prior_cached_len),
                 performance: perf_metrics,
                 is_reasoning: None,
             }),
@@ -5876,6 +5939,164 @@ mod tests {
             tokens2.extend_from_slice(&pattern);
         }
         assert_eq!(check_repetition_cutoff(&tokens2, 16, 3, 64), None);
+    }
+
+    // -------------------------------------------------------------
+    // verify_cache_prefix invariant tests
+    //
+    // The prefix-match MUST return either `0` or the full cached
+    // length — never an intermediate value. This invariant is what
+    // keeps the reset-on-miss refactor safe: a non-zero return
+    // always means "the new prompt strictly extends the cached
+    // history" so caches can be reused as-is without any
+    // mid-sequence rewind (Qwen3 Dense has no GDN state today, but
+    // the same invariant future-proofs any recurrent sibling).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn test_verify_cache_prefix_disabled() {
+        let cached = vec![1u32, 2, 3];
+        // reuse_cache=false short-circuits to 0 regardless of input.
+        assert_eq!(
+            verify_cache_prefix_pure(&[1, 2, 3, 4], &cached, true, false),
+            0
+        );
+    }
+
+    #[test]
+    fn test_verify_cache_prefix_empty_cache() {
+        // Empty cached history — cold start, must return 0 so caller
+        // proceeds with a fresh prefill.
+        assert_eq!(verify_cache_prefix_pure(&[1, 2, 3], &[], false, true), 0);
+        assert_eq!(verify_cache_prefix_pure(&[1, 2, 3], &[], true, true), 0);
+    }
+
+    #[test]
+    fn test_verify_cache_prefix_append_hit() {
+        let cached = vec![1u32, 2, 3];
+        // Append: new prompt strictly extends cached history.
+        assert_eq!(
+            verify_cache_prefix_pure(&[1, 2, 3, 4, 5], &cached, true, true),
+            3
+        );
+        // Exact-match (zero delta): still a "hit" — returns full
+        // cached length. Caller is responsible for deciding whether
+        // to re-run the last token for logits.
+        assert_eq!(verify_cache_prefix_pure(&[1, 2, 3], &cached, true, true), 3);
+    }
+
+    #[test]
+    fn test_verify_cache_prefix_divergence_miss() {
+        let cached = vec![1u32, 2, 3];
+        // Byte-divergent at position 2 — never return an
+        // intermediate value (i.e., NOT 2), must return 0.
+        assert_eq!(
+            verify_cache_prefix_pure(&[1, 2, 9, 4], &cached, true, true),
+            0
+        );
+        // Completely different — 0.
+        assert_eq!(verify_cache_prefix_pure(&[9, 9, 9], &cached, true, true), 0);
+    }
+
+    #[test]
+    fn test_verify_cache_prefix_shorter_prompt() {
+        let cached = vec![1u32, 2, 3, 4, 5];
+        // Prompt shorter than cached history — impossible to be a
+        // strict extension. Return 0.
+        assert_eq!(verify_cache_prefix_pure(&[1, 2, 3], &cached, true, true), 0);
+    }
+
+    #[test]
+    fn test_verify_cache_prefix_no_kv_caches() {
+        let cached = vec![1u32, 2, 3];
+        // `cached_token_history` set but KV handle vectors empty —
+        // defensive guard. Must return 0 so caller falls into the
+        // miss branch (reset + full prefill).
+        assert_eq!(
+            verify_cache_prefix_pure(&[1, 2, 3, 4], &cached, false, true),
+            0
+        );
+    }
+
+    #[test]
+    fn test_verify_cache_prefix_never_intermediate() {
+        // Exhaustive invariant: for every possible prompt up to some
+        // length the return value is either 0 or cached.len() — never
+        // anything else.
+        let cached = vec![1u32, 2, 3, 4];
+        let cached_len = cached.len();
+        // Try many prompts: random prefixes, random extensions,
+        // random divergences.
+        let test_prompts: Vec<Vec<u32>> = vec![
+            vec![],
+            vec![1],
+            vec![1, 2],
+            vec![1, 2, 3],
+            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4, 5],
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            vec![9, 2, 3, 4],    // diverges at 0
+            vec![1, 9, 3, 4],    // diverges at 1
+            vec![1, 2, 9, 4],    // diverges at 2
+            vec![1, 2, 3, 9],    // diverges at 3
+            vec![1, 2, 3, 9, 5], // diverges at 3 then extended
+        ];
+        for prompt in test_prompts {
+            let result = verify_cache_prefix_pure(&prompt, &cached, true, true);
+            assert!(
+                result == 0 || result == cached_len,
+                "verify_cache_prefix returned intermediate value {result} for prompt {prompt:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------
+    // chat_session_start reuse-on-append integration tests
+    //
+    // These require a loaded Qwen3 model (weights + tokenizer) so
+    // they are marked #[ignore] and stay out of the default `cargo
+    // test` run. Run explicitly with:
+    //
+    //   cargo test -p mlx-core --release \
+    //       qwen3_chat_session_prefix_reuse -- --ignored --nocapture
+    //
+    // Both tests exercise the reset-on-miss refactor end-to-end:
+    //
+    //   * append-hit: two back-to-back `chat_session_start_sync`
+    //     calls where the second's tokens = first's tokens + delta.
+    //     Assert `cached_tokens > 0` on the second result, only the
+    //     delta re-prefilled, and generation matches a fresh-session
+    //     reference.
+    //
+    //   * divergence-miss: two calls with divergent histories.
+    //     Assert `cached_tokens == 0` on the second result, full
+    //     reset + prefill, and generation is unchanged from a
+    //     cold-start call.
+    //
+    // Wiring these up requires `Qwen3Inner::new_from_weights` plus a
+    // tokenizer — follow the pattern in `__test__/models/*.test.ts`
+    // once this PR lands. Left as TODOs so the shape is documented.
+    // -------------------------------------------------------------
+
+    #[ignore = "Requires a loaded Qwen3 model (tokenizer + weights) — see comment"]
+    #[test]
+    fn qwen3_chat_session_prefix_reuse_append_hit() {
+        // TODO: build a test harness that loads Qwen3-0.6B or similar,
+        // runs chat_session_start once with messages A, then runs it
+        // again with messages A + user_turn_B, and asserts
+        // `cached_tokens` equals the token length of the first turn's
+        // `cached_token_history`. Also assert generated text is
+        // deterministic under temperature=0 and equals a reference
+        // computed from a fresh session on A + B.
+    }
+
+    #[ignore = "Requires a loaded Qwen3 model (tokenizer + weights) — see comment"]
+    #[test]
+    fn qwen3_chat_session_prefix_reuse_divergence_miss() {
+        // TODO: same harness, but second call uses divergent messages
+        // A' that share no prefix with A beyond the system prompt
+        // template header. Assert `cached_tokens == 0` and that
+        // generation matches a fresh cold-start run.
     }
 
     #[test]

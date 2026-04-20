@@ -20,6 +20,7 @@ function makeMockModel(): SessionCapableModel {
     reasoningTokens: 0,
     finishReason: 'eos',
     rawText: 'ok',
+    cachedTokens: 0,
   };
   const finalEvent = {
     text: 'ok',

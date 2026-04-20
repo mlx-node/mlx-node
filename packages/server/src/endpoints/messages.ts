@@ -2,9 +2,18 @@
  * POST /v1/messages — stateless Anthropic Messages API.
  *
  * Every request carries the full conversation in `req.messages`. We allocate
- * a fresh `ChatSession` per request via `SessionRegistry.getOrCreate(null)`,
- * prime with the mapped history, and run `startFromHistory[Stream]`. No
- * adopt/drop: the session's lifetime is this single call.
+ * a fresh `ChatSession` per request via `SessionRegistry.getOrCreate(null,
+ * …, null)`, prime with the mapped history, and run `startFromHistory[Stream]`.
+ * No adopt/drop on that path — the session's lifetime is the single call.
+ *
+ * The `prompt_cache_key` prefix-reuse feature is NOT exposed on this endpoint
+ * — the field has been removed from `AnthropicMessagesRequest` so clients
+ * are not misled into believing they are getting prefix reuse. The tier-2
+ * lookup will be re-enabled (together with advertising the request field)
+ * once native KV can be preserved across `reset() + primeHistory()` on the
+ * stateless per-turn dispatch this endpoint performs. For /v1/responses-
+ * style prefix reuse today, clients should use `prompt_cache_key` on
+ * `/v1/responses` instead.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -390,6 +399,24 @@ async function runSessionNonStreaming(
   messages: ChatMessage[],
   config: ChatConfig,
 ): Promise<ChatResult> {
+  // Tier-2 lookup is currently disabled on `/v1/messages` (see the
+  // block comment around `sessionReg.getOrCreate` in the handler),
+  // so `session` is always a fresh `turns === 0` wrapper from
+  // `newSession()` and the `turns > 0` branch below never fires
+  // today. The `turns === 0` branch still needs an explicit
+  // `reset()` because a fresh JS session does NOT imply a fresh
+  // native cache — the underlying `SessionCapableModel` is shared
+  // across `ChatSession` lifetimes, and its native
+  // `cached_token_history` persists across requests. After the
+  // native refactor moved the unconditional wipe out of
+  // `chat_session_start_sync` into the miss branch of
+  // `verify_cache_prefix_direct`, a fresh-session cold replay that
+  // did not explicitly reset would silently reuse whatever prefix
+  // happened to overlap with the previous request — a cross-request
+  // cache-affinity side channel. Only registry HITS are authorized
+  // for cache reuse, and this endpoint never produces one, so every
+  // cold replay must wipe.
+  await session.reset();
   session.primeHistory(messages);
   return await session.startFromHistory(config);
 }
@@ -405,12 +432,17 @@ interface MessagesStreamingOutcome {
   wasCommitted: () => boolean;
 }
 
-function runSessionStreaming(
+async function runSessionStreaming(
   session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
   config: ChatConfig,
   signal: AbortSignal | undefined,
-): MessagesStreamingOutcome {
+): Promise<MessagesStreamingOutcome> {
+  // See `runSessionNonStreaming` for the full rationale. Always
+  // `reset()` before `primeHistory()` to wipe the shared native
+  // model's `cached_token_history` — a fresh JS session does not
+  // imply a fresh native cache.
+  await session.reset();
   session.primeHistory(messages);
   const initialTurns = session.turns;
   return {
@@ -619,14 +651,39 @@ export async function handleCreateMessage(
           return;
         }
 
-        const session = sessionReg.getOrCreate(null, requestedSystem).session;
-
-        // `X-Session-Cache` observability header: `/v1/messages` is
-        // stateless — every request allocates a fresh `ChatSession` via
-        // `getOrCreate(null, …)` — so the status is always `fresh`. Emit
-        // it anyway to keep the header contract uniform with
-        // `/v1/responses`, and set it before any `writeHead` / SSE
-        // `beginSSE` so it lands on both JSON and SSE responses.
+        // Tier-2 lookup disabled on /v1/messages until native KV can be
+        // preserved across `reset() + primeHistory()`.
+        //
+        // The endpoint's `runSession*` helpers still `session.reset()`
+        // on every turn (since `primeHistory` refuses to overwrite a
+        // `turns > 0` session), and `ChatSession.reset()` wipes BOTH
+        // JS-side state AND the underlying model's native KV cache.
+        // Passing any `prompt_cache_key` into `sessionReg.getOrCreate`
+        // would therefore:
+        //   1. On a tier-2 hit, lease out the one warm session from the
+        //      single-warm registry (entries.clear() runs inside
+        //      getOrCreate), immediately reset() it — wiping the very
+        //      KV state the tier-2 hit exists to preserve — and NEVER
+        //      re-adopt(), because this endpoint does not assign
+        //      response ids or call `sessionReg.adopt`. Net effect: a
+        //      /v1/messages request with a matching `prompt_cache_key`
+        //      silently STEALS and destroys the /v1/responses
+        //      endpoint's warm session while gaining no reuse itself.
+        //   2. On a tier-2 miss, `entries.clear()` in the fallthrough
+        //      branch still evicts any entry keyed to a different
+        //      prompt_cache_key — same destructive side effect.
+        // Passing `null` here keeps the registry untouched for other
+        // clients and makes this endpoint a pure cold-start path.
+        //
+        // The `prompt_cache_key` field has been removed from the
+        // `AnthropicMessagesRequest` public type — advertising a
+        // field the handler silently ignores misled clients into
+        // believing they were getting prefix reuse. Re-adding both
+        // the field and this lookup becomes a single-PR change once
+        // native KV can survive a `reset()` + `primeHistory()`
+        // round-trip on this endpoint.
+        const lookup = sessionReg.getOrCreate(null, requestedSystem, null);
+        const session = lookup.session;
         res.setHeader('X-Session-Cache', 'fresh');
 
         // Outer catch branches on `responseMode` (not `res.headersSent`, which
@@ -636,12 +693,19 @@ export async function handleCreateMessage(
 
         try {
           if (body.stream === true) {
-            const outcome = runSessionStreaming(session, messages, config, streamSignal);
+            const outcome = await runSessionStreaming(session, messages, config, streamSignal);
             await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq, visibility);
           } else {
             // Native `chatSessionStart` has no AbortSignal yet — disconnect handling
             // lives inside `handleNonStreaming` / `endJson`.
             const result = await runSessionNonStreaming(session, messages, config);
+            // X-Cached-Tokens intentionally not emitted here: the
+            // tier-2 lookup is disabled above, the session is reset()
+            // before every turn, and the runSession* helpers never
+            // resume an existing conversation — so `result.cachedTokens`
+            // is always 0 on this endpoint. Flip this back on (together
+            // with the tier-2 lookup) once native KV can survive the
+            // reset() + primeHistory() round-trip.
             await handleNonStreaming(res, result, body, visibility);
           }
         } catch (err) {

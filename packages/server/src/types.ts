@@ -118,6 +118,57 @@ export interface ResponsesAPIRequest {
   previous_response_id?: string;
   store?: boolean;
   /**
+   * Stable caller-supplied key identifying the logical conversation for
+   * warm-session reuse across stateless turns. Stateless agent clients
+   * (pi-mono, Aider, Codex CLI, etc.) own the conversation history
+   * client-side and resend the full transcript on every turn — they do
+   * NOT use `previous_response_id` — so the server-side
+   * `SessionRegistry` can only reuse a warm `ChatSession` across those
+   * turns if the client threads a stable key through every request.
+   *
+   * When present (and `previous_response_id` is absent), the registry's
+   * tier-2 lookup scans for a still-live entry whose `promptCacheKey`
+   * matches and whose `instructions` are byte-equal to this request's
+   * — on a match it leases the warm session out, so the native prefix-
+   * cache verifier (`verify_cache_prefix_direct`) can skip the re-
+   * prefill of the conversation history and only prefill the newly
+   * appended user turn. When absent, each stateless turn cold-starts.
+   *
+   * `previous_response_id` unconditionally wins when both are set —
+   * the two keys may identify different conversation branches, so
+   * picking the prompt_cache_key branch on a prev-id miss would risk
+   * routing the request through the wrong warm state. Fall through to
+   * fresh on prev-id miss instead.
+   *
+   * **Prerequisites (ALL must hold, else the field is a silent no-op):**
+   *
+   *   1. The server process must have
+   *      `MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT=1` set in its
+   *      environment. This is OFF by default because the feature
+   *      assumes a single-tenant trust boundary: the key is caller-
+   *      controlled, so two clients picking the same raw key will
+   *      lease each other's warm sessions. Do NOT enable in multi-
+   *      tenant production. The first request that successfully
+   *      engages tier-2 in a given process also emits a one-time
+   *      stderr warning naming the env var — grep logs for
+   *      `[mlx-node] WARNING: prompt_cache_key tier-2 reuse` if in
+   *      doubt.
+   *   2. The key must be at least 8 characters. Shorter values
+   *      (including the empty string) are silently treated as if no
+   *      key were supplied — trivial guessing collisions on short
+   *      keys would be a real risk even in the single-tenant case.
+   *   3. `previous_response_id` must NOT be set on the same request.
+   *      Prev-id takes precedence; tier-2 never runs when both are
+   *      present.
+   *
+   * When any prerequisite fails the server FALLS BACK silently to a
+   * cold-start for this turn — no error, no 4xx. Integrators who
+   * depend on warm reuse should verify via the `X-Session-Cache`
+   * response header: `prefix_hit` means tier-2 engaged AND the
+   * native prefix verifier reused tokens; `fresh` means no reuse.
+   */
+  prompt_cache_key?: string;
+  /**
    * OpenAI-reserved `metadata` slot, repurposed here to carry MLX-Node
    * extensions. Today this only exposes `retention_seconds` as a
    * per-request override of `ServerConfig.responseRetentionSec`;
@@ -183,6 +234,21 @@ export interface ResponseUsage {
   output_tokens: number;
   output_tokens_details: { reasoning_tokens: number };
   total_tokens: number;
+  /**
+   * Mirrors the upstream OpenAI Responses API `usage.input_tokens_details`
+   * object. Populated only when the native dispatch reports
+   * `cachedTokens > 0` — a non-zero value means that many prompt tokens
+   * were served from the reused KV-cache prefix on this turn. The
+   * `X-Cached-Tokens` response header carries the same number on
+   * non-streaming responses, but SSE flushes its headers before the
+   * native prefix verifier runs, so streaming clients have to read the
+   * value out of the terminal `response.completed` event's
+   * `usage.input_tokens_details.cached_tokens` field to verify
+   * cache-reuse (see Round 5 Fix #3: streaming `X-Session-Cache` is
+   * documented as non-authoritative on the streaming path — this
+   * in-band number is the authoritative signal).
+   */
+  input_tokens_details?: { cached_tokens: number };
 }
 
 // ---------------------------------------------------------------------------

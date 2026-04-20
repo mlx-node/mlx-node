@@ -28,6 +28,7 @@ function makeChatResult(overrides: Record<string, unknown> = {}) {
     reasoningTokens: 0,
     finishReason: 'stop',
     rawText: 'Hello!',
+    cachedTokens: 0,
     performance: undefined,
     ...overrides,
   };

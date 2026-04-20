@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http';
 
 import type { ChatResult, ToolCallResult } from '@mlx-node/core';
-import type { SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
@@ -121,6 +121,7 @@ function makeChatResult(overrides: Partial<ChatResult> = {}): ChatResult {
     reasoningTokens: 0,
     finishReason: 'stop',
     rawText: 'Hello!',
+    cachedTokens: 0,
     performance: undefined,
     ...overrides,
   };
@@ -2128,6 +2129,67 @@ describe('handleCreateMessage', () => {
       // header lands alongside them because it was set BEFORE
       // `writeHead` fired.
       expect(getHeaders()['content-type']).toBe('text/event-stream');
+    });
+
+    it('messages endpoint does NOT steal a warm tier-2 session keyed to the same prompt_cache_key', async () => {
+      // Regression test for the destructive tier-2 leak.
+      //
+      // OLD bug: passing `body.prompt_cache_key` to
+      // `sessionReg.getOrCreate` would (on tier-2 hit) LEASE the
+      // actual warm `ChatSession` wrapper out of the registry. The
+      // `/v1/messages` handler then ran the turn through THAT
+      // wrapper — calling `warmSession.reset()` before
+      // `warmSession.primeHistory(...)` — silently stealing the
+      // `/v1/responses` endpoint's warm session and destroying its
+      // JS-side state, without ever calling `sessionReg.adopt()` to
+      // put it back.
+      //
+      // FIX: `/v1/messages` passes `null` for the cache key so
+      // tier-2 lookup is disabled. The handler is handed a FRESH
+      // `ChatSession` (same single-warm native KV regardless — the
+      // invariant still requires `entries.clear()` in the fallthrough),
+      // and the pre-seeded warm wrapper's JS-side state is NEVER
+      // touched. That means `warmSession.primeHistory` and
+      // `warmSession.reset` never fire on this request.
+      //
+      // The entries.clear() in the fallthrough still evicts the
+      // pre-seeded entry from the registry (it must — the native KV
+      // is shared across sessions through the same ModelRegistry
+      // binding, and the handler is about to advance it). What the
+      // fix PREVENTS is the active use of someone else's `ChatSession`
+      // wrapper.
+      const mockModel = createMockModel();
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+      const warmSession = new ChatSession(mockModel);
+      const primeSpy = vi.spyOn(warmSession, 'primeHistory');
+      const resetSpy = vi.spyOn(warmSession, 'reset');
+      sessionReg.adopt('resp_pre_seed', warmSession, null, 'chain-xyz');
+
+      const { res, getStatus } = createMockRes();
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          // Extension field — forward-compat no-op on /v1/messages
+          // until native KV can survive reset() + primeHistory().
+          prompt_cache_key: 'chain-xyz',
+        } as Parameters<typeof handleCreateMessage>[1],
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      // The pre-seeded warm wrapper was NOT handed out to the
+      // handler — neither its primeHistory nor its reset method was
+      // invoked. Contrast with the OLD buggy behavior where both
+      // would have fired during the cold-reset-and-reprime cycle
+      // inside `runSessionNonStreaming`.
+      expect(primeSpy).not.toHaveBeenCalled();
+      expect(resetSpy).not.toHaveBeenCalled();
     });
   });
 

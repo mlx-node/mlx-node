@@ -23,7 +23,15 @@ import { Writable } from 'node:stream';
 import type { ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { createHandler, ModelRegistry } from '@mlx-node/server';
-import { describe, expect, it, vi } from 'vite-plus/test';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+
+// Test-only deep import. `__resetPromptCacheKeyNonceForTests` is
+// intentionally NOT exported from `@mlx-node/server`'s public surface;
+// exposing it there would let downstream consumers invalidate every
+// live tier-2 entry in production. Tests reach it via the source path
+// so the "this is internal, do not use" signal is loud at the call
+// site.
+import { __resetPromptCacheKeyNonceForTests } from '../../packages/server/src/session-registry.js';
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -199,6 +207,7 @@ function makeChatResult(overrides: Partial<ChatResult> = {}): ChatResult {
     reasoningTokens: 0,
     finishReason: 'stop',
     rawText: 'Hello!',
+    cachedTokens: 0,
     performance: undefined,
     ...overrides,
   };
@@ -10851,16 +10860,22 @@ describe('createHandler', () => {
       expect(getHeaders()['content-type']).toBe('text/event-stream');
     });
 
-    it('warm-session continuation with single assistant-role input falls back to cold replay instead of 500', async () => {
+    it('warm-session continuation with single assistant-role input takes the full-history replay path (warm tier-1 hit)', async () => {
       // Regression: prior to the hot-path eligibility gate, a warm hit
       // plus a single assistant continuation threw
       // `unsupported last message role on hot path`. `mapRequest`
       // explicitly accepts role=assistant / role=system continuation
       // items (they just append to the rebuilt history), so the fallback
-      // is to reset + cold re-prime through `primeHistory` +
-      // `startFromHistory*`. The header flips from `hit` to
-      // `cold_replay` so operators can distinguish the two paths on the
-      // wire.
+      // is the full-history `primeHistory` + `startFromHistory*` path.
+      //
+      // Round 5 Fix #2: the tier-1 lookup is NOT re-routed to null
+      // anymore — the warm lease is still valid. The header stays `hit`
+      // because the native KV cache is genuinely reused via
+      // `resetPreservingNativeCacheForWarmReuse(session)` +
+      // `verify_cache_prefix_direct`. The delta API (`chatSessionContinue`)
+      // is still bypassed — the request routes through
+      // `chatSessionStart` with the rebuilt full history. The header no
+      // longer flips to `cold_replay` on this shape.
       const registry = new ModelRegistry();
       const chatSessionStart = vi
         .fn()
@@ -10918,17 +10933,21 @@ describe('createHandler', () => {
       await wait2();
 
       expect(getStatus2()).toBe(200);
-      expect(getHeaders2()['x-session-cache']).toBe('cold_replay');
-      // Cold-path proof: `chatSessionStart` invoked twice (turn 1 +
-      // cold-replay for turn 2), `chatSessionContinue` never reached.
+      expect(getHeaders2()['x-session-cache']).toBe('hit');
+      // Full-history replay proof: `chatSessionStart` invoked twice
+      // (turn 1 + full-history replay for turn 2), `chatSessionContinue`
+      // never reached. Warm native cache preserved via
+      // `resetPreservingNativeCacheForWarmReuse(session)`.
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       expect(chatSessionContinue).not.toHaveBeenCalled();
     });
 
-    it('warm-session continuation with single system-role input falls back to cold replay instead of 500', async () => {
+    it('warm-session continuation with single system-role input takes the full-history replay path (warm tier-1 hit)', async () => {
       // Same regression shape as the assistant-role case — a single
       // `system` continuation is accepted by `mapRequest` and must flow
-      // through cold replay rather than crash with 500.
+      // through the full-history replay path rather than crash with 500.
+      // Round 5 Fix #2: header stays `hit` because the warm tier-1
+      // lease is preserved.
       const registry = new ModelRegistry();
       const chatSessionStart = vi
         .fn()
@@ -10985,15 +11004,16 @@ describe('createHandler', () => {
       await wait2();
 
       expect(getStatus2()).toBe(200);
-      expect(getHeaders2()['x-session-cache']).toBe('cold_replay');
+      expect(getHeaders2()['x-session-cache']).toBe('hit');
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       expect(chatSessionContinue).not.toHaveBeenCalled();
     });
 
-    it('warm-session streaming continuation with single assistant-role input falls back to cold replay instead of 500', async () => {
+    it('warm-session streaming continuation with single assistant-role input takes the full-history replay path (warm tier-1 hit)', async () => {
       // Streaming variant of the same regression. The `runSessionStreaming`
-      // guard mirrored the non-streaming one, so both modes must take the
-      // cold-replay fallback.
+      // guard mirrored the non-streaming one, so both modes must take
+      // the full-history replay path. Round 5 Fix #2: header stays
+      // `hit` because the warm tier-1 lease is preserved.
       const streamEvents = [
         { done: false, text: 'part', isReasoning: false },
         {
@@ -11070,8 +11090,9 @@ describe('createHandler', () => {
       await wait2();
 
       expect(getStatus2()).toBe(200);
-      expect(getHeaders2()['x-session-cache']).toBe('cold_replay');
-      // Cold-path proof: streaming start invoked for turn 2, continue not reached.
+      expect(getHeaders2()['x-session-cache']).toBe('hit');
+      // Full-history replay proof: streaming start invoked for turn 2,
+      // continue not reached. Warm native cache preserved.
       expect(chatStreamSessionStart).toHaveBeenCalledTimes(1);
       expect(chatStreamSessionContinue).not.toHaveBeenCalled();
     });
@@ -11149,6 +11170,1055 @@ describe('createHandler', () => {
       // only called once (for turn 1).
       expect(chatSessionContinue).toHaveBeenCalledTimes(1);
       expect(chatSessionStart).toHaveBeenCalledTimes(1);
+    });
+
+    // -----------------------------------------------------------------
+    // Tier-2 `prompt_cache_key` observability
+    //
+    // Round 7 Fix #1 gates tier-2 behind `MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT=1`
+    // + scopes keys via HMAC. Tests in this block opt in explicitly and
+    // reset the nonce between tests so each starts from a clean boot.
+    // -----------------------------------------------------------------
+
+    describe('tier-2 prompt_cache_key (opt-in via MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT)', () => {
+      beforeEach(() => {
+        vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
+        __resetPromptCacheKeyNonceForTests();
+      });
+
+      afterEach(() => {
+        vi.unstubAllEnvs();
+        __resetPromptCacheKeyNonceForTests();
+      });
+
+      it('emits X-Session-Cache: prefix_hit and X-Cached-Tokens on a stateless prompt_cache_key tier-2 reuse', async () => {
+        // Stateless-agent replay pattern: two requests carry the same
+        // `prompt_cache_key` and no `previous_response_id`. Turn 1 is a
+        // cold start (tier-2 miss since no prior entry), adopts the
+        // session under the key. Turn 2 warm-hits tier 2; because the
+        // warm session has `turns === 1`, the endpoint takes the delta
+        // `chatSessionContinue` path (single-user-message
+        // continuation on the stateless hot path) — this is the
+        // whole point of the feature, since stateless agents resend
+        // only the newest user turn. The native side reports
+        // `cachedTokens > 0` on turn 2 and the header is promoted to
+        // `prefix_hit` with `X-Cached-Tokens` reporting the count.
+        const registry = new ModelRegistry();
+        const chatSessionStart = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'first', cachedTokens: 0 }));
+        const chatSessionContinue = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'second', cachedTokens: 42 }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue,
+          chatSessionContinueTool: vi.fn(),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        registry.register('test-model', mockModel);
+        const handler = createHandler(registry);
+
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'hi',
+          prompt_cache_key: 'chain-abc',
+        });
+        const { res: res1, getHeaders: getHeaders1, waitForEnd: wait1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+        // Turn 1: no prior session in the registry, so tier 2 misses
+        // and this classifies as `fresh`. No cached tokens reported.
+        expect(getHeaders1()['x-session-cache']).toBe('fresh');
+        expect(getHeaders1()['x-cached-tokens']).toBeUndefined();
+
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'follow up',
+          prompt_cache_key: 'chain-abc',
+        });
+        const { res: res2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+
+        // Turn 2: tier-2 warm-hit through chatSessionContinue (hot
+        // path). Native reports 42 cached tokens, so the
+        // classification promotes to `prefix_hit` and
+        // `X-Cached-Tokens: 42` lands on the wire. Proof the hot
+        // path was taken: chatSessionContinue was called exactly once
+        // and chatSessionStart was called exactly once (turn 1 only).
+        expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+        expect(chatSessionStart).toHaveBeenCalledTimes(1);
+        expect(getHeaders2()['x-session-cache']).toBe('prefix_hit');
+        expect(getHeaders2()['x-cached-tokens']).toBe('42');
+      });
+
+      it('tier-2 hit with cachedTokens === 0 demotes X-Session-Cache from prefix_hit back to fresh', async () => {
+        // The registry served a warm session via tier 2, but the native
+        // prefix-cache machinery did not actually reuse any tokens
+        // (e.g. the saved session's token history diverged from the
+        // replayed one). `prefix_hit` must only mean "registry matched
+        // AND real reuse" — demote to `fresh` and omit `X-Cached-Tokens`.
+        const registry = new ModelRegistry();
+        const chatSessionStart = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'first', cachedTokens: 0 }));
+        const chatSessionContinue = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'second', cachedTokens: 0 }));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue,
+          chatSessionContinueTool: vi.fn(),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        registry.register('test-model', mockModel);
+        const handler = createHandler(registry);
+
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'hi',
+          prompt_cache_key: 'chain-abc',
+        });
+        const { res: res1, waitForEnd: wait1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'follow up',
+          prompt_cache_key: 'chain-abc',
+        });
+        const { res: res2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+
+        expect(getHeaders2()['x-session-cache']).toBe('fresh');
+        expect(getHeaders2()['x-cached-tokens']).toBeUndefined();
+      });
+
+      it('tier-2 hit with multi-message full-history replay does NOT wipe native KV cache (Round 4 Fix #1 regression guard)', async () => {
+        // Round 3 Fix #2 added an unconditional `session.reset()` +
+        // `primeHistory()` to both cold branches of `runSessionNonStreaming`
+        // / `runSessionStreaming` to block a cross-request cache-affinity
+        // side channel on MISS. But `session.reset()` wipes the shared
+        // native model's KV cache via `model.resetCaches()` — and a
+        // tier-2 HIT whose `newInputMessages.length > 1` (the whole point
+        // of tier-2 for stateless agents: they resend full history every
+        // turn) ALSO goes through the reset+cold-re-prime branch because
+        // the chat-session delta API cannot splice a multi-message tail.
+        // Round 3's blanket reset therefore neutralized the entire
+        // feature on multi-message tier-2 hits: the warm native cache got
+        // wiped before `verify_cache_prefix_direct` ever ran.
+        //
+        // Round 4 Fix #1 threads `!lookup.hit` into the cold branches so
+        // the reset fires ONLY on MISS (preserving Round 3's cross-
+        // request isolation) while HIT keeps the native cache and JS
+        // state is cleared via `resetPreservingNativeCacheForWarmReuse(session)`
+        // (an internal method — the public `reset()` always full-wipes
+        // because it has no HIT/MISS signal) so `primeHistory()` accepts
+        // the replay. This test pins the
+        // invariant: on a multi-message tier-2 hit, `resetCaches` must
+        // NOT be called, and the native-reported `cachedTokens > 0` must
+        // promote the header to `prefix_hit` + emit `X-Cached-Tokens`.
+        const registry = new ModelRegistry();
+        // Turn 1: cold start via chatSessionStart.
+        // Turn 2: multi-message full-history replay → tier-2 HIT → cold
+        //         re-prime branch → chatSessionStart (NOT chatSessionContinue
+        //         — the delta API doesn't accept a multi-message tail).
+        //         Native reports 57 cached tokens proving KV was preserved.
+        const chatSessionStart = vi
+          .fn()
+          .mockResolvedValueOnce(makeChatResult({ text: 'first', cachedTokens: 0 }))
+          .mockResolvedValueOnce(makeChatResult({ text: 'second', cachedTokens: 57 }));
+        const chatSessionContinue = vi.fn();
+        const resetCaches = vi.fn();
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue,
+          chatSessionContinueTool: vi.fn(),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches,
+        } as unknown as SessionCapableModel;
+        registry.register('test-model', mockModel);
+        const handler = createHandler(registry);
+
+        // Turn 1: single-message input, prompt_cache_key="k1". Adopts
+        // under tier-2 key. This is a fresh session → `resetCaches` MAY
+        // fire (the Round 3 MISS-path wipe) and that's correct, so we
+        // capture the post-turn-1 call count as a baseline rather than
+        // asserting zero.
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'hello',
+          prompt_cache_key: 'chain-k1',
+        });
+        const { res: res1, waitForEnd: wait1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+        const resetCachesAfterTurn1 = resetCaches.mock.calls.length;
+
+        // Turn 2: multi-message full-history replay, same prompt_cache_key.
+        // Stateless-agent pattern — the client resends P1 + the new user
+        // turn in one shot. `newInputMessages.length > 1` forces the
+        // handler into the reset+cold-re-prime branch (NOT the delta
+        // hot path), which before the fix wiped the warm native cache.
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: [
+            { type: 'message', role: 'user', content: 'hello' },
+            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first' }] },
+            { type: 'message', role: 'user', content: 'follow up' },
+          ],
+          prompt_cache_key: 'chain-k1',
+        });
+        const { res: res2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+
+        // Assertion 1: the native `resetCaches()` was NOT called on
+        // turn 2. A tier-2 HIT must keep the native KV cache intact so
+        // `verify_cache_prefix_direct` can reuse the cached prefix on
+        // the replayed `chat_session_start_sync`. The pre-fix behavior
+        // called `resetCaches()` unconditionally on every cold branch,
+        // wiping the cache before the verifier ever saw it.
+        expect(resetCaches.mock.calls.length).toBe(resetCachesAfterTurn1);
+        // Assertion 2: turn 2 did take the cold re-prime branch
+        // (chatSessionStart with the full history), not the delta API.
+        // Multi-message tails are not eligible for `chatSessionContinue`.
+        expect(chatSessionStart).toHaveBeenCalledTimes(2);
+        expect(chatSessionContinue).not.toHaveBeenCalled();
+        // Assertion 3: the warm native cache survived the re-prime —
+        // native reported 57 cached tokens, so the header promotes to
+        // `prefix_hit` and `X-Cached-Tokens: 57` lands on the wire.
+        expect(getHeaders2()['x-session-cache']).toBe('prefix_hit');
+        expect(getHeaders2()['x-cached-tokens']).toBe('57');
+      });
+
+      it('requests with different prompt_cache_key values get independent fresh sessions (cross-key isolation on the wire)', async () => {
+        // Two clients threading different `prompt_cache_key` values must
+        // never share a warm session — the single-warm invariant means
+        // whichever request adopts last evicts the other's entry, and
+        // the evicted client falls through to fresh cold-start via
+        // `chatSessionStart`, NOT to the warm-path `chatSessionContinue`
+        // of the still-live B session.
+        const registry = new ModelRegistry();
+        const chatSessionStart = vi
+          .fn()
+          .mockResolvedValueOnce(makeChatResult({ text: 'A1', cachedTokens: 0 }))
+          .mockResolvedValueOnce(makeChatResult({ text: 'B1', cachedTokens: 0 }))
+          // Client A's second turn misses tier 2 because B evicted it on
+          // adopt; primeHistory + startFromHistory on a fresh session
+          // dispatches another chatSessionStart.
+          .mockResolvedValueOnce(makeChatResult({ text: 'A2', cachedTokens: 0 }));
+        const chatSessionContinue = vi
+          .fn()
+          .mockRejectedValue(new Error('A2 must cold-start — no warm session survived B eviction'));
+        const mockModel = {
+          chatSessionStart,
+          chatSessionContinue,
+          chatSessionContinueTool: vi.fn(),
+          chatStreamSessionStart: vi.fn(),
+          chatStreamSessionContinue: vi.fn(),
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        registry.register('test-model', mockModel);
+        const handler = createHandler(registry);
+
+        const reqA1 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'hi A',
+          prompt_cache_key: 'chain-A',
+        });
+        const { res: resA1, waitForEnd: waitA1 } = createMockRes();
+        await handler(reqA1, resA1);
+        await waitA1();
+
+        const reqB1 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'hi B',
+          prompt_cache_key: 'chain-B',
+        });
+        const { res: resB1, waitForEnd: waitB1 } = createMockRes();
+        await handler(reqB1, resB1);
+        await waitB1();
+
+        const reqA2 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'follow A',
+          prompt_cache_key: 'chain-A',
+        });
+        const { res: resA2, getHeaders: getHeadersA2, waitForEnd: waitA2 } = createMockRes();
+        await handler(reqA2, resA2);
+        await waitA2();
+
+        // A's second turn MUST fall through to fresh — B's adopt
+        // evicted A's warm entry under the single-warm invariant. Also
+        // assert the hot path was NOT taken (chatSessionContinue never
+        // called) so the header value reflects genuine behaviour.
+        expect(getHeadersA2()['x-session-cache']).toBe('fresh');
+        expect(chatSessionContinue).not.toHaveBeenCalled();
+        expect(chatSessionStart).toHaveBeenCalledTimes(3);
+      });
+
+      it('streaming tier-2 hit does NOT emit prefix_hit — header stays fresh even when warm reuse happens', async () => {
+        // Approach B for the streaming prefix-hit false-positive:
+        //
+        // SSE headers flush synchronously on `beginSSE`, BEFORE the native
+        // prefix verifier has reported whether any tokens were actually
+        // reused. A previous revision optimistically committed
+        // `X-Session-Cache: prefix_hit` on tier-2 hit, but if the
+        // native verifier then returned `cached_tokens == 0` (template
+        // drift, tokenizer change, image-set change, etc.) the header
+        // could not be corrected — SSE consumers would see a contradiction
+        // with any `cached_tokens` they read off the terminal event.
+        //
+        // Until `cached_tokens` can be threaded through the native
+        // streaming `start` chunk, streaming deliberately declines to
+        // promote to `prefix_hit`; the warm session is STILL reused
+        // (chatStreamSessionContinue runs on turn 2) — only the
+        // observability header is conservative.
+        //
+        // Non-streaming continues to emit authoritative `prefix_hit` +
+        // `X-Cached-Tokens: N` values (see the non-streaming test above).
+        // NOTE: no `cachedTokens` on the terminal chunk. The native
+        // streaming `ChatStreamChunk` does not carry this field today,
+        // so the TS bridge (`_runChatStream`) leaves it `undefined` on
+        // the final event rather than fabricating a `0`. Downstream
+        // consumers must treat `undefined` distinctly from `0` (skip
+        // emitting `X-Cached-Tokens` rather than reporting a bogus
+        // zero).
+        const streamEvents = [
+          { done: false, text: 'hi', isReasoning: false },
+          {
+            done: true,
+            text: 'hi',
+            finishReason: 'stop',
+            toolCalls: [] as ToolCallResult[],
+            thinking: null,
+            numTokens: 1,
+            promptTokens: 1,
+            reasoningTokens: 0,
+            rawText: 'hi',
+          },
+        ];
+        async function* makeStream() {
+          for (const event of streamEvents) {
+            yield event;
+          }
+        }
+        const registry = new ModelRegistry();
+        const chatStreamSessionStart = vi.fn(() => makeStream());
+        const chatStreamSessionContinue = vi.fn(() => makeStream());
+        const mockModel = {
+          chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming path should not call chatSessionStart')),
+          chatSessionContinue: vi
+            .fn()
+            .mockRejectedValue(new Error('streaming path should not call chatSessionContinue')),
+          chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('tool path not expected')),
+          chatStreamSessionStart,
+          chatStreamSessionContinue,
+          chatStreamSessionContinueTool: vi.fn(),
+          resetCaches: vi.fn(),
+        } as unknown as SessionCapableModel;
+        registry.register('stream-model', mockModel);
+        const handler = createHandler(registry);
+
+        // Turn 1: cold start, adopts the session under `chain-abc`.
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: 'stream-model',
+          input: 'hi',
+          stream: true,
+          prompt_cache_key: 'chain-abc',
+        });
+        const { res: res1, getHeaders: getHeaders1, waitForEnd: wait1 } = createMockRes();
+        await handler(req1, res1);
+        await wait1();
+        expect(getHeaders1()['x-session-cache']).toBe('fresh');
+
+        // Turn 2: tier-2 would hit on the warm session (the registry
+        // served the warm entry; `chatStreamSessionContinue` is the
+        // proof). Header stays `fresh` — NOT promoted to `prefix_hit`
+        // on streaming.
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: 'stream-model',
+          input: 'follow up',
+          stream: true,
+          prompt_cache_key: 'chain-abc',
+        });
+        const { res: res2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+        await handler(req2, res2);
+        await wait2();
+
+        // Hot path was taken (proving the warm session was reused).
+        expect(chatStreamSessionContinue).toHaveBeenCalledTimes(1);
+        // But the header is NOT `prefix_hit` — Approach B keeps the
+        // optimistic streaming header conservative.
+        expect(getHeaders2()['x-session-cache']).toBe('fresh');
+        expect(getHeaders2()['x-session-cache']).not.toBe('prefix_hit');
+        // X-Cached-Tokens is never emitted on streaming (the streaming
+        // path does not read native cached_tokens).
+        expect(getHeaders2()['x-cached-tokens']).toBeUndefined();
+      });
+    }); // end describe 'tier-2 prompt_cache_key (opt-in via MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT)'
+
+    it('streaming tier-2 hit surfaces cached_tokens via final response.completed event (Round 5 Fix #3)', async () => {
+      // Round 5 Fix #3: streaming `X-Session-Cache` is documented as
+      // non-authoritative (the SSE headers flush before the native
+      // prefix verifier runs), so clients CANNOT rely on the header
+      // to verify that cache reuse happened. The authoritative
+      // streaming signal is `usage.input_tokens_details.cached_tokens`
+      // on the terminal `response.completed` event — same shape as
+      // the upstream OpenAI Responses API. This test pins the invariant
+      // by shipping a `cachedTokens=42` on the terminal chunk and
+      // verifying it lands on the final SSE payload.
+      const streamEvents = [
+        { done: false, text: 'hi', isReasoning: false },
+        {
+          done: true,
+          text: 'hi',
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 100,
+          reasoningTokens: 0,
+          rawText: 'hi',
+          // The native streaming bridge exposes `cachedTokens` on
+          // the terminal chunk when the paged-attention prefix
+          // verifier ran — `_runChatStream` propagates it onto the
+          // final `ChatStreamEvent`.
+          cachedTokens: 42,
+        },
+      ];
+      async function* makeStream() {
+        for (const event of streamEvents) {
+          yield event;
+        }
+      }
+      const registry = new ModelRegistry();
+      const chatStreamSessionStart = vi.fn(() => makeStream());
+      const mockModel = {
+        chatSessionStart: vi.fn(),
+        chatSessionContinue: vi.fn(),
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('stream-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hello',
+        stream: true,
+      });
+      const { res, getBody, getHeaders, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      // X-Session-Cache header is `fresh` — documented as non-
+      // authoritative on streaming. This test doesn't change that.
+      expect(getHeaders()['x-session-cache']).toBe('fresh');
+
+      // Parse SSE stream, find the terminal `response.completed` event.
+      const body = getBody();
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const completedEvent = events.find((e) => e.event === 'response.completed');
+      expect(completedEvent).toBeDefined();
+      const response = completedEvent!.data.response as Record<string, unknown>;
+      const usage = response.usage as {
+        input_tokens: number;
+        input_tokens_details?: { cached_tokens: number };
+      };
+
+      // Invariant: `usage.input_tokens_details.cached_tokens` is
+      // present on the terminal event when the native dispatch
+      // reported a non-zero reuse count. Streaming clients MUST use
+      // this field (not the X-Session-Cache header) to detect cache
+      // reuse.
+      expect(usage.input_tokens_details).toBeDefined();
+      expect(usage.input_tokens_details?.cached_tokens).toBe(42);
+      // Full usage block is intact.
+      expect(usage.input_tokens).toBe(100);
+    });
+
+    it('streaming terminal with cachedTokens=0 omits input_tokens_details (undefined is meaningful)', async () => {
+      // Companion to the Round 5 Fix #3 test above. When the native
+      // dispatch reports `cachedTokens === 0` OR leaves the field
+      // `undefined` (the streaming bridge today does not always
+      // surface it), the SSE terminal MUST OMIT `input_tokens_details`
+      // rather than emit `{ cached_tokens: 0 }`. This preserves the
+      // "undefined distinct from 0" invariant that downstream
+      // consumers rely on to distinguish "feature inactive on this
+      // turn" from "feature active with zero reuse" — see the
+      // StreamingHandlerOutcome.cachedTokens docs.
+      const streamEvents = [
+        {
+          done: true,
+          text: 'hi',
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: 'hi',
+          // No cachedTokens field — bridge leaves it undefined.
+        },
+      ];
+      async function* makeStream() {
+        for (const event of streamEvents) {
+          yield event;
+        }
+      }
+      const registry = new ModelRegistry();
+      const mockModel = {
+        chatSessionStart: vi.fn(),
+        chatSessionContinue: vi.fn(),
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(() => makeStream()),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      registry.register('stream-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'stream-model',
+        input: 'hi',
+        stream: true,
+      });
+      const { res, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const completedEvent = events.find((e) => e.event === 'response.completed');
+      expect(completedEvent).toBeDefined();
+      const response = completedEvent!.data.response as Record<string, unknown>;
+      const usage = response.usage as {
+        input_tokens: number;
+        input_tokens_details?: { cached_tokens: number };
+      };
+      // No cache reuse reported → field MUST be absent.
+      expect(usage.input_tokens_details).toBeUndefined();
+    });
+
+    it('previous_response_id with hot-path-ineligible continuation does NOT fall through to tier-2 prompt_cache_key scan', async () => {
+      // Precedence invariant: `previous_response_id` takes priority
+      // over `prompt_cache_key`. On tier-1 miss (unknown/expired
+      // prev-id, or a warm entry that belongs to a different chain),
+      // the request falls through to FRESH, NEVER to tier-2.
+      //
+      // The subtle path the bug lived on: a request carrying both
+      // `previous_response_id` AND a single `assistant` / `system`
+      // continuation is `hotPathIneligible` — the handler bypasses the
+      // delta API and takes the reset+cold-replay branch. Previously,
+      // that branch passed `promptCacheKey` through to `getOrCreate`
+      // alongside `null` as the prev-id, which re-enabled tier-2
+      // scanning and let the mis-routed request lease an UNRELATED
+      // warm session (one adopted under a completely different chain
+      // that happened to share the key). `session.reset()` then fired
+      // on the victim's warm `ChatSession`, destroying its KV state
+      // and corrupting cross-chain rotation. This test seeds exactly
+      // that state and verifies tier-2 is disabled when a prev-id is
+      // set.
+      //
+      // Test structure:
+      //   Chain B: single request (no prev-id) adopts warm session W_B
+      //            under (rB1, 'shared-key').
+      //   Chain A: two stored turns (rA_root → rA_prev). The second
+      //            request on Chain A carries `previous_response_id=
+      //            'rA_prev'` AND `prompt_cache_key='shared-key'` AND a
+      //            single assistant-role continuation (hotPathIneligible).
+      //
+      // The registry at the time of Chain A's turn 3 holds W_B under
+      // (rB1, 'shared-key') — it is NOT the session for Chain A. The
+      // handler MUST cold-replay Chain A on a fresh session, never
+      // lease W_B via tier-2.
+      //
+      // Observable proof: a follow-up keyless request with the same
+      // `prompt_cache_key` must NOT tier-2 hit. With Fix #1's adopt-
+      // side correction (Round 3), Chain A turn 2 adopts its session
+      // under `effectivePromptCacheKey = null` (not the raw
+      // `'shared-key'`) because `previous_response_id` was set on the
+      // request. A later keyless request with `prompt_cache_key=
+      // 'shared-key'` therefore misses tier-2 and cold-replays via
+      // `chatSessionStart`. Conversely, if Fix #1 were regressed and
+      // tier-2 fired during Chain A turn 2, W_B would have been
+      // leased and then Chain A turn 2 would have re-adopted under
+      // `'shared-key'`, so the follow-up keyless request would
+      // tier-2 hit and dispatch `chatSessionContinue` (which the
+      // mock is set to throw). Either counting `chatSessionStart`
+      // invocations or observing `X-Session-Cache` on the follow-up
+      // proves the invariant.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        // Chain B turn 1: seeds the victim tier-2 warm entry.
+        .mockResolvedValueOnce(makeChatResult({ text: 'B1' }))
+        // Chain A turn 1 (root): cold start.
+        .mockResolvedValueOnce(makeChatResult({ text: 'A1' }))
+        // Chain B turn 2 (reseed victim): cold start after the
+        // single-warm invariant evicted W_B during Chain A turn 1.
+        .mockResolvedValueOnce(makeChatResult({ text: 'B2' }))
+        // Chain A turn 2: prev-id continuation. Regardless of bug or
+        // fix, this dispatches chatSessionStart exactly once through
+        // the cold-replay path (hotPathIneligible). The difference is
+        // WHICH session it runs on (victim vs. fresh), not whether
+        // chatSessionStart is called.
+        .mockResolvedValueOnce(makeChatResult({ text: 'A2-cold-replay' }))
+        // Post-A2 keyless follow-up with `prompt_cache_key=shared-key`:
+        // in the FIX path this must cold-replay via chatSessionStart
+        // (Chain A turn 2 was adopted with promptCacheKey=null). In
+        // the BUG path this would tier-2 hit Chain A turn 2's warm
+        // session and dispatch chatSessionContinue, which the
+        // companion mock throws.
+        .mockResolvedValueOnce(makeChatResult({ text: 'post-A2' }));
+      const chatSessionContinue = vi
+        .fn()
+        .mockRejectedValue(new Error('post-A2 follow-up must not reach chatSessionContinue via tier-2'));
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Chain B turn 1: no prev-id, seeds the warm tier-2 entry
+      // under 'shared-key'. Registry now holds W_B.
+      const reqB1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'B message',
+        prompt_cache_key: 'shared-key',
+      });
+      const { res: resB1, waitForEnd: waitB1 } = createMockRes();
+      await handler(reqB1, resB1);
+      await waitB1();
+
+      // Chain A turn 1 (root): no prev-id, no prompt_cache_key. This
+      // adopts a new warm session W_A1 and EVICTS W_B from the
+      // registry (single-warm invariant).
+      //
+      // That eviction is unavoidable and orthogonal to the bug — the
+      // bug triggers on a LATER turn where the registry happens to
+      // hold an unrelated-chain session under the victim's key. We
+      // reconstruct that exact shape by running one more Chain B
+      // warm-up right before Chain A's turn 2 below. See the comment
+      // block before Chain A turn 2.
+      const reqA1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'A root turn',
+      });
+      const { res: resA1, getBody: getBodyA1, waitForEnd: waitA1 } = createMockRes();
+      await handler(reqA1, resA1);
+      await waitA1();
+      const respA1 = JSON.parse(getBodyA1());
+      const rA_prev: string = respA1.id;
+
+      // Reseed Chain B's warm entry under 'shared-key' — the last
+      // Chain A turn evicted it. Now the registry holds a session
+      // that belongs to Chain B, under 'shared-key', but NOT under
+      // `rA_prev`. This is the exact shape that triggers the bug.
+      const reqB2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'B reseed',
+        prompt_cache_key: 'shared-key',
+      });
+      const { res: resB2, waitForEnd: waitB2 } = createMockRes();
+      await handler(reqB2, resB2);
+      await waitB2();
+      // Sanity: chatSessionStart was called three times — one per
+      // cold-replay of B1/A1/B2. chatSessionContinue was never
+      // reached (no tier-2 hit on any turn up to this point).
+      const startCallsBeforeBug = chatSessionStart.mock.calls.length;
+      expect(startCallsBeforeBug).toBe(3);
+      expect(chatSessionContinue.mock.calls.length).toBe(0);
+
+      // Chain A turn 2: prev-id (valid stored chain) + same
+      // prompt_cache_key as Chain B + assistant-role continuation
+      // (hotPathIneligible).
+      //   Tier-1 by rA_prev → MISS (registry holds Chain B's warm
+      //     entry under rB2, not rA_prev).
+      //   Without the fix: the hotPathIneligible branch calls
+      //     getOrCreate(null, instructions, 'shared-key'), tier-2
+      //     scans and HITS Chain B's warm entry. The warm session
+      //     (turns > 0) takes the reset+re-prime branch in
+      //     runSessionNonStreaming, triggering model.resetCaches().
+      //   With the fix: the same branch calls getOrCreate(null,
+      //     instructions, null), tier-2 is skipped, a fresh session
+      //     (turns = 0) is allocated and the primeHistory branch
+      //     runs WITHOUT calling model.resetCaches().
+      const reqA2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: rA_prev,
+        prompt_cache_key: 'shared-key',
+        input: [{ type: 'message', role: 'assistant', content: 'recall: I already said X' }],
+      });
+      const {
+        res: resA2,
+        getHeaders: getHeadersA2,
+        getStatus: getStatusA2,
+        getBody: getBodyA2,
+        waitForEnd: waitA2,
+      } = createMockRes();
+      await handler(reqA2, resA2);
+      await waitA2();
+
+      if (getStatusA2() !== 200) {
+        throw new Error(`Unexpected status ${getStatusA2()}: ${getBodyA2()}`);
+      }
+      expect(getStatusA2()).toBe(200);
+      // Classification: prev-id was set but tier-1 MISSES (the registry
+      // holds W_B under rB2, not rA_prev) and tier-2 is disabled when
+      // prev-id is present, so this is `cold_replay`.
+      expect(getHeadersA2()['x-session-cache']).toBe('cold_replay');
+      // Chain A turn 2 dispatched exactly one additional
+      // `chatSessionStart` (the cold-replay). In the bug path W_B
+      // would have been leased and the reset+re-prime branch would
+      // ALSO call `chatSessionStart`, so the delta is the same — the
+      // bug/fix distinction shows up on the follow-up below.
+      expect(chatSessionStart.mock.calls.length).toBe(startCallsBeforeBug + 1);
+      expect(chatSessionContinue.mock.calls.length).toBe(0);
+
+      // Post-A2 follow-up: keyless request with
+      // `prompt_cache_key='shared-key'`. With Fix #1 (Round-3) Chain
+      // A turn 2 adopted its session under `promptCacheKey=null`
+      // (because the request carried a prev-id, so
+      // `effectivePromptCacheKey` forced null). The follow-up MUST
+      // therefore MISS tier-2 and cold-replay via
+      // `chatSessionStart`. If Fix #1's adopt side were regressed,
+      // Chain A turn 2 would have adopted under
+      // `promptCacheKey='shared-key'`, so this follow-up would
+      // tier-2 hit that warm session, take the cheap delta path, and
+      // dispatch `chatSessionContinue` (which the companion mock
+      // throws).
+      const reqFollow = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'follow-up',
+        prompt_cache_key: 'shared-key',
+      });
+      const {
+        res: resFollow,
+        getHeaders: getHeadersFollow,
+        getStatus: getStatusFollow,
+        waitForEnd: waitFollow,
+      } = createMockRes();
+      await handler(reqFollow, resFollow);
+      await waitFollow();
+
+      expect(getStatusFollow()).toBe(200);
+      // tier-2 miss → classified as `fresh` (no prev-id, no warm
+      // entry under this key).
+      expect(getHeadersFollow()['x-session-cache']).toBe('fresh');
+      // Post-A2 dispatched one more `chatSessionStart` on a fresh
+      // session; `chatSessionContinue` is still untouched.
+      expect(chatSessionStart.mock.calls.length).toBe(startCallsBeforeBug + 2);
+      expect(chatSessionContinue.mock.calls.length).toBe(0);
+    });
+
+    it('prev-id + hot-path-ineligible continuation reuses tier-1 warm session (Round 5 Fix #2)', async () => {
+      // Regression for Round 5 Fix #2: a request with
+      // `previous_response_id` plus a single assistant/system-role
+      // continuation (hotPathIneligible) previously rewrote the
+      // tier-1 lookup to `null` to force cold-replay, throwing away
+      // the warm lease and mislabeling the turn as `cold_replay`.
+      // That was wrong: the warm native KV cache is still valid for
+      // the full-history `primeHistory` + `startFromHistory` replay
+      // — `resetPreservingNativeCacheForWarmReuse(session)` keeps it alive
+      // and `verify_cache_prefix_direct` recovers the prefix.
+      //
+      // Invariants pinned:
+      //   1. X-Session-Cache is `hit` (warm tier-1 lease consumed,
+      //      not `cold_replay`).
+      //   2. `model.resetCaches()` is NOT called on turn 2 — the
+      //      native cache must be preserved for the prefix verifier
+      //      to see it. Pre-fix, the branch routed through the MISS
+      //      `session.reset()` path which DID call resetCaches.
+      //   3. `chatSessionStart` IS called on turn 2 (the full-history
+      //      replay path), NOT `chatSessionContinue` (the delta API
+      //      has no entry point for a single assistant/system turn).
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'turn-1', cachedTokens: 0 }))
+        // Turn 2 reports cachedTokens > 0 to prove native cache was
+        // preserved across the warm tier-1 replay.
+        .mockResolvedValueOnce(makeChatResult({ text: 'turn-2-warm-replay', cachedTokens: 42 }));
+      const chatSessionContinue = vi
+        .fn()
+        .mockRejectedValue(new Error('hot-path-ineligible replay must not reach chatSessionContinue'));
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      // Turn 1: adopts the warm session under resp1.id. The cold
+      // MISS branch may call resetCaches — capture the baseline.
+      const req1 = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'hello' });
+      const { res: res1, getBody: getBody1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      const resp1 = JSON.parse(getBody1());
+      const resetCachesAfterTurn1 = resetCaches.mock.calls.length;
+
+      // Turn 2: prev-id + single assistant-role continuation →
+      // hotPathIneligible. Tier-1 HIT on resp1.id hands back the warm
+      // session. With Fix #2 we take the warm-replay path:
+      // `resetPreservingNativeCacheForWarmReuse(session)` + `primeHistory()`
+      // + `startFromHistory()`. resetCaches must NOT be called.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        previous_response_id: resp1.id,
+        input: [{ type: 'message', role: 'assistant', content: 'recall: I already said X' }],
+      });
+      const { res: res2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+
+      // Invariant 1: X-Session-Cache is `hit`, proving the warm
+      // lease was consumed — pre-fix this was `cold_replay`.
+      expect(getHeaders2()['x-session-cache']).toBe('hit');
+      // Invariant 2: turn 2 did NOT call resetCaches. The native KV
+      // cache was preserved so the prefix verifier on the next
+      // `chatSessionStart` can recover the reused prefix. Pre-fix
+      // this would have incremented past the baseline.
+      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterTurn1);
+      // Invariant 3: the full-history replay path fired
+      // `chatSessionStart` (twice total: turn 1 + turn 2 replay)
+      // and `chatSessionContinue` was never reached.
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).not.toHaveBeenCalled();
+    });
+
+    it('miss paths wipe the shared native cache before primeHistory (Fix #2: no cross-request cache-affinity)', async () => {
+      // Regression for Round-3 HIGH #2: the native `SessionCapableModel`
+      // is shared across every `ChatSession` lifetime via
+      // `ModelRegistry`, and its native `cached_token_history` / KV
+      // caches persist across requests. After the native refactor
+      // moved the unconditional cache wipe out of
+      // `chat_session_start_sync` into the miss branch of
+      // `verify_cache_prefix_direct`, a fresh JS session created on a
+      // registry miss would INHERIT the previous request's native
+      // cache — any prompt-prefix overlap would be silently reused
+      // across unrelated requests. That is a cross-request cache-
+      // affinity side channel. The fix is explicit `session.reset()`
+      // in the cold-replay branch of both `runSessionNonStreaming` and
+      // `runSessionStreaming` BEFORE `primeHistory()`, so every miss
+      // starts from a clean native slate and only registry HITS
+      // (tier-1 / tier-2) can reuse cache.
+      //
+      // Observable proof: two sequential keyless requests (no
+      // `previous_response_id`, no `prompt_cache_key`) must each
+      // invoke `model.resetCaches()` exactly once through the new
+      // cold-replay reset. A zero reset count on turn 2 would indicate
+      // the bug is present — turn 2's fresh session would skip the
+      // wipe and inherit turn 1's native cache.
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'turn-1', cachedTokens: 0 }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'turn-2', cachedTokens: 0 }));
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(),
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      // Turn 1: keyless miss → cold-replay branch must reset before
+      // priming.
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'tenant-A request',
+      });
+      const { res: res1, getHeaders: getHeaders1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      expect(getHeaders1()['x-session-cache']).toBe('fresh');
+      expect(getHeaders1()['x-cached-tokens']).toBeUndefined();
+      expect(resetCaches.mock.calls.length).toBe(1);
+
+      // Turn 2: a totally UNRELATED keyless request (different
+      // "tenant" with a nearly-identical prompt prefix — worst case
+      // for the side channel). The single-warm invariant evicts any
+      // lingering registry entry, and the cold-replay branch must
+      // explicitly wipe the shared native cache BEFORE `primeHistory()`
+      // so the native prefix verifier starts from zero. If the fix
+      // is not in place, resetCaches stays at 1 and the native side
+      // would silently reuse turn-1's cached prefix.
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'tenant-B request with overlapping prefix',
+      });
+      const { res: res2, getHeaders: getHeaders2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+      expect(getHeaders2()['x-session-cache']).toBe('fresh');
+      // Critical: X-Cached-Tokens must be absent on a keyless,
+      // prev-idless miss path — no registry hit means no authorized
+      // cache reuse.
+      expect(getHeaders2()['x-cached-tokens']).toBeUndefined();
+      // Critical: turn-2's cold-replay branch fires a second
+      // resetCaches. If this fails with a count of 1, the fix has
+      // regressed and fresh-session cold replays are silently
+      // reusing the shared native KV cache across unrelated
+      // requests.
+      expect(resetCaches.mock.calls.length).toBe(2);
+    });
+
+    it('streaming miss paths also wipe the shared native cache before primeHistory (Fix #2: streaming branch)', async () => {
+      // Companion to the non-streaming Fix #2 test above. The
+      // streaming `runSessionStreaming` helper has an identical
+      // cold-replay branch and needs the same explicit reset. Two
+      // back-to-back streaming requests with no prev-id and no
+      // prompt_cache_key must each reset the native cache.
+      const registry = new ModelRegistry();
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* stream1() {
+        yield {
+          done: true as const,
+          text: 'turn-1',
+          finishReason: 'stop' as const,
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 1,
+          reasoningTokens: 0,
+          rawText: 'turn-1',
+          cachedTokens: 0,
+        };
+      }
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* stream2() {
+        yield {
+          done: true as const,
+          text: 'turn-2',
+          finishReason: 'stop' as const,
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 1,
+          reasoningTokens: 0,
+          rawText: 'turn-2',
+          cachedTokens: 0,
+        };
+      }
+      const chatStreamSessionStart = vi.fn().mockReturnValueOnce(stream1()).mockReturnValueOnce(stream2());
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart: vi.fn(),
+        chatSessionContinue: vi.fn(),
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const req1 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'stream-1',
+        stream: true,
+      });
+      const { res: res1, waitForEnd: wait1 } = createMockRes();
+      await handler(req1, res1);
+      await wait1();
+      expect(resetCaches.mock.calls.length).toBe(1);
+
+      const req2 = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'stream-2',
+        stream: true,
+      });
+      const { res: res2, waitForEnd: wait2 } = createMockRes();
+      await handler(req2, res2);
+      await wait2();
+      expect(resetCaches.mock.calls.length).toBe(2);
     });
   });
 

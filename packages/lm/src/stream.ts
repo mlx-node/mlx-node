@@ -32,6 +32,29 @@ export interface ChatStreamFinal {
   promptTokens: number;
   reasoningTokens: number;
   rawText: string;
+  /**
+   * Number of prompt tokens served from the reused KV-cache prefix on
+   * this turn. Mirrors the `cachedTokens` field on the non-streaming
+   * `ChatResult` so session-aware streaming consumers can observe
+   * prefix-cache reuse without round-tripping to the non-streaming
+   * path.
+   *
+   * As of Round 6 Fix #2 the native `ChatStreamChunk` surfaces
+   * `cachedTokens` on the terminal (`done == true`) chunk for every
+   * streaming entry point (Qwen3, Qwen3.5 Dense / MoE, LFM2, Gemma4,
+   * QianfanOCR) — start-path chunks carry the matched prefix length
+   * from `verify_cache_prefix_direct`, delta-path chunks carry the
+   * reused prior-history length. Non-terminal deltas still carry
+   * `None` / `undefined` (only the terminal chunk is authoritative).
+   *
+   * This field remains OPTIONAL because the bridge-level mock tests
+   * (and any future in-process driver that constructs its own
+   * `ChatStreamChunk`) may legitimately omit it. Consumers SHOULD
+   * treat `undefined` distinctly from `0` (e.g. skip emitting
+   * `X-Cached-Tokens` rather than reporting `0`); a numeric value is
+   * always authoritative.
+   */
+  cachedTokens?: number;
   performance?: PerformanceMetrics;
 }
 
@@ -222,7 +245,17 @@ export async function* _runChatStream(
         if (item.error) throw item.error;
         const chunk = item.chunk!;
         if (chunk.done) {
-          yield {
+          // Round 6 Fix #2: the native `ChatStreamChunk` now carries
+          // `cachedTokens` on the terminal (`done == true`) chunk for
+          // every streaming entry point. Emit it on the final event
+          // verbatim — undefined means the native dispatch did not
+          // populate it (e.g. a bridge-level mock or a future
+          // in-process driver), in which case downstream consumers
+          // treat the absence as "unknown / not plumbed" and skip
+          // emitting e.g. `X-Cached-Tokens` rather than reporting a
+          // fabricated `0`.
+          const chunkWithCached = chunk as ChatStreamChunk & { cachedTokens?: number };
+          const finalEvent: ChatStreamFinal = {
             text: chunk.text,
             done: true,
             finishReason: chunk.finishReason!,
@@ -233,7 +266,11 @@ export async function* _runChatStream(
             reasoningTokens: chunk.reasoningTokens ?? 0,
             rawText: chunk.rawText!,
             performance: chunk.performance ?? undefined,
-          } as ChatStreamFinal;
+          };
+          if (typeof chunkWithCached.cachedTokens === 'number') {
+            finalEvent.cachedTokens = chunkWithCached.cachedTokens;
+          }
+          yield finalEvent;
           return;
         }
         yield { text: chunk.text, done: false, isReasoning: chunk.isReasoning ?? undefined } as ChatStreamDelta;

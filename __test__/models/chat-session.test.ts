@@ -20,10 +20,11 @@
  * export is added in T5.
  */
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
+import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
+import type { ChatStreamEvent, ChatStreamFinal } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
-import { ChatSession, type SessionCapableModel } from '../../packages/lm/src/chat-session.js';
-import type { ChatStreamEvent, ChatStreamFinal } from '../../packages/lm/src/stream.js';
+import { resetPreservingNativeCacheForWarmReuse } from '../../packages/server/src/chat-session-warm-reuse.js';
 
 /** Build a minimal `ChatResult` sufficient for the session layer. */
 function makeChatResult(text: string): ChatResult {
@@ -76,6 +77,7 @@ function finalChunk(text: string, finishReason: string = 'stop'): ChatStreamFina
     promptTokens: 1,
     reasoningTokens: 0,
     rawText: text,
+    cachedTokens: 0,
   } satisfies ChatStreamFinal;
 }
 
@@ -528,6 +530,84 @@ describe('ChatSession', () => {
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       const [messages] = chatSessionStart.mock.calls[1];
       expect(messages).toEqual([{ role: 'user', content: 'fresh' }]);
+    });
+
+    it('public reset() always full-wipes — the keepNativeCache option is not accepted (Round 5 Fix #1)', async () => {
+      // Public contract: `ChatSession.reset()` is always a full wipe.
+      // Round 4 accidentally exposed a `{ keepNativeCache: true }`
+      // option that downstream consumers could call in a context
+      // where the shared native model still held an unrelated
+      // request's cache, reintroducing the cross-request cache-
+      // affinity leak that Round 3 closed. Round 5 removed the
+      // option from the public surface — the preserved-cache path
+      // is now behind the helper
+      // `resetPreservingNativeCacheForWarmReuse(session)`, which
+      // lives inside `@mlx-node/server` and is called exclusively by
+      // `SessionRegistry`-gated server endpoints. (Round 6 Fix #1
+      // refactored this from a class method into a module-level
+      // function; Round 7 Fix #2 relocated the module into the
+      // server package itself so there is no `@mlx-node/lm` export
+      // surface the helper could leak through.)
+      const { model, resetCaches } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('one');
+      expect(session.turns).toBe(1);
+
+      // No-argument form always wipes.
+      await session.reset();
+      expect(resetCaches).toHaveBeenCalledTimes(1);
+      expect(session.turns).toBe(0);
+    });
+
+    it('resetPreservingNativeCacheForWarmReuse() wipes JS state only — no resetCaches call (Round 5 Fix #1 / Round 6 Fix #1 internal helper)', async () => {
+      // The module-level helper that replaced Round 4's
+      // `reset({ keepNativeCache: true })` public option, then Round 5's
+      // `_resetPreservingNativeCacheForWarmReuse()` class method. Used
+      // only by the server-side SessionRegistry warm-replay path on a
+      // tier-1 / tier-2 HIT, where the registry authoritatively vouches
+      // for the native cache belonging to this chain. Verify:
+      // (1) no resetCaches call, (2) turns/history zeroed so
+      // primeHistory() will accept the session.
+      const { model, resetCaches } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('one');
+      await session.send('two');
+      expect(session.turns).toBe(2);
+
+      await resetPreservingNativeCacheForWarmReuse(session);
+      expect(resetCaches).not.toHaveBeenCalled();
+      expect(session.turns).toBe(0);
+      expect(session.hasImages).toBe(false);
+    });
+
+    it('resetPreservingNativeCacheForWarmReuse is NOT exported from @mlx-node/lm public surface (Round 6 Fix #1 / Round 7 Fix #2)', async () => {
+      // Structural guard: the helper lives inside `@mlx-node/server`
+      // (server-private module) and MUST NOT appear in either the
+      // `@mlx-node/lm` main export surface or the `@mlx-node/server`
+      // main export surface. Round 6 Fix #1 enforced the lm-public
+      // absence; Round 7 Fix #2 deleted the `@mlx-node/lm/internal`
+      // subpath export entirely and relocated the helper into the
+      // server package so the only reachable call site is
+      // `endpoints/responses.ts`, which already holds the
+      // `SessionRegistry` HIT gate. Downstream consumers doing a plain
+      // `import { ... } from '@mlx-node/lm'` or `from '@mlx-node/server'`
+      // must therefore not be able to discover or invoke the helper.
+      const lmPublicModule = (await import('../../packages/lm/src/index.js')) as Record<string, unknown>;
+      expect('resetPreservingNativeCacheForWarmReuse' in lmPublicModule).toBe(false);
+
+      const serverPublicModule = (await import('../../packages/server/src/index.js')) as Record<string, unknown>;
+      expect('resetPreservingNativeCacheForWarmReuse' in serverPublicModule).toBe(false);
+
+      // Sanity-check: the helper is still reachable from the
+      // server-private module the endpoint code imports. Tests can
+      // reach it via the relative path; downstream consumers cannot.
+      const serverPrivateModule = (await import('../../packages/server/src/chat-session-warm-reuse.js')) as Record<
+        string,
+        unknown
+      >;
+      expect(typeof serverPrivateModule.resetPreservingNativeCacheForWarmReuse).toBe('function');
     });
 
     it('rejects reset() while a send() is in flight', async () => {

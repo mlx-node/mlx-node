@@ -70,6 +70,12 @@ describe.sequential('_runChatStream bridge', () => {
       if (event.done) finalEvent = event;
     }
 
+    // The native chunk does NOT carry `cachedTokens` — it is not part
+    // of the native `ChatStreamChunk` shape today. The bridge must
+    // therefore leave `cachedTokens` off the final event entirely (not
+    // synthesize a `0`), so downstream consumers can distinguish
+    // "unknown / not plumbed" from "zero reuse". Assert the field is
+    // absent.
     expect(finalEvent).toEqual({
       text: 'final text',
       done: true,
@@ -82,6 +88,51 @@ describe.sequential('_runChatStream bridge', () => {
       rawText: 'raw final text',
       performance: undefined,
     });
+    expect((finalEvent as ChatStreamEvent | null)?.done).toBe(true);
+    // Field must be absent, not just falsy — a `0` here would be a
+    // fabricated value.
+    expect(finalEvent !== null && 'cachedTokens' in finalEvent).toBe(false);
+  });
+
+  it('propagates native cachedTokens verbatim when the native chunk carries it', async () => {
+    // Forward-compatibility: once the native `ChatStreamChunk` grows a
+    // `cachedTokens` field (e.g. when streaming begins to surface
+    // prefix-cache counts through the `start` chunk), the bridge must
+    // propagate it to the final event. Today the native side does
+    // not populate it, but the bridge still honours the field if
+    // present so this switch-on behaves correctly when it lands.
+    const native = (
+      _messages: unknown[],
+      _config: unknown,
+      callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    ): Promise<ChatStreamHandle> => {
+      const handle = { cancel: () => {} } as ChatStreamHandle;
+      setTimeout(() => {
+        callback(null, {
+          text: 'done',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 1,
+          rawText: 'done',
+          cachedTokens: 17,
+        } as unknown as ChatStreamChunk);
+      }, 0);
+      return Promise.resolve(handle);
+    };
+
+    let finalEvent: ChatStreamEvent | null = null;
+    const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];
+    const gen = _runChatStream((callback) => native(messages, null, callback));
+    for await (const event of gen) {
+      if (event.done) finalEvent = event;
+    }
+
+    expect(finalEvent).not.toBeNull();
+    if (finalEvent && finalEvent.done) {
+      expect(finalEvent.cachedTokens).toBe(17);
+    }
   });
 
   it('should cancel generation on break via finally block', async () => {

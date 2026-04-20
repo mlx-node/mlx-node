@@ -503,6 +503,11 @@ pub(crate) fn finalize_chat_result(
         reasoning_tokens,
         finish_reason,
         raw_text: text,
+        // Callers that reused a cached prefix overwrite this via their own
+        // `cached_prefix_len as u32` after this function returns. Defaulting
+        // to zero keeps the behavior of callers that do not (yet) thread
+        // the value through intact.
+        cached_tokens: 0,
         performance,
     })
 }
@@ -642,6 +647,33 @@ pub(crate) fn save_cache_state_after_delta(
 ///
 /// Takes direct refs instead of `Arc<RwLock<>>`. Used by Qwen3.5 Dense on
 /// its dedicated model thread.
+///
+/// # Return-value invariant (load-bearing)
+///
+/// This helper returns **either `0` (cache miss — caller MUST reset caches
+/// before prefill) or `cached.len()` (exact-append hit — the new prompt
+/// strictly extends the cached history)**. It **never** returns an
+/// intermediate value such as "the first K tokens match, rewind to K".
+///
+/// That all-or-nothing contract is what makes it safe to drive Qwen3.5's
+/// **hybrid linear + attention stack**. The Gated Delta Net (GDN) layers
+/// carry a *recurrent* state (`conv_state`, `recurrent_state` in
+/// [`super::layer_cache::Qwen3_5LayerCache::Linear`]) that folds every
+/// absorbed token irreversibly into its hidden state — unlike a standard
+/// KV cache, a GDN cache **cannot be trimmed or rewound mid-sequence**
+/// without corrupting the representation. A non-zero return from this
+/// function therefore always means "the incoming tokens are a *pure append*
+/// on top of the cached state; continue decoding from the current live
+/// caches". No mid-sequence rewind ever happens.
+///
+/// Any future modification that would relax this contract (e.g. returning
+/// a prefix count less than `cached.len()`) MUST simultaneously ensure the
+/// caller either (a) restricts the relaxation to pure-KVCache models or
+/// (b) introduces GDN-state checkpointing to enable mid-sequence rewinds.
+/// Neither has been done — the invariant here is the sole reason the
+/// refactor that moves `reset_caches_sync()` from the outer session-start
+/// path into the `cached_prefix_len == 0` branch of `chat_sync_core` is
+/// safe for Qwen3.5 Dense and MoE.
 pub(crate) fn verify_cache_prefix_direct(
     reuse_cache: bool,
     has_images: bool,
@@ -810,6 +842,7 @@ macro_rules! decode_loop {
                         prompt_tokens: None,
                         reasoning_tokens: None,
                         raw_text: None,
+                        cached_tokens: None,
                         performance: None,
                         is_reasoning: Some(_is_reasoning),
                     }),
@@ -1219,5 +1252,280 @@ mod rope_delta_gate_tests {
         // current caller does this — the delta path rejects images at
         // entry — but the gate is written defensively.
         assert!(!should_clear_rope_delta(true, true));
+    }
+}
+
+#[cfg(test)]
+mod verify_cache_prefix_invariant_tests {
+    //! Guards the all-or-nothing return-value invariant of
+    //! `verify_cache_prefix_direct` documented on its rustdoc. The Qwen3.5
+    //! chat_session_start refactor — which moves the unconditional
+    //! `reset_caches_sync()` out of the outer session-start path and
+    //! relies on verify returning either `0` or the full cached length
+    //! to drive the in-core reset-on-miss branch — is **only** safe as
+    //! long as this function never returns a mid-sequence prefix length.
+    //! A regression here would silently let the caller resume decoding on
+    //! a GDN recurrent state that no longer corresponds to the token
+    //! prefix in the KV cache, corrupting every generated token.
+    use super::verify_cache_prefix_direct;
+
+    #[test]
+    fn returns_zero_when_reuse_cache_disabled() {
+        // `reuse_cache = false` short-circuits; everything else is
+        // irrelevant. This is the "caller explicitly opted out" path.
+        assert_eq!(
+            verify_cache_prefix_direct(
+                false,
+                false,
+                &[1, 2, 3, 4],
+                &[1, 2, 3, 4],
+                0,
+                &[1, 2, 3],
+                &None,
+                true,
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    fn returns_zero_when_no_caches() {
+        // `has_caches = false` means the model has no live KV caches to
+        // resume from — a full prefill is required even if the history
+        // matches.
+        assert_eq!(
+            verify_cache_prefix_direct(
+                true,
+                false,
+                &[1, 2, 3, 4],
+                &[1, 2, 3, 4],
+                0,
+                &[1, 2, 3],
+                &None,
+                false,
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    fn returns_zero_on_empty_history() {
+        // First session-start turn: nothing cached yet, so we must
+        // prefill the whole prompt.
+        assert_eq!(
+            verify_cache_prefix_direct(
+                true,
+                false,
+                &[1, 2, 3, 4],
+                &[1, 2, 3, 4],
+                0,
+                &[],
+                &None,
+                true,
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    fn returns_zero_on_first_token_mismatch() {
+        // Histories diverge at index 0 — no reusable prefix.
+        assert_eq!(
+            verify_cache_prefix_direct(
+                true,
+                false,
+                &[9, 2, 3, 4],
+                &[9, 2, 3, 4],
+                0,
+                &[1, 2, 3],
+                &None,
+                true,
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    fn returns_zero_on_midsequence_mismatch() {
+        // CRITICAL: histories match for 2 tokens then diverge. The
+        // function MUST return 0 (full miss), NOT 2 (partial hit).
+        // A partial hit would signal the caller to reuse only the first
+        // 2 positions of the KV cache — which for the GDN linear layers
+        // would require rewinding the recurrent state, which is
+        // impossible. The all-or-nothing contract is what keeps this
+        // safe.
+        assert_eq!(
+            verify_cache_prefix_direct(
+                true,
+                false,
+                &[1, 2, 7, 4],
+                &[1, 2, 7, 4],
+                0,
+                &[1, 2, 3],
+                &None,
+                true,
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    fn returns_zero_on_shorter_new_prompt() {
+        // New prompt is shorter than the cached history — can't be a
+        // forward extension. Rewinding is infeasible (see above), so
+        // return 0 and force a fresh prefill.
+        assert_eq!(
+            verify_cache_prefix_direct(
+                true,
+                false,
+                &[1, 2],
+                &[1, 2],
+                0,
+                &[1, 2, 3, 4, 5],
+                &None,
+                true,
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    fn returns_full_length_on_exact_append_hit() {
+        // Happy path: the new prompt is `cached + [extra]`. The function
+        // returns `cached.len()` so the caller prefills only the delta
+        // tail. This is the whole point of the cache-reuse machinery.
+        let cached = vec![1u32, 2, 3, 4];
+        let new_prompt = vec![1u32, 2, 3, 4, 5, 6];
+        assert_eq!(
+            verify_cache_prefix_direct(
+                true,
+                false,
+                &new_prompt,
+                &new_prompt,
+                0,
+                &cached,
+                &None,
+                true,
+            ),
+            cached.len(),
+        );
+    }
+
+    #[test]
+    fn returns_full_length_on_exact_match() {
+        // Edge case: new prompt is byte-identical to cached. Returns
+        // `cached.len()` — the caller's zero-delta guard then takes
+        // over (see the matching comment in `qwen3_5/model.rs` and
+        // `qwen3_5_moe/model.rs`).
+        let cached = vec![1u32, 2, 3, 4];
+        assert_eq!(
+            verify_cache_prefix_direct(true, false, &cached, &cached, 0, &cached, &None, true,),
+            cached.len(),
+        );
+    }
+
+    #[test]
+    fn returns_zero_on_image_key_mismatch() {
+        // VLM path: cached image key differs from the current turn's
+        // key — the images changed, so the cached KV state no longer
+        // represents the new prompt's image attention. Full reset.
+        let cached = vec![1u32, 2, 3];
+        let new_prompt = vec![1u32, 2, 3, 4];
+        assert_eq!(
+            verify_cache_prefix_direct(
+                true,
+                true,
+                &new_prompt,
+                &new_prompt,
+                /* new image key */ 999,
+                &cached,
+                &Some(42),
+                true,
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    fn returns_full_length_on_vlm_image_key_match() {
+        // VLM happy path: same images, new text tail. Returns the
+        // cached prefix length so the caller prefills only the delta.
+        let cached = vec![1u32, 2, 3];
+        let new_prompt = vec![1u32, 2, 3, 4, 5];
+        assert_eq!(
+            verify_cache_prefix_direct(
+                true,
+                true,
+                &new_prompt,
+                &new_prompt,
+                42,
+                &cached,
+                &Some(42),
+                true,
+            ),
+            cached.len(),
+        );
+    }
+
+    #[test]
+    fn returns_zero_on_vlm_missing_image_key() {
+        // VLM turn but cached state carries no image key — the cache
+        // came from a prior text-only exchange, not a VLM prefill.
+        // Safety requires a fresh VLM prefill, not a reuse.
+        let cached = vec![1u32, 2, 3];
+        let new_prompt = vec![1u32, 2, 3, 4];
+        assert_eq!(
+            verify_cache_prefix_direct(
+                true,
+                true,
+                &new_prompt,
+                &new_prompt,
+                42,
+                &cached,
+                &None,
+                true,
+            ),
+            0,
+        );
+    }
+
+    /// The contract-level invariant: across a broad sweep of inputs the
+    /// return value is ALWAYS either `0` or `cached.len()`. Any
+    /// intermediate value would corrupt GDN recurrent state on reuse.
+    ///
+    /// This property-style sweep is belt-and-suspenders on top of the
+    /// targeted unit tests above: even if a future refactor changes
+    /// branch structure, the invariant holds by construction.
+    #[test]
+    fn invariant_return_value_is_always_zero_or_cached_len() {
+        let cached = vec![10u32, 20, 30, 40, 50];
+        // Every prefix-plus-suffix combination and a selection of
+        // divergent inputs.
+        let candidates: Vec<Vec<u32>> = vec![
+            vec![],
+            vec![10],
+            vec![10, 20],
+            vec![10, 20, 30],
+            vec![10, 20, 30, 40],
+            cached.clone(),
+            [cached.clone(), vec![60]].concat(),
+            [cached.clone(), vec![60, 70, 80]].concat(),
+            vec![99, 20, 30, 40, 50, 60],
+            vec![10, 20, 99, 40, 50, 60],
+            vec![10, 20, 30, 40, 99, 60],
+        ];
+
+        for candidate in &candidates {
+            let result = verify_cache_prefix_direct(
+                true, false, candidate, candidate, 0, &cached, &None, true,
+            );
+            assert!(
+                result == 0 || result == cached.len(),
+                "invariant violated: result={} for candidate={:?} (expected 0 or {})",
+                result,
+                candidate,
+                cached.len(),
+            );
+        }
     }
 }

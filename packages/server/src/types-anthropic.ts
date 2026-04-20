@@ -93,6 +93,15 @@ export interface AnthropicMessagesRequest {
   stream?: boolean;
   stop_sequences?: string[];
   metadata?: { user_id?: string };
+  // NOTE: `prompt_cache_key` is intentionally NOT advertised on this
+  // endpoint today. The prefix-cache feature is disabled on
+  // `/v1/messages` until native KV can survive the `reset()` +
+  // `primeHistory()` round-trip the Anthropic handler performs every
+  // turn, so exposing the field would be a no-op that silently misleads
+  // clients into thinking they were getting prefix reuse. It will be
+  // re-added (with matching handler support) once the native side can
+  // preserve KV across the stateless reset. Mirrors the equivalent
+  // `prompt_cache_key` field on `/v1/responses`, which is honoured.
 }
 
 // ---------------------------------------------------------------------------

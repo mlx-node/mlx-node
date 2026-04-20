@@ -516,6 +516,15 @@ pub(crate) struct ChatDecodeInputs {
     pub prefill_tokens_len: usize,
     /// Prompt token count reported on the `ChatResult`.
     pub prompt_tokens_for_result: u32,
+    /// Length of the reused cached prefix to report on `ChatResult.cached_tokens`.
+    ///
+    /// For fresh prefills this is `cached_prefix_len` (0 on a miss, full
+    /// cached length on an exact-append hit). For the session delta path
+    /// this is the full prior-history length because the delta is
+    /// appended on top of the existing caches — we skip the `cached_prefix_len`
+    /// driver (which only gates the VLM rope-delta replay branch) while
+    /// still reporting the reused prefix accurately for observability.
+    pub cached_tokens_for_result: u32,
 
     // --- MLX state ------------------------------------------------------
     pub embedding_weight: MxArray,
@@ -867,13 +876,19 @@ impl Qwen35Inner {
 
     /// Start a new chat session.
     ///
-    /// Resets the caches up-front so the session is guaranteed to start
-    /// from a known-clean state, then delegates to [`Self::chat_sync_core`]
-    /// with `<|im_end|>` (from the tokenizer vocab) as the stop token so
-    /// the cached history ends on a clean ChatML boundary that subsequent
-    /// `chat_session_continue_sync` / [`Self::chat_tokens_delta_sync`]
-    /// calls can append a raw delta on top of without re-rendering the
-    /// jinja template.
+    /// Delegates to [`Self::chat_sync_core`] with `<|im_end|>` (from the
+    /// tokenizer vocab) as the stop token so the cached history ends on a
+    /// clean ChatML boundary that subsequent `chat_session_continue_sync`
+    /// / [`Self::chat_tokens_delta_sync`] calls can append a raw delta on
+    /// top of without re-rendering the jinja template.
+    ///
+    /// Unlike the pre-refactor contract, this method no longer resets the
+    /// caches up-front. The core path runs `verify_cache_prefix_direct`
+    /// against the freshly-tokenized prompt and reuses the cached prefix
+    /// on an exact-append hit or resets + fully prefills on a miss. This
+    /// is what enables prefix-cache reuse for stateless agent clients
+    /// that resend the full transcript on every turn. See the matching
+    /// block comment in the method body for the GDN-safety rationale.
     ///
     /// Images are accepted on session start — the downstream
     /// [`Self::chat_sync_core`] already handles the VLM prefill path
@@ -907,13 +922,24 @@ impl Qwen35Inner {
             .im_end_id()
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
 
-        // Full reset: the session-start path always begins from a clean
-        // state. This matches the documented contract that the session is
-        // owned end-to-end by the `ChatSession<Qwen35Model>` /
-        // `chat_session_*` surface and intentionally invalidates any
-        // prior session cache.
-        self.reset_caches_sync()?;
-        self.init_caches_sync()?;
+        // Prefix-cache reuse contract: the caches may carry state from a
+        // prior session-start turn. `chat_sync_core` runs
+        // `verify_cache_prefix_direct` against the freshly-tokenized prompt
+        // and either (a) reuses the cached prefix and prefills only the
+        // trailing delta (exact-append hit) or (b) resets + fully prefills
+        // from scratch on a cache miss. Driving the reset from inside the
+        // core — rather than wiping up-front here — is what lets
+        // stateless-agent clients (Aider, Codex CLI, pi-mono, etc.) that
+        // resend the full transcript on every turn avoid paying an O(N)
+        // prefill cost on every turn.
+        //
+        // Safety: the invariant on `verify_cache_prefix_direct` (returns
+        // either `0` or the full cached length — never an intermediate
+        // value) guarantees a non-zero hit means the new tokens are a
+        // pure *append* on the live caches, so Qwen3.5's GDN linear-
+        // attention layers (whose recurrent state cannot be rewound
+        // mid-sequence) stay consistent without any snapshot
+        // machinery. See the rustdoc on `verify_cache_prefix_direct`.
 
         self.chat_sync_core(messages, config, im_end_id)
     }
@@ -1070,7 +1096,29 @@ impl Qwen35Inner {
             tokens.clone()
         };
 
-        // Zero-delta guard
+        // Zero-delta guard.
+        //
+        // Triggers when `cached_prefix_len == (expanded_)tokens.len()`, i.e.
+        // the new prompt is byte-for-byte identical to the cached history
+        // and there is literally no delta to prefill. The decode loop still
+        // needs a `last_logits` to sample from, so we must run *some*
+        // forward pass. Two options were considered:
+        //   1. Trim every layer cache by one token and reprefill the final
+        //      token. **Infeasible** for Qwen3.5 — the GDN linear-attention
+        //      layers store a recurrent state (`conv_state`,
+        //      `recurrent_state`) that cannot be rewound mid-sequence
+        //      without corrupting the hidden representation. Only the
+        //      full-attention layers support `KVCache::trim`, and applying
+        //      trim to the hybrid stack would produce silent miscompiles.
+        //   2. Full reset + full re-prefill. Wasteful when it triggers but
+        //      always correct, and this branch is a cold edge case —
+        //      real-world turns always append at least a user message, so
+        //      the cached prefix is strictly shorter than the new prompt.
+        //
+        // We take option 2. The full-reset is intentional, not a "wrong
+        // force-reset" to be patched out. See the invariant doc on
+        // `verify_cache_prefix_direct` for the underlying linear-attention
+        // rewind constraint.
         let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
             info!("Zero-delta cache hit: resetting caches for full re-prefill");
             if let Some(ref mut caches) = self.caches {
@@ -1209,6 +1257,8 @@ impl Qwen35Inner {
             first_token_instant,
             prefill_tokens_len: prefill_tokens.len(),
             prompt_tokens_for_result,
+            // Fresh prefill: report the matched prefix length.
+            cached_tokens_for_result: cached_prefix_len as u32,
             embedding_weight,
             embedding_weight_t,
             generation_stream,
@@ -1362,9 +1412,15 @@ impl Qwen35Inner {
 
         let prompt_tokens_for_result = full_token_history.len() as u32;
 
-        // For the delta path there is no cached_prefix_len distinction — the
-        // caches already reflect the entire prior history. Pass 0 so the
-        // rope-deltas branch inside the helper is skipped (text-only anyway).
+        // For the delta path there is no cached_prefix_len distinction for
+        // the prefill branching — the caches already reflect the entire
+        // prior history. However, for ChatResult observability we report
+        // the cached-prefix length so clients can see the session delta
+        // reused the full history. `prior_cached_len` feeds the reported
+        // `cached_tokens`; `cached_prefix_len` stays 0 so the VLM
+        // rope-deltas re-apply branch inside the decode helper is
+        // skipped (text-only delta anyway).
+        let prior_cached_len = full_token_history.len().saturating_sub(delta_tokens.len());
         let cached_prefix_len = 0usize;
 
         // For cache save, pass the full token history (cached + delta) as
@@ -1394,6 +1450,8 @@ impl Qwen35Inner {
             first_token_instant,
             prefill_tokens_len: delta_tokens.len(),
             prompt_tokens_for_result,
+            // Delta path reuses the full prior history by construction.
+            cached_tokens_for_result: prior_cached_len as u32,
             embedding_weight,
             embedding_weight_t,
             generation_stream,
@@ -1536,6 +1594,7 @@ impl Qwen35Inner {
             mut first_token_instant,
             prefill_tokens_len,
             prompt_tokens_for_result,
+            cached_tokens_for_result,
             embedding_weight,
             embedding_weight_t,
             generation_stream,
@@ -1789,7 +1848,7 @@ impl Qwen35Inner {
         // here is cleaner than spraying `#[allow]` inside the macro body.
         let _final_sampled_token = y;
 
-        finalize_chat_result(
+        let mut result = finalize_chat_result(
             &tokenizer,
             &generated_tokens,
             finish_reason,
@@ -1800,13 +1859,22 @@ impl Qwen35Inner {
             enable_thinking.unwrap_or(true),
             prompt_tokens_for_result,
             reasoning_tracker.reasoning_token_count(),
-        )
+        )?;
+        // Report the length of the reused cached prefix for observability.
+        // Driven by the caller-supplied `cached_tokens_for_result`:
+        //   - fresh prefill: equals `cached_prefix_len` (0 miss / full hit)
+        //   - session delta: equals the prior-history length (full reuse)
+        // See the invariant doc on `verify_cache_prefix_direct`.
+        result.cached_tokens = cached_tokens_for_result;
+        Ok(result)
     }
 
     /// Streaming chat (session-start variant): same semantics as
     /// [`Self::chat_session_start_sync`] but streams token deltas through
     /// `stream_tx` rather than returning a `ChatResult`. Stops on
-    /// `<|im_end|>` and resets caches before prefill.
+    /// `<|im_end|>`. Inherits the prefix-cache reuse contract — the
+    /// caches may carry state from a prior turn; `chat_stream_sync_inner`
+    /// verifies the prefix and resets on miss.
     ///
     /// Images are accepted on session start — the downstream
     /// `chat_stream_sync_inner` already handles VLM prefill. Subsequent
@@ -1853,15 +1921,13 @@ impl Qwen35Inner {
             }
         };
 
-        // Full reset: the session always starts clean.
-        if let Err(e) = self.reset_caches_sync() {
-            let _ = stream_tx.send(Err(e));
-            return;
-        }
-        if let Err(e) = self.init_caches_sync() {
-            let _ = stream_tx.send(Err(e));
-            return;
-        }
+        // Prefix-cache reuse contract: same as `chat_session_start_sync`.
+        // Any cached state from a prior turn is intentionally preserved so
+        // `chat_stream_sync_inner` can run `verify_cache_prefix_direct`
+        // against the freshly-tokenized prompt. The inner path resets the
+        // caches on a miss and reuses them on an exact-append hit. See
+        // the rustdoc on `verify_cache_prefix_direct` for the GDN-safety
+        // invariant that keeps this sound.
 
         let result = self.chat_stream_sync_inner(messages, config, im_end_id, &cb, &cancelled);
         if let Err(e) = result {
@@ -2080,6 +2146,11 @@ impl Qwen35Inner {
         let tokenizer_for_decode = tokenizer.clone();
 
         // Build full token history = cached_history + delta.
+        // Capture `prior_cached_len` BEFORE the extend — this is the
+        // reused-prefix length reported on the terminal ChatStreamChunk's
+        // `cached_tokens` field (mirrors the non-streaming delta path's
+        // `cached_tokens_for_result`).
+        let prior_cached_len = self.cached_token_history.len() as u32;
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
 
@@ -2391,6 +2462,7 @@ impl Qwen35Inner {
                     prompt_tokens: None,
                     reasoning_tokens: None,
                     raw_text: None,
+                    cached_tokens: None,
                     performance: None,
                     is_reasoning: Some(last_is_reasoning),
                 }),
@@ -2434,6 +2506,11 @@ impl Qwen35Inner {
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
                 raw_text: Some(text),
+                // Delta path reuses the full prior history by construction
+                // — report `prior_cached_len` (captured before the
+                // `self.cached_token_history` extend above) as the
+                // authoritative cached-prefix length.
+                cached_tokens: Some(prior_cached_len),
                 performance: perf_metrics,
                 is_reasoning: None,
             }),
@@ -2582,7 +2659,10 @@ impl Qwen35Inner {
             tokens.clone()
         };
 
-        // Zero-delta guard
+        // Zero-delta guard. See the matching `chat_sync_core` comment for
+        // the design rationale — rewinding a GDN recurrent cache by one
+        // token is not possible, so the only safe response to an exact-
+        // match prompt is a full reset + re-prefill.
         let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
             info!("Zero-delta cache hit: resetting caches for full re-prefill");
             if let Some(ref mut caches) = self.caches {
@@ -2921,6 +3001,7 @@ impl Qwen35Inner {
                     prompt_tokens: None,
                     reasoning_tokens: None,
                     raw_text: None,
+                    cached_tokens: None,
                     performance: None,
                     is_reasoning: Some(last_is_reasoning),
                 }),
@@ -2969,6 +3050,10 @@ impl Qwen35Inner {
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
                 raw_text: Some(text),
+                // Start path: report the matched prefix length from
+                // `verify_cache_prefix_direct`. Zero on a miss, full
+                // cached length on an exact-append hit.
+                cached_tokens: Some(cached_prefix_len as u32),
                 performance: perf_metrics,
                 is_reasoning: None,
             }),
@@ -4458,6 +4543,15 @@ pub struct ChatResult {
     pub reasoning_tokens: u32,
     pub finish_reason: String,
     pub raw_text: String,
+    /// Number of prompt tokens served from the reused KV-cache prefix.
+    ///
+    /// When the native prefix-cache machinery successfully matches the new
+    /// prompt against the cached conversation history (via
+    /// `verify_cache_prefix_direct`), only the trailing delta is re-prefilled
+    /// and this field reports the length of the reused prefix. `0` when
+    /// the cache was missed or disabled and the full prompt had to be
+    /// re-prefilled.
+    pub cached_tokens: u32,
     /// Performance metrics (present when `reportPerformance: true` in config)
     pub performance: Option<crate::profiling::PerformanceMetrics>,
 }
@@ -4475,6 +4569,18 @@ pub struct ChatStreamChunk {
     pub prompt_tokens: Option<u32>,
     pub reasoning_tokens: Option<u32>,
     pub raw_text: Option<String>,
+    /// Number of prompt tokens served from the reused KV-cache prefix on
+    /// this turn. Populated on the terminal chunk (`done == true`) only;
+    /// `None` on mid-stream delta chunks.
+    ///
+    /// Zero on a cache miss or disabled reuse; equal to the matched
+    /// prefix length on a hit. Mirrors `ChatResult.cached_tokens`
+    /// verbatim so session-aware streaming consumers can observe
+    /// prefix-cache reuse without round-tripping to the non-streaming
+    /// path. Non-terminal chunks always carry `None` — only the
+    /// terminal chunk is authoritative.
+    #[napi(ts_type = "number | undefined")]
+    pub cached_tokens: Option<u32>,
     /// Performance metrics (only present in the final chunk when `reportPerformance: true`)
     pub performance: Option<crate::profiling::PerformanceMetrics>,
     /// Whether this delta chunk contains reasoning/thinking content.
@@ -6334,5 +6440,75 @@ mod rope_index_tests {
         // image 1 base=3, max_axis = max(0,3,3) = 3 → current_pos = 7
         // Trailing TEXT_B at 7.
         assert_eq!(*t.last().unwrap(), 7);
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_reuse_integration_tests {
+    //! End-to-end tests for the prefix KV cache reuse refactor on
+    //! Qwen3.5 Dense. These verify that `chat_session_start_sync` no
+    //! longer unconditionally wipes the cache — stateless agent clients
+    //! (Aider, Codex CLI, pi-mono, etc.) that resend the full transcript
+    //! on every turn should hit the `verify_cache_prefix_direct`
+    //! exact-append path and pay only the delta prefill cost.
+    //!
+    //! These tests are `#[ignore]`-marked because they require loading a
+    //! real Qwen3.5 model file and a tokenizer. Run them with:
+    //!
+    //!     cargo test -p mlx-core --test '*' -- --ignored prefix_cache_reuse_integration
+    //!
+    //! with `MLX_NODE_QWEN35_MODEL_DIR` set to a local Qwen3.5 dir
+    //! (e.g. `~/models/Qwen3.5-0.8B`).
+    //!
+    //! The test bodies are intentionally skeletal — they document what
+    //! needs to hold rather than wiring up the full model-loading
+    //! boilerplate. Flesh them out alongside the upcoming end-to-end
+    //! harness in `serve.ts` / the pi-mono vitest-migration smoke test
+    //! (plan doc §Verification).
+
+    /// Append hit: two back-to-back session-start calls where the second's
+    /// token sequence is `first_tokens + extra_tokens`. The result of the
+    /// second call must report `cached_tokens > 0` and a prefill that
+    /// counts only the delta tokens.
+    #[ignore = "requires a real Qwen3.5 Dense model directory; run with --ignored"]
+    #[test]
+    fn append_hit_reuses_cached_prefix() {
+        // Pseudocode for the real test body:
+        //
+        //   let mut model = Qwen35Model::load(env!("MLX_NODE_QWEN35_MODEL_DIR"))?;
+        //   let turn1 = vec![ChatMessage::user("What is 2+2?")];
+        //   let r1 = model.chat_session_start_sync(turn1, cfg())?;
+        //   assert_eq!(r1.cached_tokens, 0);
+        //
+        //   let turn2 = vec![
+        //       ChatMessage::user("What is 2+2?"),
+        //       ChatMessage::assistant(&r1.text),
+        //       ChatMessage::user("And 3+3?"),
+        //   ];
+        //   let r2 = model.chat_session_start_sync(turn2, cfg())?;
+        //   assert!(r2.cached_tokens > 0);
+        //   assert!(r2.performance.as_ref().unwrap().prefill_tokens
+        //             < turn2_token_count);  // only the delta was prefilled
+    }
+
+    /// Divergence miss: two calls with totally different histories. The
+    /// result of the second call must report `cached_tokens == 0` and a
+    /// full-history prefill.
+    #[ignore = "requires a real Qwen3.5 Dense model directory; run with --ignored"]
+    #[test]
+    fn divergence_miss_resets_and_full_prefills() {
+        // Pseudocode:
+        //
+        //   let r1 = model.chat_session_start_sync(
+        //       vec![ChatMessage::user("Hello")],
+        //       cfg(),
+        //   )?;
+        //   let r2 = model.chat_session_start_sync(
+        //       vec![ChatMessage::user("Goodbye")],
+        //       cfg(),
+        //   )?;
+        //   assert_eq!(r2.cached_tokens, 0);
+        //   // And the second call must have done a full prefill, not
+        //   // attempted to decode from stale caches.
     }
 }

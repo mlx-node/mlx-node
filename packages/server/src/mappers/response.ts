@@ -70,12 +70,22 @@ export function buildOutputItems(result: ChatResult): OutputItem[] {
 }
 
 export function buildUsage(result: ChatResult): ResponseUsage {
-  return {
+  const usage: ResponseUsage = {
     input_tokens: result.promptTokens,
     output_tokens: result.numTokens,
     output_tokens_details: { reasoning_tokens: result.reasoningTokens },
     total_tokens: result.promptTokens + result.numTokens,
   };
+  // Surface reused KV-cache prefix tokens via the upstream
+  // `input_tokens_details.cached_tokens` field when the native
+  // dispatch reports a non-zero reuse count. Omitted when zero so
+  // consumers can cheaply `usage.input_tokens_details?.cached_tokens`
+  // without also distinguishing a meaningful zero from "feature not
+  // active on this turn".
+  if (result.cachedTokens > 0) {
+    usage.input_tokens_details = { cached_tokens: result.cachedTokens };
+  }
+  return usage;
 }
 
 /** Concatenate all `output_text` parts from message items. */

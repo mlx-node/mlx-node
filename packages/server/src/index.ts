@@ -28,6 +28,13 @@ export type { ServableModel, ModelEntry, ModelRegistryOptions, RegisterOptions }
 
 export { QueueFullError, SessionRegistry } from './session-registry.js';
 export type { SessionLookupResult, SessionRegistryOptions } from './session-registry.js';
+// NOTE: `__resetPromptCacheKeyNonceForTests` is intentionally NOT
+// re-exported here. It is a test-only helper that nukes the module-
+// scoped HMAC nonce (and the once-per-process single-tenant warning
+// flag); exposing it on the public surface would let downstream
+// consumers invalidate every live tier-2 entry with one call. Tests
+// import it from the deep path
+// `packages/server/src/session-registry.js` instead.
 
 export { QWEN_SAMPLING_DEFAULTS } from './presets.js';
 

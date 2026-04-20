@@ -2515,6 +2515,17 @@ export interface ChatResult {
   reasoningTokens: number;
   finishReason: string;
   rawText: string;
+  /**
+   * Number of prompt tokens served from the reused KV-cache prefix.
+   *
+   * When the native prefix-cache machinery successfully matches the new
+   * prompt against the cached conversation history (via
+   * `verify_cache_prefix_direct`), only the trailing delta is re-prefilled
+   * and this field reports the length of the reused prefix. `0` when
+   * the cache was missed or disabled and the full prompt had to be
+   * re-prefilled.
+   */
+  cachedTokens: number;
   /** Performance metrics (present when `reportPerformance: true` in config) */
   performance?: PerformanceMetrics;
 }
@@ -2542,6 +2553,19 @@ export interface ChatStreamChunk {
   promptTokens?: number;
   reasoningTokens?: number;
   rawText?: string;
+  /**
+   * Number of prompt tokens served from the reused KV-cache prefix on
+   * this turn. Populated on the terminal chunk (`done == true`) only;
+   * `None` on mid-stream delta chunks.
+   *
+   * Zero on a cache miss or disabled reuse; equal to the matched
+   * prefix length on a hit. Mirrors `ChatResult.cached_tokens`
+   * verbatim so session-aware streaming consumers can observe
+   * prefix-cache reuse without round-tripping to the non-streaming
+   * path. Non-terminal chunks always carry `None` — only the
+   * terminal chunk is authoritative.
+   */
+  cachedTokens?: number | undefined;
   /** Performance metrics (only present in the final chunk when `reportPerformance: true`) */
   performance?: PerformanceMetrics;
   /**

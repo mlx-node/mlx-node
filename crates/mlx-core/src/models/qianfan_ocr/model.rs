@@ -720,6 +720,7 @@ impl QianfanOCRInner {
             reasoning_tokens,
             finish_reason,
             raw_text: raw_decoded,
+            cached_tokens: 0,
             performance,
         })
     }
@@ -972,6 +973,7 @@ impl QianfanOCRInner {
                     prompt_tokens: None,
                     reasoning_tokens: None,
                     raw_text: None,
+                    cached_tokens: None,
                     performance: None,
                     is_reasoning: None,
                 });
@@ -1111,6 +1113,10 @@ impl QianfanOCRInner {
                 prompt_tokens: Some(prefill_token_count as u32),
                 reasoning_tokens: Some(reasoning_tokens),
                 raw_text: Some(raw_decoded),
+                // Start path: report the matched prefix length
+                // (`clamped_prefix`). Zero on a miss or disabled
+                // reuse, equal to the matched prefix length on a hit.
+                cached_tokens: Some(clamped_prefix as u32),
                 performance,
                 is_reasoning: None,
             });
@@ -1334,6 +1340,16 @@ impl QianfanOCRInner {
             None
         };
 
+        // Capture the full prior-cached length BEFORE appending the
+        // delta. The delta path reuses the entire cached prefix by
+        // construction (it's a strict extension of
+        // `cached_token_history`), so `prior_cached_len` IS the token
+        // count skipped by the warm cache and must be surfaced on
+        // `ChatResult.cached_tokens` below. Without this, every Qianfan
+        // OCR delta turn misreports as a MISS (`cached_tokens = 0`),
+        // blocking the `/v1/responses` `prefix_hit` promotion.
+        let prior_cached_len = self.cached_token_history.len();
+
         // Build the full token history = cached_history + delta. Used as
         // penalty context AND the snapshot saved back into
         // `cached_token_history` at the end.
@@ -1544,6 +1560,11 @@ impl QianfanOCRInner {
             reasoning_tokens,
             finish_reason,
             raw_text: raw_decoded,
+            // Delta path reuses the full cached prefix by construction
+            // (strict extension of `cached_token_history`). Report it
+            // so the server endpoint can promote `X-Session-Cache` to
+            // `prefix_hit` on warm-cache continuations.
+            cached_tokens: prior_cached_len as u32,
             performance,
         })
     }
@@ -1785,6 +1806,11 @@ impl QianfanOCRInner {
         };
 
         // Build full token history = cached_history + delta.
+        // Capture `prior_cached_len` BEFORE the extend — the delta path
+        // reuses the full prior history by construction, so this is the
+        // authoritative `cached_tokens` value reported on the terminal
+        // ChatStreamChunk.
+        let prior_cached_len = self.cached_token_history.len() as u32;
         let mut all_tokens: Vec<u32> =
             Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len());
         all_tokens.extend_from_slice(&self.cached_token_history);
@@ -1894,6 +1920,7 @@ impl QianfanOCRInner {
                 prompt_tokens: None,
                 reasoning_tokens: None,
                 raw_text: None,
+                cached_tokens: None,
                 performance: None,
                 is_reasoning: None,
             });
@@ -2017,6 +2044,11 @@ impl QianfanOCRInner {
             prompt_tokens: Some(prefill_token_count as u32),
             reasoning_tokens: Some(reasoning_tokens),
             raw_text: Some(raw_decoded),
+            // Delta path reuses the full prior history by construction
+            // — report `prior_cached_len` (captured before the
+            // `self.cached_token_history` extend above) as the
+            // authoritative cached-prefix length.
+            cached_tokens: Some(prior_cached_len),
             performance,
             is_reasoning: None,
         });
@@ -2804,6 +2836,7 @@ mod tests {
             reasoning_tokens: 0,
             finish_reason: "stop".to_string(),
             raw_text: "Hello".to_string(),
+            cached_tokens: 0,
             performance: None,
         };
         assert_eq!(result.text, "Hello");

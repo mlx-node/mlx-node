@@ -666,6 +666,23 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * image key, and turn counter so the next `send()` goes through
    * `chatSessionStart` again.
    *
+   * This is a full wipe — safe default for public callers. It always
+   * calls `model.resetCaches()`, which is the ONLY behavior exposed
+   * on the public API because the underlying `SessionCapableModel`
+   * is shared across every `ChatSession` lifetime via the native
+   * `ModelRegistry`: a partial wipe that leaves the shared native
+   * KV cache intact would leak a previous (unrelated) request's
+   * cached prefix into the next `chat_session_start_sync` call. The
+   * server-side warm-lease replay path (where preserving the native
+   * cache is correct) uses its own server-private helper gated by
+   * the `SessionRegistry` HIT signal — the only authoritative proof
+   * that the native cache genuinely belongs to this chain. That
+   * helper lives inside `@mlx-node/server`, never touches the
+   * `@mlx-node/lm` export map, and is not reachable from downstream
+   * consumers. Public consumers of `@mlx-node/lm` have no such HIT
+   * signal, so the public API intentionally offers only the full-wipe
+   * option.
+   *
    * Returns `Promise<void>` for an async-friendly signature even
    * though `resetCaches()` is currently synchronous.
    */
