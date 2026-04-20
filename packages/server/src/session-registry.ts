@@ -80,6 +80,7 @@
  *     `adopt()` no-op but the native KV would already be wrong.
  */
 
+import type { ChatConfig } from '@mlx-node/core';
 import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 
 /** Constructor options for {@link SessionRegistry}. */
@@ -101,6 +102,20 @@ export interface SessionRegistryOptions {
    * `MLX_MAX_QUEUE_DEPTH_PER_MODEL` env var.
    */
   maxQueueDepth?: number;
+  /**
+   * Optional sampling defaults applied to every `ChatSession` this
+   * registry allocates. Forwarded verbatim into `new ChatSession(model,
+   * { defaultConfig })` so the session's `mergeConfig(overlay)` shallow-
+   * merges per-call config on top. Intended for server operators who
+   * want to pin per-model sampling knobs (temperature, topK, penalties,
+   * etc.) without client cooperation — per-request values from the
+   * OpenAI `/v1/responses` or Anthropic `/v1/messages` body still win
+   * where present because `ChatSession` treats them as an overlay.
+   *
+   * When `undefined`, behaviour is unchanged from the pre-defaults era
+   * (each `new ChatSession(model)` uses an empty `defaultConfig`).
+   */
+  samplingDefaults?: ChatConfig;
 }
 
 /**
@@ -156,6 +171,13 @@ export class SessionRegistry {
   private readonly model: SessionCapableModel;
   private readonly ttlSec: number;
   private readonly maxQueueDepth: number | undefined;
+  /**
+   * Per-model sampling defaults forwarded into every new `ChatSession`
+   * via its `defaultConfig` constructor option. `undefined` preserves
+   * the pre-defaults behaviour (empty `defaultConfig`). See
+   * {@link SessionRegistryOptions.samplingDefaults}.
+   */
+  private samplingDefaults: ChatConfig | undefined;
   /**
    * Number of callers that are currently WAITING for the per-model
    * execution mutex — i.e. have entered `withExclusive` but have not
@@ -215,6 +237,22 @@ export class SessionRegistry {
     this.model = opts.model;
     this.ttlSec = opts.ttlSec ?? 1800;
     this.maxQueueDepth = opts.maxQueueDepth;
+    this.samplingDefaults = opts.samplingDefaults;
+  }
+
+  /**
+   * Construct a fresh `ChatSession` bound to this registry's model and
+   * pre-seeded with the operator-configured `samplingDefaults` (if any).
+   * Centralized so every cache-miss branch of `getOrCreate` produces a
+   * session whose per-call overlay will merge on top of the same
+   * defaults — clients cannot accidentally stray from the server's
+   * pinned sampling knobs by picking a cold-replay path.
+   */
+  private newSession(): ChatSession<SessionCapableModel> {
+    if (this.samplingDefaults === undefined) {
+      return new ChatSession(this.model);
+    }
+    return new ChatSession(this.model, { defaultConfig: this.samplingDefaults });
   }
 
   /**
@@ -224,6 +262,27 @@ export class SessionRegistry {
    */
   get queueDepth(): number {
     return this.queuedCount;
+  }
+
+  /**
+   * Current sampling defaults applied to every new `ChatSession` this
+   * registry allocates. Exposed primarily for tests and diagnostics.
+   */
+  get defaultSamplingConfig(): ChatConfig | undefined {
+    return this.samplingDefaults;
+  }
+
+  /**
+   * Replace the sampling defaults forwarded into every future
+   * `ChatSession` this registry allocates. Called by `ModelRegistry`
+   * on a `register(name, model, { samplingDefaults })` refresh so a
+   * fresh registration's defaults immediately apply to the next
+   * cache-miss cold-start. Sessions already cached at call time keep
+   * the defaults they were constructed with — they settle naturally
+   * through the single-warm cache rotation.
+   */
+  setSamplingDefaults(defaults: ChatConfig | undefined): void {
+    this.samplingDefaults = defaults;
   }
 
   /** Number of sessions currently cached. Primarily for tests and diagnostics. Always 0 or 1. */
@@ -267,23 +326,23 @@ export class SessionRegistry {
     // common case is either "the entry we want" or "nothing".
     if (previousResponseId === null) {
       this.entries.clear();
-      return { session: new ChatSession(this.model), hit: false };
+      return { session: this.newSession(), hit: false };
     }
     const entry = this.entries.get(previousResponseId);
     if (entry === undefined) {
       this.entries.clear();
-      return { session: new ChatSession(this.model), hit: false };
+      return { session: this.newSession(), hit: false };
     }
     if (entry.expiresAt < nowSec()) {
       this.entries.clear();
-      return { session: new ChatSession(this.model), hit: false };
+      return { session: this.newSession(), hit: false };
     }
     // Prefix-state mismatch forces cold replay so the new
     // instructions are re-primed; without this guard, output would
     // silently depend on cache state instead of request contents.
     if (entry.instructions !== requestedInstructions) {
       this.entries.clear();
-      return { session: new ChatSession(this.model), hit: false };
+      return { session: this.newSession(), hit: false };
     }
     // Hit: clear and hand the session out as a single-use lease so
     // a concurrent second request against the same id cold-replays

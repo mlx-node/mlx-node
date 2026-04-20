@@ -24,10 +24,12 @@ export { createHandler } from './handler.js';
 export type { HandlerOptions } from './handler.js';
 
 export { ModelRegistry } from './registry.js';
-export type { ServableModel, ModelEntry, ModelRegistryOptions } from './registry.js';
+export type { ServableModel, ModelEntry, ModelRegistryOptions, RegisterOptions } from './registry.js';
 
 export { QueueFullError, SessionRegistry } from './session-registry.js';
 export type { SessionLookupResult, SessionRegistryOptions } from './session-registry.js';
+
+export { QWEN_SAMPLING_DEFAULTS } from './presets.js';
 
 export type {
   ResponsesAPIRequest,

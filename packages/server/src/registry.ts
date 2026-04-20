@@ -37,6 +37,7 @@
  *     and the continuation is accepted.
  */
 
+import type { ChatConfig } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
 
 import { SessionRegistry } from './session-registry.js';
@@ -104,6 +105,29 @@ export interface ModelRegistryOptions {
    * (unbounded — current behaviour).
    */
   maxQueueDepth?: number;
+}
+
+/**
+ * Per-registration options for {@link ModelRegistry.register}.
+ */
+export interface RegisterOptions {
+  /**
+   * Per-model sampling defaults forwarded through the bound
+   * `SessionRegistry` into every `ChatSession` it allocates (as the
+   * session's `defaultConfig`). Clients' per-request sampling values
+   * (OpenAI `temperature`/`top_p`, Anthropic equivalents) still win
+   * where present because `ChatSession.mergeConfig` treats them as an
+   * overlay — these defaults only fill the gaps for parameters the
+   * client never sent (`top_k`, `min_p`, penalties, etc.).
+   *
+   * Re-registering the same name with a fresh `samplingDefaults` value
+   * overwrites the binding's defaults in place so the next
+   * `ChatSession` allocated out of the registry picks up the new
+   * values. Warm sessions already in flight keep the previous defaults
+   * until they settle; this matches how the refresh path treats other
+   * per-binding state.
+   */
+  samplingDefaults?: ChatConfig;
 }
 
 export class ModelRegistry {
@@ -186,13 +210,19 @@ export class ModelRegistry {
    * preserves the id because `instanceIds.has(model)` is already
    * true.
    */
-  register(name: string, model: ServableModel): void {
+  register(name: string, model: ServableModel, opts?: RegisterOptions): void {
+    const samplingDefaults = opts?.samplingDefaults;
     const existing = this.models.get(name);
     if (existing && existing.model === model) {
       // Same name + same model object: leave the binding and refcount
       // alone. Refresh createdAt so `/v1/models` surfaces the most
-      // recent registration time.
+      // recent registration time. A fresh `samplingDefaults` from the
+      // re-registration is applied in place so the operator can tune
+      // per-model knobs without fully unregistering first.
       existing.createdAt = Math.floor(Date.now() / 1000);
+      if (opts && 'samplingDefaults' in opts) {
+        existing.sessionRegistry.setSamplingDefaults(samplingDefaults);
+      }
       return;
     }
     if (existing) {
@@ -210,15 +240,25 @@ export class ModelRegistry {
     let binding = this.sessionRegistriesByModel.get(model);
     if (!binding) {
       binding = {
-        registry: new SessionRegistry({ model, maxQueueDepth: this.maxQueueDepth }),
+        registry: new SessionRegistry({ model, maxQueueDepth: this.maxQueueDepth, samplingDefaults }),
         refCount: 0,
         inFlight: 0,
         pendingPersists: 0,
         pendingTeardown: false,
       };
       this.sessionRegistriesByModel.set(model, binding);
-    } else if (binding.pendingTeardown) {
-      binding.pendingTeardown = false;
+    } else {
+      if (binding.pendingTeardown) {
+        binding.pendingTeardown = false;
+      }
+      // Aliasing or reviving an existing binding: if this call passed
+      // `samplingDefaults` explicitly, overwrite the shared binding's
+      // defaults so the latest registration wins for every alias.
+      // Call sites that omit the field leave the existing defaults
+      // intact.
+      if (opts && 'samplingDefaults' in opts) {
+        binding.registry.setSamplingDefaults(samplingDefaults);
+      }
     }
     binding.refCount += 1;
     // Allocate a fresh monotonic instance id on first sight of this
