@@ -307,10 +307,22 @@ fn parse_function_tool_call(inner: &str, raw_content: &str) -> ToolCallResult {
                 param_value = &param_value[..param_value.len() - 1];
             }
 
-            param_map.insert(
-                param_name.to_string(),
-                Value::String(param_value.to_string()),
-            );
+            // Qwen3.5+ chat template emits non-string argument values via `| tojson`,
+            // so arrays/objects land here as raw JSON text inside the <parameter> block.
+            // Parse them back to Value::Array / Value::Object so the schema on the
+            // consumer side (e.g. pi's `edit` tool expecting `edits: array`) validates.
+            //
+            // We only parse when the value STARTS with `[` or `{`. The template emits
+            // string-typed args as bare text (no quotes), so `"5"` and `5` are
+            // indistinguishable at this layer; treating bare values as strings is the
+            // safe choice — schema consumers already know how to coerce.
+            let trimmed = param_value.trim();
+            let parsed_value = match trimmed.chars().next() {
+                Some('[') | Some('{') => serde_json::from_str::<Value>(trimmed)
+                    .unwrap_or_else(|_| Value::String(param_value.to_string())),
+                _ => Value::String(param_value.to_string()),
+            };
+            param_map.insert(param_name.to_string(), parsed_value);
         }
     }
 
@@ -1373,5 +1385,172 @@ The weather in Tokyo is sunny."#;
             clean.contains("</think> tag ends reasoning"),
             "literal </think> in content should be preserved, got: {clean}"
         );
+    }
+
+    // ---- Function format JSON-typed parameter values (Qwen3.5+ | tojson) ----
+
+    #[test]
+    fn test_parse_function_tool_call_array_parameter() {
+        // Array-typed argument: `<parameter=edits>[{...}]</parameter>` must come back
+        // as a Value::Array, not a JSON-encoded string.
+        let input = "<tool_call>\n<function=edit>\n<parameter=edits>\n[{\"oldText\":\"hello\",\"newText\":\"world\"}]\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "edit");
+        assert_eq!(calls[0].status, "ok");
+        let edits = &calls[0].arguments["edits"];
+        assert!(edits.is_array(), "edits must be a JSON array, got: {edits}");
+        let arr = edits.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["oldText"], "hello");
+        assert_eq!(arr[0]["newText"], "world");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_object_parameter() {
+        // Object-typed argument: `<parameter=config>{...}</parameter>` must come back
+        // as a Value::Object with working nested access.
+        let input = "<tool_call>\n<function=configure>\n<parameter=config>\n{\"key\":\"value\",\"nested\":{\"a\":1}}\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, "ok");
+        let config = &calls[0].arguments["config"];
+        assert!(config.is_object(), "config must be a JSON object");
+        assert_eq!(config["key"], "value");
+        assert_eq!(config["nested"]["a"], 1);
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_plain_string_parameter() {
+        // Bare string (no `[`/`{` prefix) must remain Value::String.
+        let input = "<tool_call>\n<function=search>\n<parameter=query>\nhello world\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        let query = &calls[0].arguments["query"];
+        assert!(query.is_string());
+        assert_eq!(query.as_str().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_bare_number_stays_string() {
+        // Conservative choice: bare numeric-looking values stay as Value::String
+        // since string/number ambiguity can't be resolved at this layer.
+        let input = "<tool_call>\n<function=count>\n<parameter=count>\n42\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        let count = &calls[0].arguments["count"];
+        assert!(count.is_string(), "bare numbers must remain strings");
+        assert_eq!(count.as_str().unwrap(), "42");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_invalid_json_array_falls_back_to_string() {
+        // Value starts with `[` but isn't valid JSON — must fall back to Value::String
+        // preserving the original raw text.
+        let input = "<tool_call>\n<function=f>\n<parameter=q>\n[unclosed\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        let q = &calls[0].arguments["q"];
+        assert!(q.is_string(), "invalid JSON array must fall back to string");
+        assert_eq!(q.as_str().unwrap(), "[unclosed");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_multiline_json_array() {
+        // Array spread across multiple lines must still parse as JSON.
+        let input = "<tool_call>\n<function=edit>\n<parameter=edits>\n[\n  {\"oldText\":\"a\",\"newText\":\"b\"},\n  {\"oldText\":\"c\",\"newText\":\"d\"}\n]\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        let edits = &calls[0].arguments["edits"];
+        assert!(edits.is_array());
+        let arr = edits.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["oldText"], "a");
+        assert_eq!(arr[1]["newText"], "d");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_array_two_items_escaped_strings() {
+        // Two-element array with JSON-escaped strings parses correctly.
+        let input = "<tool_call>\n<function=edit>\n<parameter=edits>\n[{\"oldText\":\"a\",\"newText\":\"b\"},{\"oldText\":\"c\",\"newText\":\"d\"}]\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        let edits = &calls[0].arguments["edits"];
+        let arr = edits.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["oldText"], "a");
+        assert_eq!(arr[0]["newText"], "b");
+        assert_eq!(arr[1]["oldText"], "c");
+        assert_eq!(arr[1]["newText"], "d");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_array_with_multiline_string_escape() {
+        // JSON-escaped newlines (`\n`) inside string values decode to real newlines
+        // after parse.
+        let input = "<tool_call>\n<function=edit>\n<parameter=edits>\n[{\"oldText\":\"line1\\nline2\",\"newText\":\"x\"}]\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        let edits = &calls[0].arguments["edits"];
+        let arr = edits.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["oldText"], "line1\nline2");
+        assert_eq!(arr[0]["newText"], "x");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_mixed_parameter_types() {
+        // Real-world shape: array for `edits`, plain string for `path` —
+        // both must come back with the correct type.
+        let input = "<tool_call>\n<function=edit>\n<parameter=path>\n/tmp/file.txt\n</parameter>\n<parameter=edits>\n[{\"oldText\":\"hello\",\"newText\":\"world\"}]\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        let path = &calls[0].arguments["path"];
+        assert!(path.is_string());
+        assert_eq!(path.as_str().unwrap(), "/tmp/file.txt");
+
+        let edits = &calls[0].arguments["edits"];
+        assert!(edits.is_array());
+        let arr = edits.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["oldText"], "hello");
+        assert_eq!(arr[0]["newText"], "world");
+    }
+
+    #[test]
+    fn test_parse_function_tool_call_pi_edit_tool_shape_regression() {
+        // Regression guard for the exact vitest-migration bug: pi's `edit` tool
+        // requires `edits: array` and `path: string`. Prior to the fix, `edits`
+        // arrived as a JSON-encoded string and pi rejected every call.
+        let input = "<tool_call>\n<function=edit>\n<parameter=path>\n/repo/src/foo.ts\n</parameter>\n<parameter=edits>\n[{\"oldText\":\"it.skip\",\"newText\":\"it\"},{\"oldText\":\"describe.skip\",\"newText\":\"describe\"}]\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "edit");
+        assert_eq!(calls[0].status, "ok");
+        // path: string
+        assert!(calls[0].arguments["path"].is_string());
+        assert_eq!(
+            calls[0].arguments["path"].as_str().unwrap(),
+            "/repo/src/foo.ts"
+        );
+        // edits: array (this was broken — used to be Value::String)
+        assert!(
+            calls[0].arguments["edits"].is_array(),
+            "edits must validate as array against pi's schema"
+        );
+        let arr = calls[0].arguments["edits"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["oldText"], "it.skip");
+        assert_eq!(arr[1]["newText"], "describe");
     }
 }
