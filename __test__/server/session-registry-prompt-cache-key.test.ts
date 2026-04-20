@@ -74,11 +74,10 @@ describe('SessionRegistry tier-2 prompt_cache_key lookup', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
-    // Tier-2 reuse is opt-in (see session-registry.ts). Enable it for
-    // every test in this file — the key-scoping tests in the
-    // companion `session-registry-key-scoping.test.ts` cover the
-    // env-gated behaviour explicitly.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
+    // Tier-2 reuse is ON by default (see session-registry.ts); no env
+    // stubbing is required here. The companion
+    // `session-registry-key-scoping.test.ts` covers the
+    // `MLX_DISABLE_PROMPT_CACHE_KEY` opt-out behaviour explicitly.
   });
 
   afterEach(() => {

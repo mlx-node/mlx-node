@@ -140,23 +140,24 @@ export interface ResponsesAPIRequest {
    * routing the request through the wrong warm state. Fall through to
    * fresh on prev-id miss instead.
    *
+   * **Enabled by default.** Opt out with
+   * `MLX_DISABLE_PROMPT_CACHE_KEY=1` in multi-tenant deployments,
+   * where the tier-2 lookup becomes unsafe — the key is caller-
+   * controlled, so two clients picking the same raw key would lease
+   * each other's warm sessions. HMAC-scoping with a boot-time nonce
+   * hides the raw value from memory dumps but does not protect
+   * against that shared-key hijack. Operators who need multi-tenant
+   * isolation should either disable the feature or front the server
+   * with an auth proxy that rewrites `prompt_cache_key` per tenant.
+   *
    * **Prerequisites (ALL must hold, else the field is a silent no-op):**
    *
-   *   1. The server process must have
-   *      `MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT=1` set in its
-   *      environment. This is OFF by default because the feature
-   *      assumes a single-tenant trust boundary: the key is caller-
-   *      controlled, so two clients picking the same raw key will
-   *      lease each other's warm sessions. Do NOT enable in multi-
-   *      tenant production. The first request that successfully
-   *      engages tier-2 in a given process also emits a one-time
-   *      stderr warning naming the env var — grep logs for
-   *      `[mlx-node] WARNING: prompt_cache_key tier-2 reuse` if in
-   *      doubt.
+   *   1. `MLX_DISABLE_PROMPT_CACHE_KEY` must NOT be set to `"1"` in the
+   *      server environment (default behavior is enabled).
    *   2. The key must be at least 8 characters. Shorter values
    *      (including the empty string) are silently treated as if no
    *      key were supplied — trivial guessing collisions on short
-   *      keys would be a real risk even in the single-tenant case.
+   *      keys would be a real risk even in single-tenant use.
    *   3. `previous_response_id` must NOT be set on the same request.
    *      Prev-id takes precedence; tier-2 never runs when both are
    *      present.

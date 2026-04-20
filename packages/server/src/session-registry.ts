@@ -2,17 +2,16 @@
  * SessionRegistry -- per-model cache holding AT MOST one live
  * `ChatSession` whose native KV state is currently valid.
  *
- * **Single-tenant trust boundary.** The tier-2 `prompt_cache_key`
- * reuse path (opted in via
- * `MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT=1`) is SAFE ONLY for
- * single-user / single-tenant deployments. The key is caller-
- * controlled, so two clients that happen to pick the same raw key
- * will lease each other's warm sessions — a session-hijack surface
- * in any multi-tenant setting. Multi-tenant isolation (binding the
- * key to an authenticated principal) is explicitly OUT OF SCOPE for
- * this cache; operators who need it must front the server with an
- * auth proxy that rewrites or namespaces `prompt_cache_key` per
- * tenant before it reaches this process. See also the comments on
+ * **Tier-2 `prompt_cache_key` reuse is ON by default** so the server
+ * is compatible with any stateless LLM agent that sends the full
+ * conversation history each turn. The key is caller-controlled and
+ * HMAC-scoped with a boot-time nonce (raw value never stored on the
+ * entry), but two clients that pick the same raw key will still
+ * lease the same warm session — a session-hijack surface in
+ * multi-tenant settings. For multi-tenant deployments, opt out via
+ * `MLX_DISABLE_PROMPT_CACHE_KEY=1` or front the server with an auth
+ * proxy that rewrites or namespaces `prompt_cache_key` per tenant
+ * before it reaches this process. See also the comments on
  * {@link scopePromptCacheKey}.
  *
  * Design notes:
@@ -99,28 +98,26 @@ import type { ChatConfig } from '@mlx-node/core';
 import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 
 /**
- * Tier-2 `prompt_cache_key` reuse is OPT-IN via the
- * `MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT` environment variable.
- * Default: disabled.
+ * Tier-2 `prompt_cache_key` reuse is **ON by default** so the server
+ * is immediately compatible with any stateless LLM agent (pi-mono,
+ * Aider, Codex CLI, Claude Code, Cline, Continue) that sends the full
+ * transcript every turn. Agents that set OpenAI's standard
+ * `prompt_cache_key` field — which most do — get automatic KV cache
+ * reuse across turns of the same logical session.
  *
- * **Single-tenant only.** The variable name is intentionally explicit:
- * this flag is SAFE ONLY for deployments where every request that
- * reaches this process is known to come from the same trusted
- * principal (a single developer's laptop, a single agent talking to a
- * local server, etc.). `prompt_cache_key` is a caller-chosen string
- * with no binding to an authenticated identity — if two clients pick
- * the same raw key (by accident or on purpose), the second will lease
- * the first's warm `ChatSession`: same conversation history, same
- * `cached_tokens` side channel, same sampling state. That is a
- * session-hijack surface in any multi-tenant deployment.
+ * Opt out via `MLX_DISABLE_PROMPT_CACHE_KEY=1` for **multi-tenant
+ * deployments**, where the tier-2 lookup becomes unsafe: two clients
+ * that pick the same raw `prompt_cache_key` (by accident or on
+ * purpose) would share a warm `ChatSession`, leaking conversation
+ * history and sampling state across principals.
  *
- * Multi-tenant key scoping (binding the key to a per-client principal
- * or namespace) is EXPLICITLY OUT OF SCOPE for this registry. The
+ * Multi-tenant isolation is out of scope for this registry. The
  * HMAC-scoping applied below only hides the raw key from memory /
- * dumps — it does not protect against two clients sharing the same
- * raw input. Operators who need multi-tenant isolation must front
- * this server with an auth proxy that rewrites `prompt_cache_key`
- * per-tenant before it reaches the process.
+ * dumps — it does NOT protect against two clients sharing the same
+ * raw input. Operators who need multi-tenant isolation must either
+ * disable the feature or front the server with an auth proxy that
+ * rewrites `prompt_cache_key` per-tenant before it reaches the
+ * process.
  *
  * Read at call time (not cached at module load) so tests can flip the
  * env via `vi.stubEnv()` between cases without re-importing the module.
@@ -128,40 +125,7 @@ import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
  * against the rest of the lookup work.
  */
 function isPromptCacheKeyEnabled(): boolean {
-  return process.env.MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT === '1';
-}
-
-/**
- * Module-scoped flag tracking whether the single-tenant-only warning
- * has been emitted to stderr. We emit ONCE per process to make the
- * trust boundary impossible to miss during first onboarding without
- * drowning logs on every request. Reset to `false` by
- * {@link __resetPromptCacheKeyNonceForTests} so unit tests can re-
- * exercise the once-per-process path across cases.
- */
-let singleTenantWarningEmitted = false;
-
-/**
- * Emit a once-per-process stderr warning the first time a caller
- * supplies a `prompt_cache_key` while the single-tenant opt-in env is
- * enabled. Callers MUST invoke this inside the tier-2 accept branch
- * (after the opt-in gate + min-length gate have both passed) — that
- * way disabled / too-short / absent keys never trip the warning at
- * all.
- *
- * The message names the env variable explicitly so operators can
- * `grep` logs → config. Stderr (`console.warn`) instead of stdout so
- * the warning does not contaminate any JSON response pipeline
- * redirected to stdout.
- */
-function warnSingleTenantOnce(): void {
-  if (singleTenantWarningEmitted) return;
-  singleTenantWarningEmitted = true;
-  console.warn(
-    '[mlx-node] WARNING: prompt_cache_key tier-2 reuse is enabled via MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT. ' +
-      'This is SAFE ONLY for single-tenant deployments. In multi-tenant use, clients sharing the same ' +
-      'prompt_cache_key can lease each other\u2019s warm sessions. Do NOT enable in multi-tenant production.',
-  );
+  return process.env.MLX_DISABLE_PROMPT_CACHE_KEY !== '1';
 }
 
 /**
@@ -206,10 +170,10 @@ function getNonce(): Buffer {
 
 /**
  * Test-only hook used by the scoping unit tests to simulate a
- * server restart: resets both the module-scoped HMAC nonce (so every
- * previously stored tier-2 key misses) AND the once-per-process
- * single-tenant stderr warning flag (so a test can re-exercise the
- * first-call warning path).
+ * server restart: resets the module-scoped HMAC nonce (so every
+ * previously stored tier-2 key misses) and clears the silent-miss
+ * dedupe cache so tests can re-exercise the once-per-key diagnostic
+ * path.
  *
  * **Not exported from the package's public `index.ts` surface** —
  * exporting it there would let downstream consumers nuke tier-2
@@ -223,7 +187,6 @@ function getNonce(): Buffer {
  */
 export function __resetPromptCacheKeyNonceForTests(): void {
   cachedNonce = null;
-  singleTenantWarningEmitted = false;
   loggedSilentMissKeys.clear();
 }
 
@@ -241,7 +204,7 @@ export function __resetPromptCacheKeyNonceForTests(): void {
  *
  * Returns `null` when:
  *   - The tier-2 feature is disabled
- *     (`MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT` is not `"1"`).
+ *     (`MLX_DISABLE_PROMPT_CACHE_KEY` is set to `"1"`).
  *   - `rawKey` is `null`, `undefined`, or the empty string (callers
  *     that forget to thread the key must not accidentally opt into
  *     tier-2 reuse).
@@ -252,16 +215,11 @@ export function __resetPromptCacheKeyNonceForTests(): void {
  * Otherwise returns the first 32 hex chars of
  * `HMAC-SHA256(cachedNonce, rawKey)` — opaque, server-instance-scoped,
  * and long enough to preserve the 64-bit entropy floor that the
- * pre-scoped path relied on for key uniqueness. The first time this
- * path accepts a key in a given process, {@link warnSingleTenantOnce}
- * prints a one-time stderr warning naming the env var — that way
- * operators who flipped the flag during rollout cannot miss the
- * trust-boundary caveat.
+ * pre-scoped path relied on for key uniqueness.
  */
 function scopePromptCacheKey(rawKey: string | null | undefined): string | null {
   if (!isPromptCacheKeyEnabled()) return null;
   if (rawKey == null || rawKey.length < PROMPT_CACHE_KEY_MIN_LENGTH) return null;
-  warnSingleTenantOnce();
   return createHmac('sha256', getNonce()).update(rawKey).digest('hex').slice(0, 32);
 }
 
@@ -316,10 +274,9 @@ export function maybeWarnPromptCacheKeyIneligible(rawKey: string | null | undefi
   loggedSilentMissKeys.set(digest, true);
   if (!isPromptCacheKeyEnabled()) {
     console.warn(
-      `[mlx-node] prompt_cache_key supplied but tier-2 reuse is OFF ` +
-        `(MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT is not set to "1"). ` +
-        `The key will be ignored and this turn will cold-start. ` +
-        `This message is logged once per distinct key.`,
+      `[mlx-node] prompt_cache_key supplied but tier-2 reuse is disabled ` +
+        `(MLX_DISABLE_PROMPT_CACHE_KEY=1). The key will be ignored and this ` +
+        `turn will cold-start. This message is logged once per distinct key.`,
     );
     return;
   }

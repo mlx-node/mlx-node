@@ -11175,14 +11175,14 @@ describe('createHandler', () => {
     // -----------------------------------------------------------------
     // Tier-2 `prompt_cache_key` observability
     //
-    // Round 7 Fix #1 gates tier-2 behind `MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT=1`
-    // + scopes keys via HMAC. Tests in this block opt in explicitly and
-    // reset the nonce between tests so each starts from a clean boot.
+    // Tier-2 reuse is ON by default; opt-out via
+    // `MLX_DISABLE_PROMPT_CACHE_KEY=1`. Tests in this block rely on the
+    // default-on behaviour and reset the HMAC nonce between tests so
+    // each starts from a clean boot.
     // -----------------------------------------------------------------
 
-    describe('tier-2 prompt_cache_key (opt-in via MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT)', () => {
+    describe('tier-2 prompt_cache_key (default-on)', () => {
       beforeEach(() => {
-        vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
         __resetPromptCacheKeyNonceForTests();
       });
 
@@ -11561,7 +11561,7 @@ describe('createHandler', () => {
         // path does not read native cached_tokens).
         expect(getHeaders2()['x-cached-tokens']).toBeUndefined();
       });
-    }); // end describe 'tier-2 prompt_cache_key (opt-in via MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT)'
+    }); // end describe 'tier-2 prompt_cache_key (default-on)'
 
     it('streaming tier-2 hit surfaces cached_tokens via final response.completed event (Round 5 Fix #3)', async () => {
       // Round 5 Fix #3: streaming `X-Session-Cache` is documented as

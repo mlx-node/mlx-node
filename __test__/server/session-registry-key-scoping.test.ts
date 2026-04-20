@@ -6,14 +6,15 @@
  * the tier-2 match semantics with the feature enabled). This file pins
  * the security contract:
  *
- *   - Tier-2 reuse is OFF unless `MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT=1`. When
- *     off, every tier-2 lookup misses regardless of key.
+ *   - Tier-2 reuse is ON by default. Opt out via
+ *     `MLX_DISABLE_PROMPT_CACHE_KEY=1`. When opted out, every tier-2
+ *     lookup misses regardless of key.
  *   - Stored keys are HMAC-scoped with a boot-time nonce held only in
  *     the module's memory. Resetting the nonce (simulating a server
  *     restart) invalidates every tier-2 entry.
  *   - A caller-supplied key must be at least 8 chars to be accepted;
  *     shorter keys are treated as if the caller had not supplied one.
- *   - Null / empty keys never match regardless of the opt-in.
+ *   - Null / empty keys never match regardless of the opt-out.
  *
  * The nonce reset helper is imported via the deep path into
  * `session-registry.ts` — it is not part of the server package's public
@@ -95,13 +96,13 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     __resetPromptCacheKeyNonceForTests();
   });
 
-  it('tier-2 disabled by default: any key misses when MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT is unset', () => {
-    // Security default: without the opt-in env, tier-2 reuse is off —
-    // neither adopt nor getOrCreate uses the raw caller-supplied key.
-    // A client cannot lease another client's warm session by guessing
-    // or reusing any `prompt_cache_key` because scoping returns null
-    // and the stored `promptCacheKey` field is null on every entry.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '');
+  it('tier-2 enabled by default: keys match when no disable env is set', () => {
+    // Security default: tier-2 reuse is ON out of the box so any
+    // stateless agent that threads `prompt_cache_key` gets warm-session
+    // reuse immediately. No env stubbing is required — adopting with a
+    // non-empty key and looking it up must HIT. The negative-regression
+    // branch below flips `MLX_DISABLE_PROMPT_CACHE_KEY=1` and asserts
+    // the same lookup misses, pinning the opt-out contract.
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -109,17 +110,27 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     reg.adopt('resp_1', s1, null, 'stateless-chain-1234');
     const got = reg.getOrCreate(null, null, 'stateless-chain-1234');
 
-    expect(got.session).not.toBe(s1);
-    expect(got.session).toBeInstanceOf(ChatSession);
-    expect(got.hit).toBe(false);
+    expect(got.session).toBe(s1);
+    expect(got.hit).toBe(true);
+
+    // Negative regression: with the opt-out set, adopt + lookup of the
+    // same key misses because tier-2 scoping returns null on both ends.
+    vi.stubEnv('MLX_DISABLE_PROMPT_CACHE_KEY', '1');
+    const reg2 = new SessionRegistry({ model });
+    const s2 = new ChatSession(model);
+    reg2.adopt('resp_2', s2, null, 'stateless-chain-1234');
+    const got2 = reg2.getOrCreate(null, null, 'stateless-chain-1234');
+    expect(got2.session).not.toBe(s2);
+    expect(got2.session).toBeInstanceOf(ChatSession);
+    expect(got2.hit).toBe(false);
   });
 
   it('tier-2 disabled: stored key is null (not the raw client key)', () => {
     // Belt-and-suspenders: even if some future lookup path were to
-    // bypass the opt-in gate, the stored `promptCacheKey` is itself
-    // null when the feature is off — so the raw caller-supplied
+    // bypass the opt-out gate, the stored `promptCacheKey` is itself
+    // null when the feature is disabled — so the raw caller-supplied
     // string is never reachable from the cached entry in any form.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '');
+    vi.stubEnv('MLX_DISABLE_PROMPT_CACHE_KEY', '1');
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -127,20 +138,19 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     // Sanity: adopt with a non-empty key that would match under tier-2
     // if the feature were enabled.
     reg.adopt('resp_1', s1, null, 'stateless-chain-1234');
-    // Turning the env var back on AFTER adopt cannot retroactively
-    // resurrect the stored key — the scoping happened at adopt time,
-    // not at lookup time.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
+    // Clearing the opt-out AFTER adopt cannot retroactively resurrect
+    // the stored key — the scoping happened at adopt time, not at
+    // lookup time.
+    vi.stubEnv('MLX_DISABLE_PROMPT_CACHE_KEY', '');
     const got = reg.getOrCreate(null, null, 'stateless-chain-1234');
     expect(got.hit).toBe(false);
   });
 
   it('tier-2 enabled: hit on matching scoped key', () => {
-    // Positive-path smoke: when the opt-in is on and both sides pass
-    // a sufficiently-long matching key, the registry hits on tier 2.
-    // The stored key is the HMAC of the raw key; the lookup applies
-    // the same HMAC so both sides compare equal.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
+    // Positive-path smoke: when tier-2 is active (the default) and
+    // both sides pass a sufficiently-long matching key, the registry
+    // hits on tier 2. The stored key is the HMAC of the raw key; the
+    // lookup applies the same HMAC so both sides compare equal.
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -158,7 +168,6 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     // stored before. Existing entries become unreachable — exactly
     // the contract promised in the module docstring. Simulated here
     // via the test-only `__resetPromptCacheKeyNonceForTests` hook.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -173,11 +182,10 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     expect(got.hit).toBe(false);
   });
 
-  it('empty-string key misses regardless of opt-in (min-length gate)', () => {
+  it('empty-string key misses regardless of opt-out (min-length gate)', () => {
     // The minimum-length gate rejects the empty string on both
     // adopt and lookup, so the entry's scoped `promptCacheKey` is
     // null and no request can hit tier 2 via "".
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -188,13 +196,12 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     expect(got.hit).toBe(false);
   });
 
-  it('too-short key misses regardless of opt-in (min-length gate)', () => {
+  it('too-short key misses regardless of opt-out (min-length gate)', () => {
     // Keys shorter than the minimum are rejected at scope time — they
     // would be trivially guessable and make cross-client collisions
     // plausible. The guard treats them exactly like the "no key"
     // case; the stored entry's scoped key is null and the lookup
     // returns a fresh session.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -209,7 +216,6 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
   it('exactly-minimum-length key is accepted when tier-2 is enabled', () => {
     // Boundary case: 8 chars is acceptable; pins the minimum-length
     // boundary at `length < 8` rather than `<= 8`.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -221,12 +227,13 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     expect(got.hit).toBe(true);
   });
 
-  it('env var values other than exactly "1" leave the feature disabled', () => {
+  it('only literal MLX_DISABLE_PROMPT_CACHE_KEY="1" disables — other truthy values leave it enabled', () => {
     // The check is `=== '1'`, not truthy. `'true'` / `'yes'` / numeric
     // `1` (env vars are always strings anyway) all leave the feature
-    // off. Pins that rollout recipes cannot accidentally enable it by
-    // passing a truthy-but-not-"1" value.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', 'true');
+    // ON. Pins that accidental truthy-but-not-"1" values do NOT
+    // silently disable tier-2 reuse — operators must set the exact
+    // opt-out literal.
+    vi.stubEnv('MLX_DISABLE_PROMPT_CACHE_KEY', 'true');
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -234,7 +241,8 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     reg.adopt('resp_1', s1, null, 'stateless-chain-1234');
     const got = reg.getOrCreate(null, null, 'stateless-chain-1234');
 
-    expect(got.hit).toBe(false);
+    expect(got.session).toBe(s1);
+    expect(got.hit).toBe(true);
   });
 
   it('raw caller-supplied key is not stored on the entry (HMAC-scoped only)', () => {
@@ -245,7 +253,6 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     // asserts that the stored scoped string is NOT byte-equal to the
     // raw input — the HMAC pre-image resistance is what protects
     // clients from cross-request probing in multi-tenant setups.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '1');
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
     const s1 = new ChatSession(model);
@@ -277,7 +284,7 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     // does not throw or mis-classify. Exact cap is a private detail —
     // we just assert a reasonable upper bound that is LESS THAN the
     // flood size.
-    vi.stubEnv('MLX_ENABLE_PROMPT_CACHE_KEY_SINGLE_TENANT', '');
+    vi.stubEnv('MLX_DISABLE_PROMPT_CACHE_KEY', '1');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const flood = 5000;
