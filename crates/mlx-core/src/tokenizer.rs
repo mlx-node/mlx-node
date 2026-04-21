@@ -1992,4 +1992,115 @@ mod tests {
             "path must render before edits (got path={path_idx}, edits={edits_idx}):\n{rendered}",
         );
     }
+
+    /// Gemma4 template echoes `reasoning_content` inside a
+    /// `<|channel>thought\n{thinking_text}\n<channel|>` block (see
+    /// `.cache/models/gemma-4-*-mlx/chat_template.jinja` line 238). The
+    /// label `thought\n` is hardcoded by the template, which means
+    /// `reasoning_content` MUST carry only the body — NOT the label.
+    ///
+    /// Our Gemma4 output parser historically stored the full body incl.
+    /// the `thought\n` prefix inside `thinking`. When pi-mono echoed
+    /// that back verbatim as `reasoning_summary.text` → mapper
+    /// coalesced it into `reasoning_content`, the template re-emitted
+    /// `<|channel>thought\nthought\n{body}\n<channel|>` — a byte-level
+    /// divergence from the cached prefix, zeroing `verify_cache_prefix`
+    /// on every turn. Fix: strip the leading `thought\n` in the parser
+    /// before saving to `thinking`. Guard that invariant here.
+    ///
+    /// Regression test for Gemma4 cache-reuse (always `cached_tokens=0`
+    /// under pi-mono) — see `.logging-gemma/requests.ndjson` turns 2-7.
+    #[test]
+    fn gemma4_reasoning_echo_renders_byte_for_byte_with_model_generation() {
+        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/gemma-4-26b-a4b-it-UD-Q8_K_XL-mlx/chat_template.jinja";
+        let Ok(tmpl) = std::fs::read_to_string(path) else {
+            // Skip when the fixture isn't checked out locally.
+            return;
+        };
+
+        // What the MODEL originally emitted on turn 1 between the two
+        // channel markers. This is the slice that ends up inside the
+        // cache's KV state after the decode loop.
+        let model_channel_body = "The user wants me to run ls.";
+        let model_generated = format!(
+            "<|channel>thought\n{model_channel_body}\n<channel|><|tool_call>call:bash{{command:<|\"|>ls<|\"|>}}<tool_call|>"
+        );
+
+        // Turn 2 echoes the parsed output back through the Responses
+        // mapper. Simulate the coalesced ChatMessage shape it produces:
+        // reasoning_content is whatever the parser returned, which
+        // (after the fix) must be the body WITHOUT the `thought\n`
+        // label — so when the Gemma4 template re-renders, it emits
+        // exactly what the model originally generated.
+        //
+        // We test both directions: the bug shape (with `thought\n`
+        // preserved) must produce a divergent render, and the fixed
+        // shape (body only) must produce a byte-equal render.
+        let parsed_via_bug = format!("thought\n{model_channel_body}");
+        let parsed_via_fix = model_channel_body.to_string();
+
+        let build_messages = |reasoning: &str| {
+            vec![
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "Run ls.".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    images: None,
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: Some("call_1".to_string()),
+                        name: "bash".to_string(),
+                        arguments: r#"{"command":"ls"}"#.to_string(),
+                    }]),
+                    tool_call_id: None,
+                    reasoning_content: Some(reasoning.to_string()),
+                    images: None,
+                },
+            ]
+        };
+
+        let render = |reasoning: &str| {
+            Qwen3Tokenizer::render_chat_template_jinja2(
+                &tmpl,
+                &build_messages(reasoning),
+                None,
+                /*add_generation_prompt=*/ true,
+                /*enable_thinking=*/ Some(true),
+                "<bos>",
+                "<eos>",
+            )
+            .unwrap()
+        };
+
+        let rendered_bug = render(&parsed_via_bug);
+        let rendered_fix = render(&parsed_via_fix);
+
+        // Bug shape: the template re-emits `thought\n` before the
+        // echoed reasoning, producing DOUBLED `thought\n` in the
+        // rendered channel block — NOT what the model generated.
+        assert!(
+            rendered_bug.contains("<|channel>thought\nthought\nThe user wants"),
+            "bug shape should produce doubled `thought\\n` in rendered prompt:\n{rendered_bug}"
+        );
+
+        // Fixed shape: the template re-emits `thought\n` exactly once,
+        // matching what the model generated during turn 1 decode. This
+        // is the byte sequence that was saved to `cached_token_history`
+        // (post-tokenization) and the byte sequence turn 2 must
+        // re-produce in order for `verify_cache_prefix` to succeed.
+        assert!(
+            rendered_fix.contains(model_generated.as_str()),
+            "fixed shape must re-render the model-generated slice byte-for-byte; \
+             model generated:\n  {model_generated:?}\nrendered prompt was:\n{rendered_fix}"
+        );
+        assert!(
+            !rendered_fix.contains("thought\nthought\n"),
+            "fixed shape must NOT double `thought\\n`:\n{rendered_fix}"
+        );
+    }
 }

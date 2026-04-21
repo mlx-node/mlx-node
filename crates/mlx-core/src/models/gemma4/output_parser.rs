@@ -417,6 +417,14 @@ pub(crate) struct Gemma4StreamParser {
     thinking: String,
     /// True once we've entered a channel block at least once.
     saw_channel: bool,
+    /// Has the `thought\n` channel label been stripped from the current
+    /// channel block yet? Set to `false` on each `<|channel>` open and
+    /// flipped to `true` on the first reasoning emit that consumes the
+    /// label. Subsequent emits inside the same block pass through
+    /// unchanged. See `strip_channel_label` for the full rationale —
+    /// the template re-emits its own `thought\n` label on echo, so the
+    /// client-visible `thinking` MUST NOT carry it.
+    channel_label_stripped: bool,
     /// Raw bytes of the current tool-call block (everything between the
     /// opening and closing markers).
     tool_call_buf: String,
@@ -437,14 +445,26 @@ impl Gemma4StreamParser {
             pending: String::new(),
             thinking: String::new(),
             saw_channel: false,
+            channel_label_stripped: true,
             tool_call_buf: String::new(),
             tool_calls: Vec::new(),
         }
     }
 
     /// Accumulated reasoning content, or `None` if no channel block was
-    /// ever observed. Trimmed of leading/trailing whitespace to match the
-    /// common "body of the thought" interpretation.
+    /// ever observed. Trimmed of leading/trailing whitespace to match
+    /// the common "body of the thought" interpretation.
+    ///
+    /// The `thought\n` channel label is stripped incrementally during
+    /// streaming (see `channel_label_stripped` / the first-emit path in
+    /// `drain_until_close`) so the accumulated buffer already reflects
+    /// the label-less body. The Gemma4 chat template re-emits its own
+    /// `thought\n` label when echoing `reasoning_content` back on a
+    /// subsequent turn — if we left the label in `thinking` the
+    /// rendered prompt would double it (`thought\nthought\n{body}`),
+    /// diverging from the bytes the model originally generated and
+    /// zeroing `verify_cache_prefix`'s prefix match. See
+    /// `strip_channel_label` for the full rationale.
     pub(crate) fn thinking(&self) -> Option<String> {
         if self.saw_channel {
             let t = self.thinking.trim();
@@ -550,6 +570,11 @@ impl Gemma4StreamParser {
             self.state = match marker {
                 m if m == CHANNEL_OPEN => {
                     self.saw_channel = true;
+                    // Fresh channel block — arm the label stripper so
+                    // the first reasoning emit consumes the hardcoded
+                    // `thought\n` label the chat template re-emits on
+                    // echo. See `strip_channel_label`.
+                    self.channel_label_stripped = false;
                     StreamState::Channel
                 }
                 m if m == TOOL_CALL_OPEN => {
@@ -588,6 +613,39 @@ impl Gemma4StreamParser {
         false
     }
 
+    /// Emit a reasoning chunk, stripping the hardcoded `thought\n`
+    /// channel label from the first emit of a block. Always the only
+    /// path that feeds `self.thinking` + pushes a `Reasoning` segment
+    /// so label stripping stays in sync across the accumulated buffer
+    /// and the streaming deltas.
+    ///
+    /// See `strip_channel_label` for why the label must be stripped
+    /// eagerly: the Gemma4 chat template re-emits `thought\n` on echo,
+    /// so the client-visible reasoning body MUST NOT carry it or the
+    /// re-rendered prefix diverges from the bytes the model originally
+    /// generated and KV-cache reuse misses on every turn.
+    fn emit_reasoning(&mut self, out: &mut Vec<StreamSegment>, body: String) {
+        if body.is_empty() {
+            return;
+        }
+        let stripped = if !self.channel_label_stripped {
+            self.channel_label_stripped = true;
+            // `strip_channel_label` is byte-safe: the label is ASCII-only,
+            // so stripping it never lands mid-UTF-8. Falls through to
+            // the original body when the first chunk doesn't start with
+            // the expected label (unseen channel variants — pass-through
+            // keeps those correct even if they won't re-render).
+            strip_channel_label(&body).to_string()
+        } else {
+            body
+        };
+        if stripped.is_empty() {
+            return;
+        }
+        self.thinking.push_str(&stripped);
+        out.push(StreamSegment::Reasoning(stripped));
+    }
+
     /// Drain bytes in states that end on a fixed close marker: `Channel`
     /// (emit as `Reasoning`) or `Swallow` (discard). Mirrors the guard
     /// contract of `drain_until_open_marker`.
@@ -598,13 +656,30 @@ impl Gemma4StreamParser {
         reasoning: bool,
         flushing: bool,
     ) -> bool {
+        // Buffer the `thought\n` label across feed boundaries so the
+        // stripper has enough bytes to make a definitive match. The
+        // label is 8 bytes; hold back up to that many while we wait for
+        // more input (non-flushing path). The close marker also needs
+        // to be held back — use the max of the two to avoid racing
+        // either guard.
+        if reasoning && !self.channel_label_stripped && !flushing {
+            const LABEL_LEN: usize = "thought\n".len();
+            // Only force-buffer while the pending is short AND the close
+            // marker hasn't landed yet. If the close marker is already
+            // visible, fall through to the normal drain — the label
+            // stripper will run inside `emit_reasoning` on the short
+            // body slice.
+            if self.pending.len() < LABEL_LEN && !self.pending.contains(close) {
+                return false;
+            }
+        }
+
         if let Some(idx) = self.pending.find(close) {
             let body: String = self.pending.drain(..idx).collect();
             // Drop the close marker.
             self.pending.drain(..close.len());
-            if reasoning && !body.is_empty() {
-                self.thinking.push_str(&body);
-                out.push(StreamSegment::Reasoning(body));
+            if reasoning {
+                self.emit_reasoning(out, body);
             }
             // For Swallow we intentionally discard `body`.
             self.state = StreamState::Message;
@@ -616,8 +691,7 @@ impl Gemma4StreamParser {
         if flushing {
             if reasoning && !self.pending.is_empty() {
                 let body = std::mem::take(&mut self.pending);
-                self.thinking.push_str(&body);
-                out.push(StreamSegment::Reasoning(body));
+                self.emit_reasoning(out, body);
             } else {
                 self.pending.clear();
             }
@@ -632,9 +706,8 @@ impl Gemma4StreamParser {
         }
         let emit_len = self.pending.len() - hold;
         let body: String = self.pending.drain(..emit_len).collect();
-        if reasoning && !body.is_empty() {
-            self.thinking.push_str(&body);
-            out.push(StreamSegment::Reasoning(body));
+        if reasoning {
+            self.emit_reasoning(out, body);
         }
         false
     }
@@ -678,6 +751,31 @@ impl Gemma4StreamParser {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Strip the leading `thought\n` channel label from a reasoning body so
+/// the returned slice is pure body text that round-trips byte-for-byte
+/// through the Gemma4 chat template.
+///
+/// Gemma4's channel grammar is `<|channel>{label}\n{body}\n<channel|>`.
+/// The shipped chat template (`chat_template.jinja` line 238) hardcodes
+/// `thought` as the only label it re-emits:
+///
+/// ```text
+/// '<|channel>thought\n' + thinking_text + '\n<channel|>'
+/// ```
+///
+/// Callers must therefore store `thinking` as the body only, without
+/// the label, so that when a downstream consumer echoes it back as
+/// `reasoning_content` and the template re-renders it, the output
+/// matches the bytes the model originally generated. Any other channel
+/// label (future models may use `deliberation`, `scratchpad`, etc.)
+/// passes through unchanged — the template wouldn't know how to echo
+/// those anyway, and preserving the raw body lets the caller make an
+/// informed choice.
+fn strip_channel_label(body: &str) -> &str {
+    const THOUGHT_LABEL: &str = "thought\n";
+    body.strip_prefix(THOUGHT_LABEL).unwrap_or(body)
+}
 
 /// Longest suffix of `buf` that is a non-empty prefix of any marker in
 /// `markers`. Used by the stream parser to hold back ambiguous tail bytes
@@ -834,9 +932,12 @@ mod tests {
 
     #[test]
     fn parse_channel_only() {
+        // `thought\n` is the Gemma4 channel label, stripped by the
+        // parser so the body round-trips byte-for-byte through the
+        // chat template (see `strip_channel_label` for the full rationale).
         let parsed = parse_gemma4_output("<|channel>thought\nREASON\n<channel|>");
         assert_eq!(parsed.text, "");
-        assert_eq!(parsed.thinking.as_deref(), Some("thought\nREASON"));
+        assert_eq!(parsed.thinking.as_deref(), Some("REASON"));
         assert!(parsed.tool_calls.is_empty());
     }
 
@@ -875,7 +976,8 @@ mod tests {
         let input = "before<|channel>thought\nREASON\n<channel|>middle<|tool_call>call:bash{command:ls}<tool_call|>after";
         let parsed = parse_gemma4_output(input);
         assert_eq!(parsed.text, "beforemiddleafter");
-        assert_eq!(parsed.thinking.as_deref(), Some("thought\nREASON"));
+        // `thought\n` label stripped — see `strip_channel_label`.
+        assert_eq!(parsed.thinking.as_deref(), Some("REASON"));
         assert_eq!(parsed.tool_calls.len(), 1);
         let tc = &parsed.tool_calls[0];
         assert_eq!(tc.name, "bash");
@@ -884,12 +986,14 @@ mod tests {
 
     #[test]
     fn parse_task_description_invariant() {
-        // The invariant from the task spec, verbatim.
+        // The invariant from the task spec, verbatim. `thinking`
+        // carries only the body — the `thought\n` label is stripped to
+        // keep re-renders byte-equal (see `strip_channel_label`).
         let parsed = parse_gemma4_output(
             "<|channel>thought\nREASON\n<channel|>message<|tool_call>call:bash{command:ls}<tool_call|>",
         );
         assert_eq!(parsed.text, "message");
-        assert_eq!(parsed.thinking.as_deref(), Some("thought\nREASON"));
+        assert_eq!(parsed.thinking.as_deref(), Some("REASON"));
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "bash");
         let args = parsed.tool_calls[0].arguments.as_object().unwrap();
@@ -983,8 +1087,12 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "plaintext");
-        assert_eq!(reasoning, "thought\nreason\n");
-        assert_eq!(parser.thinking().as_deref(), Some("thought\nreason"));
+        // Streaming deltas AND the accumulated `thinking()` both have
+        // the `thought\n` channel label stripped — kept in sync so the
+        // client-visible body matches the re-render contract byte for
+        // byte. See `emit_reasoning` / `strip_channel_label`.
+        assert_eq!(reasoning, "reason\n");
+        assert_eq!(parser.thinking().as_deref(), Some("reason"));
     }
 
     #[test]
@@ -1063,8 +1171,84 @@ mod tests {
         assert!(parser.tool_calls().is_empty());
     }
 
+    /// Label stripping must survive the pathological case where the
+    /// model's output gets tokenized into bytes that arrive one-at-a-time
+    /// through the streaming decode loop. This exercises the force-buffer
+    /// gate inside `drain_until_close` — pending bytes are held back
+    /// until the parser has seen enough to confirm or reject the
+    /// `thought\n` label, then the first emit strips it.
+    ///
+    /// Without the force-buffer gate, the first feed could emit a single
+    /// `t` as a Reasoning segment (and push it onto `thinking`), the
+    /// label-stripper would never match because the `thought\n` bytes
+    /// are now split across two different segments, and the accumulated
+    /// `thinking` would still carry the label — the exact regression
+    /// that zeroed Gemma4's cache reuse under pi-mono.
+    #[test]
+    fn stream_parser_strips_channel_label_split_across_single_byte_feeds() {
+        let mut parser = Gemma4StreamParser::new();
+        let mut all = Vec::new();
+        for ch in "<|channel>thought\nREASON\n<channel|>after".chars() {
+            all.extend(parser.feed(&ch.to_string()));
+        }
+        all.extend(parser.flush());
+
+        let reasoning: String = all
+            .iter()
+            .filter_map(|s| {
+                if let StreamSegment::Reasoning(t) = s {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Streaming deltas must not contain the `thought\n` label — if
+        // they did, the server would accumulate it into the outgoing
+        // reasoning_content and the next turn's template re-render
+        // would double it.
+        assert!(
+            !reasoning.starts_with("thought\n"),
+            "streaming reasoning must not leak the `thought\\n` channel label: {reasoning:?}",
+        );
+        assert!(
+            !reasoning.contains("thought\nthought"),
+            "no doubled label should ever slip through: {reasoning:?}",
+        );
+        assert_eq!(parser.thinking().as_deref(), Some("REASON"));
+    }
+
+    /// Partial channel block where the body never even reaches the full
+    /// label length before the close marker lands. The stripper must
+    /// fall through without mangling short bodies (e.g. a malformed
+    /// model emission like `<|channel>tho<channel|>`).
+    #[test]
+    fn stream_parser_passes_through_channel_body_shorter_than_label() {
+        let mut parser = Gemma4StreamParser::new();
+        let mut all = parser.feed("<|channel>tho<channel|>next");
+        all.extend(parser.flush());
+        let reasoning: String = all
+            .iter()
+            .filter_map(|s| {
+                if let StreamSegment::Reasoning(t) = s {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            reasoning, "tho",
+            "short body that isn't the full label passes through unchanged",
+        );
+        assert_eq!(parser.thinking().as_deref(), Some("tho"));
+    }
+
     #[test]
     fn stream_parser_flush_surfaces_unterminated_channel_as_reasoning() {
+        // "half-written thought" doesn't start with `thought\n`, so the
+        // label stripper passes it through unchanged — the content is
+        // exactly what the model emitted.
         let mut parser = Gemma4StreamParser::new();
         let mut all = parser.feed("<|channel>half-written thought");
         all.extend(parser.flush());
