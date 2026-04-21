@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { readdir, copyFile } from 'node:fs/promises';
+import { copyFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { parseArgs } from 'node:util';
@@ -248,43 +248,15 @@ export async function run(argv: string[]) {
   }
   console.log(`Output: ${outputDir}\n`);
 
-  // Check if already downloaded
-  if (existsSync(outputDir)) {
-    const files = await readdir(outputDir);
-    const hasConfig = files.includes('config.json');
-    const hasSingleModel = files.includes('model.safetensors');
-    const hasShardedModel = files.includes('model.safetensors.index.json');
-    const hasPaddleModel = files.includes('inference.pdiparams');
-    const hasGguf = files.some((f) => f.endsWith('.gguf'));
-    if (hasConfig && (hasSingleModel || hasShardedModel || hasPaddleModel)) {
-      console.log('Model already downloaded!\n');
-      console.log('To re-download, delete the output directory first:');
-      console.log(`   rm -rf ${outputDir}\n`);
-      return;
-    }
-    if (hasGguf && !globPatterns?.length) {
-      console.log('GGUF file(s) already downloaded!\n');
-      console.log('To re-download, delete the output directory first:');
-      console.log(`   rm -rf ${outputDir}\n`);
-      return;
-    }
-    // For glob downloads, check if all glob-matched files are present
-    if (hasGguf && globPatterns?.length) {
-      const globs = globPatterns.map(globToRegex);
-      const matchedExisting = files.filter((f) => matchesAnyGlob(f, globs) || CORE_FILES.includes(f));
-      if (matchedExisting.length > 1) {
-        console.log('Matched files already downloaded!\n');
-        console.log('To re-download, delete the output directory first:');
-        console.log(`   rm -rf ${outputDir}\n`);
-        return;
-      }
-    }
-  }
-
-  await ensureDir(outputDir);
-
+  // Always fetch the remote file list and diff against what's on disk.
+  // The prior "Model already downloaded!" short-circuit skipped the
+  // network call entirely, so any file added to the HF repo after the
+  // initial download (e.g. Google pushing `chat_template.jinja` to
+  // `google/gemma-4-26B-A4B-it` eleven days ago) stayed missing
+  // locally until the user manually wiped the directory. The
+  // reconciler model — fetch remote, diff, download only absent
+  // entries — makes the command idempotent and cheap to re-run.
   console.log('Fetching file list from HuggingFace...\n');
-
   const { totalSize, filesToDownload, allFiles } = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
 
   if (filesToDownload.length === 0) {
@@ -302,7 +274,46 @@ export async function run(argv: string[]) {
     process.exit(1);
   }
 
-  // Show what will be downloaded
+  // Partition the remote file set into "missing locally" vs "already
+  // present". Size-based completeness isn't checked — a half-downloaded
+  // file remains opaque (same behavior as the old code). Users who
+  // suspect corruption should still wipe and re-download.
+  const outputExists = existsSync(outputDir);
+  const missingFiles: ListFileEntry[] = [];
+  let missingSize = 0;
+  if (outputExists) {
+    for (const f of filesToDownload) {
+      const localPath = join(outputDir, f.path);
+      if (!existsSync(localPath)) {
+        missingFiles.push(f);
+        if (f.size) missingSize += f.size;
+      }
+    }
+  } else {
+    missingFiles.push(...filesToDownload);
+    missingSize = totalSize;
+  }
+
+  // Every weight/GGUF file the reconciler considered "expected" —
+  // both the already-present set and anything we'll now fetch — goes
+  // into `weightFiles` so `verifyDownload` confirms the complete
+  // manifest at the end, not just the delta we downloaded this run.
+  const weightFiles: string[] = filesToDownload
+    .filter((f) => f.path.endsWith('.safetensors') || f.path.endsWith('.pdiparams') || f.path.endsWith('.gguf'))
+    .map((f) => f.path);
+
+  if (outputExists && missingFiles.length === 0) {
+    console.log(`Model already up-to-date (${filesToDownload.length} file(s), ${formatBytes(totalSize)}).\n`);
+    console.log('To force a re-download, delete the output directory first:');
+    console.log(`   rm -rf ${outputDir}\n`);
+    return;
+  }
+
+  await ensureDir(outputDir);
+
+  // Show what will actually be fetched, distinguishing a cold
+  // download from a reconcile-run where most of the repo is already
+  // on disk (common after an upstream README / template push).
   if (globPatterns?.length) {
     console.log(`Matched ${filesToDownload.length} file(s):`);
     for (const f of filesToDownload) {
@@ -311,15 +322,24 @@ export async function run(argv: string[]) {
     console.log('');
   }
 
-  const sizeStr = formatBytes(totalSize);
-  console.log(`Downloading ${filesToDownload.length} file(s) (~${sizeStr})...\n`);
+  if (outputExists) {
+    const existingCount = filesToDownload.length - missingFiles.length;
+    console.log(
+      `Found ${existingCount}/${filesToDownload.length} file(s) locally; reconciling ${missingFiles.length} missing file(s) (~${formatBytes(missingSize)}).\n`,
+    );
+    for (const f of missingFiles) {
+      console.log(`  + ${f.path}${f.size ? ` (${formatBytes(f.size)})` : ''}`);
+    }
+    console.log('');
+  } else {
+    console.log(`Downloading ${missingFiles.length} file(s) (~${formatBytes(missingSize)})...\n`);
+  }
 
   const cacheDir = args['cache-dir'] ? resolve(args['cache-dir']) : DEFAULT_CACHE_DIR;
-  const weightFiles: string[] = [];
 
-  const total = filesToDownload.length;
+  const total = missingFiles.length;
   for (let i = 0; i < total; i++) {
-    const file = filesToDownload[i];
+    const file = missingFiles[i];
     const fileSizeStr = file.size ? formatBytes(file.size) : '';
     console.log(`  [${i + 1}/${total}] ${file.path}${fileSizeStr ? ` (${fileSizeStr})` : ''}...`);
     const snapshotPath = await downloadFileToCacheDir({
@@ -331,15 +351,14 @@ export async function run(argv: string[]) {
     const destPath = join(outputDir, file.path);
     await ensureDir(dirname(destPath));
     await copyFile(snapshotPath, destPath);
-    if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams') || file.path.endsWith('.gguf')) {
-      weightFiles.push(file.path);
-    }
   }
+
+  const actionVerb = outputExists ? 'Reconciled' : 'Download complete';
 
   // For GGUF downloads, skip strict verification (no config.json required in GGUF repos)
   const hasGgufFiles = weightFiles.some((f) => f.endsWith('.gguf'));
   if (hasGgufFiles) {
-    console.log(`\nDownload complete! ${weightFiles.length} file(s) saved to ${outputDir}\n`);
+    console.log(`\n${actionVerb}: ${weightFiles.length} weight file(s) expected in ${outputDir}\n`);
     console.log('To convert GGUF to MLX SafeTensors format:');
     for (const wf of weightFiles) {
       const ggufPath = join(outputDir, wf);
@@ -354,7 +373,7 @@ export async function run(argv: string[]) {
     }
     // Glob filter matched non-weight files (e.g. imatrix, calibration data).
     // Skip model verification — user is downloading auxiliary files.
-    console.log(`\nDownload complete! ${filesToDownload.length} non-weight file(s) saved to ${outputDir}\n`);
+    console.log(`\n${actionVerb}: ${filesToDownload.length} non-weight file(s) in ${outputDir}\n`);
   } else {
     console.log(`Format: Base model (needs MLX conversion)`);
     console.log('Note: After download, convert to MLX format:');
@@ -362,7 +381,7 @@ export async function run(argv: string[]) {
 
     const success = await verifyDownload(outputDir, weightFiles);
     if (success) {
-      console.log('\nModel downloaded successfully!\n');
+      console.log(`\nModel ${actionVerb.toLowerCase()} successfully!\n`);
     } else {
       console.error('\nDownload incomplete. Please try again.\n');
       process.exit(1);
