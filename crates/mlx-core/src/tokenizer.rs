@@ -847,64 +847,65 @@ impl Qwen3Tokenizer {
 
         // Add Python-compatible string methods that Qwen3's template uses
         // These are called as methods on strings: content.startswith('prefix')
+        //
+        // Also bridges Python-dict `.get(key[, default])` on mappings,
+        // which Gemma4's chat_template.jinja relies on
+        // (`message.get('reasoning_content')`, `message.get('tool_calls')`)
+        // — miniJinja only exposes bracket access `map[key]` out of the
+        // box, and a missing `.get` aborts template rendering with
+        // `unknown method: map has no method named get`.
         env.set_unknown_method_callback(|_state, value, method, args| {
-            // Only handle string methods
+            // String methods (Qwen3.5 / LFM2 / Gemma4 all use these)
             if let Some(s) = value.as_str() {
                 match method {
                     "startswith" => {
                         if let Some(prefix) = args.first().and_then(|v| v.as_str()) {
                             return Ok(minijinja::Value::from(s.starts_with(prefix)));
                         }
-                        Err(minijinja::Error::new(
+                        return Err(minijinja::Error::new(
                             minijinja::ErrorKind::InvalidOperation,
                             "startswith requires a string argument",
-                        ))
+                        ));
                     }
                     "endswith" => {
                         if let Some(suffix) = args.first().and_then(|v| v.as_str()) {
                             return Ok(minijinja::Value::from(s.ends_with(suffix)));
                         }
-                        Err(minijinja::Error::new(
+                        return Err(minijinja::Error::new(
                             minijinja::ErrorKind::InvalidOperation,
                             "endswith requires a string argument",
-                        ))
+                        ));
                     }
                     "strip" => {
-                        // Python's strip() with optional chars argument
                         if let Some(chars) = args.first().and_then(|v| v.as_str()) {
-                            Ok(minijinja::Value::from(
+                            return Ok(minijinja::Value::from(
                                 s.trim_matches(|c| chars.contains(c)),
-                            ))
-                        } else {
-                            Ok(minijinja::Value::from(s.trim()))
+                            ));
                         }
+                        return Ok(minijinja::Value::from(s.trim()));
                     }
                     "lstrip" => {
                         if let Some(chars) = args.first().and_then(|v| v.as_str()) {
-                            Ok(minijinja::Value::from(
+                            return Ok(minijinja::Value::from(
                                 s.trim_start_matches(|c| chars.contains(c)),
-                            ))
-                        } else {
-                            Ok(minijinja::Value::from(s.trim_start()))
+                            ));
                         }
+                        return Ok(minijinja::Value::from(s.trim_start()));
                     }
                     "rstrip" => {
                         if let Some(chars) = args.first().and_then(|v| v.as_str()) {
-                            Ok(minijinja::Value::from(
+                            return Ok(minijinja::Value::from(
                                 s.trim_end_matches(|c| chars.contains(c)),
-                            ))
-                        } else {
-                            Ok(minijinja::Value::from(s.trim_end()))
+                            ));
                         }
+                        return Ok(minijinja::Value::from(s.trim_end()));
                     }
                     "split" => {
-                        // Python's str.split(sep=None, maxsplit=-1)
                         let delim = args.first().and_then(|v| v.as_str());
                         let maxsplit = args
                             .get(1)
                             .and_then(|v| i64::try_from(v.clone()).ok())
                             .filter(|&n| n >= 0);
-
                         let parts: Vec<&str> = match (delim, maxsplit) {
                             (Some(d), Some(n)) => s.splitn(n as usize + 1, d).collect(),
                             (Some(d), None) => s.split(d).collect(),
@@ -913,16 +914,47 @@ impl Qwen3Tokenizer {
                             }
                             (None, None) => s.split_whitespace().collect(),
                         };
-                        Ok(minijinja::Value::from(
+                        return Ok(minijinja::Value::from(
                             parts
                                 .into_iter()
                                 .map(minijinja::Value::from)
                                 .collect::<Vec<_>>(),
-                        ))
+                        ));
+                    }
+                    _ => {
+                        return Err(minijinja::Error::new(
+                            minijinja::ErrorKind::UnknownMethod,
+                            format!("string has no method named {}", method),
+                        ));
+                    }
+                }
+            }
+
+            // Map/dict methods (Gemma4 uses `.get(key[, default])`)
+            if value.kind() == minijinja::value::ValueKind::Map {
+                match method {
+                    "get" => {
+                        let key = args.first().ok_or_else(|| {
+                            minijinja::Error::new(
+                                minijinja::ErrorKind::InvalidOperation,
+                                "get requires a key argument",
+                            )
+                        })?;
+                        let key_str = key.as_str().ok_or_else(|| {
+                            minijinja::Error::new(
+                                minijinja::ErrorKind::InvalidOperation,
+                                "get key must be a string",
+                            )
+                        })?;
+                        let default = args.get(1).cloned().unwrap_or(minijinja::Value::UNDEFINED);
+                        match value.get_attr(key_str) {
+                            Ok(v) if !v.is_undefined() => Ok(v),
+                            _ => Ok(default),
+                        }
                     }
                     _ => Err(minijinja::Error::new(
                         minijinja::ErrorKind::UnknownMethod,
-                        format!("string has no method named {}", method),
+                        format!("map has no method named {}", method),
                     )),
                 }
             } else {
@@ -1772,6 +1804,109 @@ mod tests {
     /// enabled serde_json's `preserve_order`, the BTreeMap default
     /// alphabetised `path`+`edits` into `edits`+`path`, swapping two
     /// `<parameter=…>` blocks and zeroing the cache at turn 11.
+    /// End-to-end render of the stock Gemma4 chat_template.jinja
+    /// through the production `render_chat_template_jinja2` entry
+    /// point. `#[ignore]`-gated because the template lives in
+    /// `.cache/` and tests run without network; opt in locally with
+    /// `cargo test gemma4_full_template_renders -- --include-ignored`.
+    ///
+    /// This guards against future template features (Python idioms,
+    /// new filters) we haven't bridged — the Jinja engine aborts
+    /// rendering with `unknown method: … has no method named X` the
+    /// moment it meets one it doesn't know.
+    #[test]
+    #[ignore]
+    fn gemma4_full_template_renders_without_missing_methods() {
+        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/gemma-4-26b-a4b-it-UD-Q8_K_XL-mlx/chat_template.jinja";
+        let Ok(tmpl) = std::fs::read_to_string(path) else {
+            // Skip silently when the fixture isn't checked out locally.
+            return;
+        };
+        let msgs = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            images: None,
+        }];
+        let tools = vec![ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "read".to_string(),
+                description: Some("Read a file".to_string()),
+                parameters: Some(FunctionParameters {
+                    r#type: "object".to_string(),
+                    properties: Some(
+                        r#"{"path":{"type":"string","description":"file path"}}"#.to_string(),
+                    ),
+                    required: Some(vec!["path".to_string()]),
+                }),
+            },
+        }];
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            &tmpl,
+            &msgs,
+            Some(&tools),
+            true,
+            Some(true),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap_or_else(|e| {
+            panic!("Gemma4 template render failed: {e}");
+        });
+        assert!(
+            rendered.contains("<|turn>user"),
+            "rendered prompt missing user turn marker:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("<|tool>"),
+            "rendered prompt missing tool declaration block:\n{rendered}",
+        );
+    }
+
+    /// Gemma4's chat_template.jinja leans on Python's dict `.get()`
+    /// idiom (`message.get('reasoning_content')`,
+    /// `message.get('tool_calls')`, etc.) to avoid UndefinedError when
+    /// an optional key is absent. miniJinja only ships bracket access
+    /// out of the box, so we bridge `.get` ourselves in
+    /// `render_chat_template_jinja2`. If this test fails, any Gemma4
+    /// request aborts at template render time with
+    /// `unknown method: map has no method named get`.
+    #[test]
+    fn map_get_bridge_mirrors_python_dict_get() {
+        // Reuse the production Jinja setup — the bridge lives inside
+        // `render_chat_template_jinja2`, so driving a real ChatMessage
+        // through it exercises exactly the call site the shipped
+        // template hits.
+        let msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: "hello".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some("because".to_string()),
+            images: None,
+        };
+        // Minimal template that drives the fixture map through `.get()`
+        // three different ways — hit, miss (no default), miss (with
+        // default). Any drift in the bridge trips this test.
+        let template = "{% set m = messages[0] %}{{ m.get('role') }}|{{ m.get('missing') }}|{{ m.get('missing', 'fallback') }}|{{ m.get('reasoning_content') }}";
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            template,
+            std::slice::from_ref(&msg),
+            None,
+            false,
+            None,
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        // Undefined keys render to the empty string by default —
+        // matching Python-Jinja behaviour for `dict.get(missing)`.
+        assert_eq!(rendered, "assistant||fallback|because");
+    }
+
     #[test]
     fn function_call_arg_order_survives_jinja_round_trip() {
         let mut env = jinja_env();
