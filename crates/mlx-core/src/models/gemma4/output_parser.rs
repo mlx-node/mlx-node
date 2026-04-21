@@ -27,6 +27,18 @@
 use crate::tools::ToolCallResult;
 use serde_json::Value;
 
+/// True iff the ASCII byte pattern `needle` starts at byte offset `pos` of
+/// `src`. Unlike `src[pos..].starts_with(needle)`, this is safe even when
+/// `pos` lands mid-UTF-8 multi-byte char — we never take a `&str` slice at
+/// a non-boundary position. All DSL delimiters (`<|"|>`, `<|channel>`, …) are
+/// pure ASCII, so a match at any byte position is always a valid char
+/// boundary (ASCII bytes never appear as UTF-8 continuation bytes).
+fn bytes_starts_with(src: &str, pos: usize, needle: &str) -> bool {
+    let b = src.as_bytes();
+    let n = needle.as_bytes();
+    b.len() >= pos.saturating_add(n.len()) && &b[pos..pos + n.len()] == n
+}
+
 // ---------------------------------------------------------------------------
 // Delimiter constants
 // ---------------------------------------------------------------------------
@@ -175,7 +187,7 @@ impl<'a> DslParser<'a> {
     /// accept anything up to the next `:`.
     fn parse_key(&mut self) -> Result<String, DslParseError> {
         // Accept optional `<|"|>...<|"|>` wrapping for keys defensively.
-        if self.src[self.pos..].starts_with(DSL_STRING_DELIM) {
+        if bytes_starts_with(self.src, self.pos, DSL_STRING_DELIM) {
             return self.parse_quoted_string();
         }
         let start = self.pos;
@@ -211,7 +223,7 @@ impl<'a> DslParser<'a> {
                 self.pos += 1;
                 self.parse_array_body()
             }
-            _ if self.src[self.pos..].starts_with(DSL_STRING_DELIM) => {
+            _ if bytes_starts_with(self.src, self.pos, DSL_STRING_DELIM) => {
                 self.parse_quoted_string().map(Value::String)
             }
             _ => self.parse_bare_value(),
@@ -251,12 +263,17 @@ impl<'a> DslParser<'a> {
     }
 
     fn parse_quoted_string(&mut self) -> Result<String, DslParseError> {
-        // Consume opening <|"|>.
+        // Consume opening <|"|>. Caller guarantees we're at an ASCII
+        // boundary (the `<` of the delimiter), so byte slicing is safe.
         let delim_len = DSL_STRING_DELIM.len();
         self.pos += delim_len;
         let start = self.pos;
-        let rest = &self.src[self.pos..];
-        let close = rest.find(DSL_STRING_DELIM).ok_or_else(|| {
+        // Search for the closing delimiter by bytes — safe through
+        // multi-byte UTF-8 content because `<|"|>` is pure ASCII and
+        // an ASCII byte never appears as a UTF-8 continuation byte.
+        let haystack = self.src.as_bytes();
+        let needle = DSL_STRING_DELIM.as_bytes();
+        let close = find_subslice(&haystack[start..], needle).ok_or_else(|| {
             DslParseError(format!("unterminated quoted string at position {}", start))
         })?;
         let body = &self.src[start..start + close];
@@ -742,24 +759,29 @@ fn extract_balanced_braces(s: &str) -> Option<String> {
     if bytes.first().copied() != Some(b'{') {
         return None;
     }
+    let delim = DSL_STRING_DELIM.as_bytes();
     let mut depth = 0i32;
     let mut i = 0usize;
     let mut in_dsl_string = false;
+    // Walk entirely in byte-space — DSL delimiters and structural tokens
+    // (`{`, `}`) are all ASCII, so comparing bytes is safe even when the
+    // enclosed string contains multi-byte UTF-8 (e.g. an em-dash). The
+    // final `s[1..i]` slice lands on ASCII boundaries (`{`, `}`) which
+    // are always valid char boundaries.
     while i < bytes.len() {
-        // Check for DSL-string delimiter at this position — it's 5 bytes
-        // (`<|"|>`). Strings may contain `{`/`}` bytes that must NOT be
-        // counted as depth markers, so flip a flag as we cross the delim.
-        if !in_dsl_string && s[i..].starts_with(DSL_STRING_DELIM) {
-            in_dsl_string = true;
-            i += DSL_STRING_DELIM.len();
-            continue;
-        }
-        if in_dsl_string && s[i..].starts_with(DSL_STRING_DELIM) {
-            in_dsl_string = false;
-            i += DSL_STRING_DELIM.len();
+        // DSL-string delimiter — 5 bytes (`<|"|>`). Strings may contain
+        // `{`/`}` bytes that must NOT be counted as depth markers, so
+        // flip a flag as we cross the delimiter.
+        if bytes.len() >= i + delim.len() && &bytes[i..i + delim.len()] == delim {
+            in_dsl_string = !in_dsl_string;
+            i += delim.len();
             continue;
         }
         if in_dsl_string {
+            // Advance one byte at a time through arbitrary UTF-8 payload.
+            // Safe: we only compare against ASCII bytes above, and the
+            // loop never slices `&str` at `i` while `in_dsl_string` is
+            // true.
             i += 1;
             continue;
         }
@@ -770,12 +792,27 @@ fn extract_balanced_braces(s: &str) -> Option<String> {
             depth -= 1;
             if depth == 0 {
                 // Return the inner slice (exclusive of the outer braces).
+                // `i` is at a `}` which is ASCII → safe char boundary.
                 return Some(s[1..i].to_string());
             }
         }
         i += 1;
     }
     None
+}
+
+/// Byte-level `memmem` replacement — finds the first occurrence of
+/// `needle` in `haystack`. Used so we can search for ASCII delimiters
+/// through UTF-8 payloads without ever having to take a `&str` slice at
+/// a non-boundary position. Returns the byte offset into `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,5 +1125,60 @@ mod tests {
         assert!(v.as_object().unwrap().is_empty());
         let v = parse_gemma4_dsl_args("{}").unwrap();
         assert!(v.as_object().unwrap().is_empty());
+    }
+
+    /// Regression test for a panic observed in a live Gemma4 session:
+    ///   `start byte index 281 is not a char boundary; it is inside '—'`
+    /// The model emitted a tool-call whose DSL-string value contained an
+    /// em-dash (`—`, 3 bytes in UTF-8). The previous `extract_balanced_braces`
+    /// walked byte-by-byte inside a `<|"|>...<|"|>` payload and then tried to
+    /// `&str`-slice at `s[i..].starts_with(...)`, landing mid-char and
+    /// panicking. After the fix the call should parse (or at minimum the
+    /// stream parser should not abort).
+    #[test]
+    fn stream_parser_survives_multibyte_inside_dsl_string() {
+        let mut p = Gemma4StreamParser::new();
+        let chunk = concat!(
+            "before ",
+            "<|tool_call>",
+            "call:bash{command:<|\"|># I don't have firecrawl-scrape as a tool",
+            " — wait, let me check the skills.\n",
+            "echo 'done'<|\"|>}",
+            "<tool_call|>",
+            " after",
+        );
+        // Must not panic. Also must recover the enclosing text around the
+        // tool call block.
+        let _segs = p.feed(chunk);
+        let _ = p.flush();
+        let calls = p.tool_calls();
+        assert_eq!(calls.len(), 1, "should parse exactly one tool call");
+        assert_eq!(calls[0].name, "bash");
+        // The command string is preserved whole (em-dash included).
+        let cmd = calls[0]
+            .arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(
+            cmd.contains('—'),
+            "em-dash must survive the round trip, got: {cmd:?}",
+        );
+    }
+
+    /// Direct unit test on `extract_balanced_braces` — the original panic
+    /// site — to pin the char-boundary safety in place going forward.
+    #[test]
+    fn extract_balanced_braces_handles_multibyte_inside_dsl_string() {
+        let inner_body = "<|\"|>foo — bar<|\"|>";
+        let s = format!("{{key:{}}}", inner_body);
+        let extracted = extract_balanced_braces(&s).expect("must not panic and must extract");
+        // The inner (brace-stripped) body should include both the key, the
+        // DSL delimiters, and the em-dash-bearing payload verbatim.
+        assert!(
+            extracted.contains("<|\"|>foo — bar<|\"|>"),
+            "got: {extracted:?}"
+        );
+        assert!(extracted.starts_with("key:"));
     }
 }
