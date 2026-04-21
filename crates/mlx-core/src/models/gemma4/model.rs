@@ -41,6 +41,14 @@ fn format_gemma4_value(val: &serde_json::Value) -> String {
     }
 }
 
+/// Test-only accessor for `json_args_to_gemma4_dsl`. Used by the
+/// output-parser round-trip test to verify that the parser is the exact
+/// inverse of the encoder for fixture inputs.
+#[cfg(test)]
+pub(crate) fn json_args_to_gemma4_dsl_for_test(json_str: &str) -> String {
+    json_args_to_gemma4_dsl(json_str)
+}
+
 /// Convert JSON arguments string to Gemma4 tool-call DSL.
 /// Returns the inner key:value pairs (without outer braces).
 fn json_args_to_gemma4_dsl(json_str: &str) -> String {
@@ -114,6 +122,65 @@ struct StreamSender(StreamTx<ChatStreamChunk>);
 impl StreamSender {
     fn call(&self, result: Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
         let _ = self.0.send(result);
+    }
+}
+
+/// Emit the text/reasoning deltas collected by the stream parser on this
+/// step, and fold any surfaced `ToolCall` segments into the shared
+/// accumulator. Tool calls do NOT stream out as deltas — they land on the
+/// terminal `done=true` chunk.
+fn dispatch_stream_segments(segments: Vec<super::output_parser::StreamSegment>, cb: &StreamSender) {
+    use super::output_parser::StreamSegment;
+    for seg in segments {
+        match seg {
+            StreamSegment::Text(text) => {
+                if text.is_empty() {
+                    continue;
+                }
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(false),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+            StreamSegment::Reasoning(text) => {
+                if text.is_empty() {
+                    continue;
+                }
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(true),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+            StreamSegment::ToolCall(_) => {
+                // Accumulated on `parser.tool_calls()` for the terminal chunk.
+            }
+        }
     }
 }
 
@@ -1060,8 +1127,10 @@ impl Gemma4Inner {
             }
         }
 
-        // Decode text
-        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+        // Decode text with special tokens preserved so we can extract
+        // Gemma4's `<|channel>...<channel|>` reasoning and
+        // `<|tool_call>...<tool_call|>` tool-call DSL blocks.
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
 
         // Save session state so subsequent `chat_session_continue_sync`
         // calls can append a raw delta on top of the live caches. Drop
@@ -1110,15 +1179,22 @@ impl Gemma4Inner {
             },
         });
 
+        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         Ok(ChatResult {
-            text: text.clone(),
-            tool_calls: vec![],
-            thinking: None,
+            text: parsed.text,
+            tool_calls: parsed.tool_calls,
+            thinking: parsed.thinking,
             num_tokens: generated_tokens.len() as u32,
             prompt_tokens: prompt_token_count as u32,
             reasoning_tokens: 0,
             finish_reason,
-            raw_text: text,
+            raw_text,
             cached_tokens: reported_cached_tokens as u32,
             performance,
         })
@@ -1402,8 +1478,13 @@ impl Gemma4Inner {
             && self.config.num_kv_shared_layers.is_none_or(|n| n <= 0)
             && unsafe { mlx_sys::mlx_qwen35_get_model_id() } == self.model_id;
 
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        // `decode_stream(false)` preserves Gemma4 special tokens
+        // (`<|channel>`, `<|tool_call>`, …) in the streamed text so the
+        // stream parser can see them. The final `decode_sync(…, false)`
+        // below mirrors this for consistency with the parsed ChatResult.
+        let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
+        let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
 
         if use_compiled {
             let _compiled_guard = COMPILED_FORWARD_MUTEX.lock().unwrap();
@@ -1494,23 +1575,8 @@ impl Gemma4Inner {
                 );
                 streamed_text_len += token_text.len();
 
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: None,
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
+                let segments = stream_parser.feed(&token_text);
+                dispatch_stream_segments(segments, cb);
 
                 if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
@@ -1574,23 +1640,8 @@ impl Gemma4Inner {
                 );
                 streamed_text_len += token_text.len();
 
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: None,
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
+                let segments = stream_parser.feed(&token_text);
+                dispatch_stream_segments(segments, cb);
 
                 if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
@@ -1608,28 +1659,21 @@ impl Gemma4Inner {
             }
         }
 
-        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+        // `decode_sync(…, false)` matches the streaming decoder setting
+        // so any residual bytes left inside the tokenizer's DecodeStream
+        // surface with the same special-token representation the stream
+        // parser was fed.
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
 
         // Flush any residual bytes that might not have resolved at the streaming layer
-        if text.len() > streamed_text_len {
-            let residual = text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: None,
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+        if raw_text.len() > streamed_text_len {
+            let residual = raw_text[streamed_text_len..].to_string();
+            let mut segments = stream_parser.feed(&residual);
+            segments.extend(stream_parser.flush());
+            dispatch_stream_segments(segments, cb);
+        } else {
+            let tail = stream_parser.flush();
+            dispatch_stream_segments(tail, cb);
         }
 
         // Save session state so subsequent
@@ -1672,18 +1716,26 @@ impl Gemma4Inner {
             },
         });
 
+        let parsed_tool_calls = stream_parser.tool_calls();
+        let parsed_thinking = stream_parser.thinking();
+        let finish_reason = if parsed_tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         // Emit final block
         cb.call(
             Ok(ChatStreamChunk {
                 text: String::new(),
                 done: true,
                 finish_reason: Some(finish_reason),
-                tool_calls: Some(vec![]),
-                thinking: None,
+                tool_calls: Some(parsed_tool_calls),
+                thinking: parsed_thinking,
                 num_tokens: Some(generated_tokens.len() as u32),
                 prompt_tokens: Some(prompt_token_count as u32),
                 reasoning_tokens: Some(0),
-                raw_text: Some(text),
+                raw_text: Some(raw_text),
                 // Start path: report the matched prefix length. Zero on
                 // a miss or exact-match (treated as miss), equal to the
                 // matched prefix length on a warm-reuse hit.
@@ -2027,7 +2079,7 @@ impl Gemma4Inner {
             }
         }
 
-        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
 
         // Save cache state: drop the terminal turn-boundary token when
         // the decode terminated on stop (matches the semantics of
@@ -2069,15 +2121,22 @@ impl Gemma4Inner {
             },
         });
 
+        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         Ok(ChatResult {
-            text: text.clone(),
-            tool_calls: vec![],
-            thinking: None,
+            text: parsed.text,
+            tool_calls: parsed.tool_calls,
+            thinking: parsed.thinking,
             num_tokens: generated_tokens.len() as u32,
             prompt_tokens: prompt_token_count as u32,
             reasoning_tokens: 0,
             finish_reason,
-            raw_text: text,
+            raw_text,
             cached_tokens: reused_prefix_len as u32,
             performance,
         })
@@ -2364,8 +2423,11 @@ impl Gemma4Inner {
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = "length".to_string();
 
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        // `decode_stream(false)` preserves Gemma4 special tokens so the
+        // stream parser sees `<|channel>` / `<|tool_call>` markers.
+        let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
+        let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
 
         let mut current_y = y;
         for step in 0..max_new_tokens {
@@ -2409,23 +2471,8 @@ impl Gemma4Inner {
             );
             streamed_text_len += token_text.len();
 
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: None,
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            let segments = stream_parser.feed(&token_text);
+            dispatch_stream_segments(segments, cb);
 
             if is_eos_token(token_id, &eos_ids, turn_end_id) {
                 finish_reason = "stop".to_string();
@@ -2442,28 +2489,17 @@ impl Gemma4Inner {
             }
         }
 
-        let text = tokenizer.decode_sync(&generated_tokens, true)?;
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
 
         // Flush residual bytes buffered inside decode_stream.
-        if text.len() > streamed_text_len {
-            let residual = text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: None,
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+        if raw_text.len() > streamed_text_len {
+            let residual = raw_text[streamed_text_len..].to_string();
+            let mut segments = stream_parser.feed(&residual);
+            segments.extend(stream_parser.flush());
+            dispatch_stream_segments(segments, cb);
+        } else {
+            let tail = stream_parser.flush();
+            dispatch_stream_segments(tail, cb);
         }
 
         // Save cache state for the next session turn.
@@ -2502,17 +2538,25 @@ impl Gemma4Inner {
             },
         });
 
+        let parsed_tool_calls = stream_parser.tool_calls();
+        let parsed_thinking = stream_parser.thinking();
+        let finish_reason = if parsed_tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
         cb.call(
             Ok(ChatStreamChunk {
                 text: String::new(),
                 done: true,
                 finish_reason: Some(finish_reason),
-                tool_calls: Some(vec![]),
-                thinking: None,
+                tool_calls: Some(parsed_tool_calls),
+                thinking: parsed_thinking,
                 num_tokens: Some(generated_tokens.len() as u32),
                 prompt_tokens: Some(prompt_token_count as u32),
                 reasoning_tokens: Some(0),
-                raw_text: Some(text),
+                raw_text: Some(raw_text),
                 // Delta path reuses the full prior history by
                 // construction — report `reused_prefix_len` as the
                 // authoritative cached-prefix length.

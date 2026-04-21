@@ -7,6 +7,7 @@ pub mod layer_cache;
 pub mod mlp;
 pub mod model;
 pub mod moe;
+pub(crate) mod output_parser;
 pub mod persistence;
 pub mod quantized_linear;
 pub mod vision;
