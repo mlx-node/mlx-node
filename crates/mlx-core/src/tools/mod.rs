@@ -1553,4 +1553,50 @@ The weather in Tokyo is sunny."#;
         assert_eq!(arr[0]["oldText"], "it.skip");
         assert_eq!(arr[1]["newText"], "describe");
     }
+
+    #[test]
+    fn test_parse_function_tool_call_preserves_parameter_order() {
+        // Cache-reuse regression guard: the model emits parameters in
+        // whatever order it learned from the tool schema (usually the
+        // `required` order — `[path, edits]` for pi's `edit` tool), and
+        // the warm KV cache encodes that exact byte stream. When pi-mono
+        // echoes the function_call back on the next turn, the server
+        // re-parses the arguments and feeds them through the Qwen3.5
+        // template for cache verification. If the parsed `arguments`
+        // object re-orders the keys (BTreeMap-style alphabetisation),
+        // the echoed `<parameter=…>` blocks come out as
+        // `edits, path` instead of `path, edits`, flipping two tokens at
+        // the start of the call and zeroing `verify_cache_prefix_direct`.
+        //
+        // This test pins the `[path, edits]` insertion order that the
+        // `preserve_order` serde_json feature enables — without it this
+        // assertion fails and turn N+1 cold-prefills the full history.
+        // Observed on 2026-04-21 at turn 11 of the vitest-migration
+        // session (151 s re-prefill) — see `.logging/requests.ndjson`.
+        let input = "<tool_call>\n<function=edit>\n<parameter=path>\n/f.ts\n</parameter>\n<parameter=edits>\n[{\"oldText\":\"a\",\"newText\":\"b\"}]\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+
+        let obj = calls[0]
+            .arguments
+            .as_object()
+            .expect("arguments parsed into an object");
+        let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["path", "edits"],
+            "arg-key order must match the `<parameter=…>` emission order; if this fails, serde_json is missing the `preserve_order` feature",
+        );
+
+        // Serializing back to JSON must also preserve that order —
+        // confirms the stored `ToolCall.arguments` string that pi-mono
+        // will echo is byte-parity with the model's original output.
+        let serialized = serde_json::to_string(&calls[0].arguments).unwrap();
+        let path_idx = serialized.find("\"path\"").expect("path key present");
+        let edits_idx = serialized.find("\"edits\"").expect("edits key present");
+        assert!(
+            path_idx < edits_idx,
+            "`path` must appear before `edits` in serialized args; got {serialized}",
+        );
+    }
 }

@@ -257,7 +257,7 @@ impl Qwen3Tokenizer {
                 eprintln!("Warning: {}", warning);
                 let _ = warning; // Suppress unused warning in release builds
             }
-            return Some(template.to_string());
+            return Some(Self::patch_preserve_thinking(template));
         }
 
         // Second: try standalone chat_template.jinja file (used by Gemma4 HF snapshots)
@@ -270,10 +270,44 @@ impl Qwen3Tokenizer {
                 eprintln!("Warning: {}", warning);
                 let _ = warning;
             }
-            return Some(template);
+            return Some(Self::patch_preserve_thinking(&template));
         }
 
         None
+    }
+
+    /// Rewrite the Qwen3.5 chat-template reasoning gate so our `preserve_thinking=true`
+    /// context variable takes effect.
+    ///
+    /// The stock Qwen3.5 template gates `<think>…</think>` rendering on prior assistant
+    /// turns with `{%- if loop.index0 > ns.last_query_index %}`. `ns.last_query_index`
+    /// jumps forward when a fresh top-level user message arrives, so the moment a user
+    /// appends a follow-up, every prior assistant turn flips into the else branch and
+    /// silently drops its `<think>` block on re-render. That breaks the token-level
+    /// prefix equality that `verify_cache_prefix_direct` needs for tier-2 warm-session
+    /// reuse — a 19-turn agent session observed a 151s / 180s cold re-prefill on each
+    /// such boundary (see `.logging/requests.ndjson`, turns 11 and 16).
+    ///
+    /// We already pass `preserve_thinking=true` into the Jinja context
+    /// (`render_chat_template_jinja2`), but the shipped template never reads the
+    /// variable. Rather than fork the template per model, patch the gate at load time
+    /// so `preserve_thinking` wins regardless of `last_query_index`:
+    ///
+    ///   `loop.index0 > ns.last_query_index`
+    ///     → `preserve_thinking or loop.index0 > ns.last_query_index`
+    ///
+    /// Idempotent: if the template already references `preserve_thinking` (future
+    /// upstream templates, or our own re-patched string) the replacement becomes a
+    /// no-op. For templates that don't contain the Qwen3.5 gate at all (e.g. Gemma4,
+    /// LFM2, legacy ChatML) this is a silent pass-through.
+    fn patch_preserve_thinking(template: &str) -> String {
+        if template.contains("preserve_thinking") {
+            return template.to_string();
+        }
+        template.replace(
+            "loop.index0 > ns.last_query_index",
+            "preserve_thinking or loop.index0 > ns.last_query_index",
+        )
     }
 
     /// Load tokenizer from file synchronously (for internal use)
@@ -1596,6 +1630,231 @@ mod tests {
         assert!(
             user_turn.contains("What is this?"),
             "user text missing from user turn after sanitize: {user_turn}",
+        );
+    }
+
+    /// Minimal slice of the stock Qwen3.5 chat template — just the
+    /// last-query-index scan and the assistant `<think>` gate. Used by
+    /// the preserve-thinking regression tests to verify the fix does what
+    /// we say it does on the exact expression we rewrite at load time,
+    /// without the noise of the full 7 KB template.
+    ///
+    /// Simplification vs. the shipped template: the tool-response check
+    /// `content.startswith('<tool_response>')` is dropped — miniJinja's
+    /// string-method bridge lives in `render_chat_template_jinja2` and we
+    /// want these tests self-contained. All test fixtures use plain
+    /// user text that never matches that branch anyway.
+    const QWEN35_GATE_SLICE: &str = "{%- set ns = namespace(last_query_index=-1) %}\n{%- for message in messages %}\n    {%- if message.role == \"user\" %}\n        {%- set ns.last_query_index = loop.index0 %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- set content = message.content|trim %}\n    {%- if message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content + '<|im_end|>\\n' }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}";
+
+    /// Build the Jinja env the same way `render_chat_template_jinja2` does
+    /// (minus the string-method bridge, which this slice doesn't need).
+    /// Keeps the fix tests rendering through the SAME `tojson` filter
+    /// production uses, so any future filter drift trips these tests too.
+    fn jinja_env() -> Environment<'static> {
+        let mut env = Environment::new();
+        env.add_filter("tojson", |value: minijinja::Value| -> String {
+            serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+        });
+        env
+    }
+
+    #[test]
+    fn patch_preserve_thinking_rewrites_qwen35_gate() {
+        let patched = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
+        assert!(
+            patched.contains("preserve_thinking or loop.index0 > ns.last_query_index"),
+            "patched template missing preserve_thinking clause:\n{patched}",
+        );
+        // The stock gate (without the new disjunct) must be gone — any
+        // leftover copy would still drop <think> on old assistants.
+        let stock_occurrences = patched.matches("loop.index0 > ns.last_query_index").count();
+        let preserve_occurrences = patched.matches("preserve_thinking or").count();
+        assert_eq!(
+            stock_occurrences, preserve_occurrences,
+            "every `loop.index0 > ns.last_query_index` must be prefixed with `preserve_thinking or`",
+        );
+    }
+
+    #[test]
+    fn patch_preserve_thinking_is_idempotent() {
+        let once = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
+        let twice = Qwen3Tokenizer::patch_preserve_thinking(&once);
+        assert_eq!(
+            once, twice,
+            "patching twice must be a no-op so `preserve_thinking` never gets nested",
+        );
+    }
+
+    #[test]
+    fn patch_preserve_thinking_passthrough_on_unrelated_templates() {
+        // Templates that don't carry the Qwen3.5 gate (Gemma4 / LFM2 /
+        // minimal ChatML) must survive verbatim — no `replace` call is
+        // allowed to silently corrupt their control flow.
+        let gemma4 = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+        assert_eq!(Qwen3Tokenizer::patch_preserve_thinking(gemma4), gemma4);
+    }
+
+    /// Reproduces the turn-15 → turn-16 divergence from
+    /// `.logging/requests.ndjson`: same assistant ChatMessage, rendered
+    /// once as the end-of-turn cache state (no new user yet) and once as
+    /// the next-turn echo (new user appended). The stock Qwen3.5 gate
+    /// drops the prior assistant's `<think>` on the second render,
+    /// breaking the byte-equal prefix `verify_cache_prefix_direct`
+    /// expects. The patch must restore parity.
+    #[test]
+    fn preserve_thinking_keeps_think_block_when_new_user_turn_appended() {
+        let env = jinja_env();
+
+        let patched = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
+        let build = |messages: Vec<serde_json::Value>, preserve: bool| {
+            let mut env = env.clone();
+            env.add_template("chat", &patched).unwrap();
+            let tmpl = env.get_template("chat").unwrap();
+            tmpl.render(context! {
+                messages => messages,
+                preserve_thinking => preserve,
+            })
+            .unwrap()
+        };
+
+        let assistant = serde_json::json!({
+            "role": "assistant",
+            "content": "Done.",
+            "reasoning_content": "step-by-step reasoning",
+        });
+        let msgs_end_of_turn = vec![
+            serde_json::json!({ "role": "user", "content": "Hi" }),
+            assistant.clone(),
+        ];
+        let msgs_new_user_appended = vec![
+            serde_json::json!({ "role": "user", "content": "Hi" }),
+            assistant.clone(),
+            serde_json::json!({ "role": "user", "content": "Follow-up?" }),
+        ];
+
+        // Patched template + preserve_thinking=true: the assistant turn
+        // must render identically in both contexts, so the warm cache
+        // carries over to the follow-up turn byte-for-byte.
+        let r_before = build(msgs_end_of_turn.clone(), true);
+        let r_after = build(msgs_new_user_appended.clone(), true);
+
+        let extract_assistant = |rendered: &str| -> String {
+            let start = rendered.find("<|im_start|>assistant").unwrap();
+            let end_rel = rendered[start..].find("<|im_end|>").unwrap();
+            rendered[start..start + end_rel + "<|im_end|>\n".len()].to_string()
+        };
+
+        assert_eq!(
+            extract_assistant(&r_before),
+            extract_assistant(&r_after),
+            "with preserve_thinking=true the echoed assistant turn must match the end-of-turn render",
+        );
+        assert!(
+            extract_assistant(&r_after).contains("<think>\nstep-by-step reasoning\n</think>"),
+            "echoed assistant turn must keep the <think> block intact",
+        );
+
+        // Control: with preserve_thinking=false (the stock behavior we
+        // used to ship before the patch propagated) the `<think>` block
+        // gets dropped when a new user arrives — which is exactly the
+        // miss we observed on turn 16.
+        let r_after_stock = build(msgs_new_user_appended, false);
+        assert!(
+            !extract_assistant(&r_after_stock).contains("<think>"),
+            "stock gate (preserve_thinking=false) should drop <think> when a new user turn appends — sanity check on the control",
+        );
+    }
+
+    /// Cache-reuse regression: the same assistant ChatMessage shape that
+    /// turn 10 emitted (reasoning + content + two function_calls with
+    /// schema-declared arg order `[path, edits]`) must re-render
+    /// byte-for-byte across two consecutive tool-loop turns. Before we
+    /// enabled serde_json's `preserve_order`, the BTreeMap default
+    /// alphabetised `path`+`edits` into `edits`+`path`, swapping two
+    /// `<parameter=…>` blocks and zeroing the cache at turn 11.
+    #[test]
+    fn function_call_arg_order_survives_jinja_round_trip() {
+        let mut env = jinja_env();
+        let patched = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
+        env.add_template("chat", &patched).unwrap();
+
+        // Args string exactly as pi-mono would echo it back — note
+        // `path` first, matching the tool schema's `required` order
+        // and whatever the model emitted on the prior turn.
+        let args = r#"{"path":"/a.json","edits":[{"oldText":"x","newText":"y"}]}"#;
+        let call = ToolCall {
+            id: Some("call_1".to_string()),
+            name: "edit".to_string(),
+            arguments: args.to_string(),
+        };
+        let msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: "Making the edit.".to_string(),
+            tool_calls: Some(vec![call]),
+            tool_call_id: None,
+            reasoning_content: Some("think".to_string()),
+            images: None,
+        };
+        let v = serialize_message_for_jinja(&msg);
+
+        // The parsed arguments object, as the template sees it, must
+        // iterate in the echoed order. Without `preserve_order` this
+        // would come back alphabetised.
+        let parsed_args = &v["tool_calls"][0]["arguments"];
+        let keys: Vec<&str> = parsed_args
+            .as_object()
+            .expect("arguments parsed into an object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["path", "edits"],
+            "arg-key order must match echoed JSON (preserve_order feature must be on)",
+        );
+
+        // miniJinja's `|items` has to iterate in insertion order so
+        // the template's `<parameter=…>` blocks come out in echoed
+        // order. This is orthogonal from serde_json's `preserve_order`
+        // — miniJinja has its OWN `preserve_order` feature flag, and
+        // without it the `serde_json::Value → minijinja::Value`
+        // conversion still alphabetises. Both flags must be on.
+        let it_tmpl = "{%- for k, _v in args|items -%}{{ k }}|{%- endfor -%}";
+        let mut dbg_env = Environment::new();
+        dbg_env.add_template("d", it_tmpl).unwrap();
+        let dbg_out = dbg_env
+            .get_template("d")
+            .unwrap()
+            .render(context! { args => parsed_args.clone() })
+            .unwrap();
+        assert_eq!(
+            dbg_out, "path|edits|",
+            "miniJinja must iterate args in insertion order (requires the `preserve_order` feature on the `minijinja` dependency)",
+        );
+
+        // Round-trip through the minimal gate slice + tojson: the
+        // rendered prompt has to embed the args in that same order.
+        // We wrap serialize_message_for_jinja in a throwaway template
+        // that exercises the same `| tojson` that the real assistant
+        // block uses for array-typed parameter values.
+        let test_template = "{%- for msg in messages -%}\n{%- if msg.role == 'assistant' and msg.tool_calls -%}\n{%- for tc in msg.tool_calls -%}\n<function={{ tc.name }}>\n{%- for name, value in tc.arguments|items -%}\n<parameter={{ name }}>{% if value is mapping or (value is sequence and value is not string) %}{{ value | tojson }}{% else %}{{ value }}{% endif %}</parameter>\n{%- endfor -%}\n</function>\n{%- endfor -%}\n{%- endif -%}\n{%- endfor -%}";
+        let mut rt = Environment::new();
+        rt.add_filter("tojson", |value: minijinja::Value| -> String {
+            serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+        });
+        rt.add_template("t", test_template).unwrap();
+        let messages_value = vec![v.clone()];
+        let rendered = rt
+            .get_template("t")
+            .unwrap()
+            .render(context! { messages => messages_value })
+            .unwrap();
+
+        let path_idx = rendered.find("<parameter=path>").expect("path rendered");
+        let edits_idx = rendered.find("<parameter=edits>").expect("edits rendered");
+        assert!(
+            path_idx < edits_idx,
+            "path must render before edits (got path={path_idx}, edits={edits_idx}):\n{rendered}",
         );
     }
 }

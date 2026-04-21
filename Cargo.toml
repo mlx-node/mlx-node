@@ -16,14 +16,14 @@ libc = "0.2"
 mimalloc-safe = { version = "0.1" }
 parquet = { version = "58", features = ["arrow"] }
 rand = "0.10"
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = ["std", "fmt", "json"] }
 tokenizers = "0.22"
-minijinja = { version = "2.5", features = ["json"] }
+minijinja = { version = "2.5", features = ["json", "preserve_order"] }
 uuid = { version = "1.11", features = ["v4"] }
 regex = "1.11"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
