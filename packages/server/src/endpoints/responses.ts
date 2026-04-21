@@ -234,6 +234,7 @@ function buildFailedTerminal(
   outputItems: OutputItem[],
   reason: string,
   usage: ResponseObject['usage'],
+  errorMessage: string | null,
 ): ResponseObject {
   const normalized: OutputItem[] = outputItems.map((item) => {
     if (item.type === 'message') {
@@ -251,11 +252,16 @@ function buildFailedTerminal(
     }
     return item;
   });
+  // Only the `reason: 'error'` path carries a diagnostic message —
+  // client_abort / stream_exhausted / finish_reason_error are caller
+  // or finite-state conditions, not server faults worth surfacing.
+  const error = errorMessage ? { type: 'server_error', message: errorMessage, code: null, param: null } : null;
   return {
     ...partial,
     status: 'failed',
     output: normalized,
     output_text: computeOutputText(normalized),
+    error,
     incomplete_details: { reason },
     usage,
   };
@@ -817,6 +823,12 @@ async function handleStreamingNative(
     // error would escape into the outer JSON error path with SSE
     // headers already on the wire.
     thrownError = err instanceof Error ? err : new Error(String(err));
+    // Surface the message to stderr even on the failure path — without
+    // this the native side (e.g. `Tokenizer encoded <turn|> to N
+    // tokens; expected 1`) is invisible to operators since the SSE
+    // `response.failed` payload only carries `incomplete_details.reason`
+    // and never the underlying exception text.
+    console.error(`[responses] native dispatch failed for ${req.model} (response ${responseId}):`, thrownError.message);
   } finally {
     if (httpReq) {
       httpReq.off('close', onClientClose);
@@ -956,7 +968,13 @@ async function handleStreamingNative(
     }
   }
 
-  const failedTerminal = buildFailedTerminal(partial, finalOutput, reason, usage);
+  const failedTerminal = buildFailedTerminal(
+    partial,
+    finalOutput,
+    reason,
+    usage,
+    reason === 'error' && thrownError ? thrownError.message : null,
+  );
   await flushTerminalSSE(res, 'response.failed', { response: failedTerminal }, visibility);
   endSSE(res);
   // No terminalToPersist on an uncommitted turn: a later continuation
