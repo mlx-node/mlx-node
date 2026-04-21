@@ -1184,6 +1184,56 @@ mod tests {
     /// are now split across two different segments, and the accumulated
     /// `thinking` would still carry the label — the exact regression
     /// that zeroed Gemma4's cache reuse under pi-mono.
+    /// Exact reproduction of what the Gemma4 tokenizer's `step_decode_stream`
+    /// actually emits in production: one feed per generated token. For the
+    /// opening of a reasoning block the tokens arrive as `<|channel>`
+    /// (one feed), then `thought` (one feed), then `\n` (one feed), then
+    /// the body tokens. The force-buffer gate in `drain_until_close`
+    /// MUST hold back the 7-byte `thought` chunk until `\n` arrives,
+    /// otherwise the label leaks as a standalone `Reasoning('thought')`
+    /// delta — exactly what the live log showed.
+    #[test]
+    fn stream_parser_reproduces_production_token_boundaries() {
+        let mut parser = Gemma4StreamParser::new();
+        let mut all = Vec::new();
+        // Mirror the exact production chunk sequence observed in
+        // `.logging-gemma/requests.ndjson` — first delta was `'thought'`
+        // (7 bytes, no newline), second was `'\n'`, third was `'The'`.
+        for chunk in [
+            "<|channel>",
+            "thought",
+            "\n",
+            "The user wants me to upgrade",
+            "\n<channel|>",
+            "rest",
+        ] {
+            all.extend(parser.feed(chunk));
+        }
+        all.extend(parser.flush());
+        let reasoning: Vec<String> = all
+            .iter()
+            .filter_map(|s| {
+                if let StreamSegment::Reasoning(t) = s {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            !reasoning.iter().any(|s| s == "thought"),
+            "leaked `thought` label as a standalone delta: {reasoning:?}",
+        );
+        assert!(
+            !reasoning.iter().any(|s| s.starts_with("thought\n")),
+            "any delta prefixed with `thought\\n` means the label wasn't stripped: {reasoning:?}",
+        );
+        assert_eq!(
+            parser.thinking().as_deref(),
+            Some("The user wants me to upgrade"),
+        );
+    }
+
     #[test]
     fn stream_parser_strips_channel_label_split_across_single_byte_feeds() {
         let mut parser = Gemma4StreamParser::new();
