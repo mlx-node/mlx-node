@@ -191,6 +191,20 @@ export function __resetPromptCacheKeyNonceForTests(): void {
 }
 
 /**
+ * Test-only probe for the silent-miss dedupe Map's live size. Same
+ * "do not use from app code" rationale as
+ * {@link __resetPromptCacheKeyNonceForTests}; the `__` prefix and the
+ * test-only deep-import path are the load-bearing signals. Exists so
+ * the flooding regression test can assert the FIFO cap actually bounds
+ * the stored set — an invariant that is otherwise unobservable from
+ * outside the module and is NOT implied by the warning count (each
+ * call emits at most one warning regardless of whether the cap works).
+ */
+export function __loggedSilentMissKeysSizeForTests(): number {
+  return loggedSilentMissKeys.size;
+}
+
+/**
  * Normalize and HMAC-scope a caller-supplied `prompt_cache_key` before
  * it is stored or used for lookup.
  *

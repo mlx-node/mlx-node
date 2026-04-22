@@ -33,6 +33,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 // tier-2 entry in production. Tests reach it via the source path so
 // the "this is internal, do not use" signal is loud at the call site.
 import {
+  __loggedSilentMissKeysSizeForTests,
   __resetPromptCacheKeyNonceForTests,
   maybeWarnPromptCacheKeyIneligible,
 } from '../../packages/server/src/session-registry.js';
@@ -288,28 +289,42 @@ describe('SessionRegistry prompt_cache_key scoping', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const flood = 5000;
+      const keyFor = (i: number): string =>
+        `flood-key-${i.toString().padStart(10, '0')}-0123456789abcdef0123456789abcdef`;
       for (let i = 0; i < flood; i += 1) {
         // 64 chars of hex per key, all distinct.
-        maybeWarnPromptCacheKeyIneligible(
-          `flood-key-${i.toString().padStart(10, '0')}-0123456789abcdef0123456789abcdef`,
-        );
+        maybeWarnPromptCacheKeyIneligible(keyFor(i));
       }
-      // console.warn invocation count is bounded by the cap (fresh
-      // digests after cap eviction re-warn once, so a tiny amount of
-      // churn is acceptable). The tight upper bound is O(flood) in the
-      // unbounded case, which would be ~5000. We pin that we are
-      // materially below that number — proving eviction is working.
-      // With cap=256, after the first 256 warnings, subsequent floods
-      // cycle through eviction and each previously-logged key can
-      // re-warn at most once per full cycle, so total warnings <=
-      // flood / cap * cap = flood. But in practice, because each new
-      // key is unique, the cap bounds the STORED set regardless.
-      expect(warn.mock.calls.length).toBeLessThanOrEqual(flood);
+      // Primary invariant: the dedupe Map stays bounded by the FIFO
+      // cap even after `flood >> cap` distinct keys. This is the only
+      // observation that actually distinguishes the fixed code from the
+      // pre-fix unbounded Set — warning-count alone cannot, because
+      // each call syntactically emits at most one warning whether the
+      // cap works or not. Cap is a module-private constant (256 at time
+      // of writing); we assert it is saturated but not exceeded.
+      const sizeAfterFlood = __loggedSilentMissKeysSizeForTests();
+      expect(sizeAfterFlood).toBeGreaterThan(0);
+      expect(sizeAfterFlood).toBeLessThan(flood);
+      // Re-feeding a still-resident recent key must dedupe (no new
+      // warn, no size change) — proves the Map is doing its primary
+      // job within the window.
+      const warnsBeforeRecent = warn.mock.calls.length;
+      maybeWarnPromptCacheKeyIneligible(keyFor(flood - 1));
+      expect(warn.mock.calls.length).toBe(warnsBeforeRecent);
+      expect(__loggedSilentMissKeysSizeForTests()).toBe(sizeAfterFlood);
+      // Re-feeding the oldest key (evicted thousands of iterations
+      // ago) must re-warn exactly once — proves FIFO eviction actually
+      // removed it from the dedupe store rather than the Set growing
+      // unbounded.
+      const warnsBeforeEvicted = warn.mock.calls.length;
+      maybeWarnPromptCacheKeyIneligible(keyFor(0));
+      expect(warn.mock.calls.length).toBe(warnsBeforeEvicted + 1);
     } finally {
       warn.mockRestore();
     }
     // Subsequent nonce reset must clear the dedupe store (same path
     // tests use to re-exercise the once-per-key signal).
     __resetPromptCacheKeyNonceForTests();
+    expect(__loggedSilentMissKeysSizeForTests()).toBe(0);
   });
 });
