@@ -353,6 +353,23 @@ impl Gemma4DecoderLayer {
         }
     }
 
+    pub fn set_router_proj_quantized(
+        &mut self,
+        weight: &MxArray,
+        scales: &MxArray,
+        biases: Option<&MxArray>,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<()> {
+        if let Some(ref mut router) = self.router {
+            router.set_proj_quantized(weight, scales, biases, group_size, bits)
+        } else {
+            Err(Error::from_reason(
+                "Router not initialized (MoE not enabled)",
+            ))
+        }
+    }
+
     pub fn set_moe_gate_up_proj(&mut self, w: &MxArray) -> Result<()> {
         if let Some(ref mut moe) = self.moe {
             moe.set_gate_up_proj(w)

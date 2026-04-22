@@ -21,6 +21,33 @@ use super::quantized_linear::{
     try_build_quantized_linear, try_build_quantized_switch_linear,
 };
 
+/// Parse the top-level `quantization` (or legacy `quantization_config`) block
+/// from `config.json` and return `(bits, group_size)`. Falls back to the
+/// 4-bit affine defaults used by Gemma4 when the block is absent.
+fn parse_quant_cfg(model_path: &Path) -> (i32, i32) {
+    let config_path = model_path.join("config.json");
+    let Ok(raw_str) = fs::read_to_string(&config_path) else {
+        return (DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE);
+    };
+    let Ok(raw) = serde_json::from_str::<Value>(&raw_str) else {
+        return (DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE);
+    };
+    let quant_cfg = raw
+        .get("quantization")
+        .or_else(|| raw.get("quantization_config"));
+    let bits = quant_cfg
+        .and_then(|q| q.get("bits"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(DEFAULT_QUANT_BITS);
+    let group_size = quant_cfg
+        .and_then(|q| q.get("group_size"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(DEFAULT_QUANT_GROUP_SIZE);
+    (bits, group_size)
+}
+
 /// Parse config.json into Gemma4Config.
 ///
 /// Handles the nested `text_config` structure used by HuggingFace Gemma4 models.
@@ -534,15 +561,19 @@ fn apply_weights(
     inner: &mut Gemma4Inner,
     params: &HashMap<String, MxArray>,
     config: &Gemma4Config,
+    quant_bits: i32,
+    quant_group_size: i32,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
 
     info!(
-        "Applying weights: {} tensors, quantized={}, mxfp8={}",
+        "Applying weights: {} tensors, quantized={}, mxfp8={}, bits={}, group_size={}",
         params.len(),
         is_quantized,
-        is_mxfp8
+        is_mxfp8,
+        quant_bits,
+        quant_group_size,
     );
 
     // Helper closure for building quantized linears
@@ -551,20 +582,34 @@ fn apply_weights(
             return Some(ql);
         }
         if is_quantized
-            && let Some(ql) = try_build_quantized_linear(
-                params,
-                prefix,
-                DEFAULT_QUANT_GROUP_SIZE,
-                DEFAULT_QUANT_BITS,
-            )
+            && let Some(ql) =
+                try_build_quantized_linear(params, prefix, quant_group_size, quant_bits)
         {
             return Some(ql);
         }
         None
     };
 
-    // Embedding
-    if let Some(w) = params.get("embed_tokens.weight") {
+    // Embedding. Q8 / Q4 affine checkpoints carry `.scales` (+ `.biases`)
+    // companions alongside `.weight` with a packed-last-dim shape, so the
+    // dense `load_weight` path trips its shape guard. Route quantized
+    // embeddings through `load_quantized`, which pre-dequantizes the full
+    // table for the forward lookup and (when tied) for the lm_head matmul.
+    let embed_quantized = params.contains_key("embed_tokens.scales");
+    if embed_quantized && let Some(w) = params.get("embed_tokens.weight") {
+        let scales = params.get("embed_tokens.scales").ok_or_else(|| {
+            Error::from_reason("Missing embed_tokens.scales for quantized embedding")
+        })?;
+        let biases = params.get("embed_tokens.biases");
+        inner
+            .embed_tokens
+            .load_quantized(w, scales, biases, quant_group_size, quant_bits)?;
+        if config.tie_word_embeddings {
+            let dequant = inner.embed_tokens.get_weight();
+            let w_t = dequant.transpose(Some(&[1, 0]))?;
+            inner.embed_weight_t = Some(w_t);
+        }
+    } else if let Some(w) = params.get("embed_tokens.weight") {
         inner.embed_tokens.load_weight(w)?;
         // Pre-transpose for tied lm_head: [vocab, hidden] -> [hidden, vocab]
         if config.tie_word_embeddings {
@@ -594,7 +639,24 @@ fn apply_weights(
     // PLE model-level weights
     {
         if let Some(ref mut ple) = inner.ple {
-            if let Some(w) = params.get("embed_tokens_per_layer.weight") {
+            if params.contains_key("embed_tokens_per_layer.scales")
+                && let Some(w) = params.get("embed_tokens_per_layer.weight")
+            {
+                let scales = params.get("embed_tokens_per_layer.scales").ok_or_else(|| {
+                    Error::from_reason(
+                        "Missing embed_tokens_per_layer.scales for quantized PLE embedding",
+                    )
+                })?;
+                let biases = params.get("embed_tokens_per_layer.biases");
+                ple.embed_tokens_per_layer.load_quantized(
+                    w,
+                    scales,
+                    biases,
+                    quant_group_size,
+                    quant_bits,
+                )?;
+                info!("PLE embed_tokens_per_layer loaded (quantized)");
+            } else if let Some(w) = params.get("embed_tokens_per_layer.weight") {
                 ple.embed_tokens_per_layer.load_weight(w)?;
                 info!("PLE embed_tokens_per_layer loaded");
             }
@@ -726,7 +788,21 @@ fn apply_weights(
             if let Some(w) = params.get(&format!("{}.router.scale", prefix)) {
                 layer.set_router_scale(w)?;
             }
-            if let Some(w) = params.get(&format!("{}.router.proj.weight", prefix)) {
+            let router_prefix = format!("{}.router.proj", prefix);
+            if params.contains_key(&format!("{}.scales", router_prefix))
+                && let Some(w) = params.get(&format!("{}.weight", router_prefix))
+            {
+                let scales = params
+                    .get(&format!("{}.scales", router_prefix))
+                    .ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Missing {}.scales for quantized router projection",
+                            router_prefix
+                        ))
+                    })?;
+                let biases = params.get(&format!("{}.biases", router_prefix));
+                layer.set_router_proj_quantized(w, scales, biases, quant_group_size, quant_bits)?;
+            } else if let Some(w) = params.get(&format!("{}.weight", router_prefix)) {
                 layer.set_router_proj_weight(w)?;
             }
             if let Some(w) = params.get(&format!("{}.router.per_expert_scale", prefix)) {
@@ -744,8 +820,8 @@ fn apply_weights(
                 if let Some(qsl) = try_build_quantized_switch_linear(
                     params,
                     &gate_up_prefix,
-                    DEFAULT_QUANT_GROUP_SIZE,
-                    DEFAULT_QUANT_BITS,
+                    quant_group_size,
+                    quant_bits,
                 ) {
                     layer.set_moe_gate_up_proj_quantized(qsl)?;
                 } else if let Some(qsl) =
@@ -765,8 +841,8 @@ fn apply_weights(
                 if let Some(qsl) = try_build_quantized_switch_linear(
                     params,
                     &down_prefix,
-                    DEFAULT_QUANT_GROUP_SIZE,
-                    DEFAULT_QUANT_BITS,
+                    quant_group_size,
+                    quant_bits,
                 ) {
                     layer.set_moe_down_proj_quantized(qsl)?;
                 } else if let Some(qsl) =
@@ -806,6 +882,8 @@ fn apply_vision_weights(
     inner: &mut Gemma4Inner,
     params: &HashMap<String, MxArray>,
     config: &Gemma4Config,
+    quant_bits: i32,
+    quant_group_size: i32,
 ) -> Result<()> {
     let vc = match &config.vision_config {
         Some(c) => c,
@@ -952,10 +1030,33 @@ fn apply_vision_weights(
     }
 
     // --- Multimodal Embedder ---
-    if let Some(ref mut embedder) = inner.embed_vision
-        && let Some(w) = params.get("embed_vision.embedding_projection.weight")
-    {
-        embedder.embedding_projection.set_weight(w)?;
+    // Affine-quantized checkpoints (e.g. Q8) ship this projection in packed
+    // form, so route through `Linear::load_quantized` when `.scales` is
+    // present. The dense `set_weight` path otherwise trips the shape guard.
+    if let Some(ref mut embedder) = inner.embed_vision {
+        let proj_prefix = "embed_vision.embedding_projection";
+        if params.contains_key(&format!("{}.scales", proj_prefix))
+            && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
+        {
+            let scales = params
+                .get(&format!("{}.scales", proj_prefix))
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Missing {}.scales for quantized vision embedding projection",
+                        proj_prefix
+                    ))
+                })?;
+            let biases = params.get(&format!("{}.biases", proj_prefix));
+            embedder.embedding_projection.load_quantized(
+                w,
+                scales,
+                biases,
+                quant_group_size,
+                quant_bits,
+            )?;
+        } else if let Some(w) = params.get(&format!("{}.weight", proj_prefix)) {
+            embedder.embedding_projection.set_weight(w)?;
+        }
     }
 
     info!("Vision weights applied successfully");
@@ -965,7 +1066,11 @@ fn apply_vision_weights(
 /// Register all sanitized weights with the C++ compiled forward pass.
 /// Uses the shared g_weights map (same API as Qwen3.5).
 /// Sets model_id AFTER all weights stored.
-fn register_gemma4_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
+fn register_gemma4_weights_with_cpp(
+    params: &HashMap<String, MxArray>,
+    inner: &Gemma4Inner,
+    model_id: u64,
+) {
     use mlx_sys as sys;
     use std::ffi::CString;
 
@@ -986,10 +1091,12 @@ fn register_gemma4_weights_with_cpp(params: &HashMap<String, MxArray>, model_id:
         store(name, array);
     }
 
-    // Store pre-transposed embedding weight for tied lm_head in C++ path
-    if let Some(w) = params.get("embed_tokens.weight")
-        && let Ok(w_t) = w.transpose(Some(&[1, 0]))
-    {
+    // Store pre-transposed embedding weight for tied lm_head in C++ path.
+    // Source the dense (dequantized when applicable) table from inner so
+    // quantized checkpoints don't publish a packed uint32 transpose.
+    if let Some(w_t) = inner.embed_weight_t.as_ref() {
+        store("embed_tokens.weight_t", w_t);
+    } else if let Ok(w_t) = inner.embed_tokens.get_weight().transpose(Some(&[1, 0])) {
         store("embed_tokens.weight_t", &w_t);
     }
 
@@ -1170,11 +1277,18 @@ impl Gemma4Inner {
         // Create inner model
         let mut inner = Gemma4Inner::new(config.clone())?;
 
+        // Resolve quantization parameters (bits/group_size) from config.json
+        // so the apply path picks the right packing for this checkpoint. This
+        // is required for any non-default (e.g. 8-bit) quantized build — the
+        // default 4-bit constants produce wrong shapes for `embed_tokens` and
+        // wrong kernel parameters for every QuantizedLinear.
+        let (quant_bits, quant_group_size) = parse_quant_cfg(path);
+
         // Apply weights
-        apply_weights(&mut inner, &params, &config)?;
+        apply_weights(&mut inner, &params, &config, quant_bits, quant_group_size)?;
 
         // Apply vision weights (if vision_config present)
-        apply_vision_weights(&mut inner, &params, &config)?;
+        apply_vision_weights(&mut inner, &params, &config, quant_bits, quant_group_size)?;
 
         // Materialize weights in chunked evals to avoid Metal command buffer
         // timeouts on large models. Without this, weights remain as lazy mmap
@@ -1185,7 +1299,7 @@ impl Gemma4Inner {
         }
 
         // Register weights with C++ compiled forward pass
-        register_gemma4_weights_with_cpp(&params, inner.model_id);
+        register_gemma4_weights_with_cpp(&params, &inner, inner.model_id);
 
         // NOTE: the cache-limit coordinator registration happens in
         // `Gemma4Model::load_from_dir` after this function returns,

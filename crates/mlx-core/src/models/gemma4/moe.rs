@@ -109,6 +109,22 @@ impl Gemma4Router {
         self.proj.set_weight(w)
     }
 
+    /// Load a quantized router projection weight. The router is small
+    /// (hidden → num_experts) but affine-quantized checkpoints still ship
+    /// it in packed form (e.g. 8-bit, `[num_experts, hidden/4]`), so the
+    /// dense `set_weight` path trips `Linear::set_weight`'s shape guard.
+    pub fn set_proj_quantized(
+        &mut self,
+        weight: &MxArray,
+        scales: &MxArray,
+        biases: Option<&MxArray>,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<()> {
+        self.proj
+            .load_quantized(weight, scales, biases, group_size, bits)
+    }
+
     pub fn set_per_expert_scale(&mut self, w: &MxArray) -> Result<()> {
         self.per_expert_scale = w.clone();
         Ok(())
