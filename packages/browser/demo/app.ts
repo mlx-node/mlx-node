@@ -66,6 +66,13 @@ let reasoningQueue = '';
 let contentQueue = '';
 let rafHandle: number | null = null;
 let scrollDirty = false;
+// Qwen3.5's template opens the assistant turn with `<think>\n`, so the first
+// streamed reasoning delta is pure whitespace (often several newlines). Same
+// thing on the content channel after `</think>\n\n`. Render it verbatim and
+// each panel shows a large empty gap before any real text. Skip leading
+// whitespace on each channel until the first non-whitespace char arrives.
+let reasoningHasContent = false;
+let contentHasContent = false;
 
 // Shared WASM memory, received once on 'ready' from mlx-worker. Used to mount
 // a chat-stream-sab reader over the heap region the worker mallocs per chat.
@@ -112,6 +119,8 @@ function createAssistantMessage(): HTMLDivElement {
   // Reset the typewriter queue for this new message.
   reasoningQueue = '';
   contentQueue = '';
+  reasoningHasContent = false;
+  contentHasContent = false;
   if (rafHandle != null) {
     cancelAnimationFrame(rafHandle);
     rafHandle = null;
@@ -130,9 +139,20 @@ function appendStreamedToken(deltaText: string, isReasoning: boolean) {
   setStatus(`Generating... ${streamTokenCount} tokens`, 'info');
 
   if (isReasoning) {
-    reasoningQueue += deltaText;
+    // Strip the leading `<think>\n…` whitespace padding the template injects
+    // before the first real reasoning char arrives. After that, render
+    // everything verbatim (the model's own internal whitespace is meaningful).
+    const text = reasoningHasContent ? deltaText : deltaText.replace(/^\s+/, '');
+    if (text.length === 0) return;
+    reasoningHasContent = true;
+    reasoningQueue += text;
   } else {
-    contentQueue += deltaText;
+    // Same rationale as above: strip the `</think>\n\n` whitespace padding
+    // before the first real content char arrives.
+    const text = contentHasContent ? deltaText : deltaText.replace(/^\s+/, '');
+    if (text.length === 0) return;
+    contentHasContent = true;
+    contentQueue += text;
   }
   scheduleFlush();
 }

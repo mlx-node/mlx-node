@@ -448,7 +448,8 @@ async function handleInit(data: {
 
     // 6. Pipeline warmup — first inference warms GPU pipelines + shader compilation
     post({ type: 'progress', step: 'warmup', message: 'Warming up...' });
-    await model.chat([{ role: 'user', content: 'hi' }], { maxNewTokens: 2, temperature: 0 });
+    const warmupResult = await model.chat([{ role: 'user', content: 'hi' }], { maxNewTokens: 2, temperature: 0 });
+    post({ type: 'log', message: `[WARMUP] rawText=${warmupResult.rawText} text=${warmupResult.text} finish=${warmupResult.finishReason}` });
     post({ type: 'progress', step: 'warmup', message: 'Warmup complete' });
 
     // Ship the shared WASM memory to the main thread so it can mount the
@@ -645,6 +646,11 @@ async function handleChat(data: {
     const chatConfig = {
       ...data.config,
       reasoningEffort,
+      // Cap reasoning at 128 tokens so Qwen3.5-0.8B can't get stuck inside
+      // <think> for the whole maxNewTokens budget. The ReasoningTracker
+      // forces </think> on the 128th thinking token, leaving the rest of
+      // the budget for the actual answer.
+      ...(enableThinking ? { thinkingTokenBudget: 128 } : {}),
       reportPerformance: true,
     };
 
@@ -707,6 +713,7 @@ async function handleChatBaseline(data: { messages: any[]; config?: any; enableT
     const chatConfig = {
       ...data.config,
       reasoningEffort: data.enableThinking === true ? 'high' : 'none',
+      ...(data.enableThinking === true ? { thinkingTokenBudget: 128 } : {}),
       reportPerformance: true,
     };
     resetProfileCounters();
@@ -747,6 +754,7 @@ async function handleChatTsfn(data: { messages: any[]; config?: any; enableThink
     const chatConfig = {
       ...data.config,
       reasoningEffort: data.enableThinking === true ? 'high' : 'none',
+      ...(data.enableThinking === true ? { thinkingTokenBudget: 128 } : {}),
       reportPerformance: true,
     };
     resetProfileCounters();

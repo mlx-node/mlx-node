@@ -663,11 +663,21 @@ impl Qwen3Tokenizer {
     /// Create from an already-parsed Tokenizer instance (for loading from memory).
     pub fn from_tokenizer(tokenizer: Tokenizer) -> Self {
         let (think_end_id, think_end_str) = Self::detect_think_end(&tokenizer);
+        // Resolve actual special token IDs from the tokenizer vocabulary.
+        // Qwen3.5 uses different IDs than Qwen2.5 (e.g. <|im_end|> = 248046,
+        // not 151645). Hardcoded fallbacks produce wrong stop tokens in chat.
+        let vocab = tokenizer.get_vocab(true);
+        let pad_token_id = vocab.get("<|endoftext|>").copied().unwrap_or(ENDOFTEXT_TOKEN_ID);
+        let eos_token_id = vocab.get("<|im_end|>").copied().unwrap_or(IM_END_TOKEN_ID);
+        let bos_token_id = vocab
+            .get("<|startoftext|>")
+            .or_else(|| vocab.get("<|begin_of_text|>"))
+            .copied();
         Self {
             tokenizer: Arc::new(tokenizer),
-            pad_token_id: ENDOFTEXT_TOKEN_ID,
-            eos_token_id: IM_END_TOKEN_ID,
-            bos_token_id: None,
+            pad_token_id,
+            eos_token_id,
+            bos_token_id,
             chat_template: None,
             think_end_id,
             think_end_str,
