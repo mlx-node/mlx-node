@@ -335,14 +335,10 @@ let hasShaderF16 = false;
 // We fix this by ending+restarting the pass in the gpu-worker after every dispatch.
 const passEncoderMap = new Map<number, number>(); // passHandle → encoderHandle
 
-function endAndRestartPass(passHandle: number): void {
-  const encoderHandle = passEncoderMap.get(passHandle);
-  if (encoderHandle === undefined) return;
-  const pass = handles[passHandle] as GPUComputePassEncoder;
-  pass.end();
-  const encoder = handles[encoderHandle] as GPUCommandEncoder;
-  const newPass = encoder.beginComputePass();
-  handles[passHandle] = newPass; // Replace in-place — bridge stub's cached handle stays valid
+function endAndRestartPass(_passHandle: number): void {
+  // No-op: compute pass stays open across dispatches. WebGPU validates buffer
+  // aliasing per-dispatch usage scope, not per-pass. The pass is only ended
+  // when necessary (FUSED_COPY_BUFFER, FUSED_SUBMIT, COMPUTE_PASS_END).
 }
 
 // Pre-registered handles (set during init)
