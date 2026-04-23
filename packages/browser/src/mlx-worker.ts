@@ -50,6 +50,9 @@ let wasmFree: ((ptr: number) => void) | null = null;
 // Then posts a {type:'profile', stats:...} message to the main thread.
 let profileEnabled = false;
 let bridgeRef: BridgeStub | null = null;
+// Per-worker DISPATCH_BATCH index counter. Child workers (created by emnapi's
+// asyncWorkPoolSize) receive batch buffer IDs 1, 2, 3, ...
+let nextWorkerBatchIndex = 1;
 
 function post(msg: any) {
   (self as any).postMessage(msg);
@@ -94,11 +97,17 @@ async function handleInit(data: {
     const cmdBuffer = new SharedArrayBuffer(CMD_OFFSET.TOTAL);
     const readbackBuffer = new SharedArrayBuffer(READBACK_BUFFER_SIZE);
     const poolStatsBuffer = new SharedArrayBuffer(POOL_STATS_SIZE_BYTES);
-    // Phase 2: dedicated dispatch-batch SAB. Always allocate (~16 KiB) so
-    // the same SAB can be retro-enabled by dispatchBatch without respawning
-    // the workers; the bridge stub only starts writing records when
-    // batchEnabled is true.
-    const dispatchBatchBuffer = new SharedArrayBuffer(DISPATCH_BATCH_BUFFER_SIZE);
+    // Phase 2: dedicated dispatch-batch SABs — one per worker (main + up to
+    // asyncWorkPoolSize child workers). Each worker gets its own SAB so
+    // DISPATCH_BATCH can be safely enabled on child pthread workers without
+    // races on a shared batch cursor. The gpu-worker receives all buffers in
+    // init and looks up the right one by batchBufferId.
+    const NUM_BATCH_BUFFERS = 5; // 0 = main, 1..4 = child workers
+    const batchBuffers: SharedArrayBuffer[] = [];
+    for (let i = 0; i < NUM_BATCH_BUFFERS; i++) {
+      batchBuffers.push(new SharedArrayBuffer(DISPATCH_BATCH_BUFFER_SIZE));
+    }
+    const dispatchBatchBuffer = batchBuffers[0]!;
     // Task 3: shared buffer-metadata SAB. Every bridge stub spawned against
     // this wasmMemory (main + child pthread workers created by emnapi's
     // asyncWorkPoolSize) reads and writes the same (size, usage) table,
@@ -140,7 +149,7 @@ async function handleInit(data: {
         cmdBuffer,
         readbackBuffer,
         wasmMemory: sharedMemory, // Send Memory object, not .buffer — .buffer getter always returns current byteLength after grow()
-        dispatchBatchBuffer,
+        batchBuffers,
         statsBuffer,
       });
     });
@@ -163,6 +172,7 @@ async function handleInit(data: {
       dispatchBatch,
       bufferMetadataBuffer,
       statsBuffer,
+      0, // batchBufferId = 0 for main worker
     );
     // Retain for ?profile=1 readback (resetBridgeStats / fetchGpuWorkerStats
     // need the same BridgeStub instance that owns the SAB cmdBuffer view).
@@ -233,23 +243,18 @@ async function handleInit(data: {
         // poll_instance() which is a no-op on WASM — the event loop never
         // runs, the callback never fires, infinite loop.
         const w = new Worker(new URL('./webgpu-worker.mjs', import.meta.url), { type: 'module' });
-        // Child workers share the dispatchBatchBuffer SAB. Batching stays
-        // *disabled* here for safety: multiple stubs writing to the same SAB
-        // offsets race even when the forward pass is serialized (pipeline
-        // creation, warmup, and buffer-map callbacks can fire on different
-        // worker threads concurrently). The child workers are where the
-        // decode hot path actually runs (main worker's bridgeRPCs=1 during
-        // decode — measured 2026-04-16), so batching on the main worker is
-        // effectively a no-op. Leaving the main worker's batching enabled
-        // anyway so future architecture changes that move work back to the
-        // main worker inherit the benefit automatically.
+        // Per-worker DISPATCH_BATCH: each child worker gets its own batch SAB
+        // (indexed 1..4) so batching can be enabled safely without races.
+        const workerBatchIndex = nextWorkerBatchIndex++;
+        const workerBatchBuffer = batchBuffers[workerBatchIndex] ?? batchBuffers[0]!;
         w.postMessage({
           type: '__mlx_rpc_config',
           cmdBuffer,
           readbackBuffer,
           poolStatsBuffer,
-          dispatchBatchBuffer,
-          dispatchBatch: false,
+          dispatchBatchBuffer: workerBatchBuffer,
+          batchBufferId: workerBatchIndex,
+          dispatchBatch: true, // enable batching on child workers
           bufferMetadataBuffer,
           statsBuffer,
           handles: {

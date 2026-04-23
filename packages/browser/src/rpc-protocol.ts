@@ -141,8 +141,9 @@ export const enum RpcFn {
   // SharedArrayBuffer (dispatchBatchBuffer) and fires them in one RPC.
   // Decode hot path issues ~1200 dispatches per token; batching 8-16 per
   // RPC drops that to ~75-150 round-trips per token.
-  //   ARG0: batchCount   (number of records in the batch SAB)
-  //   ARG1: batchBytes   (cursor into the batch SAB, for optional bounds check)
+  //   ARG0: batchCount    (number of records in the batch SAB)
+  //   ARG1: batchBytes    (cursor into the batch SAB, for optional bounds check)
+  //   ARG2: batchBufferId (which worker's batch SAB to read from, default 0)
   // The per-record layout is described at DISPATCH_BATCH_RECORD_OFFSET below.
   // Slots 100 and 101 in the stats histogram are already reserved for
   // smuggled pool hit/miss counters, so DISPATCH_BATCH uses 103.

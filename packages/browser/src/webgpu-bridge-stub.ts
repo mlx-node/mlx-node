@@ -177,6 +177,8 @@ export function createBridgeStub(
   dispatchBatchBuffer?: SharedArrayBuffer,
   /** Phase 2: gate DISPATCH_BATCH (default: off). */
   batchEnabled?: boolean,
+  /** Phase 2b: which batch buffer to use for DISPATCH_BATCH RPC (default: 0). */
+  batchBufferId?: number,
   /**
    * Task 3: shared SAB holding (size, usage) metadata for every real
    * gpu-worker buffer handle. When provided, all stubs sharing the same
@@ -610,6 +612,7 @@ export function createBridgeStub(
   const batchActive = batchEnabled === true && dispatchBatchBuffer !== undefined;
   const batchU32 = batchActive ? new Uint32Array(dispatchBatchBuffer!) : null;
   const batchU8 = batchActive ? new Uint8Array(dispatchBatchBuffer!) : null;
+  const batchBufferIdVal = batchBufferId ?? 0;
   let batchCount = 0;
   let batchBytes = 0;
   let diagBatchAttempt = 0;
@@ -631,7 +634,7 @@ export function createBridgeStub(
     // Write count/bytes as ARG0/ARG1 then fire. Bypass the flush-at-entry
     // guard by calling rpcCall with DISPATCH_BATCH directly — the guard
     // already skips DISPATCH_BATCH to avoid re-entrant recursion.
-    rpcCall(RpcFn.DISPATCH_BATCH, count, bytes);
+    rpcCall(RpcFn.DISPATCH_BATCH, count, bytes, batchBufferIdVal);
   }
 
   /**

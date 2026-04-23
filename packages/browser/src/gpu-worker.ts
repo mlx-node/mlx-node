@@ -360,8 +360,16 @@ let cmdU32: Uint32Array; // Fast unsigned reads (avoids DataView overhead in hot
 let wasmMemoryObj: WebAssembly.Memory; // Memory object — .buffer always reflects current size after grow()
 let readbackView: Uint8Array;
 
-// Phase 2: dispatch batch SAB (optional — only present when the mlx-worker
-// passes `dispatchBatchBuffer` in the init message). Used by DISPATCH_BATCH.
+// Phase 2: dispatch batch SABs — one per worker (main + child pthreads).
+// The mlx-worker passes an array of buffers in init; we map them by ID.
+// Fallback: a single buffer from older inits is stored at ID 0.
+interface BatchBuffer {
+  sab: SharedArrayBuffer;
+  u32: Uint32Array;
+  u8: Uint8Array;
+}
+const batchBuffers = new Map<number, BatchBuffer>();
+// Legacy fallback for single-buffer inits (test harnesses, etc.)
 let dispatchBatchU32: Uint32Array | null = null;
 let dispatchBatchU8: Uint8Array | null = null;
 let dispatchBatchBuffer: SharedArrayBuffer | null = null;
@@ -435,10 +443,25 @@ self.onmessage = async (e: MessageEvent) => {
     cmdDataView = new DataView(cmdBuffer);
     cmdU32 = new Uint32Array(cmdBuffer);
 
-    if (e.data.dispatchBatchBuffer) {
-      dispatchBatchBuffer = e.data.dispatchBatchBuffer as SharedArrayBuffer;
-      dispatchBatchU32 = new Uint32Array(dispatchBatchBuffer);
-      dispatchBatchU8 = new Uint8Array(dispatchBatchBuffer);
+    if (e.data.batchBuffers && Array.isArray(e.data.batchBuffers)) {
+      for (let i = 0; i < e.data.batchBuffers.length; i++) {
+        const buf = e.data.batchBuffers[i] as SharedArrayBuffer;
+        batchBuffers.set(i, { sab: buf, u32: new Uint32Array(buf), u8: new Uint8Array(buf) });
+      }
+      // Also set legacy fallback to ID 0 for any code that still reads it
+      const first = batchBuffers.get(0);
+      if (first) {
+        dispatchBatchBuffer = first.sab;
+        dispatchBatchU32 = first.u32;
+        dispatchBatchU8 = first.u8;
+      }
+    } else if (e.data.dispatchBatchBuffer) {
+      // Legacy single-buffer init (test harnesses)
+      const buf = e.data.dispatchBatchBuffer as SharedArrayBuffer;
+      dispatchBatchBuffer = buf;
+      dispatchBatchU32 = new Uint32Array(buf);
+      dispatchBatchU8 = new Uint8Array(buf);
+      batchBuffers.set(0, { sab: buf, u32: dispatchBatchU32, u8: dispatchBatchU8 });
     }
 
     // JS-F010: dedicated stats SAB (1 KiB = 256 u32 slots). Optional —
@@ -1074,14 +1097,16 @@ function handleFusedDispatchWithUniform(): void {
  * DISPATCH_BATCH in rpc-protocol.ts for the per-record layout.
  */
 function handleDispatchBatch(): void {
-  if (dispatchBatchU32 === null || dispatchBatchU8 === null || dispatchBatchBuffer === null) {
+  const batchBufferId = cmdU32[I_ARG0 + 2] ?? 0;
+  const buf = batchBuffers.get(batchBufferId);
+  if (!buf) {
     cmdU32[I_RESULT] = 0;
     return;
   }
   const batchCount = cmdU32[I_ARG0];
   const batchBytes = cmdU32[I_ARG0 + 1];
-  const sab = dispatchBatchU32;
-  const sabBuffer = dispatchBatchBuffer;
+  const sab = buf.u32;
+  const sabBuffer = buf.sab;
   let cursor = 0;
   for (let r = 0; r < batchCount; r++) {
     if (cursor >= batchBytes) break;

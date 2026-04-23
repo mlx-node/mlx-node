@@ -65,13 +65,13 @@ export const MIN_SAB_BYTES = SAB_HEADER_BYTES + RECORD_HEADER_BYTES + 1 + 1;
  * fraction of wakes are lost, and the reader sits parked on the stale `seq`
  * until the timeout fires. With the original 1000 ms timeout the missed-wake
  * path produced a visible "lag burst every ~1 s" artifact in streaming
- * output. 100 ms hides the artifact (≤10 hz polling on a loop that exits
- * the moment the stream's done-chunk lands, so idle cost is zero). The real
- * fix is a reliable notify path; revisit once browsers improve cross-thread
- * waitAsync delivery, or if we move the reader back into a dedicated worker
- * where same-thread notify is reliable.
+ * output. 100 ms hid the artifact but still added up to 100 ms of latency
+ * per lost notify. 16 ms (~1 frame) hides the artifact just as well while
+ * bounding worst-case latency to a single frame. Idle cost is zero: the loop
+ * exits the moment the stream's done-chunk lands. The real fix is a reliable
+ * notify path; revisit once browsers improve cross-thread waitAsync delivery.
  */
-export const READER_WAIT_TIMEOUT_MS = 100;
+export const READER_WAIT_TIMEOUT_MS = 16;
 
 // ---------------------------------------------------------------------------
 // Shared TextDecoder (module-level — avoid per-call construction cost)
