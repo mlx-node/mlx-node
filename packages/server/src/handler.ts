@@ -9,6 +9,19 @@ import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelRegistry } from './registry.js';
 import { routeRequest } from './router.js';
 
+/**
+ * Entry in the list returned by `GET /v1/models`. Matches the shape
+ * `ModelRegistry.list()` produces — exported so callers that supply a
+ * custom `listModels` callback (e.g. `mlx launch claude` discovering
+ * every model on disk) can build entries without importing internals.
+ */
+export interface PublicModelEntry {
+  id: string;
+  object: 'model';
+  created: number;
+  owned_by: string;
+}
+
 export interface HandlerOptions {
   /** Enable CORS headers (default: true). */
   cors?: boolean;
@@ -31,6 +44,18 @@ export interface HandlerOptions {
    * traffic keep the allocator pinned forever.
    */
   idleSweeper?: IdleSweeper | null;
+  /**
+   * Optional async callback invoked by `/v1/messages` before it looks
+   * the model up in the registry. The callback should register the
+   * model on demand; on return, the endpoint does `registry.get(name)`
+   * and 404s if still unresolved.
+   */
+  resolveModel?: (name: string) => Promise<void>;
+  /**
+   * Optional override for `GET /v1/models`. When provided, that endpoint
+   * returns this list instead of `registry.list()`.
+   */
+  listModels?: () => PublicModelEntry[];
 }
 
 export function createHandler(
@@ -41,6 +66,8 @@ export function createHandler(
   const store = options?.store ?? null;
   const responseRetentionSec = options?.responseRetentionSec;
   const idleSweeper = options?.idleSweeper ?? null;
+  const resolveModel = options?.resolveModel;
+  const listModels = options?.listModels;
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (cors) {
@@ -59,7 +86,7 @@ export function createHandler(
     // post-`res.end()` bookkeeping (e.g. `SessionRegistry.adopt`). `http.createServer`
     // ignores the return value, so this is transparent to production callers.
     try {
-      await routeRequest(req, res, registry, store, responseRetentionSec, idleSweeper);
+      await routeRequest(req, res, registry, store, responseRetentionSec, idleSweeper, resolveModel, listModels);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';
       if (!res.headersSent) {

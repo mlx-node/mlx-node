@@ -8,6 +8,7 @@ import { join } from 'node:path';
 
 import { ResponseStore } from '@mlx-node/core';
 
+import type { PublicModelEntry } from './handler.js';
 import { createHandler } from './handler.js';
 import { createIdleSweeper, DEFAULT_IDLE_CLEAR_CACHE_MS, parseIdleClearCacheEnv } from './idle-sweeper.js';
 import { ModelRegistry } from './registry.js';
@@ -132,6 +133,21 @@ export interface ServerConfig {
    * model is untouched and covers in-flight memory churn.
    */
   idleClearCacheMs?: number;
+  /**
+   * Optional async callback invoked before the endpoint layer looks
+   * the model up in the registry. Intended for lazy-load schemes:
+   * the callback should register the model into `registry` if it can;
+   * on return, the endpoint does `registry.get(body.model)` and 404s
+   * if still unresolved. Callback errors bubble up as 500s.
+   */
+  resolveModel?: (name: string) => Promise<void>;
+  /**
+   * Optional override for `GET /v1/models` enumeration. When provided,
+   * the endpoint returns this list instead of `registry.list()`.
+   * Intended for dynamic discovery schemes (e.g. enumerate every model
+   * on disk while only the currently-resident one is registered).
+   */
+  listModels?: () => PublicModelEntry[];
 }
 
 export interface ServerInstance {
@@ -248,7 +264,14 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   }, CLEANUP_INTERVAL_MS);
   cleanupTimer.unref();
 
-  const handler = createHandler(registry, { cors, store, responseRetentionSec, idleSweeper });
+  const handler = createHandler(registry, {
+    cors,
+    store,
+    responseRetentionSec,
+    idleSweeper,
+    resolveModel: config?.resolveModel,
+    listModels: config?.listModels,
+  });
   const server = httpCreateServer(handler);
 
   await new Promise<void>((resolve, reject) => {

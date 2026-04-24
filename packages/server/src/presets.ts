@@ -60,3 +60,57 @@ export const QWEN_SAMPLING_DEFAULTS = {
     repetitionPenalty: 1.0,
   } satisfies ChatConfig,
 } as const;
+
+/** Sampling defaults for Gemma4 Instruct. */
+export const GEMMA4_SAMPLING_DEFAULTS: ChatConfig = {
+  temperature: 0.7,
+  topP: 0.95,
+  topK: 64,
+  minP: 0.0,
+  presencePenalty: 0.0,
+  repetitionPenalty: 1.0,
+};
+
+/** Sampling defaults for LFM2.5 Thinking. */
+export const LFM2_SAMPLING_DEFAULTS: ChatConfig = {
+  temperature: 0.05,
+  topP: 1.0,
+  topK: 50,
+  minP: 0.0,
+  presencePenalty: 0.0,
+  repetitionPenalty: 1.05,
+};
+
+/** Sampling + per-model output token cap exposed by {@link LAUNCH_PRESETS}. */
+export interface LaunchPreset {
+  sampling: ChatConfig;
+  maxOutputTokens: number;
+}
+
+/**
+ * Per-`ModelType` presets used by `mlx launch claude` to pre-wire a
+ * discovered model with sensible sampling defaults + a max output
+ * token budget. Keyed on the string returned by `detectModelType()`.
+ */
+export const LAUNCH_PRESETS: Record<string, LaunchPreset> = {
+  qwen3: {
+    sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
+    maxOutputTokens: 38912,
+  },
+  qwen3_5: {
+    sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
+    maxOutputTokens: 81920,
+  },
+  qwen3_5_moe: {
+    sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
+    maxOutputTokens: 81920,
+  },
+  gemma4: {
+    sampling: GEMMA4_SAMPLING_DEFAULTS,
+    maxOutputTokens: 16384,
+  },
+  lfm2: {
+    sampling: LFM2_SAMPLING_DEFAULTS,
+    maxOutputTokens: 8192,
+  },
+};

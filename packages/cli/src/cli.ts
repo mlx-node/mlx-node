@@ -17,6 +17,7 @@ Commands:
   download model     Download a model from HuggingFace
   download dataset   Download a dataset from HuggingFace
   convert            Convert model weights to MLX format
+  launch claude      Start a local server and spawn Claude Code pointed at it
 
 Options:
   -h, --help         Show this help message
@@ -25,7 +26,8 @@ Options:
 Examples:
   mlx download model -m Qwen/Qwen3-0.6B
   mlx download dataset -d openai/gsm8k
-  mlx convert -i .cache/models/qwen3-0.6b -o .cache/models/qwen3-0.6b-mlx -d bf16
+  mlx convert -i ~/.mlx-node/models/qwen3-0.6b -o ~/.mlx-node/models/qwen3-0.6b-mlx -d bf16
+  mlx launch claude
 `);
 }
 
@@ -73,6 +75,28 @@ Run mlx download <subcommand> --help for more information.
       const rest = args.slice(1);
       const { run } = await import('./commands/convert.js');
       await run(rest);
+      break;
+    }
+
+    case 'launch': {
+      const rest = args.slice(2);
+      if (!subcommand || subcommand === '--help' || subcommand === '-h') {
+        console.log(`
+Usage:
+  mlx launch claude     Start a local server and spawn Claude Code pointed at it
+
+Run mlx launch <subcommand> --help for more information.
+`);
+        return;
+      }
+      if (subcommand === 'claude') {
+        const { run } = await import('./commands/launch-claude/index.js');
+        await run(rest);
+      } else {
+        console.error(`Unknown launch subcommand: ${subcommand}`);
+        console.error('Available: claude');
+        process.exit(1);
+      }
       break;
     }
 

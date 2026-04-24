@@ -14,6 +14,7 @@ import {
   sendMethodNotAllowed,
   sendNotFound,
 } from './errors.js';
+import type { PublicModelEntry } from './handler.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelRegistry } from './registry.js';
 import type { AnthropicMessagesRequest } from './types-anthropic.js';
@@ -47,6 +48,8 @@ export async function routeRequest(
   store: ResponseStore | null,
   responseRetentionSec?: number,
   idleSweeper?: IdleSweeper | null,
+  resolveModel?: (name: string) => Promise<void>,
+  listModels?: () => PublicModelEntry[],
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
@@ -56,7 +59,7 @@ export async function routeRequest(
       sendMethodNotAllowed(res, 'GET');
       return;
     }
-    handleListModels(res, registry);
+    handleListModels(res, registry, listModels);
     return;
   }
 
@@ -98,7 +101,7 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateMessage(res, body, registry, req, idleSweeper);
+    await handleCreateMessage(res, body, registry, req, idleSweeper, resolveModel);
     return;
   }
 

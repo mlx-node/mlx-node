@@ -459,6 +459,7 @@ export async function handleCreateMessage(
   registry: ModelRegistry,
   httpReq?: IncomingMessage,
   idleSweeper?: IdleSweeper | null,
+  resolveModel?: (name: string) => Promise<void>,
 ): Promise<void> {
   if (body == null || typeof body !== 'object') {
     sendAnthropicBadRequest(res, 'Request body must be a JSON object');
@@ -482,6 +483,13 @@ export async function handleCreateMessage(
       sendAnthropicBadRequest(res, 'Each message must be a non-null object');
       return;
     }
+  }
+
+  // Lazy-load hook: give the host a chance to register the requested
+  // model before we look it up. Errors bubble up to the handler's
+  // top-level catch which returns 500.
+  if (resolveModel) {
+    await resolveModel(body.model);
   }
 
   const model = registry.get(body.model);
