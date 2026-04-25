@@ -57,19 +57,26 @@ export function makeSwapController(
     // resident or as an alias we previously installed). Avoid chaining.
     if (registry.get(name)) return;
 
-    // Pick the discovered entry to resolve against. If the requested
-    // name matches a discovered model, use it. Otherwise (unknown
-    // name — Claude Code's hardcoded small-fast-model, etc.) fall
-    // through to the current resident so subagent dispatches don't
-    // 404, loading discovered[0] on first boot if nothing is resident
-    // yet.
-    const knownEntry = byName.get(name);
-    const targetEntry = knownEntry ?? (resident ? (byName.get(resident.name) ?? fallbackEntry) : fallbackEntry);
-    const isAlias = targetEntry.name !== name;
-
     const next = currentOp.then(async () => {
       // Re-check under the serialized section — a prior waiter may have loaded it.
       if (registry.get(name)) return;
+
+      // Pick the discovered entry to resolve against. If the requested
+      // name matches a discovered model, use it. Otherwise (unknown
+      // name — Claude Code's hardcoded small-fast-model, etc.) fall
+      // through to the current resident so subagent dispatches don't
+      // 404, loading discovered[0] on first boot if nothing is resident
+      // yet.
+      //
+      // CRITICAL: this must read `resident` at RUN time, not QUEUE time.
+      // If we capture it before chaining onto `currentOp`, a swap that
+      // ran ahead of us will leave us with a stale target — e.g. a haiku
+      // alias request that arrived during a `/model a → b` switch would
+      // capture `targetEntry = a`, then re-bind itself to `a` and undo
+      // the user's switch when its turn finally comes around.
+      const knownEntry = byName.get(name);
+      const targetEntry = knownEntry ?? (resident ? (byName.get(resident.name) ?? fallbackEntry) : fallbackEntry);
+      const isAlias = targetEntry.name !== name;
 
       // Swap out any stale resident that isn't the target.
       //

@@ -184,6 +184,74 @@ describe('makeSwapController', () => {
     expect(loader).not.toHaveBeenCalledWith('/fake/a');
   });
 
+  it('does not reload the previous resident when an alias request races a /model swap', { timeout: 5000 }, async () => {
+    // Regression: previously `targetEntry` and `isAlias` were captured at
+    // QUEUE time (i.e. the moment `resolveModel` was called), reading
+    // `resident` before chaining onto `currentOp`. A concurrent unknown-name
+    // (haiku alias) request that arrived DURING a `/model a → b` switch
+    // would capture `targetEntry = a` (the at-queue-time resident), then,
+    // when its turn ran AFTER b had become resident, would swap back to a
+    // and undo the user's switch.
+    //
+    // Fix: read `resident` inside the serialized .then() body so the
+    // target is computed against the live state at run time.
+    const reg = fakeRegistry();
+
+    // Controllable loader: each call returns a promise we can resolve on demand.
+    const pending: { path: string; resolve: (v: LoadableModel) => void }[] = [];
+    const loader = vi.fn(
+      (path: string) =>
+        new Promise<LoadableModel>((resolve) => {
+          pending.push({ path, resolve });
+        }),
+    );
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader);
+
+    // 1) Establish resident=a.
+    const pA = ctrl.resolveModel('a');
+    // Drain microtasks so the loader call lands.
+    await Promise.resolve();
+    expect(pending).toHaveLength(1);
+    expect(pending[0].path).toBe('/fake/a');
+    pending[0].resolve({ marker: '/fake/a' } as unknown as LoadableModel);
+    await pA;
+
+    // 2) Start a swap to b — DO NOT await; b is mid-load.
+    const pB = ctrl.resolveModel('b');
+    // Let the .then() body run up to the loader await.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(pending).toHaveLength(2);
+    expect(pending[1].path).toBe('/fake/b');
+
+    // 3) Concurrently fire an alias request while b is still loading.
+    // At THIS moment the live `resident` is still a, but by the time the
+    // alias's queued body runs, b will be resident. Old code captured
+    // targetEntry = a here and would have re-loaded a after b finished.
+    const pAlias = ctrl.resolveModel('claude-haiku-4-5-20251001');
+    await Promise.resolve();
+
+    // 4) Unblock the b load. The alias body runs next.
+    pending[1].resolve({ marker: '/fake/b' } as unknown as LoadableModel);
+    await pB;
+    await pAlias;
+
+    // 5) Final state: only two real loads (a then b). No third load of a.
+    const loadedPaths = loader.mock.calls.map((c) => c[0]);
+    expect(loadedPaths).toEqual(['/fake/a', '/fake/b']);
+    expect(loadedPaths.filter((p) => p === '/fake/a')).toHaveLength(1);
+
+    // The alias must be registered onto b's instance — not re-registered onto a.
+    const aliasRegister = reg.register.mock.calls.find((c) => c[0] === 'claude-haiku-4-5-20251001');
+    expect(aliasRegister).toBeDefined();
+    expect(aliasRegister?.[1]).toEqual({ marker: '/fake/b' });
+
+    // And `a` must have been unregistered exactly once (during the a → b swap),
+    // never re-registered as a fresh resident.
+    expect(reg.unregister.mock.calls.map((c) => c[0])).toContain('a');
+    expect(reg.register.mock.calls.filter((c) => c[0] === 'a')).toHaveLength(1);
+  });
+
   it('lists discovered entries in name order', () => {
     const reg = fakeRegistry();
     const loader = vi.fn(async () => ({}) as unknown as LoadableModel);

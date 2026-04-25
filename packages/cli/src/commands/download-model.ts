@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { readdir, copyFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -151,6 +151,57 @@ async function getModelFiles(modelName: string, accessToken?: string, globPatter
   return { totalSize, filesToDownload, allFiles };
 }
 
+/**
+ * Pre-flight check: does `outputDir` already hold a complete model download?
+ *
+ * Returns true ONLY when we can declare "already downloaded" with confidence.
+ * For sharded models we additionally parse `model.safetensors.index.json`
+ * and verify every shard listed under `weight_map` is present on disk —
+ * otherwise an interrupted prior run that landed the index but not all
+ * shards would silently exit as "already downloaded" and leave the user
+ * with a broken local copy.
+ *
+ * Pure function: takes the directory + its file list and only reads the
+ * index file when sharded-model checks need it. No network, no other I/O.
+ */
+export function isModelAlreadyDownloaded(outputDir: string, files: string[]): boolean {
+  const fileSet = new Set(files);
+  const hasConfig = fileSet.has('config.json');
+  if (!hasConfig) return false;
+
+  const hasSingleModel = fileSet.has('model.safetensors');
+  const hasPaddleModel = fileSet.has('inference.pdiparams');
+  if (hasSingleModel || hasPaddleModel) return true;
+
+  const hasShardedModel = fileSet.has('model.safetensors.index.json');
+  if (!hasShardedModel) return false;
+
+  // Sharded: verify every shard the index references actually exists on disk.
+  let parsed: unknown;
+  try {
+    const raw = readFileSync(join(outputDir, 'model.safetensors.index.json'), 'utf8');
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  const weightMap =
+    parsed && typeof parsed === 'object' && 'weight_map' in parsed
+      ? (parsed as { weight_map?: unknown }).weight_map
+      : undefined;
+  if (!weightMap || typeof weightMap !== 'object') return false;
+
+  const shardFilenames = new Set<string>();
+  for (const value of Object.values(weightMap as Record<string, unknown>)) {
+    if (typeof value === 'string') shardFilenames.add(value);
+  }
+  if (shardFilenames.size === 0) return false;
+
+  for (const shard of shardFilenames) {
+    if (!existsSync(join(outputDir, shard))) return false;
+  }
+  return true;
+}
+
 async function verifyDownload(outputDir: string, weightFiles: string[]): Promise<boolean> {
   console.log('\nVerifying download...');
 
@@ -253,12 +304,8 @@ export async function run(argv: string[]) {
   // Check if already downloaded
   if (existsSync(outputDir)) {
     const files = await readdir(outputDir);
-    const hasConfig = files.includes('config.json');
-    const hasSingleModel = files.includes('model.safetensors');
-    const hasShardedModel = files.includes('model.safetensors.index.json');
-    const hasPaddleModel = files.includes('inference.pdiparams');
     const hasGguf = files.some((f) => f.endsWith('.gguf'));
-    if (hasConfig && (hasSingleModel || hasShardedModel || hasPaddleModel)) {
+    if (isModelAlreadyDownloaded(outputDir, files)) {
       console.log('Model already downloaded!\n');
       console.log('To re-download, delete the output directory first:');
       console.log(`   rm -rf ${outputDir}\n`);

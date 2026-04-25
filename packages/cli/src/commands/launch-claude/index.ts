@@ -1,6 +1,7 @@
 /** `mlx launch claude` — start a local Anthropic-compatible server and spawn Claude Code pointed at it. */
 
 import { spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { createServer as netCreateServer } from 'node:net';
 import { delimiter, join } from 'node:path';
@@ -190,6 +191,7 @@ export async function run(argv: string[]): Promise<void> {
   });
 
   let shuttingDown = false;
+  let childExited = false;
   const shutdown = async (exitCode: number): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -209,6 +211,7 @@ export async function run(argv: string[]): Promise<void> {
   };
 
   child.on('exit', (code) => {
+    childExited = true;
     void shutdown(code ?? 0);
   });
   child.on('error', (err) => {
@@ -216,14 +219,38 @@ export async function run(argv: string[]): Promise<void> {
     void shutdown(1);
   });
 
-  const forwardSignal = (sig: NodeJS.Signals): void => {
-    if (shuttingDown) return;
-    child.kill(sig);
-    const timer = setTimeout(() => {
-      if (!child.killed) child.kill('SIGKILL');
-    }, 5000);
-    timer.unref();
-  };
+  const forwardSignal = makeChildKillEscalation({
+    child,
+    isShuttingDown: () => shuttingDown,
+    hasChildExited: () => childExited,
+  });
   process.on('SIGINT', () => forwardSignal('SIGINT'));
   process.on('SIGTERM', () => forwardSignal('SIGTERM'));
+}
+
+/**
+ * Build a signal forwarder that escalates to SIGKILL if the child hasn't
+ * exited within `escalateAfterMs`. Factored out (and exported) so the
+ * escalation logic is unit-testable without spawning a real process.
+ *
+ * Tracks termination via a caller-supplied `hasChildExited` predicate
+ * because `subprocess.killed` flips to true the moment the *signal* is
+ * sent, not when the child terminates — making it useless as an
+ * "is the child gone yet?" check.
+ */
+export function makeChildKillEscalation(opts: {
+  child: Pick<ChildProcess, 'kill'>;
+  isShuttingDown: () => boolean;
+  hasChildExited: () => boolean;
+  escalateAfterMs?: number;
+}): (sig: NodeJS.Signals) => void {
+  const escalateAfterMs = opts.escalateAfterMs ?? 5000;
+  return (sig: NodeJS.Signals): void => {
+    if (opts.isShuttingDown()) return;
+    opts.child.kill(sig);
+    const timer = setTimeout(() => {
+      if (!opts.hasChildExited()) opts.child.kill('SIGKILL');
+    }, escalateAfterMs);
+    timer.unref();
+  };
 }
