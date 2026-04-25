@@ -223,6 +223,53 @@ export function isGlobVariantPresent(files: string[], globPatterns: string[]): b
   return files.some((f) => matchesAnyGlob(f, globs));
 }
 
+/**
+ * Pre-flight check: is a no-glob GGUF download complete?
+ *
+ * Returns true ONLY when EVERY `.gguf` file in the remote repo manifest
+ * is also present locally. Returns false otherwise — including the
+ * "this is not a GGUF repo" case (the remote has no `.gguf` files), so
+ * the caller knows to fall through to the normal sharded/single-file
+ * checks rather than mis-routing through the GGUF early-return.
+ *
+ * Why this exists: the previous early-return was `files.some((f) =>
+ * f.endsWith('.gguf'))`, so as soon as ANY `.gguf` was on disk the
+ * command silently exited. For multi-variant GGUF repos that publish
+ * Q2_K, Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, Q8_0 as separate files, an
+ * interrupted prior download that left only Q2_K on disk would short-
+ * circuit a re-run without `--glob` and never fetch the rest. The user
+ * received zero warning that their local copy was incomplete.
+ *
+ * The fix is manifest-aware: compare the local file list against the
+ * remote `.gguf` filenames and only declare "already downloaded" when
+ * every advertised variant is present. Per-file basenames are compared
+ * (the remote manifest uses paths like `models/Q4_K_M.gguf` while local
+ * `readdir` is flat) so nested-prefix repos don't false-negative.
+ *
+ * Pure function: no I/O, no network. Caller fetches the manifest via
+ * `getModelFiles` (or equivalent) and hands the basenames in.
+ */
+export function isGgufRepoComplete(localFiles: string[], remoteFiles: string[]): boolean {
+  // Empty manifest is never complete — and is almost certainly an upstream
+  // error rather than a legitimate empty repo. Falling through to the
+  // download loop will surface the real failure (404 / auth rejection /
+  // network) instead of masking it as "already downloaded".
+  if (remoteFiles.length === 0) return false;
+  const remoteGguf = remoteFiles.filter((f) => f.endsWith('.gguf'));
+  // Not a GGUF repo — caller should route through the normal
+  // `isModelAlreadyDownloaded` (sharded / single-file) path instead.
+  if (remoteGguf.length === 0) return false;
+  const localSet = new Set(localFiles);
+  for (const remote of remoteGguf) {
+    // Remote manifest paths can include prefixes (`models/foo.gguf`);
+    // local `readdir(outputDir)` is flat. Compare basenames so a repo
+    // that publishes under a sub-directory still resolves cleanly.
+    const basename = remote.split('/').pop() ?? remote;
+    if (!localSet.has(basename)) return false;
+  }
+  return true;
+}
+
 async function verifyDownload(outputDir: string, weightFiles: string[]): Promise<boolean> {
   console.log('\nVerifying download...');
 
@@ -322,7 +369,21 @@ export async function run(argv: string[]) {
   }
   console.log(`Output: ${outputDir}\n`);
 
-  // Check if already downloaded
+  // Check if already downloaded.
+  //
+  // For non-GGUF repos the local-only `isModelAlreadyDownloaded` check
+  // is sufficient (single-file safetensors → 1 weight file; sharded →
+  // we parse the index and verify every shard is present). For GGUF
+  // repos the local-only path is wrong: a multi-variant repo (Q2_K,
+  // Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, Q8_0 as separate files) where a
+  // prior interrupted run left only Q2_K on disk would silently exit
+  // as "already downloaded" without ever fetching the rest. So for the
+  // GGUF early-return we hoist the manifest fetch above the check and
+  // require EVERY remote `.gguf` to be present locally before
+  // declaring complete. The trade-off — one extra network round-trip
+  // on the hot "already downloaded" path — is intentional; correctness
+  // wins over the ~200ms saved.
+  let cachedManifest: { totalSize: number; filesToDownload: ListFileEntry[]; allFiles: ListFileEntry[] } | null = null;
   if (existsSync(outputDir)) {
     const files = await readdir(outputDir);
     const hasGguf = files.some((f) => f.endsWith('.gguf'));
@@ -333,10 +394,33 @@ export async function run(argv: string[]) {
       return;
     }
     if (hasGguf && !globPatterns?.length) {
-      console.log('GGUF file(s) already downloaded!\n');
-      console.log('To re-download, delete the output directory first:');
-      console.log(`   rm -rf ${outputDir}\n`);
-      return;
+      // Manifest-aware completeness: only short-circuit when every
+      // remote `.gguf` is present locally. Falling through to the
+      // download loop is safe — `downloadFileToCacheDir` is content-
+      // addressed and the per-file `copyFile` to `outputDir` is
+      // idempotent, so files already on disk re-copy from cache
+      // without re-downloading bytes.
+      console.log('Fetching file list from HuggingFace...\n');
+      cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
+      const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
+      if (isGgufRepoComplete(files, remoteBasenames)) {
+        console.log('GGUF file(s) already downloaded!\n');
+        console.log('To re-download, delete the output directory first:');
+        console.log(`   rm -rf ${outputDir}\n`);
+        return;
+      }
+      // Incomplete: fall through to the download loop. Report which
+      // variants are missing so the user knows what's about to fetch.
+      const missing = cachedManifest.allFiles.filter(
+        (f) => f.path.endsWith('.gguf') && !files.includes(f.path.split('/').pop() ?? f.path),
+      );
+      if (missing.length > 0) {
+        console.log(`Detected ${missing.length} missing GGUF file(s); resuming download...`);
+        for (const f of missing) {
+          console.log(`  ${f.path}${f.size ? ` (${formatBytes(f.size)})` : ''}`);
+        }
+        console.log('');
+      }
     }
     // For glob downloads, only declare "already downloaded" when at least one
     // file actually matches the user's glob. CORE_FILES (config.json,
@@ -354,9 +438,14 @@ export async function run(argv: string[]) {
 
   await ensureDir(outputDir);
 
-  console.log('Fetching file list from HuggingFace...\n');
-
-  const { totalSize, filesToDownload, allFiles } = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
+  // Reuse the manifest fetched during the GGUF completeness check if we
+  // already have it, otherwise fetch fresh. Either way the same shape
+  // is destructured below.
+  if (cachedManifest === null) {
+    console.log('Fetching file list from HuggingFace...\n');
+  }
+  const { totalSize, filesToDownload, allFiles } =
+    cachedManifest ?? (await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns));
 
   if (filesToDownload.length === 0) {
     console.error('No files matched the given criteria.\n');

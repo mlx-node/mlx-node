@@ -343,6 +343,121 @@ describe('handleCreateMessage', () => {
   });
 
   // -----------------------------------------------------------------------
+  // Idle sweeper bracketing of resolveModel
+  // -----------------------------------------------------------------------
+
+  describe('resolveModel idle-sweeper bracketing', () => {
+    it('wraps resolveModel in withSuspendedDrains BEFORE beginRequest fires', async () => {
+      // Regression: in `mlx launch claude` mode `resolveModel` may run a
+      // 30s `loadModel()` on first sight of an unknown name. The previous
+      // request's `endRequest()` arms a 30s drain timer that fires
+      // `clearCache()` on expiry. If we did NOT bracket the lazy-load
+      // call, the timer could fire MID-LOAD while weight materialization
+      // was still allocating through the Metal free pool — exactly the
+      // hot-load race that `withSuspendedDrains` exists to prevent.
+      //
+      // The fix wraps the `resolveModel(...)` invocation in
+      // `idleSweeper.withSuspendedDrains(...)` so the drain is suspended
+      // for the full duration of the load. The bracket MUST land BEFORE
+      // `beginRequest()` (which itself only cancels an already-armed
+      // timer; it does not protect against a timer that fires *during*
+      // the await on resolveModel before beginRequest runs).
+      const registry = new ModelRegistry();
+      const { res } = createMockRes();
+
+      // Side-effect: register the model so the post-resolveModel
+      // `registry.get(...)` lookup succeeds and the handler proceeds
+      // through dispatch. The mock model simply returns a canned
+      // `ChatResult`.
+      const mockModel = createMockModel();
+      const resolveOrder: string[] = [];
+      const resolveModel = vi.fn(async (_name: string) => {
+        resolveOrder.push('resolveModel:enter');
+        // Force at least one event-loop turn so the await is real.
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        registry.register('test-model', mockModel);
+        resolveOrder.push('resolveModel:exit');
+      });
+
+      // Fake idle sweeper. `withSuspendedDrains` simply runs the supplied
+      // function; the assertion is purely on call ordering.
+      const withSuspendedDrains = vi.fn(async <T>(fn: () => T | Promise<T>): Promise<T> => {
+        return await fn();
+      });
+      const beginRequest = vi.fn();
+      const endRequest = vi.fn();
+      const fakeSweeper = {
+        withSuspendedDrains,
+        beginRequest,
+        endRequest,
+        suspendDrains: vi.fn(() => () => {}),
+        close: vi.fn(),
+        isPending: false,
+        inFlight: 0,
+      };
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+        undefined,
+        fakeSweeper as any,
+        resolveModel,
+      );
+
+      // Load-bearing assertion #1: resolveModel was actually invoked.
+      expect(resolveModel).toHaveBeenCalledTimes(1);
+      expect(resolveModel).toHaveBeenCalledWith('test-model');
+
+      // Load-bearing assertion #2: the bracket wraps resolveModel.
+      expect(withSuspendedDrains).toHaveBeenCalledTimes(1);
+      expect(resolveOrder).toEqual(['resolveModel:enter', 'resolveModel:exit']);
+
+      // Load-bearing assertion #3: withSuspendedDrains runs BEFORE
+      // beginRequest. Without this ordering the previous request's
+      // armed timer could fire mid-load.
+      expect(beginRequest).toHaveBeenCalledTimes(1);
+      expect(withSuspendedDrains.mock.invocationCallOrder[0]).toBeLessThan(beginRequest.mock.invocationCallOrder[0]);
+
+      // Sanity: the matching endRequest fires.
+      expect(endRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to a direct resolveModel call when no idle sweeper is provided', async () => {
+      // The bracket is conditional on `idleSweeper != null` so a host
+      // that opted out (or hasn't wired one) still gets the lazy-load
+      // hook fired. Asserts the fallback branch.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      const resolveModel = vi.fn(async (_name: string) => {
+        registry.register('test-model', mockModel);
+      });
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+        undefined,
+        // No sweeper → direct call.
+        null,
+        resolveModel,
+      );
+
+      expect(resolveModel).toHaveBeenCalledTimes(1);
+      expect(getStatus()).toBe(200);
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Non-streaming
   // -----------------------------------------------------------------------
 

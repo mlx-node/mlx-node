@@ -506,8 +506,25 @@ export async function handleCreateMessage(
   // Lazy-load hook: give the host a chance to register the requested
   // model before we look it up. Errors bubble up to the handler's
   // top-level catch which returns 500.
+  //
+  // The load is bracketed by `idleSweeper.withSuspendedDrains` so the
+  // post-request drain timer armed by the PREVIOUS request's
+  // `endRequest()` cannot fire mid-load. In `mlx launch claude` mode
+  // `resolveModel` may invoke a 30s `loadModel()` on first sight of an
+  // unknown name; if the prior request's matching `endRequest()`
+  // armed the default 30s drain immediately before this load began,
+  // the timer would otherwise call `clearCache()` while weight
+  // materialization was still allocating through the Metal free pool —
+  // exactly the hot-load race `withSuspendedDrains` exists to prevent.
+  // The wrapper handles try/finally itself and is a pass-through on
+  // the disabled sweeper, so the bracket is unconditional whenever
+  // a sweeper is supplied.
   if (resolveModel) {
-    await resolveModel(body.model);
+    if (idleSweeper) {
+      await idleSweeper.withSuspendedDrains(() => resolveModel(body.model));
+    } else {
+      await resolveModel(body.model);
+    }
   }
 
   const model = registry.get(body.model);

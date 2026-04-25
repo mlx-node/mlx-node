@@ -4,7 +4,11 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { isGlobVariantPresent, isModelAlreadyDownloaded } from '../../packages/cli/src/commands/download-model.js';
+import {
+  isGgufRepoComplete,
+  isGlobVariantPresent,
+  isModelAlreadyDownloaded,
+} from '../../packages/cli/src/commands/download-model.js';
 
 describe('isModelAlreadyDownloaded', () => {
   let dir: string;
@@ -141,5 +145,59 @@ describe('isGlobVariantPresent', () => {
   it('matches case-insensitively (gguf repos vary in capitalization)', () => {
     expect(isGlobVariantPresent(['model.q4_k_m.gguf'], ['*Q4_K_M*'])).toBe(true);
     expect(isGlobVariantPresent(['model.Q4_K_M.gguf'], ['*q4_k_m*'])).toBe(true);
+  });
+});
+
+describe('isGgufRepoComplete', () => {
+  it('returns false when only some of the remote GGUF variants are present locally', () => {
+    // Regression: previously a no-glob re-run after an interrupted
+    // download (e.g. only Q2_K landed) silently exited as "already
+    // downloaded" because the early-return only checked
+    // `files.some(.gguf)`. The fix compares against the remote
+    // manifest and refuses to short-circuit until every advertised
+    // GGUF variant is on disk.
+    const local = ['model.Q2_K.gguf', 'config.json'];
+    const remote = ['model.Q2_K.gguf', 'model.Q4_K_M.gguf', 'model.Q8_0.gguf'];
+    expect(isGgufRepoComplete(local, remote)).toBe(false);
+  });
+
+  it('returns true when every remote GGUF variant is present locally', () => {
+    const local = ['model.Q4_K_M.gguf', 'config.json'];
+    const remote = ['model.Q4_K_M.gguf'];
+    expect(isGgufRepoComplete(local, remote)).toBe(true);
+  });
+
+  it('returns false when the remote repo is not a GGUF repo (no .gguf files in manifest)', () => {
+    // Caller should route through `isModelAlreadyDownloaded` for
+    // safetensors / Paddle repos. A `false` return here tells the
+    // caller "do not take the GGUF early-return branch".
+    const local = ['model.safetensors', 'config.json'];
+    const remote = ['model.safetensors', 'config.json', 'tokenizer.json'];
+    expect(isGgufRepoComplete(local, remote)).toBe(false);
+  });
+
+  it('returns false on an empty remote manifest (likely upstream error)', () => {
+    // An empty manifest is almost certainly a network / auth failure
+    // rather than a legitimate empty repo. Returning false routes the
+    // caller through the download loop where the real error will
+    // surface (404 / auth) instead of being masked as "already
+    // downloaded".
+    expect(isGgufRepoComplete(['model.Q4_K_M.gguf'], [])).toBe(false);
+    expect(isGgufRepoComplete([], [])).toBe(false);
+  });
+
+  it('compares basenames so a sub-directory remote layout still resolves cleanly', () => {
+    // Some repos publish under a prefix (e.g. `models/foo.gguf`); the
+    // local `readdir(outputDir)` is always flat, so the helper compares
+    // basenames on both sides.
+    const local = ['model.Q4_K_M.gguf'];
+    const remote = ['models/model.Q4_K_M.gguf'];
+    expect(isGgufRepoComplete(local, remote)).toBe(true);
+  });
+
+  it('returns false when the local file list is empty', () => {
+    // Defensive: a fresh outputDir against a non-empty manifest is
+    // never complete.
+    expect(isGgufRepoComplete([], ['model.Q4_K_M.gguf'])).toBe(false);
   });
 });
