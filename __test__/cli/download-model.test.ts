@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import {
   isGgufRepoComplete,
+  isGlobMatchedSetComplete,
   isGlobVariantPresent,
   isModelAlreadyDownloaded,
 } from '../../packages/cli/src/commands/download-model.js';
@@ -199,5 +200,51 @@ describe('isGgufRepoComplete', () => {
     // Defensive: a fresh outputDir against a non-empty manifest is
     // never complete.
     expect(isGgufRepoComplete([], ['model.Q4_K_M.gguf'])).toBe(false);
+  });
+});
+
+describe('isGlobMatchedSetComplete', () => {
+  it('returns false when only some of the remote glob-matched files are present locally', () => {
+    // Regression: previously the early-return used `isGlobVariantPresent`,
+    // which only required AT LEAST ONE local hit. An interrupted prior
+    // `--glob "*Q4*"` run that fetched one Q4 shard but not the others
+    // would silently exit as "Matched files already downloaded" while
+    // leaving the local copy incomplete.
+    const remote = ['model.Q4_0.gguf', 'model.Q4_K_M.gguf', 'model.Q8_0.gguf', 'config.json'];
+    const local = ['model.Q4_0.gguf', 'config.json'];
+    expect(isGlobMatchedSetComplete(local, remote, ['*Q4*'])).toBe(false);
+  });
+
+  it('returns true when every remote glob-matched file is present locally', () => {
+    const remote = ['model.Q4_0.gguf', 'model.Q4_K_M.gguf', 'model.Q8_0.gguf', 'config.json'];
+    const local = ['model.Q4_0.gguf', 'model.Q4_K_M.gguf', 'config.json'];
+    expect(isGlobMatchedSetComplete(local, remote, ['*Q4*'])).toBe(true);
+  });
+
+  it('returns false when the remote manifest has no files matching the glob', () => {
+    // Empty intersection: nothing was supposed to be downloaded.
+    // Declaring "complete" here would be wrong — the downstream
+    // "no files matched the given criteria" path handles this case
+    // after listing available variants.
+    const remote = ['model.safetensors', 'config.json'];
+    const local: string[] = [];
+    expect(isGlobMatchedSetComplete(local, remote, ['*Q4*'])).toBe(false);
+  });
+
+  it('returns false on an empty remote manifest (likely upstream error)', () => {
+    expect(isGlobMatchedSetComplete(['model.Q4_K_M.gguf'], [], ['*Q4*'])).toBe(false);
+  });
+
+  it('compares basenames so a sub-directory remote layout still resolves cleanly', () => {
+    // Some repos publish under a prefix (e.g. `models/Q4_K_M.gguf`); the
+    // local `readdir(outputDir)` is always flat. Mirrors `isGgufRepoComplete`.
+    const remote = ['models/model.Q4_K_M.gguf'];
+    const local = ['model.Q4_K_M.gguf'];
+    expect(isGlobMatchedSetComplete(local, remote, ['*Q4*'])).toBe(true);
+  });
+
+  it('returns false when no glob patterns are provided', () => {
+    // Defensive: the helper requires at least one pattern to compare against.
+    expect(isGlobMatchedSetComplete(['model.Q4_K_M.gguf'], ['model.Q4_K_M.gguf'], [])).toBe(false);
   });
 });

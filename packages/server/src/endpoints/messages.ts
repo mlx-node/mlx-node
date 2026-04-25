@@ -520,10 +520,22 @@ export async function handleCreateMessage(
   // the disabled sweeper, so the bracket is unconditional whenever
   // a sweeper is supplied.
   if (resolveModel) {
-    if (idleSweeper) {
-      await idleSweeper.withSuspendedDrains(() => resolveModel(body.model));
-    } else {
-      await resolveModel(body.model);
+    // A throw here (bad model path, corrupt weights, native loader failure)
+    // would otherwise bubble up to the outer `createHandler` catch which
+    // emits the OpenAI-shape `{ error: ... }` envelope via `sendInternalError`.
+    // This endpoint is Anthropic; clients parse the
+    // `{ type: 'error', error: { type, message } }` shape, so we must
+    // serialize the failure through `sendAnthropicInternalError` here. Mirrors
+    // the `mapAnthropicRequest` try/catch above.
+    try {
+      if (idleSweeper) {
+        await idleSweeper.withSuspendedDrains(() => resolveModel(body.model));
+      } else {
+        await resolveModel(body.model);
+      }
+    } catch (err) {
+      sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
+      return;
     }
   }
 

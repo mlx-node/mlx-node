@@ -427,6 +427,46 @@ describe('handleCreateMessage', () => {
       expect(endRequest).toHaveBeenCalledTimes(1);
     });
 
+    it('returns 500 with an Anthropic-shape error envelope when resolveModel rejects', async () => {
+      // Regression: previously `resolveModel` ran outside any try/catch in
+      // this handler, so a rejection (bad model path, corrupt weights,
+      // native loader error in `mlx launch claude` mode) bubbled up to the
+      // outer `createHandler` catch which emits the OpenAI-shape
+      // `{ "error": { type, message } }` body via `sendInternalError`.
+      // This endpoint is `/v1/messages` (Anthropic) — clients parse the
+      // `{ "type": "error", "error": { "type": "api_error", "message": ... } }`
+      // envelope, so the OpenAI-shape body could not be parsed.
+      //
+      // Fix: wrap the `resolveModel(...)` call in a try/catch and route
+      // failures through `sendAnthropicInternalError`. Mirrors the
+      // `mapAnthropicRequest` try/catch a few lines above in the same handler.
+      const registry = new ModelRegistry();
+      const resolveModel = vi.fn().mockRejectedValue(new Error('bad model path'));
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+        undefined,
+        null,
+        resolveModel,
+      );
+
+      expect(resolveModel).toHaveBeenCalledTimes(1);
+      expect(getStatus()).toBe(500);
+      const parsed = JSON.parse(getBody());
+      // Anthropic-shape envelope: `{ type: 'error', error: { type, message } }`
+      // (see `sendAnthropicInternalError` in `packages/server/src/errors.ts`).
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('api_error');
+      expect(parsed.error.message).toContain('bad model path');
+    });
+
     it('falls back to a direct resolveModel call when no idle sweeper is provided', async () => {
       // The bracket is conditional on `idleSweeper != null` so a host
       // that opted out (or hasn't wired one) still gets the lazy-load

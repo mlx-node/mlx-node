@@ -224,6 +224,51 @@ export function isGlobVariantPresent(files: string[], globPatterns: string[]): b
 }
 
 /**
+ * Pre-flight check: is the user's glob-filtered download complete?
+ *
+ * Returns true ONLY when EVERY remote file whose basename matches any of
+ * the supplied glob patterns is also present locally. Returns false on
+ * empty intersection (no remote file matches any glob — the downstream
+ * "no files matched" path handles that case) and false on empty manifest
+ * (likely upstream error).
+ *
+ * Why this exists: `isGlobVariantPresent` only checks for AT LEAST ONE
+ * local hit. If a prior `--glob "*Q4*"` run was interrupted after fetching
+ * one Q4 shard but before the others, rerunning the same command would
+ * exit as "Matched files already downloaded" while silently leaving the
+ * local copy incomplete. This helper closes that gap by verifying the
+ * full glob-matched set against the remote manifest — symmetric to
+ * `isGgufRepoComplete` for the no-glob branch.
+ *
+ * Per-file basenames are compared on both sides (the remote manifest may
+ * publish under a sub-directory like `models/foo.gguf` while the local
+ * `readdir(outputDir)` is flat) so nested-prefix repos don't false-negative.
+ *
+ * Pure function: no I/O, no network. Caller fetches the manifest via
+ * `getModelFiles` (or equivalent) and hands the basenames in.
+ */
+export function isGlobMatchedSetComplete(localFiles: string[], remoteFiles: string[], globPatterns: string[]): boolean {
+  if (globPatterns.length === 0) return false;
+  if (remoteFiles.length === 0) return false;
+  const globs = globPatterns.map(globToRegex);
+  const localSet = new Set(localFiles);
+  let matched = 0;
+  for (const remote of remoteFiles) {
+    const basename = remote.split('/').pop() ?? remote;
+    if (!matchesAnyGlob(basename, globs) && !matchesAnyGlob(remote, globs)) continue;
+    matched++;
+    if (!localSet.has(basename)) return false;
+  }
+  // Empty intersection: no remote file matches any glob. The caller's
+  // downstream "no files matched the given criteria" path handles this
+  // case after listing available variants; declaring "complete" here
+  // would be wrong (nothing was supposed to be downloaded but nothing
+  // was — that's not the same as "we already have what was requested").
+  if (matched === 0) return false;
+  return true;
+}
+
+/**
  * Pre-flight check: is a no-glob GGUF download complete?
  *
  * Returns true ONLY when EVERY `.gguf` file in the remote repo manifest
@@ -422,17 +467,48 @@ export async function run(argv: string[]) {
         console.log('');
       }
     }
-    // For glob downloads, only declare "already downloaded" when at least one
-    // file actually matches the user's glob. CORE_FILES (config.json,
-    // tokenizer.json, …) are present after ANY prior download, so they cannot
-    // serve as proof of a specific quantization variant — relying on them was
-    // why first running `--glob "*Q8*"` then `--glob "*Q4*"` used to short-
-    // circuit and never fetch the Q4 weights.
+    // For glob downloads, only declare "already downloaded" when EVERY
+    // remote file matching the user's glob is also present locally. The
+    // previous "at least one local hit" check (`isGlobVariantPresent`)
+    // would short-circuit on a partial download — e.g. an interrupted
+    // prior `--glob "*Q4*"` run that fetched one Q4 shard but not the
+    // others would silently exit as "Matched files already downloaded"
+    // and leave the local copy incomplete. CORE_FILES (config.json,
+    // tokenizer.json, …) are still implicitly excluded because they
+    // never match a quantization-variant glob.
+    //
+    // This is manifest-aware, so we pay one extra HuggingFace round-trip
+    // on the hot "already downloaded" path. Correctness wins over the
+    // ~200ms saved — symmetric to the non-glob GGUF completeness check
+    // a few lines above. We cache the manifest into `cachedManifest` so
+    // the post-`ensureDir` block reuses it instead of fetching twice.
     if (hasGguf && globPatterns?.length && isGlobVariantPresent(files, globPatterns)) {
-      console.log('Matched files already downloaded!\n');
-      console.log('To re-download, delete the output directory first:');
-      console.log(`   rm -rf ${outputDir}\n`);
-      return;
+      if (cachedManifest === null) {
+        console.log('Fetching file list from HuggingFace...\n');
+        cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
+      }
+      const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
+      if (isGlobMatchedSetComplete(files, remoteBasenames, globPatterns)) {
+        console.log('Matched files already downloaded!\n');
+        console.log('To re-download, delete the output directory first:');
+        console.log(`   rm -rf ${outputDir}\n`);
+        return;
+      }
+      // Incomplete: fall through to the download loop. The per-file
+      // copy is idempotent (`downloadFileToCacheDir` is content-addressed
+      // and `copyFile` overwrites), so already-present files re-copy
+      // from cache without re-downloading bytes.
+      const missing = cachedManifest.filesToDownload.filter((f) => {
+        const basename = f.path.split('/').pop() ?? f.path;
+        return !files.includes(basename);
+      });
+      if (missing.length > 0) {
+        console.log(`Detected ${missing.length} missing file(s); resuming download...`);
+        for (const f of missing) {
+          console.log(`  ${f.path}${f.size ? ` (${formatBytes(f.size)})` : ''}`);
+        }
+        console.log('');
+      }
     }
   }
 
