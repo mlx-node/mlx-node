@@ -103,7 +103,7 @@ jobs:
           path: packages/core/
       - name: Run tests
         run: |
-          yarn mlx download model
+          yarn mlx download model --output .cache/models/qwen3-0.6b
           yarn mlx convert --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
           yarn mlx download dataset
           ${{ matrix.test }}
