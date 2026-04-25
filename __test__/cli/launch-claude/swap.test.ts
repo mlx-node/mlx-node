@@ -252,6 +252,58 @@ describe('makeSwapController', () => {
     expect(reg.register.mock.calls.filter((c) => c[0] === 'a')).toHaveLength(1);
   });
 
+  it('restores alias state when a swap load fails so a later swap can re-point them', async () => {
+    // Regression: previously, when `loadModelFn` threw mid-swap, we had
+    // already done `aliases.clear()` + `registry.unregister(oldResident)`.
+    // The controller forgot the alias names while the registry's alias
+    // bindings still held the old model object (alias bindings have their
+    // own refcount on the binding). A subsequent successful swap would NOT
+    // re-point those aliases (the controller no longer remembered them),
+    // leaving alias-routed traffic permanently pinned to the stale model
+    // and the old model's memory permanently leaked.
+    //
+    // Black-box assertion: do the failed swap, then do a successful swap
+    // to a *new* model, and verify the haiku alias is repointed onto the
+    // new model. If the controller's alias set hadn't been restored, the
+    // haiku alias would still point at the original model after the
+    // successful swap.
+    const reg = fakeRegistry();
+    let shouldFail = false;
+    const loader = vi.fn(async (p: string) => {
+      if (shouldFail) throw new Error(`refusing to load ${p}`);
+      return { marker: p } as unknown as LoadableModel;
+    });
+    const ctrl = makeSwapController(discovered(['a', 'b', 'c']), reg as unknown as ModelRegistry, loader);
+
+    // 1) Load `a` and install a haiku alias on it.
+    await ctrl.resolveModel('a');
+    await ctrl.resolveModel('claude-haiku-x');
+    // Sanity: alias resolves to a's instance.
+    const aInstance = reg.register.mock.calls.find((c) => c[0] === 'a')?.[1];
+    const probe = (name: string): unknown => (reg.get as unknown as (n: string) => unknown)(name);
+    expect(probe('claude-haiku-x')).toBe(aInstance);
+
+    // 2) Attempt a swap to `b` and have it FAIL during load.
+    shouldFail = true;
+    await expect(ctrl.resolveModel('b')).rejects.toThrow(/refusing to load/);
+
+    // After the failure: the alias name MUST still resolve in the registry
+    // (the alias binding kept the old model alive across the failed swap).
+    expect(probe('claude-haiku-x')).toBeDefined();
+
+    // 3) Now perform a successful swap to `c`. If alias state was correctly
+    // restored, the haiku alias gets repointed onto c. If it wasn't, the
+    // haiku alias would still be pinned to a's instance (or worse, to a
+    // ghost binding) because the controller forgot it existed.
+    shouldFail = false;
+    await ctrl.resolveModel('c');
+
+    const cInstance = reg.register.mock.calls.filter((c) => c[0] === 'c').slice(-1)[0]?.[1];
+    expect(cInstance).toEqual({ marker: '/fake/c' });
+    expect(probe('claude-haiku-x')).toBe(cInstance);
+    expect(probe('claude-haiku-x')).not.toBe(aInstance);
+  });
+
   it('lists discovered entries in name order', () => {
     const reg = fakeRegistry();
     const loader = vi.fn(async () => ({}) as unknown as LoadableModel);

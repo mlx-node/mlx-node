@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { createServer as netCreateServer } from 'node:net';
+import { constants as osConstants } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { parseArgs } from 'node:util';
 
@@ -210,9 +211,9 @@ export async function run(argv: string[]): Promise<void> {
     process.exit(exitCode);
   };
 
-  child.on('exit', (code) => {
+  child.on('exit', (code, signal) => {
     childExited = true;
-    void shutdown(code ?? 0);
+    void shutdown(computeExitCode(code, signal));
   });
   child.on('error', (err) => {
     console.error(`[mlx] failed to spawn claude: ${err.message}`);
@@ -226,6 +227,37 @@ export async function run(argv: string[]): Promise<void> {
   });
   process.on('SIGINT', () => forwardSignal('SIGINT'));
   process.on('SIGTERM', () => forwardSignal('SIGTERM'));
+}
+
+/**
+ * Map Node's `child.on('exit', (code, signal))` callback args onto a single
+ * shell-style exit code.
+ *
+ * Background: Node delivers `code === null && signal !== null` whenever the
+ * child terminated due to a signal. The previous handler ignored `signal`
+ * and coerced `null → 0`, so a SIGINT/SIGTERM/SIGKILL'd `claude` would
+ * report success — CI jobs treating exit code as "did the run pass" got a
+ * false green even when the process was killed. POSIX convention is
+ * `128 + signal_number` for signal-killed processes; we look the number up
+ * in `os.constants.signals` (Node exposes the standard signals there).
+ *
+ * Falls back to `1` for the genuinely-unknown cases:
+ *   - `(null, null)` — should never happen per Node's docs.
+ *   - `(null, <signal not in os.constants.signals>)` — defensive, in case a
+ *     non-standard or platform-specific signal name reaches us.
+ *
+ * Exported purely for unit testing — the real `child.on('exit', ...)` callback
+ * delegates straight to this helper.
+ */
+export function computeExitCode(code: number | null, signal: NodeJS.Signals | null): number {
+  if (code != null) return code;
+  if (signal != null) {
+    const signals = osConstants.signals as Record<string, number | undefined>;
+    const num = signals[signal];
+    if (typeof num === 'number') return 128 + num;
+    return 1;
+  }
+  return 1;
 }
 
 /**

@@ -485,6 +485,24 @@ export async function handleCreateMessage(
     }
   }
 
+  // Run the Anthropic→internal mapping BEFORE the lazy-load hook.
+  //
+  // Background: in `mlx launch claude` mode `resolveModel` may load a
+  // 27GB model from disk (~30s) on first sight of an unknown name. If
+  // we then fail mapping (unsupported role, malformed tool block, etc.)
+  // we've burned a load — and possibly evicted the currently-resident
+  // model — just to return 400 a moment later. Mapping is a pure
+  // transform with no side effects, so it's safe to hoist above
+  // resolveModel and use as a cheap pre-flight gate.
+  let mappedMessages: ChatMessage[];
+  let mappedConfig: ChatConfig;
+  try {
+    ({ messages: mappedMessages, config: mappedConfig } = mapAnthropicRequest(body));
+  } catch (err) {
+    sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
+    return;
+  }
+
   // Lazy-load hook: give the host a chance to register the requested
   // model before we look it up. Errors bubble up to the handler's
   // top-level catch which returns 500.
@@ -557,14 +575,11 @@ export async function handleCreateMessage(
     // downstream to catch the race later.
     const preLockInstanceId: number = lease.instanceId;
 
-    let messages: ChatMessage[];
-    let config: ChatConfig;
-    try {
-      ({ messages, config } = mapAnthropicRequest(body));
-    } catch (err) {
-      sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
-      return;
-    }
+    // `mapAnthropicRequest` already ran (and succeeded) above as a cheap
+    // pre-flight gate before `resolveModel` so a malformed request can't
+    // trigger a multi-second model load just to 400 a moment later.
+    const messages: ChatMessage[] = mappedMessages;
+    const config: ChatConfig = mappedConfig;
 
     // Canonicalize every assistant fan-out's trailing tool block against its
     // declared sibling order. Several native session backends pair tool results

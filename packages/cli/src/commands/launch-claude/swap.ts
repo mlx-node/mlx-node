@@ -86,17 +86,65 @@ export function makeSwapController(
       // window yields a spurious 404. Instead we carry the alias set
       // across the swap and re-point them to the new resident below,
       // so the name always resolves to *some* live instance.
+      const oldResident = resident;
       const carriedAliases = new Set(aliases);
-      if (resident && resident.name !== targetEntry.name) {
+      if (oldResident && oldResident.name !== targetEntry.name) {
+        // Drop our local alias bookkeeping AND the old resident's primary
+        // name binding, but leave the alias *names* in the registry pointed
+        // at the old model — they hold the only refcount preventing GC,
+        // and an in-flight `registry.get(alias)` must keep resolving to
+        // *some* live instance until the new model is in hand.
         aliases.clear();
-        registry.unregister(resident.name);
+        registry.unregister(oldResident.name);
         resident = null;
       }
 
-      // Ensure the target is resident.
+      // Ensure the target is resident. If the load throws, restore the
+      // pre-swap controller state so future swap attempts know about the
+      // aliases we just cleared — otherwise the alias *names* stay bound
+      // in the registry to the old model object forever (alias bindings
+      // hold their own refcount), but the controller forgets they exist
+      // and never repoints them, leaving alias-routed traffic permanently
+      // pinned to a stale model.
       let instance = registry.get(targetEntry.name);
       if (!instance) {
-        const loaded = await loadModelFn(targetEntry.path);
+        let loaded: LoadableModel;
+        try {
+          loaded = await loadModelFn(targetEntry.path);
+        } catch (err) {
+          // Recovery: re-populate the controller's alias set so the next
+          // resolveModel call still owns them. The alias→old-model bindings
+          // are still live in the registry (we never unregistered them), so
+          // we can recover the old model object via any surviving alias and
+          // re-bind the old resident's primary name.
+          //
+          // If `carriedAliases` is empty (no aliases ever existed) AND we
+          // unregistered `oldResident.name`, the binding's refcount may have
+          // hit zero and the model is gone. There's nothing the controller
+          // can do to recover in that case — the user will need to /model-
+          // pick again. This is acceptable: alias-less load failures are
+          // rare, and the user-facing symptom is "prior model gone, please
+          // re-pick", not silently-wrong responses.
+          for (const aliasName of carriedAliases) aliases.add(aliasName);
+          if (oldResident) {
+            let oldInstance: SessionCapableModel | undefined;
+            for (const aliasName of carriedAliases) {
+              const probe = registry.get(aliasName);
+              if (probe) {
+                oldInstance = probe;
+                break;
+              }
+            }
+            if (oldInstance) {
+              const oldEntry = byName.get(oldResident.name);
+              registry.register(oldResident.name, oldInstance, {
+                samplingDefaults: oldEntry?.preset.sampling,
+              });
+              resident = oldResident;
+            }
+          }
+          throw err;
+        }
         instance = loaded as unknown as SessionCapableModel;
         registry.register(targetEntry.name, instance, {
           samplingDefaults: targetEntry.preset.sampling,

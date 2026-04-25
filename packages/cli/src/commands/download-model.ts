@@ -202,6 +202,27 @@ export function isModelAlreadyDownloaded(outputDir: string, files: string[]): bo
   return true;
 }
 
+/**
+ * Pre-flight check: do any files in `outputDir` actually match the user's
+ * glob patterns?
+ *
+ * Returns true ONLY when at least one existing file matches a glob —
+ * proving the requested variant is already on disk. CORE_FILES (config,
+ * tokenizer, etc.) are deliberately excluded: they're auxiliary metadata
+ * laid down by ANY prior download, so counting them would falsely report
+ * a Q4 variant as "already downloaded" the moment a Q8 variant had been
+ * fetched (which already drops config.json + tokenizer.json into the
+ * same directory).
+ *
+ * Pure function: no I/O, no network. Caller passes the file list and
+ * patterns; helper returns boolean.
+ */
+export function isGlobVariantPresent(files: string[], globPatterns: string[]): boolean {
+  if (globPatterns.length === 0) return false;
+  const globs = globPatterns.map(globToRegex);
+  return files.some((f) => matchesAnyGlob(f, globs));
+}
+
 async function verifyDownload(outputDir: string, weightFiles: string[]): Promise<boolean> {
   console.log('\nVerifying download...');
 
@@ -317,16 +338,17 @@ export async function run(argv: string[]) {
       console.log(`   rm -rf ${outputDir}\n`);
       return;
     }
-    // For glob downloads, check if all glob-matched files are present
-    if (hasGguf && globPatterns?.length) {
-      const globs = globPatterns.map(globToRegex);
-      const matchedExisting = files.filter((f) => matchesAnyGlob(f, globs) || CORE_FILES.includes(f));
-      if (matchedExisting.length > 1) {
-        console.log('Matched files already downloaded!\n');
-        console.log('To re-download, delete the output directory first:');
-        console.log(`   rm -rf ${outputDir}\n`);
-        return;
-      }
+    // For glob downloads, only declare "already downloaded" when at least one
+    // file actually matches the user's glob. CORE_FILES (config.json,
+    // tokenizer.json, …) are present after ANY prior download, so they cannot
+    // serve as proof of a specific quantization variant — relying on them was
+    // why first running `--glob "*Q8*"` then `--glob "*Q4*"` used to short-
+    // circuit and never fetch the Q4 weights.
+    if (hasGguf && globPatterns?.length && isGlobVariantPresent(files, globPatterns)) {
+      console.log('Matched files already downloaded!\n');
+      console.log('To re-download, delete the output directory first:');
+      console.log(`   rm -rf ${outputDir}\n`);
+      return;
     }
   }
 

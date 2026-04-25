@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { isModelAlreadyDownloaded } from '../../packages/cli/src/commands/download-model.js';
+import { isGlobVariantPresent, isModelAlreadyDownloaded } from '../../packages/cli/src/commands/download-model.js';
 
 describe('isModelAlreadyDownloaded', () => {
   let dir: string;
@@ -104,5 +104,42 @@ describe('isModelAlreadyDownloaded', () => {
     write('model.safetensors', 'x');
     write('model.safetensors.index.json', JSON.stringify({ weight_map: { x: 'never-existed.safetensors' } }));
     expect(isModelAlreadyDownloaded(dir, readdirSync(dir))).toBe(true);
+  });
+});
+
+describe('isGlobVariantPresent', () => {
+  it('returns false when no patterns are provided', () => {
+    expect(isGlobVariantPresent(['config.json', 'tokenizer.json', 'model.Q8_0.gguf'], [])).toBe(false);
+  });
+
+  it('returns false when a prior Q8 download leaves only CORE_FILES + a non-matching gguf', () => {
+    // Regression: previously the early-return counted CORE_FILES toward
+    // the "matched" set, so any prior gguf download (which lays down
+    // config.json + tokenizer.json) auto-satisfied the >1 threshold and
+    // a fresh `--glob "*Q4*"` exited as "already downloaded" without
+    // ever fetching the Q4 weights. The helper must look ONLY at user-
+    // glob matches.
+    const files = ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'model.Q8_0.gguf'];
+    expect(isGlobVariantPresent(files, ['*Q4*'])).toBe(false);
+  });
+
+  it('returns true when an existing file matches one of the glob patterns', () => {
+    const files = ['config.json', 'tokenizer.json', 'model.Q4_K_M.gguf'];
+    expect(isGlobVariantPresent(files, ['*Q4*'])).toBe(true);
+  });
+
+  it('returns true when ANY pattern matches (multi-glob OR semantics)', () => {
+    const files = ['config.json', 'model.Q8_0.gguf'];
+    expect(isGlobVariantPresent(files, ['*Q4*', '*Q8*'])).toBe(true);
+  });
+
+  it('returns false when no file matches any pattern (CORE_FILES alone do not count)', () => {
+    const files = ['config.json', 'tokenizer.json', 'tokenizer_config.json'];
+    expect(isGlobVariantPresent(files, ['*BF16*'])).toBe(false);
+  });
+
+  it('matches case-insensitively (gguf repos vary in capitalization)', () => {
+    expect(isGlobVariantPresent(['model.q4_k_m.gguf'], ['*Q4_K_M*'])).toBe(true);
+    expect(isGlobVariantPresent(['model.Q4_K_M.gguf'], ['*q4_k_m*'])).toBe(true);
   });
 });

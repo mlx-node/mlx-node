@@ -296,6 +296,50 @@ describe('handleCreateMessage', () => {
       expect(parsed.error.type).toBe('not_found_error');
       expect(parsed.error.message).toContain('nonexistent');
     });
+
+    it('does NOT call resolveModel when mapAnthropicRequest will reject the body as 400', async () => {
+      // Regression: previously `resolveModel` ran AFTER shallow validation but
+      // BEFORE `mapAnthropicRequest`, so a malformed-but-shallow-valid request
+      // (e.g. an unsupported content block type) triggered a multi-second
+      // model load — and possibly evicted the currently-resident model — just
+      // to return 400 a moment later.
+      //
+      // Fix: hoist the (pure-transform) `mapAnthropicRequest` above the
+      // resolveModel hook so mapping errors short-circuit before any load.
+      const registry = new ModelRegistry();
+      const resolveModel = vi.fn().mockResolvedValue(undefined);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                // Unsupported block type — mapAnthropicRequest throws.
+                { type: 'mystery_block_type', text: 'oops' } as any,
+              ],
+            },
+          ],
+          max_tokens: 100,
+        },
+        registry,
+        undefined,
+        null,
+        resolveModel,
+      );
+
+      // The critical assertion: the lazy-load hook MUST NOT have fired for a
+      // request that was destined to 400 on mapping. Asserted first because
+      // it's the load-bearing claim of this regression test.
+      expect(resolveModel).not.toHaveBeenCalled();
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('invalid_request_error');
+    });
   });
 
   // -----------------------------------------------------------------------
