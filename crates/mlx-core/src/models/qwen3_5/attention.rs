@@ -99,12 +99,14 @@ impl Qwen3_5Attention {
     ///
     /// # Returns
     /// Output [B, T, hidden_size]
+    #[cfg_attr(not(target_family = "wasm"), allow(unused_variables))]
     pub fn forward(
         &self,
         x: &MxArray,
         _mask: Option<&MxArray>,
         cache: Option<&mut KVCache>,
         position_ids: Option<&MxArray>,
+        rope_offset_delta: i32,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -164,7 +166,11 @@ impl Qwen3_5Attention {
             (q_out, k_out)
         } else {
             // Standard scalar offset RoPE (text-only path, existing behavior)
-            let offset = cache.as_ref().map_or(0, |c| c.get_offset());
+            let base_offset = cache.as_ref().map_or(0, |c| c.get_offset());
+            #[cfg(target_family = "wasm")]
+            let offset = base_offset + rope_offset_delta;
+            #[cfg(not(target_family = "wasm"))]
+            let offset = base_offset;
             let queries = self.rope.forward(&queries, Some(offset))?;
             let keys = self.rope.forward(&keys, Some(offset))?;
             (queries, keys)
@@ -199,6 +205,80 @@ impl Qwen3_5Attention {
         // Output projection
         let result = self.o_proj.forward(&gated_output)?;
         Ok(result)
+    }
+
+    /// VLM prefill variant that returns K/V tensors instead of mutating KVCache.
+    ///
+    /// The browser WebGPU backend has a fragile path for large in-place
+    /// slice-update graphs. VLM prefill can avoid that entirely: prefill starts
+    /// from an empty cache, so the full K/V tensors are already the cache state.
+    #[cfg(target_family = "wasm")]
+    pub fn forward_vlm_prefill(
+        &self,
+        x: &MxArray,
+        _mask: Option<&MxArray>,
+        position_ids: &MxArray,
+    ) -> Result<(MxArray, MxArray, MxArray)> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        let q_proj_output = self.q_proj.forward(x)?;
+        let q_per_head = q_proj_output.reshape(&[
+            batch,
+            seq_len,
+            self.num_heads as i64,
+            (self.head_dim * 2) as i64,
+        ])?;
+        let queries = q_per_head.slice_axis(3, 0, self.head_dim as i64)?;
+        let gate = q_per_head.slice_axis(3, self.head_dim as i64, (self.head_dim * 2) as i64)?;
+        let gate = gate.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+
+        let keys = self.k_proj.forward(x)?;
+        let values = self.v_proj.forward(x)?;
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+
+        let queries = self.q_norm.forward(&queries)?;
+        let keys = self.k_norm.forward(&keys)?;
+
+        let (queries, keys) = if let Some(mrope) = &self.mrope {
+            let (cos, sin) = mrope.forward(&queries, position_ids)?;
+            let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+            let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+            let (q_out, k_out) =
+                apply_multimodal_rotary_pos_emb(&q_t, &k_t, &cos, &sin, mrope.mrope_section())?;
+            let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
+            let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
+            (q_out, k_out)
+        } else {
+            let queries = self.rope.forward(&queries, Some(0))?;
+            let keys = self.rope.forward(&keys, Some(0))?;
+            (queries, keys)
+        };
+
+        let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        let output =
+            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?;
+        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+
+        let gate_sigmoid = Activations::sigmoid(&gate)?;
+        let gated_output = output.mul(&gate_sigmoid)?;
+        let result = self.o_proj.forward(&gated_output)?;
+        Ok((result, keys, values))
     }
 
     /// Initialize M-RoPE for VLM mode.

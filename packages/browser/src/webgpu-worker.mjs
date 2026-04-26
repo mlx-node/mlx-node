@@ -38,6 +38,10 @@ const handler = new MessageHandler({
       rpcConfig.batchBufferId ?? 0, // Phase 2b — per-worker batch buffer ID
       rpcConfig.bufferMetadataBuffer, // Task 3 — shared (size, usage) table
       rpcConfig.statsBuffer, // JS-F010 — shared GET_STATS histogram SAB
+      {
+        fusionEnabled: rpcConfig.fusionEnabled !== false,
+        passCachingEnabled: rpcConfig.passCachingEnabled !== false,
+      },
     );
 
     const wasi = new WASI({

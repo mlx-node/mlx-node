@@ -87,7 +87,7 @@
   }
 
   .app-header {
-    @apply flex h-16 shrink-0 items-center gap-3 border-b bg-card/95 px-4 md:px-6;
+    @apply flex h-14 shrink-0 items-center gap-3 border-b bg-card/95 px-4 md:px-5;
   }
 
   .brand-mark {
@@ -124,12 +124,8 @@
     @apply border-destructive/40 bg-destructive/15 text-destructive;
   }
 
-  .reasoning-toggle {
-    @apply ml-auto flex shrink-0 items-center gap-2 rounded-md border bg-background/70 px-3 py-2 text-sm text-muted-foreground;
-  }
-
   .workspace-grid {
-    @apply grid min-h-0 flex-1 gap-4 overflow-hidden p-4 md:p-5;
+    @apply grid min-h-0 flex-1 gap-3 overflow-hidden p-3 md:p-4;
     grid-template-columns: minmax(0, 1fr) minmax(360px, 34vw);
   }
 
@@ -172,11 +168,52 @@
   }
 
   .composer-bar {
-    @apply flex shrink-0 items-end gap-2 border-t bg-card/95 px-4 py-3 md:px-6;
+    @apply shrink-0 border-t bg-background/95 px-4 py-2.5 md:px-6;
+  }
+
+  .composer-shell {
+    @apply mx-auto flex w-full max-w-[92rem] flex-col gap-2 rounded-3xl border bg-card px-4 py-3 shadow-lg;
   }
 
   .composer-input {
-    @apply max-h-32 min-h-11 flex-1 resize-none rounded-lg bg-background/80 text-sm leading-6;
+    @apply max-h-40 min-h-12 resize-none border-0 bg-transparent p-0 text-base leading-6 shadow-none placeholder:text-muted-foreground/75 focus-visible:border-transparent focus-visible:ring-0 disabled:opacity-100 md:text-base;
+    border-width: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .composer-actions {
+    @apply flex items-center justify-between gap-3;
+  }
+
+  .composer-actions-left,
+  .composer-actions-right {
+    @apply flex min-w-0 items-center gap-2;
+  }
+
+  .composer-actions-right {
+    @apply justify-end;
+  }
+
+  .composer-icon-btn {
+    @apply size-9 rounded-full text-muted-foreground;
+  }
+
+  .composer-status-dot {
+    @apply size-3 shrink-0 rounded-full border-2 border-muted-foreground/70;
+  }
+
+  .composer-model-label {
+    @apply shrink-0 text-sm font-medium text-foreground;
+  }
+
+  .composer-reasoning-trigger {
+    @apply h-9 min-w-24 border-0 bg-transparent px-2 text-sm text-muted-foreground shadow-none;
+  }
+
+  .composer-send-btn {
+    @apply size-10 rounded-full bg-primary text-primary-foreground hover:bg-primary/90;
   }
 
   #image-btn[data-attached="true"] {
@@ -262,10 +299,6 @@
     flex-wrap: wrap;
   }
 
-  .reasoning-toggle {
-    margin-left: 0;
-  }
-
   .workspace-grid {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) minmax(14rem, 32vh);
@@ -291,8 +324,35 @@
     padding: 0.75rem;
   }
 
+  .composer-shell {
+    gap: 0.5rem;
+    border-radius: 1.25rem;
+  }
+
   .composer-input {
-    min-height: 2.5rem;
+    min-height: 3rem;
+  }
+
+  .composer-actions {
+    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+
+  .composer-actions-left {
+    flex-wrap: wrap;
+  }
+
+  .composer-actions-right {
+    margin-left: auto;
+  }
+
+  .composer-model-label,
+  .composer-status-dot {
+    display: none;
+  }
+
+  .composer-reasoning-trigger {
+    min-width: 5.5rem;
   }
 
   .status-pill {
@@ -308,5 +368,19 @@
 
   50% {
     opacity: 0;
+  }
+}
+
+textarea.composer-input {
+  min-height: 3rem !important;
+  border-width: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+@media (max-width: 640px) {
+  textarea.composer-input {
+    min-height: 3rem !important;
   }
 }

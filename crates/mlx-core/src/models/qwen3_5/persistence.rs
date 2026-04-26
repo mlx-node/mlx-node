@@ -793,16 +793,21 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     &per_layer_quant,
                 )?;
 
-                // Register weights with C++. The dense compiled graph uses the
-                // shared quant-aware `linear_proj` helper for projections, so
-                // Q8/MXFP8 checkpoints can take the same compiled decode path
-                // as bf16 checkpoints.
-                register_weights_with_cpp(&params, inner.model_id);
+                // Register weights with C++
+                if !is_quantized_checkpoint(&params) && !is_mxfp8_checkpoint(&params) {
+                    register_weights_with_cpp(&params, inner.model_id);
+                } else {
+                    info!(
+                        "Skipping C++ compiled path for quantized model (using Rust quantized_matmul)"
+                    );
+                    let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
+                    unsafe { mlx_sys::mlx_clear_weights() };
+                }
 
                 // Materialize mmap-backed weights
                 {
                     let arrays: Vec<&MxArray> = params.values().collect();
-                    crate::array::memory::materialize_weights(&arrays)?;
+                    crate::array::memory::materialize_weights(&arrays);
                 }
 
                 // Set tokenizer
@@ -830,7 +835,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                         config.max_position_embeddings,
                     )?;
 
-                    inner.set_vision_encoder(vision_encoder)?;
+                    inner.set_vision_encoder(vision_encoder);
                     inner.set_image_processor(Qwen35VLImageProcessor::new(None));
                     inner.set_spatial_merge_size(vision_config.spatial_merge_size);
 
@@ -865,7 +870,6 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let tokenizer_out = inner.tokenizer.clone();
-            let paged_active = inner.paged_adapter.is_some();
 
             Ok((
                 inner,
@@ -875,22 +879,20 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     image_processor,
                     tokenizer_out,
                     cache_limit_guard,
-                    paged_active,
                 ),
             ))
         },
         handle_qwen35_cmd,
     );
 
-    let (config, _model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) =
-        init_rx
-            .await
-            .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+    let (config, model_id, _image_processor, _tokenizer, cache_limit_guard) = init_rx
+        .await
+        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
     Ok(Qwen3_5Model {
         thread,
         config,
-        paged_active,
+        model_id,
         _cache_limit_guard: cache_limit_guard,
     })
 }
@@ -1067,16 +1069,88 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         full_attention_interval: gi(&["full_attention_interval"], 4),
         partial_rotary_factor,
         rope_theta,
-        paged_cache_memory_mb: raw
-            .get("paged_cache_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        paged_block_size: raw
-            .get("paged_block_size")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
-        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
     })
+}
+
+/// Check if weights contain vision encoder tensors.
+pub fn has_vision_weights(params: &HashMap<String, MxArray>) -> bool {
+    #[cfg(target_family = "wasm")]
+    {
+        params.keys().any(|k| vision_tensor_key(k).is_some())
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        params
+            .keys()
+            .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."))
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn vision_tensor_key(name: &str) -> Option<String> {
+    name.strip_prefix("vision_tower.")
+        .or_else(|| name.strip_prefix("visual."))
+        .or_else(|| name.strip_prefix("model.visual."))
+        .map(str::to_string)
+}
+
+#[cfg(target_family = "wasm")]
+fn split_text_vision_params(
+    raw_params: HashMap<String, MxArray>,
+) -> (HashMap<String, MxArray>, Option<HashMap<String, MxArray>>) {
+    if !has_vision_weights(&raw_params) {
+        return (raw_params, None);
+    }
+
+    let mut vision_params = HashMap::new();
+    let mut text_params = HashMap::new();
+    for (name, array) in raw_params {
+        if let Some(vkey) = vision_tensor_key(&name) {
+            vision_params.insert(vkey, array);
+        } else {
+            text_params.insert(name, array);
+        }
+    }
+
+    (text_params, Some(vision_params))
+}
+
+#[cfg(target_family = "wasm")]
+fn attach_vision_encoder_if_present(
+    inner: &mut Qwen35Inner,
+    raw: &Value,
+    config: &Qwen3_5Config,
+    vision_params: Option<HashMap<String, MxArray>>,
+) -> Result<()> {
+    let Some(vparams) = vision_params else {
+        info!("Qwen3.5 model loaded successfully");
+        return Ok(());
+    };
+
+    let vision_config = parse_vision_config(raw);
+    info!(
+        "Vision config: {} layers, hidden={}, heads={}, patch={}",
+        vision_config.num_layers,
+        vision_config.hidden_size,
+        vision_config.num_heads,
+        vision_config.patch_size,
+    );
+
+    let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
+    load_vision_weights(&mut vision_encoder, &vparams, &vision_config)?;
+
+    inner.init_mrope_layers(
+        vec![11, 11, 10],
+        config.rope_theta,
+        config.max_position_embeddings,
+    )?;
+
+    inner.set_vision_encoder(vision_encoder);
+    inner.set_image_processor(Qwen35VLImageProcessor::new(None));
+    inner.set_spatial_merge_size(vision_config.spatial_merge_size);
+
+    info!("Qwen3.5-VL model loaded successfully (with vision encoder)");
+    Ok(())
 }
 
 /// Parse vision config from JSON.
@@ -1283,7 +1357,21 @@ pub(crate) fn build_model_inner_from_gpu_buffers(
     }
     info!("Created {} arrays from GPU buffers", raw_params.len());
 
-    // 3. Sanitize weights (strip prefixes, merge split projections, etc.)
+    // 3. Split VLM weights from language weights on the browser/WebGPU path,
+    // then sanitize the text side. Native keeps the existing text-only path.
+    #[cfg(target_family = "wasm")]
+    let (text_raw_params, vision_params) = split_text_vision_params(raw_params);
+    #[cfg(target_family = "wasm")]
+    if let Some(ref vparams) = vision_params {
+        info!(
+            "Split GPU-buffer weights: {} vision tensors, {} text tensors",
+            vparams.len(),
+            text_raw_params.len(),
+        );
+    }
+    #[cfg(target_family = "wasm")]
+    let params = sanitize_weights(text_raw_params, &config)?;
+    #[cfg(not(target_family = "wasm"))]
     let params = sanitize_weights(raw_params, &config)?;
     let quantized = is_quantized_checkpoint(&params);
     info!(
@@ -1368,8 +1456,10 @@ pub(crate) fn build_model_inner_from_gpu_buffers(
         unsafe { sys::mlx_clear_weights() };
     }
 
-    // 8. Set tokenizer
+    // 8. Set tokenizer and optional browser vision stack
     inner.set_tokenizer(Arc::new(tok));
+    #[cfg(target_family = "wasm")]
+    attach_vision_encoder_if_present(&mut inner, &raw, &config, vision_params)?;
 
     info!("Qwen3.5 inner model loaded from GPU buffers successfully");
     Ok(inner)
@@ -1536,7 +1626,21 @@ pub fn build_model_inner_from_cpu_tensors() -> Result<Qwen35Inner> {
         config.num_kv_heads,
     );
 
-    // 3. Sanitize weights (strip prefixes, merge split projections, etc.)
+    // 3. Split VLM weights from language weights on the browser/WebGPU path,
+    // then sanitize the text side. Native keeps the existing text-only path.
+    #[cfg(target_family = "wasm")]
+    let (text_raw_params, vision_params) = split_text_vision_params(raw_params);
+    #[cfg(target_family = "wasm")]
+    if let Some(ref vparams) = vision_params {
+        info!(
+            "Split CPU tensors: {} vision tensors, {} text tensors",
+            vparams.len(),
+            text_raw_params.len(),
+        );
+    }
+    #[cfg(target_family = "wasm")]
+    let params = sanitize_weights(text_raw_params, &config)?;
+    #[cfg(not(target_family = "wasm"))]
     let params = sanitize_weights(raw_params, &config)?;
     let quantized = is_quantized_checkpoint(&params);
 
@@ -1610,8 +1714,10 @@ pub fn build_model_inner_from_cpu_tensors() -> Result<Qwen35Inner> {
         unsafe { sys::mlx_clear_weights() };
     }
 
-    // 8. Set tokenizer
+    // 8. Set tokenizer and optional browser vision stack
     inner.set_tokenizer(Arc::new(tok));
+    #[cfg(target_family = "wasm")]
+    attach_vision_encoder_if_present(&mut inner, &raw, &config, vision_params)?;
 
     Ok(inner)
 }

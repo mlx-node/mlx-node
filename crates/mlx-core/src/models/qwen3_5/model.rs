@@ -1226,6 +1226,14 @@ impl Qwen35Inner {
             }
         } else {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
+            #[cfg(target_family = "wasm")]
+            let rope_offset_delta = if has_images {
+                self.cached_rope_deltas.unwrap_or(0)
+            } else {
+                0
+            };
+            #[cfg(not(target_family = "wasm"))]
+            let rope_offset_delta = 0;
             let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
@@ -1235,6 +1243,7 @@ impl Qwen35Inner {
                 &self.lm_head,
                 Some(&embedding_weight_t),
                 generation_stream,
+                rope_offset_delta,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -1792,9 +1801,17 @@ impl Qwen35Inner {
 
             MxArray::async_eval_arrays(&[&y]);
 
+            #[cfg(target_family = "wasm")]
+            let rope_offset_delta = if has_images {
+                self.cached_rope_deltas.unwrap_or(0)
+            } else {
+                0
+            };
+            #[cfg(not(target_family = "wasm"))]
+            let rope_offset_delta = 0;
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                    let logits = forward_inner(
+                    let logits = forward_inner_with_rope_delta(
                         ids,
                         emb,
                         &mut self.layers,
@@ -1802,6 +1819,7 @@ impl Qwen35Inner {
                         &self.final_norm,
                         &self.lm_head,
                         Some(&embedding_weight_t),
+                        rope_offset_delta,
                     )?;
                     Ok((logits, true))
                 },
@@ -2774,6 +2792,14 @@ impl Qwen35Inner {
             }
         } else {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
+            #[cfg(target_family = "wasm")]
+            let rope_offset_delta = if has_images {
+                self.cached_rope_deltas.unwrap_or(0)
+            } else {
+                0
+            };
+            #[cfg(not(target_family = "wasm"))]
+            let rope_offset_delta = 0;
             let logits = chunked_prefill(
                 &prompt,
                 &embedding_weight,
@@ -2783,6 +2809,7 @@ impl Qwen35Inner {
                 &self.lm_head,
                 Some(&embedding_weight_t),
                 generation_stream,
+                rope_offset_delta,
             )?;
 
             let seq_len = logits.shape_at(1)?;
@@ -2950,7 +2977,7 @@ impl Qwen35Inner {
 
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                    let logits = forward_inner(
+                    let logits = forward_inner_with_rope_delta(
                         ids,
                         emb,
                         &mut self.layers,
@@ -2958,6 +2985,7 @@ impl Qwen35Inner {
                         &self.final_norm,
                         &self.lm_head,
                         Some(&embedding_weight_t),
+                        rope_offset_delta,
                     )?;
                     Ok((logits, true))
                 },
@@ -5633,6 +5661,7 @@ fn chunked_prefill(
     lm_head: &Option<Linear>,
     embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
+    rope_offset_delta: i32,
 ) -> Result<MxArray> {
     let total_len = prompt.shape_at(1)?;
     let mut offset: i64 = 0;
@@ -5641,7 +5670,7 @@ fn chunked_prefill(
         let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
         {
             let _stream_ctx = StreamContext::new(generation_stream);
-            let _logits = forward_inner(
+            let _logits = forward_inner_with_rope_delta(
                 &chunk,
                 embedding_weight,
                 layers,
@@ -5649,6 +5678,7 @@ fn chunked_prefill(
                 final_norm,
                 lm_head,
                 embedding_weight_t,
+                rope_offset_delta,
             )?;
         }
         eval_layer_caches(caches);
@@ -5659,7 +5689,7 @@ fn chunked_prefill(
     let remaining = prompt.slice_axis(1, offset, total_len)?;
     let logits = {
         let _stream_ctx = StreamContext::new(generation_stream);
-        forward_inner(
+        forward_inner_with_rope_delta(
             &remaining,
             embedding_weight,
             layers,
@@ -5667,6 +5697,7 @@ fn chunked_prefill(
             final_norm,
             lm_head,
             embedding_weight_t,
+            rope_offset_delta,
         )?
     };
     Ok(logits)
@@ -5683,6 +5714,28 @@ fn forward_inner(
     lm_head: &Option<Linear>,
     embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
+    forward_inner_with_rope_delta(
+        input_ids,
+        embedding_weight,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embedding_weight_t,
+        0,
+    )
+}
+
+fn forward_inner_with_rope_delta(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight_t: Option<&MxArray>,
+    rope_offset_delta: i32,
+) -> Result<MxArray> {
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
@@ -5690,7 +5743,7 @@ fn forward_inner(
     let num_layers = layers.len();
     for i in 0..num_layers {
         let cache = caches.as_mut().map(|c| &mut c[i]);
-        h = layers[i].forward(&h, None, cache, None, true)?;
+        h = layers[i].forward_with_rope_delta(&h, None, cache, None, true, rope_offset_delta)?;
     }
 
     let h = final_norm.forward(&h)?;
@@ -6120,60 +6173,131 @@ pub(crate) fn merge_input_ids_with_image_features(
     inputs_embeds: &MxArray,
     input_ids: &MxArray,
 ) -> Result<MxArray> {
-    let input_shape = input_ids.shape()?;
-    let batch_size = input_shape[0];
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let input_shape = input_ids.shape()?;
+        let batch_size = input_shape[0];
 
-    let image_token = MxArray::scalar_int(image_token_id)?;
-    let image_positions = input_ids.equal(&image_token)?;
-    let inputs_embeds_shape = inputs_embeds.shape()?;
-    let hidden_dim = inputs_embeds_shape[2];
+        let image_token = MxArray::scalar_int(image_token_id)?;
+        let image_positions = input_ids.equal(&image_token)?;
+        let inputs_embeds_shape = inputs_embeds.shape()?;
+        let hidden_dim = inputs_embeds_shape[2];
 
-    let mut batch_outputs: Vec<MxArray> = Vec::new();
-    let mut feature_start_idx = 0i64;
+        let mut batch_outputs: Vec<MxArray> = Vec::new();
+        let mut feature_start_idx = 0i64;
 
-    for batch_idx in 0..batch_size {
-        let batch_mask = image_positions.slice_axis(0, batch_idx, batch_idx + 1)?;
-        let batch_mask = batch_mask.squeeze(Some(&[0]))?;
+        for batch_idx in 0..batch_size {
+            let batch_mask = image_positions.slice_axis(0, batch_idx, batch_idx + 1)?;
+            let batch_mask = batch_mask.squeeze(Some(&[0]))?;
 
-        let mask_sum = batch_mask.sum(None, None)?;
-        let num_positions = mask_sum.to_int32()?[0] as i64;
+            let mask_sum = batch_mask.sum(None, None)?;
+            let num_positions = mask_sum.to_int32()?[0] as i64;
 
-        if num_positions > 0 {
-            let batch_features = image_features.slice_axis(
-                0,
-                feature_start_idx,
-                feature_start_idx + num_positions,
-            )?;
+            if num_positions > 0 {
+                let batch_features = image_features.slice_axis(
+                    0,
+                    feature_start_idx,
+                    feature_start_idx + num_positions,
+                )?;
 
-            let batch_embeds = inputs_embeds.slice_axis(0, batch_idx, batch_idx + 1)?;
-            let batch_embeds = batch_embeds.squeeze(Some(&[0]))?;
+                let batch_embeds = inputs_embeds.slice_axis(0, batch_idx, batch_idx + 1)?;
+                let batch_embeds = batch_embeds.squeeze(Some(&[0]))?;
 
-            let mask_int = batch_mask.astype(crate::array::DType::Int32)?;
-            let cumsum = mask_int.cumsum(0)?;
+                let mask_int = batch_mask.astype(crate::array::DType::Int32)?;
+                let cumsum = mask_int.cumsum(0)?;
 
-            let ones = MxArray::scalar_int(1)?;
-            let feature_indices = cumsum.sub(&ones)?;
-            let zeros =
-                MxArray::zeros(&feature_indices.shape()?, Some(crate::array::DType::Int32))?;
-            let feature_indices = batch_mask.where_(&feature_indices, &zeros)?;
+                let ones = MxArray::scalar_int(1)?;
+                let feature_indices = cumsum.sub(&ones)?;
+                let zeros =
+                    MxArray::zeros(&feature_indices.shape()?, Some(crate::array::DType::Int32))?;
+                let feature_indices = batch_mask.where_(&feature_indices, &zeros)?;
 
-            let gathered_features = batch_features.take(&feature_indices, 0)?;
+                let gathered_features = batch_features.take(&feature_indices, 0)?;
 
-            let mask_expanded = batch_mask.reshape(&[-1, 1])?;
-            let mask_expanded =
-                MxArray::broadcast_to(&mask_expanded, &[batch_mask.shape()?[0], hidden_dim])?;
+                let mask_expanded = batch_mask.reshape(&[-1, 1])?;
+                let mask_expanded =
+                    MxArray::broadcast_to(&mask_expanded, &[batch_mask.shape()?[0], hidden_dim])?;
 
-            let batch_output = mask_expanded.where_(&gathered_features, &batch_embeds)?;
-            batch_outputs.push(batch_output);
-            feature_start_idx += num_positions;
-        } else {
-            let batch_embeds = inputs_embeds.slice_axis(0, batch_idx, batch_idx + 1)?;
-            batch_outputs.push(batch_embeds.squeeze(Some(&[0]))?);
+                let batch_output = mask_expanded.where_(&gathered_features, &batch_embeds)?;
+                batch_outputs.push(batch_output);
+                feature_start_idx += num_positions;
+            } else {
+                let batch_embeds = inputs_embeds.slice_axis(0, batch_idx, batch_idx + 1)?;
+                batch_outputs.push(batch_embeds.squeeze(Some(&[0]))?);
+            }
         }
+
+        let refs: Vec<&MxArray> = batch_outputs.iter().collect();
+        return MxArray::stack(refs, Some(0));
     }
 
-    let refs: Vec<&MxArray> = batch_outputs.iter().collect();
-    MxArray::stack(refs, Some(0))
+    #[cfg(target_family = "wasm")]
+    {
+        let input_shape = input_ids.shape()?;
+        let batch_size = input_shape[0];
+        let seq_len = input_shape[1] as usize;
+        let token_ids = input_ids.to_uint32()?;
+        let image_feature_count = image_features.shape_at(0)?;
+
+        let mut batch_outputs: Vec<MxArray> = Vec::new();
+        let mut feature_start_idx = 0i64;
+
+        for batch_idx in 0..batch_size {
+            let batch_embeds = inputs_embeds
+                .slice_axis(0, batch_idx, batch_idx + 1)?
+                .squeeze(Some(&[0]))?;
+            let token_offset = batch_idx as usize * seq_len;
+            let mut segments: Vec<MxArray> = Vec::new();
+            let mut segment_start = 0usize;
+            let mut pos = 0usize;
+
+            while pos < seq_len {
+                if token_ids[token_offset + pos] != image_token_id as u32 {
+                    pos += 1;
+                    continue;
+                }
+
+                if segment_start < pos {
+                    segments.push(batch_embeds.slice_axis(0, segment_start as i64, pos as i64)?);
+                }
+
+                let image_run_start = pos;
+                while pos < seq_len && token_ids[token_offset + pos] == image_token_id as u32 {
+                    pos += 1;
+                }
+                let image_run_len = (pos - image_run_start) as i64;
+                if feature_start_idx + image_run_len > image_feature_count {
+                    return Err(Error::from_reason(format!(
+                        "Not enough image features for image placeholders: need {}, have {}",
+                        feature_start_idx + image_run_len,
+                        image_feature_count,
+                    )));
+                }
+                segments.push(image_features.slice_axis(
+                    0,
+                    feature_start_idx,
+                    feature_start_idx + image_run_len,
+                )?);
+                feature_start_idx += image_run_len;
+                segment_start = pos;
+            }
+
+            if segment_start < seq_len {
+                segments.push(batch_embeds.slice_axis(0, segment_start as i64, seq_len as i64)?);
+            }
+
+            let batch_output = if segments.len() == 1 {
+                segments.remove(0)
+            } else {
+                let refs: Vec<&MxArray> = segments.iter().collect();
+                MxArray::concatenate_many(refs, Some(0))?
+            };
+            batch_outputs.push(batch_output);
+        }
+
+        let refs: Vec<&MxArray> = batch_outputs.iter().collect();
+        MxArray::stack(refs, Some(0))
+    }
 }
 
 /// VLM prefill: processes images through vision encoder, merges with text embeddings,
@@ -6341,12 +6465,25 @@ fn vlm_prefill(
             let num_layers = layers_guard.len();
             for i in 0..num_layers {
                 let cache = caches_guard.as_mut().map(|c| &mut c[i]);
-                let layer_pos = if layers_guard[i].is_linear() {
-                    None
-                } else {
-                    Some(&position_ids)
-                };
-                h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
+                #[cfg(target_family = "wasm")]
+                {
+                    h = layers_guard[i].forward_vlm_prefill(
+                        &h,
+                        None,
+                        cache,
+                        &position_ids,
+                        false,
+                    )?;
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let layer_pos = if layers_guard[i].is_linear() {
+                        None
+                    } else {
+                        Some(&position_ids)
+                    };
+                    h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
+                }
             }
 
             let h = final_norm_guard.forward(&h)?;
@@ -6470,7 +6607,6 @@ pub(crate) fn vlm_prepare_vision_features(
     // === STEP 3: Compute M-RoPE position IDs ===
     let (position_ids, rope_deltas) =
         get_rope_index(input_ids, Some(&grid), spatial_merge_size, IMAGE_TOKEN_ID)?;
-
     tracing::debug!(
         "VLM prefill: seq_len={}, rope_deltas={}",
         inputs_embeds.shape_at(1)?,

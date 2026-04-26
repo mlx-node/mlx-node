@@ -1,6 +1,6 @@
 import type { ChatStreamChunk } from "@mlx-node/core";
 
-import { Cpu, Paperclip, SendHorizontal, TerminalSquare } from "lucide-react";
+import { ArrowUp, Cpu, ImagePlus, Mic, TerminalSquare } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
 
@@ -15,11 +15,19 @@ import {
   CardHeader,
   CardTitle,
 } from "./components/ui/card";
-import { Switch } from "./components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./components/ui/select";
 import { Textarea } from "./components/ui/textarea";
 import "./styles.css";
 
 type StatusState = "info" | "ready" | "error";
+type ReasoningEffort = "off" | "low" | "medium" | "high";
 
 type ChatResult = {
   text?: string;
@@ -72,7 +80,7 @@ function App() {
   const sendRef = useRef<HTMLButtonElement>(null);
   const imageButtonRef = useRef<HTMLButtonElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
-  const enableThinkingRef = useRef(false);
+  const reasoningEffortRef = useRef<ReasoningEffort>("off");
 
   useEffect(() => {
     const statusEl = statusRef.current!;
@@ -107,10 +115,32 @@ function App() {
       logEl.scrollTop = logEl.scrollHeight;
     }
 
+    let imageCapabilityKnown = false;
+    let supportsImages = false;
+    let pendingImage: Uint8Array | null = null;
+
     function setImageAttached(attached: boolean) {
       imageBtn.dataset.attached = attached ? "true" : "false";
-      imageBtn.title = attached ? "Image attached" : "Attach image or paste";
+      imageBtn.dataset.unsupported = supportsImages ? "false" : "true";
+      imageBtn.title = supportsImages
+        ? attached
+          ? "Image attached. Click to replace"
+          : "Attach image"
+        : imageCapabilityKnown
+          ? "Image input unavailable for this model"
+          : "Image input available after model loads";
       imageBtn.setAttribute("aria-label", imageBtn.title);
+    }
+
+    function setImageCapability(enabled: boolean) {
+      imageCapabilityKnown = true;
+      supportsImages = enabled;
+      imageBtn.disabled = !enabled;
+      if (!enabled) {
+        pendingImage = null;
+        imageInput.value = "";
+      }
+      setImageAttached(pendingImage !== null);
     }
 
     function autosizePrompt() {
@@ -124,7 +154,6 @@ function App() {
       return copy.buffer;
     }
 
-    let pendingImage: Uint8Array | null = null;
     const messages: Array<{
       role: string;
       content: string;
@@ -399,7 +428,9 @@ function App() {
             null;
           promptEl.disabled = false;
           sendBtn.disabled = false;
-          imageBtn.disabled = false;
+          setImageCapability(
+            (data as { supportsImages?: boolean }).supportsImages === true,
+          );
           break;
 
         case "stream-sab-open": {
@@ -602,6 +633,8 @@ function App() {
     const compileGdnPre = urlParams.get("compile_gdn_pre") !== "0";
     const compileGdnPost = urlParams.get("compile_gdn_post") !== "0";
     const compileGdnG = urlParams.get("compile_gdn_g") !== "0";
+    const enableVlm = urlParams.get("disable_vlm") !== "1";
+    const fuseDispatch = urlParams.get("fuse_dispatch") !== "0";
     const useSab = urlParams.get("stream_sab") !== "0";
     const modeParam = urlParams.get("mode") as
       | "sab"
@@ -617,11 +650,14 @@ function App() {
       (compileGdnPre ? " (compile_gdn_pre=1)" : "") +
       (compileGdnPost ? " (compile_gdn_post=1)" : "") +
       (compileGdnG ? " (compile_gdn_g=1)" : "") +
+      (fuseDispatch ? "" : " (fuse_dispatch=0)") +
+      (enableVlm ? "" : " (disable_vlm=1)") +
       (useSab ? "" : " (stream_sab=0)") +
       (modeParam ? ` (mode=${modeParam})` : "");
 
     log(`Starting MLX Worker${flagBadges}...`);
     setStatus("Initializing...", "info");
+    imageBtn.disabled = true;
     setImageAttached(false);
     worker.postMessage({
       type: "init",
@@ -636,6 +672,8 @@ function App() {
       compileGdnPre,
       compileGdnPost,
       compileGdnG,
+      enableVlm,
+      fuseDispatch,
     });
 
     function handleSend() {
@@ -646,6 +684,13 @@ function App() {
       autosizePrompt();
       sendBtn.disabled = true;
       promptEl.disabled = true;
+
+      if (pendingImage && !supportsImages) {
+        log("Image removed: the loaded model does not support vision input.");
+        pendingImage = null;
+        imageInput.value = "";
+        setImageAttached(false);
+      }
 
       const userDiv = document.createElement("div");
       userDiv.className = "message user";
@@ -665,6 +710,7 @@ function App() {
       if (pendingImage) {
         msg.images = [pendingImage];
         pendingImage = null;
+        imageInput.value = "";
         setImageAttached(false);
       }
       messages.push(msg);
@@ -680,7 +726,7 @@ function App() {
         config: { maxNewTokens: 512, temperature: 0, reportPerformance: true },
         useSab,
         mode: modeParam ?? undefined,
-        enableThinking: enableThinkingRef.current,
+        reasoningEffort: reasoningEffortRef.current,
       });
     }
 
@@ -691,11 +737,25 @@ function App() {
       }
     };
 
-    const onImageClick = () => imageInput.click();
+    const onImageClick = () => {
+      if (!supportsImages) {
+        setStatus("Image input unavailable", "info");
+        log("Image input unavailable for this model.");
+        return;
+      }
+      imageInput.click();
+    };
     const onImageChange = async () => {
       const file = imageInput.files?.[0];
       if (!file) return;
+      if (!supportsImages) {
+        imageInput.value = "";
+        setStatus("Image input unavailable", "info");
+        log("Image ignored: the loaded model does not support vision input.");
+        return;
+      }
       pendingImage = new Uint8Array(await file.arrayBuffer());
+      imageInput.value = "";
       log(
         `Image attached: ${file.name} (${(pendingImage.length / 1024).toFixed(0)} KB)`,
       );
@@ -707,6 +767,13 @@ function App() {
       if (!items) return;
       for (const item of items) {
         if (item.type.startsWith("image/")) {
+          if (!supportsImages) {
+            setStatus("Image input unavailable", "info");
+            log(
+              "Image paste ignored: the loaded model does not support vision input.",
+            );
+            break;
+          }
           const file = item.getAsFile();
           if (!file) continue;
           pendingImage = new Uint8Array(await file.arrayBuffer());
@@ -749,20 +816,6 @@ function App() {
         <Badge ref={statusRef} id="status" className="status-pill info">
           Initializing...
         </Badge>
-        <label
-          className="reasoning-toggle"
-          title="Enable the model reasoning channel"
-        >
-          <span>Reasoning</span>
-          <Switch
-            id="enable-thinking"
-            size="sm"
-            aria-label="Reasoning"
-            onCheckedChange={(checked) => {
-              enableThinkingRef.current = checked;
-            }}
-          />
-        </label>
       </header>
 
       <main className="workspace-grid">
@@ -806,17 +859,79 @@ function App() {
       </main>
 
       <footer className="composer-bar">
-        <Button
-          id="image-btn"
-          ref={imageButtonRef}
-          type="button"
-          variant="outline"
-          size="icon"
-          disabled
-        >
-          <Paperclip data-icon="inline-start" />
-          <span className="sr-only">Attach image</span>
-        </Button>
+        <div className="composer-shell">
+          <Textarea
+            id="prompt"
+            ref={promptRef}
+            rows={1}
+            placeholder="Message Qwen 3.5..."
+            disabled
+            className="composer-input"
+          />
+          <div className="composer-actions">
+            <div className="composer-actions-left">
+              <Button
+                id="image-btn"
+                ref={imageButtonRef}
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="composer-icon-btn"
+                disabled
+              >
+                <ImagePlus data-icon="inline-start" />
+                <span className="sr-only">Attach image</span>
+              </Button>
+            </div>
+            <div className="composer-actions-right">
+              <span className="composer-status-dot" aria-hidden="true" />
+              <span className="composer-model-label">Qwen 3.5</span>
+              <Select
+                defaultValue="off"
+                onValueChange={(value) => {
+                  reasoningEffortRef.current = value as ReasoningEffort;
+                }}
+              >
+                <SelectTrigger
+                  id="reasoning-effort"
+                  size="sm"
+                  className="composer-reasoning-trigger"
+                  aria-label="Reasoning effort"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="off">Off</SelectItem>
+                    <SelectItem value="low">Low</SelectItem>
+                    <SelectItem value="medium">Medium</SelectItem>
+                    <SelectItem value="high">High</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="composer-icon-btn"
+                aria-label="Voice input"
+              >
+                <Mic data-icon="inline-start" />
+              </Button>
+              <Button
+                id="send"
+                ref={sendRef}
+                type="button"
+                size="icon"
+                className="composer-send-btn"
+                disabled
+              >
+                <ArrowUp data-icon="inline-start" />
+                <span className="sr-only">Send</span>
+              </Button>
+            </div>
+          </div>
+        </div>
         <input
           id="image-input"
           ref={imageInputRef}
@@ -824,18 +939,6 @@ function App() {
           accept="image/*"
           className="hidden"
         />
-        <Textarea
-          id="prompt"
-          ref={promptRef}
-          rows={1}
-          placeholder="Message Qwen 3.5..."
-          disabled
-          className="composer-input"
-        />
-        <Button id="send" ref={sendRef} type="button" disabled>
-          Send
-          <SendHorizontal data-icon="inline-end" />
-        </Button>
       </footer>
     </div>
   );

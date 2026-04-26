@@ -208,6 +208,10 @@ export function createBridgeStub(
    * Must be the same SAB the gpu-worker received in its init message.
    */
   statsBuffer?: SharedArrayBuffer,
+  options?: {
+    fusionEnabled?: boolean;
+    passCachingEnabled?: boolean;
+  },
 ): BridgeStub {
   const cmdView = new Int32Array(cmdBuffer);
   const cmdDataView = new DataView(cmdBuffer);
@@ -233,6 +237,8 @@ export function createBridgeStub(
   function wasmMalloc(size: number): number {
     return _wasmMalloc(size) >>> 0;
   }
+  const fusionEnabled = options?.fusionEnabled !== false;
+  const passCachingEnabled = options?.passCachingEnabled !== false;
   // Get a fresh Uint8Array view of WASM heap. wasmMemory.buffer always reflects
   // current size after memory.grow() (WebAssembly.Memory getter returns fresh SAB).
   function heap(): Uint8Array {
@@ -567,10 +573,14 @@ export function createBridgeStub(
     // Write WGPUBindGroupEntry array
     for (let i = 0; i < bgDesc.entries.length; i++) {
       const e = bgDesc.entries[i];
+      if (deferredCreations.has(e.bufferHandle)) {
+        materializeDeferredBuffer(e.bufferHandle);
+      }
+      const bufferHandle = resolveBufferHandle(e.bufferHandle);
       const ePtr = entriesArrPtr + i * ENTRY_SIZE;
       view.setUint32(ePtr + 0, 0, true); // nextInChain
       view.setUint32(ePtr + 4, i, true); // binding = sequential index
-      view.setUint32(ePtr + 8, e.bufferHandle, true);
+      view.setUint32(ePtr + 8, bufferHandle, true);
       view.setUint32(ePtr + 12, 0, true); // padding
       view.setUint32(ePtr + 16, 0, true); // offset lo = 0
       view.setUint32(ePtr + 20, 0, true); // offset hi = 0
@@ -1489,7 +1499,7 @@ export function createBridgeStub(
     ): void {
       const resolved = resolveBufferHandle(bufferHandle);
       // Defer small writes at offset 0 — will be packed into FUSED_DISPATCH_WITH_UNIFORM
-      if (size <= 256 && bufferOffset === 0n) {
+      if (fusionEnabled && size <= 256 && bufferOffset === 0n) {
         const h = heap();
         const data = h.slice(dataPtr, dataPtr + size);
         pendingWriteBuffers.set(resolved, { data });
@@ -1513,6 +1523,12 @@ export function createBridgeStub(
     // Cache active compute pass to avoid begin/end per dispatch.
     // C++ creates a new pass for each eval, but we reuse the existing one.
     wgpuCommandEncoderBeginComputePass(encoderHandle: number, _descPtr: number): number {
+      if (!passCachingEnabled) {
+        const handle = rpcCall(RpcFn.CMD_ENCODER_BEGIN_COMPUTE_PASS, encoderHandle);
+        activeComputePass = handle;
+        activeComputePassEncoder = encoderHandle;
+        return handle;
+      }
       if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
         // Reuse existing pass
         return activeComputePass;
@@ -1540,6 +1556,26 @@ export function createBridgeStub(
       flushPendingCompute();
       const resolvedSrc = resolveBufferHandle(srcHandle);
       const resolvedDst = resolveBufferHandle(dstHandle);
+      const srcOffsetLo = Number(srcOffset & 0xffffffffn);
+      const srcOffsetHi = Number(srcOffset >> 32n);
+      const dstOffsetLo = Number(dstOffset & 0xffffffffn);
+      const dstOffsetHi = Number(dstOffset >> 32n);
+      const sizeLo = Number(size & 0xffffffffn);
+      const sizeHi = Number(size >> 32n);
+
+      if (!passCachingEnabled) {
+        if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
+          rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
+          activeComputePass = -1;
+          activeComputePassEncoder = -1;
+        }
+        rpcCallWithHi(
+          RpcFn.CMD_ENCODER_COPY_BUFFER,
+          [encoderHandle, resolvedSrc, srcOffsetLo, srcOffsetHi, resolvedDst, dstOffsetLo, dstOffsetHi, sizeLo],
+          { 0: sizeHi },
+        );
+        return;
+      }
 
       // For 32-bit offsets/sizes (common in WASM), use fused RPC
       const srcOff32 = Number(srcOffset);
@@ -1576,12 +1612,6 @@ export function createBridgeStub(
           activeComputePass = -1;
           activeComputePassEncoder = -1;
         }
-        const srcOffsetLo = Number(srcOffset & 0xffffffffn);
-        const srcOffsetHi = Number(srcOffset >> 32n);
-        const dstOffsetLo = Number(dstOffset & 0xffffffffn);
-        const dstOffsetHi = Number(dstOffset >> 32n);
-        const sizeLo = Number(size & 0xffffffffn);
-        const sizeHi = Number(size >> 32n);
         rpcCallWithHi(
           RpcFn.CMD_ENCODER_COPY_BUFFER,
           [encoderHandle, resolvedSrc, srcOffsetLo, srcOffsetHi, resolvedDst, dstOffsetLo, dstOffsetHi, sizeLo],
@@ -1626,6 +1656,11 @@ export function createBridgeStub(
     // Buffer setPipeline + setBindGroup calls, flush them in a single fused RPC
     // when dispatch is called. This reduces 3+ RPC roundtrips to 1.
     wgpuComputePassEncoderSetPipeline(passHandle: number, pipelineHandle: number): void {
+      if (!fusionEnabled) {
+        flushPendingCompute();
+        rpcCall(RpcFn.COMPUTE_PASS_SET_PIPELINE, passHandle, pipelineHandle);
+        return;
+      }
       pendingPass = passHandle;
       pendingPipeline = pipelineHandle;
       pendingBindGroup = -1; // Reset bind group — new pipeline needs new bind group
@@ -1639,6 +1674,19 @@ export function createBridgeStub(
       dynamicOffsetCount: number,
       dynamicOffsetsPtr: number,
     ): void {
+      if (!fusionEnabled) {
+        flushPendingCompute();
+        const realBg = materializeBg(bgHandle);
+        rpcCall(
+          RpcFn.COMPUTE_PASS_SET_BIND_GROUP,
+          passHandle,
+          groupIndex,
+          realBg,
+          dynamicOffsetCount,
+          dynamicOffsetsPtr,
+        );
+        return;
+      }
       if (groupIndex === 0 && dynamicOffsetCount === 0 && pendingPipeline >= 0) {
         // Buffer for fusion with upcoming dispatch
         pendingBindGroup = bgHandle;
@@ -1660,6 +1708,11 @@ export function createBridgeStub(
     },
 
     wgpuComputePassEncoderDispatchWorkgroups(passHandle: number, x: number, y: number, z: number): void {
+      if (!fusionEnabled) {
+        flushPendingCompute();
+        rpcCall(RpcFn.COMPUTE_PASS_DISPATCH, passHandle, x, y, z);
+        return;
+      }
       // FUSED_DISPATCH_WITH_UNIFORM pre-writes uniform bytes into the SAB
       // UNIFORM_DATA region, so rpcCall's flush-at-entry is disabled for it.
       // Flush here instead, BEFORE any SAB writes, so the gpu-worker sees

@@ -12,17 +12,6 @@ use crate::vision::rope_vision::apply_rotary_pos_emb_vision;
 use napi::bindgen_prelude::*;
 use std::sync::Arc;
 
-#[cfg(test)]
-thread_local! {
-    /// Test-only call counter for [`VisionAttention::build_attention_mask`],
-    /// used to assert that callers hoist mask construction once per forward
-    /// pass instead of rebuilding it on every transformer layer.
-    /// Thread-local so concurrently-running unrelated tests (which also
-    /// exercise vision attention) can't interfere with a given test's count.
-    pub(crate) static BUILD_ATTENTION_MASK_CALLS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
 /// Vision Attention (internal)
 ///
 /// Self-attention for vision transformers with fused QKV projection.
@@ -113,25 +102,15 @@ impl VisionAttention {
     /// to each other (mask=0) and positions in different sub-sequences are
     /// penalized (mask=1). This matches the Python mlx-vlm implementation.
     ///
-    /// This is a pure function of `cu_seqlens`/`seq_len`/`dtype`. Callers that
-    /// run multiple transformer layers per forward pass (e.g. a full vision
-    /// encoder stack) share one `cu_seqlens` across all layers -- build the
-    /// mask once via this function and reuse it (see
-    /// [`Self::forward_with_mask`]) instead of calling [`Self::forward`]
-    /// once per layer, which would rebuild an identical mask every time.
-    ///
     /// # Arguments
     /// * `cu_seqlens` - Cumulative sequence lengths, e.g. [0, 196, 392]
     /// * `seq_len` - Total sequence length
     /// * `dtype` - Output dtype for the mask
-    pub(crate) fn build_attention_mask(
+    fn build_attention_mask(
         cu_seqlens: &MxArray,
         seq_len: i64,
         dtype: crate::array::DType,
     ) -> Result<MxArray> {
-        #[cfg(test)]
-        BUILD_ATTENTION_MASK_CALLS.with(|c| c.set(c.get() + 1));
-
         // Eval cu_seqlens so we can read values
         cu_seqlens.eval();
         let num_boundaries = cu_seqlens.size()? as usize;
@@ -175,26 +154,21 @@ impl VisionAttention {
         mask.reshape(&[1, seq_len, seq_len])
     }
 
-    /// Forward pass using a pre-built additive attention mask.
-    ///
-    /// Prefer this over [`Self::forward`] when calling it once per layer
-    /// across multiple layers in the same forward pass with the same
-    /// `cu_seqlens`/`seq_len`/`dtype`: build the mask once with
-    /// [`Self::build_attention_mask`] and reuse it here instead of
-    /// rebuilding an identical mask on every call.
+    /// Forward pass
     ///
     /// # Arguments
     /// * `x` - Input tensor [seq_len, dim]
-    /// * `attention_mask` - Pre-built additive mask [1, seq_len, seq_len] (or `None` for full attention)
+    /// * `cu_seqlens` - Cumulative sequence lengths for variable-length batching
     /// * `rotary_pos_emb` - Rotary position embeddings [seq_len, head_dim/2]
     ///
     /// # Returns
     /// * Output tensor [seq_len, dim]
-    fn attention_inputs(
+    pub fn forward(
         &self,
         x: &MxArray,
+        cu_seqlens: &MxArray,
         rotary_pos_emb: Option<&MxArray>,
-    ) -> Result<(MxArray, MxArray, MxArray, i64)> {
+    ) -> Result<MxArray> {
         let shape = x.shape()?;
         let seq_len = shape[0];
         let _dim = shape[1];
@@ -242,10 +216,34 @@ impl VisionAttention {
             .reshape(&[1, seq_len, self.num_heads as i64, self.head_dim as i64])?
             .transpose(Some(&[0, 2, 1, 3]))?;
 
-        Ok((q, k, v, seq_len))
-    }
+        // Build attention mask from cu_seqlens
+        let input_dtype = x.dtype()?;
 
-    fn project_attention_output(&self, output: MxArray, seq_len: i64) -> Result<MxArray> {
+        // Use fused scaled dot-product attention.
+        // On the browser WebGPU path, a single image has cu_seqlens=[0, seq_len],
+        // so the mask is all zeros. Avoiding that no-op mask keeps WebGPU on
+        // the unmasked SDPA kernel without changing native behavior.
+        #[cfg(target_family = "wasm")]
+        let attention_mask = if cu_seqlens.size()? <= 2 {
+            None
+        } else {
+            Some(Self::build_attention_mask(
+                cu_seqlens,
+                seq_len,
+                input_dtype,
+            )?)
+        };
+        #[cfg(not(target_family = "wasm"))]
+        let attention_mask = Some(Self::build_attention_mask(
+            cu_seqlens,
+            seq_len,
+            input_dtype,
+        )?);
+
+        // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len]
+        let output =
+            scaled_dot_product_attention(&q, &k, &v, self.scale as f64, attention_mask.as_ref())?;
+
         // Transpose back: [1, num_heads, seq_len, head_dim] -> [1, seq_len, num_heads, head_dim]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
 
@@ -254,102 +252,6 @@ impl VisionAttention {
 
         // Output projection
         self.out_proj.forward(&output)
-    }
-
-    pub fn forward_with_mask(
-        &self,
-        x: &MxArray,
-        attention_mask: Option<&MxArray>,
-        rotary_pos_emb: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        let (q, k, v, seq_len) = self.attention_inputs(x, rotary_pos_emb)?;
-
-        // Use fused scaled dot-product attention (Metal kernel)
-        // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len]
-        let output = scaled_dot_product_attention(&q, &k, &v, self.scale as f64, attention_mask)?;
-
-        self.project_attention_output(output, seq_len)
-    }
-
-    /// Forward variable-length image segments without constructing a global
-    /// quadratic block-diagonal mask.
-    ///
-    /// Q/K/V projections and the output projection still run once over the
-    /// concatenated token stream. Only SDPA is split at the cumulative segment
-    /// boundaries, matching mlx-vlm's Qwen3-VL vision attention. Since the old
-    /// additive mask allowed attention only within each segment, this preserves
-    /// the same attention semantics while reducing mask storage from
-    /// `O(total_tokens^2)` to zero and attention work to
-    /// `O(sum(segment_tokens^2))`.
-    pub(crate) fn forward_segmented(
-        &self,
-        x: &MxArray,
-        segment_boundaries: &[i64],
-        rotary_pos_emb: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        let (q, k, v, seq_len) = self.attention_inputs(x, rotary_pos_emb)?;
-        if segment_boundaries.len() < 2
-            || segment_boundaries.first().copied() != Some(0)
-            || segment_boundaries.last().copied() != Some(seq_len)
-            || segment_boundaries.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "vision attention segment boundaries must be a contiguous, non-empty cover of 0..{seq_len}, got {segment_boundaries:?}"
-                ),
-            ));
-        }
-
-        let mut outputs = Vec::with_capacity(segment_boundaries.len() - 1);
-        for pair in segment_boundaries.windows(2) {
-            let start = pair[0];
-            let end = pair[1];
-            let q_segment = q.slice_axis(2, start, end)?;
-            let k_segment = k.slice_axis(2, start, end)?;
-            let v_segment = v.slice_axis(2, start, end)?;
-            outputs.push(scaled_dot_product_attention(
-                &q_segment,
-                &k_segment,
-                &v_segment,
-                self.scale as f64,
-                None,
-            )?);
-        }
-
-        let output = if outputs.len() == 1 {
-            outputs.remove(0)
-        } else {
-            let refs: Vec<&MxArray> = outputs.iter().collect();
-            MxArray::concatenate_many(refs, Some(2))?
-        };
-        self.project_attention_output(output, seq_len)
-    }
-
-    /// Forward pass, building the attention mask from `cu_seqlens` internally.
-    ///
-    /// Prefer [`Self::forward_with_mask`] when calling this repeatedly with
-    /// the same `cu_seqlens`/`seq_len`/`dtype` across multiple layers in one
-    /// forward pass (e.g. a transformer stack): build the mask once and
-    /// reuse it, instead of rebuilding an identical mask on every call.
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor [seq_len, dim]
-    /// * `cu_seqlens` - Cumulative sequence lengths for variable-length batching
-    /// * `rotary_pos_emb` - Rotary position embeddings [seq_len, head_dim/2]
-    ///
-    /// # Returns
-    /// * Output tensor [seq_len, dim]
-    pub fn forward(
-        &self,
-        x: &MxArray,
-        cu_seqlens: &MxArray,
-        rotary_pos_emb: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        let seq_len = x.shape()?[0];
-        let input_dtype = x.dtype()?;
-        let attention_mask = Self::build_attention_mask(cu_seqlens, seq_len, input_dtype)?;
-        self.forward_with_mask(x, Some(&attention_mask), rotary_pos_emb)
     }
 }
 
@@ -480,64 +382,7 @@ impl VisionEncoderLayer {
         &self.layer_norm2
     }
 
-    /// Forward pass using a pre-built additive attention mask.
-    ///
-    /// Prefer this over [`Self::forward`] when a caller runs multiple layers
-    /// per forward pass with the same `cu_seqlens` (e.g. a full encoder
-    /// stack): build the mask once (see
-    /// [`VisionAttention::build_attention_mask`]) and reuse it across all
-    /// layers instead of rebuilding an identical mask per layer.
-    ///
-    /// # Arguments
-    /// * `hidden_states` - Input tensor [seq_len, dim]
-    /// * `attention_mask` - Pre-built additive mask [1, seq_len, seq_len] (or `None` for full attention)
-    /// * `rotary_pos_emb` - Rotary position embeddings
-    ///
-    /// # Returns
-    /// * Output tensor [seq_len, dim]
-    pub fn forward_with_mask(
-        &self,
-        hidden_states: &MxArray,
-        attention_mask: Option<&MxArray>,
-        rotary_pos_emb: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        // Self-attention with residual
-        let normed = self.layer_norm1.forward(hidden_states)?;
-        let attn_output =
-            self.self_attn
-                .forward_with_mask(&normed, attention_mask, rotary_pos_emb)?;
-        let hidden_states = hidden_states.add(&attn_output)?;
-
-        // MLP with residual
-        let normed = self.layer_norm2.forward(&hidden_states)?;
-        let mlp_output = self.mlp.forward(&normed)?;
-        hidden_states.add(&mlp_output)
-    }
-
-    /// Forward with attention split at variable-length image/frame boundaries.
-    /// Pointwise norms/MLP and both residuals remain on the concatenated stream;
-    /// only the attention operation is segmented.
-    pub(crate) fn forward_segmented(
-        &self,
-        hidden_states: &MxArray,
-        segment_boundaries: &[i64],
-        rotary_pos_emb: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        let normed = self.layer_norm1.forward(hidden_states)?;
-        let attn_output =
-            self.self_attn
-                .forward_segmented(&normed, segment_boundaries, rotary_pos_emb)?;
-        let hidden_states = hidden_states.add(&attn_output)?;
-
-        let normed = self.layer_norm2.forward(&hidden_states)?;
-        let mlp_output = self.mlp.forward(&normed)?;
-        hidden_states.add(&mlp_output)
-    }
-
-    /// Forward pass, building the attention mask from `cu_seqlens` internally.
-    ///
-    /// Prefer [`Self::forward_with_mask`] when calling this repeatedly with
-    /// the same `cu_seqlens` across multiple layers in one forward pass.
+    /// Forward pass
     ///
     /// # Arguments
     /// * `hidden_states` - Input tensor [seq_len, dim]
@@ -635,118 +480,5 @@ mod tests {
 
         let shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
         assert_eq!(shape, vec![seq_len, dim as i64]);
-    }
-
-    #[test]
-    fn segmented_attention_matches_block_diagonal_mask() {
-        let dim = 16u32;
-        let num_heads = 4u32;
-        let seq_len = 6i64;
-        let boundaries = [0i64, 4, 6];
-
-        let qkv_weight = random_array(&[(dim * 3) as i64, dim as i64]);
-        let out_weight = random_array(&[dim as i64, dim as i64]);
-        let attn =
-            VisionAttention::new(dim, num_heads, &qkv_weight, None, &out_weight, None).unwrap();
-        let input = random_array(&[seq_len, dim as i64]);
-
-        let cu_seqlens = MxArray::from_int32(&[0, 4, 6], &[3]).unwrap();
-        let mask = VisionAttention::build_attention_mask(
-            &cu_seqlens,
-            seq_len,
-            crate::array::DType::Float32,
-        )
-        .unwrap();
-        let masked = attn.forward_with_mask(&input, Some(&mask), None).unwrap();
-        let segmented = attn.forward_segmented(&input, &boundaries, None).unwrap();
-        MxArray::eval_arrays_with_context(
-            &[&masked, &segmented],
-            "vision_segmented_attention_equivalence",
-        )
-        .unwrap();
-
-        let masked = masked.to_float32().unwrap();
-        let segmented = segmented.to_float32().unwrap();
-        assert_eq!(masked.len(), segmented.len());
-        for (index, (expected, actual)) in masked.iter().zip(segmented.iter()).enumerate() {
-            let error = (expected - actual).abs();
-            assert!(
-                error <= 1e-4,
-                "segmented attention differs from block-mask attention at {index}: \
-                 expected {expected}, got {actual}, error {error}"
-            );
-        }
-    }
-
-    /// Throwaway microbenchmark (not part of the fix) isolating the exact
-    /// cost this task removes: rebuilding `build_attention_mask` once per
-    /// transformer layer (27x, old behavior) vs building it once and reusing
-    /// the handle (1x, new behavior), at realistic Qwen3.5-VL document-OCR
-    /// patch counts. Run manually:
-    /// `cargo test -p mlx-core --lib vision::encoder::tests::bench_build_attention_mask_27x_vs_1x -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn bench_build_attention_mask_27x_vs_1x() {
-        use crate::array::DType;
-        use std::time::Instant;
-
-        const NUM_LAYERS: usize = 27;
-        const WARMUP: usize = 3;
-        const ITERS: usize = 20;
-
-        for &seq_len in &[2048i64, 4096i64] {
-            // Single-image cu_seqlens: one segment spanning the whole image.
-            let cu_seqlens = MxArray::from_int32(&[0, seq_len as i32], &[2]).unwrap();
-
-            // Warmup both variants.
-            for _ in 0..WARMUP {
-                for _ in 0..NUM_LAYERS {
-                    let m = VisionAttention::build_attention_mask(
-                        &cu_seqlens,
-                        seq_len,
-                        DType::BFloat16,
-                    )
-                    .unwrap();
-                    m.eval();
-                }
-                let m =
-                    VisionAttention::build_attention_mask(&cu_seqlens, seq_len, DType::BFloat16)
-                        .unwrap();
-                m.eval();
-            }
-
-            // Old-shape cost: rebuild the mask once per layer (27x).
-            let start = Instant::now();
-            for _ in 0..ITERS {
-                for _ in 0..NUM_LAYERS {
-                    let m = VisionAttention::build_attention_mask(
-                        &cu_seqlens,
-                        seq_len,
-                        DType::BFloat16,
-                    )
-                    .unwrap();
-                    m.eval();
-                }
-            }
-            let old_elapsed = start.elapsed();
-
-            // New-shape cost: build once, reuse the handle 27x (the mask
-            // itself isn't rebuilt; this measures only the one build call).
-            let start = Instant::now();
-            for _ in 0..ITERS {
-                let m =
-                    VisionAttention::build_attention_mask(&cu_seqlens, seq_len, DType::BFloat16)
-                        .unwrap();
-                m.eval();
-            }
-            let new_elapsed = start.elapsed();
-
-            let old_avg_us = old_elapsed.as_micros() as f64 / ITERS as f64;
-            let new_avg_us = new_elapsed.as_micros() as f64 / ITERS as f64;
-            println!(
-                "seq_len={seq_len}: old(27x)={old_avg_us:.1}us/iter new(1x)={new_avg_us:.1}us/iter ratio={:.2}x",
-                old_avg_us / new_avg_us
-            );
-        }
     }
 }

@@ -134,7 +134,8 @@ impl GatedDeltaNet {
         // dense weights) or when the native build is running.
         // ----------------------------------------------------------------
         #[cfg(target_family = "wasm")]
-        let fused_pre = matches!(self.in_proj_qkvz, LinearProj::Standard(_))
+        let fused_pre = use_kernel
+            && matches!(self.in_proj_qkvz, LinearProj::Standard(_))
             && matches!(self.in_proj_ba, LinearProj::Standard(_));
         #[cfg(not(target_family = "wasm"))]
         let fused_pre = false;
@@ -400,7 +401,7 @@ impl GatedDeltaNet {
         // ----------------------------------------------------------------
         #[cfg(target_family = "wasm")]
         {
-            if matches!(self.out_proj, LinearProj::Standard(_)) {
+            if use_kernel && matches!(self.out_proj, LinearProj::Standard(_)) {
                 use std::ptr;
 
                 let norm_weight = self.norm.get_weight();

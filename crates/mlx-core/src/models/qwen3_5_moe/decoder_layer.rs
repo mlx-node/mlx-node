@@ -99,7 +99,7 @@ impl DecoderLayer {
             }
             AttentionType::Full(attn) => {
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                attn.forward(&normed, mask, kvc, position_ids)?
+                attn.forward(&normed, mask, kvc, position_ids, 0)?
             }
         };
 

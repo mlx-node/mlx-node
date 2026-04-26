@@ -74,8 +74,24 @@ impl Activations {
     /// matching Python's `nn.gelu_approx`. Operates in native dtype (no f32 upcast)
     /// for maximum performance — the compile fusion handles numerical stability.
     pub fn gelu(input: &MxArray) -> Result<MxArray> {
-        let handle = unsafe { sys::mlx_gelu_approx(input.handle.0) };
-        MxArray::from_handle(handle, "gelu_approx")
+        #[cfg(target_family = "wasm")]
+        {
+            let x3 = input.mul(input)?.mul(input)?;
+            let inner = input
+                .add(&x3.mul_scalar(0.044715)?)?
+                .mul_scalar(0.7978845608028654)?;
+            // WebGPU tanh can overflow internally for large arguments; GELU is already
+            // saturated at this range, so clamping preserves the approximation.
+            let inner = inner.clip(Some(-10.0), Some(10.0))?;
+            let gate = inner.tanh()?.add_scalar(1.0)?;
+            return input.mul(&gate)?.mul_scalar(0.5);
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let handle = unsafe { sys::mlx_gelu_approx(input.handle.0) };
+            MxArray::from_handle(handle, "gelu_approx")
+        }
     }
 
     /// Gaussian Error Linear Unit — exact (non-approximate) variant.

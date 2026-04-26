@@ -1186,7 +1186,6 @@ function handleFusedCopyBuffer(): void {
   if (passHandle !== 0) {
     (handles[passHandle] as GPUComputePassEncoder).end();
     passEncoderMap.delete(passHandle);
-    releaseHandle(passHandle);
   }
 
   encoder.copyBufferToBuffer(
@@ -1198,7 +1197,11 @@ function handleFusedCopyBuffer(): void {
   );
 
   const newPass = encoder.beginComputePass();
-  const newPassHandle = addHandle(newPass);
+  // copyBufferToBuffer is void in the WebGPU API, so the C++ side keeps using
+  // the same pass handle. Replace the ended pass in-place to preserve that
+  // cached handle across the fused copy/restart sequence.
+  const newPassHandle = passHandle !== 0 ? passHandle : addHandle(newPass);
+  handles[newPassHandle] = newPass;
   passEncoderMap.set(newPassHandle, encoderHandle);
   cmdU32[I_RESULT] = newPassHandle;
 }
@@ -1958,8 +1961,13 @@ async function processCommand(fnId: number): Promise<void> {
 
     case RpcFn.COMPUTE_PASS_RELEASE: {
       const handle = arg0();
-      passEncoderMap.delete(handle);
-      releaseHandle(handle);
+      // The bridge keeps compute pass handles stable across backend wrapper
+      // lifetimes and fused copy restarts. Releasing the JS handle here can
+      // invalidate a pass that another worker still references by handle, so
+      // only free handles that are no longer registered as active passes.
+      if (!passEncoderMap.has(handle)) {
+        releaseHandle(handle);
+      }
       setResult(0);
       break;
     }
@@ -2367,7 +2375,7 @@ async function processCommand(fnId: number): Promise<void> {
       if (passHandle !== 0) {
         const pass = getHandle<GPUComputePassEncoder>(passHandle);
         pass.end();
-        releaseHandle(passHandle);
+        passEncoderMap.delete(passHandle);
       }
 
       // Perform the copy
@@ -2377,7 +2385,11 @@ async function processCommand(fnId: number): Promise<void> {
 
       // Begin new compute pass for subsequent dispatches
       const newPass = encoder.beginComputePass();
-      const newPassHandle = addHandle(newPass);
+      // Preserve the pass handle for callers that cache it across the void
+      // copyBufferToBuffer boundary.
+      const newPassHandle = passHandle !== 0 ? passHandle : addHandle(newPass);
+      handles[newPassHandle] = newPass;
+      passEncoderMap.set(newPassHandle, encoderHandle);
       setResult(newPassHandle);
       break;
     }

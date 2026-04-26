@@ -57,10 +57,15 @@ pub(crate) fn merged_image_token_count(
 }
 
 /// Qwen3.5-VL image processor configuration
-fn qwen35_vl_processor_config() -> ImageProcessorConfig {
+pub fn qwen35_vl_processor_config() -> ImageProcessorConfig {
+    #[cfg(target_family = "wasm")]
+    let (min_pixels, max_pixels) = (16_384, 262_144);
+    #[cfg(not(target_family = "wasm"))]
+    let (min_pixels, max_pixels) = (147_384, 2_822_400);
+
     ImageProcessorConfig {
-        min_pixels: 147384,
-        max_pixels: 2822400,
+        min_pixels,
+        max_pixels,
         patch_size: 16,
         temporal_patch_size: 2, // Qwen3.5-VL uses temporal_patch_size=2
         merge_size: 2,
@@ -88,7 +93,7 @@ impl Qwen35VLImageProcessor {
     }
 
     /// Get the resize factor (patch_size * merge_size)
-    fn resize_factor(&self) -> i32 {
+    pub fn resize_factor(&self) -> i32 {
         self.config.patch_size * self.config.merge_size
     }
 
