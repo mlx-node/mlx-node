@@ -8,6 +8,7 @@ import {
   isGgufRepoComplete,
   isGlobMatchedSetComplete,
   isGlobVariantPresent,
+  isLocalCopyComplete,
   isModelAlreadyDownloaded,
 } from '../../packages/cli/src/commands/download-model.js';
 
@@ -246,5 +247,57 @@ describe('isGlobMatchedSetComplete', () => {
   it('returns false when no glob patterns are provided', () => {
     // Defensive: the helper requires at least one pattern to compare against.
     expect(isGlobMatchedSetComplete(['model.Q4_K_M.gguf'], ['model.Q4_K_M.gguf'], [])).toBe(false);
+  });
+});
+
+describe('isLocalCopyComplete', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mlx-download-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns false when the destination file does not exist', () => {
+    expect(isLocalCopyComplete(join(dir, 'missing.bin'), 100)).toBe(false);
+  });
+
+  it('returns true when the destination exists and size matches', () => {
+    // Regression: previously the download loop unconditionally called
+    // copyFile for every file in `filesToDownload`, re-copying gigabytes
+    // of already-complete shards from the HF cache to outputDir on every
+    // resume. The skip is gated on size-equality so a single Edit catches
+    // truncated/interrupted prior copies.
+    const path = join(dir, 'shard.bin');
+    writeFileSync(path, 'x'.repeat(100));
+    expect(isLocalCopyComplete(path, 100)).toBe(true);
+  });
+
+  it('returns false when the destination is truncated (interrupted prior copy)', () => {
+    // A previous `copyFile` killed mid-write would leave a smaller-than-
+    // expected file. The size mismatch must trigger a re-copy so the resume
+    // doesn't ship a corrupt shard to disk.
+    const path = join(dir, 'shard.bin');
+    writeFileSync(path, 'x'.repeat(50));
+    expect(isLocalCopyComplete(path, 100)).toBe(false);
+  });
+
+  it('returns false when the destination is larger than expected (corrupt write)', () => {
+    const path = join(dir, 'shard.bin');
+    writeFileSync(path, 'x'.repeat(150));
+    expect(isLocalCopyComplete(path, 100)).toBe(false);
+  });
+
+  it('falls back to existence-only when expectedSize is non-positive', () => {
+    // The HF manifest occasionally returns size=0 for tiny metadata files
+    // or when the expand=true field isn't populated. Existence is the
+    // best signal we can use without re-fetching the LFS pointer.
+    const path = join(dir, 'meta.json');
+    writeFileSync(path, '{}');
+    expect(isLocalCopyComplete(path, 0)).toBe(true);
+    expect(isLocalCopyComplete(path, -1)).toBe(true);
   });
 });

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { readdir, copyFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -315,6 +315,34 @@ export function isGgufRepoComplete(localFiles: string[], remoteFiles: string[]):
   return true;
 }
 
+/**
+ * Per-file check inside the download loop: is `destPath` already a complete
+ * copy of the remote `file`?
+ *
+ * Returns true when the local file exists AND its byte size matches the
+ * remote manifest's `file.size`. Truncated/interrupted prior copies fail
+ * the size check and re-copy. When the manifest has no size (`<= 0`), we
+ * fall back to existence-only — losing partial-recovery for that one
+ * file but matching the pre-d139679 reconciler's `existsSync` check.
+ *
+ * Why this exists: `downloadFileToCacheDir` is content-addressed (no
+ * network re-fetch when the cache already holds the blob), but the
+ * subsequent `copyFile` always copies bytes regardless. For a sharded
+ * model with the early-return short-circuited (e.g. an interrupted run
+ * left the safetensors index but not all shards), the per-file copy
+ * would otherwise re-write every already-complete shard to disk on
+ * resume — gigabytes of pointless I/O.
+ */
+export function isLocalCopyComplete(destPath: string, expectedSize: number): boolean {
+  if (!existsSync(destPath)) return false;
+  if (expectedSize <= 0) return true;
+  try {
+    return statSync(destPath).size === expectedSize;
+  } catch {
+    return false;
+  }
+}
+
 async function verifyDownload(outputDir: string, weightFiles: string[]): Promise<boolean> {
   console.log('\nVerifying download...');
 
@@ -442,9 +470,9 @@ export async function run(argv: string[]) {
       // Manifest-aware completeness: only short-circuit when every
       // remote `.gguf` is present locally. Falling through to the
       // download loop is safe — `downloadFileToCacheDir` is content-
-      // addressed and the per-file `copyFile` to `outputDir` is
-      // idempotent, so files already on disk re-copy from cache
-      // without re-downloading bytes.
+      // addressed and the per-file loop's `isLocalCopyComplete` check
+      // skips the `copyFile` for files already on disk at the right
+      // size, so resume only does I/O for the genuinely missing shards.
       console.log('Fetching file list from HuggingFace...\n');
       cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
       const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
@@ -495,9 +523,8 @@ export async function run(argv: string[]) {
         return;
       }
       // Incomplete: fall through to the download loop. The per-file
-      // copy is idempotent (`downloadFileToCacheDir` is content-addressed
-      // and `copyFile` overwrites), so already-present files re-copy
-      // from cache without re-downloading bytes.
+      // loop's `isLocalCopyComplete` check skips already-present files,
+      // so resume only fetches/copies the genuinely missing shards.
       const missing = cachedManifest.filesToDownload.filter((f) => {
         const basename = f.path.split('/').pop() ?? f.path;
         return !files.includes(basename);
@@ -557,16 +584,26 @@ export async function run(argv: string[]) {
   for (let i = 0; i < total; i++) {
     const file = filesToDownload[i];
     const fileSizeStr = file.size ? formatBytes(file.size) : '';
-    console.log(`  [${i + 1}/${total}] ${file.path}${fileSizeStr ? ` (${fileSizeStr})` : ''}...`);
-    const snapshotPath = await downloadFileToCacheDir({
-      repo: { type: 'model', name: modelName },
-      path: file.path,
-      cacheDir,
-      accessToken: HUGGINGFACE_TOKEN,
-    });
     const destPath = join(outputDir, file.path);
-    await ensureDir(dirname(destPath));
-    await copyFile(snapshotPath, destPath);
+    // Skip files already on disk with matching size — `downloadFileToCacheDir`
+    // is content-addressed (no network re-fetch) but `copyFile` always copies
+    // bytes, so without this check a resumed sharded download re-writes every
+    // already-complete shard from cache to outputDir on every invocation.
+    if (isLocalCopyComplete(destPath, file.size)) {
+      console.log(
+        `  [${i + 1}/${total}] ${file.path}${fileSizeStr ? ` (${fileSizeStr})` : ''} — already present, skipping copy`,
+      );
+    } else {
+      console.log(`  [${i + 1}/${total}] ${file.path}${fileSizeStr ? ` (${fileSizeStr})` : ''}...`);
+      const snapshotPath = await downloadFileToCacheDir({
+        repo: { type: 'model', name: modelName },
+        path: file.path,
+        cacheDir,
+        accessToken: HUGGINGFACE_TOKEN,
+      });
+      await ensureDir(dirname(destPath));
+      await copyFile(snapshotPath, destPath);
+    }
     if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams') || file.path.endsWith('.gguf')) {
       weightFiles.push(file.path);
     }
