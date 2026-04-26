@@ -25,6 +25,15 @@ import {
   CALLBACK_ENTRY_SIZE,
   STATS_OPCODE_SLOTS,
   STATS_BUFFER_SIZE,
+  STATS_EXTRA_POOL_HITS,
+  STATS_EXTRA_POOL_MISSES,
+  STATS_EXTRA_BG_CACHE_HITS,
+  STATS_EXTRA_BG_CACHE_MISSES,
+  STATS_EXTRA_UNIFORM_HOT_HITS,
+  STATS_EXTRA_UNIFORM_HOT_MISSES,
+  STATS_EXTRA_SPIN_HITS,
+  STATS_EXTRA_SPIN_MISSES,
+  STATS_EXTRA_SPIN_BUDGET,
   DISPATCH_BATCH_HEADER_BYTES,
 } from './rpc-protocol.js';
 
@@ -328,17 +337,22 @@ let queue: GPUQueue;
 let adapter: GPUAdapter;
 let hasShaderF16 = false;
 
-// Track pass→encoder association for end+begin after each dispatch.
-// WebGPU disallows buffer aliasing within a single compute pass, so each
-// dispatch must get its own pass. The C++ backend calls end_compute_pass()
-// after every dispatch, but the bridge stub caches the pass for reuse.
-// We fix this by ending+restarting the pass in the gpu-worker after every dispatch.
+// Track pass→encoder association. Normal operation lets the C++ backend emit
+// pass boundaries from semantic read/write array tracking. Keep the forced
+// restart switch as a local validation fallback while tuning the tracker.
 const passEncoderMap = new Map<number, number>(); // passHandle → encoderHandle
 
-function endAndRestartPass(_passHandle: number): void {
-  // No-op: compute pass stays open across dispatches. WebGPU validates buffer
-  // aliasing per-dispatch usage scope, not per-pass. The pass is only ended
-  // when necessary (FUSED_COPY_BUFFER, FUSED_SUBMIT, COMPUTE_PASS_END).
+const RESTART_PASS_AFTER_EACH_DISPATCH = false;
+
+function endAndRestartPassIfForced(passHandle: number): void {
+  if (!RESTART_PASS_AFTER_EACH_DISPATCH) return;
+  const encoderHandle = passEncoderMap.get(passHandle);
+  if (encoderHandle === undefined) return;
+  const pass = handles[passHandle] as GPUComputePassEncoder;
+  pass.end();
+  const encoder = handles[encoderHandle] as GPUCommandEncoder;
+  const newPass = encoder.beginComputePass();
+  handles[passHandle] = newPass; // Replace in-place — bridge stub's cached handle stays valid
 }
 
 // Pre-registered handles (set during init)
@@ -713,6 +727,7 @@ self.onmessage = async (e: MessageEvent) => {
 
     const handles: number[] = [];
     const uploadedDtypes: string[] = [];
+    const uploadedByteSizes: number[] = [];
     const packedBf16Flags: boolean[] = [];
     const packedNames: string[] = [];
     const unpackedBf16Names: string[] = [];
@@ -736,15 +751,12 @@ self.onmessage = async (e: MessageEvent) => {
       // Odd element counts pad the trailing slot with zero; the kernel
       // masks out-of-range loads so the pad is harmless.
       //
-      // Two separate allowlists:
-      //   matmul-consumed weights (large, K >= 4096) → packed GEMV/GEMM
-      //   norm-consumed weights (small, hidden_size) → packed RMSNorm/LayerNorm
-      // Each has its own min-elements threshold because the motivating
-      // kernels have different feasibility floors.
+      // Only matmul-consumed weights are packed during JS-side upload. Norm
+      // weights can require loader-side sanitization before use, so keep them
+      // on the legacy path until the post-sanitized GPU load path can pack them.
       const matmulConsumed =
         usePackBf16 && isBf16 && numElements >= PACKED_MIN_ELEMENTS && isMatmulConsumedWeight(tensor.name);
-      const normConsumed =
-        usePackBf16 && isBf16 && numElements >= NORM_PACKED_MIN_ELEMENTS && isNormConsumedWeight(tensor.name);
+      const normConsumed = false;
       const packedEligible = matmulConsumed || normConsumed;
       if (
         isBf16 &&
@@ -833,12 +845,14 @@ self.onmessage = async (e: MessageEvent) => {
       bufferSizesArr[handle] = alignedSize;
       bufferUsagesArr[handle] = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
       handles.push(handle);
+      uploadedByteSizes.push(alignedSize);
     }
 
     self.postMessage({
       type: 'weights_uploaded',
       handles,
       uploadedDtypes,
+      uploadedByteSizes,
       packedBf16Flags,
       debugPackedNames: packedNames,
       debugUnpackedBf16Names: unpackedBf16Names,
@@ -1023,7 +1037,7 @@ function dispatchFusedRecord(
   pass.setPipeline(handles[pipelineHandle] as GPUComputePipeline);
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(x, y, z);
-  endAndRestartPass(passHandle);
+  endAndRestartPassIfForced(passHandle);
   return newBufferHandle;
 }
 
@@ -1928,7 +1942,7 @@ async function processCommand(fnId: number): Promise<void> {
       const y = arg2();
       const z = arg3();
       getHandle<GPUComputePassEncoder>(passHandle).dispatchWorkgroups(x, y, z);
-      endAndRestartPass(passHandle);
+      endAndRestartPassIfForced(passHandle);
       setResult(0);
       break;
     }
@@ -2210,7 +2224,7 @@ async function processCommand(fnId: number): Promise<void> {
       pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
       pass.setBindGroup(0, getHandle<GPUBindGroup>(bgHandle));
       pass.dispatchWorkgroups(x, y, z);
-      endAndRestartPass(passHandle);
+      endAndRestartPassIfForced(passHandle);
       setResult(0);
       break;
     }
@@ -2230,7 +2244,7 @@ async function processCommand(fnId: number): Promise<void> {
       pass.setBindGroup(0, getHandle<GPUBindGroup>(bg0Handle));
       pass.setBindGroup(1, getHandle<GPUBindGroup>(bg1Handle));
       pass.dispatchWorkgroups(x, y, z);
-      endAndRestartPass(passHandle);
+      endAndRestartPassIfForced(passHandle);
       setResult(0);
       break;
     }
@@ -2283,7 +2297,7 @@ async function processCommand(fnId: number): Promise<void> {
       pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
       pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(x, y, z);
-      endAndRestartPass(passHandle);
+      endAndRestartPassIfForced(passHandle);
       cmdU32[I_RESULT] = 0;
       break;
     }
@@ -2329,7 +2343,7 @@ async function processCommand(fnId: number): Promise<void> {
       pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle));
       pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(x, y, z);
-      endAndRestartPass(passHandle);
+      endAndRestartPassIfForced(passHandle);
       cmdU32[I_RESULT] = 0;
       break;
     }
@@ -2445,31 +2459,17 @@ async function processCommand(fnId: number): Promise<void> {
     // ================================================================
     case RpcFn.GET_STATS: {
       const resetAfter = arg0();
-      // Smuggle pool hit/miss and related counters into reserved slots so
-      // the bridge's existing histogram readback picks them up with no
-      // protocol change. Slots start at 100 (above any real RpcFn opcode).
-      const POOL_HITS_SLOT = 100;
-      const POOL_MISSES_SLOT = 101;
-      const BG_CACHE_HITS_SLOT = 102;
-      const BG_CACHE_MISSES_SLOT = 103;
-      const UNIFORM_HOT_HITS_SLOT = 104;
-      const UNIFORM_HOT_MISSES_SLOT = 105;
-      // P6 observability: spin-loop hit/miss and current adaptive budget.
-      // Used to confirm the bimodal-variance fix is actually keeping us in-spin
-      // and to watch the budget adapt over a session. Budget capped at SPIN_MAX
-      // which fits in u32.
-      const SPIN_HITS_SLOT = 106;
-      const SPIN_MISSES_SLOT = 107;
-      const SPIN_BUDGET_SLOT = 108;
-      gpuRpcCounts[POOL_HITS_SLOT] = bufferPoolHitCount;
-      gpuRpcCounts[POOL_MISSES_SLOT] = bufferPoolMissCount;
-      gpuRpcCounts[BG_CACHE_HITS_SLOT] = bindGroupCacheHits;
-      gpuRpcCounts[BG_CACHE_MISSES_SLOT] = bindGroupCacheMisses;
-      gpuRpcCounts[UNIFORM_HOT_HITS_SLOT] = uniformHotHits;
-      gpuRpcCounts[UNIFORM_HOT_MISSES_SLOT] = uniformHotMisses;
-      gpuRpcCounts[SPIN_HITS_SLOT] = spinHitTotal;
-      gpuRpcCounts[SPIN_MISSES_SLOT] = spinMissTotal;
-      gpuRpcCounts[SPIN_BUDGET_SLOT] = spinDispatchBudget;
+      // Synthetic counters live in high stats slots so real RpcFn opcodes
+      // 102/103 (BUFFER_RELEASE_BATCH/DISPATCH_BATCH) remain visible.
+      gpuRpcCounts[STATS_EXTRA_POOL_HITS] = bufferPoolHitCount;
+      gpuRpcCounts[STATS_EXTRA_POOL_MISSES] = bufferPoolMissCount;
+      gpuRpcCounts[STATS_EXTRA_BG_CACHE_HITS] = bindGroupCacheHits;
+      gpuRpcCounts[STATS_EXTRA_BG_CACHE_MISSES] = bindGroupCacheMisses;
+      gpuRpcCounts[STATS_EXTRA_UNIFORM_HOT_HITS] = uniformHotHits;
+      gpuRpcCounts[STATS_EXTRA_UNIFORM_HOT_MISSES] = uniformHotMisses;
+      gpuRpcCounts[STATS_EXTRA_SPIN_HITS] = spinHitTotal;
+      gpuRpcCounts[STATS_EXTRA_SPIN_MISSES] = spinMissTotal;
+      gpuRpcCounts[STATS_EXTRA_SPIN_BUDGET] = spinDispatchBudget;
       if (statsU32) {
         // Flat copy into the dedicated stats SAB — no region math. Both
         // arrays are sized to STATS_OPCODE_SLOTS.

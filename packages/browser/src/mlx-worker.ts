@@ -26,7 +26,7 @@ TextDecoder.prototype.decode = function (input?: BufferSource | null, options?: 
 import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
 import { CMD_OFFSET, READBACK_BUFFER_SIZE, DISPATCH_BATCH_BUFFER_SIZE, STATS_BUFFER_SIZE } from './rpc-protocol.js';
-import { parseSafeTensorsHeader, dtypeToCode } from './safetensors.js';
+import { parseSafeTensorsHeader, dtypeToCode, type TensorInfo } from './safetensors.js';
 import {
   createBridgeStub,
   POOL_STATS_SIZE_BYTES,
@@ -41,6 +41,130 @@ let cppTag: any = null;
 let wasmMemory: WebAssembly.Memory | null = null;
 let wasmMalloc: ((size: number) => number) | null = null;
 let wasmFree: ((ptr: number) => void) | null = null;
+
+// GPU-buffer import currently wraps JS-created WGPUBuffer handles before Rust
+// builds Linear::weight_t transpose views. Until packed-bf16 metadata is proven
+// to survive that path end-to-end, keep JS-side packed weight upload disabled:
+// otherwise raw bf16 pairs can be read by normal f32 kernels and corrupt logits.
+const PACKED_GPU_WEIGHT_UPLOAD_ENABLED = false;
+
+type UploadTensorInfo = TensorInfo & { fromMerged?: boolean };
+
+function buildMergedLinearAttentionTensors(tensors: TensorInfo[], weights: Uint8Array, dataOffset: number): {
+  tensors: UploadTensorInfo[];
+  mergedSab?: SharedArrayBuffer;
+  mergedCount: number;
+} {
+  const byName = new Map<string, TensorInfo>();
+  for (const tensor of tensors) byName.set(tensor.name, tensor);
+
+  const consumed = new Set<string>();
+  const merged: UploadTensorInfo[] = [];
+  const mergedChunks: Uint8Array[] = [];
+  let mergedBytes = 0;
+
+  const tryMergePair = (leftSuffix: string, rightSuffix: string, mergedSuffix: string) => {
+    for (const left of tensors) {
+      if (!left.name.endsWith(leftSuffix) || consumed.has(left.name)) continue;
+      const prefix = left.name.slice(0, -leftSuffix.length);
+      const right = byName.get(`${prefix}${rightSuffix}`);
+      if (!right || consumed.has(right.name)) continue;
+      if (left.dtype !== right.dtype || left.shape.length !== right.shape.length) continue;
+      let compatible = true;
+      for (let i = 1; i < left.shape.length; i++) {
+        if (left.shape[i] !== right.shape[i]) {
+          compatible = false;
+          break;
+        }
+      }
+      if (!compatible) continue;
+
+      const byteOffset = mergedBytes;
+      const byteSize = left.byteSize + right.byteSize;
+      const shape = [left.shape[0] + right.shape[0], ...left.shape.slice(1)];
+      const chunk = new Uint8Array(byteSize);
+      chunk.set(new Uint8Array(weights.buffer, dataOffset + left.byteOffset, left.byteSize), 0);
+      chunk.set(new Uint8Array(weights.buffer, dataOffset + right.byteOffset, right.byteSize), left.byteSize);
+      mergedChunks.push(chunk);
+      mergedBytes += byteSize;
+      consumed.add(left.name);
+      consumed.add(right.name);
+      merged.push({
+        name: `${prefix}${mergedSuffix}`,
+        dtype: left.dtype,
+        shape,
+        byteOffset,
+        byteSize,
+        fromMerged: true,
+      });
+    }
+  };
+
+  for (const suffix of ['weight', 'scales', 'biases']) {
+    tryMergePair(`.linear_attn.in_proj_qkv.${suffix}`, `.linear_attn.in_proj_z.${suffix}`, `.linear_attn.in_proj_qkvz.${suffix}`);
+    tryMergePair(`.linear_attn.in_proj_b.${suffix}`, `.linear_attn.in_proj_a.${suffix}`, `.linear_attn.in_proj_ba.${suffix}`);
+  }
+
+  const uploadTensors: UploadTensorInfo[] = tensors.filter((tensor) => !consumed.has(tensor.name));
+  uploadTensors.push(...merged);
+  if (mergedBytes === 0) return { tensors: uploadTensors, mergedCount: 0 };
+
+  const mergedSab = new SharedArrayBuffer(mergedBytes);
+  const mergedView = new Uint8Array(mergedSab);
+  let cursor = 0;
+  for (const chunk of mergedChunks) {
+    mergedView.set(chunk, cursor);
+    cursor += chunk.byteLength;
+  }
+  return { tensors: uploadTensors, mergedSab, mergedCount: merged.length };
+}
+
+function uploadWeightsToGpu(
+  gpuWorker: Worker,
+  weightsSab: SharedArrayBuffer,
+  dataOffset: number,
+  tensors: UploadTensorInfo[],
+  mergedSab: SharedArrayBuffer | undefined,
+  packBf16: boolean,
+): Promise<{
+  handles: number[];
+  uploadedDtypes: string[];
+  uploadedByteSizes: number[];
+  packedBf16Flags: boolean[];
+  debugPackedTotal?: number;
+  debugUnpackedBf16Total?: number;
+}> {
+  return new Promise((resolve, reject) => {
+    const onMessage = (ev: MessageEvent) => {
+      const msg = ev.data;
+      if (msg?.type === 'weights_uploaded') {
+        cleanup();
+        resolve(msg);
+      } else if (msg?.type === 'error' || msg?.type === 'rpc-error') {
+        cleanup();
+        reject(new Error(msg.message || 'GPU weight upload failed'));
+      }
+    };
+    const onError = (ev: ErrorEvent) => {
+      cleanup();
+      reject(new Error(ev.message || 'GPU worker error during weight upload'));
+    };
+    const cleanup = () => {
+      gpuWorker.removeEventListener('message', onMessage);
+      gpuWorker.removeEventListener('error', onError);
+    };
+    gpuWorker.addEventListener('message', onMessage);
+    gpuWorker.addEventListener('error', onError);
+    gpuWorker.postMessage({
+      type: 'upload_weights',
+      weightsSab,
+      mergedSab,
+      dataOffset,
+      tensors,
+      packBf16,
+    });
+  });
+}
 
 // Phase 0 (?profile=1) state. When enabled, handleChat* wraps each
 // generation with a reset + readback of:
@@ -74,29 +198,29 @@ async function handleInit(data: {
   const sdpaFallback = data.sdpaFallback === true;
   profileEnabled = data.profile === true;
   const dispatchBatch = data.dispatchBatch === true;
-  // Phase 6b: SwiGLU MLP compile fast path. Default OFF; enable via
-  // ?compile_mlp=1 on the demo URL. Plumbed through handleInit so the
+  // Phase 6b: SwiGLU MLP compile fast path. Default ON; disable via
+  // ?compile_mlp=0 on the demo URL. Plumbed through handleInit so the
   // backend flag flips BEFORE any model forward pass runs.
-  const compileMlp = data.compileMlp === true;
-  // Phase 6c: GDN pre-recurrence compile fast path. Default OFF; enable
-  // via ?compile_gdn_pre=1 on the demo URL. Same plumbing pattern as the
+  const compileMlp = data.compileMlp !== false;
+  // Phase 6c: GDN pre-recurrence compile fast path. Default ON; disable
+  // via ?compile_gdn_pre=0 on the demo URL. Same plumbing pattern as the
   // Phase 6b MLP flag — process-wide atomic flipped before any model
   // forward pass runs.
-  const compileGdnPre = data.compileGdnPre === true;
-  // Phase 6d: GDN post-recurrence compile fast path. Default OFF; enable
-  // via ?compile_gdn_post=1 on the demo URL. Same pattern as 6b/6c —
+  const compileGdnPre = data.compileGdnPre !== false;
+  // Phase 6d: GDN post-recurrence compile fast path. Default ON; disable
+  // via ?compile_gdn_post=0 on the demo URL. Same pattern as 6b/6c —
   // process-wide atomic flipped before any forward pass runs.
-  const compileGdnPost = data.compileGdnPost === true;
-  // Phase 6e: GDN decay-gate (compute_g) compile fast path. Default OFF;
-  // enable via ?compile_gdn_g=1 on the demo URL. Same pattern as
+  const compileGdnPost = data.compileGdnPost !== false;
+  // Phase 6e: GDN decay-gate (compute_g) compile fast path. Default ON;
+  // disable via ?compile_gdn_g=0 on the demo URL. Same pattern as
   // 6b/6c/6d — process-wide atomic flipped before any forward pass runs.
-  const compileGdnG = data.compileGdnG === true;
+  const compileGdnG = data.compileGdnG !== false;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
     post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
     const cmdBuffer = new SharedArrayBuffer(CMD_OFFSET.TOTAL);
     const readbackBuffer = new SharedArrayBuffer(READBACK_BUFFER_SIZE);
-    const poolStatsBuffer = new SharedArrayBuffer(POOL_STATS_SIZE_BYTES);
+    const poolStatsBuffer = profileEnabled ? new SharedArrayBuffer(POOL_STATS_SIZE_BYTES) : undefined;
     // Phase 2: dedicated dispatch-batch SABs — one per worker (main + up to
     // asyncWorkPoolSize child workers). Each worker gets its own SAB so
     // DISPATCH_BATCH can be safely enabled on child pthread workers without
@@ -123,7 +247,7 @@ async function handleInit(data: {
     // single-slot and a fused dispatch would silently lose its UNIFORM_DATA
     // bytes). Plumbed into both the gpu-worker init message and every
     // createBridgeStub call so main + child workers share the same view.
-    const statsBuffer = new SharedArrayBuffer(STATS_BUFFER_SIZE);
+    const statsBuffer = profileEnabled ? new SharedArrayBuffer(STATS_BUFFER_SIZE) : undefined;
     // WASM module requires min 1002 pages (~66 MB). We use 4096 (~268 MB)
     // for headroom during WASM init (thread stacks, emnapi, etc.) and let
     // memory.grow expand as needed — keeps total well under the 2 GB JS
@@ -170,9 +294,9 @@ async function handleInit(data: {
       poolStatsBuffer,
       dispatchBatchBuffer,
       dispatchBatch,
+      0, // batchBufferId = 0 for main worker
       bufferMetadataBuffer,
       statsBuffer,
-      0, // batchBufferId = 0 for main worker
     );
     // Retain for ?profile=1 readback (resetBridgeStats / fetchGpuWorkerStats
     // need the same BridgeStub instance that owns the SAB cmdBuffer view).
@@ -254,7 +378,7 @@ async function handleInit(data: {
           poolStatsBuffer,
           dispatchBatchBuffer: workerBatchBuffer,
           batchBufferId: workerBatchIndex,
-          dispatchBatch: true, // enable batching on child workers
+          dispatchBatch,
           bufferMetadataBuffer,
           statsBuffer,
           handles: {
@@ -315,26 +439,25 @@ async function handleInit(data: {
     // Phase 6b SwiGLU MLP compile fast path. The setter flips a process-wide
     // std::atomic<bool> in mlx_fused_ops.cpp so the next call to
     // mlx_swiglu_mlp_forward routes the element-wise tail through
-    // mlx::core::compile. Default OFF — enable via ?compile_mlp=1 on the
-    // demo URL.
+    // mlx::core::compile. Default ON; disable via ?compile_mlp=0.
     if (typeof mlxExports.wgpuSetSwigluCompileEnabled === 'function') {
       mlxExports.wgpuSetSwigluCompileEnabled(compileMlp);
     }
     // Phase 6c GDN pre-recurrence compile fast path. Same pattern as Phase
     // 6b — process-wide atomic flag, flipped before any model forward pass
-    // runs. Default OFF; enable via ?compile_gdn_pre=1 on the demo URL.
+    // runs. Default ON; disable via ?compile_gdn_pre=0.
     if (typeof mlxExports.wgpuSetGdnPreCompileEnabled === 'function') {
       mlxExports.wgpuSetGdnPreCompileEnabled(compileGdnPre);
     }
     // Phase 6d GDN post-recurrence compile fast path. Same pattern as
     // Phase 6b/6c — process-wide atomic flag, flipped before any forward
-    // pass runs. Default OFF; enable via ?compile_gdn_post=1 on the demo URL.
+    // pass runs. Default ON; disable via ?compile_gdn_post=0.
     if (typeof mlxExports.wgpuSetGdnPostCompileEnabled === 'function') {
       mlxExports.wgpuSetGdnPostCompileEnabled(compileGdnPost);
     }
     // Phase 6e GDN decay-gate (compute_g) compile fast path. Same pattern
     // as 6b/6c/6d — process-wide atomic flag, flipped before any forward
-    // pass runs. Default OFF; enable via ?compile_gdn_g=1 on the demo URL.
+    // pass runs. Default ON; disable via ?compile_gdn_g=0.
     if (typeof mlxExports.wgpuSetGdnGCompileEnabled === 'function') {
       mlxExports.wgpuSetGdnGCompileEnabled(compileGdnG);
     }
@@ -386,21 +509,18 @@ async function handleInit(data: {
       }
     }
 
-    const weightsBuffer = new Uint8Array(loaded);
+    const weightsSab = new SharedArrayBuffer(loaded);
+    const weightsBuffer = new Uint8Array(weightsSab);
     let offset = 0;
     for (const chunk of chunks) {
       weightsBuffer.set(chunk, offset);
       offset += chunk.length;
     }
 
-    // 4. Per-tensor CPU data path
-    //
-    // For each tensor: malloc small WASM buffer → copy bytes → call addCpuTensor
-    // (Rust creates MLX array, C++ copies data) → free WASM buffer immediately.
-    //
-    // This keeps peak WASM pointer well under 2 GB (only one tensor buffer
-    // alive at a time), avoiding the i32 offset overflow that kills bulk loading.
-    // After all tensors, buildModelFromCpuTensors drains the Rust accumulator.
+    // 4. Parse safetensors and build the model. Prefer the GPU-buffer path:
+    // JS uploads raw weights directly into WebGPU buffers, then Rust wraps the
+    // handles with loadFromGpuBuffers. This is the only active load path that
+    // can preserve PackedBf16 storage for decode weights.
     post({ type: 'progress', step: 'init_model', message: 'Parsing safetensors header...' });
     wasmMalloc = wasmInst!.exports.malloc as (size: number) => number;
     wasmFree = wasmInst!.exports.free as (ptr: number) => void;
@@ -408,48 +528,102 @@ async function handleInit(data: {
     const localWasmFree = wasmFree;
 
     const { tensors, dataOffset } = parseSafeTensorsHeader(weightsBuffer.buffer);
-    post({ type: 'log', message: `[CPU] Parsed ${tensors.length} tensors, dataOffset=${dataOffset}` });
+    post({ type: 'log', message: `[MODEL] Parsed ${tensors.length} tensors, dataOffset=${dataOffset}` });
 
     const Qwen35Model = mlxExports.Qwen35Model || mlxExports.Qwen3_5Model;
 
-    // Store config + tokenizer in Rust BEFORE tensor accumulation.
-    // Must happen while WASM memory is still small to avoid emnapi DataView
-    // bounds errors (the ~5.7 MB tokenizer JSON triggers memory writes that
-    // fail if emnapi's DataView is stale after memory.grow).
-    Qwen35Model.setCpuModelConfig(configJson, tokenizerJson, tokenizerConfigJson ?? null);
-
-    post({ type: 'progress', step: 'init_model', message: `Loading ${tensors.length} tensors...` });
-    for (let i = 0; i < tensors.length; i++) {
-      const t = tensors[i];
-      if (t.byteSize === 0) continue;
-
-      // Malloc a small WASM buffer for this single tensor
-      const ptr = localWasmMalloc(t.byteSize);
-      if (ptr === 0) {
-        throw new Error(`Failed to malloc ${t.byteSize} bytes for tensor "${t.name}" (${i}/${tensors.length})`);
+    if (typeof Qwen35Model.loadFromGpuBuffers === 'function') {
+      const prepared = buildMergedLinearAttentionTensors(tensors, weightsBuffer, dataOffset);
+      post({
+        type: 'progress',
+        step: 'init_model',
+        message: `Uploading ${prepared.tensors.length} GPU tensors${prepared.mergedCount ? ` (${prepared.mergedCount} merged)` : ''}...`,
+      });
+      const uploadPackedBf16 = packBf16 && PACKED_GPU_WEIGHT_UPLOAD_ENABLED;
+      if (packBf16 && !uploadPackedBf16) {
+        post({
+          type: 'log',
+          message: '[GPU] Packed bf16 GPU-buffer upload disabled for correctness; using f32-expanded weights',
+        });
       }
-      const uptr = ptr >>> 0;
-
-      // Copy tensor bytes from download buffer into WASM memory
-      // Re-create view each iteration (memory.grow may have changed bounds)
-      const src = new Uint8Array(weightsBuffer.buffer, dataOffset + t.byteOffset, t.byteSize);
-      new Uint8Array(sharedMemory.buffer).set(src, uptr);
-
-      // Create MLX array in Rust (C++ copies from pointer) then free WASM buffer
-      Qwen35Model.addCpuTensor(t.name, uptr, t.byteSize, t.shape, dtypeToCode(t.dtype));
-      localWasmFree(ptr);
-
-      if (i % 50 === 0) {
-        post({ type: 'progress', step: 'init_model', message: `Loaded ${i}/${tensors.length} tensors...` });
+      const uploaded = await uploadWeightsToGpu(
+        gpuWorker,
+        weightsSab,
+        dataOffset,
+        prepared.tensors,
+        prepared.mergedSab,
+        uploadPackedBf16,
+      );
+      if (uploaded.handles.length !== prepared.tensors.length) {
+        throw new Error(`GPU upload returned ${uploaded.handles.length} handles for ${prepared.tensors.length} tensors`);
       }
+      const gpuTensors = prepared.tensors.map((tensor, i) => ({
+        name: tensor.name,
+        handle: uploaded.handles[i],
+        dtypeCode: dtypeToCode(uploaded.uploadedDtypes[i] ?? tensor.dtype),
+        shape: tensor.shape,
+        byteSize: uploaded.uploadedByteSizes[i] ?? tensor.byteSize,
+        packedBf16: uploaded.packedBf16Flags[i] === true,
+      }));
+      post({
+        type: 'log',
+        message:
+          `[GPU] Uploaded ${gpuTensors.length} tensors` +
+          ` packed=${uploaded.debugPackedTotal ?? 0}` +
+          ` unpacked_bf16=${uploaded.debugUnpackedBf16Total ?? 0}`,
+      });
+
+      post({ type: 'progress', step: 'init_model', message: 'Building model from GPU buffers...' });
+      const t1 = performance.now();
+      model = await Qwen35Model.loadFromGpuBuffers(
+        configJson,
+        gpuTensors,
+        tokenizerJson,
+        tokenizerConfigJson ?? null,
+      );
+      post({ type: 'progress', step: 'init_model', message: `Model ready (${(performance.now() - t1).toFixed(0)}ms)` });
+    } else {
+      // Fallback per-tensor CPU data path. For each tensor: malloc small WASM
+      // buffer → copy bytes → call addCpuTensor (Rust creates MLX array, C++
+      // copies data) → free WASM buffer immediately.
+      //
+      // This keeps peak WASM pointer under 2 GB, avoiding the i32 offset
+      // overflow that kills bulk CPU loading.
+      post({ type: 'log', message: '[CPU] loadFromGpuBuffers unavailable; using CPU tensor path' });
+      // Store config + tokenizer in Rust BEFORE tensor accumulation.
+      // Must happen while WASM memory is still small to avoid emnapi DataView
+      // bounds errors (the ~5.7 MB tokenizer JSON triggers memory writes that
+      // fail if emnapi's DataView is stale after memory.grow).
+      Qwen35Model.setCpuModelConfig(configJson, tokenizerJson, tokenizerConfigJson ?? null);
+
+      post({ type: 'progress', step: 'init_model', message: `Loading ${tensors.length} tensors...` });
+      for (let i = 0; i < tensors.length; i++) {
+        const t = tensors[i];
+        if (t.byteSize === 0) continue;
+
+        const ptr = localWasmMalloc(t.byteSize);
+        if (ptr === 0) {
+          throw new Error(`Failed to malloc ${t.byteSize} bytes for tensor "${t.name}" (${i}/${tensors.length})`);
+        }
+        const uptr = ptr >>> 0;
+
+        const src = new Uint8Array(weightsBuffer.buffer, dataOffset + t.byteOffset, t.byteSize);
+        new Uint8Array(sharedMemory.buffer).set(src, uptr);
+
+        Qwen35Model.addCpuTensor(t.name, uptr, t.byteSize, t.shape, dtypeToCode(t.dtype));
+        localWasmFree(ptr);
+
+        if (i % 50 === 0) {
+          post({ type: 'progress', step: 'init_model', message: `Loaded ${i}/${tensors.length} tensors...` });
+        }
+      }
+      post({ type: 'log', message: `[CPU] All ${tensors.length} tensors accumulated in Rust` });
+
+      post({ type: 'progress', step: 'init_model', message: 'Building model...' });
+      const t1 = performance.now();
+      model = await Qwen35Model.buildModelFromCpuTensors();
+      post({ type: 'progress', step: 'init_model', message: `Model ready (${(performance.now() - t1).toFixed(0)}ms)` });
     }
-    post({ type: 'log', message: `[CPU] All ${tensors.length} tensors accumulated in Rust` });
-
-    // Build model from accumulated tensors (config already stored pre-loop)
-    post({ type: 'progress', step: 'init_model', message: 'Building model...' });
-    const t1 = performance.now();
-    model = await Qwen35Model.buildModelFromCpuTensors();
-    post({ type: 'progress', step: 'init_model', message: `Model ready (${(performance.now() - t1).toFixed(0)}ms)` });
 
     // 6. Pipeline warmup — first inference warms GPU pipelines + shader compilation
     post({ type: 'progress', step: 'warmup', message: 'Warming up...' });

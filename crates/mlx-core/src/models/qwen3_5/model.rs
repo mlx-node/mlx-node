@@ -4736,19 +4736,38 @@ impl Qwen3_5Model {
     /// fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
     /// WASM linear memory.
     #[napi]
-    pub async fn load_from_gpu_buffers(
+    pub fn load_from_gpu_buffers<'env>(
+        env: &'env Env,
         config_json: String,
         gpu_tensors: Vec<persistence::GpuTensorInfo>,
         tokenizer_json: String,
         tokenizer_config_json: Option<String>,
-    ) -> Result<Qwen3_5Model> {
-        persistence::load_from_gpu_buffers(
+    ) -> Result<PromiseRaw<'env, Qwen3_5Model>> {
+        let inner = persistence::build_model_inner_from_gpu_buffers(
             &config_json,
             gpu_tensors,
             &tokenizer_json,
             tokenizer_config_json.as_deref(),
-        )
-        .await
+        )?;
+
+        let model_id = inner.model_id;
+        let config_out = inner.config.clone();
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+            move || Ok((inner, (config_out.clone(), model_id))),
+            handle_qwen35_cmd,
+        );
+
+        env.spawn_future(async move {
+            let (config_final, model_id_final) = init_rx.await.map_err(|_| {
+                napi::Error::from_reason("Model thread exited during GPU buffer load")
+            })??;
+
+            Ok(Qwen3_5Model {
+                thread,
+                config: config_final,
+                model_id: model_id_final,
+            })
+        })
     }
 
     /// Store config and tokenizer strings before tensor accumulation begins.

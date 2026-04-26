@@ -24,6 +24,15 @@ import {
   MAX_RELEASE_BATCH,
   STATS_OPCODE_SLOTS,
   STATS_BUFFER_SIZE,
+  STATS_EXTRA_POOL_HITS,
+  STATS_EXTRA_POOL_MISSES,
+  STATS_EXTRA_BG_CACHE_HITS,
+  STATS_EXTRA_BG_CACHE_MISSES,
+  STATS_EXTRA_UNIFORM_HOT_HITS,
+  STATS_EXTRA_UNIFORM_HOT_MISSES,
+  STATS_EXTRA_SPIN_HITS,
+  STATS_EXTRA_SPIN_MISSES,
+  STATS_EXTRA_SPIN_BUDGET,
   DISPATCH_BATCH_BUFFER_SIZE,
   MAX_DISPATCH_BATCH,
   MAX_DISPATCH_BATCH_ENTRIES,
@@ -52,7 +61,7 @@ export interface BridgeStats {
   diagReleaseUnknownHandle: number;
   /** DIAG: release rejected by isPoolable (fake handle, MAP_* usage). */
   diagReleaseUnpoolable: number;
-  /** DIAG: total FUSED_DISPATCH_WITH_UNIFORM calls that reached the batch gate. */
+  /** DIAG: total FUSED_* dispatch calls that reached the batch gate. */
   diagBatchAttempt: number;
   /** DIAG: dispatches successfully staged into DISPATCH_BATCH. */
   diagBatchStaged: number;
@@ -115,7 +124,7 @@ export interface BridgeStub {
   fetchGpuWorkerStats(resetAfter: boolean): GpuWorkerStats;
 }
 
-// Shared pool-stats SAB layout: 10 u32 slots (all Atomics.add).
+// Shared pool/batch-stats SAB layout (all Atomics.add).
 //   0: poolHits
 //   1: poolMisses
 //   2: diagCreateAll
@@ -125,8 +134,11 @@ export interface BridgeStub {
 //   6: diagReleaseUnknownHandle
 //   7: diagReleaseUnpoolable
 //   8: diagPoolEvictions
-//   9: reserved
-export const POOL_STATS_SLOTS = 10;
+//   9: diagBatchAttempt
+//  10: diagBatchStaged
+//  11: diagBatchDeferredBlock
+//  12: diagBatchStageRefused
+export const POOL_STATS_SLOTS = 13;
 export const POOL_STATS_SIZE_BYTES = POOL_STATS_SLOTS * 4;
 
 // Task 3: Shared buffer metadata SAB, indexed by real (gpu-worker) handle.
@@ -396,6 +408,10 @@ export function createBridgeStub(
   const POOL_STAT_RELEASE_UNKNOWN = 6;
   const POOL_STAT_RELEASE_UNPOOLABLE = 7;
   const POOL_STAT_EVICTIONS = 8;
+  const POOL_STAT_BATCH_ATTEMPT = 9;
+  const POOL_STAT_BATCH_STAGED = 10;
+  const POOL_STAT_BATCH_DEFERRED_BLOCK = 11;
+  const POOL_STAT_BATCH_STAGE_REFUSED = 12;
   function bumpPoolStat(slot: number): void {
     if (poolStatsArr) Atomics.add(poolStatsArr, slot, 1);
   }
@@ -619,6 +635,22 @@ export function createBridgeStub(
   let diagBatchStaged = 0;
   let diagBatchDeferredBlock = 0;
   let diagBatchStageRefused = 0;
+  function bumpBatchAttempt(): void {
+    diagBatchAttempt++;
+    bumpPoolStat(POOL_STAT_BATCH_ATTEMPT);
+  }
+  function bumpBatchStaged(): void {
+    diagBatchStaged++;
+    bumpPoolStat(POOL_STAT_BATCH_STAGED);
+  }
+  function bumpBatchDeferredBlock(): void {
+    diagBatchDeferredBlock++;
+    bumpPoolStat(POOL_STAT_BATCH_DEFERRED_BLOCK);
+  }
+  function bumpBatchStageRefused(): void {
+    diagBatchStageRefused++;
+    bumpPoolStat(POOL_STAT_BATCH_STAGE_REFUSED);
+  }
 
   function flushDispatchBatchInner(): void {
     if (batchCount === 0) return;
@@ -651,6 +683,35 @@ export function createBridgeStub(
     const uniformSize =
       opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM ? cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] >>> 0 : 0;
     if (uniformSize > MAX_DISPATCH_BATCH_UNIFORM) return false;
+
+    // Capture all dispatch args BEFORE any flush that could overwrite cmdBuffer.
+    // The shared cmd SAB is single-slot; rpcCall inside flushDispatchBatchInner
+    // clobbers ARG0..ARG6 and CB_COUNT, so we must snapshot them now.
+    const passHandle = cmdU32[I_ARG0] >>> 0;
+    const pipelineHandle = cmdU32[I_ARG0 + 1] >>> 0;
+    const layoutHandle = cmdU32[I_ARG0 + 2] >>> 0;
+    const x = cmdU32[I_ARG0 + 3] >>> 0;
+    const y = cmdU32[I_ARG0 + 4] >>> 0;
+    const z = cmdU32[I_ARG0 + 5] >>> 0;
+    const uniformEntryIdx = opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM ? cmdU32[I_ARG0 + 6] >>> 0 : 0;
+
+    // Copy entries into a local array before flush — rpcCall clears CB_COUNT
+    // and another worker could overwrite the entry region during the yield.
+    const entries = new Uint32Array(entryCount * 3);
+    for (let i = 0; i < entryCount; i++) {
+      const src = I_CB_BASE + i * 3;
+      entries[i * 3] = cmdU32[src] >>> 0;
+      entries[i * 3 + 1] = cmdU32[src + 1] >>> 0;
+      entries[i * 3 + 2] = cmdU32[src + 2] >>> 0;
+    }
+
+    // Copy uniform data into a local buffer before flush.
+    let uniformData: Uint8Array | null = null;
+    if (uniformSize > 0) {
+      uniformData = new Uint8Array(uniformSize);
+      uniformData.set(new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformSize));
+    }
+
     const uniformPadded = (uniformSize + 3) & ~3;
     const recordSize = DISPATCH_BATCH_HEADER_BYTES + entryCount * 12 + uniformPadded;
     // Flush first if this record would overflow the batch SAB or exceed the
@@ -662,33 +723,28 @@ export function createBridgeStub(
     let cursor = batchBytes;
     const base = cursor >>> 2;
     batchU32[base + 0] = opcode >>> 0;
-    batchU32[base + 1] = cmdU32[I_ARG0] >>> 0; // passHandle
-    batchU32[base + 2] = cmdU32[I_ARG0 + 1] >>> 0; // pipelineHandle
-    batchU32[base + 3] = cmdU32[I_ARG0 + 2] >>> 0; // layoutHandle
-    batchU32[base + 4] = cmdU32[I_ARG0 + 3] >>> 0; // x
-    batchU32[base + 5] = cmdU32[I_ARG0 + 4] >>> 0; // y
-    batchU32[base + 6] = cmdU32[I_ARG0 + 5] >>> 0; // z
-    batchU32[base + 7] = opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM ? cmdU32[I_ARG0 + 6] >>> 0 : 0;
+    batchU32[base + 1] = passHandle;
+    batchU32[base + 2] = pipelineHandle;
+    batchU32[base + 3] = layoutHandle;
+    batchU32[base + 4] = x;
+    batchU32[base + 5] = y;
+    batchU32[base + 6] = z;
+    batchU32[base + 7] = uniformEntryIdx;
     batchU32[base + 8] = uniformSize;
     batchU32[base + 9] = entryCount;
     cursor += DISPATCH_BATCH_HEADER_BYTES;
     // Entries: (bufHandle, sizeLo, sizeHi) × entryCount
-    let entrySrc = I_CB_BASE;
     let entryDst = cursor >>> 2;
     for (let i = 0; i < entryCount; i++) {
-      batchU32[entryDst] = cmdU32[entrySrc] >>> 0;
-      batchU32[entryDst + 1] = cmdU32[entrySrc + 1] >>> 0;
-      batchU32[entryDst + 2] = cmdU32[entrySrc + 2] >>> 0;
-      entrySrc += 3;
+      batchU32[entryDst] = entries[i * 3];
+      batchU32[entryDst + 1] = entries[i * 3 + 1];
+      batchU32[entryDst + 2] = entries[i * 3 + 2];
       entryDst += 3;
     }
     cursor += entryCount * 12;
-    // Uniform data (raw bytes) — copy from cmdBuffer.UNIFORM_DATA into the
-    // batch buffer at the cursor. Pad up to 4-byte boundary for the next
-    // record header, but only emit the exact uniformSize back out on read.
-    if (uniformSize > 0) {
-      const src = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformSize);
-      batchU8.set(src, cursor);
+    // Uniform data (raw bytes) — copy from local snapshot into the batch buffer.
+    if (uniformData !== null) {
+      batchU8.set(uniformData, cursor);
       cursor += uniformSize;
       // Zero-pad the tail (optional but keeps the SAB deterministic for
       // debugging — the receiver only reads uniformSize bytes regardless).
@@ -1490,14 +1546,17 @@ export function createBridgeStub(
       const dstOff32 = Number(dstOffset);
       const size32 = Number(size);
 
-      if (
-        srcOffset <= 0xffffffff &&
-        dstOffset <= 0xffffffff &&
-        size <= 0xffffffff &&
-        activeComputePassEncoder === encoderHandle
-      ) {
+      if (srcOffset <= 0xffffffff && dstOffset <= 0xffffffff && size <= 0xffffffff) {
         // FUSED: end pass (if active) + copy + begin new pass = 1 RPC instead of 3-4
-        const passHandle = activeComputePass >= 0 ? activeComputePass : 0;
+        let passHandle = 0;
+        if (activeComputePass >= 0) {
+          if (activeComputePassEncoder === encoderHandle) {
+            passHandle = activeComputePass;
+          } else {
+            rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
+            rpcCall(RpcFn.COMPUTE_PASS_RELEASE, activeComputePass);
+          }
+        }
         const newPassHandle = rpcCall(
           RpcFn.FUSED_COPY_BUFFER,
           encoderHandle,
@@ -1709,12 +1768,12 @@ export function createBridgeStub(
             // Batching path: only safe when the call has NO return value
             // to consume (no deferred buffer creation that expects a new
             // handle back from the gpu-worker).
-            diagBatchAttempt++;
+            bumpBatchAttempt();
             if (!deferredInfo && stageDispatchBatchRecord(RpcFn.FUSED_DISPATCH_WITH_UNIFORM)) {
-              diagBatchStaged++;
+              bumpBatchStaged();
             } else {
-              if (deferredInfo) diagBatchDeferredBlock++;
-              else diagBatchStageRefused++;
+              if (deferredInfo) bumpBatchDeferredBlock();
+              else bumpBatchStageRefused();
               // Staging refused (e.g. entryCount > MAX_DISPATCH_BATCH_ENTRIES
               // or uniformSize > MAX_DISPATCH_BATCH_UNIFORM, or a deferred
               // buffer create expects a return value). Flush any pending
@@ -1792,7 +1851,11 @@ export function createBridgeStub(
             // FUSED_FULL_DISPATCH has no uniform data; ensure the size slot
             // is zero so any concurrent batch staging sees uniformSize=0.
             cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] = 0;
-            if (!stageDispatchBatchRecord(RpcFn.FUSED_FULL_DISPATCH)) {
+            bumpBatchAttempt();
+            if (stageDispatchBatchRecord(RpcFn.FUSED_FULL_DISPATCH)) {
+              bumpBatchStaged();
+            } else {
+              bumpBatchStageRefused();
               // Staging refused (e.g. entryCount > MAX_DISPATCH_BATCH_ENTRIES
               // or buffer overflow). Flush any pending batch
               // first so the fallback dispatch does NOT reorder ahead of
@@ -1818,14 +1881,19 @@ export function createBridgeStub(
 
     wgpuComputePassEncoderEnd(passHandle: number): void {
       flushPendingCompute();
-      // Don't actually end the pass — keep it alive for reuse.
-      // It will be ended when a different encoder creates a pass,
-      // or when the encoder is finished.
+      if (activeComputePass === passHandle) {
+        activeComputePass = -1;
+        activeComputePassEncoder = -1;
+      }
+      rpcCall(RpcFn.COMPUTE_PASS_END, passHandle);
     },
 
     wgpuComputePassEncoderRelease(handle: number): void {
-      // Don't release — the pass is being reused.
-      // It will be released when the encoder finishes.
+      if (activeComputePass === handle) {
+        activeComputePass = -1;
+        activeComputePassEncoder = -1;
+      }
+      rpcCall(RpcFn.COMPUTE_PASS_RELEASE, handle);
     },
 
     // ===== Buffer =====
@@ -2175,6 +2243,10 @@ export function createBridgeStub(
     let dRelAll = diagReleaseAll;
     let dRelUnk = diagReleaseUnknownHandle;
     let dRelUnp = diagReleaseUnpoolable;
+    let dBatchAttempt = diagBatchAttempt;
+    let dBatchStaged = diagBatchStaged;
+    let dBatchDeferredBlock = diagBatchDeferredBlock;
+    let dBatchStageRefused = diagBatchStageRefused;
     if (poolStatsArr) {
       ph = Atomics.load(poolStatsArr, POOL_STAT_HITS);
       pm = Atomics.load(poolStatsArr, POOL_STAT_MISSES);
@@ -2184,6 +2256,10 @@ export function createBridgeStub(
       dRelAll = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_ALL);
       dRelUnk = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_UNKNOWN);
       dRelUnp = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_UNPOOLABLE);
+      dBatchAttempt = Atomics.load(poolStatsArr, POOL_STAT_BATCH_ATTEMPT);
+      dBatchStaged = Atomics.load(poolStatsArr, POOL_STAT_BATCH_STAGED);
+      dBatchDeferredBlock = Atomics.load(poolStatsArr, POOL_STAT_BATCH_DEFERRED_BLOCK);
+      dBatchStageRefused = Atomics.load(poolStatsArr, POOL_STAT_BATCH_STAGE_REFUSED);
     }
     return {
       rpcCount: bridgeRpcCount,
@@ -2196,10 +2272,10 @@ export function createBridgeStub(
       diagReleaseAll: dRelAll,
       diagReleaseUnknownHandle: dRelUnk,
       diagReleaseUnpoolable: dRelUnp,
-      diagBatchAttempt,
-      diagBatchStaged,
-      diagBatchDeferredBlock,
-      diagBatchStageRefused,
+      diagBatchAttempt: dBatchAttempt,
+      diagBatchStaged: dBatchStaged,
+      diagBatchDeferredBlock: dBatchDeferredBlock,
+      diagBatchStageRefused: dBatchStageRefused,
       poisonedRpcCount,
     };
   }
@@ -2238,29 +2314,27 @@ export function createBridgeStub(
         if (v > 0) byFn[i] = v;
       }
     }
-    // Smuggled counters living above the real RpcFn opcode range. They
-    // share the stats SAB with actual opcode histograms but correspond to
-    // no RpcFn — pull them out and surface on the returned record so the
-    // demo doesn't render phantom opcodes.
-    const gpuPoolHits = byFn[100] ?? 0;
-    const gpuPoolMisses = byFn[101] ?? 0;
-    const bindGroupCacheHits = byFn[102] ?? 0;
-    const bindGroupCacheMisses = byFn[103] ?? 0;
-    const uniformHotHits = byFn[104] ?? 0;
-    const uniformHotMisses = byFn[105] ?? 0;
-    // P6: spin hit/miss + current adaptive budget live in slots 106-108.
-    const spinHits = byFn[106] ?? 0;
-    const spinMisses = byFn[107] ?? 0;
-    const spinBudget = byFn[108] ?? 0;
-    delete byFn[100];
-    delete byFn[101];
-    delete byFn[102];
-    delete byFn[103];
-    delete byFn[104];
-    delete byFn[105];
-    delete byFn[106];
-    delete byFn[107];
-    delete byFn[108];
+    // Synthetic counters live above the real RpcFn opcode range. Pull them
+    // out so the demo does not render phantom opcodes while preserving real
+    // opcode 102/103 counts.
+    const gpuPoolHits = byFn[STATS_EXTRA_POOL_HITS] ?? 0;
+    const gpuPoolMisses = byFn[STATS_EXTRA_POOL_MISSES] ?? 0;
+    const bindGroupCacheHits = byFn[STATS_EXTRA_BG_CACHE_HITS] ?? 0;
+    const bindGroupCacheMisses = byFn[STATS_EXTRA_BG_CACHE_MISSES] ?? 0;
+    const uniformHotHits = byFn[STATS_EXTRA_UNIFORM_HOT_HITS] ?? 0;
+    const uniformHotMisses = byFn[STATS_EXTRA_UNIFORM_HOT_MISSES] ?? 0;
+    const spinHits = byFn[STATS_EXTRA_SPIN_HITS] ?? 0;
+    const spinMisses = byFn[STATS_EXTRA_SPIN_MISSES] ?? 0;
+    const spinBudget = byFn[STATS_EXTRA_SPIN_BUDGET] ?? 0;
+    delete byFn[STATS_EXTRA_POOL_HITS];
+    delete byFn[STATS_EXTRA_POOL_MISSES];
+    delete byFn[STATS_EXTRA_BG_CACHE_HITS];
+    delete byFn[STATS_EXTRA_BG_CACHE_MISSES];
+    delete byFn[STATS_EXTRA_UNIFORM_HOT_HITS];
+    delete byFn[STATS_EXTRA_UNIFORM_HOT_MISSES];
+    delete byFn[STATS_EXTRA_SPIN_HITS];
+    delete byFn[STATS_EXTRA_SPIN_MISSES];
+    delete byFn[STATS_EXTRA_SPIN_BUDGET];
     return {
       totalRpcs,
       byFn,

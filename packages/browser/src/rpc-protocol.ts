@@ -145,8 +145,8 @@ export const enum RpcFn {
   //   ARG1: batchBytes    (cursor into the batch SAB, for optional bounds check)
   //   ARG2: batchBufferId (which worker's batch SAB to read from, default 0)
   // The per-record layout is described at DISPATCH_BATCH_RECORD_OFFSET below.
-  // Slots 100 and 101 in the stats histogram are already reserved for
-  // smuggled pool hit/miss counters, so DISPATCH_BATCH uses 103.
+  // Synthetic stats counters live in STATS_EXTRA_* slots, not in the RpcFn
+  // range, so DISPATCH_BATCH keeps a real histogram entry at 103.
   DISPATCH_BATCH = 103,
 }
 
@@ -201,11 +201,24 @@ export const DISPATCH_BATCH_MAX_RECORD_BYTES =
 // are a flat u32 array — no region math.
 //
 // Sizing: 256 u32 slots = 1024 bytes. Covers every RpcFn opcode (max 103)
-// plus the smuggled pool/cache/spin counters at 100..108 with headroom.
+// plus synthetic pool/cache/spin counters at 240..248 with headroom.
 // 4x the historical footprint, trivially cheap (one SAB allocation per
 // worker lifetime), and leaves room for future histogram additions.
 export const STATS_OPCODE_SLOTS = 256;
 export const STATS_BUFFER_SIZE = STATS_OPCODE_SLOTS * 4; // 1024 bytes
+
+// Synthetic GPU-worker stats. These intentionally sit well above the current
+// RpcFn range so profile readback does not overwrite or delete real opcodes
+// such as BUFFER_RELEASE_BATCH=102 and DISPATCH_BATCH=103.
+export const STATS_EXTRA_POOL_HITS = 240;
+export const STATS_EXTRA_POOL_MISSES = 241;
+export const STATS_EXTRA_BG_CACHE_HITS = 242;
+export const STATS_EXTRA_BG_CACHE_MISSES = 243;
+export const STATS_EXTRA_UNIFORM_HOT_HITS = 244;
+export const STATS_EXTRA_UNIFORM_HOT_MISSES = 245;
+export const STATS_EXTRA_SPIN_HITS = 246;
+export const STATS_EXTRA_SPIN_MISSES = 247;
+export const STATS_EXTRA_SPIN_BUDGET = 248;
 //
 // Legacy layout constants for the pre-JS-F010 cmd-SAB overlap path. They are
 // no longer used by gpu-worker / bridge-stub — kept as `deprecated` so any

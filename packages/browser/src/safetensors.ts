@@ -27,7 +27,7 @@ export interface ParsedSafeTensors {
 }
 
 /** Parse SafeTensors header without copying any tensor data */
-export function parseSafeTensorsHeader(buffer: ArrayBuffer): ParsedSafeTensors {
+export function parseSafeTensorsHeader(buffer: ArrayBufferLike): ParsedSafeTensors {
   const view = new DataView(buffer);
   const headerLen = Number(view.getBigUint64(0, true));
   const headerBytes = new Uint8Array(buffer, 8, headerLen);
@@ -87,7 +87,7 @@ export function dtypeToCode(dtype: string): number {
  * Returns a map of tensor name → GPU buffer handle (integer from the bridge).
  */
 export function createGPUBuffersFromSafeTensors(
-  buffer: ArrayBuffer,
+  buffer: ArrayBufferLike,
   device: GPUDevice,
   addHandle: (obj: GPUBuffer) => number,
 ): Map<string, { handle: number; dtype: string; shape: number[]; byteSize: number }> {

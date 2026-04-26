@@ -8,15 +8,27 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "dev": "vite",
+    "dev": "vite dev",
     "test": "vp test --config vitest.config.ts",
     "build": "echo 'TODO: build WASM + bundle'"
   },
   "dependencies": {
     "@napi-rs/wasm-runtime": "^1.1.2",
-    "buffer": "^6.0.3"
+    "buffer": "^6.0.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.11.0",
+    "radix-ui": "^1.4.3",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "tailwind-merge": "^3.5.0"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.2.4",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "tailwindcss": "^4.2.4",
     "typescript": "^5.7.0",
     "vite": "^6.3.0"
   }

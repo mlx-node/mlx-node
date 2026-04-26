@@ -1236,12 +1236,12 @@ fn dtype_from_code(code: i32) -> Result<DType> {
 ///
 /// The function is synchronous because WASM is single-threaded and the async
 /// machinery (emnapi worker pool) cannot yield during model init.
-pub async fn load_from_gpu_buffers(
+pub(crate) fn build_model_inner_from_gpu_buffers(
     config_json: &str,
     gpu_tensors: Vec<GpuTensorInfo>,
     tokenizer_json: &str,
     tokenizer_config_json: Option<&str>,
-) -> Result<Qwen3_5Model> {
+) -> Result<Qwen35Inner> {
     use mlx_sys as sys;
     use tokenizers::Tokenizer;
 
@@ -1371,12 +1371,24 @@ pub async fn load_from_gpu_buffers(
     // 8. Set tokenizer
     inner.set_tokenizer(Arc::new(tok));
 
-    info!("Qwen3.5 model loaded from GPU buffers successfully");
+    info!("Qwen3.5 inner model loaded from GPU buffers successfully");
+    Ok(inner)
+}
 
-    // 9. Spawn model thread
+pub async fn load_from_gpu_buffers(
+    config_json: &str,
+    gpu_tensors: Vec<GpuTensorInfo>,
+    tokenizer_json: &str,
+    tokenizer_config_json: Option<&str>,
+) -> Result<Qwen3_5Model> {
+    let inner = build_model_inner_from_gpu_buffers(
+        config_json,
+        gpu_tensors,
+        tokenizer_json,
+        tokenizer_config_json,
+    )?;
     let model_id = inner.model_id;
     let config_out = inner.config.clone();
-
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
         move || Ok((inner, (config_out.clone(), model_id))),
         handle_qwen35_cmd,

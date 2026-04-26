@@ -35,9 +35,9 @@ const handler = new MessageHandler({
       rpcConfig.poolStatsBuffer, // may be undefined — guarded in stub
       rpcConfig.dispatchBatchBuffer, // Phase 2 — may be undefined
       rpcConfig.dispatchBatch === true,
+      rpcConfig.batchBufferId ?? 0, // Phase 2b — per-worker batch buffer ID
       rpcConfig.bufferMetadataBuffer, // Task 3 — shared (size, usage) table
       rpcConfig.statsBuffer, // JS-F010 — shared GET_STATS histogram SAB
-      rpcConfig.batchBufferId ?? 0, // Phase 2b — per-worker batch buffer ID
     );
 
     const wasi = new WASI({
