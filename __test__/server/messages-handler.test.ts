@@ -1,6 +1,6 @@
 import type { ServerResponse } from 'node:http';
 
-import type { ChatResult, ToolCallResult } from '@mlx-node/core';
+import type { ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
 import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
@@ -2632,6 +2632,33 @@ describe('handleCreateMessage', () => {
         // we never accidentally took the hot path.
         expect(chatSessionStart).toHaveBeenCalledTimes(3);
 
+        // Transcript witness: each turn must dispatch the FULL mapped
+        // history through `chatSessionStart`, not just the trailing
+        // user message. `ChatSession.startFromHistory` calls
+        // `model.chatSessionStart(this.history.slice(), config)` after
+        // `primeHistory(messages)` deep-copies the messages array, so
+        // `mock.calls[i][0]` is the exact history seeded on turn i. A
+        // regression where the handler primed only `[lastUser]` (or
+        // dropped intermediate assistant turns, or otherwise corrupted
+        // the full-history append) would still pass identity / reset /
+        // cachedTokens checks but break this transcript gate.
+        const turn1Messages = chatSessionStart.mock.calls[0]![0] as ChatMessage[];
+        expect(turn1Messages).toEqual([{ role: 'user', content: 'A' }]);
+        const turn2Messages = chatSessionStart.mock.calls[1]![0] as ChatMessage[];
+        expect(turn2Messages).toEqual([
+          { role: 'user', content: 'A' },
+          { role: 'assistant', content: 'A1' },
+          { role: 'user', content: 'B' },
+        ]);
+        const turn3Messages = chatSessionStart.mock.calls[2]![0] as ChatMessage[];
+        expect(turn3Messages).toEqual([
+          { role: 'user', content: 'A' },
+          { role: 'assistant', content: 'A1' },
+          { role: 'user', content: 'B' },
+          { role: 'assistant', content: 'A2' },
+          { role: 'user', content: 'C' },
+        ]);
+
         // Identity witness check: `primeHistory` ran three times, all
         // bound to the SAME ChatSession instance. A regression where
         // `getOrCreateWarmAny` returned `{ session: <fresh>, hit: true }`
@@ -2753,6 +2780,33 @@ describe('handleCreateMessage', () => {
         // All three turns dispatched through the streaming cold-start
         // entry point.
         expect(stream1).toHaveBeenCalledTimes(3);
+
+        // Transcript witness: same as the non-streaming sibling — each
+        // turn must dispatch the FULL mapped history through
+        // `chatStreamSessionStart`, not just the trailing user message.
+        // `ChatSession.startFromHistoryStream` calls
+        // `model.chatStreamSessionStart(historySnapshot, ...)` against
+        // a slice of the primed history, so `mock.calls[i][0]` is the
+        // history seeded on turn i. A regression where the handler
+        // primed only `[lastUser]` (or dropped intermediate assistant
+        // turns) would slip past the identity / reset gates above but
+        // fail this transcript gate.
+        const turn1Messages = stream1.mock.calls[0]![0] as ChatMessage[];
+        expect(turn1Messages).toEqual([{ role: 'user', content: 'A' }]);
+        const turn2Messages = stream1.mock.calls[1]![0] as ChatMessage[];
+        expect(turn2Messages).toEqual([
+          { role: 'user', content: 'A' },
+          { role: 'assistant', content: 'A1' },
+          { role: 'user', content: 'B' },
+        ]);
+        const turn3Messages = stream1.mock.calls[2]![0] as ChatMessage[];
+        expect(turn3Messages).toEqual([
+          { role: 'user', content: 'A' },
+          { role: 'assistant', content: 'A1' },
+          { role: 'user', content: 'B' },
+          { role: 'assistant', content: 'A2' },
+          { role: 'user', content: 'C' },
+        ]);
 
         // Identity witness check: same ChatSession instance leased on
         // turns 1..3.
@@ -2933,42 +2987,84 @@ describe('handleCreateMessage', () => {
       expect(sessionReg.size).toBe(1);
     });
 
-    it('warm-hit then mid-decode failure drops the leased slot (next request cold-starts)', async () => {
-      // Companion to the cold-failure test above. The dangerous path
-      // is NOT a cold failure (which never enters the warm slot in
-      // the first place) — it is a WARM HIT that fails mid-decode.
-      // `getOrCreateWarmAny` leases the pre-seeded session, the
-      // stream then hits `finishReason: 'error'`, and the dual-gate
-      // `streamResult.ok && wasCommitted()` MUST fall through to
-      // `sessionReg.drop(MESSAGES_WARM_SLOT_ID)` — otherwise the
-      // leased session (now in failure state, with `turns` advanced
-      // and partial native KV state) is reachable on the next
-      // request, which would silently re-lease a poisoned wrapper.
+    it('warm-hit committed-producer failure drops the leased slot (next request cold-starts)', async () => {
+      // Companion to the cold-failure test above. The DANGEROUS path
+      // — and the one this test must pin — is `wasCommitted() === true
+      // && streamResult.ok === false`. A regression that adopts on
+      // `wasCommitted()` alone (ignoring `streamResult.ok`) would
+      // silently leak the failed session to the next request.
+      //
+      // Trigger choice: a clean done event whose `toolCalls[].arguments`
+      // is malformed JSON. Routing in `handleStreamingNative`
+      // (messages.ts:295-317):
+      //
+      //   1. The done event yields with `finishReason: 'stop'` and
+      //      `status: 'ok'` tool calls — `sawDone = true`,
+      //      `terminalErrorMessage = null`.
+      //   2. The producer (`ChatSession.startFromHistoryStream`) sets
+      //      `sawFinal = true` BEFORE yielding (chat-session.ts:806-815),
+      //      so the moment control passes to the consumer's body the
+      //      producer is already poised to commit on iterator cleanup.
+      //   3. The okToolCalls writer loop runs `JSON.parse(tc.arguments)`
+      //      on the malformed string, which throws.
+      //   4. The throw propagates out of the for-await body. The spec
+      //      requires `for-await` to call `iterator.return()` before
+      //      re-throwing, which runs the producer's `finally` block —
+      //      `sawFinal` is true, so `turnCount++` fires.
+      //   5. The consumer's outer `catch` sets `thrownError`. The
+      //      post-loop `successful` gate fails on `thrownError != null`
+      //      and the writer emits a streaming `error` event, returning
+      //      `{ ok: false }`.
+      //
+      // At the adopt gate in `handleCreateMessage` (messages.ts:880):
+      // `streamResult.ok === false` AND `outcome.wasCommitted() === true`
+      // (because turnCount advanced in step 4). The gate denies adopt
+      // and the handler drops the slot. A regression that gates on
+      // `wasCommitted()` alone would re-adopt the failed session, and
+      // the next same-instructions request would lease a session whose
+      // `turnCount > 0` — `primeHistory()` would then throw, breaking
+      // the cold-start replay path.
       //
       // Coverage:
       //   * Identity witness: `primeHistory` runs on the SAME
-      //     pre-seeded session instance — proves the warm hit
-      //     actually leased it (regression where the warm path is
-      //     silently bypassed would fail this).
+      //     pre-seeded session instance on turn 1 — proves the warm
+      //     hit actually leased it.
+      //   * Committed-producer witness: `warmSession.turns === 1` after
+      //     the failure — names the exact path under test (commit
+      //     fired despite the writer-side failure).
       //   * Failed wire: `error` event without a `message_stop`.
       //   * Slot drop: `sessionReg.size === 0` after the failure —
-      //     the leased session was NOT re-adopted under the
-      //     sentinel.
+      //     the leased session was NOT re-adopted under the sentinel.
       //   * Round-trip: a follow-up streaming turn cold-starts
       //     (warm slot is empty, full reset fires on a fresh
       //     session, NOT on the dropped failed one), and adopts.
-      const failingStream = async function* () {
-        yield { text: 'partial', done: false, isReasoning: false };
+      const malformedToolCalls: ToolCallResult[] = [
+        {
+          id: 'toolu_01',
+          name: 'do_thing',
+          // Strings hit the `typeof tc.arguments === 'string'` branch in
+          // messages.ts which calls JSON.parse. Malformed JSON throws.
+          arguments: '{not valid json',
+          status: 'ok',
+          rawContent: '{not valid json',
+        },
+      ];
+      const committedFailingStream = async function* () {
+        yield { text: '', done: false, isReasoning: false };
+        // Clean done event — `finishReason: 'stop'`, NOT 'error'. This
+        // is what makes the producer's `sawFinal` flip true and lets
+        // the `finally` commit on cleanup. The malformed arguments
+        // payload is what derails the writer loop AFTER commit.
         yield {
-          text: 'partial',
+          text: '',
           done: true,
-          finishReason: 'error',
-          toolCalls: [] as ToolCallResult[],
+          finishReason: 'stop',
+          toolCalls: malformedToolCalls,
           thinking: null,
           numTokens: 1,
           promptTokens: 3,
           reasoningTokens: 0,
-          rawText: 'partial',
+          rawText: '',
         };
       };
       const successfulStream = async function* () {
@@ -2985,7 +3081,7 @@ describe('handleCreateMessage', () => {
           rawText: 'ok',
         };
       };
-      const streamSpy = vi.fn().mockImplementationOnce(failingStream).mockImplementationOnce(successfulStream);
+      const streamSpy = vi.fn().mockImplementationOnce(committedFailingStream).mockImplementationOnce(successfulStream);
       const resetCaches = vi.fn();
       const mockModel = {
         chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming test')),
@@ -3015,9 +3111,11 @@ describe('handleCreateMessage', () => {
       // `warmSession` to prove the warm hit happened.
       const primeHistorySpy = vi.spyOn(ChatSession.prototype, 'primeHistory');
       try {
-        // Turn 1: warm-hit failing stream. Lookup leases
-        // `warmSession`; the stream emits `finishReason: 'error'`;
-        // the dual-gate denies adopt; the handler drops the slot.
+        // Turn 1: warm-hit, committed-producer + writer-side failure.
+        // Lookup leases `warmSession`; the producer commits on its
+        // `finally` (turnCount: 0 -> 1); the writer's JSON.parse on
+        // the malformed tool-call args throws; the dual-gate denies
+        // adopt; the handler drops the slot.
         const r1 = createMockRes();
         await handleCreateMessage(
           r1.res,
@@ -3039,16 +3137,26 @@ describe('handleCreateMessage', () => {
         // where the warm hit is silently bypassed.
         expect(primeHistorySpy).toHaveBeenCalledTimes(1);
         expect(primeHistorySpy.mock.contexts[0]).toBe(warmSession);
-        // Slot dropped — the failed warm session was NOT
-        // re-adopted under the sentinel.
+        // Committed-producer witness: turnCount advanced on the warm
+        // session even though the wire emitted `error`. This is the
+        // exact `wasCommitted() === true && streamResult.ok === false`
+        // scenario the dual-gate exists to drop. A regression that
+        // adopts on `wasCommitted()` alone would slip past this turn.
+        expect(warmSession.turns).toBe(1);
+        // Slot dropped — the committed-but-failed warm session was
+        // NOT re-adopted under the sentinel.
         expect(sessionReg.size).toBe(0);
         const resetCachesAfterT1 = resetCaches.mock.calls.length;
 
         // Turn 2: fresh request, same instructions. The slot is
         // empty after the drop, so `getOrCreateWarmAny` MISSES
         // and the handler runs a full `session.reset()` on a
-        // BRAND-NEW session (NOT the dropped failed one). The
-        // proxy: `model.resetCaches()` advances at least once.
+        // BRAND-NEW session (NOT the dropped failed one). Lease-
+        // poisoning regression test: if turn 1 had falsely re-adopted
+        // the dropped session, turn 2 would lease a session whose
+        // `turnCount === 1` and `primeHistory()` would throw on the
+        // turn-0 invariant. The proxy: `model.resetCaches()` advances
+        // at least once.
         const r2 = createMockRes();
         await handleCreateMessage(
           r2.res,
