@@ -3821,6 +3821,22 @@ export interface Qwen3Config {
    * Default: false
    */
   useFp8Cache?: boolean | undefined;
+  /**
+   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
+   *
+   * **OPT-IN — experimental.** When `Some(true)`, `Qwen3Inner` allocates a
+   * `BlockAllocator` + `LayerKVPool` pair and constructs a
+   * `PagedKVCacheAdapter` for cross-request KV prefix reuse (vLLM-style
+   * block-paged storage with refcounted prefix caching). This flag is
+   * independent of `use_paged_attention`, which drives the legacy
+   * `PagedKVCache` + `ContinuousBatchingScheduler` path. The adapter is
+   * wired through `chat_sync_core` separately; defaulting to `false`
+   * keeps the existing flat `Vec<KVCache>` path entirely unchanged until
+   * the integration is proven on real weights.
+   *
+   * Default: false (use the existing flat KVCache path).
+   */
+  useBlockPagedCache?: boolean | undefined;
 }
 
 /** Qwen3 language model configuration */
