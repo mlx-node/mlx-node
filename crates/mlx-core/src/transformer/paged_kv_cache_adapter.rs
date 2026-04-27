@@ -5,9 +5,21 @@
 //! blocks (refcount > 1) without evicting each other — the vLLM block-paged
 //! design (see `vllm/v1/core/block_pool.py` and `kv_cache_utils.py`).
 //!
-//! This step (P1C-1) only handles block lifecycle, prefix lookup, and
-//! registration. Metal kernel dispatch (reshape_and_cache, paged_attention)
-//! and GPU buffer management are out of scope; they land in P1C-2 / P1C-3.
+//! P1C-1 wired the block lifecycle, prefix lookup, and registration. P1C-2
+//! (this file's current state) adds GPU writes via `update_keys_values`,
+//! backed by a shared `LayerKVPool` of per-layer Metal `Buffer` pairs.
+//! `gather_kv_for_decode` (P1C-3) is still out of scope.
+//!
+//! ## Storage design (B in the design doc)
+//!
+//! The adapter holds `(Arc<Mutex<BlockAllocator>>, Arc<LayerKVPool>)`. The
+//! allocator owns the *logical* lifecycle (refcounts / LRU / hashing); the
+//! pool owns the *physical* storage (per-layer K/V Metal buffers). They are
+//! consciously kept separate so the existing legacy `CacheEngineManager`
+//! path (which bundles its own allocator) is left untouched. Option A
+//! (adapter holds `Arc<CacheEngineManager>`) was considered but rejected
+//! because `CacheEngineManager` already owns a `BlockAllocator`, conflicting
+//! with the externally-shared allocator the adapter design needs.
 //!
 //! ## Scope
 //!
@@ -36,7 +48,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use mlx_paged_attn::{BlockAllocator, PhysicalBlock, SequenceBlockTable};
+use mlx_paged_attn::{BlockAllocator, LayerKVPool, PhysicalBlock, SequenceBlockTable};
+
+use crate::array::{DType, MxArray};
 
 /// Result of a prefix-cache lookup.
 #[derive(Debug)]
@@ -55,6 +69,7 @@ pub struct CachedPrefix {
 /// requests.
 pub struct PagedKVCacheAdapter {
     allocator: Arc<Mutex<BlockAllocator>>,
+    layer_kv_pool: Arc<LayerKVPool>,
     block_size: u32,
 
     /// Block table for the active request. None between requests.
@@ -76,16 +91,27 @@ pub struct PagedKVCacheAdapter {
 }
 
 impl PagedKVCacheAdapter {
-    /// Construct a new adapter sharing the given allocator.
+    /// Construct a new adapter sharing the given allocator and layer
+    /// KV-buffer pool.
     ///
-    /// `block_size` MUST equal `allocator.block_size()` — checked. Returns
-    /// `Err` with a descriptive message on mismatch.
-    pub fn new(allocator: Arc<Mutex<BlockAllocator>>, block_size: u32) -> Result<Self, String> {
-        let allocator_block_size = {
+    /// Validates:
+    /// - `block_size == allocator.block_size()`
+    /// - `block_size == layer_kv_pool.block_size()`
+    /// - `allocator.num_blocks() == layer_kv_pool.num_blocks()`
+    ///
+    /// Any mismatch returns a descriptive `Err` — silently letting the
+    /// adapter operate against mismatched logical/physical capacity would
+    /// mask block-id-out-of-range write corruption.
+    pub fn new(
+        allocator: Arc<Mutex<BlockAllocator>>,
+        layer_kv_pool: Arc<LayerKVPool>,
+        block_size: u32,
+    ) -> Result<Self, String> {
+        let (allocator_block_size, allocator_num_blocks) = {
             let guard = allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            guard.block_size()
+            (guard.block_size(), guard.num_blocks())
         };
         if block_size != allocator_block_size {
             return Err(format!(
@@ -93,8 +119,23 @@ impl PagedKVCacheAdapter {
                  {allocator_block_size}"
             ));
         }
+        if block_size != layer_kv_pool.block_size() {
+            return Err(format!(
+                "block_size mismatch: adapter requested {block_size}, layer_kv_pool has \
+                 {}",
+                layer_kv_pool.block_size()
+            ));
+        }
+        if allocator_num_blocks != layer_kv_pool.num_blocks() {
+            return Err(format!(
+                "num_blocks mismatch: allocator has {allocator_num_blocks}, layer_kv_pool has \
+                 {}. The pool's GPU storage must cover every block the allocator can hand out.",
+                layer_kv_pool.num_blocks()
+            ));
+        }
         Ok(Self {
             allocator,
+            layer_kv_pool,
             block_size,
             block_table: None,
             cached_token_count: 0,
@@ -256,6 +297,204 @@ impl PagedKVCacheAdapter {
         let new_total = self.request_tokens.len() as u32;
         block_table.set_num_tokens(new_total);
         Ok(())
+    }
+
+    /// Build the slot mapping for a contiguous chunk of tokens starting
+    /// at `first_logical_position` in this request. Each entry is the
+    /// kernel-encoded slot index `block_id * block_size + position_in_block`
+    /// (vLLM convention; verified against `reshape_and_cache.metal`).
+    ///
+    /// Returns an error if any position falls outside the request's
+    /// allocated block table (i.e. caller forgot to allocate enough
+    /// suffix blocks before writing).
+    fn build_slot_mapping(
+        &self,
+        first_logical_position: u32,
+        num_tokens: u32,
+    ) -> Result<Vec<i64>, String> {
+        let block_table = self
+            .block_table
+            .as_ref()
+            .ok_or_else(|| "build_slot_mapping called before reset_for_new_request".to_string())?;
+
+        let mut slot_mapping: Vec<i64> = Vec::with_capacity(num_tokens as usize);
+        for i in 0..num_tokens {
+            let logical_pos = first_logical_position
+                .checked_add(i)
+                .ok_or_else(|| "logical position overflow in build_slot_mapping".to_string())?;
+            let slot = block_table
+                .absolute_slot_index(logical_pos)
+                .ok_or_else(|| {
+                    format!(
+                        "logical position {logical_pos} has no allocated block (request \
+                         has {} blocks × block_size {} = {} slots; allocate more suffix blocks)",
+                        block_table.num_blocks(),
+                        self.block_size,
+                        block_table.num_blocks() as u32 * self.block_size
+                    )
+                })?;
+            slot_mapping.push(slot);
+        }
+        Ok(slot_mapping)
+    }
+
+    /// Write a chunk of K/V tokens into the layer's paged Metal buffers
+    /// via the `reshape_and_cache` kernel.
+    ///
+    /// `keys` / `values` must have shape `[num_tokens, num_kv_heads,
+    /// head_size]` matching the pool's config. `first_logical_position`
+    /// is the logical-token index in the active request where this chunk
+    /// starts; it must equal `current_token_count - num_tokens` (i.e. the
+    /// chunk represents the most recently recorded tokens). On mismatch
+    /// the adapter returns a descriptive error rather than silently
+    /// writing into the wrong slots.
+    ///
+    /// Typical caller flow per layer per chunk:
+    ///
+    /// ```ignore
+    /// adapter.allocate_suffix_blocks(total)?;       // before writing
+    /// adapter.record_tokens(chunk_token_ids)?;      // bookkeeping
+    /// let first = adapter.current_token_count() - chunk_token_ids.len() as u32;
+    /// for layer in 0..num_layers {
+    ///     adapter.update_keys_values(layer, &k[layer], &v[layer], first)?;
+    /// }
+    /// ```
+    ///
+    /// FP8 scale management is intentionally minimal here (P1C-2 defers
+    /// the non-trivial FP8 work to a later step): when the cache is FP8,
+    /// the kernel uses unit scales (1.0). A future change will plumb the
+    /// adapter through `KvScaleManager`.
+    #[cfg(target_os = "macos")]
+    pub fn update_keys_values(
+        &mut self,
+        layer_idx: u32,
+        keys: &MxArray,
+        values: &MxArray,
+        first_logical_position: u32,
+    ) -> Result<(), String> {
+        // 1. Active request?
+        if self.block_table.is_none() {
+            return Err(
+                "update_keys_values called before reset_for_new_request (no active request)"
+                    .to_string(),
+            );
+        }
+
+        // 2. Layer in range?
+        let num_layers = self.layer_kv_pool.num_layers();
+        if (layer_idx as usize) >= num_layers {
+            return Err(format!(
+                "update_keys_values: layer_idx {layer_idx} out of range (num_layers = \
+                 {num_layers})"
+            ));
+        }
+
+        // 3. Shape sanity. We require both arrays to be 3-D and to agree
+        //    on the leading (num_tokens) dimension. The kernel itself
+        //    re-derives the strides from config.num_kv_heads * head_size,
+        //    so we don't need to verify the inner dims byte-by-byte —
+        //    but we do require ndim == 3 to catch obvious caller bugs
+        //    (e.g. forgetting a reshape).
+        let key_ndim = keys
+            .ndim()
+            .map_err(|e| format!("keys.ndim() failed: {e}"))?;
+        let value_ndim = values
+            .ndim()
+            .map_err(|e| format!("values.ndim() failed: {e}"))?;
+        if key_ndim != 3 || value_ndim != 3 {
+            return Err(format!(
+                "update_keys_values: expected keys/values to be 3-D \
+                 [num_tokens, num_kv_heads, head_size]; got ndim {key_ndim}/{value_ndim}"
+            ));
+        }
+        let key_n = keys
+            .shape_at(0)
+            .map_err(|e| format!("keys.shape_at(0) failed: {e}"))?;
+        let value_n = values
+            .shape_at(0)
+            .map_err(|e| format!("values.shape_at(0) failed: {e}"))?;
+        if key_n != value_n {
+            return Err(format!(
+                "update_keys_values: keys/values disagree on num_tokens ({key_n} vs \
+                 {value_n})"
+            ));
+        }
+        if key_n < 0 {
+            return Err(format!(
+                "update_keys_values: keys.shape_at(0) returned negative ({key_n})"
+            ));
+        }
+        let num_tokens = key_n as u32;
+        if num_tokens == 0 {
+            // Nothing to write — silently succeed rather than dispatch
+            // a zero-sized kernel.
+            return Ok(());
+        }
+
+        // 4. Alignment check: chunk must end at the current token cursor.
+        let current = self.request_tokens.len() as u32;
+        let expected_first = current.checked_sub(num_tokens).ok_or_else(|| {
+            format!(
+                "update_keys_values: chunk has {num_tokens} tokens but only {current} \
+                     have been recorded (call record_tokens first)"
+            )
+        })?;
+        if first_logical_position != expected_first {
+            return Err(format!(
+                "update_keys_values: first_logical_position {first_logical_position} does \
+                 not align with the recorded suffix (expected {expected_first} based on \
+                 current_token_count {current} and chunk size {num_tokens}). The chunk \
+                 must cover the most recently recorded tokens."
+            ));
+        }
+
+        // 5. Pick the kv dtype for the kernel.
+        let dtype = keys
+            .dtype()
+            .map_err(|e| format!("keys.dtype() failed: {e}"))?;
+        let kv_metal_dtype = match dtype {
+            DType::Float32 => mlx_paged_attn::metal::MetalDtype::Float32,
+            DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
+            DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
+            other => {
+                return Err(format!(
+                    "update_keys_values: unsupported kv dtype {other:?} (expected f32/f16/bf16)"
+                ));
+            }
+        };
+
+        // 6. Build slot mapping and dispatch.
+        let slot_mapping = self.build_slot_mapping(first_logical_position, num_tokens)?;
+
+        // SAFETY: keys/values are valid `MxArray`s held by the caller for
+        // the duration of this call; `as_raw_ptr` returns the borrowed
+        // mlx_array handle. The kernel dispatcher waits until completion
+        // before returning, so the buffers stay valid.
+        unsafe {
+            self.layer_kv_pool.write_kv(
+                layer_idx,
+                keys.as_raw_ptr(),
+                values.as_raw_ptr(),
+                &slot_mapping,
+                kv_metal_dtype,
+                /* k_scale */ 1.0,
+                /* v_scale */ 1.0,
+            )
+        }
+    }
+
+    /// Non-macOS stub: the underlying Metal kernel is macOS-only. Calling
+    /// this on another platform is a programming error rather than a
+    /// runtime fallback.
+    #[cfg(not(target_os = "macos"))]
+    pub fn update_keys_values(
+        &mut self,
+        _layer_idx: u32,
+        _keys: &MxArray,
+        _values: &MxArray,
+        _first_logical_position: u32,
+    ) -> Result<(), String> {
+        Err("update_keys_values is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Register the request's FULL blocks in the prefix cache so future
@@ -456,6 +695,39 @@ mod tests {
         Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)))
     }
 
+    /// Build a placeholder `LayerKVPool` matching the allocator's capacity.
+    /// Uses `LayerKVPool::new_for_test` so the lifecycle-only tests below
+    /// don't pay GPU-allocation costs and aren't constrained to the
+    /// production-validated `block_size` set (8/16/32).
+    fn new_test_pool(num_blocks: u32, block_size: u32) -> Arc<mlx_paged_attn::LayerKVPool> {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            num_kv_heads: 1,
+            head_size: 32,
+            num_layers: 2,
+            // gpu_memory_mb is unused by new_for_test (it skips validate).
+            ..mlx_paged_attn::PagedAttentionConfig::default()
+        };
+        Arc::new(
+            mlx_paged_attn::LayerKVPool::new_for_test(cfg, num_blocks, 2)
+                .expect("new_for_test pool"),
+        )
+    }
+
+    /// Test shim mimicking the pre-P1C-2 two-arg `PagedKVCacheAdapter::new`
+    /// signature. Internally pairs the supplied allocator with a
+    /// placeholder `LayerKVPool` of matching capacity. Lets the existing
+    /// lifecycle / prefix-cache tests stay intact while exercising the
+    /// new pool-validation path.
+    fn make_adapter(
+        allocator: Arc<Mutex<BlockAllocator>>,
+        block_size: u32,
+    ) -> Result<PagedKVCacheAdapter, String> {
+        let num_blocks = allocator.lock().unwrap().num_blocks();
+        let pool = new_test_pool(num_blocks, block_size);
+        PagedKVCacheAdapter::new(allocator, pool, block_size)
+    }
+
     /// Convenience: simulates a previous completed request that registered
     /// its blocks for cross-request reuse. Mirrors the combined effect of
     /// `register_full_blocks_for_reuse` followed by `release_request`:
@@ -489,16 +761,52 @@ mod tests {
     #[test]
     fn test_new_validates_block_size() {
         let allocator = new_allocator(8, 4);
-        let bad = PagedKVCacheAdapter::new(Arc::clone(&allocator), 8);
+        // Build a pool whose block_size matches the allocator (4) so we
+        // isolate the adapter-vs-allocator mismatch.
+        let pool_4 = new_test_pool(8, 4);
+        let bad = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool_4), 8);
         assert!(bad.is_err(), "expected mismatch error, got Ok");
-        let ok = PagedKVCacheAdapter::new(allocator, 4);
+        let ok = PagedKVCacheAdapter::new(allocator, pool_4, 4);
         assert!(ok.is_ok(), "expected Ok, got {:?}", ok.err());
+    }
+
+    /// `PagedKVCacheAdapter::new` must reject a `LayerKVPool` whose
+    /// `block_size` disagrees with the adapter, even when the allocator
+    /// agrees. Otherwise downstream `update_keys_values` calls would
+    /// compute slot indices against the wrong divisor.
+    #[test]
+    fn test_new_rejects_pool_block_size_mismatch() {
+        let allocator = new_allocator(8, 4);
+        // Pool intentionally built with block_size=8.
+        let mismatched_pool = new_test_pool(8, 8);
+        let res = PagedKVCacheAdapter::new(allocator, mismatched_pool, 4);
+        assert!(res.is_err(), "expected pool block_size mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("layer_kv_pool"),
+            "error must reference layer_kv_pool, got: {msg}"
+        );
+    }
+
+    /// `PagedKVCacheAdapter::new` must reject an allocator/pool pair
+    /// whose `num_blocks` disagree.
+    #[test]
+    fn test_new_rejects_pool_num_blocks_mismatch() {
+        let allocator = new_allocator(8, 4); // 8 blocks
+        let smaller_pool = new_test_pool(4, 4); // 4 blocks
+        let res = PagedKVCacheAdapter::new(allocator, smaller_pool, 4);
+        assert!(res.is_err(), "expected num_blocks mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("num_blocks"),
+            "error must reference num_blocks, got: {msg}"
+        );
     }
 
     #[test]
     fn test_reset_for_new_request_initializes_state() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter = make_adapter(allocator, 4).unwrap();
         adapter.reset_for_new_request(7).unwrap();
         let table = adapter.block_table().expect("block_table populated");
         assert_eq!(table.seq_id, 7);
@@ -511,7 +819,7 @@ mod tests {
     #[test]
     fn test_find_cached_prefix_miss() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter = make_adapter(allocator, 4).unwrap();
         adapter.reset_for_new_request(0).unwrap();
         let res = adapter.find_cached_prefix(&[1, 2, 3, 4, 5], &[]).unwrap();
         assert!(res.blocks.is_empty());
@@ -526,7 +834,7 @@ mod tests {
         let tokens: Vec<u32> = (0..8).collect();
         seed_prefix_cache(&allocator, &tokens, 4, &[]);
 
-        let mut adapter = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter = make_adapter(allocator, 4).unwrap();
         adapter.reset_for_new_request(1).unwrap();
         // Look up with same 8 tokens — should hit both blocks.
         let res = adapter.find_cached_prefix(&tokens, &[]).unwrap();
@@ -543,7 +851,7 @@ mod tests {
     #[test]
     fn test_allocate_suffix_blocks_no_prefix() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter = make_adapter(allocator, 4).unwrap();
         adapter.reset_for_new_request(0).unwrap();
         // 10 tokens, block_size=4 -> ceil(10/4) = 3 new blocks.
         let n = adapter.allocate_suffix_blocks(10).unwrap();
@@ -559,7 +867,7 @@ mod tests {
         let prefix_tokens: Vec<u32> = (0..8).collect();
         seed_prefix_cache(&allocator, &prefix_tokens, 4, &[]);
 
-        let mut adapter = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter = make_adapter(allocator, 4).unwrap();
         adapter.reset_for_new_request(2).unwrap();
         let res = adapter.find_cached_prefix(&prefix_tokens, &[]).unwrap();
         assert_eq!(res.cached_token_count, 8);
@@ -574,7 +882,7 @@ mod tests {
     #[test]
     fn test_record_tokens_appends_to_request_tokens_and_updates_num_tokens() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter = make_adapter(allocator, 4).unwrap();
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(8).unwrap();
 
@@ -590,7 +898,7 @@ mod tests {
     #[test]
     fn test_register_full_blocks_for_reuse_idempotent() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
         adapter.reset_for_new_request(0).unwrap();
 
         adapter.allocate_suffix_blocks(8).unwrap();
@@ -599,7 +907,7 @@ mod tests {
         assert_eq!(registered, 2, "two full blocks of size 4 = 8 tokens");
 
         // Second adapter on the same allocator should now see the cached prefix.
-        let mut adapter2 = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter2 = make_adapter(allocator, 4).unwrap();
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2
             .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[])
@@ -612,7 +920,7 @@ mod tests {
     fn test_release_request_decrefs_blocks() {
         let allocator = new_allocator(8, 4);
         let initial_free = allocator.lock().unwrap().num_free_blocks();
-        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
 
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(8).unwrap(); // 2 blocks
@@ -635,7 +943,7 @@ mod tests {
     #[test]
     fn test_register_then_release_keeps_blocks_alive_in_prefix_cache() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
         adapter.reset_for_new_request(0).unwrap();
 
         adapter.allocate_suffix_blocks(8).unwrap();
@@ -652,7 +960,7 @@ mod tests {
         assert_eq!(freed, 2);
 
         // A fresh adapter on the same allocator can resurrect the prefix.
-        let mut adapter2 = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter2 = make_adapter(allocator, 4).unwrap();
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2.find_cached_prefix(&tokens, &[]).unwrap();
         assert_eq!(
@@ -680,7 +988,7 @@ mod tests {
         full_b.extend_from_slice(&user_b_tokens);
 
         // Adapter A.
-        let mut adapter_a = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter_a = make_adapter(Arc::clone(&allocator), 4).unwrap();
         adapter_a.reset_for_new_request(0).unwrap();
         adapter_a
             .allocate_suffix_blocks(full_a.len() as u32)
@@ -691,7 +999,7 @@ mod tests {
         adapter_a.release_request().unwrap();
 
         // Adapter B.
-        let mut adapter_b = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter_b = make_adapter(allocator, 4).unwrap();
         adapter_b.reset_for_new_request(1).unwrap();
         let res = adapter_b.find_cached_prefix(&full_b, &[]).unwrap();
         // SYS prefix shared (8 tokens / 2 blocks); USER_B differs → miss.
@@ -712,7 +1020,7 @@ mod tests {
     fn test_register_full_blocks_for_reuse_idempotent_repeat() {
         let allocator = new_allocator(8, 4);
         let initial_free = allocator.lock().unwrap().num_free_blocks();
-        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
         adapter.reset_for_new_request(0).unwrap();
 
         adapter.allocate_suffix_blocks(8).unwrap();
@@ -767,7 +1075,7 @@ mod tests {
 
         // A fresh adapter on the same allocator must still be able to
         // recover the prefix via `find_cached_prefix`.
-        let mut adapter2 = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter2 = make_adapter(allocator, 4).unwrap();
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2
             .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[])
@@ -782,7 +1090,7 @@ mod tests {
     #[test]
     fn test_release_request_resets_already_registered() {
         let allocator = new_allocator(16, 4);
-        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
 
         // First request: register, then explicit release.
         adapter.reset_for_new_request(0).unwrap();
@@ -814,7 +1122,7 @@ mod tests {
     #[test]
     fn test_reset_for_new_request_resets_already_registered() {
         let allocator = new_allocator(16, 4);
-        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
 
         // First request: register, then jump straight to a new reset
         // (auto-release path).
@@ -861,7 +1169,7 @@ mod tests {
             adapter.release_request().unwrap();
         };
 
-        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
 
         // Cycle 1: register a 1-block prompt. Cache holds it.
         run_once(&mut adapter, &[1, 2, 3, 4]);
@@ -914,7 +1222,7 @@ mod tests {
     fn test_adapter_can_progress_when_pool_exhausted_by_cache() {
         let allocator = new_allocator(2, 4);
         // Default cache cap is large; both prior cycles' blocks survive.
-        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
 
         // Cycle 1: register + release for prompt P1. First block held by
         // cache.
@@ -970,7 +1278,7 @@ mod tests {
         adapter.release_request().unwrap();
 
         // Confirm: a fresh adapter looking up P2 still hits.
-        let mut adapter2 = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter2 = make_adapter(Arc::clone(&allocator), 4).unwrap();
         adapter2.reset_for_new_request(99).unwrap();
         let p2_lookup = adapter2.find_cached_prefix(&p2, &[]).unwrap();
         assert_eq!(
@@ -980,7 +1288,7 @@ mod tests {
 
         // And P1's hash is gone.
         adapter2.release_request().unwrap();
-        let mut adapter3 = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        let mut adapter3 = make_adapter(allocator, 4).unwrap();
         adapter3.reset_for_new_request(100).unwrap();
         let p1_lookup = adapter3.find_cached_prefix(&p1, &[]).unwrap();
         assert_eq!(
@@ -1005,7 +1313,7 @@ mod tests {
         let prefix_tokens: Vec<u32> = (0..8).collect();
         seed_prefix_cache(&allocator, &prefix_tokens, 4, &[]);
 
-        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
         adapter.reset_for_new_request(0).unwrap();
 
         // 12-token prompt: 8-token cached prefix + 4-token new suffix.
@@ -1044,5 +1352,222 @@ mod tests {
             registered, 3,
             "12 tokens / block_size 4 = 3 full blocks eligible for registration"
         );
+    }
+
+    // ------------------------ update_keys_values ------------------------
+
+    /// Build a 3-D zero-filled `MxArray` of bf16 with the requested
+    /// num_tokens dimension. Helper for the error-path tests below.
+    fn dummy_kv(num_tokens: i64, num_kv_heads: i64, head_size: i64) -> MxArray {
+        dummy_kv_with_dtype(
+            num_tokens,
+            num_kv_heads,
+            head_size,
+            crate::array::DType::BFloat16,
+        )
+    }
+
+    fn dummy_kv_with_dtype(
+        num_tokens: i64,
+        num_kv_heads: i64,
+        head_size: i64,
+        dtype: crate::array::DType,
+    ) -> MxArray {
+        MxArray::zeros(&[num_tokens, num_kv_heads, head_size], Some(dtype)).expect("zeros")
+    }
+
+    /// `update_keys_values` must reject calls before any request is
+    /// active. Otherwise we would compute slot indices against a
+    /// missing block_table and panic.
+    #[test]
+    fn test_update_keys_values_no_active_request() {
+        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        let k = dummy_kv(1, 1, 32);
+        let v = dummy_kv(1, 1, 32);
+        let res = adapter.update_keys_values(0, &k, &v, 0);
+        assert!(res.is_err(), "expected error before reset_for_new_request");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("reset_for_new_request") || msg.contains("no active request"),
+            "error must mention missing request, got: {msg}"
+        );
+    }
+
+    /// Out-of-range `layer_idx` must return a descriptive error rather
+    /// than triggering UB inside the kernel.
+    #[test]
+    fn test_update_keys_values_layer_out_of_bounds() {
+        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        let k = dummy_kv(4, 1, 32);
+        let v = dummy_kv(4, 1, 32);
+        // Pool was constructed with num_layers = 2; 99 is far out of range.
+        let res = adapter.update_keys_values(99, &k, &v, 0);
+        assert!(res.is_err(), "expected layer_idx OOB error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("layer_idx") || msg.contains("out of range"),
+            "error must mention layer_idx, got: {msg}"
+        );
+    }
+
+    /// Mismatched leading dim between `keys` and `values` must error.
+    #[test]
+    fn test_update_keys_values_shape_mismatch() {
+        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        let k = dummy_kv(4, 1, 32);
+        let v = dummy_kv(3, 1, 32); // wrong num_tokens
+        let res = adapter.update_keys_values(0, &k, &v, 0);
+        assert!(res.is_err(), "expected shape mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("disagree on num_tokens") || msg.contains("num_tokens"),
+            "error must mention num_tokens mismatch, got: {msg}"
+        );
+    }
+
+    /// `first_logical_position` must align with the recorded suffix.
+    /// Otherwise the chunk would be written to the wrong slots.
+    #[test]
+    fn test_update_keys_values_misaligned_first_position() {
+        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[10, 11, 12, 13]).unwrap();
+        let k = dummy_kv(4, 1, 32);
+        let v = dummy_kv(4, 1, 32);
+        // Correct value is current(4) - num_tokens(4) = 0. Pass 7 to force misalignment.
+        let res = adapter.update_keys_values(0, &k, &v, 7);
+        assert!(res.is_err(), "expected alignment error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("first_logical_position") || msg.contains("align"),
+            "error must mention alignment, got: {msg}"
+        );
+    }
+
+    /// Pure CPU correctness check on the slot-mapping encoding. The
+    /// kernel reads `block_idx = slot / block_size` and
+    /// `offset = slot % block_size`, so the entry at logical position
+    /// `p` must equal `block_id_at(p / B) * B + (p % B)` where the
+    /// `block_id_at` lookup goes through the request's block_table.
+    /// Verifying this against an explicit table lets us catch any future
+    /// drift in either the kernel or the encoding.
+    #[test]
+    fn test_update_keys_values_slot_mapping_encoding() {
+        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+        // Allocate 3 blocks (12 slots) and record 12 tokens.
+        adapter.allocate_suffix_blocks(12).unwrap();
+        adapter
+            .record_tokens(&(0u32..12).collect::<Vec<_>>())
+            .unwrap();
+
+        // Snapshot the actual block ids the allocator handed out.
+        let block_ids: Vec<u32> = adapter
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(block_ids.len(), 3);
+
+        let slots = adapter.build_slot_mapping(0, 12).expect("slot mapping");
+        assert_eq!(slots.len(), 12);
+        for p in 0..12u32 {
+            let expected = block_ids[(p / 4) as usize] as i64 * 4 + (p % 4) as i64;
+            assert_eq!(
+                slots[p as usize],
+                expected,
+                "slot at position {p} must encode (block_id={}, offset={}) as block_id*B+offset",
+                block_ids[(p / 4) as usize],
+                p % 4
+            );
+        }
+    }
+
+    /// `build_slot_mapping` must reject positions beyond the allocated
+    /// block table — the caller forgot to allocate enough suffix blocks.
+    /// Catches the silently-overflow-into-junk-slot bug at the boundary.
+    #[test]
+    fn test_update_keys_values_slot_mapping_out_of_range() {
+        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+        // Allocate ONE block (4 slots) and try to map 5 positions.
+        adapter.allocate_suffix_blocks(4).unwrap();
+        let res = adapter.build_slot_mapping(0, 5);
+        assert!(res.is_err(), "expected out-of-range error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("no allocated block") || msg.contains("allocate more"),
+            "error must hint at missing allocation, got: {msg}"
+        );
+    }
+
+    /// Happy-path Metal dispatch on a tiny pool. The block id for the
+    /// freshly allocated request is recorded, then we write 2 tokens at
+    /// logical positions 0 and 1 of layer 0. We can't read back the K/V
+    /// payload (paged_attention gather lands in P1C-3) but the kernel
+    /// dispatch must succeed without error.
+    ///
+    /// Uses a real `LayerKVPool` (production constructor) to exercise
+    /// the whole path including buffer allocation, dtype routing, and
+    /// kernel name lookup. Skipped on non-macOS (Metal only).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_update_keys_values_writes_succeed_on_metal() {
+        // Production path: validated config (block_size 8, head_size 64).
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(cfg.clone(), 4) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                // Headless CI / VMs without Metal: skip rather than fail.
+                eprintln!("Skipping test_update_keys_values_writes_succeed_on_metal: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.reset_for_new_request(42).unwrap();
+        adapter.allocate_suffix_blocks(2).unwrap();
+        adapter.record_tokens(&[7, 9]).unwrap();
+
+        // Use Float16: the legacy `reshape_and_cache_kernel_name` helper
+        // hard-codes input as `half`, so only Float16 currently routes to
+        // an instantiated kernel. BF16 input support is a separate change.
+        let k = dummy_kv_with_dtype(2, 1, 64, crate::array::DType::Float16);
+        let v = dummy_kv_with_dtype(2, 1, 64, crate::array::DType::Float16);
+        // Force materialization so the Metal buffer is real before we
+        // dispatch the cache write.
+        k.eval();
+        v.eval();
+
+        let res = adapter.update_keys_values(0, &k, &v, 0);
+        match res {
+            Ok(()) => {}
+            Err(e) => {
+                // Some macOS sandboxed CI environments lack Metal — accept
+                // the explicit "Metal GPU not available" error as a skip.
+                assert!(
+                    e.contains("Metal GPU not available"),
+                    "unexpected error from update_keys_values: {e}"
+                );
+            }
+        }
     }
 }
