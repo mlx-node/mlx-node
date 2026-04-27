@@ -356,12 +356,17 @@ impl PagedAttentionLayer {
             offset: query_info.offset,
         };
 
-        // Determine dtype based on FP8 config
-        let dtype = if self.use_fp8 {
+        // Determine cache dtype based on FP8 config. The legacy
+        // `AttentionLayer` path has only ever been wired up against Float16
+        // io (queries/output) — preserve that here. For BF16 production
+        // models the new `LayerKVPool::gather_attention` path threads the
+        // model's actual io dtype through to the dispatcher.
+        let cache_dtype = if self.use_fp8 {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let io_dtype = MetalDtype::Float16;
 
         // Dispatch paged attention
         let output = unsafe {
@@ -373,7 +378,8 @@ impl PagedAttentionLayer {
                 context_lens_buffer,
                 max_context_len,
                 &attn_params,
-                dtype,
+                io_dtype,
+                cache_dtype,
             )?
         };
 

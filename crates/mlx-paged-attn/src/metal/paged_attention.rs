@@ -127,14 +127,16 @@ pub fn dispatch_paged_attention_v1(
     block_tables: &Buffer,
     context_lens: &Buffer,
     params: &PagedAttentionParams,
-    dtype: MetalDtype,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
 ) -> Result<(), String> {
     let state = MetalState::get()?;
 
     // Get V1 pipeline (partition_size = 0)
     // FORKED: Pass use_alibi=false since we don't support ALiBi yet
     let kernel_name = MetalState::paged_attention_v1_kernel_name(
-        dtype,
+        io_dtype,
+        cache_dtype,
         params.head_size,
         params.block_size,
         false,
@@ -255,7 +257,8 @@ pub fn dispatch_paged_attention_v2(
     block_tables: &Buffer,
     context_lens: &Buffer,
     params: &PagedAttentionParams,
-    dtype: MetalDtype,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
 ) -> Result<(), String> {
     let state = MetalState::get()?;
 
@@ -266,12 +269,14 @@ pub fn dispatch_paged_attention_v2(
     let exp_sums_size = (params.num_seqs * params.num_heads * max_num_partitions) as usize
         * std::mem::size_of::<f32>();
     let max_logits_size = exp_sums_size;
-    // tmp_out stores partitioned attention outputs in float16 (the I/O type),
-    // NOT the cache dtype. Using dtype.size() here would under-allocate for FP8
-    // (1 byte) when the kernel writes float16 (2 bytes), causing GPU buffer overrun.
+    // tmp_out stores partitioned attention outputs in the io dtype (NOT the
+    // cache dtype). Using cache_dtype.size() here would under-allocate for
+    // FP8 (1 byte) when the kernel writes io_dtype (2 bytes), causing GPU
+    // buffer overrun. Mirrors the same bug class fixed for the output
+    // allocation in `dispatch_paged_attention_v2_raw`.
     let tmp_out_size = (params.num_seqs * params.num_heads * max_num_partitions * params.head_size)
         as usize
-        * MetalDtype::Float16.size();
+        * io_dtype.size();
 
     let exp_sums = state.device.new_buffer(
         exp_sums_size as u64,
@@ -290,7 +295,8 @@ pub fn dispatch_paged_attention_v2(
     {
         // FORKED: Pass use_alibi=false since we don't support ALiBi yet
         let kernel_name = MetalState::paged_attention_v2_kernel_name(
-            dtype,
+            io_dtype,
+            cache_dtype,
             params.head_size,
             params.block_size,
             false,
@@ -390,7 +396,7 @@ pub fn dispatch_paged_attention_v2(
     // Phase 2: Reduce partitions
     {
         let kernel_name =
-            MetalState::paged_attention_v2_reduce_kernel_name(dtype, params.head_size);
+            MetalState::paged_attention_v2_reduce_kernel_name(io_dtype, params.head_size);
         let pipeline = state.get_pipeline(&kernel_name)?;
 
         let command_buffer = state.command_queue.new_command_buffer();
@@ -603,13 +609,17 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     block_tables: &Buffer,
     context_lens: &Buffer,
     params: &PagedAttentionParams,
-    dtype: MetalDtype,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
 ) -> Result<PagedAttentionOutput, String> {
     let state = MetalState::get()?;
 
-    // Allocate output buffer - always use float16 size since kernel outputs float16
-    // even when using FP8 cache (kernel dequantizes internally)
-    let output_element_size = MetalDtype::Float16.size() as u64;
+    // Allocate output buffer using io_dtype.size() (not the cache dtype) —
+    // the kernel writes the io type. For FP8 (cache=uchar) the kernel
+    // dequantizes internally and writes io_dtype-sized elements. Using
+    // cache_dtype.size() here would under-allocate by 2x for FP8 caches with
+    // half/bf16 io.
+    let output_element_size = io_dtype.size() as u64;
     let output_size =
         (params.num_seqs * params.num_heads * params.head_size) as u64 * output_element_size;
     let output = state
@@ -618,7 +628,8 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
 
     // Get V1 pipeline (partition_size = 0)
     let kernel_name = MetalState::paged_attention_v1_kernel_name(
-        dtype,
+        io_dtype,
+        cache_dtype,
         params.head_size,
         params.block_size,
         false, // use_alibi
@@ -724,13 +735,15 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     command_buffer.commit();
     command_buffer.wait_until_completed();
 
-    // Output is always float16 regardless of cache dtype
+    // Output dtype is the io_dtype the kernel was templated on (not the
+    // cache dtype). For FP8 (cache=uchar) the kernel dequantizes internally
+    // and writes io_dtype-sized elements.
     Ok(PagedAttentionOutput {
         buffer: output,
         num_seqs: params.num_seqs,
         num_heads: params.num_heads,
         head_size: params.head_size,
-        dtype: MetalDtype::Float16,
+        dtype: io_dtype,
     })
 }
 
@@ -749,13 +762,16 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
     block_tables: &Buffer,
     context_lens: &Buffer,
     params: &PagedAttentionParams,
-    dtype: MetalDtype,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
 ) -> Result<PagedAttentionOutput, String> {
     let state = MetalState::get()?;
 
-    // Allocate output buffer - always use float16 size since kernel outputs float16
-    // even when using FP8 cache (kernel dequantizes internally)
-    let output_element_size = MetalDtype::Float16.size() as u64;
+    // Allocate output buffer sized by io_dtype — kernel writes io_dtype
+    // elements even for FP8 caches (dequantization happens inside the
+    // kernel). Using cache_dtype.size() would under-allocate by 2x for FP8
+    // with half/bf16 io.
+    let output_element_size = io_dtype.size() as u64;
     let output_size =
         (params.num_seqs * params.num_heads * params.head_size) as u64 * output_element_size;
     let output = state
@@ -765,13 +781,15 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
     // Calculate number of partitions
     let max_num_partitions = params.max_seq_len.div_ceil(PARTITION_SIZE);
 
-    // Allocate temporary buffers - tmp_out also uses float16 (kernel output dtype)
+    // Allocate temporary buffers. `tmp_out` holds partition outputs in the
+    // io dtype (NOT the cache dtype) — the reduce kernel reads io-typed
+    // elements.
     let exp_sums_size = (params.num_seqs * params.num_heads * max_num_partitions) as usize
         * std::mem::size_of::<f32>();
     let max_logits_size = exp_sums_size;
     let tmp_out_size = (params.num_seqs * params.num_heads * max_num_partitions * params.head_size)
         as usize
-        * MetalDtype::Float16.size();
+        * io_dtype.size();
 
     let exp_sums = state.device.new_buffer(
         exp_sums_size as u64,
@@ -793,7 +811,8 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
     // Phase 1: Compute partitioned attention
     {
         let kernel_name = MetalState::paged_attention_v2_kernel_name(
-            dtype,
+            io_dtype,
+            cache_dtype,
             params.head_size,
             params.block_size,
             false,
@@ -893,7 +912,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
     // Phase 2: Reduce partitions
     {
         let kernel_name =
-            MetalState::paged_attention_v2_reduce_kernel_name(dtype, params.head_size);
+            MetalState::paged_attention_v2_reduce_kernel_name(io_dtype, params.head_size);
         let pipeline = state.get_pipeline(&kernel_name)?;
 
         let command_buffer = state.command_queue.new_command_buffer();
@@ -929,13 +948,14 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         command_buffer.wait_until_completed();
     }
 
-    // Output is always float16 regardless of cache dtype
+    // Output dtype is io_dtype (kernel writes io-typed elements). FP8
+    // caches dequantize internally — output is still io_dtype.
     Ok(PagedAttentionOutput {
         buffer: output,
         num_seqs: params.num_seqs,
         num_heads: params.num_heads,
         head_size: params.head_size,
-        dtype: MetalDtype::Float16,
+        dtype: io_dtype,
     })
 }
 
@@ -958,7 +978,8 @@ pub unsafe fn dispatch_paged_attention_auto(
     context_lens: &Buffer,
     max_context_len: u32,
     params: &PagedAttentionParams,
-    dtype: MetalDtype,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
 ) -> Result<PagedAttentionOutput, String> {
     if max_context_len <= PARTITION_SIZE {
         // SAFETY: Caller guarantees all buffer pointers are valid
@@ -970,7 +991,8 @@ pub unsafe fn dispatch_paged_attention_auto(
                 block_tables,
                 context_lens,
                 params,
-                dtype,
+                io_dtype,
+                cache_dtype,
             )
         }
     } else {
@@ -983,7 +1005,8 @@ pub unsafe fn dispatch_paged_attention_auto(
                 block_tables,
                 context_lens,
                 params,
-                dtype,
+                io_dtype,
+                cache_dtype,
             )
         }
     }

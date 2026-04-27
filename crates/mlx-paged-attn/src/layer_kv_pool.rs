@@ -31,6 +31,7 @@
 //! (vLLM cache layout, FP8 element-size handling, x = 16/sizeof(dtype)).
 
 use crate::config::PagedAttentionConfig;
+use crate::metal::MetalDtype;
 
 #[cfg(target_os = "macos")]
 use metal::Buffer;
@@ -43,6 +44,24 @@ pub struct LayerKVPool {
     config: PagedAttentionConfig,
     num_blocks: u32,
 
+    /// Element dtype of the on-GPU K/V cache. Threaded through to
+    /// `reshape_and_cache` (write side) and `paged_attention` (gather side)
+    /// so the kernel-name lookup picks the matching `(io_t, cache_t)`
+    /// instantiation. Acceptable values:
+    ///
+    /// - `Float16` — non-FP8 cache, half-precision storage.
+    /// - `BFloat16` — non-FP8 cache, bfloat16 storage. **Required** for BF16
+    ///   models (e.g. Qwen3.5 in production); without this field the gather
+    ///   path was hard-coded to `Float16`, silently reinterpreting BF16 cache
+    ///   bytes through the `(half, half)` paged-attention kernel.
+    /// - `UChar` — FP8 E4M3 quantized cache (1 byte per element).
+    ///
+    /// `Float32` and other dtypes are rejected at construction — the metal
+    /// instantiation list only covers the 2-byte (half, bfloat16) and 1-byte
+    /// (uchar, FP8) cases for KV storage; an `f32` cache would silently
+    /// dispatch through the wrong kernel-element-size path.
+    cache_dtype: MetalDtype,
+
     /// `(key_cache, value_cache)` per layer. Indexed by `layer_idx`.
     /// On non-macOS this is a placeholder vector of unit tuples to keep
     /// the structure consistent without allocating GPU memory.
@@ -54,6 +73,39 @@ pub struct LayerKVPool {
 }
 
 impl LayerKVPool {
+    /// Validate and resolve `(element_size, x)` from the supplied
+    /// `cache_dtype`, asserting the caller's `(use_fp8, dtype)` combination
+    /// is one of the kernel-supported pairs:
+    ///
+    /// - `(false, Float16)` — 2-byte cache, x = 8
+    /// - `(false, BFloat16)` — 2-byte cache, x = 8
+    /// - `(true,  UChar)` — 1-byte FP8 cache, x = 16
+    ///
+    /// All other combinations (Float32 cache, FP8 mode with Float16/BFloat16
+    /// dtype, non-FP8 mode with UChar dtype, etc.) are rejected — silently
+    /// allocating buffers under the wrong size assumption would corrupt the
+    /// cache or write OOB on the GPU. Returns `(element_size_bytes, x)`.
+    fn cache_dtype_layout(use_fp8: bool, cache_dtype: MetalDtype) -> Result<(u64, u32), String> {
+        match (use_fp8, cache_dtype) {
+            (false, MetalDtype::Float16) | (false, MetalDtype::BFloat16) => Ok((2u64, 8u32)),
+            (true, MetalDtype::UChar) => Ok((1u64, 16u32)),
+            (true, _) => Err(format!(
+                "LayerKVPool: FP8 mode requires cache_dtype = UChar, got {:?}",
+                cache_dtype
+            )),
+            (false, MetalDtype::UChar) => Err(
+                "LayerKVPool: cache_dtype = UChar requires FP8 mode (config.use_fp8_cache = \
+                 Some(true))"
+                    .to_string(),
+            ),
+            (false, MetalDtype::Float32) => Err(
+                "LayerKVPool: Float32 cache_dtype is not supported (kernels only instantiate \
+                 (half, half), (bfloat16_t, bfloat16_t), and FP8 (T, uchar) pairs)"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Allocate one (K, V) `metal::Buffer` pair per layer.
     ///
     /// Buffer shapes mirror `CacheEngine::initialize` exactly (vLLM
@@ -63,13 +115,26 @@ impl LayerKVPool {
     ///
     /// where `x = 16 / sizeof(dtype)` (8 for FP16/BF16, 16 for FP8).
     ///
+    /// `cache_dtype` selects the on-GPU storage element type. It MUST be
+    /// consistent with `config.use_fp8()`:
+    /// - non-FP8: `Float16` or `BFloat16` (2 bytes / element).
+    /// - FP8: `UChar` (1 byte / element).
+    ///
+    /// `Float32` and other widths are rejected — the kernel instantiation
+    /// list only covers the 2-byte (half, bfloat16) and 1-byte (uchar) cases.
+    ///
     /// Returns `Err` for invalid configurations:
     /// - `num_blocks == 0`
     /// - `config.num_layers == 0`
     /// - `config.validate()` fails
+    /// - `cache_dtype` mismatched with `config.use_fp8()`
     /// - allocator-side block size disagreement (caller validates that
     ///   separately)
-    pub fn new(config: PagedAttentionConfig, num_blocks: u32) -> Result<Self, String> {
+    pub fn new(
+        config: PagedAttentionConfig,
+        num_blocks: u32,
+        cache_dtype: MetalDtype,
+    ) -> Result<Self, String> {
         config.validate()?;
         if num_blocks == 0 {
             return Err("LayerKVPool::new: num_blocks must be > 0".to_string());
@@ -78,18 +143,15 @@ impl LayerKVPool {
             return Err("LayerKVPool::new: config.num_layers must be > 0".to_string());
         }
 
+        let use_fp8 = config.use_fp8();
+        let (element_size, x) = Self::cache_dtype_layout(use_fp8, cache_dtype)?;
+
         #[cfg(target_os = "macos")]
         {
             use crate::metal::MetalState;
             use metal::MTLResourceOptions;
 
             let state = MetalState::get()?;
-
-            // Mirror CacheEngine::initialize byte-for-byte so cache layout
-            // stays consistent across the legacy and adapter paths.
-            let use_fp8 = config.use_fp8();
-            let element_size = if use_fp8 { 1u64 } else { 2u64 };
-            let x = if use_fp8 { 16u32 } else { 8u32 };
 
             // head_size must be divisible by x — guard against silent
             // truncation. PagedAttentionConfig::validate already rejects
@@ -130,16 +192,22 @@ impl LayerKVPool {
             Ok(Self {
                 config,
                 num_blocks,
+                cache_dtype,
                 layers,
             })
         }
 
         #[cfg(not(target_os = "macos"))]
         {
+            // Suppress dead-code warnings on non-macOS — we still validated
+            // the layout above so the dtype error path is exercised on every
+            // platform, but the actual sizes only matter for Metal.
+            let _ = (element_size, x);
             Ok(Self {
                 num_layers: config.num_layers,
                 config,
                 num_blocks,
+                cache_dtype,
             })
         }
     }
@@ -157,6 +225,12 @@ impl LayerKVPool {
     /// undefined behaviour** (will read/write past the buffer end on
     /// the GPU, corrupt memory, or silently produce garbage).
     ///
+    /// `cache_dtype` is recorded on the pool so the gather dispatch path
+    /// routes through the correct `(io_t, cache_t)` kernel name. Tests that
+    /// do not exercise kernel dispatch can pass any of `Float16` /
+    /// `BFloat16` / `UChar` (the dtype consistency check still runs against
+    /// `cfg.use_fp8()`).
+    ///
     /// `pub` only because this file's tests live in the consuming
     /// `mlx-core` crate (cross-crate `#[cfg(test)]` is not visible).
     /// **Never call this from production code.** Production code MUST
@@ -167,6 +241,7 @@ impl LayerKVPool {
         config: PagedAttentionConfig,
         num_blocks: u32,
         num_layers: u32,
+        cache_dtype: MetalDtype,
     ) -> Result<Self, String> {
         if num_blocks == 0 {
             return Err("LayerKVPool::new_for_test: num_blocks must be > 0".to_string());
@@ -176,6 +251,10 @@ impl LayerKVPool {
         }
         let mut cfg = config;
         cfg.num_layers = num_layers;
+
+        // Run the dtype consistency check on every platform so the rejection
+        // path is covered by CPU-only test runs too.
+        let _ = Self::cache_dtype_layout(cfg.use_fp8(), cache_dtype)?;
 
         #[cfg(target_os = "macos")]
         {
@@ -199,6 +278,7 @@ impl LayerKVPool {
             Ok(Self {
                 config: cfg,
                 num_blocks,
+                cache_dtype,
                 layers,
             })
         }
@@ -208,6 +288,7 @@ impl LayerKVPool {
                 num_layers,
                 config: cfg,
                 num_blocks,
+                cache_dtype,
             })
         }
     }
@@ -239,6 +320,14 @@ impl LayerKVPool {
         &self.config
     }
 
+    /// Element dtype of the on-GPU K/V cache. This is the value the kernel
+    /// dispatchers need for `(io_t, cache_t)` template selection — see
+    /// [`MetalState::reshape_and_cache_kernel_name`] /
+    /// [`MetalState::paged_attention_v1_kernel_name`].
+    pub fn cache_dtype(&self) -> MetalDtype {
+        self.cache_dtype
+    }
+
     /// Get the key cache buffer for a layer. `None` if `layer_idx` is out
     /// of range.
     #[cfg(target_os = "macos")]
@@ -266,11 +355,13 @@ impl LayerKVPool {
     /// `[num_tokens, num_kv_heads, head_size]` layout the kernel expects.
     ///
     /// `input_dtype` describes the dtype of the K/V input arrays — `Float16`,
-    /// `BFloat16`, or `Float32`. The cache dtype is derived from the pool's
-    /// FP8 config: FP8 caches use `UChar`, otherwise the cache mirrors the
-    /// input dtype. Splitting input from cache dtype avoids the historical
-    /// "input is always half" bug that silently routed BF16 / F32 K/V to the
-    /// wrong kernel (or, in the FP8 case, reinterpreted BF16 bytes as half).
+    /// `BFloat16`, or `Float32`. The cache dtype is the one recorded on the
+    /// pool at construction (see [`Self::cache_dtype`]); for FP8 mode that's
+    /// `UChar`, otherwise it's the dtype the caller declared when allocating
+    /// the cache buffers. Splitting input from cache dtype avoids the
+    /// historical "input is always half" bug that silently routed BF16 / F32
+    /// K/V to the wrong kernel (or, in the FP8 case, reinterpreted BF16
+    /// bytes as half).
     ///
     /// # Safety
     /// - `keys`, `values` must be valid `mlx_array` pointers with shape
@@ -291,7 +382,7 @@ impl LayerKVPool {
         v_scale: f32,
     ) -> Result<(), String> {
         use crate::metal::{
-            MetalDtype, MetalState, MlxMetalBuffer, RawBufferInfo, ReshapeAndCacheParams,
+            MetalState, MlxMetalBuffer, RawBufferInfo, ReshapeAndCacheParams,
             dispatch_reshape_and_cache_raw, is_metal_extraction_supported, synchronize_mlx,
         };
         use metal::MTLResourceOptions;
@@ -333,8 +424,13 @@ impl LayerKVPool {
             MTLResourceOptions::StorageModeShared,
         );
 
-        let use_fp8 = self.config.use_fp8();
-        let x = if use_fp8 { 16i32 } else { 8i32 };
+        // `x` follows the cache element width: 8 for 2-byte (half/bf16),
+        // 16 for 1-byte (FP8). Mirrors the cache-buffer math in
+        // `LayerKVPool::new`. Source it from `cache_dtype_layout` so the
+        // formula stays in one place.
+        let (_element_size, x_u32) =
+            Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype)?;
+        let x = x_u32 as i32;
         let stride = (self.config.num_kv_heads * self.config.head_size) as i32;
 
         let params = ReshapeAndCacheParams {
@@ -362,16 +458,17 @@ impl LayerKVPool {
             offset: 0,
         };
 
-        // Cache dtype: FP8 -> UChar; otherwise mirror the input dtype (we
-        // never auto-quantize from a wider input). Input and cache dtypes
-        // are forwarded to the dispatcher independently so the kernel-name
+        // Cache dtype is the one declared when the pool was constructed —
+        // mirroring the actual element layout of `key_cache` / `value_cache`
+        // — NOT a value re-derived from the input dtype. Re-deriving lets a
+        // BF16-input model write into a cache the pool was allocated as F16
+        // (impossible after the dtype consistency check in `new`, but the
+        // explicit field makes the contract obvious to readers and to the
+        // gather path that needs the same value). Input and cache dtypes are
+        // forwarded to the dispatcher independently so the kernel-name
         // lookup picks an instantiated `(input_t, cache_t)` pair instead of
         // assuming half-input.
-        let cache_dtype = if use_fp8 {
-            MetalDtype::UChar
-        } else {
-            input_dtype
-        };
+        let cache_dtype = self.cache_dtype;
 
         // SAFETY: all buffer pointers are extracted above; they remain
         // valid until command_buffer.wait_until_completed inside the
@@ -399,21 +496,29 @@ impl LayerKVPool {
     /// is the live `block_table.num_tokens()` and is uploaded as the single
     /// element of `context_lens`.
     ///
-    /// `queries` shape on the GPU buffer is `[1, num_query_heads, head_size]`,
-    /// element type half-precision (Float16 / BFloat16). The kernel template is
-    /// fixed at Float16 io_type — passing a BFloat16 buffer reinterprets the
-    /// bytes as Float16; documented as a P1C-3 follow-up alongside the
-    /// zero-copy MxArray conversion.
+    /// `queries` shape on the GPU buffer is `[1, num_query_heads, head_size]`.
+    /// `query_dtype` MUST be the actual element dtype of the queries buffer —
+    /// passing the wrong value reinterprets the buffer bytes through the
+    /// kernel's io template, the same misroute the cache_dtype split fixed
+    /// for the cache side. For non-FP8 caches the metal source only
+    /// instantiates same-dtype `(io, cache)` pairs (`(half, half)`,
+    /// `(bfloat16_t, bfloat16_t)`, `(float, float)`), so `query_dtype` MUST
+    /// equal `self.cache_dtype()` in that case; for FP8 caches (`UChar`),
+    /// `query_dtype` may independently be `Float16`, `BFloat16`, or
+    /// `Float32` (the kernel dequantizes internally).
     ///
-    /// On FP8 caches the cache dtype routes through `UChar`; otherwise the
-    /// cache uses Float16 (the kernel's `cache_dtype` template parameter).
+    /// The cache dtype comes from the pool's recorded `cache_dtype` field —
+    /// for BF16 production caches that's `BFloat16`, NOT `Float16`. Threading
+    /// the pool's actual cache dtype through is what fixes the silent BF16
+    /// → half misroute on the gather side (the corresponding `write_kv` was
+    /// already fixed in P1C-2).
     ///
     /// Returns the attention output as a `PagedAttentionOutput`. The caller
     /// converts to an `MxArray` via `to_mlx_array` (GPU → host roundtrip).
     ///
     /// # Safety
     /// - `queries` must be a valid evaluated `mlx_array` pointer with shape
-    ///   `[1, num_query_heads, head_size]`.
+    ///   `[1, num_query_heads, head_size]` and dtype equal to `query_dtype`.
     /// - The pool must outlive the kernel completion (synchronous wait
     ///   inside the dispatcher guarantees this from the caller's view).
     /// - `block_ids` length must equal `max_num_blocks_per_seq` and every
@@ -426,6 +531,7 @@ impl LayerKVPool {
         &self,
         layer_idx: u32,
         queries: *mut mlx_sys::mlx_array,
+        query_dtype: crate::metal::MetalDtype,
         block_ids: &[i32],
         num_tokens_in_request: u32,
         num_query_heads: u32,
@@ -433,7 +539,7 @@ impl LayerKVPool {
         softcap: f32,
     ) -> Result<crate::metal::PagedAttentionOutput, String> {
         use crate::metal::{
-            MetalDtype, MetalState, MlxMetalBuffer, PagedAttentionParams, RawBufferInfo,
+            MetalState, MlxMetalBuffer, PagedAttentionParams, RawBufferInfo,
             dispatch_paged_attention_auto, is_metal_extraction_supported, synchronize_mlx,
         };
         use metal::MTLResourceOptions;
@@ -520,14 +626,32 @@ impl LayerKVPool {
             v_scale: 1.0,
         };
 
-        // Cache dtype controls the kernel-name template parameter. The kernel's
-        // io_type is always Float16 (queries + output) — caller passes a
-        // half-precision queries buffer.
-        let cache_dtype = if self.config.use_fp8() {
-            MetalDtype::UChar
-        } else {
-            MetalDtype::Float16
-        };
+        // Cache dtype is the one declared at pool construction time; for
+        // BF16 production this is BFloat16, which routes through the
+        // `paged_attention_bfloat16_t_cache_bfloat16_t_*` kernel rather than
+        // the previous hard-coded `(half, half)` misroute. The `(io, cache)`
+        // pair must be one the metal source instantiated — for non-FP8
+        // caches that's the same-dtype pair only; for FP8 caches the io
+        // dtype is independent.
+        let cache_dtype = self.cache_dtype;
+        let io_dtype = query_dtype;
+
+        // Defense-in-depth: reject `(io, cache)` combinations the metal
+        // source did not instantiate. Without this guard a caller passing a
+        // mismatched query dtype against a non-FP8 cache would still trip
+        // the kernel-name lookup (`Kernel '...' not found`) inside
+        // `MetalState::get_pipeline`, but the error from there is opaque
+        // enough that the original misroute pattern could resurface as a
+        // "kernel not found" mystery. Catching it here at the API boundary
+        // points right at the caller's bug.
+        if !cache_dtype.is_fp8() && io_dtype != cache_dtype {
+            return Err(format!(
+                "LayerKVPool::gather_attention: query_dtype ({:?}) must equal cache_dtype \
+                 ({:?}) for non-FP8 caches; the metal source only instantiates same-dtype \
+                 (io_t, cache_t) pairs for non-FP8.",
+                io_dtype, cache_dtype
+            ));
+        }
 
         let query_raw = RawBufferInfo {
             ptr: query_info.buffer_ptr,
@@ -547,6 +671,7 @@ impl LayerKVPool {
                 &context_lens_buffer,
                 num_tokens_in_request,
                 &params,
+                io_dtype,
                 cache_dtype,
             )
         }
@@ -574,7 +699,7 @@ mod tests {
     #[test]
     fn test_new_rejects_zero_num_blocks() {
         let config = base_config(2);
-        let res = LayerKVPool::new(config, 0);
+        let res = LayerKVPool::new(config, 0, MetalDtype::Float16);
         assert!(res.is_err(), "expected error, got Ok");
         let msg = res.err().unwrap();
         assert!(
@@ -591,7 +716,7 @@ mod tests {
             num_layers: 0,
             ..base_config(2)
         };
-        let res = LayerKVPool::new(config, 4);
+        let res = LayerKVPool::new(config, 4, MetalDtype::Float16);
         assert!(res.is_err(), "expected error, got Ok");
     }
 
@@ -602,15 +727,65 @@ mod tests {
             block_size: 64,
             ..base_config(2)
         };
-        let res = LayerKVPool::new(bad, 4);
+        let res = LayerKVPool::new(bad, 4, MetalDtype::Float16);
         assert!(res.is_err(), "expected validation error, got Ok");
+    }
+
+    /// Non-FP8 config + UChar `cache_dtype` is a contradiction — the cache
+    /// would be allocated as 1-byte but kernel write/gather routes through
+    /// the half/bf16 instantiations. Reject at construction.
+    #[test]
+    fn test_new_rejects_uchar_dtype_without_fp8() {
+        let cfg = base_config(2);
+        let res = LayerKVPool::new(cfg, 4, MetalDtype::UChar);
+        assert!(res.is_err(), "expected dtype/FP8 mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("UChar") && msg.contains("FP8"),
+            "error must explain UChar/FP8 contract, got: {msg}"
+        );
+    }
+
+    /// FP8 config + Float16 (or BFloat16) `cache_dtype` is the inverse
+    /// contradiction — FP8 caches MUST use UChar. Reject at construction.
+    #[test]
+    fn test_new_rejects_half_dtype_with_fp8() {
+        // FP8 mode requires block_size != 8 (PagedAttentionConfig::validate);
+        // override to 16 so we exercise the dtype/FP8 mismatch error rather
+        // than the block_size validation error.
+        let cfg = PagedAttentionConfig {
+            block_size: 16,
+            use_fp8_cache: Some(true),
+            ..base_config(2)
+        };
+        let res = LayerKVPool::new(cfg, 4, MetalDtype::Float16);
+        assert!(res.is_err(), "expected FP8/dtype mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("FP8") && msg.contains("UChar"),
+            "error must explain FP8/UChar contract, got: {msg}"
+        );
+    }
+
+    /// Float32 cache is never supported (no kernel instantiation). Reject
+    /// regardless of FP8 mode.
+    #[test]
+    fn test_new_rejects_float32_dtype() {
+        let cfg = base_config(2);
+        let res = LayerKVPool::new(cfg, 4, MetalDtype::Float32);
+        assert!(res.is_err(), "expected Float32 rejection");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("Float32"),
+            "error must mention Float32, got: {msg}"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn test_new_allocates_per_layer_buffers() {
         let config = base_config(3);
-        let pool = match LayerKVPool::new(config, 4) {
+        let pool = match LayerKVPool::new(config, 4, MetalDtype::Float16) {
             Ok(p) => p,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_new_allocates_per_layer_buffers: {e}");
@@ -621,6 +796,7 @@ mod tests {
         assert_eq!(pool.num_layers(), 3);
         assert_eq!(pool.num_blocks(), 4);
         assert_eq!(pool.block_size(), 8);
+        assert_eq!(pool.cache_dtype(), MetalDtype::Float16);
         for layer_idx in 0..3 {
             assert!(pool.key_cache(layer_idx).is_some(), "layer {layer_idx} K");
             assert!(pool.value_cache(layer_idx).is_some(), "layer {layer_idx} V");
@@ -629,5 +805,23 @@ mod tests {
             pool.key_cache(3).is_none(),
             "out-of-range layer must return None"
         );
+    }
+
+    /// BF16 pool: `cache_dtype` round-trips through the getter and the
+    /// per-layer buffer sizing matches the F16 case (both 2 bytes per
+    /// element). Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_new_allocates_bf16_pool() {
+        let pool = match LayerKVPool::new(base_config(2), 4, MetalDtype::BFloat16) {
+            Ok(p) => p,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_new_allocates_bf16_pool: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        assert_eq!(pool.cache_dtype(), MetalDtype::BFloat16);
+        assert_eq!(pool.num_layers(), 2);
     }
 }

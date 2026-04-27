@@ -1176,12 +1176,16 @@ impl PagedKVCache {
             offset: query_info.offset,
         };
 
-        // Determine dtype based on config
-        let dtype = if self.config.use_fp8() {
+        // Determine cache dtype based on config. The legacy `PagedKVCache`
+        // path is only wired up for Float16 io (queries/output) — preserve
+        // that here. The new `LayerKVPool::gather_attention` path threads
+        // io_dtype through from the production model.
+        let cache_dtype = if self.config.use_fp8() {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let io_dtype = MetalDtype::Float16;
 
         // Dispatch the kernel
         let output = unsafe {
@@ -1193,7 +1197,8 @@ impl PagedKVCache {
                 &context_lens_buffer,
                 max_context_len,
                 &params,
-                dtype,
+                io_dtype,
+                cache_dtype,
             )?
         };
 
@@ -1331,12 +1336,13 @@ impl PagedKVCache {
             offset: query_info.offset,
         };
 
-        // Determine dtype based on config
-        let dtype = if self.config.use_fp8() {
+        // Determine cache dtype based on config. Legacy path: Float16 io.
+        let cache_dtype = if self.config.use_fp8() {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let io_dtype = MetalDtype::Float16;
 
         let output = unsafe {
             dispatch_paged_attention_auto(
@@ -1347,7 +1353,8 @@ impl PagedKVCache {
                 &context_lens_buffer,
                 max_context_len,
                 &params,
-                dtype,
+                io_dtype,
+                cache_dtype,
             )?
         };
 

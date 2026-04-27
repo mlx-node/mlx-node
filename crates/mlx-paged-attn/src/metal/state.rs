@@ -150,23 +150,40 @@ impl MetalState {
         )
     }
 
-    /// Get the paged_attention V1 kernel name (no partitioning)
+    /// Get the paged_attention V1 kernel name (no partitioning).
+    ///
+    /// The metal source instantiates these `(io_type, cache_type)` pairs (see
+    /// `crates/mlx-paged-attn/metal/attention/paged_attention.metal`):
+    /// - Non-FP8: `(float, float)`, `(half, half)`, `(bfloat16_t, bfloat16_t)`
+    /// - FP8 (`cache_type = uchar`): `(float, uchar)`, `(half, uchar)`,
+    ///   `(bfloat16_t, uchar)`
+    ///
+    /// Hard-coding the io dtype as `half` (the previous behavior) silently
+    /// dispatched the wrong kernel when the cache dtype was BFloat16 — and
+    /// for non-FP8 caches there is no `(half, bfloat16_t)` instantiation, so
+    /// the kernel-name lookup would fall back to corrupt routing through
+    /// `(half, half)` (or fail loudly, depending on the cache_dtype value).
+    /// Splitting `io_dtype` from `cache_dtype` forces every caller to
+    /// identify the io dtype, and the metallib lookup now fails loudly if
+    /// the requested pair was never instantiated.
     ///
     /// # Arguments
-    /// * `cache_dtype` - Data type for cache (UChar for FP8, Float16 otherwise)
-    /// * `head_size` - Head dimension (64 or 128)
-    /// * `block_size` - Block size (16 or 32)
+    /// * `io_dtype` - Data type for queries + output (must equal `cache_dtype`
+    ///   for non-FP8; for FP8 cache the io dtype can independently be Float16,
+    ///   BFloat16, or Float32)
+    /// * `cache_dtype` - Data type for cache storage (UChar for FP8,
+    ///   otherwise Float16 / BFloat16 / Float32 to match the cache buffers)
+    /// * `head_size` - Head dimension (32, 64, 80, 96, 112, 120, 128, 192, 256)
+    /// * `block_size` - Block size (8, 16, 32)
     /// * `use_alibi` - Whether to use ALiBi positional encoding
-    ///
-    /// Note: Input queries are always float16, output is always float16.
     pub fn paged_attention_v1_kernel_name(
+        io_dtype: MetalDtype,
         cache_dtype: MetalDtype,
         head_size: u32,
         block_size: u32,
         use_alibi: bool,
     ) -> String {
-        // Input/output are always float16, cache dtype varies
-        let io_type = MetalDtype::Float16.type_string();
+        let io_type = io_dtype.type_string();
         let cache_type = cache_dtype.type_string();
         let suffix = if use_alibi { "_alibi" } else { "" };
         format!(
@@ -175,23 +192,25 @@ impl MetalState {
         )
     }
 
-    /// Get the paged_attention V2 kernel name (with partitioning)
+    /// Get the paged_attention V2 kernel name (with partitioning).
+    ///
+    /// See [`Self::paged_attention_v1_kernel_name`] for the instantiation
+    /// list. Same `(io_type, cache_type)` pairs are instantiated for V2.
     ///
     /// # Arguments
-    /// * `cache_dtype` - Data type for cache (UChar for FP8, Float16 otherwise)
-    /// * `head_size` - Head dimension (64 or 128)
-    /// * `block_size` - Block size (16 or 32)
+    /// * `io_dtype` - Data type for queries + partition output (see V1 docs)
+    /// * `cache_dtype` - Data type for cache storage (see V1 docs)
+    /// * `head_size` - Head dimension
+    /// * `block_size` - Block size
     /// * `use_alibi` - Whether to use ALiBi positional encoding
-    ///
-    /// Note: Input queries are always float16, output is always float16.
     pub fn paged_attention_v2_kernel_name(
+        io_dtype: MetalDtype,
         cache_dtype: MetalDtype,
         head_size: u32,
         block_size: u32,
         use_alibi: bool,
     ) -> String {
-        // Input/output are always float16, cache dtype varies
-        let io_type = MetalDtype::Float16.type_string();
+        let io_type = io_dtype.type_string();
         let cache_type = cache_dtype.type_string();
         let suffix = if use_alibi { "_alibi" } else { "" };
         format!(
@@ -200,15 +219,14 @@ impl MetalState {
         )
     }
 
-    /// Get the paged_attention V2 reduce kernel name
+    /// Get the paged_attention V2 reduce kernel name.
     ///
-    /// Note: Reduce kernel always uses float16 since partitioned outputs are float16.
-    pub fn paged_attention_v2_reduce_kernel_name(
-        _cache_dtype: MetalDtype,
-        head_size: u32,
-    ) -> String {
-        // Reduce kernel always works with float16 outputs from partitions
-        let io_type = MetalDtype::Float16.type_string();
+    /// The reduce kernel is templated on a single io type (the partitioned
+    /// outputs from phase 1 share the same dtype as the final output). The
+    /// metal source instantiates the reduce kernel for `float`, `half`, and
+    /// `bfloat16_t` — pick whichever matches the V2 dispatch's `io_dtype`.
+    pub fn paged_attention_v2_reduce_kernel_name(io_dtype: MetalDtype, head_size: u32) -> String {
+        let io_type = io_dtype.type_string();
         format!(
             "paged_attention_v2_reduce_{}_hs{}_nt256_nsl32_ps512",
             io_type, head_size
@@ -313,34 +331,101 @@ mod tests {
             "reshape_and_cache_kv_float_cache_uchar_fp8"
         );
 
-        // Paged attention V1/V2 — unchanged: I/O is always float16.
+        // Paged attention V1/V2 — io_dtype split from cache_dtype.
+        // (half, half) — Float16 model, Float16 cache (existing default).
         assert_eq!(
-            MetalState::paged_attention_v1_kernel_name(MetalDtype::Float16, 128, 16, false),
+            MetalState::paged_attention_v1_kernel_name(
+                MetalDtype::Float16,
+                MetalDtype::Float16,
+                128,
+                16,
+                false,
+            ),
             "paged_attention_half_cache_half_hs128_bs16_nt256_nsl32_ps0"
         );
         assert_eq!(
-            MetalState::paged_attention_v1_kernel_name(MetalDtype::Float16, 128, 16, true),
+            MetalState::paged_attention_v1_kernel_name(
+                MetalDtype::Float16,
+                MetalDtype::Float16,
+                128,
+                16,
+                true,
+            ),
             "paged_attention_half_cache_half_hs128_bs16_nt256_nsl32_ps0_alibi"
         );
         assert_eq!(
-            MetalState::paged_attention_v2_kernel_name(MetalDtype::Float16, 128, 16, false),
+            MetalState::paged_attention_v2_kernel_name(
+                MetalDtype::Float16,
+                MetalDtype::Float16,
+                128,
+                16,
+                false,
+            ),
             "paged_attention_half_cache_half_hs128_bs16_nt256_nsl32_ps512"
         );
         assert_eq!(
-            MetalState::paged_attention_v2_kernel_name(MetalDtype::Float16, 128, 16, true),
+            MetalState::paged_attention_v2_kernel_name(
+                MetalDtype::Float16,
+                MetalDtype::Float16,
+                128,
+                16,
+                true,
+            ),
             "paged_attention_half_cache_half_hs128_bs16_nt256_nsl32_ps512_alibi"
         );
+        // (bfloat16_t, bfloat16_t) — BF16 model + BF16 cache (Qwen3.5
+        // production path; this is the kernel name `gather_attention` MUST
+        // dispatch when the cache_dtype field is BFloat16).
         assert_eq!(
-            MetalState::paged_attention_v1_kernel_name(MetalDtype::UChar, 128, 16, false),
+            MetalState::paged_attention_v1_kernel_name(
+                MetalDtype::BFloat16,
+                MetalDtype::BFloat16,
+                128,
+                16,
+                false,
+            ),
+            "paged_attention_bfloat16_t_cache_bfloat16_t_hs128_bs16_nt256_nsl32_ps0"
+        );
+        assert_eq!(
+            MetalState::paged_attention_v2_kernel_name(
+                MetalDtype::BFloat16,
+                MetalDtype::BFloat16,
+                128,
+                16,
+                false,
+            ),
+            "paged_attention_bfloat16_t_cache_bfloat16_t_hs128_bs16_nt256_nsl32_ps512"
+        );
+        // (half, uchar) — FP8 cache, half io.
+        assert_eq!(
+            MetalState::paged_attention_v1_kernel_name(
+                MetalDtype::Float16,
+                MetalDtype::UChar,
+                128,
+                16,
+                false,
+            ),
             "paged_attention_half_cache_uchar_hs128_bs16_nt256_nsl32_ps0"
         );
         assert_eq!(
-            MetalState::paged_attention_v2_kernel_name(MetalDtype::UChar, 128, 16, false),
+            MetalState::paged_attention_v2_kernel_name(
+                MetalDtype::Float16,
+                MetalDtype::UChar,
+                128,
+                16,
+                false,
+            ),
             "paged_attention_half_cache_uchar_hs128_bs16_nt256_nsl32_ps512"
         );
+        // Reduce kernel uses io_dtype only (the partition outputs are the
+        // io type; cache_dtype is irrelevant for the reduce phase).
         assert_eq!(
-            MetalState::paged_attention_v2_reduce_kernel_name(MetalDtype::UChar, 128),
+            MetalState::paged_attention_v2_reduce_kernel_name(MetalDtype::Float16, 128),
             "paged_attention_v2_reduce_half_hs128_nt256_nsl32_ps512"
+        );
+        assert_eq!(
+            MetalState::paged_attention_v2_reduce_kernel_name(MetalDtype::BFloat16, 128),
+            "paged_attention_v2_reduce_bfloat16_t_hs128_nt256_nsl32_ps512"
         );
     }
 
@@ -382,8 +467,13 @@ mod tests {
             Err(e) => panic!("unexpected MetalState::get failure: {e}"),
         };
         // Test V1 kernel for Qwen3 config: head_size=128, block_size=16
-        let kernel_name =
-            MetalState::paged_attention_v1_kernel_name(MetalDtype::Float16, 128, 16, false);
+        let kernel_name = MetalState::paged_attention_v1_kernel_name(
+            MetalDtype::Float16,
+            MetalDtype::Float16,
+            128,
+            16,
+            false,
+        );
         let pipeline = state.get_pipeline(&kernel_name);
         assert!(
             pipeline.is_ok(),

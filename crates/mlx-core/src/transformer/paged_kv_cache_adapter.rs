@@ -801,19 +801,25 @@ impl PagedKVCacheAdapter {
     /// Run paged attention against this layer's K/V buffers for a single
     /// decode step on the active request, returning the attention output.
     ///
-    /// `queries` shape: `[1, num_query_heads, head_size]`, dtype `Float16` or
-    /// `BFloat16` (the kernel's io template is fixed at half-precision; a
-    /// BFloat16 buffer's bytes are reinterpreted as Float16 — same caveat
-    /// as the existing `AttentionLayer::forward` decode path).
+    /// `queries` shape: `[1, num_query_heads, head_size]`. `queries.dtype`
+    /// MUST equal the pool's `cache_dtype` for non-FP8 caches (the metal
+    /// source only instantiates same-dtype `(io_t, cache_t)` pairs for
+    /// non-FP8); for FP8 caches the io dtype can independently be Float16
+    /// or BFloat16 (the kernel dequantizes internally). The dtype is
+    /// extracted from the queries tensor and forwarded to
+    /// `LayerKVPool::gather_attention` so the kernel-name lookup picks the
+    /// right `(io_t, cache_t)` instantiation. Mismatched dtype is rejected
+    /// at the API boundary by `LayerKVPool::gather_attention`.
     ///
     /// `scale`: typically `1.0 / sqrt(head_size as f32)`.
     /// `softcap`: `1.0` disables softcapping.
     ///
     /// Returns the attention output as an `MxArray` of shape
     /// `[1, num_query_heads, head_size]`, dtype Float32. The kernel writes
-    /// Float16; we copy GPU → host → MLX as Float32 to keep the conversion
-    /// trivial — **P1C-3 follow-up**: replace with zero-copy
-    /// `mlx_array_from_metal_buffer` so the result stays on-device.
+    /// io-typed elements (matching the queries dtype); we copy GPU → host
+    /// → MLX as Float32 to keep the conversion trivial — **P1C-3
+    /// follow-up**: replace with zero-copy `mlx_array_from_metal_buffer`
+    /// so the result stays on-device in its native precision.
     ///
     /// ## Single-request semantics
     ///
@@ -856,7 +862,52 @@ impl PagedKVCacheAdapter {
         //    capacity), far below i32::MAX. Cast is safe.
         let block_ids = build_decode_block_ids(block_table);
 
-        // 5. Dispatch and wrap output in MxArray. P1C-3 follow-up:
+        // 4b. Capacity guard: `record_tokens` does not currently enforce that
+        //     the running token count stays within the allocated block table
+        //     (a caller that forgets `allocate_suffix_blocks` will silently
+        //     advance `num_tokens` past `block_ids.len() * block_size`).
+        //     Without this check the kernel would dispatch with a
+        //     `context_lens` value larger than the block-table buffer it
+        //     uploads, reading past the end on the GPU. Compute the allocated
+        //     capacity via `checked_mul` so the multiplication itself can
+        //     never overflow (block_ids and block_size are both u32-bounded
+        //     by allocator capacity, so the product fits in u64 easily).
+        let block_size_us = self.block_size as usize;
+        let allocated_capacity = block_ids.len().checked_mul(block_size_us).ok_or_else(|| {
+            format!(
+                "gather_kv_for_decode: capacity overflow computing block_ids.len() ({}) * \
+                 block_size ({})",
+                block_ids.len(),
+                block_size_us,
+            )
+        })?;
+        if (num_tokens as usize) > allocated_capacity {
+            return Err(format!(
+                "gather_kv_for_decode: context length ({num_tokens}) exceeds allocated capacity \
+                 (block_ids.len()={} blocks × block_size={} = {allocated_capacity} slots). \
+                 Call allocate_suffix_blocks(total_tokens) before recording tokens past the \
+                 currently allocated capacity.",
+                block_ids.len(),
+                block_size_us,
+            ));
+        }
+
+        // 5. Resolve the queries dtype that `gather_attention` will thread
+        //    into the kernel-name lookup. The validated `q_meta` already
+        //    rejected anything other than Float16 / BFloat16, so this
+        //    match is exhaustive over the allowed set.
+        let query_metal_dtype = match q_meta.dtype {
+            DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
+            DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
+            other => {
+                return Err(format!(
+                    "gather_kv_for_decode: unsupported query dtype {other:?} \
+                     (validate_query_input should have rejected this)"
+                ));
+            }
+        };
+
+        // 6. Dispatch and wrap output in MxArray. P1C-3 follow-up:
         //    `to_mlx_array` does GPU → host → MLX as Float32; replace with
         //    zero-copy `mlx_array_from_metal_buffer` for on-device decode.
         // SAFETY:
@@ -869,6 +920,7 @@ impl PagedKVCacheAdapter {
             self.layer_kv_pool.gather_attention(
                 layer_idx,
                 queries.as_raw_ptr(),
+                query_metal_dtype,
                 &block_ids,
                 num_tokens,
                 num_query_heads,
@@ -1111,6 +1163,22 @@ mod tests {
         num_blocks: u32,
         block_size: u32,
     ) -> Option<Arc<mlx_paged_attn::LayerKVPool>> {
+        // Default to Float16 cache — lifecycle tests don't dispatch kernels
+        // so the dtype only affects the `cache_dtype` field. The BF16
+        // numerical-correctness test below builds its own pool with
+        // `MetalDtype::BFloat16` directly.
+        maybe_test_pool_with_dtype(
+            num_blocks,
+            block_size,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        )
+    }
+
+    fn maybe_test_pool_with_dtype(
+        num_blocks: u32,
+        block_size: u32,
+        cache_dtype: mlx_paged_attn::metal::MetalDtype,
+    ) -> Option<Arc<mlx_paged_attn::LayerKVPool>> {
         let cfg = mlx_paged_attn::PagedAttentionConfig {
             block_size,
             num_kv_heads: 1,
@@ -1119,7 +1187,7 @@ mod tests {
             // gpu_memory_mb is unused by new_for_test (it skips validate).
             ..mlx_paged_attn::PagedAttentionConfig::default()
         };
-        match mlx_paged_attn::LayerKVPool::new_for_test(cfg, num_blocks, 2) {
+        match mlx_paged_attn::LayerKVPool::new_for_test(cfg, num_blocks, 2, cache_dtype) {
             Ok(p) => Some(Arc::new(p)),
             Err(e) if e.contains("No Metal device found") => None,
             Err(e) => panic!("unexpected new_for_test failure: {e}"),
@@ -2280,7 +2348,11 @@ mod tests {
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
-        let pool = match mlx_paged_attn::LayerKVPool::new(cfg.clone(), 4) {
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
             Ok(p) => Arc::new(p),
             Err(e) => {
                 // Headless CI / VMs without Metal: skip rather than fail.
@@ -2335,7 +2407,14 @@ mod tests {
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
-        let pool = match mlx_paged_attn::LayerKVPool::new(cfg.clone(), 4) {
+        // BF16 cache to match the BF16 K/V input below (post-cache_dtype-fix
+        // routing: the pool's recorded cache dtype determines the kernel-name
+        // template, NOT a re-derivation from the input dtype).
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
             Ok(p) => Arc::new(p),
             Err(e) => {
                 eprintln!("Skipping test_update_keys_values_writes_succeed_on_metal_bf16: {e}");
@@ -2625,7 +2704,11 @@ mod tests {
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
-        let pool = match mlx_paged_attn::LayerKVPool::new(cfg.clone(), 4) {
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
             Ok(p) => Arc::new(p),
             Err(e) => {
                 eprintln!("skipping test_gather_kv_for_decode_writes_succeed_on_metal: {e}");
@@ -2681,6 +2764,156 @@ mod tests {
             DType::Float32,
             "to_mlx_array materializes Float32 (GPU host roundtrip); P1C-3 \
              follow-up: zero-copy via mlx_array_from_metal_buffer"
+        );
+    }
+
+    /// **BF16 numerical correctness on Metal.** Production Qwen3.5 runs in
+    /// BF16, so the gather path must route through the
+    /// `paged_attention_bfloat16_t_cache_bfloat16_t_*` kernel rather than
+    /// silently reinterpreting BF16 cache bytes through `(half, half)`.
+    ///
+    /// Setup: Q = zeros (BF16), K = zeros (BF16), V = ones (BF16). With
+    /// scores = Q·K = 0 and softcap = 1 (no-op), softmax over a uniform
+    /// score vector gives weights `1/N` for each of the `N = num_tokens`
+    /// context positions. The attention output reduces to
+    /// `sum_i (1/N) * V[i] = 1.0` — exact for any N within numeric BF16
+    /// precision. The misrouted path (BF16 cache bytes read through `half`
+    /// instantiation) would instead read BF16 1.0 (`0x3F80`) as half ≈
+    /// `1.875`, so the test distinguishes correct routing from misroute by
+    /// a wide margin.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gather_kv_for_decode_bf16_numerical_correctness() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_gather_kv_for_decode_bf16_numerical_correctness: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.reset_for_new_request(99).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[10, 20, 30, 40]).unwrap();
+
+        // K = zeros, V = ones — both BF16. The gather kernel attends over
+        // 4 context positions; with Q · K = 0 and softcap = 1, the softmax
+        // is uniform and the output is the mean of V along the context
+        // dimension == 1.0.
+        let k = MxArray::zeros(&[4, 1, 64], Some(DType::BFloat16)).expect("k zeros");
+        let v = MxArray::ones(&[4, 1, 64], Some(DType::BFloat16)).expect("v ones");
+        k.eval();
+        v.eval();
+        match adapter.update_keys_values(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_gather_kv_for_decode_bf16_numerical_correctness: {e}");
+                return;
+            }
+            Err(e) => {
+                panic!("unexpected error from update_keys_values (BF16): {e}");
+            }
+        }
+
+        // BF16 query of zeros — io_dtype must equal cache_dtype (BF16) for
+        // non-FP8 caches. Float16 would now be rejected by
+        // `LayerKVPool::gather_attention`'s mismatch guard.
+        let q = MxArray::zeros(&[1, 1, 64], Some(DType::BFloat16)).expect("q zeros");
+        q.eval();
+
+        let scale = 1.0_f32 / (64.0_f32).sqrt();
+        let out = match adapter.gather_kv_for_decode(0, &q, scale, 1.0) {
+            Ok(arr) => arr,
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_gather_kv_for_decode_bf16_numerical_correctness: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from gather_kv_for_decode (BF16): {e}"),
+        };
+
+        // `to_mlx_array` materializes Float32 via the host roundtrip.
+        assert_eq!(out.ndim().unwrap(), 3, "output must be 3-D");
+        assert_eq!(out.shape_at(0).unwrap(), 1);
+        assert_eq!(out.shape_at(1).unwrap(), 1);
+        assert_eq!(out.shape_at(2).unwrap(), 64);
+        assert_eq!(out.dtype().unwrap(), DType::Float32);
+
+        // The misrouted path (BF16 cache → half kernel) would produce
+        // ~1.875 per element (half(0x3F80) = 1.875). Correct routing
+        // produces 1.0 exactly. Any value below 1.5 is unambiguously the
+        // correct route.
+        let mut max_diff = 0.0_f32;
+        for i in 0..64 {
+            let v = out
+                .item_at_float32(i)
+                .unwrap_or_else(|e| panic!("item_at_float32({i}): {e}"));
+            // 1.0 with BF16 round-trip + accumulator noise is ≤ 0.05 off.
+            let diff = (v - 1.0_f32).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            // Hard upper bound that still rejects the misroute (1.875).
+            assert!(
+                v < 1.5,
+                "output[{i}] = {v} suggests misrouted (half, half) kernel — \
+                 BF16 cache bytes were reinterpreted as half. Expected ~1.0."
+            );
+        }
+        assert!(
+            max_diff < 0.05,
+            "max diff vs 1.0 = {max_diff} exceeds BF16 rounding tolerance — \
+             possible kernel misroute"
+        );
+    }
+
+    /// `gather_kv_for_decode` must reject a recorded context length that
+    /// exceeds the allocated block-table capacity. Without this guard the
+    /// kernel would dispatch with a `context_lens` value larger than the
+    /// uploaded `block_tables` buffer, reading past the end on the GPU.
+    /// CPU-only — graceful skip when no Metal device is present.
+    #[test]
+    fn test_gather_kv_for_decode_rejects_capacity_overflow() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping test_gather_kv_for_decode_rejects_capacity_overflow: Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        // Allocate exactly 1 block (block_size = 4 → 4 slots), then
+        // record 5 tokens — `record_tokens` doesn't enforce capacity, so the
+        // adapter's internal `num_tokens` advances past the allocated slots.
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(adapter.current_token_count(), 5);
+        assert_eq!(adapter.num_allocated_blocks(), 1);
+
+        let q = MxArray::zeros(&[1, 1, 32], Some(DType::Float16)).expect("q zeros");
+        let res = adapter.gather_kv_for_decode(0, &q, 0.5, 1.0);
+        assert!(res.is_err(), "expected capacity overflow rejection");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("capacity") || msg.contains("exceeds"),
+            "error must mention capacity/overflow, got: {msg}"
+        );
+        assert!(
+            msg.contains("allocate_suffix_blocks"),
+            "error must point at the allocate_suffix_blocks fix path, got: {msg}"
         );
     }
 }
