@@ -812,16 +812,32 @@ export async function handleCreateMessage(
         const session = lookup.session;
         // `X-Session-Cache` observability header. Mirrors the
         // classification on `/v1/responses` (see the long comment
-        // around its `getOrCreate` call): set the optimistic value
-        // BEFORE dispatch (so the header is on the wire even if the
-        // dispatch throws) and demote post-dispatch on the
-        // non-streaming path if the warm slot was leased but native
-        // prefix reuse did not actually happen
-        // (`result.cachedTokens === 0`). Streaming uses Approach B —
-        // SSE flushes headers on `beginSSE` before the dispatch
-        // settles, so we commit the optimistic value once and do not
-        // attempt to demote.
-        let sessionCacheStatus: 'fresh' | 'prefix_hit' = lookup.hit ? 'prefix_hit' : 'fresh';
+        // around its `getOrCreate` call, lines ~2443-2476).
+        //
+        // Non-streaming: set the optimistic `prefix_hit` value BEFORE
+        // dispatch on `lookup.hit` (so the header is on the wire even
+        // if the dispatch throws) and demote post-dispatch to `fresh`
+        // when the warm slot was leased but native prefix reuse did
+        // not actually happen (`result.cachedTokens === 0` — e.g.
+        // tokenizer change, system-prompt drift squeaking past the
+        // byte-equal compare, image-set change). `res.end` has not
+        // fired yet, so the overwrite still lands on the wire.
+        //
+        // Streaming: deliberately HOLD at the conservative `fresh`
+        // value even on `lookup.hit`. A `getOrCreateWarmAny` hit only
+        // proves an unexpired warm slot whose stored `instructions`
+        // are byte-equal to the request's `system` — it does NOT
+        // prove the full-history prompt is an append of that slot's
+        // history nor that native `cachedTokens > 0`. SSE flushes
+        // headers on `beginSSE` before the dispatch settles, so a
+        // pre-dispatch `prefix_hit` cannot be retracted; emitting it
+        // on a hit that turns out to reuse zero native tokens would
+        // both mislead telemetry and act as a same-system warm-slot
+        // presence side-channel. Until `cached_tokens` is threaded
+        // through the native streaming `start` chunk (Approach A),
+        // streaming commits `fresh` unconditionally — mirroring the
+        // identical decision on `/v1/responses` streaming.
+        let sessionCacheStatus: 'fresh' | 'prefix_hit' = lookup.hit && body.stream !== true ? 'prefix_hit' : 'fresh';
         res.setHeader('X-Session-Cache', sessionCacheStatus);
 
         // Outer catch branches on `responseMode` (not `res.headersSent`, which
