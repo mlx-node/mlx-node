@@ -1,6 +1,8 @@
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::mask::create_causal_mask;
 use crate::nn::{Linear, RMSNorm, RoPE};
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
@@ -375,6 +377,180 @@ impl Gemma4Attention {
         let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
         // Output projection
+        self.o_proj.forward(&output)
+    }
+
+    /// Forward pass driven by `PagedKVCacheAdapter` for global Gemma4
+    /// attention layers.
+    ///
+    /// Mirrors `Lfm2Attention::forward_paged` but adapted to Gemma4's
+    /// quirks:
+    /// * Q/K/V are reshaped to `[B, T, H, D]` BEFORE per-head RMSNorm
+    ///   (matches `forward`).
+    /// * V receives a SCALE-FREE RMSNorm (`mlx_fast_rms_norm` with
+    ///   `weight=null`), not a learned-scale norm.
+    /// * RoPE dispatches between `Standard` (sliding) and
+    ///   `Proportional` (global) — only global layers should call this
+    ///   method, but the dispatch is uniform.
+    /// * Optional K=V sharing collapses the V projection.
+    /// * Attention scale is `1.0` (not `head_dim^-0.5`).
+    ///
+    /// Caller responsibilities (mirrors LFM2 / Qwen3 helper contracts):
+    /// 1. `adapter.record_tokens(suffix)` BEFORE this call so the
+    ///    cursor is advanced; `update_keys_values` enforces alignment.
+    /// 2. `paged_idx` is the GLOBAL-LAYER ORDINAL into the adapter's
+    ///    `LayerKVPool` (NOT the absolute decoder index). The pool is
+    ///    sized for the global layer count.
+    /// 3. `first_logical_position` is the first token's logical index
+    ///    in the FULL request — used both as the RoPE offset and the
+    ///    `update_keys_values` write position.
+    /// 4. The decoder layer's `input_layernorm` is applied OUTSIDE this
+    ///    method so `x` here is already pre-normalized (matches the
+    ///    flat path's call site).
+    ///
+    /// Output: `[1, seq_len, hidden_size]` so the decoder layer's
+    /// `apply_ffn_ple_scalar` tail can consume it unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_paged(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        paged_idx: u32,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        // 1. Q/K/V projections (matches `forward`).
+        let queries = self.q_proj.forward(x)?;
+        let keys = self.k_proj.forward(x)?;
+        let values = if self.k_is_v {
+            keys.clone()
+        } else {
+            self.v_proj.as_ref().unwrap().forward(x)?
+        };
+
+        // 2. Reshape to [B, T, H, D] BEFORE per-head norm (matches `forward`).
+        let queries =
+            queries.reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?;
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+
+        // 3. QKV normalization (Q/K learned-scale, V scale-free).
+        let queries = self.q_norm.forward(&queries)?;
+        let keys = self.k_norm.forward(&keys)?;
+        let values = {
+            let handle = unsafe {
+                sys::mlx_fast_rms_norm(values.handle.0, std::ptr::null_mut(), self.v_norm_eps)
+            };
+            MxArray::from_handle(handle, "v_norm")?
+        };
+
+        // 4. Transpose to [B, H, T, D] BEFORE RoPE (matches `forward`).
+        let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        // 5. Apply RoPE using the request's logical offset.
+        let rope_offset = first_logical_position as i32;
+        let queries_bhtd = self.rope.forward(&queries, rope_offset)?;
+        let keys_bhtd = self.rope.forward(&keys, rope_offset)?;
+        let values_bhtd = values;
+
+        // 6. Convert K/V into the paged layout `[num_tokens, n_kv_heads,
+        //    head_dim]` expected by `update_keys_values`. Currently
+        //    batch=1 so num_tokens = batch * seq_len = seq_len.
+        //    [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D]
+        let keys_paged = keys_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch * seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values_paged = values_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch * seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+
+        adapter
+            .update_keys_values(
+                paged_idx,
+                &keys_paged,
+                &values_paged,
+                first_logical_position,
+            )
+            .map_err(napi::Error::from_reason)?;
+
+        // 7. Compute attention output. Gemma4's attention scale is 1.0
+        //    (the QK norm handles scaling).
+        let attn_bhtd = if is_prefill {
+            if cached_prefix_len == 0 {
+                // Fresh prefill: SDPA over in-flight Q/K/V with internal
+                // causal mask.
+                if seq_len > 1 {
+                    scaled_dot_product_attention_causal(
+                        &queries_bhtd,
+                        &keys_bhtd,
+                        &values_bhtd,
+                        1.0,
+                    )?
+                } else {
+                    scaled_dot_product_attention(
+                        &queries_bhtd,
+                        &keys_bhtd,
+                        &values_bhtd,
+                        1.0,
+                        None,
+                    )?
+                }
+            } else {
+                // Cache-hit prefill: read full [0, total_ctx) K/V back
+                // from the pool. The suffix was just written above.
+                let total_ctx = cached_prefix_len + (seq_len as u32);
+                let (k_full, v_full) = adapter
+                    .read_kv_range(paged_idx, 0, total_ctx)
+                    .map_err(napi::Error::from_reason)?;
+                let mask =
+                    create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
+                scaled_dot_product_attention(
+                    &queries_bhtd,
+                    &k_full,
+                    &v_full,
+                    1.0,
+                    Some(&mask),
+                )?
+            }
+        } else {
+            // Decode: read FULL `[0, total_ctx)` K/V back from the pool
+            // (the new K/V was just written by `update_keys_values`) and
+            // run MLX's SDPA. Same rationale as Qwen3's
+            // `forward_paged_adapter`: this matches the flat path's
+            // reduction order bit-for-bit, while the dedicated
+            // `gather_kv_for_decode` Metal kernel drifts a few ULP per
+            // layer in BF16. Use mask=None — every cached key is at a
+            // strictly earlier (or equal) position.
+            let total_ctx = first_logical_position + 1;
+            let (k_full, v_full) = adapter
+                .read_kv_range(paged_idx, 0, total_ctx)
+                .map_err(napi::Error::from_reason)?;
+            scaled_dot_product_attention(&queries_bhtd, &k_full, &v_full, 1.0, None)?
+        };
+
+        // 8. Output: [B, H, T, D] -> [B, T, H*D] -> projection.
+        let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
+        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
         self.o_proj.forward(&output)
     }
 
