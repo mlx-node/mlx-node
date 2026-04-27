@@ -52,7 +52,7 @@ import {
   sendAnthropicRateLimit,
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
-import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
+import { canonicalizeSystemForCacheKey, mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import {
   buildAnthropicResponse,
   buildContentBlockDelta,
@@ -708,16 +708,11 @@ export async function handleCreateMessage(
 
     // The system prompt is baked into `messages` and replayed via `startFromHistory`,
     // so it cannot leak across requests. We still pass a canonicalized form to
-    // `getOrCreate` to keep the registry API uniform with `/v1/responses`. Arrays
-    // are JSON-stringified; plain strings pass through.
-    let requestedSystem: string | null;
-    if (typeof body.system === 'string') {
-      requestedSystem = body.system;
-    } else if (body.system != null) {
-      requestedSystem = JSON.stringify(body.system);
-    } else {
-      requestedSystem = null;
-    }
+    // `getOrCreate` to keep the registry API uniform with `/v1/responses`. The
+    // helper is shared with `mapAnthropicRequest`'s system loop so the cache-key
+    // view and the mapped messages can never drift — both drop the rotating
+    // Anthropic billing-header block (cf. `canonicalizeSystemForCacheKey`).
+    const requestedSystem = canonicalizeSystemForCacheKey(body.system);
 
     // Per-model execution mutex. Every dispatch through `/v1/messages` serializes
     // with every dispatch through `/v1/responses` for the same model binding.

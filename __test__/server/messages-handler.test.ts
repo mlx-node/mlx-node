@@ -2676,6 +2676,110 @@ describe('handleCreateMessage', () => {
       }
     });
 
+    it('rotating x-anthropic-billing-header does not bust the warm slot', async () => {
+      // Pins Task 5 — the request mapper drops Anthropic's per-request
+      // billing/attribution header (Claude Code injects it as the first
+      // system block with a `cch=<rotating-token>;` segment that changes
+      // every turn). Without the strip:
+      //
+      //   1. The warm-slot gate (`getOrCreateWarmAny`) compares
+      //      `requestedSystem` byte-equally — `JSON.stringify(body.system)`
+      //      with the rotating cch= token would always differ between
+      //      turns, missing the warm slot every request.
+      //   2. Even if the gate matched, the native token-prefix verifier
+      //      would still bust the cached prefix because the rotating ~60
+      //      token header is part of the prompt.
+      //
+      // After the strip, both views are stable across turns. The model
+      // never sees the billing header (assertion below on the first arg
+      // of `chatSessionStart`), and turn 2 hits the warm slot exactly
+      // like the simpler three-turn test above — but with a rotating
+      // billing block prepended.
+      const startResults = [
+        makeChatResult({ text: 'A1', cachedTokens: 0, promptTokens: 5, numTokens: 3 }),
+        makeChatResult({ text: 'A2', cachedTokens: 12, promptTokens: 20, numTokens: 5 }),
+      ];
+      const chatSessionStart = vi.fn().mockResolvedValueOnce(startResults[0]).mockResolvedValueOnce(startResults[1]);
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+
+      // ---- Turn 1 ----
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'test-model',
+          system: [
+            { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=AAAA;' },
+            { type: 'text', text: 'You are Claude.' },
+          ],
+          messages: [{ role: 'user', content: 'A' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r1.getStatus()).toBe(200);
+      expect(r1.getHeaders()['x-session-cache']).toBe('fresh');
+      expect(sessionReg.size).toBe(1);
+      const resetCachesAfterT1 = resetCaches.mock.calls.length;
+      expect(resetCachesAfterT1).toBeGreaterThanOrEqual(1);
+
+      // ---- Turn 2: rotated cch= token, otherwise identical conversation ----
+      const r2 = createMockRes();
+      await handleCreateMessage(
+        r2.res,
+        {
+          model: 'test-model',
+          system: [
+            // cch= rotated. Without the strip this whole request would
+            // miss the warm slot at the gate level.
+            { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=BBBB;' },
+            { type: 'text', text: 'You are Claude.' },
+          ],
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: 'A1' },
+            { role: 'user', content: 'B' },
+          ],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      // Warm-slot hit assertions — the rotating header MUST NOT bust the
+      // gate. These are the gates that fail under a regression.
+      expect(r2.getStatus()).toBe(200);
+      expect(r2.getHeaders()['x-session-cache']).toBe('prefix_hit');
+      expect(r2.getHeaders()['x-cached-tokens']).toBe('12');
+      const t2Body = JSON.parse(r2.getBody()) as { usage: Record<string, number> };
+      expect(t2Body.usage.cache_read_input_tokens).toBe(12);
+      expect(t2Body.usage.input_tokens).toBe(8); // 20 - 12
+      expect(sessionReg.size).toBe(1);
+      // Warm-reuse helper fired (NOT a full reset) — model.resetCaches
+      // count is unchanged from turn 1.
+      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+
+      // Model-input witness: BOTH turns dispatch a system message with
+      // the billing header DROPPED. The model only ever sees the stable
+      // `"You are Claude."` content.
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      const turn1Messages = chatSessionStart.mock.calls[0]![0] as ChatMessage[];
+      const turn2Messages = chatSessionStart.mock.calls[1]![0] as ChatMessage[];
+      expect(turn1Messages[0]).toEqual({ role: 'system', content: 'You are Claude.' });
+      expect(turn2Messages[0]).toEqual({ role: 'system', content: 'You are Claude.' });
+    });
+
     it('three-turn streaming replay reuses the warm slot (header stays fresh by design)', async () => {
       // Streaming counterpart of the previous test. Behaviour mirror:
       //   * Each turn flushes a clean SSE wire (`message_start` ...

@@ -17,6 +17,49 @@ export interface MappedAnthropicRequest {
 }
 
 /**
+ * Anthropic billing/attribution header prefix. Claude Code injects a leading
+ * system block of the shape `"x-anthropic-billing-header: cc_version=...; cch=<token>;"`
+ * where the `cch=` token rotates per request. Leaving this in the prompt
+ * defeats prefix caching at BOTH the warm-slot gate (`getOrCreateWarmAny`,
+ * which compares `requestedSystem` byte-equally) AND the native
+ * token-prefix verifier inside `chatSessionStart`. We mirror vLLM's strategy
+ * (`vllm/entrypoints/anthropic/serving.py`, commit 262b76a0, 2026-03-11):
+ * stateless, per-block, prefix-only — drop entirely BEFORE tokenization, so
+ * the model never sees the rotating token AND the byte-prefix is stable.
+ *
+ * Hardcoded (not configurable) and intentionally limited to this single
+ * prefix to mirror vLLM's exact behaviour. The string-system branch is left
+ * UNFILTERED to match upstream.
+ */
+const ANTHROPIC_BILLING_HEADER_PREFIX = 'x-anthropic-billing-header';
+
+/**
+ * Canonicalize the Anthropic `system` field into the same string the mapper
+ * bakes into the leading `system` ChatMessage. Used by both
+ * `mapAnthropicRequest` (so the model never sees the billing header) and the
+ * `/v1/messages` warm-slot gate cache-key derivation (so the gate matches
+ * across rotating billing tokens). The two views MUST stay in sync — a
+ * single source of truth prevents drift.
+ *
+ * Asymmetry vs. `mapAnthropicRequest`: the mapper THROWS on non-text blocks
+ * (it's a request-validation gate), but this helper silently skips them.
+ * Safe because `mapAnthropicRequest` runs first as a pre-flight gate, so by
+ * the time the cache-key is computed, the request shape has already been
+ * validated.
+ */
+export function canonicalizeSystemForCacheKey(system: AnthropicMessagesRequest['system']): string | null {
+  if (system == null) return null;
+  if (typeof system === 'string') return system;
+  const parts: string[] = [];
+  for (const b of system) {
+    if (b.type === 'text' && !b.text.startsWith(ANTHROPIC_BILLING_HEADER_PREFIX)) {
+      parts.push(b.text);
+    }
+  }
+  return parts.join('');
+}
+
+/**
  * Resolve the text content of a `tool_result` block. The internal `ChatMessage`
  * shape (NAPI-generated) has no `images` field on `role: 'tool'`, so nested
  * images are rejected outright — any hoist-to-trailing-user workaround loses
@@ -73,6 +116,16 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
       const systemParts: string[] = [];
       for (const b of req.system as SystemBlock[]) {
         if (b.type === 'text') {
+          // Drop Anthropic's per-request billing/attribution header — Claude Code
+          // injects "x-anthropic-billing-header: ...; cch=<rotating-token>;" as the
+          // first system block. The cch= token rotates every request, so leaving
+          // it in the prompt defeats prefix caching at both the warm-slot gate
+          // (byte-equal compare on the joined system text) and the native
+          // token-prefix verifier. Mirrors `canonicalizeSystemForCacheKey`
+          // above so the mapped messages and the cache-key view never drift.
+          if (b.text.startsWith(ANTHROPIC_BILLING_HEADER_PREFIX)) {
+            continue;
+          }
           systemParts.push(b.text);
         } else {
           throw new Error(`Unsupported system block type: "${(b as { type: string }).type}"`);

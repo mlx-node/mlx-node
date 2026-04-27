@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { mapAnthropicRequest } from '../../packages/server/src/mappers/anthropic-request.js';
+import {
+  canonicalizeSystemForCacheKey,
+  mapAnthropicRequest,
+} from '../../packages/server/src/mappers/anthropic-request.js';
 
 describe('mapAnthropicRequest', () => {
   it('maps a simple string user message to a single user ChatMessage', () => {
@@ -43,6 +46,97 @@ describe('mapAnthropicRequest', () => {
       { role: 'system', content: 'You are helpful. Be concise.' },
       { role: 'user', content: 'Hi' },
     ]);
+  });
+
+  it('drops Anthropic x-anthropic-billing-header system blocks before they reach the model', () => {
+    // Claude Code injects a leading system block of the shape
+    // `"x-anthropic-billing-header: cc_version=...; cch=<rotating-token>;"`
+    // where the cch= token rotates per request. Leaving it in the prompt
+    // defeats prefix caching at both the warm-slot gate and the native
+    // token-prefix verifier. Mirrors vLLM's exact strip logic
+    // (`vllm/entrypoints/anthropic/serving.py`, commit 262b76a0): drop any
+    // text block whose content starts with the prefix.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      system: [
+        { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cc_entrypoint=cli; cch=4a8a9;' },
+        { type: 'text', text: 'You are Claude Code.' },
+        { type: 'text', text: ' Be helpful.' },
+      ],
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+
+    expect(messages).toEqual([
+      { role: 'system', content: 'You are Claude Code. Be helpful.' },
+      { role: 'user', content: 'Hi' },
+    ]);
+  });
+
+  it('does NOT strip a string-typed system field even when it starts with the billing header', () => {
+    // String-system path is unfiltered (mirrors vLLM, which only strips at
+    // the block level). Real Claude Code traffic always sends the header in
+    // an array block, so a string-system caller copying the prefix is on
+    // their own — but the contract is to leave string `system` alone.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      system: 'x-anthropic-billing-header: cch=AAAA; You are Claude.',
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+
+    expect(messages).toEqual([
+      { role: 'system', content: 'x-anthropic-billing-header: cch=AAAA; You are Claude.' },
+      { role: 'user', content: 'Hi' },
+    ]);
+  });
+
+  describe('canonicalizeSystemForCacheKey', () => {
+    it('returns null for a missing system field', () => {
+      expect(canonicalizeSystemForCacheKey(undefined)).toBeNull();
+    });
+
+    it('passes through a string-typed system field unchanged', () => {
+      // String path mirrors the mapper's string branch — no filtering.
+      expect(canonicalizeSystemForCacheKey('You are helpful.')).toBe('You are helpful.');
+    });
+
+    it('produces the same joined text the mapper bakes into the system message (billing header dropped)', () => {
+      // Cross-check: the cache-key view MUST equal the mapper's mapped
+      // system content for the same input, otherwise the warm-slot gate
+      // misses on requests the model would otherwise treat as identical.
+      const system = [
+        { type: 'text' as const, text: 'x-anthropic-billing-header: cc_version=...; cch=ROT1;' },
+        { type: 'text' as const, text: 'You are Claude.' },
+        { type: 'text' as const, text: ' Be concise.' },
+      ];
+      const cacheKey = canonicalizeSystemForCacheKey(system);
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        system,
+        messages: [{ role: 'user', content: 'Hi' }],
+      });
+      expect(cacheKey).toBe('You are Claude. Be concise.');
+      expect(messages[0]).toEqual({ role: 'system', content: cacheKey });
+    });
+
+    it('matches across rotating cch= tokens (key-stability witness)', () => {
+      // The whole point: the cache key MUST be byte-identical across two
+      // turns whose only difference is the rotating cch= token in the
+      // first block. A regression that leaves the header in would yield
+      // distinct cache keys here.
+      const t1 = canonicalizeSystemForCacheKey([
+        { type: 'text', text: 'x-anthropic-billing-header: cch=AAAA;' },
+        { type: 'text', text: 'You are Claude.' },
+      ]);
+      const t2 = canonicalizeSystemForCacheKey([
+        { type: 'text', text: 'x-anthropic-billing-header: cch=BBBB;' },
+        { type: 'text', text: 'You are Claude.' },
+      ]);
+      expect(t1).toBe('You are Claude.');
+      expect(t1).toBe(t2);
+    });
   });
 
   it('maps multi-turn conversation (user → assistant → user)', () => {
