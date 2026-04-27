@@ -193,6 +193,18 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             .get("vision_soft_tokens_per_image")
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
+
+        // Paged-attention knobs — opt-in, default to None so existing
+        // checkpoints without these keys load unchanged.
+        paged_cache_memory_mb: raw
+            .get("paged_cache_memory_mb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        paged_block_size: raw
+            .get("paged_block_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
     })
 }
 
