@@ -1275,6 +1275,356 @@ impl Lfm2Inner {
         kinds
     }
 
+    /// Block-paged streaming variant of [`Self::chat_stream_sync_core`].
+    ///
+    /// Mirrors `chat_sync_core_paged`'s adapter lifecycle and forward
+    /// dispatch (reset → find_cached_prefix → allocate_suffix → prefill
+    /// via `run_paged_prefill_chunk` → decode loop via
+    /// `run_paged_decode_step`) but emits each generated token through
+    /// the streaming callback as it is produced.
+    ///
+    /// Mirrors the flat streaming path's terminal contract:
+    /// * Streams text chunks for every decoded token.
+    /// * Sends a residual chunk for any tokens whose detokenized text
+    ///   has not yet been flushed.
+    /// * Sends a terminal `done: true` chunk with `finish_reason`,
+    ///   aggregated `tool_calls`, `thinking`, performance metrics, and
+    ///   the matched cached-prefix length.
+    ///
+    /// Same caveats as `chat_sync_core_paged`: zero-delta prompts (every
+    /// token cached) are rejected; numerical equivalence to the flat
+    /// path is not asserted.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream_sync_core_paged(
+        &mut self,
+        tokens: Vec<u32>,
+        tokenizer: Arc<Qwen3Tokenizer>,
+        think_end_id: Option<u32>,
+        think_end_str: Option<String>,
+        include_reasoning: bool,
+        p: crate::models::qwen3_5::chat_common::ChatParams,
+        enable_thinking: Option<bool>,
+        report_perf: bool,
+        eos_token_id: u32,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let prompt_token_count = tokens.len();
+        let max_new_tokens = p.max_new_tokens;
+        let sampling_config = p.sampling_config;
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+
+        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let mut reasoning_tracker =
+            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+
+        // Streaming decode state
+        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        let mut streamed_text_len = 0usize;
+        let mut last_is_reasoning = thinking_enabled;
+
+        // === Adapter lifecycle: reset + prefix lookup + suffix allocation. ===
+        let seq_id: u32 = 0;
+        let cached_prefix_len = {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason(
+                    "chat_stream_sync_core_paged: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?;
+            adapter
+                .reset_for_new_request(seq_id)
+                .map_err(Error::from_reason)?;
+            let prefix = adapter
+                .find_cached_prefix(&tokens, &[])
+                .map_err(Error::from_reason)?;
+            let cached = prefix.cached_token_count;
+            let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+            adapter
+                .allocate_suffix_blocks(total_budget)
+                .map_err(Error::from_reason)?;
+            cached
+        };
+
+        // Reset conv-layer state for this turn (see chat_sync_core_paged
+        // doc comment).
+        self.caches = init_caches(&self.config);
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+
+        let total_prompt_tokens = tokens.len() as u32;
+        let suffix_len = total_prompt_tokens
+            .checked_sub(cached_prefix_len)
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
+                )
+            })?;
+
+        if total_prompt_tokens == 0 {
+            // Release before bailing.
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        // Run the forward + decode under a try-style block so we can
+        // always release the request afterwards.
+        let result = self.chat_stream_sync_core_paged_inner(
+            &tokens,
+            cached_prefix_len,
+            suffix_len,
+            &p,
+            sampling_config,
+            eos_token_id,
+            &mut reasoning_tracker,
+            report_perf,
+            &mut first_token_instant,
+            &tokenizer,
+            &mut decode_stream,
+            &mut streamed_text_len,
+            &mut last_is_reasoning,
+            cb,
+            cancelled,
+        );
+
+        let (generated_tokens, finish_reason) = match result {
+            Ok(t) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.register_full_blocks_for_reuse(&[]);
+                    let _ = adapter.release_request();
+                }
+                t
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        // Flush residual buffered bytes from decode_stream (mirrors flat
+        // streaming).
+        let full_text = tokenizer
+            .decode_sync(&generated_tokens, true)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to decode generated tokens: {}", e);
+                String::new()
+            });
+        if full_text.len() > streamed_text_len {
+            let residual = full_text[streamed_text_len..].to_string();
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: residual,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    cached_tokens: None,
+                    performance: None,
+                    is_reasoning: Some(last_is_reasoning),
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+        }
+
+        // Performance metrics
+        let performance = if report_perf {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                tokens.len() - cached_prefix_len as usize,
+                generated_tokens.len(),
+            )
+        } else {
+            None
+        };
+
+        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+
+        let mut result = finalize_chat_result(
+            &tokenizer,
+            &generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str.as_deref(),
+            performance,
+            include_reasoning,
+            thinking_enabled,
+            prompt_token_count as u32,
+            reasoning_tokens,
+        )?;
+        result.cached_tokens = cached_prefix_len;
+
+        // Send terminal chunk
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: result.text.clone(),
+                done: true,
+                finish_reason: Some(result.finish_reason.clone()),
+                tool_calls: Some(result.tool_calls.clone()),
+                thinking: result.thinking.clone(),
+                num_tokens: Some(result.num_tokens),
+                prompt_tokens: Some(result.prompt_tokens),
+                reasoning_tokens: Some(result.reasoning_tokens),
+                raw_text: Some(result.raw_text.clone()),
+                cached_tokens: Some(cached_prefix_len),
+                performance: result.performance.clone(),
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
+
+    /// Inner forward + streaming decode loop for
+    /// [`Self::chat_stream_sync_core_paged`]. Split out so the caller can
+    /// wrap with `release_request` in a try-style flow.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream_sync_core_paged_inner<'a>(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        suffix_len: u32,
+        p: &crate::models::qwen3_5::chat_common::ChatParams,
+        sampling_config: Option<crate::sampling::SamplingConfig>,
+        eos_token_id: u32,
+        reasoning_tracker: &mut ReasoningTracker,
+        report_perf: bool,
+        first_token_instant: &mut Option<std::time::Instant>,
+        tokenizer: &'a Arc<Qwen3Tokenizer>,
+        decode_stream: &mut tokenizers::DecodeStream<
+            'a,
+            tokenizers::ModelWrapper,
+            tokenizers::NormalizerWrapper,
+            tokenizers::PreTokenizerWrapper,
+            tokenizers::PostProcessorWrapper,
+            tokenizers::DecoderWrapper,
+        >,
+        streamed_text_len: &mut usize,
+        last_is_reasoning: &mut bool,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<(Vec<u32>, String)> {
+        if suffix_len == 0 {
+            return Err(Error::from_reason(
+                "chat_stream_sync_core_paged: zero-delta prompt (every token cached) is not yet \
+                 supported on the block-paged path; flat path required for this corner case",
+            ));
+        }
+
+        // === PREFILL ===
+        let suffix = &tokens[(cached_prefix_len as usize)..];
+        let last_logits = self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?;
+
+        // Apply penalties + sample first token
+        let mut token_history: Vec<u32> = tokens.to_vec();
+        let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
+        let mut y = sample(&last_logits, sampling_config)?;
+        y.eval();
+
+        if report_perf {
+            *first_token_instant = Some(std::time::Instant::now());
+        }
+
+        // === STREAMING DECODE LOOP ===
+        let max_new_tokens = p.max_new_tokens;
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut finish_reason = String::from("length");
+
+        for step in 0..max_new_tokens {
+            let token_id = y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+            token_history.push(token_id);
+            let is_reasoning = reasoning_tracker.observe_token(token_id);
+            *last_is_reasoning = is_reasoning;
+
+            if token_id == eos_token_id {
+                finish_reason = String::from("stop");
+                break;
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                finish_reason = String::from("cancelled");
+                break;
+            }
+
+            // Stream delta chunk
+            let token_text = Qwen3Tokenizer::step_decode_stream(
+                decode_stream,
+                tokenizer.inner(),
+                token_id,
+                &generated_tokens,
+                *streamed_text_len,
+            );
+            *streamed_text_len += token_text.len();
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: token_text,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    cached_tokens: None,
+                    performance: None,
+                    is_reasoning: Some(is_reasoning),
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+
+            if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                &generated_tokens,
+                p.max_consecutive_tokens,
+                p.max_ngram_repeats,
+                p.ngram_size,
+            ) {
+                finish_reason = reason.to_string();
+                break;
+            }
+            if step + 1 >= max_new_tokens {
+                break;
+            }
+
+            // Decode forward
+            let next_logits = self.run_paged_decode_step(token_id)?;
+            let next_logits = next_logits.squeeze(Some(&[1]))?;
+
+            let next_logits = if reasoning_tracker.should_force_think_end() {
+                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                y = MxArray::from_int32(&[forced_id], &[1])?;
+                y.eval();
+                continue;
+            } else {
+                apply_all_penalties(next_logits, &token_history, p)?
+            };
+
+            y = sample(&next_logits, sampling_config)?;
+            y.eval();
+
+            if (step + 1) % 256 == 0 {
+                crate::array::synchronize_and_clear_cache();
+            }
+        }
+
+        Ok((generated_tokens, finish_reason))
+    }
+
     /// Core streaming chat implementation.
     ///
     /// `eos_token_id` is the caller-supplied stop-on token id (e.g.
@@ -1310,6 +1660,26 @@ impl Lfm2Inner {
             tool_defs,
             enable_thinking,
         )?;
+
+        // Block-paged dispatch: when the adapter is configured, route
+        // through the parallel `chat_stream_sync_core_paged` path. The
+        // flat path below stays untouched so off-by-default behavior is
+        // byte-identical to before this commit.
+        if self.paged_adapter.is_some() {
+            return self.chat_stream_sync_core_paged(
+                tokens,
+                tokenizer,
+                think_end_id,
+                think_end_str,
+                include_reasoning,
+                p,
+                enable_thinking,
+                report_perf,
+                eos_token_id,
+                cb,
+                cancelled,
+            );
+        }
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
