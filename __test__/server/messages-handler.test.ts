@@ -3345,5 +3345,310 @@ describe('handleCreateMessage', () => {
       const probe = sessionReg.getOrCreate('resp_xyz', 'sysA');
       expect(probe.hit).toBe(false);
     });
+
+    it('non-streaming warm hit emits Anthropic cache_read_input_tokens with reduced input_tokens', async () => {
+      // Pins the body-level cache-accounting contract on /v1/messages
+      // (Task 4 Part 1). Anthropic clients (Claude Code in particular)
+      // read `response.usage.cache_read_input_tokens` directly for
+      // cost / billing display — a header-only signal is invisible to
+      // them, so the response body MUST carry the spec fields whenever
+      // the warm slot delivered actual native KV reuse.
+      //
+      //   Turn 1 — cold (cachedTokens === 0): usage carries
+      //     `input_tokens: promptTokens` and NO cache fields.
+      //   Turn 2 — warm hit (`cachedTokens: 7`, promptTokens: 20):
+      //     usage carries `cache_read_input_tokens: 7` AND
+      //     `input_tokens: 13` (= 20 - 7). The legacy
+      //     `X-Cached-Tokens` header remains as a redundant ops
+      //     signal; `X-Session-Cache: prefix_hit` mirrors the
+      //     existing classification.
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'A1', numTokens: 3, promptTokens: 5, cachedTokens: 0 }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'A2', numTokens: 5, promptTokens: 20, cachedTokens: 7 }));
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+
+      // Turn 1: cold — cache fields are OMITTED, not zeroed.
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'test-model',
+          system: 'S',
+          messages: [{ role: 'user', content: 'A' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r1.getStatus()).toBe(200);
+      const t1Body = JSON.parse(r1.getBody()) as { usage: Record<string, number> };
+      expect(t1Body.usage.input_tokens).toBe(5);
+      expect(t1Body.usage.output_tokens).toBe(3);
+      expect(t1Body.usage).not.toHaveProperty('cache_read_input_tokens');
+      expect(t1Body.usage).not.toHaveProperty('cache_creation_input_tokens');
+      expect(r1.getHeaders()['x-cached-tokens']).toBeUndefined();
+      expect(r1.getHeaders()['x-session-cache']).toBe('fresh');
+
+      // Turn 2: warm hit — `cache_read_input_tokens` lands in the
+      // body, `input_tokens` is the unsuffixed remainder, and
+      // `cache_creation_input_tokens` stays OFF the wire (we don't
+      // expose explicit cache_control breakpoints).
+      const r2 = createMockRes();
+      await handleCreateMessage(
+        r2.res,
+        {
+          model: 'test-model',
+          system: 'S',
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: 'A1' },
+            { role: 'user', content: 'B' },
+          ],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r2.getStatus()).toBe(200);
+      const t2Body = JSON.parse(r2.getBody()) as { usage: Record<string, number> };
+      expect(t2Body.usage.cache_read_input_tokens).toBe(7);
+      expect(t2Body.usage.input_tokens).toBe(13);
+      expect(t2Body.usage.output_tokens).toBe(5);
+      expect(t2Body.usage).not.toHaveProperty('cache_creation_input_tokens');
+      // Header behaviour unchanged — `X-Cached-Tokens` and
+      // `X-Session-Cache` still carry the same redundant signal.
+      expect(r2.getHeaders()['x-cached-tokens']).toBe('7');
+      expect(r2.getHeaders()['x-session-cache']).toBe('prefix_hit');
+    });
+
+    it('streaming message_delta emits cache_read_input_tokens with reduced input_tokens on warm hit', async () => {
+      // Streaming counterpart to the non-streaming Anthropic cache
+      // accounting test above. The body-level fields ride the
+      // `message_delta` event's `usage` block — flushed AFTER the
+      // SSE headers are committed — so they are independent of the
+      // pre-flush `X-Session-Cache` classification (which stays
+      // `'fresh'` on streaming by design; see the existing 3-turn
+      // streaming replay test for the full rationale).
+      function makeStream(text: string, promptTokens: number, cachedTokens: number, numTokens: number) {
+        return async function* () {
+          yield { text, done: false, isReasoning: false };
+          yield {
+            text,
+            done: true,
+            finishReason: 'stop',
+            toolCalls: [] as ToolCallResult[],
+            thinking: null,
+            numTokens,
+            promptTokens,
+            reasoningTokens: 0,
+            rawText: text,
+            cachedTokens,
+          };
+        };
+      }
+      const stream = vi
+        .fn()
+        .mockImplementationOnce(makeStream('A1', 5, 0, 3))
+        .mockImplementationOnce(makeStream('A2', 20, 7, 5));
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming test')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: stream,
+        chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        resetCaches: vi.fn(),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('stream-model', mockModel);
+
+      // Turn 1: cold streaming turn — `message_delta.usage` carries
+      // only the bare two fields (`input_tokens` + `output_tokens`).
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'stream-model',
+          system: 'S',
+          messages: [{ role: 'user', content: 'A' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+      const t1Events = parseSSE(r1.getBody());
+      const t1Delta = t1Events.find((e) => e.event === 'message_delta');
+      expect(t1Delta).toBeDefined();
+      const t1Usage = t1Delta!.data['usage'] as Record<string, number>;
+      expect(t1Usage.input_tokens).toBe(5);
+      expect(t1Usage.output_tokens).toBe(3);
+      expect(t1Usage).not.toHaveProperty('cache_read_input_tokens');
+      expect(t1Usage).not.toHaveProperty('cache_creation_input_tokens');
+
+      // Turn 2: warm hit — `cache_read_input_tokens: 7` lands in
+      // the streaming usage block, `input_tokens` is the
+      // unsuffixed remainder. `X-Session-Cache` STAYS `'fresh'`
+      // on streaming per the existing pre-flush design — that is
+      // independent of the body fields.
+      const r2 = createMockRes();
+      await handleCreateMessage(
+        r2.res,
+        {
+          model: 'stream-model',
+          system: 'S',
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: 'A1' },
+            { role: 'user', content: 'B' },
+          ],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+      const t2Events = parseSSE(r2.getBody());
+      const t2Delta = t2Events.find((e) => e.event === 'message_delta');
+      expect(t2Delta).toBeDefined();
+      const t2Usage = t2Delta!.data['usage'] as Record<string, number>;
+      expect(t2Usage.cache_read_input_tokens).toBe(7);
+      expect(t2Usage.input_tokens).toBe(13);
+      expect(t2Usage.output_tokens).toBe(5);
+      expect(t2Usage).not.toHaveProperty('cache_creation_input_tokens');
+      // Streaming header invariant unchanged.
+      expect(r2.getHeaders()['x-session-cache']).toBe('fresh');
+    });
+
+    it('warm-slot lease where the native verifier rejects (cachedTokens=0) demotes X-Session-Cache to fresh and omits cache fields', async () => {
+      // Defense-in-depth gate for the trust-the-native-verifier
+      // strategy. `getOrCreateWarmAny` matches solely on byte-equal
+      // `instructions` — but the actual prompt prefix that the
+      // native side compares (`verify_cache_prefix_direct`) sees the
+      // FULL token stream, including image tokens, tool-manifest
+      // tokens, and any chat-template revision baked into the
+      // tokenizer. When those drift between turns despite a same
+      // `system`, the JS-side warm hit fires but the native verifier
+      // rejects on token-prefix mismatch and reports
+      // `cachedTokens === 0`. The handler MUST then:
+      //   * Demote `X-Session-Cache` from the optimistic `prefix_hit`
+      //     back to `fresh` (the post-dispatch overwrite at
+      //     messages.ts ~line 897).
+      //   * NOT emit `X-Cached-Tokens`.
+      //   * NOT emit `cache_read_input_tokens` /
+      //     `cache_creation_input_tokens` in the response body.
+      // The mock controls `cachedTokens` directly — that is exactly
+      // what the native verifier returns — so the test is mocking
+      // the native contract under image-set / tool-manifest /
+      // template-revision drift WITHOUT actually wiring up images
+      // or tools. Removing the post-dispatch demote in messages.ts
+      // (the `if (lookup.hit && result.cachedTokens === 0) { ... }`
+      // block) breaks this test by leaving the header at
+      // `'prefix_hit'`.
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'first', numTokens: 4, promptTokens: 6, cachedTokens: 0 }))
+        // Second turn: instructions match (same `system: 'S'`) so
+        // `getOrCreateWarmAny` returns a hit, BUT the mocked native
+        // result reports `cachedTokens === 0` — exactly what
+        // `verify_cache_prefix_direct` returns when the prefix
+        // mismatched after a hidden change (images, tools, template).
+        .mockResolvedValueOnce(makeChatResult({ text: 'second', numTokens: 6, promptTokens: 11, cachedTokens: 0 }));
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+
+      // Turn 1: adopts the warm slot under the sentinel.
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'test-model',
+          system: 'S',
+          messages: [{ role: 'user', content: 'A' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r1.getStatus()).toBe(200);
+      const resetCachesAfterT1 = resetCaches.mock.calls.length;
+      expect(resetCachesAfterT1).toBeGreaterThanOrEqual(1);
+
+      // Identity witness: spy on `primeHistory` so we can prove the
+      // warm-reuse helper actually leased the same session for
+      // turn 2 — i.e. `getOrCreateWarmAny` HIT — even though the
+      // native side then rejected on token-prefix mismatch. Without
+      // this witness a regression that quietly skipped the warm
+      // lease (and therefore never had a chance to demote) would
+      // pass `expect(...x-session-cache).toBe('fresh')` for the
+      // wrong reason.
+      const primeHistorySpy = vi.spyOn(ChatSession.prototype, 'primeHistory');
+      try {
+        const r2 = createMockRes();
+        await handleCreateMessage(
+          r2.res,
+          {
+            model: 'test-model',
+            system: 'S',
+            messages: [
+              { role: 'user', content: 'A' },
+              { role: 'assistant', content: 'first' },
+              { role: 'user', content: 'B' },
+            ],
+            max_tokens: 100,
+          },
+          registry,
+        );
+        expect(r2.getStatus()).toBe(200);
+
+        // Warm-reuse helper fired (NOT `session.reset()`): the
+        // model's `resetCaches` did NOT advance — proves the lookup
+        // hit. If it had been a miss, the cold-start branch would
+        // have called `session.reset()` and bumped `resetCaches`.
+        expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+
+        // Header demoted from optimistic `prefix_hit` to `fresh`.
+        // This is the contract under test.
+        expect(r2.getHeaders()['x-session-cache']).toBe('fresh');
+        // No `X-Cached-Tokens` header — the redundant ops signal
+        // also stays off the wire when no tokens were actually
+        // reused.
+        expect(r2.getHeaders()['x-cached-tokens']).toBeUndefined();
+
+        // Body cache fields stay OFF the wire — no
+        // `cache_read_input_tokens`, no `cache_creation_input_tokens`.
+        const t2Body = JSON.parse(r2.getBody()) as { usage: Record<string, number> };
+        expect(t2Body.usage).not.toHaveProperty('cache_read_input_tokens');
+        expect(t2Body.usage).not.toHaveProperty('cache_creation_input_tokens');
+        expect(t2Body.usage.input_tokens).toBe(11);
+        expect(t2Body.usage.output_tokens).toBe(6);
+
+        // Identity witness: turn 2's `primeHistory` ran on the SAME
+        // ChatSession that turn 1 adopted under the sentinel. Proves
+        // the warm-reuse helper actually leased it (i.e. the demote
+        // branch was the one that fired, not a quiet miss).
+        expect(primeHistorySpy).toHaveBeenCalled();
+        const lastCtx = primeHistorySpy.mock.contexts[primeHistorySpy.mock.contexts.length - 1];
+        expect(lastCtx).toBeInstanceOf(ChatSession);
+      } finally {
+        primeHistorySpy.mockRestore();
+      }
+    });
   });
 });
