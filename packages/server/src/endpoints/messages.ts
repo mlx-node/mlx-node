@@ -1,19 +1,42 @@
 /**
  * POST /v1/messages — stateless Anthropic Messages API.
  *
- * Every request carries the full conversation in `req.messages`. We allocate
- * a fresh `ChatSession` per request via `SessionRegistry.getOrCreate(null,
- * …, null)`, prime with the mapped history, and run `startFromHistory[Stream]`.
- * No adopt/drop on that path — the session's lifetime is the single call.
+ * Every request carries the full conversation in `req.messages`. The
+ * Anthropic Messages API is stateless on the wire: there is no
+ * `previous_response_id` to thread, and clients (e.g. Claude Code)
+ * also do NOT propagate `prompt_cache_key` back to the server. The
+ * only cross-turn signal that turn N continues turn N-1's prefix is
+ * the registry's own warm slot — a per-model, single-warm cache
+ * keyed only by `instructions` byte-equality.
  *
- * The `prompt_cache_key` prefix-reuse feature is NOT exposed on this endpoint
- * — the field has been removed from `AnthropicMessagesRequest` so clients
- * are not misled into believing they are getting prefix reuse. The tier-2
- * lookup will be re-enabled (together with advertising the request field)
- * once native KV can be preserved across `reset() + primeHistory()` on the
- * stateless per-turn dispatch this endpoint performs. For /v1/responses-
- * style prefix reuse today, clients should use `prompt_cache_key` on
- * `/v1/responses` instead.
+ * Each request looks up the warm slot via
+ * `SessionRegistry.getOrCreateWarmAny(requestedSystem)`. On a HIT we
+ * keep the underlying native KV cache alive
+ * (`resetPreservingNativeCacheForWarmReuse` wipes only JS-side
+ * session state) so the native `verify_cache_prefix_direct` can
+ * recognize the cached prefix and re-prefill only the new suffix.
+ * On a MISS we run a full `session.reset()` to wipe both JS and
+ * native state — a fresh JS session does NOT imply a fresh native
+ * cache (the underlying `SessionCapableModel` is shared and its
+ * native `cached_token_history` persists across requests). Either
+ * way we then `primeHistory(messages)` + `startFromHistory[Stream]`.
+ *
+ * After the dispatch settles we adopt the session back under the
+ * sentinel id `'__msg_warm__'` (or drop on uncommitted streams /
+ * thrown errors) so the next turn can lease it. The sentinel is
+ * never produced by either the OpenAI or the Anthropic wire format,
+ * so cross-endpoint capture via tier-1 is impossible by
+ * construction. The `/v1/responses` and `/v1/messages` endpoints
+ * still SHARE the single warm slot under the registry's single-warm
+ * invariant — a turn on one side can evict the other's slot.
+ *
+ * The `prompt_cache_key` request field is still NOT exposed on this
+ * endpoint. The server-side warm slot is sufficient for the
+ * single-Claude-Code-session use case (Claude Code POSTs the entire
+ * transcript back each turn and never sees a different prompt-cache
+ * key). Cross-conversation block-level cache reuse is a separate
+ * Phase-2 feature that would require the field — re-adding both is
+ * a future change.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -21,6 +44,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
+import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
 import {
   sendAnthropicBadRequest,
   sendAnthropicInternalError,
@@ -54,6 +78,18 @@ import {
 } from '../transport-visibility.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 import { validateAndCanonicalizeHistoryToolOrder } from './responses.js';
+
+/**
+ * Sentinel response id used to adopt and drop the per-model warm slot
+ * for `/v1/messages` reuse. The Anthropic Messages API does not
+ * produce a `previous_response_id` clients could echo back, and the
+ * OpenAI `/v1/responses` side mints fresh `resp_*` ids — so this
+ * literal can never collide with a tier-1 lookup from either
+ * endpoint. Centralised here to keep the four call sites
+ * (`adopt` on success, `drop` on failure, both for streaming and
+ * non-streaming) in lockstep.
+ */
+const MESSAGES_WARM_SLOT_ID = '__msg_warm__';
 
 // Non-streaming path
 
@@ -393,30 +429,40 @@ async function handleStreamingNative(
 
 // Session routing
 
-/** Prime a fresh session with the full history and run a single turn. */
+/** Prime a session with the full history and run a single turn. */
 async function runSessionNonStreaming(
   session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
   config: ChatConfig,
+  isFreshSession: boolean,
 ): Promise<ChatResult> {
-  // Tier-2 lookup is currently disabled on `/v1/messages` (see the
-  // block comment around `sessionReg.getOrCreate` in the handler),
-  // so `session` is always a fresh `turns === 0` wrapper from
-  // `newSession()` and the `turns > 0` branch below never fires
-  // today. The `turns === 0` branch still needs an explicit
-  // `reset()` because a fresh JS session does NOT imply a fresh
-  // native cache — the underlying `SessionCapableModel` is shared
-  // across `ChatSession` lifetimes, and its native
-  // `cached_token_history` persists across requests. After the
-  // native refactor moved the unconditional wipe out of
-  // `chat_session_start_sync` into the miss branch of
-  // `verify_cache_prefix_direct`, a fresh-session cold replay that
-  // did not explicitly reset would silently reuse whatever prefix
-  // happened to overlap with the previous request — a cross-request
-  // cache-affinity side channel. Only registry HITS are authorized
-  // for cache reuse, and this endpoint never produces one, so every
-  // cold replay must wipe.
-  await session.reset();
+  // Dual-branch reset gated on the registry lookup outcome:
+  //
+  //   * MISS (`isFreshSession === true`) — we MUST run a full
+  //     `session.reset()`. A fresh JS session does NOT imply a fresh
+  //     native cache — the underlying `SessionCapableModel` is shared
+  //     across `ChatSession` lifetimes via `ModelRegistry`, and its
+  //     native `cached_token_history` persists across requests. After
+  //     the native refactor moved the unconditional wipe out of
+  //     `chat_session_start_sync` into the miss branch of
+  //     `verify_cache_prefix_direct`, skipping the wipe here would
+  //     silently reuse whatever prefix happened to overlap with the
+  //     previous (unrelated) request — the cross-request
+  //     cache-affinity side channel documented at length in
+  //     `responses.ts` (around the matching `runSessionNonStreaming`
+  //     branches). Only registry HITS are authorized for cache reuse.
+  //
+  //   * HIT (`isFreshSession === false`) — we run the JS-only
+  //     `resetPreservingNativeCacheForWarmReuse` so the registry-leased
+  //     native KV cache stays alive for `verify_cache_prefix_direct` to
+  //     recover the reused prefix on this turn. `primeHistory`
+  //     requires `turnCount === 0`, which the helper guarantees by
+  //     wiping JS-side state only.
+  if (isFreshSession) {
+    await session.reset();
+  } else {
+    await resetPreservingNativeCacheForWarmReuse(session);
+  }
   session.primeHistory(messages);
   return await session.startFromHistory(config);
 }
@@ -437,12 +483,19 @@ async function runSessionStreaming(
   messages: ChatMessage[],
   config: ChatConfig,
   signal: AbortSignal | undefined,
+  isFreshSession: boolean,
 ): Promise<MessagesStreamingOutcome> {
-  // See `runSessionNonStreaming` for the full rationale. Always
-  // `reset()` before `primeHistory()` to wipe the shared native
-  // model's `cached_token_history` — a fresh JS session does not
-  // imply a fresh native cache.
-  await session.reset();
+  // Same dual-branch reset as `runSessionNonStreaming`: MISS wipes
+  // both JS and native state to block the cross-request
+  // cache-affinity leak described at length in `responses.ts`; HIT
+  // wipes JS-only so `verify_cache_prefix_direct` can recover the
+  // leased native prefix. `initialTurns` MUST be captured AFTER the
+  // reset zeroes `turns` so the committed check reads correctly.
+  if (isFreshSession) {
+    await session.reset();
+  } else {
+    await resetPreservingNativeCacheForWarmReuse(session);
+  }
   session.primeHistory(messages);
   const initialTurns = session.turns;
   return {
@@ -703,40 +756,54 @@ export async function handleCreateMessage(
           return;
         }
 
-        // Tier-2 lookup disabled on /v1/messages until native KV can be
-        // preserved across `reset() + primeHistory()`.
+        // Per-model warm-slot lookup for `/v1/messages` reuse. The
+        // Anthropic Messages API is stateless on the wire — there is
+        // no `previous_response_id` to thread, and clients do not
+        // propagate `prompt_cache_key` back to the server (Claude
+        // Code in particular) — so neither tier-1 nor tier-2 can fire
+        // on this endpoint. The third lookup mode
+        // (`getOrCreateWarmAny`) walks the registry's at-most-one
+        // warm entry and leases it out when the stored `instructions`
+        // are byte-equal to the request's `system`; otherwise it
+        // returns a fresh session.
         //
-        // The endpoint's `runSession*` helpers still `session.reset()`
-        // on every turn (since `primeHistory` refuses to overwrite a
-        // `turns > 0` session), and `ChatSession.reset()` wipes BOTH
-        // JS-side state AND the underlying model's native KV cache.
-        // Passing any `prompt_cache_key` into `sessionReg.getOrCreate`
-        // would therefore:
-        //   1. On a tier-2 hit, lease out the one warm session from the
-        //      single-warm registry (entries.clear() runs inside
-        //      getOrCreate), immediately reset() it — wiping the very
-        //      KV state the tier-2 hit exists to preserve — and NEVER
-        //      re-adopt(), because this endpoint does not assign
-        //      response ids or call `sessionReg.adopt`. Net effect: a
-        //      /v1/messages request with a matching `prompt_cache_key`
-        //      silently STEALS and destroys the /v1/responses
-        //      endpoint's warm session while gaining no reuse itself.
-        //   2. On a tier-2 miss, `entries.clear()` in the fallthrough
-        //      branch still evicts any entry keyed to a different
-        //      prompt_cache_key — same destructive side effect.
-        // Passing `null` here keeps the registry untouched for other
-        // clients and makes this endpoint a pure cold-start path.
+        // Adoption is keyed by the literal sentinel
+        // `MESSAGES_WARM_SLOT_ID = '__msg_warm__'`. The Anthropic
+        // Messages API never produces a `previous_response_id` clients
+        // could echo back (and the OpenAI side mints `resp_*` ids),
+        // so cross-endpoint capture via tier-1 is impossible by
+        // construction — no `/v1/responses` request can collide with
+        // the sentinel through the tier-1 path.
         //
-        // The `prompt_cache_key` field has been removed from the
-        // `AnthropicMessagesRequest` public type — advertising a
-        // field the handler silently ignores misled clients into
-        // believing they were getting prefix reuse. Re-adding both
-        // the field and this lookup becomes a single-PR change once
-        // native KV can survive a `reset()` + `primeHistory()`
-        // round-trip on this endpoint.
-        const lookup = sessionReg.getOrCreate(null, requestedSystem, null);
+        // The two endpoints DO share the single warm slot under the
+        // registry's single-warm invariant: a `/v1/messages` turn
+        // following a `/v1/responses` turn can evict (and vice versa).
+        // That is the explicit trade-off of holding at most one warm
+        // entry per model — operators who need stronger isolation
+        // should run separate model bindings or front the server with
+        // a tenant-aware proxy.
+        //
+        // The `prompt_cache_key` request field is still NOT exposed
+        // on this endpoint. The server-side warm slot is sufficient
+        // for the single-Claude-Code-session use case targeted by
+        // option C; cross-conversation block-level cache reuse
+        // (which would benefit from the request-side key) is a
+        // separate Phase-2 feature.
+        const lookup = sessionReg.getOrCreateWarmAny(requestedSystem);
         const session = lookup.session;
-        res.setHeader('X-Session-Cache', 'fresh');
+        // `X-Session-Cache` observability header. Mirrors the
+        // classification on `/v1/responses` (see the long comment
+        // around its `getOrCreate` call): set the optimistic value
+        // BEFORE dispatch (so the header is on the wire even if the
+        // dispatch throws) and demote post-dispatch on the
+        // non-streaming path if the warm slot was leased but native
+        // prefix reuse did not actually happen
+        // (`result.cachedTokens === 0`). Streaming uses Approach B —
+        // SSE flushes headers on `beginSSE` before the dispatch
+        // settles, so we commit the optimistic value once and do not
+        // attempt to demote.
+        let sessionCacheStatus: 'fresh' | 'prefix_hit' = lookup.hit ? 'prefix_hit' : 'fresh';
+        res.setHeader('X-Session-Cache', sessionCacheStatus);
 
         // Outer catch branches on `responseMode` (not `res.headersSent`, which
         // flips in `writeHead` before the body lands) so a crash after
@@ -745,22 +812,61 @@ export async function handleCreateMessage(
 
         try {
           if (body.stream === true) {
-            const outcome = await runSessionStreaming(session, messages, config, streamSignal);
+            const outcome = await runSessionStreaming(session, messages, config, streamSignal, !lookup.hit);
             await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq, visibility);
+            // Adopt-or-drop gate on the stream's authoritative commit
+            // signal. A half-decoded stream (client abort, generator
+            // throw, iterator exhaustion) leaves the native KV in a
+            // poisoned state that must NOT be re-leased — mirrors the
+            // gate at responses.ts around the
+            // `committed && handlerError == null && streamFailureMode === null`
+            // check. Here `wasCommitted()` is the authoritative
+            // signal because the producer's `finally` runs on break,
+            // and a thrown error from `handleStreamingNative` would
+            // have routed through the inner catch below instead of
+            // reaching this point.
+            if (outcome.wasCommitted()) {
+              sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+            } else {
+              sessionReg.drop(MESSAGES_WARM_SLOT_ID);
+            }
           } else {
             // Native `chatSessionStart` has no AbortSignal yet — disconnect handling
             // lives inside `handleNonStreaming` / `endJson`.
-            const result = await runSessionNonStreaming(session, messages, config);
-            // X-Cached-Tokens intentionally not emitted here: the
-            // tier-2 lookup is disabled above, the session is reset()
-            // before every turn, and the runSession* helpers never
-            // resume an existing conversation — so `result.cachedTokens`
-            // is always 0 on this endpoint. Flip this back on (together
-            // with the tier-2 lookup) once native KV can survive the
-            // reset() + primeHistory() round-trip.
+            const result = await runSessionNonStreaming(session, messages, config, !lookup.hit);
+            // Re-classify the `X-Session-Cache` header. A warm-slot
+            // hit that did NOT actually produce native prefix reuse
+            // (`cachedTokens === 0` — e.g. tokenizer change, system
+            // prompt drift squeaking past the byte-equal compare via
+            // some upstream rewrite) gets demoted from `prefix_hit`
+            // back to `fresh`. `res.end` has not fired yet
+            // (`handleNonStreaming` is what flushes via `endJson`),
+            // so the overwrite still lands on the wire.
+            if (lookup.hit && result.cachedTokens === 0) {
+              sessionCacheStatus = 'fresh';
+              res.setHeader('X-Session-Cache', sessionCacheStatus);
+            }
+            // Companion `X-Cached-Tokens` header: emitted only when
+            // reuse genuinely happened, so operators can spot a stale
+            // `prefix_hit` claim from telemetry alone.
+            if (result.cachedTokens > 0) {
+              res.setHeader('X-Cached-Tokens', String(result.cachedTokens));
+            }
             await handleNonStreaming(res, result, body, visibility);
+            // Non-streaming success: adopt unconditionally. Any throw
+            // from `runSessionNonStreaming` / `handleNonStreaming`
+            // would have routed through the inner catch below (which
+            // drops the slot) instead of reaching this point.
+            sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
           }
         } catch (err) {
+          // A failed turn must not leave a poisoned warm slot for the
+          // next request to lease — drop the sentinel before
+          // emitting the error response. Streaming half-failures are
+          // already covered by the `wasCommitted()` gate above; this
+          // catch handles non-streaming throws and any pre-handler
+          // failures from the streaming path.
+          sessionReg.drop(MESSAGES_WARM_SLOT_ID);
           const message = err instanceof Error ? err.message : 'Unknown error during inference';
           if (visibility.responseMode === null) {
             sendAnthropicInternalError(res, message);
