@@ -2933,6 +2933,151 @@ describe('handleCreateMessage', () => {
       expect(sessionReg.size).toBe(1);
     });
 
+    it('warm-hit then mid-decode failure drops the leased slot (next request cold-starts)', async () => {
+      // Companion to the cold-failure test above. The dangerous path
+      // is NOT a cold failure (which never enters the warm slot in
+      // the first place) — it is a WARM HIT that fails mid-decode.
+      // `getOrCreateWarmAny` leases the pre-seeded session, the
+      // stream then hits `finishReason: 'error'`, and the dual-gate
+      // `streamResult.ok && wasCommitted()` MUST fall through to
+      // `sessionReg.drop(MESSAGES_WARM_SLOT_ID)` — otherwise the
+      // leased session (now in failure state, with `turns` advanced
+      // and partial native KV state) is reachable on the next
+      // request, which would silently re-lease a poisoned wrapper.
+      //
+      // Coverage:
+      //   * Identity witness: `primeHistory` runs on the SAME
+      //     pre-seeded session instance — proves the warm hit
+      //     actually leased it (regression where the warm path is
+      //     silently bypassed would fail this).
+      //   * Failed wire: `error` event without a `message_stop`.
+      //   * Slot drop: `sessionReg.size === 0` after the failure —
+      //     the leased session was NOT re-adopted under the
+      //     sentinel.
+      //   * Round-trip: a follow-up streaming turn cold-starts
+      //     (warm slot is empty, full reset fires on a fresh
+      //     session, NOT on the dropped failed one), and adopts.
+      const failingStream = async function* () {
+        yield { text: 'partial', done: false, isReasoning: false };
+        yield {
+          text: 'partial',
+          done: true,
+          finishReason: 'error',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: 'partial',
+        };
+      };
+      const successfulStream = async function* () {
+        yield { text: 'ok', done: false, isReasoning: false };
+        yield {
+          text: 'ok',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: 'ok',
+        };
+      };
+      const streamSpy = vi.fn().mockImplementationOnce(failingStream).mockImplementationOnce(successfulStream);
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming test')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: streamSpy,
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+
+      // Pre-seed the warm slot the way Test 6 does — adopt under
+      // a non-sentinel id so we can also confirm the
+      // `entries.clear()` in `getOrCreateWarmAny` clobbered the
+      // original key (covered indirectly via `sessionReg.size`).
+      const warmSession = new ChatSession(mockModel);
+      sessionReg.adopt('warm-prefix', warmSession, 'sysA', null);
+      expect(sessionReg.size).toBe(1);
+
+      // Identity witness: spy on the prototype (matches the
+      // 3-turn streaming test pattern). The streaming dispatcher
+      // calls `primeHistory` once on the leased session before
+      // `startFromHistoryStream` — `mock.contexts[0]` MUST be
+      // `warmSession` to prove the warm hit happened.
+      const primeHistorySpy = vi.spyOn(ChatSession.prototype, 'primeHistory');
+      try {
+        // Turn 1: warm-hit failing stream. Lookup leases
+        // `warmSession`; the stream emits `finishReason: 'error'`;
+        // the dual-gate denies adopt; the handler drops the slot.
+        const r1 = createMockRes();
+        await handleCreateMessage(
+          r1.res,
+          {
+            model: 'test-model',
+            system: 'sysA',
+            messages: [{ role: 'user', content: 'hi' }],
+            max_tokens: 100,
+            stream: true,
+          },
+          registry,
+        );
+        const t1Events = parseSSE(r1.getBody());
+        // Wire: error terminal, no message_stop.
+        expect(t1Events.find((e) => e.event === 'message_stop')).toBeUndefined();
+        expect(t1Events.find((e) => e.event === 'error')).toBeDefined();
+        // Identity witness: `primeHistory` ran on the warm
+        // session (NOT a fresh one). Rules out the regression
+        // where the warm hit is silently bypassed.
+        expect(primeHistorySpy).toHaveBeenCalledTimes(1);
+        expect(primeHistorySpy.mock.contexts[0]).toBe(warmSession);
+        // Slot dropped — the failed warm session was NOT
+        // re-adopted under the sentinel.
+        expect(sessionReg.size).toBe(0);
+        const resetCachesAfterT1 = resetCaches.mock.calls.length;
+
+        // Turn 2: fresh request, same instructions. The slot is
+        // empty after the drop, so `getOrCreateWarmAny` MISSES
+        // and the handler runs a full `session.reset()` on a
+        // BRAND-NEW session (NOT the dropped failed one). The
+        // proxy: `model.resetCaches()` advances at least once.
+        const r2 = createMockRes();
+        await handleCreateMessage(
+          r2.res,
+          {
+            model: 'test-model',
+            system: 'sysA',
+            messages: [{ role: 'user', content: 'hi again' }],
+            max_tokens: 100,
+            stream: true,
+          },
+          registry,
+        );
+        const t2Events = parseSSE(r2.getBody());
+        // Successful wire.
+        expect(t2Events.find((e) => e.event === 'message_stop')).toBeDefined();
+        expect(resetCaches.mock.calls.length).toBeGreaterThan(resetCachesAfterT1);
+        // The cold-start session is adopted under the sentinel —
+        // exactly one entry, and it is NOT the failed `warmSession`.
+        expect(sessionReg.size).toBe(1);
+        // Turn 2's `primeHistory` was the SECOND call (turn 1 was
+        // the first), and its context MUST be a fresh wrapper —
+        // NOT the dropped `warmSession`.
+        expect(primeHistorySpy).toHaveBeenCalledTimes(2);
+        expect(primeHistorySpy.mock.contexts[1]).not.toBe(warmSession);
+      } finally {
+        primeHistorySpy.mockRestore();
+      }
+    });
+
     it('model hot-swap (unregister + register) drops the warm slot', async () => {
       // `ModelRegistry.register` rebuilds the per-model
       // `SessionRegistry`, so the old warm slot is torn down with
