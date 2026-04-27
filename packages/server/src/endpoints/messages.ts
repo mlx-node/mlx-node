@@ -404,10 +404,14 @@ async function handleStreamingNative(
     }
   }
 
-  // Success requires ALL of: sawDone, wasCommitted, no thrown error, no client abort.
-  // Every failure path emits a streaming `error` and withholds `message_stop`.
+  // Success requires ALL of: sawDone, wasCommitted, no terminal error, no thrown
+  // error, no client abort. `terminalErrorMessage` is set when a stream done event
+  // arrives with `finishReason=error` (or other in-band model error paths) — those
+  // turns must route to the failure epilogue so we emit a streaming `error` and
+  // withhold `message_stop`. Every failure path emits a streaming `error` and
+  // withholds `message_stop`.
   const committed = wasCommitted();
-  const successful = sawDone && committed && thrownError == null && !clientAborted;
+  const successful = sawDone && committed && terminalErrorMessage == null && thrownError == null && !clientAborted;
 
   if (successful) {
     const stopReason = terminalStopReason ?? 'end_turn';
