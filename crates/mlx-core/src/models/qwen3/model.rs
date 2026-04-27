@@ -7535,4 +7535,198 @@ mod tests {
             serde_json::from_value(json).expect("deserialize Qwen3Config");
         assert_eq!(cfg.use_block_paged_cache, Some(true));
     }
+
+    /// **Streaming smoke test for the paged path**, structurally analogous
+    /// to [`test_chat_sync_core_paged_smoke_via_helpers`]. Drives the
+    /// same `run_paged_prefill_chunk` + `run_paged_decode_step` helpers
+    /// the streaming variant delegates to (the streaming entry just adds
+    /// per-token emit + cancellation), so the helper-level coverage
+    /// transitively validates the streaming control flow.
+    ///
+    /// What we assert:
+    /// * Prefill on a 4-token "prompt" produces logits with shape
+    ///   `[vocab]` and finite values.
+    /// * Two decode steps via `run_paged_decode_step` succeed and produce
+    ///   3-D logits.
+    /// * Adapter cursor advances correctly across prefill + decode.
+    ///
+    /// Skips on no-Metal hosts.
+    #[test]
+    fn test_chat_stream_sync_core_paged_smoke_via_helpers() {
+        let cfg = paged_tiny_config(true);
+        let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!(
+                        "skipping test_chat_stream_sync_core_paged_smoke_via_helpers (no Metal): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Qwen3Inner::new failure: {msg}");
+            }
+        };
+        assert!(
+            inner.paged_adapter.is_some(),
+            "paged_tiny_config(true) must construct paged_adapter"
+        );
+
+        // Cast all model weights to BFloat16 (paged pool dtype). Same
+        // rationale as `test_chat_sync_core_paged_smoke_via_helpers`.
+        use crate::array::DType;
+        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
+        let w = inner.embedding.get_weight();
+        inner.embedding.set_weight(&cast(&w)).expect("set embed");
+        let w = inner.final_norm.get_weight();
+        inner
+            .final_norm
+            .set_weight(&cast(&w))
+            .expect("set final_norm");
+        let w = inner.lm_head.get_weight();
+        inner.lm_head.set_weight(&cast(&w)).expect("set lm_head");
+        for layer in inner.layers.iter_mut() {
+            let w = layer.get_input_layernorm_weight();
+            layer
+                .set_input_layernorm_weight(&cast(&w))
+                .expect("set in ln");
+            let w = layer.get_post_attention_layernorm_weight();
+            layer
+                .set_post_attention_layernorm_weight(&cast(&w))
+                .expect("set post ln");
+            let w = layer.self_attn.get_q_proj_weight();
+            layer.self_attn.set_q_proj_weight(&cast(&w)).expect("set q");
+            let w = layer.self_attn.get_k_proj_weight();
+            layer.self_attn.set_k_proj_weight(&cast(&w)).expect("set k");
+            let w = layer.self_attn.get_v_proj_weight();
+            layer.self_attn.set_v_proj_weight(&cast(&w)).expect("set v");
+            let w = layer.self_attn.get_o_proj_weight();
+            layer.self_attn.set_o_proj_weight(&cast(&w)).expect("set o");
+            if let Some(qn) = layer.self_attn.get_q_norm_weight() {
+                layer
+                    .self_attn
+                    .set_q_norm_weight(&cast(&qn))
+                    .expect("set qn");
+            }
+            if let Some(kn) = layer.self_attn.get_k_norm_weight() {
+                layer
+                    .self_attn
+                    .set_k_norm_weight(&cast(&kn))
+                    .expect("set kn");
+            }
+            let w = layer.mlp.get_gate_proj_weight();
+            layer.mlp.set_gate_proj_weight(&cast(&w)).expect("set gate");
+            let w = layer.mlp.get_up_proj_weight();
+            layer.mlp.set_up_proj_weight(&cast(&w)).expect("set up");
+            let w = layer.mlp.get_down_proj_weight();
+            layer.mlp.set_down_proj_weight(&cast(&w)).expect("set down");
+        }
+
+        // Drive the adapter lifecycle the same way
+        // `chat_stream_sync_core_paged` does.
+        let prompt: Vec<u32> = vec![10, 20, 30, 40];
+        let max_decode: u32 = 2;
+        {
+            let adapter = inner
+                .paged_adapter
+                .as_mut()
+                .expect("paged_adapter constructed above");
+            adapter
+                .reset_for_new_request(0)
+                .expect("reset_for_new_request");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32 + max_decode)
+                .expect("allocate_suffix_blocks");
+        }
+
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let num_layers = inner.layers.len();
+
+        // Prefill chunk (suffix = full prompt, cached_prefix_len = 0).
+        let logits = match inner.run_paged_prefill_chunk(&prompt, 0, num_layers, &positions) {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!("skipping test_chat_stream_sync_core_paged_smoke_via_helpers: {msg}");
+                    return;
+                }
+                panic!("unexpected run_paged_prefill_chunk failure: {msg}");
+            }
+        };
+        assert_eq!(logits.ndim().expect("ndim"), 1);
+        assert_eq!(
+            logits.shape_at(0).expect("shape_at(0)"),
+            cfg.vocab_size as i64
+        );
+
+        let logits_f32 = logits
+            .astype(crate::array::DType::Float32)
+            .expect("astype f32");
+        logits_f32.eval();
+        let v0 = logits_f32.item_at_float32(0).expect("item_at_float32(0)");
+        assert!(
+            v0.is_finite(),
+            "stream-paged prefill logits[0] must be finite, got {v0}"
+        );
+
+        {
+            let adapter = inner.paged_adapter.as_ref().unwrap();
+            assert_eq!(adapter.current_token_count(), prompt.len() as u32);
+        }
+
+        // Two decode steps (matches the streaming inner loop's per-step
+        // dispatch — the only difference vs. the non-streaming variant
+        // is the per-token streaming emit, which doesn't change the
+        // forward path under test).
+        for (i, tok) in [50u32, 60u32].iter().enumerate() {
+            let next_logits = match inner.run_paged_decode_step(*tok, num_layers, &positions) {
+                Ok(l) => l,
+                Err(e) => {
+                    let msg = e.reason.to_string();
+                    if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                        eprintln!(
+                            "skipping test_chat_stream_sync_core_paged_smoke_via_helpers: {msg}"
+                        );
+                        return;
+                    }
+                    panic!("unexpected run_paged_decode_step failure on step {i}: {msg}");
+                }
+            };
+            assert_eq!(next_logits.ndim().expect("ndim"), 3);
+            assert_eq!(
+                next_logits.shape_at(2).expect("shape_at(2)"),
+                cfg.vocab_size as i64
+            );
+            let next_f32 = next_logits
+                .astype(crate::array::DType::Float32)
+                .expect("astype f32");
+            next_f32.eval();
+            let v = next_f32.item_at_float32(0).expect("item_at_float32(0)");
+            assert!(
+                v.is_finite(),
+                "stream-paged decode logits[0] step {i} must be finite, got {v}"
+            );
+        }
+
+        {
+            let adapter = inner.paged_adapter.as_ref().unwrap();
+            assert_eq!(
+                adapter.current_token_count(),
+                prompt.len() as u32 + 2,
+                "adapter cursor must reflect 4 prefill + 2 decode tokens"
+            );
+        }
+
+        // Cleanup mirrors the chat_stream_sync_core_paged success path.
+        {
+            let adapter = inner.paged_adapter.as_mut().unwrap();
+            let _ = adapter.register_full_blocks_for_reuse(&[]);
+            adapter.release_request().expect("release_request");
+        }
+    }
 }
