@@ -112,6 +112,19 @@ async function handleNonStreaming(
 
 // Streaming path
 
+/**
+ * Handler-side success signal for the streaming path. `ok === true` ONLY when
+ * we reached the clean `message_stop` terminal — i.e. `successful` was true at
+ * the post-loop gate. Every failure path that emits the streaming `error`
+ * terminal (mid-decode throw, client abort, `finishReason=error`, iterator
+ * exhaustion, missing-done) returns `ok: false`. The caller pairs this with
+ * the producer-side `wasCommitted()` to decide adopt vs. drop on the warm
+ * slot — both must be true to adopt. See the gate in `handleCreateMessage`.
+ */
+interface MessagesStreamingHandlerResult {
+  ok: boolean;
+}
+
 async function handleStreamingNative(
   res: ServerResponse,
   chatStream: AsyncGenerator<ChatStreamEvent>,
@@ -119,7 +132,7 @@ async function handleStreamingNative(
   wasCommitted: () => boolean,
   httpReq: IncomingMessage | undefined,
   visibility: TransportVisibility,
-): Promise<void> {
+): Promise<MessagesStreamingHandlerResult> {
   const messageId = genId('msg_');
   beginSSE(res);
   // Commit SSE wire format now so any throw before the terminal event routes
@@ -400,31 +413,33 @@ async function handleStreamingNative(
     const stopReason = terminalStopReason ?? 'end_turn';
     writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens));
     await flushTerminalSSE(res, 'message_stop', buildMessageStop(), visibility);
-  } else {
-    // Close any dangling content block so the error frame lands at a clean state,
-    // then emit the streaming error. Never emit `message_stop` here — pairing it
-    // with an error would tell the client the turn completed cleanly.
-    if (hasEmittedThinking && !hasEmittedText) {
-      writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
-    } else if (hasEmittedText) {
-      writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-    }
-    let message: string;
-    if (thrownError != null) {
-      message = thrownError.message;
-    } else if (clientAborted) {
-      message = 'client disconnected before the stream completed';
-    } else if (terminalErrorMessage != null) {
-      message = terminalErrorMessage;
-    } else if (sawDone) {
-      message = 'model refused to commit the turn';
-    } else {
-      message = 'stream ended without a done event';
-    }
-    // The streaming `error` event is the Anthropic terminal on the failure path.
-    await flushTerminalSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } }, visibility);
+    endSSE(res);
+    return { ok: true };
   }
+  // Close any dangling content block so the error frame lands at a clean state,
+  // then emit the streaming error. Never emit `message_stop` here — pairing it
+  // with an error would tell the client the turn completed cleanly.
+  if (hasEmittedThinking && !hasEmittedText) {
+    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+  } else if (hasEmittedText) {
+    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
+  }
+  let message: string;
+  if (thrownError != null) {
+    message = thrownError.message;
+  } else if (clientAborted) {
+    message = 'client disconnected before the stream completed';
+  } else if (terminalErrorMessage != null) {
+    message = terminalErrorMessage;
+  } else if (sawDone) {
+    message = 'model refused to commit the turn';
+  } else {
+    message = 'stream ended without a done event';
+  }
+  // The streaming `error` event is the Anthropic terminal on the failure path.
+  await flushTerminalSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } }, visibility);
   endSSE(res);
+  return { ok: false };
 }
 
 // Session routing
@@ -813,19 +828,36 @@ export async function handleCreateMessage(
         try {
           if (body.stream === true) {
             const outcome = await runSessionStreaming(session, messages, config, streamSignal, !lookup.hit);
-            await handleStreamingNative(res, outcome.stream, body, outcome.wasCommitted, httpReq, visibility);
-            // Adopt-or-drop gate on the stream's authoritative commit
-            // signal. A half-decoded stream (client abort, generator
-            // throw, iterator exhaustion) leaves the native KV in a
-            // poisoned state that must NOT be re-leased — mirrors the
-            // gate at responses.ts around the
-            // `committed && handlerError == null && streamFailureMode === null`
-            // check. Here `wasCommitted()` is the authoritative
-            // signal because the producer's `finally` runs on break,
-            // and a thrown error from `handleStreamingNative` would
-            // have routed through the inner catch below instead of
-            // reaching this point.
-            if (outcome.wasCommitted()) {
+            const streamResult = await handleStreamingNative(
+              res,
+              outcome.stream,
+              body,
+              outcome.wasCommitted,
+              httpReq,
+              visibility,
+            );
+            // Dual-gate adopt: BOTH the producer-side commit signal
+            // (`outcome.wasCommitted()`, which reads `session.turns`
+            // bumped in `startFromHistoryStream`'s `finally`) AND the
+            // handler-side success signal (`streamResult.ok`, true
+            // only when we reached the clean `message_stop` terminal)
+            // must be true to adopt. The producer's `finally` runs on
+            // every break — including client abort, mid-decode throw,
+            // and `finishReason=error` — so `wasCommitted()` alone is
+            // NOT sufficient: it can return `true` after the SSE side
+            // emitted an `error` terminal (which is not re-thrown by
+            // `handleStreamingNative`), leaving a session whose
+            // observable wire state is failure but whose `turns`
+            // counter advanced. Adopting in that window would seed the
+            // warm slot with a session the next request can lease but
+            // whose history does not match what the client received.
+            //
+            // Mirrors `responses.ts` (around line 3277) where the
+            // analogous gate combines `committed`, `handlerError`, and
+            // `streamFailureMode === null` — the producer-side commit
+            // and a clean handler-side terminal must both hold before
+            // the session is reachable from a subsequent request.
+            if (streamResult.ok && outcome.wasCommitted()) {
               sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
             } else {
               sessionReg.drop(MESSAGES_WARM_SLOT_ID);
