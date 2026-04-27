@@ -345,7 +345,17 @@ mod tests {
 
     #[test]
     fn test_get_reshape_and_cache_pipeline() {
-        let state = MetalState::get().expect("Failed to init Metal state");
+        // Graceful skip on no-Metal hosts (CI VMs, sandboxes). See
+        // `LayerKVPool::test_new_allocates_per_layer_buffers` for the
+        // canonical pattern.
+        let state = match MetalState::get() {
+            Ok(s) => s,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_get_reshape_and_cache_pipeline: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected MetalState::get failure: {e}"),
+        };
         let kernel_name = MetalState::reshape_and_cache_kernel_name(
             MetalDtype::Float16,
             MetalDtype::Float16,
@@ -361,7 +371,15 @@ mod tests {
 
     #[test]
     fn test_get_paged_attention_pipeline() {
-        let state = MetalState::get().expect("Failed to init Metal state");
+        // Graceful skip on no-Metal hosts (CI VMs, sandboxes).
+        let state = match MetalState::get() {
+            Ok(s) => s,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_get_paged_attention_pipeline: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected MetalState::get failure: {e}"),
+        };
         // Test V1 kernel for Qwen3 config: head_size=128, block_size=16
         let kernel_name =
             MetalState::paged_attention_v1_kernel_name(MetalDtype::Float16, 128, 16, false);

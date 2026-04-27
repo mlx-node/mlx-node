@@ -110,9 +110,24 @@ pub fn is_metal_extraction_supported() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metal::MetalState;
 
     #[test]
     fn test_synchronize() {
+        // Graceful skip on no-Metal hosts. Calling `synchronize_mlx()`
+        // unconditionally on a host without Metal causes MLX to abort with
+        // "fatal runtime error: Rust cannot catch foreign exceptions" when
+        // the C++ runtime is uninitialized. Probe `MetalState::get()`
+        // first — if Metal isn't available, skip with a notice rather
+        // than aborting the test process.
+        match MetalState::get() {
+            Ok(_) => {}
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_synchronize: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected MetalState::get failure: {e}"),
+        }
         // Should not panic
         synchronize_mlx();
     }

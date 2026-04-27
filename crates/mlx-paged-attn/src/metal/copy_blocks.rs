@@ -212,7 +212,18 @@ mod tests {
 
     #[test]
     fn test_get_copy_blocks_pipeline() {
-        let state = MetalState::get().expect("Failed to init Metal state");
+        // Graceful skip on no-Metal hosts (CI VMs, sandboxes). Mirrors the
+        // pattern in `LayerKVPool::test_new_allocates_per_layer_buffers`:
+        // probe `MetalState::get()` first and bail with a `skipping`
+        // notice if the device isn't available, rather than panicking.
+        let state = match MetalState::get() {
+            Ok(s) => s,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_get_copy_blocks_pipeline: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected MetalState::get failure: {e}"),
+        };
         let kernel_name = MetalState::copy_blocks_kernel_name(MetalDtype::Float16);
         let pipeline = state.get_pipeline(&kernel_name);
         assert!(
