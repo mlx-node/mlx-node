@@ -1743,6 +1743,7 @@ mod forward_pass_equivalence_tests {
             paged_cache_memory_mb: None,
             paged_block_size: None,
             use_fp8_cache: None,
+            use_block_paged_cache: None,
         }
     }
 
@@ -2171,6 +2172,7 @@ mod chunked_forward_tests {
             paged_cache_memory_mb: None,
             paged_block_size: None,
             use_fp8_cache: None,
+            use_block_paged_cache: None,
         }
     }
 

@@ -24,6 +24,7 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
 use crate::training_model::ModelType;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::{
     ContinuousBatchingScheduler, KVCache, PagedAttentionConfig, PagedKVCache, PendingRequest,
     SchedulerConfig, TransformerBlock,
@@ -142,6 +143,19 @@ pub(crate) struct Qwen3Inner {
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) paged_cache: Option<PagedKVCache>,
     pub(crate) scheduler: Option<ContinuousBatchingScheduler>,
+    /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
+    ///
+    /// **Opt-in via `Qwen3Config::use_block_paged_cache`** — separate from
+    /// the legacy `paged_cache`/`scheduler` pair above. When `Some`,
+    /// chat-session methods may route through `forward_paged_adapter` for
+    /// cross-request prefix reuse. Defaults to `None` so the existing flat
+    /// `Vec<KVCache>` path stays untouched.
+    ///
+    /// `#[allow(dead_code)]` because the read-side wiring (chat_sync_core
+    /// dispatch through `forward_paged_adapter`) lands in a separate commit;
+    /// this commit is the construction-only plumbing.
+    #[allow(dead_code)]
+    pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     pub(crate) cached_kv_keys: Vec<Option<MxArray>>,
     pub(crate) cached_kv_values: Vec<Option<MxArray>>,
     pub(crate) cached_cache_idx: i32,
@@ -699,6 +713,85 @@ impl Qwen3Inner {
             (None, None)
         };
 
+        // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
+        //
+        // This is independent of `use_paged_attention` above (which drives the
+        // legacy `PagedKVCache` + `ContinuousBatchingScheduler` infrastructure).
+        // The adapter pairs an `Arc<Mutex<BlockAllocator>>` (logical
+        // refcounted block lifecycle + prefix hash table) with an
+        // `Arc<LayerKVPool>` (per-layer Metal K/V buffers). Together they
+        // supersede the flat `Vec<KVCache>` storage when wired through the
+        // forward path.
+        //
+        // Memory budget: derived from `paged_cache_memory_mb` (same knob as
+        // the legacy paged cache) → divided by per-block size to compute
+        // `num_blocks`. We keep the budget knob shared so users don't have to
+        // tune two separate values; the legacy path and the adapter are not
+        // expected to co-exist on the same Qwen3Inner instance.
+        //
+        // Cache dtype: BFloat16 (Qwen3's production dtype). FP16 is also
+        // supported by `LayerKVPool` for non-Qwen3 callers, but Qwen3 weights
+        // ship as BF16 so we hard-code that here. FP8 mode is intentionally
+        // not yet plumbed through this path — `KvScaleManager` integration
+        // is a follow-up.
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
+            let block_size = config.paged_block_size.unwrap_or(16);
+            let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
+            let pa_config = mlx_paged_attn::PagedAttentionConfig {
+                block_size,
+                gpu_memory_mb,
+                head_size: config.head_dim as u32,
+                num_kv_heads: config.num_kv_heads as u32,
+                num_layers: config.num_layers as u32,
+                // FP8 mode for the adapter is gated separately on a follow-up
+                // (KvScaleManager); always false here. The legacy
+                // `use_fp8_cache` knob still drives the legacy `PagedKVCache`.
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(config.max_position_embeddings as u32),
+                max_batch_size: Some(32),
+            };
+
+            let num_blocks = pa_config.calculate_num_blocks();
+            if num_blocks == 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "Block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small to hold any \
+                     blocks (head_size={}, num_kv_heads={}, block_size={}, num_layers={})",
+                    pa_config.head_size,
+                    pa_config.num_kv_heads,
+                    pa_config.block_size,
+                    pa_config.num_layers,
+                )));
+            }
+
+            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+                num_blocks, block_size,
+            )));
+
+            // BFloat16 = Qwen3 production dtype.
+            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
+                .map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "Failed to construct LayerKVPool for block-paged adapter: {e}"
+                    ))
+                })?;
+
+            let adapter =
+                PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "Failed to construct PagedKVCacheAdapter: {e}"
+                    ))
+                })?;
+
+            info!(
+                "Block-paged adapter enabled: num_blocks={num_blocks}, block_size={block_size}, \
+                 gpu_memory_mb={gpu_memory_mb}, cache_dtype=BFloat16"
+            );
+            Some(adapter)
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             embedding,
@@ -709,6 +802,7 @@ impl Qwen3Inner {
             tokenizer: None,
             paged_cache,
             scheduler,
+            paged_adapter,
             cached_kv_keys: Vec::new(),
             cached_kv_values: Vec::new(),
             cached_cache_idx: 0,
@@ -6112,5 +6206,70 @@ mod tests {
         // Same pattern but only 2 repeats → no trigger
         let tokens2 = vec![10, 20, 30, 40, 50, 10, 20, 30, 40, 50];
         assert_eq!(check_repetition_cutoff(&tokens2, 16, 3, 64), None);
+    }
+
+    /// `use_block_paged_cache` MUST default to `None` (treated as false) when
+    /// the JSON config does not set it — otherwise loading any pre-existing
+    /// Qwen3 checkpoint would silently switch the storage backend.
+    ///
+    /// Pure-CPU; no MLX runtime needed.
+    #[test]
+    fn test_use_block_paged_cache_defaults_to_none_via_serde() {
+        // Round-trip a Qwen3Config JSON that omits the new field. Serde
+        // `#[serde(default)]` should populate it as `None`.
+        let json = serde_json::json!({
+            "vocab_size": 0,
+            "hidden_size": 0,
+            "num_layers": 1,
+            "num_heads": 1,
+            "num_kv_heads": 1,
+            "intermediate_size": 1,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": 2048,
+            "head_dim": 128,
+            "use_qk_norm": true,
+            "tie_word_embeddings": false,
+            "pad_token_id": 0,
+            "eos_token_id": 1,
+            "bos_token_id": 2,
+        });
+        let cfg: super::Qwen3Config =
+            serde_json::from_value(json).expect("deserialize Qwen3Config");
+        assert_eq!(
+            cfg.use_block_paged_cache, None,
+            "use_block_paged_cache must default to None on JSON without the key"
+        );
+        assert!(
+            !cfg.use_block_paged_cache.unwrap_or(false),
+            "default unwrap_or(false) must yield false"
+        );
+    }
+
+    /// `use_block_paged_cache: true` round-trips correctly through serde —
+    /// regression guard against a future rename / serde annotation drift.
+    #[test]
+    fn test_use_block_paged_cache_round_trips_true() {
+        let json = serde_json::json!({
+            "vocab_size": 0,
+            "hidden_size": 0,
+            "num_layers": 1,
+            "num_heads": 1,
+            "num_kv_heads": 1,
+            "intermediate_size": 1,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": 2048,
+            "head_dim": 128,
+            "use_qk_norm": true,
+            "tie_word_embeddings": false,
+            "pad_token_id": 0,
+            "eos_token_id": 1,
+            "bos_token_id": 2,
+            "use_block_paged_cache": true,
+        });
+        let cfg: super::Qwen3Config =
+            serde_json::from_value(json).expect("deserialize Qwen3Config");
+        assert_eq!(cfg.use_block_paged_cache, Some(true));
     }
 }

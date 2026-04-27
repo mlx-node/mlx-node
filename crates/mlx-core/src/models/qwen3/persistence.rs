@@ -385,6 +385,9 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
         use_fp8_cache: raw_config["use_fp8_cache"]
             .as_bool()
             .or_else(|| raw_config["useFp8Cache"].as_bool()),
+        use_block_paged_cache: raw_config["use_block_paged_cache"]
+            .as_bool()
+            .or_else(|| raw_config["useBlockPagedCache"].as_bool()),
     })
 }
 
