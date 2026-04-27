@@ -3444,6 +3444,37 @@ export interface Lfm2Config {
   eosTokenId: number;
   bosTokenId: number;
   padTokenId: number;
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 2048 (2GB).
+   */
+  pagedCacheMemoryMb?: number | undefined;
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 16.
+   */
+  pagedBlockSize?: number | undefined;
+  /**
+   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
+   *
+   * **OPT-IN — experimental and currently a no-op for chat dispatch.**
+   * When `Some(true)`, `Lfm2Inner` allocates a `BlockAllocator` +
+   * `LayerKVPool` pair sized for the model's full_attention layers
+   * only and constructs a `PagedKVCacheAdapter` field. The chat-session
+   * forward dispatch is NOT yet wired through this adapter — LFM2's
+   * hybrid conv + attention architecture means only attention layers
+   * can use the block-paged path; conv layers continue to use the
+   * existing `Lfm2LayerCache::Conv(ArraysCache)` storage. A bespoke
+   * per-layer dispatch on `Lfm2DecoderLayer` (mirroring the Qwen3
+   * `forward_paged_adapter` pattern) plus a hybrid cache wrapper that
+   * indexes the adapter by attention-layer ordinal (not absolute
+   * layer index) is required before forward wiring can land.
+   *
+   * Default: false (use the existing `Lfm2LayerCache` path).
+   */
+  useBlockPagedCache?: boolean | undefined;
 }
 
 export interface MemorySnapshot {
