@@ -834,6 +834,14 @@ impl Qwen3Inner {
         self.cached_cache_idx = 0;
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        // Drop any live paged-adapter request so the next session starts
+        // from a fully cold state. Without this, a finalize_turn_keep_live
+        // call from a prior session would leave block_table populated and
+        // a subsequent `chat_sync_core_paged` could mistakenly take the
+        // warm-continue path against stale tokens.
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
+        }
         Ok(())
     }
 
@@ -843,6 +851,11 @@ impl Qwen3Inner {
         self.cached_cache_idx = 0;
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        // Same rationale as `reset_kv_caches_sync`: ensure the paged
+        // adapter doesn't keep stale live state across a session reset.
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
+        }
         Ok(())
     }
 
@@ -1997,29 +2010,41 @@ impl Qwen3Inner {
     /// `BlockAllocator::register_prefix` / `find_longest_cache_hit`.
     ///
     /// Per-turn lifecycle:
-    /// 1. `reset_for_new_request(seq_id)` — drops any prior request's
-    ///    blocks (defensive; the prior turn's success path already called
-    ///    `release_request`, but this guarantees fresh state on error
-    ///    recovery).
-    /// 2. `find_cached_prefix(prompt_tokens, &[])` — looks up the longest
-    ///    matching prefix in the shared `BlockAllocator`'s prefix cache.
-    ///    On a hit, the adapter's `block_table` already covers the cached
-    ///    blocks (refcount incremented).
-    /// 3. `allocate_suffix_blocks(total_tokens)` — allocates fresh blocks
-    ///    for the suffix beyond the cached prefix.
-    /// 4. Prefill: for each layer, run `forward_paged_adapter` with
+    ///
+    /// 1. Choose between **cold start** and **warm continuation**:
+    ///    - Cold start (first turn, or after reset_caches /
+    ///      image-change): `reset_for_new_request(seq_id)` →
+    ///      `find_cached_prefix(prompt_tokens, &[])` →
+    ///      `allocate_suffix_blocks(total_tokens)`. The first looks up
+    ///      the longest matching prefix in the shared `BlockAllocator`'s
+    ///      prefix cache and pre-populates the block_table; the second
+    ///      allocates fresh blocks for the suffix beyond the cached
+    ///      prefix.
+    ///    - Warm continuation (turn 2+ within the same session, when the
+    ///      prior turn ended via `finalize_turn_keep_live`):
+    ///      `continue_turn(prompt_tokens, total_budget)`. Validates the
+    ///      new prompt extends the live recorded tokens, allocates any
+    ///      additional blocks, and clears the registration flag so the
+    ///      end-of-turn finalize runs. CRITICAL: this path keeps the
+    ///      partial trailing block from the prior turn LIVE in the pool
+    ///      so the new turn does NOT re-prefill it — the BF16 reduction
+    ///      order in parallel prefill differs from sequential decode and
+    ///      re-prefilling that span flips the argmax. See
+    ///      `PagedKVCacheAdapter::finalize_turn_keep_live` for full
+    ///      discussion.
+    /// 2. Prefill: for each layer, run `forward_paged_adapter` with
     ///    `is_prefill = true` and `cached_prefix_len`. The forward writes
     ///    the suffix K/V through `update_keys_values` and runs causal
     ///    SDPA over (read_kv_range cached prefix + new suffix).
-    /// 5. Decode loop: per generated token, run `forward_paged_adapter`
+    /// 3. Decode loop: per generated token, run `forward_paged_adapter`
     ///    with `is_prefill = false`. The adapter's `gather_kv_for_decode`
     ///    pulls historical K/V via the block table.
-    /// 6. End of turn: `register_full_blocks_for_reuse` publishes the
-    ///    request's full blocks to the prefix cache so the NEXT turn's
-    ///    `find_cached_prefix` hits them. Then `release_request` drops the
-    ///    request's own block_table refs (cache's logical refs survive).
-    /// 7. Error path: `release_request` only — no register, so a partial
-    ///    state is not published.
+    /// 4. End of turn (success): `finalize_turn_keep_live` publishes the
+    ///    request's full blocks to the prefix cache for cross-session
+    ///    reuse and KEEPS the request live so the next turn's
+    ///    `continue_turn` can resume on top of it.
+    /// 5. Session end / explicit reset / error: `release_request`
+    ///    decrefs every block in the table.
     ///
     /// **Status**: P1 wiring. Numerical validation is deferred to a
     /// follow-up — this commit's tests assert non-empty / valid-token
@@ -2070,10 +2095,17 @@ impl Qwen3Inner {
 
         let num_layers = self.layers.len();
 
-        // === Adapter lifecycle: reset + prefix lookup + suffix allocation.
-        // On any error in this block we ensure `release_request` runs by
-        // not yet recording tokens (the adapter doesn't hold blocks until
-        // `find_cached_prefix` adds them).
+        // === Adapter lifecycle: warm continuation OR cold start. ===
+        //
+        // When the adapter holds a live, finalized turn whose recorded
+        // tokens are a strict prefix of the new prompt, take the warm
+        // `continue_turn` path. This preserves the partial trailing
+        // block's K/V across turns, eliminating the cross-turn BF16
+        // re-prefill divergence (see `finalize_turn_keep_live` doc).
+        //
+        // Otherwise (cold start, prompt drift, or first turn) fall back
+        // to the original `reset → find_cached_prefix → allocate` flow.
+        let total_budget = (token_ids_vec.len() as u32) + (max_new_tokens.max(0) as u32);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 napi::Error::from_reason(
@@ -2081,23 +2113,62 @@ impl Qwen3Inner {
                      use_block_paged_cache before dispatch",
                 )
             })?;
-            adapter
-                .reset_for_new_request(seq_id)
-                .map_err(napi::Error::from_reason)?;
-            let prefix = adapter
-                .find_cached_prefix(&token_ids_vec, &[])
-                .map_err(napi::Error::from_reason)?;
-            let cached = prefix.cached_token_count;
-            // Allocate ALL blocks needed (cached prefix + suffix + max
-            // decode budget). The adapter's `allocate_suffix_blocks` only
-            // allocates beyond the cached prefix, but the budget must
-            // include decode tokens — `record_tokens` doesn't trigger
-            // re-allocation. Pre-size now.
-            let total_budget = (token_ids_vec.len() as u32) + (max_new_tokens.max(0) as u32);
-            adapter
-                .allocate_suffix_blocks(total_budget)
-                .map_err(napi::Error::from_reason)?;
-            cached
+
+            // Warm-continuation precondition: the adapter is live AND
+            // its recorded tokens are a strict prefix of the new prompt.
+            // We do the prefix check eagerly here so the cold-start
+            // fallback path (which has to release + reset + lookup
+            // again) only runs when truly necessary.
+            let can_continue = reuse_cache
+                && adapter.is_live_for_continue()
+                && token_ids_vec.starts_with(adapter.request_tokens());
+
+            if can_continue {
+                match adapter.continue_turn(&token_ids_vec, total_budget) {
+                    Ok((prior_token_count, _newly_alloc)) => prior_token_count,
+                    Err(_drift) => {
+                        // Live state is incompatible (prompt diverged). Fall
+                        // through to the cold-start path. We must release
+                        // the live state first to avoid leaking blocks.
+                        let _ = adapter.release_request();
+                        adapter
+                            .reset_for_new_request(seq_id)
+                            .map_err(napi::Error::from_reason)?;
+                        let prefix = adapter
+                            .find_cached_prefix(&token_ids_vec, &[])
+                            .map_err(napi::Error::from_reason)?;
+                        let cached = prefix.cached_token_count;
+                        adapter
+                            .allocate_suffix_blocks(total_budget)
+                            .map_err(napi::Error::from_reason)?;
+                        cached
+                    }
+                }
+            } else {
+                // Cold start: drop any live state (defensive — covers the
+                // case where the prior turn errored and left state behind),
+                // then run the standard reset → find_cached_prefix →
+                // allocate_suffix_blocks flow.
+                if adapter.block_table().is_some() {
+                    let _ = adapter.release_request();
+                }
+                adapter
+                    .reset_for_new_request(seq_id)
+                    .map_err(napi::Error::from_reason)?;
+                let prefix = adapter
+                    .find_cached_prefix(&token_ids_vec, &[])
+                    .map_err(napi::Error::from_reason)?;
+                let cached = prefix.cached_token_count;
+                // Allocate ALL blocks needed (cached prefix + suffix + max
+                // decode budget). The adapter's `allocate_suffix_blocks` only
+                // allocates beyond the cached prefix, but the budget must
+                // include decode tokens — `record_tokens` doesn't trigger
+                // re-allocation. Pre-size now.
+                adapter
+                    .allocate_suffix_blocks(total_budget)
+                    .map_err(napi::Error::from_reason)?;
+                cached
+            }
         };
 
         // Run forward / decode under a try-style closure so we can
@@ -2124,14 +2195,27 @@ impl Qwen3Inner {
             report_perf,
         );
 
-        // Always release the request on either path. Register-for-reuse
-        // is success-only.
+        // Success: finalize the turn but KEEP the request live so the
+        // next session turn's `continue_turn` can build on top of the
+        // partial trailing block's live K/V. Releasing here would drop
+        // that K/V (the prefix cache only stores FULL blocks) and force
+        // the next turn to re-prefill the partial-block span via
+        // parallel SDPA, whose BF16 reduction order differs from
+        // sequential decode and flips the argmax → cross-turn token
+        // divergence vs. the flat path.
+        //
+        // Error: release fully — partial state is not safe to keep
+        // around (the block_table may be in any state).
         let (generated_tokens, generated_logprobs, finish_reason, first_token_elapsed_ms) =
             match forward_result {
                 Ok(t) => {
                     if let Some(adapter) = self.paged_adapter.as_mut() {
-                        let _ = adapter.register_full_blocks_for_reuse(&[]);
-                        let _ = adapter.release_request();
+                        if reuse_cache {
+                            let _ = adapter.finalize_turn_keep_live(&[]);
+                        } else {
+                            let _ = adapter.register_full_blocks_for_reuse(&[]);
+                            let _ = adapter.release_request();
+                        }
                     }
                     t
                 }
@@ -2662,7 +2746,11 @@ impl Qwen3Inner {
         let num_layers = self.layers.len();
         let seq_id: u32 = 0;
 
-        // === Adapter lifecycle: reset + prefix lookup + suffix allocation. ===
+        // === Adapter lifecycle: warm continuation OR cold start. ===
+        // See the equivalent block in `chat_sync_core_paged` for full
+        // discussion of why warm continuation preserves the partial
+        // trailing block's K/V across turns.
+        let total_budget = (token_ids_vec.len() as u32) + (p.max_new_tokens.max(0) as u32);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 napi::Error::from_reason(
@@ -2670,19 +2758,45 @@ impl Qwen3Inner {
                      use_block_paged_cache before dispatch",
                 )
             })?;
-            adapter
-                .reset_for_new_request(seq_id)
-                .map_err(napi::Error::from_reason)?;
-            let prefix = adapter
-                .find_cached_prefix(&token_ids_vec, &[])
-                .map_err(napi::Error::from_reason)?;
-            let cached = prefix.cached_token_count;
-            // Pre-size for prompt + decode budget; mirrors `chat_sync_core_paged`.
-            let total_budget = (token_ids_vec.len() as u32) + (p.max_new_tokens.max(0) as u32);
-            adapter
-                .allocate_suffix_blocks(total_budget)
-                .map_err(napi::Error::from_reason)?;
-            cached
+
+            let can_continue = reuse_cache
+                && adapter.is_live_for_continue()
+                && token_ids_vec.starts_with(adapter.request_tokens());
+
+            if can_continue {
+                match adapter.continue_turn(&token_ids_vec, total_budget) {
+                    Ok((prior_token_count, _newly_alloc)) => prior_token_count,
+                    Err(_drift) => {
+                        let _ = adapter.release_request();
+                        adapter
+                            .reset_for_new_request(seq_id)
+                            .map_err(napi::Error::from_reason)?;
+                        let prefix = adapter
+                            .find_cached_prefix(&token_ids_vec, &[])
+                            .map_err(napi::Error::from_reason)?;
+                        let cached = prefix.cached_token_count;
+                        adapter
+                            .allocate_suffix_blocks(total_budget)
+                            .map_err(napi::Error::from_reason)?;
+                        cached
+                    }
+                }
+            } else {
+                if adapter.block_table().is_some() {
+                    let _ = adapter.release_request();
+                }
+                adapter
+                    .reset_for_new_request(seq_id)
+                    .map_err(napi::Error::from_reason)?;
+                let prefix = adapter
+                    .find_cached_prefix(&token_ids_vec, &[])
+                    .map_err(napi::Error::from_reason)?;
+                let cached = prefix.cached_token_count;
+                adapter
+                    .allocate_suffix_blocks(total_budget)
+                    .map_err(napi::Error::from_reason)?;
+                cached
+            }
         };
 
         // Run the forward + decode under a try-style block so we can
@@ -2705,12 +2819,18 @@ impl Qwen3Inner {
             reuse_cache,
         );
 
-        // Always release; register-for-reuse only on success.
+        // Success: keep the request live across turns when reuse is on.
+        // Error: release fully. See the non-streaming variant's terminal
+        // block for the full rationale.
         match result {
             Ok(()) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.register_full_blocks_for_reuse(&[]);
-                    let _ = adapter.release_request();
+                    if reuse_cache {
+                        let _ = adapter.finalize_turn_keep_live(&[]);
+                    } else {
+                        let _ = adapter.register_full_blocks_for_reuse(&[]);
+                        let _ = adapter.release_request();
+                    }
                 }
                 Ok(())
             }
