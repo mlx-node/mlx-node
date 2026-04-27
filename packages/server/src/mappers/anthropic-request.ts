@@ -323,14 +323,41 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
     config.topK = req.top_k;
   }
 
+  // `stop_sequences` is parsed into the request type but `ChatConfig` has no
+  // matching field, so wiring it through to the native model would require a
+  // Rust change (out of scope here). Reject explicitly with a 400 — silently
+  // dropping the field would let a client believe its custom stop strings are
+  // honoured when the model continues generating right past them. An empty
+  // array is treated as "not present" since it carries no semantics. Future
+  // Rust work can add `stopSequences` to `ChatConfig` and remove this guard.
+  if (req.stop_sequences != null && req.stop_sequences.length > 0) {
+    throw new Error(
+      'stop_sequences is not supported by this server. Remove the field or wait for a future release that supports it natively.',
+    );
+  }
+
   if (req.tools && req.tools.length > 0) {
     const toolChoice = req.tool_choice;
-    if (toolChoice?.type === 'tool' && toolChoice.name) {
-      const matched = req.tools.filter((t) => t.name === toolChoice.name);
-      if (matched.length > 0) {
-        config.tools = matched.map(mapTool);
+    if (toolChoice?.type === 'tool') {
+      // `{type:'tool', name:'X'}` is a HARD constraint: the model MUST call X
+      // and only X. If the caller omitted the name, or named a tool that is
+      // not in `req.tools`, falling through to the all-tools path would
+      // silently violate that contract. Reject up front so the failure mode
+      // is loud and the client gets a clear 400.
+      if (!toolChoice.name) {
+        throw new Error('tool_choice.type is "tool" but no name was provided');
       }
+      const matched = req.tools.filter((t) => t.name === toolChoice.name);
+      if (matched.length === 0) {
+        throw new Error(
+          `tool_choice references tool "${toolChoice.name}" which is not present in the request's tools list`,
+        );
+      }
+      config.tools = matched.map(mapTool);
     } else {
+      // `tool_choice` is undefined, `{type:'auto'}`, or `{type:'any'}` — all
+      // three semantically mean "let the model pick from any tool", so we
+      // forward the full tools array.
       config.tools = req.tools.map(mapTool);
     }
   }

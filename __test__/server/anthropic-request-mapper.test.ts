@@ -791,6 +791,104 @@ describe('mapAnthropicRequest', () => {
     expect(config.tools).toHaveLength(2);
   });
 
+  it('rejects tool_choice that names a tool not present in tools[] (silent contract violation)', () => {
+    // Anthropic semantics: `{type:'tool', name:'X'}` is a HARD constraint —
+    // the model MUST call X and only X. Previously, an unmatched name fell
+    // through to the all-tools branch and the model silently received every
+    // tool. That violates the caller's contract; reject with a 400 instead.
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        tool_choice: { type: 'tool', name: 'C' },
+        tools: [
+          { name: 'A', input_schema: {} },
+          { name: 'B', input_schema: {} },
+        ],
+      }),
+    ).toThrow(/"C".*tools list/i);
+  });
+
+  it('rejects tool_choice with type=tool but no name', () => {
+    // Malformed shape — without a name we cannot select a tool, and falling
+    // through to the all-tools path would silently accept the request.
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        tool_choice: { type: 'tool' },
+        tools: [
+          { name: 'A', input_schema: {} },
+          { name: 'B', input_schema: {} },
+        ],
+      }),
+    ).toThrow(/no name was provided/i);
+  });
+
+  it('regression: tool_choice tool with matching name selects only that tool', () => {
+    // Pin the happy path against the rejection logic added above.
+    const { config } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      tool_choice: { type: 'tool', name: 'B' },
+      tools: [
+        { name: 'A', input_schema: {} },
+        { name: 'B', input_schema: {} },
+        { name: 'C', input_schema: {} },
+      ],
+    });
+
+    expect(config.tools).toHaveLength(1);
+    expect(config.tools![0].function.name).toBe('B');
+  });
+
+  it('regression: tool_choice type=auto sends all tools', () => {
+    // Pin the auto branch — the rejection logic for `type=tool` MUST NOT
+    // affect `type=auto`, which should continue to forward every tool.
+    const { config } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      tool_choice: { type: 'auto' },
+      tools: [
+        { name: 'A', input_schema: {} },
+        { name: 'B', input_schema: {} },
+      ],
+    });
+
+    expect(config.tools).toHaveLength(2);
+  });
+
+  it('rejects non-empty stop_sequences (no native ChatConfig.stopSequences yet)', () => {
+    // `stop_sequences` is parsed into the type but `ChatConfig` has no
+    // matching field. Silently dropping the field would let a client believe
+    // its stop strings are honoured. Reject explicitly until native support
+    // lands.
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        stop_sequences: ['STOP'],
+      }),
+    ).toThrow(/stop_sequences.*not supported/i);
+  });
+
+  it('accepts empty stop_sequences array (treated as absent)', () => {
+    // Empty array carries no semantics — accept silently rather than 400 on
+    // a no-op field.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      stop_sequences: [],
+    });
+    expect(messages).toEqual([{ role: 'user', content: 'Hello' }]);
+  });
+
   it('maps max_tokens to maxNewTokens in config', () => {
     const { config } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',

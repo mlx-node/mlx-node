@@ -340,6 +340,71 @@ describe('handleCreateMessage', () => {
       expect(parsed.type).toBe('error');
       expect(parsed.error.type).toBe('invalid_request_error');
     });
+
+    it('returns 400 when tool_choice names a tool not in the tools list (no warm slot touched)', async () => {
+      // End-to-end: the mapper rejection bubbles through the handler's outer
+      // try/catch into an Anthropic-shape 400. Crucially, the warm slot must
+      // NOT be created on the failure path (the handler short-circuits before
+      // any session work).
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+      const sizeBefore = sessionReg.size;
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          tool_choice: { type: 'tool', name: 'nonexistent' },
+          tools: [
+            { name: 'A', input_schema: {} },
+            { name: 'B', input_schema: {} },
+          ],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toContain('nonexistent');
+      // Failure path MUST NOT have touched the warm slot.
+      expect(sessionReg.size).toBe(sizeBefore);
+    });
+
+    it('returns 400 when stop_sequences is non-empty (no warm slot touched)', async () => {
+      // End-to-end: native `ChatConfig` has no `stopSequences` field, so the
+      // mapper rejects the field rather than silently dropping it. The 400
+      // must propagate via the outer try/catch in the handler, and the warm
+      // slot must remain untouched.
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+      const sizeBefore = sessionReg.size;
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toContain('stop_sequences');
+      expect(sessionReg.size).toBe(sizeBefore);
+    });
   });
 
   // -----------------------------------------------------------------------
