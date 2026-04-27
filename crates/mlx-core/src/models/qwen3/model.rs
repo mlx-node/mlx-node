@@ -2566,6 +2566,371 @@ impl Qwen3Inner {
         Ok(logits)
     }
 
+    /// Block-paged streaming variant of [`Self::chat_stream_sync_core`].
+    ///
+    /// Mirrors `chat_sync_core_paged`'s adapter lifecycle and forward
+    /// dispatch (reset → find_cached_prefix → allocate_suffix → prefill
+    /// via `run_paged_prefill_chunk` → decode loop via
+    /// `run_paged_decode_step`) but emits each generated token through
+    /// the streaming callback as it is produced.
+    ///
+    /// Mirrors the flat streaming path's terminal contract:
+    ///  * Streams text chunks for every decoded token.
+    ///  * Sends a residual chunk for any tokens whose detokenized text
+    ///    has not yet been flushed.
+    ///  * Sends a terminal `done: true` chunk with `finish_reason`,
+    ///    aggregated `tool_calls`, `thinking`, performance metrics, and
+    ///    the matched cached-prefix length.
+    ///
+    /// Same Phase 2 caveats as `chat_sync_core_paged`: zero-delta prompts
+    /// (every token cached) are rejected; numerical equivalence to the
+    /// flat path is not asserted here (validated separately via
+    /// random-init smoke tests).
+    fn chat_stream_sync_core_paged(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        eos_token_id: u32,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("Tokenizer not available."))?
+            .clone();
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+        let tokenizer_for_decode = tokenizer.clone();
+
+        let tool_defs = config.tools.as_deref();
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let p = chat_common::extract_chat_params(&config);
+        let _reuse_cache = p.reuse_cache;
+        let report_perf = p.report_performance;
+
+        let token_ids_vec = tokenizer.apply_chat_template_sync(
+            &messages,
+            Some(true),
+            tool_defs,
+            enable_thinking,
+        )?;
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+
+        let prompt_token_count = token_ids_vec.len() as u32;
+        let num_layers = self.layers.len();
+        let seq_id: u32 = 0;
+
+        // === Adapter lifecycle: reset + prefix lookup + suffix allocation. ===
+        let cached_prefix_len = {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                napi::Error::from_reason(
+                    "chat_stream_sync_core_paged: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?;
+            adapter
+                .reset_for_new_request(seq_id)
+                .map_err(napi::Error::from_reason)?;
+            let prefix = adapter
+                .find_cached_prefix(&token_ids_vec, &[])
+                .map_err(napi::Error::from_reason)?;
+            let cached = prefix.cached_token_count;
+            // Pre-size for prompt + decode budget; mirrors `chat_sync_core_paged`.
+            let total_budget = (token_ids_vec.len() as u32) + (p.max_new_tokens.max(0) as u32);
+            adapter
+                .allocate_suffix_blocks(total_budget)
+                .map_err(napi::Error::from_reason)?;
+            cached
+        };
+
+        // Run the forward + decode under a try-style block so we can
+        // always release the request afterwards.
+        let result = self.chat_stream_sync_core_paged_inner(
+            &token_ids_vec,
+            cached_prefix_len,
+            num_layers,
+            &p,
+            eos_token_id,
+            think_end_id,
+            think_end_str.as_deref(),
+            enable_thinking,
+            tokenizer_for_decode,
+            cb,
+            cancelled,
+            generation_start,
+            &mut first_token_instant,
+            prompt_token_count,
+        );
+
+        // Always release; register-for-reuse only on success.
+        match result {
+            Ok(()) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.register_full_blocks_for_reuse(&[]);
+                    let _ = adapter.release_request();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner forward + streaming decode loop for
+    /// [`Self::chat_stream_sync_core_paged`]. Split out so the caller can
+    /// wrap with `release_request` in a try-style flow.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream_sync_core_paged_inner(
+        &mut self,
+        token_ids_vec: &[u32],
+        cached_prefix_len: u32,
+        num_layers: usize,
+        p: &chat_common::ChatParams,
+        eos_token_id: u32,
+        think_end_id: Option<u32>,
+        think_end_str: Option<&str>,
+        enable_thinking: Option<bool>,
+        tokenizer_for_decode: Arc<Qwen3Tokenizer>,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+        generation_start: Option<std::time::Instant>,
+        first_token_instant: &mut Option<std::time::Instant>,
+        prompt_token_count: u32,
+    ) -> Result<()> {
+        let total_prompt_tokens = token_ids_vec.len() as u32;
+        let suffix_len = total_prompt_tokens
+            .checked_sub(cached_prefix_len)
+            .ok_or_else(|| {
+                napi::Error::from_reason(
+                    "chat_stream_sync_core_paged_inner: cached_prefix_len > total_prompt_tokens",
+                )
+            })?;
+
+        if total_prompt_tokens == 0 {
+            return Err(napi::Error::from_reason("Empty prompt"));
+        }
+
+        if suffix_len == 0 {
+            // Same Phase 2 limitation as the non-streaming paged path:
+            // pure-cache prompts (every token already cached) need a cache
+            // rewind primitive that the block-paged adapter doesn't expose
+            // yet. Rejected with a clear error so callers don't get
+            // mis-aligned logits.
+            return Err(napi::Error::from_reason(
+                "chat_stream_sync_core_paged: zero-delta prompt (every token cached) is not yet \
+                 supported on the block-paged path; flat path required for this corner case",
+            ));
+        }
+
+        let positions_dummy = MxArray::from_int32(&[0], &[1])?;
+
+        // === PREFILL ===
+        let suffix = &token_ids_vec[(cached_prefix_len as usize)..];
+        let last_logits =
+            self.run_paged_prefill_chunk(suffix, cached_prefix_len, num_layers, &positions_dummy)?;
+
+        // Apply prompt-level penalties on prefill logits before the first sample.
+        let last_logits = chat_common::apply_all_penalties(last_logits, token_ids_vec, p)?;
+        let mut y = sample(&last_logits, p.sampling_config)?;
+        MxArray::async_eval_arrays(&[&y]);
+
+        // Streaming state.
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
+        let mut streamed_text_len: usize = 0;
+        let mut token_history: Vec<u32> = token_ids_vec.to_vec();
+
+        let starts_in_thinking = enable_thinking.unwrap_or(true);
+        let mut last_is_reasoning = starts_in_thinking;
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            starts_in_thinking,
+            p.thinking_token_budget,
+            think_end_id,
+        );
+
+        let max_new_tokens = p.max_new_tokens;
+        const DECODE_CLEANUP_INTERVAL: i32 = 256;
+
+        // Decode loop: pipeline-aware via run_paged_decode_step. We can't
+        // use the shared `decode_loop!` macro directly because it's
+        // hard-coded to a closure-based forward (which would require
+        // mutably borrowing `self.paged_adapter` inside the closure while
+        // ALSO borrowing `self.layers`). Inlining the loop avoids the
+        // double-borrow without sacrificing the streaming + reasoning
+        // tracking + cancellation semantics that `decode_loop!` provides.
+        for step in 0..max_new_tokens {
+            y.eval();
+            if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
+                synchronize_and_clear_cache();
+            }
+
+            let token_value = y.item_at_int32(0)? as u32;
+
+            if let Some(start) = generation_start
+                && first_token_instant.is_none()
+            {
+                let _ = start; // start time relative to outer `generation_start`
+                *first_token_instant = Some(std::time::Instant::now());
+            }
+
+            generated_tokens.push(token_value);
+            token_history.push(token_value);
+            let is_reasoning = reasoning_tracker.observe_token(token_value);
+            last_is_reasoning = is_reasoning;
+
+            // Cancellation check BEFORE emitting. Mirrors the shared macro.
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                finish_reason = String::from("cancelled");
+                break;
+            }
+
+            // Incremental detokenization + emit.
+            let token_text = Qwen3Tokenizer::step_decode_stream(
+                &mut decode_stream,
+                tokenizer_for_decode.inner(),
+                token_value,
+                &generated_tokens,
+                streamed_text_len,
+            );
+            streamed_text_len += token_text.len();
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: token_text,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    cached_tokens: None,
+                    performance: None,
+                    is_reasoning: Some(is_reasoning),
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+
+            // EOS check.
+            if token_value == eos_token_id {
+                finish_reason = String::from("stop");
+                break;
+            }
+
+            // Repetition cutoff.
+            if let Some(reason) = check_repetition_cutoff(
+                &generated_tokens,
+                p.max_consecutive_tokens,
+                p.max_ngram_repeats,
+                p.ngram_size,
+            ) {
+                finish_reason = reason.to_string();
+                break;
+            }
+
+            // Compute next logits via paged decode.
+            let next_logits =
+                self.run_paged_decode_step(token_value, num_layers, &positions_dummy)?;
+            // [1, 1, vocab] → [vocab].
+            let next_logits = next_logits.squeeze(Some(&[0, 1]))?;
+
+            let next_logits = chat_common::apply_all_penalties(next_logits, &token_history, p)?;
+            let next_y = sample(&next_logits, p.sampling_config)?;
+            MxArray::async_eval_arrays(&[&next_y]);
+            y = next_y;
+        }
+
+        // === Save / register state — none on the paged path. The caller
+        // (`chat_stream_sync_core_paged`) owns
+        // `register_full_blocks_for_reuse` + `release_request` lifecycle. ===
+
+        // Decode generated text for parsing + flush residual.
+        let full_text = tokenizer_for_decode
+            .decode_sync(&generated_tokens, true)
+            .unwrap_or_else(|e| {
+                warn!("Failed to decode generated tokens: {}", e);
+                String::new()
+            });
+        if full_text.len() > streamed_text_len {
+            let residual = full_text[streamed_text_len..].to_string();
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: residual,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    cached_tokens: None,
+                    performance: None,
+                    is_reasoning: Some(last_is_reasoning),
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+        }
+
+        let num_tokens = generated_tokens.len() as u32;
+        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+            &full_text,
+            &generated_tokens,
+            thinking_enabled,
+            think_end_id,
+            think_end_str,
+            p.include_reasoning,
+        );
+
+        let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
+        let perf_metrics = chat_common::compute_performance_metrics(
+            generation_start,
+            *first_token_instant,
+            token_ids_vec.len() - (cached_prefix_len as usize),
+            generated_tokens.len(),
+        );
+
+        // Terminal done chunk.
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: clean_text,
+                done: true,
+                finish_reason: Some(finish_reason),
+                tool_calls: Some(tool_calls),
+                thinking,
+                num_tokens: Some(num_tokens),
+                prompt_tokens: Some(prompt_token_count),
+                reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
+                raw_text: Some(full_text),
+                cached_tokens: Some(cached_prefix_len),
+                performance: perf_metrics,
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
+
     /// Core synchronous streaming chat implementation.
     ///
     /// Mirrors the Qwen3.5 Dense `chat_stream_sync_inner` reference
@@ -2596,6 +2961,17 @@ impl Qwen3Inner {
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
+        // Block-paged dispatch: when the adapter is configured (opt-in via
+        // `use_block_paged_cache`), route through the parallel
+        // `chat_stream_sync_core_paged` path that uses
+        // `forward_paged_adapter` instead of `forward_fused`. The flat
+        // path is left untouched so turning the flag off is byte-identical
+        // to before this commit. Mirrors the dispatch added to the
+        // non-streaming `chat_sync_core`.
+        if self.paged_adapter.is_some() {
+            return self.chat_stream_sync_core_paged(messages, config, eos_token_id, cb, cancelled);
+        }
+
         let tokenizer = self
             .tokenizer
             .as_ref()
