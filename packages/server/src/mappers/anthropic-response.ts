@@ -67,6 +67,35 @@ export function buildAnthropicResponse(
   const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
   const hasToolCalls = okToolCalls.length > 0;
 
+  // Cache accounting (Anthropic Messages API spec):
+  //   * On a cache HIT (`cachedTokens > 0`) the wire MUST emit
+  //     `cache_read_input_tokens: cachedTokens` and reduce
+  //     `input_tokens` to the unsuffixed remainder
+  //     `promptTokens - cachedTokens` — Claude Code (and other
+  //     Anthropic-compatible UIs) read this directly for cost /
+  //     billing display, and a wire that left `input_tokens` at the
+  //     full prompt count would silently double-bill the cached
+  //     prefix.
+  //   * On a cache MISS (`cachedTokens === 0`) the cache fields are
+  //     OMITTED — they are optional in the spec and other
+  //     Anthropic-compatible servers elide them on misses.
+  //   * `cache_creation_input_tokens` stays unset: this server's KV
+  //     reuse is implicit (no `cache_control` breakpoints), so a
+  //     client that did not request explicit caching should never
+  //     see a non-zero creation count.
+  const cachedTokens = result.cachedTokens;
+  const usage: AnthropicMessagesResponse['usage'] =
+    cachedTokens > 0
+      ? {
+          input_tokens: result.promptTokens - cachedTokens,
+          output_tokens: result.numTokens,
+          cache_read_input_tokens: cachedTokens,
+        }
+      : {
+          input_tokens: result.promptTokens,
+          output_tokens: result.numTokens,
+        };
+
   return {
     id: messageId,
     type: 'message',
@@ -75,10 +104,7 @@ export function buildAnthropicResponse(
     content: buildAnthropicContent(result),
     stop_reason: mapStopReason(result.finishReason, hasToolCalls),
     stop_sequence: null,
-    usage: {
-      input_tokens: result.promptTokens,
-      output_tokens: result.numTokens,
-    },
+    usage,
   };
 }
 
@@ -138,17 +164,31 @@ export function buildMessageDelta(
   stopReason: string,
   outputTokens: number,
   inputTokens?: number,
+  cachedTokens?: number,
 ): AnthropicMessageDeltaEvent {
+  // Streaming `message_delta` mirrors the non-streaming response's
+  // cache accounting: when `cachedTokens > 0` we emit
+  // `cache_read_input_tokens: cachedTokens` AND subtract that count
+  // from `input_tokens`. On a cache miss (or when `cachedTokens` is
+  // omitted by an in-process driver / mock) the cache fields stay
+  // off the wire. See the matching block on `buildAnthropicResponse`
+  // and the field-level docstrings on `AnthropicUsage`.
+  const usage: AnthropicMessageDeltaEvent['usage'] = { output_tokens: outputTokens };
+  if (cachedTokens != null && cachedTokens > 0) {
+    if (inputTokens != null) {
+      usage.input_tokens = inputTokens - cachedTokens;
+    }
+    usage.cache_read_input_tokens = cachedTokens;
+  } else if (inputTokens != null) {
+    usage.input_tokens = inputTokens;
+  }
   return {
     type: 'message_delta',
     delta: {
       stop_reason: stopReason,
       stop_sequence: null,
     },
-    usage: {
-      ...(inputTokens != null ? { input_tokens: inputTokens } : {}),
-      output_tokens: outputTokens,
-    },
+    usage,
   };
 }
 

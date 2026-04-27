@@ -156,6 +156,14 @@ async function handleStreamingNative(
   let terminalStopReason: string | null = null;
   let terminalNumTokens = 0;
   let terminalPromptTokens: number | undefined;
+  // Captured from the terminal `done` chunk so the success-branch
+  // `buildMessageDelta` can emit Anthropic-spec cache accounting
+  // (`cache_read_input_tokens` + reduced `input_tokens`) on warm
+  // hits. Stays `undefined` on streams whose terminal chunk omits
+  // the field — mocks and any future in-process driver that hasn't
+  // adopted the surface — so `buildMessageDelta` falls back to the
+  // pre-Round-6 behaviour.
+  let terminalCachedTokens: number | undefined;
   let terminalErrorMessage: string | null = null;
 
   // `thrownError` sticks on a generator throw; `clientAborted` sticks on
@@ -322,6 +330,7 @@ async function handleStreamingNative(
         terminalStopReason = mapStopReason(event.finishReason, hasToolCalls);
         terminalNumTokens = event.numTokens;
         terminalPromptTokens = event.promptTokens;
+        terminalCachedTokens = event.cachedTokens;
         break;
       }
 
@@ -415,7 +424,11 @@ async function handleStreamingNative(
 
   if (successful) {
     const stopReason = terminalStopReason ?? 'end_turn';
-    writeSSEEvent(res, 'message_delta', buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens));
+    writeSSEEvent(
+      res,
+      'message_delta',
+      buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens, terminalCachedTokens),
+    );
     await flushTerminalSSE(res, 'message_stop', buildMessageStop(), visibility);
     endSSE(res);
     return { ok: true };
