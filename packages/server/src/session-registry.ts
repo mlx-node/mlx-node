@@ -653,6 +653,23 @@ export class SessionRegistry {
   }
 
   /**
+   * @deprecated Planned for removal once `use_block_paged_cache` defaults
+   * to `true` for the supported full-attention models (Qwen3, LFM2 today;
+   * Gemma4 / Qwen3.5 once their forward paths are wired). The native
+   * block-paged KV adapter (`PagedKVCacheAdapter` + `BlockAllocator` +
+   * `LayerKVPool`) recovers a turn's prefix from refcounted KV blocks
+   * keyed by token-prefix hash, so the JS-side single-warm slot this
+   * method walks becomes redundant — the native cache picks up the same
+   * cross-turn reuse without the byte-equal-`instructions` gate, and
+   * supports cross-conversation prefix sharing the warm slot cannot.
+   *
+   * Until that default flips and we have real-weights numerical-
+   * equivalence validation against the flat path, this method stays
+   * load-bearing on the `/v1/messages` endpoint and MUST NOT be removed
+   * or weakened — Phase 7 server-side simplification is gated on the
+   * default flip, not on this commit. Treat the `@deprecated` marker as
+   * an intent signal for callers, not a removal date.
+   *
    * Third lookup mode — for STATELESS full-history endpoints that have
    * no `previous_response_id` to thread and do not propagate
    * `prompt_cache_key` back to the server. The Anthropic

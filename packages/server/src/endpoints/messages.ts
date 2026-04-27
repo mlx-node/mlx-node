@@ -37,6 +37,24 @@
  * key). Cross-conversation block-level cache reuse is a separate
  * Phase-2 feature that would require the field — re-adding both is
  * a future change.
+ *
+ * **Planned migration to native block-paged KV (vLLM-aligned).** The
+ * supported full-attention models (Qwen3 and LFM2 today; Gemma4 and
+ * Qwen3.5 once their forward dispatch is wired) carry an opt-in
+ * `use_block_paged_cache` config flag that swaps the per-model flat
+ * `Vec<KVCache>` for a refcounted `PagedKVCacheAdapter` keyed by
+ * token-prefix hash. When that flag becomes the default, the
+ * server-side warm-slot machinery this file orchestrates
+ * (`getOrCreateWarmAny`, `resetPreservingNativeCacheForWarmReuse`,
+ * the `__msg_warm__` adopt/drop dance) becomes redundant — the
+ * native block cache recovers the same cross-turn prefix without
+ * the byte-equal-`instructions` gate, and additionally supports
+ * cross-conversation block sharing the JS warm slot cannot. Phase 7
+ * of the messages-kv-reuse plan removes the warm-slot path on this
+ * endpoint, gated on (a) the default flip and (b) real-weights
+ * numerical-equivalence validation. Until both land, the warm-slot
+ * path below remains active and correct; this comment is the only
+ * change in that direction for now.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
