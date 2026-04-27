@@ -1,4 +1,5 @@
-use crate::array::{MxArray, scaled_dot_product_attention_causal};
+use crate::array::mask::create_causal_mask;
+use crate::array::{MxArray, scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::nn::RMSNorm;
 use crate::transformer::PagedKVCache;
 use crate::transformer::attention::{Attention, QKVResult};
@@ -336,6 +337,12 @@ impl TransformerBlock {
     ///   here, even though we still write through to the pool). Decode
     ///   goes through `gather_kv_for_decode`, which pulls historical K/V
     ///   from the paged buffers and runs the paged-attention Metal kernel.
+    /// * `cached_prefix_len` — number of logical tokens already covered by
+    ///   the prefix cache when `is_prefill` is true. When > 0 the suffix
+    ///   tokens must attend over the FULL `[0, first_logical_position +
+    ///   num_suffix_tokens)` context, so `read_kv_range` materializes the
+    ///   cached + just-written K/V back to MxArrays for SDPA. Ignored in
+    ///   the decode path.
     /// * `_positions`, `_num_query_heads`, `_num_seqs`, `_seq_len` — kept on
     ///   the signature for symmetry with `forward_paged_metal` and likely
     ///   future multi-sequence batching, but unused in the current
@@ -349,17 +356,12 @@ impl TransformerBlock {
     /// - **Single-sequence only.** `gather_kv_for_decode` and the adapter's
     ///   block_table are currently scoped to one request. Continuous
     ///   batching is the legacy `forward_paged_metal` path's responsibility.
-    /// - **Prefill SDPA over the suffix only.** When a prefix is cached the
-    ///   suffix must still attend back to the cached tokens — the current
-    ///   prefill branch does not yet read the historical K/V from the pool
-    ///   (it would need a multi-token version of `gather_kv_for_decode`,
-    ///   which the brief notes is not implemented). For the **first** call
-    ///   (no cached prefix), this is correct: SDPA over the full sequence.
-    ///   For cache-hit prefills, callers must **either** dispatch the whole
-    ///   prompt via this path with `cached_token_count == 0` and re-prefill
-    ///   the entire prefix, **or** wait for a follow-up commit that adds a
-    ///   prefill-against-paged-K/V path. The adapter wiring through
-    ///   `chat_sync_core` (a separate commit) will pick the strategy.
+    /// - **Cache-hit prefill via host-side gather.** When `cached_prefix_len > 0`
+    ///   we `read_kv_range` the full context K/V back to MxArrays and run
+    ///   causal SDPA over them. That gather is host-side (slow but correct).
+    ///   The on-device zero-copy fast-path (TODO in the adapter) will replace
+    ///   the read with a Metal kernel that attends in-place against the paged
+    ///   buffers.
     /// - **Decode output dtype.** `gather_kv_for_decode` currently returns
     ///   Float32 (host-roundtrip). We `astype` it back to `x`'s dtype
     ///   before output projection / residual so the rest of the block stays
@@ -372,6 +374,7 @@ impl TransformerBlock {
         adapter: &mut PagedKVCacheAdapter,
         layer_idx: u32,
         first_logical_position: u32,
+        cached_prefix_len: u32,
         _num_query_heads: u32,
         _positions: &MxArray,
         _num_seqs: i64,
@@ -408,37 +411,64 @@ impl TransformerBlock {
 
         // 4. Compute attention output.
         let attn_out_paged = if is_prefill {
-            // Prefill: reshape Q/K/V into SDPA-friendly 4D layout and run
-            // standard causal SDPA over the in-flight tokens. This handles
-            // the **no-cached-prefix** case correctly. See "Caveats" in the
-            // method docstring for why a cache-hit prefill needs additional
-            // wiring before the chat-session can use this path with
-            // `cached_token_count > 0`.
+            // Prefill: reshape Q into SDPA-friendly 4D layout. K/V depend
+            // on whether we have a cached prefix:
+            //   - `cached_prefix_len == 0`: SDPA over the in-flight Q/K/V
+            //     directly (no read back required).
+            //   - `cached_prefix_len > 0`: read the FULL `[0, total_ctx)`
+            //     K/V back from the pool — cached prefix already lives
+            //     there, and `update_keys_values` (called above) just
+            //     wrote the suffix. SDPA then attends Q over total_ctx.
             let num_tokens = qkv.queries.shape_at(0)?;
             let n_heads = qkv.queries.shape_at(1)?;
             let n_kv_heads = qkv.keys.shape_at(1)?;
             let head_dim = qkv.queries.shape_at(2)?;
 
-            // [num_tokens, n_heads, head_dim] -> [1, n_heads, num_tokens, head_dim]
-            // (transpose axes 0 and 1 then add a batch=1 prefix).
+            // Q: [num_tokens, n_heads, head_dim] -> [1, n_heads, num_tokens, head_dim]
             let q_4d = qkv
                 .queries
                 .reshape(&[1, num_tokens, n_heads, head_dim])?
                 .transpose(Some(&[0, 2, 1, 3]))?;
-            let k_4d = qkv
-                .keys
-                .reshape(&[1, num_tokens, n_kv_heads, head_dim])?
-                .transpose(Some(&[0, 2, 1, 3]))?;
-            let v_4d = qkv
-                .values
-                .reshape(&[1, num_tokens, n_kv_heads, head_dim])?
-                .transpose(Some(&[0, 2, 1, 3]))?;
 
             let scale = self.self_attn.get_scale();
-            // Causal mask: every prefill token only attends to earlier
-            // suffix tokens via this SDPA call. (See caveats — when there
-            // is also a cached prefix in the pool, this path under-attends.)
-            let attn_4d = scaled_dot_product_attention_causal(&q_4d, &k_4d, &v_4d, scale)?;
+
+            let attn_4d = if cached_prefix_len == 0 {
+                // No cached prefix — SDPA over the in-flight Q/K/V with
+                // MLX's optimized internal causal mask (Q seq == K seq).
+                let k_4d = qkv
+                    .keys
+                    .reshape(&[1, num_tokens, n_kv_heads, head_dim])?
+                    .transpose(Some(&[0, 2, 1, 3]))?;
+                let v_4d = qkv
+                    .values
+                    .reshape(&[1, num_tokens, n_kv_heads, head_dim])?
+                    .transpose(Some(&[0, 2, 1, 3]))?;
+                scaled_dot_product_attention_causal(&q_4d, &k_4d, &v_4d, scale)?
+            } else {
+                // Cache hit: pull total_ctx K/V back from the pool. The
+                // suffix was already written via `update_keys_values`
+                // above, so the pool's `[0, total_ctx)` covers the full
+                // attention context.
+                let total_ctx = cached_prefix_len + (num_tokens as u32);
+                let (k_4d, v_4d) = adapter
+                    .read_kv_range(layer_idx, 0, total_ctx)
+                    .map_err(napi::Error::from_reason)?;
+                // `read_kv_range` returns `[1, n_kv_heads, total_ctx, head_dim]`.
+
+                // Build an explicit causal mask of shape
+                // `[num_tokens, total_ctx]` where row i (suffix token i,
+                // logical position cached_prefix_len + i) can attend to
+                // columns 0..=cached_prefix_len + i. `create_causal_mask(
+                // seq_len=num_tokens, offset=cached_prefix_len)` does
+                // exactly that. The mask broadcasts over batch / heads via
+                // SDPA's mask handling.
+                let mask = create_causal_mask(
+                    num_tokens as i32,
+                    Some(cached_prefix_len as i32),
+                    None,
+                )?;
+                scaled_dot_product_attention(&q_4d, &k_4d, &v_4d, scale, Some(&mask))?
+            };
 
             // [1, n_heads, num_tokens, head_dim] -> [num_tokens, n_heads, head_dim]
             // for `output_projection`'s expected layout.
