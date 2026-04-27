@@ -13,6 +13,7 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::image_processor::{Gemma4ImageProcessor, ProcessedGemma4Image};
 use super::vision::{Gemma4MultimodalEmbedder, Gemma4VisionModel};
@@ -220,6 +221,19 @@ pub(crate) struct Gemma4Inner {
     /// full session restart). `None` when no session is active or the
     /// session is text-only.
     pub(crate) cached_image_key: Option<u64>,
+    /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
+    ///
+    /// **Opt-in via `Gemma4Config::use_block_paged_cache`** —
+    /// construction-only at this stage. The chat-session forward
+    /// dispatch is NOT yet wired through this adapter because Gemma4's
+    /// hybrid sliding+global attention, K=V sharing, KV-shared layers
+    /// (`forward_shared`), MoE/PLE branches, and per-layer-type head
+    /// dimensions all require a bespoke `forward_paged_adapter` on
+    /// `Gemma4DecoderLayer` that mirrors the Qwen3 pattern but covers
+    /// these variants. Defaults to `None` so the existing
+    /// `Gemma4LayerCache` path stays untouched.
+    #[allow(dead_code)]
+    pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     pub(crate) model_id: u64,
 }
 
@@ -468,6 +482,86 @@ impl Gemma4Inner {
 
         let model_id = MODEL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
+        //
+        // Construction-only plumbing. The chat dispatch is NOT yet wired
+        // through this adapter — see `Gemma4Inner::paged_adapter` and
+        // `Gemma4Config::use_block_paged_cache` for the rationale. We
+        // still allocate here so:
+        // 1. The construction surface (config flag + JSON parsing +
+        //    NAPI-typed field) is testable in isolation.
+        // 2. A follow-up commit can light up the forward path without
+        //    re-churning every persistence/test/example file.
+        //
+        // Cache dtype: BFloat16 (Gemma4's production dtype).
+        // Per-layer head_dim: Gemma4 has variable head dims per layer
+        // type (sliding vs global). The adapter currently expects a
+        // uniform `head_size`, so we use the global head_dim as the
+        // pool's per-layer slot size — this is the LARGER of the two
+        // dimensions (e.g. 512 for E2B vs 256 for sliding) and matches
+        // what a future paged-aware forward would need to allocate. A
+        // proper sliding/global hybrid pool is part of the same
+        // follow-up that wires the forward path.
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
+            let block_size = config.paged_block_size.unwrap_or(16);
+            let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
+            // Use global head_dim — it's the larger of the two for the
+            // hybrid 31B / E2B configurations and the safe upper bound
+            // for a uniform pool. Layers with sliding dims can reuse
+            // their slot's prefix when the forward path lands.
+            let head_size = config.effective_head_dim(true) as u32;
+            // Use global KV heads — same rationale.
+            let num_kv_heads = config.effective_kv_heads(true) as u32;
+
+            let pa_config = mlx_paged_attn::PagedAttentionConfig {
+                block_size,
+                gpu_memory_mb,
+                head_size,
+                num_kv_heads,
+                num_layers: config.num_hidden_layers as u32,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(config.max_position_embeddings as u32),
+                max_batch_size: Some(32),
+            };
+
+            let num_blocks = pa_config.calculate_num_blocks();
+            if num_blocks == 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "Gemma4 block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
+                     (head_size={head_size}, num_kv_heads={num_kv_heads}, \
+                     block_size={block_size}, num_layers={})",
+                    config.num_hidden_layers,
+                )));
+            }
+
+            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+                num_blocks, block_size,
+            )));
+
+            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
+                .map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "Failed to construct LayerKVPool for Gemma4 block-paged adapter: {e}"
+                    ))
+                })?;
+
+            let adapter =
+                PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
+                    napi::Error::from_reason(format!(
+                        "Failed to construct Gemma4 PagedKVCacheAdapter: {e}"
+                    ))
+                })?;
+
+            tracing::info!(
+                "Gemma4 block-paged adapter enabled (construction-only): num_blocks={num_blocks}, \
+                 block_size={block_size}, gpu_memory_mb={gpu_memory_mb}, cache_dtype=BFloat16"
+            );
+            Some(adapter)
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             embed_tokens,
@@ -483,6 +577,7 @@ impl Gemma4Inner {
             caches: None,
             cached_token_history: Vec::new(),
             cached_image_key: None,
+            paged_adapter,
             model_id,
         })
     }
@@ -3966,6 +4061,155 @@ mod tests {
             !prompt.contains("<|turn>developer"),
             "developer should not appear as a raw role"
         );
+    }
+
+    /// Tiny Gemma4 config compatible with `LayerKVPool`'s validate
+    /// constraints (head_size in {32, 64, 96, 128, 256}, FP8 off, etc.).
+    /// `head_dim = 32`, num_kv_heads = 2, no PLE/MoE/vision/sharing.
+    #[cfg(test)]
+    fn paged_tiny_config(use_block_paged: bool) -> super::Gemma4Config {
+        super::Gemma4Config {
+            vocab_size: 100,
+            hidden_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 32,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: true,
+            max_position_embeddings: 128,
+            sliding_window: 128,
+            // All-global so the uniform paged pool's head_dim choice
+            // matches every layer trivially.
+            layer_types: vec!["full_attention".to_string(), "full_attention".to_string()],
+            rope_theta: 1_000_000.0,
+            rope_local_base_freq: 10_000.0,
+            partial_rotary_factor: 0.25,
+            global_num_key_value_heads: None,
+            global_head_dim: None,
+            attention_k_eq_v: false,
+            final_logit_softcapping: None,
+            per_layer_input_embeds: false,
+            hidden_size_per_layer_input: None,
+            vocab_size_per_layer_input: None,
+            pad_token_id: 0,
+            eos_token_ids: vec![1],
+            bos_token_id: 2,
+            attention_bias: false,
+            use_double_wide_mlp: false,
+            num_kv_shared_layers: None,
+            default_temperature: None,
+            default_top_k: None,
+            default_top_p: None,
+            enable_moe_block: false,
+            num_experts: None,
+            top_k_experts: None,
+            moe_intermediate_size: None,
+            vision_config: None,
+            image_token_id: None,
+            boi_token_id: None,
+            eoi_token_id: None,
+            vision_soft_tokens_per_image: None,
+            paged_cache_memory_mb: Some(256),
+            paged_block_size: Some(16),
+            use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+        }
+    }
+
+    /// `use_block_paged_cache` defaults to `None` when absent from the
+    /// JSON config — guards against silently switching the storage
+    /// backend on existing Gemma4 checkpoints.
+    ///
+    /// Pure-CPU; no MLX runtime needed.
+    #[test]
+    fn test_use_block_paged_cache_defaults_to_none_via_serde() {
+        let json = serde_json::json!({
+            "vocab_size": 0,
+            "hidden_size": 0,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "intermediate_size": 1,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 2048,
+        });
+        let cfg: super::Gemma4Config =
+            serde_json::from_value(json).expect("deserialize Gemma4Config");
+        assert_eq!(
+            cfg.use_block_paged_cache, None,
+            "use_block_paged_cache must default to None on JSON without the key"
+        );
+        assert_eq!(cfg.paged_block_size, None);
+        assert_eq!(cfg.paged_cache_memory_mb, None);
+    }
+
+    /// `use_block_paged_cache: true` round-trips through serde.
+    #[test]
+    fn test_use_block_paged_cache_round_trips_true() {
+        let json = serde_json::json!({
+            "vocab_size": 0,
+            "hidden_size": 0,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "intermediate_size": 1,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 2048,
+            "use_block_paged_cache": true,
+        });
+        let cfg: super::Gemma4Config =
+            serde_json::from_value(json).expect("deserialize Gemma4Config");
+        assert_eq!(cfg.use_block_paged_cache, Some(true));
+    }
+
+    /// Default-flag construction must NOT allocate the block-paged adapter.
+    #[test]
+    fn test_gemma4_inner_no_paged_adapter_when_flag_is_none() {
+        let cfg = paged_tiny_config(false);
+        let inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+        assert!(
+            inner.paged_adapter.is_none(),
+            "paged_adapter must be None when use_block_paged_cache is None"
+        );
+    }
+
+    /// Construction with `use_block_paged_cache: Some(true)` must populate
+    /// `paged_adapter`. Allocates a `LayerKVPool`, so requires Metal —
+    /// gracefully skips on no-Metal sandboxes.
+    #[test]
+    fn test_gemma4_inner_constructs_paged_adapter_when_flag_is_true() {
+        let cfg = paged_tiny_config(true);
+        match super::Gemma4Inner::new(cfg) {
+            Ok(inner) => {
+                assert!(
+                    inner.paged_adapter.is_some(),
+                    "paged_adapter must be Some when use_block_paged_cache = Some(true)"
+                );
+            }
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        }
     }
 }
 
