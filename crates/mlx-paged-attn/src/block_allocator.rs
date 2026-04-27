@@ -582,6 +582,13 @@ impl BlockAllocator {
         self.num_blocks
     }
 
+    /// Alias of [`Self::total_blocks`]. Matches the naming of
+    /// `LayerKVPool::num_blocks` so the adapter can validate matching
+    /// capacity without surprise.
+    pub fn num_blocks(&self) -> u32 {
+        self.num_blocks
+    }
+
     /// Get the block size
     pub fn block_size(&self) -> u32 {
         self.block_size
