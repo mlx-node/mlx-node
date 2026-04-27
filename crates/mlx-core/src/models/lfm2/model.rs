@@ -855,6 +855,21 @@ impl Lfm2Inner {
             }
         };
 
+        // Persist the session's token history so the subsequent
+        // `chat_session_continue` (which dispatches to
+        // `chat_tokens_delta_sync`) finds an initialized session and
+        // can build its delta on top of the prior prompt + reply.
+        //
+        // The paged decode loop never feeds the LAST sampled token
+        // through `run_paged_decode_step`, so the last entry in
+        // `generated_tokens` is NOT recorded in the adapter / conv
+        // caches — drop it from the saved history to keep the live
+        // cache state aligned with what the next turn replays.
+        // Mirrors `save_cache_state(reuse_cache=true, ..., last_token_in_cache=false)`
+        // on the flat path.
+        let last_token_in_cache = false;
+        self.save_cache_state(true, &tokens, &generated_tokens, last_token_in_cache);
+
         // Performance metrics
         let performance = if report_perf {
             compute_performance_metrics(
@@ -1410,6 +1425,15 @@ impl Lfm2Inner {
                 return Err(e);
             }
         };
+
+        // Persist the session's token history so the subsequent
+        // `chat_session_continue` (which dispatches to
+        // `chat_tokens_delta_sync`) finds an initialized session and
+        // can build its delta on top of the prior prompt + reply.
+        // See the non-streaming `chat_sync_core_paged` for the rationale
+        // on `last_token_in_cache = false`.
+        let last_token_in_cache = false;
+        self.save_cache_state(true, &tokens, &generated_tokens, last_token_in_cache);
 
         // Flush residual buffered bytes from decode_stream (mirrors flat
         // streaming).
