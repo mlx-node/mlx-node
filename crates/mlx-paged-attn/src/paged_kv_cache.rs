@@ -845,12 +845,15 @@ impl PagedKVCache {
             offset: slot_info.offset,
         };
 
-        // Determine dtype based on FP8 mode
-        let dtype = if use_fp8 {
+        // Determine cache dtype based on FP8 mode. Legacy `PagedKVCache`
+        // continues to assume Float16 K/V input (matching its original
+        // behavior); the new split-dtype dispatcher just makes that explicit.
+        let cache_dtype = if use_fp8 {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let input_dtype = MetalDtype::Float16;
 
         // Dispatch the kernel
         // SAFETY: Buffer pointers are valid (extracted from MLX arrays above)
@@ -862,7 +865,8 @@ impl PagedKVCache {
                 value_cache,
                 &slot_raw,
                 &params,
-                dtype,
+                input_dtype,
+                cache_dtype,
             )?;
         }
 
@@ -987,12 +991,15 @@ impl PagedKVCache {
             offset: 0,
         };
 
-        // Determine dtype based on FP8 mode
-        let dtype = if use_fp8 {
+        // Determine cache dtype based on FP8 mode. Same explicit-input note
+        // as `update`: legacy `PagedKVCache` keeps its Float16-input
+        // assumption.
+        let cache_dtype = if use_fp8 {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let input_dtype = MetalDtype::Float16;
 
         // Dispatch the kernel
         // SAFETY: Buffer pointers are valid (extracted from MLX arrays and created above)
@@ -1004,7 +1011,8 @@ impl PagedKVCache {
                 value_cache,
                 &slot_raw,
                 &params,
-                dtype,
+                input_dtype,
+                cache_dtype,
             )?;
         }
 

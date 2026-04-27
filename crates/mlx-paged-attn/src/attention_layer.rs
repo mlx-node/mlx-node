@@ -287,12 +287,16 @@ impl PagedAttentionLayer {
             offset: 0,
         };
 
-        // Determine dtype based on FP8 config
-        let dtype = if self.use_fp8 {
+        // Determine cache dtype based on FP8 config. The legacy `PagedKVCache`
+        // path historically uses Float16 for both input and cache (non-FP8),
+        // and Float16 input + UChar cache (FP8). The split-input/cache
+        // dispatcher signature makes this explicit.
+        let cache_dtype = if self.use_fp8 {
             MetalDtype::UChar
         } else {
             MetalDtype::Float16
         };
+        let input_dtype = MetalDtype::Float16;
 
         // Dispatch reshape_and_cache
         unsafe {
@@ -303,7 +307,8 @@ impl PagedAttentionLayer {
                 value_cache,
                 &slot_raw,
                 &reshape_params,
-                dtype,
+                input_dtype,
+                cache_dtype,
             )?;
         }
 

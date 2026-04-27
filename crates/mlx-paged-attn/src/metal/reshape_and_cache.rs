@@ -47,6 +47,12 @@ impl Default for ReshapeAndCacheParams {
 
 /// Dispatch the reshape_and_cache kernel
 ///
+/// `input_dtype` describes the dtype of the K/V buffers handed to the kernel;
+/// `cache_dtype` describes the on-cache element type (`UChar` for FP8 / FP8
+/// scaling, otherwise the same as `input_dtype`). The Metal source instantiates
+/// every supported `(input, cache)` pair — see
+/// [`MetalState::reshape_and_cache_kernel_name`].
+///
 /// # Buffer Layout
 /// - buffer(0): key [num_tokens, num_heads, head_size]
 /// - buffer(1): value [num_tokens, num_heads, head_size]
@@ -66,15 +72,16 @@ pub fn dispatch_reshape_and_cache(
     value_cache: &Buffer,
     slot_mapping: &Buffer,
     params: &ReshapeAndCacheParams,
-    dtype: MetalDtype,
+    input_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
 ) -> Result<(), String> {
     let state = MetalState::get()?;
 
-    // Determine if using FP8 based on cache dtype
-    let use_fp8 = dtype.is_fp8();
+    // Determine if using FP8 based on cache dtype.
+    let use_fp8 = cache_dtype.is_fp8();
 
-    // Get pipeline for this dtype
-    let kernel_name = MetalState::reshape_and_cache_kernel_name(dtype, use_fp8);
+    // Get pipeline for this (input, cache) pair.
+    let kernel_name = MetalState::reshape_and_cache_kernel_name(input_dtype, cache_dtype, use_fp8);
     let pipeline = state.get_pipeline(&kernel_name)?;
 
     // Create command buffer and encoder
@@ -165,6 +172,10 @@ pub struct RawBufferInfo {
 /// This variant is used when integrating with MLX arrays, where we extract
 /// raw Metal buffer pointers instead of having owned `Buffer` references.
 ///
+/// `input_dtype` is the dtype of the K/V buffers, `cache_dtype` is the
+/// on-cache element type (`UChar` for FP8). See [`dispatch_reshape_and_cache`]
+/// for the full discussion of why these are split.
+///
 /// # Safety
 ///
 /// - All buffer pointers must be valid MTLBuffer* pointers
@@ -181,15 +192,16 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
     value_cache: &Buffer,
     slot_mapping: &RawBufferInfo,
     params: &ReshapeAndCacheParams,
-    dtype: MetalDtype,
+    input_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
 ) -> Result<(), String> {
     let state = MetalState::get()?;
 
-    // Determine if using FP8 based on cache dtype
-    let use_fp8 = dtype.is_fp8();
+    // Determine if using FP8 based on cache dtype.
+    let use_fp8 = cache_dtype.is_fp8();
 
-    // Get pipeline for this dtype
-    let kernel_name = MetalState::reshape_and_cache_kernel_name(dtype, use_fp8);
+    // Get pipeline for this (input, cache) pair.
+    let kernel_name = MetalState::reshape_and_cache_kernel_name(input_dtype, cache_dtype, use_fp8);
     let pipeline = state.get_pipeline(&kernel_name)?;
 
     // Create command buffer and encoder

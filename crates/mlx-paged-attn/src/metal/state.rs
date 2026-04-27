@@ -116,16 +116,32 @@ impl MetalState {
         Ok(pipeline)
     }
 
-    /// Get the reshape_and_cache kernel name for a dtype
+    /// Get the `reshape_and_cache` kernel name for an `(input, cache)` dtype pair.
+    ///
+    /// The metal source instantiates these combinations (see
+    /// `crates/mlx-paged-attn/metal/cache/reshape_and_cache.metal`):
+    /// - Non-FP8: `(float, float)`, `(half, half)`, `(bfloat16_t, bfloat16_t)`
+    /// - FP8 (cache = `uchar`): `(float, uchar)`, `(half, uchar)`, `(bfloat16_t, uchar)`
+    ///
+    /// Hard-coding the input dtype as `half` (the previous behavior) silently
+    /// dispatched the wrong kernel when callers passed BF16 or F32 K/V — and
+    /// for FP8 with BF16 input, even routed BF16 bytes through a kernel
+    /// expecting `half`, corrupting the cache. Splitting the two dtypes
+    /// explicitly forces every caller to identify the input dtype, and the
+    /// Metal source's kernel-name lookup will fail loudly if the requested
+    /// pair was never instantiated.
     ///
     /// # Arguments
-    /// * `cache_dtype` - Data type for cache storage (UChar for FP8, Float16 otherwise)
-    /// * `use_fp8` - Whether to use FP8 scaling
-    ///
-    /// Note: Input KV tensors are always float16 from the model.
-    pub fn reshape_and_cache_kernel_name(cache_dtype: MetalDtype, use_fp8: bool) -> String {
-        // Input is always float16 (from model), cache dtype varies
-        let input_type = MetalDtype::Float16.type_string();
+    /// * `input_dtype` - Data type of the K/V input arrays handed to the kernel
+    /// * `cache_dtype` - Data type for cache storage (UChar for FP8, otherwise
+    ///   the same as `input_dtype`)
+    /// * `use_fp8` - Whether to use the `_fp8` (scale-divided) variant
+    pub fn reshape_and_cache_kernel_name(
+        input_dtype: MetalDtype,
+        cache_dtype: MetalDtype,
+        use_fp8: bool,
+    ) -> String {
+        let input_type = input_dtype.type_string();
         let cache_type = cache_dtype.type_string();
         let suffix = if use_fp8 { "_fp8" } else { "" };
         format!(
@@ -252,16 +268,51 @@ mod tests {
 
     #[test]
     fn test_kernel_names() {
-        // FORKED: Updated tests for new API with use_fp8/use_alibi parameters
-        // Float16 cache mode
+        // Non-FP8: every (input, cache) pair instantiated by the metal source.
         assert_eq!(
-            MetalState::reshape_and_cache_kernel_name(MetalDtype::Float16, false),
+            MetalState::reshape_and_cache_kernel_name(
+                MetalDtype::Float16,
+                MetalDtype::Float16,
+                false,
+            ),
             "reshape_and_cache_kv_half_cache_half"
         );
         assert_eq!(
-            MetalState::reshape_and_cache_kernel_name(MetalDtype::Float16, true),
-            "reshape_and_cache_kv_half_cache_half_fp8"
+            MetalState::reshape_and_cache_kernel_name(
+                MetalDtype::BFloat16,
+                MetalDtype::BFloat16,
+                false,
+            ),
+            "reshape_and_cache_kv_bfloat16_t_cache_bfloat16_t"
         );
+        assert_eq!(
+            MetalState::reshape_and_cache_kernel_name(
+                MetalDtype::Float32,
+                MetalDtype::Float32,
+                false,
+            ),
+            "reshape_and_cache_kv_float_cache_float"
+        );
+
+        // FP8: every (input, uchar) pair instantiated with the `_fp8` suffix.
+        assert_eq!(
+            MetalState::reshape_and_cache_kernel_name(MetalDtype::Float16, MetalDtype::UChar, true,),
+            "reshape_and_cache_kv_half_cache_uchar_fp8"
+        );
+        assert_eq!(
+            MetalState::reshape_and_cache_kernel_name(
+                MetalDtype::BFloat16,
+                MetalDtype::UChar,
+                true,
+            ),
+            "reshape_and_cache_kv_bfloat16_t_cache_uchar_fp8"
+        );
+        assert_eq!(
+            MetalState::reshape_and_cache_kernel_name(MetalDtype::Float32, MetalDtype::UChar, true,),
+            "reshape_and_cache_kv_float_cache_uchar_fp8"
+        );
+
+        // Paged attention V1/V2 — unchanged: I/O is always float16.
         assert_eq!(
             MetalState::paged_attention_v1_kernel_name(MetalDtype::Float16, 128, 16, false),
             "paged_attention_half_cache_half_hs128_bs16_nt256_nsl32_ps0"
@@ -278,12 +329,6 @@ mod tests {
             MetalState::paged_attention_v2_kernel_name(MetalDtype::Float16, 128, 16, true),
             "paged_attention_half_cache_half_hs128_bs16_nt256_nsl32_ps512_alibi"
         );
-
-        // FP8 cache mode (UChar cache, but input/output still float16)
-        assert_eq!(
-            MetalState::reshape_and_cache_kernel_name(MetalDtype::UChar, true),
-            "reshape_and_cache_kv_half_cache_uchar_fp8"
-        );
         assert_eq!(
             MetalState::paged_attention_v1_kernel_name(MetalDtype::UChar, 128, 16, false),
             "paged_attention_half_cache_uchar_hs128_bs16_nt256_nsl32_ps0"
@@ -292,7 +337,6 @@ mod tests {
             MetalState::paged_attention_v2_kernel_name(MetalDtype::UChar, 128, 16, false),
             "paged_attention_half_cache_uchar_hs128_bs16_nt256_nsl32_ps512"
         );
-        // Reduce kernel always uses float16 regardless of cache dtype
         assert_eq!(
             MetalState::paged_attention_v2_reduce_kernel_name(MetalDtype::UChar, 128),
             "paged_attention_v2_reduce_half_hs128_nt256_nsl32_ps512"
@@ -302,7 +346,11 @@ mod tests {
     #[test]
     fn test_get_reshape_and_cache_pipeline() {
         let state = MetalState::get().expect("Failed to init Metal state");
-        let kernel_name = MetalState::reshape_and_cache_kernel_name(MetalDtype::Float16, false);
+        let kernel_name = MetalState::reshape_and_cache_kernel_name(
+            MetalDtype::Float16,
+            MetalDtype::Float16,
+            false,
+        );
         let pipeline = state.get_pipeline(&kernel_name);
         assert!(
             pipeline.is_ok(),

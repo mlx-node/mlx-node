@@ -258,10 +258,12 @@ impl LayerKVPool {
     /// is computed as `num_kv_heads * head_size`, matching the contiguous
     /// `[num_tokens, num_kv_heads, head_size]` layout the kernel expects.
     ///
-    /// `kv_dtype` indicates the dtype of `keys`/`values`. If the cache is
-    /// FP8 (`config.use_fp8()`), the kernel writes FP8 (`MetalDtype::UChar`)
-    /// regardless of input dtype — pass the input dtype here, the
-    /// dispatcher routes correctly.
+    /// `input_dtype` describes the dtype of the K/V input arrays — `Float16`,
+    /// `BFloat16`, or `Float32`. The cache dtype is derived from the pool's
+    /// FP8 config: FP8 caches use `UChar`, otherwise the cache mirrors the
+    /// input dtype. Splitting input from cache dtype avoids the historical
+    /// "input is always half" bug that silently routed BF16 / F32 K/V to the
+    /// wrong kernel (or, in the FP8 case, reinterpreted BF16 bytes as half).
     ///
     /// # Safety
     /// - `keys`, `values` must be valid `mlx_array` pointers with shape
@@ -277,7 +279,7 @@ impl LayerKVPool {
         keys: *mut mlx_sys::mlx_array,
         values: *mut mlx_sys::mlx_array,
         slot_mapping: &[i64],
-        kv_dtype: crate::metal::MetalDtype,
+        input_dtype: crate::metal::MetalDtype,
         k_scale: f32,
         v_scale: f32,
     ) -> Result<(), String> {
@@ -353,18 +355,16 @@ impl LayerKVPool {
             offset: 0,
         };
 
-        // Cache dtype: FP8 -> UChar; otherwise use the kv input dtype as
-        // the cache dtype (we never auto-quantize from a wider input).
-        //
-        // NOTE: the existing `reshape_and_cache_kernel_name` helper hard-
-        // codes the *input* dtype as `half` (Float16). The metal source
-        // instantiates `(half, half)`, `(bfloat16_t, bfloat16_t)`, and
-        // `(float, float)` variants, but only the `half` input route is
-        // accessible through that helper today. Callers that need to cache
-        // bf16 input must extend the helper first; this dispatcher just
-        // forwards `kv_dtype` and surfaces whatever error the kernel
-        // lookup returns. (Tracked as a follow-up to P1C-2.)
-        let dtype = if use_fp8 { MetalDtype::UChar } else { kv_dtype };
+        // Cache dtype: FP8 -> UChar; otherwise mirror the input dtype (we
+        // never auto-quantize from a wider input). Input and cache dtypes
+        // are forwarded to the dispatcher independently so the kernel-name
+        // lookup picks an instantiated `(input_t, cache_t)` pair instead of
+        // assuming half-input.
+        let cache_dtype = if use_fp8 {
+            MetalDtype::UChar
+        } else {
+            input_dtype
+        };
 
         // SAFETY: all buffer pointers are extracted above; they remain
         // valid until command_buffer.wait_until_completed inside the
@@ -377,7 +377,8 @@ impl LayerKVPool {
                 value_cache,
                 &slot_raw,
                 &params,
-                dtype,
+                input_dtype,
+                cache_dtype,
             )
         }
     }
