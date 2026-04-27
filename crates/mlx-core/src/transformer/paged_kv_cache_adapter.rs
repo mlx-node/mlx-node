@@ -864,7 +864,18 @@ mod tests {
     /// Uses `LayerKVPool::new_for_test` so the lifecycle-only tests below
     /// don't pay GPU-allocation costs and aren't constrained to the
     /// production-validated `block_size` set (8/16/32).
-    fn new_test_pool(num_blocks: u32, block_size: u32) -> Arc<mlx_paged_attn::LayerKVPool> {
+    ///
+    /// On macOS sandboxes / CI VMs without a Metal device, `new_for_test`
+    /// returns `Err("No Metal device found")`. We surface that as `None`
+    /// so each lifecycle test can `let Some(pool) = ... else { return; }`
+    /// and skip cleanly. Any other error (zero blocks/layers, etc.) is a
+    /// real bug and panics. Spec: "Graceful degrade when GPU absent is
+    /// OK" — apply that uniformly to all adapter tests that need a pool,
+    /// not just the Metal-write happy-path.
+    fn maybe_test_pool(
+        num_blocks: u32,
+        block_size: u32,
+    ) -> Option<Arc<mlx_paged_attn::LayerKVPool>> {
         let cfg = mlx_paged_attn::PagedAttentionConfig {
             block_size,
             num_kv_heads: 1,
@@ -873,24 +884,38 @@ mod tests {
             // gpu_memory_mb is unused by new_for_test (it skips validate).
             ..mlx_paged_attn::PagedAttentionConfig::default()
         };
-        Arc::new(
-            mlx_paged_attn::LayerKVPool::new_for_test(cfg, num_blocks, 2)
-                .expect("new_for_test pool"),
-        )
+        match mlx_paged_attn::LayerKVPool::new_for_test(cfg, num_blocks, 2) {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) if e.contains("No Metal device found") => None,
+            Err(e) => panic!("unexpected new_for_test failure: {e}"),
+        }
     }
 
     /// Test shim mimicking the pre-P1C-2 two-arg `PagedKVCacheAdapter::new`
     /// signature. Internally pairs the supplied allocator with a
-    /// placeholder `LayerKVPool` of matching capacity. Lets the existing
-    /// lifecycle / prefix-cache tests stay intact while exercising the
-    /// new pool-validation path.
-    fn make_adapter(
+    /// placeholder `LayerKVPool` of matching capacity. Returns `None` if
+    /// Metal is unavailable so the caller can bail-with-skip; returns
+    /// `Some(Err(...))` when the adapter constructor itself rejects (used
+    /// by the validation tests that probe pool/adapter mismatch errors).
+    fn maybe_make_adapter(
         allocator: Arc<Mutex<BlockAllocator>>,
         block_size: u32,
-    ) -> Result<PagedKVCacheAdapter, String> {
+    ) -> Option<Result<PagedKVCacheAdapter, String>> {
         let num_blocks = allocator.lock().unwrap().num_blocks();
-        let pool = new_test_pool(num_blocks, block_size);
-        PagedKVCacheAdapter::new(allocator, pool, block_size)
+        let pool = maybe_test_pool(num_blocks, block_size)?;
+        Some(PagedKVCacheAdapter::new(allocator, pool, block_size))
+    }
+
+    /// Convenience for tests that just want a constructed adapter and
+    /// expect success. Returns `None` if Metal is unavailable (skip);
+    /// panics if `PagedKVCacheAdapter::new` itself returns `Err` (real
+    /// bug). The validation tests that need to inspect the adapter
+    /// constructor's `Err` go through `maybe_make_adapter` instead.
+    fn maybe_adapter(
+        allocator: Arc<Mutex<BlockAllocator>>,
+        block_size: u32,
+    ) -> Option<PagedKVCacheAdapter> {
+        Some(maybe_make_adapter(allocator, block_size)?.expect("adapter ctor must succeed"))
     }
 
     /// Convenience: simulates a previous completed request that registered
@@ -928,7 +953,10 @@ mod tests {
         let allocator = new_allocator(8, 4);
         // Build a pool whose block_size matches the allocator (4) so we
         // isolate the adapter-vs-allocator mismatch.
-        let pool_4 = new_test_pool(8, 4);
+        let Some(pool_4) = maybe_test_pool(8, 4) else {
+            eprintln!("skipping test_new_validates_block_size: Metal device unavailable");
+            return;
+        };
         let bad = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool_4), 8);
         assert!(bad.is_err(), "expected mismatch error, got Ok");
         let ok = PagedKVCacheAdapter::new(allocator, pool_4, 4);
@@ -943,7 +971,12 @@ mod tests {
     fn test_new_rejects_pool_block_size_mismatch() {
         let allocator = new_allocator(8, 4);
         // Pool intentionally built with block_size=8.
-        let mismatched_pool = new_test_pool(8, 8);
+        let Some(mismatched_pool) = maybe_test_pool(8, 8) else {
+            eprintln!(
+                "skipping test_new_rejects_pool_block_size_mismatch: Metal device unavailable"
+            );
+            return;
+        };
         let res = PagedKVCacheAdapter::new(allocator, mismatched_pool, 4);
         assert!(res.is_err(), "expected pool block_size mismatch error");
         let msg = res.err().unwrap();
@@ -958,7 +991,13 @@ mod tests {
     #[test]
     fn test_new_rejects_pool_num_blocks_mismatch() {
         let allocator = new_allocator(8, 4); // 8 blocks
-        let smaller_pool = new_test_pool(4, 4); // 4 blocks
+        let Some(smaller_pool) = maybe_test_pool(4, 4) else {
+            // 4 blocks
+            eprintln!(
+                "skipping test_new_rejects_pool_num_blocks_mismatch: Metal device unavailable"
+            );
+            return;
+        };
         let res = PagedKVCacheAdapter::new(allocator, smaller_pool, 4);
         assert!(res.is_err(), "expected num_blocks mismatch error");
         let msg = res.err().unwrap();
@@ -971,7 +1010,10 @@ mod tests {
     #[test]
     fn test_reset_for_new_request_initializes_state() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = make_adapter(allocator, 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!("skipping test_reset_for_new_request_initializes_state: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(7).unwrap();
         let table = adapter.block_table().expect("block_table populated");
         assert_eq!(table.seq_id, 7);
@@ -984,7 +1026,10 @@ mod tests {
     #[test]
     fn test_find_cached_prefix_miss() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = make_adapter(allocator, 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!("skipping test_find_cached_prefix_miss: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
         let res = adapter.find_cached_prefix(&[1, 2, 3, 4, 5], &[]).unwrap();
         assert!(res.blocks.is_empty());
@@ -999,7 +1044,10 @@ mod tests {
         let tokens: Vec<u32> = (0..8).collect();
         seed_prefix_cache(&allocator, &tokens, 4, &[]);
 
-        let mut adapter = make_adapter(allocator, 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!("skipping test_find_cached_prefix_hit_after_register: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(1).unwrap();
         // Look up with same 8 tokens — should hit both blocks.
         let res = adapter.find_cached_prefix(&tokens, &[]).unwrap();
@@ -1016,7 +1064,10 @@ mod tests {
     #[test]
     fn test_allocate_suffix_blocks_no_prefix() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = make_adapter(allocator, 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!("skipping test_allocate_suffix_blocks_no_prefix: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
         // 10 tokens, block_size=4 -> ceil(10/4) = 3 new blocks.
         let n = adapter.allocate_suffix_blocks(10).unwrap();
@@ -1032,7 +1083,10 @@ mod tests {
         let prefix_tokens: Vec<u32> = (0..8).collect();
         seed_prefix_cache(&allocator, &prefix_tokens, 4, &[]);
 
-        let mut adapter = make_adapter(allocator, 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!("skipping test_allocate_suffix_blocks_after_prefix: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(2).unwrap();
         let res = adapter.find_cached_prefix(&prefix_tokens, &[]).unwrap();
         assert_eq!(res.cached_token_count, 8);
@@ -1047,7 +1101,13 @@ mod tests {
     #[test]
     fn test_record_tokens_appends_to_request_tokens_and_updates_num_tokens() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = make_adapter(allocator, 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!(
+                "skipping test_record_tokens_appends_to_request_tokens_and_updates_num_tokens: \
+                 Metal unavailable"
+            );
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(8).unwrap();
 
@@ -1063,7 +1123,10 @@ mod tests {
     #[test]
     fn test_register_full_blocks_for_reuse_idempotent() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_register_full_blocks_for_reuse_idempotent: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
 
         adapter.allocate_suffix_blocks(8).unwrap();
@@ -1072,7 +1135,7 @@ mod tests {
         assert_eq!(registered, 2, "two full blocks of size 4 = 8 tokens");
 
         // Second adapter on the same allocator should now see the cached prefix.
-        let mut adapter2 = make_adapter(allocator, 4).unwrap();
+        let mut adapter2 = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2
             .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[])
@@ -1085,7 +1148,10 @@ mod tests {
     fn test_release_request_decrefs_blocks() {
         let allocator = new_allocator(8, 4);
         let initial_free = allocator.lock().unwrap().num_free_blocks();
-        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_release_request_decrefs_blocks: Metal unavailable");
+            return;
+        };
 
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(8).unwrap(); // 2 blocks
@@ -1108,7 +1174,13 @@ mod tests {
     #[test]
     fn test_register_then_release_keeps_blocks_alive_in_prefix_cache() {
         let allocator = new_allocator(8, 4);
-        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_register_then_release_keeps_blocks_alive_in_prefix_cache: \
+                 Metal unavailable"
+            );
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
 
         adapter.allocate_suffix_blocks(8).unwrap();
@@ -1125,7 +1197,7 @@ mod tests {
         assert_eq!(freed, 2);
 
         // A fresh adapter on the same allocator can resurrect the prefix.
-        let mut adapter2 = make_adapter(allocator, 4).unwrap();
+        let mut adapter2 = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2.find_cached_prefix(&tokens, &[]).unwrap();
         assert_eq!(
@@ -1153,7 +1225,10 @@ mod tests {
         full_b.extend_from_slice(&user_b_tokens);
 
         // Adapter A.
-        let mut adapter_a = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter_a) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_two_adapters_share_prefix: Metal unavailable");
+            return;
+        };
         adapter_a.reset_for_new_request(0).unwrap();
         adapter_a
             .allocate_suffix_blocks(full_a.len() as u32)
@@ -1164,7 +1239,7 @@ mod tests {
         adapter_a.release_request().unwrap();
 
         // Adapter B.
-        let mut adapter_b = make_adapter(allocator, 4).unwrap();
+        let mut adapter_b = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter_b.reset_for_new_request(1).unwrap();
         let res = adapter_b.find_cached_prefix(&full_b, &[]).unwrap();
         // SYS prefix shared (8 tokens / 2 blocks); USER_B differs → miss.
@@ -1185,7 +1260,12 @@ mod tests {
     fn test_register_full_blocks_for_reuse_idempotent_repeat() {
         let allocator = new_allocator(8, 4);
         let initial_free = allocator.lock().unwrap().num_free_blocks();
-        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_register_full_blocks_for_reuse_idempotent_repeat: Metal unavailable"
+            );
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
 
         adapter.allocate_suffix_blocks(8).unwrap();
@@ -1240,7 +1320,7 @@ mod tests {
 
         // A fresh adapter on the same allocator must still be able to
         // recover the prefix via `find_cached_prefix`.
-        let mut adapter2 = make_adapter(allocator, 4).unwrap();
+        let mut adapter2 = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2
             .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[])
@@ -1255,7 +1335,10 @@ mod tests {
     #[test]
     fn test_release_request_resets_already_registered() {
         let allocator = new_allocator(16, 4);
-        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_release_request_resets_already_registered: Metal unavailable");
+            return;
+        };
 
         // First request: register, then explicit release.
         adapter.reset_for_new_request(0).unwrap();
@@ -1287,7 +1370,12 @@ mod tests {
     #[test]
     fn test_reset_for_new_request_resets_already_registered() {
         let allocator = new_allocator(16, 4);
-        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_reset_for_new_request_resets_already_registered: Metal unavailable"
+            );
+            return;
+        };
 
         // First request: register, then jump straight to a new reset
         // (auto-release path).
@@ -1334,7 +1422,13 @@ mod tests {
             adapter.release_request().unwrap();
         };
 
-        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_evict_from_prefix_cache_returns_blocks_to_free_pool: \
+                 Metal unavailable"
+            );
+            return;
+        };
 
         // Cycle 1: register a 1-block prompt. Cache holds it.
         run_once(&mut adapter, &[1, 2, 3, 4]);
@@ -1387,7 +1481,13 @@ mod tests {
     fn test_adapter_can_progress_when_pool_exhausted_by_cache() {
         let allocator = new_allocator(2, 4);
         // Default cache cap is large; both prior cycles' blocks survive.
-        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_adapter_can_progress_when_pool_exhausted_by_cache: \
+                 Metal unavailable"
+            );
+            return;
+        };
 
         // Cycle 1: register + release for prompt P1. First block held by
         // cache.
@@ -1443,7 +1543,8 @@ mod tests {
         adapter.release_request().unwrap();
 
         // Confirm: a fresh adapter looking up P2 still hits.
-        let mut adapter2 = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let mut adapter2 =
+            maybe_adapter(Arc::clone(&allocator), 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(99).unwrap();
         let p2_lookup = adapter2.find_cached_prefix(&p2, &[]).unwrap();
         assert_eq!(
@@ -1453,7 +1554,7 @@ mod tests {
 
         // And P1's hash is gone.
         adapter2.release_request().unwrap();
-        let mut adapter3 = make_adapter(allocator, 4).unwrap();
+        let mut adapter3 = maybe_adapter(allocator, 4).expect("first pool succeeded; third must");
         adapter3.reset_for_new_request(100).unwrap();
         let p1_lookup = adapter3.find_cached_prefix(&p1, &[]).unwrap();
         assert_eq!(
@@ -1478,7 +1579,10 @@ mod tests {
         let prefix_tokens: Vec<u32> = (0..8).collect();
         seed_prefix_cache(&allocator, &prefix_tokens, 4, &[]);
 
-        let mut adapter = make_adapter(Arc::clone(&allocator), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_find_cached_prefix_seeds_request_tokens: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
 
         // 12-token prompt: 8-token cached prefix + 4-token new suffix.
@@ -1546,7 +1650,10 @@ mod tests {
     /// missing block_table and panic.
     #[test]
     fn test_update_keys_values_no_active_request() {
-        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_update_keys_values_no_active_request: Metal unavailable");
+            return;
+        };
         let k = dummy_kv(1, 1, 32);
         let v = dummy_kv(1, 1, 32);
         let res = adapter.update_keys_values(0, &k, &v, 0);
@@ -1562,7 +1669,10 @@ mod tests {
     /// than triggering UB inside the kernel.
     #[test]
     fn test_update_keys_values_layer_out_of_bounds() {
-        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_update_keys_values_layer_out_of_bounds: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
         adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
@@ -1581,7 +1691,10 @@ mod tests {
     /// Mismatched leading dim between `keys` and `values` must error.
     #[test]
     fn test_update_keys_values_shape_mismatch() {
-        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_update_keys_values_shape_mismatch: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
         adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
@@ -1600,7 +1713,12 @@ mod tests {
     /// Otherwise the chunk would be written to the wrong slots.
     #[test]
     fn test_update_keys_values_misaligned_first_position() {
-        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping test_update_keys_values_misaligned_first_position: Metal unavailable"
+            );
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
         adapter.record_tokens(&[10, 11, 12, 13]).unwrap();
@@ -1625,7 +1743,10 @@ mod tests {
     /// drift in either the kernel or the encoding.
     #[test]
     fn test_update_keys_values_slot_mapping_encoding() {
-        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_update_keys_values_slot_mapping_encoding: Metal unavailable");
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
         // Allocate 3 blocks (12 slots) and record 12 tokens.
         adapter.allocate_suffix_blocks(12).unwrap();
@@ -1662,7 +1783,12 @@ mod tests {
     /// Catches the silently-overflow-into-junk-slot bug at the boundary.
     #[test]
     fn test_update_keys_values_slot_mapping_out_of_range() {
-        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping test_update_keys_values_slot_mapping_out_of_range: Metal unavailable"
+            );
+            return;
+        };
         adapter.reset_for_new_request(0).unwrap();
         // Allocate ONE block (4 slots) and try to map 5 positions.
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -1675,7 +1801,7 @@ mod tests {
         );
     }
 
-    /// CPU-only `PagedAttentionConfig` matching `new_test_pool` shape:
+    /// CPU-only `PagedAttentionConfig` matching `maybe_test_pool` shape:
     /// `num_kv_heads = 1`, `head_size = 32`. No allocation, no Metal —
     /// safe to use in any environment. Used by the `validate_kv_input`
     /// rejection tests so they can run without `MetalState::get()`.
