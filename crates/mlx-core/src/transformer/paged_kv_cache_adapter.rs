@@ -3451,3 +3451,221 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod compute_per_block_image_extra_keys_tests {
+    //! Coverage for the Phase 6 multimodal extra_keys helper.
+    //!
+    //! Pure-CPU: no Metal, no MLX runtime, no allocator. These tests
+    //! pin the algorithm so an image-aware model integration (Qwen3.5
+    //! VLM, PaddleOCR-VL) can rely on a stable per-block construction
+    //! contract. The integration tests for end-to-end
+    //! `find_cached_prefix(extra_keys=non_empty)` round-trips live
+    //! alongside the model wiring; this module validates the helper
+    //! itself.
+
+    use super::compute_per_block_image_extra_keys;
+    use mlx_paged_attn::hash_tokens;
+
+    /// Empty image positions → every block gets an empty extra_keys vec.
+    /// This is the text-only baseline — passing the result of this helper
+    /// for a text-only request must produce identical hashes to passing
+    /// `&[]` directly.
+    #[test]
+    fn empty_image_positions_produce_empty_extra_keys() {
+        let per_block = compute_per_block_image_extra_keys(&[], 4, 16);
+        assert_eq!(per_block.len(), 4);
+        for block in &per_block {
+            assert!(block.is_empty(), "expected empty extra_keys for text-only");
+        }
+    }
+
+    /// Zero blocks requested → empty output regardless of input.
+    #[test]
+    fn zero_blocks_produces_empty_output() {
+        let per_block = compute_per_block_image_extra_keys(&[(0, 0xABCD)], 0, 16);
+        assert!(per_block.is_empty());
+    }
+
+    /// Zero block_size is rejected with an empty output (defensive).
+    #[test]
+    fn zero_block_size_returns_empty() {
+        let per_block = compute_per_block_image_extra_keys(&[(0, 0xABCD)], 4, 0);
+        assert!(per_block.is_empty());
+    }
+
+    /// One image entirely within a single block — the output for that
+    /// block has 2*N entries (N = number of image-token positions),
+    /// every other block is empty.
+    #[test]
+    fn single_image_within_one_block() {
+        // 32 tokens, block_size = 16 → 2 blocks.
+        // Image at positions 5..10 (5 tokens), all within block 0.
+        let positions: Vec<(u32, u64)> = (5u32..10).map(|p| (p, 0xABCD)).collect();
+        let per_block = compute_per_block_image_extra_keys(&positions, 2, 16);
+        assert_eq!(per_block.len(), 2);
+        // Block 0: 5 image tokens × 2 entries each = 10 u64s.
+        assert_eq!(per_block[0].len(), 10);
+        // Block 1: no image tokens → empty.
+        assert!(per_block[1].is_empty());
+        // Verify pair structure: alternating (hash, pos_within_block).
+        for (i, pair) in per_block[0].chunks_exact(2).enumerate() {
+            assert_eq!(pair[0], 0xABCD, "image hash at pair {i}");
+            assert_eq!(pair[1], (5 + i) as u64, "pos_within_block at pair {i}");
+        }
+    }
+
+    /// One image spanning multiple blocks — entries distribute correctly,
+    /// each block gets only the entries whose absolute position falls
+    /// within it. `pos_within_block` resets per block (modulo block_size).
+    #[test]
+    fn single_image_spanning_multiple_blocks() {
+        // 48 tokens, block_size = 16 → 3 blocks.
+        // Image spans positions 10..40 (30 tokens).
+        // Block 0 (pos 0..16): tokens 10..16 (6 entries → 12 u64s).
+        // Block 1 (pos 16..32): tokens 16..32 (16 entries → 32 u64s).
+        // Block 2 (pos 32..48): tokens 32..40 (8 entries → 16 u64s).
+        let positions: Vec<(u32, u64)> = (10u32..40).map(|p| (p, 0xCAFE)).collect();
+        let per_block = compute_per_block_image_extra_keys(&positions, 3, 16);
+        assert_eq!(per_block.len(), 3);
+        assert_eq!(per_block[0].len(), 6 * 2);
+        assert_eq!(per_block[1].len(), 16 * 2);
+        assert_eq!(per_block[2].len(), 8 * 2);
+        // Block 0: pos_within_block runs 10..16.
+        for (i, pair) in per_block[0].chunks_exact(2).enumerate() {
+            assert_eq!(pair[0], 0xCAFE);
+            assert_eq!(pair[1], (10 + i) as u64);
+        }
+        // Block 1: pos_within_block runs 0..16 (modulo block_size).
+        for (i, pair) in per_block[1].chunks_exact(2).enumerate() {
+            assert_eq!(pair[0], 0xCAFE);
+            assert_eq!(pair[1], i as u64);
+        }
+        // Block 2: pos_within_block runs 0..8 (token 32 → pos 0; token 39 → pos 7).
+        for (i, pair) in per_block[2].chunks_exact(2).enumerate() {
+            assert_eq!(pair[0], 0xCAFE);
+            assert_eq!(pair[1], i as u64);
+        }
+    }
+
+    /// Multiple images in the same block produce concatenated entries —
+    /// preserving input order. Reordering the input image positions can
+    /// produce different outputs (extra_keys is order-sensitive — see
+    /// the `hash_tokens` doc), so production callers should sort by
+    /// `token_pos` upstream.
+    #[test]
+    fn multiple_images_within_one_block_concat_in_input_order() {
+        // 16 tokens, block_size = 16 → 1 block.
+        // Image A at positions 1, 3 (hash 0xAA).
+        // Image B at positions 5, 7 (hash 0xBB).
+        let positions: Vec<(u32, u64)> = vec![(1, 0xAA), (3, 0xAA), (5, 0xBB), (7, 0xBB)];
+        let per_block = compute_per_block_image_extra_keys(&positions, 1, 16);
+        assert_eq!(per_block.len(), 1);
+        assert_eq!(per_block[0], vec![0xAA, 1, 0xAA, 3, 0xBB, 5, 0xBB, 7]);
+    }
+
+    /// Out-of-range positions (>= num_blocks * block_size) are silently
+    /// skipped. Defensive guard — production callers should validate
+    /// upstream.
+    #[test]
+    fn out_of_range_positions_are_skipped() {
+        // 2 blocks × block_size 16 = 32 valid positions [0, 32).
+        let positions: Vec<(u32, u64)> = vec![
+            (0, 0xAA),  // block 0 — kept
+            (31, 0xBB), // block 1 — kept
+            (32, 0xCC), // out of range — dropped
+            (1000, 0xDD),
+        ];
+        let per_block = compute_per_block_image_extra_keys(&positions, 2, 16);
+        assert_eq!(per_block.len(), 2);
+        assert_eq!(per_block[0], vec![0xAA, 0]);
+        assert_eq!(per_block[1], vec![0xBB, 15]);
+    }
+
+    /// Identical text + identical images → identical per-block extra_keys.
+    /// Cache-reuse property: two requests with the same prefix and same
+    /// image set must hit the same block hashes.
+    #[test]
+    fn identical_text_and_images_produce_identical_extra_keys() {
+        let positions_a: Vec<(u32, u64)> = (5u32..10).map(|p| (p, 0xABCD)).collect();
+        let positions_b: Vec<(u32, u64)> = (5u32..10).map(|p| (p, 0xABCD)).collect();
+        let a = compute_per_block_image_extra_keys(&positions_a, 2, 16);
+        let b = compute_per_block_image_extra_keys(&positions_b, 2, 16);
+        assert_eq!(a, b);
+    }
+
+    /// Identical text + DIFFERENT images → different per-block extra_keys
+    /// for blocks containing image positions. Cache-isolation property:
+    /// the whole point of Phase 6 — a stale image's KV state must not
+    /// be reused for a request with a different image at the same
+    /// positions.
+    #[test]
+    fn identical_text_with_different_images_produces_different_extra_keys() {
+        let positions_image_a: Vec<(u32, u64)> = (5u32..10).map(|p| (p, 0xAAAA)).collect();
+        let positions_image_b: Vec<(u32, u64)> = (5u32..10).map(|p| (p, 0xBBBB)).collect();
+        let a = compute_per_block_image_extra_keys(&positions_image_a, 2, 16);
+        let b = compute_per_block_image_extra_keys(&positions_image_b, 2, 16);
+
+        // Block 0 contains the images — must differ.
+        assert_ne!(
+            a[0], b[0],
+            "block 0 carries image positions; different image hashes must produce different keys"
+        );
+        // Block 1 contains no image positions — both empty (equal).
+        assert_eq!(a[1], b[1]);
+        assert!(a[1].is_empty());
+    }
+
+    /// End-to-end with `hash_tokens`: per-block extra_keys must produce
+    /// distinct block hashes when only the image hash differs. This is
+    /// the load-bearing property the helper exists for — pinning it
+    /// alongside the helper itself catches API drift in either direction.
+    #[test]
+    fn extra_keys_change_block_hash_under_image_swap() {
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+
+        // Both requests have the same text but different image hashes
+        // pointing at the same token positions inside this block.
+        let pos_image_a: Vec<(u32, u64)> = vec![(2, 0xAAAA), (3, 0xAAAA)];
+        let pos_image_b: Vec<(u32, u64)> = vec![(2, 0xBBBB), (3, 0xBBBB)];
+
+        let extra_a = compute_per_block_image_extra_keys(&pos_image_a, 1, 16);
+        let extra_b = compute_per_block_image_extra_keys(&pos_image_b, 1, 16);
+
+        // The block hash must differ even though the tokens match exactly.
+        let hash_a = hash_tokens(&tokens, 0, &extra_a[0]);
+        let hash_b = hash_tokens(&tokens, 0, &extra_b[0]);
+        assert_ne!(
+            hash_a, hash_b,
+            "block hash MUST differ when image hash differs at the same positions; \
+             otherwise paged-prefix-cache would reuse stale image KV state"
+        );
+
+        // And same-image requests MUST produce the same hash (the cache-
+        // reuse half of the contract).
+        let pos_image_a_again: Vec<(u32, u64)> = vec![(2, 0xAAAA), (3, 0xAAAA)];
+        let extra_a_again = compute_per_block_image_extra_keys(&pos_image_a_again, 1, 16);
+        let hash_a_again = hash_tokens(&tokens, 0, &extra_a_again[0]);
+        assert_eq!(
+            hash_a, hash_a_again,
+            "block hash must be stable for identical text + identical images"
+        );
+    }
+
+    /// Text-only baseline: an empty extra_keys helper output must produce
+    /// the same `hash_tokens` result as passing `&[]` directly. Guards
+    /// against API drift that would silently change text-only hashes
+    /// (which would invalidate every existing prefix-cache entry).
+    #[test]
+    fn text_only_helper_matches_empty_extra_keys() {
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let per_block = compute_per_block_image_extra_keys(&[], 1, 16);
+        let hash_via_helper = hash_tokens(&tokens, 0, &per_block[0]);
+        let hash_via_empty = hash_tokens(&tokens, 0, &[]);
+        assert_eq!(
+            hash_via_helper, hash_via_empty,
+            "text-only path must hash identically whether extra_keys came from this \
+             helper or was passed as &[] directly"
+        );
+    }
+}
