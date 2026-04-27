@@ -3268,8 +3268,21 @@ describe('handleCreateMessage', () => {
       registry.register('test-model', mockModel);
       const sessionReg = registry.getSessionRegistry('test-model')!;
 
-      // Pre-seed the way /v1/responses would.
+      // Pre-seed the way /v1/responses would: commit a real turn
+      // BEFORE adopting so the warm slot reflects the post-commit
+      // state of a real request (`turns === 1`). A freshly
+      // constructed `ChatSession` has `turns === 0`, which would
+      // make `primeHistory()` succeed even if the warm-reuse helper
+      // failed to wipe `turnCount` — silencing the regression where
+      // `resetPreservingNativeCacheForWarmReuse` no longer clears
+      // JS-side state on a previously committed session. Running a
+      // turn through the same mock model that drives the rest of
+      // the test pins the realistic fixture and exercises the
+      // helper's load-bearing wipe path.
       const warmSession = new ChatSession(mockModel);
+      warmSession.primeHistory([{ role: 'user', content: 'seed' }]);
+      await warmSession.startFromHistory();
+      expect(warmSession.turns).toBe(1);
       const primeSpy = vi.spyOn(warmSession, 'primeHistory');
       const resetSpy = vi.spyOn(warmSession, 'reset');
       sessionReg.adopt('resp_xyz', warmSession, 'sysA', 'chain-key');
@@ -3304,6 +3317,23 @@ describe('handleCreateMessage', () => {
       expect(primeSpy).toHaveBeenCalledTimes(1);
       // Slot is re-adopted under the sentinel — exactly one entry.
       expect(sessionReg.size).toBe(1);
+
+      // Sentinel re-key invariant: the surviving entry MUST be keyed
+      // under the literal `'__msg_warm__'` sentinel — that is the
+      // contract that makes `/v1/responses` tier-1 lookup of the
+      // sentinel impossible by construction (no Anthropic client can
+      // produce a `previous_response_id === '__msg_warm__'`). Lease
+      // the slot via `getOrCreate('__msg_warm__', 'sysA', null)`:
+      // a hit with the SAME `warmSession` reference proves both the
+      // sentinel keying AND that the slot still wraps the original
+      // pre-seeded ChatSession. NB: `getOrCreate` is leasing —
+      // `entries.clear()` runs on every call — so this assertion
+      // CONSUMES the slot. The follow-up `'resp_xyz'` lookup below
+      // therefore reads an empty registry, which is exactly what the
+      // single-warm cross-endpoint trade-off pins.
+      const sentinelLookup = sessionReg.getOrCreate('__msg_warm__', 'sysA', null);
+      expect(sentinelLookup.hit).toBe(true);
+      expect(sentinelLookup.session).toBe(warmSession);
 
       // Subsequent /v1/responses-style tier-1 lookup against the
       // original `'resp_xyz'` id MISSES — the prior key was
