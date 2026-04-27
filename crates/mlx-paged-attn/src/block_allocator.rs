@@ -209,6 +209,94 @@ impl BlockAllocator {
         }
     }
 
+    /// Walk a token sequence in `block_size`-aligned chunks, looking up each
+    /// block in the prefix cache. Stop at the first miss. Returns the cached
+    /// blocks (with their ref counts already bumped via `lookup_prefix`, in
+    /// order) and the cached token count.
+    ///
+    /// `extra_keys` is applied per-block-hash (same value for every block in
+    /// this call). Phase 6 will thread per-block extra_keys for multimodal
+    /// (image hashes, cache-salt, LoRA names, etc.).
+    ///
+    /// Mirrors vLLM `vllm/v1/core/single_type_kv_cache_manager.py:421-468`
+    /// (`FullAttentionManager.find_longest_cache_hit`).
+    pub fn find_longest_cache_hit(
+        &mut self,
+        token_ids: &[u32],
+        block_size: u32,
+        extra_keys: &[u64],
+    ) -> (Vec<Arc<PhysicalBlock>>, usize) {
+        // Defensive: 0 block_size would cause infinite loop / divide by zero
+        if block_size == 0 || token_ids.is_empty() || token_ids.len() < block_size as usize {
+            return (Vec::new(), 0);
+        }
+
+        let block_size_us = block_size as usize;
+        let num_full_blocks = token_ids.len() / block_size_us;
+
+        let mut blocks: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(num_full_blocks);
+        let mut previous_block_hash: u64 = 0;
+
+        for n in 0..num_full_blocks {
+            let start = n * block_size_us;
+            let end = start + block_size_us;
+            let parent_hash = if n == 0 { 0 } else { previous_block_hash };
+            let block_hash = hash_tokens(&token_ids[start..end], parent_hash, extra_keys);
+
+            match self.lookup_prefix(block_hash) {
+                Some(block) => {
+                    blocks.push(block);
+                    previous_block_hash = block_hash;
+                }
+                None => break,
+            }
+        }
+
+        let cached_tokens = blocks.len() * block_size_us;
+        (blocks, cached_tokens)
+    }
+
+    /// Register a freshly computed sequence's blocks in the prefix cache.
+    /// Caller has already allocated `blocks` for the sequence; this method
+    /// computes the chain of block hashes and inserts each FULL block via
+    /// `register_prefix`.
+    ///
+    /// `blocks.len() * block_size` must be `<= token_ids.len()`. Only the
+    /// fully-formed blocks are registered; the trailing partial block isn't
+    /// cached until it's full.
+    ///
+    /// `extra_keys` is applied per-block-hash (same value for every block in
+    /// this call). Phase 6 will thread per-block extra_keys for multimodal.
+    ///
+    /// Mirrors vLLM `vllm/v1/core/block_pool.py:211-320` (`cache_full_blocks`).
+    pub fn cache_full_blocks(
+        &mut self,
+        token_ids: &[u32],
+        blocks: &[Arc<PhysicalBlock>],
+        block_size: u32,
+        extra_keys: &[u64],
+    ) -> Result<(), &'static str> {
+        if block_size == 0 {
+            return Err("block_size must be > 0");
+        }
+
+        let block_size_us = block_size as usize;
+        if blocks.len() * block_size_us > token_ids.len() {
+            return Err("blocks exceed token_ids length");
+        }
+
+        let mut previous_block_hash: u64 = 0;
+        for (n, block) in blocks.iter().enumerate() {
+            let start = n * block_size_us;
+            let end = start + block_size_us;
+            let parent_hash = if n == 0 { 0 } else { previous_block_hash };
+            let block_hash = hash_tokens(&token_ids[start..end], parent_hash, extra_keys);
+            self.register_prefix(Arc::clone(block), block_hash);
+            previous_block_hash = block_hash;
+        }
+        Ok(())
+    }
+
     /// Get the number of free blocks
     pub fn num_free_blocks(&self) -> u32 {
         self.free_blocks.len() as u32
@@ -235,8 +323,22 @@ impl BlockAllocator {
     }
 }
 
-/// Hash function for token sequences (for prefix caching)
-pub fn hash_tokens(tokens: &[u32], parent_hash: u64) -> u64 {
+/// Hash function for token sequences (for prefix caching).
+///
+/// Computes a chained block hash in vLLM's style: feeds `parent_hash` first,
+/// then each token id in order, then each entry of `extra_keys` in order.
+///
+/// `extra_keys` is reserved for per-block side-channel information that must
+/// participate in cache identity — image content hashes, cache-salt, LoRA
+/// names, etc. (see vLLM commit 269bf46d). Order matters: `[a, b]` and
+/// `[b, a]` produce different hashes. Most callers should pass `&[]`.
+///
+/// Uses Rust's `DefaultHasher` (SipHash-1-3). vLLM uses xxhash/sha256 for
+/// cross-process determinism, but our prefix cache is process-local — every
+/// hash is computed and consumed in the same process — so SipHash's stronger
+/// collision resistance is the better trade-off and we don't need stable
+/// hashes across runs.
+pub fn hash_tokens(tokens: &[u32], parent_hash: u64, extra_keys: &[u64]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -244,6 +346,9 @@ pub fn hash_tokens(tokens: &[u32], parent_hash: u64) -> u64 {
     parent_hash.hash(&mut hasher);
     for &token in tokens {
         token.hash(&mut hasher);
+    }
+    for &key in extra_keys {
+        key.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -317,7 +422,7 @@ mod tests {
         let mut allocator = BlockAllocator::new(10, 32);
 
         let block = allocator.allocate().unwrap();
-        let hash = hash_tokens(&[1, 2, 3], 0);
+        let hash = hash_tokens(&[1, 2, 3], 0, &[]);
 
         allocator.register_prefix(Arc::clone(&block), hash);
 
@@ -338,7 +443,7 @@ mod tests {
         let mut allocator = BlockAllocator::new(10, 32);
 
         let block = allocator.allocate().unwrap();
-        let hash = hash_tokens(&[1, 2, 3], 0);
+        let hash = hash_tokens(&[1, 2, 3], 0, &[]);
 
         // Register in prefix cache (doesn't increment ref_count)
         allocator.register_prefix(Arc::clone(&block), hash);
@@ -366,11 +471,11 @@ mod tests {
         allocator.max_prefix_cache_entries = 2; // Small cache for testing
 
         let block1 = allocator.allocate().unwrap();
-        let hash1 = hash_tokens(&[1], 0);
+        let hash1 = hash_tokens(&[1], 0, &[]);
         allocator.register_prefix(Arc::clone(&block1), hash1);
 
         let block2 = allocator.allocate().unwrap();
-        let hash2 = hash_tokens(&[2], 0);
+        let hash2 = hash_tokens(&[2], 0, &[]);
         allocator.register_prefix(Arc::clone(&block2), hash2);
 
         // Cache is at capacity (2 entries)
@@ -378,7 +483,7 @@ mod tests {
 
         // Add a third block, should evict the first (LRU)
         let block3 = allocator.allocate().unwrap();
-        let hash3 = hash_tokens(&[3], 0);
+        let hash3 = hash_tokens(&[3], 0, &[]);
         allocator.register_prefix(Arc::clone(&block3), hash3);
 
         // Verify hash1 was evicted
@@ -400,7 +505,7 @@ mod tests {
         allocator.max_prefix_cache_entries = 0; // Disable prefix caching
 
         let block = allocator.allocate().unwrap();
-        let hash = hash_tokens(&[1, 2, 3], 0);
+        let hash = hash_tokens(&[1, 2, 3], 0, &[]);
 
         // Should not cache when disabled
         allocator.register_prefix(Arc::clone(&block), hash);
@@ -418,7 +523,7 @@ mod tests {
         allocator.max_prefix_cache_entries = 1;
 
         let block1 = allocator.allocate().unwrap();
-        let hash1 = hash_tokens(&[1], 0);
+        let hash1 = hash_tokens(&[1], 0, &[]);
         allocator.register_prefix(Arc::clone(&block1), hash1);
 
         // Manually desynchronize: clear lru_order but leave prefix_cache populated
@@ -426,10 +531,215 @@ mod tests {
 
         // This should not infinite loop - it will break when pop_front returns None
         let block2 = allocator.allocate().unwrap();
-        let hash2 = hash_tokens(&[2], 0);
+        let hash2 = hash_tokens(&[2], 0, &[]);
         allocator.register_prefix(Arc::clone(&block2), hash2);
 
         // Verify we didn't infinite loop and the function completed
         assert!(!allocator.prefix_cache.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 1A additions: hash_tokens(extra_keys), find_longest_cache_hit,
+    // cache_full_blocks, refcount lifecycle, LRU eviction order.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_hash_tokens_extra_keys() {
+        // No extra_keys vs. with extra_keys -> different hashes.
+        let h_none = hash_tokens(&[1, 2, 3], 0, &[]);
+        let h_one = hash_tokens(&[1, 2, 3], 0, &[42]);
+        assert_ne!(h_none, h_one);
+
+        // Same input -> deterministic.
+        let h_one_again = hash_tokens(&[1, 2, 3], 0, &[42]);
+        assert_eq!(h_one, h_one_again);
+
+        // Order of extra_keys matters.
+        let h_ab = hash_tokens(&[1, 2, 3], 0, &[42, 100]);
+        let h_ba = hash_tokens(&[1, 2, 3], 0, &[100, 42]);
+        assert_ne!(h_ab, h_ba);
+    }
+
+    #[test]
+    fn test_find_longest_cache_hit_empty_registry() {
+        let mut allocator = BlockAllocator::new(8, 4);
+        let (blocks, n) = allocator.find_longest_cache_hit(&[1, 2, 3, 4, 5, 6, 7, 8], 4, &[]);
+        assert!(blocks.is_empty());
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_find_longest_cache_hit_full_match() {
+        let mut allocator = BlockAllocator::new(8, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+
+        // Allocate two blocks and cache them.
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        let blocks = [b0, b1];
+        allocator
+            .cache_full_blocks(&tokens, &blocks, 4, &[])
+            .unwrap();
+
+        let (hit_blocks, n) = allocator.find_longest_cache_hit(&tokens, 4, &[]);
+        assert_eq!(hit_blocks.len(), 2);
+        assert_eq!(n, 8);
+        assert_eq!(hit_blocks[0].block_id, blocks[0].block_id);
+        assert_eq!(hit_blocks[1].block_id, blocks[1].block_id);
+    }
+
+    #[test]
+    fn test_find_longest_cache_hit_partial_prefix() {
+        // Cache 2 blocks (8 tokens). Lookup 12 tokens that share the first 8.
+        // Third block was never cached -> hit count is 2 blocks / 8 tokens.
+        let mut allocator = BlockAllocator::new(8, 4);
+        let tokens_a: Vec<u32> = (0..8).collect();
+        let mut tokens_b = tokens_a.clone();
+        tokens_b.extend([100, 101, 102, 103]);
+
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        allocator
+            .cache_full_blocks(&tokens_a, &[b0, b1], 4, &[])
+            .unwrap();
+
+        let (hit_blocks, n) = allocator.find_longest_cache_hit(&tokens_b, 4, &[]);
+        assert_eq!(hit_blocks.len(), 2);
+        assert_eq!(n, 8);
+    }
+
+    #[test]
+    fn test_find_longest_cache_hit_chain_isolation() {
+        // Cache 3 blocks for sequence A. Sequence B shares first block but
+        // diverges in block 2. The hash chain must isolate -> only 1 block hits.
+        let mut allocator = BlockAllocator::new(16, 4);
+        let tokens_a: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let tokens_b: Vec<u32> = vec![1, 2, 3, 4, 99, 99, 99, 99, 9, 10, 11, 12];
+
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
+        allocator
+            .cache_full_blocks(&tokens_a, &[b0, b1, b2], 4, &[])
+            .unwrap();
+
+        let (hit_blocks, n) = allocator.find_longest_cache_hit(&tokens_b, 4, &[]);
+        assert_eq!(hit_blocks.len(), 1);
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn test_find_longest_cache_hit_short_input() {
+        let mut allocator = BlockAllocator::new(4, 4);
+        let (blocks, n) = allocator.find_longest_cache_hit(&[1, 2, 3], 4, &[]);
+        assert!(blocks.is_empty());
+        assert_eq!(n, 0);
+
+        let (blocks, n) = allocator.find_longest_cache_hit(&[], 4, &[]);
+        assert!(blocks.is_empty());
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_find_longest_cache_hit_zero_block_size() {
+        // Defensive: block_size == 0 should not panic / infinite loop.
+        let mut allocator = BlockAllocator::new(4, 4);
+        let (blocks, n) = allocator.find_longest_cache_hit(&[1, 2, 3, 4], 0, &[]);
+        assert!(blocks.is_empty());
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_cache_full_blocks_oversize_returns_err() {
+        let mut allocator = BlockAllocator::new(4, 4);
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        // 2 blocks * block_size 4 = 8 tokens required, but only 4 supplied.
+        let res = allocator.cache_full_blocks(&[1, 2, 3, 4], &[b0, b1], 4, &[]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_cache_full_blocks_extra_keys_mismatch() {
+        // Cache with extra_keys=[100], lookup with extra_keys=[] -> miss.
+        let mut allocator = BlockAllocator::new(4, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        allocator
+            .cache_full_blocks(&tokens, &[b0, b1], 4, &[100])
+            .unwrap();
+
+        let (blocks, n) = allocator.find_longest_cache_hit(&tokens, 4, &[]);
+        assert!(blocks.is_empty());
+        assert_eq!(n, 0);
+
+        // Same extra_keys -> hit.
+        let (blocks, n) = allocator.find_longest_cache_hit(&tokens, 4, &[100]);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(n, 8);
+    }
+
+    #[test]
+    fn test_register_lookup_refcount_lifecycle() {
+        let mut allocator = BlockAllocator::new(4, 4);
+        let block = allocator.allocate().unwrap();
+        // Newly allocated -> ref_count == 1.
+        assert_eq!(block.get_ref_count(), 1);
+
+        let hash = hash_tokens(&[1, 2, 3, 4], 0, &[]);
+        allocator.register_prefix(Arc::clone(&block), hash);
+        // register_prefix does NOT incref (prefix cache holds an Arc, not a logical reference).
+        assert_eq!(block.get_ref_count(), 1);
+
+        let cached = allocator.lookup_prefix(hash).unwrap();
+        // lookup_prefix increments ref_count: allocate(1) + lookup(1) = 2.
+        assert_eq!(cached.get_ref_count(), 2);
+
+        // Free the lookup'd handle: ref_count 2 -> 1, block stays out of free pool.
+        allocator.free(cached);
+        assert_eq!(block.get_ref_count(), 1);
+        assert_eq!(allocator.num_free_blocks(), 3);
+
+        // Free the original: ref_count 1 -> 0, block returns to free pool,
+        // prefix cache entry cleaned up.
+        allocator.free(block);
+        assert_eq!(allocator.num_free_blocks(), 4);
+        assert!(allocator.lookup_prefix(hash).is_none());
+    }
+
+    #[test]
+    fn test_lru_eviction_order() {
+        let mut allocator = BlockAllocator::new(8, 4);
+        allocator.max_prefix_cache_entries = 3;
+
+        // Register 4 blocks with distinct hashes; the oldest registration
+        // (hash1) should be evicted from the prefix_cache after the 4th insert.
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
+        let b3 = allocator.allocate().unwrap();
+        let b4 = allocator.allocate().unwrap();
+
+        let h1 = 0xAAAA_AAAA_AAAA_AAAA;
+        let h2 = 0xBBBB_BBBB_BBBB_BBBB;
+        let h3 = 0xCCCC_CCCC_CCCC_CCCC;
+        let h4 = 0xDDDD_DDDD_DDDD_DDDD;
+
+        allocator.register_prefix(Arc::clone(&b1), h1);
+        allocator.register_prefix(Arc::clone(&b2), h2);
+        allocator.register_prefix(Arc::clone(&b3), h3);
+        allocator.register_prefix(Arc::clone(&b4), h4);
+
+        // h1 (oldest) was evicted; h2/h3/h4 remain.
+        assert!(allocator.lookup_prefix(h1).is_none());
+        assert!(allocator.lookup_prefix(h2).is_some());
+        assert!(allocator.lookup_prefix(h3).is_some());
+        assert!(allocator.lookup_prefix(h4).is_some());
+
+        // block_hashes was also cleaned for the evicted entry.
+        assert!(!allocator.block_hashes.contains_key(&b1.block_id));
+        assert!(allocator.block_hashes.contains_key(&b2.block_id));
+        assert!(allocator.block_hashes.contains_key(&b3.block_id));
+        assert!(allocator.block_hashes.contains_key(&b4.block_id));
     }
 }
