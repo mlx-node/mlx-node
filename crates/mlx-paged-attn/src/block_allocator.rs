@@ -32,6 +32,26 @@
 //! keeps the pool from going monotonically unreachable when many unique
 //! prompts cycle through `register_prefix` + `free()` faster than they
 //! age out by capacity.
+//!
+//! # SipHash collision limitation
+//!
+//! `hash_tokens` uses Rust's `DefaultHasher` (SipHash-1-3, u64 output).
+//! Cryptographic collision resistance is NOT guaranteed. At 1024 cache
+//! entries the birthday-paradox collision probability is ~1e-14, but
+//! adversarial inputs OR very large caches could produce collisions.
+//! When a collision occurs, two different token chains share the same
+//! block hash; `find_longest_cache_hit` will return blocks from one
+//! chain when the caller intended the other → silent KV corruption.
+//!
+//! Mitigations:
+//! - `cache_full_blocks` aborts registration on the first colliding
+//!   block (so we don't WRITE a corrupted chain), see `register_prefix`
+//!   `bool` return.
+//! - For multi-tenant deployments and adversarial settings, switch to
+//!   SHA-256 by replacing `hash_tokens`'s hasher (small mechanical
+//!   change). Tracked as future work.
+//! - For deterministic reproducibility across processes, switch to
+//!   xxhash with a fixed seed (vLLM's default).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -618,6 +638,15 @@ impl BlockAllocator {
 /// hash is computed and consumed in the same process — so SipHash's stronger
 /// collision resistance is the better trade-off and we don't need stable
 /// hashes across runs.
+///
+// FIXME(p1c-followup): SipHash u64 is not cryptographically collision-resistant.
+// `find_longest_cache_hit` walks chained block hashes via `lookup_prefix`, so a
+// mid-chain collision between two different token chains can cause a
+// mixed-prefix lookup → silent KV corruption. The `cache_full_blocks` chain
+// abort prevents WRITING a corrupted chain, but lookup-side defense requires
+// switching to SHA-256 (cryptographic) or storing per-block content metadata
+// for verification on lookup. See the module-level "SipHash collision
+// limitation" doc above for details.
 pub fn hash_tokens(tokens: &[u32], parent_hash: u64, extra_keys: &[u64]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

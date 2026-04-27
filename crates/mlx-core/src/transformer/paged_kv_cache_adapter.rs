@@ -132,6 +132,18 @@ impl PagedKVCacheAdapter {
     /// Idempotent in the sense that calling it twice with the same tokens
     /// returns the same prefix; but it expects to be called once per
     /// request, after `reset_for_new_request`.
+    ///
+    /// ## Token-recording contract
+    ///
+    /// On a cache hit, the adapter automatically seeds its internal
+    /// `request_tokens` buffer with the cached prefix tokens (the slice
+    /// `prompt_tokens[..cached_token_count]`). Subsequent `record_tokens`
+    /// calls APPEND to that buffer as usual — the caller does NOT need to
+    /// know that the prefix tokens were skipped during prefill, nor does
+    /// the caller need to replay them. The invariant
+    /// `request_tokens.len() == block_table.num_tokens()` is maintained
+    /// by the seed-on-hit + record_tokens flow, and
+    /// `register_full_blocks_for_reuse` asserts it as belt-and-suspenders.
     pub fn find_cached_prefix(
         &mut self,
         prompt_tokens: &[u32],
@@ -156,6 +168,18 @@ impl PagedKVCacheAdapter {
 
         let cached_token_count = cached_tokens as u32;
         self.cached_token_count = cached_token_count;
+
+        // Seed `request_tokens` with the cached prefix so subsequent
+        // `record_tokens` calls just append the suffix tokens. This keeps
+        // `request_tokens.len() == block_table.num_tokens()` an
+        // invariant maintained by the adapter rather than a contract the
+        // caller has to remember. `block_table.num_tokens` is also bumped
+        // in lockstep so the two stay aligned.
+        self.request_tokens.clear();
+        let cached_token_count_us = cached_tokens.min(prompt_tokens.len());
+        self.request_tokens
+            .extend_from_slice(&prompt_tokens[..cached_token_count_us]);
+        block_table.set_num_tokens(self.request_tokens.len() as u32);
 
         Ok(CachedPrefix {
             blocks,
@@ -291,6 +315,27 @@ impl PagedKVCacheAdapter {
         let block_table = self.block_table.as_ref().ok_or_else(|| {
             "register_full_blocks_for_reuse called before reset_for_new_request".to_string()
         })?;
+
+        // Belt-and-suspenders invariant check: `request_tokens` must hold
+        // EVERY token in the request (cached prefix + suffix), not just
+        // the suffix. `find_cached_prefix` seeds the prefix automatically
+        // and `record_tokens` appends — so under correct API usage these
+        // are always in lockstep with `block_table.num_tokens()`. A
+        // mismatch indicates a model integration bug (e.g. bypassing
+        // `record_tokens` and writing to `block_table` directly), and
+        // proceeding would publish a subtly wrong cache entry hashed
+        // against the wrong tokens. Catch it with a clear error.
+        let expected_tokens = block_table.num_tokens() as usize;
+        if self.request_tokens.len() != expected_tokens {
+            return Err(format!(
+                "register_full_blocks_for_reuse invariant violation: \
+                 request_tokens.len() == {} but block_table.num_tokens() == {}. \
+                 The caller must record_tokens() all tokens (cached prefix + new suffix) \
+                 before registering. See find_cached_prefix doc.",
+                self.request_tokens.len(),
+                expected_tokens,
+            ));
+        }
 
         // Only count blocks fully covered by the recorded tokens; the
         // BlockAllocator caches per-block, so the trailing partial block
@@ -941,6 +986,63 @@ mod tests {
         assert_eq!(
             p1_lookup.cached_token_count, 0,
             "P1 was evicted to satisfy allocation; lookup must miss"
+        );
+    }
+
+    /// `find_cached_prefix` must seed `request_tokens` with the cached
+    /// prefix tokens automatically. After a hit, the caller can call
+    /// `record_tokens` for ONLY the suffix tokens — the adapter's
+    /// internal book-keeping replays the prefix, so
+    /// `request_tokens.len() == block_table.num_tokens()` stays an
+    /// invariant the adapter maintains rather than a contract the caller
+    /// has to remember. Prevents `register_full_blocks_for_reuse` from
+    /// publishing a cache entry whose hashed token slice doesn't match
+    /// the actual KV contents.
+    #[test]
+    fn test_find_cached_prefix_seeds_request_tokens() {
+        let allocator = new_allocator(16, 4);
+        // Pre-populate cache with 2 blocks (8 tokens).
+        let prefix_tokens: Vec<u32> = (0..8).collect();
+        seed_prefix_cache(&allocator, &prefix_tokens, 4, &[]);
+
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+
+        // 12-token prompt: 8-token cached prefix + 4-token new suffix.
+        let mut full_prompt = prefix_tokens.clone();
+        full_prompt.extend_from_slice(&[100, 101, 102, 103]);
+
+        let res = adapter.find_cached_prefix(&full_prompt, &[]).unwrap();
+        assert_eq!(res.cached_token_count, 8, "two-block prefix hit");
+        assert_eq!(res.blocks.len(), 2);
+
+        // Adapter must have seeded `request_tokens` with the 8 cached
+        // tokens, and `block_table.num_tokens` must agree.
+        assert_eq!(
+            adapter.current_token_count(),
+            8,
+            "find_cached_prefix must seed request_tokens with the cached prefix"
+        );
+        assert_eq!(
+            adapter.block_table().unwrap().num_tokens(),
+            8,
+            "block_table.num_tokens must agree with seeded request_tokens"
+        );
+
+        // Allocate the suffix block and record ONLY the suffix tokens —
+        // the caller does NOT need to know to replay the prefix.
+        adapter.allocate_suffix_blocks(12).unwrap();
+        adapter.record_tokens(&[100, 101, 102, 103]).unwrap();
+        assert_eq!(adapter.current_token_count(), 12);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 12);
+
+        // Register succeeds: invariant `request_tokens.len() ==
+        // block_table.num_tokens()` holds (12 == 12). Three full blocks
+        // (12 tokens / block_size 4) are eligible.
+        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        assert_eq!(
+            registered, 3,
+            "12 tokens / block_size 4 = 3 full blocks eligible for registration"
         );
     }
 }
