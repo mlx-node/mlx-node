@@ -223,12 +223,16 @@ impl Lfm2Attention {
         //    head_dim]` expected by `update_keys_values`. Currently
         //    batch=1 so `num_tokens = batch * seq_len = seq_len`.
         //    [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D]
-        let keys_paged = keys_bhtd
-            .transpose(Some(&[0, 2, 1, 3]))?
-            .reshape(&[batch * seq_len, self.num_kv_heads as i64, self.head_dim as i64])?;
-        let values_paged = values_bhtd
-            .transpose(Some(&[0, 2, 1, 3]))?
-            .reshape(&[batch * seq_len, self.num_kv_heads as i64, self.head_dim as i64])?;
+        let keys_paged = keys_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch * seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values_paged = values_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch * seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
 
         adapter
             .update_keys_values(
@@ -267,11 +271,8 @@ impl Lfm2Attention {
                 let (k_full, v_full) = adapter
                     .read_kv_range(attn_layer_idx, 0, total_ctx)
                     .map_err(napi::Error::from_reason)?;
-                let mask = create_causal_mask(
-                    seq_len as i32,
-                    Some(cached_prefix_len as i32),
-                    None,
-                )?;
+                let mask =
+                    create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
                 scaled_dot_product_attention(
                     &queries_bhtd,
                     &k_full,
@@ -284,9 +285,11 @@ impl Lfm2Attention {
             // Decode: gather full historical K/V via paged kernel.
             // `gather_kv_for_decode` expects `[1, num_query_heads,
             // head_size]` queries, so reshape from [1, H, 1, D].
-            let queries_3d = queries_bhtd
-                .squeeze(Some(&[2]))?
-                .reshape(&[1, self.num_heads as i64, self.head_dim as i64])?;
+            let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
+                1,
+                self.num_heads as i64,
+                self.head_dim as i64,
+            ])?;
             let attn_3d = adapter
                 .gather_kv_for_decode(
                     attn_layer_idx,

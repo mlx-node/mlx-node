@@ -766,7 +766,6 @@ impl Lfm2Inner {
     ) -> Result<ChatResult> {
         let prompt_token_count = tokens.len();
         let max_new_tokens = p.max_new_tokens;
-        let report_perf = report_perf;
         let sampling_config = p.sampling_config;
 
         let generation_start = if report_perf {
@@ -814,9 +813,7 @@ impl Lfm2Inner {
         let suffix_len = total_prompt_tokens
             .checked_sub(cached_prefix_len)
             .ok_or_else(|| {
-                Error::from_reason(
-                    "chat_sync_core_paged: cached_prefix_len > total_prompt_tokens",
-                )
+                Error::from_reason("chat_sync_core_paged: cached_prefix_len > total_prompt_tokens")
             })?;
 
         // Conv layers always need to rebuild from token 0; if the paged
@@ -916,8 +913,7 @@ impl Lfm2Inner {
         // writes the suffix into the pool — the cached prefix already
         // lives in the pool from a prior request that registered it.
         let suffix = &tokens[(cached_prefix_len as usize)..];
-        let last_logits =
-            self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?;
+        let last_logits = self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?;
 
         // Apply penalties + sample first token
         let mut token_history: Vec<u32> = tokens.to_vec();
@@ -1053,6 +1049,12 @@ impl Lfm2Inner {
         let num_layers = self.layers.len();
         let first_logical_position = cached_prefix_len;
 
+        // The index-based loop is required here: we use raw-pointer
+        // split-borrows on `self.layers` and `self.caches` to access
+        // disjoint indices simultaneously while the paged_adapter is
+        // also borrowed mutably. An iterator-based version would conflict
+        // with the borrow checker.
+        #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
             let kind = layer_kinds[layer_idx];
 
@@ -1150,6 +1152,10 @@ impl Lfm2Inner {
         let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
 
         let num_layers = self.layers.len();
+        // See `run_paged_prefill_chunk` for the rationale on the
+        // index-based loop (raw-pointer split borrow over disjoint
+        // fields).
+        #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
             let kind = layer_kinds[layer_idx];
             let layer: &Lfm2DecoderLayer = unsafe {
@@ -3233,10 +3239,7 @@ mod paged_adapter_construction_tests {
 
         // Embedding.
         let w = inner.embed_tokens.get_weight();
-        inner
-            .embed_tokens
-            .set_weight(&cast(&w))
-            .expect("set embed");
+        inner.embed_tokens.set_weight(&cast(&w)).expect("set embed");
         // Embedding norm.
         let w = inner.embedding_norm.get_weight();
         inner
@@ -3248,7 +3251,10 @@ mod paged_adapter_construction_tests {
         use crate::models::lfm2::decoder_layer::OperatorType;
         for layer in inner.layers.iter_mut() {
             let w = layer.operator_norm.get_weight();
-            layer.operator_norm.set_weight(&cast(&w)).expect("set op_norm");
+            layer
+                .operator_norm
+                .set_weight(&cast(&w))
+                .expect("set op_norm");
             let w = layer.ffn_norm.get_weight();
             layer.ffn_norm.set_weight(&cast(&w)).expect("set ffn_norm");
 
@@ -3314,9 +3320,7 @@ mod paged_adapter_construction_tests {
             Err(e) => {
                 let msg = e.reason.to_string();
                 if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
-                    eprintln!(
-                        "skipping test_lfm2_chat_sync_core_paged_smoke_via_helpers: {msg}"
-                    );
+                    eprintln!("skipping test_lfm2_chat_sync_core_paged_smoke_via_helpers: {msg}");
                     return;
                 }
                 panic!("unexpected run_paged_prefill_chunk failure: {msg}");
