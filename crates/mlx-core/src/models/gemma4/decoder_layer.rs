@@ -10,6 +10,42 @@ use super::mlp::GemmaMLP;
 use super::moe::{Gemma4MoE, Gemma4Router};
 use super::quantized_linear::{Gemma4MLPVariant, QuantizedLinear, QuantizedSwitchLinear};
 
+/// Per-layer routing kind for Gemma4's paged dispatch.
+///
+/// Mirrors `Lfm2LayerKind` but reflects Gemma4's hybrid attention layout
+/// (sliding-window + global) plus optional KV-shared layers (last
+/// `num_kv_shared_layers` reuse K/V from an earlier non-shared anchor of
+/// the same attention type).
+///
+/// Indexing rules:
+/// * `paged_idx` is the GLOBAL-LAYER ORDINAL into the paged adapter's
+///   `LayerKVPool` (NOT the absolute decoder index). The pool is sized
+///   for the count of `full_attention` layers in `config.layer_types`,
+///   so global layers are numbered 0..N_global in their original order.
+/// * `anchor_layer_idx` (in `SharedOnSliding`) is the ABSOLUTE decoder
+///   index of the anchor whose flat `Gemma4LayerCache::Sliding` slot
+///   feeds the shared layer's K/V via `take_stashed_kv`.
+#[allow(dead_code)] // Wired up in subsequent commits (forward dispatch).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Gemma4LayerKind {
+    /// Sliding (local) attention layer — stays on the existing flat
+    /// `RotatingKVCache` path even when the paged adapter is enabled.
+    /// Sliding's window-trimmed semantics don't map cleanly onto the
+    /// adapter's contiguous-block layout.
+    Sliding,
+    /// Global (full) attention layer routed through the paged adapter.
+    /// `paged_idx` is the global-layer ordinal — see the type rustdoc.
+    GlobalPaged { paged_idx: u32 },
+    /// KV-shared layer whose anchor is a global layer that goes through
+    /// the paged adapter. The shared layer reads K/V via
+    /// `adapter.read_kv_range(anchor_paged_idx, 0, total_ctx)`.
+    SharedOnGlobal { anchor_paged_idx: u32 },
+    /// KV-shared layer whose anchor is a sliding (flat-cache) layer.
+    /// The shared layer pulls K/V from `caches[anchor_layer_idx]`'s
+    /// stash (mirrors the existing flat-path KV-sharing flow).
+    SharedOnSliding { anchor_layer_idx: u32 },
+}
+
 /// A single decoder layer in the Gemma4 model.
 ///
 /// Gemma4 uses 4 norms per layer (vs 2 in Qwen3.5):

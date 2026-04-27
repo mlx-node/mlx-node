@@ -89,7 +89,7 @@ fn escape_gemma4_content(s: &str) -> String {
 }
 
 use super::config::Gemma4Config;
-use super::decoder_layer::Gemma4DecoderLayer;
+use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
 use super::layer_cache::Gemma4LayerCache;
 use crate::models::qwen3_5::chat_common;
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
@@ -617,6 +617,16 @@ impl Gemma4Inner {
         self.caches = Some(caches);
         self.clear_reuse_state();
         Ok(())
+    }
+
+    /// Build the per-layer routing list for the paged dispatch.
+    ///
+    /// See [`compute_layer_kinds`] (free helper) for full semantics.
+    /// This wrapper is the on-`Gemma4Inner` entry point used by the
+    /// chat-session forward dispatch.
+    #[allow(dead_code)] // Wired up in subsequent commits (forward dispatch).
+    pub(crate) fn compute_layer_kinds(&self) -> Vec<Gemma4LayerKind> {
+        compute_layer_kinds(&self.config)
     }
 
     /// Drop the live KV caches and clear reuse-tracking state.
@@ -3558,6 +3568,79 @@ fn project_per_layer_inputs(
     Ok(per_layer_data.clone())
 }
 
+/// Build the per-layer routing list for the paged dispatch (pure
+/// function over a `Gemma4Config`).
+///
+/// Returns `Vec<Gemma4LayerKind>` of length `config.num_hidden_layers`
+/// where each entry classifies a layer as:
+/// * `Sliding` — stays on the flat `Gemma4LayerCache::Sliding` path.
+/// * `GlobalPaged { paged_idx }` — routes through the paged adapter
+///   at the given global-layer ordinal.
+/// * `SharedOnGlobal { anchor_paged_idx }` — KV-shared layer whose
+///   anchor is a global layer; reads K/V via the adapter.
+/// * `SharedOnSliding { anchor_layer_idx }` — KV-shared layer whose
+///   anchor is a sliding layer; reads K/V from the anchor's flat
+///   cache stash.
+///
+/// `paged_idx` counts only `full_attention` layers in their original
+/// decoder order — matches the `LayerKVPool` slot count from
+/// `Gemma4Inner::new`. KV-shared layers do NOT consume a paged slot
+/// (they reuse the anchor's K/V); the shared variants carry the
+/// anchor's index so the shared forward path can resolve it.
+///
+/// Lifted to a free helper so unit tests can drive it without owning a
+/// `Gemma4Inner` (which requires loaded weights). Mirrors LFM2's
+/// `compute_layer_kinds` pattern.
+#[allow(dead_code)] // Wired up in subsequent commits (forward dispatch).
+pub(crate) fn compute_layer_kinds(config: &Gemma4Config) -> Vec<Gemma4LayerKind> {
+    let n = config.num_hidden_layers as usize;
+
+    // Pre-compute global -> paged_idx mapping so KV-shared layers can
+    // look up their anchor's pool slot.
+    let mut global_to_paged: Vec<Option<u32>> = vec![None; n];
+    let mut paged_idx: u32 = 0;
+    for i in 0..n {
+        if config.is_global_layer(i) {
+            global_to_paged[i] = Some(paged_idx);
+            paged_idx += 1;
+        }
+    }
+
+    let mut kinds = Vec::with_capacity(n);
+    for i in 0..n {
+        let kind = if config.is_kv_shared_layer(i) {
+            match config.kv_shared_anchor(i) {
+                Some(anchor) if config.is_global_layer(anchor) => {
+                    let anchor_paged_idx = global_to_paged[anchor].unwrap_or(0);
+                    Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx }
+                }
+                Some(anchor) => Gemma4LayerKind::SharedOnSliding {
+                    anchor_layer_idx: anchor as u32,
+                },
+                None => {
+                    // Fallback for malformed configs (no anchor
+                    // resolvable). Treat as flat sliding/global based
+                    // on the layer's own type so dispatch doesn't panic.
+                    if config.is_global_layer(i) {
+                        let pidx = global_to_paged[i].unwrap_or(0);
+                        Gemma4LayerKind::GlobalPaged { paged_idx: pidx }
+                    } else {
+                        Gemma4LayerKind::Sliding
+                    }
+                }
+            }
+        } else if config.is_global_layer(i) {
+            Gemma4LayerKind::GlobalPaged {
+                paged_idx: global_to_paged[i].unwrap_or(0),
+            }
+        } else {
+            Gemma4LayerKind::Sliding
+        };
+        kinds.push(kind);
+    }
+    kinds
+}
+
 /// Default prefill chunk size (tokens per chunk).
 /// Note: mlx-lm uses 2048 but the first eval triggers Metal shader compilation
 /// which can GPU-timeout with very large graphs. Using 512 keeps individual
@@ -4221,6 +4304,134 @@ mod tests {
                 }
                 panic!("unexpected Gemma4Inner::new failure: {msg}");
             }
+        }
+    }
+
+    /// All-global config: every layer must route through `GlobalPaged`
+    /// with paged_idx == absolute index, no shared layers.
+    #[test]
+    fn test_compute_layer_kinds_all_global() {
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 4,
+            layer_types: vec!["full_attention".to_string(); 4],
+            ..paged_tiny_config(false)
+        };
+        let kinds = super::compute_layer_kinds(&cfg);
+        assert_eq!(kinds.len(), 4);
+        for (i, k) in kinds.iter().enumerate() {
+            match k {
+                super::Gemma4LayerKind::GlobalPaged { paged_idx } => {
+                    assert_eq!(*paged_idx as usize, i, "layer {i} paged_idx mismatch");
+                }
+                other => panic!("layer {i}: expected GlobalPaged, got {other:?}"),
+            }
+        }
+    }
+
+    /// Hybrid sliding+global with no sharing: paged_idx counts only
+    /// global layers in original order; sliding layers map to `Sliding`.
+    #[test]
+    fn test_compute_layer_kinds_hybrid_no_sharing() {
+        // 5-layer cycle: 4 sliding + 1 global, repeated for 10 layers.
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let layer_types: Vec<String> = (0..10).map(|i| cycle[i % 5].clone()).collect();
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 10,
+            layer_types,
+            ..paged_tiny_config(false)
+        };
+        let kinds = super::compute_layer_kinds(&cfg);
+        // Global layers at indices 4 and 9 -> paged_idx 0, 1.
+        for (i, k) in kinds.iter().enumerate() {
+            if i == 4 {
+                assert!(
+                    matches!(k, super::Gemma4LayerKind::GlobalPaged { paged_idx: 0 }),
+                    "layer 4 must be GlobalPaged{{0}}, got {k:?}"
+                );
+            } else if i == 9 {
+                assert!(
+                    matches!(k, super::Gemma4LayerKind::GlobalPaged { paged_idx: 1 }),
+                    "layer 9 must be GlobalPaged{{1}}, got {k:?}"
+                );
+            } else {
+                assert!(
+                    matches!(k, super::Gemma4LayerKind::Sliding),
+                    "layer {i} must be Sliding, got {k:?}"
+                );
+            }
+        }
+    }
+
+    /// KV-shared layers must resolve their anchor's pool slot
+    /// (SharedOnGlobal) or absolute index (SharedOnSliding).
+    #[test]
+    fn test_compute_layer_kinds_kv_sharing_resolves_anchors() {
+        // 8 layers: pattern S G S G S G S G (4 global @ 1, 3, 5, 7).
+        // num_kv_shared_layers = 4 → last 4 (indices 4, 5, 6, 7) reuse anchors.
+        // Anchor for shared global at i=5 should be the last non-shared
+        // global before first_kv_shared_layer (=4): that's i=3 → paged_idx=1.
+        // Anchor for shared sliding at i=4 should be sliding at i=2.
+        let layer_types: Vec<String> = (0..8)
+            .map(|i| {
+                if i % 2 == 1 {
+                    "full_attention".to_string()
+                } else {
+                    "sliding_attention".to_string()
+                }
+            })
+            .collect();
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 8,
+            layer_types,
+            num_kv_shared_layers: Some(4),
+            ..paged_tiny_config(false)
+        };
+        let kinds = super::compute_layer_kinds(&cfg);
+        // Non-shared layers: 0=Sliding, 1=GlobalPaged{0}, 2=Sliding, 3=GlobalPaged{1}.
+        assert!(matches!(kinds[0], super::Gemma4LayerKind::Sliding));
+        assert!(matches!(
+            kinds[1],
+            super::Gemma4LayerKind::GlobalPaged { paged_idx: 0 }
+        ));
+        assert!(matches!(kinds[2], super::Gemma4LayerKind::Sliding));
+        assert!(matches!(
+            kinds[3],
+            super::Gemma4LayerKind::GlobalPaged { paged_idx: 1 }
+        ));
+        // Shared layers 4..8 (note these still consume paged_idx slots
+        // because they ARE global layers themselves at the type level —
+        // but the LayerKVPool sizing in Gemma4Inner::new counts ALL
+        // global layers (both anchors and shared) so the indexing is
+        // consistent. SharedOnGlobal carries the ANCHOR's pool slot.
+        // SharedOnSliding carries the anchor's absolute layer index.
+        match kinds[4] {
+            super::Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                assert_eq!(anchor_layer_idx, 2, "anchor for sliding-shared layer 4");
+            }
+            ref other => panic!("layer 4: expected SharedOnSliding, got {other:?}"),
+        }
+        match kinds[5] {
+            super::Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx } => {
+                // Anchor at layer 3 → paged_idx 1.
+                assert_eq!(anchor_paged_idx, 1, "anchor paged_idx for global-shared 5");
+            }
+            ref other => panic!("layer 5: expected SharedOnGlobal, got {other:?}"),
+        }
+        match kinds[6] {
+            super::Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                assert_eq!(anchor_layer_idx, 2, "anchor for sliding-shared layer 6");
+            }
+            ref other => panic!("layer 6: expected SharedOnSliding, got {other:?}"),
+        }
+        match kinds[7] {
+            super::Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx } => {
+                assert_eq!(anchor_paged_idx, 1, "anchor paged_idx for global-shared 7");
+            }
+            ref other => panic!("layer 7: expected SharedOnGlobal, got {other:?}"),
         }
     }
 }
