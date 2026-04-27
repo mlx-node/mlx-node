@@ -556,6 +556,85 @@ impl Gemma4Attention {
 
     // ========== Weight setters ==========
 
+    /// Forward pass for KV-shared layers whose anchor is a global layer
+    /// routed through the paged adapter.
+    ///
+    /// Only Q is computed; K and V are read directly from the anchor's
+    /// paged slot via `adapter.read_kv_range(anchor_paged_idx, 0,
+    /// total_ctx)` (already RoPE-applied since the anchor wrote them
+    /// post-RoPE during its own forward_paged call).
+    ///
+    /// Caller responsibilities:
+    /// 1. `cache_offset` is the RoPE offset for the queries — equal to
+    ///    the anchor's logical position when the anchor processed the
+    ///    same chunk (i.e. `first_logical_position` for prefill,
+    ///    `current_token_count - 1` for decode).
+    /// 2. `total_ctx` is the number of K/V tokens available in the
+    ///    anchor's paged slot. For prefill of a fresh suffix this is
+    ///    `cached_prefix_len + seq_len`; for decode it is the live
+    ///    token count.
+    ///
+    /// Output: `[1, seq_len, hidden_size]`, ready for the decoder
+    /// layer's `apply_ffn_ple_scalar` tail.
+    pub fn forward_paged_shared(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        anchor_paged_idx: u32,
+        cache_offset: i32,
+        total_ctx: u32,
+        is_prefill: bool,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        // Q-only path (mirrors flat `forward_shared`).
+        let queries = self.q_proj.forward(x)?;
+        let queries =
+            queries.reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?;
+        let queries = self.q_norm.forward(&queries)?;
+        let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
+        let queries_bhtd = self.rope.forward(&queries, cache_offset)?;
+
+        // Read anchor's K/V from the pool.
+        let (shared_keys, shared_values) = adapter
+            .read_kv_range(anchor_paged_idx, 0, total_ctx)
+            .map_err(napi::Error::from_reason)?;
+
+        // SDPA. Same scale=1.0 as `forward_paged`. For prefill on a
+        // suffix we build an explicit causal mask offset by the cached
+        // prefix length (cache_offset). For decode (seq_len == 1)
+        // mask=None — every cached key is at a strictly earlier position.
+        let attn_bhtd = if is_prefill && seq_len > 1 {
+            let cached_prefix_len = (total_ctx as i64) - seq_len;
+            let mask = create_causal_mask(
+                seq_len as i32,
+                Some(cached_prefix_len as i32),
+                None,
+            )?;
+            scaled_dot_product_attention(
+                &queries_bhtd,
+                &shared_keys,
+                &shared_values,
+                1.0,
+                Some(&mask),
+            )?
+        } else {
+            scaled_dot_product_attention(
+                &queries_bhtd,
+                &shared_keys,
+                &shared_values,
+                1.0,
+                None,
+            )?
+        };
+
+        // Output projection.
+        let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
+        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+        self.o_proj.forward(&output)
+    }
+
     // ========== Test-only weight getters ==========
     #[cfg(test)]
     pub(crate) fn q_proj_weight(&self) -> MxArray {

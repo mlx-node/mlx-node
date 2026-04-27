@@ -26,6 +26,25 @@ use super::quantized_linear::{Gemma4MLPVariant, QuantizedLinear, QuantizedSwitch
 /// * `anchor_layer_idx` (in `SharedOnSliding`) is the ABSOLUTE decoder
 ///   index of the anchor whose flat `Gemma4LayerCache::Sliding` slot
 ///   feeds the shared layer's K/V via `take_stashed_kv`.
+/// Inputs threaded into `forward_paged_or_flat` for KV-shared layers.
+///
+/// `cache_offset` is the RoPE offset for the queries — for
+/// `SharedOnGlobal` it equals the anchor's logical position when the
+/// anchor processed the same chunk; for `SharedOnSliding` it is the
+/// anchor's pre-update offset (the flat-path's
+/// `caches[anchor_layer_idx].get_offset() - seq_len`).
+///
+/// `total_ctx` is only consumed by `SharedOnGlobal` (the K/V token
+/// count to read from the anchor's paged slot). `keys` / `values`
+/// are only consumed by `SharedOnSliding` (anchor stash).
+#[allow(dead_code)] // Wired up by chat_sync_core_paged in commit 6.
+pub(crate) struct SharedKvInputs<'a> {
+    pub(crate) cache_offset: i32,
+    pub(crate) total_ctx: u32,
+    pub(crate) keys: Option<&'a MxArray>,
+    pub(crate) values: Option<&'a MxArray>,
+}
+
 #[allow(dead_code)] // Wired up in subsequent commits (forward dispatch).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Gemma4LayerKind {
@@ -233,20 +252,26 @@ impl Gemma4DecoderLayer {
     ///   `input_layernorm`, calls `self_attn.forward_paged` to write
     ///   K/V into the pool and compute attention, then runs the
     ///   shared `apply_ffn_ple_scalar` tail.
-    /// * `SharedOnGlobal { anchor_paged_idx }` and
-    ///   `SharedOnSliding { anchor_layer_idx }` are NOT yet routed
-    ///   through this method; they return an error so the dispatch
-    ///   surface fails fast until the shared variants are wired up
-    ///   in the follow-up commit.
+    /// * `SharedOnGlobal { anchor_paged_idx }` — Q-only forward with
+    ///   K/V read directly from the anchor's paged slot via
+    ///   `adapter.read_kv_range(...)`. The anchor must have already
+    ///   processed the same chunk in this turn so its slot is up to
+    ///   date. The caller carries `anchor_total_ctx` (= number of K/V
+    ///   tokens in the anchor's slot) and `anchor_cache_offset`
+    ///   (= RoPE offset matching the anchor's queries).
+    /// * `SharedOnSliding { anchor_layer_idx }` — Q-only forward with
+    ///   K/V read from the anchor's flat-cache stash (mirrors the flat
+    ///   path's `forward_shared`). The caller pulls `(shared_keys,
+    ///   shared_values, cache_offset)` from
+    ///   `caches[anchor_layer_idx].take_stashed_kv()` ahead of time
+    ///   and passes them in via the `shared_kv` parameter.
     ///
     /// `flat_cache` is required for the `Sliding` branch (it's the
-    /// per-layer flat cache slot). For `GlobalPaged` it is ignored
-    /// (the adapter is the source of truth).
+    /// per-layer flat cache slot). For `GlobalPaged` and the shared
+    /// kinds it is ignored (the adapter / anchor stash own K/V).
     ///
     /// `needs_stash` only matters for `Sliding` (mirrors the flat
-    /// `forward(...)` call signature). The paged path doesn't stash
-    /// — KV-shared layers will read directly from the pool via the
-    /// `SharedOnGlobal` branch in the follow-up.
+    /// `forward(...)` call signature).
     #[allow(clippy::too_many_arguments)]
     #[allow(dead_code)] // Wired up in `chat_sync_core_paged` (later commit).
     pub(crate) fn forward_paged_or_flat(
@@ -261,16 +286,19 @@ impl Gemma4DecoderLayer {
         flat_cache: Option<&mut Gemma4LayerCache>,
         per_layer_input: Option<&MxArray>,
         needs_stash: bool,
+        shared_kv: Option<SharedKvInputs<'_>>,
     ) -> Result<MxArray> {
         match kind {
             Gemma4LayerKind::Sliding => {
                 // Flat path: existing forward(...).
+                let _ = shared_kv;
                 self.forward(x, mask, flat_cache, per_layer_input, needs_stash)
             }
             Gemma4LayerKind::GlobalPaged { paged_idx } => {
                 let _ = flat_cache; // adapter owns K/V for global layers
                 let _ = mask; // paged path uses internal causal/explicit masks
-                let _ = needs_stash; // shared layers read directly from the pool
+                let _ = needs_stash;
+                let _ = shared_kv;
                 let normed = self.input_layernorm.forward(x)?;
                 let attn_out = self.self_attn.forward_paged(
                     &normed,
@@ -282,11 +310,54 @@ impl Gemma4DecoderLayer {
                 )?;
                 self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
             }
-            Gemma4LayerKind::SharedOnGlobal { .. } | Gemma4LayerKind::SharedOnSliding { .. } => {
-                Err(Error::from_reason(
-                    "Gemma4DecoderLayer::forward_paged_or_flat: KV-shared layer kinds \
-                     are not yet wired (follow-up commit)",
-                ))
+            Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx } => {
+                let _ = flat_cache;
+                let _ = mask;
+                let _ = needs_stash;
+                let inputs = shared_kv.ok_or_else(|| {
+                    Error::from_reason(
+                        "forward_paged_or_flat: SharedOnGlobal requires shared_kv with \
+                         total_ctx + cache_offset",
+                    )
+                })?;
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out = self.self_attn.forward_paged_shared(
+                    &normed,
+                    adapter,
+                    anchor_paged_idx,
+                    inputs.cache_offset,
+                    inputs.total_ctx,
+                    is_prefill,
+                )?;
+                self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
+            }
+            Gemma4LayerKind::SharedOnSliding { .. } => {
+                let _ = flat_cache;
+                let _ = needs_stash;
+                let _ = adapter;
+                let _ = first_logical_position;
+                let _ = cached_prefix_len;
+                let _ = is_prefill;
+                let inputs = shared_kv.ok_or_else(|| {
+                    Error::from_reason(
+                        "forward_paged_or_flat: SharedOnSliding requires shared_kv with \
+                         (keys, values, cache_offset)",
+                    )
+                })?;
+                let keys = inputs.keys.ok_or_else(|| {
+                    Error::from_reason("SharedOnSliding requires shared_kv.keys")
+                })?;
+                let values = inputs.values.ok_or_else(|| {
+                    Error::from_reason("SharedOnSliding requires shared_kv.values")
+                })?;
+                self.forward_shared(
+                    x,
+                    mask,
+                    keys,
+                    values,
+                    inputs.cache_offset,
+                    per_layer_input,
+                )
             }
         }
     }

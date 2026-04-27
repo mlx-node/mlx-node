@@ -1947,15 +1947,6 @@ impl Gemma4Inner {
             return Err(Error::from_reason("Empty prompt"));
         }
 
-        // Reject KV-sharing models on the paged path until the
-        // SharedOnGlobal/SharedOnSliding routing lands in the next
-        // commit. The flat path still handles them.
-        if self.config.num_kv_shared_layers.is_some_and(|n| n > 0) {
-            return Err(Error::from_reason(
-                "Gemma4 paged path does not yet support num_kv_shared_layers > 0; \
-                 disable use_block_paged_cache or wait for the SharedOn{Global,Sliding} routing follow-up",
-            ));
-        }
 
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let prompt_token_count = tokens.len();
@@ -2210,11 +2201,6 @@ impl Gemma4Inner {
     ) -> Result<()> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
-        }
-        if self.config.num_kv_shared_layers.is_some_and(|n| n > 0) {
-            return Err(Error::from_reason(
-                "Gemma4 paged streaming does not yet support num_kv_shared_layers > 0",
-            ));
         }
 
         let reuse_cache = config.reuse_cache.unwrap_or(true);
@@ -2536,7 +2522,6 @@ impl Gemma4Inner {
         // `forward_body`'s mask logic.
         let seq_len = suffix_len as i64;
         let sliding_mask = if seq_len > 1 && seq_len > self.config.sliding_window as i64 {
-            // Use the sliding cache's offset for the first sliding layer.
             let sliding_offset = self
                 .caches
                 .as_ref()
@@ -2557,11 +2542,12 @@ impl Gemma4Inner {
             None
         };
 
+        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
         let num_layers = self.layers.len();
         let first_logical_position = cached_prefix_len;
+        // Stash for sliding-anchor K/V reused by SharedOnSliding layers.
+        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
 
-        // Index-based loop with split-borrow for `self.layers`,
-        // `self.caches`, `self.paged_adapter` (mirrors LFM2).
         #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
             let kind = layer_kinds[layer_idx];
@@ -2593,6 +2579,42 @@ impl Gemma4Inner {
                     None
                 };
 
+            // Build SharedKvInputs for shared layer kinds.
+            let shared_inputs = match kind {
+                Gemma4LayerKind::SharedOnGlobal { .. } => {
+                    let total_ctx = first_logical_position + suffix_len;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset: first_logical_position as i32,
+                        total_ctx,
+                        keys: None,
+                        values: None,
+                    })
+                }
+                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "run_paged_prefill_chunk: SharedOnSliding anchor {} stash missing",
+                            anchor_layer_idx
+                        ))
+                    })?;
+                    let cache_offset =
+                        (first_logical_position as i32 + suffix_len as i32) - seq_len as i32;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset,
+                        total_ctx: 0, // unused for SharedOnSliding
+                        keys: Some(k),
+                        values: Some(v),
+                    })
+                }
+                _ => None,
+            };
+
+            // For Sliding layers that anchor a SharedOnSliding chain,
+            // request the stash so the shared layer can pull K/V.
+            let needs_stash = has_kv_sharing
+                && matches!(kind, Gemma4LayerKind::Sliding)
+                && self.config.should_store_shared_kv(layer_idx);
+
             hidden_states = layer.forward_paged_or_flat(
                 &hidden_states,
                 kind,
@@ -2603,8 +2625,25 @@ impl Gemma4Inner {
                 mask,
                 flat_cache,
                 /* per_layer_input */ None,
-                /* needs_stash */ false,
+                needs_stash,
+                shared_inputs,
             )?;
+
+            // After a Sliding anchor's forward, capture its stash so
+            // downstream SharedOnSliding layers can attend over it.
+            if needs_stash {
+                let caches = unsafe {
+                    let raw = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "run_paged_prefill_chunk: sliding cache slot missing post-forward",
+                        )
+                    })? as *mut Vec<Gemma4LayerCache>;
+                    &mut *raw
+                };
+                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
+                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
+                }
+            }
         }
 
         // Final norm + lm_head + softcap.
@@ -2656,7 +2695,9 @@ impl Gemma4Inner {
         let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
         hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
 
+        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
         let num_layers = self.layers.len();
+        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
         #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
             let kind = layer_kinds[layer_idx];
@@ -2680,6 +2721,41 @@ impl Gemma4Inner {
                     None
                 };
 
+            let shared_inputs = match kind {
+                Gemma4LayerKind::SharedOnGlobal { .. } => {
+                    // Anchor's slot already has the new token (it ran
+                    // its own forward_paged earlier in this loop, which
+                    // wrote K/V via update_keys_values). Read full ctx.
+                    let total_ctx = first_logical_position + 1;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset: first_logical_position as i32,
+                        total_ctx,
+                        keys: None,
+                        values: None,
+                    })
+                }
+                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "run_paged_decode_step: SharedOnSliding anchor {} stash missing",
+                            anchor_layer_idx
+                        ))
+                    })?;
+                    let cache_offset = first_logical_position as i32;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset,
+                        total_ctx: 0,
+                        keys: Some(k),
+                        values: Some(v),
+                    })
+                }
+                _ => None,
+            };
+
+            let needs_stash = has_kv_sharing
+                && matches!(kind, Gemma4LayerKind::Sliding)
+                && self.config.should_store_shared_kv(layer_idx);
+
             hidden_states = layer.forward_paged_or_flat(
                 &hidden_states,
                 kind,
@@ -2690,8 +2766,23 @@ impl Gemma4Inner {
                 /* mask */ None,
                 flat_cache,
                 /* per_layer_input */ None,
-                /* needs_stash */ false,
+                needs_stash,
+                shared_inputs,
             )?;
+
+            if needs_stash {
+                let caches = unsafe {
+                    let raw = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "run_paged_decode_step: sliding cache slot missing post-forward",
+                        )
+                    })? as *mut Vec<Gemma4LayerCache>;
+                    &mut *raw
+                };
+                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
+                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
+                }
+            }
         }
 
         hidden_states = self.final_norm.forward(&hidden_states)?;
@@ -2796,9 +2887,18 @@ impl Gemma4Inner {
                 }
                 Gemma4LayerKind::SharedOnGlobal { .. }
                 | Gemma4LayerKind::SharedOnSliding { .. } => {
-                    return Err(Error::from_reason(
-                        "run_sliding_only_prefill: KV-shared layers not yet supported",
-                    ));
+                    // Shared layers don't write to caches and don't
+                    // affect the sliding-only re-prefill state. Use a
+                    // throwaway global cache so hidden_states still
+                    // flows through the layer.
+                    let mut throwaway = Gemma4LayerCache::new_global();
+                    hidden_states = layer.forward(
+                        &hidden_states,
+                        /* mask */ None,
+                        Some(&mut throwaway),
+                        None,
+                        false,
+                    )?;
                 }
             }
         }
