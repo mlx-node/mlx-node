@@ -356,17 +356,30 @@ async fn qwen3_paged_vs_flat_prefix_reuse_parity() {
         r2_flat.num_tokens, r2_flat.cached_tokens, r2_paged.num_tokens, r2_paged.cached_tokens,
     );
 
-    if r2_flat.text != r2_paged.text {
+    // Compare `raw_text` (the verbatim decoded token stream) rather than
+    // the post-processed `text`. The two paths route through different
+    // text post-processors (`tools::parse_generation_output` on the
+    // paged path vs. `chat_common::parse_thinking_and_tools` on the
+    // flat-path `chat_tokens_delta_sync`) — when generation is truncated
+    // mid-`<think>` block by `max_new_tokens=32`, the latter returns
+    // `text=""` (entire output classified as reasoning) while the former
+    // returns the verbatim text. That divergence is a pre-existing
+    // parser inconsistency unrelated to KV-cache reuse; comparing
+    // `raw_text` isolates the token-level path-equivalence claim this
+    // test cares about. (Single-turn parity in
+    // `qwen3_paged_vs_flat_greedy_token_parity` compares `text` directly
+    // because both sides go through `parse_generation_output` on turn 1.)
+    if r2_flat.raw_text != r2_paged.raw_text {
         panic!(
-            "TURN-2 TEXT MISMATCH (prefix-reuse divergence between paths)\n\
-             FLAT  ({} tokens, cached={}) text={:?}\n\
-             PAGED ({} tokens, cached={}) text={:?}",
+            "TURN-2 RAW_TEXT MISMATCH (prefix-reuse divergence between paths)\n\
+             FLAT  ({} tokens, cached={}) raw_text={:?}\n\
+             PAGED ({} tokens, cached={}) raw_text={:?}",
             r2_flat.num_tokens,
             r2_flat.cached_tokens,
-            r2_flat.text,
+            r2_flat.raw_text,
             r2_paged.num_tokens,
             r2_paged.cached_tokens,
-            r2_paged.text,
+            r2_paged.raw_text,
         );
     }
     assert_eq!(
