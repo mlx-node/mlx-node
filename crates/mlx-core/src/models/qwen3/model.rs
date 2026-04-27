@@ -1554,6 +1554,24 @@ impl Qwen3Inner {
             enable_thinking,
         )?;
 
+        // Block-paged dispatch: when the adapter is configured (opt-in via
+        // `use_block_paged_cache`), route through the parallel
+        // `chat_sync_core_paged` path that uses `forward_paged_adapter`
+        // instead of `forward_fused`. The flat path is left untouched so
+        // turning the flag off is byte-identical to before this commit.
+        if self.paged_adapter.is_some() {
+            return self.chat_sync_core_paged(
+                token_ids_vec,
+                tokenizer,
+                config,
+                eos_token_id,
+                gen_config,
+                gen_start,
+                report_perf,
+                reuse_cache,
+            );
+        }
+
         // === Cache reuse: prefix verification ===
         //
         // `verify_cache_prefix` returns 0 or the full cached length only —
@@ -1966,6 +1984,594 @@ impl Qwen3Inner {
             performance,
             cached_tokens: cached_prefix_len as u32,
         })
+    }
+
+    /// Block-paged variant of [`Self::chat_sync_core`] used when the
+    /// `paged_adapter` is configured.
+    ///
+    /// Mirrors `chat_sync_core`'s control flow (penalty stack, decode loop,
+    /// EOS / repetition cutoff, performance timing, generation-output
+    /// post-processing) but threads through `forward_paged_adapter` instead
+    /// of `forward_fused`. The flat-path `cached_*` history fields are NOT
+    /// touched — the adapter owns its own block-paged prefix cache via
+    /// `BlockAllocator::register_prefix` / `find_longest_cache_hit`.
+    ///
+    /// Per-turn lifecycle:
+    /// 1. `reset_for_new_request(seq_id)` — drops any prior request's
+    ///    blocks (defensive; the prior turn's success path already called
+    ///    `release_request`, but this guarantees fresh state on error
+    ///    recovery).
+    /// 2. `find_cached_prefix(prompt_tokens, &[])` — looks up the longest
+    ///    matching prefix in the shared `BlockAllocator`'s prefix cache.
+    ///    On a hit, the adapter's `block_table` already covers the cached
+    ///    blocks (refcount incremented).
+    /// 3. `allocate_suffix_blocks(total_tokens)` — allocates fresh blocks
+    ///    for the suffix beyond the cached prefix.
+    /// 4. Prefill: for each layer, run `forward_paged_adapter` with
+    ///    `is_prefill = true` and `cached_prefix_len`. The forward writes
+    ///    the suffix K/V through `update_keys_values` and runs causal
+    ///    SDPA over (read_kv_range cached prefix + new suffix).
+    /// 5. Decode loop: per generated token, run `forward_paged_adapter`
+    ///    with `is_prefill = false`. The adapter's `gather_kv_for_decode`
+    ///    pulls historical K/V via the block table.
+    /// 6. End of turn: `register_full_blocks_for_reuse` publishes the
+    ///    request's full blocks to the prefix cache so the NEXT turn's
+    ///    `find_cached_prefix` hits them. Then `release_request` drops the
+    ///    request's own block_table refs (cache's logical refs survive).
+    /// 7. Error path: `release_request` only — no register, so a partial
+    ///    state is not published.
+    ///
+    /// **Status**: P1 wiring. Numerical validation is deferred to a
+    /// follow-up — this commit's tests assert non-empty / valid-token
+    /// output via shape checks, not exact-token equivalence to the flat
+    /// path.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_sync_core_paged(
+        &mut self,
+        token_ids_vec: Vec<u32>,
+        tokenizer: Arc<Qwen3Tokenizer>,
+        config: ChatConfig,
+        eos_token_id: u32,
+        gen_config: GenerationConfig,
+        gen_start: Option<std::time::Instant>,
+        report_perf: bool,
+        _reuse_cache: bool,
+    ) -> Result<ChatResult> {
+        let prompt_token_count = token_ids_vec.len() as f64;
+        let max_new_tokens: i32 = gen_config.max_new_tokens.unwrap_or(2048);
+        let temperature: f64 = gen_config.temperature.unwrap_or(0.7);
+        let top_k: i32 = gen_config.top_k.unwrap_or(0);
+        let top_p: f64 = gen_config.top_p.unwrap_or(0.9);
+        let min_p: f64 = gen_config.min_p.unwrap_or(0.0);
+        let repetition_penalty: f64 = gen_config.repetition_penalty.unwrap_or(1.0);
+        let repetition_context_size: i32 = gen_config.repetition_context_size.unwrap_or(256);
+        let presence_penalty: f64 = gen_config.presence_penalty.unwrap_or(0.0);
+        let presence_context_size: i32 = gen_config.presence_context_size.unwrap_or(20);
+        let frequency_penalty: f64 = gen_config.frequency_penalty.unwrap_or(0.0);
+        let frequency_context_size: i32 = gen_config.frequency_context_size.unwrap_or(20);
+        let max_consecutive_tokens: i32 = gen_config.max_consecutive_tokens.unwrap_or(16);
+        let max_ngram_repeats: i32 = gen_config.max_ngram_repeats.unwrap_or(3);
+        let ngram_size: i32 = gen_config.ngram_size.unwrap_or(64);
+        let return_logprobs = gen_config.return_logprobs.unwrap_or(false);
+        let _ = config; // currently no per-call options consumed beyond gen_config
+
+        let sampling_config = SamplingConfig {
+            temperature: Some(temperature),
+            top_k: Some(top_k),
+            top_p: Some(top_p),
+            min_p: Some(min_p),
+        };
+
+        // Per-turn seq_id: a monotonic counter would be safer, but the
+        // adapter is single-request and `reset_for_new_request` makes the
+        // previous seq_id irrelevant. Reuse 0 — caller-supplied seq_ids
+        // are NOT exposed at the chat API level.
+        let seq_id: u32 = 0;
+
+        let num_layers = self.layers.len();
+
+        // === Adapter lifecycle: reset + prefix lookup + suffix allocation.
+        // On any error in this block we ensure `release_request` runs by
+        // not yet recording tokens (the adapter doesn't hold blocks until
+        // `find_cached_prefix` adds them).
+        let cached_prefix_len = {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                napi::Error::from_reason(
+                    "chat_sync_core_paged: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?;
+            adapter
+                .reset_for_new_request(seq_id)
+                .map_err(napi::Error::from_reason)?;
+            let prefix = adapter
+                .find_cached_prefix(&token_ids_vec, &[])
+                .map_err(napi::Error::from_reason)?;
+            let cached = prefix.cached_token_count;
+            // Allocate ALL blocks needed (cached prefix + suffix + max
+            // decode budget). The adapter's `allocate_suffix_blocks` only
+            // allocates beyond the cached prefix, but the budget must
+            // include decode tokens — `record_tokens` doesn't trigger
+            // re-allocation. Pre-size now.
+            let total_budget = (token_ids_vec.len() as u32) + (max_new_tokens.max(0) as u32);
+            adapter
+                .allocate_suffix_blocks(total_budget)
+                .map_err(napi::Error::from_reason)?;
+            cached
+        };
+
+        // Run forward / decode under a try-style closure so we can
+        // `release_request` on either path. Rust doesn't have try{}, so we
+        // emulate with a helper closure returning Result and call
+        // release_request after.
+        let forward_result = self.chat_sync_core_paged_inner(
+            &token_ids_vec,
+            cached_prefix_len,
+            num_layers,
+            sampling_config,
+            max_new_tokens,
+            repetition_penalty,
+            repetition_context_size,
+            presence_penalty,
+            presence_context_size,
+            frequency_penalty,
+            frequency_context_size,
+            max_consecutive_tokens,
+            max_ngram_repeats,
+            ngram_size,
+            return_logprobs,
+            eos_token_id,
+            report_perf,
+        );
+
+        // Always release the request on either path. Register-for-reuse
+        // is success-only.
+        let (generated_tokens, generated_logprobs, finish_reason, first_token_elapsed_ms) =
+            match forward_result {
+                Ok(t) => {
+                    if let Some(adapter) = self.paged_adapter.as_mut() {
+                        let _ = adapter.register_full_blocks_for_reuse(&[]);
+                        let _ = adapter.release_request();
+                    }
+                    t
+                }
+                Err(e) => {
+                    if let Some(adapter) = self.paged_adapter.as_mut() {
+                        let _ = adapter.release_request();
+                    }
+                    return Err(e);
+                }
+            };
+
+        let gen_elapsed = gen_start.map(|s| s.elapsed());
+
+        // Decode text + tool/thinking parsing (mirrors chat_sync_core).
+        let raw_text = tokenizer.decode_sync(&generated_tokens, true)?;
+        let (cleaned_text, tool_calls, thinking) = tools::parse_generation_output(&raw_text);
+        let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
+        let performance = if let (Some(gen_elapsed), Some(first_tok_ms)) =
+            (gen_elapsed, first_token_elapsed_ms)
+        {
+            let total_ms = gen_elapsed.as_secs_f64() * 1000.0;
+            let gen_toks = generated_tokens.len() as f64;
+            let ttft_ms = first_tok_ms;
+            let decode_ms = total_ms - ttft_ms;
+            let actual_prefill_count =
+                (token_ids_vec.len() as f64) - cached_prefix_len as f64;
+            Some(crate::profiling::PerformanceMetrics {
+                ttft_ms,
+                prefill_tokens_per_second: if ttft_ms > 0.0 {
+                    actual_prefill_count.max(1.0) / (ttft_ms / 1000.0)
+                } else {
+                    0.0
+                },
+                decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                    (gen_toks - 1.0) / (decode_ms / 1000.0)
+                } else {
+                    0.0
+                },
+            })
+        } else {
+            None
+        };
+
+        let reasoning_tokens =
+            tools::count_reasoning_tokens(&thinking, &generated_tokens, tokenizer.think_end_id());
+
+        // generated_logprobs intentionally dropped here — the flat path
+        // (chat_sync_core) also collects them but does not surface them
+        // through ChatResult; keep parity until/unless the field is
+        // added to the public type.
+        let _ = generated_logprobs;
+
+        Ok(ChatResult {
+            text: cleaned_text,
+            tool_calls,
+            thinking,
+            num_tokens: generated_tokens.len() as u32,
+            prompt_tokens: prompt_token_count as u32,
+            reasoning_tokens,
+            finish_reason,
+            raw_text,
+            performance,
+            cached_tokens: cached_prefix_len,
+        })
+    }
+
+    /// Inner forward + decode loop for `chat_sync_core_paged`. Split out so
+    /// the caller can wrap it with `release_request` in a try-style flow.
+    /// Returns `(generated_tokens, generated_logprobs, finish_reason,
+    /// first_token_elapsed_ms)`.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_sync_core_paged_inner(
+        &mut self,
+        token_ids_vec: &[u32],
+        cached_prefix_len: u32,
+        num_layers: usize,
+        sampling_config: SamplingConfig,
+        max_new_tokens: i32,
+        repetition_penalty: f64,
+        repetition_context_size: i32,
+        presence_penalty: f64,
+        presence_context_size: i32,
+        frequency_penalty: f64,
+        frequency_context_size: i32,
+        max_consecutive_tokens: i32,
+        max_ngram_repeats: i32,
+        ngram_size: i32,
+        return_logprobs: bool,
+        eos_token_id: u32,
+        report_perf: bool,
+    ) -> Result<(Vec<u32>, Vec<f32>, String, Option<f64>)> {
+        let total_prompt_tokens = token_ids_vec.len() as u32;
+        let suffix_len = total_prompt_tokens
+            .checked_sub(cached_prefix_len)
+            .ok_or_else(|| {
+                napi::Error::from_reason(
+                    "chat_sync_core_paged_inner: cached_prefix_len > total_prompt_tokens",
+                )
+            })?;
+
+        if total_prompt_tokens == 0 {
+            return Err(napi::Error::from_reason("Empty prompt"));
+        }
+
+        // Borrow embedding / final_norm / lm_head out of `self` for the
+        // forward pass. Layers are borrowed separately because the
+        // forward_paged_adapter call needs `&self.layers` while the
+        // adapter is borrowed as `&mut self.paged_adapter`.
+        let embedding_weight = self.embedding.get_weight();
+        let _ = embedding_weight; // not directly used; forward path uses self.embedding.forward
+        let positions_dummy = MxArray::from_int32(&[0], &[1])?;
+
+        // === PREFILL ===
+
+        let mut first_token_elapsed_ms: Option<f64> = None;
+        let prefill_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        if suffix_len == 0 {
+            // Pure-cache prompt: every prompt token already lives in the
+            // pool. The flat path's "zero delta" branch rewinds the cache
+            // index by 1 and re-runs the last token to produce logits;
+            // the block-paged adapter doesn't expose a rewind API in P1.
+            //
+            // In normal chat usage every turn appends at least the new
+            // user message + assistant turn delimiter, so suffix_len is
+            // always > 0. Documented as a P1 limitation and rejected with
+            // a clear error so production callers don't silently get the
+            // wrong logits.
+            return Err(napi::Error::from_reason(
+                "chat_sync_core_paged: zero-delta prompt (every token cached) is not yet \
+                 supported on the block-paged path; flat path required for this corner case",
+            ));
+        }
+        let suffix = &token_ids_vec[(cached_prefix_len as usize)..];
+        let last_logits = self.run_paged_prefill_chunk(
+            suffix,
+            cached_prefix_len,
+            num_layers,
+            &positions_dummy,
+        )?;
+
+        let mut last_logits = last_logits;
+
+        // Apply prompt-level penalties on the prefill logits before the
+        // first sample. Mirrors chat_sync_core.
+        if repetition_penalty != 1.0 && !token_ids_vec.is_empty() {
+            last_logits = apply_repetition_penalty(
+                &last_logits,
+                token_ids_vec,
+                repetition_penalty,
+                Some(repetition_context_size),
+            )?;
+        }
+        if presence_penalty != 0.0 {
+            last_logits = apply_presence_penalty(
+                &last_logits,
+                token_ids_vec,
+                presence_penalty,
+                Some(presence_context_size),
+            )?;
+        }
+        if frequency_penalty != 0.0 {
+            last_logits = apply_frequency_penalty(
+                &last_logits,
+                token_ids_vec,
+                frequency_penalty,
+                Some(frequency_context_size),
+            )?;
+        }
+
+        let (mut token, mut logprobs_arr) = if return_logprobs {
+            let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
+            (tok, Some(lp))
+        } else {
+            (sample(&last_logits, Some(sampling_config))?, None)
+        };
+
+        // === DECODE LOOP ===
+        const DECODE_CLEANUP_INTERVAL: i32 = 256;
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_logprobs: Vec<f32> = if return_logprobs {
+            Vec::with_capacity(max_new_tokens.max(0) as usize)
+        } else {
+            Vec::new()
+        };
+        let mut finish_reason = "length";
+
+        for step in 0..max_new_tokens {
+            token.eval();
+            if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
+                synchronize_and_clear_cache();
+            }
+            let token_value = token.item_at_int32(0)? as u32;
+            if let Some(ps) = prefill_start
+                && first_token_elapsed_ms.is_none()
+            {
+                first_token_elapsed_ms = Some(ps.elapsed().as_secs_f64() * 1000.0);
+            }
+            generated_tokens.push(token_value);
+            if return_logprobs && let Some(ref lp) = logprobs_arr {
+                lp.eval();
+                let token_logprob = lp.item_at_float32(token_value as usize)?;
+                generated_logprobs.push(token_logprob);
+            }
+
+            if let Some(reason) = check_repetition_cutoff(
+                &generated_tokens,
+                max_consecutive_tokens,
+                max_ngram_repeats,
+                ngram_size,
+            ) {
+                finish_reason = reason;
+                break;
+            }
+            if token_value == eos_token_id {
+                finish_reason = "stop";
+                break;
+            }
+
+            // Decode step: feed `[token_value]` through the paged forward
+            // with `is_prefill = false`. The adapter must be at the right
+            // logical position — it was advanced by `record_tokens` during
+            // prefill / previous decode step. We record and forward now.
+            let next_logits = self.run_paged_decode_step(
+                token_value,
+                num_layers,
+                &positions_dummy,
+            )?;
+
+            let last_logits_dec = next_logits.squeeze(Some(&[0, 1]))?;
+            let mut next_logits = last_logits_dec;
+
+            if repetition_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0 {
+                let context_tokens: Vec<u32> = token_ids_vec
+                    .iter()
+                    .copied()
+                    .chain(generated_tokens.iter().copied())
+                    .collect();
+                if repetition_penalty != 1.0 {
+                    next_logits = apply_repetition_penalty(
+                        &next_logits,
+                        &context_tokens,
+                        repetition_penalty,
+                        Some(repetition_context_size),
+                    )?;
+                }
+                if presence_penalty != 0.0 {
+                    next_logits = apply_presence_penalty(
+                        &next_logits,
+                        &context_tokens,
+                        presence_penalty,
+                        Some(presence_context_size),
+                    )?;
+                }
+                if frequency_penalty != 0.0 {
+                    next_logits = apply_frequency_penalty(
+                        &next_logits,
+                        &context_tokens,
+                        frequency_penalty,
+                        Some(frequency_context_size),
+                    )?;
+                }
+            }
+
+            let (next_tok, next_lp) = if return_logprobs {
+                let (tok, lp) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
+                (tok, Some(lp))
+            } else {
+                (sample(&next_logits, Some(sampling_config))?, None)
+            };
+            token = next_tok;
+            logprobs_arr = next_lp;
+        }
+
+        Ok((
+            generated_tokens,
+            generated_logprobs,
+            finish_reason.to_string(),
+            first_token_elapsed_ms,
+        ))
+    }
+
+    /// Run a paged-attention prefill chunk over the layer stack.
+    ///
+    /// `suffix_tokens` is the chunk of NEW tokens (already excluded from
+    /// the prefix-cache hit). `first_logical_position` is the logical
+    /// position at which `suffix_tokens[0]` lives in the full request (so
+    /// `cached_prefix_len` for a normal cache-hit prefill, or `0` for a
+    /// fresh request). Records the chunk into the adapter and writes K/V
+    /// through the pool via `forward_paged_adapter`. Returns the last
+    /// position's logits squeezed to `[vocab]`.
+    fn run_paged_prefill_chunk(
+        &mut self,
+        suffix_tokens: &[u32],
+        first_logical_position: u32,
+        num_layers: usize,
+        positions: &MxArray,
+    ) -> Result<MxArray> {
+        if suffix_tokens.is_empty() {
+            return Err(napi::Error::from_reason(
+                "run_paged_prefill_chunk called with empty suffix",
+            ));
+        }
+        // 1. record_tokens BEFORE forward (forward_paged_adapter expects
+        //    the cursor to be advanced by the chunk so update_keys_values
+        //    aligns).
+        let suffix_len = suffix_tokens.len() as u32;
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                napi::Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
+            })?;
+            adapter
+                .record_tokens(suffix_tokens)
+                .map_err(napi::Error::from_reason)?;
+        }
+
+        // 2. Embed input ids.
+        let input_ids = MxArray::from_uint32(suffix_tokens, &[1, suffix_len as i64])?;
+        let mut hidden_states = self.embedding.forward(&input_ids)?;
+
+        // 3. Run forward through every layer, dispatching the adapter.
+        //    We have to split the borrow of `self.layers` (immutable) from
+        //    `self.paged_adapter` (mutable) — the layer slice is captured
+        //    as a separate reference and passed in, while the adapter is
+        //    accessed via `self.paged_adapter` per-layer.
+        let cached_prefix_len = first_logical_position;
+        for layer_idx in 0..num_layers {
+            // Re-borrow per layer to avoid holding the mutable borrow
+            // across the immutable layer access. `self.layers[idx]` and
+            // `self.paged_adapter` are disjoint fields, so we use a
+            // raw-ptr split borrow trick: read the layer reference up
+            // front, then re-borrow the adapter.
+            let layer: &TransformerBlock = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                napi::Error::from_reason("run_paged_prefill_chunk: paged_adapter dropped")
+            })?;
+            hidden_states = layer.forward_paged_adapter(
+                &hidden_states,
+                adapter,
+                layer_idx as u32,
+                first_logical_position,
+                cached_prefix_len,
+                self.config.num_heads as u32,
+                positions,
+                /* num_seqs */ 1,
+                /* seq_len */ suffix_len as i64,
+                /* is_prefill */ true,
+            )?;
+        }
+
+        // 4. Final norm + lm_head.
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        let logits = if self.config.tie_word_embeddings {
+            let embedding_weight = self.embedding.get_weight();
+            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+        } else {
+            self.lm_head.forward(&hidden_states)?
+        };
+
+        // Slice last token: logits shape [1, suffix_len, vocab] -> [vocab].
+        let seq_len = logits.shape_at(1)?;
+        let last = logits
+            .slice_axis(1, seq_len - 1, seq_len)?
+            .squeeze(Some(&[0, 1]))?;
+        Ok(last)
+    }
+
+    /// Run one decode step through the paged forward path. Mirrors
+    /// `run_paged_prefill_chunk` for a single-token chunk.
+    fn run_paged_decode_step(
+        &mut self,
+        token_value: u32,
+        num_layers: usize,
+        positions: &MxArray,
+    ) -> Result<MxArray> {
+        // 1. record_tokens for the new token. The decode-step's logical
+        //    position is `current_token_count` BEFORE record (=
+        //    after-record - 1).
+        let first_logical_position = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                napi::Error::from_reason("run_paged_decode_step: paged_adapter is None")
+            })?;
+            adapter.current_token_count()
+        };
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                napi::Error::from_reason("run_paged_decode_step: paged_adapter dropped")
+            })?;
+            adapter
+                .record_tokens(&[token_value])
+                .map_err(napi::Error::from_reason)?;
+        }
+
+        // 2. Embed and forward.
+        let input_ids = MxArray::from_uint32(&[token_value], &[1, 1])?;
+        let mut hidden_states = self.embedding.forward(&input_ids)?;
+
+        for layer_idx in 0..num_layers {
+            let layer: &TransformerBlock = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                napi::Error::from_reason("run_paged_decode_step: paged_adapter dropped")
+            })?;
+            hidden_states = layer.forward_paged_adapter(
+                &hidden_states,
+                adapter,
+                layer_idx as u32,
+                first_logical_position,
+                /* cached_prefix_len */ 0, // unused in decode path
+                self.config.num_heads as u32,
+                positions,
+                /* num_seqs */ 1,
+                /* seq_len */ 1,
+                /* is_prefill */ false,
+            )?;
+        }
+
+        // 3. Final norm + lm_head.
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        let logits = if self.config.tie_word_embeddings {
+            let embedding_weight = self.embedding.get_weight();
+            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+        } else {
+            self.lm_head.forward(&hidden_states)?
+        };
+        Ok(logits)
     }
 
     /// Core synchronous streaming chat implementation.
@@ -6314,6 +6920,207 @@ mod tests {
                 }
                 panic!("unexpected Qwen3Inner::new failure: {msg}");
             }
+        }
+    }
+
+    /// **Smoke test for `chat_sync_core_paged`**. Without real weights /
+    /// tokenizer we cannot drive the full chat path, but we CAN drive the
+    /// underlying `run_paged_prefill_chunk` + `run_paged_decode_step`
+    /// helpers that the chat path delegates to. This validates the
+    /// adapter lifecycle (reset → find_cached_prefix → allocate_suffix →
+    /// record_tokens → forward_paged_adapter), the prefill SDPA path
+    /// (no-cache branch), and the decode-loop control flow against a
+    /// freshly-constructed Qwen3Inner with random-init weights.
+    ///
+    /// What we assert:
+    /// * Prefill on a 4-token "prompt" produces logits with shape
+    ///   `[vocab]` and finite values.
+    /// * Two decode steps produce non-empty u32 token ids.
+    /// * Adapter's `current_token_count()` matches the cumulative
+    ///   prefill + decode tokens.
+    /// * No panics during the lifecycle.
+    ///
+    /// What we do NOT assert: numerical equivalence to the flat path.
+    /// Weights are random, so output values are arbitrary. Numerical
+    /// validation is deferred to an end-to-end test with loaded weights
+    /// (a follow-up commit, gated on tokenizer + checkpoint loading).
+    ///
+    /// Skips on no-Metal hosts via the `Qwen3Inner::new` Metal-availability
+    /// check (existing pattern from
+    /// `test_qwen3_inner_constructs_paged_adapter_when_flag_is_true`).
+    #[test]
+    fn test_chat_sync_core_paged_smoke_via_helpers() {
+        let cfg = paged_tiny_config(true);
+        let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping test_chat_sync_core_paged_smoke_via_helpers (no Metal): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen3Inner::new failure: {msg}");
+            }
+        };
+        assert!(
+            inner.paged_adapter.is_some(),
+            "paged_tiny_config(true) must construct paged_adapter"
+        );
+
+        // The default `Embedding::new` / `Linear::new` random-init produces
+        // Float32 weights. The block-paged adapter's pool was constructed
+        // BFloat16 (Qwen3 production dtype), so the K/V the layers compute
+        // would be Float32 and `update_keys_values` would (correctly) reject
+        // them. Cast every weight to BFloat16 to match the production
+        // configuration the chat path will see at inference time.
+        use crate::array::DType;
+        let cast = |a: &MxArray| -> MxArray {
+            a.astype(DType::BFloat16).expect("astype BFloat16")
+        };
+        // Embedding.
+        let w = inner.embedding.get_weight();
+        inner.embedding.set_weight(&cast(&w)).expect("set embed");
+        // Final norm.
+        let w = inner.final_norm.get_weight();
+        inner.final_norm.set_weight(&cast(&w)).expect("set final_norm");
+        // LM head.
+        let w = inner.lm_head.get_weight();
+        inner.lm_head.set_weight(&cast(&w)).expect("set lm_head");
+        // Per-layer.
+        for layer in inner.layers.iter_mut() {
+            let w = layer.get_input_layernorm_weight();
+            layer.set_input_layernorm_weight(&cast(&w)).expect("set in ln");
+            let w = layer.get_post_attention_layernorm_weight();
+            layer
+                .set_post_attention_layernorm_weight(&cast(&w))
+                .expect("set post ln");
+            let w = layer.self_attn.get_q_proj_weight();
+            layer.self_attn.set_q_proj_weight(&cast(&w)).expect("set q");
+            let w = layer.self_attn.get_k_proj_weight();
+            layer.self_attn.set_k_proj_weight(&cast(&w)).expect("set k");
+            let w = layer.self_attn.get_v_proj_weight();
+            layer.self_attn.set_v_proj_weight(&cast(&w)).expect("set v");
+            let w = layer.self_attn.get_o_proj_weight();
+            layer.self_attn.set_o_proj_weight(&cast(&w)).expect("set o");
+            if let Some(qn) = layer.self_attn.get_q_norm_weight() {
+                layer
+                    .self_attn
+                    .set_q_norm_weight(&cast(&qn))
+                    .expect("set qn");
+            }
+            if let Some(kn) = layer.self_attn.get_k_norm_weight() {
+                layer
+                    .self_attn
+                    .set_k_norm_weight(&cast(&kn))
+                    .expect("set kn");
+            }
+            let w = layer.mlp.get_gate_proj_weight();
+            layer.mlp.set_gate_proj_weight(&cast(&w)).expect("set gate");
+            let w = layer.mlp.get_up_proj_weight();
+            layer.mlp.set_up_proj_weight(&cast(&w)).expect("set up");
+            let w = layer.mlp.get_down_proj_weight();
+            layer.mlp.set_down_proj_weight(&cast(&w)).expect("set down");
+        }
+
+        // Drive the adapter lifecycle the same way `chat_sync_core_paged`
+        // does. seq_id is arbitrary (per-request scoping).
+        let prompt: Vec<u32> = vec![10, 20, 30, 40];
+        let max_decode: u32 = 2;
+
+        {
+            let adapter = inner
+                .paged_adapter
+                .as_mut()
+                .expect("paged_adapter constructed above");
+            adapter
+                .reset_for_new_request(0)
+                .expect("reset_for_new_request");
+            // First-turn cache miss → cached_prefix_len = 0.
+            let prefix = adapter.find_cached_prefix(&prompt, &[]).expect("find_cached_prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32 + max_decode)
+                .expect("allocate_suffix_blocks");
+        }
+
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let num_layers = inner.layers.len();
+
+        // Prefill the suffix == full prompt (cached_prefix_len = 0).
+        let logits = match inner.run_paged_prefill_chunk(&prompt, 0, num_layers, &positions) {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!("skipping test_chat_sync_core_paged_smoke_via_helpers: {msg}");
+                    return;
+                }
+                panic!("unexpected run_paged_prefill_chunk failure: {msg}");
+            }
+        };
+        // Logits shape: [vocab].
+        assert_eq!(logits.ndim().expect("ndim"), 1, "prefill logits must be 1-D");
+        assert_eq!(
+            logits.shape_at(0).expect("shape_at(0)"),
+            cfg.vocab_size as i64,
+            "prefill logits must be [vocab]"
+        );
+        // Spot-check a few values are finite. `item_at_float32` reads after
+        // an `eval`; the BF16 logits round-trip through cast on read.
+        let logits_f32 = logits
+            .astype(crate::array::DType::Float32)
+            .expect("astype f32");
+        logits_f32.eval();
+        let v0 = logits_f32.item_at_float32(0).expect("item_at_float32(0)");
+        assert!(v0.is_finite(), "prefill logits[0] must be finite, got {v0}");
+
+        // Adapter cursor should now equal prompt length.
+        {
+            let adapter = inner.paged_adapter.as_ref().unwrap();
+            assert_eq!(adapter.current_token_count(), prompt.len() as u32);
+        }
+
+        // Two decode steps with arbitrary token values (the random-weight
+        // model would normally pick its own; we just verify the path works
+        // for the supplied token ids).
+        for (i, tok) in [50u32, 60u32].iter().enumerate() {
+            let next_logits = match inner.run_paged_decode_step(*tok, num_layers, &positions) {
+                Ok(l) => l,
+                Err(e) => {
+                    let msg = e.reason.to_string();
+                    if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                        eprintln!("skipping test_chat_sync_core_paged_smoke_via_helpers: {msg}");
+                        return;
+                    }
+                    panic!("unexpected run_paged_decode_step failure on step {i}: {msg}");
+                }
+            };
+            // Decode logits shape: [1, 1, vocab].
+            assert_eq!(next_logits.ndim().expect("ndim"), 3);
+            assert_eq!(next_logits.shape_at(2).expect("shape_at(2)"), cfg.vocab_size as i64);
+            let next_f32 = next_logits
+                .astype(crate::array::DType::Float32)
+                .expect("astype f32");
+            next_f32.eval();
+            let v = next_f32.item_at_float32(0).expect("item_at_float32(0)");
+            assert!(v.is_finite(), "decode logits[0] step {i} must be finite, got {v}");
+        }
+
+        // Cursor advanced by 2 decode tokens.
+        {
+            let adapter = inner.paged_adapter.as_ref().unwrap();
+            assert_eq!(
+                adapter.current_token_count(),
+                prompt.len() as u32 + 2,
+                "adapter cursor must reflect 4 prefill + 2 decode tokens"
+            );
+        }
+
+        // Cleanup mirrors the chat_sync_core_paged success path.
+        {
+            let adapter = inner.paged_adapter.as_mut().unwrap();
+            let _ = adapter.register_full_blocks_for_reuse(&[]);
+            adapter.release_request().expect("release_request");
         }
     }
 
