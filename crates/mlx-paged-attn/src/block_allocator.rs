@@ -159,72 +159,90 @@ impl BlockAllocator {
     ///
     /// The block will be reused when a sequence has matching prefix tokens.
     ///
-    /// # Aliasing policy
+    /// # Aliasing policy & precedence
     ///
     /// `block_hashes` only tracks ONE reverse mapping per `block_id`, so we
     /// must keep `prefix_cache` and `block_hashes` consistent for `free()` to
-    /// clean up correctly. Two edge cases:
+    /// clean up correctly. The checks run in this order:
     ///
-    /// 1. **Same block, different hash** (e.g. same tokens cached under
-    ///    different `extra_keys`): the OLD hash is evicted from
-    ///    `prefix_cache` and `lru_order` before inserting the new alias.
-    ///    Otherwise the stale entry would survive `free()` and could hand
-    ///    out a returned-to-pool block on a future `lookup_prefix` —
-    ///    bypassing `extra_keys` isolation.
+    /// 1. **Collision drop FIRST — same hash, different block** (hash
+    ///    collision or caller logic error): the new registration is dropped
+    ///    (no-op) and we return immediately, BEFORE touching the incoming
+    ///    block's existing alias. This preserves the invariant that
+    ///    `block_hashes[id]` always reflects the entry currently in
+    ///    `prefix_cache`, and crucially also preserves any prior valid
+    ///    registration the incoming block already had — a rejected
+    ///    registration must be a true no-op for the caller's block.
     ///
-    /// 2. **Same hash, different block** (hash collision or caller logic
-    ///    error): the new registration is dropped (no-op). The existing
-    ///    block stays authoritative for that hash. This preserves the
-    ///    invariant that `block_hashes[id]` always reflects the entry
-    ///    currently in `prefix_cache`, so `free()` cannot delete the wrong
-    ///    block's cache entry. The new block is NOT inserted into
-    ///    `block_hashes` either, so freeing it later is a clean no-op on
-    ///    the cache.
+    /// 2. **Stale-alias eviction — same block, different hash** (e.g. same
+    ///    tokens cached under different `extra_keys`): the OLD hash is
+    ///    evicted from `prefix_cache` and `lru_order` before inserting the
+    ///    new alias. Otherwise the stale entry would survive `free()` and
+    ///    could hand out a returned-to-pool block on a future
+    ///    `lookup_prefix` — bypassing `extra_keys` isolation.
+    ///
+    /// 3. **Capacity eviction — only on genuine insertion**: the LRU eviction
+    ///    loop runs only when we're about to ADD a new hash entry. A
+    ///    refresh of an already-present hash doesn't grow the cache, so
+    ///    skipping the loop in that case avoids evicting unrelated entries
+    ///    under capacity pressure.
+    ///
+    /// 4. **LRU refresh + insert**: bump the hash to the back of `lru_order`
+    ///    and (re)insert into `prefix_cache` / `block_hashes`.
     pub fn register_prefix(&mut self, block: Arc<PhysicalBlock>, hash: u64) {
         // If prefix caching is disabled (max_prefix_cache_entries == 0), do nothing
         if self.max_prefix_cache_entries == 0 {
             return;
         }
 
-        // Case 1: this block_id is already registered under a different hash.
-        // Evict the stale alias before installing the new one — otherwise the
-        // old prefix_cache entry would survive free() and could leak across
-        // extra_keys boundaries. (Same block + same hash is idempotent —
-        // falls through to the LRU refresh / re-insert below.)
-        if let Some(&existing_hash) = self.block_hashes.get(&block.block_id)
-            && existing_hash != hash
-        {
-            self.prefix_cache.remove(&existing_hash);
-            self.lru_order.retain(|&h| h != existing_hash);
-            self.block_hashes.remove(&block.block_id);
-        }
-
-        // Case 2: this hash is already mapped to a DIFFERENT block. Drop the
-        // new registration to keep block_hashes / prefix_cache consistent.
+        // Step 1 (collision drop, FIRST): this hash is already mapped to a
+        // DIFFERENT block. Reject the new registration as a true no-op —
+        // don't touch the incoming block's prior alias (if any), don't
+        // shuffle LRU. The existing entry stays authoritative.
+        // (Same block + same hash falls through to the LRU refresh below;
+        // no eviction needed since the entry is already correct.)
         if let Some(existing_block) = self.prefix_cache.get(&hash)
             && existing_block.block_id != block.block_id
         {
             return;
         }
 
-        // Evict oldest entries if at capacity
-        while self.prefix_cache.len() >= self.max_prefix_cache_entries {
-            match self.lru_order.pop_front() {
-                Some(old_hash) => {
-                    // Remove evicted entry from both caches
-                    if let Some(evicted_block) = self.prefix_cache.remove(&old_hash) {
-                        self.block_hashes.remove(&evicted_block.block_id);
+        // Step 2 (stale-alias eviction): this block_id is already registered
+        // under a DIFFERENT hash. Evict the stale alias before installing the
+        // new one — otherwise the old prefix_cache entry would survive free()
+        // and could leak across extra_keys boundaries. (block_hashes will be
+        // overwritten below, no need to remove first.)
+        if let Some(&existing_hash) = self.block_hashes.get(&block.block_id)
+            && existing_hash != hash
+        {
+            self.prefix_cache.remove(&existing_hash);
+            self.lru_order.retain(|&h| h != existing_hash);
+        }
+
+        // Step 3 (capacity eviction, only on genuine insertion): if this
+        // call is a refresh of an already-present hash it won't grow the
+        // cache, so skip the eviction loop. Otherwise evict oldest entries
+        // until we have room for the new insertion.
+        let is_new_insertion = !self.prefix_cache.contains_key(&hash);
+        if is_new_insertion {
+            while self.prefix_cache.len() >= self.max_prefix_cache_entries {
+                match self.lru_order.pop_front() {
+                    Some(old_hash) => {
+                        // Remove evicted entry from both caches
+                        if let Some(evicted_block) = self.prefix_cache.remove(&old_hash) {
+                            self.block_hashes.remove(&evicted_block.block_id);
+                        }
                     }
-                }
-                None => {
-                    // Safety: If lru_order is empty but cache still has entries,
-                    // this indicates a bug (desynchronization). Break to avoid infinite loop.
-                    break;
+                    None => {
+                        // Safety: If lru_order is empty but cache still has entries,
+                        // this indicates a bug (desynchronization). Break to avoid infinite loop.
+                        break;
+                    }
                 }
             }
         }
 
-        // Update LRU order (remove if exists, add to end)
+        // Step 4: LRU refresh (remove if exists, add to end) + insert.
         self.lru_order.retain(|&h| h != hash);
         self.lru_order.push_back(hash);
 
@@ -888,5 +906,104 @@ mod tests {
         // block returns to free pool.
         allocator.free(block_b);
         assert_eq!(allocator.num_free_blocks(), initial_free);
+    }
+
+    #[test]
+    fn test_register_prefix_idempotent_at_capacity() {
+        // At capacity, re-registering the SAME (block, hash) pair must be a
+        // pure LRU refresh — it must NOT trigger capacity eviction of
+        // unrelated entries, since the cache size doesn't grow.
+        let mut allocator = BlockAllocator::new(8, 4);
+        allocator.max_prefix_cache_entries = 3;
+
+        let block_1 = allocator.allocate().unwrap();
+        let block_2 = allocator.allocate().unwrap();
+        let block_3 = allocator.allocate().unwrap();
+
+        let h1 = 0x1111_1111_1111_1111;
+        let h2 = 0x2222_2222_2222_2222;
+        let h3 = 0x3333_3333_3333_3333;
+
+        allocator.register_prefix(Arc::clone(&block_1), h1);
+        allocator.register_prefix(Arc::clone(&block_2), h2);
+        allocator.register_prefix(Arc::clone(&block_3), h3);
+
+        // Cache at full capacity (3/3).
+        assert_eq!(allocator.prefix_cache.len(), 3);
+        let free_before = allocator.num_free_blocks();
+
+        // Re-register the MIDDLE entry (block_2 under h2). This is an
+        // idempotent refresh — must not evict h1 or h3.
+        allocator.register_prefix(Arc::clone(&block_2), h2);
+
+        // All three entries still resolvable.
+        assert!(
+            allocator.lookup_prefix(h1).is_some(),
+            "h1 must not be evicted by an idempotent re-register"
+        );
+        assert!(
+            allocator.lookup_prefix(h3).is_some(),
+            "h3 must not be evicted by an idempotent re-register"
+        );
+        assert!(allocator.lookup_prefix(h2).is_some());
+
+        // num_free_blocks unchanged (no extra allocations / frees).
+        assert_eq!(allocator.num_free_blocks(), free_before);
+
+        // After the refresh, h2 should be the most-recently-used entry.
+        // (lookup_prefix calls above also bumped h1, h3, h2 in order, so
+        // we re-check by triggering one more eviction: register a 4th hash
+        // and confirm h1 — currently the LRU after the lookups — gets
+        // evicted, not h2 or h3.)
+        let block_4 = allocator.allocate().unwrap();
+        let h4 = 0x4444_4444_4444_4444;
+        allocator.register_prefix(Arc::clone(&block_4), h4);
+
+        // h1 was the oldest (first in lru_order after the lookups).
+        assert!(
+            allocator.lookup_prefix(h1).is_none(),
+            "h1 should be the LRU after subsequent lookups bumped h3 and h2"
+        );
+        assert!(allocator.lookup_prefix(h2).is_some());
+        assert!(allocator.lookup_prefix(h3).is_some());
+        assert!(allocator.lookup_prefix(h4).is_some());
+    }
+
+    #[test]
+    fn test_register_prefix_collision_preserves_incoming_block_old_hash() {
+        // block_a registered under hash_a, block_b registered under hash_b.
+        // Then register_prefix(block_b, hash_a) — a collision attempt.
+        // The collision drop must be a true no-op for block_b: hash_a stays
+        // pointing at block_a, AND block_b's prior valid alias under hash_b
+        // must NOT be torn down.
+        let mut allocator = BlockAllocator::new(4, 4);
+
+        let block_a = allocator.allocate().unwrap();
+        let block_b = allocator.allocate().unwrap();
+        assert_ne!(block_a.block_id, block_b.block_id);
+
+        let hash_a = 0xAAAA_AAAA_AAAA_AAAA;
+        let hash_b = 0xBBBB_BBBB_BBBB_BBBB;
+
+        allocator.register_prefix(Arc::clone(&block_a), hash_a);
+        allocator.register_prefix(Arc::clone(&block_b), hash_b);
+
+        // Collision attempt: try to register block_b under hash_a.
+        allocator.register_prefix(Arc::clone(&block_b), hash_a);
+
+        // hash_a still maps to block_a (unchanged).
+        let cached_a = allocator.lookup_prefix(hash_a).unwrap();
+        assert_eq!(
+            cached_a.block_id, block_a.block_id,
+            "hash_a must still resolve to block_a after collision drop"
+        );
+
+        // hash_b STILL maps to block_b — its prior valid entry was preserved
+        // despite the collision attempt.
+        let cached_b = allocator.lookup_prefix(hash_b).unwrap();
+        assert_eq!(
+            cached_b.block_id, block_b.block_id,
+            "hash_b alias of block_b must survive a collision drop on hash_a"
+        );
     }
 }
