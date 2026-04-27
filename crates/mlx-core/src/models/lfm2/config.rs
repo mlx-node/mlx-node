@@ -54,6 +54,41 @@ pub struct Lfm2Config {
     pub bos_token_id: i32,
     #[serde(default)]
     pub pad_token_id: i32,
+
+    // Paged attention options (opt-in, mirror Qwen3/Gemma4 knobs).
+    /// GPU memory budget for paged KV cache in megabytes.
+    /// Only used when `use_block_paged_cache` is true.
+    /// Default: 2048 (2GB).
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_cache_memory_mb: Option<u32>,
+
+    /// Block size for paged attention (tokens per block).
+    /// Only used when `use_block_paged_cache` is true.
+    /// Default: 16.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_block_size: Option<u32>,
+
+    /// Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
+    ///
+    /// **OPT-IN — experimental and currently a no-op for chat dispatch.**
+    /// When `Some(true)`, `Lfm2Inner` allocates a `BlockAllocator` +
+    /// `LayerKVPool` pair sized for the model's full_attention layers
+    /// only and constructs a `PagedKVCacheAdapter` field. The chat-session
+    /// forward dispatch is NOT yet wired through this adapter — LFM2's
+    /// hybrid conv + attention architecture means only attention layers
+    /// can use the block-paged path; conv layers continue to use the
+    /// existing `Lfm2LayerCache::Conv(ArraysCache)` storage. A bespoke
+    /// per-layer dispatch on `Lfm2DecoderLayer` (mirroring the Qwen3
+    /// `forward_paged_adapter` pattern) plus a hybrid cache wrapper that
+    /// indexes the adapter by attention-layer ordinal (not absolute
+    /// layer index) is required before forward wiring can land.
+    ///
+    /// Default: false (use the existing `Lfm2LayerCache` path).
+    #[serde(default)]
+    #[napi(ts_type = "boolean | undefined")]
+    pub use_block_paged_cache: Option<bool>,
 }
 
 impl Lfm2Config {
@@ -143,6 +178,9 @@ mod tests {
             eos_token_id: 7,
             bos_token_id: 1,
             pad_token_id: 0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
         }
     }
 
@@ -207,5 +245,59 @@ mod tests {
         assert_eq!(cfg.conv_l_cache, 3);
         assert_eq!(cfg.vocab_size, 65536);
         assert_eq!(cfg.layer_types.len(), 16);
+    }
+
+    /// `use_block_paged_cache` defaults to `None` when absent from the JSON
+    /// config — guards against silently switching the storage backend on
+    /// existing LFM2 checkpoints.
+    #[test]
+    fn test_use_block_paged_cache_defaults_to_none_via_serde() {
+        let json = r#"{
+            "vocab_size": 100,
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "norm_eps": 1e-5,
+            "conv_bias": false,
+            "conv_L_cache": 3,
+            "block_dim": 64,
+            "block_ff_dim": 64,
+            "layer_types": ["conv", "full_attention"]
+        }"#;
+        let cfg: Lfm2Config = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.use_block_paged_cache, None,
+            "use_block_paged_cache must default to None on JSON without the key"
+        );
+        assert_eq!(cfg.paged_block_size, None);
+        assert_eq!(cfg.paged_cache_memory_mb, None);
+    }
+
+    /// `use_block_paged_cache: true` round-trips through serde.
+    #[test]
+    fn test_use_block_paged_cache_round_trips_true() {
+        let json = r#"{
+            "vocab_size": 100,
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "norm_eps": 1e-5,
+            "conv_bias": false,
+            "conv_L_cache": 3,
+            "block_dim": 64,
+            "block_ff_dim": 64,
+            "layer_types": ["conv", "full_attention"],
+            "use_block_paged_cache": true,
+            "paged_block_size": 16,
+            "paged_cache_memory_mb": 256
+        }"#;
+        let cfg: Lfm2Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.use_block_paged_cache, Some(true));
+        assert_eq!(cfg.paged_block_size, Some(16));
+        assert_eq!(cfg.paged_cache_memory_mb, Some(256));
     }
 }
