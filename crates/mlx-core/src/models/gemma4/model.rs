@@ -495,22 +495,32 @@ impl Gemma4Inner {
         //
         // Cache dtype: BFloat16 (Gemma4's production dtype).
         // Per-layer head_dim: Gemma4 has variable head dims per layer
-        // type (sliding vs global). The adapter currently expects a
-        // uniform `head_size`, so we use the global head_dim as the
-        // pool's per-layer slot size — this is the LARGER of the two
-        // dimensions (e.g. 512 for E2B vs 256 for sliding) and matches
-        // what a future paged-aware forward would need to allocate. A
-        // proper sliding/global hybrid pool is part of the same
-        // follow-up that wires the forward path.
+        // type (sliding vs global). The pool covers ONLY global (full)
+        // attention layers — sliding layers continue to use the existing
+        // `Gemma4LayerCache::Sliding(RotatingKVCache)` path because their
+        // window-trimmed semantics don't map onto the paged pool. The
+        // pool's per-layer slot size therefore uses the global head_dim
+        // and global KV-head count.
         let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
+            // Count GLOBAL layers — the paged pool only covers
+            // full_attention layers in their original layer order. A
+            // future paged-aware forward path indexes this pool by
+            // global-layer ordinal (NOT absolute decoder index).
+            let num_global_layers: u32 = (0..config.num_hidden_layers as usize)
+                .filter(|&i| config.is_global_layer(i))
+                .count() as u32;
+            if num_global_layers == 0 {
+                return Err(napi::Error::from_reason(
+                    "Gemma4 block-paged adapter: config has no full_attention layers; \
+                     paged KV cache requires at least one global attention layer",
+                ));
+            }
+
             let block_size = config.paged_block_size.unwrap_or(16);
             let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
-            // Use global head_dim — it's the larger of the two for the
-            // hybrid 31B / E2B configurations and the safe upper bound
-            // for a uniform pool. Layers with sliding dims can reuse
-            // their slot's prefix when the forward path lands.
+            // Use global head_dim — sliding layers don't use the pool.
             let head_size = config.effective_head_dim(true) as u32;
-            // Use global KV heads — same rationale.
+            // Use global KV heads — sliding layers don't use the pool.
             let num_kv_heads = config.effective_kv_heads(true) as u32;
 
             let pa_config = mlx_paged_attn::PagedAttentionConfig {
@@ -518,7 +528,9 @@ impl Gemma4Inner {
                 gpu_memory_mb,
                 head_size,
                 num_kv_heads,
-                num_layers: config.num_hidden_layers as u32,
+                // Pool covers ONLY global attention layers — sliding
+                // layers continue to use Gemma4LayerCache::Sliding.
+                num_layers: num_global_layers,
                 use_fp8_cache: Some(false),
                 max_seq_len: Some(config.max_position_embeddings as u32),
                 max_batch_size: Some(32),
@@ -529,8 +541,7 @@ impl Gemma4Inner {
                 return Err(napi::Error::from_reason(format!(
                     "Gemma4 block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
                      (head_size={head_size}, num_kv_heads={num_kv_heads}, \
-                     block_size={block_size}, num_layers={})",
-                    config.num_hidden_layers,
+                     block_size={block_size}, num_global_layers={num_global_layers})",
                 )));
             }
 
@@ -555,7 +566,8 @@ impl Gemma4Inner {
 
             tracing::info!(
                 "Gemma4 block-paged adapter enabled (construction-only): num_blocks={num_blocks}, \
-                 block_size={block_size}, gpu_memory_mb={gpu_memory_mb}, cache_dtype=BFloat16"
+                 block_size={block_size}, gpu_memory_mb={gpu_memory_mb}, num_global_layers={num_global_layers}, \
+                 cache_dtype=BFloat16"
             );
             Some(adapter)
         } else {
