@@ -30,8 +30,8 @@
 //!
 //! ## Lifecycle contract
 //!
-//! Each adapter instance is scoped to ONE in-flight request at a time. The
-//! caller flow is:
+//! Each adapter instance scopes per-session state across multiple turns.
+//! Within a session the caller flow is:
 //!
 //! 1. `reset_for_new_request(seq_id)` — releases any prior request.
 //! 2. `find_cached_prefix(prompt_tokens, extra_keys)` — populates block_table
@@ -40,11 +40,31 @@
 //!    cover the remainder of the prompt + decode budget.
 //! 4. `record_tokens(...)` — every token consumed (prefill batch + each
 //!    decoded token), in order.
-//! 5. On success, optionally `register_full_blocks_for_reuse(extra_keys)` to
-//!    publish full blocks for cross-request prefix reuse.
-//! 6. `release_request()` — decrefs every block in the table. Blocks still
-//!    referenced by the prefix cache (registered above) survive at refcount
-//!    > 0; otherwise return to the free pool.
+//! 5. End-of-turn options:
+//!    - **Within-session continuation (recommended for chat sessions)**:
+//!      at the end of each successful turn except the last, call
+//!      `finalize_turn_keep_live(extra_keys)` to publish full blocks for
+//!      cross-request prefix reuse WITHOUT releasing the request. This
+//!      keeps the partial trailing block's K/V live across turns. The
+//!      next turn calls `continue_turn(prompt, budget)` (in lieu of step
+//!      1+2) to resume directly on top of the live state, then continues
+//!      at step 4.
+//!    - **Single-turn or session end**: optionally call
+//!      `register_full_blocks_for_reuse(extra_keys)` to publish full
+//!      blocks for cross-request prefix reuse.
+//! 6. `release_request()` — decrefs every block in the table. Blocks
+//!    still referenced by the prefix cache (registered above) survive at
+//!    refcount greater than zero; otherwise return to the free pool.
+//!    Always call exactly once when the session ends or on any error or
+//!    image-change.
+//!
+//! The "continuation" pair (`finalize_turn_keep_live` → `continue_turn`)
+//! exists because the prefix cache only registers FULL blocks. Without
+//! it, every cross-turn dispatch would silently drop the trailing partial
+//! block's K/V; the next turn's `find_cached_prefix` would then re-prefill
+//! that span via parallel SDPA, and BF16 reduction-order differences from
+//! sequential decode flip the argmax → token streams diverge from the
+//! flat path. See `finalize_turn_keep_live` for full discussion.
 
 use std::sync::{Arc, Mutex};
 
@@ -1348,6 +1368,205 @@ impl PagedKVCacheAdapter {
         Ok(count)
     }
 
+    /// Finish the current turn but keep the request's live state in the
+    /// adapter so the next turn can build directly on top of it (without
+    /// going through the prefix-cache lookup, which only registers FULL
+    /// blocks and so would silently drop the trailing partial block's K/V).
+    ///
+    /// Behaves like [`Self::register_full_blocks_for_reuse`] — i.e. it
+    /// publishes any full blocks the request has accumulated to the
+    /// cross-request prefix cache so a *different* session that shares the
+    /// same prefix can still hit them — but does NOT call
+    /// [`Self::release_request`]. The block_table, the recorded
+    /// `request_tokens`, and (crucially) the partial trailing block's K/V
+    /// stay live in the pool. The flag `already_registered` is set so a
+    /// later [`Self::continue_turn`] call clears it before the next
+    /// turn's registration runs.
+    ///
+    /// ## Session-level lifecycle
+    ///
+    /// The two-method (`finalize_turn_keep_live`, [`Self::continue_turn`])
+    /// pair extends the original per-request lifecycle into a per-session
+    /// lifecycle:
+    ///
+    /// 1. Session start: [`Self::reset_for_new_request`] → typical turn 1
+    ///    (find_cached_prefix → allocate_suffix_blocks → record_tokens →
+    ///    forward).
+    /// 2. End of every successful turn except the last:
+    ///    `finalize_turn_keep_live(extra_keys)`. The block_table / token
+    ///    list / partial-block K/V stay live.
+    /// 3. Continuation turn: [`Self::continue_turn`] (instead of
+    ///    `reset_for_new_request` + `find_cached_prefix`). Allocates any
+    ///    new suffix blocks; ready for `record_tokens` + forward.
+    /// 4. Session end (or any error / image-change / explicit reset):
+    ///    `release_request` to drop all per-session state.
+    ///
+    /// ## Why this fixes the cross-turn divergence bug
+    ///
+    /// Turn 1's last full block + a trailing partial block hold the live
+    /// sequential-decode K/V. The flat path keeps both in `cached_kv_keys`
+    /// and continues from token N+1 with sequential decode on turn 2. The
+    /// paged path's `register_full_blocks_for_reuse` only publishes the
+    /// FULL blocks; the partial block is dropped on `release_request`. On
+    /// turn 2 the paged path's `find_cached_prefix` recovers the
+    /// registered full blocks but has to re-prefill the partial-block
+    /// span via parallel SDPA. BF16 reduction order in parallel prefill
+    /// differs from sequential decode → argmax flips → token streams
+    /// diverge. Keeping the partial block live across turns eliminates the
+    /// re-prefill: turn 2 picks up exactly where turn 1 left off.
+    pub fn finalize_turn_keep_live(&mut self, extra_keys: &[u64]) -> Result<u32, String> {
+        // Idempotent like `register_full_blocks_for_reuse`: subsequent
+        // calls within the same turn return Ok(0) without side effects.
+        // This intentionally mirrors the registration-half's idempotency
+        // contract so callers can safely retry the finalize on a partial
+        // failure (the caller flow becomes: forward → finalize_turn_keep_live;
+        // a duplicate finalize after an error path doesn't double-register).
+        if self.already_registered {
+            return Ok(0);
+        }
+        // Reuse `register_full_blocks_for_reuse`'s implementation for the
+        // registration half; the only difference is that we do NOT call
+        // `release_request` after it.
+        self.register_full_blocks_for_reuse(extra_keys)
+    }
+
+    /// Continue the current session with a new turn whose full prompt
+    /// strictly extends the recorded `request_tokens`. Allocates blocks
+    /// for any growth beyond what the live block_table currently covers
+    /// and clears the `already_registered` / `prefix_lookup_done` flags
+    /// so the next turn's `record_tokens` / `register_full_blocks_for_reuse`
+    /// run cleanly.
+    ///
+    /// ## Pre-conditions
+    ///
+    /// - The adapter must be in "live but registered" state — i.e. the
+    ///   prior turn ended via [`Self::finalize_turn_keep_live`] (NOT
+    ///   `release_request`). Otherwise the partial-block K/V the caller
+    ///   wants to reuse simply isn't there. Returns Err on violation.
+    /// - `prompt_tokens` MUST start with `self.request_tokens`. If it
+    ///   doesn't, the live cache state is incompatible with the new turn
+    ///   and the caller should `release_request` + `reset_for_new_request`
+    ///   instead. Returns Err on violation rather than silently grafting
+    ///   a divergent prefix into the live block table (which would
+    ///   produce wrong logits).
+    /// - `total_budget` is the same budget passed to
+    ///   `allocate_suffix_blocks` on a fresh request: total prompt tokens
+    ///   PLUS the max decode token budget.
+    ///
+    /// ## Returns
+    ///
+    /// `(prior_token_count, newly_allocated_blocks)`:
+    /// - `prior_token_count`: the number of tokens already in
+    ///   `request_tokens` BEFORE this call. Equivalent to the
+    ///   `cached_prefix_len` the model's prefill loop expects (the position
+    ///   at which fresh `record_tokens` begins).
+    /// - `newly_allocated_blocks`: number of fresh blocks added by this
+    ///   call (analogue to `allocate_suffix_blocks`'s return).
+    ///
+    /// ## Token-recording contract
+    ///
+    /// On return, `request_tokens` is unchanged — the caller still feeds
+    /// new tokens (suffix beyond the prior turn) through `record_tokens`
+    /// and the forward path, exactly like the post-`find_cached_prefix`
+    /// flow. We do NOT seed the new prompt's tokens here because the
+    /// adapter already holds the prior turn's recorded tokens; the
+    /// prompt extension is purely additive.
+    pub fn continue_turn(
+        &mut self,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+    ) -> Result<(u32, u32), String> {
+        // Adapter must be live AND registered — otherwise the partial
+        // block K/V that this method exists to preserve isn't there.
+        if self.block_table.is_none() {
+            return Err("continue_turn called on a released adapter; call \
+                 reset_for_new_request first"
+                .to_string());
+        }
+        if !self.already_registered {
+            return Err("continue_turn called before finalize_turn_keep_live; \
+                 the prior turn must publish its full blocks first"
+                .to_string());
+        }
+        // The new prompt MUST extend the recorded tokens. Anything else
+        // is a session-state mismatch: the caller should release_request
+        // and start over.
+        if prompt_tokens.len() < self.request_tokens.len()
+            || !prompt_tokens.starts_with(&self.request_tokens)
+        {
+            return Err(format!(
+                "continue_turn: new prompt does not extend the live \
+                 request_tokens (live_len={}, prompt_len={}). Call \
+                 release_request + reset_for_new_request to start a fresh \
+                 session.",
+                self.request_tokens.len(),
+                prompt_tokens.len(),
+            ));
+        }
+        let prior_token_count = self.request_tokens.len() as u32;
+
+        // Allocate any new blocks needed to cover the budget. The adapter's
+        // existing block_table already covers `request_tokens.len()` tokens
+        // (with possibly a partial trailing block). `allocate_suffix_blocks`
+        // computes need = budget - cached_token_count, but `cached_token_count`
+        // here reflects the prior find_cached_prefix decision (cross-request
+        // hits) and would under-count what's already live. To make
+        // allocate_suffix_blocks compute the right delta, momentarily
+        // sync `cached_token_count` to the live block-table coverage —
+        // i.e. all currently-allocated capacity counts as "already there".
+        // Doing this via the existing helper keeps the partial-rollback
+        // semantics on pool exhaustion intact.
+        let block_size_us = self.block_size as u64;
+        if block_size_us == 0 {
+            return Err("block_size must be > 0".to_string());
+        }
+        let live_blocks = self
+            .block_table
+            .as_ref()
+            .map(|t| t.num_blocks())
+            .unwrap_or(0) as u32;
+        let live_capacity = live_blocks
+            .checked_mul(self.block_size)
+            .ok_or_else(|| "live capacity overflow".to_string())?;
+
+        // Save prior `cached_token_count` so we can restore it after.
+        // (allocate_suffix_blocks uses it to compute the suffix delta.)
+        let prior_cached = self.cached_token_count;
+        // Treat the entire live block table as "cached" for the purposes
+        // of `allocate_suffix_blocks` so it only allocates the gap
+        // beyond the existing capacity.
+        self.cached_token_count = live_capacity;
+        let alloc_result = self.allocate_suffix_blocks(total_budget);
+        // Restore the prior cached_token_count regardless of outcome.
+        self.cached_token_count = prior_cached;
+        let newly_allocated = alloc_result?;
+
+        // Clear the "already registered" + "prefix lookup done" flags
+        // so the upcoming turn's record_tokens / find_cached_prefix
+        // (NOT called on this path; we own the prefix discovery
+        // ourselves) / register_full_blocks_for_reuse run as expected.
+        // `already_registered` MUST be cleared so the next finalize /
+        // register call actually runs (it's idempotent against itself);
+        // `prefix_lookup_done` is cleared as belt-and-suspenders so a
+        // future caller that mixes patterns isn't tripped by stale state.
+        self.already_registered = false;
+        self.prefix_lookup_done = true; // already implicitly "done" — no fresh lookup is allowed
+
+        Ok((prior_token_count, newly_allocated))
+    }
+
+    /// Returns true when the adapter holds a finalized but still-live
+    /// turn — i.e. the prior turn ended via
+    /// [`Self::finalize_turn_keep_live`] and is ready for
+    /// [`Self::continue_turn`] (rather than
+    /// [`Self::reset_for_new_request`] + [`Self::find_cached_prefix`]).
+    ///
+    /// Models use this to decide between the cold-start prefix-lookup
+    /// flow and the warm-continue flow at the top of each turn.
+    pub fn is_live_for_continue(&self) -> bool {
+        self.block_table.is_some() && self.already_registered
+    }
+
     // ------------------------ Getters ------------------------
 
     pub fn block_size(&self) -> u32 {
@@ -1360,6 +1579,17 @@ impl PagedKVCacheAdapter {
 
     pub fn current_token_count(&self) -> u32 {
         self.request_tokens.len() as u32
+    }
+
+    /// Read-only view of the recorded request tokens. Used by callers
+    /// that need to verify a new prompt strictly extends the live
+    /// session state before invoking [`Self::continue_turn`] — the
+    /// internal validation in `continue_turn` is authoritative, but
+    /// exposing the slice lets the dispatcher decide between
+    /// `continue_turn` and `reset_for_new_request` without paying the
+    /// cost of a failed `continue_turn` round-trip.
+    pub fn request_tokens(&self) -> &[u32] {
+        &self.request_tokens
     }
 
     pub fn num_allocated_blocks(&self) -> usize {
@@ -3449,6 +3679,321 @@ mod tests {
                 "K[{i}] = {elem}, expected 0.0 (initial K was zeros)"
             );
         }
+    }
+
+    /// `finalize_turn_keep_live` registers full blocks but does NOT
+    /// release — the block_table, recorded tokens, and partial trailing
+    /// block stay live so the next turn can build directly on top.
+    /// Mirrors `register_full_blocks_for_reuse` semantics for the
+    /// publication half but skips the release.
+    #[test]
+    fn test_finalize_turn_keep_live_preserves_block_table() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_finalize_turn_keep_live_preserves_block_table: Metal unavailable"
+            );
+            return;
+        };
+
+        // Turn 1: 5 tokens (1 full block + 1 partial-block token).
+        let tokens_t1: [u32; 5] = [10, 20, 30, 40, 50];
+        adapter.reset_for_new_request(0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        adapter
+            .allocate_suffix_blocks(tokens_t1.len() as u32)
+            .unwrap();
+        adapter.record_tokens(&tokens_t1).unwrap();
+
+        // Snapshot the block table BEFORE finalize.
+        let blocks_before: Vec<u32> = adapter
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(
+            blocks_before.len(),
+            2,
+            "5 tokens at block_size=4 must occupy 2 blocks (1 full + 1 partial)"
+        );
+
+        // Finalize but keep live.
+        let registered = adapter.finalize_turn_keep_live(&[]).unwrap();
+        assert_eq!(
+            registered, 1,
+            "exactly 1 full block (4 tokens) is eligible for cross-request registration; \
+             the trailing partial block stays unregistered"
+        );
+
+        // The block_table must STILL be populated AND identical to the
+        // snapshot — no release happened.
+        assert!(
+            adapter.block_table().is_some(),
+            "block_table must remain populated after finalize_turn_keep_live"
+        );
+        let blocks_after: Vec<u32> = adapter
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(
+            blocks_before, blocks_after,
+            "block_table contents must be byte-identical before and after \
+             finalize_turn_keep_live"
+        );
+
+        // Recorded tokens stay intact.
+        assert_eq!(adapter.request_tokens(), &tokens_t1);
+        // is_live_for_continue must report true (block_table is Some AND
+        // already_registered is true).
+        assert!(adapter.is_live_for_continue());
+
+        // Cleanup.
+        adapter.release_request().unwrap();
+    }
+
+    /// Idempotency: calling `finalize_turn_keep_live` twice in a row is
+    /// a no-op the second time. Same contract as the underlying
+    /// `register_full_blocks_for_reuse`.
+    #[test]
+    fn test_finalize_turn_keep_live_idempotent() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_finalize_turn_keep_live_idempotent: Metal unavailable");
+            return;
+        };
+
+        let tokens: [u32; 4] = [1, 2, 3, 4];
+        adapter.reset_for_new_request(0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+
+        let first = adapter.finalize_turn_keep_live(&[]).unwrap();
+        assert_eq!(first, 1);
+        let second = adapter.finalize_turn_keep_live(&[]).unwrap();
+        assert_eq!(second, 0, "second call must be a no-op");
+
+        adapter.release_request().unwrap();
+    }
+
+    /// `continue_turn` validates the new prompt strictly extends the
+    /// recorded tokens, allocates only the gap blocks beyond live
+    /// capacity, and resets the registration flag.
+    #[test]
+    fn test_continue_turn_extends_live_state() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_continue_turn_extends_live_state: Metal unavailable");
+            return;
+        };
+
+        // Turn 1: 5 tokens, 2 blocks (1 full + 1 partial holding 1 token).
+        let tokens_t1: [u32; 5] = [10, 20, 30, 40, 50];
+        adapter.reset_for_new_request(0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        adapter
+            .allocate_suffix_blocks(tokens_t1.len() as u32)
+            .unwrap();
+        adapter.record_tokens(&tokens_t1).unwrap();
+        adapter.finalize_turn_keep_live(&[]).unwrap();
+
+        let block_ids_t1: Vec<u32> = adapter
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(block_ids_t1.len(), 2);
+
+        // Turn 2: prompt extends turn 1 by 5 tokens (10 total).
+        // Block budget: 10 prompt + 0 decode = 10 / 4 = ceil(2.5) = 3 blocks.
+        // Live capacity is already 2 blocks (8 tokens), so continue_turn
+        // must allocate exactly 1 more block.
+        let tokens_t2: [u32; 10] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let (prior_count, newly_allocated) = adapter
+            .continue_turn(&tokens_t2, tokens_t2.len() as u32)
+            .unwrap();
+
+        assert_eq!(
+            prior_count, 5,
+            "prior_count must equal turn 1's recorded length"
+        );
+        assert_eq!(
+            newly_allocated, 1,
+            "live capacity = 2 blocks (8 tokens); 10-token budget needs 3; allocate 1 more"
+        );
+
+        // The first 2 block IDs must be unchanged (same blocks); a 3rd
+        // block ID must have been appended.
+        let block_ids_t2: Vec<u32> = adapter
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(block_ids_t2.len(), 3);
+        assert_eq!(
+            &block_ids_t2[..2],
+            &block_ids_t1[..],
+            "the first 2 blocks must be the same physical blocks (partial K/V preserved)"
+        );
+
+        // Now the model would `record_tokens` for the suffix (5 new
+        // tokens) and forward — but we don't simulate that here. We can
+        // assert that the `already_registered` flag was cleared so a
+        // future `finalize_turn_keep_live` will run.
+        assert!(
+            !adapter.is_live_for_continue(),
+            "continue_turn must clear already_registered so the next \
+             finalize_turn_keep_live runs"
+        );
+
+        adapter.release_request().unwrap();
+    }
+
+    /// `continue_turn` rejects a prompt that does NOT strictly extend
+    /// the recorded tokens. The caller must `release_request` and start
+    /// over (the flat path's "verify_cache_prefix == 0" miss case).
+    #[test]
+    fn test_continue_turn_rejects_diverged_prompt() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_continue_turn_rejects_diverged_prompt: Metal unavailable");
+            return;
+        };
+
+        let tokens_t1: [u32; 4] = [10, 20, 30, 40];
+        adapter.reset_for_new_request(0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        adapter
+            .allocate_suffix_blocks(tokens_t1.len() as u32)
+            .unwrap();
+        adapter.record_tokens(&tokens_t1).unwrap();
+        adapter.finalize_turn_keep_live(&[]).unwrap();
+
+        // Diverged prompt — token at index 2 differs.
+        let diverged: [u32; 5] = [10, 20, 99, 40, 50];
+        let err = adapter.continue_turn(&diverged, diverged.len() as u32);
+        assert!(
+            err.is_err(),
+            "continue_turn must reject a prompt that does not extend request_tokens"
+        );
+
+        // Shorter prompt that's a prefix is also rejected (no extension).
+        let shorter: [u32; 3] = [10, 20, 30];
+        let err = adapter.continue_turn(&shorter, shorter.len() as u32);
+        assert!(err.is_err(), "shorter-than-live prompt must be rejected");
+
+        adapter.release_request().unwrap();
+    }
+
+    /// `continue_turn` rejects calls before `finalize_turn_keep_live` —
+    /// the partial block K/V we want to preserve isn't "live for continue"
+    /// until the prior turn has been finalized.
+    #[test]
+    fn test_continue_turn_requires_prior_finalize() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_continue_turn_requires_prior_finalize: Metal unavailable");
+            return;
+        };
+
+        let tokens_t1: [u32; 4] = [1, 2, 3, 4];
+        adapter.reset_for_new_request(0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        adapter
+            .allocate_suffix_blocks(tokens_t1.len() as u32)
+            .unwrap();
+        adapter.record_tokens(&tokens_t1).unwrap();
+        // NOTE: no finalize_turn_keep_live.
+
+        let extended: [u32; 5] = [1, 2, 3, 4, 5];
+        let err = adapter.continue_turn(&extended, extended.len() as u32);
+        assert!(
+            err.is_err(),
+            "continue_turn before finalize_turn_keep_live must error"
+        );
+
+        adapter.release_request().unwrap();
+    }
+
+    /// Multi-turn scenario: live blocks across turns must remain stable
+    /// (same physical block IDs for the full and partial blocks of the
+    /// prior turn). This is the regression test that captures the bug
+    /// the new finalize/continue pair fixes.
+    #[test]
+    fn test_finalize_continue_keeps_partial_block_alive_across_turns() {
+        let allocator = new_allocator(16, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_finalize_continue_keeps_partial_block_alive_across_turns: \
+                 Metal unavailable"
+            );
+            return;
+        };
+
+        // Turn 1: 7 tokens → 1 full block (4) + 1 partial block (3 tokens).
+        let t1: [u32; 7] = [1, 2, 3, 4, 5, 6, 7];
+        adapter.reset_for_new_request(0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        adapter.allocate_suffix_blocks(t1.len() as u32).unwrap();
+        adapter.record_tokens(&t1).unwrap();
+        adapter.finalize_turn_keep_live(&[]).unwrap();
+
+        let t1_block_ids: Vec<u32> = adapter
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(t1_block_ids.len(), 2);
+        let partial_block_id_t1 = t1_block_ids[1];
+
+        // Turn 2: extend prompt by 5 more → 12 tokens, 3 blocks.
+        let t2: [u32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let (prior, newly) = adapter.continue_turn(&t2, t2.len() as u32).unwrap();
+        assert_eq!(prior, 7);
+        assert!(
+            newly >= 1,
+            "must allocate at least 1 more block for the extension"
+        );
+
+        let t2_block_ids: Vec<u32> = adapter
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert!(t2_block_ids.len() >= 3);
+
+        // CRITICAL: the partial block from turn 1 must still be in the
+        // table at the same index with the same physical block_id.
+        // Without `finalize_turn_keep_live`, the prior implementation
+        // would `release_request` here, dropping that block (its K/V
+        // would be re-prefilled via parallel SDPA on turn 2 → BF16
+        // reduction-order mismatch with sequential decode → token
+        // divergence vs. the flat path).
+        assert_eq!(
+            t2_block_ids[1], partial_block_id_t1,
+            "turn 1's partial block must be preserved across turns; got block_id {} \
+             expected {}",
+            t2_block_ids[1], partial_block_id_t1,
+        );
+        assert_eq!(
+            t2_block_ids[0], t1_block_ids[0],
+            "turn 1's full block must also be preserved across turns"
+        );
+
+        adapter.release_request().unwrap();
     }
 }
 
