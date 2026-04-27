@@ -134,6 +134,10 @@ impl StreamSender {
     fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
         let _ = self.0.send(result);
     }
+
+    fn send(&self, result: napi::Result<ChatStreamChunk>) {
+        let _ = self.0.send(result);
+    }
 }
 
 /// Internal model state owned exclusively by the dedicated model thread.
@@ -148,7 +152,9 @@ pub(crate) struct Qwen3Inner {
     pub(crate) lm_head: Linear,
     pub(crate) kv_caches: Option<Vec<KVCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) paged_cache: Option<PagedKVCache>,
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) scheduler: Option<ContinuousBatchingScheduler>,
     pub(crate) cached_kv_keys: Vec<Option<MxArray>>,
     pub(crate) cached_kv_values: Vec<Option<MxArray>>,
@@ -160,6 +166,7 @@ pub(crate) struct Qwen3Inner {
     pub(crate) cached_image_key: Option<u64>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
 }
 
@@ -759,6 +766,7 @@ impl Qwen3Inner {
             cached_cache_idx: 0,
             cached_token_history: Vec::new(),
             cached_image_key: None,
+            #[cfg(not(target_family = "wasm"))]
             training_state: None,
         })
     }
@@ -821,6 +829,7 @@ impl Qwen3Inner {
         )
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn paged_cache_stats_sync(&self) -> Option<PagedCacheStats> {
         let cache = self.paged_cache.as_ref()?;
         let stats = cache.get_memory_stats();

@@ -3,8 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
-#[cfg(not(target_family = "wasm"))]
-use napi::threadsafe_function::ThreadsafeFunction;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use tracing::{info, warn};
 
@@ -14,7 +13,7 @@ use crate::chat_stream::ChatStreamSink;
 use crate::chat_stream::TsfnSink;
 #[cfg(target_family = "wasm")]
 use crate::chat_stream::{MIN_SAB_LEN, SabSink};
-use crate::model_thread::ResponseTx;
+use crate::model_thread::{ResponseTx, StreamTx};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
@@ -156,7 +155,7 @@ pub(crate) enum Qwen35Cmd {
     ChatStreamSessionStart {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        sink: Arc<dyn ChatStreamSink>,
+        stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     },
     /// Streaming session-continue: same semantics as
@@ -178,6 +177,12 @@ pub(crate) enum Qwen35Cmd {
         content: String,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    ChatStream {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        sink: Arc<dyn ChatStreamSink>,
         cancelled: Arc<AtomicBool>,
     },
     Generate {
@@ -310,7 +315,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         Qwen35Cmd::ChatStreamSessionStart {
             messages,
             config,
-            sink,
+            stream_tx,
             cancelled,
         } => {
             inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
@@ -344,6 +349,14 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
                 stream_tx,
                 cancelled,
             );
+        }
+        Qwen35Cmd::ChatStream {
+            messages,
+            config,
+            sink,
+            cancelled,
+        } => {
+            inner.chat_stream_sync(messages, config, sink, cancelled);
         }
         Qwen35Cmd::Generate {
             prompt_tokens,
@@ -1428,6 +1441,7 @@ impl Qwen35Inner {
         // Text-only prefill of the delta on top of the existing caches.
         profiler.begin_prefill();
         let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
+        let rope_offset_delta = self.cached_rope_deltas.unwrap_or(0);
         let logits = chunked_prefill(
             &prompt,
             &embedding_weight,
@@ -1437,6 +1451,7 @@ impl Qwen35Inner {
             &self.lm_head,
             Some(&embedding_weight_t),
             generation_stream,
+            rope_offset_delta,
         )?;
         let prefill_out_seq_len = logits.shape_at(1)?;
         let last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
@@ -1913,6 +1928,26 @@ impl Qwen35Inner {
         Ok(result)
     }
 
+    /// Streaming chat synchronous (runs on model thread).
+    pub(crate) fn chat_stream_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        sink: Arc<dyn ChatStreamSink>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        let eos_id = self
+            .tokenizer
+            .as_ref()
+            .map(|t| t.get_eos_token_id())
+            .unwrap_or(self.config.eos_token_id as u32);
+        let result =
+            self.chat_stream_sync_inner(messages, config, eos_id, sink.as_ref(), &cancelled);
+        if let Err(e) = result {
+            sink.send(Err(e));
+        }
+    }
+
     /// Streaming chat (session-start variant): same semantics as
     /// [`Self::chat_session_start_sync`] but streams token deltas through
     /// `stream_tx` rather than returning a `ChatResult`. Stops on
@@ -1929,7 +1964,7 @@ impl Qwen35Inner {
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        sink: Arc<dyn ChatStreamSink>,
+        stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     ) {
         let cb = StreamSender(stream_tx.clone());
@@ -1975,7 +2010,7 @@ impl Qwen35Inner {
 
         let result = self.chat_stream_sync_inner(messages, config, im_end_id, &cb, &cancelled);
         if let Err(e) = result {
-            sink.send(Err(e));
+            let _ = stream_tx.send(Err(e));
         }
     }
 
@@ -2250,6 +2285,7 @@ impl Qwen35Inner {
         // Text-only prefill of the delta on top of the existing caches.
         profiler.begin_prefill();
         let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
+        let rope_offset_delta = self.cached_rope_deltas.unwrap_or(0);
         let logits = chunked_prefill(
             &prompt,
             &embedding_weight,
@@ -2259,6 +2295,7 @@ impl Qwen35Inner {
             &self.lm_head,
             Some(&embedding_weight_t),
             generation_stream,
+            rope_offset_delta,
         )?;
         let prefill_out_seq_len = logits.shape_at(1)?;
         let mut last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
@@ -2569,7 +2606,7 @@ impl Qwen35Inner {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         eos_token_id: u32,
-        cb: &StreamSender,
+        sink: &dyn ChatStreamSink,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
@@ -2974,6 +3011,11 @@ impl Qwen35Inner {
             }
         } else {
             profiler.set_label("chat_stream_rust");
+            let rope_offset_delta = if has_images {
+                self.cached_rope_deltas.unwrap_or(0)
+            } else {
+                0
+            };
 
             let mut ops = chat_common::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
@@ -3044,23 +3086,20 @@ impl Qwen35Inner {
         // Flush residual bytes
         if text.len() > streamed_text_len {
             let residual = text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            sink.send(Ok(ChatStreamChunk {
+                text: residual,
+                done: false,
+                finish_reason: None,
+                tool_calls: None,
+                thinking: None,
+                num_tokens: None,
+                prompt_tokens: None,
+                reasoning_tokens: None,
+                raw_text: None,
+                cached_tokens: None,
+                performance: None,
+                is_reasoning: Some(last_is_reasoning),
+            }));
         }
 
         let num_tokens = generated_tokens.len() as u32;
@@ -3093,26 +3132,23 @@ impl Qwen35Inner {
         );
 
         // Send final done chunk
-        cb.call(
-            Ok(ChatStreamChunk {
-                text: clean_text,
-                done: true,
-                finish_reason: Some(finish_reason),
-                tool_calls: Some(tool_calls),
-                thinking,
-                num_tokens: Some(num_tokens),
-                prompt_tokens: Some(prompt_token_count),
-                reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(text),
-                // Start path: report the matched prefix length from
-                // `verify_cache_prefix_direct`. Zero on a miss, full
-                // cached length on an exact-append hit.
-                cached_tokens: Some(cached_prefix_len as u32),
-                performance: perf_metrics,
-                is_reasoning: None,
-            }),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
+        sink.send(Ok(ChatStreamChunk {
+            text: clean_text,
+            done: true,
+            finish_reason: Some(finish_reason),
+            tool_calls: Some(tool_calls),
+            thinking,
+            num_tokens: Some(num_tokens),
+            prompt_tokens: Some(prompt_token_count),
+            reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
+            raw_text: Some(text),
+            // Start path: report the matched prefix length from
+            // `verify_cache_prefix_direct`. Zero on a miss, full
+            // cached length on an exact-append hit.
+            cached_tokens: Some(cached_prefix_len as u32),
+            performance: perf_metrics,
+            is_reasoning: None,
+        }));
 
         Ok(())
     }
@@ -4656,6 +4692,21 @@ impl ChatStreamHandle {
     }
 }
 
+/// Adapter for session streaming paths that still use an mpsc channel.
+struct StreamSender(StreamTx<ChatStreamChunk>);
+
+impl StreamSender {
+    fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
+        let _ = self.0.send(result);
+    }
+}
+
+impl ChatStreamSink for StreamSender {
+    fn send(&self, result: napi::Result<ChatStreamChunk>) {
+        let _ = self.0.send(result);
+    }
+}
+
 /// Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
 ///
 /// All inference and training state lives on a dedicated OS thread. NAPI methods
@@ -4770,12 +4821,14 @@ impl Qwen3_5Model {
         gpu_tensors: Vec<persistence::GpuTensorInfo>,
         tokenizer_json: String,
         tokenizer_config_json: Option<String>,
+        processor_config_json: Option<String>,
     ) -> Result<PromiseRaw<'env, Qwen3_5Model>> {
         let inner = persistence::build_model_inner_from_gpu_buffers(
             &config_json,
             gpu_tensors,
             &tokenizer_json,
             tokenizer_config_json.as_deref(),
+            processor_config_json.as_deref(),
         )?;
 
         let model_id = inner.model_id;
@@ -4794,6 +4847,7 @@ impl Qwen3_5Model {
                 thread,
                 config: config_final,
                 model_id: model_id_final,
+                _cache_limit_guard: crate::cache_limit::coordinator().register(0),
             })
         })
     }
@@ -4858,6 +4912,7 @@ impl Qwen3_5Model {
                 thread,
                 config: config_final,
                 model_id: model_id_final,
+                _cache_limit_guard: crate::cache_limit::coordinator().register(0),
             })
         })
     }
@@ -5103,101 +5158,15 @@ impl Qwen3_5Model {
         self.thread.send(Qwen35Cmd::ChatStreamSessionStart {
             messages,
             config,
-            sink,
+            stream_tx,
             cancelled: cancelled_inner,
         })?;
 
         let callback = Arc::new(callback);
         tokio::spawn(async move {
-            // Pass-through mode: batch_size 0 or 1 preserves exact legacy behavior.
-            if batch_size <= 1 {
-                while let Some(result) = stream_rx.recv().await {
-                    callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-                }
-                return;
-            }
-
-            // A chunk is "typical" (i.e., safe to coalesce into a batch) iff it
-            // carries only a text delta + is_reasoning flag. Anything with
-            // done/finish_reason/tool_calls/performance/num_tokens/thinking/
-            // raw_text is a semantically-loaded chunk and must be emitted alone.
-            fn is_typical(chunk: &ChatStreamChunk) -> bool {
-                !chunk.done
-                    && chunk.finish_reason.is_none()
-                    && chunk.tool_calls.is_none()
-                    && chunk.performance.is_none()
-                    && chunk.num_tokens.is_none()
-                    && chunk.thinking.is_none()
-                    && chunk.raw_text.is_none()
-            }
-
-            let mut buf: Vec<ChatStreamChunk> = Vec::with_capacity(batch_size);
-
-            // Flush the buffer as a single merged chunk. If only one chunk is
-            // buffered, emit it directly to avoid a needless clone/allocation.
-            let flush = |buf: &mut Vec<ChatStreamChunk>,
-                         callback: &Arc<ThreadsafeFunction<ChatStreamChunk, ()>>| {
-                if buf.is_empty() {
-                    return;
-                }
-                if buf.len() == 1 {
-                    let only = buf.drain(..).next().unwrap();
-                    callback.call(Ok(only), ThreadsafeFunctionCallMode::NonBlocking);
-                    return;
-                }
-                let is_reasoning = buf[0].is_reasoning;
-                let mut merged_text = String::new();
-                for c in buf.iter() {
-                    merged_text.push_str(&c.text);
-                }
-                let merged = ChatStreamChunk {
-                    text: merged_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    raw_text: None,
-                    performance: None,
-                    is_reasoning,
-                };
-                buf.clear();
-                callback.call(Ok(merged), ThreadsafeFunctionCallMode::NonBlocking);
-            };
-
             while let Some(result) = stream_rx.recv().await {
-                match result {
-                    Err(e) => {
-                        // Rule 1: flush anything buffered before propagating the error.
-                        flush(&mut buf, &callback);
-                        callback.call(Err(e), ThreadsafeFunctionCallMode::NonBlocking);
-                    }
-                    Ok(chunk) => {
-                        if !is_typical(&chunk) {
-                            // Rule 2: terminal / semantically-loaded chunk must be
-                            // emitted alone, never merged into a batch.
-                            flush(&mut buf, &callback);
-                            callback
-                                .call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
-                            continue;
-                        }
-                        // Rule 3: is_reasoning boundary forces a flush so UIs can
-                        // distinguish <think> content from final content.
-                        if let Some(front) = buf.first() {
-                            if front.is_reasoning != chunk.is_reasoning {
-                                flush(&mut buf, &callback);
-                            }
-                        }
-                        buf.push(chunk);
-                        if buf.len() >= batch_size {
-                            flush(&mut buf, &callback);
-                        }
-                    }
-                }
+                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
             }
-
-            // Channel closed: flush any trailing partial batch.
-            flush(&mut buf, &callback);
         });
 
         Ok(ChatStreamHandle { cancelled })
@@ -6160,6 +6129,14 @@ pub(crate) fn get_rope_index(
 
     let position_ids = MxArray::stack(vec![&t_arr, &h_arr, &w_arr], Some(0))?;
 
+    #[cfg(target_family = "wasm")]
+    let max_position = all_position_ids
+        .iter()
+        .filter_map(|axis| axis.iter().max())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    #[cfg(not(target_family = "wasm"))]
     let max_position = *all_position_ids[0].iter().max().unwrap_or(&0);
     let rope_deltas = max_position + 1 - seq_len;
 

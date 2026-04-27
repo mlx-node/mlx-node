@@ -143,7 +143,13 @@ struct WireChunk {
     #[serde(skip_serializing_if = "Option::is_none")]
     num_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     raw_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     performance: Option<WirePerf>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,7 +165,10 @@ impl From<&ChatStreamChunk> for WireChunk {
             tool_calls: c.tool_calls.clone(),
             thinking: c.thinking.clone(),
             num_tokens: c.num_tokens,
+            prompt_tokens: c.prompt_tokens,
+            reasoning_tokens: c.reasoning_tokens,
             raw_text: c.raw_text.clone(),
+            cached_tokens: c.cached_tokens,
             performance: c.performance.as_ref().map(WirePerf::from),
             is_reasoning: c.is_reasoning,
         }
@@ -175,7 +184,10 @@ impl From<WireChunk> for ChatStreamChunk {
             tool_calls: w.tool_calls,
             thinking: w.thinking,
             num_tokens: w.num_tokens,
+            prompt_tokens: w.prompt_tokens,
+            reasoning_tokens: w.reasoning_tokens,
             raw_text: w.raw_text,
+            cached_tokens: w.cached_tokens,
             performance: w.performance.map(Into::into),
             is_reasoning: w.is_reasoning,
         }
@@ -372,7 +384,10 @@ pub fn decode_record(rec: &ParsedRecord<'_>) -> napi::Result<ChatStreamChunk> {
                 tool_calls: None,
                 thinking: None,
                 num_tokens: None,
+                prompt_tokens: None,
+                reasoning_tokens: None,
                 raw_text: None,
+                cached_tokens: None,
                 performance: None,
                 is_reasoning: Some(is_reasoning),
             })

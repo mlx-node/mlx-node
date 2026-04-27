@@ -327,8 +327,7 @@ impl GatedDeltaNet {
             log_tensor_stats(&format!("layer.{layer:02}.gdn.q_flat"), &q_flat);
             let k_flat = conv_out.slice_axis(2, self.key_dim as i64, (self.key_dim * 2) as i64)?;
             log_tensor_stats(&format!("layer.{layer:02}.gdn.k_flat"), &k_flat);
-            let v_flat =
-                conv_out.slice_axis(2, (self.key_dim * 2) as i64, self.conv_dim as i64)?;
+            let v_flat = conv_out.slice_axis(2, (self.key_dim * 2) as i64, self.conv_dim as i64)?;
             log_tensor_stats(&format!("layer.{layer:02}.gdn.v_flat"), &v_flat);
 
             // Reshape to head format

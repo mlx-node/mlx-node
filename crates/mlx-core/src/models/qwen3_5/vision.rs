@@ -51,6 +51,8 @@ pub struct Qwen3_5VisionEncoder {
     config: Qwen3_5VisionConfig,
     /// Patch embedding: Conv2d extracting patches from images
     patch_embed: Arc<PatchEmbedding>,
+    #[cfg(target_family = "wasm")]
+    patch_embed_bias: Option<Arc<MxArray>>,
     /// Learned position embeddings [num_pos, hidden_size]
     pos_embed: Option<Arc<MxArray>>,
     /// 27 transformer encoder layers
@@ -83,6 +85,8 @@ impl Qwen3_5VisionEncoder {
         Ok(Self {
             config,
             patch_embed: Arc::new(patch_embed),
+            #[cfg(target_family = "wasm")]
+            patch_embed_bias: None,
             pos_embed: None,
             layers: Vec::new(),
             rotary_pos_emb: Arc::new(rotary_pos_emb),
@@ -109,6 +113,11 @@ impl Qwen3_5VisionEncoder {
             bias,
         )?);
         Ok(())
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn set_patch_embed_bias(&mut self, bias: &MxArray) {
+        self.patch_embed_bias = Some(Arc::new(bias.clone()));
     }
 
     /// Set position embedding weights
@@ -229,17 +238,40 @@ impl Qwen3_5VisionEncoder {
 
         let mut height_ids: Vec<i32> = Vec::new();
         let mut width_ids: Vec<i32> = Vec::new();
+        #[cfg(target_family = "wasm")]
+        let merge = self.config.spatial_merge_size;
 
         for img_idx in 0..num_images {
             let t = grid_data[img_idx * 3];
             let h = grid_data[img_idx * 3 + 1];
             let w = grid_data[img_idx * 3 + 2];
 
-            let num_patches = t * h * w;
-            for idx in 0..num_patches {
-                let local_idx = idx % (h * w);
-                height_ids.push(local_idx / w);
-                width_ids.push(local_idx % w);
+            #[cfg(target_family = "wasm")]
+            {
+                let merged_h = h / merge;
+                let merged_w = w / merge;
+                for _ in 0..t {
+                    for bh in 0..merged_h {
+                        for bw in 0..merged_w {
+                            for ih in 0..merge {
+                                for iw in 0..merge {
+                                    height_ids.push(bh * merge + ih);
+                                    width_ids.push(bw * merge + iw);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let num_patches = t * h * w;
+                for idx in 0..num_patches {
+                    let local_idx = idx % (h * w);
+                    height_ids.push(local_idx / w);
+                    width_ids.push(local_idx % w);
+                }
             }
         }
 
@@ -297,10 +329,19 @@ impl Qwen3_5VisionEncoder {
         let flat_input = flat_input.transpose(Some(&[0, 2, 3, 1]))?;
 
         // Patch embedding
-        let patch_embeds = self.patch_embed.forward(&flat_input)?;
+        let mut patch_embeds = self.patch_embed.forward(&flat_input)?;
+        #[cfg(target_family = "wasm")]
+        if let Some(ref bias) = self.patch_embed_bias {
+            patch_embeds = patch_embeds.add(bias)?;
+        }
         let embed_dim = patch_embeds.shape()?[2];
         let embeddings = patch_embeds.reshape(&[batch, seq_len, embed_dim])?;
-        let embeddings = embeddings.squeeze(Some(&[0]))?;
+        let mut embeddings = embeddings.squeeze(Some(&[0]))?;
+
+        #[cfg(target_family = "wasm")]
+        {
+            embeddings = self.permute_to_merge_order(&embeddings, grid_thw)?;
+        }
 
         // Add position embeddings per image (with bilinear interpolation)
         let grid_data = grid_thw.to_int32()?;
@@ -327,6 +368,8 @@ impl Qwen3_5VisionEncoder {
                 } else {
                     pos
                 };
+                #[cfg(target_family = "wasm")]
+                let pos = self.permute_single_to_merge_order(&pos, t, h_dim, w_dim)?;
 
                 let img_with_pos = img_embeddings.add(&pos)?;
                 result_parts.push(img_with_pos);
@@ -405,7 +448,14 @@ impl Qwen3_5VisionEncoder {
             .merger
             .as_ref()
             .ok_or_else(|| Error::from_reason("Vision encoder merger not initialized"))?;
-        merger.forward(&h, grid_thw)
+        #[cfg(target_family = "wasm")]
+        {
+            merger.forward_merge_ordered(&h, grid_thw)
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            merger.forward(&h, grid_thw)
+        }
     }
 
     /// Interpolate position embeddings to target grid size
@@ -415,28 +465,168 @@ impl Qwen3_5VisionEncoder {
         target_h: u32,
         target_w: u32,
     ) -> Result<MxArray> {
+        #[cfg(target_family = "wasm")]
+        {
+            self.interpolate_pos_embed_align_corners(pos_embed, target_h, target_w)
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let pos_shape = pos_embed.shape()?;
+            let num_positions = pos_shape[0];
+            let embed_dim = pos_shape[1];
+
+            let base_size = (num_positions as f64).sqrt() as i64;
+            let target_patches = (target_h * target_w) as i64;
+
+            if base_size * base_size == num_positions
+                && target_h as i64 == base_size
+                && target_w as i64 == base_size
+            {
+                return Ok(pos_embed.clone());
+            }
+
+            // Reshape to 2D grid and interpolate
+            let pos_2d = pos_embed.reshape(&[base_size, base_size, embed_dim])?;
+            let interpolated = crate::vision::interpolate::bilinear_interpolate(
+                &pos_2d,
+                target_h as i64,
+                target_w as i64,
+            )?;
+            interpolated.reshape(&[target_patches, embed_dim])
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn interpolate_pos_embed_align_corners(
+        &self,
+        pos_embed: &MxArray,
+        target_h: u32,
+        target_w: u32,
+    ) -> Result<MxArray> {
         let pos_shape = pos_embed.shape()?;
         let num_positions = pos_shape[0];
         let embed_dim = pos_shape[1];
+        let base = (num_positions as f64).sqrt() as i32;
+        let target_h_i = target_h as i32;
+        let target_w_i = target_w as i32;
 
-        let base_size = (num_positions as f64).sqrt() as i64;
-        let target_patches = (target_h * target_w) as i64;
+        if base as i64 * base as i64 != num_positions {
+            return Err(Error::from_reason(format!(
+                "Position embedding count {} is not a square",
+                num_positions
+            )));
+        }
 
-        if base_size * base_size == num_positions
-            && target_h as i64 == base_size
-            && target_w as i64 == base_size
-        {
+        if target_h_i == base && target_w_i == base {
             return Ok(pos_embed.clone());
         }
 
-        // Reshape to 2D grid and interpolate
-        let pos_2d = pos_embed.reshape(&[base_size, base_size, embed_dim])?;
-        let interpolated = crate::vision::interpolate::bilinear_interpolate(
-            &pos_2d,
-            target_h as i64,
-            target_w as i64,
-        )?;
-        interpolated.reshape(&[target_patches, embed_dim])
+        let h_scale = if target_h_i > 1 {
+            (base - 1) as f32 / (target_h_i - 1) as f32
+        } else {
+            0.0
+        };
+        let w_scale = if target_w_i > 1 {
+            (base - 1) as f32 / (target_w_i - 1) as f32
+        } else {
+            0.0
+        };
+        let total = (target_h_i * target_w_i) as usize;
+        let mut idx00 = Vec::with_capacity(total);
+        let mut idx01 = Vec::with_capacity(total);
+        let mut idx10 = Vec::with_capacity(total);
+        let mut idx11 = Vec::with_capacity(total);
+        let mut w00 = Vec::with_capacity(total);
+        let mut w01 = Vec::with_capacity(total);
+        let mut w10 = Vec::with_capacity(total);
+        let mut w11 = Vec::with_capacity(total);
+
+        for h in 0..target_h_i {
+            let h_pos = h as f32 * h_scale;
+            let h_floor = h_pos.floor() as i32;
+            let h_ceil = (h_floor + 1).min(base - 1);
+            let dh = h_pos - h_floor as f32;
+            for w in 0..target_w_i {
+                let w_pos = w as f32 * w_scale;
+                let w_floor = w_pos.floor() as i32;
+                let w_ceil = (w_floor + 1).min(base - 1);
+                let dw = w_pos - w_floor as f32;
+
+                idx00.push(h_floor * base + w_floor);
+                idx01.push(h_floor * base + w_ceil);
+                idx10.push(h_ceil * base + w_floor);
+                idx11.push(h_ceil * base + w_ceil);
+
+                w00.push((1.0 - dh) * (1.0 - dw));
+                w01.push((1.0 - dh) * dw);
+                w10.push(dh * (1.0 - dw));
+                w11.push(dh * dw);
+            }
+        }
+
+        let make_idx = |data: &[i32]| MxArray::from_int32(data, &[data.len() as i64]);
+        let dtype = pos_embed.dtype()?;
+        let make_weight = |data: &[f32]| -> Result<MxArray> {
+            MxArray::from_float32(data, &[data.len() as i64, 1])?.astype(dtype)
+        };
+
+        let p00 = pos_embed
+            .take(&make_idx(&idx00)?, 0)?
+            .mul(&make_weight(&w00)?)?;
+        let p01 = pos_embed
+            .take(&make_idx(&idx01)?, 0)?
+            .mul(&make_weight(&w01)?)?;
+        let p10 = pos_embed
+            .take(&make_idx(&idx10)?, 0)?
+            .mul(&make_weight(&w10)?)?;
+        let p11 = pos_embed
+            .take(&make_idx(&idx11)?, 0)?
+            .mul(&make_weight(&w11)?)?;
+
+        p00.add(&p01)?
+            .add(&p10)?
+            .add(&p11)?
+            .reshape(&[(target_h_i * target_w_i) as i64, embed_dim])
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn permute_to_merge_order(&self, x: &MxArray, grid_thw: &MxArray) -> Result<MxArray> {
+        let grid_data = grid_thw.to_int32()?;
+        let num_images = grid_thw.shape()?[0] as usize;
+        let mut parts = Vec::with_capacity(num_images);
+        let mut start = 0i64;
+
+        for img_idx in 0..num_images {
+            let t = grid_data[img_idx * 3] as i64;
+            let h = grid_data[img_idx * 3 + 1] as i64;
+            let w = grid_data[img_idx * 3 + 2] as i64;
+            let count = t * h * w;
+            let part = x.slice_axis(0, start, start + count)?;
+            parts.push(self.permute_single_to_merge_order(&part, t, h, w)?);
+            start += count;
+        }
+
+        if parts.len() == 1 {
+            Ok(parts.remove(0))
+        } else {
+            let refs: Vec<&MxArray> = parts.iter().collect();
+            MxArray::concatenate_many(refs, Some(0))
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn permute_single_to_merge_order(
+        &self,
+        x: &MxArray,
+        t: i64,
+        h: i64,
+        w: i64,
+    ) -> Result<MxArray> {
+        let merge = self.config.spatial_merge_size as i64;
+        let dim = x.shape_at(1)?;
+        x.reshape(&[t, h / merge, merge, w / merge, merge, dim])?
+            .transpose(Some(&[0, 1, 3, 2, 4, 5]))?
+            .reshape(&[t * h * w, dim])
     }
 }
 
@@ -445,6 +635,8 @@ impl Clone for Qwen3_5VisionEncoder {
         Self {
             config: self.config.clone(),
             patch_embed: self.patch_embed.clone(),
+            #[cfg(target_family = "wasm")]
+            patch_embed_bias: self.patch_embed_bias.clone(),
             pos_embed: self.pos_embed.clone(),
             layers: self.layers.clone(),
             rotary_pos_emb: self.rotary_pos_emb.clone(),

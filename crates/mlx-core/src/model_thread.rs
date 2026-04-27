@@ -9,6 +9,9 @@
 /// Oneshot sender for request–response commands.
 pub type ResponseTx<T> = tokio::sync::oneshot::Sender<napi::Result<T>>;
 
+/// Unbounded sender for streaming commands (e.g. token-by-token output).
+pub type StreamTx<T> = tokio::sync::mpsc::UnboundedSender<napi::Result<T>>;
+
 /// A dedicated OS thread that owns model state and processes commands.
 ///
 /// Generic over `Cmd` so each model picks its command enum: the shared

@@ -189,19 +189,15 @@ pub fn wgpu_test_compile_gdn_g_dispatch_delta() -> Vec<f64> {
 #[napi]
 pub fn wgpu_get_last_test_error() -> String {
     let mut buf = vec![0_i8; 512];
-    let n = unsafe {
-        sys::mlx_get_last_test_error(buf.as_mut_ptr() as *mut _, buf.len() as i32)
-    };
+    let n = unsafe { sys::mlx_get_last_test_error(buf.as_mut_ptr() as *mut _, buf.len() as i32) };
     if n <= 0 {
         return String::new();
     }
     let end = (n as usize).min(buf.len() - 1);
     // Safety: the C++ side wrote `end` bytes of UTF-8-ish data (it may be
     // arbitrary std::exception::what() text; treat it as lossy UTF-8).
-    String::from_utf8_lossy(unsafe {
-        std::slice::from_raw_parts(buf.as_ptr() as *const u8, end)
-    })
-    .into_owned()
+    String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, end) })
+        .into_owned()
 }
 
 /// Clear the MLX memory cache to prevent memory pressure buildup

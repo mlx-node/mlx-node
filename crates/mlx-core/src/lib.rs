@@ -7,34 +7,7 @@
 pub mod array;
 pub mod autograd;
 pub mod cache_limit;
-pub mod calibration;
-pub mod convert;
-pub mod dataset;
-pub mod decode_profiler;
-pub mod gradients;
-pub mod grpo;
-pub(crate) mod inference_trace;
-pub mod model_thread;
-pub mod models;
-pub mod nn;
-pub mod optimizers;
-pub mod output_store;
-pub mod param_manager;
-pub mod profiling;
-pub mod quant;
-pub mod response_store;
-pub mod sampling;
-pub mod stream;
-pub mod tensor;
-pub mod tokenizer;
-pub mod tools;
-pub mod transformer;
-pub mod utils;
-pub mod vision;
-
-// Modules excluded from WASM browser builds (training, profiling, DB)
-#[cfg(not(target_family = "wasm"))]
-pub mod autograd;
+pub mod chat_stream;
 pub mod compat;
 pub mod convert;
 #[cfg(not(target_family = "wasm"))]
@@ -46,6 +19,7 @@ pub use compat::decode_profiler;
 pub mod gradients;
 #[cfg(not(target_family = "wasm"))]
 pub mod grpo;
+pub(crate) mod inference_trace;
 pub mod model_thread;
 pub mod models;
 pub mod nn;
@@ -57,6 +31,8 @@ pub mod param_manager;
 pub mod profiling;
 #[cfg(target_family = "wasm")]
 pub use compat::profiling;
+#[cfg(not(target_family = "wasm"))]
+pub mod response_store;
 pub mod sampling;
 #[cfg(not(target_family = "wasm"))]
 pub mod sft;

@@ -163,6 +163,71 @@ impl SpatialProjector {
         }
     }
 
+    /// Forward pass for inputs that are already ordered as
+    /// `[t, h/merge, w/merge, merge, merge, dim]`.
+    ///
+    /// Qwen3.5-VL's image processor/vision stack uses this merge-block
+    /// sequence order before the merger, so consecutive `merge^2` tokens
+    /// already form a spatial group.
+    #[cfg(target_family = "wasm")]
+    pub fn forward_merge_ordered(&self, x: &MxArray, grid_thw: &MxArray) -> Result<MxArray> {
+        let grid_shape = grid_thw.shape()?;
+        if grid_shape.len() != 2 || grid_shape[1] != 3 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "grid_thw must have shape [num_images, 3], got {:?}",
+                    grid_shape.as_ref()
+                ),
+            ));
+        }
+
+        let grid_data = grid_thw.to_int32()?;
+        let mut processed_features: Vec<MxArray> = Vec::new();
+        let mut start_idx = 0i64;
+
+        for img_idx in 0..grid_shape[0] as usize {
+            let t = grid_data[img_idx * 3] as i64;
+            let h = grid_data[img_idx * 3 + 1] as i64;
+            let w = grid_data[img_idx * 3 + 2] as i64;
+            let merge = self.spatial_merge_size as i64;
+
+            if h % merge != 0 || w % merge != 0 {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "Image {} grid ({}, {}) must be divisible by spatial_merge_size ({})",
+                        img_idx, h, w, merge
+                    ),
+                ));
+            }
+
+            let num_patches = t * h * w;
+            let end_idx = start_idx + num_patches;
+            let x_img = x.slice_axis(0, start_idx, end_idx)?;
+            let x_normed = self.pre_norm.forward(&x_img)?;
+            let dim = x_normed.shape()?[1];
+
+            let merged_patches = t * (h / merge) * (w / merge);
+            let merged_dim = merge * merge * dim;
+            let x_flat = x_normed.reshape(&[merged_patches, merged_dim])?;
+
+            let hidden = self.linear_1.forward(&x_flat)?;
+            let activated = Activations::gelu(&hidden)?;
+            let output = self.linear_2.forward(&activated)?;
+
+            processed_features.push(output);
+            start_idx = end_idx;
+        }
+
+        if processed_features.len() == 1 {
+            Ok(processed_features.remove(0))
+        } else {
+            let refs: Vec<&MxArray> = processed_features.iter().collect();
+            MxArray::concatenate_many(refs, Some(0))
+        }
+    }
+
     /// Get the pre-norm LayerNorm
     pub fn pre_norm(&self) -> &LayerNorm {
         &self.pre_norm

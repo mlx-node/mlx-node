@@ -872,8 +872,7 @@ macro_rules! decode_loop {
                     $slen,
                 );
                 $slen += token_text.len();
-                $cb.call(
-                    Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                $sink.send(Ok($crate::models::qwen3_5::model::ChatStreamChunk {
                         text: token_text,
                         done: false,
                         finish_reason: None,
@@ -886,9 +885,7 @@ macro_rules! decode_loop {
                         cached_tokens: None,
                         performance: None,
                         is_reasoning: Some(_is_reasoning),
-                    }),
-                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                );
+                    }));
             )?
 
             if token_id == $eos {

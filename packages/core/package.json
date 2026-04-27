@@ -32,7 +32,10 @@
     "preversion": "oxnode ./build.ts && git add ."
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.7.2",
+    "@emnapi/core": "^1.9.1",
+    "@emnapi/runtime": "^1.9.1",
+    "@emnapi/wasi-threads": "^1.2.0",
+    "@napi-rs/cli": "^3.6.2",
     "@oxc-node/cli": "^0.1.0",
     "vite-plus": "catalog:"
   },
@@ -43,7 +46,6 @@
     "binaryName": "mlx-core",
     "targets": [
       "aarch64-apple-darwin",
-      "aarch64-unknown-linux-gnu",
       "wasm32-wasip1-threads"
     ],
     "wasm": {

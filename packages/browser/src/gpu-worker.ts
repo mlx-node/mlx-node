@@ -132,7 +132,7 @@ const RECYCLE_DELAY = 256;
 // Buffer pool: (usage, size) → stack of free GPUBuffer handles. MLX's allocator
 // churns ~870 transient buffers/tok; reusing them eliminates Chrome's
 // createBuffer validation cost on the hot path.
-const BUFFER_POOL_CAP_PER_KEY = 32;
+const BUFFER_POOL_CAP_PER_KEY = 64;
 const bufferPool = new Map<string, number[]>();
 let bufferPoolHitCount = 0;
 let bufferPoolMissCount = 0;

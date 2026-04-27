@@ -166,6 +166,7 @@ function App() {
     let currentAssistantDiv: HTMLDivElement | null = null;
     let currentThinkingDiv: HTMLDetailsElement | null = null;
     let currentResponseDiv: HTMLDivElement | null = null;
+    let currentReasoningVisible = false;
     let isInThinking = false;
     let streamTokenCount = 0;
 
@@ -231,6 +232,7 @@ function App() {
       setStatus(`Generating... ${streamTokenCount} tokens`, "info");
 
       if (isReasoning) {
+        if (!currentReasoningVisible) return;
         const text = reasoningHasContent
           ? deltaText
           : deltaText.replace(/^\s+/, "");
@@ -347,7 +349,7 @@ function App() {
       drainQueuesSync();
 
       const trimmedThinking = thinking?.trim() || "";
-      if (trimmedThinking.length > 3) {
+      if (currentReasoningVisible && trimmedThinking.length > 3) {
         const thinkingContentEl = currentThinkingDiv.querySelector(
           ".thinking-content",
         ) as HTMLElement | null;
@@ -721,6 +723,7 @@ function App() {
       setStatus("Generating...", "info");
       streamTokenCount = 0;
       isInThinking = false;
+      currentReasoningVisible = reasoningEffortRef.current !== "off";
       createAssistantMessage();
 
       worker.postMessage({

@@ -252,6 +252,65 @@ inline std::pair<array, array> apply_mrope(
   auto pos_w = reshape(slice(position_ids, {2, 0, 0}, {3, B, T}), {B, T});
   std::vector<array> pos_channels = {pos_t, pos_h, pos_w};
 
+#if defined(__wasm32__) || defined(__wasm__)
+  // Qwen3.5 uses rope_parameters.mrope_interleaved=true. Match the
+  // Transformers layout:
+  //   freqs_t = freqs[0]
+  //   freqs_t[..., 1:mrope_section[1]*3:3] = freqs[1][..., ...]
+  //   freqs_t[..., 2:mrope_section[2]*3:3] = freqs[2][..., ...]
+  //   emb = cat(freqs_t, freqs_t)
+  //   x * cos(emb) + rotate_half(x) * sin(emb)
+  std::vector<float> inv_freq_data(half_rotary);
+  for (int i = 0; i < half_rotary; i++) {
+    float exponent = -2.0f * (float)i / (float)rope_dims;
+    inv_freq_data[i] = std::pow(rope_theta, exponent);
+  }
+  auto inv_freq = array(inv_freq_data.data(), {1, 1, half_rotary}, mlx::core::float32);
+
+  std::vector<array> freq_channels;
+  freq_channels.reserve(3);
+  for (int s = 0; s < 3; s++) {
+    auto pos = astype(reshape(pos_channels[s], {B, T, 1}), mlx::core::float32);
+    freq_channels.push_back(pos * inv_freq);
+  }
+
+  std::vector<array> half_parts;
+  half_parts.reserve(half_rotary);
+  int h_limit = mrope_section[1] * 3;
+  int w_limit = mrope_section[2] * 3;
+  for (int dim = 0; dim < half_rotary; dim++) {
+    int axis = 0;
+    if (dim % 3 == 1 && dim < h_limit) {
+      axis = 1;
+    } else if (dim % 3 == 2 && dim < w_limit) {
+      axis = 2;
+    }
+    half_parts.push_back(slice(freq_channels[axis], {0, 0, dim}, {B, T, dim + 1}));
+  }
+
+  auto freqs = concatenate(half_parts, 2);  // [B, T, half_rotary]
+  auto cos_half = cos(freqs);
+  auto sin_half = sin(freqs);
+  auto cos_f = astype(reshape(concatenate({cos_half, cos_half}, 2), {B, T, 1, rope_dims}), dt);
+  auto sin_f = astype(reshape(concatenate({sin_half, sin_half}, 2), {B, T, 1, rope_dims}), dt);
+
+  auto apply_rot = [&](const array& x) -> array {
+    int H = x.shape(2);
+    int D = x.shape(3);
+    auto x_rot = slice(x, {0, 0, 0, 0}, {B, T, H, rope_dims});
+    auto x1 = slice(x_rot, {0, 0, 0, 0}, {B, T, H, half_rotary});
+    auto x2 = slice(x_rot, {0, 0, 0, half_rotary}, {B, T, H, rope_dims});
+    auto rotated = concatenate({array(-1.0f, dt) * x2, x1}, 3);
+    auto embedded = x_rot * cos_f + rotated * sin_f;
+    if (rope_dims < D) {
+      auto x_pass = slice(x, {0, 0, 0, rope_dims}, {B, T, H, D});
+      return concatenate({embedded, x_pass}, 3);
+    }
+    return embedded;
+  };
+
+  return {apply_rot(queries), apply_rot(keys)};
+#else
   // Build concatenated frequency tensor [B, T, half_rotary]
   std::vector<array> freq_sections;
   int dim_offset = 0;
@@ -304,6 +363,7 @@ inline std::pair<array, array> apply_mrope(
   };
 
   return {apply_rot(queries), apply_rot(keys)};
+#endif
 }
 
 // =====================================================================

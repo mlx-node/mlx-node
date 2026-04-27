@@ -10,6 +10,8 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+#[cfg(target_family = "wasm")]
+use crate::models::paddleocr_vl::processing::ImageProcessorConfig;
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
@@ -23,6 +25,8 @@ use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
 use super::model::{Qwen3_5Model, Qwen35Inner, handle_qwen35_cmd};
 use super::processing::Qwen35VLImageProcessor;
+#[cfg(target_family = "wasm")]
+use super::processing::qwen35_vl_processor_config;
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MLPVariant, is_mxfp8_checkpoint,
     is_quantized_checkpoint, try_build_mxfp8_quantized_linear, try_build_quantized_linear,
@@ -1116,11 +1120,80 @@ fn split_text_vision_params(
 }
 
 #[cfg(target_family = "wasm")]
+fn read_i32(value: &Value, key: &str) -> Option<i32> {
+    value.get(key)?.as_i64().map(|v| v as i32)
+}
+
+#[cfg(target_family = "wasm")]
+fn read_f64_array(value: &Value, key: &str) -> Option<Vec<f64>> {
+    let array = value.get(key)?.as_array()?;
+    let values: Vec<f64> = array.iter().filter_map(Value::as_f64).collect();
+    (values.len() == array.len()).then_some(values)
+}
+
+#[cfg(target_family = "wasm")]
+fn parse_browser_image_processor_config(
+    processor_config_json: Option<&str>,
+    vision_config: &Qwen3_5VisionConfig,
+) -> ImageProcessorConfig {
+    let mut config = qwen35_vl_processor_config();
+    config.patch_size = vision_config.patch_size;
+    config.merge_size = vision_config.spatial_merge_size;
+
+    let Some(config_json) = processor_config_json else {
+        return config;
+    };
+    let Ok(raw) = serde_json::from_str::<Value>(config_json) else {
+        warn!("Failed to parse preprocessor_config.json; using Qwen3.5-VL defaults");
+        return config;
+    };
+
+    if let Some(value) = read_i32(&raw, "patch_size") {
+        config.patch_size = value;
+    }
+    if let Some(value) = read_i32(&raw, "temporal_patch_size") {
+        config.temporal_patch_size = value;
+    }
+    if let Some(value) = read_i32(&raw, "merge_size") {
+        config.merge_size = value;
+    }
+    if let Some(value) = read_f64_array(&raw, "image_mean") {
+        config.image_mean = value;
+    }
+    if let Some(value) = read_f64_array(&raw, "image_std") {
+        config.image_std = value;
+    }
+    if let Some(value) = raw.get("do_rescale").and_then(Value::as_bool) {
+        config.do_rescale = value;
+    }
+    if let Some(value) = raw.get("do_normalize").and_then(Value::as_bool) {
+        config.do_normalize = value;
+    }
+
+    let size = raw.get("size");
+    if let Some(value) = read_i32(&raw, "min_pixels")
+        .or_else(|| size.and_then(|v| read_i32(v, "min_pixels")))
+        .or_else(|| size.and_then(|v| read_i32(v, "shortest_edge")))
+    {
+        config.min_pixels = value;
+    }
+    if let Some(value) = read_i32(&raw, "max_pixels")
+        .or_else(|| size.and_then(|v| read_i32(v, "max_pixels")))
+        .or_else(|| size.and_then(|v| read_i32(v, "longest_edge")))
+    {
+        config.max_pixels = value;
+    }
+
+    config
+}
+
+#[cfg(target_family = "wasm")]
 fn attach_vision_encoder_if_present(
     inner: &mut Qwen35Inner,
     raw: &Value,
     config: &Qwen3_5Config,
     vision_params: Option<HashMap<String, MxArray>>,
+    processor_config_json: Option<&str>,
 ) -> Result<()> {
     let Some(vparams) = vision_params else {
         info!("Qwen3.5 model loaded successfully");
@@ -1146,7 +1219,9 @@ fn attach_vision_encoder_if_present(
     )?;
 
     inner.set_vision_encoder(vision_encoder);
-    inner.set_image_processor(Qwen35VLImageProcessor::new(None));
+    let processor_config =
+        parse_browser_image_processor_config(processor_config_json, &vision_config);
+    inner.set_image_processor(Qwen35VLImageProcessor::new(Some(processor_config)));
     inner.set_spatial_merge_size(vision_config.spatial_merge_size);
 
     info!("Qwen3.5-VL model loaded successfully (with vision encoder)");
@@ -1196,22 +1271,47 @@ pub(crate) fn load_vision_weights(
     let get_opt = |key: &str| -> Option<&MxArray> { params.get(key) };
 
     // Patch embedding: handle both 4D Conv2d [out, kH, kW, in] and
-    // 5D Conv3d [out, kD, kH, kW, in] formats. For Conv3d, extract
-    // temporal slice 0 for our Conv2d PatchEmbedding.
+    // 5D Conv3d [out, kD, kH, kW, in] formats. The browser image
+    // processor feeds still-image 2D patches, so on WASM we fold the
+    // temporal Conv3d slices into an equivalent Conv2d kernel.
     if let Some(pe_weight) = get_opt("patch_embed.proj.weight") {
+        #[cfg(target_family = "wasm")]
+        let pe_weight = {
+            let shape = pe_weight.shape()?;
+            if shape.len() == 5 && shape[4] != 3 && shape[1] == 3 {
+                pe_weight.transpose(Some(&[0, 2, 3, 4, 1]))?
+            } else {
+                pe_weight.clone()
+            }
+        };
+        #[cfg(not(target_family = "wasm"))]
+        let pe_weight = pe_weight.clone();
+
         let ndim = pe_weight.ndim()?;
         if ndim == 5 {
-            // Conv3d [out, kD, kH, kW, in] → take slice [:, 0, :, :, :]
             let out_c = pe_weight.shape_at(0)?;
+            let kd = pe_weight.shape_at(1)?;
             let kh = pe_weight.shape_at(2)?;
             let kw = pe_weight.shape_at(3)?;
             let in_c = pe_weight.shape_at(4)?;
             let slice0 = pe_weight.slice(&[0, 0, 0, 0, 0], &[out_c, 1, kh, kw, in_c])?;
             let conv2d_weight = slice0.squeeze(Some(&[1]))?;
+            #[cfg(target_family = "wasm")]
+            let conv2d_weight = if kd > 1 {
+                let slice1 = pe_weight.slice(&[0, 1, 0, 0, 0], &[out_c, 2, kh, kw, in_c])?;
+                let slice1 = slice1.squeeze(Some(&[1]))?;
+                conv2d_weight.add(&slice1)?
+            } else {
+                conv2d_weight
+            };
             encoder.set_patch_embed(&conv2d_weight)?;
         } else {
-            encoder.set_patch_embed(pe_weight)?;
+            encoder.set_patch_embed(&pe_weight)?;
         }
+    }
+    #[cfg(target_family = "wasm")]
+    if let Some(pe_bias) = get_opt("patch_embed.proj.bias") {
+        encoder.set_patch_embed_bias(pe_bias);
     }
 
     // Position embedding
@@ -1315,6 +1415,7 @@ pub(crate) fn build_model_inner_from_gpu_buffers(
     gpu_tensors: Vec<GpuTensorInfo>,
     tokenizer_json: &str,
     tokenizer_config_json: Option<&str>,
+    processor_config_json: Option<&str>,
 ) -> Result<Qwen35Inner> {
     use mlx_sys as sys;
     use tokenizers::Tokenizer;
@@ -1459,7 +1560,13 @@ pub(crate) fn build_model_inner_from_gpu_buffers(
     // 8. Set tokenizer and optional browser vision stack
     inner.set_tokenizer(Arc::new(tok));
     #[cfg(target_family = "wasm")]
-    attach_vision_encoder_if_present(&mut inner, &raw, &config, vision_params)?;
+    attach_vision_encoder_if_present(
+        &mut inner,
+        &raw,
+        &config,
+        vision_params,
+        processor_config_json,
+    )?;
 
     info!("Qwen3.5 inner model loaded from GPU buffers successfully");
     Ok(inner)
@@ -1470,12 +1577,14 @@ pub async fn load_from_gpu_buffers(
     gpu_tensors: Vec<GpuTensorInfo>,
     tokenizer_json: &str,
     tokenizer_config_json: Option<&str>,
+    processor_config_json: Option<&str>,
 ) -> Result<Qwen3_5Model> {
     let inner = build_model_inner_from_gpu_buffers(
         config_json,
         gpu_tensors,
         tokenizer_json,
         tokenizer_config_json,
+        processor_config_json,
     )?;
     let model_id = inner.model_id;
     let config_out = inner.config.clone();
@@ -1493,6 +1602,7 @@ pub async fn load_from_gpu_buffers(
         thread,
         config: config_final,
         model_id: model_id_final,
+        _cache_limit_guard: crate::cache_limit::coordinator().register(0),
     })
 }
 
@@ -1717,7 +1827,7 @@ pub fn build_model_inner_from_cpu_tensors() -> Result<Qwen35Inner> {
     // 8. Set tokenizer and optional browser vision stack
     inner.set_tokenizer(Arc::new(tok));
     #[cfg(target_family = "wasm")]
-    attach_vision_encoder_if_present(&mut inner, &raw, &config, vision_params)?;
+    attach_vision_encoder_if_present(&mut inner, &raw, &config, vision_params, None)?;
 
     Ok(inner)
 }

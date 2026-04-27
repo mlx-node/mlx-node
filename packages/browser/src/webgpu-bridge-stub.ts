@@ -409,7 +409,7 @@ export function createBridgeStub(
   // Policy: LIFO reuse (pop hot buffers first), FIFO eviction of the oldest
   // on overflow (shift from the front when the bucket is full).
   const bufferPool = new Map<string, number[]>();
-  const POOL_CAP_PER_KEY = 32;
+  const POOL_CAP_PER_KEY = 64;
 
   // Phase 1' release batching: accumulate wgpuBufferRelease handles and
   // flush them in one BUFFER_RELEASE_BATCH RPC instead of one-per-release.
@@ -1740,9 +1740,9 @@ export function createBridgeStub(
       // pending releases before the next dispatch — but only when the batch
       // is large enough to be worth a round-trip. Small-batch flushes on
       // every dispatch defeat the amortization and drop average batch size
-      // to ~3 handles. Threshold 32 keeps the release visible-to-pool
-      // latency bounded while still amortizing RPCs.
-      if (pendingReleases.length >= 32) {
+      // to ~3 handles. Flush only when the release batch is full; the
+      // dispatch path flushes pending releases before other non-batch RPCs.
+      if (pendingReleases.length >= MAX_RELEASE_BATCH) {
         flushPendingReleases();
       }
       if (pendingPipeline >= 0 && pendingBindGroup >= 0 && pendingBindGroup1 >= 0) {

@@ -3,8 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
-#[cfg(not(target_family = "wasm"))]
-use napi::threadsafe_function::ThreadsafeFunction;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use tracing::{info, warn};
 
@@ -13,7 +12,7 @@ use crate::chat_stream::ChatStreamSink;
 use crate::chat_stream::TsfnSink;
 #[cfg(target_family = "wasm")]
 use crate::chat_stream::{MIN_SAB_LEN, SabSink};
-use crate::model_thread::ResponseTx;
+use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
     ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache, VisionCacheInner,
@@ -156,7 +155,7 @@ pub(crate) enum Qwen35MoeCmd {
     ChatStreamSessionStart {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
-        sink: Arc<dyn ChatStreamSink>,
+        stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     },
     /// Streaming session-continue: same semantics as
@@ -178,6 +177,12 @@ pub(crate) enum Qwen35MoeCmd {
         content: String,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
+        cancelled: Arc<AtomicBool>,
+    },
+    ChatStream {
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        sink: Arc<dyn ChatStreamSink>,
         cancelled: Arc<AtomicBool>,
     },
     Generate {
@@ -310,7 +315,7 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
         Qwen35MoeCmd::ChatStreamSessionStart {
             messages,
             config,
-            sink,
+            stream_tx,
             cancelled,
         } => {
             inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
@@ -344,6 +349,14 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
                 stream_tx,
                 cancelled,
             );
+        }
+        Qwen35MoeCmd::ChatStream {
+            messages,
+            config,
+            sink,
+            cancelled,
+        } => {
+            inner.chat_stream_sync(messages, config, sink, cancelled);
         }
         Qwen35MoeCmd::Generate {
             prompt_tokens,
@@ -1199,7 +1212,7 @@ impl Qwen35MoeInner {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         eos_token_id: u32,
-        cb: &StreamSender,
+        sink: &dyn ChatStreamSink,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
@@ -1691,23 +1704,20 @@ impl Qwen35MoeInner {
         // Flush residual bytes
         if text.len() > streamed_text_len {
             let residual = text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            sink.send(Ok(ChatStreamChunk {
+                text: residual,
+                done: false,
+                finish_reason: None,
+                tool_calls: None,
+                thinking: None,
+                num_tokens: None,
+                prompt_tokens: None,
+                reasoning_tokens: None,
+                raw_text: None,
+                cached_tokens: None,
+                performance: None,
+                is_reasoning: Some(last_is_reasoning),
+            }));
         }
 
         let num_tokens = generated_tokens.len() as u32;
@@ -1740,28 +1750,45 @@ impl Qwen35MoeInner {
         );
 
         // Send final done chunk
-        cb.call(
-            Ok(ChatStreamChunk {
-                text: clean_text,
-                done: true,
-                finish_reason: Some(finish_reason),
-                tool_calls: Some(tool_calls),
-                thinking,
-                num_tokens: Some(num_tokens),
-                prompt_tokens: Some(prompt_token_count),
-                reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(text),
-                // Start path: report the matched prefix length from
-                // `verify_cache_prefix_direct`. Zero on a miss, full
-                // cached length on an exact-append hit.
-                cached_tokens: Some(cached_prefix_len as u32),
-                performance: perf_metrics,
-                is_reasoning: None,
-            }),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
+        sink.send(Ok(ChatStreamChunk {
+            text: clean_text,
+            done: true,
+            finish_reason: Some(finish_reason),
+            tool_calls: Some(tool_calls),
+            thinking,
+            num_tokens: Some(num_tokens),
+            prompt_tokens: Some(prompt_token_count),
+            reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
+            raw_text: Some(text),
+            // Start path: report the matched prefix length from
+            // `verify_cache_prefix_direct`. Zero on a miss, full
+            // cached length on an exact-append hit.
+            cached_tokens: Some(cached_prefix_len as u32),
+            performance: perf_metrics,
+            is_reasoning: None,
+        }));
 
         Ok(())
+    }
+
+    /// Streaming chat synchronous (runs on model thread).
+    pub(crate) fn chat_stream_sync(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        sink: Arc<dyn ChatStreamSink>,
+        cancelled: Arc<AtomicBool>,
+    ) {
+        let eos_id = self
+            .tokenizer
+            .as_ref()
+            .map(|t| t.get_eos_token_id())
+            .unwrap_or(self.config.eos_token_id as u32);
+        let result =
+            self.chat_stream_sync_core(messages, config, eos_id, sink.as_ref(), &cancelled);
+        if let Err(e) = result {
+            sink.send(Err(e));
+        }
     }
 
     /// Start a new chat session.
@@ -3254,6 +3281,7 @@ impl Qwen35MoeInner {
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
+    #[cfg(not(target_family = "wasm"))]
     fn init_training_sync(
         &mut self,
         config: crate::grpo::engine::GRPOEngineConfig,
@@ -3292,6 +3320,7 @@ impl Qwen35MoeInner {
         Ok(())
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
         let ts = self.training_state.as_ref().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
@@ -3299,6 +3328,7 @@ impl Qwen35MoeInner {
         ts.save_optimizer_state_sync(&path)
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
         let ts = self.training_state.as_mut().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
@@ -3311,6 +3341,7 @@ impl Qwen35MoeInner {
     /// Tokenizes prompts using Jinja2 chat template, generates completions,
     /// caches MxArray results in training_state for the subsequent training step,
     /// and returns plain data across the thread boundary.
+    #[cfg(not(target_family = "wasm"))]
     fn generate_for_training_thread_sync(
         &mut self,
         prompts: Vec<Vec<ChatMessage>>,
@@ -3411,6 +3442,7 @@ impl Qwen35MoeInner {
     ///
     /// Uses fresh local KV caches (not the shared inference caches).
     /// Returns GenerationResult with MxArray tokens and logprobs.
+    #[cfg(not(target_family = "wasm"))]
     fn generate_single_for_training_sync(
         &mut self,
         input_ids: &MxArray,
@@ -3630,6 +3662,7 @@ impl Qwen35MoeInner {
     }
 
     /// GRPO training step: compute loss, gradients, and apply optimizer.
+    #[cfg(not(target_family = "wasm"))]
     fn train_step_grpo_sync(
         &mut self,
         rewards: Vec<f64>,
@@ -3960,6 +3993,7 @@ impl Qwen35MoeInner {
     /// Receives plain data (Vec<i32> + shape) from the SFT engine, reconstructs
     /// MxArrays on the model thread, computes SFT loss + gradients, validates,
     /// clips, accumulates, and applies optimizer step when accumulation is complete.
+    #[cfg(not(target_family = "wasm"))]
     fn train_step_sft_sync(
         &mut self,
         input_ids: Vec<i32>,
@@ -4254,6 +4288,7 @@ impl Qwen35MoeInner {
     }
 
     /// Accumulate gradients into training state.
+    #[cfg(not(target_family = "wasm"))]
     fn accumulate_gradients_inner(
         ts: &mut crate::training_state::ModelThreadTrainingState,
         new_grads: HashMap<String, MxArray>,
@@ -4297,6 +4332,7 @@ impl Qwen35MoeInner {
     /// Apply gradients to model weights (SGD or AdamW delta application).
     ///
     /// Direct field access on Qwen35MoeInner — no locks needed.
+    #[cfg(not(target_family = "wasm"))]
     fn apply_gradients_inner(
         &mut self,
         gradients: HashMap<String, &MxArray>,
@@ -4553,6 +4589,21 @@ impl Qwen35MoeInner {
         }
 
         Ok(params)
+    }
+}
+
+/// Adapter for session streaming paths that still use an mpsc channel.
+struct StreamSender(StreamTx<ChatStreamChunk>);
+
+impl StreamSender {
+    fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
+        let _ = self.0.send(result);
+    }
+}
+
+impl ChatStreamSink for StreamSender {
+    fn send(&self, result: napi::Result<ChatStreamChunk>) {
+        let _ = self.0.send(result);
     }
 }
 
@@ -4889,7 +4940,7 @@ impl Qwen3_5MoeModel {
         self.thread.send(Qwen35MoeCmd::ChatStreamSessionStart {
             messages,
             config,
-            sink,
+            stream_tx,
             cancelled: cancelled_inner,
         })?;
 

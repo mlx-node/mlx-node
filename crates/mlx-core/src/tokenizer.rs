@@ -120,43 +120,13 @@ pub struct ChatMessage {
     /// Tool call ID this message is responding to (for tool messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    /// Whether this tool-role message represents an errored tool result.
-    ///
-    /// Authoritative, structured signal of tool-call failure. Set to
-    /// `Some(true)` when the caller (e.g. the Anthropic
-    /// `tool_result.is_error === true` translator) wants the model to
-    /// treat the tool output as an error. The renderer prepends a short
-    /// `[tool error]` prefix to `content` when emitting the wire-format
-    /// tool response so the model receives a clear text-level cue, but
-    /// the original `content` stays byte-for-byte intact in the
-    /// structured form — no JSON wrapping, no in-band marker that could
-    /// collide with a successful tool result whose literal content
-    /// happens to start with the same prefix.
-    ///
-    /// `None` / `Some(false)` produce the unmarked wire format.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_error: Option<bool>,
     /// Reasoning content for thinking mode (used with <think> tags)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    /// Thinking mode used when this assistant message was generated.
-    ///
-    /// This is replay provenance, not a request override. Gemma4's disabled-
-    /// thinking generation prefix contains an explicit empty thought channel,
-    /// while an enabled-thinking turn that emitted no reasoning contains no
-    /// such channel. Keeping the historical mode on the message lets the chat
-    /// template reproduce either byte sequence even when a later request
-    /// changes its current thinking setting.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking_enabled: Option<bool>,
     /// Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer)
     #[napi(ts_type = "Array<Uint8Array> | undefined")]
     #[serde(skip)]
     pub images: Option<Vec<Uint8Array>>,
-    /// Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer)
-    #[napi(ts_type = "Array<Uint8Array> | undefined")]
-    #[serde(skip)]
-    pub audio: Option<Vec<Uint8Array>>,
 }
 
 impl std::fmt::Debug for ChatMessage {
@@ -166,9 +136,7 @@ impl std::fmt::Debug for ChatMessage {
             .field("content", &self.content)
             .field("tool_calls", &self.tool_calls)
             .field("tool_call_id", &self.tool_call_id)
-            .field("is_error", &self.is_error)
             .field("reasoning_content", &self.reasoning_content)
-            .field("thinking_enabled", &self.thinking_enabled)
             .field(
                 "images",
                 &self
@@ -176,46 +144,7 @@ impl std::fmt::Debug for ChatMessage {
                     .as_ref()
                     .map(|imgs| imgs.iter().map(|i| i.len()).collect::<Vec<_>>()),
             )
-            .field(
-                "audio",
-                &self
-                    .audio
-                    .as_ref()
-                    .map(|clips| clips.iter().map(|a| a.len()).collect::<Vec<_>>()),
-            )
             .finish()
-    }
-}
-
-/// Marker prepended to a tool-role message's wire content when
-/// [`ChatMessage::is_error`] is `Some(true)`.
-///
-/// The marker is a **model-facing cue** — a short, conventional prefix
-/// that gives the model a clear text-level signal that the tool result
-/// represents an error. The structured `is_error` field on the message
-/// is the authoritative source of truth; the marker is purely a
-/// presentation choice for what reaches the model's prompt.
-///
-/// This constant is shared by every renderer (the Jinja serializer used
-/// by the cold-start path, the ChatML fallback formatter, and the
-/// per-variant `chat_session_continue_tool` delta builders) so the
-/// marker stays consistent across all entry points.
-pub const TOOL_ERROR_MARKER: &str = "[tool error] ";
-
-/// Apply [`TOOL_ERROR_MARKER`] to `content` when `is_error == Some(true)`.
-///
-/// Used by every wire-format renderer that consumes a tool-role
-/// `ChatMessage`: the Jinja serializer ([`serialize_message_for_jinja`])
-/// for the cold-start replay path, the ChatML fallback formatter, and
-/// each per-variant `chat_session_continue_tool` delta builder.
-///
-/// Returning `Cow<str>` keeps the unmarked path (the overwhelmingly
-/// common case) free of allocations.
-pub fn apply_tool_error_marker(content: &str, is_error: Option<bool>) -> std::borrow::Cow<'_, str> {
-    if is_error == Some(true) {
-        std::borrow::Cow::Owned(format!("{TOOL_ERROR_MARKER}{content}"))
-    } else {
-        std::borrow::Cow::Borrowed(content)
     }
 }
 
@@ -347,7 +276,7 @@ impl Qwen3Tokenizer {
         None
     }
 
-    /// Rewrite chat-template reasoning gates so our `preserve_thinking=true`
+    /// Rewrite the Qwen3.5 chat-template reasoning gate so our `preserve_thinking=true`
     /// context variable takes effect.
     ///
     /// The stock Qwen3.5 template gates `<think>…</think>` rendering on prior assistant
@@ -367,264 +296,18 @@ impl Qwen3Tokenizer {
     ///   `loop.index0 > ns.last_query_index`
     ///     → `preserve_thinking or loop.index0 > ns.last_query_index`
     ///
-    /// Gemma4 needs one additional stabilization. With `enable_thinking=false`, its
-    /// generation prompt ends in an explicit empty thought channel:
-    ///
-    /// ```text
-    /// <|channel>thought\n<channel|>
-    /// ```
-    ///
-    /// The stock history branch only emits a thought channel when
-    /// `reasoning_content` is non-empty, so replaying that completed assistant turn
-    /// drops the empty channel and diverges at the first generated token. Patch the
-    /// exact stock Gemma4 gate to (a) replay the empty disable-thinking channel only
-    /// when that historical assistant started a fresh model turn, and (b) retain
-    /// non-empty reasoning across a later user turn, just like the Qwen3.5 patch.
-    /// A tool-result continuation deliberately has no second `<|turn>model` prefix,
-    /// so it must not receive a second empty thought channel either. Per-message
-    /// `thinking_enabled` wins over the current request setting; the latter remains
-    /// a compatibility fallback for histories created before provenance existed.
-    ///
-    /// Both rewrites are idempotent and exact-pattern scoped. Templates that contain
-    /// neither stock gate (LFM2, legacy ChatML, custom templates) pass through
-    /// byte-for-byte.
+    /// Idempotent: if the template already references `preserve_thinking` (future
+    /// upstream templates, or our own re-patched string) the replacement becomes a
+    /// no-op. For templates that don't contain the Qwen3.5 gate at all (e.g. Gemma4,
+    /// LFM2, legacy ChatML) this is a silent pass-through.
     fn patch_preserve_thinking(template: &str) -> String {
-        const GEMMA4_STOCK_GATE: &str = "{%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}\n    {%- if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- endif -%}";
-        const GEMMA4_STABLE_GATE: &str = "{%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}\n    {%- set historical_thinking_enabled = message.get('thinking_enabled') -%}\n    {%- if preserve_thinking and thinking_text and message['role'] == 'assistant' -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- elif preserve_thinking and message['role'] == 'assistant' and not continue_same_model_turn and ((historical_thinking_enabled is boolean and not historical_thinking_enabled) or (historical_thinking_enabled is undefined and not enable_thinking)) -%}\n        {{- '<|channel>thought\\n<channel|>' -}}\n    {%- elif thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- endif -%}";
-
-        let mut patched = template.to_string();
-        if !patched.contains("preserve_thinking or loop.index0 > ns.last_query_index") {
-            patched = patched.replace(
-                "loop.index0 > ns.last_query_index",
-                "preserve_thinking or loop.index0 > ns.last_query_index",
-            );
-        }
-        if !patched.contains("historical_thinking_enabled") {
-            patched = patched.replace(GEMMA4_STOCK_GATE, GEMMA4_STABLE_GATE);
-        }
-        patched
-    }
-
-    /// Neutralize the HuggingFace `{% generation %}` / `{% endgeneration %}`
-    /// Jinja statement tags so a stock minijinja `Environment` can parse the
-    /// template.
-    ///
-    /// These block tags are a HuggingFace-specific extension that ONLY delimit
-    /// which emitted tokens are "assistant-generated" (for
-    /// `return_assistant_tokens_mask` during training). They render their body
-    /// verbatim and NEVER change the produced string. minijinja does not
-    /// implement them, so the LFM2.5 chat template
-    /// (`{%- generation -%}` … `{%- endgeneration -%}` inside the
-    /// `if message.role == "assistant"` branch) trips
-    /// `syntax error: unknown statement generation` at parse time.
-    ///
-    /// We rewrite each `generation`/`endgeneration` tag to a no-op
-    /// `{% set __hf_generation_noop = true %}` statement that PRESERVES the
-    /// exact leading/trailing whitespace-control dashes of the original, so
-    /// minijinja's whitespace trimming behaves identically and the rendered
-    /// output stays byte-identical to HuggingFace's renderer. Two sequential
-    /// no-op `set`s replacing a balanced open/close pair keep any enclosing
-    /// `if`/`for` balanced.
-    ///
-    /// The scan matches ONLY a statement tag whose sole keyword is the bare
-    /// word `generation` or `endgeneration`. It must never touch the
-    /// `add_generation_prompt` variable, `{{ ... }}` expressions, filters, or
-    /// any identifier that merely *contains* the substring "generation"
-    /// (e.g. `add_generation_prompt`, `generation_config`).
-    fn neutralize_generation_tags(template: &str) -> String {
-        // Fast path: nothing to rewrite if the whole word never appears.
-        if !template.contains("generation") {
+        if template.contains("preserve_thinking") {
             return template.to_string();
         }
-        let bytes = template.as_bytes();
-        let mut out = String::with_capacity(template.len());
-        // `last` marks the start of the not-yet-flushed verbatim run. Working
-        // on byte indices is safe here: a matching tag is ASCII-only and the
-        // `{%`/`{{`/`{#` we key on are themselves ASCII, so every boundary we
-        // cut on lands on a char boundary of the original (valid UTF-8) string.
-        let mut last = 0usize;
-        let mut i = 0usize;
-        while i + 1 < bytes.len() {
-            // The scanner only rewrites REAL statement tags at template
-            // top-level. Literal `{% generation %}` text that appears INSIDE a
-            // `{{ ... }}` expression, a `{# ... #}` comment, or a
-            // `{% raw %} ... {% endraw %}` block is rendered verbatim by Jinja,
-            // so rewriting it there would change the output bytes and break the
-            // byte-identical guarantee. Detect and SKIP those regions wholesale.
-            if bytes[i] == b'{' && bytes[i + 1] == b'{' {
-                // `{{ ... }}` expression: advance past the closing `}}`.
-                i = Self::skip_to_close(bytes, i + 2, b'}', b'}');
-                continue;
-            }
-            if bytes[i] == b'{' && bytes[i + 1] == b'#' {
-                // `{# ... #}` comment: advance past the closing `#}`.
-                i = Self::skip_to_close(bytes, i + 2, b'#', b'}');
-                continue;
-            }
-            if bytes[i] == b'{' && bytes[i + 1] == b'%' {
-                // A `{% raw %}` statement opens a verbatim block: skip the whole
-                // body (and the matching `{% endraw %}`) without rewriting.
-                if let Some(raw_consumed) = Self::match_keyword_tag(&bytes[i..], b"raw") {
-                    let body_start = i + raw_consumed;
-                    let after = Self::skip_to_endraw(bytes, body_start);
-                    i = after;
-                    continue;
-                }
-                // Top-level statement tag: attempt the generation rewrite.
-                if let Some((replacement, consumed)) = Self::match_generation_tag(&bytes[i..]) {
-                    out.push_str(&template[last..i]);
-                    out.push_str(&replacement);
-                    i += consumed;
-                    last = i;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        out.push_str(&template[last..]);
-        out
-    }
-
-    /// Advance past a two-byte close delimiter (`c0 c1`, e.g. `}}` or `#}`)
-    /// starting the search at `from`. Returns the index just AFTER the close, or
-    /// `bytes.len()` if the delimiter never appears (unterminated region — we
-    /// then treat the rest of the template as opaque, which is correct: an
-    /// unterminated `{{`/`{#`/raw block is a template error minijinja would also
-    /// reject, and we must not rewrite anything inside it).
-    fn skip_to_close(bytes: &[u8], from: usize, c0: u8, c1: u8) -> usize {
-        let mut j = from;
-        while j + 1 < bytes.len() {
-            if bytes[j] == c0 && bytes[j + 1] == c1 {
-                return j + 2;
-            }
-            j += 1;
-        }
-        bytes.len()
-    }
-
-    /// Starting at `from` (just after a `{% raw %}` open tag), advance past the
-    /// matching `{% endraw %}` (handling the dash/whitespace variants exactly as
-    /// `match_keyword_tag` does). Returns the index just AFTER the `endraw` tag,
-    /// or `bytes.len()` if no `endraw` is found. Any `{% generation %}` text
-    /// between the two is left verbatim.
-    fn skip_to_endraw(bytes: &[u8], from: usize) -> usize {
-        let mut j = from;
-        while j + 1 < bytes.len() {
-            if bytes[j] == b'{'
-                && bytes[j + 1] == b'%'
-                && let Some(consumed) = Self::match_keyword_tag(&bytes[j..], b"endraw")
-            {
-                return j + consumed;
-            }
-            j += 1;
-        }
-        bytes.len()
-    }
-
-    /// Match a bare keyword statement tag (`{% <kw> %}`) at the start of `s`
-    /// (which must begin with `{%`), tolerating the optional leading/trailing
-    /// whitespace-control dashes and surrounding whitespace — the SAME grammar
-    /// `match_generation_tag` accepts. Returns the number of bytes consumed on a
-    /// match, else `None`. Used to recognize `raw`/`endraw` so verbatim blocks
-    /// are skipped without rewriting their body.
-    fn match_keyword_tag(s: &[u8], kw: &[u8]) -> Option<usize> {
-        if s.len() < 2 || s[0] != b'{' || s[1] != b'%' {
-            return None;
-        }
-        let mut p = 2usize;
-
-        // Optional leading whitespace-control dash directly after `{%`.
-        if s.get(p) == Some(&b'-') {
-            p += 1;
-        }
-        // Optional whitespace before the keyword.
-        while s.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
-            p += 1;
-        }
-        // The bare keyword token (alphanumeric / underscore run).
-        let kw_start = p;
-        while s
-            .get(p)
-            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        {
-            p += 1;
-        }
-        if &s[kw_start..p] != kw {
-            return None;
-        }
-        // Optional whitespace after the keyword.
-        while s.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
-            p += 1;
-        }
-        // Optional trailing whitespace-control dash directly before `%}`.
-        if s.get(p) == Some(&b'-') {
-            p += 1;
-        }
-        // Must close with `%}` — anything else means extra arguments, so this
-        // is not the bare `raw`/`endraw` tag we recognize.
-        if s.get(p) == Some(&b'%') && s.get(p + 1) == Some(&b'}') {
-            Some(p + 2)
-        } else {
-            None
-        }
-    }
-
-    /// Try to match a `generation`/`endgeneration` statement tag at the start
-    /// of `s` (which begins with `{%`). On success returns the no-op
-    /// replacement string (preserving the original dash/whitespace-control
-    /// markers) and the number of bytes consumed from `s`. Returns `None` if
-    /// `s` does not start with such a tag.
-    fn match_generation_tag(s: &[u8]) -> Option<(String, usize)> {
-        debug_assert!(s.len() >= 2 && s[0] == b'{' && s[1] == b'%');
-        let mut p = 2usize;
-
-        // Optional leading whitespace-control dash directly after `{%`.
-        let lead_dash = s.get(p) == Some(&b'-');
-        if lead_dash {
-            p += 1;
-        }
-
-        // Optional whitespace before the keyword.
-        while s.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
-            p += 1;
-        }
-
-        // The bare keyword: `generation` or `endgeneration`.
-        let kw_start = p;
-        while s
-            .get(p)
-            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        {
-            p += 1;
-        }
-        let keyword = &s[kw_start..p];
-        if keyword != b"generation" && keyword != b"endgeneration" {
-            return None;
-        }
-
-        // Optional whitespace after the keyword.
-        while s.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
-            p += 1;
-        }
-
-        // Optional trailing whitespace-control dash directly before `%}`.
-        let trail_dash = s.get(p) == Some(&b'-');
-        if trail_dash {
-            p += 1;
-        }
-
-        // Must close with `%}` — anything else means this wasn't a bare
-        // `generation`/`endgeneration` tag (e.g. it had arguments) so we
-        // leave it untouched.
-        if s.get(p) == Some(&b'%') && s.get(p + 1) == Some(&b'}') {
-            p += 2;
-            let open = if lead_dash { "{%-" } else { "{%" };
-            let close = if trail_dash { "-%}" } else { "%}" };
-            let replacement = format!("{} set __hf_generation_noop = true {}", open, close);
-            Some((replacement, p))
-        } else {
-            None
-        }
+        template.replace(
+            "loop.index0 > ns.last_query_index",
+            "preserve_thinking or loop.index0 > ns.last_query_index",
+        )
     }
 
     /// Load tokenizer from file synchronously (for internal use)
@@ -667,7 +350,10 @@ impl Qwen3Tokenizer {
         // Qwen3.5 uses different IDs than Qwen2.5 (e.g. <|im_end|> = 248046,
         // not 151645). Hardcoded fallbacks produce wrong stop tokens in chat.
         let vocab = tokenizer.get_vocab(true);
-        let pad_token_id = vocab.get("<|endoftext|>").copied().unwrap_or(ENDOFTEXT_TOKEN_ID);
+        let pad_token_id = vocab
+            .get("<|endoftext|>")
+            .copied()
+            .unwrap_or(ENDOFTEXT_TOKEN_ID);
         let eos_token_id = vocab.get("<|im_end|>").copied().unwrap_or(IM_END_TOKEN_ID);
         let bos_token_id = vocab
             .get("<|startoftext|>")
@@ -1059,18 +745,10 @@ impl Qwen3Tokenizer {
                 content: Self::sanitize_chatml_content(&msg.content),
                 tool_calls: msg.tool_calls.clone(),
                 tool_call_id: msg.tool_call_id.clone(),
-                is_error: msg.is_error,
                 reasoning_content: msg.reasoning_content.clone(),
-                thinking_enabled: msg.thinking_enabled,
                 images: msg.images.as_ref().map(|imgs| {
                     imgs.iter()
                         .map(|img| Uint8Array::with_data_copied(img.as_ref()))
-                        .collect()
-                }),
-                audio: msg.audio.as_ref().map(|clips| {
-                    clips
-                        .iter()
-                        .map(|clip| Uint8Array::with_data_copied(clip.as_ref()))
                         .collect()
                 }),
             })
@@ -1091,18 +769,9 @@ impl Qwen3Tokenizer {
         let mut formatted = String::new();
 
         for msg in messages {
-            // For tool-role messages flagged with the structured
-            // `is_error` field, prepend the model-facing error marker
-            // to the wire content. The structured field stays
-            // authoritative; this rendering step is purely a model cue.
-            let content = if msg.role == "tool" {
-                apply_tool_error_marker(&msg.content, msg.is_error)
-            } else {
-                std::borrow::Cow::Borrowed(msg.content.as_str())
-            };
             formatted.push_str(&format!(
                 "<|im_start|>{}\n{}<|im_end|>\n",
-                msg.role, content
+                msg.role, msg.content
             ));
         }
 
@@ -1340,13 +1009,7 @@ impl Qwen3Tokenizer {
             },
         );
 
-        // Neutralize HuggingFace `{% generation %}` / `{% endgeneration %}`
-        // block tags before parsing — minijinja doesn't implement them, and
-        // they never alter the rendered output (LFM2.5 et al. use them only to
-        // mark assistant-generated token spans for training masks).
-        let template_str = Self::neutralize_generation_tags(template_str);
-
-        env.add_template("chat", &template_str)
+        env.add_template("chat", template_str)
             .map_err(|e| format!("Template parse error: {}", e))?;
 
         let tmpl = env
@@ -1528,23 +1191,6 @@ impl Qwen3Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
-    /// Encode text synchronously and return both token ids and per-token
-    /// byte offsets `(start, end)` into the original UTF-8 source string.
-    ///
-    /// HF tokenizers expose these offsets via `Encoding::get_offsets`;
-    /// `encode_sync` discards them, so callers that need them (e.g.
-    /// token-classification span extraction) use this helper instead.
-    pub(crate) fn encode_with_offsets_sync(
-        &self,
-        text: &str,
-        add_special_tokens: Option<bool>,
-    ) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
-        let encoding = Self::encode_internal(&self.tokenizer, text, add_special_tokens)?;
-        let ids = encoding.get_ids().to_vec();
-        let offsets = encoding.get_offsets().to_vec();
-        Ok((ids, offsets))
-    }
-
     /// Decode token IDs synchronously (for internal use by generate())
     pub(crate) fn decode_sync(
         &self,
@@ -1716,46 +1362,30 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
     obj.insert("role".to_string(), serde_json::json!(msg.role));
 
     let has_images = msg.images.as_ref().is_some_and(|imgs| !imgs.is_empty());
-    let has_audio = msg.audio.as_ref().is_some_and(|clips| !clips.is_empty());
 
-    // For tool-role messages flagged with the structured `is_error`
-    // field, prepend the model-facing error marker to the wire content
-    // before the template sees it. The structured field stays the
-    // source of truth — this only affects what the model reads in its
-    // prompt context.
-    let rendered_content: std::borrow::Cow<'_, str> = if msg.role == "tool" {
-        apply_tool_error_marker(&msg.content, msg.is_error)
-    } else {
-        std::borrow::Cow::Borrowed(msg.content.as_str())
-    };
-
-    if (has_images || has_audio) && msg.role == "user" {
+    if has_images && msg.role == "user" {
         let mut parts: Vec<serde_json::Value> = Vec::new();
-        if !rendered_content.is_empty() {
-            parts.push(serde_json::json!({ "type": "text", "text": rendered_content.as_ref() }));
-        }
-        // Image parts first, then audio parts — matching mlx-vlm's
-        // `_format_list_with_image` ordering (image content followed by
-        // appended audio messages). The Gemma 4 chat template emits a single
-        // `<|image|>` / `<|audio|>` placeholder per part; the per-modality
-        // token expanders (`expand_image_tokens` / `expand_audio_tokens`)
-        // grow them into their full spans during prefill.
-        if let Some(images) = msg.images.as_ref() {
-            for _ in images {
+        #[cfg(target_family = "wasm")]
+        {
+            // Browser Qwen3.5-VL follows mlx-vlm's LIST_WITH_IMAGE_FIRST
+            // message layout; keep native byte-for-byte behavior unchanged.
+            for _ in msg.images.as_ref().unwrap() {
                 parts.push(serde_json::json!({ "type": "image" }));
             }
         }
-        if let Some(clips) = msg.audio.as_ref() {
-            for _ in clips {
-                parts.push(serde_json::json!({ "type": "audio" }));
+        if !msg.content.is_empty() {
+            parts.push(serde_json::json!({ "type": "text", "text": msg.content }));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            // SAFETY: `is_some_and` above ensured this is Some and non-empty.
+            for _ in msg.images.as_ref().unwrap() {
+                parts.push(serde_json::json!({ "type": "image" }));
             }
         }
         obj.insert("content".to_string(), serde_json::Value::Array(parts));
     } else {
-        obj.insert(
-            "content".to_string(),
-            serde_json::json!(rendered_content.as_ref()),
-        );
+        obj.insert("content".to_string(), serde_json::json!(msg.content));
     }
 
     if let Some(tool_calls) = &msg.tool_calls {
@@ -1794,12 +1424,6 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
         obj.insert(
             "reasoning_content".to_string(),
             serde_json::json!(reasoning),
-        );
-    }
-    if let Some(thinking_enabled) = msg.thinking_enabled {
-        obj.insert(
-            "thinking_enabled".to_string(),
-            serde_json::json!(thinking_enabled),
         );
     }
 
@@ -1844,11 +1468,8 @@ mod tests {
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: None,
-            is_error: None,
             reasoning_content: None,
-            thinking_enabled: None,
             images,
-            audio: None,
         }
     }
 
@@ -1862,66 +1483,6 @@ mod tests {
         assert_eq!(v["role"], "user");
         assert!(v["content"].is_string());
         assert_eq!(v["content"], "Hello");
-    }
-
-    /// Build a user turn carrying `num_images` images and `num_audio` audio
-    /// clips, mirroring `user_msg` for the multimodal serializer tests.
-    fn user_mm_msg(content: &str, num_images: usize, num_audio: usize) -> ChatMessage {
-        let images = (num_images > 0).then(|| {
-            (0..num_images)
-                .map(|i| Uint8Array::new(vec![i as u8; 4]))
-                .collect()
-        });
-        let audio = (num_audio > 0).then(|| {
-            (0..num_audio)
-                .map(|i| Uint8Array::new(vec![i as u8; 8]))
-                .collect()
-        });
-        ChatMessage {
-            role: "user".to_string(),
-            content: content.to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images,
-            audio,
-        }
-    }
-
-    #[test]
-    fn user_with_one_audio_emits_text_and_audio_part() {
-        let msg = user_mm_msg("Transcribe.", 0, 1);
-        let v = serialize_message_for_jinja(&msg);
-        let parts = v["content"].as_array().expect("content is an array");
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[0]["text"], "Transcribe.");
-        assert_eq!(parts[1]["type"], "audio");
-    }
-
-    #[test]
-    fn user_with_image_and_audio_orders_image_then_audio() {
-        // Mixed image+audio user turn: text, then every image part, then every
-        // audio part (matches mlx-vlm `_format_list_with_image` ordering).
-        let msg = user_mm_msg("Look and listen.", 2, 1);
-        let v = serialize_message_for_jinja(&msg);
-        let parts = v["content"].as_array().unwrap();
-        assert_eq!(parts.len(), 4);
-        assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[1]["type"], "image");
-        assert_eq!(parts[2]["type"], "image");
-        assert_eq!(parts[3]["type"], "audio");
-    }
-
-    #[test]
-    fn user_audio_without_text_omits_text_part() {
-        let msg = user_mm_msg("", 0, 1);
-        let v = serialize_message_for_jinja(&msg);
-        let parts = v["content"].as_array().unwrap();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0]["type"], "audio");
     }
 
     #[test]
@@ -2059,25 +1620,19 @@ mod tests {
                 content: "describe these".to_string(),
                 tool_calls: None,
                 tool_call_id: None,
-                is_error: None,
                 reasoning_content: None,
-                thinking_enabled: None,
                 images: Some(vec![
                     Uint8Array::new(vec![0x01, 0x02, 0x03, 0x04]),
                     Uint8Array::new(vec![0xaa, 0xbb, 0xcc]),
                 ]),
-                audio: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "ok".to_string(),
                 tool_calls: None,
                 tool_call_id: None,
-                is_error: None,
                 reasoning_content: None,
-                thinking_enabled: None,
                 images: None,
-                audio: None,
             },
         ];
 
@@ -2129,11 +1684,8 @@ mod tests {
             content: "What is this?".to_string(),
             tool_calls: None,
             tool_call_id: None,
-            is_error: None,
             reasoning_content: None,
-            thinking_enabled: None,
             images: Some(vec![Uint8Array::new(vec![0; 4])]),
-            audio: None,
         }];
 
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(&msgs);
@@ -2169,12 +1721,6 @@ mod tests {
     /// want these tests self-contained. All test fixtures use plain
     /// user text that never matches that branch anyway.
     const QWEN35_GATE_SLICE: &str = "{%- set ns = namespace(last_query_index=-1) %}\n{%- for message in messages %}\n    {%- if message.role == \"user\" %}\n        {%- set ns.last_query_index = loop.index0 %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- set content = message.content|trim %}\n    {%- if message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content + '<|im_end|>\\n' }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}";
-
-    /// Minimal stock Gemma4 reasoning gate embedded in a small turn renderer.
-    /// The history branch intentionally has the upstream bug: an assistant
-    /// with no reasoning omits the empty thought channel that the generation
-    /// prompt emits when thinking is disabled.
-    const GEMMA4_GATE_SLICE: &str = "{%- set ns_turn = namespace(last_user_idx=-1) -%}\n{%- for i in range(messages | length) -%}\n    {%- if messages[i]['role'] == 'user' -%}\n        {%- set ns_turn.last_user_idx = i -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- for message in messages -%}\n    {%- if message['role'] == 'user' -%}\n        {{- '<|turn>user\\n' + message['content'] + '<turn|>\\n' -}}\n    {%- elif message['role'] == 'assistant' -%}\n        {{- '<|turn>model\\n' -}}\n    {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}\n    {%- if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- endif -%}\n        {%- for tool_call in message.get('tool_calls', []) -%}\n            {{- '<|tool_call>call:' + tool_call['function']['name'] + '{}<tool_call|>' -}}\n        {%- endfor -%}\n        {{- message['content'] -}}\n    {%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- '<|turn>model\\n' -}}\n    {%- if not enable_thinking -%}\n        {{- '<|channel>thought\\n<channel|>' -}}\n    {%- endif -%}\n{%- endif -%}";
 
     /// Build the Jinja env the same way `render_chat_template_jinja2` does
     /// (minus the string-method bridge, which this slice doesn't need).
@@ -2216,386 +1762,12 @@ mod tests {
     }
 
     #[test]
-    fn patch_preserve_thinking_is_idempotent_for_gemma4() {
-        let once = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
-        let twice = Qwen3Tokenizer::patch_preserve_thinking(&once);
-        assert_eq!(
-            once, twice,
-            "Gemma4's stabilization must only be applied once"
-        );
-        assert!(once.contains("historical_thinking_enabled"));
-        assert!(once.contains("not continue_same_model_turn"));
-        assert!(once.contains("preserve_thinking and thinking_text"));
-    }
-
-    #[test]
     fn patch_preserve_thinking_passthrough_on_unrelated_templates() {
-        // Templates that don't carry either recognized reasoning gate (LFM2 /
+        // Templates that don't carry the Qwen3.5 gate (Gemma4 / LFM2 /
         // minimal ChatML) must survive verbatim — no `replace` call is
         // allowed to silently corrupt their control flow.
-        let custom = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
-        assert_eq!(Qwen3Tokenizer::patch_preserve_thinking(custom), custom);
-    }
-
-    /// The exact regression from the Gemma4 agent tool loop: turn 1's
-    /// no-thinking generation prompt places an empty thought channel in KV,
-    /// then turn 2 replays the assistant tool call. The replayed assistant
-    /// prefix must contain that same channel byte-for-byte.
-    #[test]
-    fn gemma4_no_thinking_tool_call_replay_matches_generated_prefix() {
-        let template = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
-        let user = ChatMessage {
-            role: "user".to_string(),
-            content: "read it".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        };
-        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            std::slice::from_ref(&user),
-            None,
-            true,
-            Some(false),
-            "",
-            "",
-        )
-        .unwrap();
-
-        let generated_tool_call = "<|tool_call>call:read{}<tool_call|>";
-        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &[
-                user,
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: String::new(),
-                    tool_calls: Some(vec![ToolCall {
-                        id: Some("call_1".to_string()),
-                        name: "read".to_string(),
-                        arguments: "{}".to_string(),
-                    }]),
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(false),
-                    images: None,
-                    audio: None,
-                },
-            ],
-            None,
-            false,
-            Some(true),
-            "",
-            "",
-        )
-        .unwrap();
-
-        assert_eq!(
-            replay,
-            format!("{first_prompt}{generated_tool_call}"),
-            "the next full-history replay must extend the cached generation prefix exactly",
-        );
-    }
-
-    /// A mode change on the current request must not rewrite older KV. Real
-    /// historical reasoning wins over the current no-thinking fallback, even
-    /// for a final assistant response with no tool call and after a new user
-    /// turn has moved `last_user_idx` past that assistant.
-    #[test]
-    fn gemma4_real_reasoning_survives_no_thinking_mode_change_without_tool_call() {
-        let template = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
-        let user = ChatMessage {
-            role: "user".to_string(),
-            content: "question".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        };
-        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            std::slice::from_ref(&user),
-            None,
-            true,
-            Some(true),
-            "",
-            "",
-        )
-        .unwrap();
-        let generated = "<|channel>thought\nkept reasoning\n<channel|>final answer";
-        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &[
-                user,
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: "final answer".to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: Some("kept reasoning".to_string()),
-                    thinking_enabled: Some(true),
-                    images: None,
-                    audio: None,
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: "follow-up".to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: None,
-                    images: None,
-                    audio: None,
-                },
-            ],
-            None,
-            true,
-            Some(false),
-            "",
-            "",
-        )
-        .unwrap();
-
-        assert!(
-            replay.starts_with(&format!("{first_prompt}{generated}")),
-            "historical reasoning must extend its original generated prefix even when the current request disables thinking:\nfirst={first_prompt:?}\nreplay={replay:?}",
-        );
-    }
-
-    /// An enabled-thinking turn may legitimately emit no reasoning channel.
-    /// A later disabled-thinking request must not retroactively insert the
-    /// empty channel used by its own generation prompt into that history.
-    #[test]
-    fn gemma4_enabled_thinking_without_reasoning_survives_mode_change() {
-        let template = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
-        let user = ChatMessage {
-            role: "user".to_string(),
-            content: "answer directly".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        };
-        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            std::slice::from_ref(&user),
-            None,
-            true,
-            Some(true),
-            "",
-            "",
-        )
-        .unwrap();
-        let generated = "direct answer";
-        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &[
-                user,
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: generated.to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(true),
-                    images: None,
-                    audio: None,
-                },
-            ],
-            None,
-            false,
-            Some(false),
-            "",
-            "",
-        )
-        .unwrap();
-
-        assert_eq!(
-            replay,
-            format!("{first_prompt}{generated}"),
-            "historical enabled-thinking provenance must suppress the current request's empty channel",
-        );
-    }
-
-    /// Exercise the same invariant through the exact stock template used by
-    /// the local Gemma-4-12B agent checkpoint. The file is an optional local
-    /// fixture, matching the existing Gemma4 template tests below; CI without
-    /// model artifacts skips it.
-    #[test]
-    fn gemma4_stock_template_no_thinking_replay_extends_cached_prefix() {
-        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/Gemma-4-12B-IT-q4-mlx/chat_template.jinja";
-        let Ok(stock) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let template = Qwen3Tokenizer::patch_preserve_thinking(&stock);
-        assert!(
-            template.contains("historical_thinking_enabled"),
-            "the stock Gemma4 gate was not recognized"
-        );
-
-        let user = ChatMessage {
-            role: "user".to_string(),
-            content: "Read Cargo.toml.".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        };
-        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            std::slice::from_ref(&user),
-            None,
-            true,
-            Some(false),
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-        let generated_tool_call = "<|tool_call>call:read{path:<|\"|>Cargo.toml<|\"|>}<tool_call|>";
-        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &[
-                user,
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: String::new(),
-                    tool_calls: Some(vec![ToolCall {
-                        id: Some("call_1".to_string()),
-                        name: "read".to_string(),
-                        arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
-                    }]),
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(false),
-                    images: None,
-                    audio: None,
-                },
-            ],
-            None,
-            false,
-            Some(false),
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-
-        assert!(
-            replay.starts_with(&format!("{first_prompt}{generated_tool_call}")),
-            "stock Gemma4 replay diverged from the cached no-thinking prefix:\nfirst={first_prompt:?}\nreplay={replay:?}",
-        );
-    }
-
-    /// Gemma4 renders a tool result and the following assistant response in
-    /// one continuous model turn. Replaying the final assistant must append
-    /// its generated text directly; inserting another disabled-thinking
-    /// channel at that continuation point breaks the cached prefix.
-    #[test]
-    fn gemma4_stock_tool_result_final_continuation_has_no_second_thought_channel() {
-        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/Gemma-4-12B-IT-q4-mlx/chat_template.jinja";
-        let Ok(stock) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let template = Qwen3Tokenizer::patch_preserve_thinking(&stock);
-        let messages = |with_final: bool| {
-            let mut messages = vec![
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: "Read Cargo.toml.".to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: None,
-                    images: None,
-                    audio: None,
-                },
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: String::new(),
-                    tool_calls: Some(vec![ToolCall {
-                        id: Some("call_1".to_string()),
-                        name: "read".to_string(),
-                        arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
-                    }]),
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(false),
-                    images: None,
-                    audio: None,
-                },
-                ChatMessage {
-                    role: "tool".to_string(),
-                    content: "package contents".to_string(),
-                    tool_calls: None,
-                    tool_call_id: Some("call_1".to_string()),
-                    is_error: Some(false),
-                    reasoning_content: None,
-                    thinking_enabled: None,
-                    images: None,
-                    audio: None,
-                },
-            ];
-            if with_final {
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: "Done.".to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(false),
-                    images: None,
-                    audio: None,
-                });
-            }
-            messages
-        };
-
-        let continuation_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &messages(false),
-            None,
-            true,
-            Some(false),
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-        let completed_replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &messages(true),
-            None,
-            false,
-            Some(false),
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-
-        assert_eq!(
-            completed_replay,
-            format!("{continuation_prompt}Done.<turn|>\n"),
-            "tool-result continuation must not gain a second empty thought channel",
-        );
+        let gemma4 = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+        assert_eq!(Qwen3Tokenizer::patch_preserve_thinking(gemma4), gemma4);
     }
 
     /// Reproduces the turn-15 → turn-16 divergence from
@@ -2669,368 +1841,6 @@ mod tests {
         );
     }
 
-    /// The HuggingFace `{% generation %}`/`{% endgeneration %}` block tags
-    /// (used by LFM2.5-8B-A1B) only mark assistant-generated token spans for
-    /// training masks — they render their body verbatim and never change the
-    /// output string. minijinja doesn't implement them, so we rewrite them to
-    /// no-op `set` statements before parsing. This proves the rewrite is
-    /// transparent: rendering the template with the tags present is
-    /// byte-identical to rendering it with the tags removed by hand, including
-    /// every whitespace-control dash.
-    #[test]
-    fn generation_tags_render_transparently() {
-        // Minimal template that wraps the assistant content in
-        // generation/endgeneration with the dash variant LFM2.5 ships.
-        let with_tags = "{%- for m in messages -%}{{- m.role -}}{%- if m.role == 'assistant' -%}{%- generation -%}{{- ':' + m.content -}}{%- endgeneration -%}{%- endif -%}{%- endfor -%}";
-        // The same template with the tags deleted by hand — the ground truth
-        // HuggingFace's renderer (which treats the tags as transparent)
-        // produces.
-        let without_tags = "{%- for m in messages -%}{{- m.role -}}{%- if m.role == 'assistant' -%}{{- ':' + m.content -}}{%- endif -%}{%- endfor -%}";
-
-        let msgs = vec![
-            ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                tool_calls: None,
-                tool_call_id: None,
-                is_error: None,
-                reasoning_content: None,
-                thinking_enabled: None,
-                images: None,
-                audio: None,
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "hello there".to_string(),
-                tool_calls: None,
-                tool_call_id: None,
-                is_error: None,
-                reasoning_content: None,
-                thinking_enabled: None,
-                images: None,
-                audio: None,
-            },
-        ];
-
-        let rendered_with = Qwen3Tokenizer::render_chat_template_jinja2(
-            with_tags, &msgs, None, false, None, "<bos>", "<eos>",
-        )
-        .expect("template with generation tags should parse and render");
-        let rendered_without = Qwen3Tokenizer::render_chat_template_jinja2(
-            without_tags,
-            &msgs,
-            None,
-            false,
-            None,
-            "<bos>",
-            "<eos>",
-        )
-        .expect("hand-stripped template should render");
-
-        assert_eq!(
-            rendered_with, rendered_without,
-            "generation/endgeneration tags must be a no-op on the rendered output",
-        );
-        // Sanity: the body is actually rendered (not swallowed).
-        assert_eq!(rendered_with, "userassistant:hello there");
-    }
-
-    /// Guard against a false positive: the `add_generation_prompt` VARIABLE
-    /// (and any identifier merely containing the substring "generation") must
-    /// NOT be rewritten by `neutralize_generation_tags`. If it were, the
-    /// `if add_generation_prompt` branch would break and the assistant prompt
-    /// prefix would be dropped or duplicated.
-    #[test]
-    fn add_generation_prompt_variable_is_untouched() {
-        let template = "{%- for m in messages -%}{{- m.content -}}{%- endfor -%}{%- if add_generation_prompt -%}<assistant>{%- endif -%}";
-        // The transform must leave this template completely unchanged.
-        assert_eq!(
-            Qwen3Tokenizer::neutralize_generation_tags(template),
-            template,
-            "add_generation_prompt and other 'generation'-containing identifiers must not be rewritten",
-        );
-
-        let msg = ChatMessage {
-            role: "user".to_string(),
-            content: "ping".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        };
-        let with_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            template,
-            std::slice::from_ref(&msg),
-            None,
-            true,
-            None,
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-        assert_eq!(with_prompt, "ping<assistant>");
-
-        let without_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            template,
-            std::slice::from_ref(&msg),
-            None,
-            false,
-            None,
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-        assert_eq!(without_prompt, "ping");
-    }
-
-    /// Unit coverage of the scanner across every dash/whitespace variant and
-    /// the must-not-match cases, independent of a full render.
-    #[test]
-    fn neutralize_generation_tags_handles_all_variants() {
-        let cases = [
-            (
-                "{%- generation -%}",
-                "{%- set __hf_generation_noop = true -%}",
-            ),
-            ("{% generation %}", "{% set __hf_generation_noop = true %}"),
-            (
-                "{%- generation %}",
-                "{%- set __hf_generation_noop = true %}",
-            ),
-            (
-                "{% generation -%}",
-                "{% set __hf_generation_noop = true -%}",
-            ),
-            (
-                "{%- endgeneration -%}",
-                "{%- set __hf_generation_noop = true -%}",
-            ),
-            (
-                "{% endgeneration %}",
-                "{% set __hf_generation_noop = true %}",
-            ),
-            (
-                "{%-endgeneration-%}",
-                "{%- set __hf_generation_noop = true -%}",
-            ),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(
-                Qwen3Tokenizer::neutralize_generation_tags(input),
-                expected,
-                "variant `{input}` should rewrite to `{expected}`",
-            );
-        }
-
-        // Must-not-match: identifiers containing the substring, the variable,
-        // expressions, and tags with extra arguments.
-        let untouched = [
-            "{%- if add_generation_prompt -%}x{%- endif -%}",
-            "{{ generation_config }}",
-            "{{ generation }}",
-            "{%- set generation_count = 1 -%}",
-            "{%- for generation in generations -%}{%- endfor -%}",
-        ];
-        for input in untouched {
-            assert_eq!(
-                Qwen3Tokenizer::neutralize_generation_tags(input),
-                input,
-                "`{input}` must be left unchanged",
-            );
-        }
-    }
-
-    /// Finding B regression: literal `{% generation %}` text appearing INSIDE a
-    /// `{{ ... }}` expression or a `{% raw %} ... {% endraw %}` block is
-    /// rendered verbatim by Jinja, so the scanner must NOT rewrite it — doing so
-    /// would change the output bytes and break the byte-identical guarantee. A
-    /// `{# ... #}` comment is also a skip region. Meanwhile a REAL top-level
-    /// `{%- generation -%}...{%- endgeneration -%}` must still be neutralized.
-    #[test]
-    fn neutralize_generation_tags_is_region_aware() {
-        // 1. Literal tag text inside a `{{ ... }}` expression: PRESERVED.
-        let expr = r#"{{ "{% generation %}" }}"#;
-        assert_eq!(
-            Qwen3Tokenizer::neutralize_generation_tags(expr),
-            expr,
-            "literal `{{% generation %}}` inside a {{{{ ... }}}} expression must be preserved",
-        );
-
-        // 2. Literal tag text inside a `{% raw %} ... {% endraw %}` block:
-        // PRESERVED (both the open generation and the close endgeneration).
-        let raw = "{% raw %}{% generation %}{% endgeneration %}{% endraw %}";
-        assert_eq!(
-            Qwen3Tokenizer::neutralize_generation_tags(raw),
-            raw,
-            "literal generation tags inside a {{% raw %}} block must be preserved",
-        );
-
-        // 2b. Dash/whitespace variants of raw/endraw still bound the block.
-        let raw_dash = "{%- raw -%}{%- generation -%}{%- endraw -%}";
-        assert_eq!(
-            Qwen3Tokenizer::neutralize_generation_tags(raw_dash),
-            raw_dash,
-            "dash-variant {{%- raw -%}} block must preserve its body",
-        );
-
-        // 3. Literal tag text inside a `{# ... #}` comment: PRESERVED.
-        let comment = "{# {% generation %} #}";
-        assert_eq!(
-            Qwen3Tokenizer::neutralize_generation_tags(comment),
-            comment,
-            "literal generation tag inside a {{# ... #}} comment must be preserved",
-        );
-
-        // 4. A REAL top-level tag pair OUTSIDE any skip region is still
-        // neutralized — even when a raw block precedes it in the same template.
-        let mixed =
-            "{% raw %}{% generation %}{% endraw %}{%- generation -%}body{%- endgeneration -%}";
-        let expected = "{% raw %}{% generation %}{% endraw %}{%- set __hf_generation_noop = true -%}body{%- set __hf_generation_noop = true -%}";
-        assert_eq!(
-            Qwen3Tokenizer::neutralize_generation_tags(mixed),
-            expected,
-            "real top-level generation tags must still be neutralized; raw body preserved",
-        );
-    }
-
-    /// Finding B end-to-end: a template that emits literal `{% generation %}`
-    /// text via a `{{ ... }}` expression and a `{% raw %}` block must RENDER
-    /// with that literal text intact (byte-identical), while a real top-level
-    /// generation tag pair around the assistant content is transparent.
-    #[test]
-    fn generation_tags_inside_literals_render_byte_identical() {
-        // `with_scan` is what we feed the (rewriting) loader; `ground_truth` is
-        // the same template with the REAL top-level tags hand-stripped (Jinja's
-        // transparent semantics) and the literal text left exactly as-is.
-        let with_scan = concat!(
-            "{%- for m in messages -%}",
-            "{{- m.role -}}",
-            r#"{{ "{% generation %}" }}"#,
-            "{% raw %}{% generation %}{% endraw %}",
-            "{%- if m.role == 'assistant' -%}",
-            "{%- generation -%}{{- ':' + m.content -}}{%- endgeneration -%}",
-            "{%- endif -%}",
-            "{%- endfor -%}",
-        );
-        let ground_truth = concat!(
-            "{%- for m in messages -%}",
-            "{{- m.role -}}",
-            r#"{{ "{% generation %}" }}"#,
-            "{% raw %}{% generation %}{% endraw %}",
-            "{%- if m.role == 'assistant' -%}",
-            "{{- ':' + m.content -}}",
-            "{%- endif -%}",
-            "{%- endfor -%}",
-        );
-
-        let msgs = vec![
-            ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                tool_calls: None,
-                tool_call_id: None,
-                is_error: None,
-                reasoning_content: None,
-                thinking_enabled: None,
-                images: None,
-                audio: None,
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "hello there".to_string(),
-                tool_calls: None,
-                tool_call_id: None,
-                is_error: None,
-                reasoning_content: None,
-                thinking_enabled: None,
-                images: None,
-                audio: None,
-            },
-        ];
-
-        let rendered_with = Qwen3Tokenizer::render_chat_template_jinja2(
-            with_scan, &msgs, None, false, None, "<bos>", "<eos>",
-        )
-        .expect("template with literal generation tags should parse and render");
-        let rendered_truth = Qwen3Tokenizer::render_chat_template_jinja2(
-            ground_truth,
-            &msgs,
-            None,
-            false,
-            None,
-            "<bos>",
-            "<eos>",
-        )
-        .expect("ground-truth template should render");
-
-        assert_eq!(
-            rendered_with, rendered_truth,
-            "literal `{{% generation %}}` text must survive verbatim; real tags transparent",
-        );
-        // Sanity: the literal text is actually present in the output, once per
-        // message (the `{{ ... }}` expression and the raw block each emit it).
-        assert!(
-            rendered_with.contains("{% generation %}{% generation %}"),
-            "literal generation text must appear in the render:\n{rendered_with}",
-        );
-    }
-
-    /// End-to-end: load the real LFM2.5-8B-A1B chat_template.jinja (which uses
-    /// `{%- generation -%}` / `{%- endgeneration -%}`), render a single
-    /// user-message conversation with `add_generation_prompt=true`, and assert
-    /// it parses, renders, and ends with the assistant prompt prefix.
-    /// `#[ignore]`-gated because the template lives in a local checkout;
-    /// point `MLX_TEST_LFM2_TEMPLATE_PATH` at the LFM2.5-8B-A1B
-    /// `chat_template.jinja` and opt in with
-    /// `cargo test lfm2_full_template_renders -- --include-ignored`.
-    #[test]
-    #[ignore = "requires local LFM2.5 checkpoint; set MLX_TEST_LFM2_TEMPLATE_PATH to its chat_template.jinja"]
-    fn lfm2_full_template_renders_with_generation_tags() {
-        let Ok(path) = std::env::var("MLX_TEST_LFM2_TEMPLATE_PATH") else {
-            eprintln!(
-                "skipping: MLX_TEST_LFM2_TEMPLATE_PATH unset (point it at the \
-                 LFM2.5-8B-A1B chat_template.jinja)"
-            );
-            return;
-        };
-        let Ok(tmpl) = std::fs::read_to_string(&path) else {
-            // Fixture not present at the given path — nothing to assert.
-            eprintln!("skipping: MLX_TEST_LFM2_TEMPLATE_PATH file not readable: {path}");
-            return;
-        };
-        // LFM2.5's template calls strftime_now() only inside the `if tools`
-        // branch, which we don't exercise here, so the stock env suffices.
-        let msgs = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hello!".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        }];
-        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
-            &tmpl, &msgs, None, true, None, "<bos>", "<eos>",
-        )
-        .unwrap_or_else(|e| panic!("LFM2.5 template render failed: {e}"));
-
-        assert!(
-            rendered.contains("<|im_start|>user\nHello!<|im_end|>"),
-            "rendered prompt missing user turn:\n{rendered}",
-        );
-        // Line 103-104 of the template: `add_generation_prompt` appends the
-        // assistant prompt prefix. Confirmed against the on-disk template.
-        assert!(
-            rendered.ends_with("<|im_start|>assistant\n"),
-            "rendered prompt must end with the assistant prompt prefix:\n{rendered}",
-        );
-    }
-
     /// Cache-reuse regression: the same assistant ChatMessage shape that
     /// turn 10 emitted (reasoning + content + two function_calls with
     /// schema-declared arg order `[path, edits]`) must re-render
@@ -3061,11 +1871,8 @@ mod tests {
             content: "hello".to_string(),
             tool_calls: None,
             tool_call_id: None,
-            is_error: None,
             reasoning_content: None,
-            thinking_enabled: None,
             images: None,
-            audio: None,
         }];
         let tools = vec![ToolDefinition {
             r#type: "function".to_string(),
@@ -3122,11 +1929,8 @@ mod tests {
             content: "hello".to_string(),
             tool_calls: None,
             tool_call_id: None,
-            is_error: None,
             reasoning_content: Some("because".to_string()),
-            thinking_enabled: None,
             images: None,
-            audio: None,
         };
         // Minimal template that drives the fixture map through `.get()`
         // three different ways — hit, miss (no default), miss (with
@@ -3167,11 +1971,8 @@ mod tests {
             content: "Making the edit.".to_string(),
             tool_calls: Some(vec![call]),
             tool_call_id: None,
-            is_error: None,
             reasoning_content: Some("think".to_string()),
-            thinking_enabled: None,
             images: None,
-            audio: None,
         };
         let v = serialize_message_for_jinja(&msg);
 
@@ -3289,11 +2090,8 @@ mod tests {
                     content: "Run ls.".to_string(),
                     tool_calls: None,
                     tool_call_id: None,
-                    is_error: None,
                     reasoning_content: None,
-                    thinking_enabled: None,
                     images: None,
-                    audio: None,
                 },
                 ChatMessage {
                     role: "assistant".to_string(),
@@ -3304,11 +2102,8 @@ mod tests {
                         arguments: r#"{"command":"ls"}"#.to_string(),
                     }]),
                     tool_call_id: None,
-                    is_error: None,
                     reasoning_content: Some(reasoning.to_string()),
-                    thinking_enabled: None,
                     images: None,
-                    audio: None,
                 },
             ]
         };
@@ -3351,178 +2146,5 @@ mod tests {
             !rendered_fix.contains("thought\nthought\n"),
             "fixed shape must NOT double `thought\\n`:\n{rendered_fix}"
         );
-    }
-
-    // ----- Tool-error marker tests -----
-    //
-    // These guard the structured `is_error` channel on `ChatMessage`. The
-    // structured field is the authoritative failure signal; the rendered
-    // wire content carries a `[tool error]` prefix purely as a model cue,
-    // so the `content` field itself stays byte-for-byte intact and
-    // successful tool results whose literal text happens to start with
-    // the marker cannot be confused with errored ones on read-back.
-
-    fn tool_msg_with_error(content: &str, is_error: Option<bool>) -> ChatMessage {
-        ChatMessage {
-            role: "tool".to_string(),
-            content: content.to_string(),
-            tool_calls: None,
-            tool_call_id: Some("call_xyz".to_string()),
-            is_error,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        }
-    }
-
-    #[test]
-    fn apply_tool_error_marker_prepends_only_for_some_true() {
-        // Some(true) prepends; None / Some(false) pass through unchanged.
-        // The marker is the single shared constant — keep tests in sync
-        // with the constant so any rename trips the suite, not the
-        // models silently.
-        let payload = "boom: connection refused";
-        let marked = apply_tool_error_marker(payload, Some(true));
-        assert_eq!(marked, format!("{TOOL_ERROR_MARKER}{payload}"));
-        let unmarked_none = apply_tool_error_marker(payload, None);
-        assert_eq!(unmarked_none, payload);
-        let unmarked_false = apply_tool_error_marker(payload, Some(false));
-        assert_eq!(unmarked_false, payload);
-    }
-
-    #[test]
-    fn apply_tool_error_marker_borrows_on_pass_through() {
-        // The unmarked branch returns a `Cow::Borrowed` to keep the hot
-        // (non-error) path free of allocations.
-        let payload = "{\"temperature\": 72}";
-        let cow = apply_tool_error_marker(payload, None);
-        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
-        let cow_false = apply_tool_error_marker(payload, Some(false));
-        assert!(matches!(cow_false, std::borrow::Cow::Borrowed(_)));
-        let cow_err = apply_tool_error_marker(payload, Some(true));
-        assert!(matches!(cow_err, std::borrow::Cow::Owned(_)));
-    }
-
-    #[test]
-    fn jinja_serializer_injects_marker_for_errored_tool_message() {
-        // The Jinja serializer is the cold-start path's wire-format
-        // renderer (consumed by `chatSessionStart`). When the structured
-        // `is_error` flag is set, the rendered `content` field that the
-        // template sees must carry the `[tool error]` cue.
-        let msg = tool_msg_with_error("boom", Some(true));
-        let v = serialize_message_for_jinja(&msg);
-        assert_eq!(v["role"], "tool");
-        assert_eq!(
-            v["content"]
-                .as_str()
-                .expect("tool-role content is a flat string"),
-            format!("{TOOL_ERROR_MARKER}boom")
-        );
-    }
-
-    #[test]
-    fn jinja_serializer_skips_marker_when_is_error_is_none() {
-        // No flag → no marker, even if the literal content happens to
-        // begin with the marker text (the collision case Codex flagged).
-        let suspicious = format!("{TOOL_ERROR_MARKER}this is a successful payload");
-        let msg = tool_msg_with_error(&suspicious, None);
-        let v = serialize_message_for_jinja(&msg);
-        assert_eq!(
-            v["content"]
-                .as_str()
-                .expect("tool-role content is a flat string"),
-            suspicious,
-            "successful tool_result whose text resembles the marker must round-trip verbatim",
-        );
-    }
-
-    #[test]
-    fn jinja_serializer_skips_marker_when_is_error_is_some_false() {
-        let msg = tool_msg_with_error("ok", Some(false));
-        let v = serialize_message_for_jinja(&msg);
-        assert_eq!(v["content"].as_str().unwrap(), "ok");
-    }
-
-    #[test]
-    fn jinja_serializer_keeps_tool_call_id_alongside_marker() {
-        // The marker channel must coexist with `tool_call_id` — the
-        // structured field is the parallel addition that motivated this
-        // change.
-        let msg = tool_msg_with_error("boom", Some(true));
-        let v = serialize_message_for_jinja(&msg);
-        assert_eq!(v["tool_call_id"], "call_xyz");
-        assert_eq!(
-            v["content"].as_str().unwrap(),
-            format!("{TOOL_ERROR_MARKER}boom"),
-        );
-    }
-
-    #[test]
-    fn jinja_serializer_does_not_mark_non_tool_roles() {
-        // Defensive: the marker is reserved for `role == "tool"`. A
-        // user / assistant / system message with `is_error: Some(true)`
-        // (an unusual but possible direct construction) must not get
-        // the prefix — the field's contract is "errored tool result",
-        // and applying it to a user message would silently corrupt the
-        // turn the template renders.
-        for role in &["user", "assistant", "system"] {
-            let mut msg = tool_msg_with_error("hello", Some(true));
-            msg.role = (*role).to_string();
-            msg.tool_call_id = None;
-            let v = serialize_message_for_jinja(&msg);
-            assert_eq!(
-                v["content"].as_str().unwrap(),
-                "hello",
-                "role={role} must not receive the tool-error marker",
-            );
-        }
-    }
-
-    #[test]
-    fn format_chatml_presanitized_injects_marker_for_errored_tool_message() {
-        // The fallback ChatML formatter is the no-template path. The
-        // marker must apply equally there.
-        let msgs = vec![tool_msg_with_error("boom", Some(true))];
-        let rendered = Qwen3Tokenizer::format_chatml_presanitized(&msgs, false);
-        assert!(
-            rendered.contains(&format!("{TOOL_ERROR_MARKER}boom")),
-            "ChatML fallback formatter must inject the marker:\n{rendered}",
-        );
-    }
-
-    #[test]
-    fn format_chatml_presanitized_skips_marker_when_unflagged() {
-        // The hot (successful) path must remain byte-equal to the
-        // pre-feature output: same content, no prefix.
-        let msgs = vec![tool_msg_with_error("ok", None)];
-        let rendered = Qwen3Tokenizer::format_chatml_presanitized(&msgs, false);
-        assert!(
-            !rendered.contains(TOOL_ERROR_MARKER),
-            "ChatML fallback must not inject the marker on unflagged messages:\n{rendered}",
-        );
-        assert!(
-            rendered.contains("ok"),
-            "content must still appear:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn sanitize_messages_preserves_is_error() {
-        // The structured field must round-trip through sanitization the
-        // same way `tool_call_id` does — otherwise the marker injection
-        // would never see the flag for any caller that passes messages
-        // through `sanitize_messages_public` first (which is every
-        // production caller).
-        let original = vec![
-            tool_msg_with_error("boom", Some(true)),
-            tool_msg_with_error("ok-explicit", Some(false)),
-            tool_msg_with_error("ok-default", None),
-        ];
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(&original);
-        assert_eq!(sanitized.len(), 3);
-        assert_eq!(sanitized[0].is_error, Some(true));
-        assert_eq!(sanitized[1].is_error, Some(false));
-        assert_eq!(sanitized[2].is_error, None);
     }
 }

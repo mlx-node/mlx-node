@@ -8,6 +8,73 @@ use napi::bindgen_prelude::*;
 use super::config::Qwen3_5Config;
 use super::quantized_linear::{LinearProj, QuantizedLinear};
 
+#[cfg(target_family = "wasm")]
+fn apply_qwen35_mrope(
+    q: &MxArray,
+    k: &MxArray,
+    cos: &MxArray,
+    sin: &MxArray,
+    mrope_section: &[i32],
+) -> Result<(MxArray, MxArray)> {
+    let q_shape = q.shape()?;
+    let batch = q_shape[0];
+    let q_heads = q_shape[1];
+    let seq_len = q_shape[2];
+    let q_dim = q_shape[3];
+    let k_shape = k.shape()?;
+    let k_heads = k_shape[1];
+    let k_dim = k_shape[3];
+    let half_rotary: i64 = mrope_section.iter().map(|&s| s as i64).sum();
+    let rope_dims = half_rotary * 2;
+
+    let build_trig = |src: &MxArray| -> Result<MxArray> {
+        let axes = [
+            src.slice_axis(0, 0, 1)?.squeeze(Some(&[0]))?,
+            src.slice_axis(0, 1, 2)?.squeeze(Some(&[0]))?,
+            src.slice_axis(0, 2, 3)?.squeeze(Some(&[0]))?,
+        ];
+
+        let h_limit = mrope_section[1] as i64 * 3;
+        let w_limit = mrope_section[2] as i64 * 3;
+        let mut half_parts: Vec<MxArray> = Vec::with_capacity(half_rotary as usize);
+        for dim in 0..half_rotary {
+            let axis = if dim % 3 == 1 && dim < h_limit {
+                1
+            } else if dim % 3 == 2 && dim < w_limit {
+                2
+            } else {
+                0
+            };
+            half_parts.push(axes[axis].slice_axis(2, dim, dim + 1)?);
+        }
+
+        let refs: Vec<&MxArray> = half_parts.iter().collect();
+        let half = MxArray::concatenate_many(refs, Some(-1))?;
+        MxArray::concatenate_many(vec![&half, &half], Some(-1))?
+            .reshape(&[batch, 1, seq_len, rope_dims])
+    };
+
+    let cos_final = build_trig(cos)?;
+    let sin_final = build_trig(sin)?;
+
+    let rotate = |x: &MxArray, _heads: i64, dim: i64| -> Result<MxArray> {
+        let x_rot = x.slice_axis(3, 0, rope_dims)?;
+        let x1 = x_rot.slice_axis(3, 0, half_rotary)?;
+        let x2 = x_rot.slice_axis(3, half_rotary, rope_dims)?;
+        let neg_x2 = x2.mul_scalar(-1.0)?;
+        let rotated = MxArray::concatenate_many(vec![&neg_x2, &x1], Some(-1))?;
+        let embedded = x_rot.mul(&cos_final)?.add(&rotated.mul(&sin_final)?)?;
+        if rope_dims < dim {
+            let pass = x.slice_axis(3, rope_dims, dim)?;
+            MxArray::concatenate_many(vec![&embedded, &pass], Some(-1))
+        } else {
+            Ok(embedded)
+        }
+    };
+
+    Ok((rotate(q, q_heads, q_dim)?, rotate(k, k_heads, k_dim)?))
+}
+
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///
 /// Key differences from standard Qwen3 attention:
@@ -255,8 +322,8 @@ impl Qwen3_5Attention {
             let (cos, sin) = mrope.forward(&queries, position_ids)?;
             let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
             let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let (q_out, k_out) =
-                apply_multimodal_rotary_pos_emb(&q_t, &k_t, &cos, &sin, mrope.mrope_section())?;
+            let section = mrope.mrope_section();
+            let (q_out, k_out) = apply_qwen35_mrope(&q_t, &k_t, &cos, &sin, &section)?;
             let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
             let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
             (q_out, k_out)

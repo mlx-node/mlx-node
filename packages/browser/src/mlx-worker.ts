@@ -95,14 +95,19 @@ function normalizeReasoningEffort(
 }
 
 function buildChatConfig(data: {
+  messages?: any[];
   config?: any;
   enableThinking?: boolean;
   reasoningEffort?: unknown;
 }) {
-  const effort = normalizeReasoningEffort(
+  const requestedEffort = normalizeReasoningEffort(
     data.reasoningEffort,
     data.enableThinking,
   );
+  const hasImages =
+    Array.isArray(data.messages) && hasMessageImages(data.messages);
+  const effort =
+    requestedEffort === "off" && hasImages ? "low" : requestedEffort;
   if (effort === "off") {
     return {
       ...data.config,
@@ -116,10 +121,12 @@ function buildChatConfig(data: {
     ...data.config,
     // Current Qwen3.5 wasm treats "low" as no-thinking. Keep the playground
     // control Codex-shaped by enabling the template and enforcing the low
-    // budget here.
+    // budget here. Image turns with the UI set to Off also use this hidden
+    // low-budget path because the VLM template needs a short internal think;
+    // the UI still hides reasoning for Off by keeping includeReasoning false.
     reasoningEffort: effort === "low" ? "medium" : effort,
     thinkingTokenBudget: REASONING_TOKEN_BUDGET[effort],
-    includeReasoning: true,
+    includeReasoning: requestedEffort !== "off",
     reportPerformance: true,
   };
 }
@@ -711,6 +718,18 @@ async function handleInit(data: {
         "tokenizer_config.json not available, using default chat template",
       );
     }
+    let processorConfigJson: string | undefined;
+    for (const file of ["preprocessor_config.json", "processor_config.json"]) {
+      try {
+        const resp = await fetch(`${data.modelUrl}/${file}`);
+        if (resp.ok) {
+          processorConfigJson = await resp.text();
+          break;
+        }
+      } catch (e) {
+        console.warn(`${file} not available`);
+      }
+    }
 
     post({ type: "progress", step: "model", message: "Fetching weights..." });
     const weightsResponse = await fetch(`${data.modelUrl}/model.safetensors`);
@@ -843,6 +862,7 @@ async function handleInit(data: {
         gpuTensors,
         tokenizerJson,
         tokenizerConfigJson ?? null,
+        processorConfigJson ?? null,
       );
       post({
         type: "progress",
