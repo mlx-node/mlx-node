@@ -1,5 +1,8 @@
 /target
 
+# Local git worktrees created by superpowers:using-git-worktrees
+/.worktrees/
+
 
 ### Created by https://www.gitignore.io
 ### Node ###
