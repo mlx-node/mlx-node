@@ -2035,7 +2035,7 @@ impl Qwen3Inner {
         gen_config: GenerationConfig,
         gen_start: Option<std::time::Instant>,
         report_perf: bool,
-        _reuse_cache: bool,
+        reuse_cache: bool,
     ) -> Result<ChatResult> {
         let prompt_token_count = token_ids_vec.len() as f64;
         let max_new_tokens: i32 = gen_config.max_new_tokens.unwrap_or(2048);
@@ -2142,6 +2142,40 @@ impl Qwen3Inner {
                     return Err(e);
                 }
             };
+
+        // Persist the session's token history so the subsequent
+        // `chat_session_continue` (which dispatches to
+        // `chat_tokens_delta_sync`) finds an initialized session and
+        // can build its delta on top of the prior prompt + reply.
+        // Mirrors the flat path's "save cache state" block (around
+        // `chat_sync_core`'s `if reuse_cache { ... }` branch). The
+        // paged path does not use `cached_kv_keys` / `cached_kv_values`
+        // — the adapter's pool owns the K/V — but the token history is
+        // still required for the delta-path guard to pass and for
+        // `verify_cache_prefix`-style prefix lookups on the next turn.
+        if reuse_cache {
+            let mut full_history = token_ids_vec.clone();
+            // Mirror the flat path's last-token bookkeeping: when the
+            // loop exited via stop / repetition (i.e. before the last
+            // generated token's decode forward ran), that token is NOT
+            // recorded in the adapter, so drop it from the saved
+            // history to keep history aligned with the live cache.
+            // When `finish_reason == "length"` the loop completed
+            // normally and all generated tokens are recorded.
+            let history_tokens = if finish_reason != "length" && !generated_tokens.is_empty() {
+                &generated_tokens[..generated_tokens.len() - 1]
+            } else {
+                &generated_tokens[..]
+            };
+            full_history.extend_from_slice(history_tokens);
+            self.cached_token_history = full_history;
+            // Qwen3 has no vision path — keep the image cache key None
+            // for uniformity with the VLM-capable siblings' branch.
+            self.cached_image_key = None;
+        } else {
+            self.cached_token_history.clear();
+            self.cached_image_key = None;
+        }
 
         let gen_elapsed = gen_start.map(|s| s.elapsed());
 
@@ -2607,7 +2641,7 @@ impl Qwen3Inner {
         let tool_defs = config.tools.as_deref();
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
         let p = chat_common::extract_chat_params(&config);
-        let _reuse_cache = p.reuse_cache;
+        let reuse_cache = p.reuse_cache;
         let report_perf = p.report_performance;
 
         let token_ids_vec = tokenizer.apply_chat_template_sync(
@@ -2668,6 +2702,7 @@ impl Qwen3Inner {
             generation_start,
             &mut first_token_instant,
             prompt_token_count,
+            reuse_cache,
         );
 
         // Always release; register-for-reuse only on success.
@@ -2708,6 +2743,7 @@ impl Qwen3Inner {
         generation_start: Option<std::time::Instant>,
         first_token_instant: &mut Option<std::time::Instant>,
         prompt_token_count: u32,
+        reuse_cache: bool,
     ) -> Result<()> {
         let total_prompt_tokens = token_ids_vec.len() as u32;
         let suffix_len = total_prompt_tokens
@@ -2853,9 +2889,35 @@ impl Qwen3Inner {
             y = next_y;
         }
 
-        // === Save / register state — none on the paged path. The caller
-        // (`chat_stream_sync_core_paged`) owns
-        // `register_full_blocks_for_reuse` + `release_request` lifecycle. ===
+        // === Save token history for the next turn's `chat_session_continue`. ===
+        //
+        // The paged adapter's pool owns the K/V across turns, but the
+        // `chat_tokens_delta_sync` flat-path delta still needs a non-empty
+        // `cached_token_history` to pass its initialized-session guard
+        // and to build the right delta on top of the prior conversation.
+        // Mirrors the flat path's "save cache state" block in
+        // `chat_stream_sync_core` — register-for-reuse / release-request
+        // are still owned by the caller (`chat_stream_sync_core_paged`).
+        if reuse_cache {
+            let mut full_history = token_ids_vec.to_vec();
+            // When the loop exited via stop / cancellation / repetition,
+            // the just-pushed last token was NOT recorded into the
+            // adapter (the `run_paged_decode_step` call that would have
+            // written it never ran). Drop it from the saved history to
+            // keep the history aligned with the live cache. A normal
+            // length-budget exit (no early break) records every token.
+            let history_tokens = if finish_reason != "length" && !generated_tokens.is_empty() {
+                &generated_tokens[..generated_tokens.len() - 1]
+            } else {
+                &generated_tokens[..]
+            };
+            full_history.extend_from_slice(history_tokens);
+            self.cached_token_history = full_history;
+            self.cached_image_key = None;
+        } else {
+            self.cached_token_history.clear();
+            self.cached_image_key = None;
+        }
 
         // Decode generated text for parsing + flush residual.
         let full_text = tokenizer_for_decode
@@ -3482,6 +3544,58 @@ impl Qwen3Inner {
         let eos_id = tokenizer.im_end_id().ok_or_else(|| {
             napi::Error::from_reason("Tokenizer missing <|im_end|> special token")
         })?;
+
+        // Block-paged dispatch: when the adapter is configured the
+        // session's K/V lives in the adapter's pool, not in
+        // `cached_kv_keys` / `cached_kv_values` (which stay empty on
+        // the paged path — see `chat_sync_core_paged`'s save block).
+        // Reuse the full chat_sync_core_paged pipeline by reconstructing
+        // the full token history (cached + delta) and letting the
+        // adapter's `find_cached_prefix` discover the prefix that turn 1
+        // registered for reuse. The flat path below stays untouched.
+        if self.paged_adapter.is_some() {
+            let mut full_token_history = self.cached_token_history.clone();
+            full_token_history.extend(delta_tokens.iter().copied());
+            let gen_config = GenerationConfig {
+                max_new_tokens: config.max_new_tokens.or(Some(2048)),
+                temperature: config.temperature.or(Some(0.7)),
+                top_k: config.top_k,
+                top_p: config.top_p.or(Some(0.9)),
+                min_p: config.min_p,
+                repetition_penalty: config.repetition_penalty,
+                repetition_context_size: config.repetition_context_size,
+                presence_penalty: config.presence_penalty,
+                presence_context_size: config.presence_context_size,
+                frequency_penalty: config.frequency_penalty,
+                frequency_context_size: config.frequency_context_size,
+                max_consecutive_tokens: config.max_consecutive_tokens,
+                max_ngram_repeats: config.max_ngram_repeats,
+                ngram_size: config.ngram_size,
+                eos_token_id: None,
+                return_logprobs: None,
+                prefill_step_size: None,
+                kv_cache_bits: None,
+                kv_cache_group_size: None,
+                num_draft_tokens: None,
+                report_performance: config.report_performance,
+            };
+            let report_perf = config.report_performance.unwrap_or(false);
+            let gen_start = if report_perf {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            return self.chat_sync_core_paged(
+                full_token_history,
+                tokenizer,
+                config.clone(),
+                eos_id,
+                gen_config,
+                gen_start,
+                report_perf,
+                /* reuse_cache */ true,
+            );
+        }
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
