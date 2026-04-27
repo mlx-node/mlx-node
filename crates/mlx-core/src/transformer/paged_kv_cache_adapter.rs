@@ -371,9 +371,20 @@ impl PagedKVCacheAdapter {
     /// refcount on matched blocks. The adapter takes ownership (`Arc` clones)
     /// so subsequent `release_request()` correctly decrements.
     ///
-    /// Idempotent in the sense that calling it twice with the same tokens
-    /// returns the same prefix; but it expects to be called once per
-    /// request, after `reset_for_new_request`.
+    /// ## Single-call lifecycle
+    ///
+    /// MUST be called at most once per request. A second call on the same
+    /// request would re-append matched blocks to `block_table` (producing
+    /// a duplicated prefix `[cached..., cached...]`), then any subsequent
+    /// `allocate_suffix_blocks` would append the suffix AFTER the duplicate
+    /// prefix; the slot math in `update_keys_values`
+    /// (`logical_pos / block_size`) would map suffix-token writes into the
+    /// duplicate prefix block instead of the freshly allocated suffix
+    /// block, silently overwriting cached prefix KV. The lookup also
+    /// double-increments the refcount on each matched block. The function
+    /// rejects the second call with a descriptive `Err` rather than
+    /// silently corrupting state — call `reset_for_new_request` first
+    /// when starting a new request.
     ///
     /// ## Token-recording contract
     ///
@@ -395,6 +406,23 @@ impl PagedKVCacheAdapter {
             .block_table
             .as_mut()
             .ok_or_else(|| "find_cached_prefix called before reset_for_new_request".to_string())?;
+
+        // Reject re-entrant calls before touching the allocator. A second
+        // lookup on the same request would duplicate prefix blocks in the
+        // block_table and double-incref each matched block via
+        // `BlockAllocator::lookup_prefix`. The duplicated entries shift the
+        // suffix slot math in `update_keys_values` so future writes land
+        // inside the duplicated prefix block rather than the freshly
+        // allocated suffix block, silently corrupting cached prefix KV.
+        // Fail loudly instead — the caller must `reset_for_new_request`
+        // before issuing another lookup.
+        if block_table.num_blocks() > 0 {
+            return Err(format!(
+                "find_cached_prefix already called on this request (block_table holds {} blocks). \
+                 Call reset_for_new_request() to start a new request.",
+                block_table.num_blocks()
+            ));
+        }
 
         let (blocks, cached_tokens) = {
             let mut guard = self
@@ -1620,6 +1648,67 @@ mod tests {
         assert_eq!(
             registered, 3,
             "12 tokens / block_size 4 = 3 full blocks eligible for registration"
+        );
+    }
+
+    /// `find_cached_prefix` must reject a second call on the same request.
+    /// The first call appends matched prefix blocks to `block_table`; a
+    /// second call would re-append the same blocks (producing
+    /// `[cached..., cached...]`) and double-incref each block via
+    /// `BlockAllocator::lookup_prefix`. The duplicated entries break the
+    /// slot-mapping math in `update_keys_values` (`logical_pos /
+    /// block_size`), silently routing later suffix writes into the
+    /// duplicate prefix block. The guard must fire BEFORE the allocator
+    /// lookup so a rejected call leaves no side-effects.
+    #[test]
+    fn test_find_cached_prefix_rejects_double_call() {
+        let allocator = new_allocator(8, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        seed_prefix_cache(&allocator, &tokens, 4, &[]);
+
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping test_find_cached_prefix_rejects_double_call: Metal unavailable");
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+
+        // First call: cache hit, populates block_table with 2 blocks.
+        let first = adapter.find_cached_prefix(&tokens, &[]).unwrap();
+        assert_eq!(first.cached_token_count, 8);
+        assert_eq!(first.blocks.len(), 2);
+        assert_eq!(adapter.block_table().unwrap().num_blocks(), 2);
+        // Each block: 1 (prefix-cache ref) + 1 (this request's lookup) = 2.
+        for b in &first.blocks {
+            assert_eq!(b.get_ref_count(), 2, "first lookup must incref to 2");
+        }
+
+        // Second call: must reject without touching state.
+        let res = adapter.find_cached_prefix(&tokens, &[]);
+        assert!(res.is_err(), "second call must error");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("already called"),
+            "error must explain double-call: {msg}"
+        );
+
+        // Side-effects: rejection must NOT have appended duplicate blocks
+        // or double-increfed the existing ones.
+        assert_eq!(
+            adapter.block_table().unwrap().num_blocks(),
+            2,
+            "rejected call must not append duplicate blocks"
+        );
+        for b in &first.blocks {
+            assert_eq!(b.get_ref_count(), 2, "rejected call must not double-incref");
+        }
+
+        // After release + reset, a fresh lookup is allowed again.
+        adapter.release_request().unwrap();
+        adapter.reset_for_new_request(1).unwrap();
+        let again = adapter.find_cached_prefix(&tokens, &[]).unwrap();
+        assert_eq!(
+            again.cached_token_count, 8,
+            "lookup must succeed after reset_for_new_request"
         );
     }
 
