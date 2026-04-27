@@ -249,56 +249,34 @@ impl PagedKVCacheAdapter {
     ///
     /// ## Refcount semantics
     ///
-    /// `BlockAllocator::register_prefix` itself does NOT bump the logical
-    /// `ref_count` — its `prefix_cache` map holds an `Arc` clone, but the
-    /// `Arc` strong count is separate from the `AtomicU32 ref_count` that
-    /// `free()` decrements. So a freshly-allocated block at `ref_count = 1`
-    /// (held only by the request) would be evicted from the prefix cache
-    /// by `release_request()` — defeating cross-request reuse.
+    /// `BlockAllocator::register_prefix` now manages the prefix-cache's
+    /// logical reference internally — it `incref`s on a genuine insertion
+    /// and `decref`s on every removal path (LRU eviction, Case 1
+    /// stale-alias displacement). The adapter does NOT need to manually
+    /// `incref` the request's blocks before registration: registering
+    /// takes the cache's reference, and `release_request()` releases
+    /// only the request's own reference, leaving the cache's reference
+    /// behind. After release each registered block lands at `ref_count
+    /// >= 1`, surviving until the LRU eviction path drives it back to 0.
     ///
-    /// To keep registered blocks alive across the owning request's
-    /// `release_request()`, the adapter calls `incref()` on each
-    /// **freshly-allocated** block before registering it. The first
-    /// `cached_token_count / block_size` blocks of the table are
-    /// **prefix-cache hits** (already incref'd by `lookup_prefix` during
-    /// `find_cached_prefix`); registering them is a pure LRU refresh and
-    /// must not double-incref or `release_request` will leave a permanent
-    /// leak.
-    ///
-    /// After release the block lands at `ref_count = 1` (the prefix-cache
-    /// reference), surviving until it is evicted by capacity pressure or
-    /// the next owner frees the last reference.
+    /// (Prior to that fix the adapter manually incref'd freshly-allocated
+    /// blocks and relied on `register_prefix` to "absorb" the extra ref;
+    /// but no eviction path released the manual incref, so blocks
+    /// orphaned at `ref_count=1` once they fell out of the cache. See
+    /// the P1A bugfix that moved ownership of the cache's ref into the
+    /// allocator itself.)
     ///
     /// ## Idempotency
     ///
     /// Idempotent within a single request: subsequent calls after the first
     /// successful one return `Ok(0)` without side effects. The flag is reset
-    /// by `reset_for_new_request` and `release_request`. This protects
-    /// against the leak that would otherwise occur if a caller invoked the
-    /// method twice — each call would `incref` the same freshly-allocated
-    /// blocks, but `release_request` only `free`s once per block, leaving
-    /// ref_count permanently elevated and exhausting the pool over time.
-    ///
-    /// ## Known limitation: hash-collision drops
-    ///
-    /// `BlockAllocator::register_prefix` may drop a block registration as a
-    /// no-op if its content hash collides with an already-registered
-    /// (different) block (the "Case 2 collision-drop" path). When that
-    /// happens, the adapter has still incref'd the freshly-allocated block
-    /// even though it didn't end up in the prefix cache — a single
-    /// reference for that block stays pinned for the adapter's lifetime.
-    /// In correct usage this is unreachable: `find_cached_prefix` is
-    /// called BEFORE `allocate_suffix_blocks`, so any matching prefix
-    /// blocks are returned via `lookup_prefix` (not freshly allocated),
-    /// and a true SipHash collision (same hash → different content) is
-    /// astronomically unlikely. If this becomes a real problem during
-    /// model integration, we'll re-address with a more invasive fix
-    /// (e.g. returning per-block insertion status from `cache_full_blocks`).
+    /// by `reset_for_new_request` and `release_request`. The current design
+    /// (BlockAllocator owns the cache's logical ref and treats same-(block,
+    /// hash) re-registers as pure LRU refreshes) means a duplicate call
+    /// would not leak ref_counts even without this guard, but the guard
+    /// avoids the spurious LRU shuffle and re-locking work.
     pub fn register_full_blocks_for_reuse(&mut self, extra_keys: &[u64]) -> Result<u32, String> {
         // Idempotent: subsequent calls within the same request are no-ops.
-        // Without this guard, repeated registration would re-`incref` the
-        // freshly-allocated blocks while `release_request` only `free`s
-        // each block once — leaking references and exhausting the pool.
         if self.already_registered {
             return Ok(0);
         }
@@ -327,16 +305,6 @@ impl PagedKVCacheAdapter {
             return Ok(0);
         }
 
-        // The first `cached_blocks_count` blocks were reused from the prefix
-        // cache (already incref'd by lookup_prefix during find_cached_prefix);
-        // skip incref'ing them here. The remaining are freshly allocated by
-        // `allocate_suffix_blocks` — those need a +1 to outlive the
-        // owning request's release_request.
-        let cached_blocks_count = (self.cached_token_count as usize) / block_size_us;
-        for block in blocks_slice.iter().skip(cached_blocks_count) {
-            block.incref();
-        }
-
         let mut guard = self
             .allocator
             .lock()
@@ -349,13 +317,7 @@ impl PagedKVCacheAdapter {
                 self.block_size,
                 extra_keys,
             )
-            .map_err(|e| {
-                // On failure, roll back the increfs to keep ref_count balanced.
-                for block in blocks_slice.iter().skip(cached_blocks_count) {
-                    let _ = block.decref();
-                }
-                format!("cache_full_blocks failed: {e}")
-            })?;
+            .map_err(|e| format!("cache_full_blocks failed: {e}"))?;
 
         // Mark registered ONLY on the success path so an Err leaves
         // already_registered == false (callers may retry / move on, and a
@@ -439,9 +401,10 @@ mod tests {
     /// Convenience: simulates a previous completed request that registered
     /// its blocks for cross-request reuse. Mirrors the combined effect of
     /// `register_full_blocks_for_reuse` followed by `release_request`:
-    /// incref each block (so the prefix-cache reference outlives release),
-    /// register, then free (drop request handle). After return, each block
-    /// is at ref_count = 1 — the prefix-cache's long-lived logical reference.
+    /// register each block (BlockAllocator increfs internally as part of
+    /// the cache's logical reference), then `free()` the request's own
+    /// handle. After return, each block is at ref_count = 1 — the
+    /// prefix-cache's long-lived logical reference.
     fn seed_prefix_cache(
         allocator: &Arc<Mutex<BlockAllocator>>,
         tokens: &[u32],
@@ -455,14 +418,11 @@ mod tests {
         for _ in 0..num_full {
             blocks.push(guard.allocate().expect("seed_prefix_cache: free block"));
         }
-        // Incref each (mirror register_full_blocks_for_reuse) then register.
-        for b in &blocks {
-            b.incref();
-        }
         guard
             .cache_full_blocks(tokens, &blocks, block_size, extra_keys)
             .expect("seed_prefix_cache: cache_full_blocks");
-        // Now free each — decrefs from 2 → 1, blocks survive in prefix cache.
+        // Free the request handle; cache's logical ref keeps each block
+        // alive at ref_count = 1.
         for b in blocks {
             guard.free(b);
         }
@@ -685,10 +645,11 @@ mod tests {
     }
 
     /// Calling `register_full_blocks_for_reuse` twice on the same request
-    /// must NOT double-incref. Without the idempotency guard, the second
-    /// call would re-bump ref_counts and `release_request` (which only
-    /// frees once per block) would leave them permanently elevated —
-    /// blocks would never return to the free pool.
+    /// must NOT double-incref. With the BlockAllocator-owned cache
+    /// reference, even a duplicate call wouldn't permanently elevate
+    /// ref_count (same-(block, hash) re-register is a pure LRU refresh
+    /// with no incref), but the adapter's idempotency guard still prevents
+    /// the spurious LRU shuffle and re-locking work.
     #[test]
     fn test_register_full_blocks_for_reuse_idempotent_repeat() {
         let allocator = new_allocator(8, 4);
@@ -703,15 +664,15 @@ mod tests {
         assert_eq!(registered, 2, "two full blocks of size 4 = 8 tokens");
 
         // After the first registration each freshly-allocated block has
-        // ref_count == 2: one from `allocate` + one from the
-        // register-time `incref` that keeps it alive past release.
+        // ref_count == 2: alloc(1) + cache's logical ref taken by
+        // BlockAllocator::register_prefix(1).
         let block_table = adapter.block_table().unwrap();
         let first_blocks: Vec<_> = block_table.blocks().to_vec();
         for b in &first_blocks {
             assert_eq!(
                 b.get_ref_count(),
                 2,
-                "first register: 1 (alloc) + 1 (incref)"
+                "first register: 1 (alloc) + 1 (cache's ref)"
             );
         }
 
@@ -728,9 +689,7 @@ mod tests {
 
         // Release the request. Each block decrefs from 2 → 1; they remain
         // pinned in the prefix cache (NOT returned to the free pool) so a
-        // future `find_cached_prefix` can hit them. With the bug, the
-        // second register would have left ref_count == 3, which after
-        // release would still be 2 — pinning the block forever.
+        // future `find_cached_prefix` can hit them.
         let freed = adapter.release_request().unwrap();
         assert_eq!(freed, 2);
         for b in &first_blocks {
@@ -738,8 +697,7 @@ mod tests {
                 b.get_ref_count(),
                 1,
                 "after release: ref_count must be exactly 1 (prefix-cache \
-                 reference). >1 indicates a leaked reference from \
-                 double-incref."
+                 reference). >1 indicates a leaked reference."
             );
         }
         // The prefix-cache holds 2 blocks → free pool is short by 2.
@@ -821,5 +779,70 @@ mod tests {
             "reset_for_new_request must reset already_registered so the \
              next register actually runs"
         );
+    }
+
+    /// Regression test for the orphaned-block leak: when registered blocks
+    /// are evicted from the prefix cache by capacity pressure, they must
+    /// return to the free pool. Otherwise the pool would drain
+    /// monotonically as long-running requests cycle through unique
+    /// prompts.
+    #[test]
+    fn test_evict_from_prefix_cache_returns_blocks_to_free_pool() {
+        let allocator = new_allocator(8, 4);
+        // Cap the cache at 1 entry so each new register evicts the prior.
+        allocator.lock().unwrap().set_max_prefix_cache_entries(1);
+        let initial_free = allocator.lock().unwrap().num_free_blocks();
+
+        // Helper: do one full register-and-release cycle for a unique
+        // prompt, returning when the request handle has been released.
+        let run_once = |adapter: &mut PagedKVCacheAdapter, tokens: &[u32]| {
+            adapter.reset_for_new_request(0).unwrap();
+            adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+            adapter.record_tokens(tokens).unwrap();
+            adapter.register_full_blocks_for_reuse(&[]).unwrap();
+            adapter.release_request().unwrap();
+        };
+
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+
+        // Cycle 1: register a 1-block prompt. Cache holds it.
+        run_once(&mut adapter, &[1, 2, 3, 4]);
+        // 1 block pinned by the cache → free pool short by 1.
+        assert_eq!(
+            allocator.lock().unwrap().num_free_blocks(),
+            initial_free - 1
+        );
+
+        // Cycle 2: register a different 1-block prompt. The new register
+        // evicts cycle 1's block (capacity = 1). Eviction must release
+        // the cache's logical reference, returning cycle 1's block to
+        // the free pool. Cycle 2's block is now the cache occupant.
+        run_once(&mut adapter, &[10, 20, 30, 40]);
+        assert_eq!(
+            allocator.lock().unwrap().num_free_blocks(),
+            initial_free - 1,
+            "evicted block from cycle 1 must return to free pool; \
+             cycle 2 block is the new cache occupant"
+        );
+
+        // Cycle 3: same pattern. Evicts cycle 2, occupies the cache.
+        run_once(&mut adapter, &[100, 200, 300, 400]);
+        assert_eq!(
+            allocator.lock().unwrap().num_free_blocks(),
+            initial_free - 1,
+            "after three cycles only one block stays pinned (the latest); \
+             previous evictions must have replenished the pool"
+        );
+
+        // Now run many more cycles to confirm the pool isn't draining.
+        for round in 0..16u32 {
+            let base = 1000 + round * 4;
+            run_once(&mut adapter, &[base, base + 1, base + 2, base + 3]);
+            assert_eq!(
+                allocator.lock().unwrap().num_free_blocks(),
+                initial_free - 1,
+                "round {round}: pool must stabilize at initial_free - 1"
+            );
+        }
     }
 }

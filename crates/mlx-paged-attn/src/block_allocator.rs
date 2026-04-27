@@ -5,6 +5,22 @@
 //! - Reference counting for copy-on-write (beam search)
 //! - Prefix caching via content-based hashing
 //! - LRU eviction for cache management
+//!
+//! # Prefix-cache reference invariant
+//!
+//! Every entry in `prefix_cache` corresponds to **one logical reference
+//! held by the cache itself**. `register_prefix` increfs on the genuine
+//! insertion path; every cache-removal path (LRU eviction, Case 1
+//! stale-alias displacement, and `free()`'s ref_count→0 cleanup) is
+//! responsible for releasing that reference. Idempotent refresh of an
+//! already-present (block, hash) pair does NOT incref again — the
+//! existing logical reference is preserved across the LRU bump.
+//!
+//! Consequence: callers do not need to manually `incref` blocks before
+//! registering them — registration itself takes the cache's ref. Once
+//! all external references are released via `free()`, the cache's ref
+//! is what keeps the block alive until LRU eviction (or another
+//! displacement path) decrefs it back to 0 and returns it to the pool.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -159,6 +175,18 @@ impl BlockAllocator {
     ///
     /// The block will be reused when a sequence has matching prefix tokens.
     ///
+    /// # Reference-count semantics
+    ///
+    /// The `prefix_cache` holds **one logical reference per entry** (see
+    /// the module-level invariant). `register_prefix` is the function that
+    /// takes that reference on the genuine-insert path; every removal path
+    /// in this method (Case 1 stale-alias displacement, capacity eviction
+    /// loop) is responsible for releasing it via `decref()`, returning the
+    /// block to the free pool if the count hits zero.
+    ///
+    /// Idempotent refresh (same block, same hash) does NOT incref — the
+    /// existing logical reference is reused across the LRU bump.
+    ///
     /// # Aliasing policy & precedence
     ///
     /// `block_hashes` only tracks ONE reverse mapping per `block_id`, so we
@@ -173,22 +201,34 @@ impl BlockAllocator {
     ///    `prefix_cache`, and crucially also preserves any prior valid
     ///    registration the incoming block already had — a rejected
     ///    registration must be a true no-op for the caller's block.
+    ///    Because nothing was inserted, no incref happens here.
     ///
     /// 2. **Stale-alias eviction — same block, different hash** (e.g. same
     ///    tokens cached under different `extra_keys`): the OLD hash is
     ///    evicted from `prefix_cache` and `lru_order` before inserting the
     ///    new alias. Otherwise the stale entry would survive `free()` and
     ///    could hand out a returned-to-pool block on a future
-    ///    `lookup_prefix` — bypassing `extra_keys` isolation.
+    ///    `lookup_prefix` — bypassing `extra_keys` isolation. The cache's
+    ///    logical reference for the OLD hash is released here (decref); the
+    ///    new alias takes a fresh ref via Step 4 below — net change in
+    ///    ref_count for this block is zero (one ref consumed for the old
+    ///    hash, one ref taken for the new hash; the same block stays in
+    ///    the cache, just under a different key).
     ///
     /// 3. **Capacity eviction — only on genuine insertion**: the LRU eviction
     ///    loop runs only when we're about to ADD a new hash entry. A
     ///    refresh of an already-present hash doesn't grow the cache, so
     ///    skipping the loop in that case avoids evicting unrelated entries
-    ///    under capacity pressure.
+    ///    under capacity pressure. Each evicted entry releases the cache's
+    ///    logical reference (decref); if that drops the block to ref_count
+    ///    0 (no other holder), the block is removed from `allocated` and
+    ///    pushed back onto `free_blocks` — same cleanup `free()` performs.
     ///
     /// 4. **LRU refresh + insert**: bump the hash to the back of `lru_order`
-    ///    and (re)insert into `prefix_cache` / `block_hashes`.
+    ///    and (re)insert into `prefix_cache` / `block_hashes`. Incref iff
+    ///    this is a genuine new insertion (idempotent refresh skips the
+    ///    incref so the cache holds at most ONE logical reference per
+    ///    entry).
     pub fn register_prefix(&mut self, block: Arc<PhysicalBlock>, hash: u64) {
         // If prefix caching is disabled (max_prefix_cache_entries == 0), do nothing
         if self.max_prefix_cache_entries == 0 {
@@ -198,7 +238,8 @@ impl BlockAllocator {
         // Step 1 (collision drop, FIRST): this hash is already mapped to a
         // DIFFERENT block. Reject the new registration as a true no-op —
         // don't touch the incoming block's prior alias (if any), don't
-        // shuffle LRU. The existing entry stays authoritative.
+        // shuffle LRU, don't take the cache's ref (nothing was inserted).
+        // The existing entry stays authoritative.
         // (Same block + same hash falls through to the LRU refresh below;
         // no eviction needed since the entry is already correct.)
         if let Some(existing_block) = self.prefix_cache.get(&hash)
@@ -211,26 +252,51 @@ impl BlockAllocator {
         // under a DIFFERENT hash. Evict the stale alias before installing the
         // new one — otherwise the old prefix_cache entry would survive free()
         // and could leak across extra_keys boundaries. (block_hashes will be
-        // overwritten below, no need to remove first.)
+        // overwritten below, no need to remove first.) Release the cache's
+        // logical reference for the OLD hash; the new alias takes its own
+        // ref in Step 4. The block survives this swap because at least one
+        // of {external request handle, cache's ref about to be retaken} keeps
+        // ref_count >= 1.
         if let Some(&existing_hash) = self.block_hashes.get(&block.block_id)
             && existing_hash != hash
         {
-            self.prefix_cache.remove(&existing_hash);
+            if self.prefix_cache.remove(&existing_hash).is_some() {
+                // Decref the cache's logical reference for the old alias.
+                // We deliberately ignore a true return here: callers that
+                // re-register a block they still hold (the common case)
+                // keep ref_count >= 1, and Step 4 below restores the
+                // cache's ref under the new hash. If a caller somehow ends
+                // up re-registering a block they no longer hold, ref_count
+                // could hit 0 — but that block is about to be re-inserted
+                // under the new hash anyway, so leaving it in `allocated`
+                // is safe and avoids a free→re-allocate flap.
+                let _ = block.decref();
+            }
             self.lru_order.retain(|&h| h != existing_hash);
         }
 
         // Step 3 (capacity eviction, only on genuine insertion): if this
         // call is a refresh of an already-present hash it won't grow the
         // cache, so skip the eviction loop. Otherwise evict oldest entries
-        // until we have room for the new insertion.
+        // until we have room for the new insertion. Each eviction releases
+        // the cache's logical reference for that block; if no external
+        // holder remains (ref_count hits 0), the block is fully reclaimed.
         let is_new_insertion = !self.prefix_cache.contains_key(&hash);
         if is_new_insertion {
             while self.prefix_cache.len() >= self.max_prefix_cache_entries {
                 match self.lru_order.pop_front() {
                     Some(old_hash) => {
-                        // Remove evicted entry from both caches
+                        // Remove evicted entry from both side tables, then
+                        // release the cache's logical reference. If that
+                        // drops ref_count to 0 the block goes back to the
+                        // free pool — same cleanup `free()` performs.
                         if let Some(evicted_block) = self.prefix_cache.remove(&old_hash) {
-                            self.block_hashes.remove(&evicted_block.block_id);
+                            let evicted_id = evicted_block.block_id;
+                            self.block_hashes.remove(&evicted_id);
+                            if evicted_block.decref() {
+                                self.allocated.remove(&evicted_id);
+                                self.free_blocks.push_back(evicted_id);
+                            }
                         }
                     }
                     None => {
@@ -243,11 +309,18 @@ impl BlockAllocator {
         }
 
         // Step 4: LRU refresh (remove if exists, add to end) + insert.
+        // Take the cache's logical reference iff this is a genuine new
+        // insertion. An idempotent refresh leaves ref_count unchanged so
+        // the cache continues to hold exactly ONE logical ref per entry.
         self.lru_order.retain(|&h| h != hash);
         self.lru_order.push_back(hash);
 
         // Track the hash for this block (for cleanup during free)
         self.block_hashes.insert(block.block_id, hash);
+
+        if is_new_insertion {
+            block.incref();
+        }
 
         // Insert into cache
         self.prefix_cache.insert(hash, block);
@@ -382,6 +455,21 @@ impl BlockAllocator {
     pub fn can_allocate(&self, num_blocks: u32) -> bool {
         self.num_free_blocks() >= num_blocks
     }
+
+    /// Set the maximum number of entries the prefix cache will hold before
+    /// the LRU eviction loop fires on subsequent inserts.
+    ///
+    /// This setter does NOT shrink the cache below an existing population —
+    /// pre-existing entries are left in place and only the next genuine
+    /// insertion will trigger eviction.
+    pub fn set_max_prefix_cache_entries(&mut self, max_entries: usize) {
+        self.max_prefix_cache_entries = max_entries;
+    }
+
+    /// Get the current prefix-cache capacity ceiling.
+    pub fn max_prefix_cache_entries(&self) -> usize {
+        self.max_prefix_cache_entries
+    }
 }
 
 /// Hash function for token sequences (for prefix caching).
@@ -490,8 +578,8 @@ mod tests {
         // Lookup should find the block
         let cached = allocator.lookup_prefix(hash).unwrap();
         assert_eq!(cached.block_id, block.block_id);
-        // Original (1) + lookup increments (1) = 2
-        assert_eq!(cached.get_ref_count(), 2);
+        // Original (1) + register_prefix incref (1) + lookup increments (1) = 3.
+        assert_eq!(cached.get_ref_count(), 3);
 
         // Unknown hash should return None
         assert!(allocator.lookup_prefix(12345).is_none());
@@ -499,30 +587,38 @@ mod tests {
 
     #[test]
     fn test_prefix_cache_cleanup_on_free() {
-        // This test verifies the memory leak fix:
-        // When a block is freed, it must be removed from prefix_cache
+        // With the cache-holds-its-own-ref design, freeing the only
+        // external handle leaves the block alive at ref_count=1 (the
+        // cache's logical reference). LRU eviction is what eventually
+        // returns the block to the free pool — see
+        // `test_lru_eviction_returns_block_to_free_pool`.
         let mut allocator = BlockAllocator::new(10, 32);
 
         let block = allocator.allocate().unwrap();
         let hash = hash_tokens(&[1, 2, 3], 0, &[]);
 
-        // Register in prefix cache (doesn't increment ref_count)
+        // Register in prefix cache (incref'd for the cache's logical ref).
         allocator.register_prefix(Arc::clone(&block), hash);
+        // ref_count: original(1) + register(1) = 2
 
-        // Verify it's in the cache
+        // Free the external handle. ref_count: 2 -> 1. Block stays alive
+        // because the cache still holds its logical reference.
+        allocator.free(block);
+        assert_eq!(
+            allocator.num_free_blocks(),
+            9,
+            "cache holds the block; free pool should not get it back yet"
+        );
+
+        // Lookup still works — cache survived the free.
         let cached = allocator.lookup_prefix(hash).unwrap();
-        assert_eq!(cached.block_id, block.block_id);
-        // ref_count: original(1) + lookup(1) = 2
+        // ref_count: 1 (cache) + 1 (this lookup) = 2
+        assert_eq!(cached.get_ref_count(), 2);
 
-        // Free both references
-        allocator.free(block); // ref_count: 2 -> 1
-        allocator.free(cached); // ref_count: 1 -> 0, block freed
-
-        // Verify it's removed from prefix cache after free
-        assert!(allocator.lookup_prefix(hash).is_none());
-
-        // Verify the block is back in the free pool
-        assert_eq!(allocator.num_free_blocks(), 10);
+        // Free the lookup handle: ref_count 2 -> 1. Cache's ref still holds.
+        allocator.free(cached);
+        assert!(allocator.lookup_prefix(hash).is_some());
+        assert_eq!(allocator.num_free_blocks(), 9);
     }
 
     #[test]
@@ -556,6 +652,16 @@ mod tests {
         assert!(!allocator.block_hashes.contains_key(&block1.block_id));
         assert!(allocator.block_hashes.contains_key(&block2.block_id));
         assert!(allocator.block_hashes.contains_key(&block3.block_id));
+
+        // block1 (the evicted one) still has the external handle — its
+        // ref_count is now 1 (cache's ref was released by eviction). It
+        // remains in `allocated`. Drop the external handle to confirm
+        // free pool comes back to 8 (10 total - block2 - block3 still held).
+        assert_eq!(block1.get_ref_count(), 1, "cache ref released on eviction");
+        allocator.free(block1);
+        // block1 returns to pool. block2, block3, and the cached refs
+        // for hash2 and hash3 keep those blocks pinned.
+        assert_eq!(allocator.num_free_blocks(), 8);
     }
 
     #[test]
@@ -750,23 +856,25 @@ mod tests {
 
         let hash = hash_tokens(&[1, 2, 3, 4], 0, &[]);
         allocator.register_prefix(Arc::clone(&block), hash);
-        // register_prefix does NOT incref (prefix cache holds an Arc, not a logical reference).
-        assert_eq!(block.get_ref_count(), 1);
+        // register_prefix incref's so the cache holds its own logical ref:
+        // allocate(1) + register(1) = 2.
+        assert_eq!(block.get_ref_count(), 2);
 
         let cached = allocator.lookup_prefix(hash).unwrap();
-        // lookup_prefix increments ref_count: allocate(1) + lookup(1) = 2.
-        assert_eq!(cached.get_ref_count(), 2);
+        // lookup_prefix increments ref_count: 2 + 1 = 3.
+        assert_eq!(cached.get_ref_count(), 3);
 
-        // Free the lookup'd handle: ref_count 2 -> 1, block stays out of free pool.
+        // Free the lookup'd handle: 3 -> 2, block stays alive.
         allocator.free(cached);
-        assert_eq!(block.get_ref_count(), 1);
+        assert_eq!(block.get_ref_count(), 2);
         assert_eq!(allocator.num_free_blocks(), 3);
 
-        // Free the original: ref_count 1 -> 0, block returns to free pool,
-        // prefix cache entry cleaned up.
+        // Free the external handle: 2 -> 1, block STILL alive (cache's
+        // logical ref). No cleanup yet — that happens via LRU eviction or
+        // when the cache's ref is the last and it gets removed.
         allocator.free(block);
-        assert_eq!(allocator.num_free_blocks(), 4);
-        assert!(allocator.lookup_prefix(hash).is_none());
+        assert_eq!(allocator.num_free_blocks(), 3);
+        assert!(allocator.lookup_prefix(hash).is_some());
     }
 
     #[test]
@@ -802,6 +910,12 @@ mod tests {
         assert!(allocator.block_hashes.contains_key(&b2.block_id));
         assert!(allocator.block_hashes.contains_key(&b3.block_id));
         assert!(allocator.block_hashes.contains_key(&b4.block_id));
+
+        // The evicted block (b1) had its cache ref released — ref_count is
+        // now 1 (just the external b1 handle). The lookup_prefix(h1) call
+        // returned None, so it did NOT incref. b2/b3/b4 are at higher counts
+        // because lookup_prefix incref'd them.
+        assert_eq!(b1.get_ref_count(), 1);
     }
 
     // -------------------------------------------------------------------
@@ -814,7 +928,9 @@ mod tests {
     fn test_register_prefix_re_registers_same_block_different_hash() {
         // Allocate one block, register under hash A, then re-register the
         // SAME block under hash B. The stale alias on hash A must be
-        // evicted; freeing the block must leave the cache fully clean.
+        // evicted (Case 1 displacement); the block's net ref_count is
+        // unchanged since the cache decrefs the old alias and increfs
+        // the new one.
         let mut allocator = BlockAllocator::new(4, 4);
         let initial_free = allocator.num_free_blocks();
 
@@ -823,20 +939,30 @@ mod tests {
         let hash_b = 0xBBBB_BBBB_BBBB_BBBB;
 
         allocator.register_prefix(Arc::clone(&block), hash_a);
+        // After first register: alloc(1) + register(1) = 2.
+        assert_eq!(block.get_ref_count(), 2);
+
         allocator.register_prefix(Arc::clone(&block), hash_b);
+        // Case 1: cache decref's old hash_a ref, then increfs new hash_b
+        // ref. Net unchanged: still 2.
+        assert_eq!(block.get_ref_count(), 2);
 
         // Stale alias evicted; current alias resolves.
         assert!(allocator.lookup_prefix(hash_a).is_none());
         let cached = allocator.lookup_prefix(hash_b).unwrap();
         assert_eq!(cached.block_id, block.block_id);
+        // alloc(1) + register(1) + lookup(1) = 3.
+        assert_eq!(cached.get_ref_count(), 3);
 
-        // Free both handles → block returns to pool, both aliases clean.
-        allocator.free(cached);
-        allocator.free(block);
+        // Free the lookup and external handles — cache's ref still holds
+        // the block, so it stays in the cache and is NOT in the free pool.
+        allocator.free(cached); // 3 -> 2
+        allocator.free(block); // 2 -> 1
 
         assert!(allocator.lookup_prefix(hash_a).is_none());
-        assert!(allocator.lookup_prefix(hash_b).is_none());
-        assert_eq!(allocator.num_free_blocks(), initial_free);
+        // Cache still holds the block under hash_b.
+        assert!(allocator.lookup_prefix(hash_b).is_some());
+        assert_eq!(allocator.num_free_blocks(), initial_free - 1);
     }
 
     #[test]
@@ -854,30 +980,41 @@ mod tests {
         allocator
             .cache_full_blocks(&tokens, &blocks, 4, &[])
             .unwrap();
+        // After first cache_full_blocks: alloc(1) + register(1) = 2.
+        assert_eq!(b0.get_ref_count(), 2);
+
         allocator
             .cache_full_blocks(&tokens, &blocks, 4, &[99])
             .unwrap();
+        // Second cache_full_blocks: same block under different hash →
+        // Case 1 path. Decref old, incref new → net unchanged = 2.
+        assert_eq!(b0.get_ref_count(), 2);
 
-        // Free the only outstanding handle → block_id returns to pool.
+        // Free the external handle. ref_count: 2 -> 1. The cache still
+        // holds the block under hash_b (extra_keys=[99]).
         allocator.free(b0);
 
-        // Neither lookup may resurrect a freed block.
+        // The empty-extra_keys alias was displaced by the second register;
+        // it is gone.
         let (hits_none, n_none) = allocator.find_longest_cache_hit(&tokens, 4, &[]);
         assert!(hits_none.is_empty(), "stale extra_keys=[] alias leaked");
         assert_eq!(n_none, 0);
 
+        // The [99] alias still resolves — block survived because the cache
+        // still holds its logical reference. This is correct: the cached
+        // block is consistent with extra_keys=[99] and a future lookup
+        // with the matching extra_keys is a legitimate hit.
         let (hits_99, n_99) = allocator.find_longest_cache_hit(&tokens, 4, &[99]);
-        assert!(hits_99.is_empty(), "extra_keys=[99] alias survived free");
-        assert_eq!(n_99, 0);
+        assert_eq!(hits_99.len(), 1, "extra_keys=[99] alias still resolves");
+        assert_eq!(n_99, 4);
     }
 
     #[test]
     fn test_register_prefix_collision_drops_new() {
         // If two DIFFERENT blocks register under the same hash, the second
         // call is dropped (no-op). The first registration stays
-        // authoritative; freeing block_a then cleans up the cache entry,
-        // and freeing block_b (which was never registered) is a clean
-        // no-op on the cache.
+        // authoritative; block_a's ref_count includes the cache's logical
+        // ref; block_b's is unchanged because it was never inserted.
         let mut allocator = BlockAllocator::new(4, 4);
         let initial_free = allocator.num_free_blocks();
 
@@ -888,7 +1025,14 @@ mod tests {
         let hash_x = 0xFEED_FEED_FEED_FEED;
 
         allocator.register_prefix(Arc::clone(&block_a), hash_x);
+        // alloc(1) + register(1) = 2.
+        assert_eq!(block_a.get_ref_count(), 2);
+
         allocator.register_prefix(Arc::clone(&block_b), hash_x);
+        // Collision drop: nothing inserted, block_b unchanged.
+        assert_eq!(block_b.get_ref_count(), 1);
+        // block_a still authoritative; ref_count unchanged.
+        assert_eq!(block_a.get_ref_count(), 2);
 
         // block_a stays authoritative for hash_x.
         let cached = allocator.lookup_prefix(hash_x).unwrap();
@@ -896,16 +1040,18 @@ mod tests {
         // block_b was NOT inserted into block_hashes.
         assert!(!allocator.block_hashes.contains_key(&block_b.block_id));
 
-        // Free the lookup'd handle (decrements block_a refcount).
+        // Free the lookup'd handle (decrements block_a refcount: 3 -> 2).
         allocator.free(cached);
-        // Free block_a → ref_count hits 0, prefix_cache[hash_x] cleaned.
+        // Free block_a external handle → 2 -> 1. Cache still holds block_a
+        // under hash_x at ref_count = 1.
         allocator.free(block_a);
-        assert!(allocator.lookup_prefix(hash_x).is_none());
+        assert!(allocator.lookup_prefix(hash_x).is_some());
 
         // Free block_b → no-op on the cache (was never registered),
         // block returns to free pool.
         allocator.free(block_b);
-        assert_eq!(allocator.num_free_blocks(), initial_free);
+        // block_a still pinned in cache; only block_b returned.
+        assert_eq!(allocator.num_free_blocks(), initial_free - 1);
     }
 
     #[test]
@@ -1004,6 +1150,68 @@ mod tests {
         assert_eq!(
             cached_b.block_id, block_b.block_id,
             "hash_b alias of block_b must survive a collision drop on hash_a"
+        );
+    }
+
+    /// Regression test for the orphaned-block leak: when the prefix_cache
+    /// exceeds capacity, the LRU eviction loop must release the cache's
+    /// logical reference. If the evicted block has no other holder, it
+    /// must return to the free pool (otherwise the pool drains
+    /// monotonically until allocation fails).
+    #[test]
+    fn test_lru_eviction_returns_block_to_free_pool() {
+        let mut allocator = BlockAllocator::new(8, 4);
+        allocator.max_prefix_cache_entries = 2;
+        let initial_free = allocator.num_free_blocks();
+
+        // Allocate three blocks, register all three. The third register
+        // exceeds capacity → LRU eviction of the first.
+        let b1 = allocator.allocate().unwrap();
+        let h1 = 0x1111_1111_1111_1111;
+        allocator.register_prefix(Arc::clone(&b1), h1);
+
+        let b2 = allocator.allocate().unwrap();
+        let h2 = 0x2222_2222_2222_2222;
+        allocator.register_prefix(Arc::clone(&b2), h2);
+
+        let b3 = allocator.allocate().unwrap();
+        let h3 = 0x3333_3333_3333_3333;
+
+        // Drop b1's external handle BEFORE the eviction so b1's only
+        // remaining ref is the cache's logical ref. Triggering eviction
+        // must drive ref_count to 0 and return b1 to the free pool.
+        let b1_id = b1.block_id;
+        allocator.free(b1); // b1: alloc(1)+reg(1)=2 → 1 (cache only)
+
+        // b1 is still pinned in the cache — free pool didn't get it back.
+        assert_eq!(
+            allocator.num_free_blocks(),
+            initial_free - 3,
+            "before eviction: 3 blocks held (b1 by cache, b2/b3 external+cache)"
+        );
+
+        // Now register b3, evicting b1 (oldest in LRU order).
+        allocator.register_prefix(Arc::clone(&b3), h3);
+
+        // b1 was evicted, decref'd from 1 → 0, removed from `allocated`,
+        // pushed back to free_blocks.
+        assert!(allocator.lookup_prefix(h1).is_none());
+        assert!(!allocator.allocated.contains_key(&b1_id));
+        assert!(
+            allocator.free_blocks.contains(&b1_id),
+            "evicted block must return to free_blocks"
+        );
+
+        // b2 and b3 still alive (external handle + cache ref).
+        assert!(allocator.lookup_prefix(h2).is_some());
+        assert!(allocator.lookup_prefix(h3).is_some());
+
+        // Free pool: b1 came back; b2 and b3 are still held by the cache
+        // and their external handles. Net: initial_free - 2.
+        assert_eq!(
+            allocator.num_free_blocks(),
+            initial_free - 2,
+            "evicted block must return to the free pool"
         );
     }
 }
