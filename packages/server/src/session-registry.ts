@@ -653,6 +653,81 @@ export class SessionRegistry {
   }
 
   /**
+   * Third lookup mode — for STATELESS full-history endpoints that have
+   * no `previous_response_id` to thread and do not propagate
+   * `prompt_cache_key` back to the server. The Anthropic
+   * `/v1/messages` endpoint is the canonical caller: clients (e.g.
+   * Claude Code) POST the entire conversation each turn, so the only
+   * remaining signal that a turn N continues turn N-1's prefix is the
+   * registry's own warm slot.
+   *
+   * Behaviour: walk the registry's at-most-one warm entry. If it is
+   * non-expired AND its stored `instructions` are byte-equal to
+   * `requestedInstructions`, lease it out (single-use — `entries.clear()`
+   * before return, mirroring the tier-1 / tier-2 lease-on-hit
+   * semantics). Otherwise clear the map and return a fresh session.
+   *
+   * Crucially, this lookup IGNORES `entry.promptCacheKey` and ignores
+   * the entry's prior `previousResponseId` keying — any warm slot is
+   * fair game for `/v1/messages` reuse. The byte-equal `instructions`
+   * compare is the SOLE correctness gate: a system prompt change
+   * forces cold replay so the new prefix state is re-primed instead
+   * of silently reusing a stale warmed prompt.
+   *
+   * **Adoption sentinel.** `/v1/messages` adopts back under the literal
+   * sentinel id `'__msg_warm__'`. That sentinel will never appear as a
+   * `previous_response_id` on a `/v1/responses` request — the
+   * Anthropic Messages API does not produce a `previous_response_id`
+   * value clients could echo back, and the OpenAI side mints fresh
+   * `resp_*` ids — so cross-endpoint capture via tier-1 is impossible
+   * by construction. The two endpoints still SHARE the single warm
+   * slot under the registry's single-warm invariant: a
+   * `/v1/messages` turn that follows a `/v1/responses` turn can evict
+   * (and vice versa). That is the explicit trade-off of holding at
+   * most one warm entry per model.
+   *
+   * **Trust model.** Multi-tenant isolation on this endpoint requires
+   * fronting the server with an auth proxy that scopes warm-slot
+   * visibility per tenant — same trust boundary documented at the top
+   * of this file for the tier-2 `prompt_cache_key` path. The single-
+   * warm invariant plus `withExclusive`'s per-model serialization make
+   * the lookup safe under SINGLE-tenant assumptions: no two requests
+   * race the slot, and there is at most one slot to lease.
+   *
+   * **Caller contract on miss.** If `instructions` drifts between
+   * turns (system prompt changed) this returns `hit: false` and a
+   * fresh session — and the caller MUST then run a full
+   * `session.reset()` before priming history, NOT the JS-only
+   * `resetPreservingNativeCacheForWarmReuse` path. A fresh JS session
+   * does NOT imply a fresh native cache (the underlying
+   * `SessionCapableModel` is shared and its native
+   * `cached_token_history` persists across requests), so skipping the
+   * native wipe on a miss would let the next `chatSessionStart` reuse
+   * an unrelated previous request's prefix — the cross-request
+   * cache-affinity side channel that the long block comment in
+   * `responses.ts` (around the `runSessionNonStreaming` /
+   * `runSessionStreaming` branches) describes.
+   */
+  getOrCreateWarmAny(requestedInstructions: string | null): SessionLookupResult {
+    // Single-warm invariant: at most one entry. Walk it once, lease
+    // on a fresh + instructions-matched hit, otherwise clear and
+    // cold-start. The ignored fields (promptCacheKey,
+    // previousResponseId-keying) are deliberate — see the docstring.
+    for (const entry of this.entries.values()) {
+      if (entry.expiresAt < nowSec()) continue;
+      if (entry.instructions !== requestedInstructions) continue;
+      // Hit: clear and lease (single-use semantics, same as tiers 1/2).
+      this.entries.clear();
+      return { session: entry.session, hit: true };
+    }
+    // Miss (no entry, expired, or instructions drift). Clear the map
+    // so a stale wrapper cannot leak into a later lookup, and return
+    // a fresh session.
+    this.entries.clear();
+    return { session: this.newSession(), hit: false };
+  }
+
+  /**
    * Insert a session under a newly allocated response id. Clears the
    * map before inserting to keep the single-warm invariant explicit
    * regardless of caller ordering.
