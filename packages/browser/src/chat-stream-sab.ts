@@ -8,6 +8,7 @@
  */
 
 import type { ChatStreamChunk, PerformanceMetrics, ToolCallResult } from '@mlx-node/core';
+import { sanitizeAssistantText } from './generated-text.js';
 
 // ---------------------------------------------------------------------------
 // Header layout — matches SAB_HEADER_OFFSET_* constants in wire.rs
@@ -426,6 +427,13 @@ function jsonToChunk(j: Record<string, unknown>): ChatStreamChunk {
   if (j['raw_text'] != null) chunk.rawText = j['raw_text'] as string;
   if (performance != null) chunk.performance = performance;
   if (j['is_reasoning'] != null) chunk.isReasoning = j['is_reasoning'] as boolean;
+
+  if (chunk.done) {
+    chunk.text = sanitizeAssistantText(chunk.text);
+    if (chunk.rawText != null) {
+      chunk.rawText = sanitizeAssistantText(chunk.rawText);
+    }
+  }
 
   return chunk;
 }

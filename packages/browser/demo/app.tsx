@@ -24,6 +24,7 @@ import {
   SelectValue,
 } from "./components/ui/select";
 import { Textarea } from "./components/ui/textarea";
+import { sanitizeAssistantText } from "../src/generated-text.js";
 import "./styles.css";
 
 type StatusState = "info" | "ready" | "error";
@@ -378,8 +379,10 @@ function App() {
     );
 
     function finalizeFromResult(result: ChatResult) {
-      finalizeAssistantMessage(result.text ?? "", result.thinking ?? null);
-      messages.push({ role: "assistant", content: result.rawText ?? "" });
+      const text = sanitizeAssistantText(result.text);
+      const rawText = sanitizeAssistantText(result.rawText ?? text);
+      finalizeAssistantMessage(text, result.thinking ?? null);
+      messages.push({ role: "assistant", content: rawText });
 
       if (result.performance) {
         log(
