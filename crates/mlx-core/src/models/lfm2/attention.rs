@@ -1,7 +1,9 @@
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::mask::create_causal_mask;
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
 /// LFM2 multi-head attention with QK RMSNorm and RoPE.
@@ -147,6 +149,164 @@ impl Lfm2Attention {
         let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
         // Output projection
+        self.out_proj.forward(&output)
+    }
+
+    /// Forward pass driven by `PagedKVCacheAdapter` for full-attention
+    /// LFM2 layers.
+    ///
+    /// Mirrors `TransformerBlock::forward_paged_adapter` (Qwen3) but
+    /// adapted for LFM2's attention layout (Q/K layernorm AFTER reshape,
+    /// V has no layernorm, no Q gating). The decoder layer's
+    /// pre-attention `operator_norm` is applied OUTSIDE this method to
+    /// match the existing flat-path call site, so `x` here is already
+    /// pre-normalized.
+    ///
+    /// Caller responsibilities (mirrors Qwen3 helper contract):
+    /// 1. `adapter.record_tokens(&[suffix])` BEFORE this call so the
+    ///    cursor is advanced by the chunk; `update_keys_values` enforces
+    ///    alignment.
+    /// 2. `attn_layer_idx` is the ATTENTION-LAYER ORDINAL into the
+    ///    adapter's `LayerKVPool`, NOT the absolute decoder index. The
+    ///    pool is sized for `config.full_attn_idxs().len()` slots.
+    ///
+    /// Output: `[1, seq_len, hidden_size]` so the residual `h = x + r`
+    /// in the decoder layer stays the same.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_paged(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        // 1. Q/K/V projections
+        let queries = self.q_proj.forward(x)?;
+        let keys = self.k_proj.forward(x)?;
+        let values = self.v_proj.forward(x)?;
+
+        // 2. Reshape to [B, T, H, D] and apply per-head layernorm to Q/K
+        let queries =
+            queries.reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?;
+        let queries = self.q_layernorm.forward(&queries)?;
+        let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;
+
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let keys = self.k_layernorm.forward(&keys)?;
+        let keys_bhtd = keys.transpose(Some(&[0, 2, 1, 3]))?;
+
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values_bhtd = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        // 3. Apply RoPE using `first_logical_position` (the adapter's
+        //    pre-record offset).
+        let rope_offset = first_logical_position as i32;
+        let queries_bhtd = self.rope.forward(&queries_bhtd, Some(rope_offset))?;
+        let keys_bhtd = self.rope.forward(&keys_bhtd, Some(rope_offset))?;
+
+        // 4. Convert K/V to the paged layout `[num_tokens, n_kv_heads,
+        //    head_dim]` expected by `update_keys_values`. Currently
+        //    batch=1 so `num_tokens = batch * seq_len = seq_len`.
+        //    [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D]
+        let keys_paged = keys_bhtd
+            .transpose(Some(&[0, 2, 1, 3]))?
+            .reshape(&[batch * seq_len, self.num_kv_heads as i64, self.head_dim as i64])?;
+        let values_paged = values_bhtd
+            .transpose(Some(&[0, 2, 1, 3]))?
+            .reshape(&[batch * seq_len, self.num_kv_heads as i64, self.head_dim as i64])?;
+
+        adapter
+            .update_keys_values(
+                attn_layer_idx,
+                &keys_paged,
+                &values_paged,
+                first_logical_position,
+            )
+            .map_err(napi::Error::from_reason)?;
+
+        // 5. Compute attention output.
+        let attn_bhtd = if is_prefill {
+            if cached_prefix_len == 0 {
+                // Fresh prefill: SDPA over in-flight Q/K/V with internal
+                // causal mask.
+                if seq_len > 1 {
+                    scaled_dot_product_attention_causal(
+                        &queries_bhtd,
+                        &keys_bhtd,
+                        &values_bhtd,
+                        self.scale,
+                    )?
+                } else {
+                    scaled_dot_product_attention(
+                        &queries_bhtd,
+                        &keys_bhtd,
+                        &values_bhtd,
+                        self.scale,
+                        None,
+                    )?
+                }
+            } else {
+                // Cache-hit prefill: read full [0, total_ctx) K/V back
+                // from the pool. The suffix was just written above.
+                let total_ctx = cached_prefix_len + (seq_len as u32);
+                let (k_full, v_full) = adapter
+                    .read_kv_range(attn_layer_idx, 0, total_ctx)
+                    .map_err(napi::Error::from_reason)?;
+                let mask = create_causal_mask(
+                    seq_len as i32,
+                    Some(cached_prefix_len as i32),
+                    None,
+                )?;
+                scaled_dot_product_attention(
+                    &queries_bhtd,
+                    &k_full,
+                    &v_full,
+                    self.scale,
+                    Some(&mask),
+                )?
+            }
+        } else {
+            // Decode: gather full historical K/V via paged kernel.
+            // `gather_kv_for_decode` expects `[1, num_query_heads,
+            // head_size]` queries, so reshape from [1, H, 1, D].
+            let queries_3d = queries_bhtd
+                .squeeze(Some(&[2]))?
+                .reshape(&[1, self.num_heads as i64, self.head_dim as i64])?;
+            let attn_3d = adapter
+                .gather_kv_for_decode(
+                    attn_layer_idx,
+                    &queries_3d,
+                    self.scale as f32,
+                    /* softcap */ 1.0,
+                )
+                .map_err(napi::Error::from_reason)?;
+            // Cast back to x's dtype so the residual stays homogeneous
+            // (gather currently returns Float32).
+            let target_dtype = x.dtype()?;
+            let attn_3d = attn_3d.astype(target_dtype)?;
+            // Reshape [1, H, D] -> [1, H, 1, D] for the standard
+            // [B,H,T,D] tail.
+            attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
+        };
+
+        // 6. Output: [B, H, T, D] -> [B, T, H*D] -> projection.
+        let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
+        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
         self.out_proj.forward(&output)
     }
 

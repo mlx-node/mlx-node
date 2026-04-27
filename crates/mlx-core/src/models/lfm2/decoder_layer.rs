@@ -1,12 +1,31 @@
 use crate::array::MxArray;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
 use super::attention::Lfm2Attention;
 use super::config::Lfm2Config;
 use super::layer_cache::Lfm2LayerCache;
 use super::short_conv::ShortConv;
+
+/// Per-layer routing kind for the paged dispatch.
+///
+/// Mirrors vLLM's hybrid coordinator pattern (single shared block pool +
+/// per-layer-type managers) but keeps the pragmatic "attention-only paged,
+/// flat fallback" stance described in the messages-kv-reuse docs:
+/// only `FullAttention` layers go through the `PagedKVCacheAdapter`; conv
+/// layers continue to use `Lfm2LayerCache::Conv(ArraysCache)`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Lfm2LayerKind {
+    /// Full-attention layer routed through the paged adapter.
+    /// `paged_idx` is the ATTENTION-LAYER ORDINAL into the adapter's
+    /// `LayerKVPool` (NOT the absolute decoder index). The pool is sized
+    /// for `config.full_attn_idxs().len()` slots.
+    FullAttention { paged_idx: u32 },
+    /// Conv layer that stays on the existing `Lfm2LayerCache::Conv` path.
+    Conv,
+}
 
 /// Operator type: either a conv layer or an attention layer.
 pub(crate) enum OperatorType {
@@ -110,6 +129,74 @@ impl Lfm2DecoderLayer {
     /// Whether this layer uses attention (vs conv).
     pub fn is_attention_layer(&self) -> bool {
         matches!(&self.operator, OperatorType::Attention(_))
+    }
+
+    /// Forward pass with paged-or-flat dispatch.
+    ///
+    /// Branches on `kind`:
+    /// * `FullAttention { paged_idx }` — routes through the
+    ///   `PagedKVCacheAdapter` (writes K/V into the shared pool, runs
+    ///   SDPA over `read_kv_range` for cache-hit prefill or
+    ///   `gather_kv_for_decode` for decode).
+    /// * `Conv` — forwards through the existing flat `ShortConv` path
+    ///   using the layer's `Lfm2LayerCache::Conv(ArraysCache)` slot. Conv
+    ///   layers do NOT participate in cross-request prefix reuse on this
+    ///   commit (mirrors vLLM's `MambaManager` default behavior of "no
+    ///   prefix reuse for recurrent layers").
+    ///
+    /// `cache` is required for the `Conv` branch; it must be the per-layer
+    /// `Lfm2LayerCache::Conv` slot. For `FullAttention` `cache` is
+    /// ignored (the adapter is the source of truth).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged_or_flat(
+        &self,
+        x: &MxArray,
+        kind: Lfm2LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+        conv_cache: Option<&mut Lfm2LayerCache>,
+    ) -> Result<MxArray> {
+        // Pre-norm
+        let normed = self.operator_norm.forward(x)?;
+
+        // Operator dispatch
+        let r = match (kind, &self.operator) {
+            (Lfm2LayerKind::FullAttention { paged_idx }, OperatorType::Attention(attn)) => attn
+                .forward_paged(
+                    &normed,
+                    adapter,
+                    paged_idx,
+                    first_logical_position,
+                    cached_prefix_len,
+                    is_prefill,
+                )?,
+            (Lfm2LayerKind::Conv, OperatorType::Conv(conv)) => {
+                let conv_cache_slot = conv_cache.and_then(|c| c.as_conv_cache_mut());
+                conv.forward(&normed, conv_cache_slot)?
+            }
+            (Lfm2LayerKind::FullAttention { .. }, OperatorType::Conv(_)) => {
+                return Err(Error::from_reason(
+                    "Lfm2DecoderLayer::forward_paged_or_flat: layer kind \
+                     FullAttention applied to a Conv operator",
+                ));
+            }
+            (Lfm2LayerKind::Conv, OperatorType::Attention(_)) => {
+                return Err(Error::from_reason(
+                    "Lfm2DecoderLayer::forward_paged_or_flat: layer kind \
+                     Conv applied to an Attention operator",
+                ));
+            }
+        };
+
+        // Residual connection
+        let h = x.add(&r)?;
+
+        // FFN with pre-norm + residual
+        let ffn_normed = self.ffn_norm.forward(&h)?;
+        let ffn_out = self.feed_forward.forward(&ffn_normed)?;
+        h.add(&ffn_out)
     }
 
     // ========== Norm weight setters ==========
