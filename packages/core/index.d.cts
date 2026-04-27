@@ -3770,6 +3770,49 @@ export interface Qwen35Config {
   fullAttentionInterval: number;
   partialRotaryFactor: number;
   ropeTheta: number;
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 2048 (2GB).
+   */
+  pagedCacheMemoryMb?: number | undefined;
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 16.
+   */
+  pagedBlockSize?: number | undefined;
+  /**
+   * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
+   * full-attention layers.
+   *
+   * **OPT-IN — experimental.** When `Some(true)`, `Qwen35Inner`
+   * allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
+   * model's full-attention layer count and constructs a
+   * `PagedKVCacheAdapter`. The chat-session forward dispatch routes
+   * full-attention layers through this adapter while linear-attention
+   * (GatedDeltaNet / GDN) layers continue to use the existing
+   * `Qwen3_5LayerCache::Linear(ArraysCache)` path with no
+   * cross-request prefix reuse — vLLM's `MambaManager`-style "no
+   * prefix reuse for recurrent layers" stance.
+   *
+   * **Compile lockout**: when this flag is `Some(true)` the dispatch
+   * path skips the `mlx_qwen35_compiled_*` lifecycle entirely (no
+   * mutex acquisition, no `compiled_init_from_prefill`, no compiled
+   * decode). The compiled C++ forward path is incompatible with the
+   * per-layer paged dispatch; flipping this flag at runtime trades
+   * the compiled fast path for cross-request prefix reuse.
+   *
+   * **VLM is rejected**: when both `vision_encoder.is_some()` and
+   * this flag is `Some(true)`, `Qwen35Inner::new_with_paged` returns
+   * a descriptive error. Paged dispatch through M-RoPE / vision
+   * features is deferred.
+   *
+   * Default: `None` / `false` (use the existing flat path with the
+   * compiled C++ forward when available). Default-flip pending real-
+   * weights parity verification.
+   */
+  useBlockPagedCache?: boolean | undefined;
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -3824,6 +3867,35 @@ export interface Qwen35MoeConfig {
   moeIntermediateSize?: number | undefined;
   normTopkProb: boolean;
   mlpOnlyLayers?: number[] | undefined;
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 2048 (2GB).
+   */
+  pagedCacheMemoryMb?: number | undefined;
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 16.
+   */
+  pagedBlockSize?: number | undefined;
+  /**
+   * Use the block-paged KV cache adapter for full-attention layers.
+   *
+   * **OPT-IN — experimental.** Same semantics as the dense
+   * `Qwen3_5Config::use_block_paged_cache` field. Routes full-
+   * attention layers through `PagedKVCacheAdapter`; GDN linear-
+   * attention layers stay on `Qwen3_5LayerCache::Linear`. When
+   * enabled, the compiled MoE C++ forward path
+   * (`mlx_qwen35_moe_compiled_*`) is skipped — the paged adapter is
+   * incompatible with the in-graph compile cache.
+   *
+   * VLM (vision encoder present) is rejected with an error in
+   * `Qwen35MoeInner::new`.
+   *
+   * Default: `None` / `false`.
+   */
+  useBlockPagedCache?: boolean | undefined;
 }
 
 /** Generation configuration for Qwen3.5 MoE */

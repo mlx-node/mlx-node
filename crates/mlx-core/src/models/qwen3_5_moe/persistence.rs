@@ -979,7 +979,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                             config.max_position_embeddings,
                         )?;
 
-                        inner.set_vision_encoder(vision_encoder);
+                        inner.set_vision_encoder(vision_encoder)?;
                         inner.set_image_processor(Qwen35VLImageProcessor::new(None));
                         inner.set_spatial_merge_size(vision_config.spatial_merge_size);
 
@@ -1151,6 +1151,15 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
                     .filter_map(|v| v.as_i64().map(|i| i as i32))
                     .collect()
             }),
+        paged_cache_memory_mb: raw
+            .get("paged_cache_memory_mb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        paged_block_size: raw
+            .get("paged_block_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
     })
 }
 

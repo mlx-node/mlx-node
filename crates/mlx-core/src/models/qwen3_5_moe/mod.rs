@@ -10,6 +10,7 @@ pub use crate::models::qwen3_5::rms_norm_gated;
 pub mod config;
 pub mod decoder_layer;
 pub mod model;
+pub(crate) mod paged_forward;
 pub mod persistence;
 pub mod quantized_linear;
 pub mod sparse_moe;

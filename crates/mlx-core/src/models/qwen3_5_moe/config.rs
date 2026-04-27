@@ -57,6 +57,39 @@ pub struct Qwen3_5MoeConfig {
     #[serde(default)]
     #[napi(ts_type = "number[] | undefined")]
     pub mlp_only_layers: Option<Vec<i32>>,
+
+    // Paged attention options (opt-in, mirror Qwen3/Gemma4/LFM2 knobs).
+    /// GPU memory budget for paged KV cache in megabytes.
+    /// Only used when `use_block_paged_cache` is true.
+    /// Default: 2048 (2GB).
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_cache_memory_mb: Option<u32>,
+
+    /// Block size for paged attention (tokens per block).
+    /// Only used when `use_block_paged_cache` is true.
+    /// Default: 16.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_block_size: Option<u32>,
+
+    /// Use the block-paged KV cache adapter for full-attention layers.
+    ///
+    /// **OPT-IN — experimental.** Same semantics as the dense
+    /// `Qwen3_5Config::use_block_paged_cache` field. Routes full-
+    /// attention layers through `PagedKVCacheAdapter`; GDN linear-
+    /// attention layers stay on `Qwen3_5LayerCache::Linear`. When
+    /// enabled, the compiled MoE C++ forward path
+    /// (`mlx_qwen35_moe_compiled_*`) is skipped — the paged adapter is
+    /// incompatible with the in-graph compile cache.
+    ///
+    /// VLM (vision encoder present) is rejected with an error in
+    /// `Qwen35MoeInner::new`.
+    ///
+    /// Default: `None` / `false`.
+    #[serde(default)]
+    #[napi(ts_type = "boolean | undefined")]
+    pub use_block_paged_cache: Option<bool>,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -117,7 +150,18 @@ impl Qwen3_5MoeConfig {
             full_attention_interval: self.full_attention_interval,
             partial_rotary_factor: self.partial_rotary_factor,
             rope_theta: self.rope_theta,
+            paged_cache_memory_mb: self.paged_cache_memory_mb,
+            paged_block_size: self.paged_block_size,
+            use_block_paged_cache: self.use_block_paged_cache,
         }
+    }
+
+    /// Number of full-attention layers, used to size the paged adapter
+    /// pool.
+    pub fn full_attention_layer_count(&self) -> usize {
+        (0..self.num_layers as usize)
+            .filter(|&i| !self.is_linear_layer(i))
+            .count()
     }
 
     /// Returns whether a given layer index uses linear attention (GatedDeltaNet)

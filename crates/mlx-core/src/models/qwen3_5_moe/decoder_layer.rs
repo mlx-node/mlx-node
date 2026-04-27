@@ -1,6 +1,7 @@
 use crate::array::MxArray;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
 use super::attention::Qwen3_5Attention;
@@ -9,6 +10,9 @@ use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::quantized_linear::{MLPVariant, QuantizedLinear};
 use super::sparse_moe::SparseMoeBlock;
+// Reuse the dense layer-kind enum for MoE; the routing semantics
+// (Linear vs FullAttentionPaged) are identical between dense and MoE.
+pub(crate) use crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind;
 
 /// Attention type for a decoder layer.
 pub enum AttentionType {
@@ -103,6 +107,76 @@ impl DecoderLayer {
         };
 
         h.add(&mlp_out)
+    }
+
+    /// Paged-or-flat dispatch for the MoE decoder layer.
+    ///
+    /// Same shape as the dense `DecoderLayer::forward_paged_or_flat`
+    /// (see that method's rustdoc) but threaded through the MoE
+    /// MLP/expert tail. `Linear` layers stay on the flat
+    /// `Qwen3_5LayerCache::Linear` path; `FullAttentionPaged` layers
+    /// route through `Qwen3_5Attention::forward_paged`.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // Wired up by chat_sync_core_paged in a follow-up commit.
+    pub(crate) fn forward_paged_or_flat(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+        mask: Option<&MxArray>,
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+    ) -> Result<MxArray> {
+        match kind {
+            Qwen3_5LayerKind::Linear => {
+                let _ = adapter;
+                let _ = first_logical_position;
+                let _ = cached_prefix_len;
+                let _ = is_prefill;
+                if !matches!(self.attn, AttentionType::Linear(_)) {
+                    return Err(Error::from_reason(
+                        "Qwen3_5MoeDecoderLayer::forward_paged_or_flat: kind=Linear applied to a \
+                         FullAttention operator",
+                    ));
+                }
+                self.forward(x, mask, flat_cache, position_ids, use_kernel)
+            }
+            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                let _ = flat_cache;
+                let _ = position_ids;
+                let _ = use_kernel;
+                let _ = mask;
+                let attn = match &self.attn {
+                    AttentionType::Full(a) => a,
+                    AttentionType::Linear(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5MoeDecoderLayer::forward_paged_or_flat: \
+                             kind=FullAttentionPaged applied to a Linear (GDN) operator",
+                        ));
+                    }
+                };
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out = attn.forward_paged(
+                    &normed,
+                    adapter,
+                    paged_idx,
+                    first_logical_position,
+                    cached_prefix_len,
+                    is_prefill,
+                )?;
+                let h = x.add(&attn_out)?;
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                let mlp_out = match &self.mlp {
+                    MLPType::Dense(mlp) => mlp.forward(&normed)?,
+                    MLPType::MoE(moe) => moe.forward(&normed)?,
+                };
+                h.add(&mlp_out)
+            }
+        }
     }
 
     pub fn set_input_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {

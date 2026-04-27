@@ -40,6 +40,53 @@ pub struct Qwen3_5Config {
     pub partial_rotary_factor: f64,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
+
+    // Paged attention options (opt-in, mirror Qwen3/Gemma4/LFM2 knobs).
+    /// GPU memory budget for paged KV cache in megabytes.
+    /// Only used when `use_block_paged_cache` is true.
+    /// Default: 2048 (2GB).
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_cache_memory_mb: Option<u32>,
+
+    /// Block size for paged attention (tokens per block).
+    /// Only used when `use_block_paged_cache` is true.
+    /// Default: 16.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_block_size: Option<u32>,
+
+    /// Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
+    /// full-attention layers.
+    ///
+    /// **OPT-IN — experimental.** When `Some(true)`, `Qwen35Inner`
+    /// allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
+    /// model's full-attention layer count and constructs a
+    /// `PagedKVCacheAdapter`. The chat-session forward dispatch routes
+    /// full-attention layers through this adapter while linear-attention
+    /// (GatedDeltaNet / GDN) layers continue to use the existing
+    /// `Qwen3_5LayerCache::Linear(ArraysCache)` path with no
+    /// cross-request prefix reuse — vLLM's `MambaManager`-style "no
+    /// prefix reuse for recurrent layers" stance.
+    ///
+    /// **Compile lockout**: when this flag is `Some(true)` the dispatch
+    /// path skips the `mlx_qwen35_compiled_*` lifecycle entirely (no
+    /// mutex acquisition, no `compiled_init_from_prefill`, no compiled
+    /// decode). The compiled C++ forward path is incompatible with the
+    /// per-layer paged dispatch; flipping this flag at runtime trades
+    /// the compiled fast path for cross-request prefix reuse.
+    ///
+    /// **VLM is rejected**: when both `vision_encoder.is_some()` and
+    /// this flag is `Some(true)`, `Qwen35Inner::new_with_paged` returns
+    /// a descriptive error. Paged dispatch through M-RoPE / vision
+    /// features is deferred.
+    ///
+    /// Default: `None` / `false` (use the existing flat path with the
+    /// compiled C++ forward when available). Default-flip pending real-
+    /// weights parity verification.
+    #[serde(default)]
+    #[napi(ts_type = "boolean | undefined")]
+    pub use_block_paged_cache: Option<bool>,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -78,6 +125,15 @@ impl Qwen3_5Config {
             return true;
         }
         !(layer_idx + 1).is_multiple_of(self.full_attention_interval as usize)
+    }
+
+    /// Number of full-attention layers (i.e. layers that use
+    /// `Qwen3_5Attention` rather than `GatedDeltaNet`). Used to size the
+    /// paged adapter's `LayerKVPool`.
+    pub fn full_attention_layer_count(&self) -> usize {
+        (0..self.num_layers as usize)
+            .filter(|&i| !self.is_linear_layer(i))
+            .count()
     }
 
     /// Compute the RoPE dimensions for partial rotary embedding.

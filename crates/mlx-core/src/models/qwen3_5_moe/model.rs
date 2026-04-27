@@ -35,6 +35,7 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
@@ -82,6 +83,10 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) cached_image_key: Option<u64>,
     pub(crate) cached_rope_deltas: Option<i32>,
     pub(crate) model_id: u64,
+    /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
+    /// full-attention layers — same semantics as the dense model.
+    /// **Opt-in via `Qwen3_5MoeConfig::use_block_paged_cache`.**
+    pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -506,9 +511,78 @@ impl Qwen35MoeInner {
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+        // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
+        // See `Qwen35Inner::new` (dense model) for the full architectural
+        // discussion; this is the MoE-side mirror.
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
+            let attn_layer_count = config.full_attention_layer_count() as u32;
+            if attn_layer_count == 0 {
+                return Err(Error::from_reason(
+                    "Qwen3.5 MoE block-paged adapter: config has no full_attention layers; \
+                     paged KV cache requires at least one attention layer.",
+                ));
+            }
+
+            let block_size = config.paged_block_size.unwrap_or(16);
+            let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
+            let head_size = config.head_dim as u32;
+            let num_kv_heads = config.num_kv_heads as u32;
+
+            let pa_config = mlx_paged_attn::PagedAttentionConfig {
+                block_size,
+                gpu_memory_mb,
+                head_size,
+                num_kv_heads,
+                num_layers: attn_layer_count,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(config.max_position_embeddings as u32),
+                max_batch_size: Some(32),
+            };
+
+            let num_blocks = pa_config.calculate_num_blocks();
+            if num_blocks == 0 {
+                return Err(Error::from_reason(format!(
+                    "Qwen3.5 MoE block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
+                     (head_size={head_size}, num_kv_heads={num_kv_heads}, \
+                     block_size={block_size}, num_attn_layers={attn_layer_count})"
+                )));
+            }
+
+            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+                num_blocks, block_size,
+            )));
+
+            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
+                .map_err(|e| {
+                    Error::from_reason(format!(
+                        "Failed to construct LayerKVPool for Qwen3.5 MoE block-paged adapter: {e}"
+                    ))
+                })?;
+
+            let adapter =
+                PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
+                    Error::from_reason(format!(
+                        "Failed to construct Qwen3.5 MoE PagedKVCacheAdapter: {e}"
+                    ))
+                })?;
+
+            info!(
+                "Qwen3.5 MoE block-paged adapter enabled: num_blocks={}, block_size={}, \
+                 gpu_memory_mb={}, num_attn_layers={}, cache_dtype=BFloat16",
+                num_blocks, block_size, gpu_memory_mb, attn_layer_count
+            );
+            Some(adapter)
+        } else {
+            None
+        };
+
         info!(
-            "Qwen3.5 MoE inner created: {} layers, fa_idx={}, experts={}",
-            config.num_layers, fa_idx, config.num_experts
+            "Qwen3.5 MoE inner created: {} layers, fa_idx={}, experts={}, paged={}",
+            config.num_layers,
+            fa_idx,
+            config.num_experts,
+            paged_adapter.is_some()
         );
 
         Ok(Self {
@@ -531,6 +605,7 @@ impl Qwen35MoeInner {
             cached_image_key: None,
             cached_rope_deltas: None,
             model_id,
+            paged_adapter,
             training_state: None,
         })
     }
@@ -610,8 +685,18 @@ impl Qwen35MoeInner {
     }
 
     /// Set the vision encoder.
-    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) {
+    ///
+    /// Errors when `paged_adapter` is already populated — same VLM /
+    /// paged-incompatibility rationale as the dense model.
+    pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) -> Result<()> {
+        if self.paged_adapter.is_some() {
+            return Err(Error::from_reason(
+                "Qwen3.5 MoE VLM is incompatible with use_block_paged_cache=true. \
+                 Disable the paged adapter (or omit the flag) before loading vision weights.",
+            ));
+        }
         self.vision_encoder = Some(Arc::new(enc));
+        Ok(())
     }
 
     /// Set the image processor.
@@ -693,6 +778,18 @@ impl Qwen35MoeInner {
         let mut first_token_instant: Option<std::time::Instant> = None;
 
         let model_id = self.model_id;
+
+        // Block-paged dispatch — early-return BEFORE the compile lock.
+        // See dense `chat_sync_core` for the compile-lockout rationale.
+        if self.paged_adapter.is_some() {
+            if has_images {
+                return Err(Error::from_reason(
+                    "Qwen3.5 MoE paged dispatch is text-only; VLM is incompatible with \
+                     use_block_paged_cache=true in this revision.",
+                ));
+            }
+            return self.chat_sync_core_paged(tokens, tokenizer, eos_token_id, p, report_perf);
+        }
 
         // Check if compiled path will be used
         let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
@@ -1172,6 +1269,710 @@ impl Qwen35MoeInner {
         Ok(result)
     }
 
+    /// Block-paged variant of [`Self::chat_sync_core`] for the MoE
+    /// model. Mirrors the dense paged dispatch — see
+    /// `Qwen35Inner::chat_sync_core_paged` for the full rationale.
+    fn chat_sync_core_paged(
+        &mut self,
+        tokens: Vec<u32>,
+        tokenizer: Arc<Qwen3Tokenizer>,
+        eos_token_id: u32,
+        p: chat_common::ChatParams,
+        report_perf: bool,
+    ) -> Result<ChatResult> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        let prompt_token_count = tokens.len() as u32;
+        let max_new_tokens = p.max_new_tokens;
+        let sampling_config = p.sampling_config;
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+        let thinking_enabled = true;
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            thinking_enabled,
+            p.thinking_token_budget,
+            think_end_id,
+        );
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+
+        let seq_id: u32 = 0;
+        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        let cached_prefix_len = {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("MoE chat_sync_core_paged: paged_adapter is None")
+            })?;
+            let can_continue =
+                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            if can_continue {
+                match adapter.continue_turn(&tokens, total_budget) {
+                    Ok((prior, _)) => prior,
+                    Err(_) => {
+                        let _ = adapter.release_request();
+                        adapter
+                            .reset_for_new_request(seq_id)
+                            .map_err(Error::from_reason)?;
+                        let prefix = adapter
+                            .find_cached_prefix(&tokens, &[])
+                            .map_err(Error::from_reason)?;
+                        let cached = prefix.cached_token_count;
+                        adapter
+                            .allocate_suffix_blocks(total_budget)
+                            .map_err(Error::from_reason)?;
+                        cached
+                    }
+                }
+            } else {
+                if adapter.block_table().is_some() {
+                    let _ = adapter.release_request();
+                }
+                adapter
+                    .reset_for_new_request(seq_id)
+                    .map_err(Error::from_reason)?;
+                let prefix = adapter
+                    .find_cached_prefix(&tokens, &[])
+                    .map_err(Error::from_reason)?;
+                let cached = prefix.cached_token_count;
+                adapter
+                    .allocate_suffix_blocks(total_budget)
+                    .map_err(Error::from_reason)?;
+                cached
+            }
+        };
+
+        self.caches = Some(
+            (0..self.config.num_layers as usize)
+                .map(|i| {
+                    if self.config.is_linear_layer(i) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect(),
+        );
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+
+        let suffix_len = prompt_token_count
+            .checked_sub(cached_prefix_len)
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "MoE chat_sync_core_paged: cached_prefix_len > total_prompt_tokens",
+                )
+            })?;
+
+        let forward_result = self.chat_sync_core_paged_inner(
+            &tokens,
+            cached_prefix_len,
+            suffix_len,
+            &p,
+            eos_token_id,
+            &sampling_config,
+            &mut reasoning_tracker,
+            report_perf,
+            &mut first_token_instant,
+        );
+
+        let (generated_tokens, finish_reason) = match forward_result {
+            Ok(t) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.finalize_turn_keep_live(&[]);
+                }
+                t
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        let last_token_in_cache = false;
+        let mut full_history = tokens.clone();
+        if !generated_tokens.is_empty() {
+            let upto = if last_token_in_cache {
+                generated_tokens.len()
+            } else {
+                generated_tokens.len().saturating_sub(1)
+            };
+            full_history.extend_from_slice(&generated_tokens[..upto]);
+        }
+        self.cached_token_history = full_history;
+
+        let performance = if report_perf {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                tokens.len() - cached_prefix_len as usize,
+                generated_tokens.len(),
+            )
+        } else {
+            None
+        };
+
+        let mut result = finalize_chat_result(
+            &tokenizer,
+            &generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str.as_deref(),
+            performance,
+            p.include_reasoning,
+            thinking_enabled,
+            prompt_token_count,
+            reasoning_tracker.reasoning_token_count(),
+        )?;
+        result.cached_tokens = cached_prefix_len;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn chat_sync_core_paged_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        suffix_len: u32,
+        p: &chat_common::ChatParams,
+        eos_token_id: u32,
+        sampling_config: &Option<crate::sampling::SamplingConfig>,
+        reasoning_tracker: &mut chat_common::ReasoningTracker,
+        report_perf: bool,
+        first_token_instant: &mut Option<std::time::Instant>,
+    ) -> Result<(Vec<u32>, String)> {
+        if suffix_len == 0 {
+            return Err(Error::from_reason(
+                "MoE chat_sync_core_paged: zero-delta prompt is not supported on the paged path",
+            ));
+        }
+
+        let suffix = &tokens[(cached_prefix_len as usize)..];
+        let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+            self.config.num_layers as usize,
+            |i| self.config.is_linear_layer(i),
+        );
+
+        let last_logits = {
+            let embed = self.embedding.clone();
+            let embedding_weight = embed.get_weight();
+            let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("MoE chat_sync_core_paged_inner: caches not initialized")
+            })?;
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("MoE chat_sync_core_paged_inner: paged_adapter dropped")
+            })?;
+            super::paged_forward::run_paged_prefill_chunk(
+                tokens,
+                suffix,
+                cached_prefix_len,
+                &embed,
+                &mut self.layers,
+                caches_ref,
+                &self.final_norm,
+                &self.lm_head,
+                &embedding_weight,
+                &layer_kinds,
+                adapter,
+            )?
+        };
+
+        let mut token_history: Vec<u32> = tokens.to_vec();
+        let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
+        let mut y = sample(&last_logits, *sampling_config)?;
+        y.eval();
+
+        if report_perf {
+            *first_token_instant = Some(std::time::Instant::now());
+        }
+
+        let max_new_tokens = p.max_new_tokens;
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut finish_reason = String::from("length");
+
+        for step in 0..max_new_tokens {
+            let token_id = y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+            token_history.push(token_id);
+            reasoning_tracker.observe_token(token_id);
+
+            if token_id == eos_token_id {
+                finish_reason = String::from("stop");
+                break;
+            }
+            if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                &generated_tokens,
+                p.max_consecutive_tokens,
+                p.max_ngram_repeats,
+                p.ngram_size,
+            ) {
+                finish_reason = reason.to_string();
+                break;
+            }
+            if step + 1 >= max_new_tokens {
+                break;
+            }
+
+            let next_logits = {
+                let embed = self.embedding.clone();
+                let embedding_weight = embed.get_weight();
+                let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("MoE chat_sync_core_paged_inner: caches dropped mid-decode")
+                })?;
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "MoE chat_sync_core_paged_inner: paged_adapter dropped mid-decode",
+                    )
+                })?;
+                super::paged_forward::run_paged_decode_step(
+                    token_id,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    &layer_kinds,
+                    adapter,
+                )?
+            };
+            let next_logits = next_logits.squeeze(Some(&[1]))?;
+
+            let next_logits = if reasoning_tracker.should_force_think_end() {
+                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                y = MxArray::from_int32(&[forced_id], &[1])?;
+                y.eval();
+                continue;
+            } else {
+                apply_all_penalties(next_logits, &token_history, p)?
+            };
+
+            y = sample(&next_logits, *sampling_config)?;
+            y.eval();
+
+            if (step + 1) % 256 == 0 {
+                crate::array::synchronize_and_clear_cache();
+            }
+        }
+
+        Ok((generated_tokens, finish_reason))
+    }
+
+    /// Block-paged streaming variant for MoE — mirrors dense
+    /// `chat_stream_sync_core_paged`.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream_sync_core_paged(
+        &mut self,
+        tokens: Vec<u32>,
+        tokenizer: Arc<Qwen3Tokenizer>,
+        eos_token_id: u32,
+        p: chat_common::ChatParams,
+        report_perf: bool,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        let prompt_token_count = tokens.len() as u32;
+        let max_new_tokens = p.max_new_tokens;
+        let sampling_config = p.sampling_config;
+        let include_reasoning = p.include_reasoning;
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+        let thinking_enabled = true;
+        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+            thinking_enabled,
+            p.thinking_token_budget,
+            think_end_id,
+        );
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+
+        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        let mut streamed_text_len = 0usize;
+        let mut last_is_reasoning = thinking_enabled;
+
+        let seq_id: u32 = 0;
+        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        let cached_prefix_len = {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("MoE chat_stream_sync_core_paged: paged_adapter is None")
+            })?;
+            let can_continue =
+                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            if can_continue {
+                match adapter.continue_turn(&tokens, total_budget) {
+                    Ok((prior, _)) => prior,
+                    Err(_) => {
+                        let _ = adapter.release_request();
+                        adapter
+                            .reset_for_new_request(seq_id)
+                            .map_err(Error::from_reason)?;
+                        let prefix = adapter
+                            .find_cached_prefix(&tokens, &[])
+                            .map_err(Error::from_reason)?;
+                        let cached = prefix.cached_token_count;
+                        adapter
+                            .allocate_suffix_blocks(total_budget)
+                            .map_err(Error::from_reason)?;
+                        cached
+                    }
+                }
+            } else {
+                if adapter.block_table().is_some() {
+                    let _ = adapter.release_request();
+                }
+                adapter
+                    .reset_for_new_request(seq_id)
+                    .map_err(Error::from_reason)?;
+                let prefix = adapter
+                    .find_cached_prefix(&tokens, &[])
+                    .map_err(Error::from_reason)?;
+                let cached = prefix.cached_token_count;
+                adapter
+                    .allocate_suffix_blocks(total_budget)
+                    .map_err(Error::from_reason)?;
+                cached
+            }
+        };
+
+        self.caches = Some(
+            (0..self.config.num_layers as usize)
+                .map(|i| {
+                    if self.config.is_linear_layer(i) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect(),
+        );
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+
+        let suffix_len = prompt_token_count
+            .checked_sub(cached_prefix_len)
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "MoE chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
+                )
+            })?;
+
+        let result = self.chat_stream_sync_core_paged_inner(
+            &tokens,
+            cached_prefix_len,
+            suffix_len,
+            &p,
+            sampling_config,
+            eos_token_id,
+            &mut reasoning_tracker,
+            report_perf,
+            &mut first_token_instant,
+            &tokenizer,
+            &mut decode_stream,
+            &mut streamed_text_len,
+            &mut last_is_reasoning,
+            cb,
+            cancelled,
+        );
+
+        let (generated_tokens, finish_reason) = match result {
+            Ok(t) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.finalize_turn_keep_live(&[]);
+                }
+                t
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        let last_token_in_cache = false;
+        let mut full_history = tokens.clone();
+        if !generated_tokens.is_empty() {
+            let upto = if last_token_in_cache {
+                generated_tokens.len()
+            } else {
+                generated_tokens.len().saturating_sub(1)
+            };
+            full_history.extend_from_slice(&generated_tokens[..upto]);
+        }
+        self.cached_token_history = full_history;
+
+        let full_text = tokenizer
+            .decode_sync(&generated_tokens, true)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to decode generated tokens: {}", e);
+                String::new()
+            });
+        if full_text.len() > streamed_text_len {
+            let residual = full_text[streamed_text_len..].to_string();
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: residual,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    cached_tokens: None,
+                    performance: None,
+                    is_reasoning: Some(last_is_reasoning),
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+        }
+
+        let performance = if report_perf {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                tokens.len() - cached_prefix_len as usize,
+                generated_tokens.len(),
+            )
+        } else {
+            None
+        };
+
+        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+
+        let mut result = finalize_chat_result(
+            &tokenizer,
+            &generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str.as_deref(),
+            performance,
+            include_reasoning,
+            thinking_enabled,
+            prompt_token_count,
+            reasoning_tokens,
+        )?;
+        result.cached_tokens = cached_prefix_len;
+
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: result.text.clone(),
+                done: true,
+                finish_reason: Some(result.finish_reason.clone()),
+                tool_calls: Some(result.tool_calls.clone()),
+                thinking: result.thinking.clone(),
+                num_tokens: Some(result.num_tokens),
+                prompt_tokens: Some(result.prompt_tokens),
+                reasoning_tokens: Some(result.reasoning_tokens),
+                raw_text: Some(result.raw_text.clone()),
+                cached_tokens: Some(cached_prefix_len),
+                performance: result.performance.clone(),
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream_sync_core_paged_inner<'a>(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        suffix_len: u32,
+        p: &chat_common::ChatParams,
+        sampling_config: Option<crate::sampling::SamplingConfig>,
+        eos_token_id: u32,
+        reasoning_tracker: &mut chat_common::ReasoningTracker,
+        report_perf: bool,
+        first_token_instant: &mut Option<std::time::Instant>,
+        tokenizer: &'a Arc<Qwen3Tokenizer>,
+        decode_stream: &mut tokenizers::DecodeStream<
+            'a,
+            tokenizers::ModelWrapper,
+            tokenizers::NormalizerWrapper,
+            tokenizers::PreTokenizerWrapper,
+            tokenizers::PostProcessorWrapper,
+            tokenizers::DecoderWrapper,
+        >,
+        streamed_text_len: &mut usize,
+        last_is_reasoning: &mut bool,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<(Vec<u32>, String)> {
+        if suffix_len == 0 {
+            return Err(Error::from_reason(
+                "MoE chat_stream_sync_core_paged: zero-delta prompt is not supported on the paged path",
+            ));
+        }
+
+        let suffix = &tokens[(cached_prefix_len as usize)..];
+        let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+            self.config.num_layers as usize,
+            |i| self.config.is_linear_layer(i),
+        );
+
+        let last_logits = {
+            let embed = self.embedding.clone();
+            let embedding_weight = embed.get_weight();
+            let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("MoE chat_stream_sync_core_paged_inner: caches not initialized")
+            })?;
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("MoE chat_stream_sync_core_paged_inner: paged_adapter dropped")
+            })?;
+            super::paged_forward::run_paged_prefill_chunk(
+                tokens,
+                suffix,
+                cached_prefix_len,
+                &embed,
+                &mut self.layers,
+                caches_ref,
+                &self.final_norm,
+                &self.lm_head,
+                &embedding_weight,
+                &layer_kinds,
+                adapter,
+            )?
+        };
+
+        let mut token_history: Vec<u32> = tokens.to_vec();
+        let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
+        let mut y = sample(&last_logits, sampling_config)?;
+        y.eval();
+
+        if report_perf {
+            *first_token_instant = Some(std::time::Instant::now());
+        }
+
+        let max_new_tokens = p.max_new_tokens;
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut finish_reason = String::from("length");
+
+        for step in 0..max_new_tokens {
+            let token_id = y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+            token_history.push(token_id);
+            let is_reasoning = reasoning_tracker.observe_token(token_id);
+            *last_is_reasoning = is_reasoning;
+
+            if token_id == eos_token_id {
+                finish_reason = String::from("stop");
+                break;
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                finish_reason = String::from("cancelled");
+                break;
+            }
+
+            let token_text = Qwen3Tokenizer::step_decode_stream(
+                decode_stream,
+                tokenizer.inner(),
+                token_id,
+                &generated_tokens,
+                *streamed_text_len,
+            );
+            *streamed_text_len += token_text.len();
+            cb.call(
+                Ok(ChatStreamChunk {
+                    text: token_text,
+                    done: false,
+                    finish_reason: None,
+                    tool_calls: None,
+                    thinking: None,
+                    num_tokens: None,
+                    prompt_tokens: None,
+                    reasoning_tokens: None,
+                    raw_text: None,
+                    cached_tokens: None,
+                    performance: None,
+                    is_reasoning: Some(is_reasoning),
+                }),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+
+            if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                &generated_tokens,
+                p.max_consecutive_tokens,
+                p.max_ngram_repeats,
+                p.ngram_size,
+            ) {
+                finish_reason = reason.to_string();
+                break;
+            }
+            if step + 1 >= max_new_tokens {
+                break;
+            }
+
+            let next_logits = {
+                let embed = self.embedding.clone();
+                let embedding_weight = embed.get_weight();
+                let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "MoE chat_stream_sync_core_paged_inner: caches dropped mid-decode",
+                    )
+                })?;
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode",
+                    )
+                })?;
+                super::paged_forward::run_paged_decode_step(
+                    token_id,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    &layer_kinds,
+                    adapter,
+                )?
+            };
+            let next_logits = next_logits.squeeze(Some(&[1]))?;
+
+            let next_logits = if reasoning_tracker.should_force_think_end() {
+                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                y = MxArray::from_int32(&[forced_id], &[1])?;
+                y.eval();
+                continue;
+            } else {
+                apply_all_penalties(next_logits, &token_history, p)?
+            };
+
+            y = sample(&next_logits, sampling_config)?;
+            y.eval();
+
+            if (step + 1) % 256 == 0 {
+                crate::array::synchronize_and_clear_cache();
+            }
+        }
+
+        Ok((generated_tokens, finish_reason))
+    }
+
     /// Core streaming chat implementation (runs on model thread).
     ///
     /// `eos_token_id` is the caller-supplied stop-on token id (typically
@@ -1221,6 +2022,25 @@ impl Qwen35MoeInner {
             None
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
+
+        // Block-paged dispatch — early-return BEFORE the compile lock.
+        if self.paged_adapter.is_some() {
+            if has_images {
+                return Err(Error::from_reason(
+                    "Qwen3.5 MoE paged dispatch is text-only; VLM is incompatible with \
+                     use_block_paged_cache=true in this revision.",
+                ));
+            }
+            return self.chat_stream_sync_core_paged(
+                tokens,
+                tokenizer_for_decode,
+                eos_token_id,
+                p,
+                report_perf,
+                cb,
+                cancelled,
+            );
+        }
 
         // Check compiled path
         let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
@@ -1890,6 +2710,20 @@ impl Qwen35MoeInner {
 
         let model_id = self.model_id;
 
+        // Block-paged dispatch — early-return BEFORE the compile lock.
+        // The delta path drives the paged core with the FULL token
+        // history; the adapter's warm-continue path matches the cached
+        // prefix automatically.
+        if self.paged_adapter.is_some() {
+            return self.chat_sync_core_paged(
+                full_token_history.clone(),
+                tokenizer.clone(),
+                eos_id,
+                p,
+                report_perf,
+            );
+        }
+
         // Check compiled path availability
         let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
 
@@ -2536,6 +3370,19 @@ impl Qwen35MoeInner {
         let mut first_token_instant: Option<std::time::Instant> = None;
 
         let model_id = self.model_id;
+
+        // Block-paged dispatch — early-return BEFORE the compile lock.
+        if self.paged_adapter.is_some() {
+            return self.chat_stream_sync_core_paged(
+                full_token_history.clone(),
+                tokenizer_for_decode,
+                eos_id,
+                p,
+                report_perf,
+                cb,
+                cancelled,
+            );
+        }
 
         let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _moe_lock = if use_cpp {
@@ -5579,5 +6426,102 @@ mod prefix_cache_reuse_integration_tests {
         //   // sensible tokens), not garbage from a corrupted GDN state.
         //   assert!(!r2.text.is_empty());
         //   assert!(r2.num_tokens > 0);
+    }
+}
+
+#[cfg(test)]
+mod paged_construction_tests {
+    //! Construction-only smoke tests for the MoE block-paged adapter.
+
+    use super::*;
+    use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
+
+    fn tiny_moe_cfg(use_block_paged: bool) -> Qwen3_5MoeConfig {
+        Qwen3_5MoeConfig {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 8,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            shared_expert_intermediate_size: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: true,
+            mlp_only_layers: None,
+            paged_cache_memory_mb: Some(64),
+            paged_block_size: Some(16),
+            use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+        }
+    }
+
+    #[test]
+    fn test_moe_use_block_paged_cache_serde_default_none() {
+        let json = serde_json::json!({
+            "vocab_size": 1024,
+            "hidden_size": 64,
+            "num_layers": 8,
+            "num_heads": 4,
+            "num_kv_heads": 2,
+            "intermediate_size": 128,
+            "rms_norm_eps": 1e-6,
+            "head_dim": 16,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 1024,
+            "pad_token_id": 0,
+            "eos_token_id": 0,
+            "bos_token_id": 0,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+        });
+        let cfg: Qwen3_5MoeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.use_block_paged_cache, None);
+        assert_eq!(cfg.paged_block_size, None);
+        assert_eq!(cfg.paged_cache_memory_mb, None);
+    }
+
+    #[test]
+    fn test_moe_full_attention_layer_count() {
+        let cfg = tiny_moe_cfg(false);
+        assert_eq!(cfg.full_attention_layer_count(), 2);
+    }
+
+    #[test]
+    fn test_moe_inner_no_paged_adapter_when_flag_is_none() {
+        let cfg = tiny_moe_cfg(false);
+        let inner = Qwen35MoeInner::new(cfg)
+            .expect("Qwen35MoeInner::new must succeed without paged adapter");
+        assert!(inner.paged_adapter.is_none());
+    }
+
+    #[test]
+    #[ignore = "Allocates Metal LayerKVPool; gate on MLX_TEST_PAGED=1"]
+    fn test_moe_inner_constructs_paged_adapter_when_flag_is_true() {
+        if std::env::var_os("MLX_TEST_PAGED").is_none() {
+            return;
+        }
+        let cfg = tiny_moe_cfg(true);
+        let inner = Qwen35MoeInner::new(cfg).expect(
+            "Qwen35MoeInner::new with use_block_paged_cache=true must succeed on Metal host",
+        );
+        assert!(inner.paged_adapter.is_some());
     }
 }

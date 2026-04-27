@@ -1,8 +1,10 @@
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::mask::create_causal_mask;
 use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
@@ -207,6 +209,171 @@ impl Qwen3_5Attention {
         let gated_output = output.mul(&gate_sigmoid)?;
 
         // Output projection
+        self.o_proj.forward(&gated_output)
+    }
+
+    /// Forward pass routed through the block-paged KV adapter.
+    ///
+    /// Mirrors [`Self::forward`] (Q-gating, partial RoPE, Q/K layernorm)
+    /// but writes K/V into the paged pool instead of a flat `KVCache`
+    /// and reads attention K/V back via either an explicit
+    /// `read_kv_range` (cache-hit prefill) or a host-side
+    /// `read_kv_range` followed by SDPA (decode). Decode uses
+    /// `read_kv_range` instead of `gather_kv_for_decode` to keep BF16
+    /// reduction order bit-equal to the flat path's SDPA — matches
+    /// Qwen3 / Gemma4's paged decode strategy.
+    ///
+    /// **Caller contract** (mirrors LFM2 / Gemma4):
+    /// 1. `adapter.record_tokens(&[...suffix])` BEFORE this call so the
+    ///    adapter cursor is advanced by the chunk; `update_keys_values`
+    ///    enforces alignment.
+    /// 2. `attn_layer_idx` is the FULL-ATTENTION ORDINAL into the
+    ///    adapter pool (NOT the absolute decoder index). Pool was sized
+    ///    by `Qwen3_5Config::full_attention_layer_count()`.
+    /// 3. M-RoPE / VLM mode is rejected: pass `position_ids = None`.
+    ///    VLM is incompatible with paged dispatch in this revision.
+    ///
+    /// Returns `[B, T, hidden_size]` (post-output-projection,
+    /// post-gate) so the layer's residual `h = x + r` matches the flat
+    /// path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_paged(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        // Project queries (2x width for gating).
+        let q_proj_output = self.q_proj.forward(x)?;
+
+        // Per-head split of queries / gate (matches forward()).
+        let q_per_head = q_proj_output.reshape(&[
+            batch,
+            seq_len,
+            self.num_heads as i64,
+            (self.head_dim * 2) as i64,
+        ])?;
+        let queries = q_per_head.slice_axis(3, 0, self.head_dim as i64)?;
+        let gate = q_per_head.slice_axis(3, self.head_dim as i64, (self.head_dim * 2) as i64)?;
+        let gate = gate.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+
+        // K/V projections + reshape to per-head layout.
+        let keys = self.k_proj.forward(x)?;
+        let values = self.v_proj.forward(x)?;
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+
+        // QK normalization on the last dim.
+        let queries = self.q_norm.forward(&queries)?;
+        let keys = self.k_norm.forward(&keys)?;
+
+        // Standard scalar-offset partial RoPE (paged path is text-only;
+        // M-RoPE / VLM is rejected upstream).
+        let rope_offset = first_logical_position as i32;
+        let queries = self.rope.forward(&queries, Some(rope_offset))?;
+        let keys = self.rope.forward(&keys, Some(rope_offset))?;
+
+        // Transpose to [B, H, T, D] for SDPA.
+        let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys_bhtd = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let values_bhtd = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        // Paged-pool layout: `[num_tokens, num_kv_heads, head_dim]`.
+        // [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D].
+        let keys_paged = keys_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch * seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values_paged = values_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch * seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+
+        adapter
+            .update_keys_values(
+                attn_layer_idx,
+                &keys_paged,
+                &values_paged,
+                first_logical_position,
+            )
+            .map_err(napi::Error::from_reason)?;
+
+        // Compute attention output.
+        let attn_bhtd = if is_prefill {
+            if cached_prefix_len == 0 {
+                // Fresh prefill: SDPA over in-flight Q/K/V with internal
+                // causal mask.
+                if seq_len > 1 {
+                    scaled_dot_product_attention_causal(
+                        &queries_bhtd,
+                        &keys_bhtd,
+                        &values_bhtd,
+                        self.scale as f64,
+                    )?
+                } else {
+                    scaled_dot_product_attention(
+                        &queries_bhtd,
+                        &keys_bhtd,
+                        &values_bhtd,
+                        self.scale as f64,
+                        None,
+                    )?
+                }
+            } else {
+                // Cache-hit prefill: read full [0, total_ctx) K/V back
+                // from the pool. The suffix was just written above.
+                let total_ctx = cached_prefix_len + (seq_len as u32);
+                let (k_full, v_full) = adapter
+                    .read_kv_range(attn_layer_idx, 0, total_ctx)
+                    .map_err(napi::Error::from_reason)?;
+                let mask =
+                    create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
+                scaled_dot_product_attention(
+                    &queries_bhtd,
+                    &k_full,
+                    &v_full,
+                    self.scale as f64,
+                    Some(&mask),
+                )?
+            }
+        } else {
+            // Decode: read full historical K/V back from the pool and
+            // run SDPA — keeps BF16 reduction order bit-equal to the
+            // flat path's KVCache + SDPA. Mirrors Qwen3 / Gemma4 decode.
+            let total_ctx = first_logical_position + 1;
+            let (k_full, v_full) = adapter
+                .read_kv_range(attn_layer_idx, 0, total_ctx)
+                .map_err(napi::Error::from_reason)?;
+            scaled_dot_product_attention(&queries_bhtd, &k_full, &v_full, self.scale as f64, None)?
+        };
+
+        // Transpose back: [B, H, T, D] -> [B, T, H*D].
+        let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
+        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+
+        // Apply gate: output * sigmoid(gate).
+        let gate_sigmoid = Activations::sigmoid(&gate)?;
+        let gated_output = output.mul(&gate_sigmoid)?;
+
+        // Output projection.
         self.o_proj.forward(&gated_output)
     }
 
