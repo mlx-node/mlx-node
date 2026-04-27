@@ -19,6 +19,7 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::sample;
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Lfm2Config;
 use super::decoder_layer::Lfm2DecoderLayer;
@@ -43,6 +44,28 @@ pub(crate) struct Lfm2Inner {
     /// Always `None` for text-only LFM2; present so session-API code can treat
     /// all model backends uniformly.
     pub(crate) cached_image_key: Option<u64>,
+    /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
+    ///
+    /// **Opt-in via `Lfm2Config::use_block_paged_cache`** —
+    /// construction-only at this stage. The chat-session forward
+    /// dispatch is NOT yet wired through this adapter because LFM2 is a
+    /// hybrid conv + attention architecture: only `full_attention`
+    /// layers can use the block-paged path, while `conv` layers must
+    /// continue to use the existing `Lfm2LayerCache::Conv(ArraysCache)`
+    /// storage. A bespoke per-layer dispatch on `Lfm2DecoderLayer`
+    /// (mirroring the Qwen3 `forward_paged_adapter` pattern) plus a
+    /// hybrid cache wrapper that addresses the adapter by
+    /// attention-layer ordinal (not absolute layer index) is required
+    /// before forward wiring can land. Defaults to `None` so the
+    /// existing `Lfm2LayerCache` path stays untouched.
+    ///
+    /// The adapter's underlying `LayerKVPool` is sized for the count of
+    /// `full_attention` layers ONLY — conv layers do not consume KV
+    /// pool slots. Indexing into the pool from a future paged-aware
+    /// forward path will therefore be by attention-ordinal (the index
+    /// into `config.full_attn_idxs()`), not by absolute layer index.
+    #[allow(dead_code)]
+    pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -227,6 +250,93 @@ impl Lfm2Inner {
         // Initialize caches
         let caches = init_caches(&config);
 
+        // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
+        //
+        // Construction-only plumbing. The chat dispatch is NOT yet wired
+        // through this adapter — see the doc comment on
+        // `Lfm2Inner::paged_adapter` for the architectural rationale
+        // (hybrid conv + attention requires a bespoke per-layer dispatch
+        // and an attention-ordinal-indexed cache wrapper). We still
+        // allocate here so:
+        // 1. The construction surface (config flag + JSON parsing +
+        //    NAPI-typed field) is testable in isolation.
+        // 2. A follow-up commit can light up the forward path without
+        //    re-churning every persistence/test/example file.
+        //
+        // KV-pool sizing: ONLY full_attention layers participate. LFM2's
+        // hybrid layer mix is parsed from `config.layer_types`; conv
+        // layers don't consume KV slots. The pool's `num_layers` is
+        // therefore the count of `full_attention` entries, NOT the
+        // absolute `num_hidden_layers`. A future paged-aware forward
+        // path will index this pool by attention-ordinal, mapping
+        // absolute layer index → ordinal via `config.full_attn_idxs()`.
+        //
+        // Cache dtype: BFloat16 (LFM2's production dtype).
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
+            let attn_layer_count = config.full_attn_idxs().len() as u32;
+            if attn_layer_count == 0 {
+                return Err(Error::from_reason(
+                    "LFM2 block-paged adapter: config has no full_attention layers; \
+                     paged KV cache requires at least one attention layer",
+                ));
+            }
+
+            let block_size = config.paged_block_size.unwrap_or(16);
+            let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
+            let head_size = config.head_dim() as u32;
+            let num_kv_heads = config.num_key_value_heads as u32;
+
+            let pa_config = mlx_paged_attn::PagedAttentionConfig {
+                block_size,
+                gpu_memory_mb,
+                head_size,
+                num_kv_heads,
+                // Pool covers only the attention layers — conv layers
+                // continue to use Lfm2LayerCache::Conv.
+                num_layers: attn_layer_count,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(config.max_position_embeddings as u32),
+                max_batch_size: Some(32),
+            };
+
+            let num_blocks = pa_config.calculate_num_blocks();
+            if num_blocks == 0 {
+                return Err(Error::from_reason(format!(
+                    "LFM2 block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
+                     (head_size={head_size}, num_kv_heads={num_kv_heads}, \
+                     block_size={block_size}, num_attn_layers={attn_layer_count})"
+                )));
+            }
+
+            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+                num_blocks, block_size,
+            )));
+
+            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
+                .map_err(|e| {
+                    Error::from_reason(format!(
+                        "Failed to construct LayerKVPool for LFM2 block-paged adapter: {e}"
+                    ))
+                })?;
+
+            let adapter =
+                PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
+                    Error::from_reason(format!(
+                        "Failed to construct LFM2 PagedKVCacheAdapter: {e}"
+                    ))
+                })?;
+
+            info!(
+                "LFM2 block-paged adapter enabled (construction-only): num_blocks={}, \
+                 block_size={}, gpu_memory_mb={}, num_attn_layers={}, cache_dtype=BFloat16",
+                num_blocks, block_size, gpu_memory_mb, attn_layer_count
+            );
+            Some(adapter)
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             embed_tokens,
@@ -237,6 +347,7 @@ impl Lfm2Inner {
             tokenizer: None,
             cached_token_history: Vec::new(),
             cached_image_key: None,
+            paged_adapter,
         })
     }
 
@@ -2406,6 +2517,121 @@ mod prefix_cache_decision_tests {
             classify_prefix_cache_decision(10, 5),
             PrefixCacheDecision::Miss,
             "cached_prefix_len > tokens_len must be Miss (defensive fallthrough)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod paged_adapter_construction_tests {
+    //! Construction-only coverage of `Lfm2Inner::paged_adapter`. The
+    //! flag is opt-in and currently a no-op for chat dispatch — see the
+    //! doc comment on the field for the architectural rationale (LFM2's
+    //! hybrid conv + attention requires a bespoke per-layer dispatch and
+    //! an attention-ordinal-indexed cache wrapper). These tests pin the
+    //! "default = no allocation" invariant and verify that flipping the
+    //! flag wires up a real adapter without churning forward-path code.
+
+    use super::Lfm2Inner;
+    use crate::models::lfm2::Lfm2Config;
+
+    /// Tiny LFM2-shaped config compatible with `LayerKVPool`'s validate
+    /// constraints (head_size in {32, 64, 96, 128, 256}, FP8 off).
+    /// Two layers: one conv + one full_attention. Mirrors the same hybrid
+    /// shape as production LFM2 so the adapter sizing exercises the
+    /// "attention layers only" path.
+    fn paged_tiny_config(use_block_paged: bool) -> Lfm2Config {
+        Lfm2Config {
+            vocab_size: 100,
+            hidden_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            max_position_embeddings: 128,
+            norm_eps: 1e-5,
+            conv_bias: false,
+            conv_l_cache: 3,
+            block_dim: 64,
+            block_ff_dim: 64,
+            block_multiple_of: 256,
+            block_ffn_dim_multiplier: 1.0,
+            block_auto_adjust_ff_dim: false,
+            rope_theta: 1_000_000.0,
+            // 1 conv + 1 full_attention — the adapter pool should be
+            // sized for ONE attention layer, not two.
+            layer_types: vec!["conv".to_string(), "full_attention".to_string()],
+            tie_embedding: true,
+            eos_token_id: 7,
+            bos_token_id: 1,
+            pad_token_id: 0,
+            paged_cache_memory_mb: Some(256),
+            paged_block_size: Some(16),
+            use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+        }
+    }
+
+    /// Default-flag construction must NOT allocate the block-paged adapter.
+    #[test]
+    fn test_lfm2_inner_no_paged_adapter_when_flag_is_none() {
+        let cfg = paged_tiny_config(false);
+        let inner = match Lfm2Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Lfm2Inner::new failure: {msg}");
+            }
+        };
+        assert!(
+            inner.paged_adapter.is_none(),
+            "paged_adapter must be None when use_block_paged_cache is None"
+        );
+    }
+
+    /// Construction with `use_block_paged_cache: Some(true)` must populate
+    /// `paged_adapter`. Allocates a `LayerKVPool`, so requires Metal —
+    /// gracefully skips on no-Metal sandboxes.
+    #[test]
+    fn test_lfm2_inner_constructs_paged_adapter_when_flag_is_true() {
+        let cfg = paged_tiny_config(true);
+        match Lfm2Inner::new(cfg) {
+            Ok(inner) => {
+                assert!(
+                    inner.paged_adapter.is_some(),
+                    "paged_adapter must be Some when use_block_paged_cache = Some(true)"
+                );
+            }
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Lfm2Inner::new failure: {msg}");
+            }
+        }
+    }
+
+    /// All-conv config (zero attention layers) with the flag enabled must
+    /// fail with a clear error — paged KV cache is meaningless without
+    /// attention layers, and silently constructing a pool with
+    /// `num_layers=0` would violate `LayerKVPool::new`'s invariant.
+    #[test]
+    fn test_lfm2_inner_rejects_all_conv_with_paged_flag() {
+        let mut cfg = paged_tiny_config(true);
+        cfg.layer_types = vec!["conv".to_string(), "conv".to_string()];
+        let result = Lfm2Inner::new(cfg);
+        assert!(
+            result.is_err(),
+            "all-conv layer_types with use_block_paged_cache=true must fail"
+        );
+        let err_msg = result.err().unwrap().reason.to_string();
+        assert!(
+            err_msg.contains("no full_attention layers")
+                || err_msg.contains("No Metal device found"),
+            "expected clear error about missing attention layers, got: {err_msg}"
         );
     }
 }
