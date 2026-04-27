@@ -244,8 +244,13 @@ impl PagedKVCacheAdapter {
     /// `find_cached_prefix`; it MUST match for future cross-request
     /// reuse to work.
     ///
-    /// Returns the number of blocks registered (i.e. the number of full
-    /// blocks covered by `request_tokens`).
+    /// Returns the number of blocks actually registered. Normally equals
+    /// the number of full blocks covered by `request_tokens`; may be
+    /// smaller if a hash collision in the middle of the chain caused
+    /// `BlockAllocator::cache_full_blocks` to abort partway through.
+    /// Callers can treat any value as success — the adapter has done what
+    /// it can; subsequent lookups simply miss past the abort point and
+    /// trigger fresh prefill, which is correct.
     ///
     /// ## Refcount semantics
     ///
@@ -268,13 +273,15 @@ impl PagedKVCacheAdapter {
     ///
     /// ## Idempotency
     ///
-    /// Idempotent within a single request: subsequent calls after the first
-    /// successful one return `Ok(0)` without side effects. The flag is reset
-    /// by `reset_for_new_request` and `release_request`. The current design
-    /// (BlockAllocator owns the cache's logical ref and treats same-(block,
-    /// hash) re-registers as pure LRU refreshes) means a duplicate call
-    /// would not leak ref_counts even without this guard, but the guard
-    /// avoids the spurious LRU shuffle and re-locking work.
+    /// Idempotent within a single request: subsequent calls after the
+    /// first one return `Ok(0)` without side effects, regardless of
+    /// whether the first call registered every block or aborted partway.
+    /// The flag is reset by `reset_for_new_request` and `release_request`.
+    /// Partial registration is not retryable from the adapter's side
+    /// (the chain breakage isn't recoverable without freeing some blocks
+    /// first), so we set `already_registered = true` even when the
+    /// allocator returned a partial count — the call ran, the adapter
+    /// has done what it can.
     pub fn register_full_blocks_for_reuse(&mut self, extra_keys: &[u64]) -> Result<u32, String> {
         // Idempotent: subsequent calls within the same request are no-ops.
         if self.already_registered {
@@ -310,7 +317,7 @@ impl PagedKVCacheAdapter {
             .lock()
             .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
 
-        guard
+        let registered = guard
             .cache_full_blocks(
                 &self.request_tokens[..actual_blocks_to_register * block_size_us],
                 blocks_slice,
@@ -321,9 +328,15 @@ impl PagedKVCacheAdapter {
 
         // Mark registered ONLY on the success path so an Err leaves
         // already_registered == false (callers may retry / move on, and a
-        // future correct call should still be able to do the work).
+        // future correct call should still be able to do the work). A
+        // partial-count success still flips the flag — the chain breakage
+        // is not recoverable without releasing blocks first, and a retry
+        // would just re-run the same partial registration.
         self.already_registered = true;
-        Ok(actual_blocks_to_register as u32)
+        // Cast usize → u32: registered is bounded by blocks_slice.len()
+        // (≤ num_full_blocks), which is bounded by allocator capacity —
+        // far below u32::MAX in any realistic deployment.
+        Ok(registered as u32)
     }
 
     /// Release this request's block references. Decrefs every block in
