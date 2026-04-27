@@ -357,6 +357,25 @@ impl Gemma4DecoderLayer {
         Ok(out)
     }
 
+    // ========== Test-only norm weight getters ==========
+
+    #[cfg(test)]
+    pub(crate) fn input_layernorm_weight(&self) -> MxArray {
+        self.input_layernorm.get_weight()
+    }
+    #[cfg(test)]
+    pub(crate) fn post_attention_layernorm_weight(&self) -> MxArray {
+        self.post_attention_layernorm.get_weight()
+    }
+    #[cfg(test)]
+    pub(crate) fn pre_feedforward_layernorm_weight(&self) -> MxArray {
+        self.pre_feedforward_layernorm.get_weight()
+    }
+    #[cfg(test)]
+    pub(crate) fn post_feedforward_layernorm_weight(&self) -> MxArray {
+        self.post_feedforward_layernorm.get_weight()
+    }
+
     // ========== Norm weight setters ==========
 
     pub fn set_input_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {

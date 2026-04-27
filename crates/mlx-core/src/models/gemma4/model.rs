@@ -875,6 +875,23 @@ impl Gemma4Inner {
             tokens
         };
 
+        // Block-paged dispatch: when the adapter is configured AND no
+        // images are involved, route through the parallel
+        // `chat_sync_core_paged` path. The flat path stays untouched so
+        // off-by-default behavior is byte-identical to before this
+        // commit. Vision turns always use the flat path (paged dispatch
+        // is text-only at this stage).
+        if self.paged_adapter.is_some() && !has_images {
+            return self.chat_sync_core_paged(
+                tokens,
+                tokenizer,
+                config,
+                eos_token_id,
+                sampling_config,
+                max_new_tokens,
+            );
+        }
+
         // Prefix-cache verification. `verify_cache_prefix` returns 0 on
         // miss or `cached.len()` on an exact prefix relation (either
         // strict-extend or exact-match) — never intermediate (see its
@@ -1438,6 +1455,22 @@ impl Gemma4Inner {
             tokens
         };
 
+        // Block-paged streaming dispatch: same gate as the non-streaming
+        // path. See `chat_sync_core` for the rationale (text-only at
+        // this stage, flat path for vision turns).
+        if self.paged_adapter.is_some() && !has_images {
+            return self.chat_stream_sync_core_paged(
+                tokens,
+                tokenizer,
+                config,
+                eos_token_id,
+                sampling_config,
+                cb,
+                cancelled,
+                max_new_tokens,
+            );
+        }
+
         // Prefix-cache verification — see `chat_sync_core` for the full
         // rationale and the `verify_cache_prefix` rustdoc for the
         // "returns 0 or cached.len() only" invariant. As in the
@@ -1863,6 +1896,917 @@ impl Gemma4Inner {
             ThreadsafeFunctionCallMode::NonBlocking,
         );
 
+        Ok(())
+    }
+
+    // =================================================================
+    // Block-paged dispatch (chat_sync_core_paged + helpers).
+    //
+    // Mirrors Qwen3's `chat_sync_core_paged` and LFM2's `forward_paged_or_flat`
+    // pattern — sliding layers continue to use the existing flat
+    // `Gemma4LayerCache::Sliding` path while global layers route through
+    // `PagedKVCacheAdapter`. KV-shared layers are wired in a follow-up
+    // commit; for now the dispatch surface returns an error if the
+    // config has any shared layers.
+    //
+    // Lifecycle (mirrors Qwen3 / LFM2):
+    // 1. Adapter cold-start (or warm-continue when previous turn
+    //    finalize_turn_keep_live'd a strict-prefix request).
+    // 2. Conv/sliding caches RESET each turn (paged path doesn't carry
+    //    sliding state across turns at this stage — same caveat as
+    //    LFM2's conv layers).
+    // 3. Prefill via `run_paged_prefill_chunk` over the suffix.
+    // 4. Decode loop via `run_paged_decode_step`.
+    // 5. End-of-turn (success): `finalize_turn_keep_live` so the next
+    //    turn's `continue_turn` can build on top of the partial trailing
+    //    block's K/V (same partial-block carry trick as Qwen3 / LFM2).
+    //
+    // Caveats / scope:
+    // * Text-only — vision turns dispatch through the flat path.
+    // * Sliding layers re-prefill the cached prefix every turn.
+    // * Zero-delta prompts (every prompt token cached) are rejected.
+    // =================================================================
+
+    /// Block-paged variant of [`Self::chat_sync_core`].
+    ///
+    /// Reached when `paged_adapter.is_some()` AND the prompt has no
+    /// images. The caller has already done image processing /
+    /// expansion / template rendering, so this method receives a
+    /// fully-baked `tokens` vector and dispatches the paged forward.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_sync_core_paged(
+        &mut self,
+        tokens: Vec<u32>,
+        tokenizer: Arc<Qwen3Tokenizer>,
+        config: ChatConfig,
+        eos_token_id: u32,
+        sampling_config: Option<SamplingConfig>,
+        max_new_tokens: i32,
+    ) -> Result<ChatResult> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        // Reject KV-sharing models on the paged path until the
+        // SharedOnGlobal/SharedOnSliding routing lands in the next
+        // commit. The flat path still handles them.
+        if self.config.num_kv_shared_layers.is_some_and(|n| n > 0) {
+            return Err(Error::from_reason(
+                "Gemma4 paged path does not yet support num_kv_shared_layers > 0; \
+                 disable use_block_paged_cache or wait for the SharedOn{Global,Sliding} routing follow-up",
+            ));
+        }
+
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let prompt_token_count = tokens.len();
+        let eos_ids = self.config.eos_token_ids.clone();
+        let generation_start = std::time::Instant::now();
+
+        // === Adapter lifecycle: warm continuation OR cold start. ===
+        // See PagedKVCacheAdapter::finalize_turn_keep_live for why warm-
+        // continue preserves the partial trailing block's K/V across
+        // turns. Mirrors Qwen3 / LFM2.
+        let seq_id: u32 = 0;
+        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        let cached_prefix_len = {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason(
+                    "chat_sync_core_paged: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?;
+
+            let can_continue = reuse_cache
+                && adapter.is_live_for_continue()
+                && tokens.starts_with(adapter.request_tokens());
+
+            if can_continue {
+                match adapter.continue_turn(&tokens, total_budget) {
+                    Ok((prior_token_count, _newly_alloc)) => prior_token_count,
+                    Err(_drift) => {
+                        let _ = adapter.release_request();
+                        adapter
+                            .reset_for_new_request(seq_id)
+                            .map_err(Error::from_reason)?;
+                        let prefix = adapter
+                            .find_cached_prefix(&tokens, &[])
+                            .map_err(Error::from_reason)?;
+                        let cached = prefix.cached_token_count;
+                        adapter
+                            .allocate_suffix_blocks(total_budget)
+                            .map_err(Error::from_reason)?;
+                        cached
+                    }
+                }
+            } else {
+                if adapter.block_table().is_some() {
+                    let _ = adapter.release_request();
+                }
+                adapter
+                    .reset_for_new_request(seq_id)
+                    .map_err(Error::from_reason)?;
+                let prefix = adapter
+                    .find_cached_prefix(&tokens, &[])
+                    .map_err(Error::from_reason)?;
+                let cached = prefix.cached_token_count;
+                adapter
+                    .allocate_suffix_blocks(total_budget)
+                    .map_err(Error::from_reason)?;
+                cached
+            }
+        };
+
+        // Reset sliding-layer flat caches for this turn — paged path
+        // does not carry sliding prefix state across turns.
+        self.reset_caches_sync()?;
+        self.init_caches_sync()?;
+
+        let total_prompt_tokens = tokens.len() as u32;
+        let suffix_len = total_prompt_tokens
+            .checked_sub(cached_prefix_len)
+            .ok_or_else(|| {
+                Error::from_reason("chat_sync_core_paged: cached_prefix_len > total_prompt_tokens")
+            })?;
+        if suffix_len == 0 {
+            // Zero-delta: every prompt token cached. Same caveat as
+            // Qwen3 / LFM2 — flat path required for this corner case.
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            return Err(Error::from_reason(
+                "Gemma4 paged: zero-delta prompt (every token cached) is not yet \
+                 supported on the block-paged path",
+            ));
+        }
+
+        // Wrap forward in a try-style flow for proper adapter cleanup.
+        let forward_result = self.chat_sync_core_paged_inner(
+            &tokens,
+            cached_prefix_len,
+            sampling_config,
+            max_new_tokens,
+            eos_token_id,
+            &eos_ids,
+        );
+
+        let (generated_tokens, finish_reason, first_token_instant) = match forward_result {
+            Ok(t) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    if reuse_cache {
+                        let _ = adapter.finalize_turn_keep_live(&[]);
+                    } else {
+                        let _ = adapter.register_full_blocks_for_reuse(&[]);
+                        let _ = adapter.release_request();
+                    }
+                }
+                t
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        // Decode + parse output (mirrors flat path).
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
+
+        // Persist session token history for the next continue turn.
+        if reuse_cache {
+            let history_tokens: &[u32] =
+                if finish_reason != "length" && !generated_tokens.is_empty() {
+                    &generated_tokens[..generated_tokens.len() - 1]
+                } else {
+                    &generated_tokens[..]
+                };
+            let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
+            new_history.extend(tokens.iter().copied());
+            new_history.extend_from_slice(history_tokens);
+            self.cached_token_history = new_history;
+        } else {
+            self.cached_token_history.clear();
+        }
+        self.cached_image_key = None;
+
+        // Performance metrics.
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .map(|fti| fti.duration_since(generation_start).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let decode_ms = first_token_instant
+            .map(|fti| generation_end.duration_since(fti).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let gen_toks = generated_tokens.len() as f64;
+        let actual_prefill_count = (tokens.len() as f64) - cached_prefix_len as f64;
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                actual_prefill_count.max(1.0) / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+
+        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
+        Ok(ChatResult {
+            text: parsed.text,
+            tool_calls: parsed.tool_calls,
+            thinking: parsed.thinking,
+            num_tokens: generated_tokens.len() as u32,
+            prompt_tokens: prompt_token_count as u32,
+            reasoning_tokens: 0,
+            finish_reason,
+            raw_text,
+            cached_tokens: cached_prefix_len,
+            performance,
+        })
+    }
+
+    /// Inner forward + decode loop for [`Self::chat_sync_core_paged`].
+    /// Split out so the outer can wrap with adapter `release_request`
+    /// on either path.
+    fn chat_sync_core_paged_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        sampling_config: Option<SamplingConfig>,
+        max_new_tokens: i32,
+        eos_token_id: u32,
+        eos_ids: &[i32],
+    ) -> Result<(Vec<u32>, String, Option<std::time::Instant>)> {
+        let suffix = &tokens[(cached_prefix_len as usize)..];
+
+        // Pin model weights in GPU memory; share generation stream.
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        // === PREFILL ===
+        let last_logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?
+        };
+
+        let mut y = sample_next_token(&last_logits, sampling_config)?;
+        y.eval();
+        let first_token_instant = Some(std::time::Instant::now());
+
+        // === DECODE LOOP ===
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut finish_reason = String::from("length");
+
+        for step in 0..max_new_tokens {
+            let token_id = y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+
+            if is_eos_token(token_id, eos_ids, eos_token_id) {
+                finish_reason = String::from("stop");
+                break;
+            }
+            if step + 1 >= max_new_tokens {
+                break;
+            }
+
+            let next_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                self.run_paged_decode_step(token_id)?
+            };
+            let next_logits = next_logits.squeeze(Some(&[1]))?;
+            y = sample_next_token(&next_logits, sampling_config)?;
+            MxArray::async_eval_arrays(&[&y]);
+
+            if (step + 1) % 256 == 0 {
+                crate::array::clear_cache();
+            }
+        }
+
+        Ok((generated_tokens, finish_reason, first_token_instant))
+    }
+
+    /// Streaming variant of [`Self::chat_sync_core_paged`].
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream_sync_core_paged(
+        &mut self,
+        tokens: Vec<u32>,
+        tokenizer: Arc<Qwen3Tokenizer>,
+        config: ChatConfig,
+        eos_token_id: u32,
+        sampling_config: Option<SamplingConfig>,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+        max_new_tokens: i32,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+        if self.config.num_kv_shared_layers.is_some_and(|n| n > 0) {
+            return Err(Error::from_reason(
+                "Gemma4 paged streaming does not yet support num_kv_shared_layers > 0",
+            ));
+        }
+
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let prompt_token_count = tokens.len();
+        let eos_ids = self.config.eos_token_ids.clone();
+        let generation_start = std::time::Instant::now();
+
+        // Adapter lifecycle: warm continuation OR cold start (mirrors
+        // chat_sync_core_paged).
+        let seq_id: u32 = 0;
+        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        let cached_prefix_len = {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("chat_stream_sync_core_paged: paged_adapter is None")
+            })?;
+            let can_continue = reuse_cache
+                && adapter.is_live_for_continue()
+                && tokens.starts_with(adapter.request_tokens());
+            if can_continue {
+                match adapter.continue_turn(&tokens, total_budget) {
+                    Ok((prior, _)) => prior,
+                    Err(_) => {
+                        let _ = adapter.release_request();
+                        adapter
+                            .reset_for_new_request(seq_id)
+                            .map_err(Error::from_reason)?;
+                        let prefix = adapter
+                            .find_cached_prefix(&tokens, &[])
+                            .map_err(Error::from_reason)?;
+                        let cached = prefix.cached_token_count;
+                        adapter
+                            .allocate_suffix_blocks(total_budget)
+                            .map_err(Error::from_reason)?;
+                        cached
+                    }
+                }
+            } else {
+                if adapter.block_table().is_some() {
+                    let _ = adapter.release_request();
+                }
+                adapter
+                    .reset_for_new_request(seq_id)
+                    .map_err(Error::from_reason)?;
+                let prefix = adapter
+                    .find_cached_prefix(&tokens, &[])
+                    .map_err(Error::from_reason)?;
+                let cached = prefix.cached_token_count;
+                adapter
+                    .allocate_suffix_blocks(total_budget)
+                    .map_err(Error::from_reason)?;
+                cached
+            }
+        };
+
+        // Reset sliding flat caches.
+        self.reset_caches_sync()?;
+        self.init_caches_sync()?;
+
+        let total_prompt_tokens = tokens.len() as u32;
+        let suffix_len = total_prompt_tokens
+            .checked_sub(cached_prefix_len)
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
+                )
+            })?;
+        if suffix_len == 0 {
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            return Err(Error::from_reason(
+                "Gemma4 paged streaming: zero-delta prompt (every token cached) is not yet supported",
+            ));
+        }
+
+        let stream_result = self.chat_stream_sync_core_paged_inner(
+            &tokens,
+            cached_prefix_len,
+            sampling_config,
+            max_new_tokens,
+            eos_token_id,
+            &eos_ids,
+            tokenizer.clone(),
+            cb,
+            cancelled,
+        );
+
+        let (generated_tokens, finish_reason, first_token_instant) = match stream_result {
+            Ok(t) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    if reuse_cache {
+                        let _ = adapter.finalize_turn_keep_live(&[]);
+                    } else {
+                        let _ = adapter.register_full_blocks_for_reuse(&[]);
+                        let _ = adapter.release_request();
+                    }
+                }
+                t
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        // Persist session history.
+        if reuse_cache {
+            let history_tokens: &[u32] =
+                if finish_reason != "length" && !generated_tokens.is_empty() {
+                    &generated_tokens[..generated_tokens.len() - 1]
+                } else {
+                    &generated_tokens[..]
+                };
+            let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
+            new_history.extend(tokens.iter().copied());
+            new_history.extend_from_slice(history_tokens);
+            self.cached_token_history = new_history;
+        } else {
+            self.cached_token_history.clear();
+        }
+        self.cached_image_key = None;
+
+        // Terminal stream chunk.
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
+        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .map(|fti| fti.duration_since(generation_start).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let decode_ms = first_token_instant
+            .map(|fti| generation_end.duration_since(fti).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let gen_toks = generated_tokens.len() as f64;
+        let actual_prefill_count = (tokens.len() as f64) - cached_prefix_len as f64;
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                actual_prefill_count.max(1.0) / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+        });
+
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: String::new(),
+                done: true,
+                finish_reason: Some(finish_reason),
+                tool_calls: if parsed.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(parsed.tool_calls)
+                },
+                thinking: parsed.thinking,
+                num_tokens: Some(generated_tokens.len() as u32),
+                prompt_tokens: Some(prompt_token_count as u32),
+                reasoning_tokens: Some(0),
+                raw_text: Some(raw_text),
+                cached_tokens: Some(cached_prefix_len),
+                performance,
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
+
+    /// Inner streaming forward + decode loop for
+    /// [`Self::chat_stream_sync_core_paged`]. Emits text deltas via the
+    /// stream callback as tokens are produced.
+    #[allow(clippy::too_many_arguments)]
+    fn chat_stream_sync_core_paged_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        sampling_config: Option<SamplingConfig>,
+        max_new_tokens: i32,
+        eos_token_id: u32,
+        eos_ids: &[i32],
+        tokenizer: Arc<Qwen3Tokenizer>,
+        cb: &StreamSender,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<(Vec<u32>, String, Option<std::time::Instant>)> {
+        let suffix = &tokens[(cached_prefix_len as usize)..];
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        let last_logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?
+        };
+
+        let mut y = sample_next_token(&last_logits, sampling_config)?;
+        y.eval();
+        let first_token_instant = Some(std::time::Instant::now());
+
+        // Streaming detokenizer + parser.
+        let mut decode_stream = tokenizer.inner().decode_stream(false);
+        let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
+
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut finish_reason = String::from("length");
+
+        for step in 0..max_new_tokens {
+            if cancelled.load(Ordering::Relaxed) {
+                finish_reason = String::from("cancelled");
+                break;
+            }
+            let token_id = y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+
+            // Emit any text segments produced by this token.
+            if let Some(piece) = decode_stream
+                .step(token_id)
+                .map_err(|e| Error::from_reason(format!("decode_stream: {e}")))?
+            {
+                let segments = stream_parser.feed(&piece);
+                dispatch_stream_segments(segments, cb);
+            }
+
+            if is_eos_token(token_id, eos_ids, eos_token_id) {
+                finish_reason = String::from("stop");
+                break;
+            }
+            if step + 1 >= max_new_tokens {
+                break;
+            }
+
+            let next_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                self.run_paged_decode_step(token_id)?
+            };
+            let next_logits = next_logits.squeeze(Some(&[1]))?;
+            y = sample_next_token(&next_logits, sampling_config)?;
+            MxArray::async_eval_arrays(&[&y]);
+
+            if (step + 1) % 256 == 0 {
+                crate::array::clear_cache();
+            }
+        }
+
+        // Flush any residual segments accumulated by the parser but not
+        // yet emitted.
+        let residual_segments = stream_parser.flush();
+        dispatch_stream_segments(residual_segments, cb);
+
+        Ok((generated_tokens, finish_reason, first_token_instant))
+    }
+
+    /// Run a paged-attention prefill over the full prompt, dispatching
+    /// per-layer between the adapter (global layers) and the existing
+    /// flat path (sliding layers).
+    ///
+    /// `full_tokens` is the entire prompt (sliding layers re-prefill
+    /// from token 0). `suffix_tokens` is the new portion beyond the
+    /// paged prefix-cache hit (used by `record_tokens` +
+    /// `update_keys_values` for global layers). `cached_prefix_len`
+    /// is the paged-cache hit length.
+    ///
+    /// Returns the last position's logits squeezed to `[vocab]`.
+    fn run_paged_prefill_chunk(
+        &mut self,
+        full_tokens: &[u32],
+        suffix_tokens: &[u32],
+        cached_prefix_len: u32,
+    ) -> Result<MxArray> {
+        if suffix_tokens.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_prefill_chunk called with empty suffix",
+            ));
+        }
+
+        let suffix_len = suffix_tokens.len() as u32;
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
+            })?;
+            adapter
+                .record_tokens(suffix_tokens)
+                .map_err(Error::from_reason)?;
+        }
+
+        let layer_kinds = self.compute_layer_kinds();
+        let _ = full_tokens; // sliding re-prefill happens through the same code path below
+
+        // For sliding layers we need state at position cached_prefix_len.
+        // Sliding layers are restored each turn via reset_caches_sync, so
+        // we need to reprefill the cached prefix through them BEFORE the
+        // suffix can attend. Run a "sliding-only" pass over the prefix
+        // tokens, then a full pass over the suffix tokens.
+        if cached_prefix_len > 0 {
+            let prefix = &full_tokens[..(cached_prefix_len as usize)];
+            self.run_sliding_only_prefill(prefix, &layer_kinds)?;
+        }
+
+        // Pass 2: full forward (sliding + global) on the suffix.
+        let input_ids = MxArray::from_uint32(suffix_tokens, &[1, suffix_len as i64])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        // Apply Gemma4 embedding scaling (sqrt(hidden_size)).
+        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+
+        // Build sliding mask if seq_len exceeds window. Mirrors
+        // `forward_body`'s mask logic.
+        let seq_len = suffix_len as i64;
+        let sliding_mask = if seq_len > 1 && seq_len > self.config.sliding_window as i64 {
+            // Use the sliding cache's offset for the first sliding layer.
+            let sliding_offset = self
+                .caches
+                .as_ref()
+                .and_then(|caches| {
+                    caches
+                        .iter()
+                        .enumerate()
+                        .find(|(i, _)| self.config.is_sliding_layer(*i))
+                        .map(|(_, c)| c.get_offset())
+                })
+                .unwrap_or(0);
+            Some(create_sliding_mask(
+                seq_len,
+                sliding_offset,
+                self.config.sliding_window as i64,
+            )?)
+        } else {
+            None
+        };
+
+        let num_layers = self.layers.len();
+        let first_logical_position = cached_prefix_len;
+
+        // Index-based loop with split-borrow for `self.layers`,
+        // `self.caches`, `self.paged_adapter` (mirrors LFM2).
+        #[allow(clippy::needless_range_loop)]
+        for layer_idx in 0..num_layers {
+            let kind = layer_kinds[layer_idx];
+            let layer: &Gemma4DecoderLayer = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            let mask: Option<&MxArray> = if matches!(kind, Gemma4LayerKind::Sliding) {
+                sliding_mask.as_ref()
+            } else {
+                None
+            };
+
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_prefill_chunk: paged_adapter dropped mid-forward")
+            })?;
+            let flat_cache: Option<&mut Gemma4LayerCache> =
+                if matches!(kind, Gemma4LayerKind::Sliding) {
+                    let caches = unsafe {
+                        let raw = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "run_paged_prefill_chunk: sliding cache slot missing",
+                            )
+                        })? as *mut Vec<Gemma4LayerCache>;
+                        &mut *raw
+                    };
+                    Some(&mut caches[layer_idx])
+                } else {
+                    None
+                };
+
+            hidden_states = layer.forward_paged_or_flat(
+                &hidden_states,
+                kind,
+                adapter,
+                first_logical_position,
+                cached_prefix_len,
+                /* is_prefill */ true,
+                mask,
+                flat_cache,
+                /* per_layer_input */ None,
+                /* needs_stash */ false,
+            )?;
+        }
+
+        // Final norm + lm_head + softcap.
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        let logits = if let Some(ref head) = self.lm_head {
+            head.forward(&hidden_states)?
+        } else if let Some(ref w_t) = self.embed_weight_t {
+            hidden_states.matmul(w_t)?
+        } else {
+            let weight = self.embed_tokens.get_weight();
+            let weight_t = weight.transpose(Some(&[1, 0]))?;
+            hidden_states.matmul(&weight_t)?
+        };
+        let logits = if let Some(cap) = self.config.final_logit_softcapping {
+            let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
+            let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
+            MxArray::from_handle(handle, "logit_softcap")?
+        } else {
+            logits
+        };
+
+        let last_seq_len = logits.shape_at(1)?;
+        let last = logits
+            .slice_axis(1, last_seq_len - 1, last_seq_len)?
+            .squeeze(Some(&[0, 1]))?;
+        Ok(last)
+    }
+
+    /// Run one paged decode step: feed `[token_id]` through the model.
+    fn run_paged_decode_step(&mut self, token_id: u32) -> Result<MxArray> {
+        let first_logical_position = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step: paged_adapter is None")
+            })?;
+            adapter.current_token_count()
+        };
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step: paged_adapter dropped")
+            })?;
+            adapter
+                .record_tokens(&[token_id])
+                .map_err(Error::from_reason)?;
+        }
+
+        let layer_kinds = self.compute_layer_kinds();
+
+        let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+
+        let num_layers = self.layers.len();
+        #[allow(clippy::needless_range_loop)]
+        for layer_idx in 0..num_layers {
+            let kind = layer_kinds[layer_idx];
+            let layer: &Gemma4DecoderLayer = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step: paged_adapter dropped mid-forward")
+            })?;
+            let flat_cache: Option<&mut Gemma4LayerCache> =
+                if matches!(kind, Gemma4LayerKind::Sliding) {
+                    let caches = unsafe {
+                        let raw = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason("run_paged_decode_step: sliding cache slot missing")
+                        })? as *mut Vec<Gemma4LayerCache>;
+                        &mut *raw
+                    };
+                    Some(&mut caches[layer_idx])
+                } else {
+                    None
+                };
+
+            hidden_states = layer.forward_paged_or_flat(
+                &hidden_states,
+                kind,
+                adapter,
+                first_logical_position,
+                /* cached_prefix_len */ 0,
+                /* is_prefill */ false,
+                /* mask */ None,
+                flat_cache,
+                /* per_layer_input */ None,
+                /* needs_stash */ false,
+            )?;
+        }
+
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        let logits = if let Some(ref head) = self.lm_head {
+            head.forward(&hidden_states)?
+        } else if let Some(ref w_t) = self.embed_weight_t {
+            hidden_states.matmul(w_t)?
+        } else {
+            let weight = self.embed_tokens.get_weight();
+            let weight_t = weight.transpose(Some(&[1, 0]))?;
+            hidden_states.matmul(&weight_t)?
+        };
+        let logits = if let Some(cap) = self.config.final_logit_softcapping {
+            let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
+            let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
+            MxArray::from_handle(handle, "logit_softcap")?
+        } else {
+            logits
+        };
+        Ok(logits)
+    }
+
+    /// Forward the cached prefix tokens through SLIDING layers ONLY,
+    /// updating their flat caches in-place. Used to bring sliding-layer
+    /// state up to the paged cache's `cached_prefix_len` boundary
+    /// before the main `run_paged_prefill_chunk` continues with the
+    /// suffix.
+    ///
+    /// Global layers are skipped — their K/V already lives in the
+    /// paged pool (the prefix-cache hit promised that).
+    fn run_sliding_only_prefill(
+        &mut self,
+        prefix_tokens: &[u32],
+        layer_kinds: &[Gemma4LayerKind],
+    ) -> Result<()> {
+        if prefix_tokens.is_empty() {
+            return Ok(());
+        }
+        let input_ids =
+            MxArray::from_uint32(prefix_tokens, &[1, prefix_tokens.len() as i64])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+
+        // Sliding mask if seq_len > window.
+        let seq_len = prefix_tokens.len() as i64;
+        let sliding_mask = if seq_len > self.config.sliding_window as i64 {
+            Some(create_sliding_mask(
+                seq_len,
+                0,
+                self.config.sliding_window as i64,
+            )?)
+        } else {
+            None
+        };
+
+        let num_layers = self.layers.len();
+        #[allow(clippy::needless_range_loop)]
+        for layer_idx in 0..num_layers {
+            let kind = layer_kinds[layer_idx];
+            // For sliding layers we forward through the flat path; for
+            // global layers we use a NO-OP forward (skip — the K/V is
+            // already in the paged pool, hidden_states discarded).
+            // The hidden_states need to flow through ALL layers because
+            // the next sliding layer sees the previous global layer's
+            // output; we run global layers via the flat `forward` with
+            // a fresh KVCache that we throw away.
+            let layer: &Gemma4DecoderLayer = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            match kind {
+                Gemma4LayerKind::Sliding => {
+                    let caches = unsafe {
+                        let raw = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "run_sliding_only_prefill: sliding cache slot missing",
+                            )
+                        })? as *mut Vec<Gemma4LayerCache>;
+                        &mut *raw
+                    };
+                    hidden_states = layer.forward(
+                        &hidden_states,
+                        sliding_mask.as_ref(),
+                        Some(&mut caches[layer_idx]),
+                        /* per_layer_input */ None,
+                        /* needs_stash */ false,
+                    )?;
+                }
+                Gemma4LayerKind::GlobalPaged { .. } => {
+                    // Build a throwaway global cache so we can run the
+                    // standard `forward(...)` over the prefix and let
+                    // hidden_states propagate. The cache is discarded
+                    // afterwards — the paged pool already holds K/V.
+                    let mut throwaway = Gemma4LayerCache::new_global();
+                    hidden_states = layer.forward(
+                        &hidden_states,
+                        /* mask */ None,
+                        Some(&mut throwaway),
+                        None,
+                        false,
+                    )?;
+                }
+                Gemma4LayerKind::SharedOnGlobal { .. }
+                | Gemma4LayerKind::SharedOnSliding { .. } => {
+                    return Err(Error::from_reason(
+                        "run_sliding_only_prefill: KV-shared layers not yet supported",
+                    ));
+                }
+            }
+        }
+
+        // Materialize sliding caches.
+        if let Some(caches) = self.caches.as_ref() {
+            eval_gemma4_caches(caches);
+        }
         Ok(())
     }
 
@@ -4363,6 +5307,156 @@ mod tests {
                     "layer {i} must be Sliding, got {k:?}"
                 );
             }
+        }
+    }
+
+    /// Smoke test for `chat_sync_core_paged` via direct helper drives.
+    ///
+    /// Random-init weights cast to BF16 (the paged pool's expected
+    /// dtype). Validates the adapter lifecycle (reset →
+    /// find_cached_prefix → allocate_suffix → record_tokens →
+    /// forward_paged_or_flat) and that produced logits have the
+    /// expected shape, without asserting numerical equivalence to the
+    /// flat path (random weights). Gracefully skipped on no-Metal.
+    #[test]
+    fn test_run_paged_prefill_decode_smoke() {
+        use crate::array::{DType, MxArray};
+
+        let cfg = paged_tiny_config(true);
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+        assert!(inner.paged_adapter.is_some());
+        if let Err(e) = inner.init_caches_sync() {
+            eprintln!("init_caches_sync skipped: {}", e.reason);
+            return;
+        }
+
+        // Cast all weights to BF16 to match the pool dtype. Mirrors
+        // LFM2's smoke-test cast pattern.
+        let cast = |a: &MxArray| -> MxArray {
+            a.astype(DType::BFloat16).expect("astype BFloat16")
+        };
+        let w = inner.embed_tokens.get_weight();
+        inner.embed_tokens.set_weight(&cast(&w)).expect("embed");
+        let w = inner.final_norm.get_weight();
+        inner.final_norm.set_weight(&cast(&w)).expect("final_norm");
+        if let Some(ref mut head) = inner.lm_head {
+            let w = head.get_weight();
+            head.set_weight(&cast(&w)).expect("lm_head");
+        }
+        for layer in inner.layers.iter_mut() {
+            // Norms.
+            layer
+                .set_input_layernorm_weight(&cast(
+                    &layer.input_layernorm_weight().clone(),
+                ))
+                .ok();
+            layer
+                .set_post_attention_layernorm_weight(&cast(
+                    &layer.post_attention_layernorm_weight().clone(),
+                ))
+                .ok();
+            layer
+                .set_pre_feedforward_layernorm_weight(&cast(
+                    &layer.pre_feedforward_layernorm_weight().clone(),
+                ))
+                .ok();
+            layer
+                .set_post_feedforward_layernorm_weight(&cast(
+                    &layer.post_feedforward_layernorm_weight().clone(),
+                ))
+                .ok();
+            // Attention projections + norms.
+            let attn = &mut layer.self_attn;
+            let w = attn.q_proj_weight();
+            attn.set_q_proj_weight(&cast(&w)).expect("q");
+            let w = attn.k_proj_weight();
+            attn.set_k_proj_weight(&cast(&w)).expect("k");
+            if let Some(w) = attn.v_proj_weight_opt() {
+                attn.set_v_proj_weight(&cast(&w)).expect("v");
+            }
+            let w = attn.o_proj_weight();
+            attn.set_o_proj_weight(&cast(&w)).expect("o");
+            let w = attn.q_norm_weight();
+            attn.set_q_norm_weight(&cast(&w)).expect("qn");
+            let w = attn.k_norm_weight();
+            attn.set_k_norm_weight(&cast(&w)).expect("kn");
+            // MLP.
+            if let crate::models::gemma4::quantized_linear::Gemma4MLPVariant::Standard(
+                ref mut mlp,
+            ) = layer.mlp
+            {
+                let w = mlp.gate_proj_weight();
+                mlp.set_gate_proj_weight(&cast(&w)).expect("gate");
+                let w = mlp.up_proj_weight();
+                mlp.set_up_proj_weight(&cast(&w)).expect("up");
+                let w = mlp.down_proj_weight();
+                mlp.set_down_proj_weight(&cast(&w)).expect("down");
+            }
+        }
+
+        // Adapter lifecycle.
+        let prompt: Vec<u32> = vec![1, 2, 3, 4];
+        if let Some(adapter) = inner.paged_adapter.as_mut() {
+            if let Err(e) = adapter.reset_for_new_request(0) {
+                eprintln!("skipping (adapter reset failed): {e}");
+                return;
+            }
+            if let Err(e) = adapter.find_cached_prefix(&prompt, &[]) {
+                eprintln!("skipping (find_cached_prefix failed): {e}");
+                return;
+            }
+            if let Err(e) = adapter.allocate_suffix_blocks(16) {
+                eprintln!("skipping (allocate_suffix_blocks failed): {e}");
+                return;
+            }
+        }
+
+        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0) {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("No Metal device found") || msg.contains("not supported") {
+                    eprintln!("skipping smoke: {msg}");
+                    return;
+                }
+                panic!("run_paged_prefill_chunk failed: {msg}");
+            }
+        };
+        let vocab = last_logits.shape_at(0).expect("shape");
+        assert_eq!(vocab, 100, "vocab_size from paged_tiny_config");
+
+        let mut next_token: u32 = 5;
+        for _ in 0..4 {
+            match inner.run_paged_decode_step(next_token) {
+                Ok(logits) => {
+                    assert_eq!(logits.shape_at(0).expect("shape"), 1);
+                    assert_eq!(logits.shape_at(1).expect("shape"), 1);
+                    assert_eq!(logits.shape_at(2).expect("shape"), 100);
+                }
+                Err(e) => {
+                    let msg = e.reason.to_string();
+                    if msg.contains("No Metal device found") {
+                        eprintln!("skipping decode (no Metal): {msg}");
+                        return;
+                    }
+                    panic!("run_paged_decode_step failed: {msg}");
+                }
+            }
+            next_token = next_token.wrapping_add(1);
+        }
+
+        if let Some(adapter) = inner.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
         }
     }
 

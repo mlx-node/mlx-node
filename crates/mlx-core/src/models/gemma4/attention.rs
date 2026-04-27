@@ -556,6 +556,32 @@ impl Gemma4Attention {
 
     // ========== Weight setters ==========
 
+    // ========== Test-only weight getters ==========
+    #[cfg(test)]
+    pub(crate) fn q_proj_weight(&self) -> MxArray {
+        self.q_proj.get_weight()
+    }
+    #[cfg(test)]
+    pub(crate) fn k_proj_weight(&self) -> MxArray {
+        self.k_proj.get_weight()
+    }
+    #[cfg(test)]
+    pub(crate) fn v_proj_weight_opt(&self) -> Option<MxArray> {
+        self.v_proj.as_ref().map(|p| p.get_weight())
+    }
+    #[cfg(test)]
+    pub(crate) fn o_proj_weight(&self) -> MxArray {
+        self.o_proj.get_weight()
+    }
+    #[cfg(test)]
+    pub(crate) fn q_norm_weight(&self) -> MxArray {
+        self.q_norm.get_weight()
+    }
+    #[cfg(test)]
+    pub(crate) fn k_norm_weight(&self) -> MxArray {
+        self.k_norm.get_weight()
+    }
+
     pub fn set_q_proj_weight(&mut self, w: &MxArray) -> Result<()> {
         self.q_proj.set_weight(w, "q_proj")
     }
