@@ -524,13 +524,7 @@ impl Gemma4Attention {
                     .map_err(napi::Error::from_reason)?;
                 let mask =
                     create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
-                scaled_dot_product_attention(
-                    &queries_bhtd,
-                    &k_full,
-                    &v_full,
-                    1.0,
-                    Some(&mask),
-                )?
+                scaled_dot_product_attention(&queries_bhtd, &k_full, &v_full, 1.0, Some(&mask))?
             }
         } else {
             // Decode: read FULL `[0, total_ctx)` K/V back from the pool
@@ -607,11 +601,7 @@ impl Gemma4Attention {
         // mask=None — every cached key is at a strictly earlier position.
         let attn_bhtd = if is_prefill && seq_len > 1 {
             let cached_prefix_len = (total_ctx as i64) - seq_len;
-            let mask = create_causal_mask(
-                seq_len as i32,
-                Some(cached_prefix_len as i32),
-                None,
-            )?;
+            let mask = create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
             scaled_dot_product_attention(
                 &queries_bhtd,
                 &shared_keys,
@@ -620,13 +610,7 @@ impl Gemma4Attention {
                 Some(&mask),
             )?
         } else {
-            scaled_dot_product_attention(
-                &queries_bhtd,
-                &shared_keys,
-                &shared_values,
-                1.0,
-                None,
-            )?
+            scaled_dot_product_attention(&queries_bhtd, &shared_keys, &shared_values, 1.0, None)?
         };
 
         // Output projection.

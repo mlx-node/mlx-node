@@ -26,25 +26,6 @@ use super::quantized_linear::{Gemma4MLPVariant, QuantizedLinear, QuantizedSwitch
 /// * `anchor_layer_idx` (in `SharedOnSliding`) is the ABSOLUTE decoder
 ///   index of the anchor whose flat `Gemma4LayerCache::Sliding` slot
 ///   feeds the shared layer's K/V via `take_stashed_kv`.
-/// Inputs threaded into `forward_paged_or_flat` for KV-shared layers.
-///
-/// `cache_offset` is the RoPE offset for the queries — for
-/// `SharedOnGlobal` it equals the anchor's logical position when the
-/// anchor processed the same chunk; for `SharedOnSliding` it is the
-/// anchor's pre-update offset (the flat-path's
-/// `caches[anchor_layer_idx].get_offset() - seq_len`).
-///
-/// `total_ctx` is only consumed by `SharedOnGlobal` (the K/V token
-/// count to read from the anchor's paged slot). `keys` / `values`
-/// are only consumed by `SharedOnSliding` (anchor stash).
-#[allow(dead_code)] // Wired up by chat_sync_core_paged in commit 6.
-pub(crate) struct SharedKvInputs<'a> {
-    pub(crate) cache_offset: i32,
-    pub(crate) total_ctx: u32,
-    pub(crate) keys: Option<&'a MxArray>,
-    pub(crate) values: Option<&'a MxArray>,
-}
-
 #[allow(dead_code)] // Wired up in subsequent commits (forward dispatch).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Gemma4LayerKind {
@@ -64,6 +45,25 @@ pub(crate) enum Gemma4LayerKind {
     /// The shared layer pulls K/V from `caches[anchor_layer_idx]`'s
     /// stash (mirrors the existing flat-path KV-sharing flow).
     SharedOnSliding { anchor_layer_idx: u32 },
+}
+
+/// Inputs threaded into `forward_paged_or_flat` for KV-shared layers.
+///
+/// `cache_offset` is the RoPE offset for the queries — for
+/// `SharedOnGlobal` it equals the anchor's logical position when the
+/// anchor processed the same chunk; for `SharedOnSliding` it is the
+/// anchor's pre-update offset (the flat-path's
+/// `caches[anchor_layer_idx].get_offset() - seq_len`).
+///
+/// `total_ctx` is only consumed by `SharedOnGlobal` (the K/V token count
+/// to read from the anchor's paged slot). `keys` / `values` are only
+/// consumed by `SharedOnSliding` (anchor stash).
+#[allow(dead_code)] // Wired up by chat_sync_core_paged in commit 6.
+pub(crate) struct SharedKvInputs<'a> {
+    pub(crate) cache_offset: i32,
+    pub(crate) total_ctx: u32,
+    pub(crate) keys: Option<&'a MxArray>,
+    pub(crate) values: Option<&'a MxArray>,
 }
 
 /// A single decoder layer in the Gemma4 model.
@@ -344,20 +344,13 @@ impl Gemma4DecoderLayer {
                          (keys, values, cache_offset)",
                     )
                 })?;
-                let keys = inputs.keys.ok_or_else(|| {
-                    Error::from_reason("SharedOnSliding requires shared_kv.keys")
-                })?;
+                let keys = inputs
+                    .keys
+                    .ok_or_else(|| Error::from_reason("SharedOnSliding requires shared_kv.keys"))?;
                 let values = inputs.values.ok_or_else(|| {
                     Error::from_reason("SharedOnSliding requires shared_kv.values")
                 })?;
-                self.forward_shared(
-                    x,
-                    mask,
-                    keys,
-                    values,
-                    inputs.cache_offset,
-                    per_layer_input,
-                )
+                self.forward_shared(x, mask, keys, values, inputs.cache_offset, per_layer_input)
             }
         }
     }

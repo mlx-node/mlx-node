@@ -1947,7 +1947,6 @@ impl Gemma4Inner {
             return Err(Error::from_reason("Empty prompt"));
         }
 
-
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let prompt_token_count = tokens.len();
         let eos_ids = self.config.eos_token_ids.clone();
@@ -2141,8 +2140,7 @@ impl Gemma4Inner {
 
         // Pin model weights in GPU memory; share generation stream.
         let generation_stream = Stream::new(DeviceType::Gpu);
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
 
         // === PREFILL ===
         let last_logits = {
@@ -2401,8 +2399,7 @@ impl Gemma4Inner {
         let suffix = &tokens[(cached_prefix_len as usize)..];
 
         let generation_stream = Stream::new(DeviceType::Gpu);
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
 
         let last_logits = {
             let _stream_ctx = StreamContext::new(generation_stream);
@@ -2821,8 +2818,7 @@ impl Gemma4Inner {
         if prefix_tokens.is_empty() {
             return Ok(());
         }
-        let input_ids =
-            MxArray::from_uint32(prefix_tokens, &[1, prefix_tokens.len() as i64])?;
+        let input_ids = MxArray::from_uint32(prefix_tokens, &[1, prefix_tokens.len() as i64])?;
         let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
         hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
 
@@ -4643,9 +4639,9 @@ pub(crate) fn compute_layer_kinds(config: &Gemma4Config) -> Vec<Gemma4LayerKind>
     // look up their anchor's pool slot.
     let mut global_to_paged: Vec<Option<u32>> = vec![None; n];
     let mut paged_idx: u32 = 0;
-    for i in 0..n {
+    for (i, slot) in global_to_paged.iter_mut().enumerate().take(n) {
         if config.is_global_layer(i) {
-            global_to_paged[i] = Some(paged_idx);
+            *slot = Some(paged_idx);
             paged_idx += 1;
         }
     }
@@ -5442,9 +5438,7 @@ mod tests {
 
         // Cast all weights to BF16 to match the pool dtype. Mirrors
         // LFM2's smoke-test cast pattern.
-        let cast = |a: &MxArray| -> MxArray {
-            a.astype(DType::BFloat16).expect("astype BFloat16")
-        };
+        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
         let w = inner.embed_tokens.get_weight();
         inner.embed_tokens.set_weight(&cast(&w)).expect("embed");
         let w = inner.final_norm.get_weight();
@@ -5456,9 +5450,7 @@ mod tests {
         for layer in inner.layers.iter_mut() {
             // Norms.
             layer
-                .set_input_layernorm_weight(&cast(
-                    &layer.input_layernorm_weight().clone(),
-                ))
+                .set_input_layernorm_weight(&cast(&layer.input_layernorm_weight().clone()))
                 .ok();
             layer
                 .set_post_attention_layernorm_weight(&cast(
