@@ -113,25 +113,27 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
     if (typeof req.system === 'string') {
       messages.push({ role: 'system', content: req.system });
     } else {
-      const systemParts: string[] = [];
+      // Validate first — throw early on unsupported block types so the
+      // request fails fast (this is the validation gate). Stripping of
+      // the rotating billing-header prefix happens inside
+      // `canonicalizeSystemForCacheKey`, the single source of truth
+      // shared with `endpoints/messages.ts`'s `requestedSystem` cache
+      // key. Routing both call sites through the same helper means
+      // any future change to the strip semantics (prefix list,
+      // normalization, etc.) lands in exactly one place — the mapped
+      // messages and the cache-key view cannot drift.
       for (const b of req.system as SystemBlock[]) {
-        if (b.type === 'text') {
-          // Drop Anthropic's per-request billing/attribution header — Claude Code
-          // injects "x-anthropic-billing-header: ...; cch=<rotating-token>;" as the
-          // first system block. The cch= token rotates every request, so leaving
-          // it in the prompt defeats prefix caching at both the warm-slot gate
-          // (byte-equal compare on the joined system text) and the native
-          // token-prefix verifier. Mirrors `canonicalizeSystemForCacheKey`
-          // above so the mapped messages and the cache-key view never drift.
-          if (b.text.startsWith(ANTHROPIC_BILLING_HEADER_PREFIX)) {
-            continue;
-          }
-          systemParts.push(b.text);
-        } else {
+        if (b.type !== 'text') {
           throw new Error(`Unsupported system block type: "${(b as { type: string }).type}"`);
         }
       }
-      messages.push({ role: 'system', content: systemParts.join('') });
+      // Helper returns `string` (possibly empty) for any non-null array
+      // input; the `?? ''` is a defensive default for the unreachable
+      // null branch. Empty content is semantically equivalent to "no
+      // system" once stripped, and downstream tokenization handles it
+      // harmlessly.
+      const content = canonicalizeSystemForCacheKey(req.system) ?? '';
+      messages.push({ role: 'system', content });
     }
   }
 
