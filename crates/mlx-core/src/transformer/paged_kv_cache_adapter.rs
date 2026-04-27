@@ -66,6 +66,13 @@ pub struct PagedKVCacheAdapter {
     /// Full token sequence for the active request, in order. Used by
     /// `register_full_blocks_for_reuse` on completion.
     request_tokens: Vec<u32>,
+
+    /// Whether `register_full_blocks_for_reuse` has already been called for
+    /// the active request. Reset to `false` by `reset_for_new_request` and
+    /// `release_request`. Used to make the registration call idempotent
+    /// within a single request — repeated calls would otherwise leak
+    /// references via repeated `incref` of the freshly-allocated blocks.
+    already_registered: bool,
 }
 
 impl PagedKVCacheAdapter {
@@ -92,6 +99,7 @@ impl PagedKVCacheAdapter {
             block_table: None,
             cached_token_count: 0,
             request_tokens: Vec::new(),
+            already_registered: false,
         })
     }
 
@@ -107,6 +115,9 @@ impl PagedKVCacheAdapter {
         self.block_table = Some(SequenceBlockTable::new(seq_id, self.block_size));
         self.cached_token_count = 0;
         self.request_tokens.clear();
+        // Reset registration flag AFTER release so a subsequent
+        // register_full_blocks_for_reuse on the new request runs.
+        self.already_registered = false;
         Ok(())
     }
 
@@ -257,7 +268,41 @@ impl PagedKVCacheAdapter {
     /// After release the block lands at `ref_count = 1` (the prefix-cache
     /// reference), surviving until it is evicted by capacity pressure or
     /// the next owner frees the last reference.
+    ///
+    /// ## Idempotency
+    ///
+    /// Idempotent within a single request: subsequent calls after the first
+    /// successful one return `Ok(0)` without side effects. The flag is reset
+    /// by `reset_for_new_request` and `release_request`. This protects
+    /// against the leak that would otherwise occur if a caller invoked the
+    /// method twice — each call would `incref` the same freshly-allocated
+    /// blocks, but `release_request` only `free`s once per block, leaving
+    /// ref_count permanently elevated and exhausting the pool over time.
+    ///
+    /// ## Known limitation: hash-collision drops
+    ///
+    /// `BlockAllocator::register_prefix` may drop a block registration as a
+    /// no-op if its content hash collides with an already-registered
+    /// (different) block (the "Case 2 collision-drop" path). When that
+    /// happens, the adapter has still incref'd the freshly-allocated block
+    /// even though it didn't end up in the prefix cache — a single
+    /// reference for that block stays pinned for the adapter's lifetime.
+    /// In correct usage this is unreachable: `find_cached_prefix` is
+    /// called BEFORE `allocate_suffix_blocks`, so any matching prefix
+    /// blocks are returned via `lookup_prefix` (not freshly allocated),
+    /// and a true SipHash collision (same hash → different content) is
+    /// astronomically unlikely. If this becomes a real problem during
+    /// model integration, we'll re-address with a more invasive fix
+    /// (e.g. returning per-block insertion status from `cache_full_blocks`).
     pub fn register_full_blocks_for_reuse(&mut self, extra_keys: &[u64]) -> Result<u32, String> {
+        // Idempotent: subsequent calls within the same request are no-ops.
+        // Without this guard, repeated registration would re-`incref` the
+        // freshly-allocated blocks while `release_request` only `free`s
+        // each block once — leaking references and exhausting the pool.
+        if self.already_registered {
+            return Ok(0);
+        }
+
         let block_table = self.block_table.as_ref().ok_or_else(|| {
             "register_full_blocks_for_reuse called before reset_for_new_request".to_string()
         })?;
@@ -312,6 +357,10 @@ impl PagedKVCacheAdapter {
                 format!("cache_full_blocks failed: {e}")
             })?;
 
+        // Mark registered ONLY on the success path so an Err leaves
+        // already_registered == false (callers may retry / move on, and a
+        // future correct call should still be able to do the work).
+        self.already_registered = true;
         Ok(actual_blocks_to_register as u32)
     }
 
@@ -346,6 +395,10 @@ impl PagedKVCacheAdapter {
 
         self.cached_token_count = 0;
         self.request_tokens.clear();
+        // Defense-in-depth: clear the registration flag so a subsequent
+        // reset_for_new_request → register flow on this adapter works
+        // even if the caller skips the explicit reset.
+        self.already_registered = false;
         Ok(count)
     }
 
@@ -629,5 +682,144 @@ mod tests {
             "shared SYS prefix must hit even when USER suffix differs"
         );
         assert_eq!(res.blocks.len(), 2);
+    }
+
+    /// Calling `register_full_blocks_for_reuse` twice on the same request
+    /// must NOT double-incref. Without the idempotency guard, the second
+    /// call would re-bump ref_counts and `release_request` (which only
+    /// frees once per block) would leave them permanently elevated —
+    /// blocks would never return to the free pool.
+    #[test]
+    fn test_register_full_blocks_for_reuse_idempotent_repeat() {
+        let allocator = new_allocator(8, 4);
+        let initial_free = allocator.lock().unwrap().num_free_blocks();
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+
+        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        assert_eq!(registered, 2, "two full blocks of size 4 = 8 tokens");
+
+        // After the first registration each freshly-allocated block has
+        // ref_count == 2: one from `allocate` + one from the
+        // register-time `incref` that keeps it alive past release.
+        let block_table = adapter.block_table().unwrap();
+        let first_blocks: Vec<_> = block_table.blocks().to_vec();
+        for b in &first_blocks {
+            assert_eq!(
+                b.get_ref_count(),
+                2,
+                "first register: 1 (alloc) + 1 (incref)"
+            );
+        }
+
+        // Second call must be a no-op: returns 0 and does NOT incref again.
+        let registered_again = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        assert_eq!(registered_again, 0, "second register must be a no-op");
+        for b in &first_blocks {
+            assert_eq!(
+                b.get_ref_count(),
+                2,
+                "second register must NOT bump ref_count"
+            );
+        }
+
+        // Release the request. Each block decrefs from 2 → 1; they remain
+        // pinned in the prefix cache (NOT returned to the free pool) so a
+        // future `find_cached_prefix` can hit them. With the bug, the
+        // second register would have left ref_count == 3, which after
+        // release would still be 2 — pinning the block forever.
+        let freed = adapter.release_request().unwrap();
+        assert_eq!(freed, 2);
+        for b in &first_blocks {
+            assert_eq!(
+                b.get_ref_count(),
+                1,
+                "after release: ref_count must be exactly 1 (prefix-cache \
+                 reference). >1 indicates a leaked reference from \
+                 double-incref."
+            );
+        }
+        // The prefix-cache holds 2 blocks → free pool is short by 2.
+        assert_eq!(
+            allocator.lock().unwrap().num_free_blocks(),
+            initial_free - 2,
+            "2 blocks pinned in prefix cache; the rest must be free"
+        );
+
+        // A fresh adapter on the same allocator must still be able to
+        // recover the prefix via `find_cached_prefix`.
+        let mut adapter2 = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        adapter2.reset_for_new_request(1).unwrap();
+        let res = adapter2
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[])
+            .unwrap();
+        assert_eq!(res.cached_token_count, 8);
+        assert_eq!(res.blocks.len(), 2);
+    }
+
+    /// `release_request` must reset the `already_registered` flag so a
+    /// later reset → register cycle on the same adapter actually does the
+    /// work (rather than seeing a stale `true` and short-circuiting).
+    #[test]
+    fn test_release_request_resets_already_registered() {
+        let allocator = new_allocator(16, 4);
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+
+        // First request: register, then explicit release.
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        assert_eq!(registered, 2);
+        adapter.release_request().unwrap();
+
+        // Second request: register must do work again (different tokens
+        // so the prefix-cache hit doesn't skew `cached_token_count`).
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter
+            .record_tokens(&[100, 101, 102, 103, 104, 105, 106, 107])
+            .unwrap();
+        let registered_again = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        assert_eq!(
+            registered_again, 2,
+            "release_request must reset already_registered so the next \
+             register actually runs"
+        );
+        adapter.release_request().unwrap();
+    }
+
+    /// `reset_for_new_request` must reset the `already_registered` flag.
+    /// This test exercises the auto-release path inside
+    /// `reset_for_new_request` (no explicit release between requests).
+    #[test]
+    fn test_reset_for_new_request_resets_already_registered() {
+        let allocator = new_allocator(16, 4);
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+
+        // First request: register, then jump straight to a new reset
+        // (auto-release path).
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        assert_eq!(registered, 2);
+
+        // Reset without explicit release — the prior request is auto-released
+        // by reset_for_new_request, and the flag must come back to false.
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter
+            .record_tokens(&[200, 201, 202, 203, 204, 205, 206, 207])
+            .unwrap();
+        let registered_again = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        assert_eq!(
+            registered_again, 2,
+            "reset_for_new_request must reset already_registered so the \
+             next register actually runs"
+        );
     }
 }
