@@ -26,15 +26,13 @@ export interface ParsedSafeTensors {
   dataOffset: number; // offset where raw data starts in the ArrayBuffer
 }
 
-/** Parse SafeTensors header without copying any tensor data */
-export function parseSafeTensorsHeader(buffer: ArrayBufferLike): ParsedSafeTensors {
-  const view = new DataView(buffer);
-  const headerLen = Number(view.getBigUint64(0, true));
-  const headerBytes = new Uint8Array(buffer, 8, headerLen);
+function parseSafeTensorsHeaderJson(
+  headerBytes: Uint8Array,
+  dataOffset: number,
+): ParsedSafeTensors {
   const headerJson = new TextDecoder().decode(headerBytes);
   const header = JSON.parse(headerJson);
 
-  const dataOffset = 8 + headerLen;
   const tensors: TensorInfo[] = [];
   let metadata: Record<string, string> = {};
 
@@ -54,6 +52,22 @@ export function parseSafeTensorsHeader(buffer: ArrayBufferLike): ParsedSafeTenso
   }
 
   return { tensors, metadata, dataOffset };
+}
+
+/** Parse a safetensors header JSON blob read separately from the tensor data. */
+export function parseSafeTensorsHeaderBytes(
+  headerBytes: Uint8Array,
+  dataOffset: number,
+): ParsedSafeTensors {
+  return parseSafeTensorsHeaderJson(headerBytes, dataOffset);
+}
+
+/** Parse SafeTensors header without copying any tensor data */
+export function parseSafeTensorsHeader(buffer: ArrayBufferLike): ParsedSafeTensors {
+  const view = new DataView(buffer);
+  const headerLen = Number(view.getBigUint64(0, true));
+  const headerBytes = new Uint8Array(buffer, 8, headerLen);
+  return parseSafeTensorsHeaderJson(headerBytes, 8 + headerLen);
 }
 
 /**

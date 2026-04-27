@@ -508,12 +508,18 @@ self.onmessage = async (e: MessageEvent) => {
       `[GPU Worker] Detected features: shader-f16=${hasShaderF16}, subgroups=${hasSubgroups}, timestamp-query=${hasTimestampQuery}`,
     );
 
+    const maxBufferSize = adapter.limits.maxBufferSize;
+    const maxStorageBufferBindingSize = Math.min(
+      adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize,
+    );
+
     device = await adapter.requestDevice({
       requiredFeatures,
       requiredLimits: {
         maxStorageBuffersPerShaderStage: Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 16),
-        maxBufferSize: Math.min(adapter.limits.maxBufferSize, 1 << 30),
-        maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, 1 << 30),
+        maxBufferSize,
+        maxStorageBufferBindingSize,
         maxComputeWorkgroupSizeX: 256,
         maxComputeWorkgroupSizeY: 256,
         maxComputeWorkgroupSizeZ: 64,

@@ -1780,6 +1780,14 @@ impl Qwen35MoeInner {
         sink: Arc<dyn ChatStreamSink>,
         cancelled: Arc<AtomicBool>,
     ) {
+        #[cfg(target_family = "wasm")]
+        let eos_id = self
+            .tokenizer
+            .as_ref()
+            .and_then(|t| t.im_end_id())
+            .or_else(|| self.tokenizer.as_ref().map(|t| t.get_eos_token_id()))
+            .unwrap_or(self.config.eos_token_id as u32);
+        #[cfg(not(target_family = "wasm"))]
         let eos_id = self
             .tokenizer
             .as_ref()
@@ -5268,6 +5276,45 @@ impl Qwen3_5MoeModel {
 #[cfg(target_family = "wasm")]
 #[napi]
 impl Qwen3_5MoeModel {
+    /// Load a MoE model from pre-created GPU buffers (zero-copy, for browser WebGPU).
+    #[napi]
+    pub fn load_from_gpu_buffers<'env>(
+        env: &'env Env,
+        config_json: String,
+        gpu_tensors: Vec<persistence::GpuTensorInfo>,
+        tokenizer_json: String,
+        tokenizer_config_json: Option<String>,
+        processor_config_json: Option<String>,
+    ) -> Result<PromiseRaw<'env, Qwen3_5MoeModel>> {
+        let inner = persistence::build_model_inner_from_gpu_buffers(
+            &config_json,
+            gpu_tensors,
+            &tokenizer_json,
+            tokenizer_config_json.as_deref(),
+            processor_config_json.as_deref(),
+        )?;
+
+        let model_id = inner.model_id;
+        let config_out = inner.config.clone();
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+            move || Ok((inner, (config_out.clone(), model_id))),
+            handle_qwen35_moe_cmd,
+        );
+
+        env.spawn_future(async move {
+            let (config_final, model_id_final) = init_rx.await.map_err(|_| {
+                napi::Error::from_reason("Model thread exited during MoE GPU buffer load")
+            })??;
+
+            Ok(Qwen3_5MoeModel {
+                thread,
+                config: config_final,
+                model_id: model_id_final,
+                _cache_limit_guard: crate::cache_limit::coordinator().register(0),
+            })
+        })
+    }
+
     /// Streaming chat API backed by a SharedArrayBuffer ring buffer.
     ///
     /// The caller passes a `Buffer` whose backing is a region inside the

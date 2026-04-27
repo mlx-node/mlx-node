@@ -1937,6 +1937,14 @@ impl Qwen35Inner {
         sink: Arc<dyn ChatStreamSink>,
         cancelled: Arc<AtomicBool>,
     ) {
+        #[cfg(target_family = "wasm")]
+        let eos_id = self
+            .tokenizer
+            .as_ref()
+            .and_then(|t| t.im_end_id())
+            .or_else(|| self.tokenizer.as_ref().map(|t| t.get_eos_token_id()))
+            .unwrap_or(self.config.eos_token_id as u32);
+        #[cfg(not(target_family = "wasm"))]
         let eos_id = self
             .tokenizer
             .as_ref()

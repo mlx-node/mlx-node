@@ -106,8 +106,16 @@
     @apply truncate text-xs text-muted-foreground;
   }
 
+  .header-actions {
+    @apply ml-auto flex min-w-0 items-center gap-2;
+  }
+
+  .header-local-btn {
+    @apply h-8 gap-1.5 px-2.5 text-xs;
+  }
+
   .status-pill {
-    @apply ml-1 max-w-56 truncate rounded-md border px-2 py-1 text-xs font-medium;
+    @apply max-w-56 truncate rounded-md border px-2 py-1 text-xs font-medium;
   }
 
   .status-pill.info {
@@ -357,6 +365,10 @@
 
   .status-pill {
     max-width: 9rem;
+  }
+
+  .header-local-btn span {
+    display: none;
   }
 }
 

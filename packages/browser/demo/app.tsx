@@ -1,6 +1,13 @@
 import type { ChatStreamChunk } from "@mlx-node/core";
 
-import { ArrowUp, Cpu, ImagePlus, Mic, TerminalSquare } from "lucide-react";
+import {
+  ArrowUp,
+  Cpu,
+  FolderOpen,
+  ImagePlus,
+  Mic,
+  TerminalSquare,
+} from "lucide-react";
 import { useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
 
@@ -81,6 +88,7 @@ function App() {
   const sendRef = useRef<HTMLButtonElement>(null);
   const imageButtonRef = useRef<HTMLButtonElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const modelDirInputRef = useRef<HTMLInputElement>(null);
   const reasoningEffortRef = useRef<ReasoningEffort>("off");
 
   useEffect(() => {
@@ -91,6 +99,7 @@ function App() {
     const sendBtn = sendRef.current!;
     const imageBtn = imageButtonRef.current!;
     const imageInput = imageInputRef.current!;
+    const modelDirInput = modelDirInputRef.current!;
 
     if (
       !statusEl ||
@@ -99,10 +108,13 @@ function App() {
       !promptEl ||
       !sendBtn ||
       !imageBtn ||
-      !imageInput
+      !imageInput ||
+      !modelDirInput
     ) {
       return;
     }
+    modelDirInput.setAttribute("webkitdirectory", "");
+    modelDirInput.setAttribute("directory", "");
 
     function setStatus(text: string, state: StatusState = "info") {
       statusEl.textContent = text;
@@ -170,8 +182,11 @@ function App() {
     let isInThinking = false;
     let streamTokenCount = 0;
 
-    let reasoningQueue = "";
+    let reasoningBuffer = "";
     let contentQueue = "";
+    let contentPrefixBuffer = "";
+    let contentPrefixResolved = false;
+    let currentUserPrompt = "";
     let rafHandle: number | null = null;
     let scrollDirty = false;
     let reasoningHasContent = false;
@@ -207,8 +222,10 @@ function App() {
       isInThinking = false;
 
       thinkingDiv.style.display = "none";
-      reasoningQueue = "";
+      reasoningBuffer = "";
       contentQueue = "";
+      contentPrefixBuffer = "";
+      contentPrefixResolved = false;
       reasoningHasContent = false;
       contentHasContent = false;
       if (rafHandle != null) {
@@ -221,6 +238,34 @@ function App() {
     function scheduleFlush() {
       if (rafHandle != null) return;
       rafHandle = requestAnimationFrame(flushTick);
+    }
+
+    function couldStillBePromptEchoPrefix(buffer: string, prompt: string) {
+      const normalizedPrompt = prompt.trim().toLowerCase();
+      if (!normalizedPrompt) return false;
+
+      const normalizedBuffer = buffer
+        .trimStart()
+        .replace(/^(?:\((?:user)\)|user)\s*:\s*/i, "")
+        .toLowerCase();
+      if (!normalizedBuffer) return true;
+      if (normalizedPrompt.startsWith(normalizedBuffer)) return true;
+
+      if (normalizedBuffer.startsWith(normalizedPrompt)) {
+        const rest = normalizedBuffer.slice(normalizedPrompt.length);
+        return !/[\r\n]/.test(rest);
+      }
+
+      return false;
+    }
+
+    function sanitizeThinkingText(
+      thinking: string | null | undefined,
+      latestUserText?: string,
+    ) {
+      const cleaned = sanitizeAssistantText(thinking, latestUserText).trim();
+      if (/^[A-Z]$/u.test(cleaned)) return "";
+      return cleaned;
     }
 
     function appendStreamedToken(deltaText: string, isReasoning: boolean) {
@@ -238,12 +283,32 @@ function App() {
           : deltaText.replace(/^\s+/, "");
         if (text.length === 0) return;
         reasoningHasContent = true;
-        reasoningQueue += text;
+        reasoningBuffer += text;
+        return;
       } else {
-        const text = contentHasContent
+        let text = contentHasContent
           ? deltaText
           : deltaText.replace(/^\s+/, "");
         if (text.length === 0) return;
+        if (!contentPrefixResolved && currentUserPrompt) {
+          contentPrefixBuffer += text;
+          const cleaned = sanitizeAssistantText(
+            contentPrefixBuffer,
+            currentUserPrompt,
+          );
+          const shouldWait =
+            cleaned === contentPrefixBuffer.trimStart() &&
+            couldStillBePromptEchoPrefix(
+              contentPrefixBuffer,
+              currentUserPrompt,
+            ) &&
+            contentPrefixBuffer.length < currentUserPrompt.length + 24;
+          if (shouldWait) return;
+          text = cleaned;
+          contentPrefixBuffer = "";
+          contentPrefixResolved = true;
+          if (text.length === 0) return;
+        }
         contentHasContent = true;
         contentQueue += text;
       }
@@ -254,30 +319,8 @@ function App() {
       rafHandle = null;
 
       if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv) {
-        reasoningQueue = "";
         contentQueue = "";
         return;
-      }
-
-      if (reasoningQueue.length > 0) {
-        const reveal = Math.max(1, Math.ceil(reasoningQueue.length / 20));
-        const slice = reasoningQueue.slice(0, reveal);
-        reasoningQueue = reasoningQueue.slice(reveal);
-
-        if (!isInThinking) {
-          isInThinking = true;
-          currentThinkingDiv.style.display = "";
-          currentThinkingDiv.open = true;
-          const summary = currentThinkingDiv.querySelector(
-            "summary",
-          ) as HTMLElement | null;
-          if (summary) summary.textContent = "Thinking...";
-        }
-        const thinkingContentEl = currentThinkingDiv.querySelector(
-          ".thinking-content",
-        ) as HTMLElement | null;
-        if (thinkingContentEl) thinkingContentEl.textContent += slice;
-        scrollDirty = true;
       }
 
       if (contentQueue.length > 0) {
@@ -302,25 +345,13 @@ function App() {
         scrollDirty = false;
       }
 
-      if (reasoningQueue.length > 0 || contentQueue.length > 0) {
+      if (contentQueue.length > 0) {
         scheduleFlush();
       }
     }
 
     function drainQueuesSync() {
       if (currentAssistantDiv && currentThinkingDiv && currentResponseDiv) {
-        if (reasoningQueue.length > 0) {
-          if (!isInThinking) {
-            isInThinking = true;
-            currentThinkingDiv.style.display = "";
-            currentThinkingDiv.open = true;
-          }
-          const thinkingContentEl = currentThinkingDiv.querySelector(
-            ".thinking-content",
-          ) as HTMLElement | null;
-          if (thinkingContentEl)
-            thinkingContentEl.textContent += reasoningQueue;
-        }
         if (contentQueue.length > 0) {
           if (isInThinking) {
             isInThinking = false;
@@ -333,8 +364,10 @@ function App() {
           currentResponseDiv.textContent += contentQueue;
         }
       }
-      reasoningQueue = "";
+      reasoningBuffer = "";
       contentQueue = "";
+      contentPrefixBuffer = "";
+      contentPrefixResolved = false;
       if (rafHandle != null) {
         cancelAnimationFrame(rafHandle);
         rafHandle = null;
@@ -375,15 +408,36 @@ function App() {
       currentResponseDiv = null;
     }
 
-    const worker = new Worker(
+    let worker = new Worker(
       new URL("../src/mlx-worker.ts", import.meta.url),
       { type: "module" },
     );
 
     function finalizeFromResult(result: ChatResult) {
-      const text = sanitizeAssistantText(result.text);
-      const rawText = sanitizeAssistantText(result.rawText ?? text);
-      finalizeAssistantMessage(text, result.thinking ?? null);
+      const latestUserText =
+        [...messages].reverse().find((message) => message.role === "user")
+          ?.content ?? currentUserPrompt;
+      let text = sanitizeAssistantText(result.text, latestUserText);
+      let thinking = sanitizeThinkingText(
+        result.thinking ?? reasoningBuffer,
+        latestUserText,
+      );
+      const promotedThinking = thinking;
+      const trimmedText = text.trim();
+      const shouldPromoteThinking =
+        promotedThinking.length > 0 &&
+        (trimmedText.length === 0 ||
+          (trimmedText.length < promotedThinking.length * 0.75 &&
+            promotedThinking.includes(trimmedText)));
+      if (shouldPromoteThinking) {
+        text = promotedThinking;
+        thinking = "";
+      }
+      const rawText = sanitizeAssistantText(
+        text || result.rawText,
+        latestUserText,
+      );
+      finalizeAssistantMessage(text, thinking || null);
       messages.push({ role: "assistant", content: rawText });
 
       if (result.performance) {
@@ -399,7 +453,7 @@ function App() {
     }
 
     function resetStreamingUi() {
-      reasoningQueue = "";
+      reasoningBuffer = "";
       contentQueue = "";
       if (rafHandle != null) {
         cancelAnimationFrame(rafHandle);
@@ -408,7 +462,7 @@ function App() {
       scrollDirty = false;
     }
 
-    worker.onmessage = (e) => {
+    const handleWorkerMessage = (e: MessageEvent) => {
       const { type, ...data } = e.data;
 
       switch (type) {
@@ -418,7 +472,9 @@ function App() {
 
         case "progress":
           log(data.message);
-          if (data.step === "download") {
+          if (data.step === "chat") {
+            break;
+          } else if (data.step === "download" && data.pct != null) {
             setStatus(`Downloading weights... ${data.pct}%`, "info");
           } else {
             setStatus(data.message, "info");
@@ -505,6 +561,7 @@ function App() {
 
         case "error":
           log(`Error: ${data.message}`);
+          logStack(data.stack);
           resetStreamingUi();
           if (currentResponseDiv) {
             currentResponseDiv.textContent = `Error: ${data.message}`;
@@ -534,6 +591,7 @@ function App() {
         }
       }
     };
+    worker.onmessage = handleWorkerMessage;
 
     function logProfile(s: ProfileStats) {
       const n = Math.max(1, s.numTokens);
@@ -614,14 +672,23 @@ function App() {
       );
     }
 
-    worker.onerror = (e) => {
-      log(`Worker error: ${e.message || e}`);
-      if (e instanceof ErrorEvent) {
-        log(`  file: ${e.filename}`);
-        log(`  line: ${e.lineno}, col: ${e.colno}`);
+    function logStack(stack: string | undefined) {
+      if (!stack) return;
+      for (const line of stack.split("\n").slice(0, 12)) {
+        if (line.trim()) log(`  ${line}`);
       }
+    }
+
+    const handleWorkerError = (e: ErrorEvent) => {
+      e.preventDefault();
+      const inner = e.error instanceof Error ? e.error.message : "";
+      log(`Worker error: ${e.message || inner || String(e)}`);
+      log(`  file: ${e.filename}`);
+      log(`  line: ${e.lineno}, col: ${e.colno}`);
+      if (e.error instanceof Error) logStack(e.error.stack);
       setStatus("Worker error", "error");
     };
+    worker.onerror = handleWorkerError;
 
     const onMessageError = (e: MessageEvent) => {
       log(`Worker messageerror: ${e}`);
@@ -660,26 +727,62 @@ function App() {
       (useSab ? "" : " (stream_sab=0)") +
       (modeParam ? ` (mode=${modeParam})` : "");
 
-    log(`Starting MLX Worker${flagBadges}...`);
-    setStatus("Initializing...", "info");
-    imageBtn.disabled = true;
-    setImageAttached(false);
-    worker.postMessage({
-      type: "init",
-      wasmUrl: new URL(`/mlx-core.opt.wasm?v=${Date.now()}`, location.href)
-        .href,
-      modelUrl: "/model",
-      packBf16,
-      sdpaFallback,
-      profile,
-      dispatchBatch,
-      compileMlp,
-      compileGdnPre,
-      compileGdnPost,
-      compileGdnG,
-      enableVlm,
-      fuseDispatch,
-    });
+    function resetForModelLoad(label?: string) {
+      activeReaderAbort?.abort();
+      activeReaderAbort = null;
+      sharedWasmMemory = null;
+      imageCapabilityKnown = false;
+      supportsImages = false;
+      pendingImage = null;
+      imageInput.value = "";
+      setImageAttached(false);
+      resetStreamingUi();
+      currentAssistantDiv = null;
+      currentThinkingDiv = null;
+      currentResponseDiv = null;
+      messages.splice(1);
+      chatEl.replaceChildren();
+      promptEl.disabled = true;
+      sendBtn.disabled = true;
+      imageBtn.disabled = true;
+      setStatus("Initializing...", "info");
+      log(`Starting MLX Worker${flagBadges}${label ? ` (${label})` : ""}...`);
+    }
+
+    function startWorker(modelFiles?: File[], label?: string) {
+      resetForModelLoad(label);
+      worker.postMessage({
+        type: "init",
+        wasmUrl: new URL(`/mlx-core.opt.wasm?v=${Date.now()}`, location.href)
+          .href,
+        modelUrl: "/model",
+        modelFiles,
+        packBf16,
+        sdpaFallback,
+        profile,
+        dispatchBatch,
+        compileMlp,
+        compileGdnPre,
+        compileGdnPost,
+        compileGdnG,
+        enableVlm,
+        fuseDispatch,
+      });
+    }
+
+    function restartWorker(modelFiles: File[], label: string) {
+      worker.removeEventListener("messageerror", onMessageError);
+      worker.terminate();
+      worker = new Worker(new URL("../src/mlx-worker.ts", import.meta.url), {
+        type: "module",
+      });
+      worker.onmessage = handleWorkerMessage;
+      worker.onerror = handleWorkerError;
+      worker.addEventListener("messageerror", onMessageError);
+      startWorker(modelFiles, label);
+    }
+
+    startWorker();
 
     function handleSend() {
       const text = promptEl.value.trim();
@@ -723,13 +826,18 @@ function App() {
       setStatus("Generating...", "info");
       streamTokenCount = 0;
       isInThinking = false;
+      currentUserPrompt = text;
       currentReasoningVisible = reasoningEffortRef.current !== "off";
       createAssistantMessage();
 
       worker.postMessage({
         type: "chat",
         messages: [...messages],
-        config: { maxNewTokens: 512, temperature: 0, reportPerformance: true },
+        config: {
+          maxNewTokens: 512,
+          temperature: 0,
+          reportPerformance: true,
+        },
         useSab,
         mode: modeParam ?? undefined,
         reasoningEffort: reasoningEffortRef.current,
@@ -768,6 +876,17 @@ function App() {
       setImageAttached(true);
     };
 
+    const onModelDirChange = () => {
+      const files = Array.from(modelDirInput.files ?? []);
+      if (files.length === 0) return;
+      const firstPath =
+        (files[0] as File & { webkitRelativePath?: string })
+          .webkitRelativePath || files[0]!.name;
+      const label = firstPath.split("/")[0] || "local model";
+      modelDirInput.value = "";
+      restartWorker(files, label);
+    };
+
     const onPaste = async (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (!items) return;
@@ -795,6 +914,7 @@ function App() {
     promptEl.addEventListener("input", autosizePrompt);
     imageBtn.addEventListener("click", onImageClick);
     imageInput.addEventListener("change", onImageChange);
+    modelDirInput.addEventListener("change", onModelDirChange);
     document.addEventListener("paste", onPaste);
 
     return () => {
@@ -803,6 +923,7 @@ function App() {
       promptEl.removeEventListener("input", autosizePrompt);
       imageBtn.removeEventListener("click", onImageClick);
       imageInput.removeEventListener("change", onImageChange);
+      modelDirInput.removeEventListener("change", onModelDirChange);
       document.removeEventListener("paste", onPaste);
       worker.removeEventListener("messageerror", onMessageError);
       activeReaderAbort?.abort();
@@ -819,9 +940,21 @@ function App() {
           <h1>MLX Browser</h1>
           <p>Qwen 3.5 0.8B on WebGPU</p>
         </div>
-        <Badge ref={statusRef} id="status" className="status-pill info">
-          Initializing...
-        </Badge>
+        <div className="header-actions">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="header-local-btn"
+            onClick={() => modelDirInputRef.current?.click()}
+          >
+            <FolderOpen data-icon="inline-start" />
+            <span>Local model</span>
+          </Button>
+          <Badge ref={statusRef} id="status" className="status-pill info">
+            Initializing...
+          </Badge>
+        </div>
       </header>
 
       <main className="workspace-grid">
@@ -943,6 +1076,13 @@ function App() {
           ref={imageInputRef}
           type="file"
           accept="image/*"
+          className="hidden"
+        />
+        <input
+          id="model-dir-input"
+          ref={modelDirInputRef}
+          type="file"
+          multiple
           className="hidden"
         />
       </footer>

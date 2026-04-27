@@ -43,7 +43,7 @@ import {
   STATS_BUFFER_SIZE,
 } from "./rpc-protocol.js";
 import {
-  parseSafeTensorsHeader,
+  parseSafeTensorsHeaderBytes,
   dtypeToCode,
   type TensorInfo,
 } from "./safetensors.js";
@@ -75,6 +75,36 @@ const PACKED_GPU_WEIGHT_UPLOAD_ENABLED = false;
 
 type UploadTensorInfo = TensorInfo & { fromMerged?: boolean };
 type ReasoningEffort = "off" | "low" | "medium" | "high";
+type LocalModelFile = File & { webkitRelativePath?: string };
+
+const WEIGHT_UPLOAD_BATCH_BYTES = 256 * 1024 * 1024;
+
+type ModelSource =
+  | {
+      kind: "remote";
+      baseUrl: string;
+      label: string;
+      fileCache: Map<string, Uint8Array>;
+    }
+  | { kind: "local"; files: Map<string, LocalModelFile>; label: string };
+
+type GpuTensorDescriptor = {
+  name: string;
+  handle: number;
+  dtypeCode: number;
+  shape: number[];
+  byteSize: number;
+  packedBf16: boolean;
+};
+
+type UploadWeightsResult = {
+  handles: number[];
+  uploadedDtypes: string[];
+  uploadedByteSizes: number[];
+  packedBf16Flags: boolean[];
+  debugPackedTotal?: number;
+  debugUnpackedBf16Total?: number;
+};
 
 const REASONING_TOKEN_BUDGET: Record<
   Exclude<ReasoningEffort, "off">,
@@ -108,6 +138,7 @@ function buildChatConfig(data: {
     Array.isArray(data.messages) && hasMessageImages(data.messages);
   const effort =
     requestedEffort === "off" && hasImages ? "low" : requestedEffort;
+
   if (effort === "off") {
     return {
       ...data.config,
@@ -119,11 +150,8 @@ function buildChatConfig(data: {
 
   return {
     ...data.config,
-    // Current Qwen3.5 wasm treats "low" as no-thinking. Keep the playground
-    // control Codex-shaped by enabling the template and enforcing the low
-    // budget here. Image turns with the UI set to Off also use this hidden
-    // low-budget path because the VLM template needs a short internal think;
-    // the UI still hides reasoning for Off by keeping includeReasoning false.
+    // Qwen3.5 maps `low` to no-thinking internally, so the browser uses the
+    // thinking template with a low token cap to provide a true low effort.
     reasoningEffort: effort === "low" ? "medium" : effort,
     thinkingTokenBudget: REASONING_TOKEN_BUDGET[effort],
     includeReasoning: requestedEffort !== "off",
@@ -174,14 +202,19 @@ async function withBridgeModeForMessages<T>(
 
   const previousFusion = Atomics.load(bridgeOptimizationControl, 0) !== 0;
   const previousPassCaching = Atomics.load(bridgeOptimizationControl, 1) !== 0;
-  const previousDispatchBatch = Atomics.load(bridgeOptimizationControl, 2) !== 0;
+  const previousDispatchBatch =
+    Atomics.load(bridgeOptimizationControl, 2) !== 0;
   if (imageRequest) {
     // VLM prefill still needs the conservative bridge path because it has
     // cross-worker pass ownership and copy/restart patterns that are not yet
     // safe with the text decode fusion stack.
     setBridgeOptimizations(false, false, false);
   } else {
-    setBridgeOptimizations(configuredFusionEnabled, true, configuredDispatchBatchEnabled);
+    setBridgeOptimizations(
+      configuredFusionEnabled,
+      true,
+      configuredDispatchBatchEnabled,
+    );
   }
 
   try {
@@ -195,22 +228,22 @@ async function withBridgeModeForMessages<T>(
   }
 }
 
-function buildMergedLinearAttentionTensors(
-  tensors: TensorInfo[],
-  weights: Uint8Array,
-  dataOffset: number,
-): {
-  tensors: UploadTensorInfo[];
-  mergedSab?: SharedArrayBuffer;
+type LinearAttentionMergePlan = {
+  left: TensorInfo;
+  right: TensorInfo;
+  tensor: UploadTensorInfo;
+};
+
+function planMergedLinearAttentionTensors(tensors: TensorInfo[]): {
+  tensors: TensorInfo[];
+  mergePlans: LinearAttentionMergePlan[];
   mergedCount: number;
 } {
   const byName = new Map<string, TensorInfo>();
   for (const tensor of tensors) byName.set(tensor.name, tensor);
 
   const consumed = new Set<string>();
-  const merged: UploadTensorInfo[] = [];
-  const mergedChunks: Uint8Array[] = [];
-  let mergedBytes = 0;
+  const mergePlans: LinearAttentionMergePlan[] = [];
 
   const tryMergePair = (
     leftSuffix: string,
@@ -236,37 +269,21 @@ function buildMergedLinearAttentionTensors(
       }
       if (!compatible) continue;
 
-      const byteOffset = mergedBytes;
       const byteSize = left.byteSize + right.byteSize;
       const shape = [left.shape[0] + right.shape[0], ...left.shape.slice(1)];
-      const chunk = new Uint8Array(byteSize);
-      chunk.set(
-        new Uint8Array(
-          weights.buffer,
-          dataOffset + left.byteOffset,
-          left.byteSize,
-        ),
-        0,
-      );
-      chunk.set(
-        new Uint8Array(
-          weights.buffer,
-          dataOffset + right.byteOffset,
-          right.byteSize,
-        ),
-        left.byteSize,
-      );
-      mergedChunks.push(chunk);
-      mergedBytes += byteSize;
       consumed.add(left.name);
       consumed.add(right.name);
-      merged.push({
-        name: `${prefix}${mergedSuffix}`,
-        dtype: left.dtype,
-        shape,
-        byteOffset,
-        byteSize,
-        fromMerged: true,
+      mergePlans.push({
+        left,
+        right,
+        tensor: {
+          name: `${prefix}${mergedSuffix}`,
+          dtype: left.dtype,
+          shape,
+          byteOffset: 0,
+          byteSize,
+          fromMerged: true,
+        },
       });
     }
   };
@@ -287,17 +304,11 @@ function buildMergedLinearAttentionTensors(
   const uploadTensors: UploadTensorInfo[] = tensors.filter(
     (tensor) => !consumed.has(tensor.name),
   );
-  uploadTensors.push(...merged);
-  if (mergedBytes === 0) return { tensors: uploadTensors, mergedCount: 0 };
-
-  const mergedSab = new SharedArrayBuffer(mergedBytes);
-  const mergedView = new Uint8Array(mergedSab);
-  let cursor = 0;
-  for (const chunk of mergedChunks) {
-    mergedView.set(chunk, cursor);
-    cursor += chunk.byteLength;
-  }
-  return { tensors: uploadTensors, mergedSab, mergedCount: merged.length };
+  return {
+    tensors: uploadTensors,
+    mergePlans,
+    mergedCount: mergePlans.length,
+  };
 }
 
 function uploadWeightsToGpu(
@@ -307,14 +318,7 @@ function uploadWeightsToGpu(
   tensors: UploadTensorInfo[],
   mergedSab: SharedArrayBuffer | undefined,
   packBf16: boolean,
-): Promise<{
-  handles: number[];
-  uploadedDtypes: string[];
-  uploadedByteSizes: number[];
-  packedBf16Flags: boolean[];
-  debugPackedTotal?: number;
-  debugUnpackedBf16Total?: number;
-}> {
+): Promise<UploadWeightsResult> {
   return new Promise((resolve, reject) => {
     const onMessage = (ev: MessageEvent) => {
       const msg = ev.data;
@@ -347,6 +351,338 @@ function uploadWeightsToGpu(
   });
 }
 
+type UploadItem =
+  | { kind: "tensor"; tensor: TensorInfo }
+  | { kind: "merge"; plan: LinearAttentionMergePlan };
+
+function uploadItemByteSize(item: UploadItem): number {
+  return item.kind === "tensor"
+    ? item.tensor.byteSize
+    : item.plan.tensor.byteSize;
+}
+
+function describeUploadItem(item: UploadItem): UploadTensorInfo {
+  if (item.kind === "tensor") {
+    return { ...item.tensor };
+  }
+  return { ...item.plan.tensor };
+}
+
+async function copyTensorBytesInto(
+  source: ModelSource,
+  weightFile: string,
+  dataOffset: number,
+  tensor: TensorInfo,
+  dst: Uint8Array,
+  dstOffset: number,
+) {
+  const bytes = await readSourceSlice(
+    source,
+    weightFile,
+    dataOffset + tensor.byteOffset,
+    dataOffset + tensor.byteOffset + tensor.byteSize,
+  );
+  dst.set(bytes, dstOffset);
+}
+
+async function uploadPreparedWeightItems(
+  source: ModelSource,
+  weightFile: string,
+  dataOffset: number,
+  items: UploadItem[],
+  gpuWorker: Worker,
+  uploadPackedBf16: boolean,
+  onProgress: (uploaded: UploadWeightsResult, tensors: UploadTensorInfo[]) => void,
+): Promise<{ debugPackedTotal: number; debugUnpackedBf16Total: number }> {
+  let debugPackedTotal = 0;
+  let debugUnpackedBf16Total = 0;
+  let uploadedItemCount = 0;
+
+  for (let startIndex = 0; startIndex < items.length;) {
+    const batchItems: UploadItem[] = [];
+    let batchBytes = 0;
+
+    while (startIndex < items.length) {
+      const item = items[startIndex]!;
+      const itemBytes = uploadItemByteSize(item);
+      if (
+        batchItems.length > 0 &&
+        batchBytes + itemBytes > WEIGHT_UPLOAD_BATCH_BYTES
+      ) {
+        break;
+      }
+      batchItems.push(item);
+      batchBytes += itemBytes;
+      startIndex++;
+      if (batchBytes >= WEIGHT_UPLOAD_BATCH_BYTES) break;
+    }
+
+    const batchSab = new SharedArrayBuffer(batchBytes);
+    const batchView = new Uint8Array(batchSab);
+    const batchTensors: UploadTensorInfo[] = [];
+    let cursor = 0;
+
+    for (const item of batchItems) {
+      const uploadTensor = describeUploadItem(item);
+      uploadTensor.byteOffset = cursor;
+      uploadTensor.fromMerged = false;
+
+      if (item.kind === "tensor") {
+        await copyTensorBytesInto(
+          source,
+          weightFile,
+          dataOffset,
+          item.tensor,
+          batchView,
+          cursor,
+        );
+      } else {
+        const { left, right } = item.plan;
+        await copyTensorBytesInto(
+          source,
+          weightFile,
+          dataOffset,
+          left,
+          batchView,
+          cursor,
+        );
+        await copyTensorBytesInto(
+          source,
+          weightFile,
+          dataOffset,
+          right,
+          batchView,
+          cursor + left.byteSize,
+        );
+      }
+
+      batchTensors.push(uploadTensor);
+      cursor += uploadTensor.byteSize;
+    }
+
+    post({
+      type: "progress",
+      step: "init_model",
+      message:
+        `Uploading ${weightFile}: ${uploadedItemCount + batchItems.length}/${items.length}` +
+        ` tensors (${(batchBytes / 1024 / 1024).toFixed(0)} MB batch)...`,
+    });
+
+    const uploaded = await uploadWeightsToGpu(
+      gpuWorker,
+      batchSab,
+      0,
+      batchTensors,
+      undefined,
+      uploadPackedBf16,
+    );
+    if (uploaded.handles.length !== batchTensors.length) {
+      throw new Error(
+        `GPU upload returned ${uploaded.handles.length} handles for ${batchTensors.length} tensors in ${weightFile}`,
+      );
+    }
+
+    uploadedItemCount += batchItems.length;
+    debugPackedTotal += uploaded.debugPackedTotal ?? 0;
+    debugUnpackedBf16Total += uploaded.debugUnpackedBf16Total ?? 0;
+    onProgress(uploaded, batchTensors);
+  }
+
+  return { debugPackedTotal, debugUnpackedBf16Total };
+}
+
+function normalizeModelPath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\/+/, "");
+}
+
+function createModelSource(
+  modelUrl: string,
+  modelFiles?: LocalModelFile[],
+): ModelSource {
+  if (!modelFiles || modelFiles.length === 0) {
+    return {
+      kind: "remote",
+      baseUrl: modelUrl.replace(/\/+$/, ""),
+      label: modelUrl,
+      fileCache: new Map(),
+    };
+  }
+
+  const rawPaths = modelFiles.map((file) =>
+    normalizeModelPath(file.webkitRelativePath || file.name),
+  );
+  const firstRoot = rawPaths[0]?.split("/")[0] ?? "";
+  const stripRoot =
+    firstRoot.length > 0 &&
+    rawPaths.every((path) => path === firstRoot || path.startsWith(`${firstRoot}/`));
+
+  const files = new Map<string, LocalModelFile>();
+  for (let i = 0; i < modelFiles.length; i++) {
+    const file = modelFiles[i]!;
+    const rawPath = rawPaths[i] || file.name;
+    const stripped = stripRoot
+      ? rawPath.split("/").slice(1).join("/") || file.name
+      : rawPath;
+    files.set(stripped, file);
+    files.set(rawPath, file);
+    if (!files.has(file.name)) files.set(file.name, file);
+  }
+
+  return {
+    kind: "local",
+    files,
+    label: stripRoot ? firstRoot : "local model",
+  };
+}
+
+async function readSourceText(
+  source: ModelSource,
+  path: string,
+  optional = false,
+): Promise<string | undefined> {
+  const normalizedPath = normalizeModelPath(path);
+  if (source.kind === "local") {
+    const file = source.files.get(normalizedPath);
+    if (!file) {
+      if (optional) return undefined;
+      throw new Error(`Local model is missing ${normalizedPath}`);
+    }
+    return file.text();
+  }
+
+  const resp = await fetch(`${source.baseUrl}/${normalizedPath}`);
+  if (!resp.ok) {
+    if (optional && resp.status === 404) return undefined;
+    throw new Error(
+      `Failed to fetch ${normalizedPath}: HTTP ${resp.status} ${resp.statusText}`,
+    );
+  }
+  const text = await resp.text();
+  const contentType = resp.headers.get("content-type") ?? "";
+  if (
+    optional &&
+    contentType.includes("text/html") &&
+    text.trimStart().startsWith("<!doctype")
+  ) {
+    return undefined;
+  }
+  return text;
+}
+
+async function readSourceSlice(
+  source: ModelSource,
+  path: string,
+  start: number,
+  end: number,
+): Promise<Uint8Array> {
+  const normalizedPath = normalizeModelPath(path);
+  if (end < start) {
+    throw new Error(`Invalid byte range for ${normalizedPath}: ${start}-${end}`);
+  }
+  if (end === start) return new Uint8Array(0);
+
+  if (source.kind === "local") {
+    const file = source.files.get(normalizedPath);
+    if (!file) throw new Error(`Local model is missing ${normalizedPath}`);
+    if (end > file.size) {
+      throw new Error(
+        `Local range for ${normalizedPath} exceeds file size: ${end}/${file.size}`,
+      );
+    }
+    return new Uint8Array(await file.slice(start, end).arrayBuffer());
+  }
+
+  const cached = source.fileCache.get(normalizedPath);
+  if (cached) {
+    if (end > cached.byteLength) {
+      throw new Error(
+        `Cached range for ${normalizedPath} exceeds file size: ${end}/${cached.byteLength}`,
+      );
+    }
+    return cached.subarray(start, end);
+  }
+
+  const resp = await fetch(`${source.baseUrl}/${normalizedPath}`, {
+    headers: { Range: `bytes=${start}-${end - 1}` },
+  });
+  if (!resp.ok) {
+    throw new Error(
+      `Failed to fetch ${normalizedPath}: HTTP ${resp.status} ${resp.statusText}`,
+    );
+  }
+  const bytes = new Uint8Array(await resp.arrayBuffer());
+  if (resp.status === 206) {
+    if (bytes.byteLength !== end - start) {
+      throw new Error(
+        `Range fetch for ${normalizedPath} returned ${bytes.byteLength} bytes, expected ${end - start}`,
+      );
+    }
+    return bytes;
+  }
+
+  if (resp.status === 200 && start === 0 && bytes.byteLength >= end) {
+    source.fileCache.set(normalizedPath, bytes);
+    return bytes.subarray(start, end);
+  }
+
+  throw new Error(
+    `Server did not honor byte range for ${normalizedPath}; use a local model directory or a server with Range support`,
+  );
+}
+
+async function readSafeTensorsHeader(
+  source: ModelSource,
+  path: string,
+): Promise<{ tensors: TensorInfo[]; dataOffset: number }> {
+  const prefix = await readSourceSlice(source, path, 0, 8);
+  const headerLen = Number(
+    new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength)
+      .getBigUint64(0, true),
+  );
+  if (!Number.isSafeInteger(headerLen) || headerLen <= 0) {
+    throw new Error(`Invalid safetensors header length in ${path}: ${headerLen}`);
+  }
+  const dataOffset = 8 + headerLen;
+  const headerBytes = await readSourceSlice(source, path, 8, dataOffset);
+  return parseSafeTensorsHeaderBytes(headerBytes, dataOffset);
+}
+
+async function discoverWeightFiles(source: ModelSource): Promise<string[]> {
+  const indexJson = await readSourceText(
+    source,
+    "model.safetensors.index.json",
+    true,
+  );
+  if (indexJson) {
+    try {
+      const parsed = JSON.parse(indexJson) as {
+        weight_map?: Record<string, string>;
+      };
+      const files = [...new Set(Object.values(parsed.weight_map ?? {}))];
+      if (files.length > 0) return files;
+    } catch {
+      post({
+        type: "log",
+        message: "[MODEL] Ignoring invalid model.safetensors.index.json",
+      });
+    }
+  }
+
+  if (source.kind === "local") {
+    const files = [...source.files.keys()]
+      .filter((path) => path.endsWith(".safetensors") && !path.includes("/"))
+      .filter((path, index, array) => array.indexOf(path) === index)
+      .sort((a, b) => {
+        if (a === "model.safetensors") return -1;
+        if (b === "model.safetensors") return 1;
+        return a.localeCompare(b, undefined, { numeric: true });
+      });
+    if (files.length > 0) return files;
+  }
+
+  return ["model.safetensors"];
+}
+
 // Phase 0 (?profile=1) state. When enabled, handleChat* wraps each
 // generation with a reset + readback of:
 //   - wasm-worker rpcCall histogram (bridge.getBridgeStats)
@@ -363,9 +699,30 @@ function post(msg: any) {
   (self as any).postMessage(msg);
 }
 
+function formatUnknownError(e: unknown): { message: string; stack?: string } {
+  if (e instanceof Error) {
+    return { message: e.message || String(e), stack: e.stack };
+  }
+
+  if (typeof ErrorEvent !== "undefined" && e instanceof ErrorEvent) {
+    const inner = formatUnknownError(e.error);
+    const location =
+      e.filename || e.lineno || e.colno
+        ? `${e.filename}:${e.lineno}:${e.colno}`
+        : undefined;
+    return {
+      message: e.message || inner.message || "Worker error",
+      stack: inner.stack || location,
+    };
+  }
+
+  return { message: typeof e === "string" ? e : String(e) };
+}
+
 async function handleInit(data: {
   wasmUrl: string;
   modelUrl: string;
+  modelFiles?: LocalModelFile[];
   packBf16?: boolean;
   sdpaFallback?: boolean;
   profile?: boolean;
@@ -696,259 +1053,182 @@ async function handleInit(data: {
       message: `WASM loaded${flagSuffix ? " (" + flagSuffix.trim() + ")" : ""}`,
     });
 
-    // 3. Fetch model files
-    post({ type: "progress", step: "model", message: "Fetching config..." });
-    const configJson = await fetch(`${data.modelUrl}/config.json`).then((r) =>
-      r.text(),
+    // 3. Load model files. The source can be either /model over HTTP or a
+    // directory selected by the user in the browser. We process safetensors
+    // one shard at a time so large local checkpoints never need one giant JS
+    // ArrayBuffer.
+    const modelSource = createModelSource(data.modelUrl, data.modelFiles);
+    post({
+      type: "progress",
+      step: "model",
+      message: `Loading config from ${modelSource.label}...`,
+    });
+    const configJson = await readSourceText(modelSource, "config.json");
+    if (!configJson) throw new Error("config.json is empty");
+    const config = JSON.parse(configJson) as {
+      model_type?: string;
+      text_config?: { model_type?: string };
+    };
+    const modelType = String(
+      config.model_type ?? config.text_config?.model_type ?? "",
     );
 
-    post({ type: "progress", step: "model", message: "Fetching tokenizer..." });
-    const tokenizerJson = await fetch(`${data.modelUrl}/tokenizer.json`).then(
-      (r) => r.text(),
+    post({ type: "progress", step: "model", message: "Loading tokenizer..." });
+    const tokenizerJson = await readSourceText(modelSource, "tokenizer.json");
+    if (!tokenizerJson) throw new Error("tokenizer.json is empty");
+    const tokenizerConfigJson = await readSourceText(
+      modelSource,
+      "tokenizer_config.json",
+      true,
     );
-    // Fetch tokenizer_config.json for the Jinja2 chat template
-    let tokenizerConfigJson: string | undefined;
-    try {
-      const resp = await fetch(`${data.modelUrl}/tokenizer_config.json`);
-      if (resp.ok) {
-        tokenizerConfigJson = await resp.text();
-      }
-    } catch (e) {
-      console.warn(
-        "tokenizer_config.json not available, using default chat template",
-      );
-    }
+
     let processorConfigJson: string | undefined;
     for (const file of ["preprocessor_config.json", "processor_config.json"]) {
-      try {
-        const resp = await fetch(`${data.modelUrl}/${file}`);
-        if (resp.ok) {
-          processorConfigJson = await resp.text();
-          break;
-        }
-      } catch (e) {
-        console.warn(`${file} not available`);
-      }
+      processorConfigJson = await readSourceText(modelSource, file, true);
+      if (processorConfigJson) break;
     }
 
-    post({ type: "progress", step: "model", message: "Fetching weights..." });
-    const weightsResponse = await fetch(`${data.modelUrl}/model.safetensors`);
-    const totalSize = Number(
-      weightsResponse.headers.get("content-length") || 0,
-    );
-    const reader = weightsResponse.body!.getReader();
-    const chunks: Uint8Array[] = [];
-    let loaded = 0;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      loaded += value.length;
-      if (totalSize > 0 && loaded % (50 * 1024 * 1024) < value.length) {
-        const pct = ((loaded / totalSize) * 100).toFixed(0);
-        post({
-          type: "progress",
-          step: "download",
-          message: `Downloading weights... ${pct}%`,
-          pct: Number(pct),
-        });
-      }
-    }
-
-    const weightsSab = new SharedArrayBuffer(loaded);
-    const weightsBuffer = new Uint8Array(weightsSab);
-    let offset = 0;
-    for (const chunk of chunks) {
-      weightsBuffer.set(chunk, offset);
-      offset += chunk.length;
-    }
+    const weightFiles = await discoverWeightFiles(modelSource);
+    post({
+      type: "log",
+      message: `[MODEL] ${modelSource.label}: model_type=${modelType || "unknown"}, safetensors=${weightFiles.length}`,
+    });
 
     // 4. Parse safetensors and build the model. Prefer the GPU-buffer path:
     // JS uploads raw weights directly into WebGPU buffers, then Rust wraps the
     // handles with loadFromGpuBuffers. This is the only active load path that
     // can preserve PackedBf16 storage for decode weights.
-    post({
-      type: "progress",
-      step: "init_model",
-      message: "Parsing safetensors header...",
-    });
     wasmMalloc = wasmInst!.exports.malloc as (size: number) => number;
     wasmFree = wasmInst!.exports.free as (ptr: number) => void;
-    const localWasmMalloc = wasmMalloc;
-    const localWasmFree = wasmFree;
 
-    const { tensors, dataOffset } = parseSafeTensorsHeader(
-      weightsBuffer.buffer,
-    );
-    const visionTensorCount = tensors.filter((tensor) =>
-      isVisionTensorName(tensor.name),
-    ).length;
-    modelSupportsImages = enableVlm && visionTensorCount > 0;
-    const tensorsForModel = modelSupportsImages
-      ? tensors
-      : tensors.filter((tensor) => !isVisionTensorName(tensor.name));
-    post({
-      type: "log",
-      message: `[MODEL] Parsed ${tensors.length} tensors, dataOffset=${dataOffset}`,
-    });
-    post({
-      type: "log",
-      message: modelSupportsImages
-        ? `[MODEL] Vision input enabled (${visionTensorCount} vision tensors)`
-        : visionTensorCount > 0
-          ? `[MODEL] Vision tensors present (${visionTensorCount}) but VLM input is disabled by ?disable_vlm=1`
-          : "[MODEL] Vision input unavailable for this model",
-    });
-
-    const Qwen35Model = mlxExports.Qwen35Model || mlxExports.Qwen3_5Model;
-
-    if (typeof Qwen35Model.loadFromGpuBuffers === "function") {
-      const prepared = buildMergedLinearAttentionTensors(
-        tensorsForModel,
-        weightsBuffer,
-        dataOffset,
+    const DenseModel = mlxExports.Qwen35Model || mlxExports.Qwen3_5Model;
+    const MoeModel = mlxExports.Qwen35MoeModel || mlxExports.Qwen3_5MoeModel;
+    const Qwen35Model = modelType.includes("moe") ? MoeModel : DenseModel;
+    if (!Qwen35Model) {
+      throw new Error(`No WASM model class exported for model_type=${modelType}`);
+    }
+    if (typeof Qwen35Model.loadFromGpuBuffers !== "function") {
+      throw new Error(
+        `${modelType || "Qwen3.5"} does not export loadFromGpuBuffers in this WASM build`,
       );
-      post({
-        type: "progress",
-        step: "init_model",
-        message: `Uploading ${prepared.tensors.length} GPU tensors${prepared.mergedCount ? ` (${prepared.mergedCount} merged)` : ""}...`,
-      });
-      const uploadPackedBf16 = packBf16 && PACKED_GPU_WEIGHT_UPLOAD_ENABLED;
-      if (packBf16 && !uploadPackedBf16) {
-        post({
-          type: "log",
-          message:
-            "[GPU] Packed bf16 GPU-buffer upload disabled for correctness; using f32-expanded weights",
-        });
-      }
-      const uploaded = await uploadWeightsToGpu(
-        gpuWorker,
-        weightsSab,
-        dataOffset,
-        prepared.tensors,
-        prepared.mergedSab,
-        uploadPackedBf16,
-      );
-      if (uploaded.handles.length !== prepared.tensors.length) {
-        throw new Error(
-          `GPU upload returned ${uploaded.handles.length} handles for ${prepared.tensors.length} tensors`,
-        );
-      }
-      const gpuTensors = prepared.tensors.map((tensor, i) => ({
-        name: tensor.name,
-        handle: uploaded.handles[i],
-        dtypeCode: dtypeToCode(uploaded.uploadedDtypes[i] ?? tensor.dtype),
-        shape: tensor.shape,
-        byteSize: uploaded.uploadedByteSizes[i] ?? tensor.byteSize,
-        packedBf16: uploaded.packedBf16Flags[i] === true,
-      }));
+    }
+
+    const uploadPackedBf16 = packBf16 && PACKED_GPU_WEIGHT_UPLOAD_ENABLED;
+    if (packBf16 && !uploadPackedBf16) {
       post({
         type: "log",
         message:
-          `[GPU] Uploaded ${gpuTensors.length} tensors` +
-          ` packed=${uploaded.debugPackedTotal ?? 0}` +
-          ` unpacked_bf16=${uploaded.debugUnpackedBf16Total ?? 0}`,
-      });
-
-      post({
-        type: "progress",
-        step: "init_model",
-        message: "Building model from GPU buffers...",
-      });
-      const t1 = performance.now();
-      model = await Qwen35Model.loadFromGpuBuffers(
-        configJson,
-        gpuTensors,
-        tokenizerJson,
-        tokenizerConfigJson ?? null,
-        processorConfigJson ?? null,
-      );
-      post({
-        type: "progress",
-        step: "init_model",
-        message: `Model ready (${(performance.now() - t1).toFixed(0)}ms)`,
-      });
-    } else {
-      // Fallback per-tensor CPU data path. For each tensor: malloc small WASM
-      // buffer → copy bytes → call addCpuTensor (Rust creates MLX array, C++
-      // copies data) → free WASM buffer immediately.
-      //
-      // This keeps peak WASM pointer under 2 GB, avoiding the i32 offset
-      // overflow that kills bulk CPU loading.
-      post({
-        type: "log",
-        message: "[CPU] loadFromGpuBuffers unavailable; using CPU tensor path",
-      });
-      // Store config + tokenizer in Rust BEFORE tensor accumulation.
-      // Must happen while WASM memory is still small to avoid emnapi DataView
-      // bounds errors (the ~5.7 MB tokenizer JSON triggers memory writes that
-      // fail if emnapi's DataView is stale after memory.grow).
-      Qwen35Model.setCpuModelConfig(
-        configJson,
-        tokenizerJson,
-        tokenizerConfigJson ?? null,
-      );
-
-      post({
-        type: "progress",
-        step: "init_model",
-        message: `Loading ${tensorsForModel.length} tensors...`,
-      });
-      for (let i = 0; i < tensorsForModel.length; i++) {
-        const t = tensorsForModel[i];
-        if (t.byteSize === 0) continue;
-
-        const ptr = localWasmMalloc(t.byteSize);
-        if (ptr === 0) {
-          throw new Error(
-            `Failed to malloc ${t.byteSize} bytes for tensor "${t.name}" (${i}/${tensors.length})`,
-          );
-        }
-        const uptr = ptr >>> 0;
-
-        const src = new Uint8Array(
-          weightsBuffer.buffer,
-          dataOffset + t.byteOffset,
-          t.byteSize,
-        );
-        new Uint8Array(sharedMemory.buffer).set(src, uptr);
-
-        Qwen35Model.addCpuTensor(
-          t.name,
-          uptr,
-          t.byteSize,
-          t.shape,
-          dtypeToCode(t.dtype),
-        );
-        localWasmFree(ptr);
-
-        if (i % 50 === 0) {
-          post({
-            type: "progress",
-            step: "init_model",
-            message: `Loaded ${i}/${tensorsForModel.length} tensors...`,
-          });
-        }
-      }
-      post({
-        type: "log",
-        message: `[CPU] All ${tensorsForModel.length} tensors accumulated in Rust`,
-      });
-
-      post({
-        type: "progress",
-        step: "init_model",
-        message: "Building model...",
-      });
-      const t1 = performance.now();
-      model = await Qwen35Model.buildModelFromCpuTensors();
-      post({
-        type: "progress",
-        step: "init_model",
-        message: `Model ready (${(performance.now() - t1).toFixed(0)}ms)`,
+          "[GPU] Packed bf16 GPU-buffer upload disabled for correctness; using f32-expanded weights",
       });
     }
+
+    const gpuTensors: GpuTensorDescriptor[] = [];
+    let totalTensorCount = 0;
+    let totalUploadedCount = 0;
+    let totalVisionTensorCount = 0;
+    let totalMergedCount = 0;
+    let debugPackedTotal = 0;
+    let debugUnpackedBf16Total = 0;
+
+    for (let shardIndex = 0; shardIndex < weightFiles.length; shardIndex++) {
+      const weightFile = weightFiles[shardIndex]!;
+      post({
+        type: "progress",
+        step: "download",
+        message: `Loading weights ${shardIndex + 1}/${weightFiles.length}: ${weightFile}`,
+      });
+      post({
+        type: "progress",
+        step: "init_model",
+        message: `Parsing ${weightFile}...`,
+      });
+      const { tensors, dataOffset } = await readSafeTensorsHeader(
+        modelSource,
+        weightFile,
+      );
+      totalTensorCount += tensors.length;
+      const visionTensorCount = tensors.filter((tensor) =>
+        isVisionTensorName(tensor.name),
+      ).length;
+      totalVisionTensorCount += visionTensorCount;
+      const tensorsForModel = enableVlm
+        ? tensors
+        : tensors.filter((tensor) => !isVisionTensorName(tensor.name));
+
+      const prepared = planMergedLinearAttentionTensors(tensorsForModel);
+      totalMergedCount += prepared.mergedCount;
+      const uploadItems: UploadItem[] = [
+        ...prepared.tensors.map((tensor) => ({ kind: "tensor" as const, tensor })),
+        ...prepared.mergePlans.map((plan) => ({ kind: "merge" as const, plan })),
+      ];
+      post({
+        type: "progress",
+        step: "init_model",
+        message: `Uploading ${weightFile}: ${uploadItems.length} GPU tensors${prepared.mergedCount ? ` (${prepared.mergedCount} merged)` : ""}...`,
+      });
+
+      const uploadDebug = await uploadPreparedWeightItems(
+        modelSource,
+        weightFile,
+        dataOffset,
+        uploadItems,
+        gpuWorker,
+        uploadPackedBf16,
+        (uploaded, batchTensors) => {
+          for (let i = 0; i < batchTensors.length; i++) {
+            const tensor = batchTensors[i]!;
+            gpuTensors.push({
+              name: tensor.name,
+              handle: uploaded.handles[i]!,
+              dtypeCode: dtypeToCode(uploaded.uploadedDtypes[i] ?? tensor.dtype),
+              shape: tensor.shape,
+              byteSize: uploaded.uploadedByteSizes[i] ?? tensor.byteSize,
+              packedBf16: uploaded.packedBf16Flags[i] === true,
+            });
+          }
+          totalUploadedCount += batchTensors.length;
+        },
+      );
+      debugPackedTotal += uploadDebug.debugPackedTotal;
+      debugUnpackedBf16Total += uploadDebug.debugUnpackedBf16Total;
+    }
+
+    modelSupportsImages = enableVlm && totalVisionTensorCount > 0;
+    post({
+      type: "log",
+      message: modelSupportsImages
+        ? `[MODEL] Vision input enabled (${totalVisionTensorCount} vision tensors)`
+        : totalVisionTensorCount > 0
+          ? `[MODEL] Vision tensors present (${totalVisionTensorCount}) but VLM input is disabled by ?disable_vlm=1`
+          : "[MODEL] Vision input unavailable for this model",
+    });
+    post({
+      type: "log",
+      message:
+        `[GPU] Uploaded ${totalUploadedCount}/${totalTensorCount} tensors` +
+        ` merged=${totalMergedCount}` +
+        ` packed=${debugPackedTotal}` +
+        ` unpacked_bf16=${debugUnpackedBf16Total}`,
+    });
+
+    post({
+      type: "progress",
+      step: "init_model",
+      message: "Building model from GPU buffers...",
+    });
+    const t1 = performance.now();
+    model = await Qwen35Model.loadFromGpuBuffers(
+      configJson,
+      gpuTensors,
+      tokenizerJson,
+      tokenizerConfigJson ?? null,
+      processorConfigJson ?? null,
+    );
+    post({
+      type: "progress",
+      step: "init_model",
+      message: `Model ready (${(performance.now() - t1).toFixed(0)}ms)`,
+    });
 
     // 6. Pipeline warmup — first inference warms GPU pipelines + shader compilation.
     // The VLM-capable Qwen3.5 checkpoint uses a vision-aware chat template; a
@@ -1364,14 +1644,28 @@ async function handleChatTsfn(data: {
 
 // Catch unhandled errors/rejections on this worker
 self.addEventListener("error", (e) => {
+  e.preventDefault();
+  const details = formatUnknownError((e as ErrorEvent).error ?? e);
+  const location =
+    (e as ErrorEvent).filename ||
+    (e as ErrorEvent).lineno ||
+    (e as ErrorEvent).colno
+      ? `${(e as ErrorEvent).filename}:${(e as ErrorEvent).lineno}:${(e as ErrorEvent).colno}`
+      : undefined;
   post({
     type: "error",
-    message: `Worker error: ${e.message}`,
-    stack: (e as ErrorEvent).filename,
+    message: `Worker error: ${(e as ErrorEvent).message || details.message}`,
+    stack: details.stack || location,
   });
 });
 self.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
-  post({ type: "error", message: `Unhandled rejection: ${String(e.reason)}` });
+  e.preventDefault();
+  const details = formatUnknownError(e.reason);
+  post({
+    type: "error",
+    message: `Unhandled rejection: ${details.message}`,
+    stack: details.stack,
+  });
 });
 
 self.onmessage = (e: MessageEvent) => {
