@@ -2922,6 +2922,37 @@ export interface Gemma4Config {
   boiTokenId?: number;
   eoiTokenId?: number;
   visionSoftTokensPerImage?: number;
+  /**
+   * GPU memory budget for paged KV cache in megabytes.
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 2048 (2GB).
+   */
+  pagedCacheMemoryMb?: number | undefined;
+  /**
+   * Block size for paged attention (tokens per block).
+   * Only used when `use_block_paged_cache` is true.
+   * Default: 16.
+   */
+  pagedBlockSize?: number | undefined;
+  /**
+   * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
+   *
+   * **OPT-IN — experimental and currently a no-op for chat dispatch.**
+   * When `Some(true)`, `Gemma4Inner` allocates a `BlockAllocator` +
+   * `LayerKVPool` pair and constructs a `PagedKVCacheAdapter` field.
+   * The chat-session forward dispatch (`chat_sync_core_paged` /
+   * `chat_stream_sync_core_paged`) is NOT yet wired — Gemma4's
+   * hybrid sliding+global attention, K=V sharing, KV-shared layers
+   * (`forward_shared`), MoE/PLE branches, and per-layer-type head
+   * dimensions all require a bespoke `forward_paged_adapter` on
+   * `Gemma4DecoderLayer` that mirrors the Qwen3 pattern but covers
+   * these variants. This commit lands the construction-only plumbing
+   * so a follow-up can implement the forward path without churning
+   * the config surface a second time.
+   *
+   * Default: false (use the existing `Gemma4LayerCache` path).
+   */
+  useBlockPagedCache?: boolean | undefined;
 }
 
 /**
