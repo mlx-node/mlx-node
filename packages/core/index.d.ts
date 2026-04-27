@@ -457,26 +457,6 @@ export declare class MxArray {
   static fromInt64(data: BigInt64Array, shape: BigInt64Array): MxArray;
   static fromUint32(data: Uint32Array, shape: BigInt64Array): MxArray;
   static fromFloat32(data: Float32Array, shape: BigInt64Array): MxArray;
-  /**
-   * NAPI-exposed variant that accepts the raw bf16 bytes as a `Uint8Array`.
-   * The input length must be `elements * 2`. This is the only path to build
-   * a CPU-resident bf16 weight buffer from JavaScript — the regular
-   * `fromFloat32(...).astype(BF16)` idiom produces a *GPU output*, which the
-   * WebGPU backend does not treat as an "upload-pending" buffer and so
-   * cannot be placed in the packed-bf16 storage mode. When the WebGPU
-   * backend has the packed-bf16 flag enabled AND the buffer is large
-   * enough (>= `min_elements`, default `PACKED_BF16_DEFAULT_MIN_ELEMENTS`),
-   * the underlying WebGPUBuffer is flipped to `StorageMode::PackedBf16`
-   * here so the first GPU upload stores the weights 2-per-u32 and downstream
-   * GEMV dispatches the packed kernel.
-   *
-   * The optional `min_elements` override exists strictly for the browser
-   * test suite, which needs to exercise the small-norm packed path at the
-   * production `NORM_PACKED_MIN_ELEMENTS = 256` threshold used by
-   * `gpu-worker.ts` (D=1024 norm weights are far below the default 4096
-   * GEMV-tuned floor). Callers outside tests MUST NOT pass this override.
-   */
-  static fromBfloat16Bytes(data: Uint8Array, shape: BigInt64Array, minElements?: number | undefined | null): MxArray;
   static zeros(shape: BigInt64Array, dtype?: DType | undefined | null): MxArray;
   static scalarFloat(value: number): MxArray;
   static scalarInt(value: number): MxArray;
@@ -500,6 +480,26 @@ export declare class MxArray {
     step?: number | undefined | null,
     dtype?: DType | undefined | null,
   ): MxArray;
+  /**
+   * NAPI-exposed variant that accepts the raw bf16 bytes as a `Uint8Array`.
+   * The input length must be `elements * 2`. This is the only path to build
+   * a CPU-resident bf16 weight buffer from JavaScript - the regular
+   * `fromFloat32(...).astype(BF16)` idiom produces a *GPU output*, which the
+   * WebGPU backend does not treat as an "upload-pending" buffer and so
+   * cannot be placed in the packed-bf16 storage mode. When the WebGPU
+   * backend has the packed-bf16 flag enabled AND the buffer is large
+   * enough (>= `min_elements`, default `PACKED_BF16_DEFAULT_MIN_ELEMENTS`),
+   * the underlying WebGPUBuffer is flipped to `StorageMode::PackedBf16`
+   * here so the first GPU upload stores the weights 2-per-u32 and downstream
+   * GEMV dispatches the packed kernel.
+   *
+   * The optional `min_elements` override exists strictly for the browser
+   * test suite, which needs to exercise the small-norm packed path at the
+   * production `NORM_PACKED_MIN_ELEMENTS = 256` threshold used by
+   * `gpu-worker.ts` (D=1024 norm weights are far below the default 4096
+   * GEMV-tuned floor). Callers outside tests MUST NOT pass this override.
+   */
+  static fromBfloat16Bytes(data: Uint8Array, shape: BigInt64Array, minElements?: number | undefined | null): MxArray;
   static testCompileBasic(): boolean;
   static testCompileMatmul(): boolean;
   static testCompileRepeated(): boolean;
@@ -969,48 +969,6 @@ export declare class Qwen35Model {
    * - tokenizer.json + tokenizer_config.json
    */
   static load(path: string): Promise<Qwen35Model>;
-  /**
-   * Load a model from pre-created GPU buffers (zero-copy, for browser WebGPU).
-   *
-   * The JS side parses SafeTensors headers, creates GPU buffers directly from the
-   * fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
-   * WASM linear memory.
-   */
-  static loadFromGpuBuffers(
-    configJson: string,
-    gpuTensors: Array<GpuTensorInfo>,
-    tokenizerJson: string,
-    tokenizerConfigJson?: string | undefined | null,
-    processorConfigJson?: string | undefined | null,
-  ): Promise<Qwen35Model>;
-  /**
-   * Store config and tokenizer strings before tensor accumulation begins.
-   *
-   * Must be called BEFORE `addCpuTensor`, while WASM memory is still small.
-   * Avoids emnapi DataView bounds errors from passing large strings after
-   * WASM memory has grown past its initial size.
-   */
-  static setCpuModelConfig(
-    configJson: string,
-    tokenizerJson: string,
-    tokenizerConfigJson?: string | undefined | null,
-  ): void;
-  /**
-   * Add one CPU-resident tensor to the accumulator (for per-tensor loading).
-   *
-   * Creates an MLX array from the WASM pointer immediately (C++ copies the
-   * data). JS should free the WASM buffer right after this returns.
-   * Call `buildModelFromCpuTensors` after all tensors are accumulated.
-   */
-  static addCpuTensor(name: string, ptr: number, byteSize: number, shape: Array<number>, dtypeCode: number): void;
-  /**
-   * Build model from previously stored config and accumulated CPU tensors.
-   *
-   * Uses PromiseRaw + spawn_future pattern: sync work + thread spawn run
-   * in the fn body, then spawn_future returns a Promise immediately. The
-   * event loop is then free to process onCreateWorker for the model thread.
-   */
-  static buildModelFromCpuTensors(): Promise<Qwen35Model>;
   /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**
@@ -1138,6 +1096,48 @@ export declare class Qwen35Model {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
+  /**
+   * Load a model from pre-created GPU buffers (zero-copy, for browser WebGPU).
+   *
+   * The JS side parses SafeTensors headers, creates GPU buffers directly from the
+   * fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
+   * WASM linear memory.
+   */
+  static loadFromGpuBuffers(
+    configJson: string,
+    gpuTensors: Array<GpuTensorInfo>,
+    tokenizerJson: string,
+    tokenizerConfigJson?: string | undefined | null,
+    processorConfigJson?: string | undefined | null,
+  ): Promise<Qwen35Model>;
+  /**
+   * Store config and tokenizer strings before tensor accumulation begins.
+   *
+   * Must be called BEFORE `addCpuTensor`, while WASM memory is still small.
+   * Avoids emnapi DataView bounds errors from passing large strings after
+   * WASM memory has grown past its initial size.
+   */
+  static setCpuModelConfig(
+    configJson: string,
+    tokenizerJson: string,
+    tokenizerConfigJson?: string | undefined | null,
+  ): void;
+  /**
+   * Add one CPU-resident tensor to the accumulator (for per-tensor loading).
+   *
+   * Creates an MLX array from the WASM pointer immediately (C++ copies the
+   * data). JS should free the WASM buffer right after this returns.
+   * Call `buildModelFromCpuTensors` after all tensors are accumulated.
+   */
+  static addCpuTensor(name: string, ptr: number, byteSize: number, shape: Array<number>, dtypeCode: number): void;
+  /**
+   * Build model from previously stored config and accumulated CPU tensors.
+   *
+   * Uses PromiseRaw + spawn_future pattern: sync work + thread spawn run
+   * in the fn body, then spawn_future returns a Promise immediately. The
+   * event loop is then free to process onCreateWorker for the model thread.
+   */
+  static buildModelFromCpuTensors(): Promise<Qwen35Model>;
   /**
    * Streaming chat API backed by a SharedArrayBuffer ring buffer.
    *

@@ -37,6 +37,7 @@ use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 ///
 /// The JS side (gpu-worker.ts) pre-uploads SafeTensors weight data to WebGPU
 /// buffers and passes an array of these descriptors to `loadFromGpuBuffers`.
+#[cfg(target_family = "wasm")]
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct GpuTensorInfo {
@@ -59,6 +60,7 @@ pub struct GpuTensorInfo {
 /// The JS side parses the SafeTensors header, copies each tensor's bytes into
 /// WASM memory (via malloc), and passes an array of these descriptors. Each
 /// tensor is small enough (~1-50 MB) that peak WASM memory stays under 2 GB.
+#[cfg(target_family = "wasm")]
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct CpuTensorInfo {
@@ -1386,6 +1388,7 @@ pub(crate) fn load_vision_weights(
 ///
 /// JS codes match the Rust DType discriminant order:
 ///   0=f32, 1=i32, 2=f16, 3=bf16, 4=u32, 5=u8
+#[cfg(target_family = "wasm")]
 fn dtype_from_code(code: i32) -> Result<DType> {
     match code {
         0 => Ok(DType::Float32),
@@ -1410,6 +1413,7 @@ fn dtype_from_code(code: i32) -> Result<DType> {
 ///
 /// The function is synchronous because WASM is single-threaded and the async
 /// machinery (emnapi worker pool) cannot yield during model init.
+#[cfg(target_family = "wasm")]
 pub(crate) fn build_model_inner_from_gpu_buffers(
     config_json: &str,
     gpu_tensors: Vec<GpuTensorInfo>,
@@ -1572,6 +1576,7 @@ pub(crate) fn build_model_inner_from_gpu_buffers(
     Ok(inner)
 }
 
+#[cfg(target_family = "wasm")]
 pub async fn load_from_gpu_buffers(
     config_json: &str,
     gpu_tensors: Vec<GpuTensorInfo>,
@@ -1617,21 +1622,26 @@ pub async fn load_from_gpu_buffers(
 // This also allows JS to free each WASM tensor buffer immediately after the
 // MLX array is created, keeping peak WASM memory much lower.
 
+#[cfg(target_family = "wasm")]
 use std::sync::Mutex;
 
+#[cfg(target_family = "wasm")]
 pub(crate) static CPU_TENSOR_ACCUMULATOR: Mutex<Option<HashMap<String, MxArray>>> =
     Mutex::new(None);
 
 /// Config and tokenizer strings, stored before tensor accumulation begins
 /// (when WASM memory is still small, avoiding emnapi DataView stale bounds).
+#[cfg(target_family = "wasm")]
 pub(crate) struct CpuModelConfig {
     config_json: String,
     tokenizer_json: String,
     tokenizer_config_json: Option<String>,
 }
+#[cfg(target_family = "wasm")]
 pub(crate) static CPU_MODEL_CONFIG: Mutex<Option<CpuModelConfig>> = Mutex::new(None);
 
 /// Map JS dtype codes (Rust DType discriminant order) to C++ dtype codes.
+#[cfg(target_family = "wasm")]
 fn js_to_cpp_dtype(js_code: i32) -> i32 {
     match js_code {
         0 => 0, // Float32 → float32
@@ -1649,6 +1659,7 @@ fn js_to_cpp_dtype(js_code: i32) -> i32 {
 /// Must be called BEFORE any `accumulate_cpu_tensor` calls, while WASM memory
 /// is still small. This avoids emnapi DataView bounds errors that occur when
 /// passing large strings after WASM memory has grown past its initial size.
+#[cfg(target_family = "wasm")]
 pub fn set_cpu_model_config(
     config_json: String,
     tokenizer_json: String,
@@ -1669,6 +1680,7 @@ pub fn set_cpu_model_config(
 /// right after this returns.
 ///
 /// Call `build_model_from_cpu_tensors` after all tensors are accumulated.
+#[cfg(target_family = "wasm")]
 pub fn accumulate_cpu_tensor(
     name: String,
     ptr: u32,
@@ -1696,6 +1708,7 @@ pub fn accumulate_cpu_tensor(
 /// Drains both the config (from `set_cpu_model_config`) and tensor accumulator
 /// (from `accumulate_cpu_tensor`). Returns the inner model ready for thread spawn.
 /// Fully synchronous — no thread creation or async work.
+#[cfg(target_family = "wasm")]
 pub fn build_model_inner_from_cpu_tensors() -> Result<Qwen35Inner> {
     use mlx_sys as sys;
     use tokenizers::Tokenizer;

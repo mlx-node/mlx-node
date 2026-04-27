@@ -9,8 +9,6 @@ use tracing::{info, warn};
 
 use crate::array::MxArray;
 use crate::chat_stream::ChatStreamSink;
-#[cfg(not(target_family = "wasm"))]
-use crate::chat_stream::TsfnSink;
 #[cfg(target_family = "wasm")]
 use crate::chat_stream::{MIN_SAB_LEN, SabSink};
 use crate::model_thread::{ResponseTx, StreamTx};
@@ -179,6 +177,7 @@ pub(crate) enum Qwen35Cmd {
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     },
+    #[cfg(target_family = "wasm")]
     ChatStream {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
@@ -350,6 +349,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
                 cancelled,
             );
         }
+        #[cfg(target_family = "wasm")]
         Qwen35Cmd::ChatStream {
             messages,
             config,
@@ -1929,6 +1929,7 @@ impl Qwen35Inner {
     }
 
     /// Streaming chat synchronous (runs on model thread).
+    #[cfg(target_family = "wasm")]
     pub(crate) fn chat_stream_sync(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -4809,114 +4810,6 @@ impl Qwen3_5Model {
         persistence::load_with_thread(&path).await
     }
 
-    /// Load a model from pre-created GPU buffers (zero-copy, for browser WebGPU).
-    ///
-    /// The JS side parses SafeTensors headers, creates GPU buffers directly from the
-    /// fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
-    /// WASM linear memory.
-    #[napi]
-    pub fn load_from_gpu_buffers<'env>(
-        env: &'env Env,
-        config_json: String,
-        gpu_tensors: Vec<persistence::GpuTensorInfo>,
-        tokenizer_json: String,
-        tokenizer_config_json: Option<String>,
-        processor_config_json: Option<String>,
-    ) -> Result<PromiseRaw<'env, Qwen3_5Model>> {
-        let inner = persistence::build_model_inner_from_gpu_buffers(
-            &config_json,
-            gpu_tensors,
-            &tokenizer_json,
-            tokenizer_config_json.as_deref(),
-            processor_config_json.as_deref(),
-        )?;
-
-        let model_id = inner.model_id;
-        let config_out = inner.config.clone();
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
-            move || Ok((inner, (config_out.clone(), model_id))),
-            handle_qwen35_cmd,
-        );
-
-        env.spawn_future(async move {
-            let (config_final, model_id_final) = init_rx.await.map_err(|_| {
-                napi::Error::from_reason("Model thread exited during GPU buffer load")
-            })??;
-
-            Ok(Qwen3_5Model {
-                thread,
-                config: config_final,
-                model_id: model_id_final,
-                _cache_limit_guard: crate::cache_limit::coordinator().register(0),
-            })
-        })
-    }
-
-    /// Store config and tokenizer strings before tensor accumulation begins.
-    ///
-    /// Must be called BEFORE `addCpuTensor`, while WASM memory is still small.
-    /// Avoids emnapi DataView bounds errors from passing large strings after
-    /// WASM memory has grown past its initial size.
-    #[napi]
-    pub fn set_cpu_model_config(
-        config_json: String,
-        tokenizer_json: String,
-        tokenizer_config_json: Option<String>,
-    ) {
-        persistence::set_cpu_model_config(config_json, tokenizer_json, tokenizer_config_json)
-    }
-
-    /// Add one CPU-resident tensor to the accumulator (for per-tensor loading).
-    ///
-    /// Creates an MLX array from the WASM pointer immediately (C++ copies the
-    /// data). JS should free the WASM buffer right after this returns.
-    /// Call `buildModelFromCpuTensors` after all tensors are accumulated.
-    #[napi]
-    pub fn add_cpu_tensor(
-        name: String,
-        ptr: u32,
-        byte_size: u32,
-        shape: Vec<i32>,
-        dtype_code: i32,
-    ) -> Result<()> {
-        persistence::accumulate_cpu_tensor(name, ptr, byte_size, shape, dtype_code)
-    }
-
-    /// Build model from previously stored config and accumulated CPU tensors.
-    ///
-    /// Uses PromiseRaw + spawn_future pattern: sync work + thread spawn run
-    /// in the fn body, then spawn_future returns a Promise immediately. The
-    /// event loop is then free to process onCreateWorker for the model thread.
-    #[napi]
-    pub fn build_model_from_cpu_tensors<'env>(
-        env: &'env Env,
-    ) -> Result<PromiseRaw<'env, Qwen3_5Model>> {
-        // 1. All sync work: parse config, build model, apply weights
-        let inner = persistence::build_model_inner_from_cpu_tensors()?;
-
-        // 2. Spawn model thread (posts onCreateWorker to event loop)
-        let model_id = inner.model_id;
-        let config_out = inner.config.clone();
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
-            move || Ok((inner, (config_out.clone(), model_id))),
-            handle_qwen35_cmd,
-        );
-
-        // 3. Return Promise — event loop processes onCreateWorker while we await
-        env.spawn_future(async move {
-            let (config_final, model_id_final) = init_rx.await.map_err(|_| {
-                napi::Error::from_reason("Model thread exited during CPU tensor load")
-            })??;
-
-            Ok(Qwen3_5Model {
-                thread,
-                config: config_final,
-                model_id: model_id_final,
-                _cache_limit_guard: crate::cache_limit::coordinator().register(0),
-            })
-        })
-    }
-
     /// Generate text from a prompt token sequence.
     #[napi]
     pub async fn generate(
@@ -5457,72 +5350,6 @@ impl Qwen3_5Model {
     }
 }
 
-/// Native-only streaming: NAPI ThreadsafeFunction path (libuv, ~1 μs per token).
-///
-/// Kept in a separate `#[napi] impl` block so that napi-rs does not generate
-/// the `chat_stream_c_callback` helper under `#[cfg(target_family = "wasm")]`,
-/// where `ThreadsafeFunction` is unavailable.
-#[cfg(not(target_family = "wasm"))]
-#[napi]
-impl Qwen3_5Model {
-    /// Streaming chat API with tool calling support.
-    ///
-    /// Dispatches to the dedicated model thread. Tokens stream back directly
-    /// via an `Arc<dyn ChatStreamSink>` handed to the model thread. Returns a
-    /// `ChatStreamHandle` immediately; generation runs on the model thread.
-    /// Call `handle.cancel()` to abort generation early.
-    ///
-    /// Native-only. On WASM, use `chatStreamSab` instead.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-        });
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-
-        let sink: Arc<dyn ChatStreamSink> = Arc::new(TsfnSink::new(callback));
-
-        // Send streaming command to model thread. The sink is Send + Sync + 'static
-        // so it can be moved into the model thread without an intermediate channel.
-        self.thread.send(Qwen35Cmd::ChatStream {
-            messages,
-            config,
-            sink,
-            cancelled: cancelled_inner,
-        })?;
-
-        Ok(ChatStreamHandle { cancelled })
-    }
-}
-
 /// WASM-only streaming: SharedArrayBuffer ring-buffer path (~25 tok/s).
 ///
 /// Kept in a separate `#[napi] impl` block so that napi-rs generates the
@@ -5530,6 +5357,114 @@ impl Qwen3_5Model {
 #[cfg(target_family = "wasm")]
 #[napi]
 impl Qwen3_5Model {
+    /// Load a model from pre-created GPU buffers (zero-copy, for browser WebGPU).
+    ///
+    /// The JS side parses SafeTensors headers, creates GPU buffers directly from the
+    /// fetch ArrayBuffer, and passes the buffer handles here. No weight data touches
+    /// WASM linear memory.
+    #[napi]
+    pub fn load_from_gpu_buffers<'env>(
+        env: &'env Env,
+        config_json: String,
+        gpu_tensors: Vec<persistence::GpuTensorInfo>,
+        tokenizer_json: String,
+        tokenizer_config_json: Option<String>,
+        processor_config_json: Option<String>,
+    ) -> Result<PromiseRaw<'env, Qwen3_5Model>> {
+        let inner = persistence::build_model_inner_from_gpu_buffers(
+            &config_json,
+            gpu_tensors,
+            &tokenizer_json,
+            tokenizer_config_json.as_deref(),
+            processor_config_json.as_deref(),
+        )?;
+
+        let model_id = inner.model_id;
+        let config_out = inner.config.clone();
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+            move || Ok((inner, (config_out.clone(), model_id))),
+            handle_qwen35_cmd,
+        );
+
+        env.spawn_future(async move {
+            let (config_final, model_id_final) = init_rx.await.map_err(|_| {
+                napi::Error::from_reason("Model thread exited during GPU buffer load")
+            })??;
+
+            Ok(Qwen3_5Model {
+                thread,
+                config: config_final,
+                model_id: model_id_final,
+                _cache_limit_guard: crate::cache_limit::coordinator().register(0),
+            })
+        })
+    }
+
+    /// Store config and tokenizer strings before tensor accumulation begins.
+    ///
+    /// Must be called BEFORE `addCpuTensor`, while WASM memory is still small.
+    /// Avoids emnapi DataView bounds errors from passing large strings after
+    /// WASM memory has grown past its initial size.
+    #[napi]
+    pub fn set_cpu_model_config(
+        config_json: String,
+        tokenizer_json: String,
+        tokenizer_config_json: Option<String>,
+    ) {
+        persistence::set_cpu_model_config(config_json, tokenizer_json, tokenizer_config_json)
+    }
+
+    /// Add one CPU-resident tensor to the accumulator (for per-tensor loading).
+    ///
+    /// Creates an MLX array from the WASM pointer immediately (C++ copies the
+    /// data). JS should free the WASM buffer right after this returns.
+    /// Call `buildModelFromCpuTensors` after all tensors are accumulated.
+    #[napi]
+    pub fn add_cpu_tensor(
+        name: String,
+        ptr: u32,
+        byte_size: u32,
+        shape: Vec<i32>,
+        dtype_code: i32,
+    ) -> Result<()> {
+        persistence::accumulate_cpu_tensor(name, ptr, byte_size, shape, dtype_code)
+    }
+
+    /// Build model from previously stored config and accumulated CPU tensors.
+    ///
+    /// Uses PromiseRaw + spawn_future pattern: sync work + thread spawn run
+    /// in the fn body, then spawn_future returns a Promise immediately. The
+    /// event loop is then free to process onCreateWorker for the model thread.
+    #[napi]
+    pub fn build_model_from_cpu_tensors<'env>(
+        env: &'env Env,
+    ) -> Result<PromiseRaw<'env, Qwen3_5Model>> {
+        // 1. All sync work: parse config, build model, apply weights
+        let inner = persistence::build_model_inner_from_cpu_tensors()?;
+
+        // 2. Spawn model thread (posts onCreateWorker to event loop)
+        let model_id = inner.model_id;
+        let config_out = inner.config.clone();
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+            move || Ok((inner, (config_out.clone(), model_id))),
+            handle_qwen35_cmd,
+        );
+
+        // 3. Return Promise. The event loop processes onCreateWorker while we await.
+        env.spawn_future(async move {
+            let (config_final, model_id_final) = init_rx.await.map_err(|_| {
+                napi::Error::from_reason("Model thread exited during CPU tensor load")
+            })??;
+
+            Ok(Qwen3_5Model {
+                thread,
+                config: config_final,
+                model_id: model_id_final,
+                _cache_limit_guard: crate::cache_limit::coordinator().register(0),
+            })
+        })
+    }
+
     /// Streaming chat API backed by a SharedArrayBuffer ring buffer.
     ///
     /// The caller passes a `Buffer` whose backing is a region inside the

@@ -13,7 +13,8 @@
 #endif
 #include "mlx/backend/gpu/device_info.h"
 
-// Forward-declare gpu::synchronize for the WASM eval helper
+#if defined(__wasi__)
+// Forward-declare gpu::synchronize for the WASM eval helper.
 namespace mlx::core::gpu { void synchronize(Stream s); }
 
 // WASM-safe eval: uses async_eval + gpu::synchronize instead of
@@ -29,6 +30,15 @@ inline void eval_safe(std::vector<mlx::core::array> arrays) {
   mlx::core::gpu::synchronize(
       mlx::core::default_stream(mlx::core::Device::gpu));
 }
+#else
+inline void eval_safe(mlx::core::array& arr) {
+  arr.eval();
+}
+
+inline void eval_safe(std::vector<mlx::core::array> arrays) {
+  mlx::core::eval(arrays);
+}
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -218,6 +228,7 @@ int32_t from_mlx_dtype(mlx::core::Dtype dtype) {
 }
 
 bool copy_to_buffer(const array& arr, float* out, size_t len) {
+#if defined(__wasi__)
   // Materialize the array as contiguous f32 for readback.
   // We use add(zeros) to force broadcast expansion, then astype to f32.
   // For bf16 on WebGPU: convert to f32 BEFORE the add(zeros) to avoid a
@@ -239,6 +250,27 @@ bool copy_to_buffer(const array& arr, float* out, size_t len) {
   const float* data = flat.data<float>();
   std::copy(data, data + len, out);
   return true;
+#else
+  // Force materialization by adding zeros - this ensures broadcast values are
+  // expanded
+  auto zeros_arr = zeros(arr.shape(), arr.dtype());
+  auto materialized = add(arr, zeros_arr);
+  materialized.eval();
+
+  // Now flatten and copy
+  auto flat = flatten(materialized);
+  auto host = (flat.dtype() == mlx::core::float32)
+                  ? flat
+                  : astype(flat, mlx::core::float32);
+  host.eval();
+
+  if (host.size() != len) {
+    return false;
+  }
+  const float* data = host.data<float>();
+  std::copy(data, data + len, out);
+  return true;
+#endif
 }
 
 bool copy_to_buffer(const array& arr, int32_t* out, size_t len) {

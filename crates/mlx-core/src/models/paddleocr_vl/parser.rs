@@ -12,10 +12,10 @@
  * - <bcel> : blank/bottom cell
  * - <rcel> : right cell boundary
  */
-#[cfg(feature = "rust_xlsxwriter")]
+#[cfg(feature = "full")]
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
-#[cfg(feature = "rust_xlsxwriter")]
+#[cfg(feature = "full")]
 use rust_xlsxwriter::{Format, Workbook};
 use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
@@ -644,7 +644,7 @@ pub fn parse_paddle_response(text: String, config: Option<ParserConfig>) -> Stri
     format_document_internal(&doc, &cfg)
 }
 
-#[cfg(feature = "rust_xlsxwriter")]
+#[cfg(feature = "full")]
 /// Convert a ParsedDocument to XLSX bytes.
 ///
 /// Each Table element becomes a separate worksheet. Paragraphs are collected
@@ -718,7 +718,7 @@ fn document_to_xlsx_internal(doc: &ParsedDocument) -> napi::Result<Vec<u8>> {
     Ok(buf)
 }
 
-#[cfg(feature = "rust_xlsxwriter")]
+#[cfg(feature = "full")]
 /// Convert a ParsedDocument to an XLSX buffer.
 ///
 /// Each Table element becomes a separate worksheet with bold headers.
@@ -739,7 +739,7 @@ pub fn document_to_xlsx(doc: ParsedDocument) -> napi::Result<Buffer> {
     Ok(Buffer::from(bytes))
 }
 
-#[cfg(feature = "rust_xlsxwriter")]
+#[cfg(feature = "full")]
 /// Parse VLM output and save directly as XLSX file.
 ///
 /// Convenience function that parses VLM output and writes it to an XLSX file.

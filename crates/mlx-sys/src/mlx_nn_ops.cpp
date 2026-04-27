@@ -2,10 +2,14 @@
 #include "mlx/dtype.h"
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <new>
 #include <string>
+#ifndef MLX_USE_WEBGPU
+#include <mlx/graph_utils.h>
+#endif
 #ifdef MLX_USE_WEBGPU
 // Forward-declare the WebGPU types we need (avoids webgpu.h include path issues)
 typedef struct WGPUBufferImpl* WGPUBuffer;
@@ -4542,4 +4546,3 @@ int mlx_test_matmul_broadcast_batch(float* out_vals, int max_count) {
 }
 
 }  // extern "C"
-

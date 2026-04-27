@@ -1,10 +1,12 @@
 use mlx_sys as sys;
+#[cfg(target_family = "wasm")]
 use napi_derive::napi;
 
 /// Toggle the WebGPU backend's packed-bf16 weight storage path at runtime.
 /// Called from the TS worker init with the value of the `?pack_bf16=1`
 /// query param so the browser demos can A/B the packed kernel without a
 /// rebuild. On non-WebGPU builds this is a no-op.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_set_packed_bf16_enabled(enabled: bool) {
     unsafe { sys::mlx_wgpu_set_packed_bf16_enabled(enabled) }
@@ -15,6 +17,7 @@ pub fn wgpu_set_packed_bf16_enabled(enabled: bool) {
 /// `?sdpa_fallback=1` demo URL param so the browser can A/B-test the
 /// fused vector + tile SDPA kernels against the baseline without a
 /// rebuild. No-op on non-WebGPU builds.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_set_sdpa_fallback_forced(enabled: bool) {
     unsafe { sys::mlx_wgpu_set_sdpa_fallback_forced(enabled) }
@@ -31,6 +34,7 @@ pub fn wgpu_set_sdpa_fallback_forced(enabled: bool) {
 /// TS test harness so the browser can A/B without a rebuild. The C++ side
 /// also reads `MLX_WGPU_COMPILE_MLP=1` from the env on first use, so a
 /// native build can opt in via the shell environment.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_set_swiglu_compile_enabled(enabled: bool) {
     unsafe { sys::mlx_set_swiglu_compile_enabled(enabled) }
@@ -39,6 +43,7 @@ pub fn wgpu_set_swiglu_compile_enabled(enabled: bool) {
 /// Read the current state of the Phase 6b SwiGLU compile flag. Useful for
 /// the demo profile UI to display whether the run is on the compiled or
 /// eager path.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_get_swiglu_compile_enabled() -> bool {
     unsafe { sys::mlx_get_swiglu_compile_enabled() }
@@ -50,6 +55,7 @@ pub fn wgpu_get_swiglu_compile_enabled() -> bool {
 /// by the browser test suite to gate the phase: dispatch count must drop
 /// by at least 40 between the two paths and `max_abs_err` must stay near
 /// zero. Returns an empty vec if the underlying C++ test fails.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_test_compile_mlp_dispatch_delta() -> Vec<f64> {
     let mut out = [0.0_f64; 4];
@@ -71,6 +77,7 @@ pub fn wgpu_test_compile_mlp_dispatch_delta() -> Vec<f64> {
 /// Default OFF. Plumbed from the `?compile_gdn_pre=1` demo URL param and
 /// the TS test harness. The C++ side also reads `MLX_WGPU_COMPILE_GDN_PRE=1`
 /// from the env on first use for native builds.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_set_gdn_pre_compile_enabled(enabled: bool) {
     unsafe { sys::mlx_set_gdn_pre_compile_enabled(enabled) }
@@ -78,6 +85,7 @@ pub fn wgpu_set_gdn_pre_compile_enabled(enabled: bool) {
 
 /// Read the current state of the Phase 6c GDN prefusion compile flag.
 /// Useful for the demo profile UI and for the TS test harness.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_get_gdn_pre_compile_enabled() -> bool {
     unsafe { sys::mlx_get_gdn_pre_compile_enabled() }
@@ -88,6 +96,7 @@ pub fn wgpu_get_gdn_pre_compile_enabled() -> bool {
 /// `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`.
 /// Gate: delta must be at least the Phase 6c spec floor (see the TS
 /// harness for the exact threshold) and `max_abs_err` must be zero.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_test_compile_gdn_pre_dispatch_delta() -> Vec<f64> {
     let mut out = [0.0_f64; 4];
@@ -111,6 +120,7 @@ pub fn wgpu_test_compile_gdn_pre_dispatch_delta() -> Vec<f64> {
 /// Default OFF. Plumbed from the `?compile_gdn_post=1` demo URL param and
 /// the TS test harness. The C++ side also reads `MLX_WGPU_COMPILE_GDN_POST=1`
 /// from the env on first use for native builds.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_set_gdn_post_compile_enabled(enabled: bool) {
     unsafe { sys::mlx_set_gdn_post_compile_enabled(enabled) }
@@ -118,6 +128,7 @@ pub fn wgpu_set_gdn_post_compile_enabled(enabled: bool) {
 
 /// Read the current state of the Phase 6d GDN postfusion compile flag.
 /// Useful for the demo profile UI and for the TS test harness.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_get_gdn_post_compile_enabled() -> bool {
     unsafe { sys::mlx_get_gdn_post_compile_enabled() }
@@ -128,6 +139,7 @@ pub fn wgpu_get_gdn_post_compile_enabled() -> bool {
 /// `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`. Gate:
 /// delta must be at least the Phase 6d spec floor (see the TS harness for
 /// the exact threshold) and `max_abs_err` must be zero.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_test_compile_gdn_post_dispatch_delta() -> Vec<f64> {
     let mut out = [0.0_f64; 4];
@@ -153,6 +165,7 @@ pub fn wgpu_test_compile_gdn_post_dispatch_delta() -> Vec<f64> {
 /// Default OFF. Plumbed from the `?compile_gdn_g=1` demo URL param and
 /// the TS test harness. The C++ side also reads `MLX_WGPU_COMPILE_GDN_G=1`
 /// from the env on first use for native builds.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_set_gdn_g_compile_enabled(enabled: bool) {
     unsafe { sys::mlx_set_gdn_g_compile_enabled(enabled) }
@@ -160,6 +173,7 @@ pub fn wgpu_set_gdn_g_compile_enabled(enabled: bool) {
 
 /// Read the current state of the Phase 6e GDN compute_g compile flag.
 /// Useful for the demo profile UI and for the TS test harness.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_get_gdn_g_compile_enabled() -> bool {
     unsafe { sys::mlx_get_gdn_g_compile_enabled() }
@@ -170,6 +184,7 @@ pub fn wgpu_get_gdn_g_compile_enabled() -> bool {
 /// `[eager_dispatches, compiled_dispatches, max_abs_err, n_iters]`. Gate:
 /// delta must be at least the Phase 6e spec floor (see the TS harness for
 /// the exact threshold) and `max_abs_err` must be zero.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_test_compile_gdn_g_dispatch_delta() -> Vec<f64> {
     let mut out = [0.0_f64; 4];
@@ -186,6 +201,7 @@ pub fn wgpu_test_compile_gdn_g_dispatch_delta() -> Vec<f64> {
 /// A/B test functions (set when their underlying C++ call throws). The
 /// browser test worker calls this on rc != 0 to include the C++ exception
 /// text in the vitest failure output instead of an opaque numeric code.
+#[cfg(target_family = "wasm")]
 #[napi]
 pub fn wgpu_get_last_test_error() -> String {
     let mut buf = vec![0_i8; 512];

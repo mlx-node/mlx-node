@@ -221,9 +221,7 @@ void mlx_qwen35_compiled_init_from_prefill(
 
     // Break the lazy RNG split chain from model initialization.
     auto rng_key = mlx::core::random::KeySequence::default_().next();
-    mlx::core::async_eval({rng_key});
-    mlx::core::gpu::synchronize(
-        mlx::core::default_stream(mlx::core::Device::gpu));
+    eval_safe(rng_key);
   } catch (const std::exception& e) {
     std::cerr << "[MLX] mlx_qwen35_compiled_init_from_prefill: " << e.what() << std::endl;
     g_compile_inited = false;
@@ -312,10 +310,8 @@ void mlx_qwen35_sync_eval_compiled_caches() {
     for (const auto& c : g_compiled_caches) {
       to_eval.push_back(c);
     }
-    // Use async_eval + synchronize (eval() hangs on WASM)
-    mlx::core::async_eval(std::move(to_eval));
-    mlx::core::gpu::synchronize(
-        mlx::core::default_stream(mlx::core::Device::gpu));
+    // Uses async_eval + synchronize on WASM; native keeps the regular eval path.
+    eval_safe(std::move(to_eval));
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] Exception in sync_eval_compiled_caches: %s\n", e.what());
     fflush(stderr);
@@ -355,9 +351,7 @@ int mlx_qwen35_get_cache_offset() {
 int mlx_qwen35_read_weight(const char* name, float* out, int max_count) {
   try {
     auto w = get_weight(std::string(name));
-    mlx::core::async_eval({w});
-    mlx::core::gpu::synchronize(
-        mlx::core::default_stream(mlx::core::Device::gpu));
+    eval_safe(w);
     auto* d = w.data<float>();
     if (!d) return -2;
     int count = std::min(max_count, static_cast<int>(w.size()));
