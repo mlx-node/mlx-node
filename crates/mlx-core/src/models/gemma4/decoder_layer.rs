@@ -1,6 +1,7 @@
 use crate::array::MxArray;
 use crate::nn::activations::Activations;
 use crate::nn::{Linear, RMSNorm};
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
 use super::attention::Gemma4Attention;
@@ -218,6 +219,76 @@ impl Gemma4DecoderLayer {
         )?;
 
         self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
+    }
+
+    /// Forward pass with paged-or-flat dispatch.
+    ///
+    /// Branches on `kind`:
+    /// * `Sliding` — calls the existing flat `forward(...)` over the
+    ///   per-layer `Gemma4LayerCache::Sliding` slot. Sliding layers
+    ///   stay on the flat `RotatingKVCache` path even when the paged
+    ///   adapter is enabled (window-trimmed semantics don't fit the
+    ///   pool layout).
+    /// * `GlobalPaged { paged_idx }` — pre-norms the input via
+    ///   `input_layernorm`, calls `self_attn.forward_paged` to write
+    ///   K/V into the pool and compute attention, then runs the
+    ///   shared `apply_ffn_ple_scalar` tail.
+    /// * `SharedOnGlobal { anchor_paged_idx }` and
+    ///   `SharedOnSliding { anchor_layer_idx }` are NOT yet routed
+    ///   through this method; they return an error so the dispatch
+    ///   surface fails fast until the shared variants are wired up
+    ///   in the follow-up commit.
+    ///
+    /// `flat_cache` is required for the `Sliding` branch (it's the
+    /// per-layer flat cache slot). For `GlobalPaged` it is ignored
+    /// (the adapter is the source of truth).
+    ///
+    /// `needs_stash` only matters for `Sliding` (mirrors the flat
+    /// `forward(...)` call signature). The paged path doesn't stash
+    /// — KV-shared layers will read directly from the pool via the
+    /// `SharedOnGlobal` branch in the follow-up.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // Wired up in `chat_sync_core_paged` (later commit).
+    pub(crate) fn forward_paged_or_flat(
+        &self,
+        x: &MxArray,
+        kind: Gemma4LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+        mask: Option<&MxArray>,
+        flat_cache: Option<&mut Gemma4LayerCache>,
+        per_layer_input: Option<&MxArray>,
+        needs_stash: bool,
+    ) -> Result<MxArray> {
+        match kind {
+            Gemma4LayerKind::Sliding => {
+                // Flat path: existing forward(...).
+                self.forward(x, mask, flat_cache, per_layer_input, needs_stash)
+            }
+            Gemma4LayerKind::GlobalPaged { paged_idx } => {
+                let _ = flat_cache; // adapter owns K/V for global layers
+                let _ = mask; // paged path uses internal causal/explicit masks
+                let _ = needs_stash; // shared layers read directly from the pool
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out = self.self_attn.forward_paged(
+                    &normed,
+                    adapter,
+                    paged_idx,
+                    first_logical_position,
+                    cached_prefix_len,
+                    is_prefill,
+                )?;
+                self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
+            }
+            Gemma4LayerKind::SharedOnGlobal { .. } | Gemma4LayerKind::SharedOnSliding { .. } => {
+                Err(Error::from_reason(
+                    "Gemma4DecoderLayer::forward_paged_or_flat: KV-shared layer kinds \
+                     are not yet wired (follow-up commit)",
+                ))
+            }
+        }
     }
 
     /// Shared tail after attention: post-attention norm, FFN+MoE, PLE, layer scalar.
