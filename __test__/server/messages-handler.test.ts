@@ -1293,11 +1293,14 @@ describe('handleCreateMessage', () => {
 
   describe('session registry integration', () => {
     it('forwards a top-level system string into the mapped chatSessionStart history', async () => {
-      // The Anthropic endpoint is stateless: every request allocates a
-      // fresh ChatSession via `getOrCreate(null, systemString)`. The
-      // registry parameter is unused on `null`, but the system prompt
-      // still needs to land in the primed history. Guard against a
-      // regression where the endpoint forgets to wire it through.
+      // The Anthropic endpoint is stateless on the wire: every request
+      // looks up the per-model warm slot via `getOrCreateWarmAny`. On
+      // turn 1 (cold start) the lookup misses, so the handler runs a
+      // full `session.reset()` (which in turn calls `model.resetCaches()`)
+      // before priming the history. The system prompt still needs to
+      // land in the primed history so the native side sees it; this
+      // test pins that wiring and the always-resets-via-one-of-two-paths
+      // invariant that landed with the warm-slot feature.
       const registry = new ModelRegistry();
       const mockModel = createMockModel();
       registry.register('test-model', mockModel);
@@ -1322,10 +1325,17 @@ describe('handleCreateMessage', () => {
       const systemMsg = messages.find((m) => m.role === 'system');
       expect(systemMsg?.content).toBe('You are terse.');
 
-      // The Anthropic endpoint never adopts a session, so the registry
-      // stays empty regardless of the request outcome.
+      // Post Task 1: the warm-slot feature adopts the session on a
+      // successful turn under the sentinel id `'__msg_warm__'` so the
+      // NEXT request with byte-equal `system` can lease it. Exactly
+      // one of (`reset()`, `resetPreservingNativeCacheForWarmReuse`)
+      // fires per turn — turn 1 is a miss, so the cold-reset path
+      // ran and `resetCaches` was called at least once.
       const sessionReg = registry.getSessionRegistry('test-model');
-      expect(sessionReg!.size).toBe(0);
+      expect(sessionReg!.size).toBe(1);
+      // oxlint-disable-next-line @typescript-eslint/unbound-method
+      const resetCachesSpy = mockModel.resetCaches as unknown as ReturnType<typeof vi.fn>;
+      expect(resetCachesSpy).toHaveBeenCalled();
     });
 
     it('handles a structured system field (array of content blocks)', async () => {
@@ -2330,33 +2340,30 @@ describe('handleCreateMessage', () => {
       expect(getHeaders()['content-type']).toBe('text/event-stream');
     });
 
-    it('messages endpoint does NOT steal a warm tier-2 session keyed to the same prompt_cache_key', async () => {
-      // Regression test for the destructive tier-2 leak.
+    it('messages endpoint can lease an instructions-equal warm slot via getOrCreateWarmAny (single-warm cross-endpoint reuse)', async () => {
+      // Post-Task 1 contract: `/v1/messages` no longer passes
+      // `prompt_cache_key` (the field is not on the type) and no longer
+      // routes through tier-1 / tier-2 lookups at all. Instead it calls
+      // `SessionRegistry.getOrCreateWarmAny(requestedSystem)`, which
+      // walks the registry's at-most-one warm entry and leases it on
+      // BYTE-EQUAL `instructions`, IGNORING the entry's prior
+      // `previousResponseId` keying and `promptCacheKey`.
       //
-      // OLD bug: passing `body.prompt_cache_key` to
-      // `sessionReg.getOrCreate` would (on tier-2 hit) LEASE the
-      // actual warm `ChatSession` wrapper out of the registry. The
-      // `/v1/messages` handler then ran the turn through THAT
-      // wrapper — calling `warmSession.reset()` before
-      // `warmSession.primeHistory(...)` — silently stealing the
-      // `/v1/responses` endpoint's warm session and destroying its
-      // JS-side state, without ever calling `sessionReg.adopt()` to
-      // put it back.
-      //
-      // FIX: `/v1/messages` passes `null` for the cache key so
-      // tier-2 lookup is disabled. The handler is handed a FRESH
-      // `ChatSession` (same single-warm native KV regardless — the
-      // invariant still requires `entries.clear()` in the fallthrough),
-      // and the pre-seeded warm wrapper's JS-side state is NEVER
-      // touched. That means `warmSession.primeHistory` and
-      // `warmSession.reset` never fire on this request.
-      //
-      // The entries.clear() in the fallthrough still evicts the
-      // pre-seeded entry from the registry (it must — the native KV
-      // is shared across sessions through the same ModelRegistry
-      // binding, and the handler is about to advance it). What the
-      // fix PREVENTS is the active use of someone else's `ChatSession`
-      // wrapper.
+      // The behaviour-change this test pins:
+      //   * A pre-seeded entry adopted by /v1/responses with
+      //     `instructions === requestedSystem` IS a valid warm slot for
+      //     /v1/messages — `getOrCreateWarmAny` will lease it.
+      //   * On HIT the handler runs the JS-only warm-reuse helper
+      //     (`resetPreservingNativeCacheForWarmReuse`) instead of a
+      //     full `session.reset()`. The proxy: `model.resetCaches()`
+      //     fires on a full reset and DOES NOT fire on the warm-reuse
+      //     helper (see `chat-session-warm-reuse.ts`).
+      //   * The pre-seeded warm wrapper IS the one running the turn
+      //     (verified via `primeHistory` spy on the same instance).
+      //   * After commit the slot is re-adopted under the sentinel
+      //     `'__msg_warm__'`, NOT under the original `'resp_pre_seed'`
+      //     — that is the expected single-warm cross-endpoint
+      //     eviction documented on `getOrCreateWarmAny`.
       const mockModel = createMockModel();
       const registry = new ModelRegistry();
       registry.register('test-model', mockModel);
@@ -2365,30 +2372,41 @@ describe('handleCreateMessage', () => {
       const warmSession = new ChatSession(mockModel);
       const primeSpy = vi.spyOn(warmSession, 'primeHistory');
       const resetSpy = vi.spyOn(warmSession, 'reset');
-      sessionReg.adopt('resp_pre_seed', warmSession, null, 'chain-xyz');
+      // Adopt under the byte-equal `instructions = "sysA"` so
+      // `getOrCreateWarmAny('sysA')` will hit. The `chain-xyz`
+      // prompt-cache-key is deliberately left in place as a sanity
+      // check — `getOrCreateWarmAny` ignores it.
+      sessionReg.adopt('resp_pre_seed', warmSession, 'sysA', 'chain-xyz');
+      // oxlint-disable-next-line @typescript-eslint/unbound-method
+      const resetCachesSpy = mockModel.resetCaches as unknown as ReturnType<typeof vi.fn>;
+      const resetCachesBefore = resetCachesSpy.mock.calls.length;
 
       const { res, getStatus } = createMockRes();
       await handleCreateMessage(
         res,
         {
           model: 'test-model',
+          system: 'sysA',
           messages: [{ role: 'user', content: 'hi' }],
           max_tokens: 100,
-          // Extension field — forward-compat no-op on /v1/messages
-          // until native KV can survive reset() + primeHistory().
-          prompt_cache_key: 'chain-xyz',
-        } as Parameters<typeof handleCreateMessage>[1],
+        },
         registry,
       );
 
       expect(getStatus()).toBe(200);
-      // The pre-seeded warm wrapper was NOT handed out to the
-      // handler — neither its primeHistory nor its reset method was
-      // invoked. Contrast with the OLD buggy behavior where both
-      // would have fired during the cold-reset-and-reprime cycle
-      // inside `runSessionNonStreaming`.
-      expect(primeSpy).not.toHaveBeenCalled();
+      // Warm-reuse helper fired (NOT a full reset): the pre-seeded
+      // session's `reset()` method was NOT called — the helper writes
+      // to private fields directly — and `model.resetCaches()` did
+      // not advance.
       expect(resetSpy).not.toHaveBeenCalled();
+      expect(resetCachesSpy.mock.calls.length).toBe(resetCachesBefore);
+      // The pre-seeded warm wrapper was the one running the turn.
+      expect(primeSpy).toHaveBeenCalledTimes(1);
+      // After commit the slot is re-adopted under the sentinel id
+      // `'__msg_warm__'`. The `entries.clear()` inside
+      // `getOrCreateWarmAny` clobbered the prior 'resp_pre_seed' key,
+      // and `adopt` re-keyed the same session under the sentinel.
+      expect(sessionReg.size).toBe(1);
     });
   });
 
@@ -2472,6 +2490,539 @@ describe('handleCreateMessage', () => {
       releaseFirst();
       await promiseA;
       await promiseB;
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Warm-slot KV reuse via getOrCreateWarmAny (Task 1)
+  //
+  // Coverage matrix for the feature that landed in commits 7424ac8..f9759bf:
+  //   * Three-turn replay (non-streaming) reuses the warm slot.
+  //   * Three-turn replay (streaming) reuses the warm slot, but the
+  //     `X-Session-Cache` header stays at `'fresh'` (intentional —
+  //     SSE flushes headers pre-dispatch so there is no pre-flush
+  //     proof of native KV reuse to advertise).
+  //   * Instructions drift between turns invalidates the slot.
+  //   * Mid-decode failure does NOT poison the slot for the next turn.
+  //   * Model hot-swap (`unregister` + `register`) drops the slot.
+  //   * Cross-endpoint single-warm trade-off: a /v1/messages turn that
+  //     leases an instructions-equal entry pre-seeded under any prior
+  //     id (e.g. a /v1/responses `'resp_xyz'`) clobbers the original
+  //     keying when it adopts under `'__msg_warm__'`.
+  //
+  // Warm-reuse witness: `model.resetCaches()` is called by
+  // `ChatSession.reset()` but NOT by
+  // `resetPreservingNativeCacheForWarmReuse(session)` (see
+  // `packages/server/src/chat-session-warm-reuse.ts`). Comparing the
+  // mock's `resetCaches.mock.calls.length` between turns is therefore
+  // a behavioural witness for which reset path fired.
+  // -----------------------------------------------------------------------
+
+  describe('warm-slot KV reuse via getOrCreateWarmAny', () => {
+    it('three-turn non-streaming replay reuses the warm slot (resetCaches stays flat after turn 1)', async () => {
+      // Turn 1: cold start (empty registry). `getOrCreateWarmAny` misses,
+      //   handler runs full `session.reset()` -> `resetCaches` fires.
+      //   `cachedTokens: 0`, header `fresh`, no `x-cached-tokens`.
+      // Turn 2 / Turn 3: warm slot leased. Handler runs the JS-only
+      //   `resetPreservingNativeCacheForWarmReuse` (NO resetCaches call).
+      //   `cachedTokens > 0`, header `prefix_hit`, `x-cached-tokens` present.
+      const startResults = [
+        makeChatResult({ text: 'A1', cachedTokens: 0 }),
+        makeChatResult({ text: 'A2', cachedTokens: 12 }),
+        makeChatResult({ text: 'A3', cachedTokens: 24 }),
+      ];
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(startResults[0])
+        .mockResolvedValueOnce(startResults[1])
+        .mockResolvedValueOnce(startResults[2]);
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+
+      // ---- Turn 1 ----
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'A' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r1.getStatus()).toBe(200);
+      expect(r1.getHeaders()['x-session-cache']).toBe('fresh');
+      expect(r1.getHeaders()['x-cached-tokens']).toBeUndefined();
+      expect(sessionReg.size).toBe(1);
+      // Turn 1 cold reset fired.
+      const resetCachesAfterT1 = resetCaches.mock.calls.length;
+      expect(resetCachesAfterT1).toBeGreaterThanOrEqual(1);
+      // Capture the leased session via the chatSessionStart spy: the
+      // `ChatSession.startFromHistory` invocation that produced this
+      // call passed the rebuilt history as the first arg. We capture
+      // the session identity indirectly by leasing the warm slot
+      // ourselves below — the registry's at-most-one entry is the
+      // session we just adopted.
+
+      // ---- Turn 2 ----
+      const r2 = createMockRes();
+      await handleCreateMessage(
+        r2.res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: 'A1' },
+            { role: 'user', content: 'B' },
+          ],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r2.getStatus()).toBe(200);
+      // Warm slot leased and native reuse confirmed (cachedTokens > 0).
+      expect(r2.getHeaders()['x-session-cache']).toBe('prefix_hit');
+      expect(r2.getHeaders()['x-cached-tokens']).toBe('12');
+      expect(sessionReg.size).toBe(1);
+      // CRITICAL: `resetCaches` was NOT called between turn 1 and
+      // turn 2 — the warm-reuse helper wipes JS state only.
+      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+
+      // ---- Turn 3 ----
+      const r3 = createMockRes();
+      await handleCreateMessage(
+        r3.res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: 'A1' },
+            { role: 'user', content: 'B' },
+            { role: 'assistant', content: 'A2' },
+            { role: 'user', content: 'C' },
+          ],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r3.getStatus()).toBe(200);
+      expect(r3.getHeaders()['x-session-cache']).toBe('prefix_hit');
+      expect(r3.getHeaders()['x-cached-tokens']).toBe('24');
+      expect(sessionReg.size).toBe(1);
+      // Warm-reuse helper still wins — no further resetCaches call.
+      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+
+      // All three turns went through the cold-start native entry
+      // point because `/v1/messages` always replays the full history
+      // (the chat-session delta API cannot splice a multi-message
+      // tail). The `chatSessionContinue` rejecting stub guarantees
+      // we never accidentally took the hot path.
+      expect(chatSessionStart).toHaveBeenCalledTimes(3);
+    });
+
+    it('three-turn streaming replay reuses the warm slot (header stays fresh by design)', async () => {
+      // Streaming counterpart of the previous test. Behaviour mirror:
+      //   * Each turn flushes a clean SSE wire (`message_start` ...
+      //     `message_stop`).
+      //   * `wasCommitted() && streamResult.ok` lets adopt fire on
+      //     each successful turn -> `sessionReg.size === 1`.
+      //   * Turn 2 / Turn 3 hit the warm slot -> warm-reuse helper
+      //     fires (no resetCaches call advance).
+      //   * Header is ALWAYS `'fresh'` on streaming — Task 1 commit
+      //     f9759bf documents that streaming intentionally lacks a
+      //     pre-flush proof of native KV reuse, so it cannot promote
+      //     to `prefix_hit` without acting as a presence side-channel.
+      function makeStream(text: string) {
+        return async function* () {
+          yield { text, done: false, isReasoning: false };
+          yield {
+            text,
+            done: true,
+            finishReason: 'stop',
+            toolCalls: [] as ToolCallResult[],
+            thinking: null,
+            numTokens: 3,
+            promptTokens: 5,
+            reasoningTokens: 0,
+            rawText: text,
+          };
+        };
+      }
+      const stream1 = vi.fn().mockImplementationOnce(makeStream('A1'));
+      stream1.mockImplementationOnce(makeStream('A2')).mockImplementationOnce(makeStream('A3'));
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming test')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: stream1,
+        chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('stream-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('stream-model')!;
+
+      async function runTurn(messages: Array<{ role: 'user' | 'assistant'; content: string }>) {
+        const mock = createMockRes();
+        await handleCreateMessage(
+          mock.res,
+          {
+            model: 'stream-model',
+            messages,
+            max_tokens: 100,
+            stream: true,
+          },
+          registry,
+        );
+        return { events: parseSSE(mock.getBody()), headers: mock.getHeaders() };
+      }
+
+      // ---- Turn 1 ----
+      const t1 = await runTurn([{ role: 'user', content: 'A' }]);
+      expect(t1.headers['x-session-cache']).toBe('fresh');
+      expect(t1.events[0].event).toBe('message_start');
+      expect(t1.events.find((e) => e.event === 'message_stop')).toBeDefined();
+      expect(sessionReg.size).toBe(1);
+      const resetCachesAfterT1 = resetCaches.mock.calls.length;
+      expect(resetCachesAfterT1).toBeGreaterThanOrEqual(1);
+
+      // ---- Turn 2 ----
+      const t2 = await runTurn([
+        { role: 'user', content: 'A' },
+        { role: 'assistant', content: 'A1' },
+        { role: 'user', content: 'B' },
+      ]);
+      // Header STAYS fresh on streaming — see comment block.
+      expect(t2.headers['x-session-cache']).toBe('fresh');
+      expect(t2.events.find((e) => e.event === 'message_stop')).toBeDefined();
+      expect(sessionReg.size).toBe(1);
+      // Warm-reuse helper fired — no resetCaches call advance.
+      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+
+      // ---- Turn 3 ----
+      const t3 = await runTurn([
+        { role: 'user', content: 'A' },
+        { role: 'assistant', content: 'A1' },
+        { role: 'user', content: 'B' },
+        { role: 'assistant', content: 'A2' },
+        { role: 'user', content: 'C' },
+      ]);
+      expect(t3.headers['x-session-cache']).toBe('fresh');
+      expect(t3.events.find((e) => e.event === 'message_stop')).toBeDefined();
+      expect(sessionReg.size).toBe(1);
+      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+
+      // All three turns dispatched through the streaming cold-start
+      // entry point.
+      expect(stream1).toHaveBeenCalledTimes(3);
+    });
+
+    it('instructions mismatch invalidates the warm slot — full reset fires on turn 2', async () => {
+      // Turn 1 with `system: "S1"` adopts the slot under the sentinel.
+      // Turn 2 with `system: "S2"` — `getOrCreateWarmAny` returns a
+      // miss (instructions drift), `entries.clear()` runs in the miss
+      // branch, and the handler runs a full `session.reset()` so the
+      // shared native KV cache is wiped before the new system prompt
+      // is primed (the cross-request cache-affinity guard documented
+      // in messages.ts). After turn 2 the new session is itself
+      // adopted under the sentinel, so `size === 1` again.
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'first', cachedTokens: 0 }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'second', cachedTokens: 0 }));
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+
+      // Turn 1: system "S1".
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'test-model',
+          system: 'S1',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r1.getStatus()).toBe(200);
+      expect(sessionReg.size).toBe(1);
+      const resetCachesAfterT1 = resetCaches.mock.calls.length;
+      expect(resetCachesAfterT1).toBeGreaterThanOrEqual(1);
+
+      // Turn 2: system "S2" — same conversation otherwise. Slot from
+      // turn 1 is invalidated by the byte-equal compare in
+      // `getOrCreateWarmAny`.
+      const r2 = createMockRes();
+      await handleCreateMessage(
+        r2.res,
+        {
+          model: 'test-model',
+          system: 'S2',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r2.getStatus()).toBe(200);
+      // Header is `fresh` — the lookup missed so no `prefix_hit`
+      // promotion, and `cachedTokens === 0` would have demoted it
+      // anyway.
+      expect(r2.getHeaders()['x-session-cache']).toBe('fresh');
+      // Full `session.reset()` fired — `model.resetCaches()` was
+      // called at least one more time after turn 1.
+      expect(resetCaches.mock.calls.length).toBeGreaterThan(resetCachesAfterT1);
+      // The new session was adopted under the sentinel.
+      expect(sessionReg.size).toBe(1);
+    });
+
+    it('mid-decode failure (streaming finishReason=error) does NOT poison the warm slot', async () => {
+      // The `streamResult.ok && wasCommitted()` adopt gate must keep
+      // the slot empty when the turn signalled failure. We use the
+      // `finishReason: 'error'` variant because it routes through the
+      // chat-session uncommitted path AND through the streaming-mock
+      // harness already used for the analogous regression in this
+      // file (line ~1361). The thrown-mid-decode variant is exercised
+      // separately by the existing "routes a mid-decode throw"
+      // regression at line ~1048, which already pins
+      // `sessionReg.size === 0` post-failure.
+      const failingStream = async function* () {
+        yield { text: 'partial', done: false, isReasoning: false };
+        yield {
+          text: 'partial',
+          done: true,
+          finishReason: 'error',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: 'partial',
+        };
+      };
+      const successfulStream = async function* () {
+        yield { text: 'ok', done: false, isReasoning: false };
+        yield {
+          text: 'ok',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [] as ToolCallResult[],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: 'ok',
+        };
+      };
+      const streamSpy = vi.fn().mockImplementationOnce(failingStream).mockImplementationOnce(successfulStream);
+      const resetCaches = vi.fn();
+      const mockModel = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('streaming test')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: streamSpy,
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+
+      // Turn 1: failing stream. The handler emits a streaming `error`
+      // event in place of `message_stop` and the gate denies adopt.
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+      const t1Events = parseSSE(r1.getBody());
+      expect(t1Events.find((e) => e.event === 'message_stop')).toBeUndefined();
+      expect(t1Events.find((e) => e.event === 'error')).toBeDefined();
+      // Slot dropped — NOT adopted.
+      expect(sessionReg.size).toBe(0);
+      const resetCachesAfterT1 = resetCaches.mock.calls.length;
+
+      // Turn 2: a fresh request. The slot is empty, so
+      // `getOrCreateWarmAny` MISSES — handler runs the full
+      // `session.reset()` path (NOT the warm-reuse helper). That
+      // means `model.resetCaches()` advances at least one more time.
+      const r2 = createMockRes();
+      await handleCreateMessage(
+        r2.res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi again' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+      const t2Events = parseSSE(r2.getBody());
+      expect(t2Events.find((e) => e.event === 'message_stop')).toBeDefined();
+      expect(resetCaches.mock.calls.length).toBeGreaterThan(resetCachesAfterT1);
+      // Successful turn 2 adopts.
+      expect(sessionReg.size).toBe(1);
+    });
+
+    it('model hot-swap (unregister + register) drops the warm slot', async () => {
+      // `ModelRegistry.register` rebuilds the per-model
+      // `SessionRegistry`, so the old warm slot is torn down with
+      // the old registry. After re-registering, a follow-up turn
+      // takes the cold-start path (resetCaches fires on the NEW
+      // model) and the new slot is then adopted under the sentinel.
+      const modelA = createMockModel(makeChatResult({ text: 'A' }));
+      const registry = new ModelRegistry();
+      registry.register('m', modelA);
+
+      // Turn 1 against modelA — adopts the warm slot.
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'm',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r1.getStatus()).toBe(200);
+      const sessionRegA = registry.getSessionRegistry('m')!;
+      expect(sessionRegA.size).toBe(1);
+
+      // Hot swap: unregister + register a brand-new model. The
+      // SessionRegistry binding is rebuilt; the old slot is gone.
+      registry.unregister('m');
+      const modelB = createMockModel(makeChatResult({ text: 'B' }));
+      registry.register('m', modelB);
+      const sessionRegB = registry.getSessionRegistry('m')!;
+      // It IS a different SessionRegistry instance.
+      expect(sessionRegB).not.toBe(sessionRegA);
+      // And it starts empty.
+      expect(sessionRegB.size).toBe(0);
+
+      // Turn 2 against the new binding — cold start on modelB, warm
+      // slot is empty so resetCaches fires on the NEW model.
+      const r2 = createMockRes();
+      await handleCreateMessage(
+        r2.res,
+        {
+          model: 'm',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r2.getStatus()).toBe(200);
+      // Header `fresh` (cold start, cachedTokens === 0).
+      expect(r2.getHeaders()['x-session-cache']).toBe('fresh');
+      // Full reset fired on the new model.
+      // oxlint-disable-next-line @typescript-eslint/unbound-method
+      const resetCachesB = modelB.resetCaches as unknown as ReturnType<typeof vi.fn>;
+      expect(resetCachesB).toHaveBeenCalled();
+      // The old model's resetCaches did NOT fire on this turn
+      // (it is detached from the live binding).
+      // The new slot is adopted.
+      expect(sessionRegB.size).toBe(1);
+    });
+
+    it('cross-endpoint single-warm trade-off: a /v1/messages turn evicts a pre-seeded responses-style entry', async () => {
+      // Pre-seed an entry the way `/v1/responses` would (under a
+      // `'resp_xyz'` id, a `'sysA'` instructions string, and a
+      // `'chain-key'` prompt-cache key). `getOrCreateWarmAny`
+      // IGNORES `responseId` and `promptCacheKey` and matches solely
+      // on byte-equal `instructions`, so the /v1/messages turn
+      // leases the slot on a `system: 'sysA'` request.
+      //
+      // After the turn commits, the slot is re-adopted under the
+      // sentinel `'__msg_warm__'` — a subsequent `/v1/responses`
+      // request that tries to resume `'resp_xyz'` via tier-1 will
+      // MISS, because `entries.clear()` clobbered the original key
+      // when the messages handler leased the slot. This is the
+      // explicit single-warm cross-endpoint trade-off documented on
+      // `SessionRegistry.getOrCreateWarmAny`'s docstring (and the
+      // long block comment in messages.ts around the call site).
+      const mockModel = createMockModel(makeChatResult({ text: 'reused', cachedTokens: 7 }));
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+
+      // Pre-seed the way /v1/responses would.
+      const warmSession = new ChatSession(mockModel);
+      const primeSpy = vi.spyOn(warmSession, 'primeHistory');
+      const resetSpy = vi.spyOn(warmSession, 'reset');
+      sessionReg.adopt('resp_xyz', warmSession, 'sysA', 'chain-key');
+      // oxlint-disable-next-line @typescript-eslint/unbound-method
+      const resetCaches = mockModel.resetCaches as unknown as ReturnType<typeof vi.fn>;
+      const resetCachesBefore = resetCaches.mock.calls.length;
+
+      // /v1/messages turn with `system: 'sysA'`. Lookup leases the
+      // pre-seeded session on byte-equal instructions.
+      const r1 = createMockRes();
+      await handleCreateMessage(
+        r1.res,
+        {
+          model: 'test-model',
+          system: 'sysA',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+      expect(r1.getStatus()).toBe(200);
+      // Warm-reuse helper fired (NOT a full reset on the leased
+      // session): `warmSession.reset()` was NOT called and the model's
+      // `resetCaches` did not advance.
+      expect(resetSpy).not.toHaveBeenCalled();
+      expect(resetCaches.mock.calls.length).toBe(resetCachesBefore);
+      // Native cache reuse confirmed (`cachedTokens > 0`) so the
+      // header promotes to `prefix_hit`.
+      expect(r1.getHeaders()['x-session-cache']).toBe('prefix_hit');
+      expect(r1.getHeaders()['x-cached-tokens']).toBe('7');
+      // The pre-seeded session WAS the one running the turn.
+      expect(primeSpy).toHaveBeenCalledTimes(1);
+      // Slot is re-adopted under the sentinel — exactly one entry.
+      expect(sessionReg.size).toBe(1);
+
+      // Subsequent /v1/responses-style tier-1 lookup against the
+      // original `'resp_xyz'` id MISSES — the prior key was
+      // clobbered by `entries.clear()` inside `getOrCreateWarmAny`
+      // and re-keyed under the sentinel. Operators who need
+      // stronger isolation should run separate model bindings or
+      // front the server with a tenant-aware proxy (per the
+      // single-warm trade-off documented in the registry).
+      const probe = sessionReg.getOrCreate('resp_xyz', 'sysA');
+      expect(probe.hit).toBe(false);
     });
   });
 });
