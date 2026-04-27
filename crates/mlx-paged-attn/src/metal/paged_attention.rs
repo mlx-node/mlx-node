@@ -219,10 +219,18 @@ pub fn dispatch_paged_attention_v1(
     encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
     encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
-    // Calculate threadgroup memory size
-    // Need space for logits (max_seq_len floats) and reduction workspace
-    let threadgroup_mem_size = (params.max_seq_len as usize * std::mem::size_of::<f32>())
-        + (2 * 8 * std::mem::size_of::<f32>()); // 2 * NUM_WARPS * sizeof(float)
+    // Calculate threadgroup memory size — see
+    // `dispatch_paged_attention_v1_raw` for the full justification. Same
+    // bug pattern: original allocation only covered the QK softmax phase's
+    // `logits[max_seq_len]` + reduction scratchpad, silently truncating
+    // the V-reduction tree (which reinterprets `shared_mem` and needs
+    // `(NUM_WARPS/2) * HEAD_SIZE` f32s) when max_seq_len is small.
+    const NUM_WARPS_V1: usize = 8;
+    let logits_bytes_v1 = params.max_seq_len as usize * std::mem::size_of::<f32>();
+    let v_reduce_bytes_v1 =
+        (NUM_WARPS_V1 / 2) * params.head_size as usize * std::mem::size_of::<f32>();
+    let red_smem_bytes_v1 = 2 * NUM_WARPS_V1 * std::mem::size_of::<f32>();
+    let threadgroup_mem_size = logits_bytes_v1.max(v_reduce_bytes_v1) + red_smem_bytes_v1;
     encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
 
     // Dispatch: (num_heads, num_seqs, 1) threadgroups, 256 threads each
@@ -373,9 +381,19 @@ pub fn dispatch_paged_attention_v2(
         encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
         encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
-        // Threadgroup memory
-        let threadgroup_mem_size = (PARTITION_SIZE as usize * std::mem::size_of::<f32>())
-            + (2 * 8 * std::mem::size_of::<f32>());
+        // Threadgroup memory — same dual-purpose layout as V1 (see
+        // `dispatch_paged_attention_v1_raw`). V2 partitions context into
+        // PARTITION_SIZE chunks, so logits is sized by PARTITION_SIZE
+        // rather than max_seq_len. V-reduction still needs
+        // `(NUM_WARPS/2) * HEAD_SIZE` f32s; for HEAD_SIZE >= 256 that
+        // exceeds PARTITION_SIZE * 4 bytes (4*256*4 = 4096 > 512*4 =
+        // 2048), so the per-phase max keeps the largest models safe.
+        const NUM_WARPS_V2: usize = 8;
+        let logits_bytes_v2 = PARTITION_SIZE as usize * std::mem::size_of::<f32>();
+        let v_reduce_bytes_v2 =
+            (NUM_WARPS_V2 / 2) * params.head_size as usize * std::mem::size_of::<f32>();
+        let red_smem_bytes_v2 = 2 * NUM_WARPS_V2 * std::mem::size_of::<f32>();
+        let threadgroup_mem_size = logits_bytes_v2.max(v_reduce_bytes_v2) + red_smem_bytes_v2;
         encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
 
         // Dispatch: (num_heads, num_seqs, max_num_partitions)
@@ -716,9 +734,31 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
     encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
-    // Calculate threadgroup memory size
-    let threadgroup_mem_size = (params.max_seq_len as usize * std::mem::size_of::<f32>())
-        + (2 * 8 * std::mem::size_of::<f32>()); // 2 * NUM_WARPS * sizeof(float)
+    // Calculate threadgroup memory size.
+    //
+    // The kernel reuses `shared_mem` for two phases:
+    //   1. QK softmax — `logits[max_seq_len]` f32s + `red_smem[2*NUM_WARPS]` f32s.
+    //   2. V output reduction — reinterprets `shared_mem` as
+    //      `out_smem[mid * HEAD_SIZE]` f32s where `mid = NUM_WARPS/2 = 4`
+    //      at the first reduction step.
+    //
+    // The original allocation only sized phase (1), which silently
+    // truncates phase (2) when `max_seq_len * 4 < (NUM_WARPS/2) * HEAD_SIZE * 4`.
+    // In production max_seq_len always dominates (8192 × 4 = 32 KiB ≫
+    // 4 × 128 × 4 = 2 KiB), so this never surfaced. Small-context decode
+    // tests (e.g. P1C-4 toy validation: 24 tokens × HEAD_SIZE 64 → 96 < 1024)
+    // hit the truncation: upper warps' writes during the reduction tree
+    // land at undefined positions — empirically, only some lanes' rows
+    // get reduced correctly, so the gathered output equals the kernel-warp-0
+    // contribution for those rows and the multi-block sum gets dropped
+    // for the remainder. Take the per-phase max of (1) and (2) plus the
+    // dedicated red_smem scratchpad.
+    const NUM_WARPS_FOR_REDUCE: usize = 8; // NUM_THREADS (256) / NUM_SIMD_LANES (32)
+    let logits_bytes = params.max_seq_len as usize * std::mem::size_of::<f32>();
+    let v_reduce_bytes =
+        (NUM_WARPS_FOR_REDUCE / 2) * params.head_size as usize * std::mem::size_of::<f32>();
+    let red_smem_bytes = 2 * NUM_WARPS_FOR_REDUCE * std::mem::size_of::<f32>();
+    let threadgroup_mem_size = logits_bytes.max(v_reduce_bytes) + red_smem_bytes;
     encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
 
     // Dispatch: (num_heads, num_seqs, 1) threadgroups, 256 threads each
@@ -889,9 +929,19 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
         encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
-        // Threadgroup memory
-        let threadgroup_mem_size = (PARTITION_SIZE as usize * std::mem::size_of::<f32>())
-            + (2 * 8 * std::mem::size_of::<f32>());
+        // Threadgroup memory — same dual-purpose layout as V1 (see
+        // `dispatch_paged_attention_v1_raw`). V2 partitions context into
+        // PARTITION_SIZE chunks, so logits is sized by PARTITION_SIZE
+        // rather than max_seq_len. V-reduction still needs
+        // `(NUM_WARPS/2) * HEAD_SIZE` f32s; for HEAD_SIZE >= 256 that
+        // exceeds PARTITION_SIZE * 4 bytes (4*256*4 = 4096 > 512*4 =
+        // 2048), so the per-phase max keeps the largest models safe.
+        const NUM_WARPS_V2: usize = 8;
+        let logits_bytes_v2 = PARTITION_SIZE as usize * std::mem::size_of::<f32>();
+        let v_reduce_bytes_v2 =
+            (NUM_WARPS_V2 / 2) * params.head_size as usize * std::mem::size_of::<f32>();
+        let red_smem_bytes_v2 = 2 * NUM_WARPS_V2 * std::mem::size_of::<f32>();
+        let threadgroup_mem_size = logits_bytes_v2.max(v_reduce_bytes_v2) + red_smem_bytes_v2;
         encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
 
         // Dispatch: (num_heads, num_seqs, max_num_partitions)
