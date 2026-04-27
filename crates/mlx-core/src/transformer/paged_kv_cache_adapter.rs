@@ -253,6 +253,106 @@ pub(crate) fn validate_kv_input(
     })
 }
 
+/// Outcome of `validate_query_input`. Mirrors `validate_kv_input` in
+/// shape: returns the primitives the caller needs after a successful
+/// validation. `num_query_heads` is `queries.shape[1]` extracted once so
+/// `gather_kv_for_decode` doesn't redo the lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryInputInfo {
+    pub num_query_heads: u32,
+}
+
+/// Validate that `queries` metadata is compatible with `config` for a
+/// paged attention decode dispatch. Pure CPU — no pool / Metal access, no
+/// MLX runtime — so it can be unit-tested on any platform (mirrors the
+/// `validate_kv_input` design).
+///
+/// Checks:
+/// 1. `queries` is 3-D `[1, num_query_heads, head_size]`.
+/// 2. `shape_at(0) == 1` (single-request adapter; multi-sequence batching is
+///    out of scope for P1C-3).
+/// 3. `shape_at(1) > 0` (at least one query head).
+/// 4. `shape_at(2) == config.head_size` — kernel re-derives strides from
+///    `num_query_heads * head_size`; an inner-dim mismatch would walk past
+///    the end of the buffer on the GPU.
+/// 5. dtype is `Float16` or `BFloat16` (kernel io_type is half-precision).
+/// 6. `layer_idx < num_layers`.
+///
+/// Returns `QueryInputInfo { num_query_heads }` on success.
+pub(crate) fn validate_query_input(
+    queries: &KvTensorMeta,
+    config: &PagedAttentionConfig,
+    num_layers: usize,
+    layer_idx: u32,
+) -> Result<QueryInputInfo, String> {
+    if (layer_idx as usize) >= num_layers {
+        return Err(format!(
+            "gather_kv_for_decode: layer_idx {layer_idx} out of range \
+             (num_layers = {num_layers})"
+        ));
+    }
+    if queries.ndim != 3 {
+        return Err(format!(
+            "gather_kv_for_decode: queries shape mismatch: expected 3-D \
+             [1, num_query_heads, head_size]; got ndim {}",
+            queries.ndim
+        ));
+    }
+    if queries.shape.len() < 3 {
+        return Err(format!(
+            "gather_kv_for_decode: queries KvTensorMeta shape length \
+             disagrees with ndim (shape.len()={}, ndim={})",
+            queries.shape.len(),
+            queries.ndim
+        ));
+    }
+    let q_n = queries.shape[0];
+    let q_h = queries.shape[1];
+    let q_d = queries.shape[2];
+    if q_n != 1 {
+        return Err(format!(
+            "gather_kv_for_decode: queries shape mismatch: shape_at(0) = {q_n}, \
+             expected 1 (single-request adapter; multi-sequence batching is out of scope for P1C-3)"
+        ));
+    }
+    if q_h <= 0 {
+        return Err(format!(
+            "gather_kv_for_decode: queries shape mismatch: shape_at(1) = {q_h}, \
+             expected > 0 (at least one query head)"
+        ));
+    }
+    let expected_head_size = config.head_size as i64;
+    if q_d != expected_head_size {
+        return Err(format!(
+            "gather_kv_for_decode: queries shape mismatch: shape_at(2) = {q_d}, \
+             expected head_size = {expected_head_size}; kernel re-derives strides \
+             from num_query_heads * head_size"
+        ));
+    }
+    match queries.dtype {
+        DType::Float16 | DType::BFloat16 => {}
+        other => {
+            return Err(format!(
+                "gather_kv_for_decode: queries dtype not supported: {other:?}. \
+                 Supported: Float16, BFloat16 (kernel io_type is half-precision)."
+            ));
+        }
+    }
+    // q_h is bounded by typical model head counts (Qwen 3.5 ≤ 64). Cast to
+    // u32 is safe.
+    Ok(QueryInputInfo {
+        num_query_heads: q_h as u32,
+    })
+}
+
+/// Build the `block_ids` array for a paged-attention decode dispatch from
+/// a `SequenceBlockTable`. Block IDs are `u32` ≥ 0 and bounded by allocator
+/// capacity (far below `i32::MAX`), so the cast is safe. Pure CPU — keeps
+/// the marshalling test cheap and runtime-independent.
+pub(crate) fn build_decode_block_ids(table: &SequenceBlockTable) -> Vec<i32> {
+    table.blocks().iter().map(|b| b.block_id as i32).collect()
+}
+
 /// Result of a prefix-cache lookup.
 #[derive(Debug)]
 pub struct CachedPrefix {
@@ -696,6 +796,104 @@ impl PagedKVCacheAdapter {
         _first_logical_position: u32,
     ) -> Result<(), String> {
         Err("update_keys_values is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Run paged attention against this layer's K/V buffers for a single
+    /// decode step on the active request, returning the attention output.
+    ///
+    /// `queries` shape: `[1, num_query_heads, head_size]`, dtype `Float16` or
+    /// `BFloat16` (the kernel's io template is fixed at half-precision; a
+    /// BFloat16 buffer's bytes are reinterpreted as Float16 — same caveat
+    /// as the existing `AttentionLayer::forward` decode path).
+    ///
+    /// `scale`: typically `1.0 / sqrt(head_size as f32)`.
+    /// `softcap`: `1.0` disables softcapping.
+    ///
+    /// Returns the attention output as an `MxArray` of shape
+    /// `[1, num_query_heads, head_size]`, dtype Float32. The kernel writes
+    /// Float16; we copy GPU → host → MLX as Float32 to keep the conversion
+    /// trivial — **P1C-3 follow-up**: replace with zero-copy
+    /// `mlx_array_from_metal_buffer` so the result stays on-device.
+    ///
+    /// ## Single-request semantics
+    ///
+    /// Always runs with `num_seqs = 1`. The adapter is per-request — the
+    /// block_table holds exactly the active request's blocks and the
+    /// context_lens entry is the request's `num_tokens()`.
+    #[cfg(target_os = "macos")]
+    pub fn gather_kv_for_decode(
+        &self,
+        layer_idx: u32,
+        queries: &MxArray,
+        scale: f32,
+        softcap: f32,
+    ) -> Result<MxArray, String> {
+        // 1. Active request?
+        let block_table = self.block_table.as_ref().ok_or_else(|| {
+            "gather_kv_for_decode called before reset_for_new_request".to_string()
+        })?;
+
+        // 2. Tokens recorded?
+        let num_tokens = block_table.num_tokens();
+        if num_tokens == 0 {
+            return Err("gather_kv_for_decode called before any tokens recorded".to_string());
+        }
+
+        // 3. Validate query metadata. Routed through `validate_query_input`
+        //    so the rejection paths are CPU-only and don't require Metal /
+        //    MLX runtime to exercise.
+        let q_meta = KvTensorMeta::from_array(queries, "queries")?;
+        let info = validate_query_input(
+            &q_meta,
+            self.layer_kv_pool.config(),
+            self.layer_kv_pool.num_layers(),
+            layer_idx,
+        )?;
+        let num_query_heads = info.num_query_heads;
+
+        // 4. Build block_ids array (i32, length = num_blocks). PhysicalBlock
+        //    block_ids are u32 ≥ 0; bounded by num_blocks (allocator
+        //    capacity), far below i32::MAX. Cast is safe.
+        let block_ids = build_decode_block_ids(block_table);
+
+        // 5. Dispatch and wrap output in MxArray. P1C-3 follow-up:
+        //    `to_mlx_array` does GPU → host → MLX as Float32; replace with
+        //    zero-copy `mlx_array_from_metal_buffer` for on-device decode.
+        // SAFETY:
+        // - queries.as_raw_ptr() is borrowed from `queries: &MxArray` and
+        //   stays valid for the synchronous dispatch.
+        // - Block / context buffers are constructed and held inside
+        //   `gather_attention` for the dispatch's lifetime.
+        // - Pool key/value caches outlive `&self`.
+        let output = unsafe {
+            self.layer_kv_pool.gather_attention(
+                layer_idx,
+                queries.as_raw_ptr(),
+                &block_ids,
+                num_tokens,
+                num_query_heads,
+                scale,
+                softcap,
+            )?
+        };
+
+        // SAFETY: `to_mlx_array` materializes a fresh mlx_array (heap
+        // allocated by mlx_sys); ownership transfers to the MxArray below.
+        let raw = unsafe { output.to_mlx_array()? };
+        MxArray::from_handle(raw, "gather_kv_for_decode")
+            .map_err(|e| format!("gather_kv_for_decode: failed to wrap output array: {e}"))
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn gather_kv_for_decode(
+        &self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _scale: f32,
+        _softcap: f32,
+    ) -> Result<MxArray, String> {
+        Err("gather_kv_for_decode is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Register the request's FULL blocks in the prefix cache so future
@@ -2165,5 +2363,324 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------ gather_kv_for_decode ------------------------
+    //
+    // Validation tests use the CPU-only `validate_query_input` helper so the
+    // rejection paths run on any platform (no Metal, no MLX runtime, no
+    // `MxArray::zeros`). The single happy-path Metal dispatch test gracefully
+    // skips when no Metal device is present (CI VMs / sandboxes).
+
+    /// Build a `KvTensorMeta` for a queries tensor of the given shape +
+    /// dtype. Mirrors the `meta` helper used by `validate_kv_input` tests.
+    fn q_meta(num_seqs: i64, num_query_heads: i64, head_size: i64, dtype: DType) -> KvTensorMeta {
+        KvTensorMeta {
+            ndim: 3,
+            shape: vec![num_seqs, num_query_heads, head_size],
+            dtype,
+        }
+    }
+
+    /// `validate_query_input` must reject queries with the wrong rank. The
+    /// kernel re-derives strides assuming a 3-D layout; a 2-D query would
+    /// silently underflow stride math.
+    #[test]
+    fn test_gather_kv_rejects_wrong_rank() {
+        let cfg = validation_test_config();
+        let bad = KvTensorMeta {
+            ndim: 2,
+            shape: vec![1, 32],
+            dtype: DType::Float16,
+        };
+        let res = validate_query_input(&bad, &cfg, 2, 0);
+        assert!(res.is_err(), "expected rank rejection");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("ndim") || msg.contains("3-D"),
+            "error must mention rank, got: {msg}"
+        );
+    }
+
+    /// `validate_query_input` must reject queries whose leading dim != 1.
+    /// The adapter is per-request (single sequence); multi-seq batching is
+    /// out of scope for P1C-3.
+    #[test]
+    fn test_gather_kv_rejects_wrong_leading_dim() {
+        let cfg = validation_test_config();
+        let bad = q_meta(2, 4, 32, DType::Float16);
+        let res = validate_query_input(&bad, &cfg, 2, 0);
+        assert!(res.is_err(), "expected leading-dim rejection");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("shape_at(0)") || msg.contains("expected 1"),
+            "error must mention leading dim mismatch, got: {msg}"
+        );
+    }
+
+    /// `validate_query_input` must reject queries whose innermost dim does
+    /// not match the pool's head_size. Same OOB-read hazard as the K/V
+    /// validation case.
+    #[test]
+    fn test_gather_kv_rejects_wrong_head_size() {
+        let cfg = validation_test_config();
+        // Pool head_size = 32 (from `validation_test_config`); pass 16.
+        let bad = q_meta(1, 4, 16, DType::Float16);
+        let res = validate_query_input(&bad, &cfg, 2, 0);
+        assert!(res.is_err(), "expected head_size rejection");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("head_size"),
+            "error must mention head_size, got: {msg}"
+        );
+    }
+
+    /// `validate_query_input` must reject zero query heads — kernel dispatch
+    /// would then have num_heads=0 and skip all work.
+    #[test]
+    fn test_gather_kv_rejects_zero_query_heads() {
+        let cfg = validation_test_config();
+        let bad = q_meta(1, 0, 32, DType::Float16);
+        let res = validate_query_input(&bad, &cfg, 2, 0);
+        assert!(res.is_err(), "expected zero-heads rejection");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("shape_at(1)") || msg.contains("at least one"),
+            "error must mention zero heads, got: {msg}"
+        );
+    }
+
+    /// `validate_query_input` must reject Float32 / Int32 query inputs.
+    /// The kernel io_type template is fixed at half-precision; routing
+    /// 4-byte elements would silently corrupt the read.
+    #[test]
+    fn test_gather_kv_rejects_unsupported_dtype_float32() {
+        let cfg = validation_test_config();
+        let bad = q_meta(1, 4, 32, DType::Float32);
+        let res = validate_query_input(&bad, &cfg, 2, 0);
+        assert!(res.is_err(), "expected Float32 rejection");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("not supported") && msg.contains("Float32"),
+            "error must mention Float32 unsupported, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_gather_kv_rejects_unsupported_dtype_int32() {
+        let cfg = validation_test_config();
+        let bad = q_meta(1, 4, 32, DType::Int32);
+        let res = validate_query_input(&bad, &cfg, 2, 0);
+        assert!(res.is_err(), "expected Int32 rejection");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("not supported"),
+            "error must mention unsupported, got: {msg}"
+        );
+    }
+
+    /// `validate_query_input` must reject layer_idx beyond `num_layers`.
+    /// Triggers the same descriptive error as the runtime layer-OOB check.
+    #[test]
+    fn test_gather_kv_rejects_layer_idx_out_of_range() {
+        let cfg = validation_test_config();
+        let q = q_meta(1, 4, 32, DType::Float16);
+        // Pool created with num_layers = 2; layer_idx = 5 is out of range.
+        let res = validate_query_input(&q, &cfg, 2, 5);
+        assert!(res.is_err(), "expected layer_idx OOB rejection");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("layer_idx"),
+            "error must mention layer_idx, got: {msg}"
+        );
+    }
+
+    /// `validate_query_input` must accept Float16 and BFloat16 (the kernel
+    /// io_type is half-precision in the existing routing). Belt-and-suspenders
+    /// check that we don't accidentally over-restrict the dtype gate.
+    #[test]
+    fn test_gather_kv_accepts_half_precision() {
+        let cfg = validation_test_config();
+        let f16 = q_meta(1, 4, 32, DType::Float16);
+        assert!(
+            validate_query_input(&f16, &cfg, 2, 0).is_ok(),
+            "Float16 must pass"
+        );
+        let bf16 = q_meta(1, 4, 32, DType::BFloat16);
+        assert!(
+            validate_query_input(&bf16, &cfg, 2, 0).is_ok(),
+            "BFloat16 must pass"
+        );
+    }
+
+    /// `gather_kv_for_decode` must reject calls before any request is active.
+    /// The early return fires before any layer / metal access — uses the
+    /// validation-test pool (graceful skip on no-Metal hosts).
+    #[test]
+    fn test_gather_kv_no_active_request() {
+        let Some(adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_gather_kv_no_active_request: Metal unavailable");
+            return;
+        };
+        // Float16 zeros so this never reaches the kernel anyway, but the
+        // active-request guard fires first.
+        let q = MxArray::zeros(&[1, 1, 32], Some(DType::Float16)).expect("zeros");
+        let res = adapter.gather_kv_for_decode(0, &q, 0.5, 1.0);
+        assert!(res.is_err(), "expected error before reset_for_new_request");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("reset_for_new_request"),
+            "error must mention missing request, got: {msg}"
+        );
+    }
+
+    /// `gather_kv_for_decode` must reject calls before any tokens have been
+    /// recorded (`block_table.num_tokens() == 0`). Attending to nothing
+    /// would dispatch a zero-context kernel and produce garbage.
+    #[test]
+    fn test_gather_kv_zero_tokens() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_gather_kv_zero_tokens: Metal unavailable");
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        // Note: NO record_tokens here.
+        let q = MxArray::zeros(&[1, 1, 32], Some(DType::Float16)).expect("zeros");
+        let res = adapter.gather_kv_for_decode(0, &q, 0.5, 1.0);
+        assert!(res.is_err(), "expected error when num_tokens == 0");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("any tokens recorded") || msg.contains("tokens"),
+            "error must mention zero-tokens, got: {msg}"
+        );
+    }
+
+    /// Pure-CPU correctness check on the block-id marshalling. Build a
+    /// `SequenceBlockTable` with three blocks whose `block_id`s are
+    /// `[42, 3, 17]` and assert the produced `Vec<i32>` is `[42, 3, 17]`
+    /// in the same order. Catches signed-cast / endianness / order bugs
+    /// without needing Metal — `BlockAllocator` allocates on a CPU-only
+    /// path so `new_allocator` works in any sandbox.
+    #[test]
+    fn test_gather_kv_block_table_marshalling() {
+        // BlockAllocator hands out blocks with monotonically-increasing
+        // `block_id`s starting from 0. To get a non-monotonic order
+        // [42, 3, 17] we'd have to instantiate `PhysicalBlock` directly,
+        // but only `BlockAllocator` can. Instead allocate enough blocks
+        // and pick a non-monotonic subset — that still exercises the
+        // ordering: marshalled vec must match the table's iteration
+        // order verbatim.
+        let allocator = new_allocator(64, 4);
+        let mut table = SequenceBlockTable::new(0, 4);
+
+        // Allocate 64 blocks, free all but the ones we want.
+        let mut all = Vec::with_capacity(64);
+        {
+            let mut g = allocator.lock().unwrap();
+            for _ in 0..64 {
+                all.push(g.allocate().expect("alloc"));
+            }
+        }
+        // Pick blocks 42, 3, 17 in that order and add to the table.
+        // Each `Arc<PhysicalBlock>` here has block_id == its index in
+        // the allocator's free list because allocate() returns IDs in
+        // numerical order from a fresh allocator.
+        let want = [42u32, 3, 17];
+        for &idx in &want {
+            let block = Arc::clone(&all[idx as usize]);
+            assert_eq!(
+                block.block_id, idx,
+                "fresh allocator hands out IDs 0..N in order"
+            );
+            table.add_block(block);
+        }
+
+        let marshalled = build_decode_block_ids(&table);
+        assert_eq!(
+            marshalled,
+            vec![42i32, 3, 17],
+            "marshalling must preserve table iteration order, with u32 → i32 cast"
+        );
+    }
+
+    /// Happy-path Metal dispatch on a tiny pool. Allocate 4 tokens worth
+    /// (block_size 8 → 1 block fits), record them, write zero-K/V, and
+    /// dispatch `gather_kv_for_decode`. Validates the kernel name lookup,
+    /// param construction, buffer marshalling, and output shape. We don't
+    /// assert numerical contents — V is uninitialized GPU memory so the
+    /// output is whatever the kernel reads from those slots — only that
+    /// the path returns Ok with the right shape and Float32 dtype (the
+    /// `to_mlx_array` GPU → CPU → MLX path materializes Float32).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gather_kv_for_decode_writes_succeed_on_metal() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(cfg.clone(), 4) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_gather_kv_for_decode_writes_succeed_on_metal: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+
+        // Write four tokens of zeros so the cache slots have a defined
+        // value (not strictly required to call gather, but matches the
+        // production update-then-gather pattern).
+        let k = MxArray::zeros(&[4, 1, 64], Some(DType::Float16)).expect("k zeros");
+        let v = MxArray::zeros(&[4, 1, 64], Some(DType::Float16)).expect("v zeros");
+        k.eval();
+        v.eval();
+        match adapter.update_keys_values(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_gather_kv_for_decode_writes_succeed_on_metal: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+        }
+
+        // Two query heads, head_size matches the pool, dtype Float16.
+        let q = MxArray::zeros(&[1, 2, 64], Some(DType::Float16)).expect("q zeros");
+        q.eval();
+
+        let scale = 1.0_f32 / (64.0_f32).sqrt();
+        let out = match adapter.gather_kv_for_decode(0, &q, scale, 1.0) {
+            Ok(arr) => arr,
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_gather_kv_for_decode_writes_succeed_on_metal: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from gather_kv_for_decode: {e}"),
+        };
+
+        // Output shape: [1, num_query_heads, head_size]. The kernel writes
+        // Float16 internally; `PagedAttentionOutput::to_mlx_array` does a
+        // GPU → host → MLX-Float32 conversion (P1C-3 follow-up: zero-copy
+        // via mlx_array_from_metal_buffer).
+        assert_eq!(out.ndim().unwrap(), 3, "output must be 3-D");
+        assert_eq!(out.shape_at(0).unwrap(), 1);
+        assert_eq!(out.shape_at(1).unwrap(), 2);
+        assert_eq!(out.shape_at(2).unwrap(), 64);
+        assert_eq!(
+            out.dtype().unwrap(),
+            DType::Float32,
+            "to_mlx_array materializes Float32 (GPU host roundtrip); P1C-3 \
+             follow-up: zero-copy via mlx_array_from_metal_buffer"
+        );
     }
 }
