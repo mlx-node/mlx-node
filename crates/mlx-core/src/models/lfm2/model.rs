@@ -272,7 +272,11 @@ impl Lfm2Inner {
         // absolute layer index → ordinal via `config.full_attn_idxs()`.
         //
         // Cache dtype: BFloat16 (LFM2's production dtype).
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
+        // Default to ON: paged-vs-flat parity verified via
+        // `lfm2_paged_vs_flat_parity` integration test (greedy byte-equal +
+        // prefix-reuse byte-equal at BF16 against real LFM2.5-1.2B weights).
+        // Callers can still opt out with `use_block_paged_cache: Some(false)`.
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
             let attn_layer_count = config.full_attn_idxs().len() as u32;
             if attn_layer_count == 0 {
                 return Err(Error::from_reason(
@@ -3587,7 +3591,14 @@ mod paged_adapter_construction_tests {
     /// Two layers: one conv + one full_attention. Mirrors the same hybrid
     /// shape as production LFM2 so the adapter sizing exercises the
     /// "attention layers only" path.
-    fn paged_tiny_config(use_block_paged: bool) -> Lfm2Config {
+    ///
+    /// `use_block_paged` is `Option<bool>` so tests can distinguish the
+    /// three states the production code now cares about:
+    /// * `Some(true)`  — explicit opt-in, paged adapter must allocate.
+    /// * `Some(false)` — explicit opt-out, paged adapter must NOT allocate.
+    /// * `None`        — default-on under the new policy (`unwrap_or(true)`),
+    ///   paged adapter must allocate on Metal hosts.
+    fn paged_tiny_config(use_block_paged: Option<bool>) -> Lfm2Config {
         Lfm2Config {
             vocab_size: 100,
             hidden_size: 64,
@@ -3613,14 +3624,19 @@ mod paged_adapter_construction_tests {
             pad_token_id: 0,
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
-            use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+            use_block_paged_cache: use_block_paged,
         }
     }
 
-    /// Default-flag construction must NOT allocate the block-paged adapter.
+    /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged
+    /// adapter.
+    ///
+    /// The previous "None means no adapter" assertion was removed when the
+    /// default flipped from `unwrap_or(false)` to `unwrap_or(true)`. The
+    /// opt-out path is the new "no adapter" guarantee.
     #[test]
-    fn test_lfm2_inner_no_paged_adapter_when_flag_is_none() {
-        let cfg = paged_tiny_config(false);
+    fn test_lfm2_inner_no_paged_adapter_when_flag_is_explicit_false() {
+        let cfg = paged_tiny_config(Some(false));
         let inner = match Lfm2Inner::new(cfg) {
             Ok(i) => i,
             Err(err) => {
@@ -3634,8 +3650,34 @@ mod paged_adapter_construction_tests {
         };
         assert!(
             inner.paged_adapter.is_none(),
-            "paged_adapter must be None when use_block_paged_cache is None"
+            "paged_adapter must be None when use_block_paged_cache is Some(false)"
         );
+    }
+
+    /// Default-flag construction (`None`) must allocate the block-paged
+    /// adapter under the new default-on policy (`unwrap_or(true)`).
+    /// Allocates a `LayerKVPool`, so requires Metal — gracefully skips on
+    /// no-Metal sandboxes.
+    #[test]
+    fn test_lfm2_inner_paged_adapter_when_flag_is_none_default_on_macos() {
+        let cfg = paged_tiny_config(None);
+        match Lfm2Inner::new(cfg) {
+            Ok(inner) => {
+                assert!(
+                    inner.paged_adapter.is_some(),
+                    "paged_adapter must be Some when use_block_paged_cache is None \
+                     (new default-on policy: unwrap_or(true))"
+                );
+            }
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Lfm2Inner::new failure: {msg}");
+            }
+        }
     }
 
     /// Construction with `use_block_paged_cache: Some(true)` must populate
@@ -3643,7 +3685,7 @@ mod paged_adapter_construction_tests {
     /// gracefully skips on no-Metal sandboxes.
     #[test]
     fn test_lfm2_inner_constructs_paged_adapter_when_flag_is_true() {
-        let cfg = paged_tiny_config(true);
+        let cfg = paged_tiny_config(Some(true));
         match Lfm2Inner::new(cfg) {
             Ok(inner) => {
                 assert!(
@@ -3689,7 +3731,7 @@ mod paged_adapter_construction_tests {
     fn test_lfm2_chat_sync_core_paged_smoke_via_helpers() {
         use crate::array::{DType, MxArray};
 
-        let cfg = paged_tiny_config(true);
+        let cfg = paged_tiny_config(Some(true));
         let mut inner = match Lfm2Inner::new(cfg.clone()) {
             Ok(i) => i,
             Err(err) => {
@@ -3705,7 +3747,7 @@ mod paged_adapter_construction_tests {
         };
         assert!(
             inner.paged_adapter.is_some(),
-            "paged_tiny_config(true) must construct paged_adapter"
+            "paged_tiny_config(Some(true)) must construct paged_adapter"
         );
 
         // Cast all weights to BF16 to match the pool dtype. Random-init
@@ -3871,7 +3913,7 @@ mod paged_adapter_construction_tests {
     /// `num_layers=0` would violate `LayerKVPool::new`'s invariant.
     #[test]
     fn test_lfm2_inner_rejects_all_conv_with_paged_flag() {
-        let mut cfg = paged_tiny_config(true);
+        let mut cfg = paged_tiny_config(Some(true));
         cfg.layer_types = vec!["conv".to_string(), "conv".to_string()];
         let result = Lfm2Inner::new(cfg);
         assert!(

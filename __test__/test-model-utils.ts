@@ -22,6 +22,15 @@ import type { Qwen35Config, Qwen35MoeConfig, Qwen3Config } from '@mlx-node/lm';
 
 /**
  * Tiny Qwen3 test configuration for fast model creation.
+ *
+ * `useBlockPagedCache: false` is set explicitly. After the 2026-04-28
+ * default flip (`unwrap_or(false)` → `unwrap_or(true)` in
+ * `models::qwen3::model::Qwen3Inner::new`), an unspecified flag would
+ * route through the block-paged adapter, whose `LayerKVPool::validate`
+ * rejects `head_size: 16` (this tiny config). These tests do not
+ * exercise the paged path — they validate the chat session API,
+ * trainers, and other surfaces against a tiny random-init model — so
+ * the explicit opt-out keeps them on the flat path.
  */
 export const TINY_TEST_CONFIG: Qwen3Config = {
   vocabSize: 1000,
@@ -39,6 +48,7 @@ export const TINY_TEST_CONFIG: Qwen3Config = {
   padTokenId: 0,
   eosTokenId: 1,
   bosTokenId: 0,
+  useBlockPagedCache: false,
 };
 
 /**

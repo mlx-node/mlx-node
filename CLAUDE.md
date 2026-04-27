@@ -393,17 +393,26 @@ A second KV-cache backend lives alongside the legacy flat `Vec<KVCache>` path: a
 
 | Model        | Config flag wired | Forward dispatch wired | Default | Notes                                                                                                                                                                                                     |
 | ------------ | :---------------: | :--------------------: | :-----: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Qwen3**    |        Yes        |          Yes           |   off   | `chat_sync_core_paged` / `chat_stream_sync_core_paged` route through `forward_paged_adapter` when the flag is on.                                                                                         |
-| **LFM2.5**   |        Yes        |          Yes           |   off   | Hybrid arch: only `full_attention` layers use the adapter (indexed by attention-layer ordinal); conv layers stay on `Lfm2LayerCache::Conv`.                                                               |
+| **Qwen3**    |        Yes        |          Yes           |   **on**   | Default flipped 2026-04-28 after `qwen3_paged_vs_flat_parity` integration test verified greedy byte-equal + prefix-reuse byte-equal at BF16 against real Qwen3-0.6B weights. Opt out via `use_block_paged_cache: Some(false)`. |
+| **LFM2.5**   |        Yes        |          Yes           |   **on**   | Default flipped 2026-04-28 after `lfm2_paged_vs_flat_parity` integration test verified the same on real LFM2.5-1.2B weights. Hybrid arch: only `full_attention` layers use the adapter; conv layers stay on `Lfm2LayerCache::Conv`. Opt out via `use_block_paged_cache: Some(false)`.                                                               |
 | **Gemma4**   |        Yes        |           No           |   off   | Construction plumbing only. Forward dispatch is deferred — sliding+global attention, K=V sharing, `forward_shared`, MoE/PLE all need bespoke per-layer wiring before the path is correct on real weights. |
 | **Qwen3.5**  |        No         |           No           |   n/a   | Compiled C++ forward path (`mlx_qwen35*.cpp`) makes the same retrofit a much larger change; deferred.                                                                                                     |
 | Other models |         —         |           —            |    —    | OCR / document pipelines have no chat dispatch and no KV cache to retrofit.                                                                                                                               |
 
 The flag is **independent of `use_paged_attention`** — that knob drives the legacy `PagedKVCache` + `ContinuousBatchingScheduler` path, which is a different codepath. Both can be on or off independently.
 
-### Why default off
+### Default flip + parity gate
 
-The wired models (Qwen3, LFM2) have unit + smoke coverage of the dispatch plumbing but no real-weights numerical-equivalence validation against the flat path yet. Until that lands, the default stays `false` so production traffic keeps hitting the proven flat-`Vec<KVCache>` path and the new code only runs under explicit opt-in. Server-side Phase 7 simplification (collapsing `SessionRegistry.getOrCreateWarmAny` from the `/v1/messages` warm-slot path, since the native block cache supersedes the JS-side warm slot for full-attention models once enabled) is gated on the same default flip and is intentionally NOT done in this revision.
+Qwen3 and LFM2 paged paths are byte-equal to the flat path under greedy decode, verified by:
+
+- `crates/mlx-core/tests/qwen3_paged_vs_flat_parity.rs` (gated on `MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16`)
+- `crates/mlx-core/tests/lfm2_paged_vs_flat_parity.rs` (gated on `MLX_TEST_MODEL_PATH=./.cache/models/lfm2.5-1.2b-thinking-mlx`)
+
+Run with `cargo test -p mlx-core --test qwen3_paged_vs_flat_parity -- --ignored --nocapture` (analogous for LFM2). Without the env var, both tests skip cleanly. Pass criteria: byte-equal `tokens` and `raw_text` across 4 prompts × 32 tokens, plus byte-equal across a 2-turn dialog (validating `find_cached_prefix` + `finalize_turn_keep_live` cross-turn semantics).
+
+Gemma4 and Qwen3.5 stay default-off until forward dispatch is wired and parity-verified.
+
+Server-side Phase 7 simplification (collapsing `SessionRegistry.getOrCreateWarmAny` from the `/v1/messages` warm-slot path, since the native block cache supersedes the JS-side warm slot for full-attention models) becomes safe to land for Qwen3/LFM2 traffic now that paged is on by default.
 
 ### Parity gate (must pass before flipping the default)
 

@@ -734,7 +734,11 @@ impl Qwen3Inner {
         // ship as BF16 so we hard-code that here. FP8 mode is intentionally
         // not yet plumbed through this path — `KvScaleManager` integration
         // is a follow-up.
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
+        // Default to ON: paged-vs-flat parity verified via
+        // `qwen3_paged_vs_flat_parity` integration test (greedy byte-equal +
+        // prefix-reuse byte-equal at BF16 against real Qwen3-0.6B weights).
+        // Callers can still opt out with `use_block_paged_cache: Some(false)`.
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
             let block_size = config.paged_block_size.unwrap_or(16);
             let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
             let pa_config = mlx_paged_attn::PagedAttentionConfig {
@@ -7448,9 +7452,12 @@ mod tests {
             cfg.use_block_paged_cache, None,
             "use_block_paged_cache must default to None on JSON without the key"
         );
+        // After the default flip (parity-verified Qwen3 paged path):
+        // unwrap_or(true) yields true when the JSON omits the key.
+        // Explicit Some(false) still opts out.
         assert!(
-            !cfg.use_block_paged_cache.unwrap_or(false),
-            "default unwrap_or(false) must yield false"
+            cfg.use_block_paged_cache.unwrap_or(true),
+            "default unwrap_or(true) must yield true (paged on by default)"
         );
     }
 
@@ -7459,8 +7466,15 @@ mod tests {
     /// allowed set, FP8 off, etc.). Mirrors the `tiny_config` helpers in
     /// `utils/functional.rs` but with `head_dim = 32` so the LayerKVPool
     /// constructor accepts it.
+    ///
+    /// `use_block_paged` is `Option<bool>` so tests can distinguish the
+    /// three states the production code now cares about:
+    /// * `Some(true)`  — explicit opt-in, paged adapter must allocate.
+    /// * `Some(false)` — explicit opt-out, paged adapter must NOT allocate.
+    /// * `None`        — default-on under the new policy (`unwrap_or(true)`),
+    ///   paged adapter must allocate on Metal hosts.
     #[cfg(test)]
-    fn paged_tiny_config(use_block_paged: bool) -> super::Qwen3Config {
+    fn paged_tiny_config(use_block_paged: Option<bool>) -> super::Qwen3Config {
         super::Qwen3Config {
             vocab_size: 100,
             hidden_size: 64, // 2 heads * 32 head_dim
@@ -7483,21 +7497,51 @@ mod tests {
             paged_block_size: Some(16),
             use_fp8_cache: None,
             // The flag under test.
-            use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+            use_block_paged_cache: use_block_paged,
         }
     }
 
-    /// Default-flag construction must NOT allocate the block-paged adapter.
-    /// Pure path that only relies on the existing MLX runtime
+    /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged
+    /// adapter. Pure path that only relies on the existing MLX runtime
     /// (matches the rest of the `models::qwen3` test suite).
+    ///
+    /// The previous "None means no adapter" assertion was removed when the
+    /// default flipped from `unwrap_or(false)` to `unwrap_or(true)`. The
+    /// opt-out path is the new "no adapter" guarantee.
     #[test]
-    fn test_qwen3_inner_no_paged_adapter_when_flag_is_none() {
-        let cfg = paged_tiny_config(false);
+    fn test_qwen3_inner_no_paged_adapter_when_flag_is_explicit_false() {
+        let cfg = paged_tiny_config(Some(false));
         let inner = super::Qwen3Inner::new(cfg).expect("Qwen3Inner::new without paged adapter");
         assert!(
             inner.paged_adapter.is_none(),
-            "paged_adapter must be None when use_block_paged_cache is None"
+            "paged_adapter must be None when use_block_paged_cache is Some(false)"
         );
+    }
+
+    /// Default-flag construction (`None`) must allocate the block-paged
+    /// adapter under the new default-on policy (`unwrap_or(true)`).
+    /// Allocates a `LayerKVPool`, so requires Metal — gracefully skips on
+    /// no-Metal sandboxes by matching on the LayerKVPool error string.
+    #[test]
+    fn test_qwen3_inner_paged_adapter_when_flag_is_none_default_on_macos() {
+        let cfg = paged_tiny_config(None);
+        match super::Qwen3Inner::new(cfg) {
+            Ok(inner) => {
+                assert!(
+                    inner.paged_adapter.is_some(),
+                    "paged_adapter must be Some when use_block_paged_cache is None \
+                     (new default-on policy: unwrap_or(true))"
+                );
+            }
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen3Inner::new failure: {msg}");
+            }
+        }
     }
 
     /// Construction with `use_block_paged_cache: Some(true)` must populate
@@ -7506,7 +7550,7 @@ mod tests {
     /// (mirrors the pattern used in the `paged_kv_cache_adapter` test module).
     #[test]
     fn test_qwen3_inner_constructs_paged_adapter_when_flag_is_true() {
-        let cfg = paged_tiny_config(true);
+        let cfg = paged_tiny_config(Some(true));
         match super::Qwen3Inner::new(cfg) {
             Ok(inner) => {
                 assert!(
@@ -7552,7 +7596,7 @@ mod tests {
     /// `test_qwen3_inner_constructs_paged_adapter_when_flag_is_true`).
     #[test]
     fn test_chat_sync_core_paged_smoke_via_helpers() {
-        let cfg = paged_tiny_config(true);
+        let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
             Err(err) => {
@@ -7568,7 +7612,7 @@ mod tests {
         };
         assert!(
             inner.paged_adapter.is_some(),
-            "paged_tiny_config(true) must construct paged_adapter"
+            "paged_tiny_config(Some(true)) must construct paged_adapter"
         );
 
         // The default `Embedding::new` / `Linear::new` random-init produces
@@ -7787,7 +7831,7 @@ mod tests {
     /// Skips on no-Metal hosts.
     #[test]
     fn test_chat_stream_sync_core_paged_smoke_via_helpers() {
-        let cfg = paged_tiny_config(true);
+        let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
             Err(err) => {
@@ -7803,7 +7847,7 @@ mod tests {
         };
         assert!(
             inner.paged_adapter.is_some(),
-            "paged_tiny_config(true) must construct paged_adapter"
+            "paged_tiny_config(Some(true)) must construct paged_adapter"
         );
 
         // Cast all model weights to BFloat16 (paged pool dtype). Same
