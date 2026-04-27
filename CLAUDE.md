@@ -379,6 +379,34 @@ for await (const event of session.sendStream('Hello!')) { ... }
 
 ---
 
+## Block-paged KV cache (vLLM-aligned, opt-in)
+
+A second KV-cache backend lives alongside the legacy flat `Vec<KVCache>` path: a vLLM-style block-paged adapter that lets multiple in-flight requests share refcounted KV blocks for any prompt prefix they have in common (system prompt, shared few-shot preamble, repeated tool-result frames, etc.). It is **off by default** behind the per-model `use_block_paged_cache` config flag (`Option<bool>`, defaults to `None` / treated as `false`) and only the full-attention layers of supported models route through it — sliding-window, conv, and recurrent (GDN) layers continue to use their existing dedicated cache types regardless of the flag.
+
+### Foundation types (`crates/mlx-paged-attn` + `crates/mlx-core/src/transformer`)
+
+- `BlockAllocator` (`crates/mlx-paged-attn/src/block_allocator.rs`) — owns the _logical_ lifecycle: per-block refcounts, LRU eviction, and the prefix-hash table that lets a new request find blocks left over from a prior request whose token prefix matches.
+- `LayerKVPool` (`crates/mlx-paged-attn/src/layer_kv_pool.rs`) — owns the _physical_ storage: per-layer Metal `Buffer` pairs (one for K, one for V) sized to the configured `paged_cache_memory_mb` budget. Independent from `BlockAllocator` so the legacy `CacheEngineManager` path is left untouched.
+- `PagedKVCacheAdapter` (`crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs`) — the session-friendly wrapper the model forward path actually talks to. Holds `(Arc<Mutex<BlockAllocator>>, Arc<LayerKVPool>)` and exposes the per-request lifecycle: `reset_for_new_request` → `find_cached_prefix` → `allocate_suffix_blocks` → `record_tokens` (per token) → `register_full_blocks_for_reuse` → `release_request`.
+
+### Per-model support matrix
+
+| Model        | Config flag wired | Forward dispatch wired | Default | Notes                                                                                                                                                                                                     |
+| ------------ | :---------------: | :--------------------: | :-----: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Qwen3**    |        Yes        |          Yes           |   off   | `chat_sync_core_paged` / `chat_stream_sync_core_paged` route through `forward_paged_adapter` when the flag is on.                                                                                         |
+| **LFM2.5**   |        Yes        |          Yes           |   off   | Hybrid arch: only `full_attention` layers use the adapter (indexed by attention-layer ordinal); conv layers stay on `Lfm2LayerCache::Conv`.                                                               |
+| **Gemma4**   |        Yes        |           No           |   off   | Construction plumbing only. Forward dispatch is deferred — sliding+global attention, K=V sharing, `forward_shared`, MoE/PLE all need bespoke per-layer wiring before the path is correct on real weights. |
+| **Qwen3.5**  |        No         |           No           |   n/a   | Compiled C++ forward path (`mlx_qwen35*.cpp`) makes the same retrofit a much larger change; deferred.                                                                                                     |
+| Other models |         —         |           —            |    —    | OCR / document pipelines have no chat dispatch and no KV cache to retrofit.                                                                                                                               |
+
+The flag is **independent of `use_paged_attention`** — that knob drives the legacy `PagedKVCache` + `ContinuousBatchingScheduler` path, which is a different codepath. Both can be on or off independently.
+
+### Why default off
+
+The wired models (Qwen3, LFM2) have unit + smoke coverage of the dispatch plumbing but no real-weights numerical-equivalence validation against the flat path yet. Until that lands, the default stays `false` so production traffic keeps hitting the proven flat-`Vec<KVCache>` path and the new code only runs under explicit opt-in. Server-side Phase 7 simplification (collapsing `SessionRegistry.getOrCreateWarmAny` from the `/v1/messages` warm-slot path, since the native block cache supersedes the JS-side warm slot for full-attention models once enabled) is gated on the same default flip and is intentionally NOT done in this revision.
+
+---
+
 ## C++ FFI Files (crates/mlx-sys/src/)
 
 | File                   | Lines | Purpose                                                         |
