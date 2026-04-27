@@ -67,9 +67,45 @@ pub(crate) struct KvInputInfo {
     pub input_metal_dtype: mlx_paged_attn::metal::MetalDtype,
 }
 
-/// Validate that `keys`/`values` are compatible with `config` for a paged
-/// `reshape_and_cache` write. Pure CPU — no pool / Metal access — so it can
-/// be unit-tested on any platform.
+/// Pure-data view of an `MxArray`'s metadata. `validate_kv_input` only
+/// inspects ndim/shape/dtype — accepting raw primitives instead of an
+/// `&MxArray` lets the rejection-path tests run in CPU-only sandboxes that
+/// cannot link against the MLX C++ runtime (constructing an `MxArray` via
+/// `MxArray::zeros` calls into MLX, which aborts inside sandboxes that
+/// disallow foreign exceptions before any assertion can run).
+#[derive(Debug, Clone)]
+pub(crate) struct KvTensorMeta {
+    pub ndim: u32,
+    pub shape: Vec<i64>,
+    pub dtype: DType,
+}
+
+impl KvTensorMeta {
+    /// Extract metadata from a live `MxArray`. Only called from the
+    /// production `update_keys_values` path; tests construct `KvTensorMeta`
+    /// directly so they don't need the MLX runtime.
+    pub fn from_array(array: &MxArray, label: &str) -> Result<Self, String> {
+        let ndim = array
+            .ndim()
+            .map_err(|e| format!("{label}.ndim() failed: {e}"))?;
+        let mut shape = Vec::with_capacity(ndim as usize);
+        for axis in 0..ndim {
+            let dim = array
+                .shape_at(axis)
+                .map_err(|e| format!("{label}.shape_at({axis}) failed: {e}"))?;
+            shape.push(dim);
+        }
+        let dtype = array
+            .dtype()
+            .map_err(|e| format!("{label}.dtype() failed: {e}"))?;
+        Ok(Self { ndim, shape, dtype })
+    }
+}
+
+/// Validate that `keys`/`values` metadata is compatible with `config` for a
+/// paged `reshape_and_cache` write. Pure CPU — no pool / Metal access, no
+/// MLX runtime — so it can be unit-tested on any platform, including
+/// sandboxes that abort on MLX C++ initialization.
 ///
 /// Checks:
 /// 1. Both arrays are 3-D `[num_tokens, num_kv_heads, head_size]`.
@@ -90,8 +126,8 @@ pub(crate) struct KvInputInfo {
 ///
 /// Returns `KvInputInfo { num_tokens, input_metal_dtype }` on success.
 pub(crate) fn validate_kv_input(
-    keys: &MxArray,
-    values: &MxArray,
+    keys: &KvTensorMeta,
+    values: &KvTensorMeta,
     config: &PagedAttentionConfig,
 ) -> Result<KvInputInfo, String> {
     // Shape sanity. The kernel re-derives its strides from
@@ -101,39 +137,36 @@ pub(crate) fn validate_kv_input(
     // end of the input buffer. Reject that case loudly *before* kernel
     // dispatch — catching safe-Rust → out-of-bounds-GPU-read scenarios at
     // the API boundary.
-    let key_ndim = keys
-        .ndim()
-        .map_err(|e| format!("keys.ndim() failed: {e}"))?;
-    let value_ndim = values
-        .ndim()
-        .map_err(|e| format!("values.ndim() failed: {e}"))?;
-    if key_ndim != 3 || value_ndim != 3 {
+    if keys.ndim != 3 || values.ndim != 3 {
         return Err(format!(
             "update_keys_values: expected keys/values to be 3-D \
-             [num_tokens, num_kv_heads, head_size]; got ndim {key_ndim}/{value_ndim}"
+             [num_tokens, num_kv_heads, head_size]; got ndim {}/{}",
+            keys.ndim, values.ndim
+        ));
+    }
+    // ndim == 3 above guarantees at least 3 entries in each shape. Defend
+    // anyway so a malformed `KvTensorMeta` (only test code can build one
+    // with mismatched ndim/shape.len()) yields a clear error rather than
+    // panicking on the index access.
+    if keys.shape.len() < 3 || values.shape.len() < 3 {
+        return Err(format!(
+            "update_keys_values: KvTensorMeta shape length disagrees with ndim \
+             (keys: shape.len()={}, ndim={}; values: shape.len()={}, ndim={})",
+            keys.shape.len(),
+            keys.ndim,
+            values.shape.len(),
+            values.ndim,
         ));
     }
     let expected_kv_heads = config.num_kv_heads as i64;
     let expected_head_size = config.head_size as i64;
 
-    let key_n = keys
-        .shape_at(0)
-        .map_err(|e| format!("keys.shape_at(0) failed: {e}"))?;
-    let key_h = keys
-        .shape_at(1)
-        .map_err(|e| format!("keys.shape_at(1) failed: {e}"))?;
-    let key_d = keys
-        .shape_at(2)
-        .map_err(|e| format!("keys.shape_at(2) failed: {e}"))?;
-    let value_n = values
-        .shape_at(0)
-        .map_err(|e| format!("values.shape_at(0) failed: {e}"))?;
-    let value_h = values
-        .shape_at(1)
-        .map_err(|e| format!("values.shape_at(1) failed: {e}"))?;
-    let value_d = values
-        .shape_at(2)
-        .map_err(|e| format!("values.shape_at(2) failed: {e}"))?;
+    let key_n = keys.shape[0];
+    let key_h = keys.shape[1];
+    let key_d = keys.shape[2];
+    let value_n = values.shape[0];
+    let value_h = values.shape[1];
+    let value_d = values.shape[2];
     if key_n != value_n {
         return Err(format!(
             "update_keys_values: keys/values disagree on num_tokens ({key_n} vs \
@@ -182,20 +215,15 @@ pub(crate) fn validate_kv_input(
     // mode keeps the same input requirement — the cache holds 1-byte FP8
     // values, but the *input* is still the original half/bfloat16 K/V that
     // the kernel quantizes during the write.
-    let key_dtype = keys
-        .dtype()
-        .map_err(|e| format!("keys.dtype() failed: {e}"))?;
-    let value_dtype = values
-        .dtype()
-        .map_err(|e| format!("values.dtype() failed: {e}"))?;
-    if key_dtype != value_dtype {
+    if keys.dtype != values.dtype {
         return Err(format!(
-            "update_keys_values: keys/values dtype mismatch ({key_dtype:?} vs \
-             {value_dtype:?}); the kernel templates on a single KV element type and \
-             reinterprets buffers blindly"
+            "update_keys_values: keys/values dtype mismatch ({:?} vs \
+             {:?}); the kernel templates on a single KV element type and \
+             reinterprets buffers blindly",
+            keys.dtype, values.dtype
         ));
     }
-    match key_dtype {
+    match keys.dtype {
         DType::Float16 | DType::BFloat16 => {}
         other => {
             return Err(format!(
@@ -207,7 +235,7 @@ pub(crate) fn validate_kv_input(
     }
 
     #[cfg(target_os = "macos")]
-    let input_metal_dtype = match key_dtype {
+    let input_metal_dtype = match keys.dtype {
         DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
         DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
         // Unreachable: the match above already rejected anything else.
@@ -564,16 +592,18 @@ impl PagedKVCacheAdapter {
 
         // 3. Shape + dtype sanity. Routed through `validate_kv_input` so the
         //    rejection paths can be exercised on any platform (no Metal
-        //    required) — see CPU-only tests below. The kernel re-derives its
-        //    strides from `config.num_kv_heads * config.head_size`; passing
-        //    e.g. `[num_tokens, 1, 1]` keys would still cause the kernel to
-        //    read `num_kv_heads * head_size` worth of bytes per token,
-        //    walking off the end of the buffer. Validation also rejects
-        //    Float32 / unsupported dtypes whose element width does not match
-        //    the pool's 2-byte buffer layout — routing them through
-        //    `write_kv` would silently corrupt the cache or write OOB on the
-        //    GPU.
-        let info = validate_kv_input(keys, values, self.layer_kv_pool.config())?;
+        //    required, no MLX runtime — tests pass `KvTensorMeta` literals
+        //    directly). The kernel re-derives its strides from
+        //    `config.num_kv_heads * config.head_size`; passing e.g.
+        //    `[num_tokens, 1, 1]` keys would still cause the kernel to read
+        //    `num_kv_heads * head_size` worth of bytes per token, walking
+        //    off the end of the buffer. Validation also rejects Float32 /
+        //    unsupported dtypes whose element width does not match the
+        //    pool's 2-byte buffer layout — routing them through `write_kv`
+        //    would silently corrupt the cache or write OOB on the GPU.
+        let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
+        let values_meta = KvTensorMeta::from_array(values, "values")?;
+        let info = validate_kv_input(&keys_meta, &values_meta, self.layer_kv_pool.config())?;
         let num_tokens = info.num_tokens;
         if num_tokens == 0 {
             // Nothing to write — silently succeed rather than dispatch
@@ -1659,21 +1689,32 @@ mod tests {
         }
     }
 
-    /// `validate_kv_input` must reject keys whose `shape_at(1)` does not
-    /// match the pool config's `num_kv_heads`. The kernel re-derives
-    /// strides from `num_kv_heads * head_size`; an inner-dim mismatch
-    /// would walk past the end of the input buffer and read garbage on
-    /// the GPU.
+    /// Build a `KvTensorMeta` literal — the CPU-only descriptor consumed
+    /// by `validate_kv_input`. No `MxArray` construction, no MLX runtime,
+    /// safe to call inside sandboxes that abort on foreign exceptions.
+    fn meta(num_tokens: i64, num_kv_heads: i64, head_size: i64, dtype: DType) -> KvTensorMeta {
+        KvTensorMeta {
+            ndim: 3,
+            shape: vec![num_tokens, num_kv_heads, head_size],
+            dtype,
+        }
+    }
+
+    /// `validate_kv_input` must reject keys whose dim 1 does not match the
+    /// pool config's `num_kv_heads`. The kernel re-derives strides from
+    /// `num_kv_heads * head_size`; an inner-dim mismatch would walk past
+    /// the end of the input buffer and read garbage on the GPU.
     ///
-    /// CPU-only (no `LayerKVPool`, no Metal) so the rejection path is
-    /// covered on every platform — `update_keys_values` calls into
+    /// CPU-only (no `MxArray`, no `LayerKVPool`, no Metal, no MLX C++
+    /// runtime) so the rejection path is covered on every platform —
+    /// `update_keys_values` extracts the same metadata and routes through
     /// `validate_kv_input` for exactly this check.
     #[test]
     fn test_update_keys_values_rejects_wrong_num_kv_heads() {
         let cfg = validation_test_config();
         // Pass 4 KV heads instead of 1.
-        let k = dummy_kv(4, 4, 32);
-        let v = dummy_kv(4, 4, 32);
+        let k = meta(4, 4, 32, DType::BFloat16);
+        let v = meta(4, 4, 32, DType::BFloat16);
         let res = validate_kv_input(&k, &v, &cfg);
         assert!(res.is_err(), "expected num_kv_heads mismatch error");
         let msg = res.err().unwrap();
@@ -1683,15 +1724,15 @@ mod tests {
         );
     }
 
-    /// `validate_kv_input` must reject keys whose `shape_at(2)` does not
-    /// match the pool config's `head_size`. Same OOB-read hazard as the
+    /// `validate_kv_input` must reject keys whose dim 2 does not match the
+    /// pool config's `head_size`. Same OOB-read hazard as the
     /// num_kv_heads case. CPU-only.
     #[test]
     fn test_update_keys_values_rejects_wrong_head_size() {
         let cfg = validation_test_config();
         // Pass head_size = 16 instead of 32.
-        let k = dummy_kv(4, 1, 16);
-        let v = dummy_kv(4, 1, 16);
+        let k = meta(4, 1, 16, DType::BFloat16);
+        let v = meta(4, 1, 16, DType::BFloat16);
         let res = validate_kv_input(&k, &v, &cfg);
         assert!(res.is_err(), "expected head_size mismatch error");
         let msg = res.err().unwrap();
@@ -1708,8 +1749,8 @@ mod tests {
     #[test]
     fn test_update_keys_values_rejects_keys_values_dtype_mismatch() {
         let cfg = validation_test_config();
-        let k = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Float16);
-        let v = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::BFloat16);
+        let k = meta(4, 1, 32, DType::Float16);
+        let v = meta(4, 1, 32, DType::BFloat16);
         let res = validate_kv_input(&k, &v, &cfg);
         assert!(res.is_err(), "expected dtype mismatch error");
         let msg = res.err().unwrap();
@@ -1728,8 +1769,8 @@ mod tests {
     #[test]
     fn test_update_keys_values_rejects_float32_input() {
         let cfg = validation_test_config();
-        let k = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Float32);
-        let v = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Float32);
+        let k = meta(4, 1, 32, DType::Float32);
+        let v = meta(4, 1, 32, DType::Float32);
         let res = validate_kv_input(&k, &v, &cfg);
         assert!(res.is_err(), "expected Float32 rejection");
         let msg = res.err().unwrap();
@@ -1750,8 +1791,8 @@ mod tests {
     #[test]
     fn test_update_keys_values_rejects_int32_input() {
         let cfg = validation_test_config();
-        let k = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Int32);
-        let v = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Int32);
+        let k = meta(4, 1, 32, DType::Int32);
+        let v = meta(4, 1, 32, DType::Int32);
         let res = validate_kv_input(&k, &v, &cfg);
         assert!(res.is_err(), "expected Int32 rejection");
         let msg = res.err().unwrap();
