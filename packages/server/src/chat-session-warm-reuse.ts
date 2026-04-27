@@ -4,9 +4,10 @@
  * Kept out of the `@mlx-node/lm` package exports entirely so downstream
  * consumers cannot reach it: the module lives inside
  * `@mlx-node/server`, its file path is not on the server's export map,
- * and nothing re-exports it. The only caller is
- * `endpoints/responses.ts`, which invokes it exclusively under a
- * `SessionRegistry` HIT gate.
+ * and nothing re-exports it. Callers are the two server endpoints —
+ * `endpoints/responses.ts` (tier-1 / tier-2 HIT branch) and
+ * `endpoints/messages.ts` (`getOrCreateWarmAny` HIT branch) — each
+ * invoking the helper exclusively under a `SessionRegistry` HIT gate.
  *
  * Why this helper exists at all: `ChatSession.reset()` is the safe
  * public wipe — it always calls `model.resetCaches()` because the
@@ -52,9 +53,9 @@ interface ChatSessionWarmReuseInternals {
  * JS-state-only reset that DELIBERATELY preserves the underlying
  * model's native KV cache and `cached_token_history`.
  *
- * @internal server-private — used only by the `SessionRegistry` HIT
- * branch in `endpoints/responses.ts`. Never export from this package's
- * `index.ts`.
+ * @internal server-private — used only by `SessionRegistry` HIT
+ * branches in `endpoints/responses.ts` and `endpoints/messages.ts`.
+ * Never export from this package's `index.ts`.
  *
  * Wipes ONLY the JS-side session state (history array, image key, turn
  * counter, tool-call fan-out guard). With this function, the JS session

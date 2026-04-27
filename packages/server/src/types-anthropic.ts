@@ -94,14 +94,15 @@ export interface AnthropicMessagesRequest {
   stop_sequences?: string[];
   metadata?: { user_id?: string };
   // NOTE: `prompt_cache_key` is intentionally NOT advertised on this
-  // endpoint today. The prefix-cache feature is disabled on
-  // `/v1/messages` until native KV can survive the `reset()` +
-  // `primeHistory()` round-trip the Anthropic handler performs every
-  // turn, so exposing the field would be a no-op that silently misleads
-  // clients into thinking they were getting prefix reuse. It will be
-  // re-added (with matching handler support) once the native side can
-  // preserve KV across the stateless reset. Mirrors the equivalent
-  // `prompt_cache_key` field on `/v1/responses`, which is honoured.
+  // endpoint. KV-cache reuse on `/v1/messages` is delivered via the
+  // server-side `getOrCreateWarmAny` warm-slot mechanism keyed on the
+  // mapped system/instructions string and a per-model sentinel id —
+  // see the block comment on `endpoints/messages.ts`. The
+  // `prompt_cache_key` field is therefore unnecessary on this surface
+  // and re-adding it without a per-key tier-2 path on the handler
+  // would be a no-op that silently misleads clients. The equivalent
+  // field on `/v1/responses` is still honoured for that endpoint's
+  // tier-2 lookup.
 }
 
 // ---------------------------------------------------------------------------
