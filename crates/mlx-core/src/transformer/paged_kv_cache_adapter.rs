@@ -289,6 +289,16 @@ pub struct PagedKVCacheAdapter {
     /// within a single request — repeated calls would otherwise leak
     /// references via repeated `incref` of the freshly-allocated blocks.
     already_registered: bool,
+
+    /// Whether `find_cached_prefix` has already been called for the active
+    /// request (regardless of hit or miss). Reset to `false` by
+    /// `reset_for_new_request` and `release_request`. A second call would
+    /// re-enter the allocator and could either duplicate prefix blocks (on
+    /// a hit-then-hit) or graft a newly-arrived prefix into a request whose
+    /// miss path already started (race with concurrent `register_prefix` on
+    /// the shared allocator). Both violate the documented at-most-once
+    /// lifecycle.
+    prefix_lookup_done: bool,
 }
 
 impl PagedKVCacheAdapter {
@@ -342,6 +352,7 @@ impl PagedKVCacheAdapter {
             cached_token_count: 0,
             request_tokens: Vec::new(),
             already_registered: false,
+            prefix_lookup_done: false,
         })
     }
 
@@ -360,6 +371,7 @@ impl PagedKVCacheAdapter {
         // Reset registration flag AFTER release so a subsequent
         // register_full_blocks_for_reuse on the new request runs.
         self.already_registered = false;
+        self.prefix_lookup_done = false;
         Ok(())
     }
 
@@ -402,27 +414,22 @@ impl PagedKVCacheAdapter {
         prompt_tokens: &[u32],
         extra_keys: &[u64],
     ) -> Result<CachedPrefix, String> {
+        // Reject re-entrant calls BEFORE touching the allocator. The flag
+        // tracks lookup-already-ran regardless of hit/miss outcome, so a
+        // miss-then-call sequence is rejected too — block_table.num_blocks()
+        // alone wouldn't catch that case (a miss leaves the table empty,
+        // and a concurrent `register_prefix` on the shared allocator could
+        // turn the second lookup into a hit that grafts cached blocks into
+        // a request whose miss path already started).
+        if self.prefix_lookup_done {
+            return Err("find_cached_prefix already called on this request. \
+                 Call reset_for_new_request() to start a new request."
+                .to_string());
+        }
         let block_table = self
             .block_table
             .as_mut()
             .ok_or_else(|| "find_cached_prefix called before reset_for_new_request".to_string())?;
-
-        // Reject re-entrant calls before touching the allocator. A second
-        // lookup on the same request would duplicate prefix blocks in the
-        // block_table and double-incref each matched block via
-        // `BlockAllocator::lookup_prefix`. The duplicated entries shift the
-        // suffix slot math in `update_keys_values` so future writes land
-        // inside the duplicated prefix block rather than the freshly
-        // allocated suffix block, silently corrupting cached prefix KV.
-        // Fail loudly instead — the caller must `reset_for_new_request`
-        // before issuing another lookup.
-        if block_table.num_blocks() > 0 {
-            return Err(format!(
-                "find_cached_prefix already called on this request (block_table holds {} blocks). \
-                 Call reset_for_new_request() to start a new request.",
-                block_table.num_blocks()
-            ));
-        }
 
         let (blocks, cached_tokens) = {
             let mut guard = self
@@ -451,6 +458,7 @@ impl PagedKVCacheAdapter {
             .extend_from_slice(&prompt_tokens[..cached_token_count_us]);
         block_table.set_num_tokens(self.request_tokens.len() as u32);
 
+        self.prefix_lookup_done = true;
         Ok(CachedPrefix {
             blocks,
             cached_token_count,
@@ -851,6 +859,7 @@ impl PagedKVCacheAdapter {
         // reset_for_new_request → register flow on this adapter works
         // even if the caller skips the explicit reset.
         self.already_registered = false;
+        self.prefix_lookup_done = false;
         Ok(count)
     }
 
@@ -1709,6 +1718,39 @@ mod tests {
         assert_eq!(
             again.cached_token_count, 8,
             "lookup must succeed after reset_for_new_request"
+        );
+    }
+
+    /// Same re-entrancy guard must fire after a MISS too. A miss leaves the
+    /// block_table empty (num_blocks == 0), so a guard keyed solely to
+    /// num_blocks would accept a second lookup and could graft cached
+    /// blocks (registered by another request between the two calls) into a
+    /// request whose miss path already started.
+    #[test]
+    fn test_find_cached_prefix_rejects_double_call_after_miss() {
+        let allocator = new_allocator(8, 4);
+        // No seed → first call misses.
+
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_find_cached_prefix_rejects_double_call_after_miss: Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+
+        let first = adapter.find_cached_prefix(&[1, 2, 3, 4], &[]).unwrap();
+        assert_eq!(first.cached_token_count, 0, "must miss");
+        assert!(first.blocks.is_empty());
+        assert_eq!(adapter.block_table().unwrap().num_blocks(), 0);
+
+        // Second call must reject even though block_table is still empty.
+        let res = adapter.find_cached_prefix(&[1, 2, 3, 4], &[]);
+        assert!(res.is_err(), "second call after miss must error");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("already called"),
+            "error must explain double-call after miss: {msg}"
         );
     }
 

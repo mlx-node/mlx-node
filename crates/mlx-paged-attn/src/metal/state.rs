@@ -258,12 +258,13 @@ mod tests {
 
     #[test]
     fn test_metal_state_init() {
-        let state = MetalState::get();
-        assert!(
-            state.is_ok(),
-            "Failed to init Metal state: {:?}",
-            state.err()
-        );
+        match MetalState::get() {
+            Ok(_) => {}
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_metal_state_init: {e}");
+            }
+            Err(e) => panic!("unexpected MetalState::get failure: {e}"),
+        }
     }
 
     #[test]
