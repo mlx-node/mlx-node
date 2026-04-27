@@ -1374,6 +1374,116 @@ impl PagedKVCacheAdapter {
     }
 }
 
+/// Compute per-block `extra_keys` for image-aware prefix hashing.
+///
+/// **Phase 6 multimodal threading**, mirroring vLLM commit 269bf46d. When
+/// a request contains image tokens (e.g. Qwen3.5 VLM, PaddleOCR-VL),
+/// identical text token sequences with different images MUST produce
+/// distinct block hashes — otherwise a paged-prefix-cache hit on a stale
+/// image's KV state would silently corrupt the new request's
+/// generation. This helper builds the per-block side-channel keys that
+/// `BlockAllocator::cache_full_blocks` and `find_longest_cache_hit`
+/// thread into the `hash_tokens(..., extra_keys)` call.
+///
+/// # Algorithm
+///
+/// For each entry `(token_pos, image_hash)` in `token_image_positions`:
+/// 1. Compute `block_idx = token_pos / block_size`.
+/// 2. Compute `pos_within_block = token_pos % block_size`.
+/// 3. Append `[image_hash, pos_within_block as u64]` to `out[block_idx]`.
+///
+/// Blocks with no image tokens get an empty `Vec<u64>` — equivalent to
+/// passing `&[]` to `hash_tokens`, which is what text-only callers do
+/// today. Callers that have ANY image positions in the request should
+/// build the full `Vec<Vec<u64>>` once and pass `&out[block_idx]` per
+/// block; the resulting cache entries are isolated per-image-set so a
+/// future text-only request with the same prefix is still a clean miss
+/// for the image request's blocks (extra_keys mismatch).
+///
+/// # Per-model construction
+///
+/// `token_image_positions` is constructed per-model because each VLM has
+/// its own image-tokenization scheme (Qwen3.5 VLM expands one image
+/// into N image-token IDs at known positions; PaddleOCR-VL routes
+/// images through a different pre-processor). The recommended pattern
+/// for an image-aware model is:
+///
+/// 1. After tokenizing the chat template, walk the token stream and
+///    record `(absolute_position, image_content_hash)` for every image-
+///    span token. For multi-image prompts, each image's tokens carry
+///    that image's hash.
+/// 2. Pass the resulting `Vec<(u32, u64)>` to this helper to get the
+///    per-block extra_keys.
+/// 3. Pass `&per_block[block_idx]` as the `extra_keys` argument to each
+///    block-level `register_prefix` / `lookup_prefix` walk. (Today's
+///    flat callers pass the same value to `find_cached_prefix` /
+///    `register_full_blocks_for_reuse`, which apply it uniformly across
+///    every block. Per-block dispatch will land alongside the first
+///    image-aware model integration.)
+///
+/// # Determinism
+///
+/// Stable order: the output preserves the order in which image positions
+/// fall within each block. Two callers passing the same logical image
+/// set in different order will produce the same `extra_keys` vectors
+/// only if the input `token_image_positions` is also in the same order.
+/// Production callers should sort by `token_pos` before invoking to
+/// guarantee determinism across reorderings of the input.
+///
+/// # Examples
+///
+/// ```ignore
+/// // 32 tokens total, block_size = 16 → 2 blocks.
+/// // Image at positions 5..10 (hash 0xABCD) — entirely within block 0.
+/// // Block 0 carries 5 image-position entries; block 1 has none.
+/// let positions: Vec<(u32, u64)> = (5..10).map(|p| (p, 0xABCD)).collect();
+/// let per_block = compute_per_block_image_extra_keys(&positions, 2, 16);
+/// assert_eq!(per_block[0].len(), 10); // 5 entries × (hash, pos) pairs
+/// assert_eq!(per_block[1].len(), 0);
+/// ```
+///
+/// # Parameters
+///
+/// * `token_image_positions` — `(absolute_token_position, image_hash)`
+///   pairs. Positions outside `[0, num_blocks * block_size)` are
+///   silently skipped (defensive: a paged request's block_table covers
+///   exactly that range, so out-of-range positions cannot affect any
+///   block hash). Callers should validate upstream and not rely on this
+///   silent skip.
+/// * `num_blocks` — number of blocks in the output. Must match the
+///   request's `block_table.num_blocks()`.
+/// * `block_size` — tokens per block. Must equal the adapter's
+///   `block_size`. Zero is rejected (returns an empty vector).
+///
+/// # Returns
+///
+/// A `Vec<Vec<u64>>` of length `num_blocks`. Each inner vec is the
+/// `extra_keys` payload for that block — pairs of
+/// `[image_hash, position_within_block]`. Length is always even per
+/// block (every entry contributes a hash + position pair).
+pub fn compute_per_block_image_extra_keys(
+    token_image_positions: &[(u32, u64)],
+    num_blocks: usize,
+    block_size: u32,
+) -> Vec<Vec<u64>> {
+    if block_size == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<Vec<u64>> = (0..num_blocks).map(|_| Vec::new()).collect();
+    let block_size_u32 = block_size;
+    for &(token_pos, image_hash) in token_image_positions {
+        let block_idx = (token_pos / block_size_u32) as usize;
+        if block_idx >= num_blocks {
+            // Silently skip out-of-range positions — see param doc.
+            continue;
+        }
+        let pos_within_block = (token_pos % block_size_u32) as u64;
+        out[block_idx].push(image_hash);
+        out[block_idx].push(pos_within_block);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
