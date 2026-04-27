@@ -448,7 +448,14 @@ mod tests {
     #[test]
     fn test_new_allocates_per_layer_buffers() {
         let config = base_config(3);
-        let pool = LayerKVPool::new(config, 4).expect("LayerKVPool::new should succeed");
+        let pool = match LayerKVPool::new(config, 4) {
+            Ok(p) => p,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_new_allocates_per_layer_buffers: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
         assert_eq!(pool.num_layers(), 3);
         assert_eq!(pool.num_blocks(), 4);
         assert_eq!(pool.block_size(), 8);
