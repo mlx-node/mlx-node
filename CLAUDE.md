@@ -405,6 +405,32 @@ The flag is **independent of `use_paged_attention`** — that knob drives the le
 
 The wired models (Qwen3, LFM2) have unit + smoke coverage of the dispatch plumbing but no real-weights numerical-equivalence validation against the flat path yet. Until that lands, the default stays `false` so production traffic keeps hitting the proven flat-`Vec<KVCache>` path and the new code only runs under explicit opt-in. Server-side Phase 7 simplification (collapsing `SessionRegistry.getOrCreateWarmAny` from the `/v1/messages` warm-slot path, since the native block cache supersedes the JS-side warm slot for full-attention models once enabled) is gated on the same default flip and is intentionally NOT done in this revision.
 
+### Parity gate (must pass before flipping the default)
+
+Before `use_block_paged_cache` can flip from `None` to `Some(true)`, the wired models must demonstrate byte-equal greedy-decode output between the flat path and the paged path on real weights. Three test surfaces gate the flip:
+
+- `crates/mlx-core/tests/qwen3_paged_vs_flat_parity.rs` — Qwen3 single-turn (4 prompts × 32 tokens) and two-turn (prefix-reuse) parity. Run with:
+  ```shell
+  MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
+      cargo test -p mlx-core --test qwen3_paged_vs_flat_parity \
+      -- --ignored --nocapture
+  ```
+- `crates/mlx-core/tests/lfm2_paged_vs_flat_parity.rs` — LFM2 single-turn + two-turn parity (validates per-layer routing where conv layers bypass the adapter and only `full_attention` layers go through it). Run with:
+  ```shell
+  MLX_TEST_MODEL_PATH=./.cache/models/lfm2.5-1.2b-thinking-mlx \
+      cargo test -p mlx-core --test lfm2_paged_vs_flat_parity \
+      -- --ignored --nocapture
+  ```
+- `__test__/models/qwen3-paged-parity.test.ts` — Qwen3 end-to-end parity through the public NAPI surface. Loads two `Qwen3Model` instances from the same checkpoint (one with `use_block_paged_cache: true` patched into `config.json`) and asserts identical `text` and `numTokens` from `model.chatSessionStart(..., { temperature: 0 })`. (The TS test deliberately uses `chatSessionStart` rather than `generate`: `generate_sync` always uses fresh flat caches and never consults `paged_adapter`, so it would silently mask any paged-vs-flat divergence and falsely report parity.) The test is gated on `QWEN3_PAGED_PARITY_MODEL_PATH` (parallel to the Rust `MLX_TEST_MODEL_PATH` `#[ignore]` opt-in) and skips via `it.runIf` when the env var is unset, so the gate never blocks default CI:
+  ```shell
+  QWEN3_PAGED_PARITY_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
+      yarn vite run test __test__/models/qwen3-paged-parity.test.ts
+  ```
+
+**Pass criteria**: byte-equal `text` and `num_tokens` between flat and paged on every prompt; identical first-divergence-free token sequences. The standalone BF16 logit max-abs-diff variant from the original spec (tolerance `5e-2`) is intentionally not implemented because `forward_fused` / `forward_paged_adapter` are not exposed publicly enough to drive directly from an integration test, and the gate would require model-code changes that are explicitly out of scope. Greedy-token parity catches the same regressions any logit drift would surface as.
+
+CI gates the default flip on all three tests passing. The default-flip commit itself is a separate follow-up that can land only once these tests are green and stable on the supported checkpoints.
+
 ---
 
 ## C++ FFI Files (crates/mlx-sys/src/)
