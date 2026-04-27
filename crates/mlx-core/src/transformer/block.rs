@@ -462,11 +462,8 @@ impl TransformerBlock {
                 // seq_len=num_tokens, offset=cached_prefix_len)` does
                 // exactly that. The mask broadcasts over batch / heads via
                 // SDPA's mask handling.
-                let mask = create_causal_mask(
-                    num_tokens as i32,
-                    Some(cached_prefix_len as i32),
-                    None,
-                )?;
+                let mask =
+                    create_causal_mask(num_tokens as i32, Some(cached_prefix_len as i32), None)?;
                 scaled_dot_product_attention(&q_4d, &k_4d, &v_4d, scale, Some(&mask))?
             };
 

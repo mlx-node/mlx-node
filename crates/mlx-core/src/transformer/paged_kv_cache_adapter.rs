@@ -983,9 +983,10 @@ impl PagedKVCacheAdapter {
         num_tokens: u32,
     ) -> Result<(MxArray, MxArray), String> {
         // 1. Active request?
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "read_kv_range called before reset_for_new_request".to_string()
-        })?;
+        let block_table = self
+            .block_table
+            .as_ref()
+            .ok_or_else(|| "read_kv_range called before reset_for_new_request".to_string())?;
 
         // 2. Layer in range?
         let num_layers = self.layer_kv_pool.num_layers();
@@ -1132,10 +1133,7 @@ impl PagedKVCacheAdapter {
                 let h_stride = head_size_us * block_size_us;
                 let d_stride = block_size_us;
                 for d in 0..head_size_us {
-                    let elem_idx = value_block_base
-                        + h * h_stride
-                        + d * d_stride
-                        + offset_in_block;
+                    let elem_idx = value_block_base + h * h_stride + d * d_stride + offset_in_block;
                     let bits = read_u16(&value_bytes, elem_idx);
                     let out_idx = h * num_tokens_us * head_size_us + t * head_size_us + d;
                     v_out[out_idx] = bits;
@@ -1146,12 +1144,7 @@ impl PagedKVCacheAdapter {
         // 9. Construct MxArrays in [1, num_kv_heads, num_tokens, head_size]
         //    layout. Use the dtype-matching constructor so the bits are
         //    interpreted correctly (`from_float16` for FP16 cache, etc).
-        let shape: [i64; 4] = [
-            1,
-            num_kv_heads as i64,
-            num_tokens as i64,
-            head_size as i64,
-        ];
+        let shape: [i64; 4] = [1, num_kv_heads as i64, num_tokens as i64, head_size as i64];
         let (k_arr, v_arr) = match cache_dtype {
             mlx_paged_attn::metal::MetalDtype::Float16 => (
                 MxArray::from_float16(&k_out, &shape).map_err(|e| {

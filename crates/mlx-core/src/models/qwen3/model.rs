@@ -2161,8 +2161,7 @@ impl Qwen3Inner {
             let gen_toks = generated_tokens.len() as f64;
             let ttft_ms = first_tok_ms;
             let decode_ms = total_ms - ttft_ms;
-            let actual_prefill_count =
-                (token_ids_vec.len() as f64) - cached_prefix_len as f64;
+            let actual_prefill_count = (token_ids_vec.len() as f64) - cached_prefix_len as f64;
             Some(crate::profiling::PerformanceMetrics {
                 ttft_ms,
                 prefill_tokens_per_second: if ttft_ms > 0.0 {
@@ -2275,12 +2274,8 @@ impl Qwen3Inner {
             ));
         }
         let suffix = &token_ids_vec[(cached_prefix_len as usize)..];
-        let last_logits = self.run_paged_prefill_chunk(
-            suffix,
-            cached_prefix_len,
-            num_layers,
-            &positions_dummy,
-        )?;
+        let last_logits =
+            self.run_paged_prefill_chunk(suffix, cached_prefix_len, num_layers, &positions_dummy)?;
 
         let mut last_logits = last_logits;
 
@@ -2364,11 +2359,8 @@ impl Qwen3Inner {
             // with `is_prefill = false`. The adapter must be at the right
             // logical position — it was advanced by `record_tokens` during
             // prefill / previous decode step. We record and forward now.
-            let next_logits = self.run_paged_decode_step(
-                token_value,
-                num_layers,
-                &positions_dummy,
-            )?;
+            let next_logits =
+                self.run_paged_decode_step(token_value, num_layers, &positions_dummy)?;
 
             let last_logits_dec = next_logits.squeeze(Some(&[0, 1]))?;
             let mut next_logits = last_logits_dec;
@@ -6956,7 +6948,9 @@ mod tests {
             Err(err) => {
                 let msg = err.reason.to_string();
                 if msg.contains("No Metal device found") {
-                    eprintln!("skipping test_chat_sync_core_paged_smoke_via_helpers (no Metal): {msg}");
+                    eprintln!(
+                        "skipping test_chat_sync_core_paged_smoke_via_helpers (no Metal): {msg}"
+                    );
                     return;
                 }
                 panic!("unexpected Qwen3Inner::new failure: {msg}");
@@ -6974,22 +6968,25 @@ mod tests {
         // them. Cast every weight to BFloat16 to match the production
         // configuration the chat path will see at inference time.
         use crate::array::DType;
-        let cast = |a: &MxArray| -> MxArray {
-            a.astype(DType::BFloat16).expect("astype BFloat16")
-        };
+        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
         // Embedding.
         let w = inner.embedding.get_weight();
         inner.embedding.set_weight(&cast(&w)).expect("set embed");
         // Final norm.
         let w = inner.final_norm.get_weight();
-        inner.final_norm.set_weight(&cast(&w)).expect("set final_norm");
+        inner
+            .final_norm
+            .set_weight(&cast(&w))
+            .expect("set final_norm");
         // LM head.
         let w = inner.lm_head.get_weight();
         inner.lm_head.set_weight(&cast(&w)).expect("set lm_head");
         // Per-layer.
         for layer in inner.layers.iter_mut() {
             let w = layer.get_input_layernorm_weight();
-            layer.set_input_layernorm_weight(&cast(&w)).expect("set in ln");
+            layer
+                .set_input_layernorm_weight(&cast(&w))
+                .expect("set in ln");
             let w = layer.get_post_attention_layernorm_weight();
             layer
                 .set_post_attention_layernorm_weight(&cast(&w))
@@ -7036,7 +7033,9 @@ mod tests {
                 .reset_for_new_request(0)
                 .expect("reset_for_new_request");
             // First-turn cache miss → cached_prefix_len = 0.
-            let prefix = adapter.find_cached_prefix(&prompt, &[]).expect("find_cached_prefix");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
             assert_eq!(prefix.cached_token_count, 0);
             adapter
                 .allocate_suffix_blocks(prompt.len() as u32 + max_decode)
@@ -7059,7 +7058,11 @@ mod tests {
             }
         };
         // Logits shape: [vocab].
-        assert_eq!(logits.ndim().expect("ndim"), 1, "prefill logits must be 1-D");
+        assert_eq!(
+            logits.ndim().expect("ndim"),
+            1,
+            "prefill logits must be 1-D"
+        );
         assert_eq!(
             logits.shape_at(0).expect("shape_at(0)"),
             cfg.vocab_size as i64,
@@ -7097,13 +7100,19 @@ mod tests {
             };
             // Decode logits shape: [1, 1, vocab].
             assert_eq!(next_logits.ndim().expect("ndim"), 3);
-            assert_eq!(next_logits.shape_at(2).expect("shape_at(2)"), cfg.vocab_size as i64);
+            assert_eq!(
+                next_logits.shape_at(2).expect("shape_at(2)"),
+                cfg.vocab_size as i64
+            );
             let next_f32 = next_logits
                 .astype(crate::array::DType::Float32)
                 .expect("astype f32");
             next_f32.eval();
             let v = next_f32.item_at_float32(0).expect("item_at_float32(0)");
-            assert!(v.is_finite(), "decode logits[0] step {i} must be finite, got {v}");
+            assert!(
+                v.is_finite(),
+                "decode logits[0] step {i} must be finite, got {v}"
+            );
         }
 
         // Cursor advanced by 2 decode tokens.
