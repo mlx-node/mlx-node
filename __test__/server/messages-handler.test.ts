@@ -2550,85 +2550,103 @@ describe('handleCreateMessage', () => {
       registry.register('test-model', mockModel);
       const sessionReg = registry.getSessionRegistry('test-model')!;
 
-      // ---- Turn 1 ----
-      const r1 = createMockRes();
-      await handleCreateMessage(
-        r1.res,
-        {
-          model: 'test-model',
-          messages: [{ role: 'user', content: 'A' }],
-          max_tokens: 100,
-        },
-        registry,
-      );
-      expect(r1.getStatus()).toBe(200);
-      expect(r1.getHeaders()['x-session-cache']).toBe('fresh');
-      expect(r1.getHeaders()['x-cached-tokens']).toBeUndefined();
-      expect(sessionReg.size).toBe(1);
-      // Turn 1 cold reset fired.
-      const resetCachesAfterT1 = resetCaches.mock.calls.length;
-      expect(resetCachesAfterT1).toBeGreaterThanOrEqual(1);
-      // Capture the leased session via the chatSessionStart spy: the
-      // `ChatSession.startFromHistory` invocation that produced this
-      // call passed the rebuilt history as the first arg. We capture
-      // the session identity indirectly by leasing the warm slot
-      // ourselves below — the registry's at-most-one entry is the
-      // session we just adopted.
+      // Identity witness: spy on `ChatSession.prototype.primeHistory`.
+      // `mock.contexts[i]` records the `this` value of call i. After
+      // three turns we assert all three contexts are reference-equal —
+      // proves the warm slot is the SAME ChatSession instance leased
+      // across turns 1..3, not three fresh sessions that
+      // `getOrCreateWarmAny` falsely reported as warm hits.
+      const primeHistorySpy = vi.spyOn(ChatSession.prototype, 'primeHistory');
+      try {
+        // ---- Turn 1 ----
+        const r1 = createMockRes();
+        await handleCreateMessage(
+          r1.res,
+          {
+            model: 'test-model',
+            messages: [{ role: 'user', content: 'A' }],
+            max_tokens: 100,
+          },
+          registry,
+        );
+        expect(r1.getStatus()).toBe(200);
+        expect(r1.getHeaders()['x-session-cache']).toBe('fresh');
+        expect(r1.getHeaders()['x-cached-tokens']).toBeUndefined();
+        expect(sessionReg.size).toBe(1);
+        // Turn 1 cold reset fired.
+        const resetCachesAfterT1 = resetCaches.mock.calls.length;
+        expect(resetCachesAfterT1).toBeGreaterThanOrEqual(1);
 
-      // ---- Turn 2 ----
-      const r2 = createMockRes();
-      await handleCreateMessage(
-        r2.res,
-        {
-          model: 'test-model',
-          messages: [
-            { role: 'user', content: 'A' },
-            { role: 'assistant', content: 'A1' },
-            { role: 'user', content: 'B' },
-          ],
-          max_tokens: 100,
-        },
-        registry,
-      );
-      expect(r2.getStatus()).toBe(200);
-      // Warm slot leased and native reuse confirmed (cachedTokens > 0).
-      expect(r2.getHeaders()['x-session-cache']).toBe('prefix_hit');
-      expect(r2.getHeaders()['x-cached-tokens']).toBe('12');
-      expect(sessionReg.size).toBe(1);
-      // CRITICAL: `resetCaches` was NOT called between turn 1 and
-      // turn 2 — the warm-reuse helper wipes JS state only.
-      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+        // ---- Turn 2 ----
+        const r2 = createMockRes();
+        await handleCreateMessage(
+          r2.res,
+          {
+            model: 'test-model',
+            messages: [
+              { role: 'user', content: 'A' },
+              { role: 'assistant', content: 'A1' },
+              { role: 'user', content: 'B' },
+            ],
+            max_tokens: 100,
+          },
+          registry,
+        );
+        expect(r2.getStatus()).toBe(200);
+        // Warm slot leased and native reuse confirmed (cachedTokens > 0).
+        expect(r2.getHeaders()['x-session-cache']).toBe('prefix_hit');
+        expect(r2.getHeaders()['x-cached-tokens']).toBe('12');
+        expect(sessionReg.size).toBe(1);
+        // CRITICAL: `resetCaches` was NOT called between turn 1 and
+        // turn 2 — the warm-reuse helper wipes JS state only.
+        expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
 
-      // ---- Turn 3 ----
-      const r3 = createMockRes();
-      await handleCreateMessage(
-        r3.res,
-        {
-          model: 'test-model',
-          messages: [
-            { role: 'user', content: 'A' },
-            { role: 'assistant', content: 'A1' },
-            { role: 'user', content: 'B' },
-            { role: 'assistant', content: 'A2' },
-            { role: 'user', content: 'C' },
-          ],
-          max_tokens: 100,
-        },
-        registry,
-      );
-      expect(r3.getStatus()).toBe(200);
-      expect(r3.getHeaders()['x-session-cache']).toBe('prefix_hit');
-      expect(r3.getHeaders()['x-cached-tokens']).toBe('24');
-      expect(sessionReg.size).toBe(1);
-      // Warm-reuse helper still wins — no further resetCaches call.
-      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+        // ---- Turn 3 ----
+        const r3 = createMockRes();
+        await handleCreateMessage(
+          r3.res,
+          {
+            model: 'test-model',
+            messages: [
+              { role: 'user', content: 'A' },
+              { role: 'assistant', content: 'A1' },
+              { role: 'user', content: 'B' },
+              { role: 'assistant', content: 'A2' },
+              { role: 'user', content: 'C' },
+            ],
+            max_tokens: 100,
+          },
+          registry,
+        );
+        expect(r3.getStatus()).toBe(200);
+        expect(r3.getHeaders()['x-session-cache']).toBe('prefix_hit');
+        expect(r3.getHeaders()['x-cached-tokens']).toBe('24');
+        expect(sessionReg.size).toBe(1);
+        // Warm-reuse helper still wins — no further resetCaches call.
+        expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
 
-      // All three turns went through the cold-start native entry
-      // point because `/v1/messages` always replays the full history
-      // (the chat-session delta API cannot splice a multi-message
-      // tail). The `chatSessionContinue` rejecting stub guarantees
-      // we never accidentally took the hot path.
-      expect(chatSessionStart).toHaveBeenCalledTimes(3);
+        // All three turns went through the cold-start native entry
+        // point because `/v1/messages` always replays the full history
+        // (the chat-session delta API cannot splice a multi-message
+        // tail). The `chatSessionContinue` rejecting stub guarantees
+        // we never accidentally took the hot path.
+        expect(chatSessionStart).toHaveBeenCalledTimes(3);
+
+        // Identity witness check: `primeHistory` ran three times, all
+        // bound to the SAME ChatSession instance. A regression where
+        // `getOrCreateWarmAny` returned `{ session: <fresh>, hit: true }`
+        // would yield distinct `this` values here — the registry +
+        // resetCaches assertions above could not catch that.
+        expect(primeHistorySpy).toHaveBeenCalledTimes(3);
+        const ctx0 = primeHistorySpy.mock.contexts[0];
+        const ctx1 = primeHistorySpy.mock.contexts[1];
+        const ctx2 = primeHistorySpy.mock.contexts[2];
+        expect(ctx0).toBeInstanceOf(ChatSession);
+        expect(ctx1).toBe(ctx0);
+        expect(ctx2).toBe(ctx0);
+      } finally {
+        primeHistorySpy.mockRestore();
+      }
     });
 
     it('three-turn streaming replay reuses the warm slot (header stays fresh by design)', async () => {
@@ -2690,44 +2708,64 @@ describe('handleCreateMessage', () => {
         return { events: parseSSE(mock.getBody()), headers: mock.getHeaders() };
       }
 
-      // ---- Turn 1 ----
-      const t1 = await runTurn([{ role: 'user', content: 'A' }]);
-      expect(t1.headers['x-session-cache']).toBe('fresh');
-      expect(t1.events[0].event).toBe('message_start');
-      expect(t1.events.find((e) => e.event === 'message_stop')).toBeDefined();
-      expect(sessionReg.size).toBe(1);
-      const resetCachesAfterT1 = resetCaches.mock.calls.length;
-      expect(resetCachesAfterT1).toBeGreaterThanOrEqual(1);
+      // Identity witness: see the non-streaming sibling test for the
+      // rationale. The streaming handler also calls `primeHistory` once
+      // per turn before dispatching `startFromHistoryStream`, so the
+      // `mock.contexts` snapshot is the cleanest proof that the warm
+      // slot leases the SAME session across turns 2/3.
+      const primeHistorySpy = vi.spyOn(ChatSession.prototype, 'primeHistory');
+      try {
+        // ---- Turn 1 ----
+        const t1 = await runTurn([{ role: 'user', content: 'A' }]);
+        expect(t1.headers['x-session-cache']).toBe('fresh');
+        expect(t1.events[0].event).toBe('message_start');
+        expect(t1.events.find((e) => e.event === 'message_stop')).toBeDefined();
+        expect(sessionReg.size).toBe(1);
+        const resetCachesAfterT1 = resetCaches.mock.calls.length;
+        expect(resetCachesAfterT1).toBeGreaterThanOrEqual(1);
 
-      // ---- Turn 2 ----
-      const t2 = await runTurn([
-        { role: 'user', content: 'A' },
-        { role: 'assistant', content: 'A1' },
-        { role: 'user', content: 'B' },
-      ]);
-      // Header STAYS fresh on streaming — see comment block.
-      expect(t2.headers['x-session-cache']).toBe('fresh');
-      expect(t2.events.find((e) => e.event === 'message_stop')).toBeDefined();
-      expect(sessionReg.size).toBe(1);
-      // Warm-reuse helper fired — no resetCaches call advance.
-      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+        // ---- Turn 2 ----
+        const t2 = await runTurn([
+          { role: 'user', content: 'A' },
+          { role: 'assistant', content: 'A1' },
+          { role: 'user', content: 'B' },
+        ]);
+        // Header STAYS fresh on streaming — see comment block.
+        expect(t2.headers['x-session-cache']).toBe('fresh');
+        expect(t2.events.find((e) => e.event === 'message_stop')).toBeDefined();
+        expect(sessionReg.size).toBe(1);
+        // Warm-reuse helper fired — no resetCaches call advance.
+        expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
 
-      // ---- Turn 3 ----
-      const t3 = await runTurn([
-        { role: 'user', content: 'A' },
-        { role: 'assistant', content: 'A1' },
-        { role: 'user', content: 'B' },
-        { role: 'assistant', content: 'A2' },
-        { role: 'user', content: 'C' },
-      ]);
-      expect(t3.headers['x-session-cache']).toBe('fresh');
-      expect(t3.events.find((e) => e.event === 'message_stop')).toBeDefined();
-      expect(sessionReg.size).toBe(1);
-      expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
+        // ---- Turn 3 ----
+        const t3 = await runTurn([
+          { role: 'user', content: 'A' },
+          { role: 'assistant', content: 'A1' },
+          { role: 'user', content: 'B' },
+          { role: 'assistant', content: 'A2' },
+          { role: 'user', content: 'C' },
+        ]);
+        expect(t3.headers['x-session-cache']).toBe('fresh');
+        expect(t3.events.find((e) => e.event === 'message_stop')).toBeDefined();
+        expect(sessionReg.size).toBe(1);
+        expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
 
-      // All three turns dispatched through the streaming cold-start
-      // entry point.
-      expect(stream1).toHaveBeenCalledTimes(3);
+        // All three turns dispatched through the streaming cold-start
+        // entry point.
+        expect(stream1).toHaveBeenCalledTimes(3);
+
+        // Identity witness check: same ChatSession instance leased on
+        // turns 1..3.
+        expect(primeHistorySpy).toHaveBeenCalledTimes(3);
+        const ctx0 = primeHistorySpy.mock.contexts[0];
+        const ctx1 = primeHistorySpy.mock.contexts[1];
+        const ctx2 = primeHistorySpy.mock.contexts[2];
+        expect(ctx0).toBeInstanceOf(ChatSession);
+        expect(ctx1).toBe(ctx0);
+        expect(ctx2).toBe(ctx0);
+      } finally {
+        primeHistorySpy.mockRestore();
+      }
     });
 
     it('instructions mismatch invalidates the warm slot — full reset fires on turn 2', async () => {
