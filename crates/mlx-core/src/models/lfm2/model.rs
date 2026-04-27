@@ -322,9 +322,7 @@ impl Lfm2Inner {
 
             let adapter =
                 PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
-                    Error::from_reason(format!(
-                        "Failed to construct LFM2 PagedKVCacheAdapter: {e}"
-                    ))
+                    Error::from_reason(format!("Failed to construct LFM2 PagedKVCacheAdapter: {e}"))
                 })?;
 
             info!(
