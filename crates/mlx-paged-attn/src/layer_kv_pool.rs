@@ -389,6 +389,168 @@ impl LayerKVPool {
             )
         }
     }
+
+    /// Run paged attention against this layer's K/V buffers for a single
+    /// decode step (one sequence, one query token).
+    ///
+    /// The caller supplies the `block_ids` array (already cast to `i32`) for
+    /// the request's block table — kernel reads it as
+    /// `[num_seqs=1, max_num_blocks_per_seq]` row-major. `num_tokens_in_request`
+    /// is the live `block_table.num_tokens()` and is uploaded as the single
+    /// element of `context_lens`.
+    ///
+    /// `queries` shape on the GPU buffer is `[1, num_query_heads, head_size]`,
+    /// element type half-precision (Float16 / BFloat16). The kernel template is
+    /// fixed at Float16 io_type — passing a BFloat16 buffer reinterprets the
+    /// bytes as Float16; documented as a P1C-3 follow-up alongside the
+    /// zero-copy MxArray conversion.
+    ///
+    /// On FP8 caches the cache dtype routes through `UChar`; otherwise the
+    /// cache uses Float16 (the kernel's `cache_dtype` template parameter).
+    ///
+    /// Returns the attention output as a `PagedAttentionOutput`. The caller
+    /// converts to an `MxArray` via `to_mlx_array` (GPU → host roundtrip).
+    ///
+    /// # Safety
+    /// - `queries` must be a valid evaluated `mlx_array` pointer with shape
+    ///   `[1, num_query_heads, head_size]`.
+    /// - The pool must outlive the kernel completion (synchronous wait
+    ///   inside the dispatcher guarantees this from the caller's view).
+    /// - `block_ids` length must equal `max_num_blocks_per_seq` and every
+    ///   id must be a valid index into this pool (in `[0, num_blocks)`).
+    /// - `num_tokens_in_request` must be `> 0` and `<=
+    ///   block_ids.len() * block_size`.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gather_attention(
+        &self,
+        layer_idx: u32,
+        queries: *mut mlx_sys::mlx_array,
+        block_ids: &[i32],
+        num_tokens_in_request: u32,
+        num_query_heads: u32,
+        scale: f32,
+        softcap: f32,
+    ) -> Result<crate::metal::PagedAttentionOutput, String> {
+        use crate::metal::{
+            MetalDtype, MetalState, MlxMetalBuffer, PagedAttentionParams, RawBufferInfo,
+            dispatch_paged_attention_auto, is_metal_extraction_supported, synchronize_mlx,
+        };
+        use metal::MTLResourceOptions;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+
+        if layer_idx as usize >= self.layers.len() {
+            return Err(format!(
+                "LayerKVPool::gather_attention: layer_idx {} out of range \
+                 (num_layers = {})",
+                layer_idx,
+                self.layers.len()
+            ));
+        }
+        if block_ids.is_empty() {
+            return Err(
+                "LayerKVPool::gather_attention: block_ids empty (no allocated blocks)".to_string(),
+            );
+        }
+        if num_tokens_in_request == 0 {
+            return Err(
+                "LayerKVPool::gather_attention: num_tokens_in_request must be > 0".to_string(),
+            );
+        }
+        if num_query_heads == 0 {
+            return Err("LayerKVPool::gather_attention: num_query_heads must be > 0".to_string());
+        }
+
+        let (key_cache, value_cache) = &self.layers[layer_idx as usize];
+
+        // Synchronize MLX so the queries tensor is materialized.
+        synchronize_mlx();
+
+        // SAFETY: caller guarantees the pointer is valid and evaluated.
+        let query_info = unsafe { MlxMetalBuffer::from_mlx_array(queries) }
+            .ok_or_else(|| "Failed to extract Metal buffer from queries".to_string())?;
+
+        let state = MetalState::get()?;
+
+        // Upload block_tables and context_lens as shared Metal buffers
+        // (kernel reads i32 for both).
+        let block_tables_buffer = state.device.new_buffer_with_data(
+            block_ids.as_ptr() as *const _,
+            std::mem::size_of_val(block_ids) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let context_lens: [i32; 1] = [num_tokens_in_request as i32];
+        let context_lens_buffer = state.device.new_buffer_with_data(
+            context_lens.as_ptr() as *const _,
+            std::mem::size_of_val(&context_lens) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Stride math (vLLM convention, mirrors AttentionLayer::forward):
+        // - q_stride = num_query_heads * head_size  (per-token query stride)
+        // - kv_block_stride = num_kv_heads * head_size * block_size
+        // - kv_head_stride  = head_size * block_size
+        let head_size = self.config.head_size;
+        let block_size = self.config.block_size;
+        let num_kv_heads = self.config.num_kv_heads;
+        let q_stride = (num_query_heads * head_size) as i32;
+        let kv_block_stride = (num_kv_heads * head_size * block_size) as i32;
+        let kv_head_stride = (head_size * block_size) as i32;
+
+        let max_num_blocks_per_seq = block_ids.len() as u32;
+
+        let params = PagedAttentionParams {
+            num_seqs: 1,
+            num_heads: num_query_heads,
+            num_kv_heads,
+            head_size,
+            block_size,
+            max_seq_len: num_tokens_in_request,
+            max_num_blocks_per_seq,
+            scale,
+            softcapping: softcap,
+            q_stride,
+            kv_block_stride,
+            kv_head_stride,
+            // FP8 K/V scales are deferred (P1C-3 follow-up).
+            k_scale: 1.0,
+            v_scale: 1.0,
+        };
+
+        // Cache dtype controls the kernel-name template parameter. The kernel's
+        // io_type is always Float16 (queries + output) — caller passes a
+        // half-precision queries buffer.
+        let cache_dtype = if self.config.use_fp8() {
+            MetalDtype::UChar
+        } else {
+            MetalDtype::Float16
+        };
+
+        let query_raw = RawBufferInfo {
+            ptr: query_info.buffer_ptr,
+            offset: query_info.offset,
+        };
+
+        // SAFETY: query_info.buffer_ptr was just extracted (and MLX
+        // synchronized); block_tables_buffer and context_lens_buffer are
+        // bindings on the stack held until after the synchronous dispatch
+        // returns; key_cache / value_cache live for the lifetime of the pool.
+        unsafe {
+            dispatch_paged_attention_auto(
+                &query_raw,
+                key_cache,
+                value_cache,
+                &block_tables_buffer,
+                &context_lens_buffer,
+                num_tokens_in_request,
+                &params,
+                cache_dtype,
+            )
+        }
+    }
 }
 
 #[cfg(test)]
