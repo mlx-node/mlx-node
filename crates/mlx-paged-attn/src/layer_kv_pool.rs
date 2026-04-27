@@ -144,18 +144,25 @@ impl LayerKVPool {
         }
     }
 
-    /// Construct a pool with placeholder GPU buffers, intended for unit
-    /// tests of consumers (e.g. `PagedKVCacheAdapter`) that exercise
-    /// lifecycle / metadata semantics without dispatching kernels.
+    /// **Test-only.** Construct a pool with 1-byte placeholder GPU
+    /// buffers, intended for unit tests of consumers (e.g.
+    /// `PagedKVCacheAdapter`) that exercise lifecycle / metadata
+    /// semantics WITHOUT dispatching kernels.
     ///
     /// Skips `config.validate()` so callers may use arbitrary
     /// `block_size` values for test convenience. On macOS this still
     /// allocates one (tiny) `metal::Buffer` pair per layer so
     /// `key_cache` / `value_cache` return `Some`; the buffers are
-    /// 1-byte placeholders and using them with `write_kv` would
-    /// undefined-behave — kernel-dispatch tests must use [`Self::new`].
+    /// 1-byte placeholders and **using them with `write_kv` is
+    /// undefined behaviour** (will read/write past the buffer end on
+    /// the GPU, corrupt memory, or silently produce garbage).
     ///
-    /// Production code MUST use [`Self::new`].
+    /// `pub` only because this file's tests live in the consuming
+    /// `mlx-core` crate (cross-crate `#[cfg(test)]` is not visible).
+    /// **Never call this from production code.** Production code MUST
+    /// use [`Self::new`]. CPU-only validation tests should call into
+    /// `validate_kv_input` (`mlx-core`) directly without going through
+    /// any `LayerKVPool` at all.
     pub fn new_for_test(
         config: PagedAttentionConfig,
         num_blocks: u32,
