@@ -3179,6 +3179,211 @@ mod paged_adapter_construction_tests {
         }
     }
 
+    /// **Smoke test for `chat_sync_core_paged` helpers**. Without real
+    /// weights / tokenizer we cannot drive the full chat path, but we
+    /// CAN drive the underlying `run_paged_prefill_chunk` +
+    /// `run_paged_decode_step` helpers that the chat path delegates to.
+    /// This validates the adapter lifecycle (reset → find_cached_prefix
+    /// → allocate_suffix → record_tokens → forward_paged_or_flat),
+    /// the prefill SDPA path (no-cache branch), and the decode-loop
+    /// control flow against a freshly-constructed Lfm2Inner with random
+    /// BFloat16 weights.
+    ///
+    /// What we assert:
+    /// * Prefill on a 4-token "prompt" produces logits with shape
+    ///   `[vocab]` and finite values.
+    /// * Two decode steps produce non-empty u32 token ids.
+    /// * Adapter's `current_token_count()` matches the cumulative
+    ///   prefill + decode tokens.
+    /// * No panics during the lifecycle.
+    ///
+    /// What we do NOT assert: numerical equivalence to the flat path.
+    /// Weights are random, so output values are arbitrary. Numerical
+    /// validation is deferred to an end-to-end test with loaded weights.
+    ///
+    /// Skips on no-Metal hosts.
+    #[test]
+    fn test_lfm2_chat_sync_core_paged_smoke_via_helpers() {
+        use crate::array::{DType, MxArray};
+
+        let cfg = paged_tiny_config(true);
+        let mut inner = match Lfm2Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!(
+                        "skipping test_lfm2_chat_sync_core_paged_smoke_via_helpers (no Metal): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Lfm2Inner::new failure: {msg}");
+            }
+        };
+        assert!(
+            inner.paged_adapter.is_some(),
+            "paged_tiny_config(true) must construct paged_adapter"
+        );
+
+        // Cast all weights to BF16 to match the pool dtype. Random-init
+        // weights from `Lfm2Inner::new` are Float32, but the paged pool
+        // was built BFloat16, so `update_keys_values` would reject
+        // F32-typed K/V from the layers. Mirror Qwen3's smoke-test cast.
+        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
+
+        // Embedding.
+        let w = inner.embed_tokens.get_weight();
+        inner
+            .embed_tokens
+            .set_weight(&cast(&w))
+            .expect("set embed");
+        // Embedding norm.
+        let w = inner.embedding_norm.get_weight();
+        inner
+            .embedding_norm
+            .set_weight(&cast(&w))
+            .expect("set embedding_norm");
+
+        // Per-layer weights. Use the now-`pub(crate)` inner fields.
+        use crate::models::lfm2::decoder_layer::OperatorType;
+        for layer in inner.layers.iter_mut() {
+            let w = layer.operator_norm.get_weight();
+            layer.operator_norm.set_weight(&cast(&w)).expect("set op_norm");
+            let w = layer.ffn_norm.get_weight();
+            layer.ffn_norm.set_weight(&cast(&w)).expect("set ffn_norm");
+
+            match &mut layer.operator {
+                OperatorType::Attention(attn) => {
+                    let w = attn.q_proj.get_weight();
+                    attn.q_proj.set_weight(&cast(&w)).expect("set q");
+                    let w = attn.k_proj.get_weight();
+                    attn.k_proj.set_weight(&cast(&w)).expect("set k");
+                    let w = attn.v_proj.get_weight();
+                    attn.v_proj.set_weight(&cast(&w)).expect("set v");
+                    let w = attn.out_proj.get_weight();
+                    attn.out_proj.set_weight(&cast(&w)).expect("set o");
+                    let w = attn.q_layernorm.get_weight();
+                    attn.q_layernorm.set_weight(&cast(&w)).expect("set qn");
+                    let w = attn.k_layernorm.get_weight();
+                    attn.k_layernorm.set_weight(&cast(&w)).expect("set kn");
+                }
+                OperatorType::Conv(conv) => {
+                    let w = conv.conv.get_weight();
+                    conv.conv.set_weight(&cast(&w)).expect("set conv_w");
+                    let w = conv.in_proj.get_weight();
+                    conv.in_proj.set_weight(&cast(&w)).expect("set in_proj");
+                    let w = conv.out_proj.get_weight();
+                    conv.out_proj.set_weight(&cast(&w)).expect("set out_proj");
+                }
+            }
+
+            let mlp = &mut layer.feed_forward;
+            let w = mlp.get_gate_proj_weight();
+            mlp.set_gate_proj_weight(&cast(&w)).expect("set gate");
+            let w = mlp.get_up_proj_weight();
+            mlp.set_up_proj_weight(&cast(&w)).expect("set up");
+            let w = mlp.get_down_proj_weight();
+            mlp.set_down_proj_weight(&cast(&w)).expect("set down");
+        }
+
+        // Drive the adapter lifecycle the same way `chat_sync_core_paged`
+        // does. seq_id is arbitrary (per-request scoping).
+        let prompt: Vec<u32> = vec![10, 20, 30, 40];
+        let max_decode: u32 = 2;
+
+        {
+            let adapter = inner
+                .paged_adapter
+                .as_mut()
+                .expect("paged_adapter constructed above");
+            adapter
+                .reset_for_new_request(0)
+                .expect("reset_for_new_request");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32 + max_decode)
+                .expect("allocate_suffix_blocks");
+        }
+
+        // Prefill the suffix == full prompt (cached_prefix_len = 0).
+        let logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0) {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!(
+                        "skipping test_lfm2_chat_sync_core_paged_smoke_via_helpers: {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected run_paged_prefill_chunk failure: {msg}");
+            }
+        };
+        assert_eq!(
+            logits.ndim().expect("ndim"),
+            1,
+            "prefill logits must be 1-D"
+        );
+        assert_eq!(
+            logits.shape_at(0).expect("shape_at(0)"),
+            cfg.vocab_size as i64,
+            "prefill logits must be [vocab]"
+        );
+        let logits_f32 = logits.astype(DType::Float32).expect("astype f32");
+        logits_f32.eval();
+        let v0 = logits_f32.item_at_float32(0).expect("item_at_float32(0)");
+        assert!(v0.is_finite(), "prefill logits[0] must be finite, got {v0}");
+
+        // Adapter cursor should now equal prompt length.
+        {
+            let adapter = inner.paged_adapter.as_ref().unwrap();
+            assert_eq!(adapter.current_token_count(), prompt.len() as u32);
+        }
+
+        // Two decode steps with arbitrary token values.
+        for (i, tok) in [50u32, 60u32].iter().enumerate() {
+            let next_logits = match inner.run_paged_decode_step(*tok) {
+                Ok(l) => l,
+                Err(e) => {
+                    let msg = e.reason.to_string();
+                    if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                        eprintln!(
+                            "skipping test_lfm2_chat_sync_core_paged_smoke_via_helpers: {msg}"
+                        );
+                        return;
+                    }
+                    panic!("unexpected run_paged_decode_step failure on step {i}: {msg}");
+                }
+            };
+            // Decode logits shape: [1, 1, vocab].
+            assert_eq!(next_logits.ndim().expect("ndim"), 3);
+            assert_eq!(
+                next_logits.shape_at(2).expect("shape_at(2)"),
+                cfg.vocab_size as i64
+            );
+            let next_f32 = next_logits.astype(DType::Float32).expect("astype f32");
+            next_f32.eval();
+            let v = next_f32.item_at_float32(0).expect("item_at_float32(0)");
+            assert!(
+                v.is_finite(),
+                "decode logits[0] step {i} must be finite, got {v}"
+            );
+        }
+
+        // Cursor advanced by 2 decode tokens.
+        {
+            let adapter = inner.paged_adapter.as_ref().unwrap();
+            assert_eq!(
+                adapter.current_token_count(),
+                prompt.len() as u32 + 2,
+                "decode steps must advance the adapter cursor"
+            );
+        }
+    }
+
     /// All-conv config (zero attention layers) with the flag enabled must
     /// fail with a clear error — paged KV cache is meaningless without
     /// attention layers, and silently constructing a pool with

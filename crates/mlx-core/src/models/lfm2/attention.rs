@@ -16,12 +16,12 @@ use napi::bindgen_prelude::*;
 /// - Standard RoPE (neox-style, base=1M)
 /// - No bias on any projection
 pub struct Lfm2Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    out_proj: Linear,
-    q_layernorm: RMSNorm,
-    k_layernorm: RMSNorm,
+    pub(crate) q_proj: Linear,
+    pub(crate) k_proj: Linear,
+    pub(crate) v_proj: Linear,
+    pub(crate) out_proj: Linear,
+    pub(crate) q_layernorm: RMSNorm,
+    pub(crate) k_layernorm: RMSNorm,
     rope: RoPE,
     num_heads: i32,
     num_kv_heads: i32,

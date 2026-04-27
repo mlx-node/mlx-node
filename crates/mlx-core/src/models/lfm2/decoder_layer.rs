@@ -44,8 +44,8 @@ pub(crate) enum OperatorType {
 pub struct Lfm2DecoderLayer {
     pub(crate) operator: OperatorType,
     pub(crate) feed_forward: MLP,
-    operator_norm: RMSNorm,
-    ffn_norm: RMSNorm,
+    pub(crate) operator_norm: RMSNorm,
+    pub(crate) ffn_norm: RMSNorm,
 }
 
 impl Lfm2DecoderLayer {

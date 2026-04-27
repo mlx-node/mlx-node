@@ -15,9 +15,9 @@ use napi::bindgen_prelude::*;
 ///   y = C * conv_out
 ///   return out_proj(y)
 pub struct ShortConv {
-    conv: Conv1d,
-    in_proj: Linear,
-    out_proj: Linear,
+    pub(crate) conv: Conv1d,
+    pub(crate) in_proj: Linear,
+    pub(crate) out_proj: Linear,
     l_cache: i32,
     hidden_size: i32,
 }
