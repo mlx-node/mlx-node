@@ -211,6 +211,7 @@ export function createBridgeStub(
   options?: {
     fusionEnabled?: boolean;
     passCachingEnabled?: boolean;
+    optimizationControlBuffer?: SharedArrayBuffer;
   },
 ): BridgeStub {
   const cmdView = new Int32Array(cmdBuffer);
@@ -237,8 +238,27 @@ export function createBridgeStub(
   function wasmMalloc(size: number): number {
     return _wasmMalloc(size) >>> 0;
   }
-  const fusionEnabled = options?.fusionEnabled !== false;
-  const passCachingEnabled = options?.passCachingEnabled !== false;
+  const optimizationControl =
+    options?.optimizationControlBuffer &&
+    options.optimizationControlBuffer.byteLength >= 8
+      ? new Int32Array(
+          options.optimizationControlBuffer,
+          0,
+          options.optimizationControlBuffer.byteLength >= 12 ? 3 : 2,
+        )
+      : null;
+  const defaultFusionEnabled = options?.fusionEnabled !== false;
+  const defaultPassCachingEnabled = options?.passCachingEnabled !== false;
+  function fusionEnabled(): boolean {
+    return optimizationControl
+      ? Atomics.load(optimizationControl, 0) !== 0
+      : defaultFusionEnabled;
+  }
+  function passCachingEnabled(): boolean {
+    return optimizationControl
+      ? Atomics.load(optimizationControl, 1) !== 0
+      : defaultPassCachingEnabled;
+  }
   // Get a fresh Uint8Array view of WASM heap. wasmMemory.buffer always reflects
   // current size after memory.grow() (WebAssembly.Memory getter returns fresh SAB).
   function heap(): Uint8Array {
@@ -629,15 +649,12 @@ export function createBridgeStub(
   // non-dispatch RPC is about to fire (via the flush-before-any-other-RPC
   // guard at the top of rpcCall).
   //
-  // NOTE 2026-04-16: batching is currently only enabled on the main worker
-  // (child emnapi workers pass dispatchBatch=false because concurrent stubs
-  // would race on this shared SAB). The main worker's bridge is idle during
-  // decode (bridgeRPCs=1/tok measured), so in the current architecture this
-  // path accumulates zero hits in the hot path. Diagnostic counters below
-  // make that measurable.
-  const batchActive = batchEnabled === true && dispatchBatchBuffer !== undefined;
-  const batchU32 = batchActive ? new Uint32Array(dispatchBatchBuffer!) : null;
-  const batchU8 = batchActive ? new Uint8Array(dispatchBatchBuffer!) : null;
+  // NOTE 2026-04-16: batching uses a dedicated SAB per worker. It can be
+  // toggled at request boundaries by optimizationControlBuffer so VLM image
+  // prefill can stay conservative without slowing down text-only decode.
+  const batchAvailable = batchEnabled === true && dispatchBatchBuffer !== undefined;
+  const batchU32 = batchAvailable ? new Uint32Array(dispatchBatchBuffer!) : null;
+  const batchU8 = batchAvailable ? new Uint8Array(dispatchBatchBuffer!) : null;
   const batchBufferIdVal = batchBufferId ?? 0;
   let batchCount = 0;
   let batchBytes = 0;
@@ -660,6 +677,11 @@ export function createBridgeStub(
   function bumpBatchStageRefused(): void {
     diagBatchStageRefused++;
     bumpPoolStat(POOL_STAT_BATCH_STAGE_REFUSED);
+  }
+  function dispatchBatchEnabled(): boolean {
+    if (!batchAvailable) return false;
+    if (!optimizationControl || optimizationControl.length < 3) return true;
+    return Atomics.load(optimizationControl, 2) !== 0;
   }
 
   function flushDispatchBatchInner(): void {
@@ -687,7 +709,7 @@ export function createBridgeStub(
    * populate the cmdBuffer fields exactly as for a single-dispatch RPC.
    */
   function stageDispatchBatchRecord(opcode: number): boolean {
-    if (!batchActive || !batchU32 || !batchU8) return false;
+    if (!dispatchBatchEnabled() || !batchU32 || !batchU8) return false;
     const entryCount = cmdU32[I_CB_COUNT] >>> 0;
     if (entryCount > MAX_DISPATCH_BATCH_ENTRIES) return false;
     const uniformSize =
@@ -914,7 +936,7 @@ export function createBridgeStub(
     // touch cmd-SAB. Reassign `pendingReleases` to a fresh empty array
     // first so any re-entrant queueRelease after this point lands in the
     // new array (picked up by a subsequent flush), never in ours.
-    if (batchActive && batchCount > 0) {
+    if (batchCount > 0) {
       flushDispatchBatchInner();
     }
     // (3) Second drainFireAndForget: if a callback invoked during
@@ -997,7 +1019,6 @@ export function createBridgeStub(
     // invoking rpcCall so the fallback dispatch does not reorder ahead of
     // earlier staged dispatches — see the two call sites below.
     if (
-      batchActive &&
       batchCount > 0 &&
       fnId !== RpcFn.DISPATCH_BATCH &&
       fnId !== RpcFn.FUSED_FULL_DISPATCH &&
@@ -1120,7 +1141,7 @@ export function createBridgeStub(
     // a copy would let the copy RPC overtake the pending dispatches. No
     // opcode exemption is needed: rpcCallWithHi is never used for
     // DISPATCH_BATCH / FUSED_*_DISPATCH / BUFFER_RELEASE_BATCH.
-    if (batchActive && batchCount > 0) {
+    if (batchCount > 0) {
       flushDispatchBatchInner();
     }
     if (pendingReleases.length > 0) {
@@ -1499,7 +1520,7 @@ export function createBridgeStub(
     ): void {
       const resolved = resolveBufferHandle(bufferHandle);
       // Defer small writes at offset 0 — will be packed into FUSED_DISPATCH_WITH_UNIFORM
-      if (fusionEnabled && size <= 256 && bufferOffset === 0n) {
+      if (fusionEnabled() && size <= 256 && bufferOffset === 0n) {
         const h = heap();
         const data = h.slice(dataPtr, dataPtr + size);
         pendingWriteBuffers.set(resolved, { data });
@@ -1523,7 +1544,7 @@ export function createBridgeStub(
     // Cache active compute pass to avoid begin/end per dispatch.
     // C++ creates a new pass for each eval, but we reuse the existing one.
     wgpuCommandEncoderBeginComputePass(encoderHandle: number, _descPtr: number): number {
-      if (!passCachingEnabled) {
+      if (!passCachingEnabled()) {
         const handle = rpcCall(RpcFn.CMD_ENCODER_BEGIN_COMPUTE_PASS, encoderHandle);
         activeComputePass = handle;
         activeComputePassEncoder = encoderHandle;
@@ -1563,7 +1584,7 @@ export function createBridgeStub(
       const sizeLo = Number(size & 0xffffffffn);
       const sizeHi = Number(size >> 32n);
 
-      if (!passCachingEnabled) {
+      if (!passCachingEnabled()) {
         if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
           rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
           activeComputePass = -1;
@@ -1656,7 +1677,7 @@ export function createBridgeStub(
     // Buffer setPipeline + setBindGroup calls, flush them in a single fused RPC
     // when dispatch is called. This reduces 3+ RPC roundtrips to 1.
     wgpuComputePassEncoderSetPipeline(passHandle: number, pipelineHandle: number): void {
-      if (!fusionEnabled) {
+      if (!fusionEnabled()) {
         flushPendingCompute();
         rpcCall(RpcFn.COMPUTE_PASS_SET_PIPELINE, passHandle, pipelineHandle);
         return;
@@ -1674,7 +1695,7 @@ export function createBridgeStub(
       dynamicOffsetCount: number,
       dynamicOffsetsPtr: number,
     ): void {
-      if (!fusionEnabled) {
+      if (!fusionEnabled()) {
         flushPendingCompute();
         const realBg = materializeBg(bgHandle);
         rpcCall(
@@ -1708,7 +1729,7 @@ export function createBridgeStub(
     },
 
     wgpuComputePassEncoderDispatchWorkgroups(passHandle: number, x: number, y: number, z: number): void {
-      if (!fusionEnabled) {
+      if (!fusionEnabled()) {
         flushPendingCompute();
         rpcCall(RpcFn.COMPUTE_PASS_DISPATCH, passHandle, x, y, z);
         return;
@@ -1833,7 +1854,7 @@ export function createBridgeStub(
               // batch first so the fallback dispatch does NOT reorder ahead
               // of earlier staged dispatches — the flush guard at the top of
               // rpcCall exempts FUSED_* opcodes, so we must flush by hand.
-              if (batchActive && batchCount > 0) flushDispatchBatchInner();
+              if (batchCount > 0) flushDispatchBatchInner();
               const result = rpcCall(
                 RpcFn.FUSED_DISPATCH_WITH_UNIFORM,
                 pendingPass,
@@ -1914,7 +1935,7 @@ export function createBridgeStub(
               // first so the fallback dispatch does NOT reorder ahead of
               // earlier staged dispatches — the flush guard at the top of
               // rpcCall exempts FUSED_* opcodes, so we must flush by hand.
-              if (batchActive && batchCount > 0) flushDispatchBatchInner();
+              if (batchCount > 0) flushDispatchBatchInner();
               rpcCall(RpcFn.FUSED_FULL_DISPATCH, pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z);
             }
           }

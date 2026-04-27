@@ -62,6 +62,9 @@ let wasmMemory: WebAssembly.Memory | null = null;
 let wasmMalloc: ((size: number) => number) | null = null;
 let wasmFree: ((ptr: number) => void) | null = null;
 let modelSupportsImages = false;
+let bridgeOptimizationControl: Int32Array | null = null;
+let configuredFusionEnabled = true;
+let configuredDispatchBatchEnabled = false;
 
 // GPU-buffer import currently wraps JS-created WGPUBuffer handles before Rust
 // builds Linear::weight_t transpose views. Until packed-bf16 metadata is proven
@@ -141,6 +144,47 @@ function rejectUnsupportedImages(messages: any[]): boolean {
     message: "Image input is unavailable for the loaded text-only model.",
   });
   return true;
+}
+
+function setBridgeOptimizations(
+  fusionEnabled: boolean,
+  passCachingEnabled: boolean,
+  dispatchBatchEnabled: boolean,
+) {
+  if (!bridgeOptimizationControl) return;
+  Atomics.store(bridgeOptimizationControl, 0, fusionEnabled ? 1 : 0);
+  Atomics.store(bridgeOptimizationControl, 1, passCachingEnabled ? 1 : 0);
+  Atomics.store(bridgeOptimizationControl, 2, dispatchBatchEnabled ? 1 : 0);
+}
+
+async function withBridgeModeForMessages<T>(
+  messages: any[],
+  run: () => Promise<T>,
+): Promise<T> {
+  const imageRequest = hasMessageImages(messages);
+  if (!bridgeOptimizationControl) return run();
+
+  const previousFusion = Atomics.load(bridgeOptimizationControl, 0) !== 0;
+  const previousPassCaching = Atomics.load(bridgeOptimizationControl, 1) !== 0;
+  const previousDispatchBatch = Atomics.load(bridgeOptimizationControl, 2) !== 0;
+  if (imageRequest) {
+    // VLM prefill still needs the conservative bridge path because it has
+    // cross-worker pass ownership and copy/restart patterns that are not yet
+    // safe with the text decode fusion stack.
+    setBridgeOptimizations(false, false, false);
+  } else {
+    setBridgeOptimizations(configuredFusionEnabled, true, configuredDispatchBatchEnabled);
+  }
+
+  try {
+    return await run();
+  } finally {
+    setBridgeOptimizations(
+      previousFusion,
+      previousPassCaching,
+      previousDispatchBatch,
+    );
+  }
 }
 
 function buildMergedLinearAttentionTensors(
@@ -348,7 +392,8 @@ async function handleInit(data: {
   const compileGdnG = data.compileGdnG !== false;
   const enableVlm = data.enableVlm !== false;
   const fuseDispatch = data.fuseDispatch !== false;
-  const optimisticBridge = !enableVlm;
+  configuredFusionEnabled = fuseDispatch;
+  configuredDispatchBatchEnabled = dispatchBatch;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
     post({ type: "progress", step: "gpu", message: "Initializing WebGPU..." });
@@ -388,6 +433,13 @@ async function handleInit(data: {
     const statsBuffer = profileEnabled
       ? new SharedArrayBuffer(STATS_BUFFER_SIZE)
       : undefined;
+    const optimizationControlBuffer = new SharedArrayBuffer(12);
+    bridgeOptimizationControl = new Int32Array(optimizationControlBuffer);
+    setBridgeOptimizations(
+      configuredFusionEnabled,
+      true,
+      configuredDispatchBatchEnabled,
+    );
     // WASM module requires min 1002 pages (~66 MB). We use 4096 (~268 MB)
     // for headroom during WASM init (thread stacks, emnapi, etc.) and let
     // memory.grow expand as needed — keeps total well under the 2 GB JS
@@ -435,13 +487,14 @@ async function handleInit(data: {
       gpuReady.features,
       poolStatsBuffer,
       dispatchBatchBuffer,
-      optimisticBridge && dispatchBatch,
+      dispatchBatch,
       0, // batchBufferId = 0 for main worker
       bufferMetadataBuffer,
       statsBuffer,
       {
-        fusionEnabled: optimisticBridge && fuseDispatch,
-        passCachingEnabled: optimisticBridge,
+        fusionEnabled: configuredFusionEnabled,
+        passCachingEnabled: true,
+        optimizationControlBuffer,
       },
     );
     // Retain for ?profile=1 readback (resetBridgeStats / fetchGpuWorkerStats
@@ -525,10 +578,9 @@ async function handleInit(data: {
         const workerBatchIndex = nextWorkerBatchIndex++;
         const workerBatchBuffer =
           batchBuffers[workerBatchIndex] ?? batchBuffers[0]!;
-        // Child pthreads can hold local bridge state while another worker
-        // ends/releases the shared WebGPU compute pass. In VLM mode, keep
-        // child worker bridge calls immediate so delayed fused/batched
-        // dispatches cannot target a pass released by a different worker.
+        // Child pthreads share the optimization-control SAB with the main
+        // worker, so text decode keeps the fast bridge path while VLM image
+        // prefill can temporarily force immediate bridge calls.
         w.postMessage({
           type: "__mlx_rpc_config",
           cmdBuffer,
@@ -536,9 +588,10 @@ async function handleInit(data: {
           poolStatsBuffer,
           dispatchBatchBuffer: workerBatchBuffer,
           batchBufferId: workerBatchIndex,
-          dispatchBatch: optimisticBridge && dispatchBatch,
-          fusionEnabled: optimisticBridge && fuseDispatch,
-          passCachingEnabled: optimisticBridge,
+          dispatchBatch,
+          fusionEnabled: configuredFusionEnabled,
+          passCachingEnabled: true,
+          optimizationControlBuffer,
           bufferMetadataBuffer,
           statsBuffer,
           handles: {
@@ -1127,24 +1180,30 @@ async function handleChat(data: {
     // tokens render live. See the 'stream-finalize' handler below.
     post({ type: "stream-sab-open", ringOffset, size: SAB_RING_SIZE });
 
-    // chatStreamSab writes directly into the heap-backed ring — no TSFN on the
-    // hot decode path. It returns a handle once the stream is running and
-    // resolves when the producer has written the done record.
-    const handle = await model.chatStreamSab(data.messages, chatConfig, sabBuf);
-    void handle;
+    await withBridgeModeForMessages(data.messages, async () => {
+      // chatStreamSab writes directly into the heap-backed ring — no TSFN on the
+      // hot decode path. It returns a handle once the stream is running and
+      // resolves when the producer has written the done record.
+      const handle = await model.chatStreamSab(
+        data.messages,
+        chatConfig,
+        sabBuf,
+      );
+      void handle;
 
-    // Wait for the main-thread reader to drain the done-chunk and send us
-    // back its numTokens so we can emit the profile snapshot with correct
-    // ratios. This also serialises the ring free — we don't free until the
-    // reader has consumed everything.
-    const numTokens = await finalizePromise;
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-    post({
-      type: "progress",
-      step: "chat",
-      message: `chatStream completed in ${elapsed}s`,
+      // Wait for the main-thread reader to drain the done-chunk and send us
+      // back its numTokens so we can emit the profile snapshot with correct
+      // ratios. This also serialises the ring free — we don't free until the
+      // reader has consumed everything.
+      const numTokens = await finalizePromise;
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      post({
+        type: "progress",
+        step: "chat",
+        message: `chatStream completed in ${elapsed}s`,
+      });
+      postProfileSnapshot(numTokens);
     });
-    postProfileSnapshot(numTokens);
   } catch (e) {
     let message = String(e);
     let stack: string | undefined;
@@ -1170,7 +1229,9 @@ async function handleChatBaseline(data: {
     const chatConfig = buildChatConfig(data);
     resetProfileCounters();
     const t0 = performance.now();
-    const result = await model.chat(data.messages, chatConfig);
+    const result = await withBridgeModeForMessages(data.messages, () =>
+      model.chat(data.messages, chatConfig),
+    );
     const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
     post({
       type: "progress",
@@ -1220,53 +1281,55 @@ async function handleChatTsfn(data: {
     const doneP = new Promise<void>((r) => {
       doneResolve = r;
     });
-    const handle = await model.chatStream(
-      data.messages,
-      chatConfig,
-      (err: Error | null, chunk: any) => {
-        if (err) {
-          post({ type: "error", message: err.message, stack: err.stack });
-          doneResolve?.();
-          return;
-        }
-        if (chunk.done) {
-          const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-          post({
-            type: "progress",
-            step: "chat",
-            message: `chatStream completed in ${elapsed}s`,
-          });
-          postProfileSnapshot(chunk.numTokens ?? 0);
-          post({
-            type: "result",
-            text: chunk.text,
-            rawText: chunk.rawText,
-            numTokens: chunk.numTokens,
-            finishReason: chunk.finishReason,
-            toolCalls: chunk.toolCalls,
-            thinking: chunk.thinking,
-            performance: chunk.performance
-              ? {
-                  ttftMs: chunk.performance.ttftMs,
-                  prefillTokensPerSecond:
-                    chunk.performance.prefillTokensPerSecond,
-                  decodeTokensPerSecond:
-                    chunk.performance.decodeTokensPerSecond,
-                }
-              : null,
-          });
-          doneResolve?.();
-        } else {
-          post({
-            type: "chunk",
-            text: chunk.text,
-            isReasoning: chunk.isReasoning ?? false,
-          });
-        }
-      },
-    );
-    void handle;
-    await doneP;
+    await withBridgeModeForMessages(data.messages, async () => {
+      const handle = await model.chatStream(
+        data.messages,
+        chatConfig,
+        (err: Error | null, chunk: any) => {
+          if (err) {
+            post({ type: "error", message: err.message, stack: err.stack });
+            doneResolve?.();
+            return;
+          }
+          if (chunk.done) {
+            const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+            post({
+              type: "progress",
+              step: "chat",
+              message: `chatStream completed in ${elapsed}s`,
+            });
+            postProfileSnapshot(chunk.numTokens ?? 0);
+            post({
+              type: "result",
+              text: chunk.text,
+              rawText: chunk.rawText,
+              numTokens: chunk.numTokens,
+              finishReason: chunk.finishReason,
+              toolCalls: chunk.toolCalls,
+              thinking: chunk.thinking,
+              performance: chunk.performance
+                ? {
+                    ttftMs: chunk.performance.ttftMs,
+                    prefillTokensPerSecond:
+                      chunk.performance.prefillTokensPerSecond,
+                    decodeTokensPerSecond:
+                      chunk.performance.decodeTokensPerSecond,
+                  }
+                : null,
+            });
+            doneResolve?.();
+          } else {
+            post({
+              type: "chunk",
+              text: chunk.text,
+              isReasoning: chunk.isReasoning ?? false,
+            });
+          }
+        },
+      );
+      void handle;
+      await doneP;
+    });
   } catch (e) {
     let message = String(e);
     let stack: string | undefined;

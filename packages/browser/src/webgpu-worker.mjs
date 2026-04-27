@@ -41,6 +41,7 @@ const handler = new MessageHandler({
       {
         fusionEnabled: rpcConfig.fusionEnabled !== false,
         passCachingEnabled: rpcConfig.passCachingEnabled !== false,
+        optimizationControlBuffer: rpcConfig.optimizationControlBuffer,
       },
     );
 
