@@ -389,12 +389,15 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        // 3. Shape sanity. We require both arrays to be 3-D and to agree
-        //    on the leading (num_tokens) dimension. The kernel itself
-        //    re-derives the strides from config.num_kv_heads * head_size,
-        //    so we don't need to verify the inner dims byte-by-byte —
-        //    but we do require ndim == 3 to catch obvious caller bugs
-        //    (e.g. forgetting a reshape).
+        // 3. Shape sanity. We require both arrays to be 3-D and to agree on
+        //    EVERY dim against the pool's config. The kernel re-derives its
+        //    strides from `config.num_kv_heads * config.head_size`; passing
+        //    e.g. `[num_tokens, 1, 1]` keys would still cause the kernel to
+        //    read `num_kv_heads * head_size` worth of bytes per token,
+        //    walking off the end of the buffer. The validation below
+        //    rejects that case loudly *before* kernel dispatch — catching
+        //    safe-Rust → out-of-bounds-GPU-read scenarios at the API
+        //    boundary.
         let key_ndim = keys
             .ndim()
             .map_err(|e| format!("keys.ndim() failed: {e}"))?;
@@ -407,12 +410,28 @@ impl PagedKVCacheAdapter {
                  [num_tokens, num_kv_heads, head_size]; got ndim {key_ndim}/{value_ndim}"
             ));
         }
+        let cfg = self.layer_kv_pool.config();
+        let expected_kv_heads = cfg.num_kv_heads as i64;
+        let expected_head_size = cfg.head_size as i64;
+
         let key_n = keys
             .shape_at(0)
             .map_err(|e| format!("keys.shape_at(0) failed: {e}"))?;
+        let key_h = keys
+            .shape_at(1)
+            .map_err(|e| format!("keys.shape_at(1) failed: {e}"))?;
+        let key_d = keys
+            .shape_at(2)
+            .map_err(|e| format!("keys.shape_at(2) failed: {e}"))?;
         let value_n = values
             .shape_at(0)
             .map_err(|e| format!("values.shape_at(0) failed: {e}"))?;
+        let value_h = values
+            .shape_at(1)
+            .map_err(|e| format!("values.shape_at(1) failed: {e}"))?;
+        let value_d = values
+            .shape_at(2)
+            .map_err(|e| format!("values.shape_at(2) failed: {e}"))?;
         if key_n != value_n {
             return Err(format!(
                 "update_keys_values: keys/values disagree on num_tokens ({key_n} vs \
@@ -422,6 +441,34 @@ impl PagedKVCacheAdapter {
         if key_n < 0 {
             return Err(format!(
                 "update_keys_values: keys.shape_at(0) returned negative ({key_n})"
+            ));
+        }
+        if key_h != expected_kv_heads {
+            return Err(format!(
+                "update_keys_values: keys.shape_at(1) = {key_h} but pool config has \
+                 num_kv_heads = {expected_kv_heads}; mismatched inner dims would cause \
+                 the kernel to read past the end of the input buffer"
+            ));
+        }
+        if value_h != expected_kv_heads {
+            return Err(format!(
+                "update_keys_values: values.shape_at(1) = {value_h} but pool config has \
+                 num_kv_heads = {expected_kv_heads}; mismatched inner dims would cause \
+                 the kernel to read past the end of the input buffer"
+            ));
+        }
+        if key_d != expected_head_size {
+            return Err(format!(
+                "update_keys_values: keys.shape_at(2) = {key_d} but pool config has \
+                 head_size = {expected_head_size}; mismatched inner dims would cause \
+                 the kernel to read past the end of the input buffer"
+            ));
+        }
+        if value_d != expected_head_size {
+            return Err(format!(
+                "update_keys_values: values.shape_at(2) = {value_d} but pool config has \
+                 head_size = {expected_head_size}; mismatched inner dims would cause \
+                 the kernel to read past the end of the input buffer"
             ));
         }
         let num_tokens = key_n as u32;
@@ -448,11 +495,23 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        // 5. Pick the kv dtype for the kernel.
-        let dtype = keys
+        // 5. Pick the kv input dtype for the kernel and require K/V dtype
+        //    parity. Distinct dtypes would route through a kernel templated
+        //    on a single `KV_T`, silently reinterpreting one of the buffers.
+        let key_dtype = keys
             .dtype()
             .map_err(|e| format!("keys.dtype() failed: {e}"))?;
-        let kv_metal_dtype = match dtype {
+        let value_dtype = values
+            .dtype()
+            .map_err(|e| format!("values.dtype() failed: {e}"))?;
+        if key_dtype != value_dtype {
+            return Err(format!(
+                "update_keys_values: keys/values dtype mismatch ({key_dtype:?} vs \
+                 {value_dtype:?}); the kernel templates on a single KV element type and \
+                 reinterprets buffers blindly"
+            ));
+        }
+        let input_metal_dtype = match key_dtype {
             DType::Float32 => mlx_paged_attn::metal::MetalDtype::Float32,
             DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
             DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
@@ -476,7 +535,7 @@ impl PagedKVCacheAdapter {
                 keys.as_raw_ptr(),
                 values.as_raw_ptr(),
                 &slot_mapping,
-                kv_metal_dtype,
+                input_metal_dtype,
                 /* k_scale */ 1.0,
                 /* v_scale */ 1.0,
             )
@@ -1510,6 +1569,72 @@ mod tests {
         );
     }
 
+    /// `update_keys_values` must reject keys whose `shape_at(1)` does not
+    /// match the pool's `num_kv_heads`. The kernel re-derives strides from
+    /// `num_kv_heads * head_size`; an inner-dim mismatch would walk past
+    /// the end of the input buffer and read garbage on the GPU.
+    #[test]
+    fn test_update_keys_values_rejects_wrong_num_kv_heads() {
+        // Pool config: num_kv_heads = 1, head_size = 32 (from new_test_pool).
+        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        // Pass 4 KV heads instead of 1.
+        let k = dummy_kv(4, 4, 32);
+        let v = dummy_kv(4, 4, 32);
+        let res = adapter.update_keys_values(0, &k, &v, 0);
+        assert!(res.is_err(), "expected num_kv_heads mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("num_kv_heads"),
+            "error must mention num_kv_heads, got: {msg}"
+        );
+    }
+
+    /// `update_keys_values` must reject keys whose `shape_at(2)` does not
+    /// match the pool's `head_size`. Same OOB-read hazard as the
+    /// num_kv_heads case.
+    #[test]
+    fn test_update_keys_values_rejects_wrong_head_size() {
+        // Pool config: num_kv_heads = 1, head_size = 32.
+        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        // Pass head_size = 16 instead of 32.
+        let k = dummy_kv(4, 1, 16);
+        let v = dummy_kv(4, 1, 16);
+        let res = adapter.update_keys_values(0, &k, &v, 0);
+        assert!(res.is_err(), "expected head_size mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("head_size"),
+            "error must mention head_size, got: {msg}"
+        );
+    }
+
+    /// `update_keys_values` must reject keys/values whose dtypes disagree.
+    /// The kernel templates on a single `KV_T`, so passing distinct dtypes
+    /// would silently reinterpret one of the buffers (e.g. read F32 bytes
+    /// as F16, garbage cache).
+    #[test]
+    fn test_update_keys_values_rejects_keys_values_dtype_mismatch() {
+        let mut adapter = make_adapter(new_allocator(8, 4), 4).unwrap();
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        let k = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Float16);
+        let v = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Float32);
+        let res = adapter.update_keys_values(0, &k, &v, 0);
+        assert!(res.is_err(), "expected dtype mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("dtype"),
+            "error must mention dtype mismatch, got: {msg}"
+        );
+    }
+
     /// Happy-path Metal dispatch on a tiny pool. The block id for the
     /// freshly allocated request is recorded, then we write 2 tokens at
     /// logical positions 0 and 1 of layer 0. We can't read back the K/V
@@ -1547,9 +1672,8 @@ mod tests {
         adapter.allocate_suffix_blocks(2).unwrap();
         adapter.record_tokens(&[7, 9]).unwrap();
 
-        // Use Float16: the legacy `reshape_and_cache_kernel_name` helper
-        // hard-codes input as `half`, so only Float16 currently routes to
-        // an instantiated kernel. BF16 input support is a separate change.
+        // Float16 input + Float16 cache: instantiated by the metal source as
+        // `reshape_and_cache_kv_half_cache_half`.
         let k = dummy_kv_with_dtype(2, 1, 64, crate::array::DType::Float16);
         let v = dummy_kv_with_dtype(2, 1, 64, crate::array::DType::Float16);
         // Force materialization so the Metal buffer is real before we
@@ -1566,6 +1690,54 @@ mod tests {
                 assert!(
                     e.contains("Metal GPU not available"),
                     "unexpected error from update_keys_values: {e}"
+                );
+            }
+        }
+    }
+
+    /// BF16 happy-path Metal dispatch. Qwen3.5 — the largest model in this
+    /// codebase — runs in BF16 in production, so the BF16 input route MUST
+    /// route to the `reshape_and_cache_kv_bfloat16_t_cache_bfloat16_t`
+    /// kernel rather than failing kernel-name lookup. Graceful skip if
+    /// Metal isn't available (CI / sandboxed VMs).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_update_keys_values_writes_succeed_on_metal_bf16() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(cfg.clone(), 4) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("Skipping test_update_keys_values_writes_succeed_on_metal_bf16: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.reset_for_new_request(43).unwrap();
+        adapter.allocate_suffix_blocks(2).unwrap();
+        adapter.record_tokens(&[1, 2]).unwrap();
+
+        let k = dummy_kv_with_dtype(2, 1, 64, crate::array::DType::BFloat16);
+        let v = dummy_kv_with_dtype(2, 1, 64, crate::array::DType::BFloat16);
+        k.eval();
+        v.eval();
+
+        let res = adapter.update_keys_values(0, &k, &v, 0);
+        match res {
+            Ok(()) => {}
+            Err(e) => {
+                assert!(
+                    e.contains("Metal GPU not available"),
+                    "unexpected error from update_keys_values (BF16): {e}"
                 );
             }
         }
