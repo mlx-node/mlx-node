@@ -6246,6 +6246,77 @@ mod tests {
         );
     }
 
+    /// Tiny config compatible with the block-paged adapter's
+    /// `PagedAttentionConfig::validate` constraints (head_size in the
+    /// allowed set, FP8 off, etc.). Mirrors the `tiny_config` helpers in
+    /// `utils/functional.rs` but with `head_dim = 32` so the LayerKVPool
+    /// constructor accepts it.
+    #[cfg(test)]
+    fn paged_tiny_config(use_block_paged: bool) -> super::Qwen3Config {
+        super::Qwen3Config {
+            vocab_size: 100,
+            hidden_size: 64, // 2 heads * 32 head_dim
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            max_position_embeddings: 128,
+            head_dim: 32,
+            use_qk_norm: true,
+            tie_word_embeddings: false,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 0,
+            // Legacy paged-attention path — not exercised here.
+            use_paged_attention: None,
+            paged_cache_memory_mb: Some(256), // smallest valid budget
+            paged_block_size: Some(16),
+            use_fp8_cache: None,
+            // The flag under test.
+            use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+        }
+    }
+
+    /// Default-flag construction must NOT allocate the block-paged adapter.
+    /// Pure path that only relies on the existing MLX runtime
+    /// (matches the rest of the `models::qwen3` test suite).
+    #[test]
+    fn test_qwen3_inner_no_paged_adapter_when_flag_is_none() {
+        let cfg = paged_tiny_config(false);
+        let inner = super::Qwen3Inner::new(cfg).expect("Qwen3Inner::new without paged adapter");
+        assert!(
+            inner.paged_adapter.is_none(),
+            "paged_adapter must be None when use_block_paged_cache is None"
+        );
+    }
+
+    /// Construction with `use_block_paged_cache: Some(true)` must populate
+    /// `paged_adapter`. Allocates a `LayerKVPool`, so requires Metal — gracefully
+    /// skips on no-Metal sandboxes by matching on the LayerKVPool error string
+    /// (mirrors the pattern used in the `paged_kv_cache_adapter` test module).
+    #[test]
+    fn test_qwen3_inner_constructs_paged_adapter_when_flag_is_true() {
+        let cfg = paged_tiny_config(true);
+        match super::Qwen3Inner::new(cfg) {
+            Ok(inner) => {
+                assert!(
+                    inner.paged_adapter.is_some(),
+                    "paged_adapter must be Some when use_block_paged_cache = Some(true)"
+                );
+            }
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen3Inner::new failure: {msg}");
+            }
+        }
+    }
+
     /// `use_block_paged_cache: true` round-trips correctly through serde —
     /// regression guard against a future rename / serde annotation drift.
     #[test]

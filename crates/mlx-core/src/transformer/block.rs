@@ -1,9 +1,10 @@
-use crate::array::MxArray;
+use crate::array::{MxArray, scaled_dot_product_attention_causal};
 use crate::nn::RMSNorm;
 use crate::transformer::PagedKVCache;
 use crate::transformer::attention::{Attention, QKVResult};
 use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use std::ptr;
@@ -298,6 +299,184 @@ impl TransformerBlock {
     pub fn compute_qkv(&self, x: &MxArray, rope_offset: i32) -> Result<QKVResult> {
         let normed = self.input_layernorm.forward(x)?;
         self.self_attn.compute_qkv(&normed, rope_offset)
+    }
+
+    /// Forward pass driven by `PagedKVCacheAdapter` (vLLM-style block-paged
+    /// KV with refcounted prefix reuse).
+    ///
+    /// This is the read-side complement to `Qwen3Inner::paged_adapter`, used
+    /// when `Qwen3Config::use_block_paged_cache` is opt-in true. It is
+    /// intentionally separate from `forward_paged_metal` (which talks to the
+    /// older `PagedKVCache` + `ContinuousBatchingScheduler` path); this entry
+    /// point is the one we plan to wire `chat_sync_core` through, and it
+    /// tracks per-request block-table semantics rather than batched
+    /// continuous-batching semantics.
+    ///
+    /// # Arguments
+    /// * `x` — input tensor.
+    ///   - For prefill: `[1, seq_len, hidden_size]` (the suffix tokens this
+    ///     layer needs to attend; a cached prefix already lives in the pool
+    ///     and the adapter's block_table covers the full request).
+    ///   - For decode: `[1, 1, hidden_size]` (single new token).
+    /// * `adapter` — the active per-request adapter. Caller must already
+    ///   have run `reset_for_new_request`, optionally `find_cached_prefix`,
+    ///   `allocate_suffix_blocks`, and `record_tokens` for **this chunk**
+    ///   *before* calling this method (see `update_keys_values` alignment
+    ///   contract).
+    /// * `layer_idx` — index of this layer (must match the order layers were
+    ///   constructed in `Qwen3Inner::new`).
+    /// * `first_logical_position` — logical token index in the request where
+    ///   this chunk's first token lives. For a fresh prefill that's
+    ///   `cached_token_count` (the cache hit boundary); for decode it's
+    ///   `current_token_count - 1`. Forwarded verbatim to
+    ///   `update_keys_values` for the alignment check.
+    /// * `is_prefill` — selects the attention path. Prefill runs standard
+    ///   causal SDPA on the in-flight Q/K/V (the paged Metal kernel is
+    ///   decode-only — single-token Q per sequence — so we do not use it
+    ///   here, even though we still write through to the pool). Decode
+    ///   goes through `gather_kv_for_decode`, which pulls historical K/V
+    ///   from the paged buffers and runs the paged-attention Metal kernel.
+    /// * `_positions`, `_num_query_heads`, `_num_seqs`, `_seq_len` — kept on
+    ///   the signature for symmetry with `forward_paged_metal` and likely
+    ///   future multi-sequence batching, but unused in the current
+    ///   single-sequence path.
+    ///
+    /// # Returns
+    /// Output tensor with the same shape as `x`.
+    ///
+    /// # Caveats / unwired pieces
+    ///
+    /// - **Single-sequence only.** `gather_kv_for_decode` and the adapter's
+    ///   block_table are currently scoped to one request. Continuous
+    ///   batching is the legacy `forward_paged_metal` path's responsibility.
+    /// - **Prefill SDPA over the suffix only.** When a prefix is cached the
+    ///   suffix must still attend back to the cached tokens — the current
+    ///   prefill branch does not yet read the historical K/V from the pool
+    ///   (it would need a multi-token version of `gather_kv_for_decode`,
+    ///   which the brief notes is not implemented). For the **first** call
+    ///   (no cached prefix), this is correct: SDPA over the full sequence.
+    ///   For cache-hit prefills, callers must **either** dispatch the whole
+    ///   prompt via this path with `cached_token_count == 0` and re-prefill
+    ///   the entire prefix, **or** wait for a follow-up commit that adds a
+    ///   prefill-against-paged-K/V path. The adapter wiring through
+    ///   `chat_sync_core` (a separate commit) will pick the strategy.
+    /// - **Decode output dtype.** `gather_kv_for_decode` currently returns
+    ///   Float32 (host-roundtrip). We `astype` it back to `x`'s dtype
+    ///   before output projection / residual so the rest of the block stays
+    ///   in BF16. The on-device zero-copy fast-path (TODO in the adapter)
+    ///   will remove this cast.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_paged_adapter(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        layer_idx: u32,
+        first_logical_position: u32,
+        _num_query_heads: u32,
+        _positions: &MxArray,
+        _num_seqs: i64,
+        _seq_len: i64,
+        is_prefill: bool,
+    ) -> Result<MxArray> {
+        // 1. Input layer norm.
+        let normed = self.input_layernorm.forward(x)?;
+
+        // 2. Compute Q/K/V with RoPE applied. Use `compute_qkv` with the
+        //    request's logical position as the RoPE offset — this matches
+        //    `forward_with_cache`'s use of `cache.get_offset()`. For
+        //    prefill the offset is the first cached/new position; for
+        //    decode it's the position of the single new token.
+        //
+        //    `compute_qkv` returns Q/K/V in the *paged* layout
+        //    `[num_tokens, num_heads, head_dim]` (see Attention::compute_qkv
+        //    docstring) — exactly what `update_keys_values` and SDPA
+        //    expect. For prefill we still need to reshape into 4D
+        //    (batch=1, num_heads, seq_len, head_dim) for SDPA; for decode
+        //    we feed `gather_kv_for_decode` the 3D queries directly.
+        let qkv = self
+            .self_attn
+            .compute_qkv(&normed, first_logical_position as i32)?;
+
+        // 3. Always write the new K/V chunk through to the paged pool so
+        //    future tokens (or future requests sharing this prefix) can
+        //    read them back via gather. Note: the adapter's
+        //    `record_tokens` MUST already have advanced the cursor by the
+        //    chunk size before this call (see method docstring).
+        adapter
+            .update_keys_values(layer_idx, &qkv.keys, &qkv.values, first_logical_position)
+            .map_err(napi::Error::from_reason)?;
+
+        // 4. Compute attention output.
+        let attn_out_paged = if is_prefill {
+            // Prefill: reshape Q/K/V into SDPA-friendly 4D layout and run
+            // standard causal SDPA over the in-flight tokens. This handles
+            // the **no-cached-prefix** case correctly. See "Caveats" in the
+            // method docstring for why a cache-hit prefill needs additional
+            // wiring before the chat-session can use this path with
+            // `cached_token_count > 0`.
+            let num_tokens = qkv.queries.shape_at(0)?;
+            let n_heads = qkv.queries.shape_at(1)?;
+            let n_kv_heads = qkv.keys.shape_at(1)?;
+            let head_dim = qkv.queries.shape_at(2)?;
+
+            // [num_tokens, n_heads, head_dim] -> [1, n_heads, num_tokens, head_dim]
+            // (transpose axes 0 and 1 then add a batch=1 prefix).
+            let q_4d = qkv
+                .queries
+                .reshape(&[1, num_tokens, n_heads, head_dim])?
+                .transpose(Some(&[0, 2, 1, 3]))?;
+            let k_4d = qkv
+                .keys
+                .reshape(&[1, num_tokens, n_kv_heads, head_dim])?
+                .transpose(Some(&[0, 2, 1, 3]))?;
+            let v_4d = qkv
+                .values
+                .reshape(&[1, num_tokens, n_kv_heads, head_dim])?
+                .transpose(Some(&[0, 2, 1, 3]))?;
+
+            let scale = self.self_attn.get_scale();
+            // Causal mask: every prefill token only attends to earlier
+            // suffix tokens via this SDPA call. (See caveats — when there
+            // is also a cached prefix in the pool, this path under-attends.)
+            let attn_4d = scaled_dot_product_attention_causal(&q_4d, &k_4d, &v_4d, scale)?;
+
+            // [1, n_heads, num_tokens, head_dim] -> [num_tokens, n_heads, head_dim]
+            // for `output_projection`'s expected layout.
+            attn_4d
+                .transpose(Some(&[0, 2, 1, 3]))?
+                .reshape(&[num_tokens, n_heads, head_dim])?
+        } else {
+            // Decode: K/V at the new position is now in the pool. Gather
+            // KV for the entire request and run paged attention on the
+            // single-token Q.
+            let scale = self.self_attn.get_scale() as f32;
+            let attn_decode = adapter
+                .gather_kv_for_decode(layer_idx, &qkv.queries, scale, /* softcap */ 1.0)
+                .map_err(napi::Error::from_reason)?;
+
+            // `gather_kv_for_decode` currently materializes Float32 host->
+            // MLX. Cast back to x's dtype so subsequent output_projection +
+            // residual stay homogeneous (residual `x.add(&attn_out)` would
+            // otherwise upcast to f32). When the adapter ships the on-
+            // device zero-copy fast-path this cast becomes a no-op.
+            let target_dtype = x.dtype()?;
+            attn_decode.astype(target_dtype)?
+        };
+
+        // 5. Output projection + residual + MLP, identical to the other
+        //    forward variants.
+        let num_seqs = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+        let attn_out = self
+            .self_attn
+            .output_projection(&attn_out_paged, num_seqs, seq_len)?;
+        let h = x.add(&attn_out)?;
+
+        let normed = self.post_attention_layernorm.forward(&h)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        let out = h.add(&mlp_out)?;
+
+        Ok(out)
     }
 
     /// Forward pass for prefill that returns K/V pairs.
