@@ -845,4 +845,89 @@ mod tests {
             );
         }
     }
+
+    /// Regression test for the allocation-pressure / cache-eviction gap:
+    /// the adapter must keep making progress when the pool fills up
+    /// purely with cache-pinned blocks. With a tiny allocator (2 blocks)
+    /// and a large prefix cache, two register-and-release cycles leave
+    /// every block pinned by the cache. The next request must succeed
+    /// by evicting the LRU oldest cache-only block.
+    #[test]
+    fn test_adapter_can_progress_when_pool_exhausted_by_cache() {
+        let allocator = new_allocator(2, 4);
+        // Default cache cap is large; both prior cycles' blocks survive.
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+
+        // Cycle 1: register + release for prompt P1. First block held by
+        // cache.
+        let p1: [u32; 4] = [1, 2, 3, 4];
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(p1.len() as u32).unwrap();
+        let p1_block_id = adapter.block_table().unwrap().blocks()[0].block_id;
+        adapter.record_tokens(&p1).unwrap();
+        adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        adapter.release_request().unwrap();
+
+        // Cycle 2: register + release for prompt P2. Second block held
+        // by cache. Pool now empty.
+        let p2: [u32; 4] = [10, 20, 30, 40];
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(p2.len() as u32).unwrap();
+        let p2_block_id = adapter.block_table().unwrap().blocks()[0].block_id;
+        adapter.record_tokens(&p2).unwrap();
+        adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        adapter.release_request().unwrap();
+
+        assert_eq!(
+            allocator.lock().unwrap().num_free_blocks(),
+            0,
+            "after two cycles both blocks are cache-pinned"
+        );
+        assert_ne!(p1_block_id, p2_block_id);
+
+        // Cycle 3: a third unique prompt P3. find_cached_prefix misses
+        // (P3 hash is not in the cache). allocate_suffix_blocks must
+        // succeed by evicting the LRU oldest cache-only block (P1's).
+        let p3: [u32; 4] = [100, 200, 300, 400];
+        adapter.reset_for_new_request(2).unwrap();
+        let cached = adapter.find_cached_prefix(&p3, &[]).unwrap();
+        assert_eq!(cached.cached_token_count, 0, "P3 must miss");
+
+        let n_alloc = adapter
+            .allocate_suffix_blocks(p3.len() as u32)
+            .expect("allocate must succeed by evicting LRU cache-only block");
+        assert_eq!(n_alloc, 1, "single 4-token prompt = 1 block");
+
+        // The newly-issued block should be P1's recycled id (P1 was the
+        // LRU oldest cache entry).
+        let new_block_id = adapter.block_table().unwrap().blocks()[0].block_id;
+        assert_eq!(
+            new_block_id, p1_block_id,
+            "evicted block must be P1's (LRU oldest cache entry)"
+        );
+
+        // P2's prefix entry must still resolve — eviction targeted P1
+        // alone.
+        adapter.record_tokens(&p3).unwrap();
+        adapter.release_request().unwrap();
+
+        // Confirm: a fresh adapter looking up P2 still hits.
+        let mut adapter2 = PagedKVCacheAdapter::new(Arc::clone(&allocator), 4).unwrap();
+        adapter2.reset_for_new_request(99).unwrap();
+        let p2_lookup = adapter2.find_cached_prefix(&p2, &[]).unwrap();
+        assert_eq!(
+            p2_lookup.cached_token_count, 4,
+            "P2's cache entry must survive eviction of P1"
+        );
+
+        // And P1's hash is gone.
+        adapter2.release_request().unwrap();
+        let mut adapter3 = PagedKVCacheAdapter::new(allocator, 4).unwrap();
+        adapter3.reset_for_new_request(100).unwrap();
+        let p1_lookup = adapter3.find_cached_prefix(&p1, &[]).unwrap();
+        assert_eq!(
+            p1_lookup.cached_token_count, 0,
+            "P1 was evicted to satisfy allocation; lookup must miss"
+        );
+    }
 }

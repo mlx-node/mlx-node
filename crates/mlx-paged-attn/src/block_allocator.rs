@@ -21,6 +21,17 @@
 //! all external references are released via `free()`, the cache's ref
 //! is what keeps the block alive until LRU eviction (or another
 //! displacement path) decrefs it back to 0 and returns it to the pool.
+//!
+//! # Allocation under cache pressure
+//!
+//! When `free_blocks` is empty, `allocate` falls back to evicting the
+//! LRU oldest cache-only block (one whose ref_count is exactly 1 — the
+//! cache's own logical ref, with no live request holding it) to satisfy
+//! the request. This mirrors vLLM's
+//! `vllm/v1/core/block_pool.py:_maybe_evict_cached_block` pattern and
+//! keeps the pool from going monotonically unreachable when many unique
+//! prompts cycle through `register_prefix` + `free()` faster than they
+//! age out by capacity.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -122,14 +133,66 @@ impl BlockAllocator {
         }
     }
 
-    /// Allocate a new block
+    /// Allocate a new block.
     ///
-    /// Returns None if no free blocks are available
+    /// Pops from `free_blocks` first. If the free pool is empty, falls
+    /// back to evicting the LRU oldest cache-only block (see
+    /// `try_evict_lru_for_allocation`). Returns None only when neither
+    /// path can produce a block (free pool empty AND every cached entry
+    /// is in-use by a live request).
     pub fn allocate(&mut self) -> Option<Arc<PhysicalBlock>> {
-        let block_id = self.free_blocks.pop_front()?;
+        let block_id = if let Some(id) = self.free_blocks.pop_front() {
+            id
+        } else {
+            self.try_evict_lru_for_allocation()?
+        };
         let block = Arc::new(PhysicalBlock::new(block_id));
         self.allocated.insert(block_id, Arc::clone(&block));
         Some(block)
+    }
+
+    /// Attempt to evict the LRU oldest cache-only block to make room for a
+    /// new allocation. Returns the freed `block_id` if successful.
+    ///
+    /// "Cache-only" means the block's `ref_count` is exactly 1 (the
+    /// cache's own logical ref — no request handle is alive on the
+    /// block). If the LRU oldest entry has `ref_count > 1` it's still
+    /// in use by a request, so it can't be evicted; we walk forward
+    /// through `lru_order` looking for the first cache-only candidate.
+    /// If NO entry is cache-only, returns None.
+    ///
+    /// Mirrors vLLM `vllm/v1/core/block_pool.py:_maybe_evict_cached_block`.
+    ///
+    /// Side effects on success: the chosen entry is removed from
+    /// `prefix_cache`, `block_hashes`, `lru_order`, AND `allocated`. Its
+    /// ref_count is decremented from 1 → 0 (releasing the cache's
+    /// logical ref). The block_id is NOT pushed onto `free_blocks` —
+    /// `allocate` will reuse it directly via the returned id.
+    fn try_evict_lru_for_allocation(&mut self) -> Option<u32> {
+        // Snapshot the LRU order so we can mutate `prefix_cache` /
+        // `block_hashes` / `allocated` without invalidating iteration.
+        let candidates: Vec<u64> = self.lru_order.iter().copied().collect();
+        for hash in candidates {
+            let Some(block) = self.prefix_cache.get(&hash) else {
+                // Desync (shouldn't happen, but defensive): entry in
+                // lru_order has no matching prefix_cache record. Skip.
+                continue;
+            };
+            if block.get_ref_count() != 1 {
+                // In use by a live request — skip and try the next.
+                continue;
+            }
+            let block_id = block.block_id;
+            // Release the cache's logical ref (1 → 0).
+            let _ = block.decref();
+            // Remove all bookkeeping for this entry.
+            self.prefix_cache.remove(&hash);
+            self.block_hashes.remove(&block_id);
+            self.lru_order.retain(|&h| h != hash);
+            self.allocated.remove(&block_id);
+            return Some(block_id);
+        }
+        None
     }
 
     /// Free a block
@@ -451,9 +514,24 @@ impl BlockAllocator {
         self.block_size
     }
 
-    /// Check if we can allocate the requested number of blocks
+    /// Check if we can allocate the requested number of blocks.
+    ///
+    /// Counts both genuinely-free blocks AND evictable cache-only
+    /// blocks (ref_count == 1) — the same set `allocate` can draw from
+    /// via `try_evict_lru_for_allocation`. Without this, schedulers that
+    /// guard `allocate` with `can_allocate` would refuse work that the
+    /// allocator could in fact satisfy.
     pub fn can_allocate(&self, num_blocks: u32) -> bool {
-        self.num_free_blocks() >= num_blocks
+        let free = self.num_free_blocks();
+        if free >= num_blocks {
+            return true;
+        }
+        let evictable = self
+            .prefix_cache
+            .values()
+            .filter(|b| b.get_ref_count() == 1)
+            .count() as u32;
+        free + evictable >= num_blocks
     }
 
     /// Set the maximum number of entries the prefix cache will hold before
@@ -1212,6 +1290,127 @@ mod tests {
             allocator.num_free_blocks(),
             initial_free - 2,
             "evicted block must return to the free pool"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Allocation under cache pressure: when free_blocks is empty,
+    // allocate() must evict an LRU cache-only block to satisfy the
+    // request. Mirrors vLLM `_maybe_evict_cached_block`.
+    // -------------------------------------------------------------------
+
+    /// `allocate()` must fall back to evicting the LRU oldest cache-only
+    /// block when the free pool is empty. The OLDEST entry (by LRU
+    /// order, not insertion-of-cache-only) is the one selected.
+    #[test]
+    fn test_allocate_evicts_lru_when_pool_exhausted() {
+        let mut allocator = BlockAllocator::new(3, 4);
+
+        // Allocate all three blocks.
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
+        let b3 = allocator.allocate().unwrap();
+        let b1_id = b1.block_id;
+        let b2_id = b2.block_id;
+        let b3_id = b3.block_id;
+
+        // Register each under a distinct hash, in order. b1 is therefore
+        // the LRU oldest entry in `lru_order`.
+        let h1 = 0x1111_1111_1111_1111;
+        let h2 = 0x2222_2222_2222_2222;
+        let h3 = 0x3333_3333_3333_3333;
+        allocator.register_prefix(Arc::clone(&b1), h1);
+        allocator.register_prefix(Arc::clone(&b2), h2);
+        allocator.register_prefix(Arc::clone(&b3), h3);
+
+        // Free each external handle. The cache's logical ref keeps each
+        // block alive at ref_count = 1.
+        allocator.free(b1);
+        allocator.free(b2);
+        allocator.free(b3);
+
+        // Pool exhausted; all three blocks are cache-pinned.
+        assert_eq!(allocator.num_free_blocks(), 0);
+        assert_eq!(allocator.prefix_cache.len(), 3);
+
+        // Allocate again — must succeed by evicting the LRU oldest (b1).
+        let new_block = allocator
+            .allocate()
+            .expect("allocate must evict LRU cache-only block when pool empty");
+        assert_eq!(
+            new_block.block_id, b1_id,
+            "evicted block must be the LRU oldest (b1)"
+        );
+
+        // b1's hash is gone from the cache; b2 and b3 remain.
+        assert!(!allocator.prefix_cache.contains_key(&h1));
+        assert!(allocator.prefix_cache.contains_key(&h2));
+        assert!(allocator.prefix_cache.contains_key(&h3));
+        assert!(!allocator.block_hashes.contains_key(&b1_id));
+        assert!(allocator.block_hashes.contains_key(&b2_id));
+        assert!(allocator.block_hashes.contains_key(&b3_id));
+    }
+
+    /// When NO cache entry is evictable (every cached block has a live
+    /// request handle, ref_count > 1), `allocate()` returns None.
+    #[test]
+    fn test_allocate_returns_none_when_all_cache_in_use() {
+        let mut allocator = BlockAllocator::new(2, 4);
+
+        // Allocate two blocks; register each but DO NOT free the
+        // request's handle. Each ends up at ref_count = 2 (alloc + cache).
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
+        let h1 = 0xAAAA_AAAA_AAAA_AAAA;
+        let h2 = 0xBBBB_BBBB_BBBB_BBBB;
+        allocator.register_prefix(Arc::clone(&b1), h1);
+        allocator.register_prefix(Arc::clone(&b2), h2);
+
+        // Pool exhausted, but both cache entries are in-use by live
+        // request handles (ref_count == 2). No eviction possible.
+        assert_eq!(allocator.num_free_blocks(), 0);
+        assert_eq!(b1.get_ref_count(), 2);
+        assert_eq!(b2.get_ref_count(), 2);
+
+        // allocate must return None — there's nothing it can give us.
+        assert!(
+            allocator.allocate().is_none(),
+            "allocate must return None when free pool is empty AND every \
+             cache entry has a live request handle"
+        );
+    }
+
+    /// `can_allocate` must count evictable cache-only blocks alongside
+    /// genuinely-free blocks — otherwise schedulers refuse work the
+    /// allocator could in fact satisfy via the eviction fallback.
+    #[test]
+    fn test_can_allocate_counts_evictable_cache_blocks() {
+        let mut allocator = BlockAllocator::new(2, 4);
+
+        // Allocate, register, free both blocks. Both end up cache-pinned
+        // at ref_count = 1.
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
+        let h1 = 0x1111_1111_1111_1111;
+        let h2 = 0x2222_2222_2222_2222;
+        allocator.register_prefix(Arc::clone(&b1), h1);
+        allocator.register_prefix(Arc::clone(&b2), h2);
+        allocator.free(b1);
+        allocator.free(b2);
+
+        // Free pool empty, but both blocks evictable.
+        assert_eq!(allocator.num_free_blocks(), 0);
+        assert!(
+            allocator.can_allocate(1),
+            "1 cache-only block is evictable → can_allocate(1) must be true"
+        );
+        assert!(
+            allocator.can_allocate(2),
+            "2 cache-only blocks are evictable → can_allocate(2) must be true"
+        );
+        assert!(
+            !allocator.can_allocate(3),
+            "only 2 evictable; can_allocate(3) must be false"
         );
     }
 }
