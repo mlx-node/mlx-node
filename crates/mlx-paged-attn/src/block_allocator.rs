@@ -157,10 +157,53 @@ impl BlockAllocator {
 
     /// Register a block in the prefix cache
     ///
-    /// The block will be reused when a sequence has matching prefix tokens
+    /// The block will be reused when a sequence has matching prefix tokens.
+    ///
+    /// # Aliasing policy
+    ///
+    /// `block_hashes` only tracks ONE reverse mapping per `block_id`, so we
+    /// must keep `prefix_cache` and `block_hashes` consistent for `free()` to
+    /// clean up correctly. Two edge cases:
+    ///
+    /// 1. **Same block, different hash** (e.g. same tokens cached under
+    ///    different `extra_keys`): the OLD hash is evicted from
+    ///    `prefix_cache` and `lru_order` before inserting the new alias.
+    ///    Otherwise the stale entry would survive `free()` and could hand
+    ///    out a returned-to-pool block on a future `lookup_prefix` —
+    ///    bypassing `extra_keys` isolation.
+    ///
+    /// 2. **Same hash, different block** (hash collision or caller logic
+    ///    error): the new registration is dropped (no-op). The existing
+    ///    block stays authoritative for that hash. This preserves the
+    ///    invariant that `block_hashes[id]` always reflects the entry
+    ///    currently in `prefix_cache`, so `free()` cannot delete the wrong
+    ///    block's cache entry. The new block is NOT inserted into
+    ///    `block_hashes` either, so freeing it later is a clean no-op on
+    ///    the cache.
     pub fn register_prefix(&mut self, block: Arc<PhysicalBlock>, hash: u64) {
         // If prefix caching is disabled (max_prefix_cache_entries == 0), do nothing
         if self.max_prefix_cache_entries == 0 {
+            return;
+        }
+
+        // Case 1: this block_id is already registered under a different hash.
+        // Evict the stale alias before installing the new one — otherwise the
+        // old prefix_cache entry would survive free() and could leak across
+        // extra_keys boundaries. (Same block + same hash is idempotent —
+        // falls through to the LRU refresh / re-insert below.)
+        if let Some(&existing_hash) = self.block_hashes.get(&block.block_id)
+            && existing_hash != hash
+        {
+            self.prefix_cache.remove(&existing_hash);
+            self.lru_order.retain(|&h| h != existing_hash);
+            self.block_hashes.remove(&block.block_id);
+        }
+
+        // Case 2: this hash is already mapped to a DIFFERENT block. Drop the
+        // new registration to keep block_hashes / prefix_cache consistent.
+        if let Some(existing_block) = self.prefix_cache.get(&hash)
+            && existing_block.block_id != block.block_id
+        {
             return;
         }
 
@@ -741,5 +784,109 @@ mod tests {
         assert!(allocator.block_hashes.contains_key(&b2.block_id));
         assert!(allocator.block_hashes.contains_key(&b3.block_id));
         assert!(allocator.block_hashes.contains_key(&b4.block_id));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 1A bugfix: register_prefix must evict stale aliases when the
+    // same block is re-registered under a different hash, otherwise a
+    // freed block can leak back through lookup_prefix on the stale hash.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_register_prefix_re_registers_same_block_different_hash() {
+        // Allocate one block, register under hash A, then re-register the
+        // SAME block under hash B. The stale alias on hash A must be
+        // evicted; freeing the block must leave the cache fully clean.
+        let mut allocator = BlockAllocator::new(4, 4);
+        let initial_free = allocator.num_free_blocks();
+
+        let block = allocator.allocate().unwrap();
+        let hash_a = 0xAAAA_AAAA_AAAA_AAAA;
+        let hash_b = 0xBBBB_BBBB_BBBB_BBBB;
+
+        allocator.register_prefix(Arc::clone(&block), hash_a);
+        allocator.register_prefix(Arc::clone(&block), hash_b);
+
+        // Stale alias evicted; current alias resolves.
+        assert!(allocator.lookup_prefix(hash_a).is_none());
+        let cached = allocator.lookup_prefix(hash_b).unwrap();
+        assert_eq!(cached.block_id, block.block_id);
+
+        // Free both handles → block returns to pool, both aliases clean.
+        allocator.free(cached);
+        allocator.free(block);
+
+        assert!(allocator.lookup_prefix(hash_a).is_none());
+        assert!(allocator.lookup_prefix(hash_b).is_none());
+        assert_eq!(allocator.num_free_blocks(), initial_free);
+    }
+
+    #[test]
+    fn test_cache_full_blocks_extra_keys_re_register_isolation() {
+        // The Codex-identified scenario: cache the same blocks under two
+        // different extra_keys (no_keys vs [99]). After freeing, neither
+        // hash can hand back the freed block via find_longest_cache_hit —
+        // i.e. extra_keys isolation must hold across freed entries.
+        let mut allocator = BlockAllocator::new(4, 4);
+        let tokens: Vec<u32> = vec![1, 2, 3, 4];
+
+        let b0 = allocator.allocate().unwrap();
+        let blocks = [Arc::clone(&b0)];
+
+        allocator
+            .cache_full_blocks(&tokens, &blocks, 4, &[])
+            .unwrap();
+        allocator
+            .cache_full_blocks(&tokens, &blocks, 4, &[99])
+            .unwrap();
+
+        // Free the only outstanding handle → block_id returns to pool.
+        allocator.free(b0);
+
+        // Neither lookup may resurrect a freed block.
+        let (hits_none, n_none) = allocator.find_longest_cache_hit(&tokens, 4, &[]);
+        assert!(hits_none.is_empty(), "stale extra_keys=[] alias leaked");
+        assert_eq!(n_none, 0);
+
+        let (hits_99, n_99) = allocator.find_longest_cache_hit(&tokens, 4, &[99]);
+        assert!(hits_99.is_empty(), "extra_keys=[99] alias survived free");
+        assert_eq!(n_99, 0);
+    }
+
+    #[test]
+    fn test_register_prefix_collision_drops_new() {
+        // If two DIFFERENT blocks register under the same hash, the second
+        // call is dropped (no-op). The first registration stays
+        // authoritative; freeing block_a then cleans up the cache entry,
+        // and freeing block_b (which was never registered) is a clean
+        // no-op on the cache.
+        let mut allocator = BlockAllocator::new(4, 4);
+        let initial_free = allocator.num_free_blocks();
+
+        let block_a = allocator.allocate().unwrap();
+        let block_b = allocator.allocate().unwrap();
+        assert_ne!(block_a.block_id, block_b.block_id);
+
+        let hash_x = 0xFEED_FEED_FEED_FEED;
+
+        allocator.register_prefix(Arc::clone(&block_a), hash_x);
+        allocator.register_prefix(Arc::clone(&block_b), hash_x);
+
+        // block_a stays authoritative for hash_x.
+        let cached = allocator.lookup_prefix(hash_x).unwrap();
+        assert_eq!(cached.block_id, block_a.block_id);
+        // block_b was NOT inserted into block_hashes.
+        assert!(!allocator.block_hashes.contains_key(&block_b.block_id));
+
+        // Free the lookup'd handle (decrements block_a refcount).
+        allocator.free(cached);
+        // Free block_a → ref_count hits 0, prefix_cache[hash_x] cleaned.
+        allocator.free(block_a);
+        assert!(allocator.lookup_prefix(hash_x).is_none());
+
+        // Free block_b → no-op on the cache (was never registered),
+        // block returns to free pool.
+        allocator.free(block_b);
+        assert_eq!(allocator.num_free_blocks(), initial_free);
     }
 }
