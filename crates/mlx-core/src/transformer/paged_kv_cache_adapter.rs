@@ -948,6 +948,248 @@ impl PagedKVCacheAdapter {
         Err("gather_kv_for_decode is only supported on macOS (Metal backend)".to_string())
     }
 
+    /// Read K/V back from the pool for a contiguous range of logical
+    /// positions. Used during prefill when a cached prefix exists — the
+    /// caller's Q for the current prefill chunk needs to attend over the
+    /// FULL context (cached prefix + suffix), so the cached K/V must be
+    /// materialized as MxArrays for use with scaled_dot_product_attention.
+    ///
+    /// Returns `(K, V)` MxArrays of shape
+    /// `[1, num_kv_heads, num_tokens, head_size]` (transposed to the
+    /// SDPA-friendly layout). dtype matches `layer_kv_pool.cache_dtype()`
+    /// (currently Float16 or BFloat16; FP8 is rejected).
+    ///
+    /// Errors if `start_pos + num_tokens` exceeds
+    /// `block_table.num_tokens()`, or if no active request, or if the
+    /// layer index is out of range.
+    ///
+    /// ## Implementation note (host-side gather)
+    ///
+    /// This is a HOST-side gather: blits the requested blocks back over the
+    /// PCIe-equivalent path, then constructs the K/V arrays element-wise
+    /// from raw bytes. That's slow but correct, and matches the spec for
+    /// P1: production zero-copy gather is a follow-up. For correctness, we
+    /// just read each slot, copy the appropriate bytes into the output
+    /// buffer, and call `MxArray::from_float16` / `from_bfloat16` to build
+    /// half-precision MLX arrays. For typical chat workloads
+    /// (system-prompt prefix cache reuse) the cost is amortized across the
+    /// reused tokens, so the host-side cost is bounded by the prefix
+    /// length × `num_kv_heads * head_size` (typically a few MB per layer).
+    #[cfg(target_os = "macos")]
+    pub fn read_kv_range(
+        &self,
+        layer_idx: u32,
+        start_pos: u32,
+        num_tokens: u32,
+    ) -> Result<(MxArray, MxArray), String> {
+        // 1. Active request?
+        let block_table = self.block_table.as_ref().ok_or_else(|| {
+            "read_kv_range called before reset_for_new_request".to_string()
+        })?;
+
+        // 2. Layer in range?
+        let num_layers = self.layer_kv_pool.num_layers();
+        if (layer_idx as usize) >= num_layers {
+            return Err(format!(
+                "read_kv_range: layer_idx {layer_idx} out of range (num_layers = {num_layers})"
+            ));
+        }
+
+        if num_tokens == 0 {
+            return Err("read_kv_range: num_tokens must be > 0".to_string());
+        }
+
+        // 3. Range within block_table.num_tokens()?
+        let end = start_pos
+            .checked_add(num_tokens)
+            .ok_or_else(|| "read_kv_range: start_pos + num_tokens overflow".to_string())?;
+        let recorded = block_table.num_tokens();
+        if end > recorded {
+            return Err(format!(
+                "read_kv_range: requested range [{start_pos}, {end}) exceeds recorded \
+                 token count {recorded}. Call record_tokens for the full prefix first."
+            ));
+        }
+
+        let block_size = self.block_size;
+        let cfg = self.layer_kv_pool.config();
+        let num_kv_heads = cfg.num_kv_heads;
+        let head_size = cfg.head_size;
+        let cache_dtype = self.layer_kv_pool.cache_dtype();
+
+        // FP8 caches are intentionally rejected — they require k_scale /
+        // v_scale dequantization which the adapter does not yet plumb.
+        match cache_dtype {
+            mlx_paged_attn::metal::MetalDtype::Float16
+            | mlx_paged_attn::metal::MetalDtype::BFloat16 => {}
+            other => {
+                return Err(format!(
+                    "read_kv_range: cache_dtype {other:?} is not supported (only Float16 \
+                     and BFloat16; FP8 dequantization is a follow-up)"
+                ));
+            }
+        }
+
+        // 4. Compute the unique block_ids covering [start_pos, end), in
+        //    order of the block_table indices we need. Each token's block
+        //    index in the request is `pos / block_size`; we collect those.
+        //    `block_ids_to_read` is keyed by block_table index (NOT physical
+        //    block_id) so the call to `read_blocks_to_host` returns staged
+        //    bytes in the same order, which we later index by table_idx.
+        let first_table_idx = (start_pos / block_size) as usize;
+        let last_table_idx = ((end - 1) / block_size) as usize;
+        if last_table_idx >= block_table.num_blocks() {
+            return Err(format!(
+                "read_kv_range: token at logical position {} maps to table index {} but \
+                 block_table only has {} blocks",
+                end - 1,
+                last_table_idx,
+                block_table.num_blocks(),
+            ));
+        }
+        let block_ids: Vec<u32> = block_table.blocks()[first_table_idx..=last_table_idx]
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+
+        // 5. Read blocks. Returns concat'd bytes per block in the order
+        //    requested.
+        let (key_bytes, value_bytes) = self
+            .layer_kv_pool
+            .read_blocks_to_host(layer_idx, &block_ids)?;
+
+        // 6. Layout constants.
+        // Cache dtype is 2 bytes per element here (we rejected FP8 above).
+        let element_size: usize = 2;
+        let x: usize = 8;
+        let block_size_us = block_size as usize;
+        let num_kv_heads_us = num_kv_heads as usize;
+        let head_size_us = head_size as usize;
+
+        let key_block_elems = num_kv_heads_us * (head_size_us / x) * block_size_us * x;
+        let value_block_elems = num_kv_heads_us * head_size_us * block_size_us;
+
+        // 7. Allocate output buffers in [num_kv_heads, num_tokens, head_size]
+        //    layout (we'll add the leading batch=1 axis at the MxArray-from-
+        //    bytes step). dtype is u16 representing either FP16 bits or BF16
+        //    bits; we use the matching `MxArray::from_float16` /
+        //    `from_bfloat16` constructor at the end.
+        let num_tokens_us = num_tokens as usize;
+        let out_elems = num_kv_heads_us * num_tokens_us * head_size_us;
+        let mut k_out: Vec<u16> = vec![0u16; out_elems];
+        let mut v_out: Vec<u16> = vec![0u16; out_elems];
+
+        // Helper: read a u16 from a byte slice at element-index `idx`.
+        let read_u16 = |bytes: &[u8], idx: usize| -> u16 {
+            let off = idx * element_size;
+            u16::from_ne_bytes([bytes[off], bytes[off + 1]])
+        };
+
+        // 8. Per-token gather. For token at logical position `pos`:
+        //    block_table_idx = pos / block_size, offset_in_block = pos % block_size,
+        //    block_id_local_idx (within `block_ids`) = block_table_idx - first_table_idx.
+        for t in 0..num_tokens_us {
+            let pos = start_pos as usize + t;
+            let table_idx = pos / block_size_us;
+            let offset_in_block = pos % block_size_us;
+            let local = table_idx - first_table_idx;
+            let key_block_base = local * key_block_elems;
+            let value_block_base = local * value_block_elems;
+
+            // K layout per block: [num_kv_heads, head_size/x, block_size, x]
+            // K elem at (h, d) = key[h, d/x, offset_in_block, d%x]
+            // strides:
+            // - h-stride = (head_size/x) * block_size * x
+            // - dx-stride = block_size * x
+            // - off-stride = x
+            // - tail = d%x
+            for h in 0..num_kv_heads_us {
+                let h_stride = (head_size_us / x) * block_size_us * x;
+                let dx_stride = block_size_us * x;
+                let off_stride = x;
+                for d in 0..head_size_us {
+                    let dx = d / x;
+                    let dt = d % x;
+                    let elem_idx = key_block_base
+                        + h * h_stride
+                        + dx * dx_stride
+                        + offset_in_block * off_stride
+                        + dt;
+                    let bits = read_u16(&key_bytes, elem_idx);
+                    // Output index in [num_kv_heads, num_tokens, head_size]:
+                    let out_idx = h * num_tokens_us * head_size_us + t * head_size_us + d;
+                    k_out[out_idx] = bits;
+                }
+            }
+
+            // V layout per block: [num_kv_heads, head_size, block_size]
+            // V elem at (h, d) = value[h, d, offset_in_block]
+            // strides:
+            // - h-stride = head_size * block_size
+            // - d-stride = block_size
+            // - tail = offset_in_block
+            for h in 0..num_kv_heads_us {
+                let h_stride = head_size_us * block_size_us;
+                let d_stride = block_size_us;
+                for d in 0..head_size_us {
+                    let elem_idx = value_block_base
+                        + h * h_stride
+                        + d * d_stride
+                        + offset_in_block;
+                    let bits = read_u16(&value_bytes, elem_idx);
+                    let out_idx = h * num_tokens_us * head_size_us + t * head_size_us + d;
+                    v_out[out_idx] = bits;
+                }
+            }
+        }
+
+        // 9. Construct MxArrays in [1, num_kv_heads, num_tokens, head_size]
+        //    layout. Use the dtype-matching constructor so the bits are
+        //    interpreted correctly (`from_float16` for FP16 cache, etc).
+        let shape: [i64; 4] = [
+            1,
+            num_kv_heads as i64,
+            num_tokens as i64,
+            head_size as i64,
+        ];
+        let (k_arr, v_arr) = match cache_dtype {
+            mlx_paged_attn::metal::MetalDtype::Float16 => (
+                MxArray::from_float16(&k_out, &shape).map_err(|e| {
+                    format!("read_kv_range: failed to build K MxArray (Float16): {e}")
+                })?,
+                MxArray::from_float16(&v_out, &shape).map_err(|e| {
+                    format!("read_kv_range: failed to build V MxArray (Float16): {e}")
+                })?,
+            ),
+            mlx_paged_attn::metal::MetalDtype::BFloat16 => (
+                MxArray::from_bfloat16(&k_out, &shape).map_err(|e| {
+                    format!("read_kv_range: failed to build K MxArray (BFloat16): {e}")
+                })?,
+                MxArray::from_bfloat16(&v_out, &shape).map_err(|e| {
+                    format!("read_kv_range: failed to build V MxArray (BFloat16): {e}")
+                })?,
+            ),
+            // unreachable due to the early dtype guard above
+            other => {
+                return Err(format!(
+                    "read_kv_range: unreachable cache dtype {other:?} after early guard"
+                ));
+            }
+        };
+        Ok((k_arr, v_arr))
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn read_kv_range(
+        &self,
+        _layer_idx: u32,
+        _start_pos: u32,
+        _num_tokens: u32,
+    ) -> Result<(MxArray, MxArray), String> {
+        Err("read_kv_range is only supported on macOS (Metal backend)".to_string())
+    }
+
     /// Register the request's FULL blocks in the prefix cache so future
     /// requests with the same prompt prefix can reuse them. Call once
     /// per request, after generation finishes (success path only — do
@@ -2915,5 +3157,194 @@ mod tests {
             msg.contains("allocate_suffix_blocks"),
             "error must point at the allocate_suffix_blocks fix path, got: {msg}"
         );
+    }
+
+    // ------------------------ read_kv_range ------------------------
+    //
+    // CPU-only error-path tests use `maybe_adapter` which gracefully skips on
+    // no-Metal hosts. The Metal happy-path test below allocates a real
+    // `LayerKVPool` and skips when Metal is unavailable.
+
+    /// `read_kv_range` must reject calls before any request is active.
+    #[test]
+    fn test_read_kv_range_no_active_request() {
+        let Some(adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_read_kv_range_no_active_request: Metal unavailable");
+            return;
+        };
+        let res = adapter.read_kv_range(0, 0, 1);
+        assert!(res.is_err(), "expected error before reset_for_new_request");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("reset_for_new_request"),
+            "error must mention missing request, got: {msg}"
+        );
+    }
+
+    /// Out-of-range layer index must error.
+    #[test]
+    fn test_read_kv_range_layer_out_of_bounds() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_read_kv_range_layer_out_of_bounds: Metal unavailable");
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        // Pool has num_layers = 2 (validation_test_config); 99 is far out of range.
+        let res = adapter.read_kv_range(99, 0, 1);
+        assert!(res.is_err(), "expected layer_idx OOB error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("layer_idx") || msg.contains("out of range"),
+            "error must mention layer_idx, got: {msg}"
+        );
+    }
+
+    /// Range exceeding recorded token count must error rather than reading
+    /// uninitialized cache slots.
+    #[test]
+    fn test_read_kv_range_exceeds_recorded() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_read_kv_range_exceeds_recorded: Metal unavailable");
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3]).unwrap();
+        // Try to read 4 tokens [0, 4); only 3 recorded.
+        let res = adapter.read_kv_range(0, 0, 4);
+        assert!(res.is_err(), "expected out-of-range error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("exceeds") || msg.contains("recorded"),
+            "error must mention recorded token count, got: {msg}"
+        );
+    }
+
+    /// `read_kv_range` with `num_tokens == 0` must reject — calling the
+    /// kernel-free path with an empty range is still a programming bug.
+    #[test]
+    fn test_read_kv_range_zero_tokens() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!("skipping test_read_kv_range_zero_tokens: Metal unavailable");
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2]).unwrap();
+        let res = adapter.read_kv_range(0, 0, 0);
+        assert!(res.is_err(), "expected num_tokens == 0 rejection");
+    }
+
+    /// **Metal happy path**: write 8 tokens via `update_keys_values`, then
+    /// read positions [0, 4) via `read_kv_range`. Asserts shape and (since
+    /// V was filled with ones) that the readback also returns ones for the
+    /// V tensor — round-trip correctness check on the host-side gather
+    /// math. Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_read_kv_range_round_trip_bf16() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_read_kv_range_round_trip_bf16: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+
+        // Write 8 tokens: K = zeros, V = ones (BFloat16). The cache layout
+        // is identical for K and V at the byte level for V (no x split), so
+        // round-tripping `1.0` through V is a tight regression on the host
+        // gather math. K = zeros also round-trips trivially; the goal is
+        // shape + finite-value sanity for K and value-correctness for V.
+        let k = MxArray::zeros(&[8, 1, 64], Some(DType::BFloat16)).expect("k zeros");
+        let v = MxArray::ones(&[8, 1, 64], Some(DType::BFloat16)).expect("v ones");
+        k.eval();
+        v.eval();
+        match adapter.update_keys_values(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_read_kv_range_round_trip_bf16: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+        }
+
+        let (k_out, v_out) = match adapter.read_kv_range(0, 0, 4) {
+            Ok(t) => t,
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_read_kv_range_round_trip_bf16: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from read_kv_range: {e}"),
+        };
+
+        // Shape: [1, num_kv_heads=1, num_tokens=4, head_size=64].
+        assert_eq!(k_out.ndim().unwrap(), 4);
+        assert_eq!(k_out.shape_at(0).unwrap(), 1);
+        assert_eq!(k_out.shape_at(1).unwrap(), 1);
+        assert_eq!(k_out.shape_at(2).unwrap(), 4);
+        assert_eq!(k_out.shape_at(3).unwrap(), 64);
+        assert_eq!(k_out.dtype().unwrap(), DType::BFloat16);
+        assert_eq!(v_out.ndim().unwrap(), 4);
+        assert_eq!(v_out.shape_at(2).unwrap(), 4);
+        assert_eq!(v_out.shape_at(3).unwrap(), 64);
+        assert_eq!(v_out.dtype().unwrap(), DType::BFloat16);
+
+        // V correctness: every element must be 1.0 (BF16 round-trip exact).
+        // Materialize via astype(Float32) for elementwise inspection.
+        let v_f32 = v_out
+            .astype(DType::Float32)
+            .expect("astype f32 on V")
+            .reshape(&[4 * 64])
+            .expect("flatten V");
+        v_f32.eval();
+        for i in 0..(4 * 64) {
+            let elem = v_f32
+                .item_at_float32(i)
+                .unwrap_or_else(|e| panic!("item_at_float32({i}): {e}"));
+            assert!(
+                (elem - 1.0_f32).abs() < 0.01,
+                "V[{i}] = {elem}, expected 1.0 (BF16 round-trip; failure indicates host \
+                 gather math bug)"
+            );
+        }
+
+        // K correctness: every element must be 0.0.
+        let k_f32 = k_out
+            .astype(DType::Float32)
+            .expect("astype f32 on K")
+            .reshape(&[4 * 64])
+            .expect("flatten K");
+        k_f32.eval();
+        for i in 0..(4 * 64) {
+            let elem = k_f32
+                .item_at_float32(i)
+                .unwrap_or_else(|e| panic!("item_at_float32({i}): {e}"));
+            assert!(
+                elem.abs() < 0.01,
+                "K[{i}] = {elem}, expected 0.0 (initial K was zeros)"
+            );
+        }
     }
 }

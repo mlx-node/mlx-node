@@ -676,6 +676,147 @@ impl LayerKVPool {
             )
         }
     }
+
+    /// Read the raw bytes for a list of physical blocks from this layer's
+    /// K/V buffers back to host. Used by
+    /// `PagedKVCacheAdapter::read_kv_range` during cache-hit prefill — the
+    /// suffix Q must attend over the cached K/V from the pool, which the
+    /// SDPA path needs as MxArrays. This is a host-side read; production
+    /// zero-copy gather is a follow-up.
+    ///
+    /// Returns `(keys_bytes, values_bytes)`:
+    /// - `keys_bytes`: concatenation, in `block_ids` order, of each block's
+    ///   `key_block_size_bytes()` bytes (vLLM K layout
+    ///   `[num_kv_heads, head_size/x, block_size, x]`).
+    /// - `values_bytes`: same, but each block is `value_block_size_bytes()`
+    ///   bytes (V layout `[num_kv_heads, head_size, block_size]`).
+    ///
+    /// One blit copy per layer, dispatched up-front; callers can index into
+    /// the returned `Vec<u8>` per token without re-blitting. Layout is the
+    /// kernel's on-GPU layout — callers convert to logical
+    /// `[num_kv_heads, num_tokens, head_size]` themselves.
+    ///
+    /// # Safety
+    /// Pure-bytes copy. The caller must keep `block_ids` valid (each id
+    /// `< num_blocks`); out-of-range ids cause an `Err` rather than OOB
+    /// reads.
+    #[cfg(target_os = "macos")]
+    pub fn read_blocks_to_host(
+        &self,
+        layer_idx: u32,
+        block_ids: &[u32],
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        use crate::metal::is_metal_extraction_supported;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+
+        if layer_idx as usize >= self.layers.len() {
+            return Err(format!(
+                "LayerKVPool::read_blocks_to_host: layer_idx {} out of range \
+                 (num_layers = {})",
+                layer_idx,
+                self.layers.len()
+            ));
+        }
+        if block_ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        for &id in block_ids {
+            if id >= self.num_blocks {
+                return Err(format!(
+                    "LayerKVPool::read_blocks_to_host: block_id {} >= num_blocks {} \
+                     (out-of-range physical block)",
+                    id, self.num_blocks
+                ));
+            }
+        }
+
+        let (key_cache, value_cache) = &self.layers[layer_idx as usize];
+        let (element_size, x_u32) =
+            Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype)?;
+        let x = x_u32 as u64;
+        let block_size = self.config.block_size as u64;
+        let num_kv_heads = self.config.num_kv_heads as u64;
+        let head_size = self.config.head_size as u64;
+
+        // K block: [num_kv_heads, head_size/x, block_size, x] elements.
+        let key_block_size = num_kv_heads * (head_size / x) * block_size * x * element_size;
+        // V block: [num_kv_heads, head_size, block_size] elements.
+        let value_block_size = num_kv_heads * head_size * block_size * element_size;
+
+        let total_keys = key_block_size as usize * block_ids.len();
+        let total_values = value_block_size as usize * block_ids.len();
+
+        // Allocate one shared staging buffer per side, sized for all the
+        // requested blocks. We then issue per-block blits at the right
+        // (src_offset, dst_offset) pairs in a single command buffer.
+        use crate::metal::MetalState;
+        use metal::MTLResourceOptions;
+        let state = MetalState::get()?;
+        let key_staging = state
+            .device
+            .new_buffer(total_keys as u64, MTLResourceOptions::StorageModeShared);
+        let value_staging = state
+            .device
+            .new_buffer(total_values as u64, MTLResourceOptions::StorageModeShared);
+
+        let command_buffer = state.command_queue.new_command_buffer();
+        let blit_encoder = command_buffer.new_blit_command_encoder();
+
+        for (i, &block_id) in block_ids.iter().enumerate() {
+            let key_src_offset = block_id as u64 * key_block_size;
+            let value_src_offset = block_id as u64 * value_block_size;
+            let key_dst_offset = i as u64 * key_block_size;
+            let value_dst_offset = i as u64 * value_block_size;
+            blit_encoder.copy_from_buffer(
+                key_cache,
+                key_src_offset,
+                &key_staging,
+                key_dst_offset,
+                key_block_size,
+            );
+            blit_encoder.copy_from_buffer(
+                value_cache,
+                value_src_offset,
+                &value_staging,
+                value_dst_offset,
+                value_block_size,
+            );
+        }
+        blit_encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let mut keys_bytes = vec![0u8; total_keys];
+        let mut values_bytes = vec![0u8; total_values];
+        // SAFETY: shared staging buffers are CPU-accessible after the blit
+        // completes; we copy out before they go out of scope.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                key_staging.contents() as *const u8,
+                keys_bytes.as_mut_ptr(),
+                total_keys,
+            );
+            std::ptr::copy_nonoverlapping(
+                value_staging.contents() as *const u8,
+                values_bytes.as_mut_ptr(),
+                total_values,
+            );
+        }
+        Ok((keys_bytes, values_bytes))
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn read_blocks_to_host(
+        &self,
+        _layer_idx: u32,
+        _block_ids: &[u32],
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        Err("read_blocks_to_host is only supported on macOS (Metal backend)".to_string())
+    }
 }
 
 #[cfg(test)]
