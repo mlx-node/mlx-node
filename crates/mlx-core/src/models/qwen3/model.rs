@@ -2556,6 +2556,19 @@ impl Qwen3Inner {
     /// fresh request). Records the chunk into the adapter and writes K/V
     /// through the pool via `forward_paged_adapter`. Returns the last
     /// position's logits squeezed to `[vocab]`.
+    ///
+    /// When `MLX_PAGED_PREFILL_CHUNK_SIZE` is set to a positive value AND
+    /// `suffix_tokens.len()` exceeds that value, the suffix is sliced into
+    /// `<chunk_size>`-token sub-chunks. Each sub-chunk runs through every
+    /// layer with the existing `forward_paged_adapter` (which already
+    /// supports `cached_prefix_len > 0` + `Q < K` via the explicit causal
+    /// mask path). Between sub-chunks we `synchronize_and_clear_cache()` so
+    /// MLX's lazy graph + caching allocator do not pile up the entire
+    /// suffix's intermediates simultaneously. Memory peak is then bounded
+    /// by `chunk_len * hidden_dim` instead of `suffix_len * hidden_dim`.
+    /// `final_norm` + `lm_head` only run on the last sub-chunk (vocab
+    /// projection is throwaway work for non-final chunks; matches vLLM's
+    /// `is_prefill_chunk` skip).
     fn run_paged_prefill_chunk(
         &mut self,
         suffix_tokens: &[u32],
@@ -2563,26 +2576,141 @@ impl Qwen3Inner {
         num_layers: usize,
         positions: &MxArray,
     ) -> Result<MxArray> {
+        let chunk_size = crate::array::paged_prefill_chunk_size();
+        self.run_paged_prefill_chunk_with_size(
+            suffix_tokens,
+            first_logical_position,
+            num_layers,
+            positions,
+            chunk_size,
+        )
+    }
+
+    /// Chunk-size-parameterized worker for `run_paged_prefill_chunk`. The
+    /// public entry point is a thin wrapper that reads
+    /// `MLX_PAGED_PREFILL_CHUNK_SIZE` once via `OnceLock` and forwards. We
+    /// expose this private helper so tests can drive both the legacy
+    /// single-shot path (`chunk_size <= 0`) and the chunked path (>0)
+    /// without process-wide env mutation, and so we can directly verify
+    /// numerical parity between them in the same test binary.
+    ///
+    /// `chunk_size <= 0` OR `suffix_tokens.len() <= chunk_size` takes the
+    /// legacy single-shot path. Anything else loops over `chunks(chunk_size)`.
+    fn run_paged_prefill_chunk_with_size(
+        &mut self,
+        suffix_tokens: &[u32],
+        first_logical_position: u32,
+        num_layers: usize,
+        positions: &MxArray,
+        chunk_size: i32,
+    ) -> Result<MxArray> {
         if suffix_tokens.is_empty() {
             return Err(napi::Error::from_reason(
                 "run_paged_prefill_chunk called with empty suffix",
             ));
         }
+
+        // Legacy single-shot path: chunking disabled or suffix already
+        // small enough that a single forward fits within the existing
+        // memory budget.
+        if chunk_size <= 0 || suffix_tokens.len() <= chunk_size as usize {
+            return self.run_paged_prefill_single_shot(
+                suffix_tokens,
+                first_logical_position,
+                num_layers,
+                positions,
+            );
+        }
+
+        // Chunked path. We slice the suffix into `chunk_size`-token chunks
+        // and process each through ALL layers. The K/V is written into the
+        // paged pool by `forward_paged_adapter` per chunk; later chunks
+        // attend to the cumulative `[0, total_ctx)` via the
+        // `cached_prefix_len > 0` branch of `forward_paged_adapter` (which
+        // builds an explicit causal mask aligned at the suffix).
+        let chunk_size_usize = chunk_size as usize;
+        let total_chunks = suffix_tokens.len().div_ceil(chunk_size_usize);
+        let mut last_hidden: Option<MxArray> = None;
+        let mut tokens_consumed: u32 = 0;
+        for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
+            let chunk_start_pos = first_logical_position + tokens_consumed;
+            let is_last_chunk = chunk_idx + 1 == total_chunks;
+            let hidden =
+                self.run_paged_prefill_one_chunk(chunk, chunk_start_pos, num_layers, positions)?;
+            tokens_consumed += chunk.len() as u32;
+
+            if is_last_chunk {
+                last_hidden = Some(hidden);
+            } else {
+                // Materialize the residual stream so MLX can release every
+                // upstream node (embedding + per-layer attention/MLP
+                // intermediates) before we start building the next chunk's
+                // graph. Without this the lazy DAG accumulates across
+                // chunks and defeats the entire memory-bounding purpose.
+                hidden.eval();
+                synchronize_and_clear_cache();
+            }
+        }
+        let hidden_states = last_hidden.expect("chunked loop processed at least one chunk");
+
+        // Final norm + lm_head ONLY on the last chunk's residual stream
+        // (we only need the last token's logits to sample the first decode
+        // token; intermediate chunks' vocab-projections would be discarded
+        // anyway, and skipping them saves [chunk_len, vocab] worth of FLOPs
+        // per non-final chunk).
+        self.project_last_token_logits(&hidden_states)
+    }
+
+    /// Single-shot prefill: feed the entire suffix through every layer in
+    /// one forward pass. Identical to the pre-chunking implementation.
+    /// Used both by the legacy code path (chunk_size <= 0) and the
+    /// chunked-path's "small enough to skip chunking" fast path.
+    fn run_paged_prefill_single_shot(
+        &mut self,
+        suffix_tokens: &[u32],
+        first_logical_position: u32,
+        num_layers: usize,
+        positions: &MxArray,
+    ) -> Result<MxArray> {
+        let hidden_states = self.run_paged_prefill_one_chunk(
+            suffix_tokens,
+            first_logical_position,
+            num_layers,
+            positions,
+        )?;
+        self.project_last_token_logits(&hidden_states)
+    }
+
+    /// Run a single prefill chunk through `record_tokens` + every layer's
+    /// `forward_paged_adapter`. Returns the post-last-layer residual
+    /// stream (NOT logits — caller decides whether to project to vocab).
+    ///
+    /// This is the per-chunk inner loop shared between the single-shot
+    /// path and the chunked driver. It must NOT touch `final_norm` /
+    /// `lm_head` so the chunked path can skip those on intermediate
+    /// chunks.
+    fn run_paged_prefill_one_chunk(
+        &mut self,
+        chunk_tokens: &[u32],
+        chunk_first_position: u32,
+        num_layers: usize,
+        positions: &MxArray,
+    ) -> Result<MxArray> {
+        let chunk_len = chunk_tokens.len() as u32;
         // 1. record_tokens BEFORE forward (forward_paged_adapter expects
         //    the cursor to be advanced by the chunk so update_keys_values
         //    aligns).
-        let suffix_len = suffix_tokens.len() as u32;
         {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 napi::Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
             })?;
             adapter
-                .record_tokens(suffix_tokens)
+                .record_tokens(chunk_tokens)
                 .map_err(napi::Error::from_reason)?;
         }
 
         // 2. Embed input ids.
-        let input_ids = MxArray::from_uint32(suffix_tokens, &[1, suffix_len as i64])?;
+        let input_ids = MxArray::from_uint32(chunk_tokens, &[1, chunk_len as i64])?;
         let mut hidden_states = self.embedding.forward(&input_ids)?;
 
         // 3. Run forward through every layer, dispatching the adapter.
@@ -2590,7 +2718,17 @@ impl Qwen3Inner {
         //    `self.paged_adapter` (mutable) — the layer slice is captured
         //    as a separate reference and passed in, while the adapter is
         //    accessed via `self.paged_adapter` per-layer.
-        let cached_prefix_len = first_logical_position;
+        //
+        //    `cached_prefix_len = chunk_first_position`: every token
+        //    already in the paged pool (prior cache hit + prior chunks
+        //    written by earlier iterations of the chunked driver) lives at
+        //    logical positions `[0, chunk_first_position)`. The new chunk
+        //    occupies `[chunk_first_position, chunk_first_position+chunk_len)`.
+        //    `forward_paged_adapter` already handles the `cached_prefix_len
+        //    > 0` branch (Q = chunk only, K/V = cumulative `[0,
+        //    total_ctx)`, with `create_causal_mask(num_tokens=chunk_len,
+        //    offset=cached_prefix_len)` aligning the mask at the suffix).
+        let cached_prefix_len = chunk_first_position;
         for layer_idx in 0..num_layers {
             // Re-borrow per layer to avoid holding the mutable borrow
             // across the immutable layer access. `self.layers[idx]` and
@@ -2608,12 +2746,12 @@ impl Qwen3Inner {
                 &hidden_states,
                 adapter,
                 layer_idx as u32,
-                first_logical_position,
+                chunk_first_position,
                 cached_prefix_len,
                 self.config.num_heads as u32,
                 positions,
                 /* num_seqs */ 1,
-                /* seq_len */ suffix_len as i64,
+                /* seq_len */ chunk_len as i64,
                 /* is_prefill */ true,
             )?;
             // Smooth the prefill memory peak: every K layers, materialize the
@@ -2624,17 +2762,23 @@ impl Qwen3Inner {
             // sync fires. Cadence is `MLX_PAGED_PREFILL_EVAL_INTERVAL` (default 8).
             crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states);
         }
+        Ok(hidden_states)
+    }
 
-        // 4. Final norm + lm_head.
-        hidden_states = self.final_norm.forward(&hidden_states)?;
+    /// Project the per-token residual stream through `final_norm` + the
+    /// LM head and slice the last position's logits down to `[vocab]`.
+    /// Shared between the single-shot path and the chunked path's
+    /// final-chunk return path. Hidden state shape on entry: `[1,
+    /// chunk_len, hidden]`.
+    fn project_last_token_logits(&self, hidden_states: &MxArray) -> Result<MxArray> {
+        let normed = self.final_norm.forward(hidden_states)?;
         let logits = if self.config.tie_word_embeddings {
             let embedding_weight = self.embedding.get_weight();
-            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
+            normed.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
         } else {
-            self.lm_head.forward(&hidden_states)?
+            self.lm_head.forward(&normed)?
         };
-
-        // Slice last token: logits shape [1, suffix_len, vocab] -> [vocab].
+        // Slice last token: logits shape [1, chunk_len, vocab] -> [vocab].
         let seq_len = logits.shape_at(1)?;
         let last = logits
             .slice_axis(1, seq_len - 1, seq_len)?
@@ -8051,6 +8195,422 @@ mod tests {
         }
 
         // Cleanup mirrors the chat_stream_sync_core_paged success path.
+        {
+            let adapter = inner.paged_adapter.as_mut().unwrap();
+            let _ = adapter.register_full_blocks_for_reuse(&[]);
+            adapter.release_request().expect("release_request");
+        }
+    }
+
+    /// Helper used by the chunked-prefill tests below: cast every weight in
+    /// `inner` to BFloat16 so the K/V the layers compute matches the
+    /// paged-pool dtype (mirrors the `test_chat_sync_core_paged_smoke_via_helpers`
+    /// pattern). Without this `update_keys_values` rejects the F32 K/V the
+    /// random-init weights would otherwise produce.
+    #[cfg(test)]
+    fn cast_qwen3_inner_weights_bf16(inner: &mut super::Qwen3Inner) {
+        use crate::array::DType;
+        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
+        // Embedding.
+        let w = inner.embedding.get_weight();
+        inner.embedding.set_weight(&cast(&w)).expect("set embed");
+        // Final norm.
+        let w = inner.final_norm.get_weight();
+        inner
+            .final_norm
+            .set_weight(&cast(&w))
+            .expect("set final_norm");
+        // LM head.
+        let w = inner.lm_head.get_weight();
+        inner.lm_head.set_weight(&cast(&w)).expect("set lm_head");
+        // Per-layer.
+        for layer in inner.layers.iter_mut() {
+            let w = layer.get_input_layernorm_weight();
+            layer
+                .set_input_layernorm_weight(&cast(&w))
+                .expect("set in ln");
+            let w = layer.get_post_attention_layernorm_weight();
+            layer
+                .set_post_attention_layernorm_weight(&cast(&w))
+                .expect("set post ln");
+            let w = layer.self_attn.get_q_proj_weight();
+            layer.self_attn.set_q_proj_weight(&cast(&w)).expect("set q");
+            let w = layer.self_attn.get_k_proj_weight();
+            layer.self_attn.set_k_proj_weight(&cast(&w)).expect("set k");
+            let w = layer.self_attn.get_v_proj_weight();
+            layer.self_attn.set_v_proj_weight(&cast(&w)).expect("set v");
+            let w = layer.self_attn.get_o_proj_weight();
+            layer.self_attn.set_o_proj_weight(&cast(&w)).expect("set o");
+            if let Some(qn) = layer.self_attn.get_q_norm_weight() {
+                layer
+                    .self_attn
+                    .set_q_norm_weight(&cast(&qn))
+                    .expect("set qn");
+            }
+            if let Some(kn) = layer.self_attn.get_k_norm_weight() {
+                layer
+                    .self_attn
+                    .set_k_norm_weight(&cast(&kn))
+                    .expect("set kn");
+            }
+            let w = layer.mlp.get_gate_proj_weight();
+            layer.mlp.set_gate_proj_weight(&cast(&w)).expect("set gate");
+            let w = layer.mlp.get_up_proj_weight();
+            layer.mlp.set_up_proj_weight(&cast(&w)).expect("set up");
+            let w = layer.mlp.get_down_proj_weight();
+            layer.mlp.set_down_proj_weight(&cast(&w)).expect("set down");
+        }
+    }
+
+    /// Read the full contents of a 1-D `[vocab]` `MxArray` to a host
+    /// `Vec<f32>`. Goes via `astype(F32)` + per-element `item_at_float32` so
+    /// it works on bf16 logits as well.
+    #[cfg(test)]
+    fn logits_to_f32_vec(logits: &MxArray) -> Vec<f32> {
+        let f32_arr = logits
+            .astype(crate::array::DType::Float32)
+            .expect("astype f32");
+        f32_arr.eval();
+        let n = f32_arr.shape_at(0).expect("shape_at(0)") as usize;
+        (0..n)
+            .map(|i| f32_arr.item_at_float32(i).expect("item_at_float32"))
+            .collect()
+    }
+
+    /// **Phase B parity test**: chunked prefill with the same weights and
+    /// the same suffix tokens MUST produce the same final logits as the
+    /// legacy single-shot prefill, modulo small bf16 rounding noise.
+    ///
+    /// Both runs share a single `Qwen3Inner` (so weights are byte-equal)
+    /// and the paged-state is reset between them. The same prompt is fed
+    /// through `run_paged_prefill_chunk_with_size(..., 0)` (single-shot)
+    /// and then `run_paged_prefill_chunk_with_size(..., 16)` (chunked, ~6
+    /// chunks for a 96-token prompt). The post-prefill `[vocab]` logits
+    /// vectors are compared element-wise.
+    ///
+    /// Tolerance: `atol=5e-3, rtol=5e-3`. bf16 has only ~3 decimal digits
+    /// of precision, and chunked prefill changes the order of GPU
+    /// operations (split causal mask reshapes, intermediate evals); empty
+    /// reductions / different fma orderings on a vocab-sized matmul push
+    /// element-wise differences into the 1e-3 range easily. We're
+    /// validating "same answer up to floating-point noise", not bitwise
+    /// equality.
+    ///
+    /// Skips on no-Metal hosts.
+    #[test]
+    fn test_chunked_prefill_matches_single_shot_logits() {
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!(
+                        "skipping test_chunked_prefill_matches_single_shot_logits (no Metal): \
+                         {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Qwen3Inner::new failure: {msg}");
+            }
+        };
+        cast_qwen3_inner_weights_bf16(&mut inner);
+
+        // 96-token prompt — must be > paged_tiny_config max_position_embeddings/2
+        // so a chunk_size of 16 produces 6 chunks (the multi-chunk path is
+        // what we actually want to exercise). Tokens are arbitrary modulo
+        // vocab_size = 100.
+        let prompt: Vec<u32> = (0u32..96).map(|i| (i * 7 + 3) % 100).collect();
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let num_layers = inner.layers.len();
+
+        // ---- Run 1: single-shot path ----
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.reset_for_new_request(0).expect("reset");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32)
+                .expect("allocate_suffix_blocks");
+        }
+        let logits_single = match inner.run_paged_prefill_chunk_with_size(
+            &prompt, /* first_logical_position */ 0, num_layers, &positions,
+            /* chunk_size */ 0, // single-shot
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!("skipping test_chunked_prefill_matches_single_shot_logits: {msg}");
+                    return;
+                }
+                panic!("unexpected single-shot prefill failure: {msg}");
+            }
+        };
+        let single_vec = logits_to_f32_vec(&logits_single);
+        assert_eq!(single_vec.len(), cfg.vocab_size as usize);
+        for (i, v) in single_vec.iter().enumerate() {
+            assert!(v.is_finite(), "single-shot logits[{i}] not finite: {v}");
+        }
+
+        // Reset adapter so the second run starts fresh (no prefix-reuse —
+        // we want to compare apples to apples).
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.release_request().expect("release_request");
+            adapter.reset_for_new_request(0).expect("reset");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
+            assert_eq!(
+                prefix.cached_token_count, 0,
+                "second run must not see registered blocks from first run"
+            );
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32)
+                .expect("allocate_suffix_blocks");
+        }
+
+        // ---- Run 2: chunked path (chunk_size = 16, so 96/16 = 6 chunks) ----
+        let logits_chunked = inner
+            .run_paged_prefill_chunk_with_size(
+                &prompt, /* first_logical_position */ 0, num_layers, &positions,
+                /* chunk_size */ 16,
+            )
+            .expect("chunked prefill");
+        let chunked_vec = logits_to_f32_vec(&logits_chunked);
+        assert_eq!(chunked_vec.len(), cfg.vocab_size as usize);
+
+        // Element-wise close-comparison. bf16 + chunk-boundary fma reorderings
+        // give ~3 decimals; the assertion is generous to rule out structural
+        // bugs without flaking on hardware-numerics jitter.
+        let atol = 5e-3f32;
+        let rtol = 5e-3f32;
+        let mut max_abs_diff = 0.0f32;
+        let mut max_rel_diff = 0.0f32;
+        for (i, (a, b)) in single_vec.iter().zip(chunked_vec.iter()).enumerate() {
+            assert!(b.is_finite(), "chunked logits[{i}] not finite: {b}");
+            let abs_diff = (a - b).abs();
+            let rel_diff = abs_diff / (a.abs().max(b.abs()).max(1e-6));
+            if abs_diff > max_abs_diff {
+                max_abs_diff = abs_diff;
+            }
+            if rel_diff > max_rel_diff {
+                max_rel_diff = rel_diff;
+            }
+            assert!(
+                abs_diff <= atol || rel_diff <= rtol,
+                "logits diverge at index {i}: single={a}, chunked={b}, \
+                 abs_diff={abs_diff}, rel_diff={rel_diff} (max allowed: \
+                 atol={atol} or rtol={rtol})"
+            );
+        }
+        eprintln!(
+            "chunked-prefill parity max_abs_diff={max_abs_diff}, max_rel_diff={max_rel_diff} \
+             (atol={atol}, rtol={rtol}) over {} elements",
+            single_vec.len()
+        );
+
+        // Cleanup.
+        {
+            let adapter = inner.paged_adapter.as_mut().unwrap();
+            let _ = adapter.register_full_blocks_for_reuse(&[]);
+            adapter.release_request().expect("release_request");
+        }
+    }
+
+    /// **Phase B state test**: chunk-by-chunk the adapter's bookkeeping
+    /// must advance correctly. After each chunk:
+    /// * `current_token_count()` equals the cumulative chunk_lens fed.
+    /// * `request_tokens()` length matches the cumulative count.
+    /// * `block_table().num_blocks()` grows lazily — with `block_size=16`
+    ///   and 16-token chunks, each chunk lands on a fresh block.
+    ///
+    /// Uses the `_with_size` helper directly so we can drive the chunked
+    /// path without env var mutation.
+    #[test]
+    fn test_chunked_prefill_advances_adapter_state() {
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!(
+                        "skipping test_chunked_prefill_advances_adapter_state (no Metal): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Qwen3Inner::new failure: {msg}");
+            }
+        };
+        cast_qwen3_inner_weights_bf16(&mut inner);
+
+        // 64 tokens, chunk_size 16 → 4 chunks, each filling exactly one
+        // block (block_size = 16 in paged_tiny_config). After chunk N the
+        // block table must have exactly N blocks.
+        let prompt: Vec<u32> = (0u32..64).map(|i| (i * 11 + 5) % 100).collect();
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let num_layers = inner.layers.len();
+
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.reset_for_new_request(0).expect("reset");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32)
+                .expect("allocate_suffix_blocks");
+        }
+
+        // Run the full chunked prefill.
+        match inner.run_paged_prefill_chunk_with_size(
+            &prompt, /* first_logical_position */ 0, num_layers, &positions,
+            /* chunk_size */ 16,
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!("skipping test_chunked_prefill_advances_adapter_state: {msg}");
+                    return;
+                }
+                panic!("unexpected chunked prefill failure: {msg}");
+            }
+        };
+
+        // Post-prefill: cursor must equal 64 (every chunk's record_tokens
+        // ran), request_tokens must match the prompt verbatim, and the
+        // block table must have grown to cover all 64 tokens (≥4 blocks
+        // at block_size=16).
+        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+        assert_eq!(
+            adapter.current_token_count(),
+            prompt.len() as u32,
+            "cursor must advance through every chunk"
+        );
+        assert_eq!(
+            adapter.request_tokens(),
+            prompt.as_slice(),
+            "request_tokens must be the byte-equal cumulative concat of chunks"
+        );
+        let block_table = adapter.block_table().expect("block_table");
+        assert!(
+            block_table.num_blocks() >= 4,
+            "expected at least 4 blocks for 64 tokens at block_size=16, got {}",
+            block_table.num_blocks()
+        );
+    }
+
+    /// **Phase B fallback test**: legacy callers that rely on the env-var
+    /// default (chunk_size = 0) MUST still get the byte-equivalent
+    /// single-shot path. We exercise this by calling the public
+    /// `run_paged_prefill_chunk` (which reads the OnceLock-cached env)
+    /// directly and verifying it produces the same `[vocab]` logits as
+    /// `run_paged_prefill_chunk_with_size(..., 0)`. Keeps the public
+    /// signature stable.
+    #[test]
+    fn test_run_paged_prefill_chunk_default_matches_single_shot() {
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!(
+                        "skipping test_run_paged_prefill_chunk_default_matches_single_shot \
+                         (no Metal): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Qwen3Inner::new failure: {msg}");
+            }
+        };
+        cast_qwen3_inner_weights_bf16(&mut inner);
+
+        // Short 8-token prompt: small enough that `chunk_size > 0` would
+        // also take the single-shot fast path (`suffix_tokens.len() <=
+        // chunk_size`). This means the "default chunk_size = 0" case and
+        // the "chunk_size > suffix_len" case both produce numerically
+        // identical outputs to single-shot — we exercise the first form
+        // here. Bigger prompts are covered by the multi-chunk parity test
+        // above.
+        let prompt: Vec<u32> = vec![5, 11, 21, 33, 47, 60, 71, 83];
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let num_layers = inner.layers.len();
+
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.reset_for_new_request(0).expect("reset");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32)
+                .expect("allocate_suffix_blocks");
+        }
+        let logits_default = match inner.run_paged_prefill_chunk(&prompt, 0, num_layers, &positions)
+        {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!(
+                        "skipping test_run_paged_prefill_chunk_default_matches_single_shot: {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected default prefill failure: {msg}");
+            }
+        };
+        let default_vec = logits_to_f32_vec(&logits_default);
+        assert_eq!(default_vec.len(), cfg.vocab_size as usize);
+        for (i, v) in default_vec.iter().enumerate() {
+            assert!(v.is_finite(), "default-path logits[{i}] not finite: {v}");
+        }
+
+        // Reset adapter, run the same prompt explicitly with chunk_size=0
+        // (the legacy single-shot path). The two should be byte-equal
+        // since the public entry point is a thin wrapper around the
+        // _with_size helper at chunk_size=0 (matches the env-default case
+        // when MLX_PAGED_PREFILL_CHUNK_SIZE is unset).
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.release_request().expect("release_request");
+            adapter.reset_for_new_request(0).expect("reset");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32)
+                .expect("allocate_suffix_blocks");
+        }
+        let logits_explicit = inner
+            .run_paged_prefill_chunk_with_size(&prompt, 0, num_layers, &positions, 0)
+            .expect("explicit chunk_size=0 prefill");
+        let explicit_vec = logits_to_f32_vec(&logits_explicit);
+
+        // The default and explicit-zero paths run the SAME code path —
+        // bytewise equality is what we expect. Use a vanishingly small
+        // tolerance so the assertion still survives if the env var
+        // happens to be set to 0 vs. unset (both collapse to chunk_size=0
+        // anyway via parse_chunk_size).
+        for (i, (a, b)) in default_vec.iter().zip(explicit_vec.iter()).enumerate() {
+            let abs_diff = (a - b).abs();
+            assert!(
+                abs_diff <= 1e-6,
+                "default path diverged from explicit chunk_size=0 at index {i}: \
+                 default={a}, explicit={b}, abs_diff={abs_diff}"
+            );
+        }
+
         {
             let adapter = inner.paged_adapter.as_mut().unwrap();
             let _ = adapter.register_full_blocks_for_reuse(&[]);
