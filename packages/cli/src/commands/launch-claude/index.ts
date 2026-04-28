@@ -205,12 +205,17 @@ export async function run(argv: string[]): Promise<void> {
   let effectiveChunkSize = 0;
   if (rawChunkSize != null) {
     const trimmed = rawChunkSize.trim();
+    // Mirror Rust's `s.trim().parse::<i32>()`: integer-only, signed,
+    // i32 range [-2^31, 2^31). The TS parser must reject anything Rust
+    // would, otherwise the log shows "N tokens" while chunking is
+    // actually disabled.
+    const I32_MAX = 0x7fff_ffff;
     const parsed = /^-?\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
-    if (Number.isFinite(parsed) && parsed >= 0) {
+    if (Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= I32_MAX) {
       effectiveChunkSize = parsed;
     } else {
       console.warn(
-        `[mlx] warning: MLX_PAGED_PREFILL_CHUNK_SIZE=${JSON.stringify(rawChunkSize)} is not a non-negative integer; treating as 0 (disabled)`,
+        `[mlx] warning: MLX_PAGED_PREFILL_CHUNK_SIZE=${JSON.stringify(rawChunkSize)} is not a non-negative i32 integer; treating as 0 (disabled)`,
       );
     }
   }
