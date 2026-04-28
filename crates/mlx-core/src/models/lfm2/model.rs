@@ -786,7 +786,6 @@ impl Lfm2Inner {
         eos_token_id: u32,
     ) -> Result<ChatResult> {
         let prompt_token_count = tokens.len();
-        let max_new_tokens = p.max_new_tokens;
         let sampling_config = p.sampling_config;
 
         let generation_start = if report_perf {
@@ -807,7 +806,11 @@ impl Lfm2Inner {
         // cached prefix in `run_paged_prefill_chunk`'s "Pass 1" so the
         // partial-block carry only affects attention layers.
         let seq_id: u32 = 0;
-        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        // Lazy decode allocation: pass the prompt length only. Decode
+        // blocks grow on-demand via `record_tokens` (no pre-reserve of
+        // `max_new_tokens`). The inner decode loop reads `p.max_new_tokens`
+        // directly when it needs the budget bound.
+        let total_budget = tokens.len() as u32;
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
@@ -1381,7 +1384,6 @@ impl Lfm2Inner {
         cancelled: &Arc<AtomicBool>,
     ) -> Result<()> {
         let prompt_token_count = tokens.len();
-        let max_new_tokens = p.max_new_tokens;
         let sampling_config = p.sampling_config;
 
         let generation_start = if report_perf {
@@ -1404,7 +1406,8 @@ impl Lfm2Inner {
         // See the equivalent block in `chat_sync_core_paged` for full
         // discussion.
         let seq_id: u32 = 0;
-        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        // Lazy decode allocation: pass the prompt length only.
+        let total_budget = tokens.len() as u32;
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(

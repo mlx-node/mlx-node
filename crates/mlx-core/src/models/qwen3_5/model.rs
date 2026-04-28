@@ -2055,7 +2055,6 @@ impl Qwen35Inner {
         }
 
         let prompt_token_count = tokens.len() as u32;
-        let max_new_tokens = p.max_new_tokens;
         let sampling_config = p.sampling_config;
 
         let think_end_id = tokenizer.think_end_id();
@@ -2076,7 +2075,8 @@ impl Qwen35Inner {
 
         // === Adapter lifecycle: warm continuation OR cold start ===
         let seq_id: u32 = 0;
-        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        // Lazy decode allocation: pass the prompt length only.
+        let total_budget = tokens.len() as u32;
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
@@ -2379,7 +2379,6 @@ impl Qwen35Inner {
         }
 
         let prompt_token_count = tokens.len() as u32;
-        let max_new_tokens = p.max_new_tokens;
         let sampling_config = p.sampling_config;
         let include_reasoning = p.include_reasoning;
 
@@ -2406,7 +2405,8 @@ impl Qwen35Inner {
 
         // === Adapter lifecycle: warm continue OR cold start ===
         let seq_id: u32 = 0;
-        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        // Lazy decode allocation: pass the prompt length only.
+        let total_budget = tokens.len() as u32;
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(

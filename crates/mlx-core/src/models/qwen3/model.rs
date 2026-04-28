@@ -2109,7 +2109,14 @@ impl Qwen3Inner {
         //
         // Otherwise (cold start, prompt drift, or first turn) fall back
         // to the original `reset → find_cached_prefix → allocate` flow.
-        let total_budget = (token_ids_vec.len() as u32) + (max_new_tokens.max(0) as u32);
+        //
+        // Lazy decode allocation: pass the prompt length only. The decode
+        // loop's per-token `record_tokens` calls grow the block table on
+        // demand, so we no longer pre-reserve `max_new_tokens` blocks
+        // (which used to blow out the pool when callers passed
+        // max_tokens=128000 even though actual generation rarely
+        // exceeded ~10K tokens).
+        let total_budget = token_ids_vec.len() as u32;
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 napi::Error::from_reason(
@@ -2754,7 +2761,10 @@ impl Qwen3Inner {
         // See the equivalent block in `chat_sync_core_paged` for full
         // discussion of why warm continuation preserves the partial
         // trailing block's K/V across turns.
-        let total_budget = (token_ids_vec.len() as u32) + (p.max_new_tokens.max(0) as u32);
+        // Lazy decode allocation: pass the prompt length only. Decode
+        // blocks grow on-demand via `record_tokens` (no pre-reserve of
+        // `p.max_new_tokens`).
+        let total_budget = token_ids_vec.len() as u32;
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 napi::Error::from_reason(

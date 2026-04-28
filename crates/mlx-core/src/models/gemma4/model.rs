@@ -1991,7 +1991,8 @@ impl Gemma4Inner {
         // continue preserves the partial trailing block's K/V across
         // turns. Mirrors Qwen3 / LFM2.
         let seq_id: u32 = 0;
-        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        // Lazy decode allocation: pass the prompt length only.
+        let total_budget = tokens.len() as u32;
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
@@ -2254,7 +2255,8 @@ impl Gemma4Inner {
         // Adapter lifecycle: warm continuation OR cold start (mirrors
         // chat_sync_core_paged).
         let seq_id: u32 = 0;
-        let total_budget = (tokens.len() as u32) + (max_new_tokens.max(0) as u32);
+        // Lazy decode allocation: pass the prompt length only.
+        let total_budget = tokens.len() as u32;
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("chat_stream_sync_core_paged: paged_adapter is None")

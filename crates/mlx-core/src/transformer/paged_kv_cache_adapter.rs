@@ -36,10 +36,15 @@
 //! 1. `reset_for_new_request(seq_id)` — releases any prior request.
 //! 2. `find_cached_prefix(prompt_tokens, extra_keys)` — populates block_table
 //!    with reused prefix blocks (refcounts already incremented).
-//! 3. `allocate_suffix_blocks(total_tokens)` — allocates fresh blocks to
-//!    cover the remainder of the prompt + decode budget.
+//! 3. `allocate_suffix_blocks(prompt_tokens.len())` — allocates fresh
+//!    blocks to cover the prompt suffix that prefill will write. Decode
+//!    blocks are NOT pre-reserved here; `record_tokens` grows the block
+//!    table on-demand as decode crosses block boundaries (vLLM's lazy
+//!    pattern; pre-reserving `max_new_tokens` here used to blow out the
+//!    pool when callers sent `max_tokens=128000` for ~10K-token
+//!    generations).
 //! 4. `record_tokens(...)` — every token consumed (prefill batch + each
-//!    decoded token), in order.
+//!    decoded token), in order. Lazily extends `block_table` when needed.
 //! 5. End-of-turn options:
 //!    - **Within-session continuation (recommended for chat sessions)**:
 //!      at the end of each successful turn except the last, call
@@ -593,6 +598,20 @@ impl PagedKVCacheAdapter {
     /// On partial failure (some allocations succeeded before the pool ran
     /// out), the already-allocated blocks are rolled back into the pool to
     /// avoid leaks.
+    ///
+    /// ## Lazy decode allocation
+    ///
+    /// Callers should pass `total_tokens` = `prompt_tokens.len()` (the full
+    /// prompt length, INCLUDING the cached prefix), NOT
+    /// `prompt_len + max_new_tokens`. The decode loop's per-token
+    /// `record_tokens` calls now lazily allocate further blocks on-demand
+    /// as the position cursor crosses block boundaries — see `record_tokens`.
+    /// Pre-reserving the speculative `max_new_tokens` budget here used to
+    /// blow out the global `BlockAllocator` pool when callers (e.g. Claude
+    /// Code) routinely sent `max_tokens=128000` even though actual
+    /// generation rarely exceeded ~10K. vLLM uses the same lazy pattern:
+    /// the prompt's blocks are reserved at prefill, decode allocates one
+    /// block every `block_size` tokens.
     pub fn allocate_suffix_blocks(&mut self, total_tokens: u32) -> Result<u32, String> {
         let block_table = self.block_table.as_mut().ok_or_else(|| {
             "allocate_suffix_blocks called before reset_for_new_request".to_string()
@@ -639,19 +658,103 @@ impl PagedKVCacheAdapter {
         Ok(needed_blocks)
     }
 
+    /// Lazily extend `block_table` to cover `new_total_tokens` logical
+    /// positions. Called from `record_tokens` so decode steps don't have
+    /// to pre-reserve blocks for the full speculative `max_new_tokens`
+    /// budget — instead, blocks are allocated as the position cursor
+    /// crosses block boundaries (vLLM's decode pattern; see
+    /// `vllm/v1/core/kv_cache_manager.py::allocate_slots`).
+    ///
+    /// On allocator exhaustion, the already-allocated blocks within this
+    /// call are rolled back so the request's block_table is unchanged
+    /// (caller-visible state stays consistent with the pre-call state and
+    /// the next decode step can choose to abort gracefully).
+    fn ensure_blocks_for_total_tokens(&mut self, new_total_tokens: u32) -> Result<u32, String> {
+        let block_table = self.block_table.as_mut().ok_or_else(|| {
+            "ensure_blocks_for_total_tokens called before reset_for_new_request".to_string()
+        })?;
+        if self.block_size == 0 {
+            return Err("block_size must be > 0".to_string());
+        }
+        let current_blocks = block_table.num_blocks() as u32;
+        let needed_total_blocks = new_total_tokens.div_ceil(self.block_size);
+        if needed_total_blocks <= current_blocks {
+            return Ok(0);
+        }
+        let to_allocate = needed_total_blocks - current_blocks;
+
+        let mut guard = self
+            .allocator
+            .lock()
+            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        let mut newly_allocated: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(to_allocate as usize);
+        for i in 0..to_allocate {
+            match guard.allocate() {
+                Some(block) => newly_allocated.push(block),
+                None => {
+                    // Roll back partial allocations to keep the pool consistent.
+                    for partial in newly_allocated.drain(..) {
+                        guard.free(partial);
+                    }
+                    return Err(format!(
+                        "BlockAllocator exhausted: lazy decode allocation needed \
+                         {to_allocate} more block(s) (request had {current_blocks}, \
+                         needs {needed_total_blocks} for {new_total_tokens} tokens), \
+                         allocated {i} before running out"
+                    ));
+                }
+            }
+        }
+        drop(guard);
+
+        for block in newly_allocated {
+            block_table.add_block(block);
+        }
+        Ok(to_allocate)
+    }
+
     /// Record tokens emitted/consumed in this request. Updates
     /// `request_tokens` and `block_table.num_tokens`. Caller passes
     /// EVERY token (prompt prefill + decoded output) in order.
     ///
     /// `tokens.len()` may be 1 (decode step) or N (full prefill batch).
+    ///
+    /// ## Lazy block allocation
+    ///
+    /// If the new tokens push the request past the currently-allocated
+    /// block-table capacity (`num_blocks * block_size`), this call lazily
+    /// allocates additional blocks from the shared `BlockAllocator` to
+    /// cover the deficit. This matches vLLM's decode pattern and avoids
+    /// pre-reserving the speculative `max_new_tokens` budget (which used
+    /// to blow out the pool when clients sent `max_tokens=128000`).
+    ///
+    /// On allocator exhaustion the call returns `Err` WITHOUT extending
+    /// `request_tokens` or `block_table.num_tokens`, so the caller can
+    /// stop generation gracefully without writing to a non-existent block.
     pub fn record_tokens(&mut self, tokens: &[u32]) -> Result<(), String> {
+        if self.block_table.is_none() {
+            return Err("record_tokens called before reset_for_new_request".to_string());
+        }
+        // Compute the new total BEFORE mutating state so we can grow the
+        // block table first and leave caller-visible state unchanged on
+        // allocator exhaustion.
+        let prior_len = self.request_tokens.len() as u32;
+        let added = tokens.len() as u32;
+        let new_total = prior_len.checked_add(added).ok_or_else(|| {
+            format!("record_tokens: token cursor overflow (prior={prior_len}, adding={added})")
+        })?;
+
+        // Lazily grow block_table if the new tokens cross a block boundary.
+        // On exhaustion, the helper rolls back any partial allocations so
+        // request state stays consistent with the pre-call state.
+        self.ensure_blocks_for_total_tokens(new_total)?;
+
+        // Allocation succeeded — now safe to extend bookkeeping.
         let block_table = self
             .block_table
             .as_mut()
-            .ok_or_else(|| "record_tokens called before reset_for_new_request".to_string())?;
-
+            .ok_or_else(|| "record_tokens: block_table disappeared mid-call".to_string())?;
         self.request_tokens.extend_from_slice(tokens);
-        let new_total = self.request_tokens.len() as u32;
         block_table.set_num_tokens(new_total);
         Ok(())
     }
@@ -1450,8 +1553,13 @@ impl PagedKVCacheAdapter {
     ///   a divergent prefix into the live block table (which would
     ///   produce wrong logits).
     /// - `total_budget` is the same budget passed to
-    ///   `allocate_suffix_blocks` on a fresh request: total prompt tokens
-    ///   PLUS the max decode token budget.
+    ///   `allocate_suffix_blocks` on a fresh request: the total number of
+    ///   logical tokens that prefill needs covered up front. With lazy
+    ///   decode allocation (`record_tokens` grows the block table on
+    ///   demand) callers should pass `prompt_tokens.len()` — i.e. the
+    ///   total prompt length — and decode allocates further blocks
+    ///   on-demand. Pre-reserving `prompt_len + max_new_tokens` is no
+    ///   longer required.
     ///
     /// ## Returns
     ///
@@ -3456,40 +3564,55 @@ mod tests {
         );
     }
 
-    /// `gather_kv_for_decode` must reject a recorded context length that
-    /// exceeds the allocated block-table capacity. Without this guard the
-    /// kernel would dispatch with a `context_lens` value larger than the
-    /// uploaded `block_tables` buffer, reading past the end on the GPU.
+    /// `record_tokens` lazily allocates additional blocks when the new
+    /// tokens cross a block boundary, so a small pool exhausting mid-decode
+    /// must surface a clean `Err` (not a silent overshoot of the
+    /// allocated capacity that would later read past the end of the
+    /// uploaded `block_tables` buffer in `gather_kv_for_decode`). Replaces
+    /// the older "record then gather sees overflow" scenario which is
+    /// unreachable now that `record_tokens` performs lazy allocation.
     /// CPU-only — graceful skip when no Metal device is present.
     #[test]
-    fn test_gather_kv_for_decode_rejects_capacity_overflow() {
-        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+    fn test_record_tokens_lazy_alloc_errs_on_pool_exhaustion() {
+        // 2-block pool with block_size = 4 → 8-slot capacity total.
+        let Some(mut adapter) = maybe_adapter(new_allocator(2, 4), 4) else {
             eprintln!(
-                "skipping test_gather_kv_for_decode_rejects_capacity_overflow: Metal unavailable"
+                "skipping test_record_tokens_lazy_alloc_errs_on_pool_exhaustion: Metal unavailable"
             );
             return;
         };
         adapter.reset_for_new_request(0).unwrap();
-        // Allocate exactly 1 block (block_size = 4 → 4 slots), then
-        // record 5 tokens — `record_tokens` doesn't enforce capacity, so the
-        // adapter's internal `num_tokens` advances past the allocated slots.
+        // Reserve 1 block for the prompt suffix. Decode-time record_tokens
+        // calls grow the table on demand. Each block holds 4 tokens; the
+        // pool only has 2 blocks total → record_tokens MUST fail trying to
+        // fit a 9th token.
         adapter.allocate_suffix_blocks(4).unwrap();
-        adapter.record_tokens(&[1, 2, 3, 4, 5]).unwrap();
-        assert_eq!(adapter.current_token_count(), 5);
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(adapter.current_token_count(), 4);
         assert_eq!(adapter.num_allocated_blocks(), 1);
-
-        let q = MxArray::zeros(&[1, 1, 32], Some(DType::Float16)).expect("q zeros");
-        let res = adapter.gather_kv_for_decode(0, &q, 0.5, 1.0);
-        assert!(res.is_err(), "expected capacity overflow rejection");
+        // Decode tokens 5..=8 — block boundary at 5 grows to 2 blocks.
+        adapter.record_tokens(&[5]).unwrap();
+        assert_eq!(adapter.num_allocated_blocks(), 2);
+        adapter.record_tokens(&[6, 7, 8]).unwrap();
+        assert_eq!(adapter.num_allocated_blocks(), 2);
+        assert_eq!(adapter.current_token_count(), 8);
+        // 9th token requires a 3rd block; the 2-block pool is exhausted.
+        let res = adapter.record_tokens(&[9]);
+        assert!(
+            res.is_err(),
+            "expected pool-exhaustion error from lazy alloc"
+        );
         let msg = res.err().unwrap();
         assert!(
-            msg.contains("capacity") || msg.contains("exceeds"),
-            "error must mention capacity/overflow, got: {msg}"
+            msg.contains("BlockAllocator exhausted")
+                || msg.contains("lazy decode allocation")
+                || msg.contains("running out"),
+            "error must indicate allocator exhaustion, got: {msg}"
         );
-        assert!(
-            msg.contains("allocate_suffix_blocks"),
-            "error must point at the allocate_suffix_blocks fix path, got: {msg}"
-        );
+        // Caller-visible state must be unchanged on failure (token cursor
+        // and block table not advanced past the prior successful state).
+        assert_eq!(adapter.current_token_count(), 8);
+        assert_eq!(adapter.num_allocated_blocks(), 2);
     }
 
     // ------------------------ read_kv_range ------------------------
