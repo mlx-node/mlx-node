@@ -2881,6 +2881,13 @@ impl Gemma4Inner {
                     sliding_shared_kv.insert(layer_idx as u32, (k, v));
                 }
             }
+            // Smooth the prefill memory peak: every K layers, materialize the
+            // residual stream so MLX can release the upstream graph nodes
+            // (embedding + every prior layer's attention/MLP/PLE intermediates)
+            // from the cache pool. Without this the in-flight lazy graph
+            // accumulates on long contexts before the post-prefill sync fires.
+            // Cadence is `MLX_PAGED_PREFILL_EVAL_INTERVAL` (default 8).
+            crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states);
         }
 
         Ok(hidden_states)

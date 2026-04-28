@@ -103,6 +103,13 @@ pub(crate) fn run_paged_prefill_chunk(
             None,
             true,
         )?;
+        // Smooth the prefill memory peak: every K layers, materialize the
+        // residual stream so MLX can release the upstream graph nodes
+        // (embedding + every prior layer's attention/MLP intermediates)
+        // from the cache pool. Without this the in-flight lazy graph
+        // accumulates ~50 GB on long contexts before the post-prefill
+        // sync fires. Cadence is `MLX_PAGED_PREFILL_EVAL_INTERVAL` (default 8).
+        crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states);
     }
 
     let h = final_norm.forward(&hidden_states)?;

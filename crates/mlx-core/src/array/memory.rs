@@ -75,6 +75,74 @@ pub fn maybe_clear_cache_for_paged_step(step: i32) {
     }
 }
 
+/// Default paged-prefill per-layer eval+clear cadence.
+///
+/// During paged prefill (`run_paged_prefill_chunk` / `run_paged_prefill_layer_loop`)
+/// MLX's lazy evaluator stacks the per-layer activation graph into a single
+/// monolithic compute DAG. For long contexts on large models the in-flight
+/// hidden states + attention scores + MLP intermediates can balloon the
+/// caching allocator's retention to ~50 GB before the post-prefill
+/// `synchronize_and_clear_cache()` finally fires. On a 128 GB M3 Max with
+/// the model weights already pinned (~37 GB for Q8 35B), this can drive
+/// the system to 100 GB+ and trigger compression / near-OOM stalls.
+///
+/// Forcing `hidden_states.eval()` + `clear_cache()` every K layers materializes
+/// the in-flight residual stream (so MLX evaluates everything that fed
+/// into it — embedding, every prior layer's attention + MLP, every PLE
+/// residual) and then releases the upstream graph nodes from the cache
+/// pool. This caps the prefill peak to ~K layers' worth of activations
+/// at the cost of N/K forced GPU stalls per prefill (~5–10 ms each on
+/// M3 Max), which is negligible compared to a 30–60 s prefill.
+///
+/// Override at runtime via `MLX_PAGED_PREFILL_EVAL_INTERVAL` (positive
+/// integer). Operators with more memory headroom can loosen (`=16`);
+/// operators with less (M2 Air, etc.) can tighten (`=4`). The env var
+/// is read once on first use and cached; invalid / non-positive values
+/// fall back to this default.
+pub const PAGED_PREFILL_EVAL_INTERVAL_DEFAULT: i32 = 8;
+
+/// Effective paged-prefill eval+clear cadence — `MLX_PAGED_PREFILL_EVAL_INTERVAL`
+/// env override or [`PAGED_PREFILL_EVAL_INTERVAL_DEFAULT`]. Read once on first
+/// call and cached; subsequent reads hit the OnceLock fast path.
+pub fn paged_prefill_eval_interval() -> i32 {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<i32> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("MLX_PAGED_PREFILL_EVAL_INTERVAL") {
+        Ok(s) => match s.trim().parse::<i32>() {
+            Ok(n) if n > 0 => n,
+            _ => PAGED_PREFILL_EVAL_INTERVAL_DEFAULT,
+        },
+        Err(_) => PAGED_PREFILL_EVAL_INTERVAL_DEFAULT,
+    })
+}
+
+/// Helper: eval `hidden_states` + clear the MLX caching allocator every
+/// `paged_prefill_eval_interval()` layers during a paged prefill loop.
+///
+/// `layer_idx` is the zero-indexed layer that just produced `hidden_states`
+/// (so the call site fires at the BOTTOM of the per-layer body). Gated on
+/// `(layer_idx + 1) % paged_prefill_eval_interval() == 0` so we never fire
+/// on the very first layer (saves one stall when the interval is large
+/// relative to the layer count) and we always fire at boundaries that
+/// align with K layers of completed work.
+///
+/// The eval MUST be on the residual-stream tensor — that's what every
+/// upstream layer feeds into, so MLX materializes the entire dependency
+/// chain and `clear_cache` can then release it. Eval'ing a different
+/// tensor (e.g. an attention K/V) lets MLX skip the rest of the graph
+/// and the memory peak persists.
+#[inline]
+pub fn maybe_eval_clear_for_paged_prefill_layer(layer_idx: usize, hidden_states: &super::MxArray) {
+    let interval = paged_prefill_eval_interval();
+    if interval <= 0 {
+        return;
+    }
+    if (layer_idx + 1).is_multiple_of(interval as usize) {
+        hidden_states.eval();
+        clear_cache();
+    }
+}
+
 /// Get actively used memory in bytes (excludes cached memory)
 /// Internal Rust-only function - use memoryCleanupThreshold config for memory-based cleanup
 pub fn get_active_memory() -> f64 {
