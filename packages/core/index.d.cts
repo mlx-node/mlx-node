@@ -153,6 +153,20 @@ export declare class Gemma4Model {
   constructor(config: Gemma4Config);
   /** Returns true if weights have been loaded via `load()`. */
   get isInitialized(): boolean;
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Gemma4Inner::paged_adapter` was successfully
+   * constructed at load time (driven by
+   * `Gemma4Config::use_block_paged_cache`, currently default-OFF
+   * because parity is blocked on the SharedOn* numerical-diff
+   * investigation — see CLAUDE.md). Stubs constructed via
+   * `new(config)` always return `false`. Surfaced through this NAPI
+   * method so server endpoints can branch on it without a
+   * model-thread roundtrip.
+   */
+  hasBlockPagedCache(): boolean;
   modelId(): number;
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string): Promise<Gemma4Model>;
@@ -509,6 +523,23 @@ export declare class Lfm2Model {
    * state between turns.
    */
   resetCaches(): void;
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Lfm2Inner::paged_adapter` was successfully constructed
+   * at load time (driven by `Lfm2Config::use_block_paged_cache`,
+   * defaulting to `true` after paged-vs-flat parity verification).
+   * LFM2 is hybrid (10 conv + 6 full-attention layers); only the
+   * full-attention layers route through the adapter, conv layers stay
+   * on flat `Lfm2LayerCache::Conv` regardless. When `true`, the native
+   * cache reuses SYS blocks across `chatSessionStart` calls via
+   * content-addressing, so the JS-side warm slot in
+   * `SessionRegistry.getOrCreateWarmAny` is redundant and the
+   * `/v1/messages` server endpoint allocates a fresh `ChatSession` per
+   * request.
+   */
+  hasBlockPagedCache(): boolean;
   /**
    * Start a new chat session.
    *
@@ -1123,6 +1154,20 @@ export declare class Qwen35Model {
   /** Reset all caches. */
   resetCaches(): void;
   /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Qwen35Inner::paged_adapter` was successfully
+   * constructed at load time (driven by
+   * `Qwen3_5Config::use_block_paged_cache`, currently default-OFF
+   * because parity is pending real-weights validation; also always
+   * `false` on VLM checkpoints because `set_vision_encoder` rejects
+   * when the adapter is populated). Surfaced through this NAPI method
+   * so server endpoints can branch on it without round-tripping
+   * through the model thread.
+   */
+  hasBlockPagedCache(): boolean;
+  /**
    * Take the KV cache from the model, returning a `PromptCache` handle.
    *
    * The cache is moved out of the model — calling `takeCache()` twice
@@ -1290,6 +1335,20 @@ export declare class Qwen35MoeModel {
   initCaches(): void;
   /** Reset all caches. */
   resetCaches(): void;
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Qwen35MoeInner::paged_adapter` was successfully
+   * constructed at load time (driven by
+   * `Qwen3_5MoeConfig::use_block_paged_cache`, currently default-OFF
+   * because parity is pending real-weights validation; also always
+   * `false` on VLM checkpoints because `set_vision_encoder` rejects
+   * when the adapter is populated). Surfaced through this NAPI method
+   * so server endpoints can branch on it without round-tripping
+   * through the model thread.
+   */
+  hasBlockPagedCache(): boolean;
   /** Take the KV cache from the model, returning a `PromptCache` handle. */
   takeCache(): PromptCache | null;
   /** Restore a previously taken `PromptCache` into the model. */
@@ -1437,6 +1496,22 @@ export declare class Qwen3Model {
    * Call this when starting a new conversation to ensure a full prefill.
    */
   resetCache(): void;
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance.
+   *
+   * `true` iff `Qwen3Inner::paged_adapter` was successfully constructed
+   * at load time (driven by `Qwen3Config::use_block_paged_cache`,
+   * defaulting to `true` for Qwen3 since paged-vs-flat parity has been
+   * verified). When `true`, the native cache reuses SYS blocks across
+   * `chatSessionStart` calls via content-addressing in
+   * `BlockAllocator`'s prefix-hash table — the JS-side warm slot in
+   * `SessionRegistry.getOrCreateWarmAny` becomes redundant and the
+   * `/v1/messages` server endpoint allocates a fresh `ChatSession` per
+   * request. See `packages/server/src/endpoints/messages.ts` for the
+   * runtime-routing decision.
+   */
+  hasBlockPagedCache(): boolean;
   /**
    * Initialize KV caches for incremental generation
    *

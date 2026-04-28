@@ -5399,6 +5399,14 @@ pub struct Qwen3_5MoeModel {
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5MoeConfig,
     pub(crate) model_id: u64,
+    /// Snapshot of `Qwen35MoeInner::paged_adapter.is_some()` captured at
+    /// construction time. Currently default-OFF on Qwen3.5 MoE
+    /// (parity-pending — see CLAUDE.md and
+    /// `Qwen3_5MoeConfig::use_block_paged_cache`); also always `false`
+    /// on VLM checkpoints because `set_vision_encoder` rejects when the
+    /// adapter is populated. Surfaced through the `hasBlockPagedCache()`
+    /// NAPI method.
+    pub(crate) paged_active: bool,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
@@ -5420,6 +5428,22 @@ impl Qwen3_5MoeModel {
         crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::ResetCaches {
             reply,
         })
+    }
+
+    /// Whether the block-paged KV cache adapter is active on this model
+    /// instance.
+    ///
+    /// `true` iff `Qwen35MoeInner::paged_adapter` was successfully
+    /// constructed at load time (driven by
+    /// `Qwen3_5MoeConfig::use_block_paged_cache`, currently default-OFF
+    /// because parity is pending real-weights validation; also always
+    /// `false` on VLM checkpoints because `set_vision_encoder` rejects
+    /// when the adapter is populated). Surfaced through this NAPI method
+    /// so server endpoints can branch on it without round-tripping
+    /// through the model thread.
+    #[napi]
+    pub fn has_block_paged_cache(&self) -> bool {
+        self.paged_active
     }
 
     /// Take the KV cache from the model, returning a `PromptCache` handle.

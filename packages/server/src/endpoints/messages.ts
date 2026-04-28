@@ -5,56 +5,55 @@
  * Anthropic Messages API is stateless on the wire: there is no
  * `previous_response_id` to thread, and clients (e.g. Claude Code)
  * also do NOT propagate `prompt_cache_key` back to the server. The
- * only cross-turn signal that turn N continues turn N-1's prefix is
- * the registry's own warm slot — a per-model, single-warm cache
- * keyed only by `instructions` byte-equality.
+ * cross-turn / cross-conversation prefix-reuse path is one of two
+ * mutually-exclusive mechanisms, picked at request time based on
+ * whether the underlying native model has the block-paged KV cache
+ * adapter active (`SessionCapableModel.hasBlockPagedCache?.()`):
  *
- * Each request looks up the warm slot via
- * `SessionRegistry.getOrCreateWarmAny(requestedSystem)`. On a HIT we
- * keep the underlying native KV cache alive
- * (`resetPreservingNativeCacheForWarmReuse` wipes only JS-side
- * session state) so the native `verify_cache_prefix_direct` can
- * recognize the cached prefix and re-prefill only the new suffix.
- * On a MISS we run a full `session.reset()` to wipe both JS and
- * native state — a fresh JS session does NOT imply a fresh native
- * cache (the underlying `SessionCapableModel` is shared and its
- * native `cached_token_history` persists across requests). Either
- * way we then `primeHistory(messages)` + `startFromHistory[Stream]`.
+ *   * **Paged-active path** (Qwen3 + LFM2 today; eventually Gemma4
+ *     + Qwen3.5 dense + Qwen3.5 MoE once their parity is restored).
+ *     Each request allocates a fresh `ChatSession` via
+ *     `SessionRegistry.createFreshSession()` and runs a full
+ *     `session.reset()` + `primeHistory()` +
+ *     `startFromHistory[Stream]()`. The JS-side warm slot is
+ *     **not** consulted, **not** leased, and **not** adopted —
+ *     cross-request prefix reuse is handled entirely by the native
+ *     `BlockAllocator`'s content-addressed prefix-hash table, which
+ *     refcounts SYS blocks shared across requests transparently
+ *     (two parallel `/v1/messages` requests with the same system
+ *     prompt run on distinct `ChatSession` objects but reference
+ *     the same physical KV blocks). The non-streaming
+ *     `X-Session-Cache` header is promoted from `fresh` to
+ *     `prefix_hit` after dispatch when the engine reports
+ *     `cachedTokens > 0`.
  *
- * After the dispatch settles we adopt the session back under the
- * sentinel id `'__msg_warm__'` (or drop on uncommitted streams /
- * thrown errors) so the next turn can lease it. The sentinel is
- * never produced by either the OpenAI or the Anthropic wire format,
- * so cross-endpoint capture via tier-1 is impossible by
- * construction. The `/v1/responses` and `/v1/messages` endpoints
- * still SHARE the single warm slot under the registry's single-warm
- * invariant — a turn on one side can evict the other's slot.
+ *   * **Non-paged path** (Gemma4 today — parity-blocked; Qwen3.5
+ *     dense + MoE — parity-pending; the Qianfan-OCR VLM — no
+ *     adapter wired). Each request looks up the warm slot via
+ *     `SessionRegistry.getOrCreateWarmAny(requestedSystem)`. On a
+ *     HIT we keep the underlying native KV cache alive
+ *     (`resetPreservingNativeCacheForWarmReuse` wipes only JS-side
+ *     session state) so the native `verify_cache_prefix_direct` can
+ *     recognize the cached prefix and re-prefill only the new
+ *     suffix. On a MISS we run a full `session.reset()` to wipe
+ *     both JS and native state — a fresh JS session does NOT imply
+ *     a fresh native cache (the underlying `SessionCapableModel` is
+ *     shared and its native `cached_token_history` persists across
+ *     requests). After the dispatch settles we adopt the session
+ *     back under the sentinel id `'__msg_warm__'` (or drop on
+ *     uncommitted streams / thrown errors) so the next turn can
+ *     lease it. The sentinel is never produced by either the OpenAI
+ *     or the Anthropic wire format, so cross-endpoint capture via
+ *     tier-1 is impossible by construction. The `/v1/responses` and
+ *     `/v1/messages` endpoints still SHARE the single warm slot
+ *     under the registry's single-warm invariant on this path — a
+ *     turn on one side can evict the other's slot.
  *
  * The `prompt_cache_key` request field is still NOT exposed on this
- * endpoint. The server-side warm slot is sufficient for the
- * single-Claude-Code-session use case (Claude Code POSTs the entire
- * transcript back each turn and never sees a different prompt-cache
- * key). Cross-conversation block-level cache reuse is a separate
- * Phase-2 feature that would require the field — re-adding both is
- * a future change.
- *
- * **Planned migration to native block-paged KV (vLLM-aligned).** The
- * supported full-attention models (Qwen3 and LFM2 today; Gemma4 and
- * Qwen3.5 once their forward dispatch is wired) carry an opt-in
- * `use_block_paged_cache` config flag that swaps the per-model flat
- * `Vec<KVCache>` for a refcounted `PagedKVCacheAdapter` keyed by
- * token-prefix hash. When that flag becomes the default, the
- * server-side warm-slot machinery this file orchestrates
- * (`getOrCreateWarmAny`, `resetPreservingNativeCacheForWarmReuse`,
- * the `__msg_warm__` adopt/drop dance) becomes redundant — the
- * native block cache recovers the same cross-turn prefix without
- * the byte-equal-`instructions` gate, and additionally supports
- * cross-conversation block sharing the JS warm slot cannot. Phase 7
- * of the messages-kv-reuse plan removes the warm-slot path on this
- * endpoint, gated on (a) the default flip and (b) real-weights
- * numerical-equivalence validation. Until both land, the warm-slot
- * path below remains active and correct; this comment is the only
- * change in that direction for now.
+ * endpoint. Cross-conversation block-level cache reuse on the
+ * paged path is now driven by native content-addressing instead of
+ * the JS warm slot, so adding the field is no longer a prerequisite
+ * for that use case.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -801,18 +800,43 @@ export async function handleCreateMessage(
           return;
         }
 
-        // Per-model warm-slot lookup for `/v1/messages` reuse. The
-        // Anthropic Messages API is stateless on the wire — there is
-        // no `previous_response_id` to thread, and clients do not
-        // propagate `prompt_cache_key` back to the server (Claude
-        // Code in particular) — so neither tier-1 nor tier-2 can fire
-        // on this endpoint. The third lookup mode
-        // (`getOrCreateWarmAny`) walks the registry's at-most-one
-        // warm entry and leases it out when the stored `instructions`
-        // are byte-equal to the request's `system`; otherwise it
-        // returns a fresh session.
+        // Per-model session selection for `/v1/messages` reuse.
         //
-        // Adoption is keyed by the literal sentinel
+        // Two paths, gated on whether the underlying native model has
+        // the block-paged KV cache adapter active
+        // (`hasBlockPagedCache()` — captured at load time from
+        // `<Inner>::paged_adapter.is_some()` and surfaced by the
+        // `SessionCapableModel` structural interface):
+        //
+        //   * **Paged-active** (Qwen3 + LFM2 today; eventually Gemma4 +
+        //     Qwen3.5 + Qwen3.5 MoE once their parity is restored).
+        //     Allocate a fresh `ChatSession` per request via
+        //     `createFreshSession()`, do NOT touch the warm slot.
+        //     Cross-turn / cross-conversation prefix reuse is handled
+        //     entirely by the native `BlockAllocator`'s prefix-hash
+        //     table: SYS blocks shared across requests are refcounted
+        //     transparently, so two parallel `/v1/messages` requests
+        //     sharing a system prompt both run on distinct
+        //     `ChatSession` objects but reference the SAME physical
+        //     KV blocks. The JS-side warm slot would only serialize
+        //     them and force one into cold replay.
+        //
+        //   * **Non-paged** (Gemma4 today — parity-blocked; Qwen3.5
+        //     dense + MoE — parity-pending; the Qianfan-OCR VLM — no
+        //     adapter wired). Fall through to `getOrCreateWarmAny`,
+        //     which is the ONLY cross-conversation reuse mechanism
+        //     these models have. The Anthropic Messages API is
+        //     stateless on the wire (no `previous_response_id`,
+        //     clients don't propagate `prompt_cache_key`), so without
+        //     the warm slot every turn is a full cold start.
+        //
+        // The `hasBlockPagedCache?()` getter is optional on the
+        // structural interface so the `QianfanOCRModel` VLM (which
+        // has no paged-adapter wiring) still satisfies the type
+        // contract — a missing getter falls into the non-paged branch
+        // here.
+        //
+        // Adoption stays keyed by the literal sentinel
         // `MESSAGES_WARM_SLOT_ID = '__msg_warm__'`. The Anthropic
         // Messages API never produces a `previous_response_id` clients
         // could echo back (and the OpenAI side mints `resp_*` ids),
@@ -821,48 +845,54 @@ export async function handleCreateMessage(
         // the sentinel through the tier-1 path.
         //
         // The two endpoints DO share the single warm slot under the
-        // registry's single-warm invariant: a `/v1/messages` turn
-        // following a `/v1/responses` turn can evict (and vice versa).
-        // That is the explicit trade-off of holding at most one warm
-        // entry per model — operators who need stronger isolation
-        // should run separate model bindings or front the server with
-        // a tenant-aware proxy.
+        // registry's single-warm invariant on the non-paged path: a
+        // `/v1/messages` turn following a `/v1/responses` turn can
+        // evict (and vice versa). On the paged path neither side
+        // touches the warm slot, so cross-endpoint contention
+        // disappears.
         //
         // The `prompt_cache_key` request field is still NOT exposed
-        // on this endpoint. The server-side warm slot is sufficient
-        // for the single-Claude-Code-session use case targeted by
-        // option C; cross-conversation block-level cache reuse
-        // (which would benefit from the request-side key) is a
-        // separate Phase-2 feature.
-        const lookup = sessionReg.getOrCreateWarmAny(requestedSystem);
+        // on this endpoint. Cross-conversation block-level cache
+        // reuse on paged-active models is now driven by native
+        // content-addressing instead of the JS warm slot, so adding
+        // the field is no longer a prerequisite for that use case.
+        const pagedActive = leaseModel.hasBlockPagedCache?.() === true;
+        const lookup = pagedActive ? sessionReg.createFreshSession() : sessionReg.getOrCreateWarmAny(requestedSystem);
         const session = lookup.session;
-        // `X-Session-Cache` observability header. Mirrors the
-        // classification on `/v1/responses` (see the long comment
-        // around its `getOrCreate` call, lines ~2443-2476).
+        // `X-Session-Cache` observability header.
         //
-        // Non-streaming: set the optimistic `prefix_hit` value BEFORE
-        // dispatch on `lookup.hit` (so the header is on the wire even
-        // if the dispatch throws) and demote post-dispatch to `fresh`
-        // when the warm slot was leased but native prefix reuse did
-        // not actually happen (`result.cachedTokens === 0` — e.g.
-        // tokenizer change, system-prompt drift squeaking past the
-        // byte-equal compare, image-set change). `res.end` has not
-        // fired yet, so the overwrite still lands on the wire.
+        // Non-paged path:
+        //   * Non-streaming: set the optimistic `prefix_hit` value
+        //     BEFORE dispatch on `lookup.hit` (so the header is on the
+        //     wire even if the dispatch throws) and demote
+        //     post-dispatch to `fresh` when the warm slot was leased
+        //     but native prefix reuse did not actually happen
+        //     (`result.cachedTokens === 0`). `res.end` has not fired
+        //     yet, so the overwrite still lands on the wire.
+        //   * Streaming: deliberately HOLD at the conservative `fresh`
+        //     value even on `lookup.hit`. A `getOrCreateWarmAny` hit
+        //     only proves an unexpired warm slot whose stored
+        //     `instructions` are byte-equal to the request's `system`
+        //     — it does NOT prove the full-history prompt is an
+        //     append of that slot's history nor that native
+        //     `cachedTokens > 0`. SSE flushes headers on `beginSSE`
+        //     before the dispatch settles, so a pre-dispatch
+        //     `prefix_hit` cannot be retracted.
         //
-        // Streaming: deliberately HOLD at the conservative `fresh`
-        // value even on `lookup.hit`. A `getOrCreateWarmAny` hit only
-        // proves an unexpired warm slot whose stored `instructions`
-        // are byte-equal to the request's `system` — it does NOT
-        // prove the full-history prompt is an append of that slot's
-        // history nor that native `cachedTokens > 0`. SSE flushes
-        // headers on `beginSSE` before the dispatch settles, so a
-        // pre-dispatch `prefix_hit` cannot be retracted; emitting it
-        // on a hit that turns out to reuse zero native tokens would
-        // both mislead telemetry and act as a same-system warm-slot
-        // presence side-channel. Until `cached_tokens` is threaded
-        // through the native streaming `start` chunk (Approach A),
-        // streaming commits `fresh` unconditionally — mirroring the
-        // identical decision on `/v1/responses` streaming.
+        // Paged path:
+        //   * Non-streaming: `lookup.hit` is always `false` (we
+        //     `createFreshSession`); the post-dispatch promotion
+        //     branch flips `prefix_hit` when the native engine
+        //     reports `cachedTokens > 0`, which is the authoritative
+        //     signal that the block allocator's content-addressed
+        //     reuse picked up shared SYS blocks on this turn.
+        //   * Streaming: stays `fresh` unconditionally. The terminal
+        //     `done` chunk does carry `cachedTokens` (consumed by
+        //     `buildMessageDelta` to populate
+        //     `cache_read_input_tokens`), but it arrives AFTER
+        //     `beginSSE` has flushed the headers, so we cannot
+        //     retroactively promote the response header. Mirrors the
+        //     identical decision on `/v1/responses` streaming.
         let sessionCacheStatus: 'fresh' | 'prefix_hit' = lookup.hit && body.stream !== true ? 'prefix_hit' : 'fresh';
         res.setHeader('X-Session-Cache', sessionCacheStatus);
 
@@ -873,7 +903,15 @@ export async function handleCreateMessage(
 
         try {
           if (body.stream === true) {
-            const outcome = await runSessionStreaming(session, messages, config, streamSignal, !lookup.hit);
+            // On the paged path the underlying native cache is the
+            // sole reuse mechanism, so pass `isFreshSession = true`
+            // unconditionally — the dual-branch reset in
+            // `runSessionStreaming` collapses to the full
+            // `session.reset()` arm. Non-paged keeps the original
+            // `!lookup.hit` semantics so warm-slot hits route through
+            // `resetPreservingNativeCacheForWarmReuse`.
+            const isFreshSession = pagedActive ? true : !lookup.hit;
+            const outcome = await runSessionStreaming(session, messages, config, streamSignal, isFreshSession);
             const streamResult = await handleStreamingNative(
               res,
               outcome.stream,
@@ -882,16 +920,24 @@ export async function handleCreateMessage(
               httpReq,
               visibility,
             );
-            // Dual-gate adopt: BOTH the producer-side commit signal
-            // (`outcome.wasCommitted()`, which reads `session.turns`
-            // bumped in `startFromHistoryStream`'s `finally`) AND the
-            // handler-side success signal (`streamResult.ok`, true
-            // only when we reached the clean `message_stop` terminal)
-            // must be true to adopt. The producer's `finally` runs on
-            // every break — including client abort, mid-decode throw,
-            // and `finishReason=error` — so `wasCommitted()` alone is
-            // NOT sufficient: it can return `true` after the SSE side
-            // emitted an `error` terminal (which is not re-thrown by
+            // Warm-slot adopt/drop only applies to the non-paged
+            // path. On the paged path the JS-side warm slot plays no
+            // role (block reuse is content-addressed in native), so
+            // we never touch it — the fresh `ChatSession` allocated
+            // for this request is dropped on the floor and GC'd once
+            // the handler scope exits.
+            //
+            // Non-paged dual-gate adopt: BOTH the producer-side commit
+            // signal (`outcome.wasCommitted()`, which reads
+            // `session.turns` bumped in `startFromHistoryStream`'s
+            // `finally`) AND the handler-side success signal
+            // (`streamResult.ok`, true only when we reached the clean
+            // `message_stop` terminal) must be true to adopt. The
+            // producer's `finally` runs on every break — including
+            // client abort, mid-decode throw, and
+            // `finishReason=error` — so `wasCommitted()` alone is NOT
+            // sufficient: it can return `true` after the SSE side
+            // emitted an `error` terminal (not re-thrown by
             // `handleStreamingNative`), leaving a session whose
             // observable wire state is failure but whose `turns`
             // counter advanced. Adopting in that window would seed the
@@ -903,25 +949,41 @@ export async function handleCreateMessage(
             // `streamFailureMode === null` — the producer-side commit
             // and a clean handler-side terminal must both hold before
             // the session is reachable from a subsequent request.
-            if (streamResult.ok && outcome.wasCommitted()) {
-              sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
-            } else {
-              sessionReg.drop(MESSAGES_WARM_SLOT_ID);
+            if (!pagedActive) {
+              if (streamResult.ok && outcome.wasCommitted()) {
+                sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+              } else {
+                sessionReg.drop(MESSAGES_WARM_SLOT_ID);
+              }
             }
           } else {
+            // See the streaming branch above for the rationale on
+            // collapsing `isFreshSession` to `true` on the paged path.
+            const isFreshSession = pagedActive ? true : !lookup.hit;
             // Native `chatSessionStart` has no AbortSignal yet — disconnect handling
             // lives inside `handleNonStreaming` / `endJson`.
-            const result = await runSessionNonStreaming(session, messages, config, !lookup.hit);
-            // Re-classify the `X-Session-Cache` header. A warm-slot
-            // hit that did NOT actually produce native prefix reuse
-            // (`cachedTokens === 0` — e.g. tokenizer change, system
-            // prompt drift squeaking past the byte-equal compare via
-            // some upstream rewrite) gets demoted from `prefix_hit`
-            // back to `fresh`. `res.end` has not fired yet
-            // (`handleNonStreaming` is what flushes via `endJson`),
-            // so the overwrite still lands on the wire.
+            const result = await runSessionNonStreaming(session, messages, config, isFreshSession);
+            // Re-classify the `X-Session-Cache` header.
+            //
+            // Non-paged: a warm-slot hit that did NOT actually produce
+            // native prefix reuse (`cachedTokens === 0` — e.g.
+            // tokenizer change, system prompt drift squeaking past
+            // the byte-equal compare via some upstream rewrite) gets
+            // demoted from `prefix_hit` back to `fresh`.
+            //
+            // Paged: `lookup.hit` is always `false` so we entered
+            // with `sessionCacheStatus = 'fresh'`. Promote to
+            // `prefix_hit` when the native engine reports
+            // `cachedTokens > 0` — that's the authoritative signal
+            // that `BlockAllocator`'s content-addressed prefix lookup
+            // recovered shared SYS blocks on this turn. `res.end` has
+            // not fired yet (`handleNonStreaming` is what flushes via
+            // `endJson`), so the overwrite still lands on the wire.
             if (lookup.hit && result.cachedTokens === 0) {
               sessionCacheStatus = 'fresh';
+              res.setHeader('X-Session-Cache', sessionCacheStatus);
+            } else if (pagedActive && result.cachedTokens > 0) {
+              sessionCacheStatus = 'prefix_hit';
               res.setHeader('X-Session-Cache', sessionCacheStatus);
             }
             // Companion `X-Cached-Tokens` header: emitted only when
@@ -931,19 +993,31 @@ export async function handleCreateMessage(
               res.setHeader('X-Cached-Tokens', String(result.cachedTokens));
             }
             await handleNonStreaming(res, result, body, visibility);
-            // Non-streaming success: adopt unconditionally. Any throw
-            // from `runSessionNonStreaming` / `handleNonStreaming`
-            // would have routed through the inner catch below (which
-            // drops the slot) instead of reaching this point.
-            sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+            // Non-paged success: adopt the warm slot unconditionally.
+            // Any throw from `runSessionNonStreaming` /
+            // `handleNonStreaming` would have routed through the
+            // inner catch below (which drops the slot) instead of
+            // reaching this point.
+            //
+            // Paged success: never adopt — block-level reuse is
+            // already in the native cache, and adopting would
+            // re-introduce the cross-endpoint warm-slot eviction
+            // that paged is supposed to eliminate.
+            if (!pagedActive) {
+              sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+            }
           }
         } catch (err) {
-          // A failed turn must not leave a poisoned warm slot for the
-          // next request to lease — drop the sentinel before
-          // emitting the error response. Streaming half-failures are
-          // already covered by the `wasCommitted()` gate above; this
-          // catch handles non-streaming throws and any pre-handler
-          // failures from the streaming path.
+          // A failed turn on the non-paged path must not leave a
+          // poisoned warm slot for the next request to lease — drop
+          // the sentinel before emitting the error response.
+          // Streaming half-failures are already covered by the
+          // `wasCommitted()` gate above; this catch handles
+          // non-streaming throws and any pre-handler failures from
+          // the streaming path. The paged path never adopts, so the
+          // drop is a no-op there but kept unconditional for
+          // simplicity (the registry treats `drop` of an absent key
+          // as a no-op).
           sessionReg.drop(MESSAGES_WARM_SLOT_ID);
           const message = err instanceof Error ? err.message : 'Unknown error during inference';
           if (visibility.responseMode === null) {

@@ -2987,6 +2987,14 @@ fn eval_lfm2_caches(caches: &[Lfm2LayerCache]) {
 pub struct Lfm2Model {
     pub(crate) thread: crate::model_thread::ModelThread<Lfm2Cmd>,
     pub(crate) config: Lfm2Config,
+    /// Snapshot of `Lfm2Inner::paged_adapter.is_some()` captured at
+    /// construction time. The block-paged KV adapter is wired up once at
+    /// load (default-on for full-attention layers — conv layers always
+    /// stay on `Lfm2LayerCache::Conv`). Surfaced through the
+    /// `hasBlockPagedCache()` NAPI method so the server-side
+    /// `/v1/messages` endpoint can bypass the JS-side warm slot when
+    /// paged is active and rely on native content-addressed block reuse.
+    pub(crate) paged_active: bool,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
@@ -3006,6 +3014,25 @@ impl Lfm2Model {
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
         crate::model_thread::send_and_block(&self.thread, |reply| Lfm2Cmd::ResetCaches { reply })
+    }
+
+    /// Whether the block-paged KV cache adapter is active on this model
+    /// instance.
+    ///
+    /// `true` iff `Lfm2Inner::paged_adapter` was successfully constructed
+    /// at load time (driven by `Lfm2Config::use_block_paged_cache`,
+    /// defaulting to `true` after paged-vs-flat parity verification).
+    /// LFM2 is hybrid (10 conv + 6 full-attention layers); only the
+    /// full-attention layers route through the adapter, conv layers stay
+    /// on flat `Lfm2LayerCache::Conv` regardless. When `true`, the native
+    /// cache reuses SYS blocks across `chatSessionStart` calls via
+    /// content-addressing, so the JS-side warm slot in
+    /// `SessionRegistry.getOrCreateWarmAny` is redundant and the
+    /// `/v1/messages` server endpoint allocates a fresh `ChatSession` per
+    /// request.
+    #[napi]
+    pub fn has_block_paged_cache(&self) -> bool {
+        self.paged_active
     }
 
     /// Start a new chat session.

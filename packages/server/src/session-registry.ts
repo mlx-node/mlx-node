@@ -653,22 +653,29 @@ export class SessionRegistry {
   }
 
   /**
-   * @deprecated Planned for removal once `use_block_paged_cache` defaults
-   * to `true` for the supported full-attention models (Qwen3, LFM2 today;
-   * Gemma4 / Qwen3.5 once their forward paths are wired). The native
-   * block-paged KV adapter (`PagedKVCacheAdapter` + `BlockAllocator` +
-   * `LayerKVPool`) recovers a turn's prefix from refcounted KV blocks
-   * keyed by token-prefix hash, so the JS-side single-warm slot this
-   * method walks becomes redundant — the native cache picks up the same
-   * cross-turn reuse without the byte-equal-`instructions` gate, and
-   * supports cross-conversation prefix sharing the warm slot cannot.
+   * @deprecated **Redundant on `/v1/messages` for paged-active models.**
+   * Phase 7 of the messages-kv-reuse plan removed the only call site
+   * for paged-active full-attention models (Qwen3 + LFM2 today): the
+   * native block-paged KV adapter (`PagedKVCacheAdapter` +
+   * `BlockAllocator` + `LayerKVPool`) recovers a turn's prefix from
+   * refcounted KV blocks keyed by token-prefix hash, so the JS-side
+   * single-warm slot this method walks is redundant — the native
+   * cache picks up the same cross-turn reuse without the
+   * byte-equal-`instructions` gate, and additionally supports
+   * cross-conversation prefix sharing the warm slot cannot.
    *
-   * Until that default flips and we have real-weights numerical-
-   * equivalence validation against the flat path, this method stays
-   * load-bearing on the `/v1/messages` endpoint and MUST NOT be removed
-   * or weakened — Phase 7 server-side simplification is gated on the
-   * default flip, not on this commit. Treat the `@deprecated` marker as
-   * an intent signal for callers, not a removal date.
+   * The `/v1/messages` endpoint now branches at request time on
+   * {@link SessionCapableModel.hasBlockPagedCache}: paged-active models
+   * call {@link SessionRegistry.createFreshSession} per request and
+   * never touch the warm slot; non-paged models (Gemma4 today —
+   * parity-blocked; Qwen3.5 dense + MoE — parity-pending; the
+   * `QianfanOCRModel` VLM — no adapter wired) still call this method
+   * because the JS-side warm slot is the ONLY cross-conversation reuse
+   * mechanism available to them. Removing this method would silently
+   * disable cross-turn reuse on every non-paged model, so it stays
+   * load-bearing until ALL session-capable models have paged enabled
+   * by default. Treat `@deprecated` as an intent signal that paged-
+   * active callers should use `createFreshSession` instead.
    *
    * Third lookup mode — for STATELESS full-history endpoints that have
    * no `previous_response_id` to thread and do not propagate
@@ -725,6 +732,40 @@ export class SessionRegistry {
    * `responses.ts` (around the `runSessionNonStreaming` /
    * `runSessionStreaming` branches) describes.
    */
+  /**
+   * Allocate a fresh `ChatSession` bound to this registry's model
+   * without touching the warm slot. Intended for the `/v1/messages`
+   * endpoint when the underlying model has a block-paged KV cache
+   * active: the native cache already reuses SYS blocks across requests
+   * via content-addressing in `BlockAllocator`'s prefix-hash table, so
+   * the JS-side warm slot in
+   * {@link SessionRegistry.getOrCreateWarmAny} is redundant.
+   *
+   * Crucially, this call is purely additive — it does **NOT** clear,
+   * read, or evict the warm slot. Two parallel `/v1/messages` requests
+   * sharing a system prompt both call `createFreshSession` and both
+   * get distinct sessions; the native cache transparently refcounts
+   * the shared SYS blocks across them. This is the routing decision
+   * the long block comment in `packages/server/src/endpoints/messages.ts`
+   * documents: paged → fresh session, non-paged → warm-any lookup.
+   *
+   * The returned session is pre-seeded with the operator-configured
+   * `samplingDefaults` (matching every other cache-miss branch) so a
+   * client that picks the paged path does not silently stray from the
+   * server's pinned sampling knobs.
+   *
+   * Returned with `hit: false` to keep the result shape uniform with
+   * {@link SessionRegistry.getOrCreate} and
+   * {@link SessionRegistry.getOrCreateWarmAny}; callers that care
+   * about the cache header semantics should observe
+   * `result.cachedTokens` from the dispatch instead — that's the
+   * authoritative signal for whether the native engine recovered any
+   * prefix on this turn (paged or otherwise).
+   */
+  createFreshSession(): SessionLookupResult {
+    return { session: this.newSession(), hit: false };
+  }
+
   getOrCreateWarmAny(requestedInstructions: string | null): SessionLookupResult {
     // Single-warm invariant: at most one entry. Walk it once, lease
     // on a fresh + instructions-matched hit, otherwise clear and

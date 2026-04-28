@@ -215,6 +215,37 @@ export interface SessionCapableModel {
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
   resetCaches(): void;
+  /**
+   * Whether the underlying native model has the block-paged KV cache
+   * adapter (`PagedKVCacheAdapter` + `BlockAllocator` + `LayerKVPool`)
+   * active.
+   *
+   * `true` iff the adapter was successfully constructed at load time
+   * (driven by the per-model `use_block_paged_cache` config flag, which
+   * defaults to ON for Qwen3 + LFM2 after parity verification and OFF
+   * for Gemma4 + Qwen3.5 + Qwen3.5 MoE pending parity validation; also
+   * always `false` on Qwen3.5 VLM checkpoints where
+   * `set_vision_encoder` rejects when the adapter is populated).
+   *
+   * When `true`, the native cache reuses SYS blocks across requests via
+   * content-addressing in the `BlockAllocator`'s prefix-hash table —
+   * the JS-side warm slot in
+   * `SessionRegistry.getOrCreateWarmAny(requestedSystem)` becomes
+   * redundant for stateless `/v1/messages` traffic. The server
+   * endpoint reads this getter to decide whether to allocate a fresh
+   * `ChatSession` per request (paged-active) or to lease the warm slot
+   * (non-paged); see `packages/server/src/endpoints/messages.ts`.
+   *
+   * Optional on the structural interface so models that pre-date the
+   * NAPI getter (notably `QianfanOCRModel` from `@mlx-node/vlm`, which
+   * has no paged-adapter wiring) still satisfy the type contract — a
+   * missing getter is treated as `false` (not paged) by callers.
+   * Surfaced as a synchronous method on every native wrapper that DOES
+   * support paged so the routing decision in the server doesn't need a
+   * model-thread roundtrip per request — the value is captured at load
+   * time and never changes for a given model instance.
+   */
+  hasBlockPagedCache?(): boolean;
 }
 
 /** Per-call options for {@link ChatSession#send} / `sendStream`. */

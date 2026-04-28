@@ -6405,6 +6405,17 @@ pub struct Qwen3Model {
     pub(crate) config: Qwen3Config,
     // Tokenizer for text-to-text generation (loaded via load)
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    /// Snapshot of `Qwen3Inner::paged_adapter.is_some()` captured at
+    /// construction time. The block-paged KV adapter is wired up once at
+    /// load (under `config.use_block_paged_cache.unwrap_or(true)`) and
+    /// never re-allocated for the life of the model, so a `bool` snapshot
+    /// is sufficient — no model-thread roundtrip is needed for callers
+    /// that just want to know whether the native cache reuses SYS blocks
+    /// across requests via content-addressing. Surfaced through the
+    /// `hasBlockPagedCache()` NAPI method so the server-side
+    /// `/v1/messages` endpoint can bypass the (now-redundant) JS warm
+    /// slot when paged is active.
+    pub(crate) paged_active: bool,
     /// RAII: on drop (JS GC'd the wrapper) unregister this model's
     /// baseline from the cache-limit coordinator so the global cap can
     /// shrink back. Held as a field rather than consumed because the
@@ -6419,6 +6430,24 @@ impl Qwen3Model {
     #[napi]
     pub fn reset_cache(&self) -> Result<()> {
         send_and_block(&self.thread, |reply| Qwen3Cmd::ResetCache { reply })
+    }
+
+    /// Whether the block-paged KV cache adapter is active on this model
+    /// instance.
+    ///
+    /// `true` iff `Qwen3Inner::paged_adapter` was successfully constructed
+    /// at load time (driven by `Qwen3Config::use_block_paged_cache`,
+    /// defaulting to `true` for Qwen3 since paged-vs-flat parity has been
+    /// verified). When `true`, the native cache reuses SYS blocks across
+    /// `chatSessionStart` calls via content-addressing in
+    /// `BlockAllocator`'s prefix-hash table — the JS-side warm slot in
+    /// `SessionRegistry.getOrCreateWarmAny` becomes redundant and the
+    /// `/v1/messages` server endpoint allocates a fresh `ChatSession` per
+    /// request. See `packages/server/src/endpoints/messages.ts` for the
+    /// runtime-routing decision.
+    #[napi]
+    pub fn has_block_paged_cache(&self) -> bool {
+        self.paged_active
     }
 
     /// Initialize KV caches for incremental generation

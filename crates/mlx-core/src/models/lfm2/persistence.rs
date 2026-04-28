@@ -474,18 +474,20 @@ impl Lfm2Model {
                 let (inner, weight_bytes) = Lfm2Inner::load_from_dir(&model_path)?;
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let config = inner.config.clone();
-                Ok((inner, (config, cache_limit_guard)))
+                let paged_active = inner.paged_adapter.is_some();
+                Ok((inner, (config, cache_limit_guard, paged_active)))
             },
             handle_lfm2_cmd,
         );
 
-        let (config, cache_limit_guard) = init_rx
+        let (config, cache_limit_guard, paged_active) = init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
         Ok(Lfm2Model {
             thread,
             config,
+            paged_active,
             _cache_limit_guard: cache_limit_guard,
         })
     }

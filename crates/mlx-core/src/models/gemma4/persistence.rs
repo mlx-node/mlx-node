@@ -1379,12 +1379,16 @@ impl Gemma4Model {
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let model_id = inner.model_id;
                 let has_vision = inner.image_processor.is_some();
-                Ok((inner, (model_id, has_vision, cache_limit_guard)))
+                let paged_active = inner.paged_adapter.is_some();
+                Ok((
+                    inner,
+                    (model_id, has_vision, cache_limit_guard, paged_active),
+                ))
             },
             super::model::handle_gemma4_cmd,
         );
 
-        let (model_id, has_vision, cache_limit_guard) = init_rx
+        let (model_id, has_vision, cache_limit_guard, paged_active) = init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
@@ -1393,6 +1397,7 @@ impl Gemma4Model {
             model_id,
             has_vision,
             initialized: true,
+            paged_active,
             _cache_limit_guard: Some(cache_limit_guard),
         })
     }

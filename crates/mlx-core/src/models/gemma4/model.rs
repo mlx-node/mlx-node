@@ -345,6 +345,15 @@ pub struct Gemma4Model {
     /// (its guard is `None`) — running inference on that stub would
     /// under-cap the allocator.
     pub(crate) initialized: bool,
+    /// Snapshot of `Gemma4Inner::paged_adapter.is_some()` captured at
+    /// construction time. Default-OFF on Gemma4 (parity-blocked — see
+    /// `Gemma4Config::use_block_paged_cache` and the WIP per-layer
+    /// numerical-diff tracker), so this is `false` for the entire matrix
+    /// of currently-shipping configs. Stubs from `new(config)` always
+    /// report `false` because no inner was constructed. Surfaced through
+    /// the `hasBlockPagedCache()` NAPI method so server endpoints can
+    /// branch on it without round-tripping through the model thread.
+    pub(crate) paged_active: bool,
     /// RAII: unregisters this model's delta from the cache-limit
     /// coordinator on drop. `None` for instances constructed via the
     /// synchronous `new(config)` path that never loaded weights.
@@ -3964,6 +3973,7 @@ impl Gemma4Model {
             model_id: 0,
             has_vision,
             initialized: false,
+            paged_active: false,
             _cache_limit_guard: None,
         }
     }
@@ -3972,6 +3982,22 @@ impl Gemma4Model {
     #[napi(getter)]
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// Whether the block-paged KV cache adapter is active on this model
+    /// instance.
+    ///
+    /// `true` iff `Gemma4Inner::paged_adapter` was successfully
+    /// constructed at load time (driven by
+    /// `Gemma4Config::use_block_paged_cache`, currently default-OFF
+    /// because parity is blocked on the SharedOn* numerical-diff
+    /// investigation — see CLAUDE.md). Stubs constructed via
+    /// `new(config)` always return `false`. Surfaced through this NAPI
+    /// method so server endpoints can branch on it without a
+    /// model-thread roundtrip.
+    #[napi]
+    pub fn has_block_paged_cache(&self) -> bool {
+        self.paged_active
     }
 
     #[napi]

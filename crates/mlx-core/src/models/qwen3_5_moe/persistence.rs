@@ -1012,6 +1012,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let tokenizer_out = inner.tokenizer.clone();
+            let paged_active = inner.paged_adapter.is_some();
 
             Ok((
                 inner,
@@ -1021,13 +1022,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     image_processor,
                     tokenizer_out,
                     cache_limit_guard,
+                    paged_active,
                 ),
             ))
         },
         handle_qwen35_moe_cmd,
     );
 
-    let (config, model_id, _image_processor, _tokenizer, cache_limit_guard) = init_rx
+    let (config, model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
@@ -1035,6 +1037,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         thread,
         config,
         model_id,
+        paged_active,
         _cache_limit_guard: cache_limit_guard,
     })
 }

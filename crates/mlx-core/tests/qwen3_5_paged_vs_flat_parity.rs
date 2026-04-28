@@ -68,9 +68,8 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
                 fs::copy(&from, &to)
                     .map_err(|e| format!("copy({} -> {}): {e}", from.display(), to.display()))?;
             } else {
-                std::os::unix::fs::symlink(&from, &to).map_err(|e| {
-                    format!("symlink({} -> {}): {e}", from.display(), to.display())
-                })?;
+                std::os::unix::fs::symlink(&from, &to)
+                    .map_err(|e| format!("symlink({} -> {}): {e}", from.display(), to.display()))?;
             }
         }
     }
