@@ -195,9 +195,28 @@ export async function run(argv: string[]): Promise<void> {
   console.log(
     `[mlx] models dir: ${modelsDir} | listening on http://${host}:${port} | discovered ${discovered.length} model(s) | default: ${boundModel.name}`,
   );
-  const chunkSize = process.env.MLX_PAGED_PREFILL_CHUNK_SIZE ?? '0 (disabled)';
+  // Mirror the Rust-side parser in crates/mlx-core/src/array/memory.rs::
+  // paged_prefill_chunk_size: trim whitespace, parse i32, reject negative
+  // and unparseable; fall back to 0 (disabled). Logging the EFFECTIVE value
+  // — not the raw env string — prevents misleading "abc tokens" output when
+  // the user typo'd a non-numeric value (which the parser silently maps to
+  // 0/disabled).
+  const rawChunkSize = process.env.MLX_PAGED_PREFILL_CHUNK_SIZE;
+  let effectiveChunkSize = 0;
+  if (rawChunkSize != null) {
+    const trimmed = rawChunkSize.trim();
+    const parsed = /^-?\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      effectiveChunkSize = parsed;
+    } else {
+      console.warn(
+        `[mlx] warning: MLX_PAGED_PREFILL_CHUNK_SIZE=${JSON.stringify(rawChunkSize)} is not a non-negative integer; treating as 0 (disabled)`,
+      );
+    }
+  }
+  const chunkLabel = effectiveChunkSize === 0 ? '0 (disabled)' : String(effectiveChunkSize);
   console.log(
-    `[mlx] paged-prefill chunk size: ${chunkSize} tokens (set MLX_PAGED_PREFILL_CHUNK_SIZE=N to override; 0 disables)`,
+    `[mlx] paged-prefill chunk size: ${chunkLabel} tokens (set MLX_PAGED_PREFILL_CHUNK_SIZE=N to override; 0 disables)`,
   );
   if (logger) {
     console.log(`[mlx] verbose logging → ${logger.logDir}`);
