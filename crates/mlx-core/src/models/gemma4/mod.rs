@@ -2,6 +2,7 @@ pub mod attention;
 pub mod clippable_linear;
 pub mod config;
 pub mod decoder_layer;
+pub(crate) mod diagnostic;
 pub mod image_processor;
 pub mod layer_cache;
 pub mod mlp;

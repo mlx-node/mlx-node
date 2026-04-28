@@ -6,6 +6,7 @@ use napi::bindgen_prelude::*;
 
 use super::attention::Gemma4Attention;
 use super::config::Gemma4Config;
+use super::diagnostic;
 use super::layer_cache::Gemma4LayerCache;
 use super::mlp::GemmaMLP;
 use super::moe::{Gemma4MoE, Gemma4Router};
@@ -201,9 +202,13 @@ impl Gemma4DecoderLayer {
     ) -> Result<MxArray> {
         // Pre-norm + attention
         let normed = self.input_layernorm.forward(x)?;
+        diagnostic::dump_norm_current_layer("hin", &normed, None);
         let attn_out = self.self_attn.forward(&normed, mask, cache, needs_stash)?;
+        diagnostic::dump_norm_current_layer("attn", &attn_out, None);
 
-        self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
+        let out = self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)?;
+        diagnostic::dump_norm_current_layer("hout", &out, None);
+        Ok(out)
     }
 
     /// Forward pass for KV-shared layers.
@@ -229,6 +234,12 @@ impl Gemma4DecoderLayer {
     ) -> Result<MxArray> {
         // Pre-norm + shared attention (Q-only, reuses anchor K/V)
         let normed = self.input_layernorm.forward(x)?;
+        diagnostic::dump_norm_current_layer("hin", &normed, None);
+        let extra = format!(
+            ",branch=shared_flat,cache_offset={cache_offset},shared_keys_T={}",
+            shared_keys.shape_at(2).unwrap_or(-1)
+        );
+        diagnostic::dump_norm_current_layer("shared_keys", shared_keys, Some(&extra));
         let attn_out = self.self_attn.forward_shared(
             &normed,
             mask,
@@ -236,8 +247,11 @@ impl Gemma4DecoderLayer {
             shared_values,
             cache_offset,
         )?;
+        diagnostic::dump_norm_current_layer("attn", &attn_out, None);
 
-        self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
+        let out = self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)?;
+        diagnostic::dump_norm_current_layer("hout", &out, None);
+        Ok(out)
     }
 
     /// Forward pass with paged-or-flat dispatch.
@@ -300,6 +314,7 @@ impl Gemma4DecoderLayer {
                 let _ = needs_stash;
                 let _ = shared_kv;
                 let normed = self.input_layernorm.forward(x)?;
+                diagnostic::dump_norm_current_layer("hin", &normed, None);
                 let attn_out = self.self_attn.forward_paged(
                     &normed,
                     adapter,
@@ -308,7 +323,16 @@ impl Gemma4DecoderLayer {
                     cached_prefix_len,
                     is_prefill,
                 )?;
-                self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
+                diagnostic::dump_norm_current_layer(
+                    "attn",
+                    &attn_out,
+                    Some(&format!(
+                        ",branch=global_paged,paged_idx={paged_idx},first_pos={first_logical_position}"
+                    )),
+                );
+                let out = self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)?;
+                diagnostic::dump_norm_current_layer("hout", &out, None);
+                Ok(out)
             }
             Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx } => {
                 let _ = flat_cache;
@@ -321,6 +345,27 @@ impl Gemma4DecoderLayer {
                     )
                 })?;
                 let normed = self.input_layernorm.forward(x)?;
+                diagnostic::dump_norm_current_layer("hin", &normed, None);
+                // Pre-dump the donor's K from the pool so we can compare
+                // it against the flat path's `shared_keys` stash. This
+                // requires reading the pool twice (the inner SDPA call
+                // also re-reads), but the cost is gated on
+                // MLX_DEBUG_GEMMA4_DUMP=1 and only fires when the env
+                // var is set.
+                if diagnostic::dump_enabled()
+                    && let Ok((peeked_k, _peeked_v)) =
+                        adapter.read_kv_range(anchor_paged_idx, 0, inputs.total_ctx)
+                {
+                    let extra = format!(
+                        ",branch=shared_paged,anchor_paged_idx={anchor_paged_idx},cache_offset={},total_ctx={}",
+                        inputs.cache_offset, inputs.total_ctx,
+                    );
+                    diagnostic::dump_norm_current_layer("shared_keys", &peeked_k, Some(&extra));
+                }
+                let extra = format!(
+                    ",branch=shared_paged,anchor_paged_idx={anchor_paged_idx},cache_offset={},total_ctx={}",
+                    inputs.cache_offset, inputs.total_ctx,
+                );
                 let attn_out = self.self_attn.forward_paged_shared(
                     &normed,
                     adapter,
@@ -329,7 +374,10 @@ impl Gemma4DecoderLayer {
                     inputs.total_ctx,
                     is_prefill,
                 )?;
-                self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
+                diagnostic::dump_norm_current_layer("attn", &attn_out, Some(&extra));
+                let out = self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)?;
+                diagnostic::dump_norm_current_layer("hout", &out, None);
+                Ok(out)
             }
             Gemma4LayerKind::SharedOnSliding { .. } => {
                 let _ = flat_cache;
@@ -350,6 +398,7 @@ impl Gemma4DecoderLayer {
                 let values = inputs.values.ok_or_else(|| {
                     Error::from_reason("SharedOnSliding requires shared_kv.values")
                 })?;
+                // Delegate to flat `forward_shared` (which already dumps).
                 self.forward_shared(x, mask, keys, values, inputs.cache_offset, per_layer_input)
             }
         }

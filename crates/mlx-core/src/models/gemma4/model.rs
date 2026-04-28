@@ -1080,6 +1080,7 @@ impl Gemma4Inner {
                 .caches
                 .as_mut()
                 .expect("caches populated by init_caches_sync above");
+            crate::models::gemma4::diagnostic::set_step(-1);
             forward_inner(
                 &last_token,
                 &self.embed_tokens,
@@ -1232,6 +1233,7 @@ impl Gemma4Inner {
                         .expect("caches populated by init_caches_sync above");
 
                     let next_ids = current_y.reshape(&[1, 1])?;
+                    crate::models::gemma4::diagnostic::set_step(step);
                     let logits = forward_inner(
                         &next_ids,
                         &self.embed_tokens,
@@ -2154,6 +2156,7 @@ impl Gemma4Inner {
         // === PREFILL ===
         let last_logits = {
             let _stream_ctx = StreamContext::new(generation_stream);
+            crate::models::gemma4::diagnostic::set_step(-1);
             self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?
         };
 
@@ -2179,6 +2182,7 @@ impl Gemma4Inner {
 
             let next_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
+                crate::models::gemma4::diagnostic::set_step(step);
                 self.run_paged_decode_step(token_id)?
             };
             let next_logits = next_logits.squeeze(Some(&[1]))?;
@@ -2574,8 +2578,12 @@ impl Gemma4Inner {
         // Stash for sliding-anchor K/V reused by SharedOnSliding layers.
         let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
 
+        crate::models::gemma4::diagnostic::set_path("paged");
+        crate::models::gemma4::diagnostic::set_step(-1);
+
         #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
+            crate::models::gemma4::diagnostic::set_layer(layer_idx);
             let kind = layer_kinds[layer_idx];
             let layer: &Gemma4DecoderLayer = unsafe {
                 let ptr = self.layers.as_ptr().add(layer_idx);
@@ -2746,8 +2754,10 @@ impl Gemma4Inner {
         let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
         let num_layers = self.layers.len();
         let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
+        crate::models::gemma4::diagnostic::set_path("paged");
         #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
+            crate::models::gemma4::diagnostic::set_layer(layer_idx);
             let kind = layer_kinds[layer_idx];
             let layer: &Gemma4DecoderLayer = unsafe {
                 let ptr = self.layers.as_ptr().add(layer_idx);
@@ -4549,7 +4559,10 @@ fn forward_body(
     let has_kv_sharing = config.num_kv_shared_layers.is_some_and(|n| n > 0);
     let mut shared_kv: HashMap<usize, (MxArray, MxArray)> = HashMap::new();
 
+    crate::models::gemma4::diagnostic::set_path("flat");
+
     for (i, layer) in layers.iter().enumerate() {
+        crate::models::gemma4::diagnostic::set_layer(i);
         let is_global = config.is_global_layer(i);
 
         // Global layers: None mask → attention module uses causal SDPA or no-mask path
