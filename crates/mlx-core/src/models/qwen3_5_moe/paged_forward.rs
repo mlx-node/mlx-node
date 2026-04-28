@@ -176,26 +176,22 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     }
 
     let total_chunks = suffix_tokens.len().div_ceil(chunk_size_usize);
-    let mut last_hidden: Option<MxArray> = None;
+    let mut last_logits: Option<MxArray> = None;
     let mut chunk_start_position: u32 = cached_prefix_len;
 
     for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
         let is_last_chunk = chunk_idx + 1 == total_chunks;
 
         // 1. Advance cursor + grow blocks for this chunk. Must happen
-        //    BEFORE the layer loop so `update_keys_values` aligns at
+        //    BEFORE calling the per-chunk helper so `update_keys_values`
+        //    inside the layer loop aligns at
         //    `[chunk_start_position, chunk_start_position+chunk.len())`.
         paged_adapter
             .record_tokens(chunk)
             .map_err(Error::from_reason)?;
 
-        // 2. Embed the chunk only — residual stream sized by chunk.len().
-        let chunk_len = chunk.len() as i64;
-        let input_ids = MxArray::from_uint32(chunk, &[1, chunk_len])?;
-        let mut hidden = embed.forward(&input_ids)?;
-
-        // 3. Layer loop. For chunk N starting at cumulative position
-        //    `chunk_start_position`:
+        // 2. Run the per-chunk forward (embed → layer loop). For chunk N
+        //    starting at cumulative position `chunk_start_position`:
         //    * Q has chunk.len() positions starting at chunk_start_position
         //    * K/V is cumulative [0..chunk_start_position+chunk.len())
         //    * `forward_paged_or_flat` for FullAttentionPaged layers
@@ -203,51 +199,25 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         //      offset=chunk_start_position)` to align Q within K.
         //    * Linear (GDN) layers' recurrent state mutates in-place
         //      across chunks via `Qwen3_5LayerCache::Linear(ArraysCache)`.
-        let num_layers = layers.len();
-        #[allow(clippy::needless_range_loop)]
-        for layer_idx in 0..num_layers {
-            let kind = layer_kinds[layer_idx];
-            let layer = unsafe {
-                let ptr = layers.as_mut_ptr().add(layer_idx);
-                &mut *ptr
-            };
-            let cache_slot = unsafe {
-                let ptr = caches.as_mut_ptr().add(layer_idx);
-                &mut *ptr
-            };
-            hidden = layer.forward_paged_or_flat(
-                &hidden,
-                kind,
-                paged_adapter,
-                chunk_start_position,
-                chunk_start_position,
-                true,
-                None,
-                Some(cache_slot),
-                None,
-                true,
-            )?;
-            // Per-layer eval+clear cadence smooths the prefill peak
-            // within each chunk (cadence is `MLX_PAGED_PREFILL_EVAL_INTERVAL`,
-            // default 8). Same call as the single-shot path.
-            crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden);
-        }
+        let hidden = run_paged_prefill_one_chunk_moe(
+            chunk,
+            chunk_start_position,
+            embed,
+            layers,
+            caches,
+            layer_kinds,
+            paged_adapter,
+        )?;
 
         if is_last_chunk {
             // Last chunk: project final_norm + lm_head and extract
             // last-token logits.
-            let h = final_norm.forward(&hidden)?;
-            let logits = if let Some(head) = lm_head {
-                head.forward(&h)?
-            } else {
-                let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-                h.matmul(&weight_t)?
-            };
-            let seq_len = logits.shape_at(1)?;
-            let last = logits
-                .slice_axis(1, seq_len - 1, seq_len)?
-                .squeeze(Some(&[0, 1]))?;
-            last_hidden = Some(last);
+            last_logits = Some(project_last_token_logits_moe(
+                &hidden,
+                final_norm,
+                lm_head,
+                embedding_weight,
+            )?);
         } else {
             // Force materialize the residual stream so MLX can release
             // the upstream graph nodes (embedding + every prior layer's
@@ -264,7 +234,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         chunk_start_position += chunk.len() as u32;
     }
 
-    last_hidden.ok_or_else(|| {
+    last_logits.ok_or_else(|| {
         Error::from_reason(
             "MoE chunked prefill produced no last chunk (unreachable for non-empty suffix)",
         )
@@ -278,6 +248,12 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
 ///
 /// The empty-suffix check is performed by the caller
 /// (`run_paged_prefill_chunk_with_size`); this helper trusts its input.
+///
+/// Thin wrapper over `run_paged_prefill_one_chunk_moe` +
+/// `project_last_token_logits_moe`. Kept as a named helper because
+/// callers (and the chunked driver's fast-path branch) reference it
+/// by name and the GDN pre-pass / `record_tokens` ordering matches
+/// the single-shot semantics we want to preserve byte-for-byte.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_prefill_single_shot(
     full_tokens: &[u32],
@@ -301,30 +277,77 @@ pub(crate) fn run_paged_prefill_single_shot(
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
     }
 
-    let suffix_len = suffix_tokens.len() as i64;
-    let input_ids = MxArray::from_uint32(suffix_tokens, &[1, suffix_len])?;
-    let mut hidden_states = embed.forward(&input_ids)?;
+    let hidden_states = run_paged_prefill_one_chunk_moe(
+        suffix_tokens,
+        cached_prefix_len,
+        embed,
+        layers,
+        caches,
+        layer_kinds,
+        paged_adapter,
+    )?;
+    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embedding_weight)
+}
 
-    let num_layers = layers.len();
-    let first_logical_position = cached_prefix_len;
+/// Run a single prefill chunk through `embed → layer loop`. Returns
+/// the post-last-layer residual stream (NOT logits — caller decides
+/// whether to project to vocab).
+///
+/// This is the per-chunk inner shared between
+/// `run_paged_prefill_single_shot` and the chunked driver. It must
+/// NOT touch `final_norm` / `lm_head` so the chunked path can skip
+/// those on intermediate chunks (matches vLLM's `is_prefill_chunk`
+/// skip — non-final-chunk vocab projections would be discarded
+/// anyway).
+///
+/// Caller contract:
+///
+/// * `paged_adapter.record_tokens(chunk_tokens)` MUST have been
+///   called BEFORE this function so `update_keys_values` inside the
+///   FullAttention layer aligns at
+///   `[chunk_first_position, chunk_first_position+chunk.len())`.
+/// * For the cached-prefix GDN pre-pass (when
+///   `chunk_first_position > 0` on the first chunk), the caller is
+///   responsible for running `run_gdn_only_prefill` on the prefix
+///   tokens BEFORE the first chunk. This helper only handles
+///   per-chunk forward — no cached-prefix replay.
+/// * `cached_prefix_len` (the layer's K/V coverage at chunk start)
+///   equals `chunk_first_position`: every token already in the paged
+///   pool — be it from a prior cache hit OR from a prior chunk
+///   written by an earlier iteration of the chunked driver — lives
+///   at logical positions `[0, chunk_first_position)`.
+fn run_paged_prefill_one_chunk_moe(
+    chunk_tokens: &[u32],
+    chunk_first_position: u32,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+) -> Result<MxArray> {
+    debug_assert_eq!(layers.len(), caches.len());
+    debug_assert_eq!(layers.len(), layer_kinds.len());
 
-    #[allow(clippy::needless_range_loop)]
-    for layer_idx in 0..num_layers {
-        let kind = layer_kinds[layer_idx];
-        let layer = unsafe {
-            let ptr = layers.as_mut_ptr().add(layer_idx);
-            &mut *ptr
-        };
-        let cache_slot = unsafe {
-            let ptr = caches.as_mut_ptr().add(layer_idx);
-            &mut *ptr
-        };
-        hidden_states = layer.forward_paged_or_flat(
-            &hidden_states,
+    let chunk_len = chunk_tokens.len() as i64;
+    let input_ids = MxArray::from_uint32(chunk_tokens, &[1, chunk_len])?;
+    let mut hidden = embed.forward(&input_ids)?;
+
+    // Layer loop. Safe-by-construction via `iter_mut().zip(...)` —
+    // each iteration takes disjoint `&mut DecoderLayer` and `&mut
+    // Qwen3_5LayerCache` references, with `kind` consumed by-value
+    // (`Qwen3_5LayerKind: Copy`).
+    for (layer_idx, ((layer, cache_slot), kind)) in layers
+        .iter_mut()
+        .zip(caches.iter_mut())
+        .zip(layer_kinds.iter().copied())
+        .enumerate()
+    {
+        hidden = layer.forward_paged_or_flat(
+            &hidden,
             kind,
             paged_adapter,
-            first_logical_position,
-            cached_prefix_len,
+            chunk_first_position,
+            chunk_first_position,
             true,
             None,
             Some(cache_slot),
@@ -337,17 +360,34 @@ pub(crate) fn run_paged_prefill_single_shot(
         // from the cache pool. Without this the in-flight lazy graph
         // accumulates ~50 GB on long contexts before the post-prefill
         // sync fires. Cadence is `MLX_PAGED_PREFILL_EVAL_INTERVAL` (default 8).
-        crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states);
+        crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden);
     }
+    Ok(hidden)
+}
 
-    let h = final_norm.forward(&hidden_states)?;
+/// Project the per-token residual stream through `final_norm` + the
+/// LM head and slice the last position's logits down to `[vocab]`.
+/// Shared between the single-shot path and the chunked path's
+/// final-chunk return path. Hidden state shape on entry: `[1,
+/// chunk_len, hidden]`.
+///
+/// `lm_head = None` corresponds to the tied-word-embeddings case;
+/// we matmul against `embedding_weight.T` instead of going through a
+/// dedicated `LinearProj`.
+fn project_last_token_logits_moe(
+    hidden_states: &MxArray,
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    embedding_weight: &MxArray,
+) -> Result<MxArray> {
+    let h = final_norm.forward(hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
     };
-
+    // Slice last token: logits shape [1, chunk_len, vocab] -> [vocab].
     let seq_len = logits.shape_at(1)?;
     let last = logits
         .slice_axis(1, seq_len - 1, seq_len)?
@@ -431,11 +471,22 @@ mod tests {
     //! turn the parity assertion into a flaky check. With a fixed
     //! seed both `max_abs_diff` and the argmax index are bit-stable.
     //!
-    //! All tests skip cleanly when no Metal device is available
-    //! (the standard `if msg.contains("No Metal device") { return; }`
-    //! guard from Phase B's tests). They also skip when the env var
-    //! `MLX_PAGED_PREFILL_CHUNK_SIZE` is set to a non-zero value for
-    //! the default-path test (process-global OnceLock pollution).
+    //! **All tests are `#[ignore]`-marked.** They require a Metal
+    //! GPU; on machines without Metal, `Qwen35MoeInner::new` can
+    //! throw a foreign C++ exception BEFORE Rust receives an `Err`,
+    //! aborting the test process with `fatal runtime error: Rust
+    //! cannot catch foreign exceptions, aborting`. String-matching
+    //! the no-Metal error message is therefore unsafe in CI/sandboxes,
+    //! so we gate the tests behind `--ignored` instead. Run with:
+    //!
+    //! ```bash
+    //! cargo test -p mlx-core --lib qwen3_5_moe -- --ignored
+    //! ```
+    //!
+    //! The default `cargo test` run does NOT execute these. They also
+    //! skip when the env var `MLX_PAGED_PREFILL_CHUNK_SIZE` is set to
+    //! a non-zero value for the default-path test (process-global
+    //! OnceLock pollution).
 
     use super::*;
     use crate::array::DType;
@@ -733,7 +784,12 @@ mod tests {
     /// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
     /// chunked-vs-single-shot drift is reproducible across runs;
     /// observed `max_abs_diff = 0.0693`, argmax stable at idx=69.
+    /// Requires Metal GPU; run with `--ignored`.
+    /// `Qwen35MoeInner::new` can throw a foreign C++ exception on
+    /// machines without Metal, which aborts the test process before
+    /// Rust can catch the failure.
     #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
     fn test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits() {
         unsafe {
             mlx_sys::mlx_seed(0xC0DEC0DE);
@@ -805,7 +861,12 @@ mod tests {
     /// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
     /// chunked-vs-single-shot drift is reproducible across runs;
     /// observed `max_abs_diff = 0.1199`, argmax stable at idx=80.
+    /// Requires Metal GPU; run with `--ignored`.
+    /// `Qwen35MoeInner::new` can throw a foreign C++ exception on
+    /// machines without Metal, which aborts the test process before
+    /// Rust can catch the failure.
     #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
     fn test_chunked_prefill_qwen3_5_moe_uneven_tail() {
         unsafe {
             mlx_sys::mlx_seed(0xC0DEC0DE);
@@ -983,7 +1044,12 @@ mod tests {
     /// when the env knob is unset. Skips if the env knob is set
     /// (process-global OnceLock pollution would route through the
     /// chunked branch and invalidate the comparison).
+    /// Requires Metal GPU; run with `--ignored`.
+    /// `Qwen35MoeInner::new` can throw a foreign C++ exception on
+    /// machines without Metal, which aborts the test process before
+    /// Rust can catch the failure.
     #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
     fn test_run_paged_prefill_chunk_default_matches_single_shot_qwen3_5_moe() {
         if crate::array::memory::paged_prefill_chunk_size() != 0 {
             eprintln!(
