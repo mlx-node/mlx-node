@@ -2186,6 +2186,13 @@ impl Gemma4Inner {
 
         let mut y = sample_next_token(&last_logits, sampling_config)?;
         y.eval();
+
+        // Smooth memory peak: drop transient prefill buffers before decode
+        // starts allocating. Prefill builds a massive MLX subgraph; once
+        // we have the last logits, those intermediates are dead but
+        // MLX's caching allocator holds them.
+        crate::array::synchronize_and_clear_cache();
+
         let first_token_instant = Some(std::time::Instant::now());
 
         // === DECODE LOOP ===
@@ -2222,9 +2229,7 @@ impl Gemma4Inner {
             y = sample_next_token(&next_logits, sampling_config)?;
             MxArray::async_eval_arrays(&[&y]);
 
-            if (step + 1) % 256 == 0 {
-                crate::array::clear_cache();
-            }
+            crate::array::maybe_clear_cache_for_paged_step(step);
         }
 
         Ok((generated_tokens, finish_reason, first_token_instant))
@@ -2455,6 +2460,11 @@ impl Gemma4Inner {
 
         let mut y = sample_next_token(&last_logits, sampling_config)?;
         y.eval();
+
+        // Smooth memory peak: drop transient prefill buffers before decode
+        // starts allocating (see chat_sync_core_paged_inner for rationale).
+        crate::array::synchronize_and_clear_cache();
+
         let first_token_instant = Some(std::time::Instant::now());
 
         // Streaming detokenizer + parser.
@@ -2501,9 +2511,7 @@ impl Gemma4Inner {
             y = sample_next_token(&next_logits, sampling_config)?;
             MxArray::async_eval_arrays(&[&y]);
 
-            if (step + 1) % 256 == 0 {
-                crate::array::clear_cache();
-            }
+            crate::array::maybe_clear_cache_for_paged_step(step);
         }
 
         // Flush any residual segments accumulated by the parser but not

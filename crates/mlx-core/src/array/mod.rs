@@ -23,9 +23,10 @@ pub use padding::{
 
 // Re-exports from memory submodule (used across the crate)
 pub use memory::{
-    check_memory_safety, clear_cache, compile_clear_cache, get_active_memory, get_cache_memory,
-    get_memory_limit, get_peak_memory, heavy_cleanup, reset_peak_memory, set_cache_limit,
-    set_memory_limit, synchronize, synchronize_and_clear_cache,
+    PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT, check_memory_safety, clear_cache,
+    compile_clear_cache, get_active_memory, get_cache_memory, get_memory_limit, get_peak_memory,
+    heavy_cleanup, maybe_clear_cache_for_paged_step, paged_decode_cache_clear_interval,
+    reset_peak_memory, set_cache_limit, set_memory_limit, synchronize, synchronize_and_clear_cache,
 };
 
 use mlx_sys as sys;

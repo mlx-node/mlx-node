@@ -2442,8 +2442,13 @@ impl Qwen3Inner {
             (sample(&last_logits, Some(sampling_config))?, None)
         };
 
+        // Smooth memory peak: drop transient prefill buffers before decode
+        // starts allocating. Prefill builds a massive MLX subgraph; once
+        // we have the last logits, those intermediates are dead but
+        // MLX's caching allocator holds them.
+        synchronize_and_clear_cache();
+
         // === DECODE LOOP ===
-        const DECODE_CLEANUP_INTERVAL: i32 = 256;
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
             Vec::with_capacity(max_new_tokens.max(0) as usize)
@@ -2454,9 +2459,7 @@ impl Qwen3Inner {
 
         for step in 0..max_new_tokens {
             token.eval();
-            if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
-                synchronize_and_clear_cache();
-            }
+            crate::array::maybe_clear_cache_for_paged_step(step);
             let token_value = token.item_at_int32(0)? as u32;
             if let Some(ps) = prefill_start
                 && first_token_elapsed_ms.is_none()
@@ -2916,6 +2919,10 @@ impl Qwen3Inner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
+        // Smooth memory peak: drop transient prefill buffers before decode
+        // starts allocating (see chat_sync_core_paged_inner for rationale).
+        synchronize_and_clear_cache();
+
         // Streaming state.
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
@@ -2932,7 +2939,6 @@ impl Qwen3Inner {
         );
 
         let max_new_tokens = p.max_new_tokens;
-        const DECODE_CLEANUP_INTERVAL: i32 = 256;
 
         // Decode loop: pipeline-aware via run_paged_decode_step. We can't
         // use the shared `decode_loop!` macro directly because it's
@@ -2943,9 +2949,7 @@ impl Qwen3Inner {
         // tracking + cancellation semantics that `decode_loop!` provides.
         for step in 0..max_new_tokens {
             y.eval();
-            if step > 0 && step % DECODE_CLEANUP_INTERVAL == 0 {
-                synchronize_and_clear_cache();
-            }
+            crate::array::maybe_clear_cache_for_paged_step(step);
 
             let token_value = y.item_at_int32(0)? as u32;
 

@@ -1491,6 +1491,12 @@ impl Qwen35MoeInner {
         let mut y = sample(&last_logits, *sampling_config)?;
         y.eval();
 
+        // Smooth memory peak: drop transient prefill buffers before decode
+        // starts allocating. Prefill of long prompts builds a massive MLX
+        // subgraph; once we have the last logits, those intermediates are
+        // dead but MLX's cache holds them.
+        crate::array::synchronize_and_clear_cache();
+
         if report_perf {
             *first_token_instant = Some(std::time::Instant::now());
         }
@@ -1559,9 +1565,7 @@ impl Qwen35MoeInner {
             y = sample(&next_logits, *sampling_config)?;
             y.eval();
 
-            if (step + 1) % 256 == 0 {
-                crate::array::synchronize_and_clear_cache();
-            }
+            crate::array::maybe_clear_cache_for_paged_step(step);
         }
 
         Ok((generated_tokens, finish_reason))
@@ -1863,6 +1867,10 @@ impl Qwen35MoeInner {
         let mut y = sample(&last_logits, sampling_config)?;
         y.eval();
 
+        // Smooth memory peak: drop transient prefill buffers before decode
+        // starts allocating (see chat_sync_core_paged_inner for rationale).
+        crate::array::synchronize_and_clear_cache();
+
         if report_perf {
             *first_token_instant = Some(std::time::Instant::now());
         }
@@ -1965,9 +1973,7 @@ impl Qwen35MoeInner {
             y = sample(&next_logits, sampling_config)?;
             y.eval();
 
-            if (step + 1) % 256 == 0 {
-                crate::array::synchronize_and_clear_cache();
-            }
+            crate::array::maybe_clear_cache_for_paged_step(step);
         }
 
         Ok((generated_tokens, finish_reason))

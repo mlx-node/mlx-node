@@ -26,6 +26,55 @@ pub fn synchronize_and_clear_cache() {
     }
 }
 
+/// Default paged-decode-step cache cleanup cadence.
+///
+/// Per-step transients (~30+ MB across many layers from GDN/MoE/attention
+/// intermediates) accumulate in MLX's caching allocator until cleared. On
+/// the paged path the per-layer `synchronize_mlx()` inside
+/// `LayerKVPool::gather_attention` already pays the GPU-stall cost, so calling
+/// `clear_cache()` more often is essentially free. At 64 steps the peak is
+/// capped to ~64 × 30 MB ≈ 2 GB instead of ~30 GB at the prior 256-step
+/// cadence — small enough to keep RSS well below the M3 Max's 128 GB
+/// physical-memory ceiling under multi-conversation Claude Code workloads,
+/// without the GPU-stall churn of an aggressive 16-step cadence. The flat
+/// path keeps its 256-step cadence because its compiled C++ forward has
+/// its own memory management.
+///
+/// Override at runtime by exporting `MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL`
+/// (positive integer). The env var is read once on first use and cached;
+/// invalid / non-positive values fall back to this default.
+pub const PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT: i32 = 64;
+
+/// Effective cadence — `MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL` env override
+/// or [`PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT`]. Read once on first call
+/// and cached; subsequent reads hit the OnceLock fast path.
+pub fn paged_decode_cache_clear_interval() -> i32 {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<i32> = OnceLock::new();
+    *CACHED.get_or_init(
+        || match std::env::var("MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL") {
+            Ok(s) => match s.trim().parse::<i32>() {
+                Ok(n) if n > 0 => n,
+                _ => PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT,
+            },
+            Err(_) => PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT,
+        },
+    )
+}
+
+/// Helper: clear MLX's caching allocator on every Nth paged decode step.
+///
+/// `step` is the zero-indexed decode step. Clears are gated on
+/// `(step + 1) % paged_decode_cache_clear_interval() == 0` to match the
+/// cadence used by the existing call sites and avoid clearing on step 0
+/// (right after prefill, which is handled separately).
+#[inline]
+pub fn maybe_clear_cache_for_paged_step(step: i32) {
+    if (step + 1) % paged_decode_cache_clear_interval() == 0 {
+        clear_cache();
+    }
+}
+
 /// Get actively used memory in bytes (excludes cached memory)
 /// Internal Rust-only function - use memoryCleanupThreshold config for memory-based cleanup
 pub fn get_active_memory() -> f64 {

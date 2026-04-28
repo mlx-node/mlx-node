@@ -446,6 +446,23 @@ async function handleStreamingNative(
       'message_delta',
       buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens, terminalCachedTokens),
     );
+    // HTTP/1.1 chunked-encoding trailer: report the engine's cache-hit
+    // count once the SSE stream has settled. The header has to wait
+    // for `terminalCachedTokens` because `beginSSE` flushes response
+    // headers before the dispatch returns. Trailer-aware clients
+    // (curl `--trailer-name`, custom HTTP libraries, the verbose
+    // logger's response listener) get the authoritative value;
+    // SSE-only clients get the same value via the `usage.cache_read_input_tokens`
+    // field on `message_delta`. The `Trailer: X-Cached-Tokens` header
+    // was announced before `beginSSE` flushed (see messages.ts call site).
+    if (typeof terminalCachedTokens === 'number' && terminalCachedTokens > 0) {
+      try {
+        res.addTrailers({ 'X-Cached-Tokens': String(terminalCachedTokens) });
+      } catch {
+        // res.addTrailers throws if headers/trailers were not announced
+        // up front — non-fatal; the SSE usage field still carries the value.
+      }
+    }
     await flushTerminalSSE(res, 'message_stop', buildMessageStop(), visibility);
     endSSE(res);
     return { ok: true };
@@ -869,15 +886,16 @@ export async function handleCreateMessage(
         //     but native prefix reuse did not actually happen
         //     (`result.cachedTokens === 0`). `res.end` has not fired
         //     yet, so the overwrite still lands on the wire.
-        //   * Streaming: deliberately HOLD at the conservative `fresh`
-        //     value even on `lookup.hit`. A `getOrCreateWarmAny` hit
-        //     only proves an unexpired warm slot whose stored
-        //     `instructions` are byte-equal to the request's `system`
-        //     — it does NOT prove the full-history prompt is an
-        //     append of that slot's history nor that native
-        //     `cachedTokens > 0`. SSE flushes headers on `beginSSE`
-        //     before the dispatch settles, so a pre-dispatch
-        //     `prefix_hit` cannot be retracted.
+        //   * Streaming: emits `streaming` to signal the authoritative
+        //     post-dispatch value rides on the SSE stream
+        //     (`message_delta.usage.cache_read_input_tokens` and the
+        //     `X-Cached-Tokens` HTTP trailer, set below in
+        //     `handleStreamingNative` once `terminalCachedTokens` is
+        //     known). Reporting `fresh` here would be a lie — the
+        //     paged engine routinely returns `cachedTokens > 0` on
+        //     turn-2+ and the prior `'fresh'` default falsely advertised
+        //     a cache miss. The previous comment documented this as
+        //     intentional but it was a logging bug.
         //
         // Paged path:
         //   * Non-streaming: `lookup.hit` is always `false` (we
@@ -886,15 +904,25 @@ export async function handleCreateMessage(
         //     reports `cachedTokens > 0`, which is the authoritative
         //     signal that the block allocator's content-addressed
         //     reuse picked up shared SYS blocks on this turn.
-        //   * Streaming: stays `fresh` unconditionally. The terminal
-        //     `done` chunk does carry `cachedTokens` (consumed by
-        //     `buildMessageDelta` to populate
-        //     `cache_read_input_tokens`), but it arrives AFTER
-        //     `beginSSE` has flushed the headers, so we cannot
-        //     retroactively promote the response header. Mirrors the
-        //     identical decision on `/v1/responses` streaming.
-        let sessionCacheStatus: 'fresh' | 'prefix_hit' = lookup.hit && body.stream !== true ? 'prefix_hit' : 'fresh';
+        //   * Streaming: same `streaming` value as non-paged; the SSE
+        //     `usage.cache_read_input_tokens` field carries the
+        //     authoritative value.
+        //
+        // Header values: `'fresh' | 'prefix_hit' | 'streaming'`. The
+        // `'streaming'` value tells operators to read the SSE
+        // `message_delta.usage.cache_read_input_tokens` for the
+        // resolved cache-hit count (or `X-Cached-Tokens` trailer if
+        // the client supports HTTP trailers).
+        let sessionCacheStatus: 'fresh' | 'prefix_hit' | 'streaming' =
+          body.stream === true ? 'streaming' : lookup.hit ? 'prefix_hit' : 'fresh';
         res.setHeader('X-Session-Cache', sessionCacheStatus);
+        // HTTP/1.1 chunked-encoding trailer announcement for streaming.
+        // The actual value is filled in by `handleStreamingNative`
+        // once it has captured `terminalCachedTokens` from the final
+        // SSE chunk.
+        if (body.stream === true) {
+          res.setHeader('Trailer', 'X-Cached-Tokens');
+        }
 
         // Outer catch branches on `responseMode` (not `res.headersSent`, which
         // flips in `writeHead` before the body lands) so a crash after

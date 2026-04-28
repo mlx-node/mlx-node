@@ -2368,7 +2368,7 @@ describe('handleCreateMessage', () => {
       expect(getHeaders()['x-session-cache']).toBe('fresh');
     });
 
-    it('messages endpoint always emits X-Session-Cache: fresh on streaming', async () => {
+    it('messages endpoint emits X-Session-Cache: streaming on streaming responses', async () => {
       const streamEvents = [
         { done: false, text: 'hi', isReasoning: false },
         {
@@ -2398,10 +2398,14 @@ describe('handleCreateMessage', () => {
         registry,
       );
 
-      expect(getHeaders()['x-session-cache']).toBe('fresh');
+      // Streaming responses emit the literal `'streaming'` value to
+      // signal that the authoritative cache classification is on the
+      // SSE stream (`message_delta.usage.cache_read_input_tokens`)
+      // and HTTP `X-Cached-Tokens` trailer rather than this header.
       // SSE headers are committed by `beginSSE`; the observability
       // header lands alongside them because it was set BEFORE
       // `writeHead` fired.
+      expect(getHeaders()['x-session-cache']).toBe('streaming');
       expect(getHeaders()['content-type']).toBe('text/event-stream');
     });
 
@@ -2845,7 +2849,7 @@ describe('handleCreateMessage', () => {
       expect(turn2Messages[0]).toEqual({ role: 'system', content: 'You are Claude.' });
     });
 
-    it('three-turn streaming replay reuses the warm slot (header stays fresh by design)', async () => {
+    it('three-turn streaming replay reuses the warm slot (header reports streaming)', async () => {
       // Streaming counterpart of the previous test. Behaviour mirror:
       //   * Each turn flushes a clean SSE wire (`message_start` ...
       //     `message_stop`).
@@ -2913,7 +2917,7 @@ describe('handleCreateMessage', () => {
       try {
         // ---- Turn 1 ----
         const t1 = await runTurn([{ role: 'user', content: 'A' }]);
-        expect(t1.headers['x-session-cache']).toBe('fresh');
+        expect(t1.headers['x-session-cache']).toBe('streaming');
         expect(t1.events[0].event).toBe('message_start');
         expect(t1.events.find((e) => e.event === 'message_stop')).toBeDefined();
         expect(sessionReg.size).toBe(1);
@@ -2926,8 +2930,11 @@ describe('handleCreateMessage', () => {
           { role: 'assistant', content: 'A1' },
           { role: 'user', content: 'B' },
         ]);
-        // Header STAYS fresh on streaming — see comment block.
-        expect(t2.headers['x-session-cache']).toBe('fresh');
+        // Header reports `streaming` on streaming responses — the
+        // authoritative cache classification lives in the SSE
+        // `message_delta.usage.cache_read_input_tokens` field and
+        // the `X-Cached-Tokens` HTTP trailer.
+        expect(t2.headers['x-session-cache']).toBe('streaming');
         expect(t2.events.find((e) => e.event === 'message_stop')).toBeDefined();
         expect(sessionReg.size).toBe(1);
         // Warm-reuse helper fired — no resetCaches call advance.
@@ -2941,7 +2948,7 @@ describe('handleCreateMessage', () => {
           { role: 'assistant', content: 'A2' },
           { role: 'user', content: 'C' },
         ]);
-        expect(t3.headers['x-session-cache']).toBe('fresh');
+        expect(t3.headers['x-session-cache']).toBe('streaming');
         expect(t3.events.find((e) => e.event === 'message_stop')).toBeDefined();
         expect(sessionReg.size).toBe(1);
         expect(resetCaches.mock.calls.length).toBe(resetCachesAfterT1);
@@ -3692,8 +3699,10 @@ describe('handleCreateMessage', () => {
       expect(t2Usage.input_tokens).toBe(13);
       expect(t2Usage.output_tokens).toBe(5);
       expect(t2Usage).not.toHaveProperty('cache_creation_input_tokens');
-      // Streaming header invariant unchanged.
-      expect(r2.getHeaders()['x-session-cache']).toBe('fresh');
+      // Streaming header reports `streaming` — the cache-hit count is
+      // carried by the SSE `usage.cache_read_input_tokens` field
+      // (asserted above) and the `X-Cached-Tokens` HTTP trailer.
+      expect(r2.getHeaders()['x-session-cache']).toBe('streaming');
     });
 
     it('warm-slot lease where the native verifier rejects (cachedTokens=0) demotes X-Session-Cache to fresh and omits cache fields', async () => {
