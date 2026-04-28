@@ -84,20 +84,25 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
         }
     }
 
+    // Always explicitly pin `use_block_paged_cache` — the default flipped
+    // to `true` once parity landed, so a missing key would silently route
+    // BOTH "flat" and "paged" copies through the paged path and reduce
+    // the parity test to a no-op (paged-vs-paged). Pin explicitly so the
+    // test is unambiguous regardless of default-flip drift.
+    let cfg_path = dst.join("config.json");
+    let raw = fs::read_to_string(&cfg_path)
+        .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
+    let mut cfg: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
+    cfg["use_block_paged_cache"] = serde_json::Value::Bool(use_block_paged);
     if use_block_paged {
-        let cfg_path = dst.join("config.json");
-        let raw = fs::read_to_string(&cfg_path)
-            .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
-        let mut cfg: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
-        cfg["use_block_paged_cache"] = serde_json::Value::Bool(true);
         cfg["paged_cache_memory_mb"] = serde_json::Value::from(512u32);
         cfg["paged_block_size"] = serde_json::Value::from(16u32);
-        let pretty = serde_json::to_string_pretty(&cfg)
-            .map_err(|e| format!("serialize config.json: {e}"))?;
-        fs::write(&cfg_path, pretty)
-            .map_err(|e| format!("write config.json: {e} (path={})", cfg_path.display()))?;
     }
+    let pretty =
+        serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;
+    fs::write(&cfg_path, pretty)
+        .map_err(|e| format!("write config.json: {e} (path={})", cfg_path.display()))?;
 
     Ok(dst)
 }
@@ -171,8 +176,7 @@ fn resolve_source_model() -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Gemma4 checkpoint; \
-            paged forward dispatch is not yet parity-verified — expected to fail until follow-ups"]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Gemma4 checkpoint"]
 async fn gemma4_paged_vs_flat_greedy_token_parity() {
     use mlx_core::models::gemma4::model::Gemma4Model;
 
@@ -251,8 +255,7 @@ async fn gemma4_paged_vs_flat_greedy_token_parity() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Gemma4 checkpoint; \
-            paged forward dispatch is not yet parity-verified — expected to fail until follow-ups"]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Gemma4 checkpoint"]
 async fn gemma4_paged_vs_flat_prefix_reuse_parity() {
     use mlx_core::models::gemma4::model::Gemma4Model;
 

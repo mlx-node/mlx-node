@@ -143,3 +143,66 @@ fn compute_l2_norm(arr: &MxArray) -> Result<f32, String> {
         .item_at_float32(0)
         .map_err(|e| format!("item: {e:?}"))
 }
+
+/// Dump the top-5 logits + their indices from a `[V]` or `[1, V]` or
+/// `[1, 1, V]` logit tensor. Used at the prefill→decode boundary and at
+/// each decode step to compare the final argmax-determining values
+/// between flat and paged paths.
+pub(crate) fn dump_logits(tag: &str, logits: &MxArray) {
+    if !dump_enabled() {
+        return;
+    }
+    let path = DUMP_PATH.with(|c| c.get());
+    let step = DUMP_STEP.with(|c| c.get());
+    match top_k_logits(logits, 5) {
+        Ok(pairs) => {
+            let entries: Vec<String> = pairs
+                .iter()
+                .map(|(idx, v)| format!("{idx}={v:.6e}"))
+                .collect();
+            eprintln!(
+                "[gemma4-logits] path={path} step={step} tag={tag} top5=[{}]",
+                entries.join(",")
+            );
+        }
+        Err(e) => {
+            eprintln!("[gemma4-logits] path={path} step={step} tag={tag} err={e}");
+        }
+    }
+}
+
+/// Returns the top-k logit (index, value) pairs sorted by value desc.
+fn top_k_logits(logits: &MxArray, k: usize) -> Result<Vec<(i64, f32)>, String> {
+    use crate::array::DType;
+
+    let shape = logits.shape().map_err(|e| format!("shape: {e:?}"))?;
+    let dims = shape.to_vec();
+    // Flatten to 1-D vocab vector.
+    let total: i64 = dims.iter().copied().product::<i64>().max(1);
+    let flat = logits
+        .reshape(&[total])
+        .map_err(|e| format!("reshape: {e:?}"))?;
+    let casted = flat
+        .astype(DType::Float32)
+        .map_err(|e| format!("astype: {e:?}"))?;
+    casted.eval();
+
+    // Pull the entire vector to host. Vocab ~256K * 4B = ~1MB which is
+    // acceptable for a debug-only env-gated path.
+    let vocab = total as usize;
+    let mut buf: Vec<f32> = Vec::with_capacity(vocab);
+    for i in 0..vocab {
+        let v = casted
+            .item_at_float32(i)
+            .map_err(|e| format!("item({i}): {e:?}"))?;
+        buf.push(v);
+    }
+    let mut indexed: Vec<(i64, f32)> = buf
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (i as i64, v))
+        .collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.truncate(k);
+    Ok(indexed)
+}

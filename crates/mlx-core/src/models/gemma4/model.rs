@@ -510,7 +510,7 @@ impl Gemma4Inner {
         // window-trimmed semantics don't map onto the paged pool. The
         // pool's per-layer slot size therefore uses the global head_dim
         // and global KV-head count.
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
             // Count GLOBAL layers — the paged pool only covers
             // full_attention layers in their original layer order. A
             // future paged-aware forward path indexes this pool by
@@ -1193,6 +1193,8 @@ impl Gemma4Inner {
                     None
                 };
 
+                // See `chat_sync_core_paged_inner` for the rationale.
+                current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
@@ -1253,6 +1255,19 @@ impl Gemma4Inner {
                     None
                 };
 
+                // Force `current_y` to evaluate before reading its host value.
+                // The previous iteration kicked an async eval on the sampled
+                // token (`next_token`), which became `current_y` here. On
+                // intermediate steps the lazy graph from
+                // `current_y.reshape(...) → forward_inner → ...` would normally
+                // chain the eval, but `read_scalar` (mlx_nn_ops.cpp) reads
+                // `arr.data<T>()` directly off CPU memory without triggering
+                // an implicit `eval()`. On the FINAL iteration there is no
+                // forward at all, so the data may still be unevaluated. Without
+                // this sync the host sees raw uninitialized bits → garbage
+                // token ID → mismatch on length-finish prompts. Mirrors
+                // `chat_sync_core_paged_inner`.
+                current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
@@ -1719,6 +1734,12 @@ impl Gemma4Inner {
                     None
                 };
 
+                // See `chat_sync_core_paged_inner` for the rationale —
+                // `read_scalar` reads `arr.data<T>()` directly without
+                // forcing eval, so the previous iteration's async-eval'd
+                // `current_y` (or the final iteration's no-forward case)
+                // can hand back uninitialized bits.
+                current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
@@ -1784,6 +1805,8 @@ impl Gemma4Inner {
                     None
                 };
 
+                // See `chat_sync_core_paged_inner` for the rationale.
+                current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
@@ -2169,6 +2192,15 @@ impl Gemma4Inner {
         let mut finish_reason = String::from("length");
 
         for step in 0..max_new_tokens {
+            // Force `y` to evaluate before reading via `item_at_int32`.
+            // The previous iteration only kicked an async eval on `y`,
+            // and `item_at_int32` reads CPU memory directly via
+            // `read_scalar` (mlx_nn_ops.cpp) — it does NOT trigger an
+            // implicit eval. Without this sync, decode reads the
+            // raw-bit-uninitialized buffer, the "token id" is garbage,
+            // and the EOS check trivially never matches. Mirrors
+            // Qwen3's `run_paged_decode_step` loop (qwen3/model.rs:2935).
+            y.eval();
             let token_id = y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
@@ -2435,6 +2467,10 @@ impl Gemma4Inner {
                 finish_reason = String::from("cancelled");
                 break;
             }
+            // Force `y` to evaluate before reading via `item_at_int32`
+            // — async_eval kicked from the previous iteration does not
+            // implicitly sync. Same rationale as `chat_sync_core_paged_inner`.
+            y.eval();
             let token_id = y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
@@ -2602,6 +2638,7 @@ impl Gemma4Inner {
 
         // Final norm + lm_head + softcap (only for the final token).
         hidden_states = self.final_norm.forward(&hidden_states)?;
+        crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &hidden_states, None);
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
         } else if let Some(ref w_t) = self.embed_weight_t {
@@ -2611,11 +2648,15 @@ impl Gemma4Inner {
             let weight_t = weight.transpose(Some(&[1, 0]))?;
             hidden_states.matmul(&weight_t)?
         };
+        crate::models::gemma4::diagnostic::dump_logits("pre_softcap", &logits);
         let logits = if let Some(cap) = self.config.final_logit_softcapping {
             let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
             let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
-            MxArray::from_handle(handle, "logit_softcap")?
+            let capped = MxArray::from_handle(handle, "logit_softcap")?;
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &capped);
+            capped
         } else {
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
             logits
         };
 
@@ -2973,6 +3014,7 @@ impl Gemma4Inner {
         }
 
         hidden_states = self.final_norm.forward(&hidden_states)?;
+        crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &hidden_states, None);
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
         } else if let Some(ref w_t) = self.embed_weight_t {
@@ -2982,11 +3024,15 @@ impl Gemma4Inner {
             let weight_t = weight.transpose(Some(&[1, 0]))?;
             hidden_states.matmul(&weight_t)?
         };
+        crate::models::gemma4::diagnostic::dump_logits("pre_softcap", &logits);
         let logits = if let Some(cap) = self.config.final_logit_softcapping {
             let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
             let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
-            MxArray::from_handle(handle, "logit_softcap")?
+            let capped = MxArray::from_handle(handle, "logit_softcap")?;
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &capped);
+            capped
         } else {
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
             logits
         };
         Ok(logits)
@@ -3332,6 +3378,31 @@ impl Gemma4Inner {
         let sampling_config = make_sampling_config(&config, &self.config);
         let eos_ids = self.config.eos_token_ids.clone();
 
+        // Block-paged dispatch: when the adapter is configured the
+        // session's K/V for global layers lives in the adapter's pool —
+        // the flat caches (sliding only on the paged path) were reset at
+        // the end of turn 1 and cannot be used to pick up the global
+        // context. Route the delta through the same pipeline as
+        // `chat_sync_core_paged` by reconstructing the full token
+        // history (cached + delta) — `find_cached_prefix` will discover
+        // the prefix that turn 1 registered for reuse, sliding-only
+        // re-prefill bridges the sliding-layer state, and the full
+        // suffix (just the delta tokens) gets the same SDPA reduction
+        // order as turn 1's prefill→decode boundary. Mirrors Qwen3's
+        // `chat_tokens_delta_sync` paged dispatch.
+        if self.paged_adapter.is_some() {
+            let mut full_token_history = self.cached_token_history.clone();
+            full_token_history.extend(delta_tokens.iter().copied());
+            return self.chat_sync_core_paged(
+                full_token_history,
+                tokenizer,
+                config,
+                turn_end_id,
+                sampling_config,
+                max_new_tokens,
+            );
+        }
+
         // Build the full token history = cached_history + delta. Used
         // when save_cache_state-ing back to `self.cached_token_history`
         // at the end (the decode loop doesn't actually consult the
@@ -3430,6 +3501,8 @@ impl Gemma4Inner {
                 None
             };
 
+            // See `chat_sync_core_paged_inner` for the rationale.
+            current_y.eval();
             let token_id = current_y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
@@ -3732,6 +3805,28 @@ impl Gemma4Inner {
         let sampling_config = make_sampling_config(&config, &self.config);
         let eos_ids = self.config.eos_token_ids.clone();
 
+        // Paged dispatch: same rationale as `chat_tokens_delta_sync` —
+        // the global K/V lives in the paged adapter's pool, the flat
+        // (sliding) caches were reset at end-of-turn-1, so the only way
+        // to resume the conversation faithfully is to route the full
+        // history (cached + delta) through the paged streaming pipeline
+        // and let `find_cached_prefix` discover the prefix that turn 1
+        // registered for reuse.
+        if self.paged_adapter.is_some() {
+            let mut full_token_history = self.cached_token_history.clone();
+            full_token_history.extend(delta_tokens.iter().copied());
+            return self.chat_stream_sync_core_paged(
+                full_token_history,
+                tokenizer,
+                config,
+                turn_end_id,
+                sampling_config,
+                cb,
+                cancelled,
+                max_new_tokens,
+            );
+        }
+
         // The streaming delta path is 100% cache-reuse by construction
         // (mirrors `chat_tokens_delta_sync`); capture the reused prefix
         // length for the final `cached_tokens` report.
@@ -3823,6 +3918,8 @@ impl Gemma4Inner {
                 None
             };
 
+            // See `chat_sync_core_paged_inner` for the rationale.
+            current_y.eval();
             let token_id = current_y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
@@ -4771,6 +4868,8 @@ fn forward_inner(
         config,
     )?;
 
+    crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &h, None);
+
     // LM head or tied embeddings
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
@@ -4781,13 +4880,17 @@ fn forward_inner(
         let weight_t = weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
     };
+    crate::models::gemma4::diagnostic::dump_logits("pre_softcap", &logits);
 
     // Logit softcapping — compiled fused kernel (matches Python's mx.compile logit_softcap)
     if let Some(cap) = config.final_logit_softcapping {
         let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
         let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
-        Ok(MxArray::from_handle(handle, "logit_softcap")?)
+        let capped = MxArray::from_handle(handle, "logit_softcap")?;
+        crate::models::gemma4::diagnostic::dump_logits("post_softcap", &capped);
+        Ok(capped)
     } else {
+        crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
         Ok(logits)
     }
 }
@@ -5434,7 +5537,7 @@ mod tests {
     /// constraints (head_size in {32, 64, 96, 128, 256}, FP8 off, etc.).
     /// `head_dim = 32`, num_kv_heads = 2, no PLE/MoE/vision/sharing.
     #[cfg(test)]
-    fn paged_tiny_config(use_block_paged: bool) -> super::Gemma4Config {
+    fn paged_tiny_config(use_block_paged: Option<bool>) -> super::Gemma4Config {
         super::Gemma4Config {
             vocab_size: 100,
             hidden_size: 64,
@@ -5480,7 +5583,7 @@ mod tests {
             vision_soft_tokens_per_image: None,
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
-            use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+            use_block_paged_cache: use_block_paged,
         }
     }
 
@@ -5534,10 +5637,13 @@ mod tests {
         assert_eq!(cfg.use_block_paged_cache, Some(true));
     }
 
-    /// Default-flag construction must NOT allocate the block-paged adapter.
+    /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged
+    /// adapter. The previous "None means no adapter" assertion was removed
+    /// when the default flipped from `unwrap_or(false)` to `unwrap_or(true)`
+    /// — the explicit-false path is the new "no adapter" guarantee.
     #[test]
-    fn test_gemma4_inner_no_paged_adapter_when_flag_is_none() {
-        let cfg = paged_tiny_config(false);
+    fn test_gemma4_inner_no_paged_adapter_when_flag_is_explicit_false() {
+        let cfg = paged_tiny_config(Some(false));
         let inner = match super::Gemma4Inner::new(cfg) {
             Ok(i) => i,
             Err(err) => {
@@ -5551,8 +5657,34 @@ mod tests {
         };
         assert!(
             inner.paged_adapter.is_none(),
-            "paged_adapter must be None when use_block_paged_cache is None"
+            "paged_adapter must be None when use_block_paged_cache is Some(false)"
         );
+    }
+
+    /// Default-flag construction (`None`) must allocate the block-paged
+    /// adapter under the new default-on policy (`unwrap_or(true)`).
+    /// Allocates a `LayerKVPool`, so requires Metal — gracefully skips
+    /// on no-Metal sandboxes.
+    #[test]
+    fn test_gemma4_inner_paged_adapter_when_flag_is_none_default_on_macos() {
+        let cfg = paged_tiny_config(None);
+        match super::Gemma4Inner::new(cfg) {
+            Ok(inner) => {
+                assert!(
+                    inner.paged_adapter.is_some(),
+                    "paged_adapter must be Some when use_block_paged_cache is None \
+                     (new default-on policy: unwrap_or(true))"
+                );
+            }
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        }
     }
 
     /// Construction with `use_block_paged_cache: Some(true)` must populate
@@ -5560,7 +5692,7 @@ mod tests {
     /// gracefully skips on no-Metal sandboxes.
     #[test]
     fn test_gemma4_inner_constructs_paged_adapter_when_flag_is_true() {
-        let cfg = paged_tiny_config(true);
+        let cfg = paged_tiny_config(Some(true));
         match super::Gemma4Inner::new(cfg) {
             Ok(inner) => {
                 assert!(
@@ -5586,7 +5718,7 @@ mod tests {
         let cfg = super::Gemma4Config {
             num_hidden_layers: 4,
             layer_types: vec!["full_attention".to_string(); 4],
-            ..paged_tiny_config(false)
+            ..paged_tiny_config(None)
         };
         let kinds = super::compute_layer_kinds(&cfg);
         assert_eq!(kinds.len(), 4);
@@ -5614,7 +5746,7 @@ mod tests {
         let cfg = super::Gemma4Config {
             num_hidden_layers: 10,
             layer_types,
-            ..paged_tiny_config(false)
+            ..paged_tiny_config(None)
         };
         let kinds = super::compute_layer_kinds(&cfg);
         // Global layers at indices 4 and 9 -> paged_idx 0, 1.
@@ -5650,7 +5782,7 @@ mod tests {
     fn test_run_paged_prefill_decode_smoke() {
         use crate::array::{DType, MxArray};
 
-        let cfg = paged_tiny_config(true);
+        let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Gemma4Inner::new(cfg) {
             Ok(i) => i,
             Err(err) => {
@@ -5806,7 +5938,7 @@ mod tests {
             num_hidden_layers: 8,
             layer_types,
             num_kv_shared_layers: Some(4),
-            ..paged_tiny_config(false)
+            ..paged_tiny_config(None)
         };
         let kinds = super::compute_layer_kinds(&cfg);
         // Non-shared layers: 0=Sliding, 1=GlobalPaged{0}, 2=Sliding, 3=GlobalPaged{1}.

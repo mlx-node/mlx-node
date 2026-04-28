@@ -121,20 +121,20 @@ pub struct Gemma4Config {
 
     /// Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
     ///
-    /// **OPT-IN — experimental and currently a no-op for chat dispatch.**
-    /// When `Some(true)`, `Gemma4Inner` allocates a `BlockAllocator` +
-    /// `LayerKVPool` pair and constructs a `PagedKVCacheAdapter` field.
-    /// The chat-session forward dispatch (`chat_sync_core_paged` /
-    /// `chat_stream_sync_core_paged`) is NOT yet wired — Gemma4's
-    /// hybrid sliding+global attention, K=V sharing, KV-shared layers
-    /// (`forward_shared`), MoE/PLE branches, and per-layer-type head
-    /// dimensions all require a bespoke `forward_paged_adapter` on
-    /// `Gemma4DecoderLayer` that mirrors the Qwen3 pattern but covers
-    /// these variants. This commit lands the construction-only plumbing
-    /// so a follow-up can implement the forward path without churning
-    /// the config surface a second time.
+    /// When `Some(true)` or unset (the default), `Gemma4Inner` allocates
+    /// a `BlockAllocator` + `LayerKVPool` pair and constructs a
+    /// `PagedKVCacheAdapter`. Sliding-window layers stay on the existing
+    /// flat `RotatingKVCache` path (window-trimmed semantics don't map
+    /// onto the paged pool), while full_attention (global) layers route
+    /// through the adapter — including `KV-shared` layers whose anchor
+    /// is global (read via `read_kv_range`) and KV-shared layers whose
+    /// anchor is sliding (pull from the flat anchor's stash).
     ///
-    /// Default: false (use the existing `Gemma4LayerCache` path).
+    /// Default: `true` (paged adapter on; opt-out via
+    /// `use_block_paged_cache: false` in `config.json` to fall back to
+    /// the legacy all-flat `Gemma4LayerCache` path). Parity is verified
+    /// by `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` against
+    /// real Gemma-4-E2B weights.
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,
