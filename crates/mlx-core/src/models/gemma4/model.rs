@@ -2515,6 +2515,26 @@ impl Gemma4Inner {
         // Apply Gemma4 embedding scaling (sqrt(hidden_size)).
         hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
 
+        // Compute PLE (per-layer embeddings) for the suffix tokens. Mirrors
+        // `forward_body`: PLE feeds an additive residual inside every
+        // layer's `apply_ffn_ple_scalar` tail. For Gemma4 E2B/E4B this is
+        // load-bearing — dropping it produces nonsense logits because each
+        // layer is missing a critical residual contribution. Only the
+        // suffix is computed here because sliding-only re-prefill of any
+        // cached prefix doesn't propagate PLE through the global layers
+        // we'll touch below (their stored K/V already accounts for it).
+        let projected_ple_suffix: Option<MxArray> = if let Some(ref ple) = self.ple {
+            let pre_layer_h = hidden_states.clone();
+            Some(compute_ple(
+                &input_ids,
+                &pre_layer_h,
+                ple,
+                suffix_len as i64,
+            )?)
+        } else {
+            None
+        };
+
         // Build sliding mask if seq_len exceeds window. Mirrors
         // `forward_body`'s mask logic.
         let seq_len = suffix_len as i64;
@@ -2612,6 +2632,17 @@ impl Gemma4Inner {
                 && matches!(kind, Gemma4LayerKind::Sliding)
                 && self.config.should_store_shared_kv(layer_idx);
 
+            // Slice the per-layer PLE input ([B, T, num_layers, ple_dim] →
+            // [B, T, ple_dim]). Mirrors `forward_body`'s per-layer slice.
+            let ple_input = projected_ple_suffix.as_ref().map(|p| {
+                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
+                    .and_then(|s| s.squeeze(Some(&[2])))
+            });
+            let ple_input_ref = match &ple_input {
+                Some(Ok(arr)) => Some(arr),
+                _ => None,
+            };
+
             hidden_states = layer.forward_paged_or_flat(
                 &hidden_states,
                 kind,
@@ -2621,7 +2652,7 @@ impl Gemma4Inner {
                 /* is_prefill */ true,
                 mask,
                 flat_cache,
-                /* per_layer_input */ None,
+                ple_input_ref,
                 needs_stash,
                 shared_inputs,
             )?;
@@ -2692,6 +2723,17 @@ impl Gemma4Inner {
         let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
         hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
 
+        // Compute PLE for the single decode token. Same load-bearing
+        // residual contribution as the prefill path — see the comment in
+        // `run_paged_prefill_chunk` for why dropping this destroys logits
+        // on Gemma4 E2B/E4B.
+        let projected_ple_step: Option<MxArray> = if let Some(ref ple) = self.ple {
+            let pre_layer_h = hidden_states.clone();
+            Some(compute_ple(&input_ids, &pre_layer_h, ple, 1)?)
+        } else {
+            None
+        };
+
         let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
         let num_layers = self.layers.len();
         let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
@@ -2753,6 +2795,17 @@ impl Gemma4Inner {
                 && matches!(kind, Gemma4LayerKind::Sliding)
                 && self.config.should_store_shared_kv(layer_idx);
 
+            // Slice the per-layer PLE input ([B, T, num_layers, ple_dim] →
+            // [B, T, ple_dim]).
+            let ple_input = projected_ple_step.as_ref().map(|p| {
+                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
+                    .and_then(|s| s.squeeze(Some(&[2])))
+            });
+            let ple_input_ref = match &ple_input {
+                Some(Ok(arr)) => Some(arr),
+                _ => None,
+            };
+
             hidden_states = layer.forward_paged_or_flat(
                 &hidden_states,
                 kind,
@@ -2762,7 +2815,7 @@ impl Gemma4Inner {
                 /* is_prefill */ false,
                 /* mask */ None,
                 flat_cache,
-                /* per_layer_input */ None,
+                ple_input_ref,
                 needs_stash,
                 shared_inputs,
             )?;
@@ -2824,6 +2877,18 @@ impl Gemma4Inner {
 
         // Sliding mask if seq_len > window.
         let seq_len = prefix_tokens.len() as i64;
+
+        // Compute PLE for the prefix tokens. Without this, sliding-layer
+        // K/V written here will diverge from the flat path's K/V because
+        // hidden_states fed into the sliding pre-norm depends on the
+        // PLE-augmented output of the prior layer. Same load-bearing
+        // residual as in `run_paged_prefill_chunk`.
+        let projected_ple_prefix: Option<MxArray> = if let Some(ref ple) = self.ple {
+            let pre_layer_h = hidden_states.clone();
+            Some(compute_ple(&input_ids, &pre_layer_h, ple, seq_len)?)
+        } else {
+            None
+        };
         let sliding_mask = if seq_len > self.config.sliding_window as i64 {
             Some(create_sliding_mask(
                 seq_len,
@@ -2849,6 +2914,16 @@ impl Gemma4Inner {
                 let ptr = self.layers.as_ptr().add(layer_idx);
                 &*ptr
             };
+            // Slice this layer's PLE input ([B, T, num_layers, ple_dim] →
+            // [B, T, ple_dim]).
+            let ple_input = projected_ple_prefix.as_ref().map(|p| {
+                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
+                    .and_then(|s| s.squeeze(Some(&[2])))
+            });
+            let ple_input_ref = match &ple_input {
+                Some(Ok(arr)) => Some(arr),
+                _ => None,
+            };
             match kind {
                 Gemma4LayerKind::Sliding => {
                     let caches = unsafe {
@@ -2863,7 +2938,7 @@ impl Gemma4Inner {
                         &hidden_states,
                         sliding_mask.as_ref(),
                         Some(&mut caches[layer_idx]),
-                        /* per_layer_input */ None,
+                        ple_input_ref,
                         /* needs_stash */ false,
                     )?;
                 }
@@ -2877,7 +2952,7 @@ impl Gemma4Inner {
                         &hidden_states,
                         /* mask */ None,
                         Some(&mut throwaway),
-                        None,
+                        ple_input_ref,
                         false,
                     )?;
                 }
@@ -2892,7 +2967,7 @@ impl Gemma4Inner {
                         &hidden_states,
                         /* mask */ None,
                         Some(&mut throwaway),
-                        None,
+                        ple_input_ref,
                         false,
                     )?;
                 }
