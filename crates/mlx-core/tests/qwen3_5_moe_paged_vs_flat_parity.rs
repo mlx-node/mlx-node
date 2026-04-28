@@ -40,14 +40,22 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
     }
     fs::create_dir_all(&dst).map_err(|e| format!("create_dir_all({}): {e}", dst.display()))?;
 
+    // Symlink weight files; only config.json mutated. Avoids disk-OOM.
     let read_dir = fs::read_dir(src).map_err(|e| format!("read_dir({}): {e}", src.display()))?;
     for entry in read_dir {
         let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_file() {
-            fs::copy(&from, &to)
-                .map_err(|e| format!("copy({} -> {}): {e}", from.display(), to.display()))?;
+            let name = entry.file_name();
+            if name == "config.json" {
+                fs::copy(&from, &to)
+                    .map_err(|e| format!("copy({} -> {}): {e}", from.display(), to.display()))?;
+            } else {
+                std::os::unix::fs::symlink(&from, &to).map_err(|e| {
+                    format!("symlink({} -> {}): {e}", from.display(), to.display())
+                })?;
+            }
         }
     }
 

@@ -46,7 +46,7 @@ impl PagedAttentionConfig {
         }
 
         // Validate head size
-        let valid_head_sizes = [32, 64, 80, 96, 112, 120, 128, 192, 256];
+        let valid_head_sizes = [32, 64, 80, 96, 112, 120, 128, 192, 256, 512];
         if !valid_head_sizes.contains(&self.head_size) {
             return Err(format!(
                 "Invalid head_size: {}. Must be one of {:?}.",
