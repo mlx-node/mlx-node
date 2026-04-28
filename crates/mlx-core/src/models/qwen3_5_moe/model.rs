@@ -784,8 +784,8 @@ impl Qwen35MoeInner {
         if self.paged_adapter.is_some() {
             if has_images {
                 return Err(Error::from_reason(
-                    "Qwen3.5 MoE paged dispatch is text-only; VLM is incompatible with \
-                     use_block_paged_cache=true in this revision.",
+                    "Qwen3.5 MoE paged dispatch is text-only; image-bearing turns require \
+                     use_block_paged_cache=false (text-only turns continue to work).",
                 ));
             }
             return self.chat_sync_core_paged(tokens, tokenizer, eos_token_id, p, report_perf);
@@ -2027,8 +2027,8 @@ impl Qwen35MoeInner {
         if self.paged_adapter.is_some() {
             if has_images {
                 return Err(Error::from_reason(
-                    "Qwen3.5 MoE paged dispatch is text-only; VLM is incompatible with \
-                     use_block_paged_cache=true in this revision.",
+                    "Qwen3.5 MoE paged dispatch is text-only; image-bearing turns require \
+                     use_block_paged_cache=false (text-only turns continue to work).",
                 ));
             }
             return self.chat_stream_sync_core_paged(

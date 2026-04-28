@@ -230,8 +230,11 @@ impl Qwen3_5Attention {
     /// 2. `attn_layer_idx` is the FULL-ATTENTION ORDINAL into the
     ///    adapter pool (NOT the absolute decoder index). Pool was sized
     ///    by `Qwen3_5Config::full_attention_layer_count()`.
-    /// 3. M-RoPE / VLM mode is rejected: pass `position_ids = None`.
-    ///    VLM is incompatible with paged dispatch in this revision.
+    /// 3. The paged forward unconditionally uses standard scalar-offset
+    ///    `self.rope` (no M-RoPE branching). Text-only inputs match the
+    ///    flat path's behaviour (which uses `self.rope` whenever
+    ///    `position_ids = None`); image-bearing turns are rejected
+    ///    upstream at the chat-entry sites before reaching this fn.
     ///
     /// Returns `[B, T, hidden_size]` (post-output-projection,
     /// post-gate) so the layer's residual `h = x + r` matches the flat
@@ -283,8 +286,10 @@ impl Qwen3_5Attention {
         let queries = self.q_norm.forward(&queries)?;
         let keys = self.k_norm.forward(&keys)?;
 
-        // Standard scalar-offset partial RoPE (paged path is text-only;
-        // M-RoPE / VLM is rejected upstream).
+        // Standard scalar-offset partial RoPE. Paged path is text-only;
+        // image-bearing turns are rejected at the chat-entry sites
+        // (`chat_sync_core` / `chat_stream_sync_inner` and the MoE
+        // counterparts) before reaching this forward.
         let rope_offset = first_logical_position as i32;
         let queries = self.rope.forward(&queries, Some(rope_offset))?;
         let keys = self.rope.forward(&keys, Some(rope_offset))?;
