@@ -532,19 +532,31 @@ impl Gemma4Attention {
             }
         } else {
             // Single-token path (decode OR split-prefill pass 2):
-            // read full `[0, total_ctx)` K/V back from the pool (the
-            // new K/V was just written by `update_keys_values`) and
-            // run MLX's SDPA with mask=None — every cached key is at
-            // a strictly earlier (or equal) position. Same rationale
-            // as Qwen3's `forward_paged_adapter`: this matches the
-            // flat path's reduction order bit-for-bit, while the
-            // dedicated `gather_kv_for_decode` Metal kernel drifts a
-            // few ULP per layer in BF16.
-            let total_ctx = first_logical_position + (seq_len as u32);
-            let (k_full, v_full) = adapter
-                .read_kv_range(paged_idx, 0, total_ctx)
+            // dispatch the `gather_kv_for_decode` Metal kernel directly
+            // against the on-GPU paged buffers. Avoids the per-step host
+            // roundtrip (~57 MB per layer per K/V on long contexts) that
+            // `read_kv_range` performs and that was driving a ~40 GB
+            // memory regression in long-context decode (see Fix #2 spec).
+            //
+            // `gather_kv_for_decode` expects queries shape
+            // `[1, num_query_heads, head_size]` (3-D). For seq_len=1
+            // `queries_bhtd` is `[1, n_heads, 1, head_dim]`, so squeeze
+            // axis 2 to land on the expected layout. Returns
+            // `[1, n_heads, head_dim]`; reshape back to the standard
+            // `[B, H, T, D]` tail with T=1.
+            let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
+                1,
+                self.num_heads as i64,
+                self.head_dim as i64,
+            ])?;
+            let attn_3d = adapter
+                .gather_kv_for_decode(paged_idx, &queries_3d, 1.0, /* softcap */ 1.0)
                 .map_err(napi::Error::from_reason)?;
-            scaled_dot_product_attention(&queries_bhtd, &k_full, &v_full, 1.0, None)?
+            // Cast back to x's dtype so the residual stays homogeneous
+            // (gather currently returns Float32).
+            let target_dtype = x.dtype()?;
+            let attn_3d = attn_3d.astype(target_dtype)?;
+            attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
         };
 
         // 8. Output: [B, H, T, D] -> [B, T, H*D] -> projection.
@@ -595,16 +607,19 @@ impl Gemma4Attention {
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
         let queries_bhtd = self.rope.forward(&queries, cache_offset)?;
 
-        // Read anchor's K/V from the pool.
-        let (shared_keys, shared_values) = adapter
-            .read_kv_range(anchor_paged_idx, 0, total_ctx)
-            .map_err(napi::Error::from_reason)?;
-
         // SDPA. Same scale=1.0 as `forward_paged`. For prefill on a
         // suffix we build an explicit causal mask offset by the cached
-        // prefix length (cache_offset). For decode (seq_len == 1)
-        // mask=None — every cached key is at a strictly earlier position.
+        // prefix length (cache_offset). For decode (seq_len == 1) we
+        // dispatch the on-GPU `gather_kv_for_decode` Metal kernel
+        // directly — every cached key is at a strictly earlier position
+        // so mask=None is implicit, and we skip the `read_kv_range`
+        // host roundtrip that drove the long-context memory regression.
         let attn_bhtd = if is_prefill && seq_len > 1 {
+            // Cache-hit prefill: still need the full K/V as MxArrays for
+            // SDPA with an explicit causal+offset mask.
+            let (shared_keys, shared_values) = adapter
+                .read_kv_range(anchor_paged_idx, 0, total_ctx)
+                .map_err(napi::Error::from_reason)?;
             let cached_prefix_len = (total_ctx as i64) - seq_len;
             let mask = create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
             scaled_dot_product_attention(
@@ -615,7 +630,20 @@ impl Gemma4Attention {
                 Some(&mask),
             )?
         } else {
-            scaled_dot_product_attention(&queries_bhtd, &shared_keys, &shared_values, 1.0, None)?
+            // Single-token path (decode OR split-prefill pass 2):
+            // dispatch `gather_kv_for_decode` against the anchor's paged
+            // slot. Queries shape: `[1, num_heads, head_dim]` (squeeze T=1).
+            let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
+                1,
+                self.num_heads as i64,
+                self.head_dim as i64,
+            ])?;
+            let attn_3d = adapter
+                .gather_kv_for_decode(anchor_paged_idx, &queries_3d, 1.0, /* softcap */ 1.0)
+                .map_err(napi::Error::from_reason)?;
+            let target_dtype = x.dtype()?;
+            let attn_3d = attn_3d.astype(target_dtype)?;
+            attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
         };
 
         // Output projection.

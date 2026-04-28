@@ -360,14 +360,33 @@ impl Qwen3_5Attention {
                 )?
             }
         } else {
-            // Decode: read full historical K/V back from the pool and
-            // run SDPA — keeps BF16 reduction order bit-equal to the
-            // flat path's KVCache + SDPA. Mirrors Qwen3 / Gemma4 decode.
-            let total_ctx = first_logical_position + 1;
-            let (k_full, v_full) = adapter
-                .read_kv_range(attn_layer_idx, 0, total_ctx)
+            // Decode: dispatch `gather_kv_for_decode` Metal kernel
+            // directly against the on-GPU paged buffers. Avoids the
+            // per-step host roundtrip (~57 MB per layer per K/V on long
+            // contexts) that `read_kv_range` performs and that was
+            // driving a ~40 GB memory regression in long-context decode
+            // (see Fix #2 spec). Mirrors Qwen3 / Gemma4 / LFM2 paged decode.
+            //
+            // `gather_kv_for_decode` expects `[1, num_query_heads,
+            // head_size]` queries (3-D); squeeze T=1 from `queries_bhtd`
+            // and reshape. Returns `[1, n_heads, head_dim]` which we cast
+            // to x's dtype and reshape to the standard `[B, H, T, D]` tail.
+            let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
+                1,
+                self.num_heads as i64,
+                self.head_dim as i64,
+            ])?;
+            let attn_3d = adapter
+                .gather_kv_for_decode(
+                    attn_layer_idx,
+                    &queries_3d,
+                    self.scale,
+                    /* softcap */ 1.0,
+                )
                 .map_err(napi::Error::from_reason)?;
-            scaled_dot_product_attention(&queries_bhtd, &k_full, &v_full, self.scale as f64, None)?
+            let target_dtype = x.dtype()?;
+            let attn_3d = attn_3d.astype(target_dtype)?;
+            attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
         };
 
         // Transpose back: [B, H, T, D] -> [B, T, H*D].

@@ -474,43 +474,39 @@ impl TransformerBlock {
                 .reshape(&[num_tokens, n_heads, head_dim])?
         } else {
             // Decode: K/V at the new position has just been written to the
-            // pool by `update_keys_values` above. Read the FULL `[0, total)`
-            // K/V back from the pool and run MLX's SDPA. This gives bit-for-
-            // bit equivalent reduction order to the flat path's cached SDPA
-            // (both end up calling `mlx::core::fast::scaled_dot_product_attention`),
-            // which the dedicated `gather_kv_for_decode` Metal kernel does
-            // not — its block-wise softmax accumulation drifts from MLX's
-            // standard kernel by a few ULP per layer in BF16, enough to flip
-            // argmax on close decisions and break greedy parity (see
-            // `qwen3_paged_vs_flat_parity.rs`).
+            // pool by `update_keys_values` above. Dispatch the
+            // `gather_kv_for_decode` Metal kernel directly against the
+            // on-GPU paged buffers — avoids the per-step host roundtrip
+            // (~57 MB per layer per K/V on long contexts) that
+            // `read_kv_range` performs and that was driving a ~40 GB
+            // memory regression in long-context decode (see Fix #2 spec).
             //
-            // P1C-3 follow-up: replace this round-trip with a zero-copy
-            // on-device gather that calls MLX SDPA directly against the
-            // paged buffers. Until then, accept the host-side gather cost
-            // for the parity gate to stay green.
-            let total_ctx = first_logical_position + 1;
-            let (k_4d, v_4d) = adapter
-                .read_kv_range(layer_idx, 0, total_ctx)
-                .map_err(napi::Error::from_reason)?;
-            // `read_kv_range` returns `[1, n_kv_heads, total_ctx, head_dim]`
-            // in the pool's cache dtype (BF16 for our supported configs).
-
-            // Q for decode is `[1, n_heads, head_dim]` (single token);
-            // reshape to `[1, n_heads, 1, head_dim]` for SDPA.
-            let n_heads = qkv.queries.shape_at(1)?;
-            let head_dim = qkv.queries.shape_at(2)?;
-            let q_4d = qkv.queries.reshape(&[1, n_heads, 1, head_dim])?;
-
+            // The kernel returns Float32; cast back to x's dtype so the
+            // rest of the block stays homogeneous (matches LFM2's paged
+            // decode path). This is a zero-extra-host-buffer path — the
+            // K/V are not materialized as MxArrays at all.
+            //
+            // `gather_kv_for_decode` expects queries shape
+            // `[1, num_query_heads, head_size]` (3-D). `qkv.queries` from
+            // `compute_qkv` is already `[num_tokens=1, n_heads, head_dim]`
+            // for the single-token decode chunk, so it's a direct fit.
             let scale = self.self_attn.get_scale();
 
-            // Decode is single-Q-against-many-K — MLX's "causal" mask mode
-            // requires Q seq == K seq, so we don't use it. We don't need an
-            // explicit mask either: every cached key is at a strictly earlier
-            // (or equal) logical position than the new token, so all of
-            // `[0, total_ctx)` is visible. Pass mask=None.
-            scaled_dot_product_attention(&q_4d, &k_4d, &v_4d, scale, None)?
-                .transpose(Some(&[0, 2, 1, 3]))?
-                .reshape(&[1, n_heads, head_dim])?
+            let attn_3d = adapter
+                .gather_kv_for_decode(
+                    layer_idx,
+                    &qkv.queries,
+                    scale as f32,
+                    /* softcap */ 1.0,
+                )
+                .map_err(napi::Error::from_reason)?;
+
+            // Cast back to x's dtype (gather currently returns Float32).
+            // `gather_kv_for_decode` returns `[1, n_heads, head_dim]`, which
+            // is exactly the layout `output_projection` expects for
+            // `batch * seq_len = 1`.
+            let target_dtype = x.dtype()?;
+            attn_3d.astype(target_dtype)?
         };
 
         // 5. Output projection + residual + MLP, identical to the other
