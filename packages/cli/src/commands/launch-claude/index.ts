@@ -210,7 +210,8 @@ export async function run(argv: string[]): Promise<void> {
     // would, otherwise the log shows "N tokens" while chunking is
     // actually disabled.
     const I32_MAX = 0x7fff_ffff;
-    const parsed = /^-?\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
+    // Rust's parse::<i32>() accepts an optional leading '+' or '-'.
+    const parsed = /^[+-]?\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
     if (Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= I32_MAX) {
       effectiveChunkSize = parsed;
     } else {
