@@ -45,6 +45,13 @@ Options:
   --                 Everything after this separator is forwarded to the
                      spawned \`claude\` binary verbatim.
 
+Environment variables:
+  MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
+                                1024 under \`mlx launch claude\` to bound
+                                cold-prefill memory peaks; set to 0 to
+                                disable chunking, or to a smaller value
+                                (e.g. 512 / 256) if 1024 still peaks.
+
 Examples:
   mlx launch claude
   mlx launch claude --verbose
@@ -109,6 +116,17 @@ export async function run(argv: string[]): Promise<void> {
   if (args.help) {
     printHelp();
     return;
+  }
+
+  // Bound paged-prefill memory peak by chunking the prompt: vLLM-aligned
+  // default of 1024 tokens/chunk caps per-chunk SDPA + MoE intermediates
+  // to chunk-sized tiles instead of full-prompt tiles. Respect any
+  // user-provided value (set in their shell) so power users can tune
+  // down to 512 / 256 if 1024 still peaks. The MLX env var is read via
+  // OnceLock on first paged-prefill call, so setting `process.env` here —
+  // before any model loads — is sufficient to apply the default.
+  if (process.env.MLX_PAGED_PREFILL_CHUNK_SIZE == null) {
+    process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '1024';
   }
 
   const modelsDir = resolveModelsDir(args['models-dir']);
@@ -176,6 +194,10 @@ export async function run(argv: string[]): Promise<void> {
 
   console.log(
     `[mlx] models dir: ${modelsDir} | listening on http://${host}:${port} | discovered ${discovered.length} model(s) | default: ${boundModel.name}`,
+  );
+  const chunkSize = process.env.MLX_PAGED_PREFILL_CHUNK_SIZE ?? '0 (disabled)';
+  console.log(
+    `[mlx] paged-prefill chunk size: ${chunkSize} tokens (set MLX_PAGED_PREFILL_CHUNK_SIZE=N to override; 0 disables)`,
   );
   if (logger) {
     console.log(`[mlx] verbose logging → ${logger.logDir}`);
