@@ -116,6 +116,46 @@ pub fn paged_prefill_eval_interval() -> i32 {
     })
 }
 
+/// Default paged-prefill chunk size in tokens.
+///
+/// `0` means "do not chunk" — callers MUST treat 0 as a signal to take the
+/// legacy single-shot whole-suffix prefill path. Any positive value is the
+/// number of new (non-cached) tokens to feed through the model per chunk
+/// when the chunked-prefill driver is active.
+///
+/// Override at runtime via `MLX_PAGED_PREFILL_CHUNK_SIZE`. Negative values,
+/// non-integer values, and unset env all collapse to this default. The env
+/// var is read once on first call and cached via `OnceLock`; subsequent
+/// reads hit the cached fast path.
+pub const PAGED_PREFILL_CHUNK_SIZE_DEFAULT: i32 = 0;
+
+/// Returns the configured paged-prefill chunk size in tokens.
+///
+/// Reads `MLX_PAGED_PREFILL_CHUNK_SIZE` env var once via OnceLock.
+/// Returns 0 when env unset, set to 0, set to a negative number, or
+/// unparseable — callers MUST treat 0 as "do not chunk; run legacy
+/// single-shot prefill".
+pub fn paged_prefill_chunk_size() -> i32 {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<i32> = OnceLock::new();
+    *CACHED.get_or_init(|| parse_chunk_size(std::env::var("MLX_PAGED_PREFILL_CHUNK_SIZE").ok()))
+}
+
+/// Pure parser for the chunk-size env value. Extracted so it can be unit
+/// tested without touching process env state (which `paged_prefill_chunk_size`
+/// reads exactly once via `OnceLock` per process).
+fn parse_chunk_size(env_value: Option<String>) -> i32 {
+    match env_value {
+        Some(s) => s
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|&n| n >= 0)
+            .unwrap_or(PAGED_PREFILL_CHUNK_SIZE_DEFAULT),
+        None => PAGED_PREFILL_CHUNK_SIZE_DEFAULT,
+    }
+}
+
 /// Helper: eval `hidden_states` + clear the MLX caching allocator every
 /// `paged_prefill_eval_interval()` layers during a paged prefill loop.
 ///
@@ -322,4 +362,58 @@ pub fn check_memory_safety(required_mb: f64) -> (bool, String) {
     );
 
     (is_safe, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_chunk_size_returns_default_when_env_unset() {
+        assert_eq!(parse_chunk_size(None), PAGED_PREFILL_CHUNK_SIZE_DEFAULT);
+    }
+
+    #[test]
+    fn parse_chunk_size_returns_default_when_empty_string() {
+        assert_eq!(
+            parse_chunk_size(Some("".to_string())),
+            PAGED_PREFILL_CHUNK_SIZE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_chunk_size_returns_default_when_non_integer() {
+        assert_eq!(
+            parse_chunk_size(Some("abc".to_string())),
+            PAGED_PREFILL_CHUNK_SIZE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_chunk_size_returns_default_when_negative() {
+        assert_eq!(
+            parse_chunk_size(Some("-1".to_string())),
+            PAGED_PREFILL_CHUNK_SIZE_DEFAULT
+        );
+        assert_eq!(
+            parse_chunk_size(Some("-1024".to_string())),
+            PAGED_PREFILL_CHUNK_SIZE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_chunk_size_zero_is_zero() {
+        assert_eq!(parse_chunk_size(Some("0".to_string())), 0);
+    }
+
+    #[test]
+    fn parse_chunk_size_positive_returns_value() {
+        assert_eq!(parse_chunk_size(Some("1024".to_string())), 1024);
+        assert_eq!(parse_chunk_size(Some("256".to_string())), 256);
+    }
+
+    #[test]
+    fn parse_chunk_size_trims_whitespace() {
+        assert_eq!(parse_chunk_size(Some("  512  ".to_string())), 512);
+    }
 }
