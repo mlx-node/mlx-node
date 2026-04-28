@@ -171,6 +171,52 @@ pub fn get_profiling_data() -> ProfilingSession {
     }
 }
 
+/// Snapshot of MLX's GPU memory counters at this instant. All values
+/// are in bytes. On Apple Silicon, GPU and CPU share unified memory,
+/// so these are NOT a separate "VRAM" pool — they reflect MLX's own
+/// tracking of `StorageModePrivate` Metal buffers (model weights,
+/// `LayerKVPool`, transient intermediate tensors) attributed to the
+/// MLX runtime in this process.
+///
+/// Useful for live observability during long-running sessions:
+///
+/// ```js
+/// const { getMemorySnapshot } = require('@mlx-node/core');
+/// setInterval(() => {
+///   const m = getMemorySnapshot();
+///   console.log(`active=${(m.activeBytes/1e9).toFixed(2)}GB peak=${(m.peakBytes/1e9).toFixed(2)}GB cache=${(m.cacheBytes/1e9).toFixed(2)}GB`);
+/// }, 1000);
+/// ```
+#[napi(object)]
+pub struct GpuMemorySnapshot {
+    /// Current actively-used GPU buffer bytes (excludes cache pool).
+    pub active_bytes: f64,
+    /// Peak GPU buffer bytes since the last `resetPeakMemory()` call.
+    pub peak_bytes: f64,
+    /// Bytes held in MLX's caching allocator (released by `clearCache`).
+    pub cache_bytes: f64,
+}
+
+/// Sample MLX's GPU memory counters. See [`GpuMemorySnapshot`].
+#[napi]
+pub fn get_memory_snapshot() -> GpuMemorySnapshot {
+    use crate::array::{get_active_memory, get_cache_memory, get_peak_memory};
+    GpuMemorySnapshot {
+        active_bytes: get_active_memory(),
+        peak_bytes: get_peak_memory(),
+        cache_bytes: get_cache_memory(),
+    }
+}
+
+/// Reset MLX's peak-memory counter to the current active level.
+/// Useful for measuring per-request peak memory in a long-running
+/// process — call before a request, sample
+/// `getMemorySnapshot().peakBytes` after.
+#[napi]
+pub fn reset_peak_memory() {
+    crate::array::reset_peak_memory();
+}
+
 /// Clear all collected profiling data and reset session timer.
 #[napi]
 pub fn reset_profiling_data() {
