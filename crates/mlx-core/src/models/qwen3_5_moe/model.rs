@@ -686,15 +686,15 @@ impl Qwen35MoeInner {
 
     /// Set the vision encoder.
     ///
-    /// Errors when `paged_adapter` is already populated — same VLM /
-    /// paged-incompatibility rationale as the dense model.
+    /// Permits loading the vision encoder even when `paged_adapter` is
+    /// active so VLM checkpoints can run text-only inference through
+    /// the paged dispatch. See `Qwen35Inner::set_vision_encoder` (dense)
+    /// for the full rationale; in short, the chat-entry sites reject
+    /// `has_images && paged_adapter` so text-only paged turns proceed
+    /// normally while image turns surface a clear runtime error, and
+    /// for text-only inputs M-RoPE collapses to standard scalar-offset
+    /// RoPE so flat and paged byte-equal parity holds.
     pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) -> Result<()> {
-        if self.paged_adapter.is_some() {
-            return Err(Error::from_reason(
-                "Qwen3.5 MoE VLM is incompatible with use_block_paged_cache=true. \
-                 Disable the paged adapter (or omit the flag) before loading vision weights.",
-            ));
-        }
         self.vision_encoder = Some(Arc::new(enc));
         Ok(())
     }
@@ -5402,10 +5402,10 @@ pub struct Qwen3_5MoeModel {
     /// Snapshot of `Qwen35MoeInner::paged_adapter.is_some()` captured at
     /// construction time. Currently default-OFF on Qwen3.5 MoE
     /// (parity-pending — see CLAUDE.md and
-    /// `Qwen3_5MoeConfig::use_block_paged_cache`); also always `false`
-    /// on VLM checkpoints because `set_vision_encoder` rejects when the
-    /// adapter is populated. Surfaced through the `hasBlockPagedCache()`
-    /// NAPI method.
+    /// `Qwen3_5MoeConfig::use_block_paged_cache`). VLM checkpoints can
+    /// load with the adapter on for text-only inference; image-bearing
+    /// chat turns are rejected at runtime by the chat-entry sites.
+    /// Surfaced through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
@@ -5436,11 +5436,12 @@ impl Qwen3_5MoeModel {
     /// `true` iff `Qwen35MoeInner::paged_adapter` was successfully
     /// constructed at load time (driven by
     /// `Qwen3_5MoeConfig::use_block_paged_cache`, currently default-OFF
-    /// because parity is pending real-weights validation; also always
-    /// `false` on VLM checkpoints because `set_vision_encoder` rejects
-    /// when the adapter is populated). Surfaced through this NAPI method
-    /// so server endpoints can branch on it without round-tripping
-    /// through the model thread.
+    /// because parity is pending real-weights validation). On VLM
+    /// checkpoints the adapter can still be active for text-only
+    /// inference; image-bearing chat turns are rejected at runtime by
+    /// the chat-entry sites. Surfaced through this NAPI method so
+    /// server endpoints can branch on it without round-tripping through
+    /// the model thread.
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active

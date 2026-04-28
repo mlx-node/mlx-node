@@ -573,17 +573,15 @@ impl Qwen35Inner {
 
         // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
         //
-        // VLM is incompatible with paged dispatch in this revision: the
-        // M-RoPE / vision-feature path requires bespoke
-        // `forward_paged_*` plumbing that is deferred. We reject early
-        // when both the vision encoder will be loaded later and this
-        // flag is on. The vision_encoder field is populated AFTER `new`
-        // returns (via `set_vision_encoder`), so we cannot detect VLM
-        // here from `vision_encoder.is_some()`. Instead the persistence
-        // layer (`load_with_paged_guard`) checks for vision weights and
-        // refuses to flip `use_block_paged_cache` on. As a defensive
-        // backstop, the dispatch sites also reject when both fields are
-        // populated at runtime.
+        // VLM checkpoints can co-exist with paged dispatch for
+        // text-only inference: the M-RoPE / vision-feature path is
+        // only invoked when an input message carries images, and the
+        // chat-entry sites reject `has_images && paged_adapter` at
+        // runtime. Text-only forward (`Qwen3_5Attention::forward` with
+        // `position_ids = None`) and the paged forward
+        // (`Qwen3_5Attention::forward_paged`) both go through standard
+        // `self.rope`, so byte-equal parity holds on text-only inputs
+        // even on VLM weights.
         let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
             let attn_layer_count = config.full_attention_layer_count() as u32;
             if attn_layer_count == 0 {
@@ -933,18 +931,24 @@ impl Qwen35Inner {
 
     /// Set the vision encoder.
     ///
-    /// Errors when `paged_adapter` is already populated — VLM is
-    /// incompatible with paged dispatch in this revision (the M-RoPE /
-    /// vision-feature path requires bespoke `forward_paged_*` plumbing
-    /// that is deferred). Set `use_block_paged_cache: false` (or omit
-    /// it) on VLM checkpoints.
+    /// Permits loading the vision encoder even when `paged_adapter` is
+    /// active so VLM checkpoints can run text-only inference through
+    /// the paged dispatch. The actual incompatibility is the
+    /// M-RoPE / vision-feature plumbing on the paged forward path,
+    /// which only fires when an input message carries images. The
+    /// chat-entry sites (`chat_sync_core`, `chat_stream_sync_inner`,
+    /// and the MoE counterparts) reject `has_images && paged_adapter`
+    /// before dispatching, so text-only paged turns proceed normally
+    /// while image turns surface a clear runtime error.
+    ///
+    /// For text-only inputs M-RoPE collapses to standard scalar-offset
+    /// RoPE — `Qwen3_5Attention::forward` uses `self.rope` whenever
+    /// `position_ids` is `None`, which is the case for every text-only
+    /// flat call. The paged forward (`Qwen3_5Attention::forward_paged`)
+    /// also goes through `self.rope` unconditionally. Both paths share
+    /// the same RoPE on text-only inputs, so byte-equal parity holds
+    /// on VLM checkpoints provided no images are passed.
     pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) -> Result<()> {
-        if self.paged_adapter.is_some() {
-            return Err(Error::from_reason(
-                "Qwen3.5 VLM is incompatible with use_block_paged_cache=true. \
-                 Disable the paged adapter (or omit the flag) before loading vision weights.",
-            ));
-        }
         self.vision_encoder = Some(Arc::new(enc));
         Ok(())
     }
@@ -5567,9 +5571,10 @@ pub struct Qwen3_5Model {
     pub(crate) model_id: u64,
     /// Snapshot of `Qwen35Inner::paged_adapter.is_some()` captured at
     /// construction time. Currently default-OFF on Qwen3.5 (parity-pending
-    /// — see CLAUDE.md and `Qwen3_5Config::use_block_paged_cache`); also
-    /// always `false` on VLM checkpoints because `set_vision_encoder`
-    /// rejects when the adapter is populated. Surfaced through the
+    /// — see CLAUDE.md and `Qwen3_5Config::use_block_paged_cache`).
+    /// VLM checkpoints can load with the adapter on for text-only
+    /// inference; image-bearing chat turns are rejected at runtime by
+    /// the chat-entry sites. Surfaced through the
     /// `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
     /// RAII: unregisters this model's baseline from the cache-limit
@@ -5598,11 +5603,12 @@ impl Qwen3_5Model {
     /// `true` iff `Qwen35Inner::paged_adapter` was successfully
     /// constructed at load time (driven by
     /// `Qwen3_5Config::use_block_paged_cache`, currently default-OFF
-    /// because parity is pending real-weights validation; also always
-    /// `false` on VLM checkpoints because `set_vision_encoder` rejects
-    /// when the adapter is populated). Surfaced through this NAPI method
-    /// so server endpoints can branch on it without round-tripping
-    /// through the model thread.
+    /// because parity is pending real-weights validation). On VLM
+    /// checkpoints the adapter can still be active for text-only
+    /// inference; image-bearing chat turns are rejected at runtime by
+    /// the chat-entry sites. Surfaced through this NAPI method so
+    /// server endpoints can branch on it without round-tripping through
+    /// the model thread.
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
@@ -7617,11 +7623,13 @@ mod paged_construction_tests {
         );
     }
 
-    /// VLM is rejected: `set_vision_encoder` errors when paged adapter
-    /// is on.
+    /// VLM checkpoints are accepted under paged dispatch: the vision
+    /// encoder loads even with `paged_adapter` on. Text-only chat
+    /// entry points reject image-bearing turns at runtime; this test
+    /// verifies only the load-time wiring.
     #[test]
     #[ignore = "Allocates Metal LayerKVPool; gate on MLX_TEST_PAGED=1"]
-    fn test_vlm_rejected_when_paged_enabled() {
+    fn test_vlm_loads_when_paged_enabled() {
         if std::env::var_os("MLX_TEST_PAGED").is_none() {
             return;
         }
@@ -7644,13 +7652,13 @@ mod paged_construction_tests {
             Qwen3_5VisionEncoder::new(vision_cfg).expect("vision encoder construction");
         let result = inner.set_vision_encoder(vision_enc);
         assert!(
-            result.is_err(),
-            "set_vision_encoder must error when paged_adapter is Some"
+            result.is_ok(),
+            "set_vision_encoder must succeed when paged_adapter is Some so VLM \
+             checkpoints can run text-only paged inference; got {result:?}"
         );
-        let msg = result.err().unwrap().to_string();
         assert!(
-            msg.contains("VLM is incompatible") || msg.contains("use_block_paged_cache"),
-            "unexpected error message: {msg}"
+            inner.vision_encoder.is_some(),
+            "vision_encoder field must be populated after a successful set"
         );
     }
 }
