@@ -2487,6 +2487,27 @@ impl Gemma4Inner {
     /// is the paged-cache hit length.
     ///
     /// Returns the last position's logits squeezed to `[vocab]`.
+    ///
+    /// ## Prefill split (parity with the flat path)
+    ///
+    /// The flat path's `prefill_body_gemma4` processes tokens
+    /// `[0..N-1]` through `forward_body`, then the caller runs a
+    /// SECOND, single-token `forward_inner` for the final token. That
+    /// second dispatch is load-bearing — see the doc-comment on
+    /// `prefill_body_gemma4`: "SDPA computes slightly different
+    /// numerical results for multi-token causal attention vs
+    /// single-token attention with cached K/V. These small differences
+    /// compound through layers, causing divergent logits if the last
+    /// prompt token is processed in the same batch as the rest."
+    ///
+    /// This function mirrors that split for the paged path so the
+    /// K/V-cache reduction order at the prefill→decode boundary
+    /// matches between flat and paged. Without the split, BF16 SDPA
+    /// drift on the last layer's hidden state at step 0 (~1%) flips
+    /// argmax to a nearby zero-embedding `<unused>` token, causing the
+    /// `<turn|>` stop signal to be missed and the decoder to fall into
+    /// the all-zero-input cycle (`mean(V)` attention output → `id+1`
+    /// counting cascade).
     fn run_paged_prefill_chunk(
         &mut self,
         full_tokens: &[u32],
@@ -2500,198 +2521,86 @@ impl Gemma4Inner {
         }
 
         let suffix_len = suffix_tokens.len() as u32;
-        {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
-            })?;
-            adapter
-                .record_tokens(suffix_tokens)
-                .map_err(Error::from_reason)?;
-        }
-
         let layer_kinds = self.compute_layer_kinds();
-        let _ = full_tokens; // sliding re-prefill happens through the same code path below
 
         // For sliding layers we need state at position cached_prefix_len.
         // Sliding layers are restored each turn via reset_caches_sync, so
         // we need to reprefill the cached prefix through them BEFORE the
         // suffix can attend. Run a "sliding-only" pass over the prefix
-        // tokens, then a full pass over the suffix tokens.
+        // tokens, then the suffix passes below.
         if cached_prefix_len > 0 {
             let prefix = &full_tokens[..(cached_prefix_len as usize)];
             self.run_sliding_only_prefill(prefix, &layer_kinds)?;
         }
 
-        // Pass 2: full forward (sliding + global) on the suffix.
-        let input_ids = MxArray::from_uint32(suffix_tokens, &[1, suffix_len as i64])?;
-        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
-        // Apply Gemma4 embedding scaling (sqrt(hidden_size)).
-        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
-
-        // Compute PLE (per-layer embeddings) for the suffix tokens. Mirrors
-        // `forward_body`: PLE feeds an additive residual inside every
-        // layer's `apply_ffn_ple_scalar` tail. For Gemma4 E2B/E4B this is
-        // load-bearing — dropping it produces nonsense logits because each
-        // layer is missing a critical residual contribution. Only the
-        // suffix is computed here because sliding-only re-prefill of any
-        // cached prefix doesn't propagate PLE through the global layers
-        // we'll touch below (their stored K/V already accounts for it).
-        let projected_ple_suffix: Option<MxArray> = if let Some(ref ple) = self.ple {
-            let pre_layer_h = hidden_states.clone();
-            Some(compute_ple(
-                &input_ids,
-                &pre_layer_h,
-                ple,
-                suffix_len as i64,
-            )?)
-        } else {
-            None
-        };
-
-        // Build sliding mask if seq_len exceeds window. Mirrors
-        // `forward_body`'s mask logic.
-        let seq_len = suffix_len as i64;
-        let sliding_mask = if seq_len > 1 && seq_len > self.config.sliding_window as i64 {
-            let sliding_offset = self
-                .caches
-                .as_ref()
-                .and_then(|caches| {
-                    caches
-                        .iter()
-                        .enumerate()
-                        .find(|(i, _)| self.config.is_sliding_layer(*i))
-                        .map(|(_, c)| c.get_offset())
-                })
-                .unwrap_or(0);
-            Some(create_sliding_mask(
-                seq_len,
-                sliding_offset,
-                self.config.sliding_window as i64,
-            )?)
-        } else {
-            None
-        };
-
-        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
-        let num_layers = self.layers.len();
-        let first_logical_position = cached_prefix_len;
-        // Stash for sliding-anchor K/V reused by SharedOnSliding layers.
-        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
-
         crate::models::gemma4::diagnostic::set_path("paged");
         crate::models::gemma4::diagnostic::set_step(-1);
 
-        #[allow(clippy::needless_range_loop)]
-        for layer_idx in 0..num_layers {
-            crate::models::gemma4::diagnostic::set_layer(layer_idx);
-            let kind = layer_kinds[layer_idx];
-            let layer: &Gemma4DecoderLayer = unsafe {
-                let ptr = self.layers.as_ptr().add(layer_idx);
-                &*ptr
-            };
-            let mask: Option<&MxArray> = if matches!(kind, Gemma4LayerKind::Sliding) {
-                sliding_mask.as_ref()
-            } else {
-                None
-            };
-
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("run_paged_prefill_chunk: paged_adapter dropped mid-forward")
-            })?;
-            let flat_cache: Option<&mut Gemma4LayerCache> =
-                if matches!(kind, Gemma4LayerKind::Sliding) {
-                    let caches = unsafe {
-                        let raw = self.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "run_paged_prefill_chunk: sliding cache slot missing",
-                            )
-                        })? as *mut Vec<Gemma4LayerCache>;
-                        &mut *raw
-                    };
-                    Some(&mut caches[layer_idx])
-                } else {
-                    None
-                };
-
-            // Build SharedKvInputs for shared layer kinds.
-            let shared_inputs = match kind {
-                Gemma4LayerKind::SharedOnGlobal { .. } => {
-                    let total_ctx = first_logical_position + suffix_len;
-                    Some(super::decoder_layer::SharedKvInputs {
-                        cache_offset: first_logical_position as i32,
-                        total_ctx,
-                        keys: None,
-                        values: None,
-                    })
-                }
-                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
-                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "run_paged_prefill_chunk: SharedOnSliding anchor {} stash missing",
-                            anchor_layer_idx
-                        ))
-                    })?;
-                    let cache_offset =
-                        (first_logical_position as i32 + suffix_len as i32) - seq_len as i32;
-                    Some(super::decoder_layer::SharedKvInputs {
-                        cache_offset,
-                        total_ctx: 0, // unused for SharedOnSliding
-                        keys: Some(k),
-                        values: Some(v),
-                    })
-                }
-                _ => None,
-            };
-
-            // For Sliding layers that anchor a SharedOnSliding chain,
-            // request the stash so the shared layer can pull K/V.
-            let needs_stash = has_kv_sharing
-                && matches!(kind, Gemma4LayerKind::Sliding)
-                && self.config.should_store_shared_kv(layer_idx);
-
-            // Slice the per-layer PLE input ([B, T, num_layers, ple_dim] →
-            // [B, T, ple_dim]). Mirrors `forward_body`'s per-layer slice.
-            let ple_input = projected_ple_suffix.as_ref().map(|p| {
-                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
-                    .and_then(|s| s.squeeze(Some(&[2])))
-            });
-            let ple_input_ref = match &ple_input {
-                Some(Ok(arr)) => Some(arr),
-                _ => None,
-            };
-
-            hidden_states = layer.forward_paged_or_flat(
-                &hidden_states,
-                kind,
-                adapter,
-                first_logical_position,
-                cached_prefix_len,
-                /* is_prefill */ true,
-                mask,
-                flat_cache,
-                ple_input_ref,
-                needs_stash,
-                shared_inputs,
+        // Two-pass split (mirrors flat `prefill_body_gemma4 →
+        // forward_inner`):
+        //   Pass 1: tokens `[..suffix_len-1]` (no-op if suffix_len == 1).
+        //           Layer-loop only — its hidden_states are discarded;
+        //           we keep the per-layer K/V writes the loop made into
+        //           the paged pool / sliding caches.
+        //   Pass 2: the FINAL token (length 1). Now
+        //           `cached_prefix_len_for_chunk = cached_prefix_len +
+        //           suffix_len - 1`, which is > 0, so global layers
+        //           take the cache-hit `read_kv_range` branch in
+        //           `forward_paged` — the same path decode uses. This
+        //           aligns the SDPA reduction order with the flat
+        //           path's `forward_inner` dispatch.
+        if suffix_len > 1 {
+            // --- Pass 1: all-but-last suffix tokens. ---
+            let pass1_tokens = &suffix_tokens[..(suffix_len as usize - 1)];
+            {
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
+                })?;
+                adapter
+                    .record_tokens(pass1_tokens)
+                    .map_err(Error::from_reason)?;
+            }
+            let _hidden_pass1 = self.run_paged_prefill_layer_loop(
+                pass1_tokens,
+                /* first_logical_position */ cached_prefix_len,
+                /* cached_prefix_len_for_chunk */ cached_prefix_len,
+                &layer_kinds,
             )?;
 
-            // After a Sliding anchor's forward, capture its stash so
-            // downstream SharedOnSliding layers can attend over it.
-            if needs_stash {
-                let caches = unsafe {
-                    let raw = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_paged_prefill_chunk: sliding cache slot missing post-forward",
-                        )
-                    })? as *mut Vec<Gemma4LayerCache>;
-                    &mut *raw
-                };
-                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
-                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
-                }
+            // Materialize sliding-cache writes from pass 1 before pass 2
+            // reads through them. The paged pool's `update_keys_values`
+            // calls `synchronize_mlx()` internally so global-layer K/V
+            // is already on-pool, but the sliding flat caches are still
+            // lazy graphs at this point. Mirrors the
+            // `eval_gemma4_caches(caches)` call between chunks in
+            // `prefill_body_gemma4`. We deliberately do NOT eval the
+            // pass-1 hidden_states — it is discarded.
+            if let Some(caches) = self.caches.as_ref() {
+                eval_gemma4_caches(caches);
             }
+            crate::array::clear_cache();
         }
 
-        // Final norm + lm_head + softcap.
+        // --- Pass 2: the FINAL suffix token (length 1). ---
+        let pass2_tokens = &suffix_tokens[(suffix_len as usize - 1)..];
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
+            })?;
+            adapter
+                .record_tokens(pass2_tokens)
+                .map_err(Error::from_reason)?;
+        }
+        let pass2_first_position = cached_prefix_len + (suffix_len - 1);
+        let pass2_cached_prefix_len = pass2_first_position;
+        let mut hidden_states = self.run_paged_prefill_layer_loop(
+            pass2_tokens,
+            pass2_first_position,
+            pass2_cached_prefix_len,
+            &layer_kinds,
+        )?;
+
+        // Final norm + lm_head + softcap (only for the final token).
         hidden_states = self.final_norm.forward(&hidden_states)?;
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
@@ -2715,6 +2624,215 @@ impl Gemma4Inner {
             .slice_axis(1, last_seq_len - 1, last_seq_len)?
             .squeeze(Some(&[0, 1]))?;
         Ok(last)
+    }
+
+    /// One forward pass through the embed → PLE → layer-loop pipeline
+    /// for a single contiguous chunk of tokens. Returns the chunk's
+    /// post-final-layer hidden state (NO final norm / lm_head / softcap
+    /// — the caller decides whether to apply those).
+    ///
+    /// `chunk_tokens` is the slice being processed THIS call.
+    /// `first_logical_position` is the absolute logical position of
+    /// `chunk_tokens[0]` in the request (used as the RoPE offset and
+    /// the slot-mapping anchor). `cached_prefix_len_for_chunk` is the
+    /// number of K/V tokens already in the paged pool BEFORE this
+    /// chunk's writes — when this is > 0 the global-layer SDPA takes
+    /// the `read_kv_range` cache-hit branch, matching decode's
+    /// reduction order. `layer_kinds` is the per-layer routing
+    /// classification (Sliding / GlobalPaged / SharedOnGlobal /
+    /// SharedOnSliding).
+    ///
+    /// Caller must have already called `record_tokens(chunk_tokens)`
+    /// on the paged adapter so `update_keys_values`'s alignment check
+    /// (`first_logical_position == current_token_count - chunk.len()`)
+    /// passes.
+    fn run_paged_prefill_layer_loop(
+        &mut self,
+        chunk_tokens: &[u32],
+        first_logical_position: u32,
+        cached_prefix_len_for_chunk: u32,
+        layer_kinds: &[Gemma4LayerKind],
+    ) -> Result<MxArray> {
+        let chunk_len = chunk_tokens.len() as u32;
+        if chunk_len == 0 {
+            return Err(Error::from_reason(
+                "run_paged_prefill_layer_loop: chunk_tokens must be non-empty",
+            ));
+        }
+
+        let input_ids = MxArray::from_uint32(chunk_tokens, &[1, chunk_len as i64])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        // Apply Gemma4 embedding scaling (sqrt(hidden_size)).
+        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+
+        // Compute PLE (per-layer embeddings) for the chunk's tokens.
+        // Mirrors `forward_body`: PLE feeds an additive residual inside
+        // every layer's `apply_ffn_ple_scalar` tail. For Gemma4 E2B/E4B
+        // this is load-bearing — dropping it produces nonsense logits
+        // because each layer is missing a critical residual
+        // contribution. Sliding-only re-prefill of any cached prefix
+        // doesn't propagate PLE through the global layers we'll touch
+        // here (their stored K/V already accounts for it).
+        let projected_ple: Option<MxArray> = if let Some(ref ple) = self.ple {
+            let pre_layer_h = hidden_states.clone();
+            Some(compute_ple(
+                &input_ids,
+                &pre_layer_h,
+                ple,
+                chunk_len as i64,
+            )?)
+        } else {
+            None
+        };
+
+        // Build sliding mask if seq_len exceeds window. Mirrors
+        // `forward_body`'s mask logic.
+        let seq_len = chunk_len as i64;
+        let sliding_mask = if seq_len > 1 && seq_len > self.config.sliding_window as i64 {
+            let sliding_offset = self
+                .caches
+                .as_ref()
+                .and_then(|caches| {
+                    caches
+                        .iter()
+                        .enumerate()
+                        .find(|(i, _)| self.config.is_sliding_layer(*i))
+                        .map(|(_, c)| c.get_offset())
+                })
+                .unwrap_or(0);
+            Some(create_sliding_mask(
+                seq_len,
+                sliding_offset,
+                self.config.sliding_window as i64,
+            )?)
+        } else {
+            None
+        };
+
+        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
+        let num_layers = self.layers.len();
+        // Stash for sliding-anchor K/V reused by SharedOnSliding layers.
+        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
+
+        #[allow(clippy::needless_range_loop)]
+        for layer_idx in 0..num_layers {
+            crate::models::gemma4::diagnostic::set_layer(layer_idx);
+            let kind = layer_kinds[layer_idx];
+            let layer: &Gemma4DecoderLayer = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            let mask: Option<&MxArray> = if matches!(kind, Gemma4LayerKind::Sliding) {
+                sliding_mask.as_ref()
+            } else {
+                None
+            };
+
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason(
+                    "run_paged_prefill_layer_loop: paged_adapter dropped mid-forward",
+                )
+            })?;
+            let flat_cache: Option<&mut Gemma4LayerCache> =
+                if matches!(kind, Gemma4LayerKind::Sliding) {
+                    let caches = unsafe {
+                        let raw = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "run_paged_prefill_layer_loop: sliding cache slot missing",
+                            )
+                        })? as *mut Vec<Gemma4LayerCache>;
+                        &mut *raw
+                    };
+                    Some(&mut caches[layer_idx])
+                } else {
+                    None
+                };
+
+            // Build SharedKvInputs for shared layer kinds.
+            let shared_inputs = match kind {
+                Gemma4LayerKind::SharedOnGlobal { .. } => {
+                    // Anchor's pool currently holds
+                    // `cached_prefix_len_for_chunk + chunk_len` tokens
+                    // for this layer (the anchor wrote its part of
+                    // this chunk earlier in the same loop).
+                    let total_ctx = cached_prefix_len_for_chunk + chunk_len;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset: first_logical_position as i32,
+                        total_ctx,
+                        keys: None,
+                        values: None,
+                    })
+                }
+                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "run_paged_prefill_layer_loop: SharedOnSliding anchor {} stash \
+                             missing",
+                            anchor_layer_idx
+                        ))
+                    })?;
+                    let cache_offset =
+                        (first_logical_position as i32 + chunk_len as i32) - seq_len as i32;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset,
+                        total_ctx: 0, // unused for SharedOnSliding
+                        keys: Some(k),
+                        values: Some(v),
+                    })
+                }
+                _ => None,
+            };
+
+            // For Sliding layers that anchor a SharedOnSliding chain,
+            // request the stash so the shared layer can pull K/V.
+            let needs_stash = has_kv_sharing
+                && matches!(kind, Gemma4LayerKind::Sliding)
+                && self.config.should_store_shared_kv(layer_idx);
+
+            // Slice the per-layer PLE input ([B, T, num_layers, ple_dim] →
+            // [B, T, ple_dim]). Mirrors `forward_body`'s per-layer slice.
+            let ple_input = projected_ple.as_ref().map(|p| {
+                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
+                    .and_then(|s| s.squeeze(Some(&[2])))
+            });
+            let ple_input_ref = match &ple_input {
+                Some(Ok(arr)) => Some(arr),
+                _ => None,
+            };
+
+            hidden_states = layer.forward_paged_or_flat(
+                &hidden_states,
+                kind,
+                adapter,
+                first_logical_position,
+                cached_prefix_len_for_chunk,
+                /* is_prefill */ true,
+                mask,
+                flat_cache,
+                ple_input_ref,
+                needs_stash,
+                shared_inputs,
+            )?;
+
+            // After a Sliding anchor's forward, capture its stash so
+            // downstream SharedOnSliding layers can attend over it.
+            if needs_stash {
+                let caches = unsafe {
+                    let raw = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "run_paged_prefill_layer_loop: sliding cache slot missing \
+                             post-forward",
+                        )
+                    })? as *mut Vec<Gemma4LayerCache>;
+                    &mut *raw
+                };
+                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
+                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
+                }
+            }
+        }
+
+        Ok(hidden_states)
     }
 
     /// Run one paged decode step: feed `[token_id]` through the model.

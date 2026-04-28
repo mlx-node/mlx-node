@@ -495,29 +495,33 @@ impl Gemma4Attention {
 
         // 7. Compute attention output. Gemma4's attention scale is 1.0
         //    (the QK norm handles scaling).
-        let attn_bhtd = if is_prefill {
+        //
+        // Single-token query path (`seq_len == 1`) ALWAYS takes the
+        // mask=None branch regardless of `is_prefill` /
+        // `cached_prefix_len`. The query is at logical position
+        // `first_logical_position` and every key in
+        // `[0, first_logical_position + 1)` is at a strictly-earlier
+        // (or equal) position, so a causal mask never filters anything
+        // out. But MLX dispatches `scaled_dot_product_attention` to
+        // different kernels with vs. without an explicit mask, and the
+        // mask-bearing kernel uses a different BF16 reduction order.
+        // For Gemma4 paged-vs-flat parity at the prefill→decode
+        // boundary (split-prefill pass 2 and every decode step) we
+        // need the SAME kernel as flat decode (`scaled_dot_product_
+        // attention(..., None)` at attention.rs:319) — without this,
+        // the K/V written for the last prompt position diverges from
+        // the flat cache by a few ULP per layer in BF16, which
+        // compounds into an argmax flip on the first decode step.
+        let attn_bhtd = if is_prefill && seq_len > 1 {
             if cached_prefix_len == 0 {
-                // Fresh prefill: SDPA over in-flight Q/K/V with internal
-                // causal mask.
-                if seq_len > 1 {
-                    scaled_dot_product_attention_causal(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        1.0,
-                    )?
-                } else {
-                    scaled_dot_product_attention(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        1.0,
-                        None,
-                    )?
-                }
+                // Fresh multi-token prefill: SDPA over in-flight Q/K/V
+                // with internal causal mask.
+                scaled_dot_product_attention_causal(&queries_bhtd, &keys_bhtd, &values_bhtd, 1.0)?
             } else {
-                // Cache-hit prefill: read full [0, total_ctx) K/V back
-                // from the pool. The suffix was just written above.
+                // Cache-hit multi-token prefill: read full
+                // [0, total_ctx) K/V back from the pool with an
+                // explicit causal+offset mask. The suffix was just
+                // written above.
                 let total_ctx = cached_prefix_len + (seq_len as u32);
                 let (k_full, v_full) = adapter
                     .read_kv_range(paged_idx, 0, total_ctx)
@@ -527,15 +531,16 @@ impl Gemma4Attention {
                 scaled_dot_product_attention(&queries_bhtd, &k_full, &v_full, 1.0, Some(&mask))?
             }
         } else {
-            // Decode: read FULL `[0, total_ctx)` K/V back from the pool
-            // (the new K/V was just written by `update_keys_values`) and
-            // run MLX's SDPA. Same rationale as Qwen3's
-            // `forward_paged_adapter`: this matches the flat path's
-            // reduction order bit-for-bit, while the dedicated
-            // `gather_kv_for_decode` Metal kernel drifts a few ULP per
-            // layer in BF16. Use mask=None — every cached key is at a
-            // strictly earlier (or equal) position.
-            let total_ctx = first_logical_position + 1;
+            // Single-token path (decode OR split-prefill pass 2):
+            // read full `[0, total_ctx)` K/V back from the pool (the
+            // new K/V was just written by `update_keys_values`) and
+            // run MLX's SDPA with mask=None — every cached key is at
+            // a strictly earlier (or equal) position. Same rationale
+            // as Qwen3's `forward_paged_adapter`: this matches the
+            // flat path's reduction order bit-for-bit, while the
+            // dedicated `gather_kv_for_decode` Metal kernel drifts a
+            // few ULP per layer in BF16.
+            let total_ctx = first_logical_position + (seq_len as u32);
             let (k_full, v_full) = adapter
                 .read_kv_range(paged_idx, 0, total_ctx)
                 .map_err(napi::Error::from_reason)?;
