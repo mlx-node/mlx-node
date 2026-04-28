@@ -423,6 +423,14 @@ mod tests {
     //! K/V dtype, and the chunked path is compared against the
     //! single-shot path on a same-prompt fresh-adapter run.
     //!
+    //! Each parity test pins MLX's PRNG via `mlx_sys::mlx_seed` before
+    //! constructing the model so weight init is reproducible across
+    //! `cargo test` invocations. Without that, weight init varies per
+    //! run and the chunked-vs-single-shot drift magnitude wanders from
+    //! `~5e-2` to `~2e-1` with occasional argmax flips, which would
+    //! turn the parity assertion into a flaky check. With a fixed
+    //! seed both `max_abs_diff` and the argmax index are bit-stable.
+    //!
     //! All tests skip cleanly when no Metal device is available
     //! (the standard `if msg.contains("No Metal device") { return; }`
     //! guard from Phase B's tests). They also skip when the env var
@@ -718,10 +726,18 @@ mod tests {
     /// single-shot path (chunk_size=0). This is the primary correctness
     /// guarantee: if any chunk-boundary bug exists in either the
     /// full-attention K/V write path OR the GDN linear-attention
-    /// recurrent-state propagation, this test fails — single-shot is
-    /// the byte-equivalent reference.
+    /// recurrent-state propagation, this test fails. Asserts via
+    /// `assert_logit_parity_relaxed` (tight `max_abs_diff <= 0.25` +
+    /// argmax-must-match — see helper rustdoc for tolerance rationale).
+    ///
+    /// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
+    /// chunked-vs-single-shot drift is reproducible across runs;
+    /// observed `max_abs_diff = 0.0693`, argmax stable at idx=69.
     #[test]
     fn test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits() {
+        unsafe {
+            mlx_sys::mlx_seed(0xC0DEC0DE);
+        }
         let cfg = moe_paged_tiny_config();
         let mut inner = match Qwen35MoeInner::new(cfg.clone()) {
             Ok(i) => i,
@@ -783,9 +799,17 @@ mod tests {
     /// aligned to a block boundary, and the explicit causal mask in
     /// the full-attention path must be built with `num_tokens=1,
     /// offset=96`. Compared against single-shot for the same 97-token
-    /// prompt.
+    /// prompt. Asserts via `assert_logit_parity_relaxed` (tight
+    /// `max_abs_diff <= 0.25` + argmax-must-match — see helper rustdoc).
+    ///
+    /// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
+    /// chunked-vs-single-shot drift is reproducible across runs;
+    /// observed `max_abs_diff = 0.1199`, argmax stable at idx=80.
     #[test]
     fn test_chunked_prefill_qwen3_5_moe_uneven_tail() {
+        unsafe {
+            mlx_sys::mlx_seed(0xC0DEC0DE);
+        }
         let cfg = moe_paged_tiny_config();
         let mut inner = match Qwen35MoeInner::new(cfg.clone()) {
             Ok(i) => i,
@@ -835,44 +859,53 @@ mod tests {
         );
     }
 
-    /// Structural parity assertion suited to MoE + GDN with **random-init
-    /// weights**.
+    /// Real parity assertion for MoE chunked-vs-single-shot.
     ///
-    /// **Why not numerical parity**: The MoE path is materially more
-    /// dtype-sensitive than dense Qwen3. GDN linear-attention accumulates
-    /// a recurrent state across tokens (chunk boundaries change the
-    /// order of bf16 fma'd into the same accumulator), and the per-layer
-    /// MoE router does a softmax + top-k that can flip border-line
-    /// expert selections under bf16 noise. With random-init weights and
-    /// small dims (this synthetic config), individual logits drift by
-    /// `O(1e-1)` and even argmax can flip in arbitrary positions across
-    /// runs; the dense Qwen3 `5e-3` budget does NOT hold here, and even
-    /// argmax-stability tests with `1e-1` bands flake intermittently.
+    /// **Determinism gate**: callers must seed `mlx_sys::mlx_seed` to a
+    /// fixed value at the top of the test before constructing
+    /// `Qwen35MoeInner`. With a fixed seed, MLX's random init produces
+    /// byte-equal weights across `cargo test` invocations, and the
+    /// downstream chunked-vs-single-shot logit drift is reproducible
+    /// (verified bit-stable across 5 consecutive runs with seed
+    /// `0xC0DEC0DE`). Without a seed, weight init varies per run and
+    /// the drift magnitude can range from `~5e-2` to `~2e-1` with
+    /// occasional argmax flips, which is what made the original
+    /// finiteness-only assertion structurally weak — it would also
+    /// pass for a deterministic-but-wrong chunking path.
     ///
-    /// Numerical parity for MoE chunked-vs-single-shot is verified
-    /// instead by the existing flat-path integration test in
-    /// `crates/mlx-core/tests/qwen3_5_moe_chunked_prefill.rs`
-    /// (`test_chunked_prefill_matches_single_shot`), which uses
-    /// **real Qwen3.5 MoE checkpoint weights** and asserts byte-identical
-    /// greedy-decoded token streams across two runs of the same
-    /// long-context prompt. With trained weights expert routing is
-    /// confident enough that border-line flips don't occur, so
-    /// token-level equality holds. Random-init synthetic tests can't
-    /// reproduce that property.
+    /// **Tolerance choice**: bf16 paged K/V (the pool's hard
+    /// requirement) + GDN linear-attention's recurrent state mutating
+    /// in chunk-sized batches + MoE softmax+top-k under bf16 noise add
+    /// up to `~1e-1` of element-wise drift between chunked and
+    /// single-shot at this synthetic config size. The dense Qwen3
+    /// `5e-3` budget would falsely flag this as a regression, so we
+    /// allow `max_abs_diff <= 0.25` — comfortably above the observed
+    /// `0.07` (matches test) / `0.12` (uneven-tail test) drift but
+    /// far below the `O(1)` divergence any real chunking bug would
+    /// produce (e.g. GDN state reset between chunks, K/V write to
+    /// wrong slot, position off-by-one — all of those amplify through
+    /// 8 layers + softmax to either NaN/Inf or a complete logit
+    /// reshuffle). Argmax must match — a "deterministic finite
+    /// wrong" chunked path is overwhelmingly likely to flip the
+    /// argmax under any real bug, since the small bf16 noise we
+    /// tolerate is weight-driven and can't move argmax under fixed
+    /// weights.
     ///
-    /// **What this assertion does check**:
+    /// **Why not byte-equal**: The dense Qwen3 Phase B inline parity
+    /// tests (in `crates/mlx-core/src/models/qwen3/model.rs`) hit
+    /// byte-equal `max_abs_diff = 0` because that model has 2 layers,
+    /// no GDN, no MoE — bf16 fma orderings happen to align across
+    /// chunk boundaries at that scale. Adding GDN's recurrent fma
+    /// chain and MoE's per-token softmax routing breaks bit-equality
+    /// without breaking semantic equality.
     ///
-    /// 1. Vector length parity (vocab size lines up on both paths).
-    /// 2. **Finiteness on both paths** (NO NaN, NO Inf). This is the
-    ///    load-bearing structural check — the regressions Phase C
-    ///    could introduce (GDN state reset between chunks, position
-    ///    off-by-one in the layer loop, mask misalignment, paged-pool
-    ///    K/V write to wrong slots) all surface as NaN/Inf within a
-    ///    few layers because the recurrent accumulator or the softmax
-    ///    over an unmasked future amplifies bf16 zeros into infinities.
-    /// 3. Diagnostic stats (`max_abs_diff`, argmax of each path) are
-    ///    emitted to the test log so a human reading the output can
-    ///    eyeball whether the magnitudes are within expectation.
+    /// Numerical parity on **real Qwen3.5 MoE checkpoint weights** is
+    /// gated separately by the integration test in
+    /// `crates/mlx-core/tests/qwen3_5_moe_chunked_prefill.rs` (which
+    /// asserts byte-identical greedy-decoded token streams under a
+    /// real prompt). That test runs only when a checkpoint is on
+    /// disk; this synthetic test runs always and gates against the
+    /// regressions any real chunking bug would produce.
     fn assert_logit_parity_relaxed(single_vec: &[f32], chunked_vec: &[f32], label: &str) {
         assert_eq!(
             single_vec.len(),
@@ -880,7 +913,8 @@ mod tests {
             "{label}: vector length mismatch"
         );
 
-        // Finiteness on both paths.
+        // Finiteness on both paths. NaN/Inf would short-circuit the
+        // numeric checks below, so assert separately first.
         for (i, v) in single_vec.iter().enumerate() {
             assert!(
                 v.is_finite(),
@@ -894,9 +928,6 @@ mod tests {
             );
         }
 
-        // Diagnostic stats (no assertion). Useful when reading test
-        // output — if max_abs_diff is e.g. 50 instead of 1e-1, that's
-        // a structural bug visible at a glance.
         let argmax = |v: &[f32]| -> (usize, f32) {
             v.iter()
                 .enumerate()
@@ -907,18 +938,41 @@ mod tests {
         let (idx_single, val_single) = argmax(single_vec);
         let (idx_chunked, val_chunked) = argmax(chunked_vec);
         let mut max_abs_diff = 0.0f32;
-        for (a, b) in single_vec.iter().zip(chunked_vec.iter()) {
+        let mut argmax_diff_idx = 0usize;
+        for (i, (a, b)) in single_vec.iter().zip(chunked_vec.iter()).enumerate() {
             let d = (a - b).abs();
             if d > max_abs_diff {
                 max_abs_diff = d;
+                argmax_diff_idx = i;
             }
         }
+
         eprintln!(
-            "{label}: max_abs_diff={max_abs_diff}, single-shot argmax=(idx={idx_single}, \
-             val={val_single}), chunked argmax=(idx={idx_chunked}, val={val_chunked}) over \
-             {} elements. (Random-init synthetic test asserts only finiteness; numerical \
-             parity is gated by `qwen3_5_moe_chunked_prefill` integration test on real weights.)",
+            "{label}: max_abs_diff={max_abs_diff} (at idx={argmax_diff_idx}), single-shot \
+             argmax=(idx={idx_single}, val={val_single}), chunked argmax=(idx={idx_chunked}, \
+             val={val_chunked}) over {} elements",
             single_vec.len()
+        );
+
+        // Hard parity bounds — the real assertions a chunking bug must
+        // surface against. See the rustdoc above for tolerance rationale.
+        const ATOL: f32 = 0.25;
+        assert!(
+            max_abs_diff <= ATOL,
+            "{label}: max_abs_diff {max_abs_diff} exceeds tolerance {ATOL} \
+             (at idx={argmax_diff_idx}: single={}, chunked={}). A real chunking \
+             regression — GDN state reset between chunks, position off-by-one in \
+             the layer loop, mask misalignment, or paged-pool K/V write to wrong \
+             slots — would surface here. Re-seed only after investigating.",
+            single_vec[argmax_diff_idx],
+            chunked_vec[argmax_diff_idx]
+        );
+        assert_eq!(
+            idx_single, idx_chunked,
+            "{label}: argmax flipped (single={idx_single} val={val_single}, \
+             chunked={idx_chunked} val={val_chunked}). Under a fixed mlx_seed, \
+             argmax flipping is the canonical signature of a chunking bug — bf16 \
+             noise alone cannot move argmax under fixed weights."
         );
     }
 
