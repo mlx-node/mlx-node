@@ -8976,6 +8976,18 @@ mod tests {
     /// signature stable.
     #[test]
     fn test_run_paged_prefill_chunk_default_matches_single_shot() {
+        // Skip when MLX_PAGED_PREFILL_CHUNK_SIZE is set in the env: the
+        // OnceLock-cached `paged_prefill_chunk_size()` is process-global, and
+        // a positive value smaller than the 8-token prompt would route the
+        // public wrapper through the chunked branch instead of the legacy
+        // path this test is meant to exercise.
+        if crate::array::memory::paged_prefill_chunk_size() != 0 {
+            eprintln!(
+                "skipping test_run_paged_prefill_chunk_default_matches_single_shot: \
+                 MLX_PAGED_PREFILL_CHUNK_SIZE is set, default-path coverage is environment-dependent"
+            );
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
