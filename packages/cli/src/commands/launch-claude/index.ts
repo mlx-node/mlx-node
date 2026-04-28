@@ -14,6 +14,7 @@ import { createServer } from '@mlx-node/server';
 import { resolveMlxNodeHome, resolveModelsDir } from '../../config.js';
 import { discoverModels } from './discover.js';
 import { attachLogger, resolveLogDir, type Logger } from './logger.js';
+import { cleanupPagedOverrides, resolvePagedAwareModelPath } from './paged-config-override.js';
 import { makeSwapController } from './swap.js';
 
 function printHelp(): void {
@@ -155,7 +156,13 @@ export async function run(argv: string[]): Promise<void> {
     resolveModel: (name) => ctrlRef.current!.resolveModel(name),
     listModels: () => ctrlRef.current!.listModels(),
   });
-  ctrlRef.current = makeSwapController(discovered, server.registry, loadModel, boundModel.name);
+  // Wrap loadModel so Qwen3.5 dense / MoE checkpoints get
+  // `use_block_paged_cache: true` injected via a temp-dir clone with
+  // patched config.json (see ./paged-config-override.ts for why this
+  // command turns paged ON despite the upstream Qwen3.5 default being
+  // OFF). Other model types pass through unmodified.
+  const loadModelPagedAware = async (path: string) => loadModel(await resolvePagedAwareModelPath(path));
+  ctrlRef.current = makeSwapController(discovered, server.registry, loadModelPagedAware, boundModel.name);
 
   // Verbose logging: attach AFTER `createServer` so we wrap every
   // incoming request (including `GET /v1/models` which claude fires
@@ -205,6 +212,11 @@ export async function run(argv: string[]): Promise<void> {
     }
     try {
       await server.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await cleanupPagedOverrides();
     } catch {
       /* ignore */
     }
