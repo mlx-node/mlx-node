@@ -8422,15 +8422,35 @@ mod tests {
         }
     }
 
-    /// **Phase B state test**: chunk-by-chunk the adapter's bookkeeping
-    /// must advance correctly. After each chunk:
-    /// * `current_token_count()` equals the cumulative chunk_lens fed.
-    /// * `request_tokens()` length matches the cumulative count.
-    /// * `block_table().num_blocks()` grows lazily — with `block_size=16`
-    ///   and 16-token chunks, each chunk lands on a fresh block.
+    /// **Phase B state test (per-chunk progression)**: drive the chunked
+    /// prefill chunk-by-chunk through `run_paged_prefill_one_chunk` and
+    /// assert the adapter's bookkeeping advances correctly **after every
+    /// chunk**, not just at the end.
     ///
-    /// Uses the `_with_size` helper directly so we can drive the chunked
-    /// path without env var mutation.
+    /// Why this matters: a previous version of this test fed the entire
+    /// 64-token prompt through `run_paged_prefill_chunk_with_size` once
+    /// and only checked final state. That assertion would still pass if
+    /// the implementation silently recorded the whole suffix in one shot
+    /// (no real chunking) or never grew `block_table` at chunk
+    /// boundaries — exactly the regressions the test is supposed to catch.
+    ///
+    /// What this test asserts after EACH of the 4 chunks (16 tokens each,
+    /// `block_size=16`):
+    /// * `adapter.current_token_count()` equals the cumulative tokens fed
+    ///   so far (16, 32, 48, 64).
+    /// * `adapter.request_tokens().len()` matches that same cumulative
+    ///   count (the slice itself byte-equals `prompt[..cumulative]`).
+    /// * `adapter.block_table().num_blocks()` is at least
+    ///   `ceil(cumulative / block_size)` — i.e. lazy growth never lags
+    ///   behind the cursor. With `block_size=16` and 16-token chunks this
+    ///   tightens to exactly `cumulative / 16` per chunk (1, 2, 3, 4),
+    ///   but the assertion uses `>=` so we don't pin block-table growth
+    ///   policy harder than the contract requires.
+    ///
+    /// Drives `run_paged_prefill_one_chunk` directly (it lives in the
+    /// same crate's `pub(crate)` impl block, and this test module sits
+    /// inside it). That bypasses the chunked driver loop while exercising
+    /// the same per-chunk state-advancement code paths the driver runs.
     #[test]
     fn test_chunked_prefill_advances_adapter_state() {
         let cfg = paged_tiny_config(Some(true));
@@ -8449,12 +8469,14 @@ mod tests {
         };
         cast_qwen3_inner_weights_bf16(&mut inner);
 
-        // 64 tokens, chunk_size 16 → 4 chunks, each filling exactly one
-        // block (block_size = 16 in paged_tiny_config). After chunk N the
-        // block table must have exactly N blocks.
+        // 64 tokens, chunk_size 16 → 4 chunks at block_size=16. After
+        // chunk N the block table must have ≥ ceil(N*16 / 16) = N blocks.
         let prompt: Vec<u32> = (0u32..64).map(|i| (i * 11 + 5) % 100).collect();
         let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
         let num_layers = inner.layers.len();
+        let block_size = cfg
+            .paged_block_size
+            .expect("block_size in paged_tiny_config");
 
         {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
@@ -8468,43 +8490,481 @@ mod tests {
                 .expect("allocate_suffix_blocks");
         }
 
-        // Run the full chunked prefill.
-        match inner.run_paged_prefill_chunk_with_size(
+        // Pre-flight: nothing fed yet → cursor at 0, no recorded tokens.
+        // (block_table may already hold preallocated suffix blocks from
+        // `allocate_suffix_blocks` above; we don't pin its starting size
+        // here, only verify it grows as cumulative tokens cross block
+        // boundaries below.)
+        {
+            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+            assert_eq!(adapter.current_token_count(), 0, "pre-flight cursor");
+            assert_eq!(
+                adapter.request_tokens().len(),
+                0,
+                "pre-flight request_tokens"
+            );
+        }
+
+        // Drive chunk-by-chunk. For each chunk we:
+        //   1. Call `run_paged_prefill_one_chunk(chunk, chunk_first_pos, ...)`,
+        //      which is the same per-chunk inner the chunked driver loops
+        //      over.
+        //   2. Materialize the residual stream (matches the driver's
+        //      `hidden.eval()` between chunks so the lazy graph doesn't
+        //      pile up).
+        //   3. Assert cursor / request_tokens / block_table reflect the
+        //      cumulative chunks processed so far.
+        let chunk_size_usize: usize = 16;
+        let mut cumulative: usize = 0;
+        for (chunk_idx, chunk) in prompt.chunks(chunk_size_usize).enumerate() {
+            let chunk_first_position = cumulative as u32;
+            let hidden = match inner.run_paged_prefill_one_chunk(
+                chunk,
+                chunk_first_position,
+                num_layers,
+                &positions,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    let msg = e.reason.to_string();
+                    if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                        eprintln!("skipping test_chunked_prefill_advances_adapter_state: {msg}");
+                        return;
+                    }
+                    panic!("unexpected per-chunk prefill failure on chunk {chunk_idx}: {msg}");
+                }
+            };
+            // Mirror the driver loop: eval to release upstream graph
+            // nodes before starting the next chunk's forward.
+            hidden.eval();
+            synchronize_and_clear_cache();
+
+            cumulative += chunk.len();
+
+            // Per-chunk assertions on adapter state.
+            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+            assert_eq!(
+                adapter.current_token_count() as usize,
+                cumulative,
+                "after chunk {chunk_idx}: cursor must equal cumulative tokens fed \
+                 ({cumulative}), got {}",
+                adapter.current_token_count()
+            );
+            assert_eq!(
+                adapter.request_tokens().len(),
+                cumulative,
+                "after chunk {chunk_idx}: request_tokens len must equal cumulative \
+                 tokens fed ({cumulative}), got {}",
+                adapter.request_tokens().len()
+            );
+            assert_eq!(
+                adapter.request_tokens(),
+                &prompt[..cumulative],
+                "after chunk {chunk_idx}: request_tokens must byte-equal the cumulative \
+                 prefix of the prompt"
+            );
+            // Lazy growth lower bound: enough blocks to cover every
+            // cumulative token. ceil(cumulative / block_size).
+            let block_table = adapter.block_table().expect("block_table");
+            let required_blocks = (cumulative as u32).div_ceil(block_size) as usize;
+            assert!(
+                block_table.num_blocks() >= required_blocks,
+                "after chunk {chunk_idx}: block_table.num_blocks() ({}) must be ≥ \
+                 ceil({cumulative} / {block_size}) = {required_blocks}",
+                block_table.num_blocks()
+            );
+        }
+
+        assert_eq!(
+            cumulative,
+            prompt.len(),
+            "loop must consume every prompt token"
+        );
+
+        // Cleanup.
+        {
+            let adapter = inner.paged_adapter.as_mut().unwrap();
+            let _ = adapter.register_full_blocks_for_reuse(&[]);
+            adapter.release_request().expect("release_request");
+        }
+    }
+
+    /// **Phase B uneven-tail parity test**: prove the chunked path handles
+    /// a final partial chunk correctly. 97 tokens at chunk_size=16 produces
+    /// 6 full chunks of 16 tokens + 1 trailing chunk of 1 token. This is
+    /// the worst case for off-by-one bugs at chunk boundaries (the trailing
+    /// 1-token chunk's `chunk_first_position` is 96, not aligned to a block
+    /// boundary; the explicit causal mask in `forward_paged_adapter` must
+    /// be built with `num_tokens=1, offset=96` rather than rounding either
+    /// up or down).
+    ///
+    /// Compares the post-prefill `[vocab]` logits between chunked
+    /// (chunk_size=16) and single-shot (chunk_size=0) runs over the same
+    /// 97-token prompt. Tolerance budget mirrors the multi-chunk parity
+    /// test (atol=rtol=5e-3 for bf16 + chunk-boundary fma reorderings).
+    ///
+    /// Skips on no-Metal hosts.
+    #[test]
+    fn test_chunked_prefill_uneven_tail_matches_single_shot() {
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!(
+                        "skipping test_chunked_prefill_uneven_tail_matches_single_shot \
+                         (no Metal): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Qwen3Inner::new failure: {msg}");
+            }
+        };
+        cast_qwen3_inner_weights_bf16(&mut inner);
+
+        // 97 tokens — 96 = 6*16 full chunks + 1 leftover token. Need
+        // max_position_embeddings >= 97; paged_tiny_config gives 128.
+        let prompt: Vec<u32> = (0u32..97).map(|i| (i * 13 + 7) % 100).collect();
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let num_layers = inner.layers.len();
+
+        // ---- Run 1: single-shot ----
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.reset_for_new_request(0).expect("reset");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32)
+                .expect("allocate_suffix_blocks");
+        }
+        let logits_single = match inner.run_paged_prefill_chunk_with_size(
             &prompt, /* first_logical_position */ 0, num_layers, &positions,
-            /* chunk_size */ 16,
+            /* chunk_size */ 0,
         ) {
-            Ok(_) => {}
+            Ok(l) => l,
             Err(e) => {
                 let msg = e.reason.to_string();
                 if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
-                    eprintln!("skipping test_chunked_prefill_advances_adapter_state: {msg}");
+                    eprintln!(
+                        "skipping test_chunked_prefill_uneven_tail_matches_single_shot: {msg}"
+                    );
                     return;
                 }
-                panic!("unexpected chunked prefill failure: {msg}");
+                panic!("unexpected single-shot prefill failure: {msg}");
             }
         };
+        let single_vec = logits_to_f32_vec(&logits_single);
+        assert_eq!(single_vec.len(), cfg.vocab_size as usize);
 
-        // Post-prefill: cursor must equal 64 (every chunk's record_tokens
-        // ran), request_tokens must match the prompt verbatim, and the
-        // block table must have grown to cover all 64 tokens (≥4 blocks
-        // at block_size=16).
-        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+        // Reset adapter for the second run.
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.release_request().expect("release_request");
+            adapter.reset_for_new_request(0).expect("reset");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[])
+                .expect("find_cached_prefix");
+            assert_eq!(
+                prefix.cached_token_count, 0,
+                "second run must not see registered blocks from first run \
+                 (no register_full_blocks call between runs)"
+            );
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32)
+                .expect("allocate_suffix_blocks");
+        }
+
+        // ---- Run 2: chunked, 7 chunks (6 of size 16 + 1 of size 1) ----
+        let logits_chunked = inner
+            .run_paged_prefill_chunk_with_size(
+                &prompt, /* first_logical_position */ 0, num_layers, &positions,
+                /* chunk_size */ 16,
+            )
+            .expect("uneven-tail chunked prefill");
+        let chunked_vec = logits_to_f32_vec(&logits_chunked);
+        assert_eq!(chunked_vec.len(), cfg.vocab_size as usize);
+
+        // Confirm we actually exercised a 1-token trailing chunk: cursor
+        // must equal 97 after the run.
+        {
+            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+            assert_eq!(
+                adapter.current_token_count(),
+                97,
+                "uneven-tail chunked prefill must record all 97 tokens \
+                 (including the trailing 1-token chunk)"
+            );
+        }
+
+        let atol = 5e-3f32;
+        let rtol = 5e-3f32;
+        let mut max_abs_diff = 0.0f32;
+        let mut max_rel_diff = 0.0f32;
+        for (i, (a, b)) in single_vec.iter().zip(chunked_vec.iter()).enumerate() {
+            assert!(
+                b.is_finite(),
+                "uneven-tail chunked logits[{i}] not finite: {b}"
+            );
+            let abs_diff = (a - b).abs();
+            let rel_diff = abs_diff / (a.abs().max(b.abs()).max(1e-6));
+            if abs_diff > max_abs_diff {
+                max_abs_diff = abs_diff;
+            }
+            if rel_diff > max_rel_diff {
+                max_rel_diff = rel_diff;
+            }
+            assert!(
+                abs_diff <= atol || rel_diff <= rtol,
+                "uneven-tail logits diverge at index {i}: single={a}, chunked={b}, \
+                 abs_diff={abs_diff}, rel_diff={rel_diff} (max allowed: \
+                 atol={atol} or rtol={rtol})"
+            );
+        }
+        eprintln!(
+            "uneven-tail chunked-prefill parity max_abs_diff={max_abs_diff}, \
+             max_rel_diff={max_rel_diff} (atol={atol}, rtol={rtol}) over {} elements",
+            single_vec.len()
+        );
+
+        {
+            let adapter = inner.paged_adapter.as_mut().unwrap();
+            let _ = adapter.register_full_blocks_for_reuse(&[]);
+            adapter.release_request().expect("release_request");
+        }
+    }
+
+    /// **Phase B cached-prefix parity test**: exercise the
+    /// `cached_prefix_len > 0` (Q < K) branch of `forward_paged_adapter`
+    /// that the chunked path relies on for chunks N>0 — but with a
+    /// genuinely non-zero cached prefix at the START of the prefill
+    /// (rather than only synthesized by the chunked driver itself).
+    ///
+    /// Setup uses the practical proxy from the spec: turn 1 prefills the
+    /// first 32 tokens, registers full blocks, releases. Turn 2 then
+    /// prefills the full 96-token prompt (whose first 32 tokens are
+    /// identical to turn 1's). On turn 2, `find_cached_prefix` returns
+    /// `cached_token_count = 32`, so the prefill that follows runs over
+    /// a 64-token suffix while the adapter already holds 32 cached
+    /// tokens — exactly the state the chunked path's middle chunks see.
+    ///
+    /// We then run turn 2 twice on a freshly-reset prefix-cache state:
+    /// once chunked (chunk_size=16, 4 chunks of 16 tokens each over the
+    /// 64-token suffix) and once single-shot (chunk_size=0). Both must
+    /// produce the same final-token logits.
+    ///
+    /// Tolerance: same atol=rtol=5e-3 budget as the other parity tests.
+    #[test]
+    fn test_chunked_prefill_with_cached_prefix_matches_single_shot() {
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!(
+                        "skipping test_chunked_prefill_with_cached_prefix_matches_single_shot \
+                         (no Metal): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Qwen3Inner::new failure: {msg}");
+            }
+        };
+        cast_qwen3_inner_weights_bf16(&mut inner);
+
+        // Full prompt: 96 tokens. The first 32 are what turn 1 will
+        // prefill + register; the remaining 64 are turn 2's "suffix
+        // beyond the cached prefix". 96 = 6*16 so chunk_size=16 → 4
+        // chunks of 16 over the 64-token suffix on turn 2.
+        let full_prompt: Vec<u32> = (0u32..96).map(|i| (i * 7 + 3) % 100).collect();
+        let prefix_len: usize = 32; // == 2 * block_size (16)
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let num_layers = inner.layers.len();
+
+        // ---- Turn 1: prefill the 32-token prefix and register its full
+        // blocks so subsequent `find_cached_prefix` calls see it. ----
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.reset_for_new_request(0).expect("reset");
+            let prefix_lookup = adapter
+                .find_cached_prefix(&full_prompt[..prefix_len], &[])
+                .expect("find_cached_prefix turn 1");
+            assert_eq!(
+                prefix_lookup.cached_token_count, 0,
+                "turn 1 must start with a cold prefix cache"
+            );
+            adapter
+                .allocate_suffix_blocks(prefix_len as u32)
+                .expect("allocate_suffix_blocks turn 1");
+        }
+        match inner.run_paged_prefill_chunk_with_size(
+            &full_prompt[..prefix_len],
+            /* first_logical_position */ 0,
+            num_layers,
+            &positions,
+            /* chunk_size */ 0, // single-shot is fine for the seeding turn
+        ) {
+            Ok(_logits) => {}
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!(
+                        "skipping test_chunked_prefill_with_cached_prefix_matches_single_shot \
+                         (turn 1): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected turn-1 prefill failure: {msg}");
+            }
+        };
+        // Register turn 1's full blocks so the BlockAllocator publishes
+        // them for prefix lookup. With prefix_len=32 and block_size=16
+        // we expect exactly 2 full blocks to register.
+        let registered = {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            let n = adapter
+                .register_full_blocks_for_reuse(&[])
+                .expect("register_full_blocks_for_reuse turn 1");
+            adapter.release_request().expect("release_request turn 1");
+            n
+        };
         assert_eq!(
-            adapter.current_token_count(),
-            prompt.len() as u32,
-            "cursor must advance through every chunk"
+            registered, 2,
+            "turn 1 must register exactly 2 full blocks for a 32-token prefix at block_size=16"
         );
+
+        // ---- Turn 2 (run A): single-shot prefill of the full 96-token
+        // prompt. `find_cached_prefix` should re-find the 32-token prefix
+        // turn 1 just registered. ----
+        let cached_a = {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.reset_for_new_request(0).expect("reset turn 2A");
+            let prefix_lookup = adapter
+                .find_cached_prefix(&full_prompt, &[])
+                .expect("find_cached_prefix turn 2A");
+            adapter
+                .allocate_suffix_blocks(full_prompt.len() as u32)
+                .expect("allocate_suffix_blocks turn 2A");
+            prefix_lookup.cached_token_count
+        };
         assert_eq!(
-            adapter.request_tokens(),
-            prompt.as_slice(),
-            "request_tokens must be the byte-equal cumulative concat of chunks"
+            cached_a, prefix_len as u32,
+            "turn 2A must rediscover the 32-token cached prefix from turn 1"
         );
-        let block_table = adapter.block_table().expect("block_table");
-        assert!(
-            block_table.num_blocks() >= 4,
-            "expected at least 4 blocks for 64 tokens at block_size=16, got {}",
-            block_table.num_blocks()
+        let suffix_a = &full_prompt[cached_a as usize..];
+        let logits_single = match inner.run_paged_prefill_chunk_with_size(
+            suffix_a, /* first_logical_position */ cached_a, num_layers, &positions,
+            /* chunk_size */ 0, // single-shot
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!(
+                        "skipping test_chunked_prefill_with_cached_prefix_matches_single_shot \
+                         (turn 2A): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected turn-2A prefill failure: {msg}");
+            }
+        };
+        let single_vec = logits_to_f32_vec(&logits_single);
+        assert_eq!(single_vec.len(), cfg.vocab_size as usize);
+
+        // Release turn 2A WITHOUT registering — we don't want turn 2A's
+        // additional blocks to alter the prefix-cache state turn 2B sees.
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.release_request().expect("release_request turn 2A");
+        }
+
+        // ---- Turn 2 (run B): chunked prefill over the same 64-token
+        // suffix. cached_prefix_len = 32 > 0 throughout, so every chunk
+        // exercises the Q < K branch of `forward_paged_adapter`. ----
+        let cached_b = {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.reset_for_new_request(0).expect("reset turn 2B");
+            let prefix_lookup = adapter
+                .find_cached_prefix(&full_prompt, &[])
+                .expect("find_cached_prefix turn 2B");
+            adapter
+                .allocate_suffix_blocks(full_prompt.len() as u32)
+                .expect("allocate_suffix_blocks turn 2B");
+            prefix_lookup.cached_token_count
+        };
+        assert_eq!(
+            cached_b, prefix_len as u32,
+            "turn 2B must rediscover the same 32-token cached prefix from turn 1"
         );
+        let suffix_b = &full_prompt[cached_b as usize..];
+        assert_eq!(suffix_b.len(), 64, "expected a 64-token suffix to chunk");
+        let logits_chunked = inner
+            .run_paged_prefill_chunk_with_size(
+                suffix_b, /* first_logical_position */ cached_b, num_layers, &positions,
+                /* chunk_size */ 16, // 4 chunks of 16
+            )
+            .expect("turn-2B chunked prefill");
+        let chunked_vec = logits_to_f32_vec(&logits_chunked);
+        assert_eq!(chunked_vec.len(), cfg.vocab_size as usize);
+
+        // Sanity: cumulative state after turn 2B must equal the full 96
+        // tokens (32 cached + 64 newly recorded).
+        {
+            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+            assert_eq!(
+                adapter.current_token_count() as usize,
+                full_prompt.len(),
+                "turn 2B cursor must reflect full prompt length (cached + suffix)"
+            );
+            assert_eq!(
+                adapter.request_tokens(),
+                full_prompt.as_slice(),
+                "turn 2B request_tokens must byte-equal the full prompt"
+            );
+        }
+
+        // Compare logits.
+        let atol = 5e-3f32;
+        let rtol = 5e-3f32;
+        let mut max_abs_diff = 0.0f32;
+        let mut max_rel_diff = 0.0f32;
+        for (i, (a, b)) in single_vec.iter().zip(chunked_vec.iter()).enumerate() {
+            assert!(
+                b.is_finite(),
+                "cached-prefix chunked logits[{i}] not finite: {b}"
+            );
+            let abs_diff = (a - b).abs();
+            let rel_diff = abs_diff / (a.abs().max(b.abs()).max(1e-6));
+            if abs_diff > max_abs_diff {
+                max_abs_diff = abs_diff;
+            }
+            if rel_diff > max_rel_diff {
+                max_rel_diff = rel_diff;
+            }
+            assert!(
+                abs_diff <= atol || rel_diff <= rtol,
+                "cached-prefix logits diverge at index {i}: single={a}, chunked={b}, \
+                 abs_diff={abs_diff}, rel_diff={rel_diff} (max allowed: \
+                 atol={atol} or rtol={rtol})"
+            );
+        }
+        eprintln!(
+            "cached-prefix chunked-prefill parity max_abs_diff={max_abs_diff}, \
+             max_rel_diff={max_rel_diff} (atol={atol}, rtol={rtol}) over {} elements",
+            single_vec.len()
+        );
+
+        // Cleanup.
+        {
+            let adapter = inner.paged_adapter.as_mut().unwrap();
+            let _ = adapter.register_full_blocks_for_reuse(&[]);
+            adapter.release_request().expect("release_request turn 2B");
+        }
     }
 
     /// **Phase B fallback test**: legacy callers that rely on the env-var
