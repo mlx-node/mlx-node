@@ -117,6 +117,11 @@ unsafe extern "C-unwind" {
         w_down: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    // Fused SwiGLU activation: silu(gate) * up. In browser/WASM this can use
+    // the same compile flag as mlx_swiglu_mlp_forward to collapse the sigmoid
+    // and multiplies into one WebGPU dispatch.
+    pub fn mlx_swiglu_forward(gate: *mut mlx_array, up: *mut mlx_array) -> *mut mlx_array;
+
     // Fused GDN pre-recurrence forward pass (Qwen3.5 GatedDeltaNet).
     //
     // Collapses projections, mask, conv state prepend, conv1d, SiLU, split,

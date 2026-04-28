@@ -834,6 +834,7 @@ async function handleInit(data: {
         wasmMemory: sharedMemory, // Send Memory object, not .buffer — .buffer getter always returns current byteLength after grow()
         batchBuffers,
         statsBuffer,
+        bufferMetadataBuffer,
       });
     });
     post({ type: "progress", step: "gpu", message: "WebGPU ready" });
@@ -1240,7 +1241,7 @@ async function handleInit(data: {
         message: "[WARMUP] skipped for VLM-capable model",
       });
       post({ type: "progress", step: "warmup", message: "Warmup skipped" });
-    } else {
+    } else if (typeof model.chat === "function") {
       post({ type: "progress", step: "warmup", message: "Warming up..." });
       const warmupResult = await model.chat([{ role: "user", content: "hi" }], {
         maxNewTokens: 2,
@@ -1254,6 +1255,12 @@ async function handleInit(data: {
         message: `[WARMUP] rawText=${warmupResult.rawText} text=${warmupResult.text} finish=${warmupResult.finishReason}`,
       });
       post({ type: "progress", step: "warmup", message: "Warmup complete" });
+    } else {
+      post({
+        type: "log",
+        message: "[WARMUP] skipped because chat() is not exported by this WASM build",
+      });
+      post({ type: "progress", step: "warmup", message: "Warmup skipped" });
     }
 
     // Ship the shared WASM memory to the main thread so it can mount the
@@ -1321,6 +1328,7 @@ function postProfileSnapshot(numTokens: number): void {
         diagReleaseAll: 0,
         diagReleaseUnknownHandle: 0,
         diagReleaseUnpoolable: 0,
+        diagPoolEvictions: 0,
         poisonedRpcCount: 0,
       } as any);
     const gpuStats = bridgeRef?.fetchGpuWorkerStats(false) ?? {
@@ -1373,6 +1381,7 @@ function postProfileSnapshot(numTokens: number): void {
         diagReleaseUnknownHandle:
           (bridgeStats as any).diagReleaseUnknownHandle ?? 0,
         diagReleaseUnpoolable: (bridgeStats as any).diagReleaseUnpoolable ?? 0,
+        diagPoolEvictions: (bridgeStats as any).diagPoolEvictions ?? 0,
         diagBatchAttempt: (bridgeStats as any).diagBatchAttempt ?? 0,
         diagBatchStaged: (bridgeStats as any).diagBatchStaged ?? 0,
         diagBatchDeferredBlock:

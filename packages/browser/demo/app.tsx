@@ -74,6 +74,7 @@ type ProfileStats = {
   diagReleaseAll?: number;
   diagReleaseUnknownHandle?: number;
   diagReleaseUnpoolable?: number;
+  diagPoolEvictions?: number;
   diagBatchAttempt?: number;
   diagBatchStaged?: number;
   diagBatchDeferredBlock?: number;
@@ -665,7 +666,7 @@ function App() {
       }
 
       log(
-        `[profile] diag: createAll=${s.diagCreateAll ?? 0} (mappedCopyDst=${s.diagCreateMappedCopyDst ?? 0}, mappedNoCopyDst=${s.diagCreateMappedNoCopyDst ?? 0}) | releaseAll=${s.diagReleaseAll ?? 0} (unknownHandle=${s.diagReleaseUnknownHandle ?? 0}, unpoolable=${s.diagReleaseUnpoolable ?? 0})`,
+        `[profile] diag: createAll=${s.diagCreateAll ?? 0} (mappedCopyDst=${s.diagCreateMappedCopyDst ?? 0}, mappedNoCopyDst=${s.diagCreateMappedNoCopyDst ?? 0}) | releaseAll=${s.diagReleaseAll ?? 0} (unknownHandle=${s.diagReleaseUnknownHandle ?? 0}, unpoolable=${s.diagReleaseUnpoolable ?? 0}, evictions=${s.diagPoolEvictions ?? 0})`,
       );
       log(
         `[profile] batch: attempt=${s.diagBatchAttempt ?? 0} staged=${s.diagBatchStaged ?? 0} deferredBlock=${s.diagBatchDeferredBlock ?? 0} stageRefused=${s.diagBatchStageRefused ?? 0}`,

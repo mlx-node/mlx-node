@@ -174,9 +174,18 @@ impl Activations {
 
     /// Swish/SwiGLU: Used in gated variants
     pub fn swiglu(gate: &MxArray, up: &MxArray) -> Result<MxArray> {
-        // swiglu(gate, up) = silu(gate) * up
-        let silu_gate = Self::silu(gate)?;
-        silu_gate.mul(up)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let handle = unsafe { sys::mlx_swiglu_forward(gate.handle.0, up.handle.0) };
+            return MxArray::from_handle(handle, "swiglu_forward");
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // swiglu(gate, up) = silu(gate) * up
+            let silu_gate = Self::silu(gate)?;
+            silu_gate.mul(up)
+        }
     }
 
     /// Hard Swish: x * clamp(x + 3, 0, 6) / 6

@@ -511,6 +511,15 @@ std::vector<mlx::core::array> swiglu_mlp_body(
   return {output};
 }
 
+std::vector<mlx::core::array> swiglu_body(
+    const std::vector<mlx::core::array>& inputs) {
+  using mlx::core::sigmoid;
+  const auto& gate = inputs[0];
+  const auto& up = inputs[1];
+  auto gate_act = gate * sigmoid(gate);
+  return {gate_act * up};
+}
+
 // Lazy-initialized compile cache. The first call traces swiglu_mlp_body for
 // the input-shape-set; subsequent calls with the same shapes hit the
 // internal CompilerCache (mlx/compile.cpp). For Qwen3.5-0.8B decode every
@@ -518,6 +527,11 @@ std::vector<mlx::core::array> swiglu_mlp_body(
 // so we get 1 trace + N reuses across the whole generation.
 auto& compiled_swiglu_mlp() {
   static auto fn = mlx::core::compile(swiglu_mlp_body, /*shapeless=*/false);
+  return fn;
+}
+
+auto& compiled_swiglu() {
+  static auto fn = mlx::core::compile(swiglu_body, /*shapeless=*/false);
   return fn;
 }
 
@@ -539,6 +553,29 @@ void mlx_set_swiglu_compile_enabled(bool enabled) {
 
 bool mlx_get_swiglu_compile_enabled() {
   return compile_mlp_enabled();
+}
+
+mlx_array* mlx_swiglu_forward(mlx_array* gate_handle, mlx_array* up_handle) {
+  try {
+    if (!gate_handle || !up_handle) {
+      throw std::runtime_error("required input handle is null");
+    }
+    auto gate = reinterpret_cast<array*>(gate_handle);
+    auto up = reinterpret_cast<array*>(up_handle);
+
+    if (compile_mlp_enabled()) {
+      std::vector<array> ins{*gate, *up};
+      auto outs = compiled_swiglu()(ins);
+      return reinterpret_cast<mlx_array*>(new array(std::move(outs[0])));
+    }
+
+    auto gate_act = *gate * sigmoid(*gate);
+    auto output = gate_act * *up;
+    return reinterpret_cast<mlx_array*>(new array(std::move(output)));
+  } catch (const std::exception& e) {
+    std::cerr << "mlx_swiglu_forward error: " << e.what() << std::endl;
+    return nullptr;
+  }
 }
 
 // Phase 6c: runtime setter/getter for the GDN pre-recurrence compile fast

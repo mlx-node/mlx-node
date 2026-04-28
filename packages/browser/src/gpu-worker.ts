@@ -87,6 +87,26 @@ const bufferLogicalSizesArr: (number | undefined)[] = [undefined];
 const bufferUsagesArr: (number | undefined)[] = [undefined];
 let nextHandle = 1;
 
+// Shared with every wasm-side bridge stub. Handles imported directly in this
+// worker, such as local-model weight buffers, never pass through
+// wgpuDeviceCreateBuffer in the stub, so seed their metadata here.
+const BUFFER_METADATA_MAX_HANDLES = 1 << 20;
+let bufferMetaU32: Uint32Array | null = null;
+
+function setSharedBufferMeta(handle: number, size: number, usage: number): void {
+  if (!bufferMetaU32 || handle <= 0 || handle >= BUFFER_METADATA_MAX_HANDLES) return;
+  const base = handle * 2;
+  Atomics.store(bufferMetaU32, base + 1, usage >>> 0);
+  Atomics.store(bufferMetaU32, base, size >>> 0);
+}
+
+function clearSharedBufferMeta(handle: number): void {
+  if (!bufferMetaU32 || handle <= 0 || handle >= BUFFER_METADATA_MAX_HANDLES) return;
+  const base = handle * 2;
+  Atomics.store(bufferMetaU32, base, 0);
+  Atomics.store(bufferMetaU32, base + 1, 0);
+}
+
 // JS-F007: handle recycling.
 //
 // Previously `addHandle` only did `nextHandle++`. Released slots were never
@@ -132,10 +152,16 @@ const RECYCLE_DELAY = 256;
 // Buffer pool: (usage, size) → stack of free GPUBuffer handles. MLX's allocator
 // churns ~870 transient buffers/tok; reusing them eliminates Chrome's
 // createBuffer validation cost on the hot path.
-const BUFFER_POOL_CAP_PER_KEY = 64;
 const bufferPool = new Map<string, number[]>();
 let bufferPoolHitCount = 0;
 let bufferPoolMissCount = 0;
+
+function bufferPoolCapForSize(size: number): number {
+  if (size <= 4 * 1024) return 512;
+  if (size <= 64 * 1024) return 256;
+  if (size <= 1024 * 1024) return 128;
+  return 64;
+}
 
 // Task C: single-entry LRU bind group cache per pipeline.
 //
@@ -241,6 +267,7 @@ function releaseHandle(id: number): void {
   bufferSizesArr[id] = undefined;
   bufferLogicalSizesArr[id] = undefined;
   bufferUsagesArr[id] = undefined;
+  clearSharedBufferMeta(id);
   freeHandleList.push(id);
 }
 
@@ -263,7 +290,7 @@ function releaseBufferHandle(handle: number): void {
       stack = [];
       bufferPool.set(key, stack);
     }
-    if (stack.length < BUFFER_POOL_CAP_PER_KEY) {
+    if (stack.length < bufferPoolCapForSize(size)) {
       stack.push(handle);
       // Keep handles[handle] / bufferSizesArr[handle] / bufferUsagesArr[handle]
       // populated so a subsequent pool hit can return this handle with its
@@ -480,6 +507,16 @@ self.onmessage = async (e: MessageEvent) => {
     // supplies this; test harnesses may not.
     if (e.data.statsBuffer && (e.data.statsBuffer as SharedArrayBuffer).byteLength >= STATS_BUFFER_SIZE) {
       statsU32 = new Uint32Array(e.data.statsBuffer as SharedArrayBuffer, 0, STATS_OPCODE_SLOTS);
+    }
+    if (
+      e.data.bufferMetadataBuffer &&
+      (e.data.bufferMetadataBuffer as SharedArrayBuffer).byteLength >= BUFFER_METADATA_MAX_HANDLES * 8
+    ) {
+      bufferMetaU32 = new Uint32Array(
+        e.data.bufferMetadataBuffer as SharedArrayBuffer,
+        0,
+        BUFFER_METADATA_MAX_HANDLES * 2,
+      );
     }
 
     // Create GPU device
@@ -777,7 +814,9 @@ self.onmessage = async (e: MessageEvent) => {
         }
       }
       // bf16 expands to f32 for legacy storage; f16 stays native when shader-f16 is available.
-      const needsExpand = (isBf16 && !packedEligible) || (isF16 && !hasShaderF16);
+      const needsExpand =
+        (isBf16 && !packedEligible) ||
+        (isF16 && !hasShaderF16);
 
       let gpuByteSize: number;
       if (packedEligible) {
@@ -849,7 +888,13 @@ self.onmessage = async (e: MessageEvent) => {
 
       const handle = addHandle(gpuBuffer);
       bufferSizesArr[handle] = alignedSize;
+      bufferLogicalSizesArr[handle] = alignedSize;
       bufferUsagesArr[handle] = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+      setSharedBufferMeta(
+        handle,
+        alignedSize,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      );
       handles.push(handle);
       uploadedByteSizes.push(alignedSize);
     }

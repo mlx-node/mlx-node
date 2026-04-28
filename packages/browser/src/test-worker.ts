@@ -111,7 +111,7 @@ async function initAndRun(wasmUrl: string) {
 
   const cmdBuf = new SharedArrayBuffer(CMD_OFFSET.TOTAL);
   const readbackBuf = new SharedArrayBuffer(READBACK_BUFFER_SIZE);
-  const wasmMem = new WebAssembly.Memory({ initial: 1002, maximum: 65536, shared: true });
+  const wasmMem = new WebAssembly.Memory({ initial: 1003, maximum: 65536, shared: true });
 
   const gpuW = new Worker(new URL('./gpu-worker.ts', import.meta.url), { type: 'module' });
   gpuW.onerror = (err) => post({ type: 'error', message: `GPU worker error: ${err.message}` });
@@ -1658,6 +1658,22 @@ async function initAndRun(wasmUrl: string) {
       const idx = a.argmax(0); idx.eval();
       const token = idx.toUint32()[0];
       if (token !== 42) throw new Error(`argmax=${token} (expected 42)`);
+    }},
+    { name: 'argmax on sliced vocab row', run() {
+      // Greedy decode samples from a sliced logits row. WebGPU ArgReduce must
+      // apply the source array offset before reducing, otherwise it samples
+      // from an earlier prompt row.
+      const rows = 3;
+      const N = 4096;
+      const data = new Float32Array(rows * N).fill(-100);
+      data[0 * N + 7] = 100;
+      data[1 * N + 13] = 100;
+      data[2 * N + 42] = 100;
+      const a = MxArray.fromFloat32(data, new BigInt64Array([BigInt(rows), BigInt(N)]));
+      const row = a.slice(new BigInt64Array([2n, 0n]), new BigInt64Array([3n, BigInt(N)]));
+      const idx = row.argmax(-1); idx.eval();
+      const token = idx.toUint32()[0];
+      if (token !== 42) throw new Error(`sliced argmax=${token} (expected 42)`);
     }},
     { name: 'bf16 double astype roundtrip', run() {
       // f32 → bf16 → f32 → readback

@@ -61,6 +61,8 @@ export interface BridgeStats {
   diagReleaseUnknownHandle: number;
   /** DIAG: release rejected by isPoolable (fake handle, MAP_* usage). */
   diagReleaseUnpoolable: number;
+  /** DIAG: pool-full evictions from the bridge-side buffer pool. */
+  diagPoolEvictions: number;
   /** DIAG: total FUSED_* dispatch calls that reached the batch gate. */
   diagBatchAttempt: number;
   /** DIAG: dispatches successfully staged into DISPATCH_BATCH. */
@@ -409,7 +411,12 @@ export function createBridgeStub(
   // Policy: LIFO reuse (pop hot buffers first), FIFO eviction of the oldest
   // on overflow (shift from the front when the bucket is full).
   const bufferPool = new Map<string, number[]>();
-  const POOL_CAP_PER_KEY = 64;
+  function poolCapForSize(size: number): number {
+    if (size <= 4 * 1024) return 512;
+    if (size <= 64 * 1024) return 256;
+    if (size <= 1024 * 1024) return 128;
+    return 64;
+  }
 
   // Phase 1' release batching: accumulate wgpuBufferRelease handles and
   // flush them in one BUFFER_RELEASE_BATCH RPC instead of one-per-release.
@@ -2214,7 +2221,7 @@ export function createBridgeStub(
           stack = [];
           bufferPool.set(key, stack);
         }
-        if (stack.length < POOL_CAP_PER_KEY) {
+        if (stack.length < poolCapForSize(bucketSize)) {
           stack.push(resolved);
           return; // suppressed RPC — handle stays alive in the gpu-worker
         }
@@ -2317,6 +2324,7 @@ export function createBridgeStub(
     let dRelAll = diagReleaseAll;
     let dRelUnk = diagReleaseUnknownHandle;
     let dRelUnp = diagReleaseUnpoolable;
+    let dPoolEvictions = 0;
     let dBatchAttempt = diagBatchAttempt;
     let dBatchStaged = diagBatchStaged;
     let dBatchDeferredBlock = diagBatchDeferredBlock;
@@ -2330,6 +2338,7 @@ export function createBridgeStub(
       dRelAll = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_ALL);
       dRelUnk = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_UNKNOWN);
       dRelUnp = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_UNPOOLABLE);
+      dPoolEvictions = Atomics.load(poolStatsArr, POOL_STAT_EVICTIONS);
       dBatchAttempt = Atomics.load(poolStatsArr, POOL_STAT_BATCH_ATTEMPT);
       dBatchStaged = Atomics.load(poolStatsArr, POOL_STAT_BATCH_STAGED);
       dBatchDeferredBlock = Atomics.load(poolStatsArr, POOL_STAT_BATCH_DEFERRED_BLOCK);
@@ -2346,6 +2355,7 @@ export function createBridgeStub(
       diagReleaseAll: dRelAll,
       diagReleaseUnknownHandle: dRelUnk,
       diagReleaseUnpoolable: dRelUnp,
+      diagPoolEvictions: dPoolEvictions,
       diagBatchAttempt: dBatchAttempt,
       diagBatchStaged: dBatchStaged,
       diagBatchDeferredBlock: dBatchDeferredBlock,

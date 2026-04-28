@@ -1298,6 +1298,14 @@ export declare class Qwen35MoeModel {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
+  /** Load a MoE model from pre-created GPU buffers (zero-copy, for browser WebGPU). */
+  static loadFromGpuBuffers(
+    configJson: string,
+    gpuTensors: Array<GpuTensorInfo>,
+    tokenizerJson: string,
+    tokenizerConfigJson?: string | undefined | null,
+    processorConfigJson?: string | undefined | null,
+  ): Promise<Qwen35MoeModel>;
   /**
    * Streaming chat API backed by a SharedArrayBuffer ring buffer.
    *
