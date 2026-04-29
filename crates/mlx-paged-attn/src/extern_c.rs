@@ -315,14 +315,14 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
         eprintln!("mlx_paged_attn_paged_attention_dispatch: null buffer pointer");
         return -1;
     }
-    // Phase 1 does not honor sliding_window. Reject nonzero values
-    // here too so a missing C++-side validation can never silently
-    // tunnel a sliding_window setting through to a kernel that
-    // ignores it. Phase 7 (Gemma4) will plumb this end-to-end.
-    if sliding_window != 0 {
+    // Phase 7: sliding_window is now plumbed end-to-end. Negative values
+    // are still nonsensical (the only well-defined sentinel for "no mask"
+    // is 0) and would otherwise reach the Metal kernel as garbage, so
+    // reject them up front.
+    if sliding_window < 0 {
         eprintln!(
             "mlx_paged_attn_paged_attention_dispatch: sliding_window={sliding_window} \
-             is not implemented in Phase 1 (only 0 is supported; Phase 7 adds Gemma4)"
+             must be >= 0 (use 0 to disable the sliding mask)"
         );
         return -1;
     }
@@ -372,6 +372,7 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
         kv_head_stride,
         k_scale,
         v_scale,
+        sliding_window,
     };
 
     let queries_raw = RawBufferInfo {

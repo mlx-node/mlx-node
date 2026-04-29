@@ -866,6 +866,10 @@ impl LayerKVPool {
             // FP8 K/V scales are deferred (P1C-3 follow-up).
             k_scale: 1.0,
             v_scale: 1.0,
+            // Phase 7: LayerKVPool's direct attention helper is used by
+            // pure-Rust paged forwards that don't need sliding-window
+            // masking yet; default off.
+            sliding_window: 0,
         };
 
         // Cache dtype is the one declared at pool construction time; for

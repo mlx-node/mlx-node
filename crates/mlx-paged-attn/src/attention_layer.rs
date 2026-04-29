@@ -349,6 +349,10 @@ impl PagedAttentionLayer {
             kv_head_stride,
             k_scale: self.k_scale,
             v_scale: self.v_scale,
+            // Phase 7: PagedAttentionLayer is the legacy non-block-paged
+            // path; sliding-window masking is opt-in via the lower-level
+            // FFI dispatcher. Keep the default off here.
+            sliding_window: 0,
         };
 
         let query_raw = RawBufferInfo {

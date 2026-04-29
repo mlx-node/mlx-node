@@ -487,12 +487,15 @@ void validate_paged_attention_inputs(
   require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");
   require_row_contiguous_zero_offset(v_scale, op_name, "v_scale");
 
-  // 2. Phase 1 contract: sliding_window must be 0 (Phase 7 lifts this).
-  if (sliding_window != 0) {
+  // 2. Phase 7 lifts the Phase 1 sliding_window=0 restriction. Negative
+  // values are still nonsensical (the only "no mask" sentinel is 0) so
+  // reject them up-front; the Metal kernel masks K positions older than
+  // `context_len - sliding_window` when sliding_window > 0.
+  if (sliding_window < 0) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name
-        << "] sliding_window not yet implemented; Phase 7 will add it "
-        << "(Gemma4). The only supported value in Phase 1 is 0.";
+        << "] sliding_window (" << sliding_window
+        << ") must be >= 0 (use 0 to disable the sliding mask).";
     throw std::invalid_argument(msg.str());
   }
 
@@ -1522,13 +1525,15 @@ int mlx_paged_attention_test_output_shapes(
 }
 
 /// Returns 1 iff the public `paged_attention(...)` factory throws
-/// `std::invalid_argument` when called with sliding_window=512.
+/// `std::invalid_argument` when called with sliding_window=-1.
 /// Returns 0 if it doesn't throw or throws a different exception.
 ///
-/// The factory is the earliest validation point; we call it with
-/// well-formed shape inputs and a non-zero sliding_window to confirm
-/// rejection. The pool/q arrays use tracer-only construction (no
-/// backing data needed — the throw fires before eval_gpu).
+/// Phase 7 lifts the Phase 1 sliding_window=0 restriction; the factory
+/// now accepts any non-negative value. Negative values remain illegal
+/// because the only "no mask" sentinel is 0, so we test a NEGATIVE
+/// value here to keep the test exercising the rejection path. The
+/// pool/q arrays use tracer-only construction (no backing data needed —
+/// the throw fires before eval_gpu).
 int mlx_paged_attention_factory_rejects_sliding_window() {
   using namespace mlx::core;
   using namespace mlx::core::fast;
@@ -1557,7 +1562,7 @@ int mlx_paged_attention_factory_rejects_sliding_window() {
         v_scale,
         /*scale=*/0.125f,
         /*softcap=*/0.0f,
-        /*sliding_window=*/512,
+        /*sliding_window=*/-1,
         /*block_size=*/16,
         /*num_q_heads=*/8,
         /*num_kv_heads=*/4,
@@ -4756,10 +4761,10 @@ int mlx_paged_attention_eval_gpu_rejects_indivisible_grouping() {
   }
 }
 
-/// Primitive directly constructed with `sliding_window_!=0`. eval_gpu's
-/// validator must reject — Phase 1 explicitly disallows nonzero sliding
-/// window, and silently accepting it here would produce full-context
-/// attention behind the caller's back.
+/// Primitive directly constructed with `sliding_window_<0`. eval_gpu's
+/// validator must reject — Phase 7 lifts the Phase 1 sliding_window=0
+/// restriction but negative values are still illegal (the only "no
+/// mask" sentinel is 0).
 int mlx_paged_attention_eval_gpu_rejects_sliding_window() {
   try {
     using namespace mlx::core::fast;
@@ -4770,7 +4775,7 @@ int mlx_paged_attention_eval_gpu_rejects_sliding_window() {
         /*num_q_heads=*/8,
         /*num_kv_heads=*/4,
         /*head_size=*/64,
-        /*sliding_window=*/512,
+        /*sliding_window=*/-1,
         KvDtype::Bf16);
   } catch (const std::exception& e) {
     fprintf(

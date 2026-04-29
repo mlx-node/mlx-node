@@ -348,6 +348,7 @@ void dispatch_paged_attention_v1_inner(
     int max_blocks_per_seq,
     float scale,
     float softcapping,
+    int sliding_window,
     KvDtype io_dtype,
     KvDtype cache_dtype) {
   std::string kernel_name = paged_attention_v1_kernel_name(
@@ -407,6 +408,9 @@ void dispatch_paged_attention_v1_inner(
   encoder.set_bytes<int32_t>(kv_block_stride, 16);
   encoder.set_bytes<int32_t>(kv_head_stride, 17);
 
+  // Phase 7: sliding-window mask. 0 = full context (default).
+  encoder.set_bytes<int32_t>(sliding_window, 18);
+
   // Threadgroup memory math: same dual-purpose layout as Rust V1.
   // Phase 1: logits[max_seq_len] f32 + red_smem[2*NUM_WARPS] f32.
   // Phase 2: out_smem[(NUM_WARPS/2) * head_size] f32 + same red_smem.
@@ -455,6 +459,7 @@ void dispatch_paged_attention_v2_inner(
     int max_blocks_per_seq,
     float scale,
     float softcapping,
+    int sliding_window,
     KvDtype io_dtype,
     KvDtype cache_dtype) {
   // Number of partitions for V2 (mirrors Rust path).
@@ -544,6 +549,9 @@ void dispatch_paged_attention_v2_inner(
     encoder.set_bytes<int32_t>(q_stride, 15);
     encoder.set_bytes<int32_t>(kv_block_stride, 16);
     encoder.set_bytes<int32_t>(kv_head_stride, 17);
+
+    // Phase 7: sliding-window mask. 0 = full context (default).
+    encoder.set_bytes<int32_t>(sliding_window, 18);
 
     // Threadgroup memory: V2 partitions context into PARTITION_SIZE
     // chunks, so logits is sized by PARTITION_SIZE (not max_seq_len).
@@ -642,11 +650,14 @@ void dispatch_paged_attention_auto(
     float softcap,
     int sliding_window,
     KvDtype kv_dtype) {
-  if (sliding_window != 0) {
+  // Phase 7 lifts the Phase 1/2 sliding_window=0 restriction: the Metal
+  // kernel now masks K positions older than `context_len - sliding_window`
+  // when sliding_window > 0. Negative values remain illegal (only 0 is
+  // a valid "no mask" sentinel).
+  if (sliding_window < 0) {
     std::ostringstream msg;
     msg << "[mlx_paged_dispatch] sliding_window=" << sliding_window
-        << " is not implemented in Phase 2 (only 0 is supported; Phase 7 "
-           "adds Gemma4)";
+        << " must be >= 0 (use 0 to disable the sliding mask).";
     throw std::runtime_error(msg.str());
   }
   if (num_seqs == 0 || num_q_heads == 0 || head_size == 0 ||
@@ -690,6 +701,7 @@ void dispatch_paged_attention_auto(
         max_blocks_per_seq,
         scale,
         softcapping,
+        sliding_window,
         io_dtype,
         cache_dtype);
   } else {
@@ -714,6 +726,7 @@ void dispatch_paged_attention_auto(
         max_blocks_per_seq,
         scale,
         softcapping,
+        sliding_window,
         io_dtype,
         cache_dtype);
   }

@@ -65,6 +65,17 @@ static std::vector<array> g_gemma4_caches;     // num_layers * 2 arrays (keys, v
 static int g_gemma4_offset_int = 0;
 static bool g_gemma4_inited = false;
 
+// Phase 7: paged-decode globals. Independent from the flat-path globals
+// above so both compile graphs can coexist while the Rust dispatcher
+// chooses one or the other per-turn. `mlx_gemma4_reset` wipes BOTH.
+static Gemma4Config g_gemma4_paged_config{};
+static std::vector<array> g_gemma4_k_pools;          // [num_layers]
+static std::vector<array> g_gemma4_v_pools;          // [num_layers]
+static std::vector<array> g_gemma4_k_scales;         // [num_layers]
+static std::vector<array> g_gemma4_v_scales;         // [num_layers]
+static int g_gemma4_paged_offset_int = 0;
+static bool g_gemma4_paged_inited = false;
+
 // Pre-computed freqs for fast::rope on global layers: 1-D [rotary_dim/2]
 // This is what Python ProportionalRoPE stores as self._freqs.
 // fast::rope internally computes reciprocal(freqs) to get inv_freq, then
@@ -272,6 +283,153 @@ static Gemma4AttnResult gemma4_attention(
   auto output = linear_proj(attn_out, pfx + "o_proj");
 
   return {output, new_kv_keys, new_kv_values};
+}
+
+// =====================================================================
+// Phase 7: Gemma4 paged attention helper.
+//
+// Uses paged_kv_write + paged_attention instead of slice_update +
+// scaled_dot_product_attention. Same Q/K/V projection + normalization
+// + RoPE pipeline as `gemma4_attention`, but the cache write goes
+// into a per-layer block-paged pool (`k_pool`/`v_pool`) and the read
+// goes through the Phase 7 paged-attention kernel which natively
+// supports sliding-window masking via the `sliding_window` parameter.
+//
+// PHASE 7 CONTRACT: SINGLE-TOKEN DECODE ONLY (B == num_tokens ==
+// num_seqs == 1). The flat path supports multi-token via the
+// pre-built additive mask; the paged kernel currently only handles
+// single-token decode (chunked prefill is reserved for a later phase).
+//
+// Per-layer layout:
+//   - Global layers: pool stores [num_blocks, global_num_kv_heads,
+//     global_head_dim/x_pack=8, block_size=16, x_pack=8] / value mirror,
+//     sliding_window = 0.
+//   - Sliding layers: pool stores [num_blocks, num_kv_heads,
+//     head_dim/x_pack=8, block_size=16, x_pack=8] / value mirror,
+//     sliding_window = cfg.sliding_window.
+//
+// The caller threads the offset, block_table, slot_mapping, seq_lens,
+// num_valid_tokens, num_valid_blocks for this layer through and we
+// just gather + write.
+struct Gemma4PagedAttnResult { array output, k_pool_out, v_pool_out; };
+
+static Gemma4PagedAttnResult gemma4_attention_paged(
+    const array& x,            // [B, hidden] -- 2D, B == 1
+    int layer_idx,
+    const array& k_pool,       // [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+    const array& v_pool,       // [num_blocks, num_kv_heads, head_dim, block_size]
+    const array& k_scale,      // [1] f32 placeholder (1.0)
+    const array& v_scale,      // [1] f32 placeholder (1.0)
+    const array& offset_arr,   // [1] int32
+    const array& block_table,  // [1, max_blocks_per_seq] int32
+    const array& slot_mapping, // [1] int64
+    const array& seq_lens,     // [1] int32
+    int block_size,
+    const Gemma4Config& cfg) {
+
+  int B = x.shape(0);
+  bool is_global = cfg.is_global_layer[layer_idx];
+  int num_kv_heads = is_global ? cfg.global_num_kv_heads : cfg.num_kv_heads;
+  int head_dim = is_global ? cfg.global_head_dim : cfg.head_dim;
+
+  // Global layers use K = V (before k_norm); sliding layers use a
+  // separate v_proj.
+  bool k_is_v = is_global;
+
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
+
+  // Q projection + reshape + q_norm.
+  auto queries = linear_proj(x, pfx + "q_proj");
+  queries = reshape(queries, {B, 1, cfg.num_heads, head_dim});
+  queries = fast::rms_norm(queries, get_weight(pfx + "q_norm.weight"), cfg.rms_norm_eps);
+
+  // K projection + reshape; V either copied from K or projected
+  // separately depending on layer type.
+  auto keys = linear_proj(x, pfx + "k_proj");
+  keys = reshape(keys, {B, 1, num_kv_heads, head_dim});
+
+  array values = keys;
+  if (!k_is_v) {
+    values = linear_proj(x, pfx + "v_proj");
+    values = reshape(values, {B, 1, num_kv_heads, head_dim});
+  }
+
+  // K-norm + scale-free V-norm.
+  keys = fast::rms_norm(keys, get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
+  values = rms_norm_no_weight(values, cfg.rms_norm_eps);
+
+  // Transpose to [B, Hkv, 1, D] for RoPE.
+  keys = transpose(keys, {0, 2, 1, 3});
+  values = transpose(values, {0, 2, 1, 3});
+
+  if (is_global) {
+    keys = proportional_rope(keys, offset_arr);
+  } else {
+    keys = fast::rope(keys, head_dim, false, cfg.rope_local_base_freq, 1.0f, offset_arr);
+  }
+
+  // Transpose Q + apply RoPE.
+  queries = transpose(queries, {0, 2, 1, 3});
+  if (is_global) {
+    queries = proportional_rope(queries, offset_arr);
+  } else {
+    queries = fast::rope(queries, head_dim, false, cfg.rope_local_base_freq, 1.0f, offset_arr);
+  }
+
+  // Reshape to paged-kernel layouts:
+  //   new_k / new_v: [num_tokens=1, num_kv_heads, head_dim]
+  //   q:             [num_seqs=1, num_q_heads, head_dim]
+  int num_tokens = B; // == 1 by contract
+  auto new_k = reshape(keys, {num_tokens, num_kv_heads, head_dim});
+  auto new_v = reshape(values, {num_tokens, num_kv_heads, head_dim});
+  auto q_pa = reshape(queries, {num_tokens, cfg.num_heads, head_dim});
+
+  constexpr int X_PACK = 8;
+  const auto kv_dtype = mlx::core::fast::KvDtype::Bf16;
+
+  // 1) Write the new K/V into the paged pool.
+  auto write_pair = mlx::core::fast::paged_kv_write(
+      k_pool, v_pool,
+      new_k, new_v,
+      slot_mapping,
+      k_scale, v_scale,
+      block_size,
+      num_kv_heads,
+      head_dim,
+      X_PACK,
+      kv_dtype);
+  auto new_k_pool = std::move(write_pair.first);
+  auto new_v_pool = std::move(write_pair.second);
+
+  // 2) Gather + attend via paged kernel against the just-written pool.
+  // Sliding layers pass cfg.sliding_window so the Phase 7 kernel masks
+  // K positions older than `context_len - sliding_window`. Global
+  // layers pass 0 (full-context attention).
+  int sliding_window = is_global ? 0 : cfg.sliding_window;
+
+  // Gemma4 attention scale: 1.0 (Q/K normalization handles scaling).
+  float scale = 1.0f;
+  auto attn_out = mlx::core::fast::paged_attention(
+      q_pa,
+      new_k_pool, new_v_pool,
+      block_table, seq_lens,
+      k_scale, v_scale,
+      scale,
+      /*softcap=*/0.0f,
+      sliding_window,
+      block_size,
+      cfg.num_heads,
+      num_kv_heads,
+      head_dim,
+      kv_dtype);
+
+  // attn_out: [num_tokens, num_q_heads, head_dim].
+  // Reshape to [B, num_q_heads * head_dim] for o_proj.
+  attn_out = reshape(attn_out, {B, cfg.num_heads * head_dim});
+
+  auto output = linear_proj(attn_out, pfx + "o_proj");
+
+  return {output, new_k_pool, new_v_pool};
 }
 
 // =====================================================================
@@ -632,6 +790,172 @@ static std::vector<array> gemma4_compiled_decode_greedy_fn(
 
 static auto& compiled_gemma4_decode_greedy() {
   static auto fn = mlx::core::compile(gemma4_compiled_decode_greedy_fn);
+  return fn;
+}
+
+// =====================================================================
+// Phase 7: paged compile graph.
+//
+// Mirrors `gemma4_compiled_decode_fn` but routes the attention phase
+// through `gemma4_attention_paged` which uses paged_kv_write +
+// paged_attention with the Phase 7 sliding-window kernel parameter.
+// All other layer components (router, MLP, MoE experts, layer norms)
+// are reused unchanged.
+//
+// Input vector layout (per-layer paged storage):
+//   [0]                  h:                 [B, hidden] embedding
+//   [1]                  offset_arr:        [1] int32
+//   [2]                  block_table:       [1, max_blocks_per_seq] int32
+//   [3]                  slot_mapping:      [1] int64
+//   [4]                  num_valid_tokens:  [1] int32 (informational)
+//   [5]                  num_valid_blocks:  [1] int32 (informational)
+//   [6]                  seq_lens:          [1] int32
+//   For each layer i in [0, num_layers):
+//     [7 + i*4 + 0]      k_pool
+//     [7 + i*4 + 1]      v_pool
+//     [7 + i*4 + 2]      k_scale
+//     [7 + i*4 + 3]      v_scale
+//
+// Output vector layout:
+//   [0]                  logits / next_token (depending on greedy variant)
+//   [1]                  new_offset:        offset_arr + 1
+//   For each layer i:
+//     [2 + i*2 + 0]      new_k_pool
+//     [2 + i*2 + 1]      new_v_pool
+static std::vector<array> gemma4_compiled_decode_fn_paged(
+    const std::vector<array>& inputs) {
+  const auto& cfg = g_gemma4_paged_config;
+  auto h                = inputs[0];
+  auto offset_arr       = inputs[1];
+  auto block_table      = inputs[2];
+  auto slot_mapping     = inputs[3];
+  // num_valid_tokens / num_valid_blocks are informational on the
+  // single-token decode path; the paged kernel reads seq_lens directly
+  // for the upper bound and slot_mapping for the write index.
+  auto seq_lens         = inputs[6];
+
+  constexpr int BLOCK_SIZE = 16;
+  constexpr int kHeader = 7;
+  constexpr int kPerLayer = 4;
+
+  std::vector<array> new_caches;
+  new_caches.reserve(cfg.num_layers * 2);
+  for (int i = 0; i < cfg.num_layers * 2; i++) {
+    new_caches.push_back(zeros({}, mlx::core::bfloat16));
+  }
+
+  for (int i = 0; i < cfg.num_layers; i++) {
+    std::string lp = "layers." + std::to_string(i);
+
+    // residual + input_layernorm + paged attention.
+    auto residual = h;
+    auto normed = fast::rms_norm(h, get_weight(lp + ".input_layernorm.weight"), cfg.rms_norm_eps);
+
+    int base = kHeader + i * kPerLayer;
+    const auto& k_pool  = inputs[base + 0];
+    const auto& v_pool  = inputs[base + 1];
+    const auto& k_scale = inputs[base + 2];
+    const auto& v_scale = inputs[base + 3];
+    auto attn_res = gemma4_attention_paged(
+        normed, i,
+        k_pool, v_pool,
+        k_scale, v_scale,
+        offset_arr,
+        block_table, slot_mapping,
+        seq_lens,
+        BLOCK_SIZE,
+        cfg);
+
+    auto attn_normed = fast::rms_norm(attn_res.output,
+        get_weight(lp + ".post_attention_layernorm.weight"), cfg.rms_norm_eps);
+    h = residual + attn_normed;
+
+    new_caches[i * 2]     = std::move(attn_res.k_pool_out);
+    new_caches[i * 2 + 1] = std::move(attn_res.v_pool_out);
+
+    // FFN block (MoE-or-dense MLP, identical to flat path).
+    residual = h;
+    bool has_moe = (cfg.num_experts > 0 && has_weight(lp + ".router.proj.weight"));
+    if (has_moe) {
+      auto h1 = fast::rms_norm(h,
+          get_weight(lp + ".pre_feedforward_layernorm.weight"), cfg.rms_norm_eps);
+      h1 = gemma4_dense_mlp(h1, i);
+      h1 = fast::rms_norm(h1,
+          get_weight(lp + ".post_feedforward_layernorm_1.weight"), cfg.rms_norm_eps);
+
+      auto router_res = gemma4_router(h, i, cfg);
+
+      auto h2 = fast::rms_norm(h,
+          get_weight(lp + ".pre_feedforward_layernorm_2.weight"), cfg.rms_norm_eps);
+      h2 = gemma4_moe_experts(h2, router_res.top_k_indices, router_res.top_k_weights, i, cfg);
+      h2 = fast::rms_norm(h2,
+          get_weight(lp + ".post_feedforward_layernorm_2.weight"), cfg.rms_norm_eps);
+
+      h = h1 + h2;
+    } else {
+      h = fast::rms_norm(h,
+          get_weight(lp + ".pre_feedforward_layernorm.weight"), cfg.rms_norm_eps);
+      h = gemma4_dense_mlp(h, i);
+    }
+
+    h = fast::rms_norm(h,
+        get_weight(lp + ".post_feedforward_layernorm.weight"), cfg.rms_norm_eps);
+    h = residual + h;
+
+    if (has_weight(lp + ".layer_scalar")) {
+      h = h * get_weight(lp + ".layer_scalar");
+    }
+  }
+
+  // Final norm + LM head + optional logit softcap.
+  h = fast::rms_norm(h, get_weight("norm.weight"), cfg.rms_norm_eps);
+
+  if (cfg.tie_word_embeddings) {
+    h = linear_proj(h, "embed_tokens");
+  } else {
+    h = linear_proj(h, "lm_head");
+  }
+
+  if (cfg.final_logit_softcapping > 0.0f) {
+    auto cap = array(cfg.final_logit_softcapping, h.dtype());
+    h = tanh(h / cap) * cap;
+  }
+
+  auto new_offset = offset_arr + array(1, mlx::core::int32);
+
+  std::vector<array> result;
+  result.reserve(2 + cfg.num_layers * 2);
+  result.push_back(std::move(h));
+  result.push_back(std::move(new_offset));
+  for (auto& c : new_caches) result.push_back(std::move(c));
+  return result;
+}
+
+static auto& compiled_gemma4_decode_paged() {
+  static auto fn = mlx::core::compile(gemma4_compiled_decode_fn_paged);
+  return fn;
+}
+
+// Greedy variant of the paged compile graph (argmax inside the
+// compiled graph).
+static std::vector<array> gemma4_compiled_decode_greedy_fn_paged(
+    const std::vector<array>& inputs) {
+  const auto& cfg = g_gemma4_paged_config;
+  auto outputs = gemma4_compiled_decode_fn_paged(inputs);
+  auto next_token = argmax(outputs[0], -1);
+
+  std::vector<array> result;
+  result.reserve(2 + cfg.num_layers * 2);
+  result.push_back(std::move(next_token));
+  result.push_back(std::move(outputs[1]));
+  for (size_t i = 2; i < outputs.size(); ++i) {
+    result.push_back(std::move(outputs[i]));
+  }
+  return result;
+}
+
+static auto& compiled_gemma4_decode_greedy_paged() {
+  static auto fn = mlx::core::compile(gemma4_compiled_decode_greedy_fn_paged);
   return fn;
 }
 
@@ -1112,14 +1436,340 @@ double mlx_gemma4_benchmark(int num_steps) {
   }
 }
 
-// Reset Gemma4 state
+// Reset Gemma4 state. Phase 7: clears BOTH the legacy flat compile
+// state AND the paged-path globals so a single reset wipes both.
 void mlx_gemma4_reset() {
+  // Legacy flat-path compiled globals.
   g_gemma4_caches.clear();
   g_gemma4_offset_int = 0;
   g_gemma4_inited = false;
   g_weight_transposes_3d.clear();
   g_rope_freqs_storage.clear();
   g_gemma4_config.is_global_layer.clear();
+
+  // Phase 7 paged-path globals.
+  g_gemma4_paged_config = Gemma4Config{};
+  g_gemma4_k_pools.clear();
+  g_gemma4_v_pools.clear();
+  g_gemma4_k_scales.clear();
+  g_gemma4_v_scales.clear();
+  g_gemma4_paged_offset_int = 0;
+  g_gemma4_paged_inited = false;
+}
+
+// =============================================================================
+// Phase 7: Gemma4 paged forward FFI.
+//
+// These coexist alongside the flat `mlx_gemma4_forward` /
+// `mlx_gemma4_init_from_prefill` while the Rust dispatcher decides
+// per-turn which graph to run. A single `mlx_gemma4_reset()` wipes
+// BOTH graphs' state.
+// =============================================================================
+
+// Initialize the paged Gemma4 forward graph from per-layer pool / scale
+// handles. Mirrors `mlx_qwen35_init_paged` but tracks Gemma4-specific
+// per-layer config (sliding vs global) and the proportional-RoPE freqs.
+//
+// The per-layer pools must satisfy:
+//   k_pool[i] : [num_blocks, kv_heads_i, head_dim_i / x_pack=8, block_size=16, x_pack=8]
+//   v_pool[i] : [num_blocks, kv_heads_i, head_dim_i, block_size=16]
+// where (kv_heads_i, head_dim_i) depends on whether layer i is global
+// (global_num_kv_heads, global_head_dim) or sliding (num_kv_heads,
+// head_dim). Both pools are bf16.
+//
+// k_scale_handles[i] / v_scale_handles[i] are [1] f32 scalars (1.0 in
+// Phase 7; FP8 calibration is reserved for a later phase).
+//
+// `prefill_offset` becomes the initial `g_gemma4_paged_offset_int`.
+//
+// Returns 0 on success, -1 on failure. On failure
+// `g_gemma4_paged_inited` is left cleared and a stderr diagnostic is
+// emitted; the Rust caller MUST inspect the return value and fall
+// back to the pure-Rust paged path.
+int32_t mlx_gemma4_init_paged(
+    int num_layers,
+    int hidden_size,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int global_num_kv_heads,
+    int global_head_dim,
+    float rope_theta,
+    float rope_local_base_freq,
+    float partial_rotary_factor,
+    float rms_norm_eps,
+    int sliding_window,
+    int tie_word_embeddings,
+    int max_kv_len,
+    int batch_size,
+    int num_experts,
+    int top_k_experts,
+    int moe_intermediate_size,
+    int intermediate_size,
+    float final_logit_softcapping,
+    const int* layer_types,
+    int layer_types_len,
+    mlx_array** k_pool_handles,
+    mlx_array** v_pool_handles,
+    mlx_array** k_scale_handles,
+    mlx_array** v_scale_handles,
+    int prefill_offset
+) {
+  try {
+    // Build paged config.
+    g_gemma4_paged_config = Gemma4Config{};
+    g_gemma4_paged_config.num_layers = num_layers;
+    g_gemma4_paged_config.hidden_size = hidden_size;
+    g_gemma4_paged_config.num_heads = num_heads;
+    g_gemma4_paged_config.num_kv_heads = num_kv_heads;
+    g_gemma4_paged_config.head_dim = head_dim;
+    g_gemma4_paged_config.global_num_kv_heads = global_num_kv_heads;
+    g_gemma4_paged_config.global_head_dim = global_head_dim;
+    g_gemma4_paged_config.rope_theta = rope_theta;
+    g_gemma4_paged_config.rope_local_base_freq = rope_local_base_freq;
+    g_gemma4_paged_config.partial_rotary_factor = partial_rotary_factor;
+    g_gemma4_paged_config.rms_norm_eps = rms_norm_eps;
+    g_gemma4_paged_config.sliding_window = sliding_window;
+    g_gemma4_paged_config.tie_word_embeddings = (tie_word_embeddings != 0);
+    g_gemma4_paged_config.max_kv_len = max_kv_len;
+    g_gemma4_paged_config.batch_size = batch_size;
+    g_gemma4_paged_config.num_experts = num_experts;
+    g_gemma4_paged_config.top_k_experts = top_k_experts;
+    g_gemma4_paged_config.moe_intermediate_size = moe_intermediate_size;
+    g_gemma4_paged_config.intermediate_size = intermediate_size;
+    g_gemma4_paged_config.final_logit_softcapping = final_logit_softcapping;
+
+    g_gemma4_paged_config.is_global_layer.clear();
+    g_gemma4_paged_config.is_global_layer.reserve(num_layers);
+    for (int i = 0; i < num_layers; i++) {
+      bool is_global = (i < layer_types_len) ? (layer_types[i] != 0) : false;
+      g_gemma4_paged_config.is_global_layer.push_back(is_global);
+    }
+
+    const auto& cfg = g_gemma4_paged_config;
+
+    // Pre-compute proportional-RoPE freqs (shared with flat path; we
+    // overwrite the same global storage so both compile graphs use
+    // identical freqs). Identical math to `mlx_gemma4_init_from_prefill`.
+    {
+      int rotary_dim = (int)(global_head_dim * partial_rotary_factor);
+      int rope_angles = rotary_dim / 2;
+      g_rotated_dims = 2 * rope_angles;
+
+      std::vector<float> freqs_data(rope_angles);
+      for (int i = 0; i < rope_angles; i++) {
+        float exponent = (2.0f * i) / (float)global_head_dim;
+        freqs_data[i] = std::pow(rope_theta, exponent);
+      }
+      g_rope_freqs_storage.clear();
+      g_rope_freqs_storage.push_back(array(freqs_data.data(), {rope_angles}, mlx::core::float32));
+    }
+
+    // Pre-compute 3D transposes for expert weights (MoE layers).
+    g_weight_transposes_3d.clear();
+    {
+      std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
+      for (const auto& [name, w] : g_weights()) {
+        if (w.ndim() == 3) {
+          g_weight_transposes_3d.insert_or_assign(name, transpose(w, {0, 2, 1}));
+        }
+      }
+    }
+
+    // Per-layer pool / scale storage.
+    g_gemma4_k_pools.clear();
+    g_gemma4_v_pools.clear();
+    g_gemma4_k_scales.clear();
+    g_gemma4_v_scales.clear();
+    g_gemma4_k_pools.reserve(num_layers);
+    g_gemma4_v_pools.reserve(num_layers);
+    g_gemma4_k_scales.reserve(num_layers);
+    g_gemma4_v_scales.reserve(num_layers);
+
+    for (int i = 0; i < num_layers; i++) {
+      if (!k_pool_handles || !v_pool_handles ||
+          !k_scale_handles || !v_scale_handles ||
+          !k_pool_handles[i] || !v_pool_handles[i] ||
+          !k_scale_handles[i] || !v_scale_handles[i]) {
+        std::cerr << "[MLX] mlx_gemma4_init_paged: missing pool/scale handle for layer " << i << std::endl;
+        g_gemma4_paged_inited = false;
+        return -1;
+      }
+      g_gemma4_k_pools.push_back(*reinterpret_cast<array*>(k_pool_handles[i]));
+      g_gemma4_v_pools.push_back(*reinterpret_cast<array*>(v_pool_handles[i]));
+      g_gemma4_k_scales.push_back(*reinterpret_cast<array*>(k_scale_handles[i]));
+      g_gemma4_v_scales.push_back(*reinterpret_cast<array*>(v_scale_handles[i]));
+    }
+
+    g_gemma4_paged_offset_int = prefill_offset;
+
+    // Defense-in-depth: validate dtypes + force-eval pool/scale layouts
+    // here so any Metal-allocation or layout error throws BEFORE the
+    // first forward call (the caller's record_tokens has already
+    // mutated adapter state by then).
+    {
+      std::vector<array> probe;
+      probe.reserve(num_layers * 4 + 1);
+      for (int i = 0; i < num_layers; i++) {
+        if (g_gemma4_k_pools[i].dtype() != mlx::core::bfloat16) {
+          std::cerr << "[MLX] mlx_gemma4_init_paged: layer " << i
+                    << " k_pool dtype != bf16" << std::endl;
+          g_gemma4_paged_inited = false;
+          return -1;
+        }
+        if (g_gemma4_v_pools[i].dtype() != mlx::core::bfloat16) {
+          std::cerr << "[MLX] mlx_gemma4_init_paged: layer " << i
+                    << " v_pool dtype != bf16" << std::endl;
+          g_gemma4_paged_inited = false;
+          return -1;
+        }
+        if (g_gemma4_k_scales[i].dtype() != mlx::core::float32) {
+          std::cerr << "[MLX] mlx_gemma4_init_paged: layer " << i
+                    << " k_scale dtype != f32" << std::endl;
+          g_gemma4_paged_inited = false;
+          return -1;
+        }
+        if (g_gemma4_v_scales[i].dtype() != mlx::core::float32) {
+          std::cerr << "[MLX] mlx_gemma4_init_paged: layer " << i
+                    << " v_scale dtype != f32" << std::endl;
+          g_gemma4_paged_inited = false;
+          return -1;
+        }
+        probe.push_back(g_gemma4_k_pools[i]);
+        probe.push_back(g_gemma4_v_pools[i]);
+        probe.push_back(g_gemma4_k_scales[i]);
+        probe.push_back(g_gemma4_v_scales[i]);
+      }
+      auto rng_key = mlx::core::random::KeySequence::default_().next();
+      probe.push_back(rng_key);
+      mlx::core::eval(std::move(probe));
+    }
+
+    // Sanity-reference cfg to silence unused-variable warnings on
+    // builds where the only consumer is an asserted check.
+    (void)cfg;
+
+    g_gemma4_paged_inited = true;
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_gemma4_init_paged: " << e.what() << std::endl;
+    g_gemma4_paged_inited = false;
+    return -1;
+  } catch (...) {
+    std::cerr << "[MLX] mlx_gemma4_init_paged: unknown exception" << std::endl;
+    g_gemma4_paged_inited = false;
+    return -1;
+  }
+}
+
+// Single-token paged decode step. Inputs come from the Rust adapter's
+// `build_paged_attention_inputs`; per-layer pool/scale globals come
+// from `mlx_gemma4_init_paged`.
+//
+// PHASE 7 CONTRACT: decode-only. `input_ids.size() == 1` and
+// `slot_mapping.shape == [1]`. Multi-token / chunked prefill is
+// reserved for later phases. The contract is enforced explicitly:
+// violating it returns null logits without modifying global state.
+void mlx_gemma4_forward_paged(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    mlx_array* offset_arr_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* slot_mapping_ptr,
+    mlx_array* num_valid_tokens_ptr,
+    mlx_array* num_valid_blocks_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array** output_logits,
+    int* cache_offset_out
+) {
+  if (!g_gemma4_paged_inited) {
+    if (output_logits) *output_logits = nullptr;
+    return;
+  }
+  if (!input_ids_ptr || !embedding_weight_ptr || !output_logits ||
+      !offset_arr_ptr || !block_table_ptr || !slot_mapping_ptr ||
+      !num_valid_tokens_ptr || !num_valid_blocks_ptr || !seq_lens_ptr) {
+    if (output_logits) *output_logits = nullptr;
+    return;
+  }
+  const auto& cfg = g_gemma4_paged_config;
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+    auto& offset_arr       = *reinterpret_cast<array*>(offset_arr_ptr);
+    auto& block_table      = *reinterpret_cast<array*>(block_table_ptr);
+    auto& slot_mapping     = *reinterpret_cast<array*>(slot_mapping_ptr);
+    auto& num_valid_tokens = *reinterpret_cast<array*>(num_valid_tokens_ptr);
+    auto& num_valid_blocks = *reinterpret_cast<array*>(num_valid_blocks_ptr);
+    auto& seq_lens         = *reinterpret_cast<array*>(seq_lens_ptr);
+
+    if (input_ids.size() != 1) {
+      fprintf(stderr,
+              "[MLX] mlx_gemma4_forward_paged: phase 7 contract violated — "
+              "input_ids.size() = %lld, expected 1 (decode-only)\n",
+              static_cast<long long>(input_ids.size()));
+      fflush(stderr);
+      *output_logits = nullptr;
+      return;
+    }
+    if (slot_mapping.ndim() != 1 || slot_mapping.shape(0) != 1) {
+      fprintf(stderr,
+              "[MLX] mlx_gemma4_forward_paged: phase 7 contract violated — "
+              "slot_mapping shape must be [1]\n");
+      fflush(stderr);
+      *output_logits = nullptr;
+      return;
+    }
+
+    auto flat_ids = reshape(input_ids, {-1});
+    auto h = take(embedding_weight, flat_ids, 0);
+    auto embed_scale = array(std::sqrt((float)cfg.hidden_size), h.dtype());
+    h = h * embed_scale;
+
+    std::vector<array> fn_inputs;
+    fn_inputs.reserve(7 + cfg.num_layers * 4);
+    fn_inputs.push_back(std::move(h));
+    fn_inputs.push_back(offset_arr);
+    fn_inputs.push_back(block_table);
+    fn_inputs.push_back(slot_mapping);
+    fn_inputs.push_back(num_valid_tokens);
+    fn_inputs.push_back(num_valid_blocks);
+    fn_inputs.push_back(seq_lens);
+    for (int i = 0; i < cfg.num_layers; i++) {
+      fn_inputs.push_back(g_gemma4_k_pools[i]);
+      fn_inputs.push_back(g_gemma4_v_pools[i]);
+      fn_inputs.push_back(g_gemma4_k_scales[i]);
+      fn_inputs.push_back(g_gemma4_v_scales[i]);
+    }
+
+    static bool no_compile = std::getenv("MLX_NO_COMPILE") != nullptr;
+    auto outputs = no_compile
+        ? gemma4_compiled_decode_fn_paged(fn_inputs)
+        : compiled_gemma4_decode_paged()(fn_inputs);
+
+    *output_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
+    g_gemma4_paged_offset_int++;
+
+    // Stash post-step pool tensors back into the per-layer slots so the
+    // dependency edge flows through subsequent calls.
+    for (int i = 0; i < cfg.num_layers; i++) {
+      g_gemma4_k_pools[i] = outputs[2 + i * 2];
+      g_gemma4_v_pools[i] = outputs[2 + i * 2 + 1];
+    }
+
+    if (cache_offset_out) {
+      *cache_offset_out = g_gemma4_paged_offset_int;
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_gemma4_forward_paged: %s\n", e.what());
+    fflush(stderr);
+    *output_logits = nullptr;
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in mlx_gemma4_forward_paged\n");
+    fflush(stderr);
+    *output_logits = nullptr;
+  }
 }
 
 // Export caches for PromptCache reuse.

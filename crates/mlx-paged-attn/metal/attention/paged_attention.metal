@@ -789,6 +789,12 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     const constant int &q_stride [[buffer(15)]],
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
+    // Phase 7: Sliding-window mask for hybrid attention models (Gemma4 et al.).
+    // When sliding_window > 0, K positions older than
+    // `context_len - sliding_window` are masked out (zero contribution to
+    // softmax / V reduction). When sliding_window == 0 the kernel falls
+    // back to the original full-context behaviour.
+    const constant int &sliding_window [[buffer(18)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -952,11 +958,46 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
       if (thread_group_offset == 0) {
         // Store the partial reductions to shared memory.
-        // NOTE: It is required to zero out the masked logits.
-        const bool mask = token_idx >= context_len;
-        logits[token_idx - start_token_idx] = mask ? 0.f : qk;
-        // Update the max value.
-        qk_max = mask ? qk_max : max(qk_max, qk);
+        //
+        // Two distinct masks are applied here:
+        //
+        //   1. Upper-bound mask (`token_idx >= context_len`): kept at
+        //      logit=0 + V-zero (see the V loop below) for backward
+        //      compatibility with the original kernel. The V-vector for
+        //      positions past `context_len` may contain uninitialised
+        //      memory / NaN, so zero-V is the safe option.
+        //
+        //   2. Phase 7 sliding-window mask (`sliding_window > 0` and
+        //      `token_idx < context_len - sliding_window`): set
+        //      logit=-INFINITY so `exp(-inf - qk_max) == 0` and the
+        //      masked contribution drops out of softmax exactly. Unlike
+        //      out-of-context positions, sliding-window-evicted slots
+        //      hold valid initialised K/V from earlier real tokens — the
+        //      cleanest mask is at the softmax step, not via V-zeroing.
+        //
+        // With `sliding_window == 0` the lower bound collapses to 0 and
+        // only the upper-bound mask fires — identical behaviour to the
+        // pre-Phase-7 kernel.
+        const int sw = sliding_window;
+        const uint32_t sliding_lower =
+            (sw > 0 && context_len > uint32_t(sw))
+                ? (context_len - uint32_t(sw))
+                : 0u;
+        const bool sliding_evicted =
+            sw > 0 && uint32_t(token_idx) < sliding_lower;
+        const bool out_of_context = token_idx >= context_len;
+        float stored_logit;
+        if (out_of_context) {
+          stored_logit = 0.f;
+        } else if (sliding_evicted) {
+          stored_logit = -INFINITY;
+        } else {
+          stored_logit = qk;
+        }
+        logits[token_idx - start_token_idx] = stored_logit;
+        // Update the max value (exclude masked positions of either kind).
+        const bool any_mask = out_of_context || sliding_evicted;
+        qk_max = any_mask ? qk_max : max(qk_max, qk);
       }
     }
   }
@@ -1287,6 +1328,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       const constant int &q_stride [[buffer(15)]],                             \
       const constant int &kv_block_stride [[buffer(16)]],                      \
       const constant int &kv_head_stride [[buffer(17)]],                       \
+      const constant int &sliding_window [[buffer(18)]],                       \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \

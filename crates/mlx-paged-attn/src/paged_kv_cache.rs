@@ -1169,6 +1169,9 @@ impl PagedKVCache {
             kv_head_stride,
             k_scale,
             v_scale,
+            // Phase 7: legacy PagedKVCache forward path; sliding-window
+            // masking is opt-in elsewhere.
+            sliding_window: 0,
         };
 
         let query_raw = RawBufferInfo {
@@ -1329,6 +1332,9 @@ impl PagedKVCache {
             kv_head_stride,
             k_scale,
             v_scale,
+            // Phase 7: legacy PagedKVCache forward path; sliding-window
+            // masking is opt-in elsewhere.
+            sliding_window: 0,
         };
 
         let query_raw = RawBufferInfo {

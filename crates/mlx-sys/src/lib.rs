@@ -1932,6 +1932,97 @@ unsafe extern "C-unwind" {
     /// Adjust Gemma4 cache offset by delta (for VLM position correction).
     pub fn mlx_gemma4_adjust_offset(delta: i32);
 
+    // ============================================
+    // Phase 7: paged Gemma4 forward (coexists with the flat compile
+    // path). The Rust dispatcher decides per-turn which graph to run;
+    // a single `mlx_gemma4_reset` wipes BOTH graphs' state.
+    // ============================================
+
+    /// Initialize the paged Gemma4 forward graph from per-layer pool /
+    /// scale handles. Same per-layer Gemma4Config as
+    /// `mlx_gemma4_init_from_prefill` plus the per-layer paged pool /
+    /// scale arrays.
+    ///
+    /// `k_pool_handles[i]`: pointer to a `[num_blocks, kv_heads_i,
+    /// head_dim_i / x_pack=8, block_size=16, x_pack=8]` bf16 array,
+    /// where `(kv_heads_i, head_dim_i)` follows the layer's type
+    /// (`global_*` for global, `num_kv_heads`/`head_dim` for sliding).
+    /// `v_pool_handles[i]`: pointer to a `[num_blocks, kv_heads_i,
+    /// head_dim_i, block_size=16]` bf16 array.
+    /// `k_scale_handles[i]` / `v_scale_handles[i]`: pointer to `[1]`
+    /// f32 scale placeholders (1.0 in Phase 7).
+    ///
+    /// `prefill_offset` becomes the initial paged offset.
+    ///
+    /// Compile-graph configuration:
+    /// - block_size = 16
+    /// - kv_dtype = Bf16
+    /// - x_pack = 8
+    /// - sliding_window per layer: 0 for global, `cfg.sliding_window`
+    ///   for sliding (passed through to the Phase 7 paged_attention
+    ///   kernel).
+    ///
+    /// Returns 0 on success, -1 on failure. On failure the C++ side
+    /// clears `g_gemma4_paged_inited` and emits a stderr diagnostic.
+    /// The Rust caller MUST inspect the return value and fall back to
+    /// the pure-Rust paged path on `-1`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_gemma4_init_paged(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        global_num_kv_heads: i32,
+        global_head_dim: i32,
+        rope_theta: f32,
+        rope_local_base_freq: f32,
+        partial_rotary_factor: f32,
+        rms_norm_eps: f32,
+        sliding_window: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        num_experts: i32,
+        top_k_experts: i32,
+        moe_intermediate_size: i32,
+        intermediate_size: i32,
+        final_logit_softcapping: f32,
+        layer_types: *const i32,
+        layer_types_len: i32,
+        k_pool_handles: *mut *mut mlx_array,
+        v_pool_handles: *mut *mut mlx_array,
+        k_scale_handles: *mut *mut mlx_array,
+        v_scale_handles: *mut *mut mlx_array,
+        prefill_offset: i32,
+    ) -> i32;
+
+    /// Single-token paged Gemma4 decode step.
+    ///
+    /// **Phase 7 contract — decode-only.** `input_ids` MUST have
+    /// exactly one element and `slot_mapping` MUST be `[1]`. Multi-
+    /// token / chunked prefill is reserved for later phases. The
+    /// contract is enforced on the C++ side: violating it returns
+    /// null logits and writes a stderr diagnostic, leaving global
+    /// state untouched so the caller can fall back.
+    ///
+    /// `output_logits` receives a heap-allocated `mlx_array*` (caller
+    /// owns) on success, or `nullptr` on error / when
+    /// `mlx_gemma4_init_paged` hasn't been called.
+    /// `cache_offset_out` receives the post-step offset.
+    pub fn mlx_gemma4_forward_paged(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        offset_arr: *mut mlx_array,
+        block_table: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+        num_valid_tokens: *mut mlx_array,
+        num_valid_blocks: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
     /// Load safetensors file using MLX's lazy loading (data read on eval, not upfront).
     /// Calls `callback` for each tensor with (name, name_len, array_handle, ctx).
     /// Returns number of tensors loaded, or -1 on error.

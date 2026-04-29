@@ -855,10 +855,11 @@ fn paged_attention_output_shapes_uses_scalar_state() {
 //
 // The public `paged_attention` and `paged_kv_write` factories must
 // reject inputs that would silently corrupt the kernel dispatch:
-//   - sliding_window != 0 (Phase 1 doesn't implement it)
+//   - sliding_window < 0 (Phase 7 lifts the Phase 1 sliding_window=0
+//     restriction; only negative values remain illegal)
 //   - q whose trailing dims disagree with primitive scalar state
 //   - K/V pool whose interior dims disagree with primitive state
-// The Rust extern-C shim ALSO rejects sliding_window != 0 so a
+// The Rust extern-C shim ALSO rejects negative sliding_window so a
 // missing C++-side check can't tunnel through.
 // =============================================================================
 
@@ -868,7 +869,8 @@ fn paged_attention_factory_rejects_sliding_window() {
     assert_eq!(
         threw, 1,
         "paged_attention(...) must throw std::invalid_argument when \
-         sliding_window != 0 (got {threw}); Phase 7 will add support"
+         sliding_window < 0 (got {threw}); Phase 7 lifts the Phase 1 \
+         sliding_window=0 restriction but negative values remain illegal"
     );
 }
 
@@ -896,18 +898,21 @@ fn paged_kv_write_factory_rejects_pool_shape_mismatch() {
 fn paged_attention_shim_rejects_sliding_window() {
     // Independent extern-C-side guard: even if some caller bypasses
     // the C++ factory's rejection (e.g. constructs a primitive
-    // directly) the shim will refuse a nonzero sliding_window.
+    // directly) the shim will refuse a NEGATIVE sliding_window.
+    // Phase 7 lifts the Phase 1 sliding_window=0 restriction; only
+    // negative values remain illegal (the only "no mask" sentinel is
+    // 0).
     let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
     let rc = unsafe {
         mlx_paged_attn::mlx_paged_attn_paged_attention_dispatch(
             dummy, 0, dummy, dummy, dummy, dummy, dummy, 0, /*num_seqs=*/ 1,
             /*num_q_heads=*/ 8, /*num_kv_heads=*/ 4, /*head_size=*/ 64,
             /*block_size=*/ 16, /*max_context_len=*/ 32, /*max_blocks_per_seq=*/ 4,
-            /*scale=*/ 0.125, /*softcap=*/ 0.0, /*sliding_window=*/ 512,
+            /*scale=*/ 0.125, /*softcap=*/ 0.0, /*sliding_window=*/ -1,
             /*kv_dtype=Bf16*/ 1, /*k_scale=*/ 1.0, /*v_scale=*/ 1.0,
         )
     };
-    assert_eq!(rc, -1, "shim must reject sliding_window != 0");
+    assert_eq!(rc, -1, "shim must reject sliding_window < 0");
 }
 
 // =============================================================================
@@ -1864,7 +1869,8 @@ fn paged_attention_eval_gpu_rejects_sliding_window() {
     let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_sliding_window() };
     assert_eval_gpu_rejects_bad_state(
         rc,
-        "PagedAttention sliding_window=512 (Phase 1 disallows nonzero)",
+        "PagedAttention sliding_window=-1 (negative values illegal; \
+         Phase 7 enables sliding_window > 0)",
     );
 }
 

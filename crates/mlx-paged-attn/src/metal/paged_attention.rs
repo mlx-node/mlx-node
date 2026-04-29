@@ -79,6 +79,10 @@ pub struct PagedAttentionParams {
     pub k_scale: f32,
     /// V scale for FP8 quantization (1.0 for non-FP8)
     pub v_scale: f32,
+    /// Phase 7: Sliding-window mask. When > 0, K positions older than
+    /// `context_len - sliding_window` are excluded from attention. When
+    /// 0 (default), no sliding mask is applied (full-context attention).
+    pub sliding_window: i32,
 }
 
 impl Default for PagedAttentionParams {
@@ -98,6 +102,7 @@ impl Default for PagedAttentionParams {
             kv_head_stride: 0,
             k_scale: 1.0,
             v_scale: 1.0,
+            sliding_window: 0,
         }
     }
 }
@@ -218,6 +223,10 @@ pub fn dispatch_paged_attention_v1(
     encoder.set_buffer(15, Some(&q_stride_buf), 0);
     encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
     encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
+
+    // Phase 7: sliding-window mask. 0 = full context (default).
+    let sliding_window_buf = create_int_buffer(params.sliding_window);
+    encoder.set_buffer(18, Some(&sliding_window_buf), 0);
 
     // Calculate threadgroup memory size — see
     // `dispatch_paged_attention_v1_raw` for the full justification. Same
@@ -380,6 +389,10 @@ pub fn dispatch_paged_attention_v2(
         encoder.set_buffer(15, Some(&q_stride_buf), 0);
         encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
         encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
+
+        // Phase 7: sliding-window mask. 0 = full context (default).
+        let sliding_window_buf = create_int_buffer(params.sliding_window);
+        encoder.set_buffer(18, Some(&sliding_window_buf), 0);
 
         // Threadgroup memory — same dual-purpose layout as V1 (see
         // `dispatch_paged_attention_v1_raw`). V2 partitions context into
@@ -734,6 +747,10 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
     encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
+    // Phase 7: sliding-window mask. 0 = full context (default).
+    let sliding_window_buf = create_int_buffer(params.sliding_window);
+    encoder.set_buffer(18, Some(&sliding_window_buf), 0);
+
     // Calculate threadgroup memory size.
     //
     // The kernel reuses `shared_mem` for two phases:
@@ -929,6 +946,10 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
         encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
+        // Phase 7: sliding-window mask. 0 = full context (default).
+        let sliding_window_buf = create_int_buffer(params.sliding_window);
+        encoder.set_buffer(18, Some(&sliding_window_buf), 0);
+
         // Threadgroup memory — same dual-purpose layout as V1 (see
         // `dispatch_paged_attention_v1_raw`). V2 partitions context into
         // PARTITION_SIZE chunks, so logits is sized by PARTITION_SIZE
@@ -1083,8 +1104,10 @@ mod tests {
             kv_head_stride: 16384,
             k_scale: 1.0,
             v_scale: 1.0,
+            sliding_window: 0,
         };
         assert_eq!(params.num_heads / params.num_kv_heads, 6); // GQA ratio
+        assert_eq!(params.sliding_window, 0);
     }
 
     #[test]
@@ -1096,5 +1119,14 @@ mod tests {
         };
         assert_eq!(params.k_scale, 0.5);
         assert_eq!(params.v_scale, 0.25);
+    }
+
+    #[test]
+    fn test_sliding_window_params() {
+        let params = PagedAttentionParams {
+            sliding_window: 1024,
+            ..Default::default()
+        };
+        assert_eq!(params.sliding_window, 1024);
     }
 }
