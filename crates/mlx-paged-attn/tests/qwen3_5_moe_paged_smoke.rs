@@ -115,6 +115,10 @@ unsafe fn delete(handle: *mut mlx_sys::mlx_array) {
 }
 
 unsafe extern "C" {
+    // The canonical mlx-sys binding (and the underlying C++ definition)
+    // returns `i32` (0 on success, -1 on failure). Mirror that here so
+    // tests can assert success before exercising paths that require
+    // initialized state.
     fn mlx_qwen35_moe_init_paged(
         num_layers: i32,
         hidden_size: i32,
@@ -145,7 +149,7 @@ unsafe extern "C" {
         v_scale_handles: *mut *mut mlx_sys::mlx_array,
         linear_cache_arrays: *mut *mut mlx_sys::mlx_array,
         prefill_offset: i32,
-    );
+    ) -> i32;
 
     fn mlx_qwen35_moe_forward_paged(
         input_ids: *mut mlx_sys::mlx_array,
@@ -326,7 +330,7 @@ fn forward_paged_graph_builds_without_crash() {
 
     // Init the paged graph. linear_cache_arrays is null → init stashes
     // bf16 placeholders for every linear-layer slot.
-    unsafe {
+    let init_status = unsafe {
         mlx_qwen35_moe_init_paged(
             NUM_LAYERS,
             HIDDEN_SIZE,
@@ -357,8 +361,12 @@ fn forward_paged_graph_builds_without_crash() {
             v_scale_vec.as_mut_ptr(),
             ptr::null_mut(),
             0,
-        );
-    }
+        )
+    };
+    assert_eq!(
+        init_status, 0,
+        "mlx_qwen35_moe_init_paged must succeed with full per-layer handle bundle"
+    );
 
     // PagedAttentionInputs metadata at the shapes documented in
     // mlx_common.h.
@@ -588,7 +596,7 @@ fn forward_paged_after_reset_returns_null() {
     }
 
     unsafe {
-        mlx_qwen35_moe_init_paged(
+        let init_status = mlx_qwen35_moe_init_paged(
             NUM_LAYERS,
             HIDDEN_SIZE,
             NUM_HEADS,
@@ -618,6 +626,10 @@ fn forward_paged_after_reset_returns_null() {
             v_scale_vec.as_mut_ptr(),
             ptr::null_mut(),
             42, // arbitrary prefill_offset to make stale state visible
+        );
+        assert_eq!(
+            init_status, 0,
+            "mlx_qwen35_moe_init_paged must succeed with full pool bundle"
         );
 
         // Reset must clear `g_paged_inited`. After the fix this returns
@@ -832,7 +844,7 @@ fn forward_paged_rejects_multi_token_contract_violation() {
         return;
     }
 
-    unsafe {
+    let init_status = unsafe {
         mlx_qwen35_moe_init_paged(
             NUM_LAYERS,
             HIDDEN_SIZE,
@@ -863,8 +875,9 @@ fn forward_paged_rejects_multi_token_contract_violation() {
             v_scale_vec.as_mut_ptr(),
             ptr::null_mut(),
             0,
-        );
-    }
+        )
+    };
+    assert_eq!(init_status, 0, "init must succeed");
 
     // Build inputs that VIOLATE the single-token contract:
     //   - input_ids.size() == 2 (should be 1)

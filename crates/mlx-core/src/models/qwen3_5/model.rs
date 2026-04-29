@@ -2358,6 +2358,20 @@ impl Qwen35Inner {
         // exit so stale C++ globals don't leak into the next request.
         let _dense_paged_guard = cpp_session_ready.then_some(CompiledResetGuard);
 
+        // Tracks whether ANY compiled C++ paged step has succeeded
+        // during this turn. After a successful compiled step the C++
+        // side has advanced its per-layer GDN linear-cache globals
+        // (conv_state / recurrent_state) but those updates never get
+        // imported back into `self.caches`. Falling back to pure-Rust
+        // decode after that point would run from stale pre-step-N GDN
+        // state while `paged_adapter` and `token_history` have already
+        // advanced — silently corrupting the rest of the request. The
+        // mid-turn fallback below is therefore only safe BEFORE the
+        // first successful compiled step (the only failure mode we
+        // really need to defend against is init/configuration mismatch
+        // on the very first forward call).
+        let mut cpp_compiled_step_completed = false;
+
         // === DECODE LOOP ===
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
@@ -2400,17 +2414,15 @@ impl Qwen35Inner {
             // Decode forward.
             //
             // Defense-in-depth: if the C++ compiled paged forward returns
-            // null (despite init succeeding), we rollback the
-            // `record_tokens` cursor advance, mark `cpp_session_ready =
-            // false` so subsequent steps go straight to pure-Rust without
-            // retrying compiled, and re-run this token through
-            // `run_paged_decode_step` (which re-calls `record_tokens` on
-            // the now-rolled-back cursor). The C++ side has its own
-            // init-time test eval that should catch layout/dtype errors
-            // before we reach here, but a foreign exception inside the
-            // graph compile or eval would still surface as a null return —
-            // and since `record_tokens` mutated adapter state BEFORE the
-            // forward call, we have to undo it manually.
+            // null on the FIRST step, we rollback the `record_tokens`
+            // cursor advance, mark `cpp_session_ready = false`, and
+            // re-run this token through pure-Rust `run_paged_decode_step`
+            // (which re-calls `record_tokens` on the now-rolled-back
+            // cursor). After ANY compiled step has succeeded the C++ GDN
+            // linear-cache globals have advanced but we never copy them
+            // back into `self.caches`, so a Rust fallback would read
+            // stale pre-step state — propagate the error as fatal
+            // instead of silently corrupting the response.
             let next_logits = if cpp_session_ready {
                 let embedding_weight = self.embedding.get_weight();
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
@@ -2426,12 +2438,31 @@ impl Qwen35Inner {
                     .map_err(Error::from_reason)?;
                 let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
                 match forward_dense_cpp_paged(&input_ids, &embedding_weight, &inputs) {
-                    Ok(logits) => logits,
+                    Ok(logits) => {
+                        cpp_compiled_step_completed = true;
+                        logits
+                    }
                     Err(e) => {
+                        if should_propagate_compiled_paged_error(cpp_compiled_step_completed) {
+                            eprintln!(
+                                "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed \
+                                 mid-decode (step={step}) AFTER an earlier compiled step \
+                                 succeeded. The C++ GDN linear-cache globals have advanced \
+                                 but those updates are not imported back into self.caches, \
+                                 so a pure-Rust fallback would run from stale pre-step state \
+                                 and silently corrupt the response. Propagating as fatal. \
+                                 cause: {e}"
+                            );
+                            adapter
+                                .rollback_last_tokens(1)
+                                .map_err(Error::from_reason)?;
+                            return Err(e);
+                        }
                         eprintln!(
-                            "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed mid-decode \
-                             (step={step}); rolling back token cursor and falling back to \
-                             pure-Rust paged decode for the rest of this request. cause: {e}"
+                            "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed on \
+                             first decode step (step={step}); rolling back token cursor \
+                             and falling back to pure-Rust paged decode for the rest of \
+                             this request. cause: {e}"
                         );
                         adapter
                             .rollback_last_tokens(1)
@@ -2902,6 +2933,16 @@ impl Qwen35Inner {
         // so stale C++ globals don't leak into the next request.
         let _dense_paged_guard = cpp_session_ready.then_some(CompiledResetGuard);
 
+        // Tracks whether ANY compiled C++ paged step has succeeded
+        // during this turn. After a successful compiled step the C++
+        // GDN linear-cache globals (conv_state / recurrent_state) have
+        // advanced but are never imported back into `self.caches`, so a
+        // pure-Rust fallback would read stale pre-step state. The
+        // mid-turn fallback below is therefore only safe BEFORE the
+        // first successful compiled step. See sync sibling
+        // `chat_sync_core_paged_inner` for the full rationale.
+        let mut cpp_compiled_step_completed = false;
+
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
         let mut finish_reason = String::from("length");
@@ -2973,7 +3014,9 @@ impl Qwen35Inner {
             }
 
             // Decode forward. Defense-in-depth fallback: see
-            // `chat_sync_core_paged_inner` for the rollback rationale.
+            // `chat_sync_core_paged_inner` for the rollback rationale —
+            // mid-turn fallback only safe BEFORE the first successful
+            // compiled step.
             let next_logits = if cpp_session_ready {
                 let embedding_weight = self.embedding.get_weight();
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
@@ -2989,13 +3032,31 @@ impl Qwen35Inner {
                     .map_err(Error::from_reason)?;
                 let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
                 match forward_dense_cpp_paged(&input_ids, &embedding_weight, &inputs) {
-                    Ok(logits) => logits,
+                    Ok(logits) => {
+                        cpp_compiled_step_completed = true;
+                        logits
+                    }
                     Err(e) => {
+                        if should_propagate_compiled_paged_error(cpp_compiled_step_completed) {
+                            eprintln!(
+                                "[MLX] Qwen3.5 Dense (stream): C++ compiled paged forward \
+                                 failed mid-decode (step={step}) AFTER an earlier compiled \
+                                 step succeeded. The C++ GDN linear-cache globals have \
+                                 advanced but those updates are not imported back into \
+                                 self.caches, so a pure-Rust fallback would run from stale \
+                                 pre-step state and silently corrupt the response. \
+                                 Propagating as fatal. cause: {e}"
+                            );
+                            adapter
+                                .rollback_last_tokens(1)
+                                .map_err(Error::from_reason)?;
+                            return Err(e);
+                        }
                         eprintln!(
                             "[MLX] Qwen3.5 Dense (stream): C++ compiled paged forward failed \
-                             mid-decode (step={step}); rolling back token cursor and falling \
-                             back to pure-Rust paged decode for the rest of this request. \
-                             cause: {e}"
+                             on first decode step (step={step}); rolling back token cursor \
+                             and falling back to pure-Rust paged decode for the rest of \
+                             this request. cause: {e}"
                         );
                         adapter
                             .rollback_last_tokens(1)
@@ -6881,6 +6942,63 @@ fn forward_dense_cpp_paged(
     }
 
     MxArray::from_handle(output_ptr, "dense_paged_forward_logits")
+}
+
+/// Policy decision for the C++ compiled paged forward fallback.
+///
+/// Inputs:
+/// * `compiled_step_completed` — whether ANY compiled C++ paged step
+///   has succeeded earlier in this turn.
+///
+/// Output:
+/// * `true` — propagate the forward error as fatal. Returned when a
+///   compiled step has previously succeeded; the C++ side has advanced
+///   its per-layer GDN linear-cache globals (conv_state /
+///   recurrent_state) but those updates are never imported back into
+///   `self.caches`. Falling back to the pure-Rust paged decode after
+///   that point would read stale pre-step state and silently corrupt
+///   the response.
+/// * `false` — safe to fall back to the pure-Rust paged decode.
+///   Returned when no compiled step has succeeded yet; the only failure
+///   mode at that point is an init/configuration mismatch caught at
+///   first dispatch, which leaves `self.caches` consistent with
+///   `paged_adapter` after a `rollback_last_tokens(1)`.
+///
+/// This mirrors the policy applied identically in the dense and MoE
+/// sync + streaming decode loops; extracting it as a stand-alone helper
+/// keeps the tests in lockstep.
+#[inline]
+fn should_propagate_compiled_paged_error(compiled_step_completed: bool) -> bool {
+    compiled_step_completed
+}
+
+#[cfg(test)]
+mod compiled_paged_fallback_policy_tests {
+    use super::should_propagate_compiled_paged_error;
+
+    /// Regression test for review Finding 1 (HIGH): mid-turn fallback
+    /// after a successful compiled step would corrupt the GDN linear
+    /// cache state. The policy must propagate the error as fatal once
+    /// any compiled step has completed; only the first-step failure is
+    /// safe to fall back to pure-Rust decode.
+    #[test]
+    fn no_compiled_step_yet_allows_fallback() {
+        assert!(
+            !should_propagate_compiled_paged_error(false),
+            "first-step compiled forward failure must allow fallback to pure-Rust paged decode \
+             (self.caches is still consistent with paged_adapter pre-rollback)"
+        );
+    }
+
+    #[test]
+    fn after_successful_compiled_step_propagates_as_fatal() {
+        assert!(
+            should_propagate_compiled_paged_error(true),
+            "compiled forward failure AFTER a successful compiled step must propagate as fatal: \
+             the C++ GDN linear-cache globals advanced but self.caches is stale, so a pure-Rust \
+             fallback would silently corrupt the response"
+        );
+    }
 }
 
 // ============================================================================
