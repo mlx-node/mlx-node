@@ -951,6 +951,62 @@ unsafe extern "C-unwind" {
     /// rejected (Phase 1 safety check; eval-based bounds verification).
     pub fn mlx_paged_kv_write_factory_rejects_slot_mapping_out_of_range() -> i32;
 
+    // =============================================================================
+    // Phase 1 review-round-4 dtype-mismatch FFI declarations (finding B+C).
+    //
+    // Each helper constructs `paged_attention` / `paged_kv_write` factory
+    // inputs that are well-formed EXCEPT for one specific dtype slot
+    // (q, k_pool, v_pool, new_k, or new_v) that disagrees with the
+    // dtype implied by `kv_dtype`. The factory MUST reject by throwing
+    // `std::invalid_argument`. Returns 1 on rejection, 0 otherwise.
+    // =============================================================================
+
+    /// k_pool dtype != bfloat16 must be rejected for kv_dtype=Bf16.
+    pub fn mlx_paged_kv_write_factory_rejects_k_pool_dtype_bf16() -> i32;
+
+    /// v_pool dtype != bfloat16 must be rejected for kv_dtype=Bf16.
+    pub fn mlx_paged_kv_write_factory_rejects_v_pool_dtype_bf16() -> i32;
+
+    /// new_k dtype != bfloat16 must be rejected for kv_dtype=Bf16.
+    pub fn mlx_paged_kv_write_factory_rejects_new_k_dtype_bf16() -> i32;
+
+    /// new_v dtype != bfloat16 must be rejected for kv_dtype=Bf16.
+    pub fn mlx_paged_kv_write_factory_rejects_new_v_dtype_bf16() -> i32;
+
+    /// k_pool dtype != uint8 must be rejected for kv_dtype=Fp8.
+    pub fn mlx_paged_kv_write_factory_rejects_k_pool_dtype_fp8() -> i32;
+
+    /// new_k dtype != bfloat16 must be rejected for kv_dtype=Fp8
+    /// (Phase 1 contract: FP8 io dtype is bfloat16).
+    pub fn mlx_paged_kv_write_factory_rejects_new_k_dtype_fp8() -> i32;
+
+    /// q dtype != bfloat16 must be rejected for kv_dtype=Bf16.
+    pub fn mlx_paged_attention_factory_rejects_q_dtype_bf16() -> i32;
+
+    /// q dtype != bfloat16 must be rejected for kv_dtype=Fp8 (Phase 1
+    /// contract: FP8 io dtype is bfloat16).
+    pub fn mlx_paged_attention_factory_rejects_q_dtype_fp8() -> i32;
+
+    /// k_pool dtype != bfloat16 must be rejected for kv_dtype=Bf16.
+    pub fn mlx_paged_attention_factory_rejects_k_pool_dtype_bf16() -> i32;
+
+    /// k_pool dtype != uint8 must be rejected for kv_dtype=Fp8.
+    pub fn mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() -> i32;
+
+    /// Compile a `paged_kv_write`-emitting function, call it once with a
+    /// valid slot_mapping (cache miss, factory check passes), then call
+    /// it again with an out-of-range slot_mapping. The cache HIT bypasses
+    /// the factory; `PagedKVWrite::eval_gpu`'s own bounds check MUST
+    /// throw `std::invalid_argument` on the second eval.
+    ///
+    /// Return codes:
+    ///   1   — second-call eval threw `std::invalid_argument` (fix
+    ///         working).
+    ///   0   — second-call eval did NOT throw (regression).
+    ///  -1   — internal/setup error.
+    ///  -3   — Metal not available; eval-based verification skipped.
+    pub fn mlx_paged_kv_write_compile_cached_oob_throws() -> i32;
+
     /// Reset the compile-trace counter to 0 before exercising the
     /// `mlx_paged_kv_write_compile_trace_smoke` helper.
     pub fn mlx_paged_kv_write_trace_count_reset();

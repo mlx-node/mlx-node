@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -99,9 +100,13 @@ int x_pack_for(KvDtype kv_dtype) {
 }
 
 // Map the `KvDtype` enum to the matching MLX `Dtype` for io tensors.
-// Phase 1 contract (must match the Rust shim):
+// Phase 1 contract (must match the Rust shim's
+// `mlx_paged_attn_reshape_and_cache_dispatch` derivation in
+// `crates/mlx-paged-attn/src/extern_c.rs`):
 //   - non-FP8 cache → io dtype == cache dtype
-//   - FP8 cache     → io dtype == bfloat16 (BF16-default for production)
+//   - FP8 cache     → io dtype == bfloat16 (BF16-default for production;
+//                     matches `MetalState::reshape_and_cache_kernel_name`'s
+//                     `(bfloat16_t, uchar)` instantiation)
 mlx::core::Dtype io_dtype_for_kv_dtype(KvDtype kv_dtype) {
   switch (kv_dtype) {
     case KvDtype::Fp16:
@@ -110,6 +115,25 @@ mlx::core::Dtype io_dtype_for_kv_dtype(KvDtype kv_dtype) {
       return mlx::core::bfloat16;
     case KvDtype::Fp8:
       return mlx::core::bfloat16;
+  }
+  // Unreachable; quiet the warning.
+  return mlx::core::bfloat16;
+}
+
+// Map the `KvDtype` enum to the matching MLX `Dtype` for the on-cache
+// (K/V pool) storage. Phase 1 contract:
+//   - Fp16 cache → float16
+//   - Bf16 cache → bfloat16
+//   - Fp8 cache  → uint8 (FP8 stored opaquely as bytes; the kernel
+//                  reinterprets via `to_cache<KV_T, uchar>` below)
+mlx::core::Dtype cache_dtype_for_kv_dtype(KvDtype kv_dtype) {
+  switch (kv_dtype) {
+    case KvDtype::Fp16:
+      return mlx::core::float16;
+    case KvDtype::Bf16:
+      return mlx::core::bfloat16;
+    case KvDtype::Fp8:
+      return mlx::core::uint8;
   }
   // Unreachable; quiet the warning.
   return mlx::core::bfloat16;
@@ -214,6 +238,50 @@ void PagedKVWrite::eval_gpu(
         "num_kv_heads, head_size]");
   }
   uint32_t num_tokens = static_cast<uint32_t>(new_k.shape(0));
+
+  // Slot-id bounds check (Phase 1 safety; runs on EVERY runtime call,
+  // including the compile-cached path).
+  //
+  // The Metal kernel does NOT bounds-check `slot_idx`; a value
+  // `>= num_blocks * block_size` writes past the K/V pool. The factory
+  // performs an early-fail eval-based check, but `mlx::core::compile`
+  // skips the factory on cached re-traces and routes runtime
+  // `slot_mapping` straight into `eval_gpu`. We must therefore re-check
+  // here on every call.
+  //
+  // MLX evaluates all primitive inputs before invoking `eval_gpu`, so
+  // `slot_mapping.data<int64_t>()` is materialized and safe to read
+  // host-side. This is the same pattern used immediately below in
+  // `PagedAttention::eval_gpu` to read `seq_lens.data<int32_t>()`.
+  if (slot_mapping.dtype() != mlx::core::int64) {
+    throw std::runtime_error(
+        "PagedKVWrite: slot_mapping must be int64 (kernel reads as int64_t*)");
+  }
+  if (slot_mapping.shape(0) > 0) {
+    const int32_t num_blocks_runtime = static_cast<int32_t>(k_pool.shape(0));
+    const int64_t pool_capacity = static_cast<int64_t>(num_blocks_runtime) *
+        static_cast<int64_t>(block_size_);
+    const int64_t* slot_data = slot_mapping.data<int64_t>();
+    int64_t max_slot = -1;
+    for (size_t i = 0; i < slot_mapping.size(); ++i) {
+      // Negative slot ids are sentinels for "skip this token"; the
+      // kernel handles them with an early `return`. Don't include them
+      // in the max — only valid (non-negative) ids must stay in range.
+      if (slot_data[i] >= 0 && slot_data[i] > max_slot) {
+        max_slot = slot_data[i];
+      }
+    }
+    if (max_slot >= pool_capacity) {
+      std::ostringstream msg;
+      msg << "PagedKVWrite::eval_gpu: slot_mapping max (" << max_slot
+          << ") exceeds pool capacity (num_blocks=" << num_blocks_runtime
+          << " * block_size=" << block_size_ << " = " << pool_capacity
+          << "). The kernel does not bounds-check slot_idx; an out-of-range "
+          << "slot would write past the K/V pool. This check fires on every "
+          << "runtime call (including the compile-cached path).";
+      throw std::invalid_argument(msg.str());
+    }
+  }
 
   auto k_pool_ptr = metal_array_ptr(k_pool);
   auto v_pool_ptr = metal_array_ptr(v_pool);
@@ -457,6 +525,67 @@ std::pair<array, array> paged_kv_write(
         "paged_kv_write has no fallback implementation (inference-only)");
   };
 
+  // Dtype-vs-kv_dtype validation. The Rust shim derives `cache_dtype`
+  // and `input_dtype` from `kv_dtype` (see
+  // `crates/mlx-paged-attn/src/extern_c.rs`); a dtype mismatch here
+  // silently misroutes which Metal kernel template gets called, which
+  // would either crash on a buffer-size mismatch OR (worse) produce
+  // garbage K/V values that downstream attention reads as if they were
+  // valid. Reject every combination at the factory.
+  //
+  // These checks fire BEFORE the pairwise k_pool==v_pool /
+  // new_k==new_v checks below — putting the kv_dtype checks first
+  // ensures each input slot (k_pool, v_pool, new_k, new_v) has its
+  // own dedicated rejection path that the negative tests can exercise
+  // directly. If we kept the pairwise check first, a (k_pool=bf16,
+  // v_pool=uint8) input would short-circuit on the pairwise check
+  // before the v_pool-vs-kv_dtype check ever ran, leaving the
+  // v_pool-specific path untested.
+  {
+    auto expected_cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
+    if (k_pool.dtype() != expected_cache_dtype) {
+      std::ostringstream msg;
+      msg << "[paged_kv_write] k_pool dtype " << k_pool.dtype()
+          << " disagrees with the expected cache dtype "
+          << expected_cache_dtype << " for kv_dtype "
+          << static_cast<int>(kv_dtype);
+      throw std::invalid_argument(msg.str());
+    }
+    if (v_pool.dtype() != expected_cache_dtype) {
+      std::ostringstream msg;
+      msg << "[paged_kv_write] v_pool dtype " << v_pool.dtype()
+          << " disagrees with the expected cache dtype "
+          << expected_cache_dtype << " for kv_dtype "
+          << static_cast<int>(kv_dtype);
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  {
+    auto expected_io_dtype = io_dtype_for_kv_dtype(kv_dtype);
+    if (new_k.dtype() != expected_io_dtype) {
+      std::ostringstream msg;
+      msg << "[paged_kv_write] new_k dtype " << new_k.dtype()
+          << " disagrees with the expected io dtype "
+          << expected_io_dtype << " for kv_dtype "
+          << static_cast<int>(kv_dtype)
+          << " (FP8 io dtype is bfloat16 per Phase 1 contract)";
+      throw std::invalid_argument(msg.str());
+    }
+    if (new_v.dtype() != expected_io_dtype) {
+      std::ostringstream msg;
+      msg << "[paged_kv_write] new_v dtype " << new_v.dtype()
+          << " disagrees with the expected io dtype "
+          << expected_io_dtype << " for kv_dtype "
+          << static_cast<int>(kv_dtype)
+          << " (FP8 io dtype is bfloat16 per Phase 1 contract)";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  // Defense-in-depth pairwise checks. Unreachable when the
+  // kv_dtype-vs-input checks above fully cover the inputs (which is
+  // the case for every supported kv_dtype today), but kept as a
+  // tripwire for future kv_dtype additions where the cache/io maps
+  // might temporarily go out of sync.
   if (k_pool.dtype() != v_pool.dtype()) {
     std::ostringstream msg;
     msg << "[paged_kv_write] k_pool dtype " << k_pool.dtype()
@@ -736,6 +865,41 @@ array paged_attention(
     throw std::invalid_argument(
         "[paged_attention] q must be rank 3 "
         "[num_seqs, num_q_heads, head_size]");
+  }
+
+  // Dtype-vs-kv_dtype validation. Like the paged_kv_write factory, a
+  // dtype mismatch silently misroutes the Metal kernel template
+  // selection (see `MetalState::paged_attention_kernel_name`) and
+  // would either crash on a buffer-size mismatch or produce garbage
+  // attention outputs.
+  {
+    auto expected_io_dtype = io_dtype_for_kv_dtype(kv_dtype);
+    if (q.dtype() != expected_io_dtype) {
+      std::ostringstream msg;
+      msg << "[paged_attention] q dtype " << q.dtype()
+          << " disagrees with the expected io dtype "
+          << expected_io_dtype << " for kv_dtype "
+          << static_cast<int>(kv_dtype)
+          << " (FP8 io dtype is bfloat16 per Phase 1 contract)";
+      throw std::invalid_argument(msg.str());
+    }
+    auto expected_cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
+    if (k_pool.dtype() != expected_cache_dtype) {
+      std::ostringstream msg;
+      msg << "[paged_attention] k_pool dtype " << k_pool.dtype()
+          << " disagrees with the expected cache dtype "
+          << expected_cache_dtype << " for kv_dtype "
+          << static_cast<int>(kv_dtype);
+      throw std::invalid_argument(msg.str());
+    }
+    if (v_pool.dtype() != expected_cache_dtype) {
+      std::ostringstream msg;
+      msg << "[paged_attention] v_pool dtype " << v_pool.dtype()
+          << " disagrees with the expected cache dtype "
+          << expected_cache_dtype << " for kv_dtype "
+          << static_cast<int>(kv_dtype);
+      throw std::invalid_argument(msg.str());
+    }
   }
 
   // Shape validation against scalar state. q is `[num_seqs,
@@ -1252,12 +1416,16 @@ namespace {
 // v_pool, block_table, seq_lens) and well-formed scalar state. Returns
 // 1 on `std::invalid_argument`, 0 otherwise. Used by the negative-test
 // helpers below to keep them concise.
+//
+// `kv_dtype` defaults to `Bf16`, matching the original Phase 1 review
+// callers. Round-4 review adds Fp8 cases that pass `kv_dtype = Fp8`.
 int call_paged_attention_expecting_throw(
     const mlx::core::array& q,
     const mlx::core::array& k_pool,
     const mlx::core::array& v_pool,
     const mlx::core::array& block_table,
-    const mlx::core::array& seq_lens) {
+    const mlx::core::array& seq_lens,
+    mlx::core::fast::KvDtype kv_dtype = mlx::core::fast::KvDtype::Bf16) {
   using namespace mlx::core;
   using namespace mlx::core::fast;
   array k_scale(1.0f, float32);
@@ -1278,7 +1446,7 @@ int call_paged_attention_expecting_throw(
         /*num_q_heads=*/8,
         /*num_kv_heads=*/4,
         /*head_size=*/64,
-        KvDtype::Bf16,
+        kv_dtype,
         StreamOrDevice{});
   } catch (const std::invalid_argument&) {
     return 1;
@@ -1288,12 +1456,17 @@ int call_paged_attention_expecting_throw(
   return 0;
 }
 
+// Helper: invoke `paged_kv_write(...)` with custom inputs and the
+// supplied (kv_dtype, x_pack) pair. Round-4 review uses this with
+// `KvDtype::Fp8 + x_pack=16` to validate FP8 dtype rejection.
 int call_paged_kv_write_expecting_throw(
     const mlx::core::array& k_pool,
     const mlx::core::array& v_pool,
     const mlx::core::array& new_k,
     const mlx::core::array& new_v,
-    const mlx::core::array& slot_mapping) {
+    const mlx::core::array& slot_mapping,
+    mlx::core::fast::KvDtype kv_dtype = mlx::core::fast::KvDtype::Bf16,
+    int x_pack = 8) {
   using namespace mlx::core;
   using namespace mlx::core::fast;
   array k_scale(1.0f, float32);
@@ -1310,8 +1483,8 @@ int call_paged_kv_write_expecting_throw(
         /*block_size=*/16,
         /*num_kv_heads=*/4,
         /*head_size=*/64,
-        /*x_pack=*/8,
-        KvDtype::Bf16,
+        x_pack,
+        kv_dtype,
         StreamOrDevice{});
   } catch (const std::invalid_argument&) {
     return 1;
@@ -1876,6 +2049,69 @@ int mlx_paged_kv_write_compile_trace_smoke(int num_tokens) {
     }
   }
 
+  // V-pool byte verification (Phase 1 review-round-4 addition).
+  //
+  // K-only verification can pass even if input 3 (`new_v`) was left
+  // stale by a `compile_replace` bug that correctly threaded inputs
+  // 0/1/2/4 (k_pool, v_pool, new_k, slot_mapping) but not input 3
+  // (new_v). In that case `kVValA` would land in block 1 V-slots
+  // instead of `kVValB`. Read the V pool back and assert each test
+  // slot holds the expected V value to close that hole.
+  //
+  // V layout (vLLM, distinct from K's `_x` packing):
+  //   v_pool[block_idx, num_kv_heads, head_size, block_size]
+  // Strides (in elements):
+  const size_t head_per_block_v =
+      static_cast<size_t>(kHeadSize) * kBlockSize;
+  const size_t stride_block_v =
+      static_cast<size_t>(kNumKvHeads) * head_per_block_v;
+  const size_t stride_head_v = head_per_block_v;
+  const size_t stride_j_v = static_cast<size_t>(kBlockSize);
+
+  const bfloat16_t* v_pool_bf16 = v_pool.data<bfloat16_t>();
+  if (v_pool_bf16 == nullptr) {
+    fprintf(stderr, "[compile_trace_smoke] v_pool data ptr is null\n");
+    return -1;
+  }
+  const uint16_t* v_pool_data =
+      reinterpret_cast<const uint16_t*>(v_pool_bf16);
+
+  // Check first-call slots (block 0, head=0, j=0): expect kVValA.
+  // Check second-call slots (block 1, head=0, j=0): expect kVValB.
+  for (int t = 0; t < num_tokens; ++t) {
+    const size_t v_block0_offset = stride_block_v * 0 + // block 0
+        stride_head_v * 0 + // head 0
+        stride_j_v * 0 + // j = 0
+        static_cast<size_t>(t); // block_offset = t
+    const size_t v_block1_offset = stride_block_v * 1 + // block 1
+        stride_head_v * 0 + // head 0
+        stride_j_v * 0 + // j = 0
+        static_cast<size_t>(t);
+
+    if (v_pool_data[v_block0_offset] != kVValA) {
+      fprintf(
+          stderr,
+          "[compile_trace_smoke] V slot at block 0, position t=%d, head=0, j=0: "
+          "expected kVValA=0x%04x got 0x%04x (first-call V should be at first-call slots)\n",
+          t,
+          kVValA,
+          v_pool_data[v_block0_offset]);
+      return -2;
+    }
+    if (v_pool_data[v_block1_offset] != kVValB) {
+      fprintf(
+          stderr,
+          "[compile_trace_smoke] V slot at block 1, position t=%d, head=0, j=0: "
+          "expected kVValB=0x%04x got 0x%04x — did compile_replace fail to thread input 3 (new_v)? "
+          "If you see kVValA=0x%04x the second call inherited the first call's new_v.\n",
+          t,
+          kVValB,
+          v_pool_data[v_block1_offset],
+          kVValA);
+      return -2;
+    }
+  }
+
   return count_after_second;
 }
 
@@ -1914,6 +2150,369 @@ int mlx_paged_kv_write_factory_rejects_pool_shape_mismatch() {
   } catch (...) {
     return 0;
   }
+  return 0;
+}
+
+// =============================================================================
+// Phase 1 review-round-4 dtype-mismatch negative tests for paged_kv_write.
+//
+// Round 4 finding B: the factory previously checked only pairwise dtype
+// equality (k_pool == v_pool, new_k == new_v) — it did NOT verify the
+// dtype matched the cache/io dtype implied by `kv_dtype`. These helpers
+// each construct factory inputs that are well-formed EXCEPT for one
+// dtype slot, then assert `std::invalid_argument` is thrown.
+// =============================================================================
+
+/// k_pool dtype is uint8 instead of the expected bfloat16 for Bf16.
+int mlx_paged_kv_write_factory_rejects_k_pool_dtype_bf16() {
+  using namespace mlx::core;
+  // Both pools must agree pairwise to reach the kv_dtype check.
+  array k_pool(Shape{4, 4, 8, 16, 8}, uint8, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, uint8, nullptr, {});
+  // new_k/new_v keep the right io dtype so only k_pool dtype triggers
+  // the throw.
+  array new_k(Shape{2, 4, 64}, bfloat16, nullptr, {});
+  array new_v(Shape{2, 4, 64}, bfloat16, nullptr, {});
+  array slot_mapping(Shape{2}, int64, nullptr, {});
+  return call_paged_kv_write_expecting_throw(
+      k_pool, v_pool, new_k, new_v, slot_mapping);
+}
+
+/// v_pool dtype is uint8 instead of the expected bfloat16 for Bf16.
+/// k_pool stays at the right dtype so the k_pool kv_dtype check
+/// passes; v_pool is the only mismatch, exercising the v_pool-vs-
+/// kv_dtype check directly (the kv_dtype checks fire BEFORE the
+/// pairwise check now, see the factory's reordered validation).
+int mlx_paged_kv_write_factory_rejects_v_pool_dtype_bf16() {
+  using namespace mlx::core;
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, uint8, nullptr, {});
+  array new_k(Shape{2, 4, 64}, bfloat16, nullptr, {});
+  array new_v(Shape{2, 4, 64}, bfloat16, nullptr, {});
+  array slot_mapping(Shape{2}, int64, nullptr, {});
+  return call_paged_kv_write_expecting_throw(
+      k_pool, v_pool, new_k, new_v, slot_mapping);
+}
+
+/// new_k dtype is float32 instead of the expected bfloat16 for Bf16.
+int mlx_paged_kv_write_factory_rejects_new_k_dtype_bf16() {
+  using namespace mlx::core;
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  // new_k float32, new_v float32 — pair agrees, but disagrees with
+  // kv_dtype's expected io dtype (bfloat16).
+  array new_k(Shape{2, 4, 64}, float32, nullptr, {});
+  array new_v(Shape{2, 4, 64}, float32, nullptr, {});
+  array slot_mapping(Shape{2}, int64, nullptr, {});
+  return call_paged_kv_write_expecting_throw(
+      k_pool, v_pool, new_k, new_v, slot_mapping);
+}
+
+/// new_v dtype is float32 instead of the expected bfloat16 for Bf16.
+/// new_k stays at the right dtype so the new_k kv_dtype check passes;
+/// new_v is the only mismatch, exercising the new_v-vs-kv_dtype check
+/// directly (the kv_dtype checks fire BEFORE the pairwise check now,
+/// see the factory's reordered validation).
+int mlx_paged_kv_write_factory_rejects_new_v_dtype_bf16() {
+  using namespace mlx::core;
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array new_k(Shape{2, 4, 64}, bfloat16, nullptr, {});
+  array new_v(Shape{2, 4, 64}, float32, nullptr, {});
+  array slot_mapping(Shape{2}, int64, nullptr, {});
+  return call_paged_kv_write_expecting_throw(
+      k_pool, v_pool, new_k, new_v, slot_mapping);
+}
+
+/// k_pool dtype is bfloat16 instead of the expected uint8 for Fp8.
+int mlx_paged_kv_write_factory_rejects_k_pool_dtype_fp8() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  // FP8 expects k_pool/v_pool dtype = uint8, x_pack = 16, head_size/x = 4.
+  // We pass bfloat16 for the pools to trigger the kv_dtype check.
+  array k_pool(Shape{4, 4, 4, 16, 16}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array new_k(Shape{2, 4, 64}, bfloat16, nullptr, {});
+  array new_v(Shape{2, 4, 64}, bfloat16, nullptr, {});
+  array slot_mapping(Shape{2}, int64, nullptr, {});
+  return call_paged_kv_write_expecting_throw(
+      k_pool, v_pool, new_k, new_v, slot_mapping, KvDtype::Fp8, /*x_pack=*/16);
+}
+
+/// new_k dtype is float16 instead of the expected bfloat16 for Fp8.
+int mlx_paged_kv_write_factory_rejects_new_k_dtype_fp8() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  array k_pool(Shape{4, 4, 4, 16, 16}, uint8, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, uint8, nullptr, {});
+  // new_k/new_v float16 — pair agrees, but Phase 1 contract demands
+  // bfloat16 io for FP8 cache.
+  array new_k(Shape{2, 4, 64}, float16, nullptr, {});
+  array new_v(Shape{2, 4, 64}, float16, nullptr, {});
+  array slot_mapping(Shape{2}, int64, nullptr, {});
+  return call_paged_kv_write_expecting_throw(
+      k_pool, v_pool, new_k, new_v, slot_mapping, KvDtype::Fp8, /*x_pack=*/16);
+}
+
+// =============================================================================
+// Phase 1 review-round-4 dtype-mismatch negative tests for paged_attention.
+//
+// Round 4 finding C: the factory validated scale dtype, q rank/shape,
+// pool layout, and index-buffer dtypes, but never validated `q.dtype()`
+// or `k_pool`/`v_pool` dtypes against `kv_dtype`. These helpers
+// construct factory inputs that are well-formed EXCEPT for one dtype
+// slot, then assert `std::invalid_argument` is thrown.
+// =============================================================================
+
+/// q dtype is float32 instead of the expected bfloat16 for Bf16.
+int mlx_paged_attention_factory_rejects_q_dtype_bf16() {
+  using namespace mlx::core;
+  // q float32 — disagrees with the bf16 io dtype implied by Bf16 kv_dtype.
+  array q(Shape{1, 8, 64}, float32, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  return call_paged_attention_expecting_throw(
+      q, k_pool, v_pool, block_table, seq_lens);
+}
+
+/// q dtype is float16 instead of the expected bfloat16 for Fp8.
+int mlx_paged_attention_factory_rejects_q_dtype_fp8() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  // FP8 cache: q must be bfloat16 (Phase 1 contract). Pass float16 to
+  // trigger the throw. Pools at FP8-correct (uint8, x_pack=16) so the
+  // q-dtype check is the only mismatch.
+  array q(Shape{1, 8, 64}, float16, nullptr, {});
+  array k_pool(Shape{4, 4, 4, 16, 16}, uint8, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, uint8, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  return call_paged_attention_expecting_throw(
+      q, k_pool, v_pool, block_table, seq_lens, KvDtype::Fp8);
+}
+
+/// k_pool dtype is uint8 instead of the expected bfloat16 for Bf16.
+int mlx_paged_attention_factory_rejects_k_pool_dtype_bf16() {
+  using namespace mlx::core;
+  // q correct, k_pool/v_pool wrong → kv_dtype check rejects.
+  array q(Shape{1, 8, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, uint8, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, uint8, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  return call_paged_attention_expecting_throw(
+      q, k_pool, v_pool, block_table, seq_lens);
+}
+
+/// k_pool dtype is bfloat16 instead of the expected uint8 for Fp8.
+int mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  array q(Shape{1, 8, 64}, bfloat16, nullptr, {});
+  // FP8 expects pools = uint8, x_pack = 16. Pass bfloat16 to trigger.
+  array k_pool(Shape{4, 4, 4, 16, 16}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  return call_paged_attention_expecting_throw(
+      q, k_pool, v_pool, block_table, seq_lens, KvDtype::Fp8);
+}
+
+} // extern "C"
+
+// =============================================================================
+// Phase 1 review-round-4 finding A: compile-cached path slot-bounds test.
+//
+// `paged_kv_write`'s factory eval-checks slot bounds, but
+// `mlx::core::compile` skips the factory on cache hits and routes
+// runtime `slot_mapping` straight into `eval_gpu`. The fix is to also
+// check bounds inside `PagedKVWrite::eval_gpu` (which fires on every
+// runtime call, including the compile-cached path). This helper
+// exercises that path: compile a function, call it once with a valid
+// slot_mapping (cache miss → factory check passes), then call it again
+// with an out-of-range slot_mapping. The second call MUST throw from
+// `eval_gpu` because the cached graph bypasses the factory.
+// =============================================================================
+
+namespace {
+
+/// Trace function for the compile-cached out-of-bounds slot test.
+/// Mirrors `paged_kv_write_trace_fn` but is its own static so the
+/// compile cache key is independent of the existing test's cache.
+std::vector<mlx::core::array> paged_kv_write_oob_trace_fn(
+    const std::vector<mlx::core::array>& inputs) {
+  using namespace mlx::core::fast;
+  if (inputs.size() != 7) {
+    throw std::runtime_error("paged_kv_write_oob_trace_fn: expected 7 inputs");
+  }
+  auto out = paged_kv_write(
+      inputs[0],
+      inputs[1],
+      inputs[2],
+      inputs[3],
+      inputs[4],
+      inputs[5],
+      inputs[6],
+      /*block_size=*/16,
+      /*num_kv_heads=*/4,
+      /*head_size=*/64,
+      /*x_pack=*/8,
+      KvDtype::Bf16,
+      /*s=*/{});
+  return {out.first, out.second};
+}
+
+} // namespace
+
+extern "C" {
+
+/// Compiled-path slot-bounds regression test.
+///
+/// 1. Compile `paged_kv_write_oob_trace_fn`.
+/// 2. Call it once with valid slot_mapping = [0, 16] — cache miss
+///    triggers the factory's eval-based bounds check (passes).
+/// 3. Call it again with the SAME shapes/dtypes but slot_mapping =
+///    [0, num_blocks * block_size] = [0, 64] — out of range. Cache HIT
+///    bypasses the factory. The bounds check inside
+///    `PagedKVWrite::eval_gpu` MUST throw `std::invalid_argument`
+///    during the second eval.
+///
+/// Layout matches the existing compile-trace smoke helper:
+///   block_size=16, num_kv_heads=4, head_size=64, x_pack=8, Bf16.
+///   k_pool: [4, 4, 8, 16, 8] bf16
+///   v_pool: [4, 4, 64, 16] bf16
+///   new_k:  [2, 4, 64] bf16
+///   new_v:  [2, 4, 64] bf16
+///   slot_mapping: [2] int64
+///
+/// Return codes:
+///   1   — second-call eval threw `std::invalid_argument` (fix
+///         working — the compile-cached path is bounds-checked).
+///   0   — second-call eval did NOT throw (regression — the
+///         out-of-range slot reached the kernel, which would write
+///         past the K/V pool).
+///  -1   — internal/setup error (first call failed unexpectedly,
+///         compile produced 0 outputs, etc.).
+///  -3   — Metal not available; eval-based verification skipped.
+int mlx_paged_kv_write_compile_cached_oob_throws() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  // Build REAL data-backed inputs. Layout matches the existing
+  // compile-trace smoke test.
+  const int kBlockSize = 16;
+  const int kNumKvHeads = 4;
+  const int kHeadSize = 64;
+  const int kXPack = 8;
+  const int kNumBlocks = 4;
+  const int kNumTokens = 2;
+
+  const size_t k_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      (kHeadSize / kXPack) * kBlockSize * kXPack;
+  const size_t v_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      kHeadSize * kBlockSize;
+  const size_t new_kv_elems =
+      static_cast<size_t>(kNumTokens) * kNumKvHeads * kHeadSize;
+
+  std::vector<uint16_t> k_pool_host(k_pool_elems, 0);
+  std::vector<uint16_t> v_pool_host(v_pool_elems, 0);
+  std::vector<uint16_t> new_k_host(new_kv_elems, 0x3FC0); // bf16(1.5)
+  std::vector<uint16_t> new_v_host(new_kv_elems, 0x4040); // bf16(3.0)
+
+  auto bf16_arr = [](const std::vector<uint16_t>& src, Shape shape) {
+    auto* p = reinterpret_cast<const bfloat16_t*>(src.data());
+    return array(p, std::move(shape), bfloat16);
+  };
+  auto i64_arr = [](const std::vector<int64_t>& src, Shape shape) {
+    return array(src.data(), std::move(shape), int64);
+  };
+
+  Shape k_pool_shape{kNumBlocks, kNumKvHeads, kHeadSize / kXPack, kBlockSize,
+      kXPack};
+  Shape v_pool_shape{kNumBlocks, kNumKvHeads, kHeadSize, kBlockSize};
+  Shape new_kv_shape{kNumTokens, kNumKvHeads, kHeadSize};
+
+  array k_pool = bf16_arr(k_pool_host, k_pool_shape);
+  array v_pool = bf16_arr(v_pool_host, v_pool_shape);
+  array new_k = bf16_arr(new_k_host, new_kv_shape);
+  array new_v = bf16_arr(new_v_host, new_kv_shape);
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  auto compiled = mlx::core::compile(&paged_kv_write_oob_trace_fn);
+
+  // First call: valid slot_mapping = [0, 16]. Both slots within pool
+  // capacity (4*16 = 64).
+  std::vector<int64_t> good_slots = {0, 16};
+  array slot_mapping_good = i64_arr(good_slots, Shape{kNumTokens});
+
+  std::vector<array> inputs1{
+      k_pool, v_pool, new_k, new_v, slot_mapping_good, k_scale, v_scale};
+
+  std::vector<array> outputs1;
+  try {
+    outputs1 = compiled(inputs1);
+    if (outputs1.size() != 2) {
+      return -1;
+    }
+    mlx::core::eval(outputs1[0], outputs1[1]);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[compile_cached_oob] first call (valid slots) threw unexpectedly: %s\n",
+        e.what());
+    return -1;
+  }
+
+  // Second call: slot_mapping = [0, 64]. Pool capacity = 4*16 = 64,
+  // so slot 64 is out of range (valid slots are 0..63).
+  // Cache HIT: factory's eval-based check is BYPASSED. eval_gpu's
+  // own bounds check MUST throw.
+  std::vector<int64_t> bad_slots = {
+      0, static_cast<int64_t>(kNumBlocks) * static_cast<int64_t>(kBlockSize)};
+  array slot_mapping_bad = i64_arr(bad_slots, Shape{kNumTokens});
+
+  std::vector<array> inputs2{
+      k_pool, v_pool, new_k, new_v, slot_mapping_bad, k_scale, v_scale};
+
+  std::vector<array> outputs2;
+  try {
+    outputs2 = compiled(inputs2);
+    if (outputs2.size() != 2) {
+      return -1;
+    }
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[compile_cached_oob] second call (compile) threw early: %s\n",
+        e.what());
+    return -1;
+  }
+
+  // The throw should fire on eval, not on the compiled() lambda call
+  // itself (the lambda just stitches the graph; eval invokes
+  // `eval_gpu`).
+  try {
+    mlx::core::eval(outputs2[0], outputs2[1]);
+  } catch (const std::invalid_argument& /*e*/) {
+    return 1; // SUCCESS — eval_gpu caught the out-of-range slot.
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[compile_cached_oob] second-call eval threw a non-invalid_argument: %s\n",
+        e.what());
+    return 0;
+  }
+  fprintf(
+      stderr,
+      "[compile_cached_oob] second-call eval did NOT throw — the "
+      "compile-cached path is missing its slot-bounds check\n");
   return 0;
 }
 

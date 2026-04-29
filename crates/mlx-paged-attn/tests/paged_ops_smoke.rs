@@ -1115,3 +1115,156 @@ fn paged_kv_write_factory_rejects_slot_mapping_out_of_range() {
          this check kernel-side."
     );
 }
+
+// =============================================================================
+// Phase 1 review-round-4 dtype-mismatch tests (finding B + C).
+//
+// The factory previously checked only pairwise dtype equality (k_pool ==
+// v_pool, new_k == new_v). It did NOT verify the dtype matched the
+// cache/io dtype implied by `kv_dtype`. Round 4 adds factory-side
+// validation: any dtype slot that disagrees with `kv_dtype`'s expected
+// (cache, io) pair must be rejected with `std::invalid_argument`.
+// =============================================================================
+
+#[test]
+fn paged_kv_write_factory_rejects_k_pool_dtype_bf16() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_k_pool_dtype_bf16() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject k_pool dtype != bfloat16 for kv_dtype=Bf16 \
+         (got {threw}); a dtype mismatch silently misroutes the Metal kernel template"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_v_pool_dtype_bf16() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_v_pool_dtype_bf16() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject v_pool dtype != bfloat16 for kv_dtype=Bf16 (got {threw})"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_new_k_dtype_bf16() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_new_k_dtype_bf16() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject new_k dtype != bfloat16 for kv_dtype=Bf16 (got {threw})"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_new_v_dtype_bf16() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_new_v_dtype_bf16() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject new_v dtype != bfloat16 for kv_dtype=Bf16 (got {threw})"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_k_pool_dtype_fp8() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_k_pool_dtype_fp8() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject k_pool dtype != uint8 for kv_dtype=Fp8 \
+         (got {threw}); FP8 cache is stored opaquely as bytes"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_new_k_dtype_fp8() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_new_k_dtype_fp8() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject new_k dtype != bfloat16 for kv_dtype=Fp8 \
+         (got {threw}); Phase 1 contract: FP8 io dtype is bfloat16"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_q_dtype_bf16() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_q_dtype_bf16() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject q dtype != bfloat16 for kv_dtype=Bf16 (got {threw})"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_q_dtype_fp8() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_q_dtype_fp8() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject q dtype != bfloat16 for kv_dtype=Fp8 \
+         (got {threw}); Phase 1 contract: FP8 io dtype is bfloat16"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_k_pool_dtype_bf16() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_k_pool_dtype_bf16() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject k_pool dtype != bfloat16 for kv_dtype=Bf16 (got {threw})"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_k_pool_dtype_fp8() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject k_pool dtype != uint8 for kv_dtype=Fp8 (got {threw})"
+    );
+}
+
+// =============================================================================
+// Phase 1 review-round-4 finding A: compile-cached path slot-bounds test.
+//
+// The factory's slot bounds check is skipped during MLX tracing AND on
+// compile-cache hits (the cache routes runtime `slot_mapping` straight
+// into `eval_gpu`). The fix moves the bounds check into
+// `PagedKVWrite::eval_gpu` so it fires on EVERY runtime call. This test
+// verifies the runtime check triggers when the cached graph's eval is
+// invoked with an out-of-range slot.
+// =============================================================================
+
+#[test]
+fn compile_cached_paged_kv_write_oob_slot_throws() {
+    // The C++ helper:
+    //   1. Compiles a function emitting `paged_kv_write`.
+    //   2. Calls it with valid slot_mapping = [0, 16] — cache miss
+    //      triggers the factory's eval-based check (passes).
+    //   3. Calls it again with the SAME shapes but
+    //      slot_mapping = [0, num_blocks * block_size = 64] —
+    //      out-of-range. Cache HIT bypasses the factory.
+    //      `PagedKVWrite::eval_gpu`'s own bounds check MUST throw.
+    //
+    // Return codes:
+    //   1   → success (eval_gpu threw on the out-of-range slot).
+    //   0   → regression (eval_gpu did NOT throw — the kernel would
+    //         have written past the K/V pool).
+    //  -1   → internal/setup error (first call failed).
+    //  -3   → Metal not available; verification skipped.
+    let rc = unsafe { mlx_sys::mlx_paged_kv_write_compile_cached_oob_throws() };
+
+    if rc == -3 {
+        eprintln!(
+            "compile_cached_paged_kv_write_oob_slot_throws: \
+             Metal not available; skipping eval-based verification"
+        );
+        return;
+    }
+
+    assert_ne!(rc, -1, "compile-cached OOB helper hit an internal error");
+    assert_eq!(
+        rc, 1,
+        "PagedKVWrite::eval_gpu must throw std::invalid_argument when the \
+         compile-cached path receives a slot_mapping with max >= num_blocks * \
+         block_size (got rc={rc}). The factory check is skipped on cache hits, \
+         so the bounds check must fire kernel-side / eval_gpu-side. Without it, \
+         the Metal kernel writes past the K/V pool."
+    );
+}
