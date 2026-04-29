@@ -3204,6 +3204,9 @@ export interface GenerationWithToolCalls {
 /** Get expected weight keys for PaddleOCR-VL model */
 export declare function getExpectedWeightKeys(): Array<string>;
 
+/** Sample MLX's GPU memory counters. See [`GpuMemorySnapshot`]. */
+export declare function getMemorySnapshot(): GpuMemorySnapshot;
+
 /** Retrieve all collected profiling data as a `ProfilingSession`. */
 export declare function getProfilingData(): ProfilingSession;
 
@@ -3258,6 +3261,33 @@ export interface GgufConversionResult {
 export interface GpuInfo {
   /** GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17). */
   architectureGen: number;
+}
+
+/**
+ * Snapshot of MLX's GPU memory counters at this instant. All values
+ * are in bytes. On Apple Silicon, GPU and CPU share unified memory,
+ * so these are NOT a separate "VRAM" pool — they reflect MLX's own
+ * tracking of `StorageModePrivate` Metal buffers (model weights,
+ * `LayerKVPool`, transient intermediate tensors) attributed to the
+ * MLX runtime in this process.
+ *
+ * Useful for live observability during long-running sessions:
+ *
+ * ```js
+ * const { getMemorySnapshot } = require('@mlx-node/core');
+ * setInterval(() => {
+ *   const m = getMemorySnapshot();
+ *   console.log(`active=${(m.activeBytes/1e9).toFixed(2)}GB peak=${(m.peakBytes/1e9).toFixed(2)}GB cache=${(m.cacheBytes/1e9).toFixed(2)}GB`);
+ * }, 1000);
+ * ```
+ */
+export interface GpuMemorySnapshot {
+  /** Current actively-used GPU buffer bytes (excludes cache pool). */
+  activeBytes: number;
+  /** Peak GPU buffer bytes since the last `resetPeakMemory()` call. */
+  peakBytes: number;
+  /** Bytes held in MLX's caching allocator (released by `clearCache`). */
+  cacheBytes: number;
 }
 
 /** Configuration for the GRPO training engine */
@@ -4073,6 +4103,14 @@ export interface RecResult {
   /** Confidence score (mean character probability) */
   score: number;
 }
+
+/**
+ * Reset MLX's peak-memory counter to the current active level.
+ * Useful for measuring per-request peak memory in a long-running
+ * process — call before a request, sample
+ * `getMemorySnapshot().peakBytes` after.
+ */
+export declare function resetPeakMemory(): void;
 
 /** Clear all collected profiling data and reset session timer. */
 export declare function resetProfilingData(): void;

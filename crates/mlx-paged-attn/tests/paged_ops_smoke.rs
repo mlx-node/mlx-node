@@ -1651,3 +1651,89 @@ fn compile_cached_paged_attention_rejects_non_contiguous() {
          of the backing allocation."
     );
 }
+
+// =============================================================================
+// Phase 1 review-round-10 finding: factory + eval_gpu validation must be
+// unified via a shared helper.
+//
+// Rounds 3-9 each surfaced another factory-only check that
+// `mlx::core::compile`'s cache-hit replay bypassed (compile_replace
+// rebuilds the cached primitive with real inputs WITHOUT re-running
+// the factory). Round 10 refactors the entire structural / scalar /
+// shape / dtype / contiguity validation into a shared helper that the
+// factory AND eval_gpu BOTH call, closing the entire class of hazards
+// in one swoop.
+//
+// These tests prove eval_gpu now catches bad scalar state on its own
+// (without relying on the factory having already rejected the inputs).
+// The C++ helper directly constructs a primitive with deliberately
+// bad scalar state, wires it into an MLX graph via `array::make_arrays`,
+// and `eval()`s the result. The factory is never invoked, so the throw
+// must come from the validator inside `eval_gpu` itself.
+// =============================================================================
+
+fn assert_eval_gpu_rejects_bad_state(rc: i32, scenario: &str) {
+    assert_ne!(rc, -1, "{scenario}: helper hit an internal error (rc=-1)");
+    assert_eq!(
+        rc, 1,
+        "{scenario}: eval_gpu must throw std::invalid_argument when the \
+         primitive is constructed with deliberately bad scalar state \
+         (got rc={rc}). Without the validator inside eval_gpu, a \
+         compile-cache replay (which bypasses the factory) could route \
+         a primitive with bad scalar state to the dispatch path."
+    );
+}
+
+#[test]
+fn paged_kv_write_eval_gpu_rejects_zero_kv_heads() {
+    let rc = unsafe { mlx_sys::mlx_paged_kv_write_eval_gpu_rejects_zero_kv_heads() };
+    assert_eval_gpu_rejects_bad_state(rc, "PagedKVWrite num_kv_heads=0");
+}
+
+#[test]
+fn paged_kv_write_eval_gpu_rejects_zero_block_size() {
+    let rc = unsafe { mlx_sys::mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() };
+    assert_eval_gpu_rejects_bad_state(rc, "PagedKVWrite block_size=0");
+}
+
+#[test]
+fn paged_kv_write_eval_gpu_rejects_zero_head_size() {
+    let rc = unsafe { mlx_sys::mlx_paged_kv_write_eval_gpu_rejects_zero_head_size() };
+    assert_eval_gpu_rejects_bad_state(rc, "PagedKVWrite head_size=0");
+}
+
+#[test]
+fn paged_kv_write_eval_gpu_rejects_x_pack_dtype_mismatch() {
+    let rc = unsafe { mlx_sys::mlx_paged_kv_write_eval_gpu_rejects_x_pack_dtype_mismatch() };
+    assert_eval_gpu_rejects_bad_state(rc, "PagedKVWrite x_pack=16 vs Bf16 (expects x_pack=8)");
+}
+
+#[test]
+fn paged_attention_eval_gpu_rejects_zero_kv_heads() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_zero_kv_heads() };
+    assert_eval_gpu_rejects_bad_state(rc, "PagedAttention num_kv_heads=0");
+}
+
+#[test]
+fn paged_attention_eval_gpu_rejects_indivisible_grouping() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_indivisible_grouping() };
+    assert_eval_gpu_rejects_bad_state(
+        rc,
+        "PagedAttention num_q_heads=6 not divisible by num_kv_heads=4",
+    );
+}
+
+#[test]
+fn paged_attention_eval_gpu_rejects_sliding_window() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_sliding_window() };
+    assert_eval_gpu_rejects_bad_state(
+        rc,
+        "PagedAttention sliding_window=512 (Phase 1 disallows nonzero)",
+    );
+}
+
+#[test]
+fn paged_attention_eval_gpu_rejects_zero_block_size() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_zero_block_size() };
+    assert_eval_gpu_rejects_bad_state(rc, "PagedAttention block_size=0");
+}

@@ -1178,6 +1178,21 @@ unsafe extern "C-unwind" {
     /// check inside `PagedAttention::eval_gpu` MUST throw on the second
     /// eval.
     pub fn mlx_paged_attention_compile_cached_non_contiguous_throws() -> i32;
+
+    // Round-10 defense-in-depth tests: directly construct the
+    // primitive with deliberately bad scalar state and dispatch
+    // `eval_gpu` via `eval()`. The factory is never invoked, so the
+    // throw must come from the validator inside `eval_gpu` itself —
+    // proving that compile-cache replay (which bypasses the factory)
+    // can never bypass a check the helper performs.
+    pub fn mlx_paged_kv_write_eval_gpu_rejects_zero_kv_heads() -> i32;
+    pub fn mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() -> i32;
+    pub fn mlx_paged_kv_write_eval_gpu_rejects_zero_head_size() -> i32;
+    pub fn mlx_paged_kv_write_eval_gpu_rejects_x_pack_dtype_mismatch() -> i32;
+    pub fn mlx_paged_attention_eval_gpu_rejects_zero_kv_heads() -> i32;
+    pub fn mlx_paged_attention_eval_gpu_rejects_indivisible_grouping() -> i32;
+    pub fn mlx_paged_attention_eval_gpu_rejects_sliding_window() -> i32;
+    pub fn mlx_paged_attention_eval_gpu_rejects_zero_block_size() -> i32;
 }
 
 // ================================================================================
