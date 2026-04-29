@@ -489,16 +489,18 @@ impl Gemma4Inner {
 
         let model_id = MODEL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
+        // Block-paged KV adapter — default-on; opt out via
+        // `use_block_paged_cache: false`.
         //
-        // Construction-only plumbing. The chat dispatch is NOT yet wired
-        // through this adapter — see `Gemma4Inner::paged_adapter` and
-        // `Gemma4Config::use_block_paged_cache` for the rationale. We
-        // still allocate here so:
-        // 1. The construction surface (config flag + JSON parsing +
-        //    NAPI-typed field) is testable in isolation.
-        // 2. A follow-up commit can light up the forward path without
-        //    re-churning every persistence/test/example file.
+        // Default-on adapter construction (2026-04-28 default flip).
+        // Text-only paged dispatch is active: every text-only chat-entry
+        // site (`chat_sync_core_paged`, `chat_stream_sync_core_paged`,
+        // `chat_tokens_delta_sync`, `chat_stream_tokens_delta_sync_inner`)
+        // routes through the paged adapter; vision turns still take the
+        // flat `Gemma4LayerCache::Sliding(RotatingKVCache)` path. Setting
+        // `use_block_paged_cache: false` in the model config is the
+        // explicit opt-out and reverts every layer to the legacy flat
+        // caches.
         //
         // Cache dtype: BFloat16 (Gemma4's production dtype).
         // Per-layer head_dim: Gemma4 has variable head dims per layer

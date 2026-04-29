@@ -10,9 +10,10 @@
  * whether the underlying native model has the block-paged KV cache
  * adapter active (`SessionCapableModel.hasBlockPagedCache?.()`):
  *
- *   * **Paged-active path** (Qwen3 + LFM2 today; eventually Gemma4
- *     + Qwen3.5 dense + Qwen3.5 MoE once their parity is restored).
- *     Each request allocates a fresh `ChatSession` via
+ *   * **Paged-active path** (Qwen3 + LFM2 + Gemma4 are paged-active
+ *     today; Qwen3.5 dense/MoE and Qianfan-OCR remain non-paged /
+ *     default-off pending a perf decision and adapter wiring
+ *     respectively). Each request allocates a fresh `ChatSession` via
  *     `SessionRegistry.createFreshSession()` and runs a full
  *     `session.reset()` + `primeHistory()` +
  *     `startFromHistory[Stream]()`. The JS-side warm slot is
@@ -27,9 +28,9 @@
  *     `prefix_hit` after dispatch when the engine reports
  *     `cachedTokens > 0`.
  *
- *   * **Non-paged path** (Gemma4 today — parity-blocked; Qwen3.5
- *     dense + MoE — parity-pending; the Qianfan-OCR VLM — no
- *     adapter wired). Each request looks up the warm slot via
+ *   * **Non-paged path** (Qwen3.5 dense + MoE — default-off pending a
+ *     perf decision; the Qianfan-OCR VLM — no adapter wired). Each
+ *     request looks up the warm slot via
  *     `SessionRegistry.getOrCreateWarmAny(requestedSystem)`. On a
  *     HIT we keep the underlying native KV cache alive
  *     (`resetPreservingNativeCacheForWarmReuse` wipes only JS-side
