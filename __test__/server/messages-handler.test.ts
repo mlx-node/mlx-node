@@ -1075,6 +1075,63 @@ describe('handleCreateMessage', () => {
       expect(toolStarts).toHaveLength(0);
     });
 
+    it('does not duplicate preamble when closed tool_call parses non-ok and finalText is trimmed', async () => {
+      // Codex-found regression 2026-04-29 (branch #2 path): when a CLOSED
+      // <tool_call>...</tool_call> block parses to a non-ok status (e.g.
+      // invalid JSON inside <function>), `okToolCalls` is empty, so the
+      // suppression-recovery branch fires. With a streamed preamble that
+      // had trailing whitespace and a finalText that the native side
+      // trimmed via `parse_tool_calls`, the overlap math returns 0 and
+      // emits finalText whole — duplicating the preamble.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'Let me check. ', done: false, isReasoning: false },
+        {
+          text: '<tool_call>\n<function=lookup>\n<parameter=q>\n{not valid json\n</parameter>\n</function>\n</tool_call>',
+          done: false,
+          isReasoning: false,
+        },
+        {
+          // Native parse_tool_calls strips the closed block AND trims →
+          // finalText is the trimmed preamble.
+          text: 'Let me check.',
+          done: true,
+          finishReason: 'stop',
+          // Non-ok tool call — okToolCalls filter returns [].
+          toolCalls: [{ id: 'tool_1', name: 'lookup', arguments: '', status: 'invalid_json' }],
+          thinking: null,
+          numTokens: 25,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText:
+            'Let me check. <tool_call>\n<function=lookup>\n<parameter=q>\n{not valid json\n</parameter>\n</function>\n</tool_call>',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'use a tool' }],
+          max_tokens: 30,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+
+      // Preamble must appear exactly once. Bug would emit "Let me check. Let me check."
+      const occurrences = combined.match(/Let me check/g) ?? [];
+      expect(occurrences.length, `preamble duplicated; combined text deltas: ${JSON.stringify(combined)}`).toBe(1);
+    });
+
     it('does not duplicate preamble when finalText is shorter than streamed (native trim)', async () => {
       // Codex-found regression 2026-04-29: when the model emits a closed
       // tool_call with leading text, the streaming path emits the preamble

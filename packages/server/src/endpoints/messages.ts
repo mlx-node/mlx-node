@@ -301,7 +301,13 @@ async function handleStreamingNative(
             'content_block_delta',
             buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
           );
-        } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedText) {
+        } else if (
+          tagBuffer.suppressed &&
+          !hasToolCalls &&
+          finalText &&
+          hasEmittedText &&
+          finalText.length > emittedText.length
+        ) {
           // Recovery: streaming text was cut off by a false-alarm `<tool_call>` tag.
           //
           // `emittedTextLength` is an index into the streamed chunks, NOT into
@@ -312,6 +318,13 @@ async function handleStreamingNative(
           // `<tool_call>` and emit `"ool_call>\n<function=..."`. Find the
           // longest streamed-suffix == finalText-prefix overlap and emit
           // whatever finalText has BEYOND that overlap.
+          //
+          // The `finalText.length > emittedText.length` guard prevents
+          // re-emitting a TRIMMED finalText (e.g. preamble streamed as
+          // "Let me check. " then closed-but-non-ok tool_call, where native
+          // `parse_tool_calls` strips the block AND trims trailing whitespace
+          // → finalText="Let me check.", overlap returns 0, would otherwise
+          // emit duplicate "Let me check.").
           const overlap = longestSuffixPrefixOverlap(emittedText, finalText);
           const unsent = finalText.slice(overlap);
           if (unsent) {
