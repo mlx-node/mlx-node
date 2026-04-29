@@ -46,50 +46,21 @@ pub(crate) struct Lfm2Inner {
     pub(crate) cached_image_key: Option<u64>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
     ///
-    /// **Opt-in via `Lfm2Config::use_block_paged_cache`** —
-    /// construction-only at this stage. The chat-session forward
-    /// dispatch is NOT yet wired through this adapter because LFM2 is a
-    /// hybrid conv + attention architecture: only `full_attention`
-    /// layers can use the block-paged path, while `conv` layers must
+    /// **Opt-in via `Lfm2Config::use_block_paged_cache`**. LFM2 is a
+    /// hybrid conv + attention architecture, so only `full_attention`
+    /// layers route through the block-paged path while `conv` layers
     /// continue to use the existing `Lfm2LayerCache::Conv(ArraysCache)`
-    /// storage. A bespoke per-layer dispatch on `Lfm2DecoderLayer`
-    /// (mirroring the Qwen3 `forward_paged_adapter` pattern) plus a
-    /// hybrid cache wrapper that addresses the adapter by
-    /// attention-layer ordinal (not absolute layer index) is required
-    /// before forward wiring can land. Defaults to `None` so the
-    /// existing `Lfm2LayerCache` path stays untouched.
-    ///
-    /// The adapter's underlying `LayerKVPool` is sized for the count of
-    /// `full_attention` layers ONLY — conv layers do not consume KV
-    /// pool slots. Indexing into the pool from a future paged-aware
-    /// forward path will therefore be by attention-ordinal (the index
-    /// into `config.full_attn_idxs()`), not by absolute layer index.
-    #[allow(dead_code)]
+    /// storage. The adapter's underlying `LayerKVPool` is sized for the
+    /// count of `full_attention` layers ONLY — conv layers do not
+    /// consume KV pool slots, and the pool is indexed by
+    /// attention-layer ordinal (the index into `config.full_attn_idxs()`),
+    /// not by absolute layer index. `Lfm2DecoderLayer::forward_paged_or_flat`
+    /// performs the per-layer dispatch.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Lfm2Cmd {
-    /// Session-based chat continuation: prefill a pre-tokenized delta on top
-    /// of the existing LFM2 caches (conv + KV), then decode. Text-only and
-    /// requires an active session (prior `ChatSessionStart` call that
-    /// populated `cached_token_history`).
-    ///
-    /// This bypasses the jinja chat template entirely — the caller is
-    /// responsible for producing the correctly-formatted delta tokens
-    /// (typically `\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`).
-    ///
-    /// Not currently wired through a NAPI method directly — external callers
-    /// use `ChatSessionContinue` instead, which handles delta construction
-    /// on the model thread. Kept as its own variant so the lower-level
-    /// pre-tokenized entry point stays exposed for the gated integration
-    /// test and future advanced use cases.
-    #[allow(dead_code)]
-    ChatTokensDelta {
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
     /// Start a new session via the jinja-render path with `<|im_end|>` as
     /// the stop token. See [`Lfm2Inner::chat_session_start_sync`] for the
     /// behavioural contract (full cache reset, session boundary on
@@ -2883,13 +2854,6 @@ impl Lfm2Inner {
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_lfm2_cmd(inner: &mut Lfm2Inner, cmd: Lfm2Cmd) {
     match cmd {
-        Lfm2Cmd::ChatTokensDelta {
-            delta_tokens,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_tokens_delta_sync(delta_tokens, config));
-        }
         Lfm2Cmd::ChatSessionStart {
             messages,
             config,
@@ -3326,34 +3290,6 @@ impl Lfm2Model {
         self.thread.send(Lfm2Cmd::ChatStreamSessionContinue {
             user_message,
             images,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-        Ok((ChatStreamHandle { cancelled }, stream_rx))
-    }
-
-    /// Test-only entry point that dispatches
-    /// `ChatStreamSessionContinueTool` and returns the raw mpsc
-    /// receiver the model thread writes into.
-    #[doc(hidden)]
-    pub fn chat_stream_session_continue_tool_for_test(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-    ) -> Result<(
-        ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
-    )> {
-        let config = config.unwrap_or_default();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(Lfm2Cmd::ChatStreamSessionContinueTool {
-            tool_call_id,
-            content,
             config,
             stream_tx,
             cancelled: cancelled_inner,

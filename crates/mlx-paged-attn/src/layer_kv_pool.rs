@@ -47,7 +47,10 @@ use metal::Buffer;
 /// Float32 is rejected here too — `LayerKVPool::new` already rejects it
 /// at construction, but having this match defends against any future
 /// caller that bypasses the pool.
-#[allow(dead_code)] // Used only on macOS for the array-view helpers.
+///
+/// Only used on macOS (its callers `key_cache_array_raw` /
+/// `value_cache_array_raw` are gated on `target_os = "macos"`).
+#[cfg(any(target_os = "macos", test))]
 fn bridge_dtype_code(dtype: MetalDtype) -> Result<i32, String> {
     Ok(match dtype {
         MetalDtype::Float16 => 2,

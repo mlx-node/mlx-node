@@ -94,26 +94,6 @@ pub(crate) struct Qwen35MoeInner {
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35MoeCmd {
-    /// Session-based chat continuation: prefill a pre-tokenized delta on top
-    /// of the existing KV caches, then decode. Text-only; requires an active
-    /// session (prior `ChatSessionStart` call that initialized `self.caches`).
-    ///
-    /// This bypasses the jinja chat template entirely — the caller is
-    /// responsible for producing the correctly-formatted delta tokens
-    /// (typically `\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`).
-    ///
-    /// Constructed internally by `chat_session_continue_sync` after building
-    /// and tokenizing the delta. Not currently wired through a NAPI method
-    /// directly — external callers use `ChatSessionContinue` instead, which
-    /// handles delta construction on the model thread. Kept as its own
-    /// variant so the lower-level pre-tokenized entry point stays exposed
-    /// for the gated integration test and future advanced use cases.
-    #[allow(dead_code)]
-    ChatTokensDelta {
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
     /// Start a new session via the jinja-render path with `<|im_end|>` as
     /// the stop token. See [`Qwen35MoeInner::chat_session_start_sync`] for
     /// the behavioural contract (full cache reset, session boundary on
@@ -260,13 +240,6 @@ pub(crate) enum Qwen35MoeCmd {
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCmd) {
     match cmd {
-        Qwen35MoeCmd::ChatTokensDelta {
-            delta_tokens,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_tokens_delta_sync(delta_tokens, config));
-        }
         Qwen35MoeCmd::ChatSessionStart {
             messages,
             config,
@@ -5957,35 +5930,6 @@ impl Qwen3_5MoeModel {
             stream_tx,
             cancelled: cancelled_inner,
         })?;
-        Ok((ChatStreamHandle { cancelled }, stream_rx))
-    }
-
-    /// Test-only entry point that dispatches
-    /// `ChatStreamSessionContinueTool` and returns the raw mpsc
-    /// receiver the model thread writes into.
-    #[doc(hidden)]
-    pub fn chat_stream_session_continue_tool_for_test(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-    ) -> Result<(
-        ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
-    )> {
-        let config = config.unwrap_or_default();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread
-            .send(Qwen35MoeCmd::ChatStreamSessionContinueTool {
-                tool_call_id,
-                content,
-                config,
-                stream_tx,
-                cancelled: cancelled_inner,
-            })?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 

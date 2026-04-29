@@ -33,8 +33,6 @@
 //!   For the **no-cache** case (cached_prefix_len = 0), pass 1 is
 //!   skipped entirely and the result is exact.
 
-use std::sync::Arc;
-
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
@@ -246,8 +244,3 @@ pub(crate) fn run_paged_decode_step(
     };
     Ok(logits)
 }
-
-/// `Arc` to keep the documentation valid that we can dispatch from a
-/// single owning thread.
-#[allow(dead_code)]
-pub(crate) type SharedAdapter = Arc<PagedKVCacheAdapter>;

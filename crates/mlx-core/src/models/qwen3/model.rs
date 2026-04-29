@@ -147,14 +147,9 @@ pub(crate) struct Qwen3Inner {
     ///
     /// **Opt-in via `Qwen3Config::use_block_paged_cache`** — separate from
     /// the legacy `paged_cache`/`scheduler` pair above. When `Some`,
-    /// chat-session methods may route through `forward_paged_adapter` for
+    /// chat-session methods route through `forward_paged_adapter` for
     /// cross-request prefix reuse. Defaults to `None` so the existing flat
     /// `Vec<KVCache>` path stays untouched.
-    ///
-    /// `#[allow(dead_code)]` because the read-side wiring (chat_sync_core
-    /// dispatch through `forward_paged_adapter`) lands in a separate commit;
-    /// this commit is the construction-only plumbing.
-    #[allow(dead_code)]
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     pub(crate) cached_kv_keys: Vec<Option<MxArray>>,
     pub(crate) cached_kv_values: Vec<Option<MxArray>>,

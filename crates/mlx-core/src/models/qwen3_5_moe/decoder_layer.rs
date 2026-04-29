@@ -117,7 +117,6 @@ impl DecoderLayer {
     /// `Qwen3_5LayerCache::Linear` path; `FullAttentionPaged` layers
     /// route through `Qwen3_5Attention::forward_paged`.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // Wired up by chat_sync_core_paged in a follow-up commit.
     pub(crate) fn forward_paged_or_flat(
         &mut self,
         x: &MxArray,

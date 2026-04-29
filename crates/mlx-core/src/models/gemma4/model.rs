@@ -223,16 +223,14 @@ pub(crate) struct Gemma4Inner {
     pub(crate) cached_image_key: Option<u64>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
     ///
-    /// **Opt-in via `Gemma4Config::use_block_paged_cache`** —
-    /// construction-only at this stage. The chat-session forward
-    /// dispatch is NOT yet wired through this adapter because Gemma4's
+    /// **Opt-in via `Gemma4Config::use_block_paged_cache`**. Gemma4's
     /// hybrid sliding+global attention, K=V sharing, KV-shared layers
     /// (`forward_shared`), MoE/PLE branches, and per-layer-type head
-    /// dimensions all require a bespoke `forward_paged_adapter` on
-    /// `Gemma4DecoderLayer` that mirrors the Qwen3 pattern but covers
-    /// these variants. Defaults to `None` so the existing
-    /// `Gemma4LayerCache` path stays untouched.
-    #[allow(dead_code)]
+    /// dimensions are all handled by
+    /// `Gemma4DecoderLayer::forward_paged_or_flat`, which routes only
+    /// global attention layers through this adapter. Defaults to `None`
+    /// when the config flag is unset, in which case the model falls
+    /// back to the flat `Gemma4LayerCache` path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     pub(crate) model_id: u64,
 }
@@ -633,7 +631,6 @@ impl Gemma4Inner {
     /// See [`compute_layer_kinds`] (free helper) for full semantics.
     /// This wrapper is the on-`Gemma4Inner` entry point used by the
     /// chat-session forward dispatch.
-    #[allow(dead_code)] // Wired up in subsequent commits (forward dispatch).
     pub(crate) fn compute_layer_kinds(&self) -> Vec<Gemma4LayerKind> {
         compute_layer_kinds(&self.config)
     }
@@ -4983,7 +4980,6 @@ fn project_per_layer_inputs(
 /// Lifted to a free helper so unit tests can drive it without owning a
 /// `Gemma4Inner` (which requires loaded weights). Mirrors LFM2's
 /// `compute_layer_kinds` pattern.
-#[allow(dead_code)] // Wired up in subsequent commits (forward dispatch).
 pub(crate) fn compute_layer_kinds(config: &Gemma4Config) -> Vec<Gemma4LayerKind> {
     let n = config.num_hidden_layers as usize;
 

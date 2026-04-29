@@ -27,7 +27,6 @@ use super::quantized_linear::{Gemma4MLPVariant, QuantizedLinear, QuantizedSwitch
 /// * `anchor_layer_idx` (in `SharedOnSliding`) is the ABSOLUTE decoder
 ///   index of the anchor whose flat `Gemma4LayerCache::Sliding` slot
 ///   feeds the shared layer's K/V via `take_stashed_kv`.
-#[allow(dead_code)] // Wired up in subsequent commits (forward dispatch).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Gemma4LayerKind {
     /// Sliding (local) attention layer — stays on the existing flat
@@ -59,7 +58,6 @@ pub(crate) enum Gemma4LayerKind {
 /// `total_ctx` is only consumed by `SharedOnGlobal` (the K/V token count
 /// to read from the anchor's paged slot). `keys` / `values` are only
 /// consumed by `SharedOnSliding` (anchor stash).
-#[allow(dead_code)] // Wired up by chat_sync_core_paged in commit 6.
 pub(crate) struct SharedKvInputs<'a> {
     pub(crate) cache_offset: i32,
     pub(crate) total_ctx: u32,
@@ -287,7 +285,6 @@ impl Gemma4DecoderLayer {
     /// `needs_stash` only matters for `Sliding` (mirrors the flat
     /// `forward(...)` call signature).
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // Wired up in `chat_sync_core_paged` (later commit).
     pub(crate) fn forward_paged_or_flat(
         &self,
         x: &MxArray,

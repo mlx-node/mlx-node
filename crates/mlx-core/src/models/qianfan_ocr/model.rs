@@ -281,13 +281,6 @@ pub struct QianfanOCRModel {
     /// model was constructed via `new(config)` without loading weights —
     /// in that uninitialized state only `isInitialized` is meaningful.
     thread: Option<crate::model_thread::ModelThread<QianfanOCRCmd>>,
-    /// Cloned from inner for pure-getter NAPI methods (no command
-    /// dispatch needed). For uninitialized instances this holds the
-    /// bare constructor argument. Marked `allow(dead_code)` because
-    /// nothing on the NAPI surface currently exposes a config getter —
-    /// kept in place so one can be added without re-plumbing.
-    #[allow(dead_code)]
-    config: QianfanOCRConfig,
     /// Whether the model was loaded with real weights. `false` for
     /// `new QianfanOCRModel(config)` calls that predate `load()`.
     initialized: bool,
@@ -2143,13 +2136,18 @@ impl QianfanOCRModel {
     /// Create a new QianfanOCRModel from config (uninitialized, no weights).
     ///
     /// This constructor path does not spawn a model thread — the returned
-    /// instance is only useful for config inspection. Call
-    /// [`QianfanOCRModel::load`] to actually run inference.
+    /// instance is only useful for `is_initialized` queries until
+    /// [`QianfanOCRModel::load`] is called to actually run inference. The
+    /// `config` argument is accepted to preserve the `new
+    /// QianfanOCRModel(config)` JS surface; the value is discarded because
+    /// nothing on the uninitialized path consults it (any future config
+    /// getter would forward to the inner thread state populated by
+    /// `load()`).
     #[napi(constructor)]
     pub fn new(config: QianfanOCRConfig) -> Self {
+        let _ = config;
         Self {
             thread: None,
-            config,
             initialized: false,
             _cache_limit_guard: None,
         }
@@ -2185,22 +2183,20 @@ impl QianfanOCRModel {
                         let (inner, weight_bytes) = load_qianfan_ocr_inner_from_dir(&model_path)?;
                         let cache_limit_guard =
                             crate::cache_limit::coordinator().register(weight_bytes);
-                        let config = inner.config.clone();
-                        Ok((inner, (config, cache_limit_guard)))
+                        Ok((inner, cache_limit_guard))
                     },
                     handle_qianfan_ocr_cmd,
                 );
 
-                let (config, cache_limit_guard) = init_rx
+                let cache_limit_guard = init_rx
                     .await
                     .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
-                Ok((thread, config, cache_limit_guard))
+                Ok((thread, cache_limit_guard))
             },
-            |_env, (thread, config, cache_limit_guard)| {
+            |_env, (thread, cache_limit_guard)| {
                 Ok(QianfanOCRModel {
                     thread: Some(thread),
-                    config,
                     initialized: true,
                     _cache_limit_guard: Some(cache_limit_guard),
                 })

@@ -18,7 +18,6 @@ use super::quantized_linear::{MLPVariant, QuantizedLinear};
 /// (GDN) layers continue to use `Qwen3_5LayerCache::Linear(ArraysCache)`
 /// with no cross-request prefix reuse — vLLM's `MambaManager`-style "no
 /// prefix reuse for recurrent layers" stance.
-#[allow(dead_code)] // Wired up by chat_sync_core_paged in a follow-up commit.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Qwen3_5LayerKind {
     /// GDN linear-attention layer that stays on the existing flat
@@ -45,7 +44,6 @@ pub enum AttentionType {
 ///   where `paged_idx` is the ordinal index counting only
 ///   full-attention layers (i.e. the index into the paged adapter's
 ///   `LayerKVPool`).
-#[allow(dead_code)] // Wired up by chat_sync_core_paged in a follow-up commit.
 pub(crate) fn compute_layer_kinds(
     num_layers: usize,
     is_linear: impl Fn(usize) -> bool,
@@ -175,7 +173,6 @@ impl DecoderLayer {
     /// returns a descriptive error rather than panicking — matches
     /// the LFM2 dispatch pattern.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // Wired up by chat_sync_core_paged in a follow-up commit.
     pub(crate) fn forward_paged_or_flat(
         &mut self,
         x: &MxArray,
