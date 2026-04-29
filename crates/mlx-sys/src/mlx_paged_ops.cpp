@@ -381,6 +381,40 @@ void PagedAttention::eval_gpu(
         "PagedAttention: k_scale and v_scale must be 1-element arrays");
   }
 
+  // GQA head-group validation (defense-in-depth — mirrors the
+  // identical check in the public `paged_attention(...)` factory).
+  //
+  // The factory normally rejects bad scalar state before the primitive
+  // is ever constructed, but `mlx::core::compile`'s cached re-traces
+  // route runtime inputs straight through `eval_gpu` and bypass the
+  // factory. If a future code path constructs the primitive directly
+  // (or a compile-cached graph somehow inherited bad state), the
+  // Metal kernel would otherwise compute
+  //   num_queries_per_kv = num_q_heads_ / num_kv_heads_
+  //   kv_head_idx        = head_idx / num_queries_per_kv
+  // (paged_attention.metal:839-840) and either divide by zero or
+  // dereference out-of-pool K/V memory.
+  if (num_kv_heads_ <= 0) {
+    std::ostringstream msg;
+    msg << "PagedAttention::eval_gpu: num_kv_heads (" << num_kv_heads_
+        << ") must be > 0; the Metal kernel divides num_heads by it.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (num_q_heads_ <= 0) {
+    std::ostringstream msg;
+    msg << "PagedAttention::eval_gpu: num_q_heads (" << num_q_heads_
+        << ") must be > 0.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (num_q_heads_ % num_kv_heads_ != 0) {
+    std::ostringstream msg;
+    msg << "PagedAttention::eval_gpu: GQA grouping invalid: num_q_heads="
+        << num_q_heads_ << " must be divisible by num_kv_heads="
+        << num_kv_heads_ << " (got remainder "
+        << (num_q_heads_ % num_kv_heads_) << ").";
+    throw std::invalid_argument(msg.str());
+  }
+
   uint32_t num_seqs = static_cast<uint32_t>(q.shape(0));
   uint32_t max_blocks_per_seq = static_cast<uint32_t>(block_table.shape(1));
 
@@ -606,6 +640,30 @@ std::pair<array, array> paged_kv_write(
     throw std::runtime_error(
         "paged_kv_write has no fallback implementation (inference-only)");
   };
+
+  // Positive-value scalar-state checks. The factory's downstream shape
+  // validation divides by `block_size`, multiplies by `num_kv_heads` /
+  // `head_size`, and uses these as kernel grid extents. A zero or
+  // negative value would either trip an integer-divide-by-zero in
+  // host validation or produce a degenerate Metal launch.
+  if (num_kv_heads <= 0) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] num_kv_heads (" << num_kv_heads
+        << ") must be > 0.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (head_size <= 0) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] head_size (" << head_size
+        << ") must be > 0.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (block_size <= 0) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] block_size (" << block_size
+        << ") must be > 0.";
+    throw std::invalid_argument(msg.str());
+  }
 
   // Dtype-vs-kv_dtype validation. The Rust shim derives `cache_dtype`
   // and `input_dtype` from `kv_dtype` (see
@@ -932,6 +990,50 @@ array paged_attention(
         "[paged_attention] sliding_window not yet implemented; "
         "Phase 7 will add it (Gemma4). The only supported value in "
         "Phase 1 is 0.");
+  }
+
+  // GQA head-group validation. The Metal kernel computes
+  //   num_queries_per_kv = num_heads / num_kv_heads
+  //   kv_head_idx        = head_idx / num_queries_per_kv
+  // (see crates/mlx-paged-attn/metal/attention/paged_attention.metal:839-840).
+  //
+  // - num_kv_heads == 0 → division by zero in the first line.
+  // - num_q_heads  == 0 → no work to dispatch; reject so the primitive
+  //   never enters a degenerate state.
+  // - num_q_heads  < num_kv_heads → num_queries_per_kv = 0 → division
+  //   by zero in the second line.
+  // - num_q_heads  % num_kv_heads != 0 → later heads compute kv_head_idx
+  //   beyond the KV-head dimension and dereference out-of-pool K/V memory
+  //   (e.g. q=6 / kv=4 → num_queries_per_kv=1, head_idx=5 → kv_head_idx=5
+  //   into a pool that only has 4 KV heads).
+  //
+  // Reject all four cases at the factory so a malformed but
+  // structurally shape-consistent call cannot tunnel a GPU fault or
+  // silent garbage attention through to the dispatcher.
+  if (num_kv_heads <= 0) {
+    std::ostringstream msg;
+    msg << "[paged_attention] num_kv_heads (" << num_kv_heads
+        << ") must be > 0; the Metal kernel computes "
+        << "num_queries_per_kv = num_heads / num_kv_heads, which would "
+        << "divide by zero.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (num_q_heads <= 0) {
+    std::ostringstream msg;
+    msg << "[paged_attention] num_q_heads (" << num_q_heads
+        << ") must be > 0.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (num_q_heads % num_kv_heads != 0) {
+    std::ostringstream msg;
+    msg << "[paged_attention] GQA grouping invalid: num_q_heads="
+        << num_q_heads << " must be divisible by num_kv_heads="
+        << num_kv_heads << " (got remainder "
+        << (num_q_heads % num_kv_heads) << "). When num_q_heads < "
+        << "num_kv_heads the kernel divides by zero; when "
+        << "num_q_heads % num_kv_heads != 0 later heads index past "
+        << "the KV-head dimension and read out-of-pool memory.";
+    throw std::invalid_argument(msg.str());
   }
 
   if (k_scale.dtype() != mlx::core::float32 ||
@@ -2400,6 +2502,143 @@ int mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() {
   array seq_lens(Shape{1}, int32, nullptr, {});
   return call_paged_attention_expecting_throw(
       q, k_pool, v_pool, block_table, seq_lens, KvDtype::Fp8);
+}
+
+// =============================================================================
+// Phase 1 review-round-6 finding: GQA head-group divisibility.
+//
+// The Metal kernel computes
+//   num_queries_per_kv = num_heads / num_kv_heads
+//   kv_head_idx        = head_idx / num_queries_per_kv
+// (paged_attention.metal:839-840). Passing num_kv_heads=0,
+// num_q_heads<num_kv_heads, or num_q_heads not divisible by
+// num_kv_heads turns a structurally shape-consistent call into a GPU
+// fault (division by zero) or an out-of-pool K/V read. The factory now
+// rejects these cases up front. Each helper builds shape-consistent
+// well-formed inputs that match the supplied (num_q_heads, num_kv_heads)
+// scalar state, and asserts `std::invalid_argument` is thrown.
+// =============================================================================
+
+/// num_kv_heads = 0 must be rejected (division-by-zero risk in
+/// `num_queries_per_kv = num_heads / num_kv_heads`).
+int mlx_paged_attention_factory_rejects_zero_kv_heads() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  // Build q/k_pool/v_pool whose shapes match num_q_heads=8 and
+  // num_kv_heads=0. We let the factory throw on the GQA check before
+  // any other shape check fires (the GQA validation runs early).
+  array q(Shape{1, 8, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 0, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 0, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+  try {
+    paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/0,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// num_q_heads (2) < num_kv_heads (4) must be rejected. The kernel
+/// would compute `num_queries_per_kv = 2 / 4 = 0` (integer division)
+/// and then divide head_idx by zero on the kv_head_idx line.
+int mlx_paged_attention_factory_rejects_q_heads_less_than_kv_heads() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  // Build inputs consistent with num_q_heads=2, num_kv_heads=4 so the
+  // GQA check is the only mismatch; q.shape(1)=2, pool dim 1 = 4.
+  array q(Shape{1, 2, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+  try {
+    paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/2,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// num_q_heads (6) not divisible by num_kv_heads (4) must be rejected.
+/// 6 % 4 = 2, so the last two q-heads would compute kv_head_idx = 4, 5
+/// — past the end of the 4-entry KV-head dimension, reading out-of-pool
+/// memory.
+int mlx_paged_attention_factory_rejects_indivisible_grouping() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  array q(Shape{1, 6, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+  try {
+    paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/6,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
 }
 
 } // extern "C"

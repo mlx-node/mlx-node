@@ -993,6 +993,30 @@ unsafe extern "C-unwind" {
     /// k_pool dtype != uint8 must be rejected for kv_dtype=Fp8.
     pub fn mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() -> i32;
 
+    // =============================================================================
+    // Phase 1 review-round-6 finding: GQA head-group divisibility.
+    //
+    // The Metal kernel computes `num_queries_per_kv = num_heads /
+    // num_kv_heads` and then `kv_head_idx = head_idx /
+    // num_queries_per_kv`. A num_kv_heads of 0, num_q_heads <
+    // num_kv_heads, or non-divisible grouping triggers division by
+    // zero or out-of-pool K/V reads. The factory must reject all three.
+    // Each helper returns 1 iff `std::invalid_argument` was thrown.
+    // =============================================================================
+
+    /// num_kv_heads = 0 must be rejected.
+    pub fn mlx_paged_attention_factory_rejects_zero_kv_heads() -> i32;
+
+    /// num_q_heads (2) < num_kv_heads (4) must be rejected (kernel
+    /// would divide by zero on `kv_head_idx = head_idx /
+    /// num_queries_per_kv` because `num_queries_per_kv = 0`).
+    pub fn mlx_paged_attention_factory_rejects_q_heads_less_than_kv_heads() -> i32;
+
+    /// num_q_heads (6) not divisible by num_kv_heads (4) must be
+    /// rejected (later heads would compute kv_head_idx outside the
+    /// KV-head pool dimension).
+    pub fn mlx_paged_attention_factory_rejects_indivisible_grouping() -> i32;
+
     /// Compile a `paged_kv_write`-emitting function, call it once with a
     /// valid slot_mapping (cache miss, factory check passes), then call
     /// it again with an out-of-range slot_mapping. The cache HIT bypasses

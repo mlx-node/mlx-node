@@ -1221,6 +1221,56 @@ fn paged_attention_factory_rejects_k_pool_dtype_fp8() {
 }
 
 // =============================================================================
+// Phase 1 review-round-6 finding: GQA head-group divisibility.
+//
+// The Metal kernel computes:
+//   num_queries_per_kv = num_heads / num_kv_heads
+//   kv_head_idx        = head_idx / num_queries_per_kv
+// (paged_attention.metal:839-840). A malformed (num_q_heads,
+// num_kv_heads) pair turns a structurally shape-consistent call into
+// a GPU fault (division by zero) or an out-of-pool K/V read. The
+// factory now rejects three invariant violations up front:
+//   1. num_kv_heads == 0
+//   2. num_q_heads <  num_kv_heads (q-per-kv is 0; div-by-zero risk)
+//   3. num_q_heads % num_kv_heads != 0 (later heads index past KV dim)
+// =============================================================================
+
+#[test]
+fn paged_attention_factory_rejects_zero_kv_heads() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_zero_kv_heads() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject num_kv_heads=0 (got {threw}); \
+         the kernel computes num_queries_per_kv = num_heads / num_kv_heads, \
+         which would divide by zero."
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_q_heads_less_than_kv_heads() {
+    let threw =
+        unsafe { mlx_sys::mlx_paged_attention_factory_rejects_q_heads_less_than_kv_heads() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject num_q_heads (2) < num_kv_heads (4) \
+         (got {threw}); the kernel would compute num_queries_per_kv = 2/4 = 0 \
+         (integer division) and then divide head_idx by zero on the kv_head_idx \
+         line."
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_indivisible_grouping() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_indivisible_grouping() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject num_q_heads (6) % num_kv_heads (4) != 0 \
+         (got {threw}); 6 / 4 = 1, so head_idx = 4, 5 would compute kv_head_idx \
+         = 4, 5 — past the end of the 4-entry KV-head pool dimension."
+    );
+}
+
+// =============================================================================
 // Phase 1 review-round-4 finding A: compile-cached path slot-bounds test.
 //
 // The factory's slot bounds check is skipped during MLX tracing AND on
