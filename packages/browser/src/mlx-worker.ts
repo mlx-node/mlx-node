@@ -53,7 +53,6 @@ import {
   BUFFER_METADATA_SIZE_BYTES,
   type BridgeStub,
 } from "./webgpu-bridge-stub.js";
-import { sanitizeAssistantText } from "./generated-text.js";
 
 let model: any = null;
 let mlxExports: any = null;
@@ -2054,8 +2053,8 @@ async function handleChatBaseline(data: {
     postProfileSnapshot(result.numTokens ?? 0);
     post({
       type: "result",
-      text: sanitizeAssistantText(result.text),
-      rawText: sanitizeAssistantText(result.rawText),
+      text: result.text,
+      rawText: result.rawText,
       numTokens: result.numTokens,
       finishReason: result.finishReason,
       toolCalls: result.toolCalls,
@@ -2114,8 +2113,8 @@ async function handleChatTsfn(data: {
             postProfileSnapshot(chunk.numTokens ?? 0);
             post({
               type: "result",
-              text: sanitizeAssistantText(chunk.text),
-              rawText: sanitizeAssistantText(chunk.rawText),
+              text: chunk.text,
+              rawText: chunk.rawText,
               numTokens: chunk.numTokens,
               finishReason: chunk.finishReason,
               toolCalls: chunk.toolCalls,

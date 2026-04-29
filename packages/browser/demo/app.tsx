@@ -32,7 +32,11 @@ import {
   SelectValue,
 } from "./components/ui/select";
 import { Textarea } from "./components/ui/textarea";
-import { sanitizeAssistantText } from "../src/generated-text.js";
+import {
+  sanitizeAssistantText,
+  sanitizeThinkingText as sanitizeThinkingMarkup,
+  splitAssistantThinking,
+} from "../src/generated-text.js";
 import "./styles.css";
 
 type StatusState = "info" | "ready" | "error";
@@ -385,9 +389,46 @@ function App() {
       thinking: string | null | undefined,
       latestUserText?: string,
     ) {
-      const cleaned = sanitizeAssistantText(thinking, latestUserText).trim();
+      const cleaned = sanitizeThinkingMarkup(
+        splitAssistantThinking(thinking, latestUserText).thinking || thinking,
+      );
       if (/^[A-Z]$/u.test(cleaned)) return "";
       return cleaned;
+    }
+
+    function mergeThinkingText(current: string, next: string) {
+      const left = sanitizeThinkingText(current);
+      const right = sanitizeThinkingText(next);
+      if (!right) return left;
+      if (!left) return right;
+      if (left.includes(right)) return left;
+      if (right.includes(left)) return right;
+      return `${left}\n\n${right}`;
+    }
+
+    function setStreamingThinkingText(text: string, open = true) {
+      if (!currentThinkingDiv || !currentReasoningVisible) return;
+      const cleaned = sanitizeThinkingText(text);
+      if (!cleaned) return;
+      const thinkingContentEl = currentThinkingDiv.querySelector(
+        ".thinking-content",
+      ) as HTMLElement | null;
+      const summary = currentThinkingDiv.querySelector(
+        "summary",
+      ) as HTMLElement | null;
+      if (summary) summary.textContent = "Thought process";
+      if (thinkingContentEl) thinkingContentEl.textContent = cleaned;
+      currentThinkingDiv.style.display = "";
+      currentThinkingDiv.open = open;
+      reasoningHasContent = true;
+      scrollDirty = true;
+      scheduleFlush();
+    }
+
+    function looksLikeReasoningLeak(text: string) {
+      return /(?:<\/(?:think|longcat_think)>|here'?s a thinking process|(?:^|\n)\s*(?:\d+\.\s*)?\*\*(?:draft response|check against|final output|analy[sz]e|identify))/iu.test(
+        text,
+      );
     }
 
     function appendStreamedToken(deltaText: string, isReasoning: boolean) {
@@ -400,12 +441,8 @@ function App() {
 
       if (isReasoning) {
         if (!currentReasoningVisible) return;
-        const text = reasoningHasContent
-          ? deltaText
-          : deltaText.replace(/^\s+/, "");
-        if (text.length === 0) return;
-        reasoningHasContent = true;
-        reasoningBuffer += text;
+        reasoningBuffer += deltaText;
+        setStreamingThinkingText(reasoningBuffer, true);
         return;
       } else {
         let text = contentHasContent
@@ -414,22 +451,51 @@ function App() {
         if (text.length === 0) return;
         if (!contentPrefixResolved && currentUserPrompt) {
           contentPrefixBuffer += text;
-          const cleaned = sanitizeAssistantText(
-            contentPrefixBuffer,
-            currentUserPrompt,
-          );
-          const shouldWait =
-            cleaned === contentPrefixBuffer.trimStart() &&
-            couldStillBePromptEchoPrefix(
+          if (
+            currentReasoningVisible &&
+            reasoningHasContent &&
+            looksLikeReasoningLeak(contentPrefixBuffer)
+          ) {
+            const split = splitAssistantThinking(
               contentPrefixBuffer,
               currentUserPrompt,
-            ) &&
-            contentPrefixBuffer.length < currentUserPrompt.length + 24;
-          if (shouldWait) return;
-          text = cleaned;
-          contentPrefixBuffer = "";
-          contentPrefixResolved = true;
-          if (text.length === 0) return;
+            );
+            if (split.thinking) {
+              reasoningBuffer = mergeThinkingText(
+                reasoningBuffer,
+                split.thinking,
+              );
+              setStreamingThinkingText(reasoningBuffer, true);
+              text = split.text;
+              contentPrefixBuffer = "";
+              contentPrefixResolved = true;
+              if (text.length === 0) return;
+            } else if (contentPrefixBuffer.length < 16_384) {
+              setStreamingThinkingText(
+                mergeThinkingText(reasoningBuffer, contentPrefixBuffer),
+                true,
+              );
+              return;
+            }
+          }
+          if (!contentPrefixResolved) {
+            const cleaned = sanitizeAssistantText(
+              contentPrefixBuffer,
+              currentUserPrompt,
+            );
+            const shouldWait =
+              cleaned === contentPrefixBuffer.trimStart() &&
+              couldStillBePromptEchoPrefix(
+                contentPrefixBuffer,
+                currentUserPrompt,
+              ) &&
+              contentPrefixBuffer.length < currentUserPrompt.length + 24;
+            if (shouldWait) return;
+            text = cleaned;
+            contentPrefixBuffer = "";
+            contentPrefixResolved = true;
+            if (text.length === 0) return;
+          }
         }
         contentHasContent = true;
         contentQueue += text;
@@ -538,26 +604,20 @@ function App() {
       const latestUserText =
         [...messages].reverse().find((message) => message.role === "user")
           ?.content ?? currentUserPrompt;
-      let text = sanitizeAssistantText(result.text, latestUserText);
+      const textParts = splitAssistantThinking(result.text, latestUserText);
+      const rawParts = splitAssistantThinking(result.rawText, latestUserText);
+      let text =
+        rawParts.text ||
+        textParts.text ||
+        sanitizeAssistantText(result.text, latestUserText);
       let thinking = sanitizeThinkingText(
         result.thinking ?? reasoningBuffer,
         latestUserText,
       );
-      const promotedThinking = thinking;
-      const trimmedText = text.trim();
-      const shouldPromoteThinking =
-        promotedThinking.length > 0 &&
-        (trimmedText.length === 0 ||
-          (trimmedText.length < promotedThinking.length * 0.75 &&
-            promotedThinking.includes(trimmedText)));
-      if (shouldPromoteThinking) {
-        text = promotedThinking;
-        thinking = "";
-      }
-      const rawText = sanitizeAssistantText(
-        text || result.rawText,
-        latestUserText,
-      );
+      thinking = mergeThinkingText(thinking, textParts.thinking);
+      thinking = mergeThinkingText(thinking, rawParts.thinking);
+      const rawText =
+        text || sanitizeAssistantText(result.rawText, latestUserText);
       finalizeAssistantMessage(text, thinking || null);
       messages.push({ role: "assistant", content: rawText });
 
