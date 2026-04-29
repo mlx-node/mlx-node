@@ -306,7 +306,7 @@ async function handleStreamingNative(
           !hasToolCalls &&
           finalText &&
           hasEmittedText &&
-          finalText.length > emittedText.length
+          !emittedText.includes(finalText)
         ) {
           // Recovery: streaming text was cut off by a false-alarm `<tool_call>` tag.
           //
@@ -319,12 +319,17 @@ async function handleStreamingNative(
           // longest streamed-suffix == finalText-prefix overlap and emit
           // whatever finalText has BEYOND that overlap.
           //
-          // The `finalText.length > emittedText.length` guard prevents
-          // re-emitting a TRIMMED finalText (e.g. preamble streamed as
-          // "Let me check. " then closed-but-non-ok tool_call, where native
-          // `parse_tool_calls` strips the block AND trims trailing whitespace
-          // → finalText="Let me check.", overlap returns 0, would otherwise
-          // emit duplicate "Let me check.").
+          // The `!emittedText.includes(finalText)` guard distinguishes:
+          //   (a) duplicate-trim case: streamed "Let me check. " + closed
+          //       non-ok tool_call → finalText="Let me check." (trimmed). The
+          //       trimmed text IS a substring of the streamed text → skip
+          //       (otherwise we'd duplicate "Let me check.").
+          //   (b) unclosed-tool case: streamed `\n\n` + unclosed
+          //       `<tool_call>...` → finalText=`<tool_call>...`. The malformed
+          //       tag is NOT a substring of the streamed whitespace → emit
+          //       (this is the original `<t`-strip bug we're fixing).
+          // Length-based guards (`finalText.length > emittedText.length`)
+          // misclassify case (b) when the streamed whitespace is long.
           const overlap = longestSuffixPrefixOverlap(emittedText, finalText);
           const unsent = finalText.slice(overlap);
           if (unsent) {
@@ -336,7 +341,7 @@ async function handleStreamingNative(
               buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
             );
           }
-        } else if (hasEmittedText && finalText && finalText.length > emittedText.length) {
+        } else if (hasEmittedText && finalText && !emittedText.includes(finalText)) {
           // Emit any unsent suffix when final text extends past what was
           // streamed. Same divergence concern as above (post-</think> trim
           // can leave `emittedText` longer than the matching prefix of
@@ -344,14 +349,10 @@ async function handleStreamingNative(
           // a length-based one. When the overlap covers all of `finalText`
           // (i.e. nothing more to emit) `unsent` is empty and we skip.
           //
-          // The length guard `finalText.length > emittedText.length` is
-          // load-bearing: when native cleanup TRIMS trailing whitespace
-          // from finalText (e.g. `parse_tool_calls` calls `.trim()` on the
-          // cleaned text), `finalText` can be SHORTER than `emittedText`.
-          // Without the guard, `longestSuffixPrefixOverlap` would return 0
-          // (the shorter trimmed prefix is not a suffix of the longer
-          // streamed text) and we'd emit `finalText` whole, duplicating
-          // preamble text the client already received in the streaming path.
+          // The `!emittedText.includes(finalText)` guard skips the
+          // duplicate-trim case where finalText is a substring of the
+          // streamed text (e.g. native `.trim()` shrinkage). See the
+          // companion comment above for the case-distinction rationale.
           const overlap = longestSuffixPrefixOverlap(emittedText, finalText);
           const unsent = finalText.slice(overlap);
           if (unsent) {

@@ -1132,6 +1132,62 @@ describe('handleCreateMessage', () => {
       expect(occurrences.length, `preamble duplicated; combined text deltas: ${JSON.stringify(combined)}`).toBe(1);
     });
 
+    it('recovers malformed tool_call when streamed leading-whitespace exceeds finalText length', async () => {
+      // Codex-found regression 2026-04-29 (third pass): a `finalText.length >
+      // emittedText.length` length guard was wrong when streamed leading
+      // whitespace (e.g. many newlines after `</think>`) is LONGER than the
+      // malformed tool_call body in finalText. With the length guard, branch
+      // #2 was skipped → client received only whitespace, losing the malformed
+      // `<tool_call>...` text entirely. The fix uses `!emittedText.includes(
+      // finalText)` instead, which correctly distinguishes "trimmed substring
+      // of streamed" (duplicate case → skip) from "different content"
+      // (recovery case → emit).
+      const longWhitespace = '\n'.repeat(80); // 80 chars > finalText length below
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: longWhitespace, done: false, isReasoning: false },
+        { text: '<tool_call>\n<function=Agent>{"q":"x"}', done: false, isReasoning: false },
+        {
+          // Native split_at_think_end trims the leading whitespace → finalText
+          // starts with "<tool_call>" (length ~38, less than emittedText's 80
+          // chars of whitespace).
+          text: '<tool_call>\n<function=Agent>{"q":"x"}',
+          done: true,
+          finishReason: 'length',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 25,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: `${longWhitespace}<tool_call>\n<function=Agent>{"q":"x"}`,
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'x' }],
+          max_tokens: 30,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+
+      // The malformed `<tool_call>` text MUST surface to the client (not be
+      // swallowed by the length guard).
+      expect(combined).toContain('<tool_call>');
+      expect(combined).toContain('<function=Agent>');
+    });
+
     it('does not duplicate preamble when finalText is shorter than streamed (native trim)', async () => {
       // Codex-found regression 2026-04-29: when the model emits a closed
       // tool_call with leading text, the streaming path emits the preamble
