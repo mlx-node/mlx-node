@@ -951,6 +951,15 @@ unsafe extern "C-unwind" {
     /// rejected (Phase 1 safety check; eval-based bounds verification).
     pub fn mlx_paged_kv_write_factory_rejects_slot_mapping_out_of_range() -> i32;
 
+    /// Round-13 finding: assert the factory-side slot_mapping bounds
+    /// guard's `std::invalid_argument` message contains the `[runtime]`
+    /// marker (matching the same marker used by the eval_gpu-side guard
+    /// for the same data-dependent property). See the C++ helper for
+    /// the full return-code contract: 1 = passes (threw + marker
+    /// present), 0 = no throw, -1 = wrong exception class / setup
+    /// error, -2 = threw but `[runtime]` marker missing.
+    pub fn mlx_paged_kv_write_factory_slot_mapping_out_of_range_runtime_marker() -> i32;
+
     // =============================================================================
     // Phase 1 review-round-4 dtype-mismatch FFI declarations (finding B+C).
     //

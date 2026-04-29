@@ -1116,6 +1116,57 @@ fn paged_kv_write_factory_rejects_slot_mapping_out_of_range() {
     );
 }
 
+/// Round-13 regression: assert the factory's slot_mapping bounds
+/// `std::invalid_argument` carries the `[runtime]` marker.
+///
+/// The slot_mapping bounds check is a data-dependent runtime guard
+/// (the value of `max(slot_mapping)` cannot be known structurally —
+/// it requires real materialized data). The same property is also
+/// guarded inside `PagedKVWrite::eval_gpu` (the compile-cached path),
+/// where the throw is tagged `[runtime] PagedKVWrite::eval_gpu`.
+///
+/// The companion factory throw must use the same `[runtime]` prefix so
+/// runtime-content guards stay uniformly distinguishable from
+/// `[validator]`-tagged structural rejections, regardless of which path
+/// caught the bad data. Without this regression test, a naive rebase
+/// could drop the prefix from the factory side without breaking any
+/// existing assertion (the previous test only checked the exception
+/// class).
+#[test]
+fn paged_kv_write_factory_runtime_guard_marker() {
+    let rc =
+        unsafe { mlx_sys::mlx_paged_kv_write_factory_slot_mapping_out_of_range_runtime_marker() };
+    match rc {
+        1 => {} // success: factory threw + message contained "[runtime]"
+        0 => panic!(
+            "paged_kv_write factory did NOT throw on slot_mapping max >= \
+             num_blocks*block_size; runtime-content bounds guard regressed. \
+             A regression here would let out-of-pool slot ids reach the \
+             Metal kernel, writing past the K/V allocation."
+        ),
+        -2 => panic!(
+            "paged_kv_write factory threw std::invalid_argument on \
+             out-of-range slot_mapping but the message did NOT contain \
+             '[runtime]' — the prefix on the factory-side runtime guard \
+             regressed. The factory and the eval_gpu-side bounds check \
+             must BOTH tag their throws with '[runtime]' so callers can \
+             uniformly distinguish runtime-content guards from \
+             '[validator]'-tagged structural rejections. See stderr for \
+             the actual message."
+        ),
+        -1 => panic!(
+            "paged_kv_write factory threw a non-invalid_argument exception \
+             OR the helper hit a setup error before the factory could \
+             throw. See stderr for the underlying message."
+        ),
+        other => panic!(
+            "paged_kv_write_factory_runtime_guard_marker: helper returned \
+             unexpected rc={other}; valid codes are 0 (no throw), 1 (pass), \
+             -1 (internal error), -2 (marker missing)."
+        ),
+    }
+}
+
 // =============================================================================
 // Phase 1 review-round-4 dtype-mismatch tests (finding B + C).
 //

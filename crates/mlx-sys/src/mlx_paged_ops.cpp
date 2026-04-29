@@ -1271,8 +1271,15 @@ std::pair<array, array> paged_kv_write(
     int64_t pool_capacity =
         static_cast<int64_t>(k_pool.shape(0)) * static_cast<int64_t>(block_size);
     if (max_slot_v >= pool_capacity) {
+      // Runtime data-dependent guard: `[runtime]` prefix matches the
+      // `[runtime] PagedKVWrite::eval_gpu` marker used by the same
+      // bounds check inside `PagedKVWrite::eval_gpu`. Tagging both
+      // throw sites with the same `[runtime]` prefix keeps slot_mapping
+      // bounds errors uniformly distinguishable from `[validator]`
+      // structural rejections, regardless of which path (factory vs.
+      // compile-cached eval_gpu) caught the bad data.
       std::ostringstream msg;
-      msg << "[paged_kv_write] slot_mapping max (" << max_slot_v
+      msg << "[runtime] [paged_kv_write] slot_mapping max (" << max_slot_v
           << ") exceeds pool capacity (num_blocks=" << k_pool.shape(0)
           << " * block_size=" << block_size << " = " << pool_capacity << ")";
       throw std::invalid_argument(msg.str());
@@ -1994,6 +2001,110 @@ int mlx_paged_kv_write_factory_rejects_slot_mapping_out_of_range() {
     return 0;
   }
   return 0;
+}
+
+/// Round-13 finding: assert the factory-side slot_mapping bounds
+/// guard's `std::invalid_argument` message contains the `[runtime]`
+/// marker. The factory and the compile-cached eval_gpu path BOTH guard
+/// the same data-dependent property (slot value < num_blocks *
+/// block_size); both must use the `[runtime]` prefix so callers / test
+/// infrastructure can distinguish runtime-content guards from the
+/// `[validator]`-tagged structural validators that produce different
+/// throw classes.
+///
+/// Returns:
+///   1   — factory threw `std::invalid_argument` AND the message
+///         contains the `[runtime]` substring (pass).
+///   0   — factory did NOT throw (regression — out-of-range
+///         slot_mapping reached the kernel).
+///  -2   — factory threw `std::invalid_argument` but the message did
+///         NOT contain `[runtime]` (the prefix regressed; the runtime
+///         guard is no longer uniformly tagged).
+///  -1   — factory threw a non-`std::invalid_argument` exception, or
+///         a setup step threw (internal helper bug).
+///
+/// The companion Rust test `paged_kv_write_factory_runtime_guard_marker`
+/// asserts rc=1.
+int mlx_paged_kv_write_factory_slot_mapping_out_of_range_runtime_marker() {
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::fast;
+
+    // Same configuration as `_factory_rejects_slot_mapping_out_of_range`:
+    // pool with 4 blocks × block_size=16 → capacity = 64 slots, and
+    // slot_mapping=[0, 64] so max_slot=64 == capacity → out of range.
+    array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+    array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+
+    std::vector<uint16_t> new_kv_zeros(2 * 4 * 64, 0);
+    auto* bf16_p = reinterpret_cast<const bfloat16_t*>(new_kv_zeros.data());
+    array new_k(bf16_p, Shape{2, 4, 64}, bfloat16);
+    array new_v(bf16_p, Shape{2, 4, 64}, bfloat16);
+
+    std::vector<int64_t> slot_mapping_host = {0, 64};
+    array slot_mapping(slot_mapping_host.data(), Shape{2}, int64);
+    array k_scale(1.0f, float32);
+    array v_scale(1.0f, float32);
+
+    static constexpr const char* kRuntimeTag = "[runtime]";
+    try {
+      paged_kv_write(
+          k_pool,
+          v_pool,
+          new_k,
+          new_v,
+          slot_mapping,
+          k_scale,
+          v_scale,
+          /*block_size=*/16,
+          /*num_kv_heads=*/4,
+          /*head_size=*/64,
+          /*x_pack=*/8,
+          KvDtype::Bf16,
+          StreamOrDevice{});
+    } catch (const std::invalid_argument& e) {
+      const std::string what = e.what();
+      if (what.find(kRuntimeTag) != std::string::npos) {
+        return 1;
+      }
+      fprintf(
+          stderr,
+          "[mlx_paged_kv_write_factory_slot_mapping_out_of_range_runtime_"
+          "marker] factory threw std::invalid_argument but message did NOT "
+          "contain '%s' marker — runtime-content guard prefix regressed. "
+          "Got: %s\n",
+          kRuntimeTag,
+          what.c_str());
+      return -2;
+    } catch (const std::exception& e) {
+      fprintf(
+          stderr,
+          "[mlx_paged_kv_write_factory_slot_mapping_out_of_range_runtime_"
+          "marker] factory threw non-invalid_argument: %s\n",
+          e.what());
+      return -1;
+    }
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_factory_slot_mapping_out_of_range_runtime_"
+        "marker] factory did NOT throw on out-of-range slot_mapping\n");
+    return 0;
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_factory_slot_mapping_out_of_range_runtime_"
+        "marker] FFI boundary caught uncontained C++ exception "
+        "(extern-C catch-all): %s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_factory_slot_mapping_out_of_range_runtime_"
+        "marker] FFI boundary caught uncontained non-std exception "
+        "(extern-C catch-all)\n");
+    return -1;
+  }
 }
 
 } // extern "C"
@@ -4497,31 +4608,78 @@ int eval_paged_attention_with_bad_state(
 
 extern "C" {
 
+// Round-13 hardening: every extern-C eval_gpu test helper below wraps
+// its body in a catch-all so NO C++ exception ever crosses into Rust.
+// The inner helpers (`eval_paged_kv_write_with_bad_state` /
+// `eval_paged_attention_with_bad_state`) already catch known throw
+// sites (graph construction + eval), but a stray exception from any
+// other code path inside this boundary (array destructors, MLX
+// internals, allocator failures, etc.) would otherwise propagate
+// through the FFI boundary and abort the test harness with "Rust
+// cannot catch foreign exceptions". Returning `-1` here keeps the
+// existing rc contract (-1 == internal helper error) so the Rust
+// `assert_eval_gpu_rejects_bad_state` matcher reports a clean
+// failure with the underlying message on stderr.
+//
+// All helpers must satisfy: `try { ... return rc; } catch (...) {
+// return -1; }`. Do NOT add code that can throw outside the inner
+// `try { ... }` block of these wrappers.
+
 /// Primitive directly constructed with `num_kv_heads_=0`. eval_gpu's
 /// validator must reject before the dispatch path can touch the
 /// buffers (the kernel would otherwise compute a degenerate
 /// `num_queries_per_kv` and divide by zero).
 int mlx_paged_kv_write_eval_gpu_rejects_zero_kv_heads() {
-  using namespace mlx::core::fast;
-  return eval_paged_kv_write_with_bad_state(
-      /*block_size=*/16,
-      /*num_kv_heads=*/0,
-      /*head_size=*/64,
-      /*x_pack=*/8,
-      KvDtype::Bf16);
+  try {
+    using namespace mlx::core::fast;
+    return eval_paged_kv_write_with_bad_state(
+        /*block_size=*/16,
+        /*num_kv_heads=*/0,
+        /*head_size=*/64,
+        /*x_pack=*/8,
+        KvDtype::Bf16);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_rejects_zero_kv_heads] FFI boundary "
+        "caught uncontained C++ exception (extern-C catch-all): %s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_rejects_zero_kv_heads] FFI boundary "
+        "caught uncontained non-std exception (extern-C catch-all)\n");
+    return -1;
+  }
 }
 
 /// Primitive directly constructed with `block_size_=0`. eval_gpu's
 /// validator must reject; otherwise the runtime bounds check would
 /// compute `(s + block_size_ - 1) / block_size_` and divide by zero.
 int mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() {
-  using namespace mlx::core::fast;
-  return eval_paged_kv_write_with_bad_state(
-      /*block_size=*/0,
-      /*num_kv_heads=*/4,
-      /*head_size=*/64,
-      /*x_pack=*/8,
-      KvDtype::Bf16);
+  try {
+    using namespace mlx::core::fast;
+    return eval_paged_kv_write_with_bad_state(
+        /*block_size=*/0,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*x_pack=*/8,
+        KvDtype::Bf16);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_rejects_zero_block_size] FFI boundary "
+        "caught uncontained C++ exception (extern-C catch-all): %s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_rejects_zero_block_size] FFI boundary "
+        "caught uncontained non-std exception (extern-C catch-all)\n");
+    return -1;
+  }
 }
 
 /// Round-12 regression: prove the scalar validator (NOT the runtime
@@ -4537,14 +4695,31 @@ int mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() {
 /// rejecting `block_size <= 0`; if its `[validator]` marker is
 /// missing, the helper returns rc=-2 by contract.
 int mlx_paged_kv_write_eval_gpu_validator_proof_zero_block_size() {
-  using namespace mlx::core::fast;
-  return eval_paged_kv_write_with_bad_state(
-      /*block_size=*/0,
-      /*num_kv_heads=*/4,
-      /*head_size=*/64,
-      /*x_pack=*/8,
-      KvDtype::Bf16,
-      /*benign_slot_mapping=*/true);
+  try {
+    using namespace mlx::core::fast;
+    return eval_paged_kv_write_with_bad_state(
+        /*block_size=*/0,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*x_pack=*/8,
+        KvDtype::Bf16,
+        /*benign_slot_mapping=*/true);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_validator_proof_zero_block_size] FFI "
+        "boundary caught uncontained C++ exception (extern-C catch-all): "
+        "%s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_validator_proof_zero_block_size] FFI "
+        "boundary caught uncontained non-std exception (extern-C "
+        "catch-all)\n");
+    return -1;
+  }
 }
 
 /// Primitive directly constructed with `head_size_=0`. eval_gpu's
@@ -4552,13 +4727,28 @@ int mlx_paged_kv_write_eval_gpu_validator_proof_zero_block_size() {
 /// extent and indexing stride — a zero-sized inner dim is a degenerate
 /// launch.
 int mlx_paged_kv_write_eval_gpu_rejects_zero_head_size() {
-  using namespace mlx::core::fast;
-  return eval_paged_kv_write_with_bad_state(
-      /*block_size=*/16,
-      /*num_kv_heads=*/4,
-      /*head_size=*/0,
-      /*x_pack=*/8,
-      KvDtype::Bf16);
+  try {
+    using namespace mlx::core::fast;
+    return eval_paged_kv_write_with_bad_state(
+        /*block_size=*/16,
+        /*num_kv_heads=*/4,
+        /*head_size=*/0,
+        /*x_pack=*/8,
+        KvDtype::Bf16);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_rejects_zero_head_size] FFI boundary "
+        "caught uncontained C++ exception (extern-C catch-all): %s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_rejects_zero_head_size] FFI boundary "
+        "caught uncontained non-std exception (extern-C catch-all)\n");
+    return -1;
+  }
 }
 
 /// Primitive directly constructed with `x_pack_=16` (Fp8 value)
@@ -4566,13 +4756,30 @@ int mlx_paged_kv_write_eval_gpu_rejects_zero_head_size() {
 /// validator must reject; otherwise the K-pool layout assumed by
 /// the kernel would disagree with what the dispatch path encodes.
 int mlx_paged_kv_write_eval_gpu_rejects_x_pack_dtype_mismatch() {
-  using namespace mlx::core::fast;
-  return eval_paged_kv_write_with_bad_state(
-      /*block_size=*/16,
-      /*num_kv_heads=*/4,
-      /*head_size=*/64,
-      /*x_pack=*/16,
-      KvDtype::Bf16);
+  try {
+    using namespace mlx::core::fast;
+    return eval_paged_kv_write_with_bad_state(
+        /*block_size=*/16,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*x_pack=*/16,
+        KvDtype::Bf16);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_rejects_x_pack_dtype_mismatch] FFI "
+        "boundary caught uncontained C++ exception (extern-C catch-all): "
+        "%s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_kv_write_eval_gpu_rejects_x_pack_dtype_mismatch] FFI "
+        "boundary caught uncontained non-std exception (extern-C "
+        "catch-all)\n");
+    return -1;
+  }
 }
 
 /// Primitive directly constructed with `num_kv_heads_=0`. eval_gpu's
@@ -4580,16 +4787,31 @@ int mlx_paged_kv_write_eval_gpu_rejects_x_pack_dtype_mismatch() {
 /// would otherwise compute `num_queries_per_kv = num_q_heads_ / 0` and
 /// divide by zero.
 int mlx_paged_attention_eval_gpu_rejects_zero_kv_heads() {
-  using namespace mlx::core::fast;
-  return eval_paged_attention_with_bad_state(
-      /*scale=*/0.125f,
-      /*softcap=*/0.0f,
-      /*block_size=*/16,
-      /*num_q_heads=*/8,
-      /*num_kv_heads=*/0,
-      /*head_size=*/64,
-      /*sliding_window=*/0,
-      KvDtype::Bf16);
+  try {
+    using namespace mlx::core::fast;
+    return eval_paged_attention_with_bad_state(
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/0,
+        /*head_size=*/64,
+        /*sliding_window=*/0,
+        KvDtype::Bf16);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_eval_gpu_rejects_zero_kv_heads] FFI boundary "
+        "caught uncontained C++ exception (extern-C catch-all): %s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_eval_gpu_rejects_zero_kv_heads] FFI boundary "
+        "caught uncontained non-std exception (extern-C catch-all)\n");
+    return -1;
+  }
 }
 
 /// Primitive directly constructed with `num_q_heads_ % num_kv_heads_
@@ -4597,16 +4819,33 @@ int mlx_paged_attention_eval_gpu_rejects_zero_kv_heads() {
 /// would compute kv_head_idx beyond the KV-head dimension and read
 /// out-of-pool memory.
 int mlx_paged_attention_eval_gpu_rejects_indivisible_grouping() {
-  using namespace mlx::core::fast;
-  return eval_paged_attention_with_bad_state(
-      /*scale=*/0.125f,
-      /*softcap=*/0.0f,
-      /*block_size=*/16,
-      /*num_q_heads=*/6,
-      /*num_kv_heads=*/4,
-      /*head_size=*/64,
-      /*sliding_window=*/0,
-      KvDtype::Bf16);
+  try {
+    using namespace mlx::core::fast;
+    return eval_paged_attention_with_bad_state(
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*block_size=*/16,
+        /*num_q_heads=*/6,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*sliding_window=*/0,
+        KvDtype::Bf16);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_eval_gpu_rejects_indivisible_grouping] FFI "
+        "boundary caught uncontained C++ exception (extern-C catch-all): "
+        "%s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_eval_gpu_rejects_indivisible_grouping] FFI "
+        "boundary caught uncontained non-std exception (extern-C "
+        "catch-all)\n");
+    return -1;
+  }
 }
 
 /// Primitive directly constructed with `sliding_window_!=0`. eval_gpu's
@@ -4614,16 +4853,31 @@ int mlx_paged_attention_eval_gpu_rejects_indivisible_grouping() {
 /// window, and silently accepting it here would produce full-context
 /// attention behind the caller's back.
 int mlx_paged_attention_eval_gpu_rejects_sliding_window() {
-  using namespace mlx::core::fast;
-  return eval_paged_attention_with_bad_state(
-      /*scale=*/0.125f,
-      /*softcap=*/0.0f,
-      /*block_size=*/16,
-      /*num_q_heads=*/8,
-      /*num_kv_heads=*/4,
-      /*head_size=*/64,
-      /*sliding_window=*/512,
-      KvDtype::Bf16);
+  try {
+    using namespace mlx::core::fast;
+    return eval_paged_attention_with_bad_state(
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*sliding_window=*/512,
+        KvDtype::Bf16);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_eval_gpu_rejects_sliding_window] FFI boundary "
+        "caught uncontained C++ exception (extern-C catch-all): %s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_eval_gpu_rejects_sliding_window] FFI boundary "
+        "caught uncontained non-std exception (extern-C catch-all)\n");
+    return -1;
+  }
 }
 
 /// Primitive directly constructed with `block_size_=0`. eval_gpu's
@@ -4631,16 +4885,31 @@ int mlx_paged_attention_eval_gpu_rejects_sliding_window() {
 /// divide `(s + block_size_ - 1) / block_size_` by zero in host code,
 /// crashing the process before the `max_context_len <= 0` guard runs.
 int mlx_paged_attention_eval_gpu_rejects_zero_block_size() {
-  using namespace mlx::core::fast;
-  return eval_paged_attention_with_bad_state(
-      /*scale=*/0.125f,
-      /*softcap=*/0.0f,
-      /*block_size=*/0,
-      /*num_q_heads=*/8,
-      /*num_kv_heads=*/4,
-      /*head_size=*/64,
-      /*sliding_window=*/0,
-      KvDtype::Bf16);
+  try {
+    using namespace mlx::core::fast;
+    return eval_paged_attention_with_bad_state(
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*block_size=*/0,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*sliding_window=*/0,
+        KvDtype::Bf16);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_eval_gpu_rejects_zero_block_size] FFI boundary "
+        "caught uncontained C++ exception (extern-C catch-all): %s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_eval_gpu_rejects_zero_block_size] FFI boundary "
+        "caught uncontained non-std exception (extern-C catch-all)\n");
+    return -1;
+  }
 }
 
 } // extern "C"
