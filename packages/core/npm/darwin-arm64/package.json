@@ -4,7 +4,8 @@
   "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
   "files": [
     "mlx-core.darwin-arm64.node",
-    "mlx.metallib"
+    "mlx.metallib",
+    "paged_attn.metallib"
   ],
   "os": [
     "darwin"

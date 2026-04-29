@@ -4820,7 +4820,8 @@ int mlx_paged_attention_eval_gpu_rejects_zero_block_size() {
   }
 }
 
-/// Phase 2 stress test (mixed paged + non-paged ops, determinism).
+/// Phase 2 stress test (mixed paged + non-paged ops, correctness +
+/// determinism + V1/V2 coverage).
 ///
 /// Builds a small graph that:
 ///   1. computes `q_offset = q + bias` (a non-paged op before the write)
@@ -4835,40 +4836,66 @@ int mlx_paged_attention_eval_gpu_rejects_zero_block_size() {
 /// fence these correctly. Phase 1's separate-queue dispatch
 /// fundamentally cannot get this right; Phase 2 does.
 ///
-/// Determinism criterion: run the graph `iterations` times with
-/// IDENTICAL inputs and assert the output is byte-equal across every
-/// run. A race between paged_kv_write's writes and a subsequent op's
-/// reads would surface as nondeterminism (different outputs across
-/// runs).
+/// Correctness + determinism criteria:
+///
+///   1. SYNCHRONOUS REFERENCE: build the same write+attention graph
+///      with an explicit `eval()` between the write and the attention
+///      read. The `eval()` boundary forces a true synchronization
+///      barrier, so this output is provably correct (the read sees
+///      the fully-completed write). Every stress-loop run must be
+///      byte-equal to this reference.
+///
+///   2. NO-WRITE BASELINE: build an attention graph reading a
+///      ZERO-INITIALIZED pool (no preceding write). Every stress-loop
+///      run's output must DIFFER from this baseline — otherwise a
+///      race could deterministically schedule the read before the
+///      write and pass the determinism check while reading stale
+///      zeros.
+///
+/// `seq_len` selects V1 vs V2 of the underlying paged-attention
+/// kernel: max_context_len <= 512 picks V1 (no partitioning), > 512
+/// picks V2 (partitioning + reduce). Coverage of both paths is
+/// required because V2 allocates auxiliary buffers
+/// (`exp_sums`/`max_logits`/`tmp_out`) and chains a second kernel —
+/// the encoder must fence both phases plus any preceding write.
 ///
 /// Returns:
-///   0     — success (all `iterations` runs byte-identical)
+///   0     — success (all `iterations` runs byte-equal to the
+///           synchronous reference AND differ from the no-write
+///           baseline)
 ///   -1    — internal/setup error
-///   -2    — outputs diverged across runs (race detected)
+///   -2    — a stress-loop run diverged from the synchronous reference
 ///   -3    — Metal not available; test skipped
-extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
+///   -4    — a stress-loop run matched the no-write baseline (the
+///           write didn't actually land in time, but the loop happened
+///           to be deterministic about it)
+extern "C" int mlx_paged_phase2_stress_mixed_graph_v(
+    int iterations,
+    int seq_len) {
   using namespace mlx::core;
   using namespace mlx::core::fast;
 
-  if (iterations <= 0) {
+  if (iterations <= 0 || seq_len <= 0) {
     return -1;
   }
   if (!mlx::core::metal::is_available()) {
     return -3;
   }
 
-  // Small but non-trivial config. head_size must be in the
-  // instantiation list (32, 64, 80, 96, 112, 120, 128, 192, 256, 512)
-  // and divisible by x_pack (8 for Bf16). block_size in {8, 16, 32}.
+  // Block layout: head_size must be in the kernel's instantiation list
+  // (32, 64, 80, 96, 112, 120, 128, 192, 256, 512) and divisible by
+  // x_pack (8 for Bf16). block_size in {8, 16, 32}.
   const int kBlockSize = 16;
   const int kNumQHeads = 4;
   const int kNumKvHeads = 4;
   const int kHeadSize = 64;
   const int kXPack = 8;
-  const int kNumBlocks = 4;
   const int kNumSeqs = 1;
-  const int kSeqLen = 8;
-  const int kMaxBlocksPerSeq = 4;
+  const int kSeqLen = seq_len;
+  // ceil(seq_len / block_size). Pad by one extra block to keep the
+  // pool/block-table comfortably sized.
+  const int kMaxBlocksPerSeq = (kSeqLen + kBlockSize - 1) / kBlockSize + 1;
+  const int kNumBlocks = kMaxBlocksPerSeq;
 
   try {
     Shape k_pool_shape{
@@ -4893,83 +4920,241 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
       return array(p, std::move(shape), bfloat16);
     };
 
-    // Build inputs FRESH each iteration. We can't reuse k_pool /
-    // v_pool across iterations because paged_kv_write mutates them
-    // in place — we'd need to reset to zero between runs. Easier
-    // and clearer to just build new ones. The bytes coming OUT of
-    // bf16_arr are deterministic for the same (n, seed_a, seed_b)
-    // tuple.
-    auto build_inputs = [&]() {
-      const size_t k_pool_n = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
-          (kHeadSize / kXPack) * kBlockSize * kXPack;
-      const size_t v_pool_n = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
-          kHeadSize * kBlockSize;
-      const size_t new_kv_n = static_cast<size_t>(kSeqLen) * kNumKvHeads *
-          kHeadSize;
+    // Build a fresh zero-initialized BF16 array of the given shape.
+    auto bf16_zeros = [](size_t n, Shape shape) {
+      std::vector<uint16_t> host(n, 0);
+      auto* p = reinterpret_cast<const bfloat16_t*>(host.data());
+      return array(p, std::move(shape), bfloat16);
+    };
 
-      array k_pool = bf16_arr(k_pool_n, 0.0f, 0.0f, k_pool_shape);
-      array v_pool = bf16_arr(v_pool_n, 0.0f, 0.0f, v_pool_shape);
-      array new_k = bf16_arr(new_kv_n, 0.13f, 0.7f, new_kv_shape);
-      array new_v = bf16_arr(new_kv_n, 0.17f, 1.3f, new_kv_shape);
+    // Sizes used for the host-side allocations.
+    const size_t k_pool_n = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+        (kHeadSize / kXPack) * kBlockSize * kXPack;
+    const size_t v_pool_n = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+        kHeadSize * kBlockSize;
+    const size_t new_kv_n =
+        static_cast<size_t>(kSeqLen) * kNumKvHeads * kHeadSize;
+    const size_t q_n =
+        static_cast<size_t>(kNumSeqs) * kNumQHeads * kHeadSize;
+    const size_t bias_n = q_n;
 
-      std::vector<int64_t> slot_host(kSeqLen);
-      for (int i = 0; i < kSeqLen; ++i) {
-        slot_host[i] = i;
-      }
-      array slot_mapping(slot_host.data(), Shape{kSeqLen}, int64);
-
-      const size_t q_n = static_cast<size_t>(kNumSeqs) * kNumQHeads * kHeadSize;
-      array q = bf16_arr(q_n, 0.21f, 2.1f, q_shape);
-
+    auto build_block_table = [&]() {
       std::vector<int32_t> block_table_host(kNumSeqs * kMaxBlocksPerSeq);
       for (int s = 0; s < kNumSeqs; ++s) {
         for (int b = 0; b < kMaxBlocksPerSeq; ++b) {
           block_table_host[s * kMaxBlocksPerSeq + b] = b;
         }
       }
-      array block_table(
+      return array(
           block_table_host.data(),
           Shape{kNumSeqs, kMaxBlocksPerSeq},
           int32);
+    };
 
+    auto build_seq_lens = [&]() {
       std::vector<int32_t> seq_lens_host(kNumSeqs, kSeqLen);
-      array seq_lens(seq_lens_host.data(), Shape{kNumSeqs}, int32);
+      return array(seq_lens_host.data(), Shape{kNumSeqs}, int32);
+    };
 
+    auto build_slot_mapping = [&]() {
+      std::vector<int64_t> slot_host(kSeqLen);
+      for (int i = 0; i < kSeqLen; ++i) {
+        slot_host[i] = i;
+      }
+      return array(slot_host.data(), Shape{kSeqLen}, int64);
+    };
+
+    auto k_pool_input = [&]() { return bf16_zeros(k_pool_n, k_pool_shape); };
+    auto v_pool_input = [&]() { return bf16_zeros(v_pool_n, v_pool_shape); };
+    auto new_k_input = [&]() {
+      return bf16_arr(new_kv_n, 0.13f, 0.7f, new_kv_shape);
+    };
+    auto new_v_input = [&]() {
+      return bf16_arr(new_kv_n, 0.17f, 1.3f, new_kv_shape);
+    };
+    auto q_input = [&]() {
+      return bf16_arr(q_n, 0.21f, 2.1f, q_shape);
+    };
+    auto bias_input = [&]() {
+      return bf16_arr(bias_n, 0.05f, 0.0f, q_shape);
+    };
+
+    // ---------------------------------------------------------------
+    // Step 0a: SYNCHRONOUS REFERENCE.
+    //
+    // Build write+attention with an explicit `eval()` between the
+    // write and the attention read. The eval boundary is a hard sync
+    // barrier — Metal's queues drain to completion before host code
+    // continues, so the attention here MUST see the just-written
+    // K/V. This output is the known-good answer.
+    // ---------------------------------------------------------------
+    std::vector<uint16_t> reference_bytes;
+    size_t expected_n_elems = 0;
+    {
+      array k_pool_ref = k_pool_input();
+      array v_pool_ref = v_pool_input();
+      array new_k_ref = new_k_input();
+      array new_v_ref = new_v_input();
+      array slot_mapping_ref = build_slot_mapping();
+      array q_ref = q_input();
+      array bias_ref = bias_input();
+      array block_table_ref = build_block_table();
+      array seq_lens_ref = build_seq_lens();
+      array k_scale_ref(1.0f, float32);
+      array v_scale_ref(1.0f, float32);
+
+      array q_offset_ref = mlx::core::add(q_ref, bias_ref);
+
+      auto [k_pool_written, v_pool_written] = paged_kv_write(
+          k_pool_ref,
+          v_pool_ref,
+          new_k_ref,
+          new_v_ref,
+          slot_mapping_ref,
+          k_scale_ref,
+          v_scale_ref,
+          kBlockSize,
+          kNumKvHeads,
+          kHeadSize,
+          kXPack,
+          KvDtype::Bf16);
+
+      // Force the write to complete before the read graph is built.
+      // This is the "true reference" guarantee — eval() drains the
+      // command queue, so any subsequent dispatch sees fully-written
+      // K/V regardless of any write-to-read fence.
+      mlx::core::eval({k_pool_written, v_pool_written});
+
+      array attn_ref = paged_attention(
+          q_offset_ref,
+          k_pool_written,
+          v_pool_written,
+          block_table_ref,
+          seq_lens_ref,
+          k_scale_ref,
+          v_scale_ref,
+          /*scale=*/0.125f,
+          /*softcap=*/0.0f,
+          /*sliding_window=*/0,
+          kBlockSize,
+          kNumQHeads,
+          kNumKvHeads,
+          kHeadSize,
+          KvDtype::Bf16);
+
+      array out_ref = mlx::core::add(attn_ref, attn_ref);
+      mlx::core::eval(out_ref);
+
+      const bfloat16_t* data = out_ref.data<bfloat16_t>();
+      expected_n_elems = out_ref.size();
+      const uint16_t* bits = reinterpret_cast<const uint16_t*>(data);
+      reference_bytes.assign(bits, bits + expected_n_elems);
+    }
+
+    // ---------------------------------------------------------------
+    // Step 0b: NO-WRITE BASELINE.
+    //
+    // Run the attention graph against a ZERO pool with no preceding
+    // write. This is what a broken write→read fence could
+    // deterministically read if it scheduled the read before the
+    // write completed. Stress-loop outputs MUST DIFFER from this.
+    // ---------------------------------------------------------------
+    std::vector<uint16_t> nowrite_bytes;
+    {
+      array k_pool_zero = k_pool_input();
+      array v_pool_zero = v_pool_input();
+      array q_zero = q_input();
+      array bias_zero = bias_input();
+      array block_table_zero = build_block_table();
+      array seq_lens_zero = build_seq_lens();
+      array k_scale_zero(1.0f, float32);
+      array v_scale_zero(1.0f, float32);
+
+      array q_offset_zero = mlx::core::add(q_zero, bias_zero);
+
+      array attn_zero = paged_attention(
+          q_offset_zero,
+          k_pool_zero,
+          v_pool_zero,
+          block_table_zero,
+          seq_lens_zero,
+          k_scale_zero,
+          v_scale_zero,
+          /*scale=*/0.125f,
+          /*softcap=*/0.0f,
+          /*sliding_window=*/0,
+          kBlockSize,
+          kNumQHeads,
+          kNumKvHeads,
+          kHeadSize,
+          KvDtype::Bf16);
+
+      array out_zero = mlx::core::add(attn_zero, attn_zero);
+      mlx::core::eval(out_zero);
+
+      const bfloat16_t* data = out_zero.data<bfloat16_t>();
+      const size_t n_elems = out_zero.size();
+      const uint16_t* bits = reinterpret_cast<const uint16_t*>(data);
+      nowrite_bytes.assign(bits, bits + n_elems);
+
+      if (n_elems != expected_n_elems) {
+        fprintf(
+            stderr,
+            "[phase2_stress] no-write baseline output size %zu != "
+            "reference size %zu\n",
+            n_elems,
+            expected_n_elems);
+        return -1;
+      }
+    }
+
+    // Reference and no-write baselines must differ. If they happen
+    // to be byte-equal — almost impossible with non-zero K/V — the
+    // "nowrite" assertion below is meaningless. (A single byte of
+    // disagreement is enough.)
+    {
+      bool any_differ = false;
+      for (size_t i = 0; i < expected_n_elems; ++i) {
+        if (reference_bytes[i] != nowrite_bytes[i]) {
+          any_differ = true;
+          break;
+        }
+      }
+      if (!any_differ) {
+        fprintf(
+            stderr,
+            "[phase2_stress] reference and no-write baselines are "
+            "byte-equal; pick non-zero K/V to make this test "
+            "discriminating\n");
+        return -1;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Step 1: stress loop. Build the mixed graph N times, identical
+    // inputs each time. Each output must equal the synchronous
+    // reference and differ from the no-write baseline.
+    // ---------------------------------------------------------------
+    for (int run = 0; run < iterations; ++run) {
+      array k_pool = k_pool_input();
+      array v_pool = v_pool_input();
+      array new_k = new_k_input();
+      array new_v = new_v_input();
+      array slot_mapping = build_slot_mapping();
+      array q = q_input();
+      array bias = bias_input();
+      array block_table = build_block_table();
+      array seq_lens = build_seq_lens();
       array k_scale(1.0f, float32);
       array v_scale(1.0f, float32);
 
-      return std::make_tuple(
-          k_pool,
-          v_pool,
-          new_k,
-          new_v,
-          slot_mapping,
-          q,
-          block_table,
-          seq_lens,
-          k_scale,
-          v_scale);
-    };
-
-    std::vector<uint16_t> baseline_bytes;
-    size_t expected_bytes = 0;
-
-    for (int run = 0; run < iterations; ++run) {
-      auto [k_pool, v_pool, new_k, new_v, slot_mapping, q, block_table,
-            seq_lens, k_scale, v_scale] = build_inputs();
-
-      // Step 1: a non-paged op BEFORE the paged write so MLX's
+      // Step 1a: a non-paged op BEFORE the paged write so MLX's
       // dependency graph has to fence between us and another
       // command. (`add` produces a fresh allocation; the write below
       // doesn't depend on it.)
-      array bias = bf16_arr(
-          static_cast<size_t>(kNumSeqs) * kNumQHeads * kHeadSize,
-          0.05f,
-          0.0f,
-          q_shape);
       array q_offset = mlx::core::add(q, bias);
 
-      // Step 2: paged_kv_write — fills slots 0..kSeqLen-1 in block 0.
+      // Step 1b: paged_kv_write — fills slots 0..kSeqLen-1.
       auto [k_pool_after, v_pool_after] = paged_kv_write(
           k_pool,
           v_pool,
@@ -4984,10 +5169,12 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
           kXPack,
           KvDtype::Bf16);
 
-      // Step 3: paged_attention reads from the just-written pools.
-      // The encoder must fence between the write (Step 2) and this
+      // Step 1c: paged_attention reads from the just-written pools.
+      // The encoder must fence between the write (Step 1b) and this
       // read; if Phase 2 dispatch is correct, MLX's `set_output_array`
-      // → `set_input_array` chain handles it.
+      // → `set_input_array` chain handles it. NOTE: no `eval()`
+      // between the write and this read in the stress runs — the
+      // whole point is to test the encoder's automatic fencing.
       array attn = paged_attention(
           q_offset,
           k_pool_after,
@@ -5005,7 +5192,7 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
           kHeadSize,
           KvDtype::Bf16);
 
-      // Step 4: a non-paged op AFTER the read (depends on attn).
+      // Step 1d: a non-paged op AFTER the read (depends on attn).
       array out = mlx::core::add(attn, attn);
 
       mlx::core::eval(out);
@@ -5014,32 +5201,55 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
       const size_t n_elems = out.size();
       const uint16_t* bits = reinterpret_cast<const uint16_t*>(data);
 
-      if (run == 0) {
-        baseline_bytes.assign(bits, bits + n_elems);
-        expected_bytes = n_elems;
-      } else {
-        if (n_elems != expected_bytes) {
+      if (n_elems != expected_n_elems) {
+        fprintf(
+            stderr,
+            "[phase2_stress] run %d output size mismatch: expected %zu "
+            "got %zu\n",
+            run,
+            expected_n_elems,
+            n_elems);
+        return -2;
+      }
+
+      // Compare to the synchronous reference (the known-good answer).
+      // A race in the write→read fence would surface as a divergence
+      // here.
+      for (size_t i = 0; i < n_elems; ++i) {
+        if (bits[i] != reference_bytes[i]) {
           fprintf(
               stderr,
-              "[phase2_stress] run %d output size mismatch: expected %zu "
-              "got %zu\n",
+              "[phase2_stress] run %d byte %zu diverged from synchronous "
+              "reference: ref=0x%04x current=0x%04x (race or stale read)\n",
               run,
-              expected_bytes,
-              n_elems);
+              i,
+              reference_bytes[i],
+              bits[i]);
           return -2;
         }
+      }
+
+      // Compare to the no-write baseline. A run that schedules the
+      // read before the write would read zeros and match this
+      // baseline; that pattern would also match the previous loop's
+      // determinism check, so we have to assert non-equality
+      // explicitly. (At least one byte must differ.)
+      {
+        bool any_differ = false;
         for (size_t i = 0; i < n_elems; ++i) {
-          if (bits[i] != baseline_bytes[i]) {
-            fprintf(
-                stderr,
-                "[phase2_stress] run %d byte %zu diverged: baseline=0x%04x "
-                "current=0x%04x (race detected)\n",
-                run,
-                i,
-                baseline_bytes[i],
-                bits[i]);
-            return -2;
+          if (bits[i] != nowrite_bytes[i]) {
+            any_differ = true;
+            break;
           }
+        }
+        if (!any_differ) {
+          fprintf(
+              stderr,
+              "[phase2_stress] run %d output is byte-equal to the "
+              "no-write baseline. The write→read fence either failed "
+              "or never ran; the read saw zeros. (race detected)\n",
+              run);
+          return -4;
         }
       }
     }
@@ -5052,6 +5262,14 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
     fprintf(stderr, "[phase2_stress] threw non-std exception\n");
     return -1;
   }
+}
+
+/// Backward-compatible wrapper: defaults to V1 (seq_len=8). Kept so
+/// any external caller that still binds the original symbol gets the
+/// hardened logic without re-binding. The Rust test calls the `_v`
+/// variant directly so it can drive both V1 and V2.
+extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
+  return mlx_paged_phase2_stress_mixed_graph_v(iterations, /*seq_len=*/8);
 }
 
 } // extern "C"

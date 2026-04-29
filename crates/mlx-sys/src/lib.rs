@@ -1222,15 +1222,36 @@ unsafe extern "C-unwind" {
     pub fn mlx_paged_attention_eval_gpu_rejects_sliding_window() -> i32;
     pub fn mlx_paged_attention_eval_gpu_rejects_zero_block_size() -> i32;
 
-    /// Phase 2 stress test (mixed paged + non-paged ops, determinism).
+    /// Phase 2 stress test (mixed paged + non-paged ops, correctness +
+    /// determinism + V1/V2 coverage).
+    ///
     /// Builds a small graph mixing `paged_kv_write` + non-paged
     /// `add` + `paged_attention` + `add`, runs it `iterations` times
-    /// with identical inputs, and asserts byte-identical outputs across
-    /// every run. Returns:
-    ///   0  → success
-    ///  -1  → internal/setup error
-    ///  -2  → outputs diverged across runs (race detected)
-    ///  -3  → Metal not available; test skipped
+    /// with identical inputs, and asserts:
+    ///
+    /// - every run is byte-equal to a synchronous reference output
+    ///   computed with explicit `eval()` between write and read
+    ///   (proves the encoder fence honors the write→read dep);
+    /// - every run differs from a no-write baseline output computed
+    ///   against a zero pool (proves the write actually landed before
+    ///   the read — guards against a deterministically stale read).
+    ///
+    /// `seq_len` selects the V1 (no partitioning) vs V2 (with
+    /// partitioning + reduce) kernel path: `max_context_len <= 512`
+    /// picks V1, `> 512` picks V2.
+    ///
+    /// Returns:
+    ///
+    /// - `0` — success
+    /// - `-1` — internal/setup error
+    /// - `-2` — run diverged from synchronous reference (race detected)
+    /// - `-3` — Metal not available; test skipped
+    /// - `-4` — run matched no-write baseline (write didn't land)
+    pub fn mlx_paged_phase2_stress_mixed_graph_v(iterations: i32, seq_len: i32) -> i32;
+
+    /// Backward-compatible default-V1 wrapper around
+    /// `mlx_paged_phase2_stress_mixed_graph_v` with `seq_len=8`. Same
+    /// return-code contract.
     pub fn mlx_paged_phase2_stress_mixed_graph(iterations: i32) -> i32;
 }
 

@@ -40,48 +40,106 @@ for (const output of outputs) {
 // Also copy paged_attn.metallib (Phase 2 of the paged-attention
 // compile integration), which mlx_paged_dispatch.cpp loads via a
 // `dladdr`-based colocated lookup at runtime.
+//
+// Both metallibs are copied to TWO destinations:
+//   1. `packages/core/`       — sits next to the local
+//      `mlx-core.darwin-arm64.node` for in-repo `yarn build:native`
+//      developer flow.
+//   2. `packages/core/npm/darwin-arm64/` — the platform-specific
+//      optional package that gets published to npm. The user-facing
+//      install path resolves the .node addon from this package, so
+//      the metallibs MUST ship here too — otherwise the
+//      `dladdr`-based runtime lookup in `mlx_paged_dispatch.cpp`
+//      lands in the published package directory and finds no
+//      `paged_attn.metallib`, throwing on first use.
+//
+// Both metallibs are required-on-darwin: `mlx.metallib` for stock
+// MLX kernels, `paged_attn.metallib` for the paged-attention
+// dispatch path used by `Qwen3Model` (where `use_paged_attention`
+// is on by default for the legacy `PagedKVCache` route and by
+// `use_block_paged_cache` on by default for the new vLLM-style path).
+// We FAIL the build if either is missing so a packaging regression
+// surfaces immediately rather than as a runtime throw at first use
+// in a published install.
 await copyMetallibs();
 
 async function copyMetallibs() {
+  const npmDarwinDir = join(__dirname, 'npm', 'darwin-arm64');
+  const destDirs = [__dirname, npmDarwinDir];
+
   const targetDir = join(__dirname, '../../target');
-  try {
-    // Find mlx.metallib in the build directory
-    // Pattern: target/*/release/build/mlx-sys-*/out/lib/mlx.metallib
-    const archDirs = await readdir(targetDir);
-    for (const arch of archDirs) {
-      const releaseDir = join(targetDir, arch, 'release', 'build');
+  // Find mlx.metallib in the build directory.
+  // Pattern: target/*/release/build/mlx-sys-*/out/lib/mlx.metallib
+  const archDirs = await readdir(targetDir);
+  for (const arch of archDirs) {
+    const releaseDir = join(targetDir, arch, 'release', 'build');
+    let buildDirs: string[];
+    try {
+      buildDirs = await readdir(releaseDir);
+    } catch {
+      // release/build dir doesn't exist for this arch
+      continue;
+    }
+    for (const dir of buildDirs) {
+      if (!dir.startsWith('mlx-sys-')) continue;
+      const libDir = join(releaseDir, dir, 'out', 'lib');
+      const mlxPath = join(libDir, 'mlx.metallib');
       try {
-        const buildDirs = await readdir(releaseDir);
-        for (const dir of buildDirs) {
-          if (dir.startsWith('mlx-sys-')) {
-            const libDir = join(releaseDir, dir, 'out', 'lib');
-            const mlxPath = join(libDir, 'mlx.metallib');
-            try {
-              await stat(mlxPath);
-              await copyFile(mlxPath, './mlx.metallib');
-              console.log('Copied mlx.metallib');
-              // Best-effort copy of the paged-attn metallib (Phase 2).
-              // It lives next to mlx.metallib in the same lib dir.
-              const pagedPath = join(libDir, 'paged_attn.metallib');
-              try {
-                await stat(pagedPath);
-                await copyFile(pagedPath, './paged_attn.metallib');
-                console.log('Copied paged_attn.metallib');
-              } catch {
-                console.warn('Note: paged_attn.metallib not found (Phase 2 paged-attn compile path will throw at first use)');
-              }
-              return;
-            } catch {
-              // metallib not at this path, continue searching
-            }
-          }
-        }
+        await stat(mlxPath);
       } catch {
-        // release/build dir doesn't exist for this arch
+        // metallib not at this path, continue searching
+        continue;
+      }
+      // mlx.metallib is required: copy to all destinations or fail.
+      for (const dest of destDirs) {
+        const dst = join(dest, 'mlx.metallib');
+        await copyFile(mlxPath, dst);
+        console.log(`Copied mlx.metallib -> ${dst}`);
+      }
+      // paged_attn.metallib is also required for darwin (Phase 2).
+      // It lives next to mlx.metallib in the same lib dir.
+      const pagedPath = join(libDir, 'paged_attn.metallib');
+      try {
+        await stat(pagedPath);
+      } catch {
+        throw new Error(
+          `paged_attn.metallib not found at ${pagedPath}. The paged-attention ` +
+            `compile path (mlx_paged_dispatch.cpp) loads this metallib via dladdr ` +
+            `at runtime; without it, the addon throws on first paged-attention use. ` +
+            `Check that mlx-sys/build.rs ran compile_paged_attn_metallib successfully.`,
+        );
+      }
+      for (const dest of destDirs) {
+        const dst = join(dest, 'paged_attn.metallib');
+        await copyFile(pagedPath, dst);
+        console.log(`Copied paged_attn.metallib -> ${dst}`);
+      }
+      // Final sanity-check: every destination must have BOTH files.
+      // This catches a copy that silently overwrote or partially
+      // failed; cheaper to fail the build than to publish a broken
+      // optional package.
+      await assertMetallibPresence(destDirs);
+      return;
+    }
+  }
+  throw new Error('mlx.metallib not found under any target/<arch>/release/build/mlx-sys-*/out/lib/');
+}
+
+async function assertMetallibPresence(destDirs: string[]) {
+  const required = ['mlx.metallib', 'paged_attn.metallib'];
+  for (const dest of destDirs) {
+    for (const name of required) {
+      const p = join(dest, name);
+      try {
+        await stat(p);
+      } catch {
+        throw new Error(
+          `[build.ts smoke check] expected ${name} at ${p} but it is missing. ` +
+            `If this fires, the published npm package will not contain this metallib ` +
+            `and the runtime dladdr lookup will throw on first use.`,
+        );
       }
     }
-    throw new Error('Note: mlx.metallib not found');
-  } catch {
-    throw new Error('Note: mlx.metallib not found');
+    console.log(`Smoke check: ${dest} has all ${required.length} required metallibs.`);
   }
 }

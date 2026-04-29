@@ -51,10 +51,19 @@ jobs:
         with:
           name: mlx-node
           path: packages/core/*.node
+      # Both metallibs ship as part of the darwin-arm64 optional
+      # package: `mlx.metallib` for stock MLX kernels and
+      # `paged_attn.metallib` for the paged-attention compile path
+      # (loaded via dladdr-relative lookup at runtime). The publish
+      # job downloads this artifact INTO
+      # `packages/core/npm/darwin-arm64/` so both files have to be
+      # in the same artifact to land alongside the .node addon.
       - uses: actions/upload-artifact@v6
         with:
           name: mlx-metallib
-          path: packages/core/mlx.metallib
+          path: |
+            packages/core/mlx.metallib
+            packages/core/paged_attn.metallib
   test:
     name: ${{ matrix.test }}
     runs-on: macos-latest
