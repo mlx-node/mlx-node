@@ -29,6 +29,7 @@ import { getPendingWritesFor } from '../pending-writes.js';
 import type { ModelRegistry } from '../registry.js';
 import { maybeWarnPromptCacheKeyIneligible, QueueFullError, type SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
+import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
   createVisibility,
@@ -54,30 +55,6 @@ import type {
  * this 30-minute fallback is only used by legacy direct-invocation callers.
  */
 const RESPONSE_TTL_SECONDS = 1800;
-
-/**
- * Find the largest k such that `streamed.endsWith(final.slice(0, k))`.
- * Used to compute the unsent suffix of `finalText` when the streamed-chunk
- * prefix and `finalText` prefix can diverge — the native side trims leading
- * whitespace after `</think>` via `split_at_think_end`, so e.g. streamed
- * could be `"\n\n"` and final could start with `"<tool_call>"`.
- *
- * Returns 0 when there is no overlap (caller emits finalText whole).
- * Returns final.length when finalText is fully contained in streamed
- * (caller emits nothing).
- *
- * TODO: factor into a shared module (`packages/server/src/text-recovery.ts`)
- * once messages.ts can be touched safely. Duplicated here verbatim from
- * messages.ts to avoid churn on a file that codex already PASS-verdict'd
- * (commits 53f5b81 + 92f6b55 + 716e1f5 + 6c99c48).
- */
-function longestSuffixPrefixOverlap(streamed: string, final: string): number {
-  const max = Math.min(streamed.length, final.length);
-  for (let k = max; k > 0; k--) {
-    if (streamed.endsWith(final.slice(0, k))) return k;
-  }
-  return 0;
-}
 
 /**
  * Value of the `X-Session-Cache` response header emitted on every
