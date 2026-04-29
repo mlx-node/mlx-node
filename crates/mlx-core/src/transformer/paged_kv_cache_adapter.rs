@@ -590,6 +590,73 @@ impl PagedKVCacheAdapter {
         })
     }
 
+    /// Per-block-extra_keys variant of [`Self::find_cached_prefix`].
+    ///
+    /// Walks the prompt's prefix-cache hash chain using
+    /// `extra_keys_per_block[n]` for each block n. This is the load-bearing
+    /// Phase 6 primitive for multimodal cache isolation: a request whose
+    /// prompt contains image tokens passes per-block image hashes (built
+    /// via [`compute_per_block_image_extra_keys`]) so identical text with
+    /// different images produces distinct block hashes.
+    ///
+    /// `extra_keys_per_block.len()` must be at least
+    /// `prompt_tokens.len() / block_size` to cover every full block in the
+    /// prompt. Pass an all-empty vec (e.g. produced by
+    /// `compute_per_block_image_extra_keys(&[], num_blocks, block_size)`)
+    /// for text-only requests — the result is bit-equal to
+    /// `find_cached_prefix(prompt_tokens, &[])`.
+    ///
+    /// Otherwise behaves identically to [`Self::find_cached_prefix`]
+    /// (single-call lifecycle, token-recording contract, refcount
+    /// semantics). See that method's doc for the full contract.
+    pub fn find_cached_prefix_per_block(
+        &mut self,
+        prompt_tokens: &[u32],
+        extra_keys_per_block: &[Vec<u64>],
+    ) -> Result<CachedPrefix, String> {
+        if self.prefix_lookup_done {
+            return Err(
+                "find_cached_prefix_per_block already called on this request. \
+                 Call reset_for_new_request() to start a new request."
+                    .to_string(),
+            );
+        }
+        let block_table = self.block_table.as_mut().ok_or_else(|| {
+            "find_cached_prefix_per_block called before reset_for_new_request".to_string()
+        })?;
+
+        let (blocks, cached_tokens) = {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+            guard.find_longest_cache_hit_per_block(
+                prompt_tokens,
+                self.block_size,
+                extra_keys_per_block,
+            )
+        };
+
+        for block in &blocks {
+            block_table.add_block(Arc::clone(block));
+        }
+
+        let cached_token_count = cached_tokens as u32;
+        self.cached_token_count = cached_token_count;
+
+        self.request_tokens.clear();
+        let cached_token_count_us = cached_tokens.min(prompt_tokens.len());
+        self.request_tokens
+            .extend_from_slice(&prompt_tokens[..cached_token_count_us]);
+        block_table.set_num_tokens(self.request_tokens.len() as u32);
+
+        self.prefix_lookup_done = true;
+        Ok(CachedPrefix {
+            blocks,
+            cached_token_count,
+        })
+    }
+
     /// Allocate enough new blocks to hold `total_tokens` tokens beyond
     /// the cached prefix. Appends them to the block_table. Returns the
     /// number of NEW blocks allocated.
@@ -1468,6 +1535,91 @@ impl PagedKVCacheAdapter {
         Ok(registered as u32)
     }
 
+    /// Per-block-extra_keys variant of
+    /// [`Self::register_full_blocks_for_reuse`].
+    ///
+    /// Each block in the request's block_table is registered with its own
+    /// `extra_keys` vector (`extra_keys_per_block[n]`). The contract is
+    /// otherwise identical to the uniform variant (idempotency, partial-
+    /// success semantics, refcount handling).
+    ///
+    /// `extra_keys_per_block.len()` must be at least the number of full
+    /// blocks the request covers (`request_tokens.len() / block_size`).
+    /// Pass an all-empty per-block vec for text-only requests — the result
+    /// is bit-equal to `register_full_blocks_for_reuse(&[])`.
+    ///
+    /// Phase 6 multimodal cache isolation: callers building per-block
+    /// image hashes via [`compute_per_block_image_extra_keys`] thread the
+    /// result here so the registered cache entries are isolated by image
+    /// content.
+    pub fn register_full_blocks_for_reuse_per_block(
+        &mut self,
+        extra_keys_per_block: &[Vec<u64>],
+    ) -> Result<u32, String> {
+        if self.already_registered {
+            return Ok(0);
+        }
+        let block_table = self.block_table.as_ref().ok_or_else(|| {
+            "register_full_blocks_for_reuse_per_block called before reset_for_new_request"
+                .to_string()
+        })?;
+
+        let expected_tokens = block_table.num_tokens() as usize;
+        if self.request_tokens.len() != expected_tokens {
+            return Err(format!(
+                "register_full_blocks_for_reuse_per_block invariant violation: \
+                 request_tokens.len() == {} but block_table.num_tokens() == {}. \
+                 The caller must record_tokens() all tokens (cached prefix + new suffix) \
+                 before registering.",
+                self.request_tokens.len(),
+                expected_tokens,
+            ));
+        }
+
+        let block_size_us = self.block_size as usize;
+        if block_size_us == 0 {
+            return Err("block_size must be > 0".to_string());
+        }
+        let num_full_blocks = self.request_tokens.len() / block_size_us;
+        if num_full_blocks == 0 {
+            return Ok(0);
+        }
+
+        let blocks_slice = &block_table.blocks()[..num_full_blocks.min(block_table.num_blocks())];
+        let actual_blocks_to_register = blocks_slice.len();
+        if actual_blocks_to_register == 0 {
+            return Ok(0);
+        }
+
+        if extra_keys_per_block.len() < actual_blocks_to_register {
+            return Err(format!(
+                "register_full_blocks_for_reuse_per_block: extra_keys_per_block has {} \
+                 entries but {} blocks need registration. The caller must size the per-\
+                 block vec to the registered-block count (typically the result of \
+                 compute_per_block_image_extra_keys with num_blocks=block_table.num_blocks()).",
+                extra_keys_per_block.len(),
+                actual_blocks_to_register,
+            ));
+        }
+
+        let mut guard = self
+            .allocator
+            .lock()
+            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+
+        let registered = guard
+            .cache_full_blocks_per_block(
+                &self.request_tokens[..actual_blocks_to_register * block_size_us],
+                blocks_slice,
+                self.block_size,
+                &extra_keys_per_block[..actual_blocks_to_register],
+            )
+            .map_err(|e| format!("cache_full_blocks_per_block failed: {e}"))?;
+
+        self.already_registered = true;
+        Ok(registered as u32)
+    }
+
     /// Release this request's block references. Decrefs every block in
     /// the block_table. Blocks with refcount > 0 (still referenced by
     /// the prefix cache or another in-flight request) survive; blocks
@@ -1567,6 +1719,27 @@ impl PagedKVCacheAdapter {
         // registration half; the only difference is that we do NOT call
         // `release_request` after it.
         self.register_full_blocks_for_reuse(extra_keys)
+    }
+
+    /// Per-block-extra_keys variant of [`Self::finalize_turn_keep_live`].
+    ///
+    /// Same session-continuation semantics — registers full blocks for
+    /// cross-request prefix reuse without calling `release_request`, so
+    /// the partial trailing block's K/V stays live across the turn
+    /// boundary. The difference vs. the uniform variant: each block is
+    /// hashed with its own `extra_keys_per_block[n]`, isolating the cache
+    /// by per-block content (multimodal Phase 6).
+    ///
+    /// Pass an all-empty per-block vec to get behavior bit-equal to
+    /// `finalize_turn_keep_live(&[])`.
+    pub fn finalize_turn_keep_live_per_block(
+        &mut self,
+        extra_keys_per_block: &[Vec<u64>],
+    ) -> Result<u32, String> {
+        if self.already_registered {
+            return Ok(0);
+        }
+        self.register_full_blocks_for_reuse_per_block(extra_keys_per_block)
     }
 
     /// Continue the current session with a new turn whose full prompt

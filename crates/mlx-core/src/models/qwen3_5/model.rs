@@ -2081,6 +2081,20 @@ impl Qwen35Inner {
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
+        // Phase 6: per-block extra_keys for prefix-cache lookup. Text-only
+        // dispatch (current state — image-bearing turns route to the flat
+        // path) yields all-empty per-block vecs; the resulting hashes are
+        // bit-equal to passing `&[]` to the uniform API. When VLM-paged
+        // forward integration lands, this call site swaps in real image-
+        // position pairs to enable image-aware cache isolation.
+        let block_size = {
+            let adapter = self
+                .paged_adapter
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("chat_sync_core_paged: paged_adapter is None"))?;
+            adapter.block_size()
+        };
+        let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
@@ -2101,7 +2115,7 @@ impl Qwen35Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[])
+                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -2118,7 +2132,7 @@ impl Qwen35Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[])
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2168,7 +2182,14 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason) = match forward_result {
             Ok(t) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.finalize_turn_keep_live(&[]);
+                    // Build per-block extra_keys covering the FULL request
+                    // (prompt + decoded tokens) for finalize. Text-only
+                    // path produces all-empty vecs → bit-equal to the
+                    // uniform `&[]` finalize.
+                    let total_for_finalize = adapter.request_tokens().len();
+                    let finalize_extra_keys =
+                        chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
+                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys);
                 }
                 t
             }
@@ -2614,6 +2635,15 @@ impl Qwen35Inner {
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
+        // Phase 6: per-block extra_keys for prefix-cache lookup. See the
+        // matching comment in `chat_sync_core_paged`.
+        let block_size = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason("chat_stream_sync_core_paged: paged_adapter is None")
+            })?;
+            adapter.block_size()
+        };
+        let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
@@ -2634,7 +2664,7 @@ impl Qwen35Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[])
+                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -2651,7 +2681,7 @@ impl Qwen35Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[])
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2706,7 +2736,10 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason) = match result {
             Ok(t) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.finalize_turn_keep_live(&[]);
+                    let total_for_finalize = adapter.request_tokens().len();
+                    let finalize_extra_keys =
+                        chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
+                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys);
                 }
                 t
             }

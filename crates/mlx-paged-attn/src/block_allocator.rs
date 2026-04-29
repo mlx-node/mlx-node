@@ -457,9 +457,10 @@ impl BlockAllocator {
     /// blocks (with their ref counts already bumped via `lookup_prefix`, in
     /// order) and the cached token count.
     ///
-    /// `extra_keys` is applied per-block-hash (same value for every block in
-    /// this call). Phase 6 will thread per-block extra_keys for multimodal
-    /// (image hashes, cache-salt, LoRA names, etc.).
+    /// `extra_keys` is applied uniformly per-block-hash (same value for every
+    /// block in this call). For per-block extra_keys (multimodal cache
+    /// isolation where different blocks carry different image hashes), use
+    /// [`Self::find_longest_cache_hit_per_block`] instead.
     ///
     /// Mirrors vLLM `vllm/v1/core/single_type_kv_cache_manager.py:421-468`
     /// (`FullAttentionManager.find_longest_cache_hit`).
@@ -499,6 +500,66 @@ impl BlockAllocator {
         (blocks, cached_tokens)
     }
 
+    /// Per-block-extra_keys variant of [`Self::find_longest_cache_hit`].
+    ///
+    /// Each block uses its own `extra_keys` vector for the hash, indexed by
+    /// block position. This is the load-bearing primitive for multimodal
+    /// prefix caching: a request whose blocks contain image-token positions
+    /// passes per-block image hashes here so that two requests with the same
+    /// text prefix but different images produce distinct block hashes (and
+    /// therefore distinct cache identities).
+    ///
+    /// `extra_keys_per_block.len()` MUST be at least the number of full
+    /// blocks scanned (`token_ids.len() / block_size`). When shorter, the
+    /// scan stops at the first block without per-block keys (treated as a
+    /// cache miss). Pass an all-empty vec (e.g. produced by
+    /// `compute_per_block_image_extra_keys(&[], num_blocks, block_size)`)
+    /// for text-only requests to get the same hashes as
+    /// `find_longest_cache_hit(token_ids, block_size, &[])`.
+    ///
+    /// Mirrors vLLM commit 269bf46d which added per-block extra_keys to the
+    /// FullAttentionManager prefix-cache walk.
+    pub fn find_longest_cache_hit_per_block(
+        &mut self,
+        token_ids: &[u32],
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+    ) -> (Vec<Arc<PhysicalBlock>>, usize) {
+        if block_size == 0 || token_ids.is_empty() || token_ids.len() < block_size as usize {
+            return (Vec::new(), 0);
+        }
+
+        let block_size_us = block_size as usize;
+        let num_full_blocks = token_ids.len() / block_size_us;
+
+        let mut blocks: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(num_full_blocks);
+        let mut previous_block_hash: u64 = 0;
+
+        for n in 0..num_full_blocks {
+            let Some(per_block) = extra_keys_per_block.get(n) else {
+                // Caller didn't supply keys for this block — treat as a
+                // miss to keep cache identity unambiguous. (vLLM aborts
+                // here too.)
+                break;
+            };
+            let start = n * block_size_us;
+            let end = start + block_size_us;
+            let parent_hash = if n == 0 { 0 } else { previous_block_hash };
+            let block_hash = hash_tokens(&token_ids[start..end], parent_hash, per_block);
+
+            match self.lookup_prefix(block_hash) {
+                Some(block) => {
+                    blocks.push(block);
+                    previous_block_hash = block_hash;
+                }
+                None => break,
+            }
+        }
+
+        let cached_tokens = blocks.len() * block_size_us;
+        (blocks, cached_tokens)
+    }
+
     /// Register a freshly computed sequence's blocks in the prefix cache.
     /// Caller has already allocated `blocks` for the sequence; this method
     /// computes the chain of block hashes and inserts each FULL block via
@@ -508,8 +569,9 @@ impl BlockAllocator {
     /// fully-formed blocks are registered; the trailing partial block isn't
     /// cached until it's full.
     ///
-    /// `extra_keys` is applied per-block-hash (same value for every block in
-    /// this call). Phase 6 will thread per-block extra_keys for multimodal.
+    /// `extra_keys` is applied uniformly per-block-hash (same value for
+    /// every block in this call). For per-block extra_keys (multimodal
+    /// cache isolation), use [`Self::cache_full_blocks_per_block`].
     ///
     /// Mirrors vLLM `vllm/v1/core/block_pool.py:211-320` (`cache_full_blocks`).
     ///
@@ -559,6 +621,62 @@ impl BlockAllocator {
                 // corrupts future find_longest_cache_hit walks. Return
                 // the count of accepted registrations up to (but not
                 // including) the dropped block.
+                break;
+            }
+            previous_block_hash = block_hash;
+            registered += 1;
+        }
+        Ok(registered)
+    }
+
+    /// Per-block-extra_keys variant of [`Self::cache_full_blocks`].
+    ///
+    /// Each block in `blocks` is hashed with its own `extra_keys` vector
+    /// (`extra_keys_per_block[n]`). The chain semantics (parent_hash,
+    /// abort-on-collision, partial-success return) match
+    /// `cache_full_blocks` exactly. The two methods produce identical
+    /// hashes when `extra_keys_per_block[n] == extra_keys` for every n
+    /// (verified by unit tests).
+    ///
+    /// `extra_keys_per_block.len()` MUST be at least `blocks.len()`. The
+    /// caller built it via [`compute_per_block_image_extra_keys`] (in the
+    /// adapter module) or an analogous per-model helper that maps absolute
+    /// token positions to their owning block.
+    ///
+    /// Returns the number of blocks actually registered. May be less than
+    /// `blocks.len()` if the chain aborted on a hash collision mid-way.
+    ///
+    /// Mirrors vLLM commit 269bf46d (per-block extra_keys for multimodal).
+    pub fn cache_full_blocks_per_block(
+        &mut self,
+        token_ids: &[u32],
+        blocks: &[Arc<PhysicalBlock>],
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+    ) -> Result<usize, &'static str> {
+        if block_size == 0 {
+            return Err("block_size must be > 0");
+        }
+        let block_size_us = block_size as usize;
+        if blocks.len() * block_size_us > token_ids.len() {
+            return Err("blocks exceed token_ids length");
+        }
+        if extra_keys_per_block.len() < blocks.len() {
+            return Err("extra_keys_per_block shorter than blocks");
+        }
+
+        let mut previous_block_hash: u64 = 0;
+        let mut registered = 0usize;
+        for (n, block) in blocks.iter().enumerate() {
+            let start = n * block_size_us;
+            let end = start + block_size_us;
+            let parent_hash = if n == 0 { 0 } else { previous_block_hash };
+            let block_hash = hash_tokens(
+                &token_ids[start..end],
+                parent_hash,
+                &extra_keys_per_block[n],
+            );
+            if !self.register_prefix(Arc::clone(block), block_hash) {
                 break;
             }
             previous_block_hash = block_hash;
@@ -1694,5 +1812,185 @@ mod tests {
         // The key invariant we're testing is that we did NOT register
         // ghost descendants — chain_b2's hash isn't cached.
         assert!(!allocator.prefix_cache.contains_key(&block2_hash));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 6: per-block extra_keys variants for multimodal cache isolation.
+    // -------------------------------------------------------------------
+
+    /// Per-block API with all-empty per-block keys must produce IDENTICAL
+    /// hashes (and therefore IDENTICAL cache hits) to the uniform API with
+    /// `extra_keys=&[]`. This is the load-bearing invariant that lets
+    /// text-only paged callers migrate to the per-block API without
+    /// invalidating their existing cache entries.
+    #[test]
+    fn test_per_block_empty_matches_uniform_empty() {
+        let tokens: Vec<u32> = (0..8).collect();
+        let block_size = 4u32;
+        let num_full = tokens.len() / block_size as usize;
+        let empty_per_block: Vec<Vec<u64>> = (0..num_full).map(|_| Vec::new()).collect();
+
+        // Cache via the uniform API.
+        let mut a_uniform = BlockAllocator::new(8, block_size);
+        let blocks_uniform: Vec<Arc<PhysicalBlock>> = (0..num_full)
+            .map(|_| a_uniform.allocate().unwrap())
+            .collect();
+        a_uniform
+            .cache_full_blocks(&tokens, &blocks_uniform, block_size, &[])
+            .expect("uniform cache_full_blocks");
+
+        // Cache via the per-block API (in a fresh allocator to keep hashes
+        // independent — but they must STILL collide if both APIs hash the
+        // same way, which would manifest as a Case 2 collision drop. We
+        // assert hash equivalence directly below to avoid that subtlety).
+        let mut a_per_block = BlockAllocator::new(8, block_size);
+        let blocks_pb: Vec<Arc<PhysicalBlock>> = (0..num_full)
+            .map(|_| a_per_block.allocate().unwrap())
+            .collect();
+        a_per_block
+            .cache_full_blocks_per_block(&tokens, &blocks_pb, block_size, &empty_per_block)
+            .expect("per-block cache_full_blocks");
+
+        // Lookup with the uniform API in a_per_block: must hit if the
+        // hashes match between the two APIs.
+        let (hits_uniform_view, n_uniform_view) =
+            a_per_block.find_longest_cache_hit(&tokens, block_size, &[]);
+        assert_eq!(hits_uniform_view.len(), num_full);
+        assert_eq!(n_uniform_view, tokens.len());
+
+        // Lookup with the per-block API in a_uniform: must also hit.
+        let (hits_pb_view, n_pb_view) =
+            a_uniform.find_longest_cache_hit_per_block(&tokens, block_size, &empty_per_block);
+        assert_eq!(hits_pb_view.len(), num_full);
+        assert_eq!(n_pb_view, tokens.len());
+    }
+
+    /// Two requests with identical text but DIFFERENT per-block image
+    /// hashes must produce DIFFERENT cache identities. This is the load-
+    /// bearing Phase 6 property: a stale image's KV state must NOT be
+    /// reused for a request with a different image at the same positions.
+    #[test]
+    fn test_per_block_image_hash_isolation() {
+        let tokens: Vec<u32> = (0..8).collect();
+        let block_size = 4u32;
+        let num_full = tokens.len() / block_size as usize;
+
+        // Image A puts its hash on block 0; image B does the same but with
+        // a different hash. Both blocks 1+ are text-only (empty).
+        let per_block_a: Vec<Vec<u64>> = vec![vec![0xAAAA, 0], Vec::new()];
+        let per_block_b: Vec<Vec<u64>> = vec![vec![0xBBBB, 0], Vec::new()];
+
+        let mut allocator = BlockAllocator::new(8, block_size);
+
+        // Request A: cache blocks under image-A's per-block keys.
+        let blocks_a: Vec<Arc<PhysicalBlock>> = (0..num_full)
+            .map(|_| allocator.allocate().unwrap())
+            .collect();
+        allocator
+            .cache_full_blocks_per_block(&tokens, &blocks_a, block_size, &per_block_a)
+            .expect("cache_full_blocks_per_block A");
+
+        // Request B (same tokens, different image): lookup with image-B's
+        // per-block keys MUST miss block 0 (because the image hash on that
+        // block differs). The chain breaks at block 0, so blocks 1+ are
+        // also misses (unreachable).
+        let (hits_b, n_b) =
+            allocator.find_longest_cache_hit_per_block(&tokens, block_size, &per_block_b);
+        assert_eq!(
+            hits_b.len(),
+            0,
+            "different image hash on block 0 must produce a cache miss; \
+             otherwise stale image KV state would be reused for a \
+             different image",
+        );
+        assert_eq!(n_b, 0);
+
+        // Sanity: the same image's per-block keys still hit.
+        let (hits_a, n_a) =
+            allocator.find_longest_cache_hit_per_block(&tokens, block_size, &per_block_a);
+        assert_eq!(hits_a.len(), num_full);
+        assert_eq!(n_a, tokens.len());
+    }
+
+    /// Per-block extra_keys mismatch only on a non-leading block isolates
+    /// at the divergence point. Blocks before the mismatch hit; blocks at
+    /// and after do not.
+    #[test]
+    fn test_per_block_image_hash_partial_isolation() {
+        let tokens: Vec<u32> = (0..16).collect();
+        let block_size = 4u32;
+        let num_full = tokens.len() / block_size as usize;
+
+        // Image A puts its hash on block 2 only.
+        let per_block_a: Vec<Vec<u64>> = vec![Vec::new(), Vec::new(), vec![0xAAAA, 0], Vec::new()];
+        // Image B differs ONLY on block 2.
+        let per_block_b: Vec<Vec<u64>> = vec![Vec::new(), Vec::new(), vec![0xBBBB, 0], Vec::new()];
+
+        let mut allocator = BlockAllocator::new(8, block_size);
+        let blocks_a: Vec<Arc<PhysicalBlock>> = (0..num_full)
+            .map(|_| allocator.allocate().unwrap())
+            .collect();
+        allocator
+            .cache_full_blocks_per_block(&tokens, &blocks_a, block_size, &per_block_a)
+            .expect("cache_full_blocks_per_block A");
+
+        // Request B: blocks 0 and 1 hit (text-only, identical hashes); the
+        // chain breaks at block 2.
+        let (hits_b, n_b) =
+            allocator.find_longest_cache_hit_per_block(&tokens, block_size, &per_block_b);
+        assert_eq!(
+            hits_b.len(),
+            2,
+            "blocks 0+1 share text-only hashes; block 2 differs by image hash",
+        );
+        assert_eq!(n_b, 2 * block_size as usize);
+    }
+
+    /// `cache_full_blocks_per_block` must reject mismatched lengths
+    /// (per-block vec shorter than the block list). This catches model-
+    /// integration bugs where the caller forgot to size the per-block
+    /// vec to the block table's length.
+    #[test]
+    fn test_per_block_rejects_length_mismatch() {
+        let tokens: Vec<u32> = (0..8).collect();
+        let block_size = 4u32;
+        let mut allocator = BlockAllocator::new(8, block_size);
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+
+        // Only one entry in per_block, but two blocks → mismatch.
+        let too_short: Vec<Vec<u64>> = vec![Vec::new()];
+        let res = allocator.cache_full_blocks_per_block(
+            &tokens,
+            &[Arc::clone(&b0), Arc::clone(&b1)],
+            block_size,
+            &too_short,
+        );
+        assert!(res.is_err());
+    }
+
+    /// `find_longest_cache_hit_per_block` with too-short keys treats the
+    /// missing entry as a chain-break (no panic). Defensive test.
+    #[test]
+    fn test_per_block_lookup_short_keys_breaks_chain() {
+        let tokens: Vec<u32> = (0..16).collect();
+        let block_size = 4u32;
+        let num_full = tokens.len() / block_size as usize;
+
+        // Cache 4 blocks under all-empty per-block keys.
+        let per_block_full: Vec<Vec<u64>> = (0..num_full).map(|_| Vec::new()).collect();
+        let mut allocator = BlockAllocator::new(8, block_size);
+        let blocks: Vec<Arc<PhysicalBlock>> = (0..num_full)
+            .map(|_| allocator.allocate().unwrap())
+            .collect();
+        allocator
+            .cache_full_blocks_per_block(&tokens, &blocks, block_size, &per_block_full)
+            .unwrap();
+
+        // Lookup with only 2 entries → chain breaks at block 2.
+        let too_short: Vec<Vec<u64>> = vec![Vec::new(), Vec::new()];
+        let (hits, n) = allocator.find_longest_cache_hit_per_block(&tokens, block_size, &too_short);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(n, 2 * block_size as usize);
     }
 }

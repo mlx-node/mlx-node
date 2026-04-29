@@ -63,6 +63,47 @@ pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
     combine_image_hashes(&individual_hashes)
 }
 
+/// Build per-block extra_keys for the paged adapter's prefix-cache walk.
+///
+/// Phase 6 multimodal cache isolation: when the prompt contains image
+/// tokens, the per-block extra_keys ensure that "same prompt + different
+/// image" produces a cache miss (preventing stale-image KV reuse). For
+/// text-only prompts (`token_image_positions` is empty), every block gets
+/// an empty extra_keys vec — bit-equal to passing `&[]` uniformly to the
+/// uniform `find_cached_prefix` / `finalize_turn_keep_live` API.
+///
+/// `total_tokens` is the FULL prompt length (cached prefix + new suffix
+/// the request will write). The number of full blocks covered is
+/// `total_tokens / block_size`; the trailing partial block (if any) is
+/// not registered until full and so gets no entry here.
+///
+/// `token_image_positions` should be sorted by `token_pos` for stable
+/// hashes (the helper preserves input order; reordered inputs would
+/// produce different hashes). Today's Qwen3.5 paged dispatch is text-only
+/// (image-bearing turns are routed to the flat path), so the production
+/// call always passes `&[]` here. The hook stays in place so that when
+/// VLM-paged forward integration lands, the call site only needs to swap
+/// in the real image positions.
+pub(crate) fn build_paged_extra_keys(
+    total_tokens: usize,
+    block_size: u32,
+    token_image_positions: &[(u32, u64)],
+) -> Vec<Vec<u64>> {
+    let block_size_us = block_size as usize;
+    if block_size_us == 0 {
+        return Vec::new();
+    }
+    // Cover every block the request might register (full blocks only).
+    // The adapter's per-block API tolerates an over-long vec by indexing
+    // only what it needs, so erring high is safe.
+    let num_blocks = total_tokens.div_ceil(block_size_us);
+    crate::transformer::paged_kv_cache_adapter::compute_per_block_image_extra_keys(
+        token_image_positions,
+        num_blocks,
+        block_size,
+    )
+}
+
 /// Report a guard-violation error through the stream channel.
 ///
 /// Used by the streaming session entry points (`chat_stream_session_*`
