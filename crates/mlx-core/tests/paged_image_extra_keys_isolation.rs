@@ -17,9 +17,13 @@
 //!    Qwen3.5 paged dispatcher (and any future VLM-paged caller) goes
 //!    through.
 //!
-//! Pure-CPU bookkeeping checks (no GPU dispatch). Skips cleanly on
-//! sandboxed CI VMs without Metal via `LayerKVPool::new_for_test`'s
-//! "No Metal device found" branch.
+//! Pure-CPU bookkeeping checks (no GPU dispatch). The fixture goes through
+//! `LayerKVPool::new_for_validation_only`, which never touches the Metal
+//! device, so these tests run identically on Metal hosts and on sandboxed
+//! CI VMs without a Metal device. Previously the fixture used
+//! `new_for_test`, which calls `MetalState::get` and silently early-
+//! returned `None` on non-Metal hosts — producing green test runs that
+//! had not actually exercised the load-bearing adapter code.
 
 use std::sync::{Arc, Mutex};
 
@@ -31,9 +35,15 @@ use mlx_paged_attn::{BlockAllocator, LayerKVPool, PagedAttentionConfig, metal::M
 const NUM_BLOCKS: u32 = 32;
 const BLOCK_SIZE: u32 = 8;
 
-/// Build a placeholder pool + adapter pair. Returns `None` when Metal is
-/// unavailable so callers can skip cleanly.
-fn build_adapter() -> Option<PagedKVCacheAdapter> {
+/// Build a placeholder pool + adapter pair. Uses
+/// `LayerKVPool::new_for_validation_only` so construction succeeds on
+/// every platform (Metal or not) — the load-bearing
+/// `PagedKVCacheAdapter::find_cached_prefix_per_block` /
+/// `register_full_blocks_for_reuse_per_block` paths these tests exercise
+/// only touch the `BlockAllocator` (pure CPU) and the adapter
+/// constructor's block_size/num_blocks validation, which only reads
+/// `LayerKVPool::block_size` / `num_blocks`. **No GPU dispatch occurs.**
+fn build_adapter() -> PagedKVCacheAdapter {
     let cfg = PagedAttentionConfig {
         block_size: BLOCK_SIZE,
         num_kv_heads: 1,
@@ -41,13 +51,10 @@ fn build_adapter() -> Option<PagedKVCacheAdapter> {
         num_layers: 2,
         ..PagedAttentionConfig::default()
     };
-    let pool = match LayerKVPool::new_for_test(cfg, NUM_BLOCKS, 2, MetalDtype::Float16) {
-        Ok(p) => Arc::new(p),
-        Err(e) if e.contains("No Metal device found") => return None,
-        Err(e) => panic!("unexpected new_for_test failure: {e}"),
-    };
+    let pool = LayerKVPool::new_for_validation_only(cfg, NUM_BLOCKS, 2, MetalDtype::Float16)
+        .expect("new_for_validation_only must succeed on every platform");
     let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
-    Some(PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("adapter ctor"))
+    PagedKVCacheAdapter::new(allocator, Arc::new(pool), BLOCK_SIZE).expect("adapter ctor")
 }
 
 /// Drive a request through the per-block paged lifecycle: reset → cached-
@@ -94,10 +101,7 @@ fn run_request(
 /// "same prompt + same image → block reuse" property.
 #[test]
 fn same_text_same_image_hits_cache() {
-    let Some(mut adapter) = build_adapter() else {
-        eprintln!("skipping: Metal unavailable");
-        return;
-    };
+    let mut adapter = build_adapter();
 
     // 16 tokens = 2 full blocks. Image positions 4..8 are entirely inside
     // block 0 (which carries the image hash); block 1 is text-only.
@@ -123,10 +127,7 @@ fn same_text_same_image_hits_cache() {
 /// a different image.
 #[test]
 fn same_text_different_image_misses_cache() {
-    let Some(mut adapter) = build_adapter() else {
-        eprintln!("skipping: Metal unavailable");
-        return;
-    };
+    let mut adapter = build_adapter();
 
     let tokens: Vec<u32> = (1..=16).collect();
     let image_a_positions: Vec<(u32, u64)> = (4u32..8).map(|p| (p, 0xAAAA_AAAA)).collect();
@@ -157,10 +158,7 @@ fn same_text_different_image_misses_cache() {
 /// are misses.
 #[test]
 fn image_diff_on_later_block_isolates_at_divergence() {
-    let Some(mut adapter) = build_adapter() else {
-        eprintln!("skipping: Metal unavailable");
-        return;
-    };
+    let mut adapter = build_adapter();
 
     // 24 tokens = 3 full blocks. Image positions 16..20 are entirely
     // inside block 2.
@@ -188,10 +186,7 @@ fn image_diff_on_later_block_isolates_at_divergence() {
 /// invalidate their pre-existing cache entries.
 #[test]
 fn per_block_empty_matches_uniform_for_text_only() {
-    let Some(mut adapter) = build_adapter() else {
-        eprintln!("skipping: Metal unavailable");
-        return;
-    };
+    let mut adapter = build_adapter();
 
     let tokens: Vec<u32> = (1..=16).collect();
     let num_blocks = tokens.len() / BLOCK_SIZE as usize;

@@ -323,6 +323,74 @@ impl LayerKVPool {
         }
     }
 
+    /// **Test-only, CPU-only.** Construct a pool with **no** GPU buffers,
+    /// intended for adapter-lifecycle tests that exercise the
+    /// `PagedKVCacheAdapter` constructor's validation (block_size /
+    /// num_blocks agreement) and the pure-CPU bookkeeping paths
+    /// (`find_cached_prefix*`, `allocate_suffix_blocks`, `record_tokens`,
+    /// `register_full_blocks_for_reuse*`, `release_request`) WITHOUT
+    /// touching any Metal device.
+    ///
+    /// Unlike [`Self::new_for_test`] this does **not** call `MetalState::get`,
+    /// so the constructor succeeds on macOS sandboxes / CI VMs that have
+    /// no Metal device. The trade-off is that the resulting pool reports
+    /// `num_layers() == 0` on macOS (the `layers` vec is empty) — any call
+    /// that indexes into per-layer buffers (`key_cache`, `value_cache`,
+    /// `key_cache_array_raw`, `value_cache_array_raw`, `write_kv`,
+    /// `gather_attention`, etc.) will return `None` / `Err` / panic. **Never
+    /// dispatch kernels through this pool.**
+    ///
+    /// Use cases:
+    /// - Image-isolation / extra_keys tests for the adapter that only care
+    ///   about the `BlockAllocator`-level prefix-cache behaviour.
+    /// - Any other test of adapter bookkeeping that does not need to read
+    ///   or write KV bytes.
+    ///
+    /// `pub` only because the consuming tests live in the `mlx-core` crate.
+    /// **Never call this from production code.**
+    pub fn new_for_validation_only(
+        config: PagedAttentionConfig,
+        num_blocks: u32,
+        num_layers: u32,
+        cache_dtype: MetalDtype,
+    ) -> Result<Self, String> {
+        if num_blocks == 0 {
+            return Err("LayerKVPool::new_for_validation_only: num_blocks must be > 0".to_string());
+        }
+        if num_layers == 0 {
+            return Err("LayerKVPool::new_for_validation_only: num_layers must be > 0".to_string());
+        }
+        let mut cfg = config;
+        cfg.num_layers = num_layers;
+
+        // Still run the dtype consistency check so the rejection path is
+        // covered on every platform — same as `new_for_test`.
+        let _ = Self::cache_dtype_layout(cfg.use_fp8(), cache_dtype)?;
+
+        #[cfg(target_os = "macos")]
+        {
+            // Empty layers vec: `num_layers()` will report 0, and any
+            // per-layer buffer accessor will return `None`. The adapter
+            // constructor only queries `block_size()` and `num_blocks()`,
+            // so this is sufficient for adapter-lifecycle tests.
+            Ok(Self {
+                config: cfg,
+                num_blocks,
+                cache_dtype,
+                layers: Vec::new(),
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(Self {
+                num_layers,
+                config: cfg,
+                num_blocks,
+                cache_dtype,
+            })
+        }
+    }
+
     /// Number of transformer layers covered by this pool.
     pub fn num_layers(&self) -> usize {
         #[cfg(target_os = "macos")]
