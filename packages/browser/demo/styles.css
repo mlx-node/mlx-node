@@ -110,6 +110,23 @@
     @apply ml-auto flex min-w-0 items-center gap-2;
   }
 
+  .header-hf-form {
+    @apply flex min-w-0 items-center gap-1.5;
+  }
+
+  .hf-input {
+    @apply h-8 rounded-md border bg-background px-2 text-xs text-foreground shadow-xs transition-colors placeholder:text-muted-foreground/70 focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/40 focus-visible:outline-none disabled:opacity-50;
+  }
+
+  .hf-repo-input {
+    @apply w-64 min-w-0;
+  }
+
+  .hf-revision-input {
+    @apply w-24;
+  }
+
+  .header-hf-btn,
   .header-local-btn {
     @apply h-8 gap-1.5 px-2.5 text-xs;
   }
@@ -214,6 +231,19 @@
 
   .composer-model-label {
     @apply shrink-0 text-sm font-medium text-foreground;
+  }
+
+  .composer-temperature-input,
+  .composer-max-output-input {
+    @apply h-9 rounded-md border bg-transparent px-2 text-sm text-muted-foreground shadow-none transition-colors focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/40 focus-visible:outline-none;
+  }
+
+  .composer-temperature-input {
+    @apply w-16;
+  }
+
+  .composer-max-output-input {
+    @apply w-20;
   }
 
   .composer-reasoning-trigger {
@@ -359,6 +389,11 @@
     display: none;
   }
 
+  .composer-temperature-input,
+  .composer-max-output-input {
+    width: 5rem;
+  }
+
   .composer-reasoning-trigger {
     min-width: 5.5rem;
   }
@@ -369,6 +404,20 @@
 
   .header-local-btn span {
     display: none;
+  }
+
+  .header-hf-form {
+    order: 10;
+    width: 100%;
+  }
+
+  .hf-repo-input {
+    flex: 1 1 auto;
+    width: auto;
+  }
+
+  .hf-revision-input {
+    width: 5.75rem;
   }
 }
 

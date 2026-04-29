@@ -29,6 +29,11 @@ function stripGeneratedPromptEcho(
       "i",
     ),
     new RegExp(`^\\s*${escaped}(?:\\s*\\r?\\n)+\\s*`, "i"),
+    new RegExp(
+      `^\\s*(?:\\((?:user)\\)|user)\\s*:\\s*${escaped}\\s*(?:[!?。！？]+\\s*)?`,
+      "i",
+    ),
+    new RegExp(`^\\s*${escaped}\\s*(?:[!?。！？]+\\s*)?`, "i"),
   ];
 
   let cleaned = text;
@@ -43,7 +48,9 @@ function stripGeneratedPromptEcho(
 }
 
 function stripLeadingDecodeFragment(text: string): string {
-  return text.replace(/^\s*[A-Z]\s*(?:\r?\n){2,}(?=[A-Z])/u, "");
+  return text
+    .replace(/^\s*[A-Z]\s*(?:\r?\n){2,}(?=[A-Z])/u, "")
+    .replace(/^\s*[!?]+\s*(?=[A-Z0-9"'(])/u, "");
 }
 
 function normalizeSentenceForRepeat(sentence: string): string {

@@ -243,7 +243,9 @@ export const STATS_RESERVED_SLOTS = 16;
 // Bytes 64..187 hold the callback ring / bind group entries.
 // Bytes 188..191 hold the inline uniform data size (for FUSED_DISPATCH_WITH_UNIFORM).
 // Bytes 192..447 hold inline uniform data (up to 256 bytes).
-// Bytes 448..511 are reserved.
+// Bytes 448..511 are reserved. Byte 448 is a cross-worker command mutex:
+// the command channel is a single slot shared by the main WASM worker and
+// pthread workers, so every writer must take this lock before touching FN/ARG.
 //
 // All offsets are byte offsets from the start of the SharedArrayBuffer.
 
@@ -282,6 +284,8 @@ export const CMD_OFFSET = {
   UNIFORM_DATA: 192, // start of inline uniform data (up to 256 bytes)
 
   // ---- Total ----
+  LOCK: 448, // i32: cross-worker command slot lock (0 = free, 1 = held)
+  ERROR: 452, // u32: gpu-worker sets non-zero when the RPC threw
   TOTAL: 512,
 } as const;
 

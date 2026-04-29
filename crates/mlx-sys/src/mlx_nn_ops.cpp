@@ -1258,6 +1258,7 @@ mlx_array* mlx_array_from_gpu_buffer(
             }
         };
         Dtype dt = dt_from_code(dtype_code);
+        wbuf->dtype_val = dt.val();
 
         auto* arr = new array(buf, std::move(arr_shape), dt, deleter);
         return reinterpret_cast<mlx_array*>(arr);

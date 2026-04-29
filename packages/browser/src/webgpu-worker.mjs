@@ -18,9 +18,82 @@ import { createBridgeStub } from './webgpu-bridge-stub.js';
 
 // RPC config received from mlx-worker before emnapi's init message
 let rpcConfig = null;
+let wasmInstanceRef = null;
+let wasmMemoryRef = null;
+const cppExceptionTag = new WebAssembly.Tag({ parameters: ['i32'] });
+
+function extractWasmExceptionMessage(err) {
+  if (!(err instanceof WebAssembly.Exception) || !wasmMemoryRef) return null;
+  try {
+    const ptr = err.getArg(cppExceptionTag, 0) >>> 0;
+    const mem = new Uint8Array(wasmMemoryRef.buffer);
+    const view = new DataView(mem.buffer);
+    const found = [];
+    for (const off of [4, 8, 12, 16, 20, 24, 28, 32]) {
+      if (ptr + off + 4 >= mem.byteLength) continue;
+      const strPtr = view.getUint32(ptr + off, true);
+      if (strPtr <= 1024 || strPtr >= mem.byteLength - 4) continue;
+      let s = '';
+      for (let i = strPtr; i < mem.byteLength && mem[i] !== 0 && i - strPtr < 512; i++) {
+        const ch = mem[i];
+        if (ch >= 32 && ch < 127) s += String.fromCharCode(ch);
+        else {
+          s = '';
+          break;
+        }
+      }
+      if (s.length > 4) found.push(`@${off}:${s}`);
+    }
+    return found.length > 0 ? `C++ exception ptr=${ptr} ${found.join(' | ')}` : `C++ exception ptr=${ptr}`;
+  } catch (decodeErr) {
+    return `C++ exception (decode failed: ${decodeErr instanceof Error ? decodeErr.message : String(decodeErr)})`;
+  }
+}
+
+function formatWorkerError(err) {
+  if (err instanceof ErrorEvent) {
+    const inner = formatWorkerError(err.error);
+    const location =
+      err.filename || err.lineno || err.colno
+        ? `${err.filename}:${err.lineno}:${err.colno}`
+        : '';
+    return {
+      message: err.message || inner.message,
+      stack: inner.stack || location,
+    };
+  }
+  const wasmMessage = extractWasmExceptionMessage(err);
+  if (wasmMessage) return { message: wasmMessage, stack: err?.stack };
+  if (err instanceof Error) return { message: err.message || String(err), stack: err.stack };
+  return { message: typeof err === 'string' ? err : String(err), stack: undefined };
+}
+
+function reportWorkerError(prefix, err) {
+  const details = formatWorkerError(err);
+  const message = `${prefix}: ${details.message}`;
+  console.error(`[WASM child] ${message}`, details.stack || '');
+  try {
+    globalThis.postMessage({
+      type: '__mlx_child_error',
+      message,
+      stack: details.stack,
+    });
+  } catch {
+    // Ignore postMessage failures while the emnapi worker is tearing down.
+  }
+}
+
+globalThis.addEventListener?.('error', (event) => {
+  reportWorkerError('Worker error', event.error ?? event);
+});
+
+globalThis.addEventListener?.('unhandledrejection', (event) => {
+  reportWorkerError('Unhandled rejection', event.reason);
+});
 
 const handler = new MessageHandler({
   async onLoad({ wasmModule, wasmMemory }) {
+    wasmMemoryRef = wasmMemory;
     // Wait for RPC config (arrives before emnapi's init message)
     while (!rpcConfig) {
       await new Promise((r) => setTimeout(r, 1));
@@ -47,9 +120,13 @@ const handler = new MessageHandler({
 
     const wasi = new WASI({
       print: function () {
+        const line = Array.from(arguments).map(String).join(' ');
+        if (line.includes('[MLX-KERNEL]')) return;
         console.log.apply(console, arguments);
       },
       printErr: function () {
+        const line = Array.from(arguments).map(String).join(' ');
+        if (line.includes('[MLX-KERNEL]')) return;
         console.error.apply(console, arguments);
       },
     });
@@ -63,7 +140,7 @@ const handler = new MessageHandler({
           ...importObject.napi,
           ...importObject.emnapi,
           memory: wasmMemory,
-          __cpp_exception: new WebAssembly.Tag({ parameters: ['i32'] }),
+          __cpp_exception: cppExceptionTag,
           _ZN3mlx4core3gpu4initEv: () => {},
           // Task 4's SabSink declares __wasm_i32_atomic_wait /
           // __wasm_atomic_notify as extern "C" — wasm-ld emits them as host
@@ -85,6 +162,7 @@ const handler = new MessageHandler({
         };
       },
       beforeInit({ instance }) {
+        wasmInstanceRef = instance;
         bridge.setInstance(instance);
       },
     });

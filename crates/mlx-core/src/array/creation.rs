@@ -2,6 +2,8 @@ use super::{DType, MxArray};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+#[cfg(target_family = "wasm")]
+use std::ffi::CString;
 
 fn validate_data_shape(data_len: usize, shape: &[i64], context: &str) -> Result<()> {
     let mut expected: usize = 1;
@@ -246,7 +248,6 @@ impl MxArray {
         let handle = unsafe { sys::mlx_array_arange(start, stop, step.unwrap_or(1.0), dt.code()) };
         MxArray::from_handle(handle, "array_arange")
     }
-
 }
 
 #[cfg(target_family = "wasm")]
@@ -322,6 +323,1138 @@ impl MxArray {
     #[napi]
     pub fn test_gpu_buffer_arrays() -> bool {
         unsafe { sys::mlx_test_gpu_buffer_arrays() }
+    }
+
+    /// Browser/WebGPU regression test for affine quantized kernels.
+    ///
+    /// Returns [
+    ///   dequantize_max_error,
+    ///   qmatmul_max_error,
+    ///   qgemv_max_error,
+    ///   gather_qmm_direct_max_error,
+    ///   gather_qmm_explicit_lhs_max_error,
+    ///   gather_qmm_sorted_max_error,
+    ///   gather_qmm_sorted_vs_direct_max_error,
+    /// ].
+    #[napi]
+    pub fn test_quantized_affine_ops(bits: i32) -> Result<Vec<f64>> {
+        if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
+            return Err(Error::from_reason(format!(
+                "unsupported affine quantization bits: {bits}"
+            )));
+        }
+
+        fn pack_value(
+            packed: &mut [u32],
+            row: usize,
+            row_words: usize,
+            k: usize,
+            bits: usize,
+            value: u32,
+        ) {
+            fn write_byte(
+                packed: &mut [u32],
+                row: usize,
+                row_words: usize,
+                byte_offset: usize,
+                byte: u32,
+            ) {
+                let word = row * row_words + byte_offset / 4;
+                let shift = (byte_offset % 4) * 8;
+                packed[word] |= (byte & 0xff) << shift;
+            }
+
+            let value = value & ((1u32 << bits) - 1);
+            if bits == 3 {
+                let byte_base = (k / 8) * 3;
+                match k & 7 {
+                    0 => write_byte(packed, row, row_words, byte_base, value),
+                    1 => write_byte(packed, row, row_words, byte_base, value << 3),
+                    2 => {
+                        write_byte(packed, row, row_words, byte_base, (value & 0x3) << 6);
+                        write_byte(packed, row, row_words, byte_base + 1, value >> 2);
+                    }
+                    3 => write_byte(packed, row, row_words, byte_base + 1, value << 1),
+                    4 => write_byte(packed, row, row_words, byte_base + 1, value << 4),
+                    5 => {
+                        write_byte(packed, row, row_words, byte_base + 1, (value & 0x1) << 7);
+                        write_byte(packed, row, row_words, byte_base + 2, value >> 1);
+                    }
+                    6 => write_byte(packed, row, row_words, byte_base + 2, value << 2),
+                    _ => write_byte(packed, row, row_words, byte_base + 2, value << 5),
+                }
+                return;
+            }
+
+            if bits == 5 {
+                let byte_base = (k / 8) * 5;
+                match k & 7 {
+                    0 => write_byte(packed, row, row_words, byte_base, value),
+                    1 => {
+                        write_byte(packed, row, row_words, byte_base, (value & 0x7) << 5);
+                        write_byte(packed, row, row_words, byte_base + 1, value >> 3);
+                    }
+                    2 => write_byte(packed, row, row_words, byte_base + 1, value << 2),
+                    3 => {
+                        write_byte(packed, row, row_words, byte_base + 1, (value & 0x1) << 7);
+                        write_byte(packed, row, row_words, byte_base + 2, value >> 1);
+                    }
+                    4 => {
+                        write_byte(packed, row, row_words, byte_base + 2, (value & 0xf) << 4);
+                        write_byte(packed, row, row_words, byte_base + 3, value >> 4);
+                    }
+                    5 => write_byte(packed, row, row_words, byte_base + 3, value << 1),
+                    6 => {
+                        write_byte(packed, row, row_words, byte_base + 3, (value & 0x3) << 6);
+                        write_byte(packed, row, row_words, byte_base + 4, value >> 2);
+                    }
+                    _ => write_byte(packed, row, row_words, byte_base + 4, value << 3),
+                }
+                return;
+            }
+
+            if bits == 6 {
+                let byte_base = (k / 4) * 3;
+                match k & 3 {
+                    0 => write_byte(packed, row, row_words, byte_base, value),
+                    1 => {
+                        write_byte(packed, row, row_words, byte_base, (value & 0x3) << 6);
+                        write_byte(packed, row, row_words, byte_base + 1, value >> 2);
+                    }
+                    2 => {
+                        write_byte(packed, row, row_words, byte_base + 1, (value & 0xf) << 4);
+                        write_byte(packed, row, row_words, byte_base + 2, value >> 4);
+                    }
+                    _ => write_byte(packed, row, row_words, byte_base + 2, value << 2),
+                }
+                return;
+            }
+
+            let bit_offset = k * bits;
+            let word = bit_offset / 32;
+            let shift = bit_offset % 32;
+            packed[row * row_words + word] |= value << shift;
+            if shift + bits > 32 {
+                packed[row * row_words + word + 1] |= value >> (32 - shift);
+            }
+        }
+
+        fn quant_value(seed: usize, mask: u32) -> u32 {
+            ((seed * 13 + seed / 3 + 7) as u32) & mask
+        }
+
+        fn qmatmul(
+            x: &MxArray,
+            w: &MxArray,
+            scales: &MxArray,
+            biases: &MxArray,
+            group_size: i32,
+            bits: i32,
+        ) -> Result<MxArray> {
+            let mode = CString::new("affine").unwrap();
+            let handle = unsafe {
+                sys::mlx_quantized_matmul(
+                    x.handle.0,
+                    w.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    true,
+                    group_size,
+                    bits,
+                    mode.as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "test_quantized_matmul")
+        }
+
+        fn dequantize(
+            w: &MxArray,
+            scales: &MxArray,
+            biases: &MxArray,
+            group_size: i32,
+            bits: i32,
+        ) -> Result<MxArray> {
+            let mode = CString::new("affine").unwrap();
+            let handle = unsafe {
+                sys::mlx_dequantize(
+                    w.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    group_size,
+                    bits,
+                    -1,
+                    mode.as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "test_dequantize")
+        }
+
+        fn gather_qmm(
+            x: &MxArray,
+            w: &MxArray,
+            scales: &MxArray,
+            biases: &MxArray,
+            lhs_indices: Option<&MxArray>,
+            rhs_indices: &MxArray,
+            group_size: i32,
+            bits: i32,
+            sorted: bool,
+        ) -> Result<MxArray> {
+            let mode = CString::new("affine").unwrap();
+            let handle = unsafe {
+                sys::mlx_gather_qmm(
+                    x.handle.0,
+                    w.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    lhs_indices.map_or(std::ptr::null_mut(), |idx| idx.handle.0),
+                    rhs_indices.handle.0,
+                    true,
+                    group_size,
+                    bits,
+                    mode.as_ptr(),
+                    sorted,
+                )
+            };
+            MxArray::from_handle(handle, "test_gather_qmm")
+        }
+
+        fn max_abs_diff(actual: &[f32], expected: &[f32]) -> f64 {
+            actual
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, e)| (*a - *e).abs() as f64)
+                .fold(0.0, f64::max)
+        }
+
+        let bits_usize = bits as usize;
+        let group_size = 64i32;
+        let group_size_usize = group_size as usize;
+        let k_dim = 256usize;
+        let num_groups = k_dim / group_size_usize;
+        let w_cols = k_dim * bits_usize / 32;
+        let mask = (1u32 << bits_usize) - 1;
+
+        let m_dim = 3usize;
+        let n_dim = 5usize;
+        let mut x_data = vec![0.0f32; m_dim * k_dim];
+        for (i, v) in x_data.iter_mut().enumerate() {
+            *v = ((i % 29) as f32 - 14.0) / 17.0;
+        }
+
+        let mut w_data = vec![0u32; n_dim * w_cols];
+        let mut scales_data = vec![0.0f32; n_dim * num_groups];
+        let mut biases_data = vec![0.0f32; n_dim * num_groups];
+        for n in 0..n_dim {
+            for group in 0..num_groups {
+                let idx = n * num_groups + group;
+                scales_data[idx] = 0.015625 * ((idx % 7) as f32 + 1.0);
+                biases_data[idx] = -0.375 + (idx as f32) * 0.03125;
+            }
+            for k in 0..k_dim {
+                let q = quant_value(n * 97 + k, mask);
+                pack_value(&mut w_data, n, w_cols, k, bits_usize, q);
+            }
+        }
+
+        let x = MxArray::from_float32(&x_data, &[m_dim as i64, k_dim as i64])?;
+        let x_gemv = MxArray::from_float32(&x_data[..k_dim], &[1, k_dim as i64])?;
+        let w = MxArray::from_uint32(&w_data, &[n_dim as i64, w_cols as i64])?;
+        let scales = MxArray::from_float32(&scales_data, &[n_dim as i64, num_groups as i64])?;
+        let biases = MxArray::from_float32(&biases_data, &[n_dim as i64, num_groups as i64])?;
+        let q_out = qmatmul(&x, &w, &scales, &biases, group_size, bits)?;
+        let q_gemv_out = qmatmul(&x_gemv, &w, &scales, &biases, group_size, bits)?;
+        let dequantized = dequantize(&w, &scales, &biases, group_size, bits)?;
+        q_out.eval();
+        q_gemv_out.eval();
+        dequantized.eval();
+        let q_actual = q_out.to_float32_vec()?;
+        let q_gemv_actual = q_gemv_out.to_float32_vec()?;
+        let deq_actual = dequantized.to_float32_vec()?;
+        let mut deq_expected = vec![0.0f32; n_dim * k_dim];
+        let mut q_expected = vec![0.0f32; m_dim * n_dim];
+        for n in 0..n_dim {
+            for k in 0..k_dim {
+                let q = quant_value(n * 97 + k, mask) as f32;
+                let group = k / group_size_usize;
+                let sb_idx = n * num_groups + group;
+                deq_expected[n * k_dim + k] = q * scales_data[sb_idx] + biases_data[sb_idx];
+            }
+        }
+        for m in 0..m_dim {
+            for n in 0..n_dim {
+                let mut acc = 0.0f32;
+                for k in 0..k_dim {
+                    let q = quant_value(n * 97 + k, mask) as f32;
+                    let group = k / group_size_usize;
+                    let sb_idx = n * num_groups + group;
+                    let deq = q * scales_data[sb_idx] + biases_data[sb_idx];
+                    acc += x_data[m * k_dim + k] * deq;
+                }
+                q_expected[m * n_dim + n] = acc;
+            }
+        }
+        let deq_err = max_abs_diff(&deq_actual, &deq_expected);
+        let q_err = max_abs_diff(&q_actual, &q_expected);
+        let q_gemv_err = max_abs_diff(&q_gemv_actual, &q_expected[..n_dim]);
+
+        let num_experts = 3usize;
+        let tokens = 20usize;
+        let top_k = 4usize;
+        let routed = tokens * top_k;
+        let mut gx_data = vec![0.0f32; tokens * k_dim];
+        for (i, v) in gx_data.iter_mut().enumerate() {
+            *v = ((i * 5 % 37) as f32 - 18.0) / 23.0;
+        }
+        let mut gw_data = vec![0u32; num_experts * n_dim * w_cols];
+        let mut gs_data = vec![0.0f32; num_experts * n_dim * num_groups];
+        let mut gb_data = vec![0.0f32; num_experts * n_dim * num_groups];
+        for e in 0..num_experts {
+            for n in 0..n_dim {
+                let row = e * n_dim + n;
+                for group in 0..num_groups {
+                    let idx = row * num_groups + group;
+                    gs_data[idx] = 0.0125 * ((idx % 11) as f32 + 1.0);
+                    gb_data[idx] = -0.25 + (idx as f32) * 0.015625;
+                }
+                for k in 0..k_dim {
+                    let q = quant_value(e * 211 + n * 97 + k, mask);
+                    pack_value(&mut gw_data, row, w_cols, k, bits_usize, q);
+                }
+            }
+        }
+        let mut idx_data = vec![0u32; routed];
+        let mut lhs_data = vec![0u32; routed];
+        for t in 0..tokens {
+            for j in 0..top_k {
+                idx_data[t * top_k + j] = ((t * 2 + j * 5 + 1) % num_experts) as u32;
+                lhs_data[t * top_k + j] = t as u32;
+            }
+        }
+
+        let gx = MxArray::from_float32(&gx_data, &[tokens as i64, k_dim as i64])?;
+        let gw =
+            MxArray::from_uint32(&gw_data, &[num_experts as i64, n_dim as i64, w_cols as i64])?;
+        let gs = MxArray::from_float32(
+            &gs_data,
+            &[num_experts as i64, n_dim as i64, num_groups as i64],
+        )?;
+        let gb = MxArray::from_float32(
+            &gb_data,
+            &[num_experts as i64, n_dim as i64, num_groups as i64],
+        )?;
+        let indices = MxArray::from_uint32(&idx_data, &[tokens as i64, top_k as i64])?;
+        let lhs_indices = MxArray::from_uint32(&lhs_data, &[tokens as i64, top_k as i64])?;
+
+        let x_expanded = gx.reshape(&[tokens as i64, 1, 1, k_dim as i64])?;
+        let direct = gather_qmm(
+            &x_expanded,
+            &gw,
+            &gs,
+            &gb,
+            None,
+            &indices,
+            group_size,
+            bits,
+            false,
+        )?;
+        let direct_explicit_lhs = gather_qmm(
+            &x_expanded,
+            &gw,
+            &gs,
+            &gb,
+            Some(&lhs_indices),
+            &indices,
+            group_size,
+            bits,
+            false,
+        )?;
+
+        let flat_indices = indices.reshape(&[routed as i64])?;
+        let order = flat_indices.argsort(Some(-1))?;
+        let inv_order = order.argsort(Some(-1))?;
+        let idx_sorted = flat_indices.take(&order, 0)?;
+        let x_flat = x_expanded.reshape(&[-1, 1, k_dim as i64])?;
+        let token_indices = order.floor_divide(&MxArray::scalar_int(top_k as i32)?)?;
+        let x_sorted = x_flat.take(&token_indices, 0)?;
+        let sorted = gather_qmm(
+            &x_sorted,
+            &gw,
+            &gs,
+            &gb,
+            None,
+            &idx_sorted,
+            group_size,
+            bits,
+            true,
+        )?;
+        let unsorted =
+            sorted
+                .take(&inv_order, 0)?
+                .reshape(&[tokens as i64, top_k as i64, 1, n_dim as i64])?;
+
+        let mut gather_expected = vec![0.0f32; tokens * top_k * n_dim];
+        for t in 0..tokens {
+            for j in 0..top_k {
+                let expert = idx_data[t * top_k + j] as usize;
+                for n in 0..n_dim {
+                    let row = expert * n_dim + n;
+                    let mut acc = 0.0f32;
+                    for k in 0..k_dim {
+                        let q = quant_value(expert * 211 + n * 97 + k, mask) as f32;
+                        let group = k / group_size_usize;
+                        let sb_idx = row * num_groups + group;
+                        let deq = q * gs_data[sb_idx] + gb_data[sb_idx];
+                        acc += gx_data[t * k_dim + k] * deq;
+                    }
+                    gather_expected[(t * top_k + j) * n_dim + n] = acc;
+                }
+            }
+        }
+
+        direct.eval();
+        direct_explicit_lhs.eval();
+        unsorted.eval();
+        let direct_vals = direct.to_float32_vec()?;
+        let direct_explicit_lhs_vals = direct_explicit_lhs.to_float32_vec()?;
+        let unsorted_vals = unsorted.to_float32_vec()?;
+        let direct_err = max_abs_diff(&direct_vals, &gather_expected);
+        let direct_explicit_lhs_err = max_abs_diff(&direct_explicit_lhs_vals, &gather_expected);
+        let sorted_err = max_abs_diff(&unsorted_vals, &gather_expected);
+        let gather_err = max_abs_diff(&unsorted_vals, &direct_vals);
+
+        // Keep the shape/group constants used above live in this test; changing
+        // them accidentally can make non-power-of-two packing stop crossing word
+        // boundaries.
+        debug_assert_eq!(k_dim % group_size_usize, 0);
+        Ok(vec![
+            deq_err,
+            q_err,
+            q_gemv_err,
+            direct_err,
+            direct_explicit_lhs_err,
+            sorted_err,
+            gather_err,
+        ])
+    }
+
+    /// Browser/WebGPU regression test for model-scale affine quantized decode
+        /// shapes. Qwen3.6 MoE quantized checkpoints use K=2048, group_size=64,
+        /// bf16 activations/scales/biases, and 3/4/5/6/8-bit packed rows; the smaller
+        /// smoke test above does not exercise those dispatch and packing paths.
+        #[napi]
+        pub fn test_quantized_affine_model_shape_ops(bits: i32) -> Result<Vec<f64>> {
+        if !matches!(bits, 3 | 4 | 5 | 6 | 8) {
+            return Err(Error::from_reason(format!(
+                "model-shape affine test supports bits 3, 4, 5, 6, and 8; got {bits}"
+            )));
+        }
+
+        fn pack_value(
+            packed: &mut [u32],
+            row: usize,
+            row_words: usize,
+            k: usize,
+            bits: usize,
+            value: u32,
+        ) {
+            fn write_byte(
+                packed: &mut [u32],
+                row: usize,
+                row_words: usize,
+                byte_offset: usize,
+                byte: u32,
+            ) {
+                let word = row * row_words + byte_offset / 4;
+                let shift = (byte_offset % 4) * 8;
+                packed[word] |= (byte & 0xff) << shift;
+            }
+
+            let value = value & ((1u32 << bits) - 1);
+            if bits == 3 {
+                let byte_base = (k / 8) * 3;
+                match k & 7 {
+                    0 => write_byte(packed, row, row_words, byte_base, value),
+                    1 => write_byte(packed, row, row_words, byte_base, value << 3),
+                    2 => {
+                        write_byte(packed, row, row_words, byte_base, (value & 0x3) << 6);
+                        write_byte(packed, row, row_words, byte_base + 1, value >> 2);
+                    }
+                    3 => write_byte(packed, row, row_words, byte_base + 1, value << 1),
+                    4 => write_byte(packed, row, row_words, byte_base + 1, value << 4),
+                    5 => {
+                        write_byte(packed, row, row_words, byte_base + 1, (value & 0x1) << 7);
+                        write_byte(packed, row, row_words, byte_base + 2, value >> 1);
+                    }
+                    6 => write_byte(packed, row, row_words, byte_base + 2, value << 2),
+                    _ => write_byte(packed, row, row_words, byte_base + 2, value << 5),
+                }
+                return;
+            }
+
+            if bits == 5 {
+                let byte_base = (k / 8) * 5;
+                match k & 7 {
+                    0 => write_byte(packed, row, row_words, byte_base, value),
+                    1 => {
+                        write_byte(packed, row, row_words, byte_base, (value & 0x7) << 5);
+                        write_byte(packed, row, row_words, byte_base + 1, value >> 3);
+                    }
+                    2 => write_byte(packed, row, row_words, byte_base + 1, value << 2),
+                    3 => {
+                        write_byte(packed, row, row_words, byte_base + 1, (value & 0x1) << 7);
+                        write_byte(packed, row, row_words, byte_base + 2, value >> 1);
+                    }
+                    4 => {
+                        write_byte(packed, row, row_words, byte_base + 2, (value & 0xf) << 4);
+                        write_byte(packed, row, row_words, byte_base + 3, value >> 4);
+                    }
+                    5 => write_byte(packed, row, row_words, byte_base + 3, value << 1),
+                    6 => {
+                        write_byte(packed, row, row_words, byte_base + 3, (value & 0x3) << 6);
+                        write_byte(packed, row, row_words, byte_base + 4, value >> 2);
+                    }
+                    _ => write_byte(packed, row, row_words, byte_base + 4, value << 3),
+                }
+                return;
+            }
+
+            if bits == 6 {
+                let byte_base = (k / 4) * 3;
+                match k & 3 {
+                    0 => write_byte(packed, row, row_words, byte_base, value),
+                    1 => {
+                        write_byte(packed, row, row_words, byte_base, (value & 0x3) << 6);
+                        write_byte(packed, row, row_words, byte_base + 1, value >> 2);
+                    }
+                    2 => {
+                        write_byte(packed, row, row_words, byte_base + 1, (value & 0xf) << 4);
+                        write_byte(packed, row, row_words, byte_base + 2, value >> 4);
+                    }
+                    _ => write_byte(packed, row, row_words, byte_base + 2, value << 2),
+                }
+                return;
+            }
+
+            let bit_offset = k * bits;
+            let word = bit_offset / 32;
+            let shift = bit_offset % 32;
+            packed[row * row_words + word] |= value << shift;
+            if shift + bits > 32 {
+                packed[row * row_words + word + 1] |= value >> (32 - shift);
+            }
+        }
+
+        fn quant_value(seed: usize, mask: u32) -> u32 {
+            ((seed
+                .wrapping_mul(1103515245)
+                .wrapping_add(seed >> 2)
+                .wrapping_add(12345)) as u32)
+                & mask
+        }
+
+        fn qmatmul(
+            x: &MxArray,
+            w: &MxArray,
+            scales: &MxArray,
+            biases: &MxArray,
+            group_size: i32,
+            bits: i32,
+        ) -> Result<MxArray> {
+            let mode = CString::new("affine").unwrap();
+            let handle = unsafe {
+                sys::mlx_quantized_matmul(
+                    x.handle.0,
+                    w.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    true,
+                    group_size,
+                    bits,
+                    mode.as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "test_model_shape_quantized_matmul")
+        }
+
+        fn gather_qmm(
+            x: &MxArray,
+            w: &MxArray,
+            scales: &MxArray,
+            biases: &MxArray,
+            rhs_indices: &MxArray,
+            group_size: i32,
+            bits: i32,
+            sorted: bool,
+        ) -> Result<MxArray> {
+            let mode = CString::new("affine").unwrap();
+            let handle = unsafe {
+                sys::mlx_gather_qmm(
+                    x.handle.0,
+                    w.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    std::ptr::null_mut(),
+                    rhs_indices.handle.0,
+                    true,
+                    group_size,
+                    bits,
+                    mode.as_ptr(),
+                    sorted,
+                )
+            };
+            MxArray::from_handle(handle, "test_model_shape_gather_qmm")
+        }
+
+        fn dequantize(
+            w: &MxArray,
+            scales: &MxArray,
+            biases: &MxArray,
+            group_size: i32,
+            bits: i32,
+        ) -> Result<MxArray> {
+            let mode = CString::new("affine").unwrap();
+            let handle = unsafe {
+                sys::mlx_dequantize(
+                    w.handle.0,
+                    scales.handle.0,
+                    biases.handle.0,
+                    group_size,
+                    bits,
+                    -1,
+                    mode.as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "test_model_shape_dequantize")
+        }
+
+        fn max_abs_diff(actual: &[f32], expected: &[f32]) -> f64 {
+            actual
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, e)| (*a - *e).abs() as f64)
+                .fold(0.0, f64::max)
+        }
+
+        let bits_usize = bits as usize;
+        let group_size = 64i32;
+        let group_size_usize = group_size as usize;
+        let k_dim = 2048usize;
+        let num_groups = k_dim / group_size_usize;
+        let w_cols = k_dim * bits_usize / 32;
+        let mask = (1u32 << bits_usize) - 1;
+
+        // GEMV/GEMM path: large enough to use many column workgroups, but
+        // still cheap enough to run in a browser worker during regression.
+        let m_dim = 2usize;
+        let n_dim = if bits == 6 { 4096usize } else { 2048usize };
+        let mut x_data = vec![0.0f32; m_dim * k_dim];
+        for (i, v) in x_data.iter_mut().enumerate() {
+            *v = ((i * 17 % 97) as f32 - 48.0) / 97.0;
+        }
+
+        let mut w_data = vec![0u32; n_dim * w_cols];
+        let mut scales_data = vec![0.0f32; n_dim * num_groups];
+        let mut biases_data = vec![0.0f32; n_dim * num_groups];
+        for n in 0..n_dim {
+            for group in 0..num_groups {
+                let idx = n * num_groups + group;
+                scales_data[idx] = 0.001953125 * ((idx % 13) as f32 + 1.0);
+                biases_data[idx] = -0.0625 + ((idx % 17) as f32) * 0.0078125;
+            }
+            for k in 0..k_dim {
+                let q = quant_value(n * 4099 + k, mask);
+                pack_value(&mut w_data, n, w_cols, k, bits_usize, q);
+            }
+        }
+
+        let x = MxArray::from_float32(&x_data, &[m_dim as i64, k_dim as i64])?
+            .astype(DType::BFloat16)?;
+        let x_gemv =
+            MxArray::from_float32(&x_data[..k_dim], &[1, k_dim as i64])?.astype(DType::BFloat16)?;
+        let w = MxArray::from_uint32(&w_data, &[n_dim as i64, w_cols as i64])?;
+        let scales = MxArray::from_float32(&scales_data, &[n_dim as i64, num_groups as i64])?
+            .astype(DType::BFloat16)?;
+        let biases = MxArray::from_float32(&biases_data, &[n_dim as i64, num_groups as i64])?
+            .astype(DType::BFloat16)?;
+
+        let q_out = qmatmul(&x, &w, &scales, &biases, group_size, bits)?;
+        let q_gemv_out = qmatmul(&x_gemv, &w, &scales, &biases, group_size, bits)?;
+        q_out.eval();
+        q_gemv_out.eval();
+        let q_actual = q_out.to_float32_vec()?;
+        let q_gemv_actual = q_gemv_out.to_float32_vec()?;
+
+        let mut q_expected = vec![0.0f32; m_dim * n_dim];
+        for m in 0..m_dim {
+            for n in 0..n_dim {
+                let mut acc = 0.0f32;
+                for k in 0..k_dim {
+                    let q = quant_value(n * 4099 + k, mask) as f32;
+                    let group = k / group_size_usize;
+                    let sb_idx = n * num_groups + group;
+                    let deq = q * scales_data[sb_idx] + biases_data[sb_idx];
+                    acc += x_data[m * k_dim + k] * deq;
+                }
+                q_expected[m * n_dim + n] = acc;
+            }
+        }
+        let q_err = max_abs_diff(&q_actual, &q_expected);
+        let q_gemv_err = max_abs_diff(&q_gemv_actual, &q_expected[..n_dim]);
+
+        let (large_vocab_gemv_err, large_vocab_argmax_ok) = if bits == 6 {
+            // Qwen3.6 MoE uses a large 6-bit lm_head
+            // [vocab_size, hidden_size]. Keep N just above WebGPU's minimum
+            // 65535 workgroups-per-dimension boundary so the 2-D GEMV tile
+            // addressing path is exercised without allocating the full 248K
+            // vocab in the smoke test.
+            let vocab_dim = 70_000usize;
+            let selected_ks = [0usize, 63, 64, 127, 1024, 2047];
+            let mut vx_data = vec![0.0f32; k_dim];
+            for (i, &k) in selected_ks.iter().enumerate() {
+                vx_data[k] = 0.125 + i as f32 * 0.03125;
+            }
+            let mut vw_data = vec![0u32; vocab_dim * w_cols];
+            let mut vs_data = vec![0.0f32; vocab_dim * num_groups];
+            let mut vb_data = vec![0.0f32; vocab_dim * num_groups];
+            for n in 0..vocab_dim {
+                for group in 0..num_groups {
+                    let idx = n * num_groups + group;
+                    vs_data[idx] = 0.001953125 * ((idx % 13) as f32 + 1.0);
+                    vb_data[idx] = -0.03125 + ((idx % 7) as f32) * 0.00390625;
+                }
+                for &k in &selected_ks {
+                    let q = quant_value(n * 32771 + k, mask);
+                    pack_value(&mut vw_data, n, w_cols, k, bits_usize, q);
+                }
+            }
+
+            let vx =
+                MxArray::from_float32(&vx_data, &[1, k_dim as i64])?.astype(DType::BFloat16)?;
+            let vw = MxArray::from_uint32(&vw_data, &[vocab_dim as i64, w_cols as i64])?;
+            let vs = MxArray::from_float32(&vs_data, &[vocab_dim as i64, num_groups as i64])?
+                .astype(DType::BFloat16)?;
+            let vb = MxArray::from_float32(&vb_data, &[vocab_dim as i64, num_groups as i64])?
+                .astype(DType::BFloat16)?;
+            let out = qmatmul(&vx, &vw, &vs, &vb, group_size, bits)?;
+            out.eval();
+            let actual = out.to_float32_vec()?;
+            let mut expected = vec![0.0f32; vocab_dim];
+            for n in 0..vocab_dim {
+                let mut acc = 0.0f32;
+                for &k in &selected_ks {
+                    let q = quant_value(n * 32771 + k, mask) as f32;
+                    let group = k / group_size_usize;
+                    let sb_idx = n * num_groups + group;
+                    acc += vx_data[k] * (q * vs_data[sb_idx] + vb_data[sb_idx]);
+                }
+                expected[n] = acc;
+            }
+            let actual_argmax = actual
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(usize::MAX);
+            let expected_argmax = expected
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(usize::MAX);
+            (
+                max_abs_diff(&actual, &expected),
+                if actual_argmax == expected_argmax {
+                    0.0
+                } else {
+                    1.0
+                },
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        // Batched activations with unbatched quantized weights must broadcast
+        // the weight/scales/biases batch stride as zero. This is the common
+        // projection shape for transformer batches.
+        let batch_dim = 2usize;
+        let batched_m_dim = 3usize;
+        let batched_n_dim = 512usize;
+        let mut bx_data = vec![0.0f32; batch_dim * batched_m_dim * k_dim];
+        for (i, v) in bx_data.iter_mut().enumerate() {
+            *v = ((i * 23 % 101) as f32 - 50.0) / 101.0;
+        }
+        let mut bw_data = vec![0u32; batched_n_dim * w_cols];
+        let mut bs_data = vec![0.0f32; batched_n_dim * num_groups];
+        let mut bb_data = vec![0.0f32; batched_n_dim * num_groups];
+        for n in 0..batched_n_dim {
+            for group in 0..num_groups {
+                let idx = n * num_groups + group;
+                bs_data[idx] = 0.001953125 * ((idx % 7) as f32 + 1.0);
+                bb_data[idx] = -0.046875 + ((idx % 11) as f32) * 0.005859375;
+            }
+            for k in 0..k_dim {
+                let q = quant_value(n * 8191 + k, mask);
+                pack_value(&mut bw_data, n, w_cols, k, bits_usize, q);
+            }
+        }
+        let bx = MxArray::from_float32(
+            &bx_data,
+            &[batch_dim as i64, batched_m_dim as i64, k_dim as i64],
+        )?
+        .astype(DType::BFloat16)?;
+        let bw = MxArray::from_uint32(&bw_data, &[batched_n_dim as i64, w_cols as i64])?;
+        let bs = MxArray::from_float32(&bs_data, &[batched_n_dim as i64, num_groups as i64])?
+            .astype(DType::BFloat16)?;
+        let bb = MxArray::from_float32(&bb_data, &[batched_n_dim as i64, num_groups as i64])?
+            .astype(DType::BFloat16)?;
+        let batched_out = qmatmul(&bx, &bw, &bs, &bb, group_size, bits)?;
+        batched_out.eval();
+        let batched_actual = batched_out.to_float32_vec()?;
+        let mut batched_expected = vec![0.0f32; batch_dim * batched_m_dim * batched_n_dim];
+        for b in 0..batch_dim {
+            for m in 0..batched_m_dim {
+                for n in 0..batched_n_dim {
+                    let mut acc = 0.0f32;
+                    for k in 0..k_dim {
+                        let q = quant_value(n * 8191 + k, mask) as f32;
+                        let group = k / group_size_usize;
+                        let sb_idx = n * num_groups + group;
+                        let deq = q * bs_data[sb_idx] + bb_data[sb_idx];
+                        let x_idx = (b * batched_m_dim + m) * k_dim + k;
+                        acc += bx_data[x_idx] * deq;
+                    }
+                    batched_expected[(b * batched_m_dim + m) * batched_n_dim + n] = acc;
+                }
+            }
+        }
+        let batched_err = max_abs_diff(&batched_actual, &batched_expected);
+
+        // MoE gather path for Q3 expert weights. Keep the expert count at the
+        // real 256 so index arithmetic reaches the same address range pattern.
+        let num_experts = 256usize;
+        let expert_out = 32usize;
+        let top_k = 8usize;
+        let routed = top_k;
+        let mut gx_data = vec![0.0f32; k_dim];
+        for (i, v) in gx_data.iter_mut().enumerate() {
+            *v = ((i * 19 % 89) as f32 - 44.0) / 89.0;
+        }
+        let mut gw_data = vec![0u32; num_experts * expert_out * w_cols];
+        let mut gs_data = vec![0.0f32; num_experts * expert_out * num_groups];
+        let mut gb_data = vec![0.0f32; num_experts * expert_out * num_groups];
+        for e in 0..num_experts {
+            for n in 0..expert_out {
+                let row = e * expert_out + n;
+                for group in 0..num_groups {
+                    let idx = row * num_groups + group;
+                    gs_data[idx] = 0.001953125 * ((idx % 11) as f32 + 1.0);
+                    gb_data[idx] = -0.03125 + ((idx % 7) as f32) * 0.0078125;
+                }
+                for k in 0..k_dim {
+                    let q = quant_value(e * 65537 + n * 4099 + k, mask);
+                    pack_value(&mut gw_data, row, w_cols, k, bits_usize, q);
+                }
+            }
+        }
+        let rhs_data = [255u32, 0, 127, 1, 254, 64, 192, 5];
+        let gx = MxArray::from_float32(&gx_data, &[1, 1, k_dim as i64])?.astype(DType::BFloat16)?;
+        let gw = MxArray::from_uint32(
+            &gw_data,
+            &[num_experts as i64, expert_out as i64, w_cols as i64],
+        )?;
+        let gs = MxArray::from_float32(
+            &gs_data,
+            &[num_experts as i64, expert_out as i64, num_groups as i64],
+        )?
+        .astype(DType::BFloat16)?;
+        let gb = MxArray::from_float32(
+            &gb_data,
+            &[num_experts as i64, expert_out as i64, num_groups as i64],
+        )?
+        .astype(DType::BFloat16)?;
+        let rhs = MxArray::from_uint32(&rhs_data, &[routed as i64])?;
+        let gather_out = gather_qmm(&gx, &gw, &gs, &gb, &rhs, group_size, bits, true)?;
+        gather_out.eval();
+        let gather_actual = gather_out.to_float32_vec()?;
+        let mut gather_expected = vec![0.0f32; routed * expert_out];
+        for slot in 0..routed {
+            let expert = rhs_data[slot] as usize;
+            for n in 0..expert_out {
+                let row = expert * expert_out + n;
+                let mut acc = 0.0f32;
+                for k in 0..k_dim {
+                    let q = quant_value(expert * 65537 + n * 4099 + k, mask) as f32;
+                    let group = k / group_size_usize;
+                    let sb_idx = row * num_groups + group;
+                    let deq = q * gs_data[sb_idx] + gb_data[sb_idx];
+                    acc += gx_data[k] * deq;
+                }
+                gather_expected[slot * expert_out + n] = acc;
+            }
+        }
+        let gather_err = max_abs_diff(&gather_actual, &gather_expected);
+
+        let exact_sorted_gather_err = if bits == 3 {
+            // Real Qwen3.6 MoE decode/prefill sorts routed tokens before
+            // calling gather_qmm. This covers the exact [routes, 1, K] x-shape
+            // and [routes] rhs-index shape with the real 512-column expert
+            // projection size used by Q3 gate/up expert weights.
+            let exact_expert_out = 512usize;
+            let mut ex_data = vec![0.0f32; routed * k_dim];
+            for slot in 0..routed {
+                for k in 0..k_dim {
+                    ex_data[slot * k_dim + k] =
+                        (((slot + 3) * (k + 17) % 127) as f32 - 63.0) / 127.0;
+                }
+            }
+            let mut ew_data = vec![0u32; num_experts * exact_expert_out * w_cols];
+            let mut es_data = vec![0.0f32; num_experts * exact_expert_out * num_groups];
+            let mut eb_data = vec![0.0f32; num_experts * exact_expert_out * num_groups];
+            for e in 0..num_experts {
+                for n in 0..exact_expert_out {
+                    let row = e * exact_expert_out + n;
+                    for group in 0..num_groups {
+                        let idx = row * num_groups + group;
+                        es_data[idx] = 0.001953125 * ((idx % 13) as f32 + 1.0);
+                        eb_data[idx] = -0.0234375 + ((idx % 11) as f32) * 0.00390625;
+                    }
+                    for k in 0..k_dim {
+                        let q = quant_value(e * 131071 + n * 4099 + k, mask);
+                        pack_value(&mut ew_data, row, w_cols, k, bits_usize, q);
+                    }
+                }
+            }
+            let ex = MxArray::from_float32(&ex_data, &[routed as i64, 1, k_dim as i64])?
+                .astype(DType::BFloat16)?;
+            let ew = MxArray::from_uint32(
+                &ew_data,
+                &[num_experts as i64, exact_expert_out as i64, w_cols as i64],
+            )?;
+            let es = MxArray::from_float32(
+                &es_data,
+                &[
+                    num_experts as i64,
+                    exact_expert_out as i64,
+                    num_groups as i64,
+                ],
+            )?
+            .astype(DType::BFloat16)?;
+            let eb = MxArray::from_float32(
+                &eb_data,
+                &[
+                    num_experts as i64,
+                    exact_expert_out as i64,
+                    num_groups as i64,
+                ],
+            )?
+            .astype(DType::BFloat16)?;
+            let exact_out = gather_qmm(&ex, &ew, &es, &eb, &rhs, group_size, bits, true)?;
+            exact_out.eval();
+            let actual = exact_out.to_float32_vec()?;
+            let mut expected = vec![0.0f32; routed * exact_expert_out];
+            for slot in 0..routed {
+                let expert = rhs_data[slot] as usize;
+                for n in 0..exact_expert_out {
+                    let row = expert * exact_expert_out + n;
+                    let mut acc = 0.0f32;
+                    for k in 0..k_dim {
+                        let q = quant_value(expert * 131071 + n * 4099 + k, mask) as f32;
+                        let group = k / group_size_usize;
+                        let sb_idx = row * num_groups + group;
+                        let deq = q * es_data[sb_idx] + eb_data[sb_idx];
+                        acc += ex_data[slot * k_dim + k] * deq;
+                    }
+                    expected[slot * exact_expert_out + n] = acc;
+                }
+            }
+            max_abs_diff(&actual, &expected)
+        } else {
+            0.0
+        };
+
+        let large_dequant_err = if bits == 5 {
+            // Embedding dequantization for Qwen3.6 uses bits=5, K=2048 and a
+            // very large row count. This row count is enough to force the
+            // WebGPU dequantize kernel into its 2-D dispatch addressing path.
+            let rows = 10_000usize;
+            let mut lw_data = vec![0u32; rows * w_cols];
+            let mut ls_data = vec![0.0f32; rows * num_groups];
+            let mut lb_data = vec![0.0f32; rows * num_groups];
+            for row in 0..rows {
+                for group in 0..num_groups {
+                    let idx = row * num_groups + group;
+                    ls_data[idx] = 0.001953125 * ((idx % 9) as f32 + 1.0);
+                    lb_data[idx] = -0.046875 + ((idx % 5) as f32) * 0.0078125;
+                }
+                for k in 0..k_dim {
+                    let q = quant_value(row * 4099 + k, mask);
+                    pack_value(&mut lw_data, row, w_cols, k, bits_usize, q);
+                }
+            }
+            let lw = MxArray::from_uint32(&lw_data, &[rows as i64, w_cols as i64])?;
+            let ls = MxArray::from_float32(&ls_data, &[rows as i64, num_groups as i64])?
+                .astype(DType::BFloat16)?;
+            let lb = MxArray::from_float32(&lb_data, &[rows as i64, num_groups as i64])?
+                .astype(DType::BFloat16)?;
+            let deq = dequantize(&lw, &ls, &lb, group_size, bits)?;
+            let sample_rows = [0usize, 1, 4096, 8191, 9999];
+            let idx = MxArray::from_uint32(
+                &sample_rows.iter().map(|v| *v as u32).collect::<Vec<_>>(),
+                &[sample_rows.len() as i64],
+            )?;
+            let sampled = deq.take(&idx, 0)?;
+            sampled.eval();
+            let actual = sampled.to_float32_vec()?;
+            let mut expected = vec![0.0f32; sample_rows.len() * k_dim];
+            for (sr, row) in sample_rows.iter().copied().enumerate() {
+                for k in 0..k_dim {
+                    let q = quant_value(row * 4099 + k, mask) as f32;
+                    let group = k / group_size_usize;
+                    let sb_idx = row * num_groups + group;
+                    expected[sr * k_dim + k] = q * ls_data[sb_idx] + lb_data[sb_idx];
+                }
+            }
+            max_abs_diff(&actual, &expected)
+        } else {
+            0.0
+        };
+
+        let split_projection_concat_err = if bits == 5 {
+            // Qwen3.6-35B-A3B stores linear_attn.in_proj_qkv and in_proj_z as
+            // separate 5-bit affine tensors, then sanitize_weights merges them
+            // with MLX concatenate before QuantizedLinear construction. This
+            // exercises that exact WebGPU path without reading packed U32
+            // weights back through the test-only to_uint32 materialization.
+            let qkv_rows = 8192usize;
+            let z_rows = 4096usize;
+            let total_rows = qkv_rows + z_rows;
+            let mut qkv_w = vec![0u32; qkv_rows * w_cols];
+            let mut z_w = vec![0u32; z_rows * w_cols];
+            let mut qkv_scales = vec![0.0f32; qkv_rows * num_groups];
+            let mut z_scales = vec![0.0f32; z_rows * num_groups];
+            let mut qkv_biases = vec![0.0f32; qkv_rows * num_groups];
+            let mut z_biases = vec![0.0f32; z_rows * num_groups];
+            for row in 0..qkv_rows {
+                for group in 0..num_groups {
+                    let idx = row * num_groups + group;
+                    qkv_scales[idx] = 0.001953125 * ((idx % 17) as f32 + 1.0);
+                    qkv_biases[idx] = -0.0390625 + ((idx % 19) as f32) * 0.00390625;
+                }
+                for k in 0..k_dim {
+                    let q = quant_value(row * 4099 + k, mask);
+                    pack_value(&mut qkv_w, row, w_cols, k, bits_usize, q);
+                }
+            }
+            for row in 0..z_rows {
+                for group in 0..num_groups {
+                    let idx = row * num_groups + group;
+                    z_scales[idx] = 0.001953125 * ((idx % 23) as f32 + 1.0);
+                    z_biases[idx] = -0.03125 + ((idx % 13) as f32) * 0.00390625;
+                }
+                for k in 0..k_dim {
+                    let q = quant_value((row + qkv_rows) * 4099 + k, mask);
+                    pack_value(&mut z_w, row, w_cols, k, bits_usize, q);
+                }
+            }
+            let mut sx_data = vec![0.0f32; k_dim];
+            for (i, v) in sx_data.iter_mut().enumerate() {
+                *v = ((i * 29 % 113) as f32 - 56.0) / 113.0;
+            }
+
+            let sx =
+                MxArray::from_float32(&sx_data, &[1, k_dim as i64])?.astype(DType::BFloat16)?;
+            let qkv_w_arr =
+                MxArray::from_uint32(&qkv_w, &[qkv_rows as i64, w_cols as i64])?;
+            let z_w_arr = MxArray::from_uint32(&z_w, &[z_rows as i64, w_cols as i64])?;
+            let qkv_s_arr =
+                MxArray::from_float32(&qkv_scales, &[qkv_rows as i64, num_groups as i64])?
+                    .astype(DType::BFloat16)?;
+            let z_s_arr =
+                MxArray::from_float32(&z_scales, &[z_rows as i64, num_groups as i64])?
+                    .astype(DType::BFloat16)?;
+            let qkv_b_arr =
+                MxArray::from_float32(&qkv_biases, &[qkv_rows as i64, num_groups as i64])?
+                    .astype(DType::BFloat16)?;
+            let z_b_arr =
+                MxArray::from_float32(&z_biases, &[z_rows as i64, num_groups as i64])?
+                    .astype(DType::BFloat16)?;
+
+            let merged_w = MxArray::concatenate(&qkv_w_arr, &z_w_arr, 0)?;
+            let merged_s = MxArray::concatenate(&qkv_s_arr, &z_s_arr, 0)?;
+            let merged_b = MxArray::concatenate(&qkv_b_arr, &z_b_arr, 0)?;
+            let out = qmatmul(&sx, &merged_w, &merged_s, &merged_b, group_size, bits)?;
+            out.eval();
+            let actual = out.to_float32_vec()?;
+            let mut expected = vec![0.0f32; total_rows];
+            for row in 0..total_rows {
+                let (scales_ref, biases_ref, local_row) = if row < qkv_rows {
+                    (&qkv_scales, &qkv_biases, row)
+                } else {
+                    (&z_scales, &z_biases, row - qkv_rows)
+                };
+                let mut acc = 0.0f32;
+                for k in 0..k_dim {
+                    let q = quant_value(row * 4099 + k, mask) as f32;
+                    let group = k / group_size_usize;
+                    let sb_idx = local_row * num_groups + group;
+                    let deq = q * scales_ref[sb_idx] + biases_ref[sb_idx];
+                    acc += sx_data[k] * deq;
+                }
+                expected[row] = acc;
+            }
+            max_abs_diff(&actual, &expected)
+        } else {
+            0.0
+        };
+
+        Ok(vec![
+            q_err,
+            q_gemv_err,
+            gather_err,
+            large_dequant_err,
+            batched_err,
+            large_vocab_gemv_err,
+            large_vocab_argmax_ok,
+            exact_sorted_gather_err,
+            split_projection_concat_err,
+        ])
+    }
+
+    /// WebGPU diagnostic: softmax over a contiguous slice view with non-zero offset.
+    /// Returns [max_abs_error, output...].
+    #[cfg(target_family = "wasm")]
+    #[napi]
+    pub fn test_webgpu_softmax_offset_view() -> Result<Vec<f64>> {
+        let input = MxArray::from_float32(
+            &[
+                -5.0, -4.0, -3.0, -2.0, //
+                1.0, 2.0, 3.0, 4.0, //
+                7.0, 8.0, 9.0, 10.0,
+            ],
+            &[3, 4],
+        )?;
+        let view = input.slice(&[1, 0], &[2, 4])?;
+        let handle = unsafe { sys::mlx_array_softmax_precise(view.handle.0, -1) };
+        let out = MxArray::from_handle(handle, "test_webgpu_softmax_offset_view")?;
+        out.eval();
+        let actual = out.to_float32_vec()?;
+
+        let row = [1.0f32, 2.0, 3.0, 4.0];
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp: Vec<f32> = row.iter().map(|v| (*v - max).exp()).collect();
+        let denom: f32 = exp.iter().sum();
+        let expected: Vec<f32> = exp.iter().map(|v| *v / denom).collect();
+        let err = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (*a - *b).abs())
+            .fold(0.0f32, f32::max);
+
+        let mut result = Vec::with_capacity(actual.len() + 1);
+        result.push(err as f64);
+        result.extend(actual.iter().map(|v| *v as f64));
+        Ok(result)
     }
 
     /// Run single layer forward using model weights, return first 5 values

@@ -66,6 +66,7 @@ let modelSupportsImages = false;
 let bridgeOptimizationControl: Int32Array | null = null;
 let configuredFusionEnabled = true;
 let configuredDispatchBatchEnabled = false;
+let modelGenerationDefaults: Record<string, number | boolean> = {};
 
 // GPU-buffer import currently wraps JS-created WGPUBuffer handles before Rust
 // builds Linear::weight_t transpose views. Until packed-bf16 metadata is proven
@@ -76,8 +77,35 @@ const PACKED_GPU_WEIGHT_UPLOAD_ENABLED = false;
 type UploadTensorInfo = TensorInfo & { fromMerged?: boolean };
 type ReasoningEffort = "off" | "low" | "medium" | "high";
 type LocalModelFile = File & { webkitRelativePath?: string };
+type HuggingFaceModelConfig = {
+  repoId: string;
+  revision?: string;
+};
 
-const WEIGHT_UPLOAD_BATCH_BYTES = 256 * 1024 * 1024;
+function normalizeGenerationConfig(
+  raw: unknown,
+): Record<string, number | boolean> {
+  if (!raw || typeof raw !== "object") return {};
+  const cfg = raw as Record<string, unknown>;
+  const out: Record<string, number | boolean> = {};
+  const assignNumber = (src: string, dst: string = src) => {
+    const value = cfg[src];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      out[dst] = value;
+    }
+  };
+  assignNumber("temperature");
+  assignNumber("top_k", "topK");
+  assignNumber("top_p", "topP");
+  assignNumber("min_p", "minP");
+  assignNumber("repetition_penalty", "repetitionPenalty");
+  if (typeof cfg.do_sample === "boolean") out.doSample = cfg.do_sample;
+  return out;
+}
+
+const WEIGHT_UPLOAD_BATCH_BYTES = 128 * 1024 * 1024;
+const HF_CACHE_NAME = "mlx-browser-huggingface-models-v1";
+const HF_CACHE_ORIGIN = "https://mlx-node-browser.local";
 
 type ModelSource =
   | {
@@ -86,7 +114,52 @@ type ModelSource =
       label: string;
       fileCache: Map<string, Uint8Array>;
     }
-  | { kind: "local"; files: Map<string, LocalModelFile>; label: string };
+  | { kind: "local"; files: Map<string, LocalModelFile>; label: string }
+  | {
+      kind: "huggingface";
+      repoId: string;
+      revision: string;
+      resolvedRevision?: string;
+      label: string;
+      blobCache: Map<string, Blob>;
+      files?: string[];
+    };
+
+function formatModelLabel(source: ModelSource, config: any): string {
+  const textConfig = config?.text_config ?? config;
+  const rawModelType = String(
+    textConfig?.model_type ?? config?.model_type ?? "model",
+  );
+  let family = rawModelType
+    .replace(/_text$/i, "")
+    .replace(/qwen3_5_moe/i, "Qwen3.5 MoE")
+    .replace(/qwen3_5/i, "Qwen3.5")
+    .replace(/qwen3_6/i, "Qwen3.6")
+    .replace(/_/g, " ");
+  family = family
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => (part.toLowerCase() === "qwen" ? "Qwen" : part))
+    .join(" ");
+  const layers = Number(textConfig?.num_hidden_layers ?? 0) || 0;
+  const hidden = Number(textConfig?.hidden_size ?? 0) || 0;
+  const experts = Number(textConfig?.num_experts ?? 0) || 0;
+  const bits = Number(config?.quantization?.bits ?? 0) || 0;
+  const details = [
+    layers > 0 ? `${layers}L` : "",
+    hidden > 0 ? `${hidden}h` : "",
+    experts > 0 ? `${experts}e` : "",
+    bits > 0 ? `Q${bits}` : "",
+  ].filter(Boolean);
+  const configLabel =
+    details.length > 0 ? `${family} ${details.join(" ")}` : family;
+  if (source.kind === "remote" && source.label && source.label !== "/model") {
+    return source.label;
+  }
+  if (source.kind === "remote") return configLabel || source.label;
+  if (source.label && source.label !== "local model") return source.label;
+  return configLabel || source.label;
+}
 
 type GpuTensorDescriptor = {
   name: string;
@@ -130,6 +203,10 @@ function buildChatConfig(data: {
   enableThinking?: boolean;
   reasoningEffort?: unknown;
 }) {
+  const baseConfig = {
+    ...modelGenerationDefaults,
+    ...(data.config ?? {}),
+  };
   const requestedEffort = normalizeReasoningEffort(
     data.reasoningEffort,
     data.enableThinking,
@@ -141,7 +218,7 @@ function buildChatConfig(data: {
 
   if (effort === "off") {
     return {
-      ...data.config,
+      ...baseConfig,
       reasoningEffort: "none",
       includeReasoning: false,
       reportPerformance: true,
@@ -149,7 +226,7 @@ function buildChatConfig(data: {
   }
 
   return {
-    ...data.config,
+    ...baseConfig,
     // Qwen3.5 maps `low` to no-thinking internally, so the browser uses the
     // thinking template with a low token cap to provide a true low effort.
     reasoningEffort: effort === "low" ? "medium" : effort,
@@ -239,84 +316,19 @@ function planMergedLinearAttentionTensors(tensors: TensorInfo[]): {
   mergePlans: LinearAttentionMergePlan[];
   mergedCount: number;
 } {
-  const byName = new Map<string, TensorInfo>();
-  for (const tensor of tensors) byName.set(tensor.name, tensor);
-
-  const consumed = new Set<string>();
-  const mergePlans: LinearAttentionMergePlan[] = [];
-
-  const tryMergePair = (
-    leftSuffix: string,
-    rightSuffix: string,
-    mergedSuffix: string,
-  ) => {
-    for (const left of tensors) {
-      if (!left.name.endsWith(leftSuffix) || consumed.has(left.name)) continue;
-      const prefix = left.name.slice(0, -leftSuffix.length);
-      const right = byName.get(`${prefix}${rightSuffix}`);
-      if (!right || consumed.has(right.name)) continue;
-      if (
-        left.dtype !== right.dtype ||
-        left.shape.length !== right.shape.length
-      )
-        continue;
-      let compatible = true;
-      for (let i = 1; i < left.shape.length; i++) {
-        if (left.shape[i] !== right.shape[i]) {
-          compatible = false;
-          break;
-        }
-      }
-      if (!compatible) continue;
-
-      const byteSize = left.byteSize + right.byteSize;
-      const shape = [left.shape[0] + right.shape[0], ...left.shape.slice(1)];
-      consumed.add(left.name);
-      consumed.add(right.name);
-      mergePlans.push({
-        left,
-        right,
-        tensor: {
-          name: `${prefix}${mergedSuffix}`,
-          dtype: left.dtype,
-          shape,
-          byteOffset: 0,
-          byteSize,
-          fromMerged: true,
-        },
-      });
-    }
-  };
-
-  for (const suffix of ["weight", "scales", "biases"]) {
-    tryMergePair(
-      `.linear_attn.in_proj_qkv.${suffix}`,
-      `.linear_attn.in_proj_z.${suffix}`,
-      `.linear_attn.in_proj_qkvz.${suffix}`,
-    );
-    tryMergePair(
-      `.linear_attn.in_proj_b.${suffix}`,
-      `.linear_attn.in_proj_a.${suffix}`,
-      `.linear_attn.in_proj_ba.${suffix}`,
-    );
-  }
-
-  const uploadTensors: UploadTensorInfo[] = tensors.filter(
-    (tensor) => !consumed.has(tensor.name),
-  );
-  return {
-    tensors: uploadTensors,
-    mergePlans,
-    mergedCount: mergePlans.length,
-  };
+  // Keep browser model assembly aligned with native: Rust sanitize_weights()
+  // owns linear-attention projection merging for dense and quantized tensors.
+  // A JS raw-byte concat here can diverge from MLX concatenate semantics when
+  // tensor storage/layout rules change.
+  return { tensors, mergePlans: [], mergedCount: 0 };
 }
 
 function uploadWeightsToGpu(
   gpuWorker: Worker,
-  weightsSab: SharedArrayBuffer,
+  weightsBuffer: ArrayBuffer | SharedArrayBuffer,
   dataOffset: number,
   tensors: UploadTensorInfo[],
-  mergedSab: SharedArrayBuffer | undefined,
+  mergedBuffer: ArrayBuffer | SharedArrayBuffer | undefined,
   packBf16: boolean,
 ): Promise<UploadWeightsResult> {
   return new Promise((resolve, reject) => {
@@ -325,7 +337,11 @@ function uploadWeightsToGpu(
       if (msg?.type === "weights_uploaded") {
         cleanup();
         resolve(msg);
-      } else if (msg?.type === "error" || msg?.type === "rpc-error") {
+      } else if (
+        msg?.type === "error" ||
+        msg?.type === "rpc-error" ||
+        msg?.type === "gpu-error"
+      ) {
         cleanup();
         reject(new Error(msg.message || "GPU weight upload failed"));
       }
@@ -340,14 +356,20 @@ function uploadWeightsToGpu(
     };
     gpuWorker.addEventListener("message", onMessage);
     gpuWorker.addEventListener("error", onError);
-    gpuWorker.postMessage({
-      type: "upload_weights",
-      weightsSab,
-      mergedSab,
-      dataOffset,
-      tensors,
-      packBf16,
-    });
+    const transfer: Transferable[] = [];
+    if (weightsBuffer instanceof ArrayBuffer) transfer.push(weightsBuffer);
+    if (mergedBuffer instanceof ArrayBuffer) transfer.push(mergedBuffer);
+    gpuWorker.postMessage(
+      {
+        type: "upload_weights",
+        weightsBuffer,
+        mergedBuffer,
+        dataOffset,
+        tensors,
+        packBf16,
+      },
+      transfer,
+    );
   });
 }
 
@@ -392,13 +414,16 @@ async function uploadPreparedWeightItems(
   items: UploadItem[],
   gpuWorker: Worker,
   uploadPackedBf16: boolean,
-  onProgress: (uploaded: UploadWeightsResult, tensors: UploadTensorInfo[]) => void,
+  onProgress: (
+    uploaded: UploadWeightsResult,
+    tensors: UploadTensorInfo[],
+  ) => void,
 ): Promise<{ debugPackedTotal: number; debugUnpackedBf16Total: number }> {
   let debugPackedTotal = 0;
   let debugUnpackedBf16Total = 0;
   let uploadedItemCount = 0;
 
-  for (let startIndex = 0; startIndex < items.length;) {
+  for (let startIndex = 0; startIndex < items.length; ) {
     const batchItems: UploadItem[] = [];
     let batchBytes = 0;
 
@@ -417,8 +442,8 @@ async function uploadPreparedWeightItems(
       if (batchBytes >= WEIGHT_UPLOAD_BATCH_BYTES) break;
     }
 
-    const batchSab = new SharedArrayBuffer(batchBytes);
-    const batchView = new Uint8Array(batchSab);
+    const batchBuffer = new ArrayBuffer(batchBytes);
+    const batchView = new Uint8Array(batchBuffer);
     const batchTensors: UploadTensorInfo[] = [];
     let cursor = 0;
 
@@ -470,7 +495,7 @@ async function uploadPreparedWeightItems(
 
     const uploaded = await uploadWeightsToGpu(
       gpuWorker,
-      batchSab,
+      batchBuffer,
       0,
       batchTensors,
       undefined,
@@ -495,43 +520,394 @@ function normalizeModelPath(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\/+/, "");
 }
 
+function normalizeHfRepoId(value: string): string {
+  return value
+    .trim()
+    .replace(/^https:\/\/huggingface\.co\//i, "")
+    .replace(/^hf:\/\//i, "")
+    .replace(/^models\//i, "")
+    .replace(/\/(?:tree|resolve)\/.*$/i, "")
+    .replace(/^\/+|\/+$/g, "");
+}
+
+function encodePathParts(value: string): string {
+  return value.split("/").map(encodeURIComponent).join("/");
+}
+
+function hfResolveUrl(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+  path: string,
+): string {
+  const repoId = encodePathParts(source.repoId);
+  const revision = encodeURIComponent(
+    source.resolvedRevision ?? source.revision,
+  );
+  return `https://huggingface.co/${repoId}/resolve/${revision}/${encodePathParts(path)}`;
+}
+
+function hfTreeUrl(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+): string {
+  const repoId = encodePathParts(source.repoId);
+  const revision = encodeURIComponent(
+    source.resolvedRevision ?? source.revision,
+  );
+  return `https://huggingface.co/api/models/${repoId}/tree/${revision}?recursive=1`;
+}
+
+function isPinnedHfRevision(revision: string): boolean {
+  return /^[0-9a-f]{40}$/i.test(revision);
+}
+
+function hfCacheRequest(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+  path: string,
+): Request {
+  const revision = source.resolvedRevision ?? source.revision;
+  const key =
+    `${HF_CACHE_ORIGIN}/huggingface/` +
+    `${encodeURIComponent(source.repoId)}/` +
+    `${encodeURIComponent(revision)}/` +
+    encodePathParts(path);
+  return new Request(key);
+}
+
+async function openHfCache(): Promise<Cache | null> {
+  if (typeof caches === "undefined") return null;
+  try {
+    return await caches.open(HF_CACHE_NAME);
+  } catch (e) {
+    post({
+      type: "log",
+      message: `[HF] Cache Storage unavailable: ${String(e)}`,
+    });
+    return null;
+  }
+}
+
+async function fetchHfNetworkResponse(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+  path: string,
+  optional = false,
+): Promise<Response | undefined> {
+  const normalizedPath = normalizeModelPath(path);
+  post({
+    type: "progress",
+    step: "download",
+    message: `Downloading ${normalizedPath} from Hugging Face...`,
+  });
+  const resp = await fetch(hfResolveUrl(source, normalizedPath), {
+    headers: { Accept: "application/octet-stream" },
+  });
+  if (!resp.ok) {
+    if (optional && resp.status === 404) return undefined;
+    throw new Error(
+      `Failed to fetch ${normalizedPath} from ${source.repoId}@${source.revision}: HTTP ${resp.status} ${resp.statusText}`,
+    );
+  }
+
+  const commit = resp.headers.get("x-repo-commit");
+  if (commit && source.resolvedRevision !== commit) {
+    source.resolvedRevision = commit;
+    post({
+      type: "log",
+      message: `[HF] ${source.repoId}@${source.revision} resolved to ${commit.slice(0, 12)}`,
+    });
+  }
+  return resp;
+}
+
+async function fetchHfFileResponse(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+  path: string,
+  optional = false,
+): Promise<Response | undefined> {
+  const normalizedPath = normalizeModelPath(path);
+  const cache = await openHfCache();
+  const shouldResolveRevision =
+    source.resolvedRevision == null &&
+    normalizedPath === "config.json" &&
+    !isPinnedHfRevision(source.revision);
+
+  if (cache && !shouldResolveRevision) {
+    const cached = await cache.match(hfCacheRequest(source, normalizedPath));
+    if (cached) return cached;
+  }
+
+  const resp = await fetchHfNetworkResponse(source, normalizedPath, optional);
+  if (!resp) return undefined;
+
+  if (cache) {
+    const request = hfCacheRequest(source, normalizedPath);
+    try {
+      await cache.put(request, resp.clone());
+      const cached = await cache.match(request);
+      if (cached) return cached;
+    } catch (e) {
+      post({
+        type: "log",
+        message: `[HF] Could not persist ${normalizedPath}; continuing without browser cache: ${String(e)}`,
+      });
+    }
+  }
+
+  return resp;
+}
+
+async function getHfOpfsRevisionDirectory(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+  create: boolean,
+): Promise<any | null> {
+  const storage = (navigator as any).storage;
+  if (!storage?.getDirectory) return null;
+
+  try {
+    let dir = await storage.getDirectory();
+    dir = await dir.getDirectoryHandle(HF_CACHE_NAME, { create });
+    dir = await dir.getDirectoryHandle(encodeURIComponent(source.repoId), {
+      create,
+    });
+    dir = await dir.getDirectoryHandle(
+      encodeURIComponent(source.resolvedRevision ?? source.revision),
+      { create },
+    );
+    return dir;
+  } catch (e) {
+    if (!create) return null;
+    post({
+      type: "log",
+      message: `[HF] OPFS cache unavailable: ${String(e)}`,
+    });
+    return null;
+  }
+}
+
+async function getHfOpfsFileHandle(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+  path: string,
+  create: boolean,
+): Promise<any | null> {
+  let dir = await getHfOpfsRevisionDirectory(source, create);
+  if (!dir) return null;
+
+  const parts = normalizeModelPath(path).split("/").filter(Boolean);
+  const fileName = parts.pop();
+  if (!fileName) return null;
+
+  try {
+    for (const part of parts) {
+      dir = await dir.getDirectoryHandle(encodeURIComponent(part), { create });
+    }
+    return await dir.getFileHandle(encodeURIComponent(fileName), { create });
+  } catch (e) {
+    if (!create) return null;
+    throw e;
+  }
+}
+
+async function readHfOpfsFileBlob(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+  path: string,
+): Promise<Blob | undefined> {
+  const handle = await getHfOpfsFileHandle(source, path, false);
+  if (!handle) return undefined;
+  const file = await handle.getFile();
+  return file.size > 0 ? file : undefined;
+}
+
+function maybePostHfDownloadProgress(
+  path: string,
+  loaded: number,
+  total: number,
+  lastPct: number,
+): number {
+  if (total > 0) {
+    const pct = Math.min(100, Math.floor((loaded / total) * 100));
+    if (pct === 100 || pct >= lastPct + 5) {
+      post({
+        type: "progress",
+        step: "download",
+        pct,
+        message: `Caching ${path} from Hugging Face... ${pct}%`,
+      });
+      return pct;
+    }
+    return lastPct;
+  }
+
+  const loadedMb = Math.floor(loaded / 1024 / 1024);
+  if (loadedMb >= lastPct + 128) {
+    post({
+      type: "progress",
+      step: "download",
+      message: `Caching ${path} from Hugging Face... ${loadedMb} MB`,
+    });
+    return loadedMb;
+  }
+  return lastPct;
+}
+
+async function downloadHfFileToOpfs(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+  path: string,
+): Promise<Blob | undefined> {
+  const normalizedPath = normalizeModelPath(path);
+  if (!(navigator as any).storage?.getDirectory) return undefined;
+
+  const resp = await fetchHfNetworkResponse(source, normalizedPath);
+  if (!resp) return undefined;
+
+  const handle = await getHfOpfsFileHandle(source, normalizedPath, true);
+  if (!handle) return undefined;
+
+  const writable = await handle.createWritable();
+  try {
+    const total = Number(resp.headers.get("content-length") ?? "0") || 0;
+    let loaded = 0;
+    let lastProgress = total > 0 ? -5 : -128;
+
+    if (resp.body) {
+      const reader = resp.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        await writable.write(value);
+        loaded += value.byteLength;
+        lastProgress = maybePostHfDownloadProgress(
+          normalizedPath,
+          loaded,
+          total,
+          lastProgress,
+        );
+      }
+    } else {
+      const blob = await resp.blob();
+      await writable.write(blob);
+      loaded = blob.size;
+      maybePostHfDownloadProgress(normalizedPath, loaded, loaded, -5);
+    }
+
+    await writable.close();
+    return await handle.getFile();
+  } catch (e) {
+    try {
+      await writable.abort?.();
+    } catch {
+      // Ignore abort errors; the original download/write error is more useful.
+    }
+    throw e;
+  }
+}
+
+async function readHfFileBlob(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+  path: string,
+): Promise<Blob> {
+  const normalizedPath = normalizeModelPath(path);
+  const cached = source.blobCache.get(normalizedPath);
+  if (cached) return cached;
+
+  const opfsBlob = await readHfOpfsFileBlob(source, normalizedPath);
+  if (opfsBlob) {
+    source.blobCache.set(normalizedPath, opfsBlob);
+    return opfsBlob;
+  }
+
+  const downloadedBlob = await downloadHfFileToOpfs(source, normalizedPath);
+  if (downloadedBlob) {
+    source.blobCache.set(normalizedPath, downloadedBlob);
+    return downloadedBlob;
+  }
+
+  const resp = await fetchHfFileResponse(source, normalizedPath);
+  if (!resp) throw new Error(`Hugging Face model is missing ${normalizedPath}`);
+  const blob = await resp.blob();
+  source.blobCache.set(normalizedPath, blob);
+  return blob;
+}
+
+async function listHfRepoFiles(
+  source: Extract<ModelSource, { kind: "huggingface" }>,
+): Promise<string[]> {
+  if (source.files) return source.files;
+
+  post({
+    type: "progress",
+    step: "download",
+    message: `Listing files from ${source.label}...`,
+  });
+  const resp = await fetch(hfTreeUrl(source), {
+    headers: { Accept: "application/json" },
+  });
+  if (!resp.ok) {
+    throw new Error(
+      `Failed to list ${source.label}: HTTP ${resp.status} ${resp.statusText}`,
+    );
+  }
+
+  const tree = (await resp.json()) as Array<{ path?: string; type?: string }>;
+  source.files = tree
+    .filter(
+      (entry) => entry.path && (entry.type == null || entry.type === "file"),
+    )
+    .map((entry) => normalizeModelPath(entry.path!));
+  return source.files;
+}
+
 function createModelSource(
   modelUrl: string,
   modelFiles?: LocalModelFile[],
+  hfModel?: HuggingFaceModelConfig,
+  modelLabel?: string,
 ): ModelSource {
-  if (!modelFiles || modelFiles.length === 0) {
+  if (modelFiles && modelFiles.length > 0) {
+    const rawPaths = modelFiles.map((file) =>
+      normalizeModelPath(file.webkitRelativePath || file.name),
+    );
+    const firstRoot = rawPaths[0]?.split("/")[0] ?? "";
+    const stripRoot =
+      firstRoot.length > 0 &&
+      rawPaths.every(
+        (path) => path === firstRoot || path.startsWith(`${firstRoot}/`),
+      );
+
+    const files = new Map<string, LocalModelFile>();
+    for (let i = 0; i < modelFiles.length; i++) {
+      const file = modelFiles[i]!;
+      const rawPath = rawPaths[i] || file.name;
+      const stripped = stripRoot
+        ? rawPath.split("/").slice(1).join("/") || file.name
+        : rawPath;
+      files.set(stripped, file);
+      files.set(rawPath, file);
+      if (!files.has(file.name)) files.set(file.name, file);
+    }
+
     return {
-      kind: "remote",
-      baseUrl: modelUrl.replace(/\/+$/, ""),
-      label: modelUrl,
-      fileCache: new Map(),
+      kind: "local",
+      files,
+      label: stripRoot ? firstRoot : "local model",
     };
   }
 
-  const rawPaths = modelFiles.map((file) =>
-    normalizeModelPath(file.webkitRelativePath || file.name),
-  );
-  const firstRoot = rawPaths[0]?.split("/")[0] ?? "";
-  const stripRoot =
-    firstRoot.length > 0 &&
-    rawPaths.every((path) => path === firstRoot || path.startsWith(`${firstRoot}/`));
-
-  const files = new Map<string, LocalModelFile>();
-  for (let i = 0; i < modelFiles.length; i++) {
-    const file = modelFiles[i]!;
-    const rawPath = rawPaths[i] || file.name;
-    const stripped = stripRoot
-      ? rawPath.split("/").slice(1).join("/") || file.name
-      : rawPath;
-    files.set(stripped, file);
-    files.set(rawPath, file);
-    if (!files.has(file.name)) files.set(file.name, file);
+  const repoId = hfModel?.repoId ? normalizeHfRepoId(hfModel.repoId) : "";
+  if (repoId) {
+    const revision = hfModel?.revision?.trim() || "main";
+    return {
+      kind: "huggingface",
+      repoId,
+      revision,
+      label: `hf:${repoId}@${revision}`,
+      blobCache: new Map(),
+    };
   }
 
   return {
-    kind: "local",
-    files,
-    label: stripRoot ? firstRoot : "local model",
+    kind: "remote",
+    baseUrl: modelUrl.replace(/\/+$/, ""),
+    label: modelLabel?.trim() || modelUrl,
+    fileCache: new Map(),
   };
 }
 
@@ -548,6 +924,21 @@ async function readSourceText(
       throw new Error(`Local model is missing ${normalizedPath}`);
     }
     return file.text();
+  }
+
+  if (source.kind === "huggingface") {
+    const resp = await fetchHfFileResponse(source, normalizedPath, optional);
+    if (!resp) return undefined;
+    const text = await resp.text();
+    const contentType = resp.headers.get("content-type") ?? "";
+    if (
+      optional &&
+      contentType.includes("text/html") &&
+      text.trimStart().startsWith("<!doctype")
+    ) {
+      return undefined;
+    }
+    return text;
   }
 
   const resp = await fetch(`${source.baseUrl}/${normalizedPath}`);
@@ -577,7 +968,9 @@ async function readSourceSlice(
 ): Promise<Uint8Array> {
   const normalizedPath = normalizeModelPath(path);
   if (end < start) {
-    throw new Error(`Invalid byte range for ${normalizedPath}: ${start}-${end}`);
+    throw new Error(
+      `Invalid byte range for ${normalizedPath}: ${start}-${end}`,
+    );
   }
   if (end === start) return new Uint8Array(0);
 
@@ -590,6 +983,16 @@ async function readSourceSlice(
       );
     }
     return new Uint8Array(await file.slice(start, end).arrayBuffer());
+  }
+
+  if (source.kind === "huggingface") {
+    const blob = await readHfFileBlob(source, normalizedPath);
+    if (end > blob.size) {
+      throw new Error(
+        `Hugging Face range for ${normalizedPath} exceeds file size: ${end}/${blob.size}`,
+      );
+    }
+    return new Uint8Array(await blob.slice(start, end).arrayBuffer());
   }
 
   const cached = source.fileCache.get(normalizedPath);
@@ -636,11 +1039,16 @@ async function readSafeTensorsHeader(
 ): Promise<{ tensors: TensorInfo[]; dataOffset: number }> {
   const prefix = await readSourceSlice(source, path, 0, 8);
   const headerLen = Number(
-    new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength)
-      .getBigUint64(0, true),
+    new DataView(
+      prefix.buffer,
+      prefix.byteOffset,
+      prefix.byteLength,
+    ).getBigUint64(0, true),
   );
   if (!Number.isSafeInteger(headerLen) || headerLen <= 0) {
-    throw new Error(`Invalid safetensors header length in ${path}: ${headerLen}`);
+    throw new Error(
+      `Invalid safetensors header length in ${path}: ${headerLen}`,
+    );
   }
   const dataOffset = 8 + headerLen;
   const headerBytes = await readSourceSlice(source, path, 8, dataOffset);
@@ -678,6 +1086,24 @@ async function discoverWeightFiles(source: ModelSource): Promise<string[]> {
         return a.localeCompare(b, undefined, { numeric: true });
       });
     if (files.length > 0) return files;
+  }
+
+  if (source.kind === "huggingface") {
+    try {
+      const files = (await listHfRepoFiles(source))
+        .filter((path) => path.endsWith(".safetensors") && !path.includes("/"))
+        .sort((a, b) => {
+          if (a === "model.safetensors") return -1;
+          if (b === "model.safetensors") return 1;
+          return a.localeCompare(b, undefined, { numeric: true });
+        });
+      if (files.length > 0) return files;
+    } catch (e) {
+      post({
+        type: "log",
+        message: `[HF] Could not list repository files; falling back to model.safetensors: ${String(e)}`,
+      });
+    }
   }
 
   return ["model.safetensors"];
@@ -722,7 +1148,9 @@ function formatUnknownError(e: unknown): { message: string; stack?: string } {
 async function handleInit(data: {
   wasmUrl: string;
   modelUrl: string;
+  modelLabel?: string;
   modelFiles?: LocalModelFile[];
+  hfModel?: HuggingFaceModelConfig;
   packBf16?: boolean;
   sdpaFallback?: boolean;
   profile?: boolean;
@@ -767,12 +1195,14 @@ async function handleInit(data: {
     const poolStatsBuffer = profileEnabled
       ? new SharedArrayBuffer(POOL_STATS_SIZE_BYTES)
       : undefined;
+    nextWorkerBatchIndex = 1;
     // Phase 2: dedicated dispatch-batch SABs — one per worker (main + up to
     // asyncWorkPoolSize child workers). Each worker gets its own SAB so
     // DISPATCH_BATCH can be safely enabled on child pthread workers without
     // races on a shared batch cursor. The gpu-worker receives all buffers in
     // init and looks up the right one by batchBufferId.
-    const NUM_BATCH_BUFFERS = 5; // 0 = main, 1..4 = child workers
+    const ASYNC_WORK_POOL_SIZE = 4;
+    const NUM_BATCH_BUFFERS = ASYNC_WORK_POOL_SIZE + 1; // 0 = main
     const batchBuffers: SharedArrayBuffer[] = [];
     for (let i = 0; i < NUM_BATCH_BUFFERS; i++) {
       batchBuffers.push(new SharedArrayBuffer(DISPATCH_BATCH_BUFFER_SIZE));
@@ -802,7 +1232,7 @@ async function handleInit(data: {
     bridgeOptimizationControl = new Int32Array(optimizationControlBuffer);
     setBridgeOptimizations(
       configuredFusionEnabled,
-      true,
+      false,
       configuredDispatchBatchEnabled,
     );
     // WASM module requires min 1002 pages (~66 MB). We use 4096 (~268 MB)
@@ -838,6 +1268,18 @@ async function handleInit(data: {
       });
     });
     post({ type: "progress", step: "gpu", message: "WebGPU ready" });
+    gpuWorker.addEventListener("message", (event: MessageEvent) => {
+      const msg = event.data;
+      if (msg?.type === "gpu-error" || msg?.type === "rpc-error") {
+        const context = msg.context ? ` (${msg.context})` : "";
+        const detail = `[GPU] ${msg.type}${context}: ${msg.message}`;
+        post({ type: "log", message: detail });
+        if (msg.stack) post({ type: "log", message: msg.stack });
+        if (msg.type === "gpu-error") {
+          post({ type: "error", message: detail });
+        }
+      }
+    });
 
     // 2. Create bridge stub (RPC via Atomics.wait to gpu-worker)
     const bridge = createBridgeStub(
@@ -927,7 +1369,7 @@ async function handleInit(data: {
 
     const { napiModule } = await instantiateNapiModule(wasmFile, {
       context,
-      asyncWorkPoolSize: 4,
+      asyncWorkPoolSize: ASYNC_WORK_POOL_SIZE,
       wasi,
       onCreateWorker() {
         // Child workers (model thread) share the gpu-worker's GPUDevice via
@@ -939,14 +1381,39 @@ async function handleInit(data: {
         const w = new Worker(new URL("./webgpu-worker.mjs", import.meta.url), {
           type: "module",
         });
-        // Per-worker DISPATCH_BATCH: each child worker gets its own batch SAB
-        // (indexed 1..4) so batching can be enabled safely without races.
+        w.addEventListener("message", (event: MessageEvent) => {
+          const msg = event.data;
+          if (msg?.type === "__mlx_child_error") {
+            post({
+              type: "error",
+              message: msg.message,
+              stack: msg.stack,
+            });
+          }
+        });
+        w.addEventListener("error", (event: ErrorEvent) => {
+          post({
+            type: "error",
+            message: `WASM child worker error: ${event.message}`,
+            stack:
+              event.error instanceof Error
+                ? event.error.stack
+                : `${event.filename}:${event.lineno}:${event.colno}`,
+          });
+        });
+        // Child pthreads can outlive the compute-pass lifetime observed by the
+        // main bridge stub. Their bridge view cannot safely cache/fuse pass
+        // handles because another stub may end/release the pass first. Keep
+        // the aggressive bridge path on the main worker only.
         const workerBatchIndex = nextWorkerBatchIndex++;
-        const workerBatchBuffer =
-          batchBuffers[workerBatchIndex] ?? batchBuffers[0]!;
         // Child pthreads share the optimization-control SAB with the main
         // worker, so text decode keeps the fast bridge path while VLM image
         // prefill can temporarily force immediate bridge calls.
+        const workerDispatchBatch =
+          dispatchBatch && workerBatchIndex < batchBuffers.length;
+        const workerBatchBuffer = workerDispatchBatch
+          ? batchBuffers[workerBatchIndex]
+          : undefined;
         w.postMessage({
           type: "__mlx_rpc_config",
           cmdBuffer,
@@ -954,9 +1421,9 @@ async function handleInit(data: {
           poolStatsBuffer,
           dispatchBatchBuffer: workerBatchBuffer,
           batchBufferId: workerBatchIndex,
-          dispatchBatch,
+          dispatchBatch: workerDispatchBatch,
           fusionEnabled: configuredFusionEnabled,
-          passCachingEnabled: true,
+          passCachingEnabled: false,
           optimizationControlBuffer,
           bufferMetadataBuffer,
           statsBuffer,
@@ -1058,7 +1525,12 @@ async function handleInit(data: {
     // directory selected by the user in the browser. We process safetensors
     // one shard at a time so large local checkpoints never need one giant JS
     // ArrayBuffer.
-    const modelSource = createModelSource(data.modelUrl, data.modelFiles);
+    const modelSource = createModelSource(
+      data.modelUrl,
+      data.modelFiles,
+      data.hfModel,
+      data.modelLabel,
+    );
     post({
       type: "progress",
       step: "model",
@@ -1073,6 +1545,7 @@ async function handleInit(data: {
     const modelType = String(
       config.model_type ?? config.text_config?.model_type ?? "",
     );
+    const modelLabel = formatModelLabel(modelSource, config);
 
     post({ type: "progress", step: "model", message: "Loading tokenizer..." });
     const tokenizerJson = await readSourceText(modelSource, "tokenizer.json");
@@ -1082,6 +1555,20 @@ async function handleInit(data: {
       "tokenizer_config.json",
       true,
     );
+    const generationConfigJson = await readSourceText(
+      modelSource,
+      "generation_config.json",
+      true,
+    );
+    modelGenerationDefaults = generationConfigJson
+      ? normalizeGenerationConfig(JSON.parse(generationConfigJson))
+      : {};
+    if (Object.keys(modelGenerationDefaults).length > 0) {
+      post({
+        type: "log",
+        message: `[MODEL] generation defaults ${JSON.stringify(modelGenerationDefaults)}`,
+      });
+    }
 
     let processorConfigJson: string | undefined;
     for (const file of ["preprocessor_config.json", "processor_config.json"]) {
@@ -1106,7 +1593,9 @@ async function handleInit(data: {
     const MoeModel = mlxExports.Qwen35MoeModel || mlxExports.Qwen3_5MoeModel;
     const Qwen35Model = modelType.includes("moe") ? MoeModel : DenseModel;
     if (!Qwen35Model) {
-      throw new Error(`No WASM model class exported for model_type=${modelType}`);
+      throw new Error(
+        `No WASM model class exported for model_type=${modelType}`,
+      );
     }
     if (typeof Qwen35Model.loadFromGpuBuffers !== "function") {
       throw new Error(
@@ -1159,8 +1648,14 @@ async function handleInit(data: {
       const prepared = planMergedLinearAttentionTensors(tensorsForModel);
       totalMergedCount += prepared.mergedCount;
       const uploadItems: UploadItem[] = [
-        ...prepared.tensors.map((tensor) => ({ kind: "tensor" as const, tensor })),
-        ...prepared.mergePlans.map((plan) => ({ kind: "merge" as const, plan })),
+        ...prepared.tensors.map((tensor) => ({
+          kind: "tensor" as const,
+          tensor,
+        })),
+        ...prepared.mergePlans.map((plan) => ({
+          kind: "merge" as const,
+          plan,
+        })),
       ];
       post({
         type: "progress",
@@ -1181,7 +1676,9 @@ async function handleInit(data: {
             gpuTensors.push({
               name: tensor.name,
               handle: uploaded.handles[i]!,
-              dtypeCode: dtypeToCode(uploaded.uploadedDtypes[i] ?? tensor.dtype),
+              dtypeCode: dtypeToCode(
+                uploaded.uploadedDtypes[i] ?? tensor.dtype,
+              ),
               shape: tensor.shape,
               byteSize: uploaded.uploadedByteSizes[i] ?? tensor.byteSize,
               packedBf16: uploaded.packedBf16Flags[i] === true,
@@ -1258,7 +1755,8 @@ async function handleInit(data: {
     } else {
       post({
         type: "log",
-        message: "[WARMUP] skipped because chat() is not exported by this WASM build",
+        message:
+          "[WARMUP] skipped because chat() is not exported by this WASM build",
       });
       post({ type: "progress", step: "warmup", message: "Warmup skipped" });
     }
@@ -1274,7 +1772,12 @@ async function handleInit(data: {
     // whose Atomics.waitAsync promise resolves on this thread cannot
     // actually run its microtask until chatStreamSab returns. The main
     // thread is never blocked during decode, so the reader drains live.
-    post({ type: "ready", sharedMemory, supportsImages: modelSupportsImages });
+    post({
+      type: "ready",
+      sharedMemory,
+      supportsImages: modelSupportsImages,
+      modelLabel,
+    });
   } catch (e) {
     post({
       type: "error",

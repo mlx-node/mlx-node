@@ -3,6 +3,7 @@ import type { ChatStreamChunk } from "@mlx-node/core";
 import {
   ArrowUp,
   Cpu,
+  Download,
   FolderOpen,
   ImagePlus,
   Mic,
@@ -36,6 +37,10 @@ import "./styles.css";
 
 type StatusState = "info" | "ready" | "error";
 type ReasoningEffort = "off" | "low" | "medium" | "high";
+const DEFAULT_MODEL_LABEL = "Qwen3.6-35b-a3b-UD-Q3_K_XL-mlx";
+const MAX_BROWSER_OUTPUT_TOKENS = 36864;
+const DEFAULT_BROWSER_OUTPUT_TOKENS = 1024;
+const DEFAULT_BROWSER_TEMPERATURE = 0.6;
 
 type ChatResult = {
   text?: string;
@@ -90,7 +95,37 @@ function App() {
   const imageButtonRef = useRef<HTMLButtonElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const modelDirInputRef = useRef<HTMLInputElement>(null);
+  const hfFormRef = useRef<HTMLFormElement>(null);
+  const hfRepoInputRef = useRef<HTMLInputElement>(null);
+  const hfRevisionInputRef = useRef<HTMLInputElement>(null);
+  const hfLoadButtonRef = useRef<HTMLButtonElement>(null);
+  const composerModelLabelRef = useRef<HTMLSpanElement>(null);
+  const temperatureInputRef = useRef<HTMLInputElement>(null);
+  const maxOutputTokensInputRef = useRef<HTMLInputElement>(null);
   const reasoningEffortRef = useRef<ReasoningEffort>("off");
+  const initialUrlParams = new URLSearchParams(location.search);
+  const initialHfRepo = initialUrlParams.get("hf") ?? "";
+  const initialHfRevision = initialUrlParams.get("revision") ?? "main";
+  const initialMaxOutputTokens = Math.min(
+    MAX_BROWSER_OUTPUT_TOKENS,
+    Math.max(
+      1,
+      Number.parseInt(
+        initialUrlParams.get("max_new_tokens") ??
+          initialUrlParams.get("maxOutputTokens") ??
+          `${DEFAULT_BROWSER_OUTPUT_TOKENS}`,
+        10,
+      ) || DEFAULT_BROWSER_OUTPUT_TOKENS,
+    ),
+  );
+  const parsedInitialTemperature = Number.parseFloat(
+    initialUrlParams.get("temperature") ??
+      initialUrlParams.get("temp") ??
+      `${DEFAULT_BROWSER_TEMPERATURE}`,
+  );
+  const initialTemperature = Number.isFinite(parsedInitialTemperature)
+    ? Math.min(2, Math.max(0, parsedInitialTemperature))
+    : DEFAULT_BROWSER_TEMPERATURE;
 
   useEffect(() => {
     const statusEl = statusRef.current!;
@@ -101,6 +136,13 @@ function App() {
     const imageBtn = imageButtonRef.current!;
     const imageInput = imageInputRef.current!;
     const modelDirInput = modelDirInputRef.current!;
+    const hfForm = hfFormRef.current!;
+    const hfRepoInput = hfRepoInputRef.current!;
+    const hfRevisionInput = hfRevisionInputRef.current!;
+    const hfLoadBtn = hfLoadButtonRef.current!;
+    const composerModelLabel = composerModelLabelRef.current!;
+    const temperatureInput = temperatureInputRef.current!;
+    const maxOutputTokensInput = maxOutputTokensInputRef.current!;
 
     if (
       !statusEl ||
@@ -110,12 +152,34 @@ function App() {
       !sendBtn ||
       !imageBtn ||
       !imageInput ||
-      !modelDirInput
+      !modelDirInput ||
+      !hfForm ||
+      !hfRepoInput ||
+      !hfRevisionInput ||
+      !hfLoadBtn ||
+      !composerModelLabel ||
+      !maxOutputTokensInput
     ) {
       return;
     }
     modelDirInput.setAttribute("webkitdirectory", "");
     modelDirInput.setAttribute("directory", "");
+    let activeModelLabel = DEFAULT_MODEL_LABEL;
+
+    if (navigator.storage?.persist) {
+      void navigator.storage
+        .persist()
+        .then((persisted) => {
+          log(
+            persisted
+              ? "Browser storage persistence granted."
+              : "Browser storage persistence unavailable; cached models may be evicted under storage pressure.",
+          );
+        })
+        .catch((error) => {
+          log(`Browser storage persistence request failed: ${String(error)}`);
+        });
+    }
 
     function setStatus(text: string, state: StatusState = "info") {
       statusEl.textContent = text;
@@ -127,6 +191,63 @@ function App() {
       line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
       logEl.appendChild(line);
       logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setHfControlsDisabled(disabled: boolean) {
+      hfRepoInput.disabled = disabled;
+      hfRevisionInput.disabled = disabled;
+      hfLoadBtn.disabled = disabled;
+    }
+
+    function normalizeHfRepoInput(value: string) {
+      return value
+        .trim()
+        .replace(/^https:\/\/huggingface\.co\//i, "")
+        .replace(/^hf:\/\//i, "")
+        .replace(/^models\//i, "")
+        .replace(/\/(?:tree|resolve)\/.*$/i, "")
+        .replace(/^\/+|\/+$/g, "");
+    }
+
+    function compactModelLabel(label: string) {
+      if (!label.startsWith("HF ")) return label;
+      const full = label.slice(3);
+      const [repoId, revision] = full.split("@");
+      const name = repoId?.split("/").pop() || repoId || full;
+      return revision ? `${name}@${revision}` : name;
+    }
+
+    function readMaxOutputTokens() {
+      const parsed = Number.parseInt(maxOutputTokensInput.value, 10);
+      const clamped = Math.min(
+        MAX_BROWSER_OUTPUT_TOKENS,
+        Math.max(
+          1,
+          Number.isFinite(parsed) ? parsed : DEFAULT_BROWSER_OUTPUT_TOKENS,
+        ),
+      );
+      if (`${clamped}` !== maxOutputTokensInput.value) {
+        maxOutputTokensInput.value = `${clamped}`;
+      }
+      return clamped;
+    }
+
+    function readTemperature() {
+      const parsed = Number.parseFloat(temperatureInput.value);
+      const clamped = Math.min(
+        2,
+        Math.max(
+          0,
+          Number.isFinite(parsed) ? parsed : DEFAULT_BROWSER_TEMPERATURE,
+        ),
+      );
+      const formatted = Number.isInteger(clamped)
+        ? `${clamped}`
+        : `${Math.round(clamped * 100) / 100}`;
+      if (formatted !== temperatureInput.value) {
+        temperatureInput.value = formatted;
+      }
+      return clamped;
     }
 
     let imageCapabilityKnown = false;
@@ -409,10 +530,9 @@ function App() {
       currentResponseDiv = null;
     }
 
-    let worker = new Worker(
-      new URL("../src/mlx-worker.ts", import.meta.url),
-      { type: "module" },
-    );
+    let worker = new Worker(new URL("../src/mlx-worker.ts", import.meta.url), {
+      type: "module",
+    });
 
     function finalizeFromResult(result: ChatResult) {
       const latestUserText =
@@ -446,9 +566,10 @@ function App() {
           `${result.numTokens} tokens | TTFT ${result.performance.ttftMs.toFixed(0)}ms | Decode ${result.performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
         );
       }
-      setStatus("Qwen 3.5 0.8B - Ready", "ready");
+      setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, "ready");
       sendBtn.disabled = false;
       promptEl.disabled = false;
+      setHfControlsDisabled(false);
       promptEl.focus();
       chatEl.scrollTop = chatEl.scrollHeight;
     }
@@ -483,13 +604,19 @@ function App() {
           break;
 
         case "ready":
+          if (typeof data.modelLabel === "string" && data.modelLabel) {
+            activeModelLabel = data.modelLabel;
+            composerModelLabel.textContent =
+              compactModelLabel(activeModelLabel);
+          }
           log("Model ready!");
-          setStatus("Qwen 3.5 0.8B - Ready", "ready");
+          setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, "ready");
           sharedWasmMemory =
             (data as { sharedMemory?: WebAssembly.Memory }).sharedMemory ??
             null;
           promptEl.disabled = false;
           sendBtn.disabled = false;
+          setHfControlsDisabled(false);
           setImageCapability(
             (data as { supportsImages?: boolean }).supportsImages === true,
           );
@@ -541,6 +668,7 @@ function App() {
               setStatus("Error", "error");
               sendBtn.disabled = false;
               promptEl.disabled = false;
+              setHfControlsDisabled(false);
               currentAssistantDiv = null;
               currentThinkingDiv = null;
               currentResponseDiv = null;
@@ -570,6 +698,7 @@ function App() {
           setStatus("Error", "error");
           sendBtn.disabled = false;
           promptEl.disabled = false;
+          setHfControlsDisabled(false);
           currentAssistantDiv = null;
           currentThinkingDiv = null;
           currentResponseDiv = null;
@@ -588,6 +717,7 @@ function App() {
           sendBtn.disabled = true;
           promptEl.disabled = true;
           imageBtn.disabled = true;
+          setHfControlsDisabled(false);
           break;
         }
       }
@@ -688,6 +818,7 @@ function App() {
       log(`  line: ${e.lineno}, col: ${e.colno}`);
       if (e.error instanceof Error) logStack(e.error.stack);
       setStatus("Worker error", "error");
+      setHfControlsDisabled(false);
     };
     worker.onerror = handleWorkerError;
 
@@ -729,6 +860,8 @@ function App() {
       (modeParam ? ` (mode=${modeParam})` : "");
 
     function resetForModelLoad(label?: string) {
+      activeModelLabel = label ?? DEFAULT_MODEL_LABEL;
+      composerModelLabel.textContent = compactModelLabel(activeModelLabel);
       activeReaderAbort?.abort();
       activeReaderAbort = null;
       sharedWasmMemory = null;
@@ -746,18 +879,27 @@ function App() {
       promptEl.disabled = true;
       sendBtn.disabled = true;
       imageBtn.disabled = true;
+      setHfControlsDisabled(true);
       setStatus("Initializing...", "info");
       log(`Starting MLX Worker${flagBadges}${label ? ` (${label})` : ""}...`);
     }
 
-    function startWorker(modelFiles?: File[], label?: string) {
-      resetForModelLoad(label);
+    function startWorker(
+      source: {
+        modelFiles?: File[];
+        hfModel?: { repoId: string; revision?: string };
+        label?: string;
+      } = {},
+    ) {
+      resetForModelLoad(source.label);
       worker.postMessage({
         type: "init",
         wasmUrl: new URL(`/mlx-core.opt.wasm?v=${Date.now()}`, location.href)
           .href,
         modelUrl: "/model",
-        modelFiles,
+        modelLabel: source.label ?? DEFAULT_MODEL_LABEL,
+        modelFiles: source.modelFiles,
+        hfModel: source.hfModel,
         packBf16,
         sdpaFallback,
         profile,
@@ -771,7 +913,11 @@ function App() {
       });
     }
 
-    function restartWorker(modelFiles: File[], label: string) {
+    function restartWorker(source: {
+      modelFiles?: File[];
+      hfModel?: { repoId: string; revision?: string };
+      label?: string;
+    }) {
       worker.removeEventListener("messageerror", onMessageError);
       worker.terminate();
       worker = new Worker(new URL("../src/mlx-worker.ts", import.meta.url), {
@@ -780,10 +926,21 @@ function App() {
       worker.onmessage = handleWorkerMessage;
       worker.onerror = handleWorkerError;
       worker.addEventListener("messageerror", onMessageError);
-      startWorker(modelFiles, label);
+      startWorker(source);
     }
 
-    startWorker();
+    const initialRepoId = normalizeHfRepoInput(urlParams.get("hf") ?? "");
+    if (initialRepoId) {
+      const revision = urlParams.get("revision")?.trim() || "main";
+      hfRepoInput.value = initialRepoId;
+      hfRevisionInput.value = revision;
+      startWorker({
+        hfModel: { repoId: initialRepoId, revision },
+        label: `HF ${initialRepoId}@${revision}`,
+      });
+    } else {
+      startWorker();
+    }
 
     function handleSend() {
       const text = promptEl.value.trim();
@@ -835,8 +992,8 @@ function App() {
         type: "chat",
         messages: [...messages],
         config: {
-          maxNewTokens: 512,
-          temperature: 0,
+          maxNewTokens: readMaxOutputTokens(),
+          temperature: readTemperature(),
           reportPerformance: true,
         },
         useSab,
@@ -885,7 +1042,24 @@ function App() {
           .webkitRelativePath || files[0]!.name;
       const label = firstPath.split("/")[0] || "local model";
       modelDirInput.value = "";
-      restartWorker(files, label);
+      restartWorker({ modelFiles: files, label });
+    };
+
+    const onHfSubmit = (event: Event) => {
+      event.preventDefault();
+      const repoId = normalizeHfRepoInput(hfRepoInput.value);
+      const revision = hfRevisionInput.value.trim() || "main";
+      if (!repoId) {
+        setStatus("Enter a Hugging Face repo", "error");
+        hfRepoInput.focus();
+        return;
+      }
+      hfRepoInput.value = repoId;
+      hfRevisionInput.value = revision;
+      restartWorker({
+        hfModel: { repoId, revision },
+        label: `HF ${repoId}@${revision}`,
+      });
     };
 
     const onPaste = async (e: ClipboardEvent) => {
@@ -916,6 +1090,7 @@ function App() {
     imageBtn.addEventListener("click", onImageClick);
     imageInput.addEventListener("change", onImageChange);
     modelDirInput.addEventListener("change", onModelDirChange);
+    hfForm.addEventListener("submit", onHfSubmit);
     document.addEventListener("paste", onPaste);
 
     return () => {
@@ -925,6 +1100,7 @@ function App() {
       imageBtn.removeEventListener("click", onImageClick);
       imageInput.removeEventListener("change", onImageChange);
       modelDirInput.removeEventListener("change", onModelDirChange);
+      hfForm.removeEventListener("submit", onHfSubmit);
       document.removeEventListener("paste", onPaste);
       worker.removeEventListener("messageerror", onMessageError);
       activeReaderAbort?.abort();
@@ -939,9 +1115,41 @@ function App() {
         <div className="brand-mark">MLX</div>
         <div className="brand-copy">
           <h1>MLX Browser</h1>
-          <p>Qwen 3.5 0.8B on WebGPU</p>
+          <p>WebGPU model playground</p>
         </div>
         <div className="header-actions">
+          <form ref={hfFormRef} className="header-hf-form">
+            <input
+              ref={hfRepoInputRef}
+              className="hf-input hf-repo-input"
+              type="text"
+              placeholder="Hugging Face repo"
+              defaultValue={initialHfRepo}
+              spellCheck={false}
+              autoCapitalize="none"
+              aria-label="Hugging Face model repository"
+            />
+            <input
+              ref={hfRevisionInputRef}
+              className="hf-input hf-revision-input"
+              type="text"
+              placeholder="main"
+              defaultValue={initialHfRevision}
+              spellCheck={false}
+              autoCapitalize="none"
+              aria-label="Hugging Face model revision"
+            />
+            <Button
+              ref={hfLoadButtonRef}
+              type="submit"
+              variant="outline"
+              size="sm"
+              className="header-hf-btn"
+            >
+              <Download data-icon="inline-start" />
+              <span>Load HF</span>
+            </Button>
+          </form>
           <Button
             type="button"
             variant="outline"
@@ -1004,7 +1212,7 @@ function App() {
             id="prompt"
             ref={promptRef}
             rows={1}
-            placeholder="Message Qwen 3.5..."
+            placeholder="Message the model..."
             disabled
             className="composer-input"
           />
@@ -1025,7 +1233,34 @@ function App() {
             </div>
             <div className="composer-actions-right">
               <span className="composer-status-dot" aria-hidden="true" />
-              <span className="composer-model-label">Qwen 3.5</span>
+              <span
+                ref={composerModelLabelRef}
+                className="composer-model-label"
+              >
+                {DEFAULT_MODEL_LABEL}
+              </span>
+              <input
+                ref={temperatureInputRef}
+                className="composer-temperature-input"
+                type="number"
+                min={0}
+                max={2}
+                step={0.1}
+                defaultValue={initialTemperature}
+                aria-label="Temperature"
+                title="Temperature (0-2)"
+              />
+              <input
+                ref={maxOutputTokensInputRef}
+                className="composer-max-output-input"
+                type="number"
+                min={1}
+                max={MAX_BROWSER_OUTPUT_TOKENS}
+                step={1}
+                defaultValue={initialMaxOutputTokens}
+                aria-label="Max output tokens"
+                title={`Max output tokens (1-${MAX_BROWSER_OUTPUT_TOKENS})`}
+              />
               <Select
                 defaultValue="off"
                 onValueChange={(value) => {

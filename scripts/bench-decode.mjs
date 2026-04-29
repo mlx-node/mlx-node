@@ -23,24 +23,29 @@
 // commit message. Stats preserved: tok/s median+p5+p95, gpuRPCs/tok median,
 // pool hit rate, bind-group cache hit rate, spin hit rate, per-opcode means.
 
-import { chromium } from 'playwright';
+import { withWebGPUPage } from "./webgpu-browser.mjs";
 
-const URL_BASE = process.env.URL ?? 'http://localhost:5173';
+const URL_BASE = process.env.URL ?? "http://localhost:5173";
 const RUNS = Number(process.env.RUNS ?? 8);
 const WARMUP = Number(process.env.WARMUP ?? 1);
-const HEADED = process.env.HEADED === '1';
+const HEADED = process.env.HEADED === "1";
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS ?? 180_000);
-const PROMPT = process.env.PROMPT ?? 'Write a short haiku about atoms.';
+const PROMPT = process.env.PROMPT ?? "Write a short haiku about atoms.";
 
 // Regexes matched against the demo's log panel output.
 // Source: packages/browser/demo/app.ts 'profile' case.
 // Demo prefixes every log line with `[HH:MM:SS AM|PM] ` (app.ts log()). We
 // search anywhere in the line rather than anchoring at start.
-const RE_DECODE_LINE = /\[profile\] Decode (\d+) tok \| dispatches=(\d+) .* gpuRPCs=(\d+) \(([\d.]+)\/tok\)/;
-const RE_POOL = /\[profile\] pool: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
-const RE_GPU_POOL = /\[profile\] gpu-pool: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
-const RE_BG_CACHE = /\[profile\] bg-cache: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
-const RE_SPIN = /\[profile\] spin: hits=(\d+) misses=(\d+) hitRate=([\d.]+)% budget=(\d+)/;
+const RE_DECODE_LINE =
+  /\[profile\] Decode (\d+) tok \| dispatches=(\d+) .* gpuRPCs=(\d+) \(([\d.]+)\/tok\)/;
+const RE_POOL =
+  /\[profile\] pool: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
+const RE_GPU_POOL =
+  /\[profile\] gpu-pool: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
+const RE_BG_CACHE =
+  /\[profile\] bg-cache: hits=(\d+) .* misses=(\d+) .* hitRate=([\d.]+)%/;
+const RE_SPIN =
+  /\[profile\] spin: hits=(\d+) misses=(\d+) hitRate=([\d.]+)% budget=(\d+)/;
 const RE_OPCODES = /\[profile\] opcodes: (.+)$/;
 // Status bar reports tok/s via setStatus('... | Decode XX.X tok/s', 'ready')
 // — keep a second source in case the profile line is truncated.
@@ -48,7 +53,10 @@ const RE_TOKPS_STATUS = /Decode ([\d.]+) tok\/s/;
 
 function percentile(sortedNums, p) {
   if (sortedNums.length === 0) return 0;
-  const idx = Math.min(sortedNums.length - 1, Math.max(0, Math.floor(p * sortedNums.length)));
+  const idx = Math.min(
+    sortedNums.length - 1,
+    Math.max(0, Math.floor(p * sortedNums.length)),
+  );
   return sortedNums[idx];
 }
 
@@ -67,16 +75,19 @@ async function runOnce(page, runIdx, isWarmup) {
 
   // Clear log panel by reloading. Reloading also resets bridgeStub state
   // and the gpu-worker handle table — keeps runs independent.
-  await page.goto(`${URL_BASE}/?profile=1`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`${URL_BASE}/?profile=1`, { waitUntil: "domcontentloaded" });
 
   // Wait for model to load and Ready status.
-  await page.waitForFunction(() => document.getElementById('status')?.textContent?.includes('Ready'), {
-    timeout: TIMEOUT_MS,
-  });
+  await page.waitForFunction(
+    () => document.getElementById("status")?.textContent?.includes("Ready"),
+    {
+      timeout: TIMEOUT_MS,
+    },
+  );
 
   // Fire the prompt.
-  await page.fill('#prompt', PROMPT);
-  await page.click('#send');
+  await page.fill("#prompt", PROMPT);
+  await page.click("#send");
 
   // Poll the log panel directly. MutationObserver→exposeFunction drops
   // updates under rapid DOM changes; direct page.evaluate polling is
@@ -86,8 +97,10 @@ async function runOnce(page, runIdx, isWarmup) {
   let tokPerSec = NaN;
   while (Date.now() < deadline) {
     const snapshot = await page.evaluate(() => ({
-      lines: Array.from(document.getElementById('log')?.children ?? []).map((c) => c.textContent),
-      status: document.getElementById('status')?.textContent ?? '',
+      lines: Array.from(document.getElementById("log")?.children ?? []).map(
+        (c) => c.textContent,
+      ),
+      status: document.getElementById("status")?.textContent ?? "",
     }));
     logLines = snapshot.lines;
     const m = RE_TOKPS_STATUS.exec(snapshot.status);
@@ -96,7 +109,8 @@ async function runOnce(page, runIdx, isWarmup) {
     await page.waitForTimeout(500);
   }
   const profileLine = logLines.find((l) => RE_DECODE_LINE.test(l));
-  if (!profileLine) throw new Error(`${tag}: no [profile] line within ${TIMEOUT_MS}ms`);
+  if (!profileLine)
+    throw new Error(`${tag}: no [profile] line within ${TIMEOUT_MS}ms`);
 
   // Parse.
   const m1 = RE_DECODE_LINE.exec(profileLine);
@@ -126,7 +140,8 @@ async function runOnce(page, runIdx, isWarmup) {
     rate: Number(m[3]),
     budget: Number(m[4]),
   })) ?? { hits: 0, misses: 0, rate: 0, budget: 0 };
-  const opcodes = findAndMatch(logLines, RE_OPCODES, (m) => parseOpcodes(m[1])) ?? {};
+  const opcodes =
+    findAndMatch(logLines, RE_OPCODES, (m) => parseOpcodes(m[1])) ?? {};
 
   return {
     tag,
@@ -158,106 +173,102 @@ function summarize(label, nums) {
     median: percentile(sorted, 0.5).toFixed(2),
     p5: percentile(sorted, 0.05).toFixed(2),
     p95: percentile(sorted, 0.95).toFixed(2),
-    min: sorted[0]?.toFixed(2) ?? 'n/a',
-    max: sorted[sorted.length - 1]?.toFixed(2) ?? 'n/a',
+    min: sorted[0]?.toFixed(2) ?? "n/a",
+    max: sorted[sorted.length - 1]?.toFixed(2) ?? "n/a",
     n: nums.length,
   };
 }
 
 async function main() {
-  console.log(`bench-decode: URL=${URL_BASE} runs=${RUNS} warmup=${WARMUP} headed=${HEADED}`);
-  const browser = await chromium.launch({
-    headless: !HEADED,
-    // WebGPU requires specific flags; these are Chromium-only.
-    args: [
-      '--enable-unsafe-webgpu',
-      '--enable-features=Vulkan,SharedArrayBuffer',
-      '--disable-dawn-features=disallow_unsafe_apis',
-    ],
-  });
-  const ctx = await browser.newContext();
-  const page = await ctx.newPage();
-  // Playwright's per-call `{ timeout }` on waitForFunction is sometimes
-  // overridden by the context default. Set both explicitly so 30s isn't a
-  // ceiling during cold WASM + model load + warmup.
-  page.setDefaultTimeout(TIMEOUT_MS);
-  page.setDefaultNavigationTimeout(TIMEOUT_MS);
-  page.on('pageerror', (e) => console.error('pageerror:', e.message));
+  console.log(
+    `bench-decode: URL=${URL_BASE} runs=${RUNS} warmup=${WARMUP} headed=${HEADED}`,
+  );
+  await withWebGPUPage({ headed: HEADED }, async (page) => {
+    // Playwright's per-call `{ timeout }` on waitForFunction is sometimes
+    // overridden by the context default. Set both explicitly so 30s isn't a
+    // ceiling during cold WASM + model load + warmup.
+    page.setDefaultTimeout(TIMEOUT_MS);
+    page.setDefaultNavigationTimeout(TIMEOUT_MS);
+    page.on("pageerror", (e) => console.error("pageerror:", e.message));
 
-  const results = [];
-  for (let i = 0; i < WARMUP; i++) {
-    await runOnce(page, i + 1, true);
-  }
-  for (let i = 0; i < RUNS; i++) {
-    const r = await runOnce(page, i + 1, false);
-    console.log(
-      `  ${r.tag}: ${r.tokPerSec.toFixed(2)} tok/s | ${r.numTokens} tok | ` +
-        `gpuRPCs/tok=${r.gpuRpcsPerTok.toFixed(1)} | pool=${r.pool.rate}% | spin=${r.spin.rate}% (budget=${r.spin.budget})`,
-    );
-    results.push(r);
-  }
-
-  const tokps = summarize(
-    'tok/s',
-    results.map((r) => r.tokPerSec),
-  );
-  const rpcs = summarize(
-    'gpuRPCs/tok',
-    results.map((r) => r.gpuRpcsPerTok),
-  );
-  const poolRate = summarize(
-    'pool-hit%',
-    results.map((r) => r.pool.rate),
-  );
-  const spinRate = summarize(
-    'spin-hit%',
-    results.map((r) => r.spin.rate),
-  );
-  const spinBudget = summarize(
-    'spin-budget',
-    results.map((r) => r.spin.budget),
-  );
-
-  // Mean per-opcode RPC count across runs.
-  const opcodeSums = {};
-  for (const r of results) {
-    for (const [name, count] of Object.entries(r.opcodes)) {
-      opcodeSums[name] = (opcodeSums[name] ?? 0) + count;
+    const results = [];
+    for (let i = 0; i < WARMUP; i++) {
+      await runOnce(page, i + 1, true);
     }
-  }
-  const opcodeMeans = Object.fromEntries(
-    Object.entries(opcodeSums).map(([n, s]) => [n, Number((s / results.length).toFixed(1))]),
-  );
+    for (let i = 0; i < RUNS; i++) {
+      const r = await runOnce(page, i + 1, false);
+      console.log(
+        `  ${r.tag}: ${r.tokPerSec.toFixed(2)} tok/s | ${r.numTokens} tok | ` +
+          `gpuRPCs/tok=${r.gpuRpcsPerTok.toFixed(1)} | pool=${r.pool.rate}% | spin=${r.spin.rate}% (budget=${r.spin.budget})`,
+      );
+      results.push(r);
+    }
 
-  console.log('\n=== Summary ===');
-  for (const s of [tokps, rpcs, poolRate, spinRate, spinBudget]) {
-    console.log(
-      `  ${s.label.padEnd(14)} median=${s.median.padStart(8)}  p5=${s.p5.padStart(8)}  p95=${s.p95.padStart(8)}  min=${s.min.padStart(8)}  max=${s.max.padStart(8)}`,
+    const tokps = summarize(
+      "tok/s",
+      results.map((r) => r.tokPerSec),
     );
-  }
-  console.log('\nper-opcode mean (sorted):');
-  const opcodesSorted = Object.entries(opcodeMeans).sort((a, b) => b[1] - a[1]);
-  for (const [name, mean] of opcodesSorted.slice(0, 25)) {
-    console.log(`  ${name.padEnd(40)} ${mean}`);
-  }
+    const rpcs = summarize(
+      "gpuRPCs/tok",
+      results.map((r) => r.gpuRpcsPerTok),
+    );
+    const poolRate = summarize(
+      "pool-hit%",
+      results.map((r) => r.pool.rate),
+    );
+    const spinRate = summarize(
+      "spin-hit%",
+      results.map((r) => r.spin.rate),
+    );
+    const spinBudget = summarize(
+      "spin-budget",
+      results.map((r) => r.spin.budget),
+    );
 
-  // JSON blob for commit-message paste.
-  const json = {
-    url: URL_BASE,
-    runs: RUNS,
-    warmup: WARMUP,
-    prompt: PROMPT,
-    tokps,
-    rpcs,
-    poolRate,
-    spinRate,
-    spinBudget,
-    opcodeMeans,
-  };
-  console.log('\n=== JSON (paste into commit) ===');
-  console.log(JSON.stringify(json, null, 2));
+    // Mean per-opcode RPC count across runs.
+    const opcodeSums = {};
+    for (const r of results) {
+      for (const [name, count] of Object.entries(r.opcodes)) {
+        opcodeSums[name] = (opcodeSums[name] ?? 0) + count;
+      }
+    }
+    const opcodeMeans = Object.fromEntries(
+      Object.entries(opcodeSums).map(([n, s]) => [
+        n,
+        Number((s / results.length).toFixed(1)),
+      ]),
+    );
 
-  await browser.close();
+    console.log("\n=== Summary ===");
+    for (const s of [tokps, rpcs, poolRate, spinRate, spinBudget]) {
+      console.log(
+        `  ${s.label.padEnd(14)} median=${s.median.padStart(8)}  p5=${s.p5.padStart(8)}  p95=${s.p95.padStart(8)}  min=${s.min.padStart(8)}  max=${s.max.padStart(8)}`,
+      );
+    }
+    console.log("\nper-opcode mean (sorted):");
+    const opcodesSorted = Object.entries(opcodeMeans).sort(
+      (a, b) => b[1] - a[1],
+    );
+    for (const [name, mean] of opcodesSorted.slice(0, 25)) {
+      console.log(`  ${name.padEnd(40)} ${mean}`);
+    }
+
+    // JSON blob for commit-message paste.
+    const json = {
+      url: URL_BASE,
+      runs: RUNS,
+      warmup: WARMUP,
+      prompt: PROMPT,
+      tokps,
+      rpcs,
+      poolRate,
+      spinRate,
+      spinBudget,
+      opcodeMeans,
+    };
+    console.log("\n=== JSON (paste into commit) ===");
+    console.log(JSON.stringify(json, null, 2));
+  });
 }
 
 main().catch((e) => {

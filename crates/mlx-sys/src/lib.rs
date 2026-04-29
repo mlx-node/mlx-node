@@ -758,10 +758,7 @@ unsafe extern "C-unwind" {
     /// buffer has not yet been used on the GPU). Returns true if the flip
     /// was applied, false if any precondition failed. Safe to call from any
     /// bf16 constructor — a false return is not an error.
-    pub fn mlx_wgpu_try_opt_in_packed_bf16(
-        handle: *mut mlx_array,
-        min_elements: usize,
-    ) -> bool;
+    pub fn mlx_wgpu_try_opt_in_packed_bf16(handle: *mut mlx_array, min_elements: usize) -> bool;
 
     /// Unconditionally mark a bf16 array as PackedBf16 storage. Caller must
     /// have already placed packed u32 pairs in the underlying WGPUBuffer —
@@ -776,10 +773,7 @@ unsafe extern "C-unwind" {
     /// mlx/backend/webgpu/device.cpp). Plumbed into the browser's
     /// `?profile=1` path so the demo page can display dispatches/token.
     /// On non-WebGPU builds this writes zeros.
-    pub fn mlx_wgpu_get_dispatch_stats(
-        out_dispatches: *mut u64,
-        out_pass_ends: *mut u64,
-    );
+    pub fn mlx_wgpu_get_dispatch_stats(out_dispatches: *mut u64, out_pass_ends: *mut u64);
 
     /// Phase 0 dispatch-stats reset: zeros both counters. Called at the
     /// start of each generation when ?profile=1 is active so the
@@ -1531,7 +1525,11 @@ unsafe extern "C-unwind" {
     // Diagnostic
     pub fn mlx_qwen35_get_weight_count() -> i32;
     pub fn mlx_qwen35_check_weight(name: *const std::os::raw::c_char) -> i32;
-    pub fn mlx_qwen35_read_weight(name: *const std::os::raw::c_char, out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_qwen35_read_weight(
+        name: *const std::os::raw::c_char,
+        out: *mut f32,
+        max_count: i32,
+    ) -> i32;
     pub fn mlx_test_single_layer_forward(out: *mut f32, max_count: i32) -> bool;
     pub fn mlx_test_gdn_step_by_step(checkpoint: i32, out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_gdn_recurrence_small(out: *mut f32, max_count: i32) -> i32;
@@ -1545,50 +1543,17 @@ unsafe extern "C-unwind" {
     pub fn mlx_test_sdpa_decode_gqa(out: *mut f32, max_count: i32) -> i32;
     // Tile (prefill) SDPA parity tests for the Tq > 1 fused kernel.
     pub fn mlx_test_sdpa_tile_tq2_d64(out: *mut f32, max_count: i32) -> i32;
-    pub fn mlx_test_sdpa_tile_tq8_d128_causal_gqa(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_tile_tq32_d128_addmask(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_tile_tq33_d128_tailtile(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_tile_tq128_d128_l4096(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_tile_d256_gqa(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_tile_d256_simple(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_tile_d256_causal(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_tile_d256_gqa_nocausal(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_tile_d256_causal_gqa_minimal(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_vector_d256(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
-    pub fn mlx_test_sdpa_vector_d256_simple(
-        out: *mut f32,
-        max_count: i32,
-    ) -> i32;
+    pub fn mlx_test_sdpa_tile_tq8_d128_causal_gqa(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_tile_tq32_d128_addmask(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_tile_tq33_d128_tailtile(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_tile_tq128_d128_l4096(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_gqa(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_simple(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_causal(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_gqa_nocausal(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_tile_d256_causal_gqa_minimal(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_vector_d256(out: *mut f32, max_count: i32) -> i32;
+    pub fn mlx_test_sdpa_vector_d256_simple(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_full_attn_layer_bf16(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_rms_norm_bf16(out: *mut f32, max_count: i32) -> i32;
     pub fn mlx_test_swiglu_mlp_bf16(out: *mut f32, max_count: i32) -> i32;

@@ -75,6 +75,21 @@ describe('Basic Operations', () => {
     expect(r.passed, r.error).toBe(true);
   });
 
+  test('reduce offset view', async () => {
+    const r = await runTest('reduce offset view');
+    expect(r.passed, r.error).toBe(true);
+  });
+
+  test('softmax offset view', async () => {
+    const r = await runTest('softmax offset view');
+    expect(r.passed, r.error).toBe(true);
+  });
+
+  test('logsumexp offset view', async () => {
+    const r = await runTest('logsumexp offset view');
+    expect(r.passed, r.error).toBe(true);
+  });
+
   test('broadcast add', async () => {
     const r = await runTest('broadcast add');
     expect(r.passed, r.error).toBe(true);
@@ -234,6 +249,31 @@ describe('Basic Operations', () => {
     const r = await runTest('gather (embedding lookup)');
     expect(r.passed, r.error).toBe(true);
   });
+
+  test('gather respects sliced index offsets', async () => {
+    const r = await runTest('gather respects sliced index offsets');
+    expect(r.passed, r.error).toBe(true);
+  });
+
+  test('MoE gather_sort int64 token indices', async () => {
+    const r = await runTest('MoE gather_sort int64 token indices');
+    expect(r.passed, r.error).toBe(true);
+  });
+
+  test('MoE routing argpartition top-k parity', async () => {
+    const r = await runTest('MoE routing argpartition top-k parity');
+    expect(r.passed, r.error).toBe(true);
+  });
+
+  test('quantized affine qmatmul/gather_qmm parity', async () => {
+    const r = await runTest('quantized affine qmatmul/gather_qmm parity');
+    expect(r.passed, r.error).toBe(true);
+  });
+
+  test('quantized affine model-shape parity', async () => {
+    const r = await runTest('quantized affine model-shape parity');
+    expect(r.passed, r.error).toBe(true);
+  }, 180000);
 
   test('rmsnorm pattern', async () => {
     const r = await runTest('rmsnorm pattern');

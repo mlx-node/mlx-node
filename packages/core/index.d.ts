@@ -504,6 +504,32 @@ export declare class MxArray {
   static testCompileMatmul(): boolean;
   static testCompileRepeated(): boolean;
   static testGpuBufferArrays(): boolean;
+  /**
+   * Browser/WebGPU regression test for affine quantized kernels.
+   *
+   * Returns [
+   *   dequantize_max_error,
+   *   qmatmul_max_error,
+   *   qgemv_max_error,
+   *   gather_qmm_direct_max_error,
+   *   gather_qmm_explicit_lhs_max_error,
+   *   gather_qmm_sorted_max_error,
+   *   gather_qmm_sorted_vs_direct_max_error,
+   * ].
+   */
+  static testQuantizedAffineOps(bits: number): Array<number>;
+  /**
+   * Browser/WebGPU regression test for model-scale affine quantized decode
+   * shapes. Qwen3.6 MoE quantized checkpoints use K=2048, group_size=64,
+   * bf16 activations/scales/biases, and 3/4/5/6/8-bit packed rows; the smaller
+   * smoke test above does not exercise those dispatch and packing paths.
+   */
+  static testQuantizedAffineModelShapeOps(bits: number): Array<number>;
+  /**
+   * WebGPU diagnostic: softmax over a contiguous slice view with non-zero offset.
+   * Returns [max_abs_error, output...].
+   */
+  static testWebgpuSoftmaxOffsetView(): Array<number>;
   /** Run single layer forward using model weights, return first 5 values */
   static testSingleLayerForward(): Array<number>;
   /** Read first N float values from a C++ weight map entry */

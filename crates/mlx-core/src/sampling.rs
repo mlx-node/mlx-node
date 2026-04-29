@@ -592,14 +592,15 @@ pub fn sample(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArra
     }
 }
 
-/// Sample using non-compiled operations (fallback for WASM).
+/// Sample using non-compiled operations for WASM/WebGPU.
 ///
-/// For temperature > 0, reads logits to CPU and does the entire sampling pipeline
-/// in pure Rust (temperature, softmax, categorical) to avoid creating intermediate
-/// MLX arrays that exhaust the ~1.9GB WASM heap during the decode loop.
+/// For temperature > 0, read back only the final vocab logits and sample in
+/// Rust. In the browser this is faster than dispatching several full-vocab
+/// WebGPU passes (softmax + cumsum + compare + argmax) per decode token.
 pub fn sample_uncompiled(logits: &MxArray, config: Option<SamplingConfig>) -> Result<MxArray> {
     let cfg = config.unwrap_or_default();
     let temp = cfg.temperature.unwrap_or(1.0);
+
     // Greedy: use argmax when temperature <= 0.
     if temp <= 0.0 {
         #[cfg(target_family = "wasm")]
@@ -609,9 +610,8 @@ pub fn sample_uncompiled(logits: &MxArray, config: Option<SamplingConfig>) -> Re
         #[cfg(not(target_family = "wasm"))]
         return argmax_compat(logits, -1);
     }
-    // Pure Rust categorical: read logits to CPU, apply temperature + sampling there.
-    // Avoids MLX array ops (categorical/cumsum/random) that exhaust WASM heap.
-    cpu_categorical_sample(logits, temp)
+
+    cpu_categorical_sample(logits, &cfg)
 }
 
 /// Argmax helper for non-WASM fallback paths.
@@ -620,11 +620,12 @@ fn argmax_compat(logits: &MxArray, axis: i32) -> Result<MxArray> {
     logits.argmax(axis, None)
 }
 
-/// Categorical sampling in pure Rust — no MLX array ops for intermediates.
-/// Reads logits to CPU, applies temperature, computes softmax + cumsum in Rust,
-/// samples with thread-local RNG, returns a scalar MxArray.
-/// Memory: one Vec<f32> for logits + one Vec<f64> for cumulative probs.
-fn cpu_categorical_sample(logits: &MxArray, temperature: f64) -> Result<MxArray> {
+/// Categorical sampling in pure Rust for WASM/WebGPU.
+///
+/// Reads only the final vocab logits to CPU and samples without allocating
+/// intermediate scaled/probability/cumsum buffers. Decode calls this once per
+/// token, so avoiding vocab-sized temporaries matters in browser runtimes.
+fn cpu_categorical_sample(logits: &MxArray, cfg: &SamplingConfig) -> Result<MxArray> {
     // Force evaluation so we can read the data
     logits.eval();
 
@@ -637,22 +638,94 @@ fn cpu_categorical_sample(logits: &MxArray, temperature: f64) -> Result<MxArray>
         ));
     }
 
-    // Apply temperature
-    let inv_temp = 1.0 / temperature;
-    let scaled: Vec<f64> = data.iter().map(|&x| (x as f64) * inv_temp).collect();
+    let temperature = cfg.temperature.unwrap_or(1.0);
+    let inv_temp = (1.0 / temperature) as f32;
+    let top_k = cfg.top_k.unwrap_or(0).max(0) as usize;
+    let top_p = cfg.top_p.unwrap_or(1.0);
+    let min_p = cfg.min_p.unwrap_or(0.0);
+
+    let mut candidates: Vec<(usize, f32)> = data.iter().copied().enumerate().collect();
+    if top_k > 0 && top_k < candidates.len() {
+        candidates.select_nth_unstable_by(top_k, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(top_k);
+    }
+    if top_p < 1.0 || min_p > 0.0 || top_k > 0 {
+        candidates
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    if candidates.is_empty() {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "No sampling candidates",
+        ));
+    }
 
     // Softmax: shift by max for numerical stability
-    let max_val = scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let exps: Vec<f64> = scaled.iter().map(|&x| (x - max_val).exp()).collect();
-    let sum: f64 = exps.iter().sum();
-    let probs: Vec<f64> = exps.iter().map(|&e| e / sum).collect();
+    let max_val = candidates
+        .iter()
+        .map(|&(_, x)| x * inv_temp)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut exps = Vec::with_capacity(data.len());
+    let mut sum = 0.0;
+    for &(_, x) in &candidates {
+        let e = (x * inv_temp - max_val).exp();
+        exps.push(e);
+        sum += e as f64;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        let idx = candidates
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| *idx)
+            .unwrap_or(0);
+        return MxArray::from_int32(&[idx as i32], &[1]);
+    }
 
-    // Cumulative sum
-    let mut cumsum = Vec::with_capacity(probs.len());
-    let mut acc = 0.0;
-    for &p in &probs {
-        acc += p;
-        cumsum.push(acc);
+    if min_p > 0.0 {
+        let max_prob = exps.iter().map(|&e| e as f64 / sum).fold(0.0, f64::max);
+        let cutoff = max_prob * min_p;
+        let mut filtered_candidates = Vec::with_capacity(candidates.len());
+        let mut filtered_exps = Vec::with_capacity(exps.len());
+        let mut filtered_sum = 0.0;
+        for ((idx, logit), e) in candidates.into_iter().zip(exps.into_iter()) {
+            let p = e as f64 / sum;
+            if p >= cutoff {
+                filtered_candidates.push((idx, logit));
+                filtered_exps.push(e);
+                filtered_sum += e as f64;
+            }
+        }
+        if !filtered_candidates.is_empty() {
+            candidates = filtered_candidates;
+            exps = filtered_exps;
+            sum = filtered_sum;
+        } else {
+            let idx = data
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            return MxArray::from_int32(&[idx as i32], &[1]);
+        }
+    }
+
+    if top_p < 1.0 && candidates.len() > 1 {
+        let mut filtered_len = candidates.len();
+        let mut cumulative = 0.0;
+        for (i, &e) in exps.iter().enumerate() {
+            cumulative += e as f64 / sum;
+            if cumulative >= top_p {
+                filtered_len = i + 1;
+                break;
+            }
+        }
+        filtered_len = filtered_len.max(1);
+        candidates.truncate(filtered_len);
+        exps.truncate(filtered_len);
+        sum = exps.iter().map(|&e| e as f64).sum();
     }
 
     // Sample using thread-local RNG
@@ -669,10 +742,16 @@ fn cpu_categorical_sample(logits: &MxArray, temperature: f64) -> Result<MxArray>
         (*state as f64) / (u64::MAX as f64)
     });
 
-    let idx = cumsum
-        .iter()
-        .position(|&c| c > r)
-        .unwrap_or(probs.len() - 1);
+    let threshold = r * sum;
+    let mut acc = 0.0;
+    let mut idx = candidates.last().map(|(idx, _)| *idx).unwrap_or(0);
+    for (i, &e) in exps.iter().enumerate() {
+        acc += e as f64;
+        if acc > threshold {
+            idx = candidates[i].0;
+            break;
+        }
+    }
     MxArray::from_int32(&[idx as i32], &[1])
 }
 
