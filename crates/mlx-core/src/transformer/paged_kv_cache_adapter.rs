@@ -1710,6 +1710,186 @@ impl PagedKVCacheAdapter {
     pub fn block_table(&self) -> Option<&SequenceBlockTable> {
         self.block_table.as_ref()
     }
+
+    /// Materialize the standardized `PagedAttentionInputs` for a
+    /// compiled-forward dispatch (Phase 3+).
+    ///
+    /// Layout (matches `mlx::core::fast::paged::PagedAttentionInputs` in
+    /// `mlx_common.h`):
+    ///
+    /// - `offset_arr` — `[1]` int32: global token position of the first
+    ///   new token. Equal to `current_token_count - num_new_tokens`
+    ///   (i.e. where the chunk being written starts in the flat token
+    ///   sequence).
+    /// - `block_table` — `[1, max_blocks_per_seq]` int32, sentinel-padded
+    ///   with `-1`. Active prefix is `block_table[0, ..num_valid_blocks]`.
+    /// - `slot_mapping` — `[chunk_size_max]` int64, sentinel-padded with
+    ///   `-1`. Active prefix is `slot_mapping[..num_valid_tokens]` and
+    ///   maps `slot_mapping[i]` to `block_id * block_size +
+    ///   slot_within_block` for token `i` of the new chunk.
+    /// - `num_valid_tokens` — `[1]` int32: equals `num_new_tokens` for
+    ///   non-zero chunks (= valid prefix of `slot_mapping`).
+    /// - `num_valid_blocks` — `[1]` int32: equals
+    ///   `block_table.num_blocks()` for the active request (= valid prefix
+    ///   of `block_table`).
+    /// - `seq_lens` — `[1]` int32: total context length so far
+    ///   (= `current_token_count` AFTER the chunk; the gather kernel
+    ///   reads `seq_lens[seq_idx=0]` to know how many tokens of the
+    ///   block table are populated).
+    ///
+    /// Sentinel padding to FIXED `(max_blocks_per_seq, chunk_size_max)`
+    /// shapes is what keeps the compile cache hitting across calls — only
+    /// contents change per request. Callers (each model's compiled
+    /// forward) pick `max_blocks_per_seq` to bound the longest sequence
+    /// they support and `chunk_size_max` to bound the largest single-call
+    /// chunk (e.g. `max_position_embeddings` for prefill, `1` for decode).
+    ///
+    /// ## Semantics relative to existing helpers
+    ///
+    /// - `slot_mapping[..num_valid_tokens]` is the same data
+    ///   `build_slot_mapping(first_logical_position, num_new_tokens)`
+    ///   produces, just sentinel-padded.
+    /// - `block_table[0, ..num_valid_blocks]` is the same data
+    ///   `build_decode_block_ids(self.block_table())` produces, just
+    ///   sentinel-padded and broadcast to a 2-D `[1, max_blocks_per_seq]`
+    ///   layout (one batch entry, this adapter is per-request).
+    /// - `seq_lens[0]` reads the recorded token count from
+    ///   `block_table.num_tokens()` AFTER the new chunk has been
+    ///   accounted for via `record_tokens`.
+    ///
+    /// ## Errors
+    ///
+    /// - No active request (caller didn't call `reset_for_new_request`).
+    /// - `num_new_tokens > chunk_size_max` (caller's compile-cached graph
+    ///   was sized for a smaller chunk than the runtime request needs).
+    /// - `block_table.num_blocks() > max_blocks_per_seq` (caller's graph
+    ///   was sized for a shorter sequence than this request grew to).
+    /// - `num_new_tokens > current_token_count` (chunk doesn't fit in
+    ///   recorded tokens — caller missed `record_tokens`).
+    /// - Slot-mapping construction fails (logical position past allocated
+    ///   blocks; `build_slot_mapping` already enforces this).
+    pub fn build_paged_attention_inputs(
+        &self,
+        num_new_tokens: u32,
+        chunk_size_max: u32,
+        max_blocks_per_seq: u32,
+    ) -> Result<crate::transformer::paged_attention_inputs::PagedAttentionInputs, String> {
+        // Guard active-request invariant.
+        let block_table = self.block_table.as_ref().ok_or_else(|| {
+            "build_paged_attention_inputs called before reset_for_new_request".to_string()
+        })?;
+        if chunk_size_max == 0 {
+            return Err("build_paged_attention_inputs: chunk_size_max must be > 0".to_string());
+        }
+        if max_blocks_per_seq == 0 {
+            return Err("build_paged_attention_inputs: max_blocks_per_seq must be > 0".to_string());
+        }
+        if num_new_tokens > chunk_size_max {
+            return Err(format!(
+                "build_paged_attention_inputs: num_new_tokens {num_new_tokens} exceeds \
+                 compile-time chunk_size_max {chunk_size_max} (recompile the forward graph \
+                 for the larger chunk, or split the dispatch)"
+            ));
+        }
+        let n_blocks = block_table.num_blocks() as u32;
+        if n_blocks > max_blocks_per_seq {
+            return Err(format!(
+                "build_paged_attention_inputs: request has {n_blocks} blocks, exceeds \
+                 compile-time max_blocks_per_seq {max_blocks_per_seq}. Recompile the forward \
+                 graph for a longer max_seq_len."
+            ));
+        }
+        let recorded = block_table.num_tokens();
+        if num_new_tokens > recorded {
+            return Err(format!(
+                "build_paged_attention_inputs: num_new_tokens {num_new_tokens} exceeds \
+                 recorded token count {recorded}. Call record_tokens for the chunk first."
+            ));
+        }
+
+        // 1. offset_arr: global position of the first new token.
+        let first_logical_position = recorded - num_new_tokens;
+        let offset_arr = MxArray::from_int32(&[first_logical_position as i32], &[1])
+            .map_err(|e| format!("build_paged_attention_inputs offset_arr: {e}"))?;
+
+        // 2. block_table: sentinel-pad to [1, max_blocks_per_seq]. The kernel
+        //    reads -1 entries as "skip" — guarded factory-side in Phase 1.
+        let mut block_table_data: Vec<i32> = vec![-1; max_blocks_per_seq as usize];
+        for (i, block) in block_table.blocks().iter().enumerate() {
+            block_table_data[i] = block.block_id as i32;
+        }
+        let block_table_arr =
+            MxArray::from_int32(&block_table_data, &[1, max_blocks_per_seq as i64])
+                .map_err(|e| format!("build_paged_attention_inputs block_table: {e}"))?;
+
+        // 3. slot_mapping: build for the new chunk and sentinel-pad to
+        //    [chunk_size_max]. Empty-chunk callers (num_new_tokens == 0)
+        //    get an all-sentinel array — kernels skip via `num_valid_tokens`.
+        let mut slot_mapping_data: Vec<i64> = vec![-1; chunk_size_max as usize];
+        if num_new_tokens > 0 {
+            let live = self.build_slot_mapping(first_logical_position, num_new_tokens)?;
+            for (i, slot) in live.iter().enumerate() {
+                slot_mapping_data[i] = *slot;
+            }
+        }
+        let slot_mapping_arr = MxArray::from_int64(&slot_mapping_data, &[chunk_size_max as i64])
+            .map_err(|e| format!("build_paged_attention_inputs slot_mapping: {e}"))?;
+
+        // 4. num_valid_tokens / num_valid_blocks / seq_lens.
+        let num_valid_tokens = MxArray::from_int32(&[num_new_tokens as i32], &[1])
+            .map_err(|e| format!("build_paged_attention_inputs num_valid_tokens: {e}"))?;
+        let num_valid_blocks = MxArray::from_int32(&[n_blocks as i32], &[1])
+            .map_err(|e| format!("build_paged_attention_inputs num_valid_blocks: {e}"))?;
+        let seq_lens = MxArray::from_int32(&[recorded as i32], &[1])
+            .map_err(|e| format!("build_paged_attention_inputs seq_lens: {e}"))?;
+
+        Ok(
+            crate::transformer::paged_attention_inputs::PagedAttentionInputs {
+                offset_arr,
+                block_table: block_table_arr,
+                slot_mapping: slot_mapping_arr,
+                num_valid_tokens,
+                num_valid_blocks,
+                seq_lens,
+            },
+        )
+    }
+
+    /// Wrap the K cache buffer for `layer_idx` as a zero-copy MxArray view
+    /// over the per-layer Metal storage (Phase 3+).
+    ///
+    /// Pass-through to [`LayerKVPool::key_cache_array_raw`] — converts the
+    /// raw `*mut mlx_array` pointer into a managed `MxArray`. The
+    /// resulting MxArray's Drop calls `mlx_array_delete` on the wrapper
+    /// struct only; the underlying Metal buffer is owned by the pool and
+    /// is NOT released. As long as the pool outlives the MxArray (the
+    /// adapter holds `Arc<LayerKVPool>` so this is automatic), the array
+    /// view is sound.
+    #[cfg(target_os = "macos")]
+    pub fn key_pool_array(&self, layer_idx: u32) -> Result<MxArray, String> {
+        let raw = self.layer_kv_pool.key_cache_array_raw(layer_idx)?;
+        MxArray::from_handle(raw, "key_pool_array").map_err(|e| format!("key_pool_array: {e}"))
+    }
+
+    /// Wrap the V cache buffer for `layer_idx` as a zero-copy MxArray view.
+    /// See [`Self::key_pool_array`] for ownership semantics.
+    #[cfg(target_os = "macos")]
+    pub fn value_pool_array(&self, layer_idx: u32) -> Result<MxArray, String> {
+        let raw = self.layer_kv_pool.value_cache_array_raw(layer_idx)?;
+        MxArray::from_handle(raw, "value_pool_array").map_err(|e| format!("value_pool_array: {e}"))
+    }
+
+    /// Non-macOS stub for `key_pool_array`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn key_pool_array(&self, _layer_idx: u32) -> Result<MxArray, String> {
+        Err("key_pool_array is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Non-macOS stub for `value_pool_array`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn value_pool_array(&self, _layer_idx: u32) -> Result<MxArray, String> {
+        Err("value_pool_array is only supported on macOS (Metal backend)".to_string())
+    }
 }
 
 /// Compute per-block `extra_keys` for image-aware prefix hashing.
@@ -4115,6 +4295,196 @@ mod tests {
             t2_block_ids[0], t1_block_ids[0],
             "turn 1's full block must also be preserved across turns"
         );
+
+        adapter.release_request().unwrap();
+    }
+
+    /// `build_paged_attention_inputs` returns the 6 MxArrays with FIXED
+    /// compile-time shapes. Verifies the sentinel-padding contract for
+    /// `block_table` (-1) and `slot_mapping` (-1). Skipped on no-Metal
+    /// hosts (the underlying `LayerKVPool::new_for_test` needs Metal,
+    /// per `maybe_test_pool`).
+    #[test]
+    fn test_build_paged_attention_inputs_basic() {
+        let block_size = 8u32;
+        let num_blocks = 8u32;
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let Some(mut adapter) = maybe_adapter(allocator, block_size) else {
+            eprintln!("skipping test_build_paged_attention_inputs_basic: Metal unavailable");
+            return;
+        };
+
+        adapter.reset_for_new_request(0).unwrap();
+        let prompt: Vec<u32> = (0..18).collect();
+        adapter
+            .find_cached_prefix(&prompt, &[])
+            .expect("prefix lookup");
+        adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
+        adapter.record_tokens(&prompt).unwrap();
+
+        // Shape parameters that the model wrapper picks for the compiled
+        // forward graph: 64 max_blocks_per_seq, 32 chunk_size_max.
+        let inputs = adapter
+            .build_paged_attention_inputs(
+                /*num_new_tokens=*/ 18, /*chunk_size_max=*/ 32,
+                /*max_blocks_per_seq=*/ 64,
+            )
+            .expect("build inputs");
+
+        // 1. offset_arr: [1] int32, value = 0 (this is the only chunk, so
+        //    first new token starts at position 0).
+        assert_eq!(inputs.offset_arr.ndim().unwrap(), 1);
+        assert_eq!(inputs.offset_arr.shape_at(0).unwrap(), 1);
+        assert_eq!(
+            inputs.offset_arr.dtype().unwrap(),
+            crate::array::DType::Int32
+        );
+
+        // 2. block_table: [1, 64] int32. n_blocks = ceil(18/8) = 3.
+        assert_eq!(inputs.block_table.ndim().unwrap(), 2);
+        assert_eq!(inputs.block_table.shape_at(0).unwrap(), 1);
+        assert_eq!(inputs.block_table.shape_at(1).unwrap(), 64);
+        assert_eq!(
+            inputs.block_table.dtype().unwrap(),
+            crate::array::DType::Int32
+        );
+
+        // 3. slot_mapping: [32] int64. (DType enum exposes only the
+        //    inference-relevant codes; int64 is intentionally absent so we
+        //    don't read it back here. The kernel-side input contract is
+        //    `paged_kv_write(slot_mapping, ..., dtype=int64)` enforced in
+        //    the Phase 1 factory validation.)
+        assert_eq!(inputs.slot_mapping.ndim().unwrap(), 1);
+        assert_eq!(inputs.slot_mapping.shape_at(0).unwrap(), 32);
+
+        // 4. num_valid_tokens / num_valid_blocks / seq_lens — all [1] int32.
+        for arr in [
+            &inputs.num_valid_tokens,
+            &inputs.num_valid_blocks,
+            &inputs.seq_lens,
+        ] {
+            assert_eq!(arr.ndim().unwrap(), 1);
+            assert_eq!(arr.shape_at(0).unwrap(), 1);
+            assert_eq!(arr.dtype().unwrap(), crate::array::DType::Int32);
+        }
+
+        adapter.release_request().unwrap();
+    }
+
+    /// Rejects compile-time bound violations: `num_new_tokens` exceeding
+    /// `chunk_size_max` (model needs to recompile for a larger chunk),
+    /// `block_table.num_blocks()` exceeding `max_blocks_per_seq` (model
+    /// needs to recompile for a longer max_seq_len), and
+    /// `num_new_tokens` exceeding the recorded count (caller missed
+    /// record_tokens). All three are caller bugs that must surface as
+    /// errors rather than corrupt the compiled graph's input shape.
+    #[test]
+    fn test_build_paged_attention_inputs_rejects_bound_violations() {
+        let block_size = 8u32;
+        let num_blocks = 8u32;
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let Some(mut adapter) = maybe_adapter(allocator, block_size) else {
+            eprintln!(
+                "skipping test_build_paged_attention_inputs_rejects_bound_violations: Metal \
+                 unavailable"
+            );
+            return;
+        };
+
+        adapter.reset_for_new_request(0).unwrap();
+        let prompt: Vec<u32> = (0..16).collect();
+        adapter.find_cached_prefix(&prompt, &[]).unwrap();
+        adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
+        adapter.record_tokens(&prompt).unwrap();
+
+        // chunk_size_max smaller than the requested chunk → reject.
+        let err = match adapter.build_paged_attention_inputs(16, 8, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("must reject chunk overflow"),
+        };
+        assert!(
+            err.contains("chunk_size_max"),
+            "expected chunk error, got: {err}"
+        );
+
+        // num_new_tokens > recorded → reject.
+        let err = match adapter.build_paged_attention_inputs(20, 32, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("must reject token overflow"),
+        };
+        assert!(
+            err.contains("recorded token count"),
+            "expected recorded-count error, got: {err}"
+        );
+
+        // max_blocks_per_seq too small for current request (n_blocks=2,
+        // we ask for 1) → reject.
+        let err = match adapter.build_paged_attention_inputs(16, 32, 1) {
+            Err(e) => e,
+            Ok(_) => panic!("must reject max_blocks_per_seq overflow"),
+        };
+        assert!(
+            err.contains("max_blocks_per_seq"),
+            "expected blocks-per-seq error, got: {err}"
+        );
+
+        adapter.release_request().unwrap();
+    }
+
+    /// No active request → reject. Callers must `reset_for_new_request`
+    /// before building inputs (the bundle has no meaning without an
+    /// active block_table).
+    #[test]
+    fn test_build_paged_attention_inputs_no_active_request() {
+        let block_size = 8u32;
+        let num_blocks = 4u32;
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let Some(adapter) = maybe_adapter(allocator, block_size) else {
+            eprintln!(
+                "skipping test_build_paged_attention_inputs_no_active_request: Metal unavailable"
+            );
+            return;
+        };
+
+        let err = match adapter.build_paged_attention_inputs(1, 32, 64) {
+            Err(e) => e,
+            Ok(_) => panic!("must reject without active request"),
+        };
+        assert!(
+            err.contains("reset_for_new_request"),
+            "expected lifecycle error, got: {err}"
+        );
+    }
+
+    /// Zero-token chunk produces a fully-sentinel slot_mapping. This is
+    /// the entry-point shape every model can use to bootstrap an empty
+    /// dispatch (e.g. the trivial first call before any prefill data
+    /// arrives).
+    #[test]
+    fn test_build_paged_attention_inputs_zero_chunk() {
+        let block_size = 8u32;
+        let num_blocks = 4u32;
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let Some(mut adapter) = maybe_adapter(allocator, block_size) else {
+            eprintln!("skipping test_build_paged_attention_inputs_zero_chunk: Metal unavailable");
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+
+        // No prefix, no suffix, no recorded tokens → zero chunk should
+        // succeed (every model's first-step path).
+        let inputs = adapter
+            .build_paged_attention_inputs(0, 16, 32)
+            .expect("zero-chunk inputs");
+        // num_valid_tokens = 0
+        assert_eq!(inputs.num_valid_tokens.ndim().unwrap(), 1);
+        assert_eq!(
+            inputs.num_valid_tokens.shape_at(0).unwrap(),
+            1,
+            "num_valid_tokens shape is [1]"
+        );
+        // slot_mapping shape stays at chunk_size_max regardless of chunk.
+        assert_eq!(inputs.slot_mapping.shape_at(0).unwrap(), 16);
 
         adapter.release_request().unwrap();
     }

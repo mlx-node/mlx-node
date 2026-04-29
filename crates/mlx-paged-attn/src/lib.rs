@@ -28,6 +28,7 @@ mod extern_c;
 mod input_metadata;
 mod layer_kv_pool;
 mod paged_kv_cache;
+pub mod profile;
 mod scheduler;
 mod token_tracker;
 

@@ -506,7 +506,7 @@ mod tests {
         // Even with non-null pointers this should fail at the dtype
         // parse step. Use `1` as a placeholder pointer to force the
         // null check to pass.
-        let dummy: *mut c_void = 1 as *mut c_void;
+        let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
         let rc = unsafe {
             mlx_paged_attn_reshape_and_cache_dispatch(
                 dummy, dummy, dummy, 0, dummy, 0, dummy, 0, 1, 4, 64, 16, 8, 99, 1.0, 1.0,
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn x_pack_disagreement_returns_error() {
-        let dummy: *mut c_void = 1 as *mut c_void;
+        let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
         // Fp16 expects x_pack = 8; pass 16 to trigger the disagreement
         // check.
         let rc = unsafe {

@@ -330,7 +330,7 @@ fn round_trip_k_v_through_shim() {
 fn fp8_scale_plumbing_rejects_wrong_x_pack() {
     // Use dummy non-null pointers; the shim's validation should
     // reject before it dereferences them.
-    let dummy: *mut c_void = 1 as *mut c_void;
+    let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
 
     // FP8 with x_pack = 8 is a contradiction (FP8 requires x=16).
     let rc = unsafe {
@@ -651,7 +651,7 @@ fn fp8_dispatch_uses_runtime_scales() {
 /// primitive's `eval_gpu` to the Rust shim's parameter validation.
 #[test]
 fn paged_attention_shim_rejects_zero_context() {
-    let dummy: *mut c_void = 1 as *mut c_void;
+    let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
     let rc = unsafe {
         mlx_paged_attn::mlx_paged_attn_paged_attention_dispatch(
             dummy, 0, dummy, dummy, dummy, dummy, dummy, 0, /*num_seqs=*/ 1,
@@ -897,7 +897,7 @@ fn paged_attention_shim_rejects_sliding_window() {
     // Independent extern-C-side guard: even if some caller bypasses
     // the C++ factory's rejection (e.g. constructs a primitive
     // directly) the shim will refuse a nonzero sliding_window.
-    let dummy: *mut c_void = 1 as *mut c_void;
+    let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
     let rc = unsafe {
         mlx_paged_attn::mlx_paged_attn_paged_attention_dispatch(
             dummy, 0, dummy, dummy, dummy, dummy, dummy, 0, /*num_seqs=*/ 1,
@@ -1728,19 +1728,19 @@ fn compile_cached_paged_attention_rejects_non_contiguous() {
 /// the helper now distinguishes graph-construction rejection from
 /// eval_gpu rejection so a pre-eval throw can no longer masquerade as
 /// success. Return codes:
-///   *  `1`  — eval threw `std::invalid_argument` AND the message
-///             contains the eval_gpu validator context. **Pass.**
-///   *  `0`  — eval did not throw at all. Bad scalar state was
-///             silently accepted. **Fail.**
-///   *  `2`  — graph construction threw `std::invalid_argument`
-///             BEFORE eval ran. The helper's structurally-valid inputs
-///             should never trigger this — internal helper bug. **Fail.**
-///   * `-1`  — non-`std::invalid_argument` exception in either step.
-///             **Fail.**
-///   * `-2`  — eval threw `std::invalid_argument` but the message did
-///             not contain the eval_gpu validator context. The throw
-///             came from somewhere other than the validator we are
-///             exercising. **Fail.**
+///
+/// - `1` — eval threw `std::invalid_argument` AND the message contains
+///   the eval_gpu validator context. **Pass.**
+/// - `0` — eval did not throw at all. Bad scalar state was silently
+///   accepted. **Fail.**
+/// - `2` — graph construction threw `std::invalid_argument` BEFORE eval
+///   ran. The helper's structurally-valid inputs should never trigger
+///   this — internal helper bug. **Fail.**
+/// - `-1` — non-`std::invalid_argument` exception in either step.
+///   **Fail.**
+/// - `-2` — eval threw `std::invalid_argument` but the message did not
+///   contain the eval_gpu validator context. The throw came from
+///   somewhere other than the validator we are exercising. **Fail.**
 fn assert_eval_gpu_rejects_bad_state(rc: i32, scenario: &str) {
     match rc {
         1 => {} // success

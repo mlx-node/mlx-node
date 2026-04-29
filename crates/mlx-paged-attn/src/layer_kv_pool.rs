@@ -36,6 +36,33 @@ use crate::metal::MetalDtype;
 #[cfg(target_os = "macos")]
 use metal::Buffer;
 
+/// Convert a `MetalDtype` to the matching `BridgeDType` code understood by
+/// `mlx_array_from_metal_buffer_view`. Mirrors the enum in
+/// `crates/mlx-sys/src/mlx_common.h`:
+/// - `FLOAT32 = 0`
+/// - `FLOAT16 = 2`
+/// - `BFLOAT16 = 3`
+/// - `UINT8 = 5`
+///
+/// Float32 is rejected here too — `LayerKVPool::new` already rejects it
+/// at construction, but having this match defends against any future
+/// caller that bypasses the pool.
+#[allow(dead_code)] // Used only on macOS for the array-view helpers.
+fn bridge_dtype_code(dtype: MetalDtype) -> Result<i32, String> {
+    Ok(match dtype {
+        MetalDtype::Float16 => 2,
+        MetalDtype::BFloat16 => 3,
+        MetalDtype::UChar => 5,
+        MetalDtype::Float32 => {
+            return Err(
+                "bridge_dtype_code: Float32 cache dtype is not supported (no kernel \
+                 instantiation)"
+                    .to_string(),
+            );
+        }
+    })
+}
+
 /// Shared per-layer Metal KV-cache buffer pool.
 ///
 /// On non-macOS targets this compiles to a no-op stub so the rest of the
@@ -340,6 +367,151 @@ impl LayerKVPool {
     #[cfg(target_os = "macos")]
     pub fn value_cache(&self, layer_idx: u32) -> Option<&Buffer> {
         self.layers.get(layer_idx as usize).map(|(_, v)| v)
+    }
+
+    /// Wrap the K cache buffer for `layer_idx` as a zero-copy MLX `array`
+    /// view, suitable for use as an input to a compiled forward graph
+    /// (Phase 3+).
+    ///
+    /// Shape: `[num_blocks, num_kv_heads, head_size/x, block_size, x]`
+    /// (vLLM K layout; matches `LayerKVPool::new`'s allocation).
+    /// Dtype: `cache_dtype` (Float16 / BFloat16 / UChar).
+    /// Element layout is the kernel's on-GPU layout — callers writing
+    /// in-place via `PagedKVWrite` must match.
+    ///
+    /// The returned pointer is owned by the caller; drop it via
+    /// `mlx_array_delete` (the typical wrapper is `MxArray::from_handle`,
+    /// which calls delete on Drop). The underlying Metal buffer is NOT
+    /// released — the array uses a no-op deleter so the pool remains the
+    /// sole owner of the buffer.
+    ///
+    /// Returns `Err` if:
+    /// - `layer_idx` is out of range
+    /// - Metal extraction is not supported on this host
+    /// - the FFI call fails to build the array
+    ///
+    /// # Safety
+    /// The pool MUST outlive every array view returned by this method.
+    /// Dropping the pool while an array view is live is undefined
+    /// behaviour — the array's MTL::Buffer pointer becomes dangling.
+    /// In practice the adapter holds `Arc<LayerKVPool>` so the pool
+    /// stays alive while any adapter references it.
+    #[cfg(target_os = "macos")]
+    pub fn key_cache_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
+        use crate::metal::is_metal_extraction_supported;
+        use metal::foreign_types::ForeignType;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        if layer_idx as usize >= self.layers.len() {
+            return Err(format!(
+                "LayerKVPool::key_cache_array_raw: layer_idx {} out of range \
+                 (num_layers = {})",
+                layer_idx,
+                self.layers.len()
+            ));
+        }
+        let (key_cache, _) = &self.layers[layer_idx as usize];
+
+        let (_element_size, x) = Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype)?;
+        let dims = self.key_cache_shape(x);
+        let dtype_code = bridge_dtype_code(self.cache_dtype)?;
+
+        // SAFETY: `key_cache` is owned by this pool and lives at least
+        // until `&self` becomes invalid; the FFI call wraps the buffer
+        // pointer with a no-op deleter so the array does NOT free the
+        // buffer on Drop.
+        let arr = unsafe {
+            mlx_sys::mlx_array_from_metal_buffer_view(
+                key_cache.as_ptr() as *mut _,
+                dims.as_ptr(),
+                dims.len(),
+                dtype_code,
+            )
+        };
+        if arr.is_null() {
+            return Err(
+                "mlx_array_from_metal_buffer_view returned null (Metal unavailable or invalid dtype)"
+                    .to_string(),
+            );
+        }
+        Ok(arr)
+    }
+
+    /// Wrap the V cache buffer for `layer_idx` as a zero-copy MLX `array`
+    /// view. Shape: `[num_blocks, num_kv_heads, head_size, block_size]`
+    /// (vLLM V layout). See [`Self::key_cache_array_raw`] for ownership
+    /// semantics.
+    #[cfg(target_os = "macos")]
+    pub fn value_cache_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
+        use crate::metal::is_metal_extraction_supported;
+        use metal::foreign_types::ForeignType;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        if layer_idx as usize >= self.layers.len() {
+            return Err(format!(
+                "LayerKVPool::value_cache_array_raw: layer_idx {} out of range \
+                 (num_layers = {})",
+                layer_idx,
+                self.layers.len()
+            ));
+        }
+        let (_, value_cache) = &self.layers[layer_idx as usize];
+
+        let dims = self.value_cache_shape();
+        let dtype_code = bridge_dtype_code(self.cache_dtype)?;
+
+        // SAFETY: as `key_cache_array_raw`.
+        let arr = unsafe {
+            mlx_sys::mlx_array_from_metal_buffer_view(
+                value_cache.as_ptr() as *mut _,
+                dims.as_ptr(),
+                dims.len(),
+                dtype_code,
+            )
+        };
+        if arr.is_null() {
+            return Err(
+                "mlx_array_from_metal_buffer_view returned null (Metal unavailable or invalid dtype)"
+                    .to_string(),
+            );
+        }
+        Ok(arr)
+    }
+
+    /// Compute the K cache view shape for `layer_idx`. `x` is the
+    /// kernel-pack factor (8 for non-FP8, 16 for FP8). Pure CPU — pulled
+    /// out so unit tests can verify shape correctness without a Metal
+    /// host.
+    pub fn key_cache_shape(&self, x: u32) -> [i64; 5] {
+        [
+            self.num_blocks as i64,
+            self.config.num_kv_heads as i64,
+            (self.config.head_size / x) as i64,
+            self.config.block_size as i64,
+            x as i64,
+        ]
+    }
+
+    /// Compute the V cache view shape for `layer_idx`. Pure CPU — pulled
+    /// out so unit tests can verify shape correctness without a Metal
+    /// host.
+    pub fn value_cache_shape(&self) -> [i64; 4] {
+        [
+            self.num_blocks as i64,
+            self.config.num_kv_heads as i64,
+            self.config.head_size as i64,
+            self.config.block_size as i64,
+        ]
+    }
+
+    /// Compute the kernel-pack factor `x` (8 for FP16/BF16, 16 for FP8).
+    /// Mirrors `cache_dtype_layout` but only returns `x`.
+    pub fn cache_pack_factor(&self) -> Result<u32, String> {
+        Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype).map(|(_, x)| x)
     }
 
     /// Dispatch the `reshape_and_cache` kernel to write a contiguous chunk
@@ -964,5 +1136,94 @@ mod tests {
         };
         assert_eq!(pool.cache_dtype(), MetalDtype::BFloat16);
         assert_eq!(pool.num_layers(), 2);
+    }
+
+    /// Shape helpers compute the vLLM K layout
+    /// `[num_blocks, num_kv_heads, head_size/x, block_size, x]` for a
+    /// non-FP8 (x=8) cache and the matching V layout
+    /// `[num_blocks, num_kv_heads, head_size, block_size]`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_cache_view_shapes_non_fp8() {
+        let pool = match LayerKVPool::new(base_config(2), 4, MetalDtype::BFloat16) {
+            Ok(p) => p,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_cache_view_shapes_non_fp8: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let x = pool.cache_pack_factor().expect("pack factor");
+        assert_eq!(x, 8, "non-FP8 expects x=8");
+        let k_shape = pool.key_cache_shape(x);
+        // num_blocks=4, num_kv_heads=2, head_size=64, block_size=8.
+        // head_size/x = 64/8 = 8.
+        assert_eq!(k_shape, [4, 2, 8, 8, 8]);
+        let v_shape = pool.value_cache_shape();
+        assert_eq!(v_shape, [4, 2, 64, 8]);
+    }
+
+    /// Same for the FP8 path: `x = 16`, `cache_dtype = UChar`,
+    /// `block_size = 16` (validate rejects 8 with FP8), and
+    /// `head_size/x = 64/16 = 4`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_cache_view_shapes_fp8() {
+        let cfg = PagedAttentionConfig {
+            block_size: 16,
+            use_fp8_cache: Some(true),
+            ..base_config(2)
+        };
+        let pool = match LayerKVPool::new(cfg, 4, MetalDtype::UChar) {
+            Ok(p) => p,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_cache_view_shapes_fp8: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        assert_eq!(pool.cache_pack_factor().unwrap(), 16);
+        let k_shape = pool.key_cache_shape(16);
+        // num_blocks=4, num_kv_heads=2, head_size=64, block_size=16, x=16.
+        assert_eq!(k_shape, [4, 2, 4, 16, 16]);
+        let v_shape = pool.value_cache_shape();
+        assert_eq!(v_shape, [4, 2, 64, 16]);
+    }
+
+    /// `key_cache_array_raw` / `value_cache_array_raw` round-trip a real
+    /// MLX array view that points at the per-layer Metal buffer.
+    /// We only check non-null + delete; testing the buffer pointer
+    /// equivalence requires `mlx_array_get_metal_buffer` after eval and
+    /// is covered by a higher-level integration test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_cache_array_raw_round_trip() {
+        let pool = match LayerKVPool::new(base_config(2), 4, MetalDtype::BFloat16) {
+            Ok(p) => p,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_cache_array_raw_round_trip: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let k = pool.key_cache_array_raw(0).expect("key view");
+        assert!(!k.is_null());
+        unsafe { mlx_sys::mlx_array_delete(k) };
+
+        let v = pool.value_cache_array_raw(0).expect("value view");
+        assert!(!v.is_null());
+        unsafe { mlx_sys::mlx_array_delete(v) };
+
+        // Out-of-range layer
+        let oob = pool.key_cache_array_raw(99);
+        assert!(oob.is_err());
+    }
+
+    #[test]
+    fn test_bridge_dtype_code_table() {
+        assert_eq!(bridge_dtype_code(MetalDtype::Float16).unwrap(), 2);
+        assert_eq!(bridge_dtype_code(MetalDtype::BFloat16).unwrap(), 3);
+        assert_eq!(bridge_dtype_code(MetalDtype::UChar).unwrap(), 5);
+        assert!(bridge_dtype_code(MetalDtype::Float32).is_err());
     }
 }

@@ -673,6 +673,36 @@ unsafe extern "C-unwind" {
     pub fn mlx_set_cache_limit(limit: usize) -> usize;
     pub fn mlx_array_nbytes(handle: *mut mlx_array) -> usize;
 
+    // Total physical system memory in bytes (Apple Silicon: unified memory
+    // shared with the GPU). On macOS this matches `device_info()["memory_size"]`
+    // and is sourced from `sysctlbyname("hw.memsize")` so it works
+    // regardless of Metal availability. Returns 0 on unsupported
+    // platforms — the Rust profile.rs auto-sizer surfaces ProfileError
+    // when this is 0.
+    pub fn mlx_total_system_memory() -> usize;
+
+    // GPU-visible working-set bound (`MTLDevice
+    // recommendedMaxWorkingSetSize`). 0 if Metal unavailable.
+    pub fn mlx_max_recommended_working_set_size() -> usize;
+
+    // Wrap an existing MTL::Buffer (`void*` MTLBuffer pointer — the same
+    // shape `mlx_array_get_metal_buffer` returns) as an MLX `array` view.
+    // Zero-copy: the deleter is a no-op so dropping the resulting array
+    // does NOT free the buffer. Caller (typically LayerKVPool) retains
+    // ownership and must keep the buffer alive for the array's lifetime.
+    //
+    // - `metal_buffer_ptr`: MTL::Buffer* as `void*`
+    // - `dims`/`ndim`: view shape (caller validates element-count vs
+    //   buffer length)
+    // - `dtype_code`: BridgeDType (FLOAT16/BFLOAT16/UINT8/etc.)
+    // Returns null on unsupported platforms / null buffer / invalid args.
+    pub fn mlx_array_from_metal_buffer_view(
+        metal_buffer_ptr: *mut std::ffi::c_void,
+        dims: *const i64,
+        ndim: usize,
+        dtype_code: i32,
+    ) -> *mut mlx_array;
+
     // Fused generation loop - entire generation in one FFI call
     // This matches mlx-lm's async pipelining pattern for maximum performance
     pub fn mlx_qwen3_generate(

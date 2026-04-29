@@ -31,6 +31,62 @@ struct mlx_stream {
   int32_t device_type;  // 0 = CPU, 1 = GPU
 };
 
+namespace mlx::core::fast::paged {
+
+// Standardized metadata that EVERY paged-attention model's compiled forward
+// receives. Shapes are FIXED at compile time (sentinel-padded contents); only
+// contents change per request — that's what keeps the compile cache hitting
+// across calls instead of re-tracing on every shape change.
+//
+// Phase 3 deliverable: Phases 4-9 (one per model migration) will accept a
+// `PagedAttentionInputs` parameter group from the model wrapper and route
+// every input through the same struct, so the compile-cache key stays
+// uniform across models and the metadata flow can be reasoned about in
+// one place.
+//
+// The struct is a thin POD-style aggregator — it does NOT own the arrays.
+// Callers (the Rust adapter) materialize the arrays once per request,
+// hand the struct into the compiled graph, and the arrays die with the
+// caller's stack frame. No copies, no ref counting beyond MLX's own
+// `array` machinery.
+struct PagedAttentionInputs {
+  // Global token position of the first new token in this request, broadcast
+  // as a `[1]` int32 array so the compile cache treats it as a tracer rather
+  // than a fixed scalar (matches the per-request `offset` array threaded
+  // through `mlx_qwen35.cpp` today).
+  array offset_arr;
+
+  // Per-request block table, sentinel-padded with -1 to a fixed
+  // `[1, max_blocks_per_seq]` int32 shape. The kernel reads
+  // `block_table[seq_idx, block_idx]` and uses -1 entries as a dispatch-time
+  // skip signal (validated by `paged_attention` factory).
+  array block_table;
+
+  // Per-token slot mapping for the current write chunk, sentinel-padded with
+  // -1 to a fixed `[chunk_size_max]` int64 shape. The kernel reads
+  // `slot_mapping[token_idx]` and computes `block_id = slot / block_size`
+  // for the K/V write target. Sentinel slots are skipped on dispatch
+  // (validated factory-side).
+  array slot_mapping;
+
+  // Valid prefix length of `slot_mapping` (so the write kernel knows how
+  // many tokens of the padded chunk are real). `[1]` int32.
+  array num_valid_tokens;
+
+  // Valid prefix length of `block_table` (so the gather kernel knows how
+  // many blocks of the padded table are real). `[1]` int32.
+  array num_valid_blocks;
+
+  // Total context length so far for this single-request adapter (= number of
+  // tokens already recorded after the chunk being written), threaded as a
+  // `[1]` int32 array so the kernel reads `context_lens[seq_idx=0]` from
+  // the right place. Mirrors vLLM's `seq_lens` argument to the
+  // `paged_attention` kernel (one entry per dispatched sequence).
+  array seq_lens;
+};
+
+}  // namespace mlx::core::fast::paged
+
 namespace {
 using mlx::core::add;
 using mlx::core::arange;
