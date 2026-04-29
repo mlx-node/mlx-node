@@ -1893,6 +1893,31 @@ impl PagedKVCacheAdapter {
     pub fn value_pool_array(&self, _layer_idx: u32) -> Result<MxArray, String> {
         Err("value_pool_array is only supported on macOS (Metal backend)".to_string())
     }
+
+    /// Return a `[1]` fp32 placeholder K scale for `layer_idx`.
+    ///
+    /// Phase 4 prerequisite: the new `mlx_qwen35_moe_forward_paged` graph
+    /// (and its sister graphs in subsequent model migrations) needs a per-
+    /// layer `k_scale` MxArray to thread into `paged_kv_write` and
+    /// `paged_attention`. Phase 10 will swap this for a real FP8 calibration
+    /// scale; until then we ship a `1.0f32` placeholder that the kernels
+    /// treat as a no-op.
+    ///
+    /// `layer_idx` is currently unused (every layer uses the same placeholder)
+    /// but is taken for symmetry with `key_pool_array` so callers can cleanly
+    /// migrate to per-layer scales when calibration lands.
+    pub fn k_scale_array(&self, _layer_idx: u32) -> Result<MxArray, String> {
+        MxArray::from_float32(&[1.0f32], &[1])
+            .map_err(|e| format!("k_scale_array: failed to build placeholder: {e}"))
+    }
+
+    /// Return a `[1]` fp32 placeholder V scale for `layer_idx`. See
+    /// [`Self::k_scale_array`] for the placeholder rationale and Phase 10
+    /// migration path.
+    pub fn v_scale_array(&self, _layer_idx: u32) -> Result<MxArray, String> {
+        MxArray::from_float32(&[1.0f32], &[1])
+            .map_err(|e| format!("v_scale_array: failed to build placeholder: {e}"))
+    }
 }
 
 /// Compute per-block `extra_keys` for image-aware prefix hashing.
@@ -4490,6 +4515,50 @@ mod tests {
         assert_eq!(inputs.slot_mapping.shape_at(0).unwrap(), 16);
 
         adapter.release_request().unwrap();
+    }
+
+    /// Phase 4 Q4 prerequisite: `k_scale_array` / `v_scale_array` return a
+    /// `[1]` fp32 placeholder that the upcoming compiled paged decode will
+    /// thread into `paged_kv_write` / `paged_attention`. Until FP8
+    /// calibration lands (Phase 10) the kernels treat 1.0 as a no-op, so
+    /// the unit test pins:
+    /// - shape `[1]` and dtype `Float32` (the strict factory contract;
+    ///   wrong shape/dtype throws at the C++ factory),
+    /// - layer-index independence (every layer currently uses the same
+    ///   placeholder; a future per-layer scale will wire through
+    ///   `layer_idx`).
+    ///
+    /// The factory-contract pinning here is what lets the upstream
+    /// migration commit deletes-and-replaces the old non-paged FFI
+    /// without re-discovering shape/dtype invariants by trial-and-error
+    /// on a real model run.
+    #[test]
+    fn k_v_scale_arrays_are_fp32_one_placeholders() {
+        let allocator = new_allocator(8, 16);
+        let Some(adapter) = maybe_adapter(allocator, 16) else {
+            eprintln!("skipping k_v_scale_arrays test: Metal device unavailable");
+            return;
+        };
+        for layer_idx in 0..2u32 {
+            let k = adapter
+                .k_scale_array(layer_idx)
+                .expect("k_scale_array must succeed");
+            let v = adapter
+                .v_scale_array(layer_idx)
+                .expect("v_scale_array must succeed");
+            let k_ndim = k.ndim().expect("k_scale ndim");
+            let v_ndim = v.ndim().expect("v_scale ndim");
+            assert_eq!(k_ndim, 1, "k_scale must be rank 1");
+            assert_eq!(v_ndim, 1, "v_scale must be rank 1");
+            let k_dim0 = k.shape_at(0).expect("k_scale shape_at(0)");
+            let v_dim0 = v.shape_at(0).expect("v_scale shape_at(0)");
+            assert_eq!(k_dim0, 1, "k_scale must have shape [1]");
+            assert_eq!(v_dim0, 1, "v_scale must have shape [1]");
+            let k_dtype = k.dtype().expect("k_scale dtype");
+            let v_dtype = v.dtype().expect("v_scale dtype");
+            assert_eq!(k_dtype, DType::Float32, "k_scale must be float32");
+            assert_eq!(v_dtype, DType::Float32, "v_scale must be float32");
+        }
     }
 }
 
