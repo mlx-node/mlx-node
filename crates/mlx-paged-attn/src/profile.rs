@@ -77,13 +77,25 @@ pub enum ProfileError {
     /// or device init failed). The auto-sizer cannot proceed because
     /// reading peak memory and the working-set bound require a live
     /// `MetalAllocator`. Caller should fall back to a static heuristic.
+    ///
     /// We surface this as a separate variant from `TotalMemoryUnavailable`
     /// because the diagnostic is materially different — sysctl SUCCEEDED,
-    /// the GPU is just unreachable. Surfacing the variant also prevents
-    /// the underlying C++ shims (`mlx_get_peak_memory`,
-    /// `mlx_reset_peak_memory`, ...) from being called: those wrap their
-    /// internals in catch-all but they still emit cerr noise on every
-    /// call when Metal init fails.
+    /// the GPU is just unreachable.
+    ///
+    /// Two routes can produce this variant:
+    ///   1. The fast-path `mlx_metal_is_available()` gate returns false
+    ///      before we touch any memory FFI (clean — no cerr noise).
+    ///   2. A memory FFI shim (`mlx_get_peak_memory`,
+    ///      `mlx_reset_peak_memory`, etc.) returns -1 because its
+    ///      internal C++ call threw and was caught. This catches the
+    ///      degraded-Metal case where `mlx_metal_is_available()` somehow
+    ///      reports true but the allocator construction still throws —
+    ///      previously the fallible contract handled this by returning
+    ///      the ambiguous sentinel `0`, which the auto-sizer then
+    ///      consumed as a real "peak=0" measurement and oversized the
+    ///      KV pool to billions of blocks. The new contract treats -1
+    ///      as MetalUnavailable so the auto-sizer can short-circuit
+    ///      cleanly.
     MetalUnavailable,
     /// `MLX_KV_MEMORY_UTILIZATION` parsed but outside `(0.0, 1.0]`. The
     /// value rounds to zero or exceeds total — neither is meaningful.
@@ -293,14 +305,18 @@ pub fn compute_num_blocks_from_measurements(
 /// Probe MLX/Metal for the total system memory budget. On macOS reads
 /// `mlx_total_system_memory()` (= `sysctl hw.memsize`); on other platforms
 /// returns `Err(TotalMemoryUnavailable)`.
+///
+/// Uses the fallible-FFI contract: a -1 return from the C++ shim becomes
+/// `TotalMemoryUnavailable` (sysctl failed or the call threw).
 fn read_total_memory_bytes() -> Result<u64, ProfileError> {
     #[cfg(target_os = "macos")]
     {
-        let total = unsafe { mlx_sys::mlx_total_system_memory() };
-        if total == 0 {
+        let mut total: u64 = 0;
+        let rc = unsafe { mlx_sys::mlx_total_system_memory(&mut total) };
+        if rc != 0 || total == 0 {
             return Err(ProfileError::TotalMemoryUnavailable);
         }
-        Ok(total as u64)
+        Ok(total)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -321,12 +337,13 @@ fn read_total_memory_bytes() -> Result<u64, ProfileError> {
 /// Returns `None` when:
 /// - Metal is unavailable (CPU-only build, no GPU);
 /// - the device_info map doesn't have `max_recommended_working_set_size`;
-/// - the C++ helper returns 0 for any reason (defensive: the caller
+/// - the C++ helper threw and returned -1 (defensive: the caller
 ///   then falls back to the physical-RAM budget).
 #[cfg(target_os = "macos")]
 fn read_working_set_bytes() -> Option<u64> {
-    let ws = unsafe { mlx_sys::mlx_max_recommended_working_set_size() };
-    if ws == 0 { None } else { Some(ws as u64) }
+    let mut ws: u64 = 0;
+    let rc = unsafe { mlx_sys::mlx_max_recommended_working_set_size(&mut ws) };
+    if rc != 0 || ws == 0 { None } else { Some(ws) }
 }
 
 /// Pure-formula step that combines the physical-RAM budget with the
@@ -409,17 +426,41 @@ pub fn compute_num_blocks_with_working_set(
 /// Reset the MLX peak-memory counter. Called immediately before the
 /// caller's dummy forward so the post-forward `mlx_get_peak_memory()` read
 /// reflects only the model's max footprint during one max-seq forward.
+///
+/// Returns `Err(MetalUnavailable)` if the C++ shim caught an exception
+/// (-1 return). This is the failure mode the bug report flagged: previously
+/// this was an infallible `()` return that swallowed exceptions through
+/// the catch-all into a no-op, leaving the peak counter undefined and
+/// letting the auto-sizer consume an unrelated stale value as a real
+/// measurement.
 #[cfg(target_os = "macos")]
-fn reset_peak_memory() {
-    unsafe { mlx_sys::mlx_reset_peak_memory() };
+fn reset_peak_memory() -> Result<(), ProfileError> {
+    let rc = unsafe { mlx_sys::mlx_reset_peak_memory() };
+    if rc != 0 {
+        return Err(ProfileError::MetalUnavailable);
+    }
+    Ok(())
 }
 
 /// Read MLX's peak memory counter (in bytes). Includes weights +
 /// activations + intermediate buffers — everything the allocator counted
 /// as "in flight at once" since the last `mlx_reset_peak_memory()`.
+///
+/// Returns `Err(MetalUnavailable)` if the C++ shim caught an exception
+/// (-1 return). This is the critical failure path the bug report flagged:
+/// previously the caller would consume the ambiguous sentinel `0` from a
+/// caught exception as a real "peak=0 MiB" measurement, oversizing the
+/// KV pool to billions of blocks. The fallible-FFI contract makes the
+/// failure observable and the auto-sizer short-circuits with a clean
+/// `MetalUnavailable` instead.
 #[cfg(target_os = "macos")]
-fn read_peak_memory() -> u64 {
-    unsafe { mlx_sys::mlx_get_peak_memory() as u64 }
+fn read_peak_memory() -> Result<u64, ProfileError> {
+    let mut peak: u64 = 0;
+    let rc = unsafe { mlx_sys::mlx_get_peak_memory(&mut peak) };
+    if rc != 0 {
+        return Err(ProfileError::MetalUnavailable);
+    }
+    Ok(peak)
 }
 
 /// Run a caller-supplied dummy forward, measure peak memory, and compute
@@ -477,18 +518,29 @@ where
 
     #[cfg(target_os = "macos")]
     {
-        // GUARD: sysctl(`hw.memsize`) succeeds even on macOS hosts where
-        // Metal is unavailable (CPU-only MLX build, no GPU, sandbox
-        // without IOAccelerator, virtualized environment). The downstream
-        // `reset_peak_memory` / `read_peak_memory` / `read_working_set_bytes`
-        // calls all resolve through `mlx::core::metal::allocator()`, which
-        // lazily constructs a `MetalAllocator` keyed off `device(Device::gpu)`
-        // — and that constructor THROWS when the GPU device cannot be
-        // created. Those C++ shims are now wrapped in catch-all (so the
-        // process no longer aborts on the FFI boundary), but the cleaner
-        // contract is to surface `MetalUnavailable` to the caller before
-        // we even attempt the call. Avoids cerr noise from each catch-all
-        // and lets the caller fall back to a static heuristic deterministically.
+        // FAST-PATH GUARD: sysctl(`hw.memsize`) succeeds even on macOS
+        // hosts where Metal is unavailable (CPU-only MLX build, no GPU,
+        // sandbox without IOAccelerator, virtualized environment). The
+        // downstream `reset_peak_memory` / `read_peak_memory` /
+        // `read_working_set_bytes` calls all resolve through
+        // `mlx::core::metal::allocator()`, which lazily constructs a
+        // `MetalAllocator` keyed off `device(Device::gpu)` — and that
+        // constructor THROWS when the GPU device cannot be created.
+        //
+        // The fallible-FFI contract on those shims now turns a caught
+        // exception into a -1 return, which `reset_peak_memory()` /
+        // `read_peak_memory()` translate into
+        // `ProfileError::MetalUnavailable`. So the auto-sizer is safe
+        // even without this fast-path gate: the bug fix removed the
+        // possibility of consuming a sentinel-zero as a real measurement.
+        //
+        // We keep the gate anyway as an optimization — when Metal init
+        // is known-broken upfront we avoid one exception throw + cerr
+        // line per memory call (the catch-all fallback is correct but
+        // noisy). When the gate is bypassed (degraded-Metal host where
+        // `mlx_metal_is_available()` lies and reports true), the
+        // fallible contract still catches the failure cleanly through
+        // `read_peak_memory`'s `Err` propagation below.
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
             // Run the dummy forward closure with the supplied max_seq so
             // platform-portable model-loading bugs surface deterministically
@@ -500,9 +552,16 @@ where
             return Err(ProfileError::MetalUnavailable);
         }
 
-        reset_peak_memory();
+        // The fallible memory FFI catches the degraded-Metal case where
+        // `mlx_metal_is_available()` returned true but the underlying
+        // allocator init still throws. `?` propagates `MetalUnavailable`
+        // immediately — we MUST NOT proceed with a stale or zero peak
+        // (the bug report's scenario: peak_non_kv = 0 MiB +
+        // working_set_bytes = none → the formula treats it as a real
+        // measurement and oversizes the KV pool to millions of blocks).
+        reset_peak_memory()?;
         dummy_forward(max_position_embeddings).map_err(ProfileError::DummyForwardFailed)?;
-        let peak = read_peak_memory();
+        let peak = read_peak_memory()?;
         // Clamp against MLX's recommended working-set bound. Apple Silicon
         // reports ~75% of unified memory as the upper bound MTLDevice will
         // happily commit — past that we get `MTLBuffer` allocation

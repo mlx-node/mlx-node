@@ -155,10 +155,24 @@ impl WiredLimitContext {
             );
         }
 
-        // Set wired limit to max_recommended_working_set_size
-        let old_limit = unsafe { sys::mlx_set_wired_limit(max_rec_size) };
+        // Set wired limit to max_recommended_working_set_size. The fallible
+        // shim returns -1 on degraded-Metal hosts (allocator init throws);
+        // we treat that the same as the unavailable-Metal short-circuit
+        // above and return a no-op context so `Drop` doesn't try to
+        // restore a never-set limit.
+        let mut prev: u64 = 0;
+        let rc = unsafe { sys::mlx_set_wired_limit(max_rec_size as u64, &mut prev) };
+        if rc != 0 {
+            return Self {
+                old_limit: 0,
+                streams: Vec::new(),
+            };
+        }
 
-        Self { old_limit, streams }
+        Self {
+            old_limit: prev as usize,
+            streams,
+        }
     }
 
     /// Query GPU's `max_recommended_working_set_size` in bytes.
@@ -201,9 +215,12 @@ impl Drop for WiredLimitContext {
             stream.synchronize();
         }
 
-        // Restore original wired limit
-        unsafe {
-            sys::mlx_set_wired_limit(self.old_limit);
-        }
+        // Restore original wired limit. Best-effort: ignore the fallible
+        // shim's -1 return on degraded-Metal hosts (the constructor
+        // already short-circuited to a no-op context in that case, so
+        // `old_limit` is 0 and the early-return above kicked in — this
+        // line is reachable only on success-path drops).
+        let mut _prev: u64 = 0;
+        let _rc = unsafe { sys::mlx_set_wired_limit(self.old_limit as u64, &mut _prev) };
     }
 }

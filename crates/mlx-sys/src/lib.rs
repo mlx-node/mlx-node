@@ -659,31 +659,44 @@ unsafe extern "C-unwind" {
     pub fn mlx_set_default_stream(stream: mlx_stream);
     pub fn mlx_stream_synchronize(stream: mlx_stream);
 
-    // Metal operations (for memory management)
+    // Metal operations (for memory management).
+    //
+    // Fallible-FFI contract: every memory accessor below returns `i32`
+    // (0 = success, -1 = caught C++ exception) and writes its measurement
+    // through a caller-supplied out-pointer. This replaces the prior
+    // "ambiguous sentinel `0`" contract: a real measurement of zero bytes
+    // is now distinguishable from a caught exception. See
+    // `crates/mlx-sys/src/mlx_stream.cpp` and `mlx_paged_profile.cpp`
+    // for the C++-side rationale (lazy `metal::allocator()` construction
+    // throws on no-Metal hosts; without the catch-all the unwind crosses
+    // the FFI boundary and aborts the process). Pass null `out_*` to
+    // ignore the value.
     pub fn mlx_metal_is_available() -> bool;
     pub fn mlx_metal_device_info() -> *const std::os::raw::c_char;
-    pub fn mlx_set_wired_limit(limit: usize) -> usize;
-    pub fn mlx_get_wired_limit() -> usize;
-    pub fn mlx_get_peak_memory() -> usize;
-    pub fn mlx_get_active_memory() -> usize;
-    pub fn mlx_get_cache_memory() -> usize;
-    pub fn mlx_reset_peak_memory();
-    pub fn mlx_set_memory_limit(limit: usize) -> usize;
-    pub fn mlx_get_memory_limit() -> usize;
-    pub fn mlx_set_cache_limit(limit: usize) -> usize;
+    pub fn mlx_set_wired_limit(limit: u64, out_old_limit: *mut u64) -> i32;
+    pub fn mlx_get_wired_limit(out_value: *mut u64) -> i32;
+    pub fn mlx_get_peak_memory(out_value: *mut u64) -> i32;
+    pub fn mlx_get_active_memory(out_value: *mut u64) -> i32;
+    pub fn mlx_get_cache_memory(out_value: *mut u64) -> i32;
+    pub fn mlx_reset_peak_memory() -> i32;
+    pub fn mlx_set_memory_limit(limit: u64, out_old_limit: *mut u64) -> i32;
+    pub fn mlx_get_memory_limit(out_value: *mut u64) -> i32;
+    pub fn mlx_set_cache_limit(limit: u64, out_old_limit: *mut u64) -> i32;
     pub fn mlx_array_nbytes(handle: *mut mlx_array) -> usize;
 
     // Total physical system memory in bytes (Apple Silicon: unified memory
     // shared with the GPU). On macOS this matches `device_info()["memory_size"]`
     // and is sourced from `sysctlbyname("hw.memsize")` so it works
-    // regardless of Metal availability. Returns 0 on unsupported
-    // platforms — the Rust profile.rs auto-sizer surfaces ProfileError
-    // when this is 0.
-    pub fn mlx_total_system_memory() -> usize;
+    // regardless of Metal availability. Returns 0 on success (with value
+    // written to `out_value`), -1 if sysctl fails / non-macOS host. The
+    // Rust profile.rs auto-sizer surfaces ProfileError on -1.
+    pub fn mlx_total_system_memory(out_value: *mut u64) -> i32;
 
     // GPU-visible working-set bound (`MTLDevice
-    // recommendedMaxWorkingSetSize`). 0 if Metal unavailable.
-    pub fn mlx_max_recommended_working_set_size() -> usize;
+    // recommendedMaxWorkingSetSize`). Returns 0 on success (writes value
+    // through `out_value`); returns -1 if Metal unavailable, device_info
+    // is missing the entry, or an exception is caught.
+    pub fn mlx_max_recommended_working_set_size(out_value: *mut u64) -> i32;
 
     // Wrap an existing MTL::Buffer (`void*` MTLBuffer pointer — the same
     // shape `mlx_array_get_metal_buffer` returns) as an MLX `array` view.

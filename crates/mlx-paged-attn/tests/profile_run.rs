@@ -282,24 +282,54 @@ fn profile_run_threads_max_position_embeddings_to_closure() {
 }
 
 /// `MetalUnavailable` is surfaced WITHOUT a process abort when the
-/// underlying memory FFI would otherwise throw across the boundary.
+/// underlying memory FFI would otherwise throw across the boundary, AND
+/// the auto-sizer NEVER silently consumes a sentinel-zero peak from a
+/// caught C++ exception as if it were a real measurement.
 ///
-/// The test cannot synthesize a no-Metal environment from a Metal-equipped
-/// host, so we run on whatever host CI provides:
+/// Bug fixed: previously `mlx_get_peak_memory()` and friends returned
+/// the ambiguous sentinel `0` from a caught C++ exception, indistinguishable
+/// from a legitimate "0 bytes peak" reading. On a degraded-Metal host
+/// (where `mlx_metal_is_available()` somehow reports true but the
+/// downstream `MetalAllocator` constructor still throws), the auto-sizer
+/// would log `peak_non_kv 0 MiB` and return through the success path
+/// with millions of blocks — silently oversizing the KV pool to billions
+/// of pages, which then fail later during serving with MTLBuffer
+/// allocation errors.
 ///
-/// - On a Metal-equipped host: the function does NOT return
-///   `MetalUnavailable` (it returns Ok or another error). The test still
-///   passes — the regression we guard against is "process abort", which
-///   can only happen on the no-Metal path. A Metal-equipped host never
-///   exercises that path.
-/// - On a no-Metal host: the function returns `MetalUnavailable` cleanly,
-///   the closure was invoked exactly once, and the process did NOT abort.
-///   The test asserts both.
+/// The fallible-FFI contract fixes this STRUCTURALLY: each memory shim
+/// now returns -1 on caught exception, and the Rust caller `?`-propagates
+/// the failure as `ProfileError::MetalUnavailable`. There is no longer
+/// a code path through the auto-sizer that consumes a caught-exception
+/// peak as a real measurement.
 ///
-/// Either way the test exits with status code 0 — the bug we are
-/// regressing is a fatal abort, which would prevent ANY assertion from
-/// running. Reaching the assertions at all is itself the regression
-/// guard.
+/// What this test verifies given the test cannot synthesize a degraded-
+/// Metal environment from a Metal-equipped host:
+///
+/// - The process does NOT abort at any point. A foreign-exception unwind
+///   would have killed the binary before reaching the `match` below;
+///   reaching the assertions is itself the regression guard for the
+///   `Rust cannot catch foreign exceptions` abort.
+/// - The result is exactly one of the documented variants. There is no
+///   silent-success path: any caught C++ exception is funneled through
+///   `read_peak_memory()` / `reset_peak_memory()` returning `Err(...)`,
+///   which the auto-sizer `?`-propagates.
+/// - On no-Metal hosts (CI runners without GPU): we get `MetalUnavailable`
+///   AND the closure was invoked exactly once with the supplied
+///   `max_position_embeddings`.
+/// - On Metal-equipped hosts: the auto-sizer returns `Ok` (with a
+///   `num_blocks > 0` derived from whatever `peak_non_kv` was real on
+///   the host — for this test's no-op dummy forward, that's typically
+///   close to zero MiB plus whatever the host already had loaded; the
+///   resulting `num_blocks` can legitimately be in the millions and
+///   that's NOT the regression we're guarding against). Or it returns
+///   one of the expected explicit-error variants.
+///
+/// The test does NOT and cannot bound `num_blocks` on the success path
+/// because a no-op closure produces a legitimate near-zero `peak`, and
+/// the bug being regressed isn't "millions of blocks per se" — it's
+/// "a caught exception silently became a peak measurement". With the
+/// fallible-FFI contract, a caught exception ALWAYS surfaces as `Err`,
+/// so a successful `Ok` necessarily came from a real measurement.
 #[test]
 fn profile_run_no_metal_returns_metal_unavailable_without_abort() {
     let observed = Arc::new(AtomicU32::new(0));
@@ -325,15 +355,49 @@ fn profile_run_no_metal_returns_metal_unavailable_without_abort() {
     // Reaching this assertion proves the FFI did not abort the process.
     // (A foreign-exception unwind would have killed the test binary
     // before this line.)
-    if matches!(res, Err(ProfileError::MetalUnavailable)) {
-        // No-Metal path took the early return — must have invoked
-        // the closure exactly once with the supplied max_seq.
-        assert_eq!(observed.load(Ordering::SeqCst), 9999);
-        assert_eq!(invoke_count.load(Ordering::SeqCst), 1);
+    match res {
+        Ok(num_blocks) => {
+            // Metal-equipped host or successful no-op closure: the
+            // fallible-FFI contract guarantees this `Ok` came from a
+            // real `peak_non_kv` measurement, not a caught-exception
+            // sentinel. Assert at least one block — anything zero
+            // would imply a silent path through `compute_num_blocks_*`
+            // that the math layer is supposed to reject explicitly.
+            assert!(
+                num_blocks > 0,
+                "auto-sizer returned 0 blocks on the success path \
+                 (math layer should have surfaced NotEnoughBlocks instead)"
+            );
+            // Closure must have been invoked exactly once on the
+            // success path too — the auto-sizer threads the supplied
+            // max_seq into the closure as part of measuring peak,
+            // and a Metal-present host runs through reset → forward → read.
+            assert_eq!(observed.load(Ordering::SeqCst), 9999);
+            assert_eq!(invoke_count.load(Ordering::SeqCst), 1);
+        }
+        Err(ProfileError::MetalUnavailable) => {
+            // No-Metal / degraded-Metal path took the early return.
+            // The closure was invoked once for the platform-portable
+            // model-loading bug surfacing path, with the supplied
+            // max_seq.
+            assert_eq!(observed.load(Ordering::SeqCst), 9999);
+            assert_eq!(invoke_count.load(Ordering::SeqCst), 1);
+        }
+        Err(ProfileError::TotalMemoryUnavailable) => {
+            // Non-macOS host (sysctl unavailable). On non-macOS the
+            // auto-sizer invokes the closure once before returning.
+            // No silent-success path.
+        }
+        Err(ProfileError::InsufficientMemory { .. })
+        | Err(ProfileError::NotEnoughBlocks { .. }) => {
+            // Tiny dummy forward + tight budget rejection — both
+            // explicit-error variants. The closure was invoked.
+            assert_eq!(invoke_count.load(Ordering::SeqCst), 1);
+        }
+        Err(other) => {
+            panic!("unexpected error variant: {other:?}");
+        }
     }
-    // Otherwise: Metal-equipped host, the no-Metal path was not
-    // exercised. No abort already proves the C++ catch-all guard is
-    // intact end-to-end on whatever host this is.
 }
 
 /// Closure failure propagates verbatim to ProfileError::DummyForwardFailed

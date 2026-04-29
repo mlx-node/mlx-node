@@ -38,28 +38,35 @@ extern "C" {
 // when Metal is available; we read sysctl directly so the call works on
 // pre-MLX-init paths and on no-Metal hosts.
 //
-// Returns 0 on unsupported platforms or if sysctl fails — the Rust profile
-// caller treats 0 as "memory APIs unavailable" and surfaces ProfileError.
+// Fallible-FFI contract: returns 0 on success and writes the value through
+// `out_value`. Returns -1 if sysctl fails or an exception is caught
+// (`out_value` is left untouched on failure). The Rust profile caller
+// surfaces `ProfileError::TotalMemoryUnavailable` on -1 (or on a successful
+// 0 from a non-macOS host).
 //
 // Wrapped in a catch-all so any unexpected failure (sysctl currently never
 // throws, but this is defense-in-depth: future MLX changes could add a
 // memory-size helper that does) cannot unwind across the FFI boundary
 // into Rust — that would abort the process via "Rust cannot catch
 // foreign exceptions".
-size_t mlx_total_system_memory() {
+int32_t mlx_total_system_memory(uint64_t* out_value) {
 #if defined(__APPLE__)
   try {
     size_t memsize = 0;
     size_t length = sizeof(memsize);
     if (sysctlbyname("hw.memsize", &memsize, &length, nullptr, 0) != 0) {
-      return 0;
+      return -1;
     }
-    return memsize;
-  } catch (...) {
+    if (out_value != nullptr) {
+      *out_value = static_cast<uint64_t>(memsize);
+    }
     return 0;
+  } catch (...) {
+    return -1;
   }
 #else
-  return 0;
+  (void)out_value;
+  return -1;
 #endif
 }
 
@@ -174,25 +181,35 @@ mlx_array* mlx_array_from_metal_buffer_view(
 // over-commit the system.
 //
 // The value comes from `mlx::core::gpu::device_info()["max_recommended_
-// working_set_size"]` (populated in `device_info.cpp`). Returns 0 if Metal
-// is unavailable or device_info is empty (e.g. CPU-only build); the Rust
-// caller falls back to the sysctl total in that case.
-size_t mlx_max_recommended_working_set_size() {
+// working_set_size"]` (populated in `device_info.cpp`).
+//
+// Fallible-FFI contract:
+//   - Returns 0 and writes the value through `out_value` on success.
+//   - Returns -1 if Metal is unavailable, the device_info entry is missing
+//     or has the wrong type, or any C++ exception is caught
+//     (`out_value` is left untouched on failure).
+//
+// The Rust auto-sizer caller treats -1 as "no working-set bound reported"
+// and falls back to the physical-RAM budget alone.
+int32_t mlx_max_recommended_working_set_size(uint64_t* out_value) {
   if (!mlx::core::metal::is_available()) {
-    return 0;
+    return -1;
   }
   try {
     auto& info = mlx::core::gpu::device_info(0);
     auto it = info.find("max_recommended_working_set_size");
     if (it == info.end()) {
-      return 0;
+      return -1;
     }
     if (auto* p = std::get_if<size_t>(&it->second)) {
-      return *p;
+      if (out_value != nullptr) {
+        *out_value = static_cast<uint64_t>(*p);
+      }
+      return 0;
     }
-    return 0;
+    return -1;
   } catch (...) {
-    return 0;
+    return -1;
   }
 }
 

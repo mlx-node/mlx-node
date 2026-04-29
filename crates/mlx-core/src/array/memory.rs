@@ -183,46 +183,67 @@ pub fn maybe_eval_clear_for_paged_prefill_layer(layer_idx: usize, hidden_states:
     }
 }
 
-/// Get actively used memory in bytes (excludes cached memory)
-/// Internal Rust-only function - use memoryCleanupThreshold config for memory-based cleanup
+/// Get actively used memory in bytes (excludes cached memory).
+/// Internal Rust-only function — use memoryCleanupThreshold config for
+/// memory-based cleanup.
+///
+/// Returns 0.0 when the underlying FFI shim catches a C++ exception (-1
+/// return on the fallible API). For dashboards / heuristics this is the
+/// safest fallback: a degraded-Metal host has no meaningful "active"
+/// number to report.
 pub fn get_active_memory() -> f64 {
-    unsafe { sys::mlx_get_active_memory() as f64 }
+    let mut v: u64 = 0;
+    let rc = unsafe { sys::mlx_get_active_memory(&mut v) };
+    if rc != 0 { 0.0 } else { v as f64 }
 }
 
-/// Get cache memory size in bytes
-/// Internal Rust-only function - use memoryCleanupThreshold config for memory-based cleanup
+/// Get cache memory size in bytes.
+/// Internal Rust-only function — use memoryCleanupThreshold config for
+/// memory-based cleanup. Returns 0.0 if the shim caught an exception.
 pub fn get_cache_memory() -> f64 {
-    unsafe { sys::mlx_get_cache_memory() as f64 }
+    let mut v: u64 = 0;
+    let rc = unsafe { sys::mlx_get_cache_memory(&mut v) };
+    if rc != 0 { 0.0 } else { v as f64 }
 }
 
-/// Get peak memory usage in bytes
-/// Internal Rust-only function
+/// Get peak memory usage in bytes.
+/// Internal Rust-only function. Returns 0.0 if the shim caught an
+/// exception.
 pub fn get_peak_memory() -> f64 {
-    unsafe { sys::mlx_get_peak_memory() as f64 }
+    let mut v: u64 = 0;
+    let rc = unsafe { sys::mlx_get_peak_memory(&mut v) };
+    if rc != 0 { 0.0 } else { v as f64 }
 }
 
-/// Reset peak memory counter to zero
-/// Internal Rust-only function
+/// Reset peak memory counter to zero.
+/// Internal Rust-only function. Best-effort: silently ignores the failure
+/// return on degraded-Metal hosts (the cleanup hooks that call this don't
+/// have an error channel).
 pub fn reset_peak_memory() {
-    unsafe { sys::mlx_reset_peak_memory() }
+    let _ = unsafe { sys::mlx_reset_peak_memory() };
 }
 
-/// Set memory limit (guideline for max memory use)
-/// Returns the previous limit
-/// Internal Rust-only function
+/// Set memory limit (guideline for max memory use).
+/// Returns the previous limit, or 0.0 if the shim caught an exception.
+/// Internal Rust-only function.
 pub fn set_memory_limit(limit: f64) -> f64 {
-    unsafe { sys::mlx_set_memory_limit(limit as usize) as f64 }
+    let mut prev: u64 = 0;
+    let rc = unsafe { sys::mlx_set_memory_limit(limit as u64, &mut prev) };
+    if rc != 0 { 0.0 } else { prev as f64 }
 }
 
-/// Get current memory limit
-/// Internal Rust-only function
+/// Get current memory limit.
+/// Returns 0.0 if the shim caught an exception. Internal Rust-only function.
 pub fn get_memory_limit() -> f64 {
-    unsafe { sys::mlx_get_memory_limit() as f64 }
+    let mut v: u64 = 0;
+    let rc = unsafe { sys::mlx_get_memory_limit(&mut v) };
+    if rc != 0 { 0.0 } else { v as f64 }
 }
 
-/// Set cache limit (controls memory pool/cache size)
+/// Set cache limit (controls memory pool/cache size).
 /// This limits how much memory MLX pre-allocates for caching.
-/// Returns the previous limit in bytes.
+/// Returns the previous limit in bytes, or 0.0 if the shim caught an
+/// exception.
 ///
 /// Use this to reduce memory pre-allocation, which can prevent the
 /// "100GB Alloc" issue on high-memory systems.
@@ -233,7 +254,9 @@ pub fn get_memory_limit() -> f64 {
 /// set_cache_limit(32.0 * 1024.0 * 1024.0 * 1024.0);
 /// ```
 pub fn set_cache_limit(limit: f64) -> f64 {
-    unsafe { sys::mlx_set_cache_limit(limit as usize) as f64 }
+    let mut prev: u64 = 0;
+    let rc = unsafe { sys::mlx_set_cache_limit(limit as u64, &mut prev) };
+    if rc != 0 { 0.0 } else { prev as f64 }
 }
 
 /// Clear MLX's compiler cache (traced computation graphs)
@@ -252,7 +275,7 @@ pub fn heavy_cleanup() {
         sys::mlx_synchronize();
         sys::mlx_clear_cache();
         let _ = sys::mlx_compile_clear_cache(); // ignore result, errors logged to stderr
-        sys::mlx_reset_peak_memory();
+        let _ = sys::mlx_reset_peak_memory(); // best-effort; -1 on degraded-Metal
     }
 }
 

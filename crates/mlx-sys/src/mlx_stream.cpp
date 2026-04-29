@@ -67,6 +67,25 @@ void mlx_stream_synchronize(mlx_stream stream) {
 // ================================================================================
 // Metal Operations (Memory Management)
 // ================================================================================
+//
+// Fallible-FFI contract:
+//
+// Every memory accessor below is wrapped in catch-all because the underlying
+// `mlx::core::*` calls resolve through `metal::allocator()` on macOS, which
+// lazily constructs a `MetalAllocator` keyed off `device(Device::gpu)`. On a
+// host where Metal is unavailable (CPU-only build, no GPU, sandbox without
+// IOAccelerator, virtualized environment), constructing the allocator can
+// throw a `std::runtime_error` from MLX. Without the catch-all the C++
+// exception unwinds across the FFI boundary into Rust and aborts the
+// process with "Rust cannot catch foreign exceptions".
+//
+// Each shim now returns `int32_t` (0 = success, -1 = caught exception)
+// and writes its measurement into a caller-supplied out-pointer. This
+// replaces the old "ambiguous sentinel `0`" contract: a real measurement
+// of zero bytes is now distinguishable from a caught exception. The Rust
+// callers translate `-1` into `ProfileError::MetalUnavailable` (auto-
+// sizer) or fall back to a static heuristic (memory stats, cache limit
+// coordinator).
 
 // Check if Metal backend is available
 bool mlx_metal_is_available() {
@@ -115,140 +134,171 @@ const char* mlx_metal_device_info() {
   }
 }
 
-// Set the wired memory limit and return the old limit
-// Wired memory cannot be paged out (important for Metal GPU)
-// Uses mlx::core::set_wired_limit (not metal-specific)
-size_t mlx_set_wired_limit(size_t limit) {
+// Set the wired memory limit. Writes the previous limit through `out_old_limit`
+// (which may be null). Wired memory cannot be paged out (important for Metal
+// GPU). Uses mlx::core::set_wired_limit (not metal-specific).
+//
+// Returns 0 on success, -1 on caught exception (out_old_limit is left
+// untouched on failure).
+int32_t mlx_set_wired_limit(uint64_t limit, uint64_t* out_old_limit) {
   try {
-    return mlx::core::set_wired_limit(limit);
+    size_t prev = mlx::core::set_wired_limit(static_cast<size_t>(limit));
+    if (out_old_limit != nullptr) {
+      *out_old_limit = static_cast<uint64_t>(prev);
+    }
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in set_wired_limit: " << e.what() << std::endl;
-    return 0;
+    return -1;
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in set_wired_limit" << std::endl;
-    return 0;
+    return -1;
   }
 }
 
-// Get the current wired memory limit
-// Note: MLX doesn't have a get_wired_limit function, so we return 0
-// The set_wired_limit function returns the old limit when called
-size_t mlx_get_wired_limit() {
-  // MLX doesn't provide a getter for wired limit
-  // Return 0 to indicate no limit is set
+// Get the current wired memory limit. Writes the value through `out_value`
+// (which may be null).
+//
+// Note: MLX doesn't expose a getter for the wired limit. We always write 0
+// and return 0 — semantically "no value", but distinct from the fallible
+// sibling shims because nothing ever throws here.
+int32_t mlx_get_wired_limit(uint64_t* out_value) {
+  if (out_value != nullptr) {
+    *out_value = 0;
+  }
   return 0;
 }
 
-// Get peak memory usage (works with any backend).
-//
-// SAFETY: Wrapped in try/catch because the underlying
-// `mlx::core::get_peak_memory()` resolves through `metal::allocator()` on
-// macOS, which lazily constructs a `MetalAllocator` keyed off
-// `device(Device::gpu)`. On a host where Metal is unavailable
-// (CPU-only build, no GPU, sandbox without IOAccelerator), constructing
-// the allocator can throw a `std::runtime_error` from MLX. Without this
-// guard the C++ exception unwinds across the FFI boundary into Rust and
-// aborts the process with "Rust cannot catch foreign exceptions". Returns
-// 0 as the "memory unavailable" sentinel; the Rust caller in
-// `crates/mlx-paged-attn/src/profile.rs` treats `0` paired with a
-// `mlx_metal_is_available() == false` precondition as
-// `ProfileError::MetalUnavailable`.
-size_t mlx_get_peak_memory() {
+// Get peak memory usage (works with any backend). Writes the result through
+// `out_value` on success. Returns 0 on success, -1 on caught exception
+// (out_value is left untouched on failure).
+int32_t mlx_get_peak_memory(uint64_t* out_value) {
   try {
-    return mlx::core::get_peak_memory();
+    size_t v = mlx::core::get_peak_memory();
+    if (out_value != nullptr) {
+      *out_value = static_cast<uint64_t>(v);
+    }
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in get_peak_memory: " << e.what() << std::endl;
-    return 0;
+    return -1;
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in get_peak_memory" << std::endl;
-    return 0;
+    return -1;
   }
 }
 
-// Get actively used memory in bytes (excludes cached memory).
-// See `mlx_get_peak_memory` for the exception-safety rationale.
-size_t mlx_get_active_memory() {
+// Get actively used memory in bytes (excludes cached memory). Returns 0 on
+// success, -1 on caught exception. See `mlx_get_peak_memory` for the
+// fallible-FFI contract rationale.
+int32_t mlx_get_active_memory(uint64_t* out_value) {
   try {
-    return mlx::core::get_active_memory();
+    size_t v = mlx::core::get_active_memory();
+    if (out_value != nullptr) {
+      *out_value = static_cast<uint64_t>(v);
+    }
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in get_active_memory: " << e.what() << std::endl;
-    return 0;
+    return -1;
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in get_active_memory" << std::endl;
-    return 0;
+    return -1;
   }
 }
 
-// Get cache memory size in bytes.
-// See `mlx_get_peak_memory` for the exception-safety rationale.
-size_t mlx_get_cache_memory() {
+// Get cache memory size in bytes. Returns 0 on success, -1 on caught
+// exception. See `mlx_get_peak_memory` for the fallible-FFI contract
+// rationale.
+int32_t mlx_get_cache_memory(uint64_t* out_value) {
   try {
-    return mlx::core::get_cache_memory();
+    size_t v = mlx::core::get_cache_memory();
+    if (out_value != nullptr) {
+      *out_value = static_cast<uint64_t>(v);
+    }
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in get_cache_memory: " << e.what() << std::endl;
-    return 0;
+    return -1;
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in get_cache_memory" << std::endl;
-    return 0;
+    return -1;
   }
 }
 
-// Reset peak memory counter to zero.
-// See `mlx_get_peak_memory` for the exception-safety rationale. On
-// no-Metal hosts the underlying `mlx::core::reset_peak_memory()` can
-// throw while constructing the lazy `metal::allocator()`; catch and
-// swallow rather than aborting via the FFI boundary. Caller should
-// gate this behind a `mlx_metal_is_available()` check on no-Metal
-// hosts to avoid the cerr spam.
-void mlx_reset_peak_memory() {
+// Reset peak memory counter to zero. Returns 0 on success, -1 on caught
+// exception. See `mlx_get_peak_memory` for the fallible-FFI contract
+// rationale. On no-Metal hosts the underlying `mlx::core::reset_peak_memory()`
+// can throw while constructing the lazy `metal::allocator()`; the caller is
+// expected to gate this behind a `mlx_metal_is_available()` check on no-
+// Metal hosts to avoid the cerr spam.
+int32_t mlx_reset_peak_memory() {
   try {
     mlx::core::reset_peak_memory();
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in reset_peak_memory: " << e.what() << std::endl;
+    return -1;
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in reset_peak_memory" << std::endl;
+    return -1;
   }
 }
 
-// Set memory limit (guideline for max memory use). Returns the previous
-// limit, or 0 if the call threw (Metal unavailable, etc).
-size_t mlx_set_memory_limit(size_t limit) {
+// Set memory limit (guideline for max memory use). Writes the previous
+// limit through `out_old_limit` (which may be null). Returns 0 on success,
+// -1 on caught exception.
+int32_t mlx_set_memory_limit(uint64_t limit, uint64_t* out_old_limit) {
   try {
-    return mlx::core::set_memory_limit(limit);
+    size_t prev = mlx::core::set_memory_limit(static_cast<size_t>(limit));
+    if (out_old_limit != nullptr) {
+      *out_old_limit = static_cast<uint64_t>(prev);
+    }
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in set_memory_limit: " << e.what() << std::endl;
-    return 0;
+    return -1;
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in set_memory_limit" << std::endl;
-    return 0;
+    return -1;
   }
 }
 
-// Get current memory limit.
-// See `mlx_get_peak_memory` for the exception-safety rationale.
-size_t mlx_get_memory_limit() {
+// Get current memory limit. Returns 0 on success, -1 on caught exception.
+// See `mlx_get_peak_memory` for the fallible-FFI contract rationale.
+int32_t mlx_get_memory_limit(uint64_t* out_value) {
   try {
-    return mlx::core::get_memory_limit();
+    size_t v = mlx::core::get_memory_limit();
+    if (out_value != nullptr) {
+      *out_value = static_cast<uint64_t>(v);
+    }
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in get_memory_limit: " << e.what() << std::endl;
-    return 0;
+    return -1;
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in get_memory_limit" << std::endl;
-    return 0;
+    return -1;
   }
 }
 
-// Set cache limit (controls memory pool/cache size). Returns the previous
-// limit. This limits how much memory MLX pre-allocates for caching.
-size_t mlx_set_cache_limit(size_t limit) {
+// Set cache limit (controls memory pool/cache size). Writes the previous
+// limit through `out_old_limit` (which may be null). This limits how much
+// memory MLX pre-allocates for caching. Returns 0 on success, -1 on
+// caught exception.
+int32_t mlx_set_cache_limit(uint64_t limit, uint64_t* out_old_limit) {
   try {
-    return mlx::core::set_cache_limit(limit);
+    size_t prev = mlx::core::set_cache_limit(static_cast<size_t>(limit));
+    if (out_old_limit != nullptr) {
+      *out_old_limit = static_cast<uint64_t>(prev);
+    }
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in set_cache_limit: " << e.what() << std::endl;
-    return 0;
+    return -1;
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in set_cache_limit" << std::endl;
-    return 0;
+    return -1;
   }
 }
 
