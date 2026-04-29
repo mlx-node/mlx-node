@@ -160,10 +160,16 @@ unsafe extern "C" {
     fn mlx_qwen35_moe_reset();
 
     // Phase 4 piece 1 test helper that builds the
-    // `attn_for_compile_paged` graph in isolation. Returns 0 on success,
-    // non-zero on failure. Self-registers + clears synthetic weights for
-    // layer 0 self-attention; eval()s the output so paged_kv_write +
-    // paged_attention actually dispatch on the Metal queue.
+    // `attn_for_compile_paged` graph in isolation. Self-registers +
+    // clears synthetic weights for layer 0 self-attention; eval()s the
+    // output so paged_kv_write + paged_attention actually dispatch on
+    // the Metal queue.
+    //
+    // Return codes:
+    //    0  — success (graph built, eval succeeded, kernels dispatched).
+    //   -1  — Metal not available on this host (clean skip).
+    //   -2  — graph construction / eval / weight registration failed
+    //         (HARD FAILURE — proves a paged kernel binding is broken).
     fn mlx_qwen35_moe_trace_paged_attn_helper() -> i32;
 }
 
@@ -662,9 +668,21 @@ fn forward_paged_after_reset_returns_null() {
 ///      bind and run).
 ///   4. Cleans up the synthetic weights.
 ///
-/// Returns 0 on success; non-zero indicates the helper caught an
-/// exception. On Metal-less hosts, kernel allocation will fail inside
-/// `eval()` and the helper returns non-zero; treat that as a clean skip.
+/// Return codes from `mlx_qwen35_moe_trace_paged_attn_helper`:
+///
+///   0  — success: graph built, eval succeeded, kernels dispatched.
+///        Test passes.
+///  -1  — Metal not available on this host (e.g. CI without an Apple
+///        GPU, or `metal::is_available()` returned false). The paged
+///        kernels can't dispatch at all, so this is treated as a clean
+///        skip — the test prints a notice and passes.
+///  -2 (or any other nonzero) — graph construction, eval, weight
+///        registration, or some other exception failed. This is a HARD
+///        FAILURE: it proves a paged-attention binding is broken on a
+///        Metal-equipped host. The original test at this site accepted
+///        ANY nonzero code as a skip, which let `paged_kv_write` /
+///        `paged_attention` regressions pass silently because cargo
+///        suppresses passing-test stderr by default.
 #[test]
 fn paged_attn_graph_dispatches_on_metal() {
     unsafe {
@@ -682,12 +700,26 @@ fn paged_attn_graph_dispatches_on_metal() {
         mlx_qwen35_moe_reset();
     }
 
-    if rc != 0 {
-        // Treat as skip rather than failure on Metal-less CI hosts.
-        eprintln!(
-            "paged_attn_graph_dispatches_on_metal: trace helper returned {rc} \
-             (likely Metal-less host or unavailable paged kernel — see stderr)"
-        );
+    match rc {
+        0 => {
+            // Full success — graph built, eval dispatched on Metal.
+        }
+        -1 => {
+            // No Metal device available — treat as skip.
+            eprintln!(
+                "paged_attn_graph_dispatches_on_metal: skipped (Metal not \
+                 available — `metal::is_available()` returned false)"
+            );
+        }
+        other => {
+            panic!(
+                "paged_attn_graph_dispatches_on_metal: trace helper returned \
+                 {other} — paged graph construction or eval failed on a \
+                 Metal-equipped host (see stderr above for the exception). \
+                 This indicates a real regression in `paged_kv_write` / \
+                 `paged_attention` / `attn_for_compile_paged` bindings."
+            );
+        }
     }
 }
 

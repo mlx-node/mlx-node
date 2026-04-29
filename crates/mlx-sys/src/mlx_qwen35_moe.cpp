@@ -1401,8 +1401,18 @@ void mlx_qwen35_moe_forward_paged(
 // force kernel dispatch (proving paged_kv_write + paged_attention bind
 // and run), then clears the synthetic weights.
 //
-// Returns 0 on success, non-zero on failure (exception caught and stderr
-// diagnostic written). The Rust test asserts the return value.
+// Return codes:
+//   0  — success (graph built, eval() succeeded, kernels dispatched).
+//  -1  — Metal not available on this host. The Rust test treats this as a
+//        clean skip (no Metal device → can't synthesize the dispatch).
+//  -2  — any other failure (graph construction, eval, weight registration,
+//        unknown exception). The Rust test treats this as a HARD FAILURE.
+//
+// Splitting -1 (no-Metal skip) from -2 (real failure) prevents a broken
+// `paged_kv_write`/`paged_attention` binding from silently passing on a
+// Metal-equipped host: cargo hides passing-test stderr by default, so a
+// single "non-zero return" code lumped both cases together and the
+// originally weakened test would have accepted any failure as success.
 //
 // This is the "graph build smoke" coverage that Codex's Finding 3 asked
 // for — the existing forward_paged smoke test fails inside the LM-head /
@@ -1413,6 +1423,12 @@ void mlx_qwen35_moe_forward_paged(
 // `mlx_clear_weights()` before/after if any other model state is loaded.
 // The Rust test wrapper does both explicitly.
 int mlx_qwen35_moe_trace_paged_attn_helper() {
+  // Fast path: if Metal isn't available, the paged kernels can't dispatch
+  // at all. Surface a distinct return code so the Rust test skips cleanly
+  // instead of conflating this with a graph/eval failure.
+  if (!mlx::core::metal::is_available()) {
+    return -1;
+  }
   // Hard-coded contract shapes mirror the smoke-test config.
   constexpr int B               = 1;
   constexpr int NUM_HEADS       = 16;
@@ -1552,12 +1568,12 @@ int mlx_qwen35_moe_trace_paged_attn_helper() {
             "[MLX] Exception in mlx_qwen35_moe_trace_paged_attn_helper: %s\n",
             e.what());
     fflush(stderr);
-    return 1;
+    return -2;
   } catch (...) {
     fprintf(stderr,
             "[MLX] Unknown exception in mlx_qwen35_moe_trace_paged_attn_helper\n");
     fflush(stderr);
-    return 1;
+    return -2;
   }
 }
 
