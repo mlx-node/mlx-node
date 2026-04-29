@@ -1075,6 +1075,72 @@ describe('handleCreateMessage', () => {
       expect(toolStarts).toHaveLength(0);
     });
 
+    it('does not duplicate preamble when finalText is shorter than streamed (native trim)', async () => {
+      // Codex-found regression 2026-04-29: when the model emits a closed
+      // tool_call with leading text, the streaming path emits the preamble
+      // verbatim ("Let me check. " — note trailing space), but the native
+      // side trims trailing whitespace from result.text via parse_tool_calls
+      // (`.trim()` at the end of parse_generation_output / split_at_think_end).
+      // So `emittedText = "Let me check. "` (length 15) but `finalText =
+      // "Let me check."` (length 14). The terminal "tail catch-up" branch
+      // must NOT re-emit finalText whole — that would duplicate the preamble.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        // Pre-tool text streamed verbatim through tagBuffer.
+        { text: 'Let me check. ', done: false, isReasoning: false },
+        // Closed tool_call — tagBuffer suppresses, then parse extracts.
+        {
+          text: '<tool_call>\n<function=lookup>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call>',
+          done: false,
+          isReasoning: false,
+        },
+        {
+          // finalText: native parse_tool_calls strips the closed <tool_call>
+          // block AND calls .trim() on the cleaned text → trailing space gone.
+          text: 'Let me check.',
+          done: true,
+          finishReason: 'tool_calls',
+          toolCalls: [{ id: 'tool_1', name: 'lookup', arguments: { q: 'x' }, status: 'ok' }],
+          thinking: null,
+          numTokens: 20,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText:
+            'Let me check. <tool_call>\n<function=lookup>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call>',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'use a tool' }],
+          max_tokens: 30,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+
+      // The preamble must appear exactly once. The bug would have produced
+      // "Let me check. Let me check." (streamed prefix + duplicated finalText).
+      const occurrences = combined.match(/Let me check/g) ?? [];
+      expect(occurrences.length, `preamble duplicated; combined text deltas: ${JSON.stringify(combined)}`).toBe(1);
+
+      // The valid tool_use block must still be emitted.
+      const toolStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+      );
+      expect(toolStarts).toHaveLength(1);
+    });
+
     it('recovers full text after false-alarm tool_call tag when no text was emitted yet', async () => {
       // The model immediately outputs "<tool_call>" with no prior text,
       // but the final event has no actual tool calls.

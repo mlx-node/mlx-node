@@ -323,13 +323,22 @@ async function handleStreamingNative(
               buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
             );
           }
-        } else if (hasEmittedText && finalText) {
+        } else if (hasEmittedText && finalText && finalText.length > emittedText.length) {
           // Emit any unsent suffix when final text extends past what was
           // streamed. Same divergence concern as above (post-</think> trim
           // can leave `emittedText` longer than the matching prefix of
           // `finalText`), so we use the same overlap-based slice instead of
           // a length-based one. When the overlap covers all of `finalText`
           // (i.e. nothing more to emit) `unsent` is empty and we skip.
+          //
+          // The length guard `finalText.length > emittedText.length` is
+          // load-bearing: when native cleanup TRIMS trailing whitespace
+          // from finalText (e.g. `parse_tool_calls` calls `.trim()` on the
+          // cleaned text), `finalText` can be SHORTER than `emittedText`.
+          // Without the guard, `longestSuffixPrefixOverlap` would return 0
+          // (the shorter trimmed prefix is not a suffix of the longer
+          // streamed text) and we'd emit `finalText` whole, duplicating
+          // preamble text the client already received in the streaming path.
           const overlap = longestSuffixPrefixOverlap(emittedText, finalText);
           const unsent = finalText.slice(overlap);
           if (unsent) {
