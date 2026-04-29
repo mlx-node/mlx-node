@@ -1202,6 +1202,12 @@ unsafe extern "C-unwind" {
     pub fn mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() -> i32;
     pub fn mlx_paged_kv_write_eval_gpu_rejects_zero_head_size() -> i32;
     pub fn mlx_paged_kv_write_eval_gpu_rejects_x_pack_dtype_mismatch() -> i32;
+    /// Round-12 regression: same scenario as
+    /// `..._rejects_zero_block_size`, but with `slot_mapping={-1,-1}`
+    /// so the runtime bounds guard CANNOT fire — only the scalar
+    /// validator can throw. Proves the `[validator]` marker is on the
+    /// scalar reject and not on a runtime guard masquerading as one.
+    pub fn mlx_paged_kv_write_eval_gpu_validator_proof_zero_block_size() -> i32;
     pub fn mlx_paged_attention_eval_gpu_rejects_zero_kv_heads() -> i32;
     pub fn mlx_paged_attention_eval_gpu_rejects_indivisible_grouping() -> i32;
     pub fn mlx_paged_attention_eval_gpu_rejects_sliding_window() -> i32;

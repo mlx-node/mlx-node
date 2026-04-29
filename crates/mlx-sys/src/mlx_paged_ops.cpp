@@ -204,7 +204,7 @@ void require_row_contiguous_zero_offset(
     const char* input_name) {
   if (!arr.flags().row_contiguous) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] " << input_name
+    msg << "[validator] [" << op_name << "] " << input_name
         << " must be row-contiguous; got non-row-contiguous view "
         << "(probably from a transpose / non-trivial slice). "
         << "Materialize a contiguous copy first via "
@@ -213,7 +213,7 @@ void require_row_contiguous_zero_offset(
   }
   if (arr.offset() != 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] " << input_name
+    msg << "[validator] [" << op_name << "] " << input_name
         << " must have offset 0; got offset " << arr.offset()
         << " (probably from a sliced view starting partway into the "
         << "backing buffer). Materialize a contiguous copy first via "
@@ -278,25 +278,25 @@ void validate_paged_kv_write_inputs(
   //    scalar can never reach divide-by-zero arithmetic below.
   if (num_kv_heads <= 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] num_kv_heads (" << num_kv_heads
+    msg << "[validator] [" << op_name << "] num_kv_heads (" << num_kv_heads
         << ") must be > 0.";
     throw std::invalid_argument(msg.str());
   }
   if (head_size <= 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] head_size (" << head_size
+    msg << "[validator] [" << op_name << "] head_size (" << head_size
         << ") must be > 0.";
     throw std::invalid_argument(msg.str());
   }
   if (block_size <= 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] block_size (" << block_size
+    msg << "[validator] [" << op_name << "] block_size (" << block_size
         << ") must be > 0.";
     throw std::invalid_argument(msg.str());
   }
   if (x_pack <= 0 || head_size % x_pack != 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] x_pack (" << x_pack
+    msg << "[validator] [" << op_name << "] x_pack (" << x_pack
         << ") must be positive and divide head_size (" << head_size << ")";
     throw std::invalid_argument(msg.str());
   }
@@ -307,7 +307,7 @@ void validate_paged_kv_write_inputs(
     int x_pack_expected = x_pack_for(kv_dtype);
     if (x_pack != x_pack_expected) {
       std::ostringstream msg;
-      msg << "[" << op_name << "] x_pack (" << x_pack
+      msg << "[validator] [" << op_name << "] x_pack (" << x_pack
           << ") disagrees with the dtype-derived x_pack ("
           << x_pack_expected << ") for kv_dtype "
           << static_cast<int>(kv_dtype);
@@ -322,7 +322,7 @@ void validate_paged_kv_write_inputs(
     auto expected_cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
     if (k_pool.dtype() != expected_cache_dtype) {
       std::ostringstream msg;
-      msg << "[" << op_name << "] k_pool dtype " << k_pool.dtype()
+      msg << "[validator] [" << op_name << "] k_pool dtype " << k_pool.dtype()
           << " disagrees with the expected cache dtype "
           << expected_cache_dtype << " for kv_dtype "
           << static_cast<int>(kv_dtype);
@@ -330,7 +330,7 @@ void validate_paged_kv_write_inputs(
     }
     if (v_pool.dtype() != expected_cache_dtype) {
       std::ostringstream msg;
-      msg << "[" << op_name << "] v_pool dtype " << v_pool.dtype()
+      msg << "[validator] [" << op_name << "] v_pool dtype " << v_pool.dtype()
           << " disagrees with the expected cache dtype "
           << expected_cache_dtype << " for kv_dtype "
           << static_cast<int>(kv_dtype);
@@ -341,7 +341,7 @@ void validate_paged_kv_write_inputs(
     auto expected_io_dtype = io_dtype_for_kv_dtype(kv_dtype);
     if (new_k.dtype() != expected_io_dtype) {
       std::ostringstream msg;
-      msg << "[" << op_name << "] new_k dtype " << new_k.dtype()
+      msg << "[validator] [" << op_name << "] new_k dtype " << new_k.dtype()
           << " disagrees with the expected io dtype "
           << expected_io_dtype << " for kv_dtype "
           << static_cast<int>(kv_dtype)
@@ -350,7 +350,7 @@ void validate_paged_kv_write_inputs(
     }
     if (new_v.dtype() != expected_io_dtype) {
       std::ostringstream msg;
-      msg << "[" << op_name << "] new_v dtype " << new_v.dtype()
+      msg << "[validator] [" << op_name << "] new_v dtype " << new_v.dtype()
           << " disagrees with the expected io dtype "
           << expected_io_dtype << " for kv_dtype "
           << static_cast<int>(kv_dtype)
@@ -361,25 +361,25 @@ void validate_paged_kv_write_inputs(
   // Defense-in-depth pairwise checks (tripwire for future kv_dtype additions).
   if (k_pool.dtype() != v_pool.dtype()) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool dtype " << k_pool.dtype()
+    msg << "[validator] [" << op_name << "] k_pool dtype " << k_pool.dtype()
         << " disagrees with v_pool dtype " << v_pool.dtype();
     throw std::invalid_argument(msg.str());
   }
   if (new_k.dtype() != new_v.dtype()) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] new_k dtype " << new_k.dtype()
+    msg << "[validator] [" << op_name << "] new_k dtype " << new_k.dtype()
         << " disagrees with new_v dtype " << new_v.dtype();
     throw std::invalid_argument(msg.str());
   }
   if (k_scale.dtype() != mlx::core::float32 ||
       v_scale.dtype() != mlx::core::float32) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_scale / v_scale must be float32";
+    msg << "[validator] [" << op_name << "] k_scale / v_scale must be float32";
     throw std::invalid_argument(msg.str());
   }
   if (k_scale.size() != 1 || v_scale.size() != 1) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_scale / v_scale must be 1-element arrays";
+    msg << "[validator] [" << op_name << "] k_scale / v_scale must be 1-element arrays";
     throw std::invalid_argument(msg.str());
   }
 
@@ -388,63 +388,63 @@ void validate_paged_kv_write_inputs(
   //    V layout: [num_blocks, num_kv_heads, head_size, block_size]
   if (k_pool.ndim() != 5) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool must be rank 5 "
+    msg << "[validator] [" << op_name << "] k_pool must be rank 5 "
         << "[num_blocks, num_kv_heads, head_size/x, block_size, x]; got rank "
         << k_pool.ndim();
     throw std::invalid_argument(msg.str());
   }
   if (v_pool.ndim() != 4) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] v_pool must be rank 4 "
+    msg << "[validator] [" << op_name << "] v_pool must be rank 4 "
         << "[num_blocks, num_kv_heads, head_size, block_size]; got rank "
         << v_pool.ndim();
     throw std::invalid_argument(msg.str());
   }
   if (k_pool.shape(1) != num_kv_heads) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool.shape(1) (" << k_pool.shape(1)
+    msg << "[validator] [" << op_name << "] k_pool.shape(1) (" << k_pool.shape(1)
         << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
     throw std::invalid_argument(msg.str());
   }
   if (k_pool.shape(2) != head_size / x_pack) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool.shape(2) (" << k_pool.shape(2)
+    msg << "[validator] [" << op_name << "] k_pool.shape(2) (" << k_pool.shape(2)
         << ") disagrees with head_size/x_pack (" << head_size / x_pack << ")";
     throw std::invalid_argument(msg.str());
   }
   if (k_pool.shape(3) != block_size) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool.shape(3) (" << k_pool.shape(3)
+    msg << "[validator] [" << op_name << "] k_pool.shape(3) (" << k_pool.shape(3)
         << ") disagrees with block_size (" << block_size << ")";
     throw std::invalid_argument(msg.str());
   }
   if (k_pool.shape(4) != x_pack) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool.shape(4) (" << k_pool.shape(4)
+    msg << "[validator] [" << op_name << "] k_pool.shape(4) (" << k_pool.shape(4)
         << ") disagrees with x_pack (" << x_pack << ")";
     throw std::invalid_argument(msg.str());
   }
   if (v_pool.shape(1) != num_kv_heads) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] v_pool.shape(1) (" << v_pool.shape(1)
+    msg << "[validator] [" << op_name << "] v_pool.shape(1) (" << v_pool.shape(1)
         << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
     throw std::invalid_argument(msg.str());
   }
   if (v_pool.shape(2) != head_size) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] v_pool.shape(2) (" << v_pool.shape(2)
+    msg << "[validator] [" << op_name << "] v_pool.shape(2) (" << v_pool.shape(2)
         << ") disagrees with head_size (" << head_size << ")";
     throw std::invalid_argument(msg.str());
   }
   if (v_pool.shape(3) != block_size) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] v_pool.shape(3) (" << v_pool.shape(3)
+    msg << "[validator] [" << op_name << "] v_pool.shape(3) (" << v_pool.shape(3)
         << ") disagrees with block_size (" << block_size << ")";
     throw std::invalid_argument(msg.str());
   }
   if (k_pool.shape(0) != v_pool.shape(0)) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool num_blocks (" << k_pool.shape(0)
+    msg << "[validator] [" << op_name << "] k_pool num_blocks (" << k_pool.shape(0)
         << ") disagrees with v_pool num_blocks (" << v_pool.shape(0) << ")";
     throw std::invalid_argument(msg.str());
   }
@@ -452,33 +452,33 @@ void validate_paged_kv_write_inputs(
   // 5. new_k / new_v rank + per-dim agreement.
   if (new_k.ndim() != 3) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] new_k must be rank 3 "
+    msg << "[validator] [" << op_name << "] new_k must be rank 3 "
         << "[num_tokens, num_kv_heads, head_size]; got rank " << new_k.ndim();
     throw std::invalid_argument(msg.str());
   }
   if (new_v.ndim() != 3) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] new_v must be rank 3 "
+    msg << "[validator] [" << op_name << "] new_v must be rank 3 "
         << "[num_tokens, num_kv_heads, head_size]; got rank " << new_v.ndim();
     throw std::invalid_argument(msg.str());
   }
   if (new_k.shape(1) != num_kv_heads || new_v.shape(1) != num_kv_heads) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] new_k/new_v shape(1) ("
+    msg << "[validator] [" << op_name << "] new_k/new_v shape(1) ("
         << new_k.shape(1) << "/" << new_v.shape(1)
         << ") must equal num_kv_heads (" << num_kv_heads << ")";
     throw std::invalid_argument(msg.str());
   }
   if (new_k.shape(2) != head_size || new_v.shape(2) != head_size) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] new_k/new_v shape(2) ("
+    msg << "[validator] [" << op_name << "] new_k/new_v shape(2) ("
         << new_k.shape(2) << "/" << new_v.shape(2)
         << ") must equal head_size (" << head_size << ")";
     throw std::invalid_argument(msg.str());
   }
   if (new_k.shape(0) != new_v.shape(0)) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] new_k tokens (" << new_k.shape(0)
+    msg << "[validator] [" << op_name << "] new_k tokens (" << new_k.shape(0)
         << ") disagrees with new_v tokens (" << new_v.shape(0) << ")";
     throw std::invalid_argument(msg.str());
   }
@@ -486,20 +486,20 @@ void validate_paged_kv_write_inputs(
   // 6. slot_mapping rank/dtype/length.
   if (slot_mapping.ndim() != 1) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] slot_mapping must be rank 1 [num_tokens]; "
+    msg << "[validator] [" << op_name << "] slot_mapping must be rank 1 [num_tokens]; "
         << "got rank " << slot_mapping.ndim();
     throw std::invalid_argument(msg.str());
   }
   if (slot_mapping.dtype() != mlx::core::int64) {
     std::ostringstream msg;
-    msg << "[" << op_name
+    msg << "[validator] [" << op_name
         << "] slot_mapping must be int64 (kernel reads it as "
         << "`int64_t*`); got dtype " << slot_mapping.dtype();
     throw std::invalid_argument(msg.str());
   }
   if (slot_mapping.shape(0) != new_k.shape(0)) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] slot_mapping length ("
+    msg << "[validator] [" << op_name << "] slot_mapping length ("
         << slot_mapping.shape(0) << ") disagrees with new_k tokens ("
         << new_k.shape(0) << ")";
     throw std::invalid_argument(msg.str());
@@ -541,7 +541,7 @@ void validate_paged_attention_inputs(
   // 2. Phase 1 contract: sliding_window must be 0 (Phase 7 lifts this).
   if (sliding_window != 0) {
     std::ostringstream msg;
-    msg << "[" << op_name
+    msg << "[validator] [" << op_name
         << "] sliding_window not yet implemented; Phase 7 will add it "
         << "(Gemma4). The only supported value in Phase 1 is 0.";
     throw std::invalid_argument(msg.str());
@@ -550,7 +550,7 @@ void validate_paged_attention_inputs(
   // 3. Scalar-state positivity + GQA divisibility (rounds 6 + 7).
   if (num_kv_heads <= 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] num_kv_heads (" << num_kv_heads
+    msg << "[validator] [" << op_name << "] num_kv_heads (" << num_kv_heads
         << ") must be > 0; the Metal kernel computes "
         << "num_queries_per_kv = num_heads / num_kv_heads, which would "
         << "divide by zero.";
@@ -558,13 +558,13 @@ void validate_paged_attention_inputs(
   }
   if (num_q_heads <= 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] num_q_heads (" << num_q_heads
+    msg << "[validator] [" << op_name << "] num_q_heads (" << num_q_heads
         << ") must be > 0.";
     throw std::invalid_argument(msg.str());
   }
   if (num_q_heads % num_kv_heads != 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] GQA grouping invalid: num_q_heads="
+    msg << "[validator] [" << op_name << "] GQA grouping invalid: num_q_heads="
         << num_q_heads << " must be divisible by num_kv_heads="
         << num_kv_heads << " (got remainder "
         << (num_q_heads % num_kv_heads) << "). When num_q_heads < "
@@ -575,7 +575,7 @@ void validate_paged_attention_inputs(
   }
   if (block_size <= 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] block_size (" << block_size
+    msg << "[validator] [" << op_name << "] block_size (" << block_size
         << ") must be > 0; eval_gpu's bounds check divides by it "
         << "(`(s + block_size - 1) / block_size`) and the Metal kernel "
         << "uses it as a grid extent.";
@@ -583,7 +583,7 @@ void validate_paged_attention_inputs(
   }
   if (head_size <= 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] head_size (" << head_size
+    msg << "[validator] [" << op_name << "] head_size (" << head_size
         << ") must be > 0; the Metal kernel uses it as a grid extent "
         << "and indexing stride.";
     throw std::invalid_argument(msg.str());
@@ -596,13 +596,13 @@ void validate_paged_attention_inputs(
   int x_pack_expected = x_pack_for(kv_dtype);
   if (x_pack_expected <= 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] dtype-derived x_pack (" << x_pack_expected
+    msg << "[validator] [" << op_name << "] dtype-derived x_pack (" << x_pack_expected
         << ") must be > 0 (kv_dtype " << static_cast<int>(kv_dtype) << ").";
     throw std::invalid_argument(msg.str());
   }
   if (head_size % x_pack_expected != 0) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] head_size (" << head_size
+    msg << "[validator] [" << op_name << "] head_size (" << head_size
         << ") must be divisible by dtype-derived x_pack ("
         << x_pack_expected << ") for kv_dtype "
         << static_cast<int>(kv_dtype);
@@ -613,19 +613,19 @@ void validate_paged_attention_inputs(
   if (k_scale.dtype() != mlx::core::float32 ||
       v_scale.dtype() != mlx::core::float32) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_scale / v_scale must be float32";
+    msg << "[validator] [" << op_name << "] k_scale / v_scale must be float32";
     throw std::invalid_argument(msg.str());
   }
   if (k_scale.size() != 1 || v_scale.size() != 1) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_scale / v_scale must be 1-element arrays";
+    msg << "[validator] [" << op_name << "] k_scale / v_scale must be 1-element arrays";
     throw std::invalid_argument(msg.str());
   }
 
   // 5. q rank + dtype + per-dim shape.
   if (q.ndim() != 3) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] q must be rank 3 "
+    msg << "[validator] [" << op_name << "] q must be rank 3 "
         << "[num_seqs, num_q_heads, head_size]; got rank " << q.ndim();
     throw std::invalid_argument(msg.str());
   }
@@ -633,7 +633,7 @@ void validate_paged_attention_inputs(
     auto expected_io_dtype = io_dtype_for_kv_dtype(kv_dtype);
     if (q.dtype() != expected_io_dtype) {
       std::ostringstream msg;
-      msg << "[" << op_name << "] q dtype " << q.dtype()
+      msg << "[validator] [" << op_name << "] q dtype " << q.dtype()
           << " disagrees with the expected io dtype "
           << expected_io_dtype << " for kv_dtype "
           << static_cast<int>(kv_dtype)
@@ -643,7 +643,7 @@ void validate_paged_attention_inputs(
     auto expected_cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
     if (k_pool.dtype() != expected_cache_dtype) {
       std::ostringstream msg;
-      msg << "[" << op_name << "] k_pool dtype " << k_pool.dtype()
+      msg << "[validator] [" << op_name << "] k_pool dtype " << k_pool.dtype()
           << " disagrees with the expected cache dtype "
           << expected_cache_dtype << " for kv_dtype "
           << static_cast<int>(kv_dtype);
@@ -651,7 +651,7 @@ void validate_paged_attention_inputs(
     }
     if (v_pool.dtype() != expected_cache_dtype) {
       std::ostringstream msg;
-      msg << "[" << op_name << "] v_pool dtype " << v_pool.dtype()
+      msg << "[validator] [" << op_name << "] v_pool dtype " << v_pool.dtype()
           << " disagrees with the expected cache dtype "
           << expected_cache_dtype << " for kv_dtype "
           << static_cast<int>(kv_dtype);
@@ -660,13 +660,13 @@ void validate_paged_attention_inputs(
   }
   if (q.shape(1) != num_q_heads) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] q.shape(1) (" << q.shape(1)
+    msg << "[validator] [" << op_name << "] q.shape(1) (" << q.shape(1)
         << ") disagrees with num_q_heads (" << num_q_heads << ")";
     throw std::invalid_argument(msg.str());
   }
   if (q.shape(2) != head_size) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] q.shape(2) (" << q.shape(2)
+    msg << "[validator] [" << op_name << "] q.shape(2) (" << q.shape(2)
         << ") disagrees with head_size (" << head_size << ")";
     throw std::invalid_argument(msg.str());
   }
@@ -674,47 +674,47 @@ void validate_paged_attention_inputs(
   // 6. Pool rank/shape validation.
   if (k_pool.ndim() != 5) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool must be rank 5 "
+    msg << "[validator] [" << op_name << "] k_pool must be rank 5 "
         << "[num_blocks, num_kv_heads, head_size/x, block_size, x]; got rank "
         << k_pool.ndim();
     throw std::invalid_argument(msg.str());
   }
   if (v_pool.ndim() != 4) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] v_pool must be rank 4 "
+    msg << "[validator] [" << op_name << "] v_pool must be rank 4 "
         << "[num_blocks, num_kv_heads, head_size, block_size]; got rank "
         << v_pool.ndim();
     throw std::invalid_argument(msg.str());
   }
   if (k_pool.shape(0) != v_pool.shape(0)) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool num_blocks (" << k_pool.shape(0)
+    msg << "[validator] [" << op_name << "] k_pool num_blocks (" << k_pool.shape(0)
         << ") disagrees with v_pool num_blocks (" << v_pool.shape(0) << ")";
     throw std::invalid_argument(msg.str());
   }
   if (k_pool.shape(1) != num_kv_heads || v_pool.shape(1) != num_kv_heads) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool/v_pool num_kv_heads ("
+    msg << "[validator] [" << op_name << "] k_pool/v_pool num_kv_heads ("
         << k_pool.shape(1) << "/" << v_pool.shape(1)
         << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
     throw std::invalid_argument(msg.str());
   }
   if (k_pool.shape(3) != block_size || v_pool.shape(3) != block_size) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool/v_pool block_size ("
+    msg << "[validator] [" << op_name << "] k_pool/v_pool block_size ("
         << k_pool.shape(3) << "/" << v_pool.shape(3)
         << ") disagrees with block_size (" << block_size << ")";
     throw std::invalid_argument(msg.str());
   }
   if (v_pool.shape(2) != head_size) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] v_pool.shape(2) (" << v_pool.shape(2)
+    msg << "[validator] [" << op_name << "] v_pool.shape(2) (" << v_pool.shape(2)
         << ") disagrees with head_size (" << head_size << ")";
     throw std::invalid_argument(msg.str());
   }
   if (k_pool.shape(2) != head_size / x_pack_expected) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool.shape(2) (" << k_pool.shape(2)
+    msg << "[validator] [" << op_name << "] k_pool.shape(2) (" << k_pool.shape(2)
         << ") disagrees with head_size/x_pack ("
         << head_size / x_pack_expected
         << ") (head_size=" << head_size << ", x_pack=" << x_pack_expected
@@ -723,7 +723,7 @@ void validate_paged_attention_inputs(
   }
   if (k_pool.shape(4) != x_pack_expected) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] k_pool.shape(4) (" << k_pool.shape(4)
+    msg << "[validator] [" << op_name << "] k_pool.shape(4) (" << k_pool.shape(4)
         << ") disagrees with dtype-derived x_pack (" << x_pack_expected
         << ") for kv_dtype " << static_cast<int>(kv_dtype);
     throw std::invalid_argument(msg.str());
@@ -732,20 +732,20 @@ void validate_paged_attention_inputs(
   // 7. block_table rank / shape / dtype.
   if (block_table.ndim() != 2) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] block_table must be rank 2 "
+    msg << "[validator] [" << op_name << "] block_table must be rank 2 "
         << "[num_seqs, max_blocks_per_seq]; got rank " << block_table.ndim();
     throw std::invalid_argument(msg.str());
   }
   if (block_table.shape(0) != q.shape(0)) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] block_table.shape(0) ("
+    msg << "[validator] [" << op_name << "] block_table.shape(0) ("
         << block_table.shape(0) << ") disagrees with q num_seqs ("
         << q.shape(0) << ")";
     throw std::invalid_argument(msg.str());
   }
   if (block_table.dtype() != mlx::core::int32) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] block_table dtype must be int32 (kernel "
+    msg << "[validator] [" << op_name << "] block_table dtype must be int32 (kernel "
         << "reads it as 32-bit indices); got dtype " << block_table.dtype();
     throw std::invalid_argument(msg.str());
   }
@@ -753,19 +753,19 @@ void validate_paged_attention_inputs(
   // 8. seq_lens rank / shape / dtype.
   if (seq_lens.ndim() != 1) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] seq_lens must be rank 1 [num_seqs]; got rank "
+    msg << "[validator] [" << op_name << "] seq_lens must be rank 1 [num_seqs]; got rank "
         << seq_lens.ndim();
     throw std::invalid_argument(msg.str());
   }
   if (seq_lens.shape(0) != q.shape(0)) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] seq_lens.shape(0) (" << seq_lens.shape(0)
+    msg << "[validator] [" << op_name << "] seq_lens.shape(0) (" << seq_lens.shape(0)
         << ") disagrees with q num_seqs (" << q.shape(0) << ")";
     throw std::invalid_argument(msg.str());
   }
   if (seq_lens.dtype() != mlx::core::int32) {
     std::ostringstream msg;
-    msg << "[" << op_name << "] seq_lens dtype must be int32 (kernel reads "
+    msg << "[validator] [" << op_name << "] seq_lens dtype must be int32 (kernel reads "
         << "it as 32-bit lengths); got dtype " << seq_lens.dtype();
     throw std::invalid_argument(msg.str());
   }
@@ -885,9 +885,10 @@ void PagedKVWrite::eval_gpu(
     }
     if (max_slot >= pool_capacity) {
       std::ostringstream msg;
-      msg << "PagedKVWrite::eval_gpu: slot_mapping max (" << max_slot
-          << ") exceeds pool capacity (num_blocks=" << num_blocks_runtime
-          << " * block_size=" << block_size_ << " = " << pool_capacity
+      msg << "[runtime] PagedKVWrite::eval_gpu: slot_mapping max ("
+          << max_slot << ") exceeds pool capacity (num_blocks="
+          << num_blocks_runtime << " * block_size=" << block_size_ << " = "
+          << pool_capacity
           << "). The kernel does not bounds-check slot_idx; an out-of-range "
           << "slot would write past the K/V pool. This check fires on every "
           << "runtime call (including the compile-cached path).";
@@ -1057,8 +1058,8 @@ void PagedAttention::eval_gpu(
       const int32_t s = seq_lens_data[i];
       if (s < 0 || static_cast<int64_t>(s) > max_seq_len_bound) {
         std::ostringstream msg;
-        msg << "PagedAttention::eval_gpu: seq_lens[" << i << "] (" << s
-            << ") out of range [0, max_blocks_per_seq * block_size = "
+        msg << "[runtime] PagedAttention::eval_gpu: seq_lens[" << i << "] ("
+            << s << ") out of range [0, max_blocks_per_seq * block_size = "
             << max_blocks_per_seq << " * " << block_size_ << " = "
             << max_seq_len_bound
             << "]. The kernel reads context_lens[seq_idx] as uint32_t and "
@@ -1078,9 +1079,9 @@ void PagedAttention::eval_gpu(
         const int32_t blk = block_table_data[row_offset + static_cast<size_t>(j)];
         if (blk < 0 || blk >= num_blocks) {
           std::ostringstream msg;
-          msg << "PagedAttention::eval_gpu: block_table[" << i << ", " << j
-              << "] (" << blk << ") out of range [0, num_blocks = "
-              << num_blocks
+          msg << "[runtime] PagedAttention::eval_gpu: block_table[" << i
+              << ", " << j << "] (" << blk
+              << ") out of range [0, num_blocks = " << num_blocks
               << "). The kernel uses block_table entries directly as "
               << "physical_block_number * kv_block_stride for K/V reads; "
               << "a value outside [0, num_blocks) addresses arbitrary GPU "
@@ -4149,14 +4150,29 @@ namespace {
 /// Build a primitive with deliberately bad scalar state, wire it into
 /// the MLX graph via `array::make_arrays`, and `eval()` the result.
 ///
-/// Return-code contract (round-11 tightening): the helper must
+/// Return-code contract (round-12 tightening): the helper must
 /// strictly prove the throw came from `PagedKVWrite::eval_gpu`'s
-/// validator — not from the graph-construction step (`make_arrays`)
-/// nor from a different code path that happens to throw the same
-/// exception class. Codes:
+/// validator — not from the graph-construction step (`make_arrays`),
+/// not from a different code path that happens to throw the same
+/// exception class, and crucially NOT from a later runtime-content
+/// guard inside `PagedKVWrite::eval_gpu` itself (slot_mapping bounds
+/// check, etc.). The runtime guards in the same `eval_gpu` body emit
+/// messages tagged "[runtime] PagedKVWrite::eval_gpu" — those would
+/// otherwise pass a substring match on the operation tag alone and
+/// falsely report rc=1 even if the scalar validator regressed.
+///
+/// To distinguish, the validator helper `validate_paged_kv_write_inputs`
+/// (and its sister `require_row_contiguous_zero_offset`) prepend the
+/// unique marker "[validator]" to every throw. The runtime-content
+/// guards in `PagedKVWrite::eval_gpu` use "[runtime]" instead. The
+/// helper requires BOTH "[validator]" AND the operation tag
+/// "PagedKVWrite::eval_gpu" to count as a validator-driven rejection.
+///
+/// Codes:
 ///   * `1`  — eval threw `std::invalid_argument` AND the message
-///            contains the eval_gpu validator context prefix
-///            "PagedKVWrite::eval_gpu". TEST SUCCESS.
+///            contains BOTH "[validator]" AND "PagedKVWrite::eval_gpu".
+///            TEST SUCCESS: the eval_gpu validator (not a runtime
+///            guard) is the throw site.
 ///   * `0`  — eval did not throw at all. TEST FAILURE: bad inputs were
 ///            silently accepted.
 ///   * `2`  — `make_arrays` threw `std::invalid_argument` BEFORE eval
@@ -4167,15 +4183,19 @@ namespace {
 ///   * `-1` — any other exception type fired (from either step). TEST
 ///            FAILURE: internal error.
 ///   * `-2` — eval threw `std::invalid_argument` but the message did
-///            NOT contain the eval_gpu context prefix. TEST FAILURE:
-///            something else in the eval path is throwing, not the
-///            validator we are exercising.
+///            NOT satisfy BOTH the "[validator]" marker AND the
+///            "PagedKVWrite::eval_gpu" operation tag. TEST FAILURE:
+///            either a non-eval_gpu layer threw, or a runtime-content
+///            guard inside eval_gpu threw (which would mean the scalar
+///            validator missed the bad state — the very regression
+///            this test is here to catch).
 int eval_paged_kv_write_with_bad_state(
     int block_size,
     int num_kv_heads,
     int head_size,
     int x_pack,
-    mlx::core::fast::KvDtype kv_dtype) {
+    mlx::core::fast::KvDtype kv_dtype,
+    bool benign_slot_mapping = false) {
   using namespace mlx::core;
   using namespace mlx::core::fast;
 
@@ -4193,11 +4213,26 @@ int eval_paged_kv_write_with_bad_state(
   // actually invokes eval_gpu. With tracer-only `array(shape, dtype,
   // nullptr, {})` inputs, MLX may treat the primitive as part of a
   // trace graph that never reaches eval_gpu.
+  //
+  // `benign_slot_mapping` controls whether the slot_mapping is also
+  // designed to bypass the runtime bounds guard inside `eval_gpu`.
+  // The default `{0, 16}` is fine for cases where the validator's
+  // own scalar reject (num_kv_heads=0, x_pack mismatch, etc.) fires
+  // BEFORE the runtime guard could see the data, but for cases like
+  // `block_size=0` the runtime guard would also reject (pool_capacity=
+  // num_blocks * block_size = 0, max_slot=16 >= 0). Setting
+  // `benign_slot_mapping=true` swaps in `{-1, -1}` (all "skip"
+  // sentinels), which the runtime guard explicitly excludes from
+  // its max-slot reduction (`if (slot_data[i] >= 0 && ...)`), so
+  // ONLY the scalar validator can possibly throw — proving the
+  // validator (not the runtime guard) is the throw site.
   std::vector<uint16_t> k_pool_host(4 * 4 * 8 * 16 * 8, 0);
   std::vector<uint16_t> v_pool_host(4 * 4 * 64 * 16, 0);
   std::vector<uint16_t> new_k_host(2 * 4 * 64, 0);
   std::vector<uint16_t> new_v_host(2 * 4 * 64, 0);
-  std::vector<int64_t> slot_mapping_host = {0, 16};
+  std::vector<int64_t> slot_mapping_host =
+      benign_slot_mapping ? std::vector<int64_t>{-1, -1}
+                          : std::vector<int64_t>{0, 16};
 
   auto bf16_arr = [](const std::vector<uint16_t>& src, Shape shape) {
     auto* p = reinterpret_cast<const bfloat16_t*>(src.data());
@@ -4252,29 +4287,43 @@ int eval_paged_kv_write_with_bad_state(
   }
 
   // Step 2: eval. ONLY this call should be capable of producing the
-  // success exception. The validator in `PagedKVWrite::eval_gpu`
-  // tags every error message with the prefix
-  // "[PagedKVWrite::eval_gpu]" via the shared
-  // `validate_paged_kv_write_inputs` helper, so we can confirm the
-  // throw site by message inspection. A `std::invalid_argument`
-  // without that prefix would mean a different layer of the eval
-  // path is throwing — which would NOT prove the eval_gpu validator
-  // is intact.
+  // success exception. The validator helpers
+  // (`validate_paged_kv_write_inputs` /
+  // `require_row_contiguous_zero_offset`) tag every throw with BOTH
+  // "[validator]" AND the operation context "PagedKVWrite::eval_gpu",
+  // while later runtime-content guards inside the same `eval_gpu`
+  // body (slot_mapping bounds check) tag their throws with
+  // "[runtime] PagedKVWrite::eval_gpu" instead. We require BOTH the
+  // validator marker AND the operation tag to count as success — a
+  // `std::invalid_argument` lacking either substring means the
+  // throw is not coming from the scalar validator we are exercising
+  // (it is either from a different code layer or from the runtime
+  // guard, the latter of which would mean the validator regressed).
+  static constexpr const char* kValidatorTag = "[validator]";
   static constexpr const char* kEvalGpuTag = "PagedKVWrite::eval_gpu";
   try {
     mlx::core::eval(results[0], results[1]);
   } catch (const std::invalid_argument& e) {
-    if (std::string(e.what()).find(kEvalGpuTag) != std::string::npos) {
+    const std::string what = e.what();
+    const bool has_validator_tag = what.find(kValidatorTag) != std::string::npos;
+    const bool has_eval_gpu_tag = what.find(kEvalGpuTag) != std::string::npos;
+    if (has_validator_tag && has_eval_gpu_tag) {
       return 1;
     }
     fprintf(
         stderr,
         "[eval_paged_kv_write_with_bad_state] eval threw "
-        "std::invalid_argument but message did NOT contain expected "
-        "validator context '%s' — throw site is NOT eval_gpu's "
-        "validator. Got: %s\n",
+        "std::invalid_argument but message did NOT satisfy both "
+        "expected markers (validator='%s' present=%d, op='%s' "
+        "present=%d) — throw site is NOT eval_gpu's scalar validator "
+        "(it is either a different code layer, or a runtime-content "
+        "guard inside eval_gpu, which would mean the validator "
+        "regressed). Got: %s\n",
+        kValidatorTag,
+        static_cast<int>(has_validator_tag),
         kEvalGpuTag,
-        e.what());
+        static_cast<int>(has_eval_gpu_tag),
+        what.c_str());
     return -2;
   } catch (const std::exception& e) {
     fprintf(
@@ -4294,8 +4343,12 @@ int eval_paged_kv_write_with_bad_state(
 /// Build a PagedAttention primitive with deliberately bad scalar
 /// state, wire it into an MLX graph, and `eval()` the result. See
 /// `eval_paged_kv_write_with_bad_state` above for the full
-/// return-code contract — same semantics, with the validator context
-/// prefix being "PagedAttention::eval_gpu".
+/// return-code contract — same semantics, with the operation context
+/// tag being "PagedAttention::eval_gpu". The validator marker
+/// "[validator]" stays the same; runtime-content guards in
+/// `PagedAttention::eval_gpu` (seq_lens bounds, block_table bounds)
+/// emit "[runtime] PagedAttention::eval_gpu", and rc=1 still requires
+/// BOTH "[validator]" AND the operation tag to be present.
 int eval_paged_attention_with_bad_state(
     float scale,
     float softcap,
@@ -4390,26 +4443,40 @@ int eval_paged_attention_with_bad_state(
   }
 
   // Step 2: eval. Only this call should produce the success
-  // exception, and the message must contain the validator context
-  // tag injected by `validate_paged_attention_inputs` via
-  // `PagedAttention::eval_gpu`. A bare `std::invalid_argument`
-  // without that tag means a different eval-path layer threw — that
-  // does NOT prove the eval_gpu validator is intact.
+  // exception, and the message must contain BOTH the validator-only
+  // marker "[validator]" injected by `validate_paged_attention_inputs`
+  // (and `require_row_contiguous_zero_offset`) AND the operation tag
+  // "PagedAttention::eval_gpu". A bare `std::invalid_argument` lacking
+  // either substring means the throw came from a different code layer
+  // (no op tag) or from a runtime-content guard inside eval_gpu (op
+  // tag present but no validator marker — those guards use
+  // "[runtime] PagedAttention::eval_gpu"). Either case fails to prove
+  // the scalar validator is intact, so we return -2.
+  static constexpr const char* kValidatorTag = "[validator]";
   static constexpr const char* kEvalGpuTag = "PagedAttention::eval_gpu";
   try {
     mlx::core::eval(*result_holder);
   } catch (const std::invalid_argument& e) {
-    if (std::string(e.what()).find(kEvalGpuTag) != std::string::npos) {
+    const std::string what = e.what();
+    const bool has_validator_tag = what.find(kValidatorTag) != std::string::npos;
+    const bool has_eval_gpu_tag = what.find(kEvalGpuTag) != std::string::npos;
+    if (has_validator_tag && has_eval_gpu_tag) {
       return 1;
     }
     fprintf(
         stderr,
         "[eval_paged_attention_with_bad_state] eval threw "
-        "std::invalid_argument but message did NOT contain expected "
-        "validator context '%s' — throw site is NOT eval_gpu's "
-        "validator. Got: %s\n",
+        "std::invalid_argument but message did NOT satisfy both "
+        "expected markers (validator='%s' present=%d, op='%s' "
+        "present=%d) — throw site is NOT eval_gpu's scalar validator "
+        "(it is either a different code layer, or a runtime-content "
+        "guard inside eval_gpu, which would mean the validator "
+        "regressed). Got: %s\n",
+        kValidatorTag,
+        static_cast<int>(has_validator_tag),
         kEvalGpuTag,
-        e.what());
+        static_cast<int>(has_eval_gpu_tag),
+        what.c_str());
     return -2;
   } catch (const std::exception& e) {
     fprintf(
@@ -4455,6 +4522,29 @@ int mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() {
       /*head_size=*/64,
       /*x_pack=*/8,
       KvDtype::Bf16);
+}
+
+/// Round-12 regression: prove the scalar validator (NOT the runtime
+/// slot_mapping bounds guard) is the throw site for `block_size=0`.
+/// The previous helper used slot_mapping={0,16}, which means a
+/// regressed validator could still surface rc=1 because the runtime
+/// guard would fire (pool_capacity = num_blocks*block_size = 0,
+/// max_slot=16 >= 0). With `benign_slot_mapping=true` the
+/// slot_mapping is `{-1,-1}` — the runtime guard excludes negative
+/// sentinels from its max-slot reduction, so it can NEVER fire on
+/// this input. The ONLY throw site capable of producing an
+/// `std::invalid_argument` here is `validate_paged_kv_write_inputs`
+/// rejecting `block_size <= 0`; if its `[validator]` marker is
+/// missing, the helper returns rc=-2 by contract.
+int mlx_paged_kv_write_eval_gpu_validator_proof_zero_block_size() {
+  using namespace mlx::core::fast;
+  return eval_paged_kv_write_with_bad_state(
+      /*block_size=*/0,
+      /*num_kv_heads=*/4,
+      /*head_size=*/64,
+      /*x_pack=*/8,
+      KvDtype::Bf16,
+      /*benign_slot_mapping=*/true);
 }
 
 /// Primitive directly constructed with `head_size_=0`. eval_gpu's

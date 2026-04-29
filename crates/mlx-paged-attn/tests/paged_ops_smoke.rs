@@ -1717,11 +1717,16 @@ fn assert_eval_gpu_rejects_bad_state(rc: i32, scenario: &str) {
         ),
         -2 => panic!(
             "{scenario}: eval threw std::invalid_argument but the \
-             message did not contain the expected eval_gpu validator \
-             context (e.g. \"PagedKVWrite::eval_gpu\" / \
-             \"PagedAttention::eval_gpu\"). The throw is coming from a \
-             different layer of the eval path, NOT from the validator \
-             we intend to exercise. See stderr for the actual message."
+             message did not satisfy BOTH required markers — the \
+             validator-only token \"[validator]\" AND the operation \
+             tag (e.g. \"PagedKVWrite::eval_gpu\" / \
+             \"PagedAttention::eval_gpu\"). The throw is coming from \
+             either a different layer of the eval path (no op tag) or \
+             from a runtime-content guard inside eval_gpu (op tag \
+             present but no \"[validator]\" marker; those guards use \
+             \"[runtime] ...\"). Either failure mode means the scalar \
+             validator regressed and a non-validator throw is masking \
+             it. See stderr for the actual message."
         ),
         other => panic!(
             "{scenario}: helper returned unexpected rc={other}; valid \
@@ -1743,6 +1748,37 @@ fn paged_kv_write_eval_gpu_rejects_zero_kv_heads() {
 fn paged_kv_write_eval_gpu_rejects_zero_block_size() {
     let rc = unsafe { mlx_sys::mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() };
     assert_eval_gpu_rejects_bad_state(rc, "PagedKVWrite block_size=0");
+}
+
+/// Round-12 regression: prove the scalar validator (NOT the runtime
+/// slot_mapping bounds guard) is the throw site for `block_size=0`.
+///
+/// The companion `..._rejects_zero_block_size` test uses
+/// `slot_mapping={0,16}`, which means a regressed scalar validator
+/// would let the runtime guard fire on `max_slot=16 >= pool_capacity=
+/// num_blocks*block_size=0` — and a substring-only check on
+/// "PagedKVWrite::eval_gpu" would silently report rc=1 even though
+/// the validator is gone.
+///
+/// This regression test deliberately uses `slot_mapping={-1,-1}`
+/// (all "skip" sentinels). The runtime guard explicitly excludes
+/// negative slot ids from its max-slot reduction
+/// (`if (slot_data[i] >= 0 ...)` in PagedKVWrite::eval_gpu), so the
+/// guard physically cannot throw on this input. The ONLY remaining
+/// throw site capable of producing `std::invalid_argument` is the
+/// scalar validator's `block_size <= 0` reject. If that reject
+/// regressed, the helper would proceed all the way to the metal
+/// dispatch (returning rc=0 — eval did not throw). If the
+/// `[validator]` marker were stripped, rc=-2 would surface.
+#[test]
+fn paged_kv_write_eval_gpu_validator_proof_zero_block_size() {
+    let rc = unsafe { mlx_sys::mlx_paged_kv_write_eval_gpu_validator_proof_zero_block_size() };
+    assert_eval_gpu_rejects_bad_state(
+        rc,
+        "PagedKVWrite block_size=0 with benign slot_mapping (proves \
+         the scalar validator, not the runtime guard, is the throw \
+         site — runtime guard is excluded by sentinel slot ids)",
+    );
 }
 
 #[test]
