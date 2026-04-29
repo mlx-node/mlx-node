@@ -415,6 +415,35 @@ void PagedAttention::eval_gpu(
     throw std::invalid_argument(msg.str());
   }
 
+  // Positive-value checks for `block_size_` and `head_size_`
+  // (defense-in-depth — mirrors the identical checks in the public
+  // `paged_attention(...)` factory).
+  //
+  // The factory normally rejects bad scalar state before the primitive
+  // is ever constructed, but `mlx::core::compile`'s cached re-traces
+  // route runtime inputs straight through `eval_gpu` and bypass the
+  // factory. If a future code path constructs the primitive directly
+  // (or a compile-cached graph somehow inherited bad state), the
+  // bounds check below would compute
+  //   `(s + block_size_ - 1) / block_size_`
+  // and divide by zero before the later `max_context_len <= 0` guard
+  // could reject. Run these checks BEFORE that arithmetic.
+  if (block_size_ <= 0) {
+    std::ostringstream msg;
+    msg << "PagedAttention::eval_gpu: block_size (" << block_size_
+        << ") must be > 0; the bounds check divides by it "
+        << "(`(s + block_size - 1) / block_size`) and the Metal kernel "
+        << "uses it as a grid extent.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (head_size_ <= 0) {
+    std::ostringstream msg;
+    msg << "PagedAttention::eval_gpu: head_size (" << head_size_
+        << ") must be > 0; the Metal kernel uses it as a grid extent "
+        << "and indexing stride.";
+    throw std::invalid_argument(msg.str());
+  }
+
   uint32_t num_seqs = static_cast<uint32_t>(q.shape(0));
   uint32_t max_blocks_per_seq = static_cast<uint32_t>(block_table.shape(1));
 
@@ -1033,6 +1062,40 @@ array paged_attention(
         << "num_kv_heads the kernel divides by zero; when "
         << "num_q_heads % num_kv_heads != 0 later heads index past "
         << "the KV-head dimension and read out-of-pool memory.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Positive-value checks for `block_size` and `head_size` (mirror the
+  // identical checks in the public `paged_kv_write(...)` factory).
+  //
+  // `block_size <= 0` is the more dangerous of the two: the structural
+  // pool-shape check below only verifies `k_pool.shape(3) ==
+  // block_size`, so a zero-sized pool block dimension passes the shape
+  // equality with `block_size=0`. On `eval_gpu`, the runtime bounds
+  // check then computes `max_seq_len_bound = max_blocks_per_seq *
+  // block_size_ = 0`, accepts `seq_lens[i] == 0`, and immediately
+  // computes `(s + block_size_ - 1) / block_size_` — divide-by-zero in
+  // host code, BEFORE the later `max_context_len <= 0` guard runs.
+  // That is a process-crash hazard, not just a bad-kernel-name failure.
+  //
+  // `head_size <= 0` doesn't have the same crash path through eval_gpu
+  // arithmetic, but it would set up a degenerate Metal launch with a
+  // zero-sized inner dim (the kernel uses head_size as a grid extent
+  // and indexing stride). Reject both at the factory so the primitive
+  // never enters a degenerate state.
+  if (block_size <= 0) {
+    std::ostringstream msg;
+    msg << "[paged_attention] block_size (" << block_size
+        << ") must be > 0; eval_gpu's bounds check divides by it "
+        << "(`(s + block_size - 1) / block_size`) and the Metal kernel "
+        << "uses it as a grid extent.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (head_size <= 0) {
+    std::ostringstream msg;
+    msg << "[paged_attention] head_size (" << head_size
+        << ") must be > 0; the Metal kernel uses it as a grid extent "
+        << "and indexing stride.";
     throw std::invalid_argument(msg.str());
   }
 
@@ -2631,6 +2694,95 @@ int mlx_paged_attention_factory_rejects_indivisible_grouping() {
         /*num_q_heads=*/6,
         /*num_kv_heads=*/4,
         /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// block_size = 0 must be rejected. Without the factory check, the
+/// pool shape equality (`k_pool.shape(3) == block_size`) accepts a
+/// zero-sized pool block dimension when `block_size=0`, and on
+/// `eval_gpu` the runtime bounds check would compute `(s + block_size -
+/// 1) / block_size` and divide by zero in host code BEFORE the later
+/// `max_context_len <= 0` guard could reject. Build a structurally
+/// consistent zero-block-size graph and assert the factory throws.
+int mlx_paged_attention_factory_rejects_zero_block_size() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  // Pool's block_size dim (k_pool.shape(3) and v_pool.shape(3)) is 0 to
+  // satisfy the structural shape-equality check (`pool.shape(3) ==
+  // block_size`) — that is precisely the path the bug exploits.
+  array q(Shape{1, 8, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 0, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 0}, bfloat16, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+  try {
+    paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/0,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// head_size = 0 must be rejected. The Metal kernel uses head_size as
+/// a grid extent and indexing stride; a zero-sized inner dim would set
+/// up a degenerate Metal launch. Mirrors `paged_kv_write`'s identical
+/// `head_size > 0` check for symmetry.
+int mlx_paged_attention_factory_rejects_zero_head_size() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  // q.shape(2) and v_pool.shape(2) are 0 to keep the structural
+  // shape-equality checks satisfied — head_size flows through both
+  // q's trailing dim and v_pool's interior dim.
+  array q(Shape{1, 8, 0}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 0, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 0, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+  try {
+    paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/0,
         KvDtype::Bf16,
         StreamOrDevice{});
   } catch (const std::invalid_argument&) {

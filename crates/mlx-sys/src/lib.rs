@@ -1017,6 +1017,18 @@ unsafe extern "C-unwind" {
     /// KV-head pool dimension).
     pub fn mlx_paged_attention_factory_rejects_indivisible_grouping() -> i32;
 
+    /// block_size = 0 must be rejected. Without this check the pool
+    /// shape equality accepts a zero-sized pool block dim when
+    /// block_size=0, and `eval_gpu`'s bounds check then divides by
+    /// zero in host code (`(s + block_size - 1) / block_size`).
+    pub fn mlx_paged_attention_factory_rejects_zero_block_size() -> i32;
+
+    /// head_size = 0 must be rejected. The Metal kernel uses head_size
+    /// as a grid extent and indexing stride; a zero-sized inner dim
+    /// would set up a degenerate Metal launch. Mirrors
+    /// `paged_kv_write`'s identical check for symmetry.
+    pub fn mlx_paged_attention_factory_rejects_zero_head_size() -> i32;
+
     /// Compile a `paged_kv_write`-emitting function, call it once with a
     /// valid slot_mapping (cache miss, factory check passes), then call
     /// it again with an out-of-range slot_mapping. The cache HIT bypasses

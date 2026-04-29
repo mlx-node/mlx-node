@@ -1271,6 +1271,42 @@ fn paged_attention_factory_rejects_indivisible_grouping() {
 }
 
 // =============================================================================
+// Phase 1 review-round-7 finding: PagedAttention factory must reject
+// `block_size == 0` and `head_size == 0`.
+//
+// The pool-shape equality check only verifies `pool.shape(3) ==
+// block_size`, so a zero-sized pool block dimension passes when
+// `block_size=0`. On `eval_gpu`, the runtime bounds check then computes
+// `(s + block_size - 1) / block_size` and divides by zero in host code
+// BEFORE the later `max_context_len <= 0` guard could reject — a
+// process-crash hazard. `head_size == 0` is the symmetric case and is
+// already rejected in `paged_kv_write`'s factory; mirror it here.
+// =============================================================================
+
+#[test]
+fn paged_attention_factory_rejects_zero_block_size() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_zero_block_size() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject block_size = 0 (got {threw}); \
+         the pool shape equality check accepts a zero-sized pool block \
+         dim when block_size=0, and `eval_gpu`'s subsequent bounds check \
+         would then divide by zero in `(s + block_size - 1) / block_size`."
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_zero_head_size() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_zero_head_size() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject head_size = 0 (got {threw}); \
+         the Metal kernel uses head_size as a grid extent and indexing \
+         stride. Mirrors `paged_kv_write`'s identical check for symmetry."
+    );
+}
+
+// =============================================================================
 // Phase 1 review-round-4 finding A: compile-cached path slot-bounds test.
 //
 // The factory's slot bounds check is skipped during MLX tracing AND on
