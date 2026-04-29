@@ -1139,6 +1139,45 @@ unsafe extern "C-unwind" {
     /// seq_lens sliced as `seq_lens[1:]` (nonzero offset) must be
     /// rejected by the `paged_attention` factory.
     pub fn mlx_paged_attention_factory_rejects_non_contiguous_seq_lens() -> i32;
+
+    // =============================================================================
+    // Phase 1 review-round-9 finding: PagedKVWrite::eval_gpu and
+    // PagedAttention::eval_gpu must mirror the row-contiguous /
+    // zero-offset check that the factories already perform. The compile
+    // cache key only compares rank/shape/dtype, so a graph first traced
+    // with contiguous inputs can be replayed via `compile_replace` with
+    // a same-shape sliced/transposed view that bypasses the factory's
+    // check entirely.
+    //
+    // Each helper compiles a function emitting the relevant primitive,
+    // calls it once with contiguous inputs (cache miss; factory +
+    // eval_gpu both pass), then calls it again with the SAME shapes and
+    // dtypes but with one input substituted by a non-row-contiguous /
+    // nonzero-offset view. The mirrored eval_gpu check MUST throw on
+    // the second eval.
+    //
+    // Return codes:
+    //   1   — second-call eval threw `std::invalid_argument` (fix
+    //         working — the compile-cached path is contiguity-checked).
+    //   0   — second-call eval did NOT throw (regression — a malformed
+    //         view reached the kernel).
+    //  -1   — internal/setup error (first call failed unexpectedly).
+    //  -3   — Metal not available; eval-based verification skipped
+    //         (slice/transpose materialization needs Metal).
+    // =============================================================================
+
+    /// Compile a `paged_kv_write`-emitting function, call it once with
+    /// contiguous inputs, then call it again with `new_k` substituted
+    /// by a transposed (non-row-contiguous) view. The mirrored check
+    /// inside `PagedKVWrite::eval_gpu` MUST throw on the second eval.
+    pub fn mlx_paged_kv_write_compile_cached_non_contiguous_throws() -> i32;
+
+    /// Compile a `paged_attention`-emitting function, call it once with
+    /// contiguous inputs, then call it again with `block_table`
+    /// substituted by a sliced (nonzero-offset) view. The mirrored
+    /// check inside `PagedAttention::eval_gpu` MUST throw on the second
+    /// eval.
+    pub fn mlx_paged_attention_compile_cached_non_contiguous_throws() -> i32;
 }
 
 // ================================================================================

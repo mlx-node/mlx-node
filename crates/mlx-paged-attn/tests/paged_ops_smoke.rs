@@ -1547,3 +1547,107 @@ fn paged_attention_factory_rejects_non_contiguous_seq_lens() {
          the logical slice start."
     );
 }
+
+// =============================================================================
+// Phase 1 review-round-9: compile-cached eval_gpu must mirror the
+// factory's row-contiguous / zero-offset check.
+//
+// `mlx::core::compile` cache hits rebuild the cached primitive with real
+// inputs via `compile_replace` WITHOUT re-running the factory — the
+// cache key only compares rank/shape/dtype. A graph first traced with
+// contiguous inputs can later be replayed with a same-shape
+// sliced/transposed view that bypasses the factory's check entirely.
+// The fix mirrors `require_row_contiguous_zero_offset` inside both
+// `PagedKVWrite::eval_gpu` and `PagedAttention::eval_gpu`. These tests
+// verify the mirrored check fires on the compile-cached second eval.
+// =============================================================================
+
+#[test]
+fn compile_cached_paged_kv_write_rejects_non_contiguous() {
+    // The C++ helper:
+    //   1. Compiles a function emitting `paged_kv_write`.
+    //   2. Calls it with contiguous inputs (cache miss; factory +
+    //      eval_gpu both pass).
+    //   3. Calls it again with the SAME shapes/dtypes but with `new_k`
+    //      substituted by a transposed (non-row-contiguous) view.
+    //      Cache HIT bypasses the factory. The mirrored
+    //      `require_row_contiguous_zero_offset` check inside
+    //      `PagedKVWrite::eval_gpu` MUST throw `std::invalid_argument`.
+    //
+    // Return codes:
+    //   1   → success (eval_gpu threw on the non-contiguous view).
+    //   0   → regression (eval_gpu did NOT throw — the kernel would
+    //         have aliased the wrong region of the new_k buffer).
+    //  -1   → internal/setup error (first call failed).
+    //  -3   → Metal not available; verification skipped (slice/
+    //         transpose materialization needs Metal).
+    let rc = unsafe { mlx_sys::mlx_paged_kv_write_compile_cached_non_contiguous_throws() };
+
+    if rc == -3 {
+        eprintln!(
+            "compile_cached_paged_kv_write_rejects_non_contiguous: \
+             Metal not available; skipping eval-based verification"
+        );
+        return;
+    }
+
+    assert_ne!(
+        rc, -1,
+        "compile-cached paged_kv_write non-contiguous helper hit an internal error"
+    );
+    assert_eq!(
+        rc, 1,
+        "PagedKVWrite::eval_gpu must throw std::invalid_argument when the \
+         compile-cached path receives a non-row-contiguous input view \
+         (got rc={rc}). The factory's contiguity check is skipped on \
+         cache hits, so the mirrored check must fire eval_gpu-side. \
+         Without it, the dispatch would silently alias the wrong region \
+         of the backing allocation."
+    );
+}
+
+#[test]
+fn compile_cached_paged_attention_rejects_non_contiguous() {
+    // The C++ helper:
+    //   1. Compiles a function emitting `paged_attention`.
+    //   2. Calls it with contiguous inputs (cache miss; factory +
+    //      eval_gpu both pass).
+    //   3. Calls it again with the SAME shapes/dtypes but with
+    //      `block_table` substituted by a sliced (nonzero-offset) view
+    //      of a wider [3, 4] backing buffer (rows [1:2] → shape [1, 4]
+    //      at nonzero offset). Cache HIT bypasses the factory. The
+    //      mirrored `require_row_contiguous_zero_offset` check inside
+    //      `PagedAttention::eval_gpu` MUST throw `std::invalid_argument`.
+    //
+    // Return codes:
+    //   1   → success (eval_gpu threw on the non-contiguous view).
+    //   0   → regression (eval_gpu did NOT throw — the kernel would
+    //         have read from offset 0 of the backing buffer instead of
+    //         the logical slice start).
+    //  -1   → internal/setup error (first call failed).
+    //  -3   → Metal not available; verification skipped (slice
+    //         materialization needs Metal).
+    let rc = unsafe { mlx_sys::mlx_paged_attention_compile_cached_non_contiguous_throws() };
+
+    if rc == -3 {
+        eprintln!(
+            "compile_cached_paged_attention_rejects_non_contiguous: \
+             Metal not available; skipping eval-based verification"
+        );
+        return;
+    }
+
+    assert_ne!(
+        rc, -1,
+        "compile-cached paged_attention non-contiguous helper hit an internal error"
+    );
+    assert_eq!(
+        rc, 1,
+        "PagedAttention::eval_gpu must throw std::invalid_argument when the \
+         compile-cached path receives a non-row-contiguous / nonzero-offset \
+         input view (got rc={rc}). The factory's contiguity check is skipped \
+         on cache hits, so the mirrored check must fire eval_gpu-side. \
+         Without it, the dispatch would silently read from the wrong region \
+         of the backing allocation."
+    );
+}

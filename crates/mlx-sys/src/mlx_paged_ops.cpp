@@ -247,6 +247,37 @@ void PagedKVWrite::eval_gpu(
   const array& k_scale = inputs[5];
   const array& v_scale = inputs[6];
 
+  // Phase 1 review-round-9 contract: every input must be row-contiguous
+  // and start at offset 0 in its backing buffer. Mirrors the identical
+  // checks in the public `paged_kv_write(...)` factory.
+  //
+  // The factory normally rejects non-contiguous / nonzero-offset views
+  // before the primitive is constructed, but `mlx::core::compile`'s
+  // cached re-traces rebuild the cached primitive with real inputs via
+  // `compile_replace` WITHOUT re-running the factory — the cache key
+  // only compares rank/shape/dtype. Without a mirrored check here, a
+  // graph first traced with contiguous inputs could be replayed with a
+  // same-shape sliced/transposed view, and the dispatch path (which
+  // forwards raw MTLBuffer pointers + at most slot_mapping/new_k/new_v
+  // offsets) would silently alias the wrong region of memory. Run BEFORE
+  // any host reads (slot_mapping.data<int64_t>(), k_scale.item<float>()
+  // etc.) and BEFORE `metal_array_ptr` extraction so the throw fires
+  // before we touch the buffers.
+  require_row_contiguous_zero_offset(
+      k_pool, "PagedKVWrite::eval_gpu", "k_pool");
+  require_row_contiguous_zero_offset(
+      v_pool, "PagedKVWrite::eval_gpu", "v_pool");
+  require_row_contiguous_zero_offset(
+      new_k, "PagedKVWrite::eval_gpu", "new_k");
+  require_row_contiguous_zero_offset(
+      new_v, "PagedKVWrite::eval_gpu", "new_v");
+  require_row_contiguous_zero_offset(
+      slot_mapping, "PagedKVWrite::eval_gpu", "slot_mapping");
+  require_row_contiguous_zero_offset(
+      k_scale, "PagedKVWrite::eval_gpu", "k_scale");
+  require_row_contiguous_zero_offset(
+      v_scale, "PagedKVWrite::eval_gpu", "v_scale");
+
   // Output arrays semantically alias the input pools (in-place write).
   // `copy_shared_buffer` makes the output `array` point at the same
   // backing buffer + offset / strides as the input pool.
@@ -419,6 +450,37 @@ void PagedAttention::eval_gpu(
   const array& v_scale = inputs[6];
 
   array& out = outputs[0];
+
+  // Phase 1 review-round-9 contract: every input must be row-contiguous
+  // and start at offset 0 in its backing buffer. Mirrors the identical
+  // checks in the public `paged_attention(...)` factory.
+  //
+  // The factory normally rejects non-contiguous / nonzero-offset views
+  // before the primitive is constructed, but `mlx::core::compile`'s
+  // cached re-traces rebuild the cached primitive with real inputs via
+  // `compile_replace` WITHOUT re-running the factory — the cache key
+  // only compares rank/shape/dtype. Without a mirrored check here, a
+  // graph first traced with contiguous inputs could be replayed with a
+  // same-shape sliced/transposed view, and the dispatch path (which
+  // forwards raw MTLBuffer pointers + only q.offset()/out.offset()
+  // through to the Rust shim) would silently read from the wrong region
+  // of memory. Run BEFORE any host reads (seq_lens.data<int32_t>(),
+  // block_table.data<int32_t>(), k_scale.item<float>() etc.) and BEFORE
+  // `metal_array_ptr` extraction so the throw fires before we touch the
+  // buffers.
+  require_row_contiguous_zero_offset(q, "PagedAttention::eval_gpu", "q");
+  require_row_contiguous_zero_offset(
+      k_pool, "PagedAttention::eval_gpu", "k_pool");
+  require_row_contiguous_zero_offset(
+      v_pool, "PagedAttention::eval_gpu", "v_pool");
+  require_row_contiguous_zero_offset(
+      block_table, "PagedAttention::eval_gpu", "block_table");
+  require_row_contiguous_zero_offset(
+      seq_lens, "PagedAttention::eval_gpu", "seq_lens");
+  require_row_contiguous_zero_offset(
+      k_scale, "PagedAttention::eval_gpu", "k_scale");
+  require_row_contiguous_zero_offset(
+      v_scale, "PagedAttention::eval_gpu", "v_scale");
 
   if (q.ndim() != 3) {
     throw std::runtime_error(
@@ -3736,6 +3798,422 @@ int mlx_paged_attention_factory_rejects_non_contiguous_seq_lens() {
   } catch (...) {
     return 0;
   }
+  return 0;
+}
+
+} // extern "C"
+
+// =============================================================================
+// Phase 1 review-round-9 finding: PagedKVWrite::eval_gpu and
+// PagedAttention::eval_gpu must mirror the row-contiguous / zero-offset
+// check that the factories already perform, because `mlx::core::compile`
+// cache hits rebuild the cached primitive with real inputs via
+// `compile_replace` WITHOUT re-running the factory — the cache key only
+// compares rank/shape/dtype. A graph first traced with contiguous inputs
+// can later be replayed with a same-shape sliced/transposed view.
+//
+// These helpers verify the eval_gpu mirrored check fires on the second
+// (compile-cached) eval. Layout is shared with the round-3/round-4 OOB
+// tests so the cache keys remain independent of those existing tests.
+// =============================================================================
+
+namespace {
+
+/// Trace function for the compile-cached non-contiguous `paged_kv_write`
+/// test. Hard-coded scalars match the second-call invocation so the
+/// cache key is consistent across compile+replay. Independent of
+/// `paged_kv_write_oob_trace_fn` to keep the per-test compile cache
+/// disjoint.
+std::vector<mlx::core::array> paged_kv_write_non_contig_trace_fn(
+    const std::vector<mlx::core::array>& inputs) {
+  using namespace mlx::core::fast;
+  if (inputs.size() != 7) {
+    throw std::runtime_error(
+        "paged_kv_write_non_contig_trace_fn: expected 7 inputs");
+  }
+  auto out = paged_kv_write(
+      inputs[0],
+      inputs[1],
+      inputs[2],
+      inputs[3],
+      inputs[4],
+      inputs[5],
+      inputs[6],
+      /*block_size=*/16,
+      /*num_kv_heads=*/4,
+      /*head_size=*/64,
+      /*x_pack=*/8,
+      KvDtype::Bf16,
+      /*s=*/{});
+  return {out.first, out.second};
+}
+
+/// Trace function for the compile-cached non-contiguous
+/// `paged_attention` test. Independent of
+/// `paged_attention_oob_trace_fn` to keep the per-test compile cache
+/// disjoint.
+std::vector<mlx::core::array> paged_attention_non_contig_trace_fn(
+    const std::vector<mlx::core::array>& inputs) {
+  using namespace mlx::core::fast;
+  if (inputs.size() != 7) {
+    throw std::runtime_error(
+        "paged_attention_non_contig_trace_fn: expected 7 inputs");
+  }
+  auto out = paged_attention(
+      inputs[0], // q
+      inputs[1], // k_pool
+      inputs[2], // v_pool
+      inputs[3], // block_table
+      inputs[4], // seq_lens
+      inputs[5], // k_scale
+      inputs[6], // v_scale
+      /*scale=*/0.125f,
+      /*softcap=*/0.0f,
+      /*sliding_window=*/0,
+      /*block_size=*/16,
+      /*num_q_heads=*/8,
+      /*num_kv_heads=*/4,
+      /*head_size=*/64,
+      KvDtype::Bf16,
+      /*s=*/{});
+  return {out};
+}
+
+} // namespace
+
+extern "C" {
+
+/// Compile a `paged_kv_write`-emitting function, call it once with
+/// contiguous inputs (cache miss → factory + eval_gpu both pass), then
+/// call it again with the SAME shapes / dtypes but with `new_k`
+/// substituted by a non-row-contiguous transposed view. Cache HIT
+/// bypasses the factory; `PagedKVWrite::eval_gpu`'s mirrored
+/// `require_row_contiguous_zero_offset` check MUST throw on the second
+/// eval.
+///
+/// Layout matches `mlx_paged_kv_write_compile_cached_oob_throws`:
+///   block_size=16, num_kv_heads=4, head_size=64, x_pack=8, Bf16.
+///   k_pool: [4, 4, 8, 16, 8] bf16
+///   v_pool: [4, 4, 64, 16] bf16
+///   new_k:  [2, 4, 64] bf16
+///   new_v:  [2, 4, 64] bf16
+///   slot_mapping: [2] int64
+///
+/// The non-contiguous `new_k` is built by transposing a `[64, 4, 2]`
+/// row-contiguous source via permutation `(2, 1, 0)`, yielding a
+/// `[2, 4, 64]` view whose strides do not match its logical layout
+/// (row_contiguous == false).
+///
+/// Return codes:
+///   1   — second-call eval threw `std::invalid_argument` (fix
+///         working — the compile-cached path mirrors the contiguity
+///         check).
+///   0   — second-call eval did NOT throw (regression — a non-contiguous
+///         view reached the kernel, which would alias the wrong region
+///         of memory).
+///  -1   — internal/setup error (first call failed unexpectedly).
+///  -3   — Metal not available; eval-based verification skipped (slice/
+///         transpose materialization needs Metal).
+int mlx_paged_kv_write_compile_cached_non_contiguous_throws() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  const int kBlockSize = 16;
+  const int kNumKvHeads = 4;
+  const int kHeadSize = 64;
+  const int kXPack = 8;
+  const int kNumBlocks = 4;
+  const int kNumTokens = 2;
+
+  const size_t k_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      (kHeadSize / kXPack) * kBlockSize * kXPack;
+  const size_t v_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      kHeadSize * kBlockSize;
+  const size_t new_kv_elems =
+      static_cast<size_t>(kNumTokens) * kNumKvHeads * kHeadSize;
+
+  std::vector<uint16_t> k_pool_host(k_pool_elems, 0);
+  std::vector<uint16_t> v_pool_host(v_pool_elems, 0);
+  std::vector<uint16_t> new_k_host(new_kv_elems, 0x3FC0); // bf16(1.5)
+  std::vector<uint16_t> new_v_host(new_kv_elems, 0x4040); // bf16(3.0)
+
+  auto bf16_arr = [](const std::vector<uint16_t>& src, Shape shape) {
+    auto* p = reinterpret_cast<const bfloat16_t*>(src.data());
+    return array(p, std::move(shape), bfloat16);
+  };
+  auto i64_arr = [](const std::vector<int64_t>& src, Shape shape) {
+    return array(src.data(), std::move(shape), int64);
+  };
+
+  Shape k_pool_shape{kNumBlocks, kNumKvHeads, kHeadSize / kXPack, kBlockSize,
+      kXPack};
+  Shape v_pool_shape{kNumBlocks, kNumKvHeads, kHeadSize, kBlockSize};
+  Shape new_kv_shape{kNumTokens, kNumKvHeads, kHeadSize};
+
+  array k_pool = bf16_arr(k_pool_host, k_pool_shape);
+  array v_pool = bf16_arr(v_pool_host, v_pool_shape);
+  array new_k_good = bf16_arr(new_k_host, new_kv_shape);
+  array new_v = bf16_arr(new_v_host, new_kv_shape);
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  // First call: contiguous inputs, valid slot_mapping. Cache miss →
+  // factory + eval_gpu both pass.
+  std::vector<int64_t> good_slots = {0, 16};
+  array slot_mapping = i64_arr(good_slots, Shape{kNumTokens});
+
+  auto compiled = mlx::core::compile(&paged_kv_write_non_contig_trace_fn);
+
+  std::vector<array> inputs1{
+      k_pool, v_pool, new_k_good, new_v, slot_mapping, k_scale, v_scale};
+
+  std::vector<array> outputs1;
+  try {
+    outputs1 = compiled(inputs1);
+    if (outputs1.size() != 2) {
+      return -1;
+    }
+    mlx::core::eval(outputs1[0], outputs1[1]);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_kv_write_compile_cached_non_contig] first call (contiguous "
+        "inputs) threw unexpectedly: %s\n",
+        e.what());
+    return -1;
+  }
+
+  // Second call: substitute a non-row-contiguous view of `new_k` while
+  // keeping every other input identical. Build a [64, 4, 2] source and
+  // transpose with permutation (2, 1, 0) → [2, 4, 64]; the result has
+  // the right logical shape but the strides mirror the [64, 4, 2]
+  // layout, so row_contiguous == false.
+  std::vector<uint16_t> new_k_alt_host(new_kv_elems, 0x3FC0);
+  array new_k_alt = bf16_arr(new_k_alt_host, Shape{kHeadSize, kNumKvHeads,
+      kNumTokens});
+  eval(new_k_alt);
+  array new_k_bad = mlx::core::transpose(new_k_alt, std::vector<int>{2, 1, 0});
+  eval(new_k_bad);
+
+  if (new_k_bad.flags().row_contiguous && new_k_bad.offset() == 0) {
+    fprintf(
+        stderr,
+        "[paged_kv_write_compile_cached_non_contig] WARNING: transpose "
+        "produced a row-contiguous view at offset 0; the test will not "
+        "exercise the intended eval_gpu rejection path.\n");
+  }
+
+  std::vector<array> inputs2{
+      k_pool, v_pool, new_k_bad, new_v, slot_mapping, k_scale, v_scale};
+
+  std::vector<array> outputs2;
+  try {
+    outputs2 = compiled(inputs2);
+    if (outputs2.size() != 2) {
+      return -1;
+    }
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_kv_write_compile_cached_non_contig] second call (compile) "
+        "threw early: %s\n",
+        e.what());
+    return -1;
+  }
+
+  // The throw must fire on eval, not on the compiled() lambda call
+  // itself (the lambda just stitches the graph; eval invokes
+  // `eval_gpu`).
+  try {
+    mlx::core::eval(outputs2[0], outputs2[1]);
+  } catch (const std::invalid_argument& /*e*/) {
+    return 1; // SUCCESS — eval_gpu caught the non-contiguous view.
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_kv_write_compile_cached_non_contig] second-call eval threw "
+        "a non-invalid_argument: %s\n",
+        e.what());
+    return 0;
+  }
+  fprintf(
+      stderr,
+      "[paged_kv_write_compile_cached_non_contig] second-call eval did NOT "
+      "throw — the compile-cached path is missing its mirrored "
+      "row-contiguous / zero-offset check\n");
+  return 0;
+}
+
+/// Compile a `paged_attention`-emitting function, call it once with
+/// contiguous inputs (cache miss → factory + eval_gpu both pass), then
+/// call it again with the SAME shapes / dtypes but with `block_table`
+/// substituted by a sliced (nonzero-offset) view of a wider table.
+/// Cache HIT bypasses the factory; `PagedAttention::eval_gpu`'s mirrored
+/// `require_row_contiguous_zero_offset` check MUST throw on the second
+/// eval.
+///
+/// Layout matches `mlx_paged_attention_compile_cached_oob_throws`:
+///   block_size=16, num_kv_heads=4, head_size=64, x_pack=8, Bf16,
+///   num_q_heads=8, num_seqs=1, max_blocks_per_seq=4.
+///
+/// The non-contiguous `block_table` is built by slicing rows [0:1] of a
+/// [3, 4] row-contiguous source. The slice has shape [1, 4] (matching
+/// the first call's `block_table` shape), but rows beyond row 0 of the
+/// underlying [3, 4] backing buffer make the view... actually, for
+/// `block_table[0:1]` on a [3, 4] backing buffer, the slice IS
+/// row-contiguous at offset 0. To force a nonzero offset, slice rows
+/// [1:2] of a [3, 4] backing buffer: shape [1, 4], offset != 0.
+///
+/// Return codes:
+///   1   — second-call eval threw `std::invalid_argument` (fix
+///         working — the compile-cached path mirrors the contiguity
+///         check).
+///   0   — second-call eval did NOT throw (regression — a sliced
+///         view with nonzero offset reached the kernel, which would
+///         read from the wrong region of the backing allocation).
+///  -1   — internal/setup error (first call failed unexpectedly).
+///  -3   — Metal not available; eval-based verification skipped (slice
+///         materialization needs Metal).
+int mlx_paged_attention_compile_cached_non_contiguous_throws() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  const int kBlockSize = 16;
+  const int kNumKvHeads = 4;
+  const int kHeadSize = 64;
+  const int kXPack = 8;
+  const int kNumBlocks = 4;
+  const int kNumQHeads = 8;
+  const int kNumSeqs = 1;
+  const int kMaxBlocksPerSeq = 4;
+
+  const size_t k_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      (kHeadSize / kXPack) * kBlockSize * kXPack;
+  const size_t v_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      kHeadSize * kBlockSize;
+  const size_t q_elems =
+      static_cast<size_t>(kNumSeqs) * kNumQHeads * kHeadSize;
+
+  std::vector<uint16_t> k_pool_host(k_pool_elems, 0);
+  std::vector<uint16_t> v_pool_host(v_pool_elems, 0);
+  std::vector<uint16_t> q_host(q_elems, 0x3F80); // bf16(1.0)
+
+  auto bf16_arr = [](const std::vector<uint16_t>& src, Shape shape) {
+    auto* p = reinterpret_cast<const bfloat16_t*>(src.data());
+    return array(p, std::move(shape), bfloat16);
+  };
+  auto i32_arr = [](const std::vector<int32_t>& src, Shape shape) {
+    return array(src.data(), std::move(shape), int32);
+  };
+
+  Shape k_pool_shape{kNumBlocks, kNumKvHeads, kHeadSize / kXPack, kBlockSize,
+      kXPack};
+  Shape v_pool_shape{kNumBlocks, kNumKvHeads, kHeadSize, kBlockSize};
+  Shape q_shape{kNumSeqs, kNumQHeads, kHeadSize};
+
+  array q = bf16_arr(q_host, q_shape);
+  array k_pool = bf16_arr(k_pool_host, k_pool_shape);
+  array v_pool = bf16_arr(v_pool_host, v_pool_shape);
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  auto compiled = mlx::core::compile(&paged_attention_non_contig_trace_fn);
+
+  // First call: contiguous block_table = [0, 0, 0, 0], seq_lens = [16].
+  // Cache miss → factory + eval_gpu both pass.
+  std::vector<int32_t> good_seq_lens = {16};
+  std::vector<int32_t> good_block_table = {0, 0, 0, 0};
+  array seq_lens_good = i32_arr(good_seq_lens, Shape{kNumSeqs});
+  array block_table_good = i32_arr(
+      good_block_table, Shape{kNumSeqs, kMaxBlocksPerSeq});
+
+  std::vector<array> inputs1{
+      q, k_pool, v_pool, block_table_good, seq_lens_good, k_scale, v_scale};
+
+  std::vector<array> outputs1;
+  try {
+    outputs1 = compiled(inputs1);
+    if (outputs1.size() != 1) {
+      return -1;
+    }
+    mlx::core::eval(outputs1[0]);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_attention_compile_cached_non_contig] first call (contiguous "
+        "inputs) threw unexpectedly: %s\n",
+        e.what());
+    return -1;
+  }
+
+  // Second call: substitute a non-row-contiguous view of `block_table`
+  // while keeping every other input identical. Build a [3, 4] backing
+  // buffer with all-zero entries (so the bounds check would still
+  // pass), then take rows [1:2] → shape [1, 4] at nonzero offset.
+  std::vector<int32_t> bt_full_host(3 * kMaxBlocksPerSeq, 0);
+  array bt_full = i32_arr(bt_full_host, Shape{3, kMaxBlocksPerSeq});
+  eval(bt_full);
+  array block_table_bad = mlx::core::slice(
+      bt_full,
+      Shape{1, 0},
+      Shape{2, kMaxBlocksPerSeq},
+      Shape{1, 1});
+  eval(block_table_bad);
+
+  if (block_table_bad.flags().row_contiguous &&
+      block_table_bad.offset() == 0) {
+    fprintf(
+        stderr,
+        "[paged_attention_compile_cached_non_contig] WARNING: slice "
+        "produced a row-contiguous view at offset 0; the test will not "
+        "exercise the intended eval_gpu rejection path.\n");
+  }
+
+  std::vector<array> inputs2{
+      q, k_pool, v_pool, block_table_bad, seq_lens_good, k_scale, v_scale};
+
+  std::vector<array> outputs2;
+  try {
+    outputs2 = compiled(inputs2);
+    if (outputs2.size() != 1) {
+      return -1;
+    }
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_attention_compile_cached_non_contig] second call (compile) "
+        "threw early: %s\n",
+        e.what());
+    return -1;
+  }
+
+  // The throw must fire on eval, not on the compiled() lambda call
+  // itself.
+  try {
+    mlx::core::eval(outputs2[0]);
+  } catch (const std::invalid_argument& /*e*/) {
+    return 1; // SUCCESS — eval_gpu caught the non-contiguous view.
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_attention_compile_cached_non_contig] second-call eval "
+        "threw a non-invalid_argument: %s\n",
+        e.what());
+    return 0;
+  }
+  fprintf(
+      stderr,
+      "[paged_attention_compile_cached_non_contig] second-call eval did "
+      "NOT throw — the compile-cached path is missing its mirrored "
+      "row-contiguous / zero-offset check\n");
   return 0;
 }
 
