@@ -1672,16 +1672,65 @@ fn compile_cached_paged_attention_rejects_non_contiguous() {
 // must come from the validator inside `eval_gpu` itself.
 // =============================================================================
 
+/// Assert the C++ helper proved that **`eval_gpu`** (not the
+/// graph-construction step) is the throwing site. Round-11 tightening:
+/// the helper now distinguishes graph-construction rejection from
+/// eval_gpu rejection so a pre-eval throw can no longer masquerade as
+/// success. Return codes:
+///   *  `1`  — eval threw `std::invalid_argument` AND the message
+///             contains the eval_gpu validator context. **Pass.**
+///   *  `0`  — eval did not throw at all. Bad scalar state was
+///             silently accepted. **Fail.**
+///   *  `2`  — graph construction threw `std::invalid_argument`
+///             BEFORE eval ran. The helper's structurally-valid inputs
+///             should never trigger this — internal helper bug. **Fail.**
+///   * `-1`  — non-`std::invalid_argument` exception in either step.
+///             **Fail.**
+///   * `-2`  — eval threw `std::invalid_argument` but the message did
+///             not contain the eval_gpu validator context. The throw
+///             came from somewhere other than the validator we are
+///             exercising. **Fail.**
 fn assert_eval_gpu_rejects_bad_state(rc: i32, scenario: &str) {
-    assert_ne!(rc, -1, "{scenario}: helper hit an internal error (rc=-1)");
-    assert_eq!(
-        rc, 1,
-        "{scenario}: eval_gpu must throw std::invalid_argument when the \
-         primitive is constructed with deliberately bad scalar state \
-         (got rc={rc}). Without the validator inside eval_gpu, a \
-         compile-cache replay (which bypasses the factory) could route \
-         a primitive with bad scalar state to the dispatch path."
-    );
+    match rc {
+        1 => {} // success
+        0 => panic!(
+            "{scenario}: eval_gpu DID NOT throw — bad scalar state was \
+             silently accepted. Without the validator inside eval_gpu, a \
+             compile-cache replay (which bypasses the factory) could route \
+             a primitive with bad scalar state to the dispatch path."
+        ),
+        2 => panic!(
+            "{scenario}: INTERNAL HELPER BUG — graph construction \
+             (make_arrays / array constructor) threw \
+             std::invalid_argument BEFORE eval ran. This means the \
+             helper is not actually exercising eval_gpu's validator; \
+             the rejection is happening at the wrong layer. Fix the \
+             helper to keep its structural inputs valid so the bad \
+             scalar state must be caught by eval_gpu, not by graph \
+             construction."
+        ),
+        -1 => panic!(
+            "{scenario}: helper hit an internal error (rc=-1) — a \
+             non-invalid_argument exception fired in either \
+             construction or eval. See stderr for the underlying \
+             message."
+        ),
+        -2 => panic!(
+            "{scenario}: eval threw std::invalid_argument but the \
+             message did not contain the expected eval_gpu validator \
+             context (e.g. \"PagedKVWrite::eval_gpu\" / \
+             \"PagedAttention::eval_gpu\"). The throw is coming from a \
+             different layer of the eval path, NOT from the validator \
+             we intend to exercise. See stderr for the actual message."
+        ),
+        other => panic!(
+            "{scenario}: helper returned unexpected rc={other}; valid \
+             codes are 0 (eval did not throw), 1 (eval_gpu validator \
+             threw — pass), 2 (graph construction threw — internal \
+             helper bug), -1 (non-invalid_argument), -2 (wrong throw \
+             site)."
+        ),
+    }
 }
 
 #[test]

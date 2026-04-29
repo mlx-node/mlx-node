@@ -1185,6 +1185,19 @@ unsafe extern "C-unwind" {
     // throw must come from the validator inside `eval_gpu` itself —
     // proving that compile-cache replay (which bypasses the factory)
     // can never bypass a check the helper performs.
+    //
+    // Round-11 tightening: every helper distinguishes graph
+    // construction from eval, AND verifies the exception message
+    // contains the eval_gpu validator context tag. Return codes:
+    //   *  1 — eval_gpu validator threw `std::invalid_argument` with
+    //          the expected context tag (PASS).
+    //   *  0 — eval did not throw (bad inputs accepted; FAIL).
+    //   *  2 — graph construction (`make_arrays` / `array(...)`)
+    //          threw before eval (internal helper bug; FAIL).
+    //   * -1 — non-`std::invalid_argument` exception (FAIL).
+    //   * -2 — eval threw `std::invalid_argument` but message did
+    //          NOT contain the eval_gpu context tag — throw site is
+    //          NOT the validator (FAIL).
     pub fn mlx_paged_kv_write_eval_gpu_rejects_zero_kv_heads() -> i32;
     pub fn mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() -> i32;
     pub fn mlx_paged_kv_write_eval_gpu_rejects_zero_head_size() -> i32;

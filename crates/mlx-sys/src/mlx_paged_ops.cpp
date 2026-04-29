@@ -18,8 +18,10 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -4146,8 +4148,28 @@ namespace {
 
 /// Build a primitive with deliberately bad scalar state, wire it into
 /// the MLX graph via `array::make_arrays`, and `eval()` the result.
-/// Returns 1 if `std::invalid_argument` was thrown, 0 if no throw, -1
-/// if some other exception fired.
+///
+/// Return-code contract (round-11 tightening): the helper must
+/// strictly prove the throw came from `PagedKVWrite::eval_gpu`'s
+/// validator — not from the graph-construction step (`make_arrays`)
+/// nor from a different code path that happens to throw the same
+/// exception class. Codes:
+///   * `1`  — eval threw `std::invalid_argument` AND the message
+///            contains the eval_gpu validator context prefix
+///            "PagedKVWrite::eval_gpu". TEST SUCCESS.
+///   * `0`  — eval did not throw at all. TEST FAILURE: bad inputs were
+///            silently accepted.
+///   * `2`  — `make_arrays` threw `std::invalid_argument` BEFORE eval
+///            ran. TEST FAILURE: this is an internal helper bug — the
+///            graph-construction step should never reject these
+///            structurally-valid inputs. Without this code, a pre-eval
+///            rejection would masquerade as eval_gpu rejection.
+///   * `-1` — any other exception type fired (from either step). TEST
+///            FAILURE: internal error.
+///   * `-2` — eval threw `std::invalid_argument` but the message did
+///            NOT contain the eval_gpu context prefix. TEST FAILURE:
+///            something else in the eval path is throwing, not the
+///            validator we are exercising.
 int eval_paged_kv_write_with_bad_state(
     int block_size,
     int num_kv_heads,
@@ -4197,6 +4219,13 @@ int eval_paged_kv_write_with_bad_state(
   std::vector<array> inputs{
       k_pool, v_pool, new_k, new_v, slot_mapping, k_scale, v_scale};
 
+  // Step 1: graph construction. This MUST succeed — `make_arrays`
+  // does not invoke the primitive's `eval_gpu` and only rejects on
+  // structural problems with the supplied inputs/outputs (rank/dtype
+  // mismatches with the requested output shape/dtype, etc.). The
+  // structural inputs above are intentionally well-formed for the
+  // kv_dtype=Bf16 canonical layout, so any throw here is a helper
+  // bug — NOT proof that eval_gpu rejected.
   std::vector<array> results;
   try {
     results = array::make_arrays(
@@ -4204,8 +4233,15 @@ int eval_paged_kv_write_with_bad_state(
         {k_pool.dtype(), v_pool.dtype()},
         primitive,
         inputs);
-  } catch (const std::invalid_argument&) {
-    return 1;
+  } catch (const std::invalid_argument& e) {
+    fprintf(
+        stderr,
+        "[eval_paged_kv_write_with_bad_state] INTERNAL HELPER BUG: "
+        "make_arrays threw std::invalid_argument BEFORE eval (this "
+        "is a graph-construction rejection, NOT proof of eval_gpu "
+        "rejection): %s\n",
+        e.what());
+    return 2;
   } catch (const std::exception& e) {
     fprintf(
         stderr,
@@ -4215,10 +4251,31 @@ int eval_paged_kv_write_with_bad_state(
     return -1;
   }
 
+  // Step 2: eval. ONLY this call should be capable of producing the
+  // success exception. The validator in `PagedKVWrite::eval_gpu`
+  // tags every error message with the prefix
+  // "[PagedKVWrite::eval_gpu]" via the shared
+  // `validate_paged_kv_write_inputs` helper, so we can confirm the
+  // throw site by message inspection. A `std::invalid_argument`
+  // without that prefix would mean a different layer of the eval
+  // path is throwing — which would NOT prove the eval_gpu validator
+  // is intact.
+  static constexpr const char* kEvalGpuTag = "PagedKVWrite::eval_gpu";
   try {
     mlx::core::eval(results[0], results[1]);
-  } catch (const std::invalid_argument&) {
-    return 1;
+  } catch (const std::invalid_argument& e) {
+    if (std::string(e.what()).find(kEvalGpuTag) != std::string::npos) {
+      return 1;
+    }
+    fprintf(
+        stderr,
+        "[eval_paged_kv_write_with_bad_state] eval threw "
+        "std::invalid_argument but message did NOT contain expected "
+        "validator context '%s' — throw site is NOT eval_gpu's "
+        "validator. Got: %s\n",
+        kEvalGpuTag,
+        e.what());
+    return -2;
   } catch (const std::exception& e) {
     fprintf(
         stderr,
@@ -4234,6 +4291,11 @@ int eval_paged_kv_write_with_bad_state(
   return 0;
 }
 
+/// Build a PagedAttention primitive with deliberately bad scalar
+/// state, wire it into an MLX graph, and `eval()` the result. See
+/// `eval_paged_kv_write_with_bad_state` above for the full
+/// return-code contract — same semantics, with the validator context
+/// prefix being "PagedAttention::eval_gpu".
 int eval_paged_attention_with_bad_state(
     float scale,
     float softcap,
@@ -4300,13 +4362,55 @@ int eval_paged_attention_with_bad_state(
   int safe_out_dim2 = head_size > 0 ? head_size : 1;
   Shape out_shape{q.shape(0), safe_out_dim1, safe_out_dim2};
 
-  array result =
-      array(std::move(out_shape), bfloat16, primitive, std::move(inputs));
-
+  // Step 1: graph construction. The `array(shape, dtype, primitive,
+  // inputs)` constructor only validates structural input/output
+  // shapes — it does NOT invoke `eval_gpu`. Wrap it in its own try
+  // so a pre-eval rejection is surfaced as rc=2 (internal helper
+  // bug) instead of being conflated with eval_gpu rejection.
+  std::unique_ptr<array> result_holder;
   try {
-    mlx::core::eval(result);
-  } catch (const std::invalid_argument&) {
-    return 1;
+    result_holder = std::make_unique<array>(
+        std::move(out_shape), bfloat16, primitive, std::move(inputs));
+  } catch (const std::invalid_argument& e) {
+    fprintf(
+        stderr,
+        "[eval_paged_attention_with_bad_state] INTERNAL HELPER BUG: "
+        "array constructor threw std::invalid_argument BEFORE eval "
+        "(this is a graph-construction rejection, NOT proof of "
+        "eval_gpu rejection): %s\n",
+        e.what());
+    return 2;
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[eval_paged_attention_with_bad_state] array constructor threw "
+        "non-invalid_argument: %s\n",
+        e.what());
+    return -1;
+  }
+
+  // Step 2: eval. Only this call should produce the success
+  // exception, and the message must contain the validator context
+  // tag injected by `validate_paged_attention_inputs` via
+  // `PagedAttention::eval_gpu`. A bare `std::invalid_argument`
+  // without that tag means a different eval-path layer threw — that
+  // does NOT prove the eval_gpu validator is intact.
+  static constexpr const char* kEvalGpuTag = "PagedAttention::eval_gpu";
+  try {
+    mlx::core::eval(*result_holder);
+  } catch (const std::invalid_argument& e) {
+    if (std::string(e.what()).find(kEvalGpuTag) != std::string::npos) {
+      return 1;
+    }
+    fprintf(
+        stderr,
+        "[eval_paged_attention_with_bad_state] eval threw "
+        "std::invalid_argument but message did NOT contain expected "
+        "validator context '%s' — throw site is NOT eval_gpu's "
+        "validator. Got: %s\n",
+        kEvalGpuTag,
+        e.what());
+    return -2;
   } catch (const std::exception& e) {
     fprintf(
         stderr,
