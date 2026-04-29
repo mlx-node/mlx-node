@@ -4518,47 +4518,106 @@ mod tests {
     }
 
     /// Phase 4 Q4 prerequisite: `k_scale_array` / `v_scale_array` return a
-    /// `[1]` fp32 placeholder that the upcoming compiled paged decode will
-    /// thread into `paged_kv_write` / `paged_attention`. Until FP8
+    /// `[1]` fp32 placeholder = 1.0 that the upcoming compiled paged decode
+    /// will thread into `paged_kv_write` / `paged_attention`. Until FP8
     /// calibration lands (Phase 10) the kernels treat 1.0 as a no-op, so
     /// the unit test pins:
     /// - shape `[1]` and dtype `Float32` (the strict factory contract;
     ///   wrong shape/dtype throws at the C++ factory),
-    /// - layer-index independence (every layer currently uses the same
-    ///   placeholder; a future per-layer scale will wire through
-    ///   `layer_idx`).
+    /// - **scalar value `1.0`** (the no-op contract; a regression returning
+    ///   `[2.0]` would silently scale every paged write by 2x without
+    ///   any other test catching it),
+    /// - **cross-layer consistency** (layer 0 must equal layer 1; the
+    ///   accessors currently ignore `layer_idx`, so they MUST hand out
+    ///   identical scalar values; a future per-layer scale will violate
+    ///   this and require this assertion to be relaxed).
     ///
     /// The factory-contract pinning here is what lets the upstream
     /// migration commit deletes-and-replaces the old non-paged FFI
     /// without re-discovering shape/dtype invariants by trial-and-error
     /// on a real model run.
+    ///
+    /// The accessor body builds a CPU-side fp32 array via `from_float32`,
+    /// which routes through `allocator::malloc` and on macOS goes through
+    /// `metal::allocator()`. On a no-Metal host that constructor throws —
+    /// so we can't exercise the accessor at all without Metal. We keep
+    /// the early-return pattern but ALSO emit an explicit skip message
+    /// so a regression on a no-Metal CI runner is not silently masked
+    /// (the test "passing" with no value assertion was the original
+    /// vacuous-pass bug).
     #[test]
     fn k_v_scale_arrays_are_fp32_one_placeholders() {
         let allocator = new_allocator(8, 16);
         let Some(adapter) = maybe_adapter(allocator, 16) else {
+            // No-Metal host: the accessor body itself would fail at
+            // `MxArray::from_float32` because allocator::malloc routes
+            // through metal::allocator(). Skip cleanly. The accessor's
+            // value contract (1.0 fp32 [1]) is exercised on every
+            // Metal-equipped CI host this test runs on.
             eprintln!("skipping k_v_scale_arrays test: Metal device unavailable");
             return;
         };
-        for layer_idx in 0..2u32 {
-            let k = adapter
-                .k_scale_array(layer_idx)
-                .expect("k_scale_array must succeed");
-            let v = adapter
-                .v_scale_array(layer_idx)
-                .expect("v_scale_array must succeed");
-            let k_ndim = k.ndim().expect("k_scale ndim");
-            let v_ndim = v.ndim().expect("v_scale ndim");
-            assert_eq!(k_ndim, 1, "k_scale must be rank 1");
-            assert_eq!(v_ndim, 1, "v_scale must be rank 1");
-            let k_dim0 = k.shape_at(0).expect("k_scale shape_at(0)");
-            let v_dim0 = v.shape_at(0).expect("v_scale shape_at(0)");
-            assert_eq!(k_dim0, 1, "k_scale must have shape [1]");
-            assert_eq!(v_dim0, 1, "v_scale must have shape [1]");
-            let k_dtype = k.dtype().expect("k_scale dtype");
-            let v_dtype = v.dtype().expect("v_scale dtype");
-            assert_eq!(k_dtype, DType::Float32, "k_scale must be float32");
-            assert_eq!(v_dtype, DType::Float32, "v_scale must be float32");
+
+        // Collect both layers' scales so we can also assert layer-pair
+        // consistency at the end.
+        let k0 = adapter
+            .k_scale_array(0)
+            .expect("k_scale_array(0) must succeed");
+        let k1 = adapter
+            .k_scale_array(1)
+            .expect("k_scale_array(1) must succeed");
+        let v0 = adapter
+            .v_scale_array(0)
+            .expect("v_scale_array(0) must succeed");
+        let v1 = adapter
+            .v_scale_array(1)
+            .expect("v_scale_array(1) must succeed");
+
+        for (label, arr) in [("k0", &k0), ("k1", &k1), ("v0", &v0), ("v1", &v1)] {
+            let ndim = arr.ndim().unwrap_or_else(|e| panic!("{label} ndim: {e:?}"));
+            assert_eq!(ndim, 1, "{label} must be rank 1");
+            let dim0 = arr
+                .shape_at(0)
+                .unwrap_or_else(|e| panic!("{label} shape_at(0): {e:?}"));
+            assert_eq!(dim0, 1, "{label} must have shape [1]");
+            let dtype = arr
+                .dtype()
+                .unwrap_or_else(|e| panic!("{label} dtype: {e:?}"));
+            assert_eq!(dtype, DType::Float32, "{label} must be float32");
+            // Scalar VALUE check. The factory contract says these are
+            // no-op placeholders = 1.0. A regression returning [2.0f32]
+            // would still pass shape+dtype but break paged kernels by
+            // silently scaling K/V writes. `item_at_float32(0)` reads
+            // the CPU buffer directly (no GPU eval needed because
+            // `from_float32` initializes the data inline).
+            let val = arr
+                .item_at_float32(0)
+                .unwrap_or_else(|e| panic!("{label} item_at_float32(0): {e:?}"));
+            assert_eq!(
+                val, 1.0_f32,
+                "{label} placeholder must be exactly 1.0 (got {val})"
+            );
         }
+
+        // Cross-layer consistency. The accessors currently ignore
+        // `layer_idx` and hand out the same placeholder per-call, so
+        // layer 0 and layer 1 MUST be equal. A regression that diverges
+        // them silently (e.g. returning `[2.0]` only for layer 0) would
+        // be caught by the per-array val==1.0 check above, but if
+        // someone changes the constant later they should also update
+        // this comparison so the contract is explicit.
+        let k0_val = k0.item_at_float32(0).unwrap();
+        let k1_val = k1.item_at_float32(0).unwrap();
+        let v0_val = v0.item_at_float32(0).unwrap();
+        let v1_val = v1.item_at_float32(0).unwrap();
+        assert_eq!(
+            k0_val, k1_val,
+            "k_scale must be identical across layers (current placeholder ignores layer_idx)"
+        );
+        assert_eq!(
+            v0_val, v1_val,
+            "v_scale must be identical across layers (current placeholder ignores layer_idx)"
+        );
     }
 }
 

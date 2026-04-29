@@ -40,14 +40,24 @@ extern "C" {
 //
 // Returns 0 on unsupported platforms or if sysctl fails — the Rust profile
 // caller treats 0 as "memory APIs unavailable" and surfaces ProfileError.
+//
+// Wrapped in a catch-all so any unexpected failure (sysctl currently never
+// throws, but this is defense-in-depth: future MLX changes could add a
+// memory-size helper that does) cannot unwind across the FFI boundary
+// into Rust — that would abort the process via "Rust cannot catch
+// foreign exceptions".
 size_t mlx_total_system_memory() {
 #if defined(__APPLE__)
-  size_t memsize = 0;
-  size_t length = sizeof(memsize);
-  if (sysctlbyname("hw.memsize", &memsize, &length, nullptr, 0) != 0) {
+  try {
+    size_t memsize = 0;
+    size_t length = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &length, nullptr, 0) != 0) {
+      return 0;
+    }
+    return memsize;
+  } catch (...) {
     return 0;
   }
-  return memsize;
 #else
   return 0;
 #endif

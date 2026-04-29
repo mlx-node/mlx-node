@@ -72,6 +72,19 @@ pub enum ProfileError {
     /// `mlx_total_system_memory()` returned 0 — non-macOS host, or sysctl
     /// failed. Caller should fall back to a static heuristic.
     TotalMemoryUnavailable,
+    /// macOS host where sysctl works but Metal is unavailable (CPU-only
+    /// MLX build, no GPU, sandboxed environment without IOAccelerator,
+    /// or device init failed). The auto-sizer cannot proceed because
+    /// reading peak memory and the working-set bound require a live
+    /// `MetalAllocator`. Caller should fall back to a static heuristic.
+    /// We surface this as a separate variant from `TotalMemoryUnavailable`
+    /// because the diagnostic is materially different — sysctl SUCCEEDED,
+    /// the GPU is just unreachable. Surfacing the variant also prevents
+    /// the underlying C++ shims (`mlx_get_peak_memory`,
+    /// `mlx_reset_peak_memory`, ...) from being called: those wrap their
+    /// internals in catch-all but they still emit cerr noise on every
+    /// call when Metal init fails.
+    MetalUnavailable,
     /// `MLX_KV_MEMORY_UTILIZATION` parsed but outside `(0.0, 1.0]`. The
     /// value rounds to zero or exceeds total — neither is meaningful.
     InvalidUtil(String),
@@ -111,6 +124,11 @@ impl std::fmt::Display for ProfileError {
                 f,
                 "total system memory unavailable (mlx_total_system_memory returned 0); falling \
                  back to static heuristic"
+            ),
+            ProfileError::MetalUnavailable => write!(
+                f,
+                "Metal device unavailable (mlx_metal_is_available returned false); cannot \
+                 profile peak memory or read working-set bound — falling back to static heuristic"
             ),
             ProfileError::InvalidUtil(s) => {
                 write!(f, "invalid {ENV_UTIL}={s}: must parse as f64 in (0.0, 1.0]")
@@ -459,6 +477,29 @@ where
 
     #[cfg(target_os = "macos")]
     {
+        // GUARD: sysctl(`hw.memsize`) succeeds even on macOS hosts where
+        // Metal is unavailable (CPU-only MLX build, no GPU, sandbox
+        // without IOAccelerator, virtualized environment). The downstream
+        // `reset_peak_memory` / `read_peak_memory` / `read_working_set_bytes`
+        // calls all resolve through `mlx::core::metal::allocator()`, which
+        // lazily constructs a `MetalAllocator` keyed off `device(Device::gpu)`
+        // — and that constructor THROWS when the GPU device cannot be
+        // created. Those C++ shims are now wrapped in catch-all (so the
+        // process no longer aborts on the FFI boundary), but the cleaner
+        // contract is to surface `MetalUnavailable` to the caller before
+        // we even attempt the call. Avoids cerr noise from each catch-all
+        // and lets the caller fall back to a static heuristic deterministically.
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            // Run the dummy forward closure with the supplied max_seq so
+            // platform-portable model-loading bugs surface deterministically
+            // even on no-Metal hosts. The closure's return value is
+            // intentionally discarded — the auto-sizer can't compute a
+            // useful budget without GPU memory APIs, so the result would
+            // not be actionable here regardless.
+            let _ = dummy_forward(max_position_embeddings);
+            return Err(ProfileError::MetalUnavailable);
+        }
+
         reset_peak_memory();
         dummy_forward(max_position_embeddings).map_err(ProfileError::DummyForwardFailed)?;
         let peak = read_peak_memory();

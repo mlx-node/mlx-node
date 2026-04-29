@@ -227,9 +227,20 @@ fn working_set_unreported_uses_physical_budget() {
 /// into the closure verbatim. The closure captures the value via an
 /// AtomicU32 so the assertion runs on the closure's side without
 /// blocking on GPU memory APIs (which the math doesn't need to actually
-/// hit — the macOS path returns `TotalMemoryUnavailable` on no-GPU CI
-/// runners and the test still verifies that the closure was invoked
-/// with the expected value before the error path takes over).
+/// hit — the macOS path returns `MetalUnavailable` on no-GPU CI runners
+/// after invoking the closure once, and the test still verifies the
+/// closure was invoked with the expected value).
+///
+/// Reproduction note: previously this path called `reset_peak_memory()`
+/// unconditionally on macOS, which on a no-Metal host (sysctl works,
+/// Metal init fails) would throw a C++ `std::runtime_error` from
+/// `metal::allocator()` across the FFI boundary and abort the process
+/// with "fatal runtime error: Rust cannot catch foreign exceptions".
+/// The fix is two-pronged: (1) the C++ shims wrap each MLX call in
+/// catch-all so the abort cannot recur even if the gate is bypassed,
+/// and (2) the Rust path checks `mlx_metal_is_available()` upfront and
+/// returns `MetalUnavailable` cleanly without ever invoking the
+/// peak-memory FFI on a no-Metal host.
 #[test]
 fn profile_run_threads_max_position_embeddings_to_closure() {
     let observed = Arc::new(AtomicU32::new(0));
@@ -242,7 +253,7 @@ fn profile_run_threads_max_position_embeddings_to_closure() {
         Ok(())
     };
 
-    let _ = profile_run_and_compute_num_blocks(
+    let res = profile_run_and_compute_num_blocks(
         dummy_forward,
         4321u32, // The exact value to assert reached the closure.
         28,
@@ -252,11 +263,77 @@ fn profile_run_threads_max_position_embeddings_to_closure() {
         16,
     );
 
-    // We only require the closure ran with the supplied max_seq. Whether
-    // the auto-sizer succeeded or returned a memory error past that
-    // point depends on the host (Metal availability), which is not
-    // what this test pins.
+    // Closure ran with the supplied max_seq regardless of Metal
+    // availability — both the Metal-present path (reset → forward
+    // → read) and the no-Metal early-return path invoke it once.
     assert_eq!(observed.load(Ordering::SeqCst), 4321);
+
+    // Sanity: the result is either Ok (Metal-present host with
+    // enough memory) or an explicit error variant. NEVER an abort
+    // from an unwound C++ exception.
+    match res {
+        Ok(_) => {} // Metal present + enough memory — auto-sizer succeeded.
+        Err(ProfileError::MetalUnavailable) => {} // No-GPU host: short-circuited cleanly.
+        Err(ProfileError::TotalMemoryUnavailable) => {} // sysctl failed: also acceptable.
+        Err(ProfileError::InsufficientMemory { .. }) => {} // Tiny dummy forward, plausible budget reject.
+        Err(ProfileError::NotEnoughBlocks { .. }) => {}    // Small budget after util haircut.
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+/// `MetalUnavailable` is surfaced WITHOUT a process abort when the
+/// underlying memory FFI would otherwise throw across the boundary.
+///
+/// The test cannot synthesize a no-Metal environment from a Metal-equipped
+/// host, so we run on whatever host CI provides:
+///
+/// - On a Metal-equipped host: the function does NOT return
+///   `MetalUnavailable` (it returns Ok or another error). The test still
+///   passes — the regression we guard against is "process abort", which
+///   can only happen on the no-Metal path. A Metal-equipped host never
+///   exercises that path.
+/// - On a no-Metal host: the function returns `MetalUnavailable` cleanly,
+///   the closure was invoked exactly once, and the process did NOT abort.
+///   The test asserts both.
+///
+/// Either way the test exits with status code 0 — the bug we are
+/// regressing is a fatal abort, which would prevent ANY assertion from
+/// running. Reaching the assertions at all is itself the regression
+/// guard.
+#[test]
+fn profile_run_no_metal_returns_metal_unavailable_without_abort() {
+    let observed = Arc::new(AtomicU32::new(0));
+    let invoke_count = Arc::new(AtomicU32::new(0));
+    let observed_for_closure = Arc::clone(&observed);
+    let invoke_count_for_closure = Arc::clone(&invoke_count);
+    let dummy_forward = move |max_seq: u32| -> Result<(), String> {
+        observed_for_closure.store(max_seq, Ordering::SeqCst);
+        invoke_count_for_closure.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    };
+
+    let res = profile_run_and_compute_num_blocks(
+        dummy_forward,
+        9999u32,
+        4,
+        2,
+        64,
+        MetalDtype::BFloat16,
+        16,
+    );
+
+    // Reaching this assertion proves the FFI did not abort the process.
+    // (A foreign-exception unwind would have killed the test binary
+    // before this line.)
+    if matches!(res, Err(ProfileError::MetalUnavailable)) {
+        // No-Metal path took the early return — must have invoked
+        // the closure exactly once with the supplied max_seq.
+        assert_eq!(observed.load(Ordering::SeqCst), 9999);
+        assert_eq!(invoke_count.load(Ordering::SeqCst), 1);
+    }
+    // Otherwise: Metal-equipped host, the no-Metal path was not
+    // exercised. No abort already proves the C++ catch-all guard is
+    // intact end-to-end on whatever host this is.
 }
 
 /// Closure failure propagates verbatim to ProfileError::DummyForwardFailed
@@ -280,24 +357,27 @@ fn profile_run_propagates_closure_error() {
         16,
     );
 
-    // On macOS hosts with Metal we get DummyForwardFailed (the closure
-    // returned Err). On CI VMs without Metal we get
-    // TotalMemoryUnavailable (the helper short-circuits before invoking
-    // the closure on the macOS branch — but this branch is gated on
-    // target_os, so on a real macOS host without GPU we'd still hit
-    // the closure first, then attempt to read peak_memory and return
-    // its value if the dummy_forward returned Ok). Either way: when
-    // the closure runs, we want the value passed in to be 128.
+    // The closure observed value depends on which path the function
+    // takes:
+    // - Metal present, sysctl works → reset_peak_memory(), then closure
+    //   invoked, returns Err → DummyForwardFailed propagates.
+    // - Metal absent on macOS → MetalUnavailable, closure was invoked
+    //   once first to surface platform-portable model-loading bugs.
+    // - Non-macOS or sysctl failure → TotalMemoryUnavailable; on the
+    //   non-macOS branch the closure also runs once.
+    // Either way: when the closure runs, max_seq must be 128.
     match res {
         Err(ProfileError::DummyForwardFailed(msg)) => {
             assert_eq!(msg, "synthetic forward failure");
             assert_eq!(*captured.lock().unwrap(), Some(128));
         }
+        Err(ProfileError::MetalUnavailable) => {
+            assert_eq!(*captured.lock().unwrap(), Some(128));
+        }
         Err(ProfileError::TotalMemoryUnavailable) => {
-            // No-GPU host: closure was never invoked, captured stays None.
-            // Both behaviours are valid for this test — we're only
-            // asserting that IF the closure runs, max_seq was threaded
-            // through correctly.
+            // The non-macOS branch invokes the closure before returning;
+            // macOS branch only reaches TotalMemoryUnavailable via
+            // sysctl failure (closure not yet invoked).
             assert!(captured.lock().unwrap().is_none() || *captured.lock().unwrap() == Some(128));
         }
         other => panic!("unexpected result: {other:?}"),
