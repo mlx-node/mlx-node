@@ -51,7 +51,7 @@ fn bf16_bits_to_f32(bits: u16) -> f32 {
 
 /// True iff Metal is reachable on this host.
 fn metal_available() -> bool {
-    matches!(MetalState::get(), Ok(_))
+    MetalState::get().is_ok()
 }
 
 /// Compute the host-side reference paged-attention output for the K/V
@@ -60,7 +60,7 @@ fn metal_available() -> bool {
 /// Mirrors the kernel's softmax-over-K-V exactly:
 ///   * scores[t] = sum_d Q[d] * K[t][d] * scale
 ///   * mask[t] = (t < context_len) AND (sliding_window == 0 OR
-///                t >= context_len - sliding_window)
+///     t >= context_len - sliding_window)
 ///   * masked_scores[t] = mask[t] ? scores[t] : -INFINITY
 ///   * weights = softmax(masked_scores)
 ///   * output[d] = sum_t weights[t] * V[t][d]
@@ -203,6 +203,7 @@ fn build_v_pool_bf16(v_per_token: &[f32]) -> Vec<u16> {
 /// return the output as a flat Vec<f32> of length `head_size`. The
 /// caller controls only `sliding_window`; everything else is fixed by
 /// the test config.
+#[allow(clippy::too_many_arguments)]
 fn run_dispatch(
     state: &MetalState,
     k_pool_bytes: &[u16],
@@ -215,27 +216,27 @@ fn run_dispatch(
 ) -> Vec<f32> {
     let key_pool = state.device.new_buffer_with_data(
         k_pool_bytes.as_ptr() as *const _,
-        (k_pool_bytes.len() * std::mem::size_of::<u16>()) as u64,
+        std::mem::size_of_val(k_pool_bytes) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let value_pool = state.device.new_buffer_with_data(
         v_pool_bytes.as_ptr() as *const _,
-        (v_pool_bytes.len() * std::mem::size_of::<u16>()) as u64,
+        std::mem::size_of_val(v_pool_bytes) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let q_buf = state.device.new_buffer_with_data(
         q_bf16.as_ptr() as *const _,
-        (q_bf16.len() * std::mem::size_of::<u16>()) as u64,
+        std::mem::size_of_val(q_bf16) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let block_table_buf = state.device.new_buffer_with_data(
         block_table.as_ptr() as *const _,
-        (block_table.len() * std::mem::size_of::<u32>()) as u64,
+        std::mem::size_of_val(block_table) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let seq_lens_buf = state.device.new_buffer_with_data(
         seq_lens.as_ptr() as *const _,
-        (seq_lens.len() * std::mem::size_of::<u32>()) as u64,
+        std::mem::size_of_val(seq_lens) as u64,
         MTLResourceOptions::StorageModeShared,
     );
 
@@ -350,7 +351,7 @@ fn check_sliding_window(window: i32, label: &str) {
     let seq_lens: Vec<u32> = vec![CONTEXT_LEN];
 
     let kernel_out = run_dispatch(
-        &state,
+        state,
         &k_pool_bf16,
         &v_pool_bf16,
         &q_bf16,
@@ -459,7 +460,7 @@ fn sliding_window_one_differs_from_full_context() {
     let seq_lens: Vec<u32> = vec![CONTEXT_LEN];
 
     let out_no_mask = run_dispatch(
-        &state,
+        state,
         &k_pool_bf16,
         &v_pool_bf16,
         &q_bf16,
@@ -469,7 +470,7 @@ fn sliding_window_one_differs_from_full_context() {
         scale,
     );
     let out_w1 = run_dispatch(
-        &state,
+        state,
         &k_pool_bf16,
         &v_pool_bf16,
         &q_bf16,
