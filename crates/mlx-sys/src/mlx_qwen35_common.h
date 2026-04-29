@@ -742,8 +742,30 @@ inline GDNPureResult gdn_prefill_fn(
 // and gathers attention K/V via PagedAttention (instead of a static
 // additive mask over the flat cache).
 //
+// PHASE 4 PIECE 1 CONTRACT: SINGLE-TOKEN DECODE ONLY.
+//
+// This helper is used exclusively for decode steps that process exactly
+// ONE new token per call. The `mlx_qwen35_moe_forward_paged` FFI that
+// drives it is wired only into the per-step decode loop; chunked prefill
+// continues to flow through the legacy flat path until piece 2's transfer
+// step lands a separate prefill helper. As a hard invariant:
+//
+//     B == num_tokens == num_seqs == 1
+//     slot_mapping.shape(0) == new_k.shape(0) == new_v.shape(0) == 1
+//
+// `num_valid_tokens` is therefore implicitly 1 and is NOT consulted here —
+// `paged_kv_write` requires `slot_mapping.shape(0) == new_k.shape(0)`, so
+// any caller violating the single-token invariant would crash inside the
+// kernel validator. The FFI enforces this with an explicit guard before
+// graph construction.
+//
+// When piece 2 lands chunked-prefill support (B / num_tokens > 1), this
+// helper will need a second variant that honors the
+// `num_valid_tokens` / sentinel-padded `slot_mapping` contract from
+// `PagedAttentionInputs` (see `crates/mlx-paged-attn/src/inputs.rs`).
+//
 // Inputs:
-//   - x:                 [B, hidden] — 2D activation
+//   - x:                 [B=1, hidden] — 2D activation
 //   - layer_idx:         transformer layer index (used for weight prefix)
 //   - k_pool, v_pool:    per-layer paged K/V storage (shapes per
 //                        `mlx_paged_ops.h`)
@@ -752,9 +774,10 @@ inline GDNPureResult gdn_prefill_fn(
 //   - offset_arr:        [1] int32 — global token position of the new token
 //                        (used by RoPE; same role as in `attn_for_compile`)
 //   - block_table:       [1, max_blocks_per_seq] int32, sentinel-padded -1
-//   - slot_mapping:      [chunk_size_max] int64, sentinel-padded -1
-//   - num_valid_tokens:  [1] int32 (informational; kernel reads slot table
-//                        directly)
+//   - slot_mapping:      [1] int64 — single active slot (NOT sentinel-padded
+//                        for piece 1; chunk_size_max MUST equal 1)
+//   - num_valid_tokens:  [1] int32 (UNUSED in piece 1; reserved for chunked
+//                        prefill in piece 2)
 //   - num_valid_blocks:  [1] int32 (informational)
 //   - seq_lens:          [1] int32 — total context length so far (paged_attn
 //                        kernel reads `seq_lens[seq_idx=0]`)

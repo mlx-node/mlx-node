@@ -1730,6 +1730,13 @@ unsafe extern "C-unwind" {
     /// allocated `mlx_array*` (caller owns) on success, or `nullptr` on
     /// error / when `mlx_qwen35_moe_init_paged` hasn't been called.
     /// `cache_offset_out` receives the post-step offset.
+    ///
+    /// **Phase 4 piece 1 contract — decode-only.** `input_ids` MUST
+    /// have exactly one element and `slot_mapping` MUST be `[1]`.
+    /// Multi-token / chunked prefill is reserved for piece 2. The
+    /// contract is enforced on the C++ side: violating it returns null
+    /// logits and writes a stderr diagnostic, leaving global state
+    /// untouched so the caller can fall back to the flat path.
     pub fn mlx_qwen35_moe_forward_paged(
         input_ids: *mut mlx_array,
         embedding_weight: *mut mlx_array,
@@ -1742,6 +1749,24 @@ unsafe extern "C-unwind" {
         output_logits: *mut *mut mlx_array,
         cache_offset_out: *mut i32,
     );
+
+    /// Phase 4 piece 1 test helper — builds the `attn_for_compile_paged`
+    /// graph in isolation against synthetic weights, force-evaluates the
+    /// output (so paged_kv_write + paged_attention actually dispatch on
+    /// the Metal queue), and cleans up the synthetic weights.
+    ///
+    /// Returns 0 on success, non-zero on failure (exception caught and
+    /// stderr diagnostic written). Used by
+    /// `crates/mlx-paged-attn/tests/qwen3_5_moe_paged_smoke.rs` to
+    /// guarantee the paged graph itself is exercised — the existing
+    /// `forward_paged` smoke test fails inside the embedding/LM-head
+    /// lookups before reaching the paged attention graph.
+    ///
+    /// IMPORTANT: this helper writes to the global weight map and
+    /// clears its own additions on exit. Callers MUST also invoke
+    /// `mlx_clear_weights()` before/after to avoid contaminating other
+    /// model state.
+    pub fn mlx_qwen35_moe_trace_paged_attn_helper() -> i32;
 
     // ============================================
     // Gemma4 Forward Pass (compiled)

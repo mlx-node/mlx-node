@@ -957,14 +957,31 @@ void mlx_qwen35_moe_sync_eval_caches() {
   }
 }
 
-// Reset MoE state
+// Reset MoE state — clears BOTH the legacy flat globals AND the
+// Phase 4 piece 1 paged globals. Keeping these symmetric is required
+// because `mlx_qwen35_moe_init_paged` flips `g_paged_inited` to true
+// independently of `g_moe_inited`; without clearing the paged side here,
+// a later `mlx_qwen35_moe_forward_paged()` would pass the init guard
+// and reuse stale KV pools / scales / linear caches / offset from a
+// previous request or model.
 void mlx_qwen35_moe_reset() {
+  // Legacy flat-path globals.
   g_moe_caches.clear();
   g_moe_offset_int = 0;
   g_moe_inited = false;
   g_layer_quant.clear();
   g_dense_quant.clear();
   g_weight_transposes_3d.clear();
+
+  // Phase 4 piece 1 paged-path globals.
+  g_paged_config = MoeConfig{};
+  g_k_pools.clear();
+  g_v_pools.clear();
+  g_k_scales.clear();
+  g_v_scales.clear();
+  g_paged_linear_caches.clear();
+  g_paged_offset_int = 0;
+  g_paged_inited = false;
 }
 
 // Export MoE caches for PromptCache reuse.
@@ -1226,6 +1243,15 @@ void mlx_qwen35_moe_init_paged(
 // the Rust adapter's `build_paged_attention_inputs` (Phase 3); the per-
 // layer pool/scale globals come from `mlx_qwen35_moe_init_paged`.
 //
+// PHASE 4 PIECE 1 CONTRACT: This FFI is decode-only — `input_ids` MUST
+// have exactly one element and `slot_mapping` MUST be `[1]`. Chunked
+// prefill (multi-token) goes through the legacy flat path until piece 2
+// lands a separate paged-prefill helper. The contract is enforced
+// explicitly: violating it returns null logits without modifying global
+// state, so the Rust caller can fall back cleanly. See the docstring on
+// `attn_for_compile_paged` in `mlx_qwen35_common.h` for the full
+// rationale.
+//
 // `output_logits` receives a heap-allocated `mlx_array*` (caller owns).
 // `cache_offset_out` receives the post-step offset (== prefill_offset + 1 + n
 // after n successful calls).
@@ -1262,6 +1288,37 @@ void mlx_qwen35_moe_forward_paged(
     auto& num_valid_tokens = *reinterpret_cast<array*>(num_valid_tokens_ptr);
     auto& num_valid_blocks = *reinterpret_cast<array*>(num_valid_blocks_ptr);
     auto& seq_lens         = *reinterpret_cast<array*>(seq_lens_ptr);
+
+    // Phase 4 piece 1 contract: single-token decode only.
+    //
+    // `attn_for_compile_paged` builds new_k / new_v with shape
+    // `[1, num_kv_heads, head_size]` and feeds `slot_mapping` directly
+    // into `paged_kv_write`, which requires
+    // `slot_mapping.shape(0) == new_k.shape(0)`. Chunked-prefill (B > 1)
+    // is reserved for piece 2's transfer step; until then, reject any
+    // caller that tries to push more than one token through the paged
+    // FFI. Returning null here matches the existing error contract and
+    // lets the Rust caller fall back to the flat path cleanly.
+    if (input_ids.size() != 1) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_moe_forward_paged: phase 4 piece 1 contract "
+              "violated — input_ids.size() = %lld, expected 1 (decode-only)\n",
+              static_cast<long long>(input_ids.size()));
+      fflush(stderr);
+      *output_logits = nullptr;
+      return;
+    }
+    if (slot_mapping.ndim() != 1 || slot_mapping.shape(0) != 1) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_moe_forward_paged: phase 4 piece 1 contract "
+              "violated — slot_mapping shape must be [1], got ndim=%d, "
+              "shape[0]=%lld\n",
+              slot_mapping.ndim(),
+              slot_mapping.ndim() >= 1 ? static_cast<long long>(slot_mapping.shape(0)) : -1LL);
+      fflush(stderr);
+      *output_logits = nullptr;
+      return;
+    }
 
     // Embedding lookup: [B, 1] → [B, hidden] (2D)
     auto flat_ids = reshape(input_ids, {-1});
@@ -1328,6 +1385,179 @@ void mlx_qwen35_moe_forward_paged(
     fprintf(stderr, "[MLX] Unknown exception in mlx_qwen35_moe_forward_paged\n");
     fflush(stderr);
     *output_logits = nullptr;
+  }
+}
+
+// =============================================================================
+// Phase 4 piece 1 test helper: build the paged-attention graph in isolation
+// and force-evaluate it.
+//
+// Unlike `mlx_qwen35_moe_forward_paged`, which traces the full MoE decode
+// graph (all 40 layers + MoE routing + LM head) and therefore needs the
+// FULL weight set registered, this helper exercises ONLY
+// `attn_for_compile_paged` for layer 0. It self-registers a minimal
+// synthetic weight set (q/k/v/o + q_norm/k_norm), constructs synthetic
+// inputs at the contract shapes, calls the helper, eval()s the output to
+// force kernel dispatch (proving paged_kv_write + paged_attention bind
+// and run), then clears the synthetic weights.
+//
+// Returns 0 on success, non-zero on failure (exception caught and stderr
+// diagnostic written). The Rust test asserts the return value.
+//
+// This is the "graph build smoke" coverage that Codex's Finding 3 asked
+// for — the existing forward_paged smoke test fails inside the LM-head /
+// embedding lookup BEFORE reaching `attn_for_compile_paged`, so without
+// this helper the paged graph itself is never exercised.
+//
+// IMPORTANT: This helper writes to `g_weights()`, so callers MUST invoke
+// `mlx_clear_weights()` before/after if any other model state is loaded.
+// The Rust test wrapper does both explicitly.
+int mlx_qwen35_moe_trace_paged_attn_helper() {
+  // Hard-coded contract shapes mirror the smoke-test config.
+  constexpr int B               = 1;
+  constexpr int NUM_HEADS       = 16;
+  constexpr int NUM_KV_HEADS    = 2;
+  constexpr int HEAD_DIM        = 128;
+  constexpr int HIDDEN          = NUM_HEADS * HEAD_DIM;
+  constexpr int Q_OUT           = NUM_HEADS * HEAD_DIM * 2;  // 2x for gating
+  constexpr int KV_OUT          = NUM_KV_HEADS * HEAD_DIM;
+  constexpr int BLOCK_SIZE      = 16;
+  constexpr int X_PACK          = 8;
+  constexpr int NUM_BLOCKS      = 4;
+  constexpr int MAX_BLOCKS_PER_SEQ = NUM_BLOCKS;
+  constexpr int LAYER_IDX       = 0;
+  constexpr float ROPE_THETA    = 100000.0f;
+  constexpr int   ROPE_DIMS     = 32;
+  constexpr float RMS_NORM_EPS  = 1e-6f;
+
+  try {
+    // ---- Self-register synthetic weights for layer 0 self-attention ----
+    //
+    // Weight shapes follow the standard MLX layout `[out_features, in_features]`
+    // (mlx_store_weight auto-transposes 2D weights for matmul use).
+    auto rms_w = [](int dim) {
+      return mlx::core::ones({dim}, mlx::core::bfloat16);
+    };
+    auto proj_w = [](int out_features, int in_features) {
+      // Small constants keep the result finite; exact values irrelevant —
+      // we're testing graph wiring + kernel dispatch, not numerical
+      // correctness.
+      return mlx::core::full({out_features, in_features}, 0.01f, mlx::core::bfloat16);
+    };
+
+    // Acquire the writer lock once for the whole synthetic-weight bundle.
+    {
+      std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
+      auto store = [](const std::string& name, array w) {
+        g_weights().insert_or_assign(name, w);
+        if (w.ndim() == 2) {
+          g_weight_transposes().insert_or_assign(name, transpose(w));
+        }
+      };
+      const std::string pfx = "layers." + std::to_string(LAYER_IDX) + ".self_attn.";
+      store(pfx + "q_proj.weight", proj_w(Q_OUT,  HIDDEN));
+      store(pfx + "k_proj.weight", proj_w(KV_OUT, HIDDEN));
+      store(pfx + "v_proj.weight", proj_w(KV_OUT, HIDDEN));
+      store(pfx + "o_proj.weight", proj_w(HIDDEN, NUM_HEADS * HEAD_DIM));
+      store(pfx + "q_norm.weight", rms_w(HEAD_DIM));
+      store(pfx + "k_norm.weight", rms_w(HEAD_DIM));
+    }
+
+    // ---- Synthetic inputs at the piece-1 contract shapes ----
+    auto x = mlx::core::zeros({B, HIDDEN}, mlx::core::bfloat16);
+
+    auto k_pool = mlx::core::zeros(
+        {NUM_BLOCKS, NUM_KV_HEADS, HEAD_DIM / X_PACK, BLOCK_SIZE, X_PACK},
+        mlx::core::bfloat16);
+    auto v_pool = mlx::core::zeros(
+        {NUM_BLOCKS, NUM_KV_HEADS, HEAD_DIM, BLOCK_SIZE},
+        mlx::core::bfloat16);
+    auto k_scale = mlx::core::array(1.0f, mlx::core::float32);
+    auto v_scale = mlx::core::array(1.0f, mlx::core::float32);
+
+    // RoPE offset, block_table, slot_mapping, valid counts, seq_lens —
+    // all at the piece-1 single-token contract shapes.
+    int32_t offset_buf[1]      = {0};
+    int32_t block_table_buf[MAX_BLOCKS_PER_SEQ];
+    for (int i = 0; i < MAX_BLOCKS_PER_SEQ; i++) block_table_buf[i] = (i == 0) ? 0 : -1;
+    int64_t slot_mapping_buf[1]   = {0};
+    int32_t num_valid_tokens_buf[1] = {1};
+    int32_t num_valid_blocks_buf[1] = {1};
+    int32_t seq_lens_buf[1]         = {1};
+
+    auto offset_arr = mlx::core::array(
+        offset_buf, mlx::core::Shape{1}, mlx::core::int32);
+    auto block_table = mlx::core::array(
+        block_table_buf, mlx::core::Shape{1, MAX_BLOCKS_PER_SEQ}, mlx::core::int32);
+    auto slot_mapping = mlx::core::array(
+        slot_mapping_buf, mlx::core::Shape{1}, mlx::core::int64);
+    auto num_valid_tokens = mlx::core::array(
+        num_valid_tokens_buf, mlx::core::Shape{1}, mlx::core::int32);
+    auto num_valid_blocks = mlx::core::array(
+        num_valid_blocks_buf, mlx::core::Shape{1}, mlx::core::int32);
+    auto seq_lens = mlx::core::array(
+        seq_lens_buf, mlx::core::Shape{1}, mlx::core::int32);
+
+    BaseConfig cfg{};
+    cfg.num_layers              = 1;
+    cfg.hidden_size             = HIDDEN;
+    cfg.num_heads               = NUM_HEADS;
+    cfg.num_kv_heads            = NUM_KV_HEADS;
+    cfg.head_dim                = HEAD_DIM;
+    cfg.rope_theta              = ROPE_THETA;
+    cfg.rope_dims               = ROPE_DIMS;
+    cfg.rms_norm_eps            = RMS_NORM_EPS;
+    cfg.full_attention_interval = 1;
+    cfg.linear_num_k_heads      = 0;
+    cfg.linear_num_v_heads      = 0;
+    cfg.linear_key_head_dim     = 0;
+    cfg.linear_value_head_dim   = 0;
+    cfg.linear_conv_kernel_dim  = 0;
+    cfg.tie_word_embeddings     = false;
+    cfg.max_kv_len              = 0;
+    cfg.batch_size              = B;
+
+    // ---- Build the paged-attention graph ----
+    auto res = attn_for_compile_paged(
+        x, LAYER_IDX,
+        k_pool, v_pool, k_scale, v_scale,
+        offset_arr,
+        block_table, slot_mapping,
+        num_valid_tokens, num_valid_blocks,
+        seq_lens,
+        BLOCK_SIZE,
+        cfg);
+
+    // ---- Force evaluation so paged_kv_write + paged_attention actually
+    // dispatch on the Metal queue. Graph construction alone is lazy;
+    // without eval() this could pass even if a kernel binding broke.
+    mlx::core::eval({res.output, res.keys, res.values});
+
+    // ---- Clean up synthetic weights so concurrent state stays clean ----
+    {
+      std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
+      const std::string pfx = "layers." + std::to_string(LAYER_IDX) + ".self_attn.";
+      for (const auto& suffix : {
+               "q_proj.weight", "k_proj.weight", "v_proj.weight",
+               "o_proj.weight", "q_norm.weight", "k_norm.weight",
+           }) {
+        std::string key = pfx + suffix;
+        g_weights().erase(key);
+        g_weight_transposes().erase(key);
+      }
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in mlx_qwen35_moe_trace_paged_attn_helper: %s\n",
+            e.what());
+    fflush(stderr);
+    return 1;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_moe_trace_paged_attn_helper\n");
+    fflush(stderr);
+    return 1;
   }
 }
 
