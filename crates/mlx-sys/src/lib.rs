@@ -1221,6 +1221,17 @@ unsafe extern "C-unwind" {
     pub fn mlx_paged_attention_eval_gpu_rejects_indivisible_grouping() -> i32;
     pub fn mlx_paged_attention_eval_gpu_rejects_sliding_window() -> i32;
     pub fn mlx_paged_attention_eval_gpu_rejects_zero_block_size() -> i32;
+
+    /// Phase 2 stress test (mixed paged + non-paged ops, determinism).
+    /// Builds a small graph mixing `paged_kv_write` + non-paged
+    /// `add` + `paged_attention` + `add`, runs it `iterations` times
+    /// with identical inputs, and asserts byte-identical outputs across
+    /// every run. Returns:
+    ///   0  → success
+    ///  -1  → internal/setup error
+    ///  -2  → outputs diverged across runs (race detected)
+    ///  -3  → Metal not available; test skipped
+    pub fn mlx_paged_phase2_stress_mixed_graph(iterations: i32) -> i32;
 }
 
 // ================================================================================

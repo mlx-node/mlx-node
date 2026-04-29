@@ -1,0 +1,125 @@
+// Phase 2 of the paged-attention compile integration.
+//
+// This header declares pure-C++ kernel dispatch wrappers that the
+// `PagedKVWrite` / `PagedAttention` `Custom` primitives call from inside
+// `eval_gpu`. Unlike Phase 1's extern-C shim into the mlx-paged-attn
+// Rust crate, these wrappers encode kernels onto MLX's own
+// `metal::CommandEncoder`, so dependency tracking is correct and no
+// `wait_until_completed` synchronization band-aid is needed.
+//
+// Kernel names + threadgroup-memory math + V1/V2 selection mirror the
+// Rust dispatcher in `crates/mlx-paged-attn/src/metal/{state,
+// reshape_and_cache, paged_attention}.rs`. The Rust dispatcher remains
+// in place for now (only the C++ side stops calling the extern-C shim);
+// Phase 11 deletes the Rust path once all model migrations are done.
+//
+// Notes:
+//   - The .metallib for these kernels is compiled by `mlx-sys/build.rs`
+//     from `crates/mlx-paged-attn/metal/*.metal`. It ships colocated
+//     with `mlx.metallib` (e.g. in `packages/core/`) and is loaded via
+//     MLX's `Device::get_library(name, path)` path overload.
+//   - `mlx::core::metal::Device::get_library` and `::get_kernel` cache
+//     by name, so we get pipeline reuse for free.
+//   - The Custom primitive's `eval_gpu` is responsible for argument
+//     validation, output allocation (`array::set_data`), and any
+//     pre-dispatch host-side checks. These functions only do the kernel
+//     dispatch.
+
+#pragma once
+
+#include <cstdint>
+
+#include "mlx/array.h"
+#include "mlx/backend/metal/device.h"
+
+namespace mlx::core::fast::paged {
+
+/// On-cache element type. Matches the Rust `MetalDtype` enum used in
+/// kernel names: Fp16 → "half", Bf16 → "bfloat16_t", Fp8 → "uchar".
+/// (The C++ `KvDtype` enum in `mlx_paged_ops.h` is the public-facing
+/// version; this internal enum is equivalent but lives in its own
+/// namespace so we don't crowd the public header.)
+enum class KvDtype : uint8_t {
+  Fp16 = 0,
+  Bf16 = 1,
+  Fp8 = 2,
+};
+
+/// Dispatch the `reshape_and_cache` kernel onto the MLX command
+/// encoder. Writes `num_tokens` of `(new_k, new_v)` into the per-layer
+/// block-paged K/V pools at the slot ids supplied by `slot_mapping`.
+///
+/// All array references must already be evaluated (MLX guarantees this
+/// before invoking `eval_gpu`). The K-pool layout the kernel expects
+/// (with `x = 16 / sizeof(KV_T)`):
+///   - K-pool: `[num_blocks, num_kv_heads, head_size/x, block_size, x]`
+///   - V-pool: `[num_blocks, num_kv_heads, head_size, block_size]`
+///   - new_k/new_v: `[num_tokens, num_kv_heads, head_size]`
+///   - slot_mapping: `[num_tokens]` of int64
+///
+/// The K/V pools are written in-place; the caller's `Custom::eval_gpu`
+/// has already arranged for the output arrays to share the input
+/// pools' buffers via `copy_shared_buffer`. We pass them as outputs to
+/// the encoder so MLX correctly tracks the in-place mutation when
+/// scheduling subsequent commands.
+///
+/// `k_scale` / `v_scale` are FP32 scalar arrays of size 1, only
+/// consumed by the kernel for FP8 caches (kernel ignores them
+/// otherwise) — but they participate in the compile graph either way.
+void dispatch_reshape_and_cache(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    const mlx::core::array& new_k,
+    const mlx::core::array& new_v,
+    mlx::core::array& k_pool,
+    mlx::core::array& v_pool,
+    const mlx::core::array& slot_mapping,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    int num_tokens,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int x_pack,
+    KvDtype kv_dtype);
+
+/// Dispatch the paged-attention kernel (V1 if `max_context_len <=
+/// PARTITION_SIZE`, else V2 in two phases) onto the MLX command
+/// encoder. Writes attention output to `out` (an array MLX has already
+/// `set_data`-allocated to shape `[num_seqs, num_q_heads, head_size]`).
+///
+/// V2 needs three temporary arrays (`exp_sums`, `max_logits`,
+/// `tmp_out`) which we allocate and hand to MLX via
+/// `encoder.add_temporaries(...)` so MLX manages their lifetime. They
+/// are not returned.
+///
+/// `softcap == 0.0` is the disabled sentinel (no soft-capping). The
+/// underlying kernel uses `1.0` as its disabled sentinel; this function
+/// translates.
+///
+/// Sliding window must be 0 in Phase 2 (Phase 7 adds Gemma4 support).
+void dispatch_paged_attention_auto(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    mlx::core::Stream stream,
+    mlx::core::array& out,
+    const mlx::core::array& q,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& block_table,
+    const mlx::core::array& seq_lens,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    int num_seqs,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int max_context_len,
+    int max_blocks_per_seq,
+    float scale,
+    float softcap,
+    int sliding_window,
+    KvDtype kv_dtype);
+
+} // namespace mlx::core::fast::paged

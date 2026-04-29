@@ -1,23 +1,30 @@
-// Phase 1 of the paged-attention compile integration.
+// Phase 2 of the paged-attention compile integration.
 //
 // Implements the `PagedKVWrite` and `PagedAttention` MLX `Custom`
-// primitives. Their `eval_gpu` paths call into a temporary `extern "C"`
-// shim exposed by the `mlx-paged-attn` Rust crate (see
-// `crates/mlx-paged-attn/src/extern_c.rs`).
+// primitives. Their `eval_gpu` paths now dispatch onto MLX's own
+// `metal::CommandEncoder` via `crates/mlx-sys/src/mlx_paged_dispatch.cpp`
+// (Phase 2). The Phase 1 extern-C shim into `crates/mlx-paged-attn/
+// src/extern_c.rs` is no longer used by `eval_gpu`, but the shim
+// itself is left in place because the existing smoke-test suite
+// (`crates/mlx-paged-attn/tests/paged_ops_smoke.rs`) drives the Rust
+// dispatcher directly and the broader Rust kernel-dispatch code is
+// scheduled for removal in Phase 11.
 //
-// PHASE 1 LIMITATION: this shim dispatches to mlx_paged_attn's separate
-// Metal command queue. Phase 2 ports dispatch to MLX's queue (the one
-// used by `inputs[0].primitive_ptr()->stream()`) so dependency tracking
-// is correct. Until then, callers MUST `eval()` any prior dependencies
-// before calling `paged_kv_write`/`paged_attention`, and `eval()` the
-// outputs before reading them outside an MLX graph.
+// Because the dispatch is now on MLX's command queue, MLX's dependency
+// tracking is correct: callers no longer need to `eval()` ancestor
+// arrays before invoking `paged_kv_write` / `paged_attention`, nor
+// `eval()` the outputs before reading them — the standard MLX evaluation
+// order guarantees correctness.
 
 #include "mlx_paged_ops.h"
 #include "mlx_common.h"
+#include "mlx_paged_dispatch.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -25,61 +32,11 @@
 #include <utility>
 #include <vector>
 
+#include "mlx/backend/metal/device.h"
 #include "mlx/compile.h"
 #include "mlx/transforms_impl.h"
 
 namespace mlx::core::fast {
-
-// =============================================================================
-// extern-C shim contract
-//
-// Symbols defined in `crates/mlx-paged-attn/src/extern_c.rs`. They are
-// linked into the final .node cdylib alongside this static library
-// (mlx-core depends on both mlx-sys and mlx-paged-attn). Both wrappers
-// return 0 on success, -1 on error; errors are written to stderr by
-// the Rust side.
-// =============================================================================
-
-extern "C" int mlx_paged_attn_reshape_and_cache_dispatch(
-    void* key_pool_buffer,
-    void* value_pool_buffer,
-    void* new_keys_buffer,
-    size_t new_keys_offset,
-    void* new_values_buffer,
-    size_t new_values_offset,
-    void* slot_mapping_buffer,
-    size_t slot_mapping_offset,
-    uint32_t num_tokens,
-    uint32_t num_kv_heads,
-    uint32_t head_size,
-    uint32_t block_size,
-    int32_t x_pack,
-    uint8_t kv_dtype_raw,
-    float k_scale,
-    float v_scale);
-
-extern "C" int mlx_paged_attn_paged_attention_dispatch(
-    void* queries_buffer,
-    size_t queries_offset,
-    void* key_pool_buffer,
-    void* value_pool_buffer,
-    void* block_table_buffer,
-    void* seq_lens_buffer,
-    void* output_buffer,
-    size_t output_offset,
-    uint32_t num_seqs,
-    uint32_t num_q_heads,
-    uint32_t num_kv_heads,
-    uint32_t head_size,
-    uint32_t block_size,
-    uint32_t max_context_len,
-    uint32_t max_blocks_per_seq,
-    float scale,
-    float softcap,
-    int32_t sliding_window,
-    uint8_t kv_dtype_raw,
-    float k_scale,
-    float v_scale);
 
 namespace {
 
@@ -141,28 +98,20 @@ mlx::core::Dtype cache_dtype_for_kv_dtype(KvDtype kv_dtype) {
   return mlx::core::bfloat16;
 }
 
-// Extract a Metal `MTLBuffer*` (as a `void*`) plus the byte offset
-// from an evaluated `array`. Mirrors the FFI helpers used by the
-// existing Rust integration (see
-// `mlx_array_get_metal_buffer` in `mlx_advanced_ops.cpp`).
-//
-// PHASE 1 LIMITATION: we sidestep the public FFI here because we're
-// inside the MLX C++ namespace and have direct access to the array's
-// buffer. Callers must ensure the array is evaluated before this is
-// invoked.
-struct MetalArrayPtr {
-  void* buffer; // raw MTLBuffer* (cast to void*)
-  size_t offset; // byte offset into the buffer
-};
-
-MetalArrayPtr metal_array_ptr(const array& arr) {
-  // arr.buffer().ptr() is `const void*`; cast away const because the
-  // Metal C API takes `id<MTLBuffer>` (a non-const pointer). The
-  // dispatcher does not write through this pointer except in the
-  // documented in-place case.
-  return MetalArrayPtr{
-      const_cast<void*>(arr.buffer().ptr()),
-      static_cast<size_t>(arr.offset())};
+// Translate the public `KvDtype` enum into the dispatch-internal
+// `paged::KvDtype` so we can call `mlx::core::fast::paged::dispatch_*`.
+// Phase 2: both enums have the same wire values; the cast just
+// satisfies the type system.
+mlx::core::fast::paged::KvDtype to_paged_dtype(KvDtype d) {
+  switch (d) {
+    case KvDtype::Fp16:
+      return mlx::core::fast::paged::KvDtype::Fp16;
+    case KvDtype::Bf16:
+      return mlx::core::fast::paged::KvDtype::Bf16;
+    case KvDtype::Fp8:
+      return mlx::core::fast::paged::KvDtype::Fp8;
+  }
+  return mlx::core::fast::paged::KvDtype::Bf16;
 }
 
 // Reject non-row-contiguous or nonzero-offset views at the factory.
@@ -828,40 +777,18 @@ void PagedKVWrite::eval_gpu(
 
   // Output arrays semantically alias the input pools (in-place write).
   // `copy_shared_buffer` makes the output `array` point at the same
-  // backing buffer + offset / strides as the input pool.
+  // backing buffer + offset / strides as the input pool. We do this
+  // BEFORE the dispatch so the encoder's `set_output_array` call sees
+  // the right buffer (the input pool's, shared into the output).
   outputs[0].copy_shared_buffer(k_pool);
   outputs[1].copy_shared_buffer(v_pool);
-
-  // PHASE 1 LIMITATION: This shim dispatches to mlx_paged_attn's
-  // separate Metal command queue. Phase 2 ports dispatch to MLX's
-  // queue (the one used by `inputs[0].primitive_ptr()->stream()`) so
-  // dependency tracking is correct. Until then, callers MUST `eval()`
-  // any prior dependencies before invoking `paged_kv_write` (so the
-  // input pools / new K/V / slot_mapping have committed) and `eval()`
-  // the outputs before reading.
-  //
-  // We must NOT call `mlx::core::synchronize()` from inside `eval_gpu`
-  // — synchronize enqueues a future onto the same scheduler that
-  // dispatched us, deadlocking (it would wait on a task enqueued
-  // BEHIND the current eval). The dispatcher's own
-  // `wait_until_completed` covers the read-back side.
-
-  // Read scale arrays as host scalars. Scalars constructed via
-  // `array(1.0f)` are in `Status::available` immediately, so
-  // `item<float>()` is safe without a pre-eval. Calling
-  // `mlx::core::eval(...)` here would recurse into the scheduler and
-  // deadlock; for graph-produced scales the caller is responsible for
-  // evaluating before invoking the primitive. The validator above
-  // already enforced size/dtype.
-  float k_scale_f = k_scale.item<float>();
-  float v_scale_f = v_scale.item<float>();
 
   // Determine num_tokens from new_k's leading dimension. The kernel
   // expects shape [num_tokens, num_kv_heads, head_size]. The validator
   // already enforced rank 3.
-  uint32_t num_tokens = static_cast<uint32_t>(new_k.shape(0));
+  int num_tokens = static_cast<int>(new_k.shape(0));
 
-  // Slot-id bounds check (Phase 1 safety; runs on EVERY runtime call,
+  // Slot-id bounds check (Phase 2 safety; runs on EVERY runtime call,
   // including the compile-cached path). Stays out of the validator
   // because it requires materialized data that tracer arrays do not
   // have. The Metal kernel does NOT bounds-check `slot_idx`; a value
@@ -896,34 +823,28 @@ void PagedKVWrite::eval_gpu(
     }
   }
 
-  auto k_pool_ptr = metal_array_ptr(k_pool);
-  auto v_pool_ptr = metal_array_ptr(v_pool);
-  auto new_k_ptr = metal_array_ptr(new_k);
-  auto new_v_ptr = metal_array_ptr(new_v);
-  auto slot_mapping_ptr = metal_array_ptr(slot_mapping);
+  // Phase 2: dispatch onto MLX's command encoder. MLX's dependency
+  // tracking handles ordering against any preceding/following ops.
+  auto& s = stream();
+  auto& d = mlx::core::metal::device(s.device);
+  auto& compute_encoder = mlx::core::metal::get_command_encoder(s);
 
-  int rc = mlx_paged_attn_reshape_and_cache_dispatch(
-      k_pool_ptr.buffer,
-      v_pool_ptr.buffer,
-      new_k_ptr.buffer,
-      new_k_ptr.offset,
-      new_v_ptr.buffer,
-      new_v_ptr.offset,
-      slot_mapping_ptr.buffer,
-      slot_mapping_ptr.offset,
+  mlx::core::fast::paged::dispatch_reshape_and_cache(
+      compute_encoder,
+      d,
+      new_k,
+      new_v,
+      outputs[0],
+      outputs[1],
+      slot_mapping,
+      k_scale,
+      v_scale,
       num_tokens,
-      static_cast<uint32_t>(num_kv_heads_),
-      static_cast<uint32_t>(head_size_),
-      static_cast<uint32_t>(block_size_),
-      static_cast<int32_t>(x_pack_),
-      static_cast<uint8_t>(kv_dtype_),
-      k_scale_f,
-      v_scale_f);
-
-  if (rc != 0) {
-    throw std::runtime_error(
-        "PagedKVWrite: extern-C dispatch failed (see stderr for details)");
-  }
+      num_kv_heads_,
+      head_size_,
+      block_size_,
+      x_pack_,
+      to_paged_dtype(kv_dtype_));
 }
 
 std::vector<array> PagedKVWrite::vjp(
@@ -989,9 +910,9 @@ void PagedAttention::eval_gpu(
   // future code path ever constructs the primitive directly with
   // mismatched scalars, the eval_gpu validation rejects before the
   // dispatch path can touch the buffers. Run BEFORE any host reads
-  // (seq_lens.data<int32_t>(), block_table.data<int32_t>(),
-  // k_scale.item<float>() etc.) and BEFORE `metal_array_ptr` extraction
-  // so the throw fires before we touch the buffers.
+  // (seq_lens.data<int32_t>(), block_table.data<int32_t>() etc.) and
+  // BEFORE the encoder dispatch so the throw fires before we touch
+  // the buffers.
   validate_paged_attention_inputs(
       q,
       k_pool,
@@ -1107,55 +1028,42 @@ void PagedAttention::eval_gpu(
         "PagedAttention: max_context_len from seq_lens must be > 0");
   }
 
-  // Allocate the output buffer via MLX's allocator. The shim blits
-  // the dispatcher's internal output into this buffer. Phase 2 will
-  // pre-route the dispatcher to write here directly.
+  // Allocate the output buffer via MLX's allocator BEFORE dispatch —
+  // the encoder's `set_output_array` reads `out.buffer().ptr()` so
+  // the buffer must exist by the time the dispatch runs.
   out.set_data(allocator::malloc(out.nbytes()));
 
-  // PHASE 1 LIMITATION: same as PagedKVWrite — callers must `eval()`
-  // any prior dependencies before invoking `paged_attention`. We do
-  // NOT call `mlx::core::synchronize()` here (would deadlock; see the
-  // PagedKVWrite::eval_gpu comment). The dispatcher's own
-  // `wait_until_completed` covers the read-back side.
+  // Phase 2: dispatch onto MLX's command encoder. MLX's dependency
+  // tracking handles ordering against any preceding/following ops,
+  // so callers no longer need to `eval()` ancestors before invoking
+  // `paged_attention` nor `eval()` the output before reading.
+  auto& s = stream();
+  auto& d = mlx::core::metal::device(s.device);
+  auto& compute_encoder = mlx::core::metal::get_command_encoder(s);
 
-  // Scale dtype/size already enforced by validate_paged_attention_inputs.
-  float k_scale_f = k_scale.item<float>();
-  float v_scale_f = v_scale.item<float>();
-
-  auto q_ptr = metal_array_ptr(q);
-  auto k_pool_ptr = metal_array_ptr(k_pool);
-  auto v_pool_ptr = metal_array_ptr(v_pool);
-  auto block_table_ptr = metal_array_ptr(block_table);
-  auto seq_lens_ptr = metal_array_ptr(seq_lens);
-  auto out_ptr = metal_array_ptr(out);
-
-  int rc = mlx_paged_attn_paged_attention_dispatch(
-      q_ptr.buffer,
-      q_ptr.offset,
-      k_pool_ptr.buffer,
-      v_pool_ptr.buffer,
-      block_table_ptr.buffer,
-      seq_lens_ptr.buffer,
-      out_ptr.buffer,
-      out_ptr.offset,
-      num_seqs,
-      static_cast<uint32_t>(num_q_heads_),
-      static_cast<uint32_t>(num_kv_heads_),
-      static_cast<uint32_t>(head_size_),
-      static_cast<uint32_t>(block_size_),
-      static_cast<uint32_t>(max_context_len),
-      max_blocks_per_seq,
+  mlx::core::fast::paged::dispatch_paged_attention_auto(
+      compute_encoder,
+      d,
+      s,
+      out,
+      q,
+      k_pool,
+      v_pool,
+      block_table,
+      seq_lens,
+      k_scale,
+      v_scale,
+      static_cast<int>(num_seqs),
+      num_q_heads_,
+      num_kv_heads_,
+      head_size_,
+      block_size_,
+      max_context_len,
+      static_cast<int>(max_blocks_per_seq),
       scale_,
       softcap_,
-      static_cast<int32_t>(sliding_window_),
-      static_cast<uint8_t>(kv_dtype_),
-      k_scale_f,
-      v_scale_f);
-
-  if (rc != 0) {
-    throw std::runtime_error(
-        "PagedAttention: extern-C dispatch failed (see stderr for details)");
-  }
+      sliding_window_,
+      to_paged_dtype(kv_dtype_));
 }
 
 std::vector<array> PagedAttention::vjp(
@@ -4908,6 +4816,240 @@ int mlx_paged_attention_eval_gpu_rejects_zero_block_size() {
         stderr,
         "[mlx_paged_attention_eval_gpu_rejects_zero_block_size] FFI boundary "
         "caught uncontained non-std exception (extern-C catch-all)\n");
+    return -1;
+  }
+}
+
+/// Phase 2 stress test (mixed paged + non-paged ops, determinism).
+///
+/// Builds a small graph that:
+///   1. computes `q_offset = q + bias` (a non-paged op before the write)
+///   2. writes new K/V into the K-pool/V-pool via `paged_kv_write`
+///   3. computes `attn = paged_attention(q_offset, k_pool', v_pool', ...)`
+///   4. computes `out = attn + attn` (a non-paged op after the read)
+///
+/// This exercises the dispatch's interaction with MLX's command-encoder
+/// dependency tracking — `paged_kv_write` mutates k_pool/v_pool in
+/// place (registered via `set_output_array`), which `paged_attention`
+/// then reads (registered via `set_input_array`). MLX's encoder must
+/// fence these correctly. Phase 1's separate-queue dispatch
+/// fundamentally cannot get this right; Phase 2 does.
+///
+/// Determinism criterion: run the graph `iterations` times with
+/// IDENTICAL inputs and assert the output is byte-equal across every
+/// run. A race between paged_kv_write's writes and a subsequent op's
+/// reads would surface as nondeterminism (different outputs across
+/// runs).
+///
+/// Returns:
+///   0     — success (all `iterations` runs byte-identical)
+///   -1    — internal/setup error
+///   -2    — outputs diverged across runs (race detected)
+///   -3    — Metal not available; test skipped
+extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (iterations <= 0) {
+    return -1;
+  }
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  // Small but non-trivial config. head_size must be in the
+  // instantiation list (32, 64, 80, 96, 112, 120, 128, 192, 256, 512)
+  // and divisible by x_pack (8 for Bf16). block_size in {8, 16, 32}.
+  const int kBlockSize = 16;
+  const int kNumQHeads = 4;
+  const int kNumKvHeads = 4;
+  const int kHeadSize = 64;
+  const int kXPack = 8;
+  const int kNumBlocks = 4;
+  const int kNumSeqs = 1;
+  const int kSeqLen = 8;
+  const int kMaxBlocksPerSeq = 4;
+
+  try {
+    Shape k_pool_shape{
+        kNumBlocks, kNumKvHeads, kHeadSize / kXPack, kBlockSize, kXPack};
+    Shape v_pool_shape{kNumBlocks, kNumKvHeads, kHeadSize, kBlockSize};
+    Shape new_kv_shape{kSeqLen, kNumKvHeads, kHeadSize};
+    Shape q_shape{kNumSeqs, kNumQHeads, kHeadSize};
+
+    // Build BF16 array from a deterministic host-side function. We
+    // synthesize values via sin(seed_a * i + seed_b) * 0.25 then
+    // truncate to bf16 (top 16 bits of the f32 representation).
+    auto bf16_arr = [](size_t n, float seed_a, float seed_b, Shape shape) {
+      std::vector<uint16_t> host(n);
+      for (size_t i = 0; i < n; ++i) {
+        float f =
+            std::sin(seed_a * static_cast<float>(i) + seed_b) * 0.25f;
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        host[i] = static_cast<uint16_t>(bits >> 16);
+      }
+      auto* p = reinterpret_cast<const bfloat16_t*>(host.data());
+      return array(p, std::move(shape), bfloat16);
+    };
+
+    // Build inputs FRESH each iteration. We can't reuse k_pool /
+    // v_pool across iterations because paged_kv_write mutates them
+    // in place — we'd need to reset to zero between runs. Easier
+    // and clearer to just build new ones. The bytes coming OUT of
+    // bf16_arr are deterministic for the same (n, seed_a, seed_b)
+    // tuple.
+    auto build_inputs = [&]() {
+      const size_t k_pool_n = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+          (kHeadSize / kXPack) * kBlockSize * kXPack;
+      const size_t v_pool_n = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+          kHeadSize * kBlockSize;
+      const size_t new_kv_n = static_cast<size_t>(kSeqLen) * kNumKvHeads *
+          kHeadSize;
+
+      array k_pool = bf16_arr(k_pool_n, 0.0f, 0.0f, k_pool_shape);
+      array v_pool = bf16_arr(v_pool_n, 0.0f, 0.0f, v_pool_shape);
+      array new_k = bf16_arr(new_kv_n, 0.13f, 0.7f, new_kv_shape);
+      array new_v = bf16_arr(new_kv_n, 0.17f, 1.3f, new_kv_shape);
+
+      std::vector<int64_t> slot_host(kSeqLen);
+      for (int i = 0; i < kSeqLen; ++i) {
+        slot_host[i] = i;
+      }
+      array slot_mapping(slot_host.data(), Shape{kSeqLen}, int64);
+
+      const size_t q_n = static_cast<size_t>(kNumSeqs) * kNumQHeads * kHeadSize;
+      array q = bf16_arr(q_n, 0.21f, 2.1f, q_shape);
+
+      std::vector<int32_t> block_table_host(kNumSeqs * kMaxBlocksPerSeq);
+      for (int s = 0; s < kNumSeqs; ++s) {
+        for (int b = 0; b < kMaxBlocksPerSeq; ++b) {
+          block_table_host[s * kMaxBlocksPerSeq + b] = b;
+        }
+      }
+      array block_table(
+          block_table_host.data(),
+          Shape{kNumSeqs, kMaxBlocksPerSeq},
+          int32);
+
+      std::vector<int32_t> seq_lens_host(kNumSeqs, kSeqLen);
+      array seq_lens(seq_lens_host.data(), Shape{kNumSeqs}, int32);
+
+      array k_scale(1.0f, float32);
+      array v_scale(1.0f, float32);
+
+      return std::make_tuple(
+          k_pool,
+          v_pool,
+          new_k,
+          new_v,
+          slot_mapping,
+          q,
+          block_table,
+          seq_lens,
+          k_scale,
+          v_scale);
+    };
+
+    std::vector<uint16_t> baseline_bytes;
+    size_t expected_bytes = 0;
+
+    for (int run = 0; run < iterations; ++run) {
+      auto [k_pool, v_pool, new_k, new_v, slot_mapping, q, block_table,
+            seq_lens, k_scale, v_scale] = build_inputs();
+
+      // Step 1: a non-paged op BEFORE the paged write so MLX's
+      // dependency graph has to fence between us and another
+      // command. (`add` produces a fresh allocation; the write below
+      // doesn't depend on it.)
+      array bias = bf16_arr(
+          static_cast<size_t>(kNumSeqs) * kNumQHeads * kHeadSize,
+          0.05f,
+          0.0f,
+          q_shape);
+      array q_offset = mlx::core::add(q, bias);
+
+      // Step 2: paged_kv_write — fills slots 0..kSeqLen-1 in block 0.
+      auto [k_pool_after, v_pool_after] = paged_kv_write(
+          k_pool,
+          v_pool,
+          new_k,
+          new_v,
+          slot_mapping,
+          k_scale,
+          v_scale,
+          kBlockSize,
+          kNumKvHeads,
+          kHeadSize,
+          kXPack,
+          KvDtype::Bf16);
+
+      // Step 3: paged_attention reads from the just-written pools.
+      // The encoder must fence between the write (Step 2) and this
+      // read; if Phase 2 dispatch is correct, MLX's `set_output_array`
+      // → `set_input_array` chain handles it.
+      array attn = paged_attention(
+          q_offset,
+          k_pool_after,
+          v_pool_after,
+          block_table,
+          seq_lens,
+          k_scale,
+          v_scale,
+          /*scale=*/0.125f,
+          /*softcap=*/0.0f,
+          /*sliding_window=*/0,
+          kBlockSize,
+          kNumQHeads,
+          kNumKvHeads,
+          kHeadSize,
+          KvDtype::Bf16);
+
+      // Step 4: a non-paged op AFTER the read (depends on attn).
+      array out = mlx::core::add(attn, attn);
+
+      mlx::core::eval(out);
+
+      const bfloat16_t* data = out.data<bfloat16_t>();
+      const size_t n_elems = out.size();
+      const uint16_t* bits = reinterpret_cast<const uint16_t*>(data);
+
+      if (run == 0) {
+        baseline_bytes.assign(bits, bits + n_elems);
+        expected_bytes = n_elems;
+      } else {
+        if (n_elems != expected_bytes) {
+          fprintf(
+              stderr,
+              "[phase2_stress] run %d output size mismatch: expected %zu "
+              "got %zu\n",
+              run,
+              expected_bytes,
+              n_elems);
+          return -2;
+        }
+        for (size_t i = 0; i < n_elems; ++i) {
+          if (bits[i] != baseline_bytes[i]) {
+            fprintf(
+                stderr,
+                "[phase2_stress] run %d byte %zu diverged: baseline=0x%04x "
+                "current=0x%04x (race detected)\n",
+                run,
+                i,
+                baseline_bytes[i],
+                bits[i]);
+            return -2;
+          }
+        }
+      }
+    }
+
+    return 0;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[phase2_stress] threw: %s\n", e.what());
+    return -1;
+  } catch (...) {
+    fprintf(stderr, "[phase2_stress] threw non-std exception\n");
     return -1;
   }
 }

@@ -36,10 +36,13 @@ for (const output of outputs) {
 }
 
 // Copy mlx.metallib for colocated Metal shader loading
-// MLX looks for metallib next to the binary, so we copy it here
-await copyMetallib();
+// MLX looks for metallib next to the binary, so we copy it here.
+// Also copy paged_attn.metallib (Phase 2 of the paged-attention
+// compile integration), which mlx_paged_dispatch.cpp loads via a
+// `dladdr`-based colocated lookup at runtime.
+await copyMetallibs();
 
-async function copyMetallib() {
+async function copyMetallibs() {
   const targetDir = join(__dirname, '../../target');
   try {
     // Find mlx.metallib in the build directory
@@ -51,11 +54,22 @@ async function copyMetallib() {
         const buildDirs = await readdir(releaseDir);
         for (const dir of buildDirs) {
           if (dir.startsWith('mlx-sys-')) {
-            const metallibPath = join(releaseDir, dir, 'out', 'lib', 'mlx.metallib');
+            const libDir = join(releaseDir, dir, 'out', 'lib');
+            const mlxPath = join(libDir, 'mlx.metallib');
             try {
-              await stat(metallibPath);
-              await copyFile(metallibPath, './mlx.metallib');
+              await stat(mlxPath);
+              await copyFile(mlxPath, './mlx.metallib');
               console.log('Copied mlx.metallib');
+              // Best-effort copy of the paged-attn metallib (Phase 2).
+              // It lives next to mlx.metallib in the same lib dir.
+              const pagedPath = join(libDir, 'paged_attn.metallib');
+              try {
+                await stat(pagedPath);
+                await copyFile(pagedPath, './paged_attn.metallib');
+                console.log('Copied paged_attn.metallib');
+              } catch {
+                console.warn('Note: paged_attn.metallib not found (Phase 2 paged-attn compile path will throw at first use)');
+              }
               return;
             } catch {
               // metallib not at this path, continue searching

@@ -10,6 +10,124 @@ fn metal_toolchain_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Compile the paged-attention `.metal` sources into
+/// `<out_dir>/paged_attn.metallib`. The kernels live in
+/// `crates/mlx-paged-attn/metal/`. mlx-sys's own
+/// `mlx_paged_dispatch.cpp` resolves this metallib at runtime by
+/// looking next to the loaded binary (the .node addon copies it
+/// alongside `mlx.metallib` during the package-build step).
+///
+/// Mirror of `crates/mlx-paged-attn/build.rs`'s metal-shader compile:
+/// same `xcrun -sdk macosx metal -O3 -ffast-math` invocation, same
+/// link step.
+fn compile_paged_attn_metallib(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
+    let metal_src_dir = manifest_dir
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has a parent")
+        .join("mlx-paged-attn")
+        .join("metal");
+    if !metal_src_dir.exists() {
+        panic!(
+            "expected paged-attn metal sources at {}",
+            metal_src_dir.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", metal_src_dir.display());
+    let walk = walk_metal_dir(&metal_src_dir);
+    for path in &walk {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    let metal_files = [
+        "attention/paged_attention.metal",
+        "cache/reshape_and_cache.metal",
+        "cache/copy_blocks.metal",
+    ];
+
+    let mut air_files = Vec::new();
+    for file in &metal_files {
+        let src_path = metal_src_dir.join(file);
+        let air_name = file.replace('/', "_").replace(".metal", ".air");
+        let air_path = out_dir.join(&air_name);
+
+        let status = Command::new("xcrun")
+            .args([
+                "-sdk",
+                "macosx",
+                "metal",
+                "-c",
+                src_path.to_str().unwrap(),
+                "-o",
+                air_path.to_str().unwrap(),
+                "-I",
+                metal_src_dir.to_str().unwrap(),
+                "-O3",
+                "-ffast-math",
+            ])
+            .status()
+            .expect("Failed to execute xcrun metal");
+        if !status.success() {
+            panic!(
+                "Metal compilation failed for {}: exit code {:?}",
+                file,
+                status.code()
+            );
+        }
+        air_files.push(air_path);
+    }
+
+    let metallib_path = out_dir.join("paged_attn.metallib");
+    let mut link_cmd = Command::new("xcrun");
+    link_cmd.args(["-sdk", "macosx", "metallib"]);
+    for air in &air_files {
+        link_cmd.arg(air.to_str().unwrap());
+    }
+    link_cmd.args(["-o", metallib_path.to_str().unwrap()]);
+    let status = link_cmd.status().expect("Failed to execute xcrun metallib");
+    if !status.success() {
+        panic!(
+            "Paged-attn metallib linking failed: exit code {:?}",
+            status.code()
+        );
+    }
+
+    metallib_path
+}
+
+/// Walk ancestors of `start` looking for a directory whose final name
+/// equals `name`. Returns the matching ancestor's path, or `None`.
+fn find_ancestor_with_name(start: &Path, name: &str) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        if ancestor
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .as_deref()
+            == Some(name)
+        {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn walk_metal_dir(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                out.extend(walk_metal_dir(&p));
+            } else if let Some(ext) = p.extension()
+                && ext == "metal"
+            {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 fn add_link_search(path: &Path) {
     if path.exists() {
         println!("cargo:rustc-link-search=native={}", path.display());
@@ -56,6 +174,19 @@ fn main() {
             "Metal toolchain not found. Install it with `xcodebuild -downloadComponent MetalToolchain` or set MLX_DISABLE_METAL=1 to force a CPU-only build."
         );
     }
+
+    // Compile the paged-attention `.metallib` BEFORE we run the cmake
+    // build for MLX. Both products land in `OUT_DIR`. Skipped if Metal
+    // is disabled (no Metal toolchain) — the C++ side guards the
+    // dispatch with `target_os = "macos"` and the runtime
+    // `paged_attn_metallib_path` lookup will throw if the metallib is
+    // not findable.
+    let out_dir_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let paged_metallib_path = if !metal_disabled {
+        Some(compile_paged_attn_metallib(&manifest_dir, &out_dir_path))
+    } else {
+        None
+    };
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is not set");
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is not set");
@@ -114,6 +245,63 @@ fn main() {
         );
     }
 
+    // Co-locate `paged_attn.metallib` with `mlx.metallib`. Both must
+    // ship next to the loaded binary at runtime (see
+    // `packages/core/build.ts::copyMetallib` which copies the cmake
+    // output's `lib/mlx.metallib` into the addon directory).
+    //
+    // Also copy to common locations next to test binaries:
+    //   - `target/<profile>/`        (cargo test --release / debug)
+    //   - `target/<profile>/deps/`   (where Rust integration tests run)
+    //   - `target/<arch>/<profile>/{,deps/}` (cross-target)
+    // so `cargo test` works without manual env var setup. The runtime
+    // `dladdr`-based lookup in mlx_paged_dispatch.cpp finds the addon
+    // binary's parent directory and looks for `paged_attn.metallib`
+    // there.
+    if let Some(paged_metallib) = paged_metallib_path.as_ref() {
+        for candidate in lib_candidates.iter() {
+            if candidate.exists() {
+                let dst_path = candidate.join("paged_attn.metallib");
+                if let Err(e) = std::fs::copy(paged_metallib, &dst_path) {
+                    panic!(
+                        "Failed to copy paged_attn.metallib to {}: {e}",
+                        dst_path.display()
+                    );
+                }
+            }
+        }
+
+        // Copy to test/binary-output directories: cargo passes
+        // OUT_DIR but test binaries live at target/<profile>/deps/.
+        // Walk up to find the target dir.
+        let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+        // OUT_DIR shape: target/<arch>/<profile>/build/mlx-sys-<hash>/out
+        // Want:           target/<arch>/<profile>/{,deps/}
+        // and:            target/<profile>/{,deps/} (default-target build)
+        if let Some(profile_dir) = find_ancestor_with_name(&out_path, "build")
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
+            let mut sinks = vec![profile_dir.clone(), profile_dir.join("deps")];
+            // Also try walking one level above to support per-target
+            // dirs (target/<arch>/<profile> path layout).
+            if let Some(parent) = profile_dir.parent()
+                && parent
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .as_deref()
+                    != Some("target")
+            {
+                sinks.push(parent.join("deps"));
+            }
+            for sink in sinks {
+                if sink.exists() {
+                    let dst = sink.join("paged_attn.metallib");
+                    let _ = std::fs::copy(paged_metallib, &dst);
+                }
+            }
+        }
+    }
+
     println!("cargo:rustc-link-lib=static=mlx");
 
     if !metal_disabled {
@@ -142,6 +330,16 @@ fn main() {
 
     if include_generated.exists() {
         bridge.include(&include_generated);
+        // metal-cpp installs to `<install>/include/metal_cpp/Metal/Metal.hpp`.
+        // mlx_paged_dispatch.cpp (Phase 2) needs it because the public
+        // `mlx::core::metal::Device` API exposes `MTL::*` types from
+        // `<Metal/Metal.hpp>`. The CMake build links MLX against
+        // metal_cpp transitively but the cc-rs C++ bridge must be told
+        // explicitly.
+        let metal_cpp_include = include_generated.join("metal_cpp");
+        if metal_cpp_include.exists() {
+            bridge.include(&metal_cpp_include);
+        }
     }
     // Add src/ as include path for metal/*.metal.inc includes
     bridge.include(&src_dir);
