@@ -881,9 +881,9 @@ export async function handleCreateMessage(
         // `<Inner>::paged_adapter.is_some()` and surfaced by the
         // `SessionCapableModel` structural interface):
         //
-        //   * **Paged-active** (Qwen3 + LFM2 today; eventually Gemma4 +
-        //     Qwen3.5 + Qwen3.5 MoE once their parity is restored).
-        //     Allocate a fresh `ChatSession` per request via
+        //   * **Paged-active** (Qwen3 + LFM2 + Gemma4 today; Qwen3.5
+        //     dense + Qwen3.5 MoE once their perf trade-off is
+        //     decided). Allocate a fresh `ChatSession` per request via
         //     `createFreshSession()`, do NOT touch the warm slot.
         //     Cross-turn / cross-conversation prefix reuse is handled
         //     entirely by the native `BlockAllocator`'s prefix-hash
@@ -894,12 +894,12 @@ export async function handleCreateMessage(
         //     KV blocks. The JS-side warm slot would only serialize
         //     them and force one into cold replay.
         //
-        //   * **Non-paged** (Gemma4 today — parity-blocked; Qwen3.5
-        //     dense + MoE — parity-pending; the Qianfan-OCR VLM — no
-        //     adapter wired). Fall through to `getOrCreateWarmAny`,
-        //     which is the ONLY cross-conversation reuse mechanism
-        //     these models have. The Anthropic Messages API is
-        //     stateless on the wire (no `previous_response_id`,
+        //   * **Non-paged** (Qwen3.5 dense + MoE — default-OFF pending
+        //     a perf decision against the compiled C++ flat path;
+        //     the Qianfan-OCR VLM — no adapter wired). Fall through to
+        //     `getOrCreateWarmAny`, which is the ONLY cross-conversation
+        //     reuse mechanism these models have. The Anthropic Messages
+        //     API is stateless on the wire (no `previous_response_id`,
         //     clients don't propagate `prompt_cache_key`), so without
         //     the warm slot every turn is a full cold start.
         //

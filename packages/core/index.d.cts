@@ -159,12 +159,12 @@ export declare class Gemma4Model {
    *
    * `true` iff `Gemma4Inner::paged_adapter` was successfully
    * constructed at load time (driven by
-   * `Gemma4Config::use_block_paged_cache`, currently default-OFF
-   * because parity is blocked on the SharedOn* numerical-diff
-   * investigation — see CLAUDE.md). Stubs constructed via
-   * `new(config)` always return `false`. Surfaced through this NAPI
-   * method so server endpoints can branch on it without a
-   * model-thread roundtrip.
+   * `Gemma4Config::use_block_paged_cache`, default-ON since the
+   * `gemma4_paged_vs_flat_parity` integration test verified greedy
+   * byte-equal at BF16 against real Gemma-4-E2B-IT weights — see
+   * CLAUDE.md). Stubs constructed via `new(config)` always return
+   * `false`. Surfaced through this NAPI method so server endpoints
+   * can branch on it without a model-thread roundtrip.
    */
   hasBlockPagedCache(): boolean;
   modelId(): number;

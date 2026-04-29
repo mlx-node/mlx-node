@@ -10,8 +10,13 @@
 // Kernel names + threadgroup-memory math + V1/V2 selection mirror the
 // Rust dispatcher in `crates/mlx-paged-attn/src/metal/{state,
 // reshape_and_cache, paged_attention}.rs`. The Rust dispatcher remains
-// in place for now (only the C++ side stops calling the extern-C shim);
-// Phase 11 deletes the Rust path once all model migrations are done.
+// in place: it is the active production paged path for Qwen3, LFM2,
+// and Gemma4 (whose paged forward goes through `PagedKVCacheAdapter`
+// → `LayerKVPool` → Rust `dispatch_*` calls, NOT through the C++
+// `PagedKVWrite` / `PagedAttention` Custom primitives). The C++ port
+// in this header is exclusively for the compile-traceable primitives
+// used inside the Qwen3.5 dense / Qwen3.5 MoE C++ compile graphs
+// (`mlx_qwen35_init_paged` / `mlx_qwen35_moe_init_paged`).
 //
 // Notes:
 //   - The .metallib for these kernels is compiled by `mlx-sys/build.rs`

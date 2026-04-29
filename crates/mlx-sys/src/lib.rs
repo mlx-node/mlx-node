@@ -1564,9 +1564,6 @@ unsafe extern "C-unwind" {
     /// Eval next_token and all compiled cache arrays to prevent graph accumulation.
     pub fn mlx_qwen35_eval_token_and_compiled_caches(next_token: *mut mlx_array);
 
-    /// Synchronously eval all compiled cache arrays (for training decode loop).
-    pub fn mlx_qwen35_sync_eval_compiled_caches();
-
     /// Adjust the compiled offset by delta (for VLM rope_deltas).
     pub fn mlx_qwen35_compiled_adjust_offset(delta: i32);
 
@@ -1685,7 +1682,6 @@ unsafe extern "C-unwind" {
 
     pub fn mlx_qwen35_vlm_cache_count() -> i32;
     pub fn mlx_qwen35_vlm_get_cache(index: i32) -> *mut mlx_array;
-    pub fn mlx_qwen35_vlm_get_offset() -> i32;
     pub fn mlx_qwen35_vlm_reset();
 
     // ============================================
@@ -1731,9 +1727,6 @@ unsafe extern "C-unwind" {
 
     /// Eval next_token and all MoE cache arrays to prevent graph accumulation.
     pub fn mlx_qwen35_moe_eval_token_and_caches(next_token: *mut mlx_array);
-
-    /// Synchronously eval all MoE cache arrays (for training decode loop).
-    pub fn mlx_qwen35_moe_sync_eval_caches();
 
     /// Reset MoE state.
     pub fn mlx_qwen35_moe_reset();
@@ -1889,48 +1882,11 @@ unsafe extern "C-unwind" {
         cache_offset_out: *mut i32,
     );
 
-    /// Gemma4 single-token greedy decode step.
-    pub fn mlx_gemma4_forward_greedy(
-        input_ids: *mut mlx_array,
-        embedding_weight: *mut mlx_array,
-        output_token: *mut *mut mlx_array,
-        cache_offset_out: *mut i32,
-    );
-
     /// Eval next_token and all Gemma4 cache arrays to prevent graph accumulation.
     pub fn mlx_gemma4_eval_token_and_caches(next_token: *mut mlx_array);
 
-    /// Synchronously eval all Gemma4 cache arrays (for periodic memory management).
-    pub fn mlx_gemma4_sync_eval_caches();
-
     /// Reset Gemma4 state.
     pub fn mlx_gemma4_reset();
-
-    /// Export Gemma4 caches for PromptCache reuse.
-    /// Copies cache arrays to caller-provided output pointers.
-    /// Returns number of arrays exported, or 0 if not initialized.
-    pub fn mlx_gemma4_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
-
-    /// Get current Gemma4 cache offset (tokens processed).
-    pub fn mlx_gemma4_get_cache_offset() -> i32;
-
-    /// Benchmark: run N decode steps entirely in C++ with per-step eval.
-    pub fn mlx_gemma4_benchmark(num_steps: i32) -> f64;
-
-    /// Full decode loop in C++ — no per-step Rust round-trip.
-    /// Returns number of tokens generated. Token IDs written to out_tokens.
-    pub fn mlx_gemma4_generate(
-        first_token: *mut mlx_array,
-        embedding_weight: *mut mlx_array,
-        max_tokens: i32,
-        temperature: f32,
-        eos_ids: *const i32,
-        num_eos_ids: i32,
-        out_tokens: *mut i32,
-    ) -> i32;
-
-    /// Adjust Gemma4 cache offset by delta (for VLM position correction).
-    pub fn mlx_gemma4_adjust_offset(delta: i32);
 
     /// Load safetensors file using MLX's lazy loading (data read on eval, not upfront).
     /// Calls `callback` for each tensor with (name, name_len, array_handle, ctx).

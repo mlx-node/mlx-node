@@ -655,8 +655,8 @@ export class SessionRegistry {
   /**
    * @deprecated **Redundant on `/v1/messages` for paged-active models.**
    * Phase 7 of the messages-kv-reuse plan removed the only call site
-   * for paged-active full-attention models (Qwen3 + LFM2 today): the
-   * native block-paged KV adapter (`PagedKVCacheAdapter` +
+   * for paged-active full-attention models (Qwen3 + LFM2 + Gemma4
+   * today): the native block-paged KV adapter (`PagedKVCacheAdapter` +
    * `BlockAllocator` + `LayerKVPool`) recovers a turn's prefix from
    * refcounted KV blocks keyed by token-prefix hash, so the JS-side
    * single-warm slot this method walks is redundant — the native
@@ -667,15 +667,15 @@ export class SessionRegistry {
    * The `/v1/messages` endpoint now branches at request time on
    * {@link SessionCapableModel.hasBlockPagedCache}: paged-active models
    * call {@link SessionRegistry.createFreshSession} per request and
-   * never touch the warm slot; non-paged models (Gemma4 today —
-   * parity-blocked; Qwen3.5 dense + MoE — parity-pending; the
-   * `QianfanOCRModel` VLM — no adapter wired) still call this method
-   * because the JS-side warm slot is the ONLY cross-conversation reuse
-   * mechanism available to them. Removing this method would silently
-   * disable cross-turn reuse on every non-paged model, so it stays
-   * load-bearing until ALL session-capable models have paged enabled
-   * by default. Treat `@deprecated` as an intent signal that paged-
-   * active callers should use `createFreshSession` instead.
+   * never touch the warm slot; non-paged models (Qwen3.5 dense + MoE —
+   * default-OFF pending a perf decision; the `QianfanOCRModel` VLM —
+   * no adapter wired) still call this method because the JS-side warm
+   * slot is the ONLY cross-conversation reuse mechanism available to
+   * them. Removing this method would silently disable cross-turn reuse
+   * on every non-paged model, so it stays load-bearing until ALL
+   * session-capable models have paged enabled by default. Treat
+   * `@deprecated` as an intent signal that paged-active callers should
+   * use `createFreshSession` instead.
    *
    * Third lookup mode — for STATELESS full-history endpoints that have
    * no `previous_response_id` to thread and do not propagate

@@ -939,24 +939,6 @@ void mlx_qwen35_moe_eval_token_and_caches(mlx_array* next_token_ptr) {
   }
 }
 
-void mlx_qwen35_moe_sync_eval_caches() {
-  try {
-    if (g_moe_caches.empty()) return;
-    std::vector<array> to_eval;
-    to_eval.reserve(g_moe_caches.size());
-    for (const auto& c : g_moe_caches) {
-      to_eval.push_back(c);
-    }
-    mlx::core::eval(std::move(to_eval));
-  } catch (const std::exception& e) {
-    fprintf(stderr, "[MLX] Exception in moe_sync_eval_caches: %s\n", e.what());
-    fflush(stderr);
-  } catch (...) {
-    fprintf(stderr, "[MLX] Unknown exception in moe_sync_eval_caches\n");
-    fflush(stderr);
-  }
-}
-
 // Reset MoE state — clears BOTH the legacy flat globals AND the
 // Phase 4 piece 1 paged globals. Keeping these symmetric is required
 // because `mlx_qwen35_moe_init_paged` flips `g_paged_inited` to true

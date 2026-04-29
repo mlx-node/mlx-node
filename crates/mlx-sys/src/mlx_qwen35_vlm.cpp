@@ -189,10 +189,6 @@ mlx_array* mlx_qwen35_vlm_get_cache(int index) {
   return reinterpret_cast<mlx_array*>(new array(g_vlm_caches[index]));
 }
 
-int mlx_qwen35_vlm_get_offset() {
-  return g_vlm_offset;
-}
-
 void mlx_qwen35_vlm_reset() {
   g_vlm_caches.clear();
   g_vlm_offset = 0;
