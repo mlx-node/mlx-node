@@ -108,6 +108,25 @@ import { validateAndCanonicalizeHistoryToolOrder } from './responses.js';
  */
 const MESSAGES_WARM_SLOT_ID = '__msg_warm__';
 
+/**
+ * Find the largest k such that `streamed.endsWith(final.slice(0, k))`.
+ * Used to compute the unsent suffix of `finalText` when the streamed-chunk
+ * prefix and `finalText` prefix can diverge — the native side trims leading
+ * whitespace after </think> via `split_at_think_end`, so e.g. streamed
+ * could be `"\n\n"` and final could start with `"<tool_call>"`.
+ *
+ * Returns 0 when there is no overlap (caller emits finalText whole).
+ * Returns final.length when finalText is fully contained in streamed
+ * (caller emits nothing).
+ */
+function longestSuffixPrefixOverlap(streamed: string, final: string): number {
+  const max = Math.min(streamed.length, final.length);
+  for (let k = max; k > 0; k--) {
+    if (streamed.endsWith(final.slice(0, k))) return k;
+  }
+  return 0;
+}
+
 // Non-streaming path
 
 async function handleNonStreaming(
@@ -162,6 +181,15 @@ async function handleStreamingNative(
   let hasEmittedThinking = false;
   let hasEmittedText = false;
   let emittedTextLength = 0;
+  // Mirror of the actual streamed text body, used by the malformed-tool-call
+  // recovery branches below. `emittedTextLength` counts bytes of streamed text
+  // — but `event.text` on the terminal `done` chunk is the post-</think>-trim
+  // cleaned text from the native `split_at_think_end`, so streamed and final
+  // prefixes can diverge (e.g. streamed=`"\n\n<tool_call>..."`,
+  // finalText=`"<tool_call>..."`). The recovery branches use
+  // `longestSuffixPrefixOverlap(emittedText, finalText)` to find the unsent
+  // suffix instead of a length-based slice that would chop characters.
+  let emittedText = '';
   const tagBuffer = new ToolCallTagBuffer();
 
   // Terminal emission is deferred until after the loop drains so `wasCommitted()`
@@ -240,6 +268,7 @@ async function handleStreamingNative(
               buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
             );
           }
+          emittedText += remainingText;
           emittedTextLength += remainingText.length;
           writeSSEEvent(
             res,
@@ -265,6 +294,7 @@ async function handleStreamingNative(
             'content_block_start',
             buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
           );
+          emittedText += finalText;
           emittedTextLength += finalText.length;
           writeSSEEvent(
             res,
@@ -272,9 +302,20 @@ async function handleStreamingNative(
             buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
           );
         } else if (tagBuffer.suppressed && !hasToolCalls && finalText && hasEmittedText) {
-          // Recovery: streaming text was cut off by a false-alarm `<tool_call>` tag. Emit the unsent suffix.
-          const unsent = finalText.slice(emittedTextLength);
+          // Recovery: streaming text was cut off by a false-alarm `<tool_call>` tag.
+          //
+          // `emittedTextLength` is an index into the streamed chunks, NOT into
+          // `finalText`. The native side trims leading whitespace after
+          // `</think>` via `split_at_think_end`, so the prefixes can diverge:
+          // e.g. streamed=`"\n\n<tool_call>..."`, finalText=`"<tool_call>..."`.
+          // A naive `finalText.slice(emittedTextLength)` would chop `<t` off
+          // `<tool_call>` and emit `"ool_call>\n<function=..."`. Find the
+          // longest streamed-suffix == finalText-prefix overlap and emit
+          // whatever finalText has BEYOND that overlap.
+          const overlap = longestSuffixPrefixOverlap(emittedText, finalText);
+          const unsent = finalText.slice(overlap);
           if (unsent) {
+            emittedText += unsent;
             emittedTextLength += unsent.length;
             writeSSEEvent(
               res,
@@ -282,17 +323,24 @@ async function handleStreamingNative(
               buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
             );
           }
-        }
-
-        // Emit any unsent suffix when final text is longer than what was streamed.
-        if (hasEmittedText && finalText && finalText.length > emittedTextLength) {
-          const unsent = finalText.slice(emittedTextLength);
-          emittedTextLength += unsent.length;
-          writeSSEEvent(
-            res,
-            'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
-          );
+        } else if (hasEmittedText && finalText) {
+          // Emit any unsent suffix when final text extends past what was
+          // streamed. Same divergence concern as above (post-</think> trim
+          // can leave `emittedText` longer than the matching prefix of
+          // `finalText`), so we use the same overlap-based slice instead of
+          // a length-based one. When the overlap covers all of `finalText`
+          // (i.e. nothing more to emit) `unsent` is empty and we skip.
+          const overlap = longestSuffixPrefixOverlap(emittedText, finalText);
+          const unsent = finalText.slice(overlap);
+          if (unsent) {
+            emittedText += unsent;
+            emittedTextLength += unsent.length;
+            writeSSEEvent(
+              res,
+              'content_block_delta',
+              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
+            );
+          }
         }
 
         if (hasEmittedText) {
@@ -307,6 +355,7 @@ async function handleStreamingNative(
             'content_block_start',
             buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
           );
+          emittedText += finalText;
           emittedTextLength += finalText.length;
           writeSSEEvent(
             res,
@@ -386,6 +435,7 @@ async function handleStreamingNative(
                 buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
               );
             }
+            emittedText += cleanPrefix;
             emittedTextLength += cleanPrefix.length;
             writeSSEEvent(
               res,
@@ -405,6 +455,7 @@ async function handleStreamingNative(
               buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
             );
           }
+          emittedText += safeText;
           emittedTextLength += safeText.length;
           writeSSEEvent(
             res,

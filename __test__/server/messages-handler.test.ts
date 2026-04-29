@@ -996,6 +996,85 @@ describe('handleCreateMessage', () => {
       expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
     });
 
+    it('recovers full malformed tool_call when finalText is post-</think>-trim cleaned', async () => {
+      // Real bug 2026-04-28: model decode-loops past max_tokens with an unclosed
+      // <tool_call>. Streamed chunks include "\n\n" (post-</think> whitespace)
+      // before the <tool_call> suppression triggers. Native finalText is the
+      // cleaned text starting with "<tool_call>" (split_at_think_end trims the
+      // leading "\n\n"). The recovery branch must NOT slice into <t — it must
+      // emit a complete "<tool_call>" tag.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        // Thinking tokens
+        { text: 'reasoning here', done: false, isReasoning: true },
+        // Reasoning closing fence (server filters '</think>' out via replace)
+        { text: '</think>', done: false, isReasoning: true },
+        // Post-</think> whitespace flowing as a non-reasoning text delta —
+        // this advances emittedTextLength to 2 BEFORE suppression triggers.
+        { text: '\n\n', done: false, isReasoning: false },
+        // Unclosed tool_call — tagBuffer suppresses everything from here on.
+        { text: '<tool_call>\n<function=Agent>{"q":"x"}', done: false, isReasoning: false },
+        {
+          // Native side trims the leading "\n\n" (split_at_think_end), so
+          // finalText starts with "<tool_call>" — NOT "\n\n<tool_call>".
+          // toolCalls is empty because the parser failed (no </tool_call>).
+          text: '<tool_call>\n<function=Agent>{"q":"x"}',
+          done: true,
+          finishReason: 'length',
+          toolCalls: [],
+          thinking: 'reasoning here',
+          numTokens: 30,
+          promptTokens: 10,
+          reasoningTokens: 5,
+          rawText: '<think>reasoning here</think>\n\n<tool_call>\n<function=Agent>{"q":"x"}',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Use a tool' }],
+          max_tokens: 30,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+
+      // Should have exactly one text content_block_start
+      const textStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
+      );
+      expect(textStarts).toHaveLength(1);
+
+      // The combined text deltas must contain a complete "<tool_call>" tag.
+      // The bug emitted "ool_call>\n<function=..." (leading "<t" sliced off
+      // by `finalText.slice(emittedTextLength)` where emittedTextLength=2
+      // counted the streamed "\n\n" but finalText had been post-</think>-trim
+      // cleaned to start at "<tool_call>"). Check that every "ool_call>"
+      // occurrence is preceded by "<t" — i.e. no orphaned, half-sliced tag.
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(combined).toContain('<tool_call>');
+      // Guard against the bug's specific signature: an "ool_call>" with no
+      // "<t" immediately before it. Under the fix every "ool_call>" is part
+      // of a complete "<tool_call>".
+      const orphanMatch = /(^|[^t])ool_call>/.exec(combined);
+      expect(orphanMatch, `combined text contains a half-sliced tool_call tag: ${combined!}`).toBeNull();
+
+      // Should NOT have any tool_use block (parser failed → empty toolCalls)
+      const toolStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+      );
+      expect(toolStarts).toHaveLength(0);
+    });
+
     it('recovers full text after false-alarm tool_call tag when no text was emitted yet', async () => {
       // The model immediately outputs "<tool_call>" with no prior text,
       // but the final event has no actual tool calls.
