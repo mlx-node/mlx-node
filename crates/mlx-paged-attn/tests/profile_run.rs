@@ -263,20 +263,38 @@ fn profile_run_threads_max_position_embeddings_to_closure() {
         16,
     );
 
-    // Closure ran with the supplied max_seq regardless of Metal
-    // availability — both the Metal-present path (reset → forward
-    // → read) and the no-Metal early-return path invoke it once.
-    assert_eq!(observed.load(Ordering::SeqCst), 4321);
+    // Closure ran with the supplied max_seq on every path EXCEPT the
+    // degraded-Metal sub-path of MetalUnavailable, where
+    // `reset_peak_memory()` returns `-1` and `?`-propagates BEFORE the
+    // closure runs. In that case `observed` stays at its initial 0;
+    // any non-zero value MUST equal the supplied max_seq. (See the
+    // companion test `profile_run_no_metal_returns_metal_unavailable_
+    // without_abort` for the explicit invocation-count contract.)
+    let observed_value = observed.load(Ordering::SeqCst);
+    assert!(
+        observed_value == 0 || observed_value == 4321,
+        "observed max_seq must be 0 (closure never ran) or 4321 (closure ran), got {observed_value}"
+    );
 
     // Sanity: the result is either Ok (Metal-present host with
     // enough memory) or an explicit error variant. NEVER an abort
     // from an unwound C++ exception.
     match res {
-        Ok(_) => {} // Metal present + enough memory — auto-sizer succeeded.
+        Ok(_) => {
+            // Metal present + enough memory — auto-sizer succeeded;
+            // closure must have run with the supplied max_seq.
+            assert_eq!(observed.load(Ordering::SeqCst), 4321);
+        }
         Err(ProfileError::MetalUnavailable) => {} // No-GPU host: short-circuited cleanly.
         Err(ProfileError::TotalMemoryUnavailable) => {} // sysctl failed: also acceptable.
-        Err(ProfileError::InsufficientMemory { .. }) => {} // Tiny dummy forward, plausible budget reject.
-        Err(ProfileError::NotEnoughBlocks { .. }) => {}    // Small budget after util haircut.
+        Err(ProfileError::InsufficientMemory { .. }) => {
+            // Tiny dummy forward, plausible budget reject — closure ran.
+            assert_eq!(observed.load(Ordering::SeqCst), 4321);
+        }
+        Err(ProfileError::NotEnoughBlocks { .. }) => {
+            // Small budget after util haircut — closure ran.
+            assert_eq!(observed.load(Ordering::SeqCst), 4321);
+        }
         other => panic!("unexpected result: {other:?}"),
     }
 }
@@ -387,12 +405,26 @@ fn profile_run_no_metal_returns_metal_unavailable_without_abort() {
             assert_eq!(invoke_count.load(Ordering::SeqCst), 1);
         }
         Err(ProfileError::MetalUnavailable) => {
-            // No-Metal / degraded-Metal path took the early return.
-            // The closure was invoked once for the platform-portable
-            // model-loading bug surfacing path, with the supplied
-            // max_seq.
-            assert_eq!(observed.load(Ordering::SeqCst), 9999);
-            assert_eq!(invoke_count.load(Ordering::SeqCst), 1);
+            // Two legitimate sub-paths land here:
+            //   (a) `mlx_metal_is_available()` returned false upfront —
+            //       the no-Metal early return invokes the closure once
+            //       to surface platform-portable model-loading bugs
+            //       deterministically before short-circuiting.
+            //   (b) `mlx_metal_is_available()` returned true (degraded-
+            //       Metal host) but `reset_peak_memory()` then returned
+            //       `-1` because the allocator constructor threw. In
+            //       that path `reset_peak_memory()?` propagates BEFORE
+            //       the closure runs, so `invoke_count == 0`.
+            // Accept both invocation counts; when the closure DID run,
+            // `observed` must equal the supplied max_seq.
+            let count = invoke_count.load(Ordering::SeqCst);
+            assert!(
+                count <= 1,
+                "MetalUnavailable should invoke closure 0 or 1 times, got {count}"
+            );
+            if count == 1 {
+                assert_eq!(observed.load(Ordering::SeqCst), 9999);
+            }
         }
         Err(ProfileError::TotalMemoryUnavailable) => {
             // Non-macOS host (sysctl unavailable). On non-macOS the
@@ -553,8 +585,12 @@ fn profile_run_propagates_closure_error() {
     // takes:
     // - Metal present, sysctl works → reset_peak_memory(), then closure
     //   invoked, returns Err → DummyForwardFailed propagates.
-    // - Metal absent on macOS → MetalUnavailable, closure was invoked
-    //   once first to surface platform-portable model-loading bugs.
+    // - Metal absent on macOS (fast-path gate) → MetalUnavailable,
+    //   closure was invoked once first to surface platform-portable
+    //   model-loading bugs.
+    // - Degraded-Metal on macOS (gate passes but reset_peak_memory
+    //   throws) → MetalUnavailable propagates BEFORE the closure runs.
+    //   `captured` stays None.
     // - Non-macOS or sysctl failure → TotalMemoryUnavailable; on the
     //   non-macOS branch the closure also runs once.
     // Either way: when the closure runs, max_seq must be 128.
@@ -564,7 +600,15 @@ fn profile_run_propagates_closure_error() {
             assert_eq!(*captured.lock().unwrap(), Some(128));
         }
         Err(ProfileError::MetalUnavailable) => {
-            assert_eq!(*captured.lock().unwrap(), Some(128));
+            // Closure was invoked 0 times (reset_peak_memory failed
+            // first) or 1 time (no-Metal fast-path gate). When it ran,
+            // max_seq must be the supplied 128.
+            let captured_val = *captured.lock().unwrap();
+            assert!(
+                captured_val.is_none() || captured_val == Some(128),
+                "captured max_seq must be None (closure never ran) or Some(128) (closure ran), \
+                 got {captured_val:?}"
+            );
         }
         Err(ProfileError::TotalMemoryUnavailable) => {
             // The non-macOS branch invokes the closure before returning;

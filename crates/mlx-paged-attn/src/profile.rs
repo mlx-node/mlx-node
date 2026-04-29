@@ -325,6 +325,39 @@ fn read_total_memory_bytes() -> Result<u64, ProfileError> {
     }
 }
 
+/// Translate the raw FFI result `(rc, ws)` from
+/// `mlx_max_recommended_working_set_size` into the auto-sizer's
+/// `Result<Option<u64>, ProfileError>` contract.
+///
+/// Pulled out of [`read_working_set_bytes`] as a pure function so the
+/// translation is unit-testable without invoking the live FFI — the
+/// C++ shim's split status contract is exercised here directly via
+/// synthetic `(rc, ws)` pairs.
+///
+/// Contract (must match the C++ shim's status codes in
+/// `crates/mlx-sys/src/mlx_paged_profile.cpp::mlx_max_recommended_
+/// working_set_size`):
+/// - `(0, non_zero)` → `Ok(Some(non_zero))` — real bound published.
+/// - `(0, 0)` → `Ok(None)` — schema drift, missing key, wrong variant
+///   type, or Metal unavailable. NOT a failure mode.
+/// - `(-1, _)` → `Err(MetalUnavailable)` — C++ exception caught.
+fn translate_working_set_status(rc: i32, ws: u64) -> Result<Option<u64>, ProfileError> {
+    if rc != 0 {
+        // Caught C++ exception. Surface `MetalUnavailable` so the
+        // auto-sizer matches the peak-memory FFI's failure mode.
+        return Err(ProfileError::MetalUnavailable);
+    }
+    if ws == 0 {
+        // FFI succeeded but no bound is published — either the
+        // `device_info` map omits the entry, the entry has the wrong
+        // variant type, or Metal isn't available. All three are
+        // legitimate "no working-set bound" cases, NOT failures.
+        Ok(None)
+    } else {
+        Ok(Some(ws))
+    }
+}
+
 /// MLX's GPU-visible working-set bound (`MTLDevice
 /// recommendedMaxWorkingSetSize`), if available.
 ///
@@ -334,43 +367,35 @@ fn read_total_memory_bytes() -> Result<u64, ProfileError> {
 /// `MLX_KV_MEMORY_UTILIZATION` × `hw.memsize` would otherwise
 /// over-commit the GPU.
 ///
-/// Return values:
-/// - `Ok(None)` — the FFI succeeded but reported `0`, meaning the
-///   `mlx_metal_device_info` map literally does NOT contain a
-///   `max_recommended_working_set_size` entry. This is structurally
-///   different from a Metal failure: we just don't have a working-set
-///   bound to clamp against, so the auto-sizer falls back to the
-///   physical-RAM budget alone.
-/// - `Err(MetalUnavailable)` — the FFI returned -1 because the C++
-///   shim caught an exception. Common cause: degraded-Metal hosts
-///   where `mlx_metal_is_available()` lies and reports true but the
-///   underlying `MetalAllocator` constructor still throws.
+/// Return values map to the C++ shim's split status contract:
+/// - `Ok(Some(value))` — the FFI returned `0` AND wrote a non-zero
+///   value through `out_value`. The shim found a real
+///   `max_recommended_working_set_size` entry in the `device_info`
+///   map.
+/// - `Ok(None)` — the FFI returned `0` AND wrote `0`. This is the
+///   legitimate "no bound published" case: the `device_info` map
+///   does not contain the entry, the entry has the wrong variant
+///   type (schema drift across MLX versions), or `mlx_metal_is_
+///   available()` reports false. The auto-sizer falls back to the
+///   physical-RAM budget alone — schema/version drift should NOT
+///   abort profiling as if Metal failed.
+/// - `Err(MetalUnavailable)` — the FFI returned `-1` because the
+///   C++ shim caught an exception. Common cause: degraded-Metal
+///   hosts where `mlx_metal_is_available()` lies and reports true
+///   but the underlying `MetalAllocator` constructor still throws.
 ///
-/// Previously this function silently masked the FFI failure as `None`,
-/// which the auto-sizer then treated as "use physical RAM budget as-is"
-/// — producing an oversized KV pool that deferred MTLBuffer allocation
-/// failures from profile time to serving time. The fallible signature
-/// makes the failure observable so the caller can short-circuit with
-/// the same `MetalUnavailable` semantics it already uses for
-/// `read_peak_memory` / `reset_peak_memory`.
+/// Previously the C++ shim returned `-1` for both schema drift and
+/// caught exceptions, which collapsed the legitimate "missing key"
+/// case into `MetalUnavailable` and aborted profiling on hosts that
+/// could otherwise have completed via the physical-RAM fallback.
+/// The split status now disambiguates the two: `0`/`Ok(None)` keeps
+/// the auto-sizer running on schema drift; `-1`/`Err(MetalUnavailable)`
+/// remains reserved for the genuine Metal-failure mode.
 #[cfg(target_os = "macos")]
 fn read_working_set_bytes() -> Result<Option<u64>, ProfileError> {
     let mut ws: u64 = 0;
     let rc = unsafe { mlx_sys::mlx_max_recommended_working_set_size(&mut ws) };
-    if rc != 0 {
-        // Caught C++ exception. The previous infallible signature
-        // collapsed this case into `None`; with the new contract we
-        // surface `MetalUnavailable` so the auto-sizer matches the
-        // peak-memory FFI's failure mode.
-        return Err(ProfileError::MetalUnavailable);
-    }
-    if ws == 0 {
-        // FFI succeeded but the entry isn't in the device_info map —
-        // legitimate "no bound reported" case.
-        Ok(None)
-    } else {
-        Ok(Some(ws))
-    }
+    translate_working_set_status(rc, ws)
 }
 
 /// Pure-formula step that combines the physical-RAM budget with the
@@ -885,6 +910,55 @@ mod tests {
             bpb,
         );
         assert!(matches!(res, Err(ProfileError::InsufficientMemory { .. })));
+    }
+
+    /// Pin the FFI status-code translation that bridges the C++ shim's
+    /// split status to the Rust `Result<Option<u64>, ProfileError>` the
+    /// auto-sizer consumes.
+    ///
+    /// The C++ shim
+    /// (`crates/mlx-sys/src/mlx_paged_profile.cpp::mlx_max_recommended_
+    /// working_set_size`) MUST return:
+    /// - `0` AND write a non-zero `out_value` on success with a real bound.
+    /// - `0` AND write `0` to `out_value` when the `device_info` map
+    ///   omits the entry, the entry has the wrong variant type, or Metal
+    ///   isn't available. Schema/version drift is NOT a failure — the
+    ///   auto-sizer falls back to the physical-RAM budget instead.
+    /// - `-1` ONLY when a C++ exception is caught.
+    ///
+    /// This test pins the Rust-side translation against synthetic
+    /// `(rc, ws)` pairs that mirror each shim status. Runs on every
+    /// platform — no FFI invocation required.
+    #[test]
+    fn working_set_status_translation_matches_ffi_contract() {
+        // Real bound published: `(0, non_zero)` → `Ok(Some(non_zero))`.
+        let real_bound = 48u64 * 1024 * 1024 * 1024;
+        assert_eq!(
+            translate_working_set_status(0, real_bound),
+            Ok(Some(real_bound))
+        );
+
+        // Missing-key path (schema drift): `(0, 0)` → `Ok(None)`. This
+        // is the regression-guarding case for finding 1 — previously the
+        // C++ shim returned `-1` here and the Rust translation collapsed
+        // it into `Err(MetalUnavailable)`, aborting profiling on hosts
+        // where the `device_info` map simply doesn't publish the entry.
+        // The fix splits the status so a missing/wrong-type key surfaces
+        // as success-with-zero, which translates to `Ok(None)` and keeps
+        // the auto-sizer running via the physical-RAM fallback.
+        assert_eq!(translate_working_set_status(0, 0), Ok(None));
+
+        // Caught-exception path: `(-1, _)` → `Err(MetalUnavailable)`.
+        // The shim leaves `out_value` untouched on this path, but the
+        // translation must NOT consume `ws` — it short-circuits on `rc`.
+        assert_eq!(
+            translate_working_set_status(-1, 0),
+            Err(ProfileError::MetalUnavailable)
+        );
+        assert_eq!(
+            translate_working_set_status(-1, 12345),
+            Err(ProfileError::MetalUnavailable)
+        );
     }
 
     /// Physical budget passes, but the working-set budget is too small

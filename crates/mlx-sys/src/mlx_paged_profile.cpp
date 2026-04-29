@@ -183,23 +183,39 @@ mlx_array* mlx_array_from_metal_buffer_view(
 // The value comes from `mlx::core::gpu::device_info()["max_recommended_
 // working_set_size"]` (populated in `device_info.cpp`).
 //
-// Fallible-FFI contract:
-//   - Returns 0 and writes the value through `out_value` on success.
-//   - Returns -1 if Metal is unavailable, the device_info entry is missing
-//     or has the wrong type, or any C++ exception is caught
-//     (`out_value` is left untouched on failure).
+// Fallible-FFI contract (split status to disambiguate "missing key" from
+// "Metal failure"):
+//   - Returns 0 and writes the actual value through `out_value` on success.
+//   - Returns 0 and writes `0` through `out_value` when Metal is
+//     unavailable, the `device_info` map does not contain the
+//     `max_recommended_working_set_size` entry, or the entry exists but
+//     has the wrong type. These are the legitimate "no bound published"
+//     cases — schema/version drift in `device_info.cpp` should NOT be
+//     conflated with a Metal allocator failure.
+//   - Returns -1 ONLY if a C++ exception is caught (`out_value` is left
+//     untouched on this path). This is the genuine Metal-failure mode.
 //
-// The Rust auto-sizer caller treats -1 as "no working-set bound reported"
-// and falls back to the physical-RAM budget alone.
+// The Rust auto-sizer caller maps `Ok(0)` to "no working-set bound
+// reported" (falls back to the physical-RAM budget alone) and `-1` to
+// `ProfileError::MetalUnavailable`.
 int32_t mlx_max_recommended_working_set_size(uint64_t* out_value) {
   if (!mlx::core::metal::is_available()) {
-    return -1;
+    if (out_value != nullptr) {
+      *out_value = 0;
+    }
+    return 0;
   }
   try {
     auto& info = mlx::core::gpu::device_info(0);
     auto it = info.find("max_recommended_working_set_size");
     if (it == info.end()) {
-      return -1;
+      // Schema/version drift: `device_info.cpp` no longer publishes this
+      // key. Surface as success-with-zero so the auto-sizer falls back
+      // to the physical-RAM budget rather than aborting profiling.
+      if (out_value != nullptr) {
+        *out_value = 0;
+      }
+      return 0;
     }
     if (auto* p = std::get_if<size_t>(&it->second)) {
       if (out_value != nullptr) {
@@ -207,7 +223,12 @@ int32_t mlx_max_recommended_working_set_size(uint64_t* out_value) {
       }
       return 0;
     }
-    return -1;
+    // Wrong variant type — also schema/version drift. Same handling as
+    // missing key: success-with-zero, NOT a Metal failure.
+    if (out_value != nullptr) {
+      *out_value = 0;
+    }
+    return 0;
   } catch (...) {
     return -1;
   }
