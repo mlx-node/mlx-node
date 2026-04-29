@@ -817,6 +817,62 @@ unsafe extern "C-unwind" {
 }
 
 // ================================================================================
+// Paged ops Phase 1 test helpers (defined in `mlx_paged_ops.cpp`)
+//
+// These exist solely so the unit tests in
+// `crates/mlx-paged-attn/tests/paged_ops_smoke.rs` can exercise the
+// C++ `PagedKVWrite` / `PagedAttention` primitives' `is_equivalent`
+// and `vjp` semantics without standing up a separate C++ test runner.
+// Phase 2 may delete them.
+// ================================================================================
+
+unsafe extern "C-unwind" {
+    /// Compare two `PagedKVWrite` primitives via `is_equivalent`.
+    /// Returns `true` iff both are equivalent (same scalar state).
+    pub fn mlx_paged_kv_write_is_equivalent(
+        block_size_lhs: i32,
+        num_kv_heads_lhs: i32,
+        head_size_lhs: i32,
+        x_pack_lhs: i32,
+        kv_dtype_lhs: u8,
+        block_size_rhs: i32,
+        num_kv_heads_rhs: i32,
+        head_size_rhs: i32,
+        x_pack_rhs: i32,
+        kv_dtype_rhs: u8,
+    ) -> bool;
+
+    /// Returns 1 iff `PagedKVWrite::vjp` throws `std::runtime_error`,
+    /// 0 otherwise. The test asserts on the value `1`.
+    pub fn mlx_paged_kv_write_vjp_throws() -> i32;
+
+    /// Returns 1 iff `PagedAttention::vjp` throws `std::runtime_error`,
+    /// 0 otherwise.
+    pub fn mlx_paged_attention_vjp_throws() -> i32;
+
+    /// Compare two `PagedAttention` primitives via `is_equivalent`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_attention_is_equivalent(
+        scale_lhs: f32,
+        softcap_lhs: f32,
+        block_size_lhs: i32,
+        num_q_heads_lhs: i32,
+        num_kv_heads_lhs: i32,
+        head_size_lhs: i32,
+        sliding_window_lhs: i32,
+        kv_dtype_lhs: u8,
+        scale_rhs: f32,
+        softcap_rhs: f32,
+        block_size_rhs: i32,
+        num_q_heads_rhs: i32,
+        num_kv_heads_rhs: i32,
+        head_size_rhs: i32,
+        sliding_window_rhs: i32,
+        kv_dtype_rhs: u8,
+    ) -> bool;
+}
+
+// ================================================================================
 // Quantization Operations (for QuantizedKVCache)
 // ================================================================================
 
