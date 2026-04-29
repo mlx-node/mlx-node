@@ -72,6 +72,38 @@ static bool g_moe_inited = false;
 static std::vector<LayerQuantInfo> g_layer_quant;     // per-layer MoE quant info
 static std::vector<DenseMLPQuantInfo> g_dense_quant;  // per-layer dense MLP quant info
 
+// =====================================================================
+// Phase 4 piece 1: paged-decode globals.
+//
+// Independent from the flat-path globals above so both compile graphs can
+// coexist while piece 2 wires the Rust caller. Sized at init-time from
+// the active `MoeConfig.num_layers`.
+//
+// `g_paged_inited` gates the new `mlx_qwen35_moe_forward_paged` FFI. Until
+// piece 2 swaps Rust callers over, `mlx_qwen35_moe_init_paged` is the only
+// way for any of these to flip true.
+//
+// Layout (size = num_layers; one entry per layer indexed by `layer_idx`):
+//   - g_k_pools / g_v_pools / g_k_scales / g_v_scales: meaningful only for
+//     full-attention layers. Linear-layer slots hold a small placeholder
+//     `zeros({}, bf16)` array — they're never read by the paged graph.
+//   - g_paged_linear_caches: size = num_layers * 2. Slot `2i` and `2i+1`
+//     hold conv_state and recurrent_state for layer `i` when that layer is
+//     linear-attention. Full-attn slots hold placeholders.
+//
+// This indexed-by-layer design keeps the per-layer dispatch in the
+// compile graph as a simple `inputs[base + i*4 + k]` lookup with a single
+// `is_linear` branch.
+// =====================================================================
+static MoeConfig g_paged_config{};
+static std::vector<array> g_k_pools;          // [num_layers]
+static std::vector<array> g_v_pools;          // [num_layers]
+static std::vector<array> g_k_scales;         // [num_layers]
+static std::vector<array> g_v_scales;         // [num_layers]
+static std::vector<array> g_paged_linear_caches;  // [num_layers * 2]
+static int g_paged_offset_int = 0;
+static bool g_paged_inited = false;
+
 // Cached 3D transposes for expert weights [E,out,in] → [E,in,out]
 static std::unordered_map<std::string, array> g_weight_transposes_3d;
 
@@ -501,6 +533,146 @@ static auto& compiled_moe_decode() {
   return fn;
 }
 
+// =====================================================================
+// Paged MoE decode function — Phase 4 piece 1.
+//
+// Mirrors `moe_compiled_decode_fn` structurally but routes full-attention
+// layers through `attn_for_compile_paged` (paged_kv_write + paged_attention)
+// instead of the flat slice_update + masked SDPA path. Linear (GDN) layers
+// take the same `gdn_pure_fn` path the flat graph uses — paged storage only
+// applies to full-attention K/V.
+//
+// Input vector layout (all arrays — order matters for the compile cache):
+//   [0]                  h:                  embedded input
+//   [1]                  offset_arr:         [1] int32
+//   [2]                  block_table:        [1, max_blocks_per_seq] int32
+//   [3]                  slot_mapping:       [chunk_size_max] int64
+//   [4]                  num_valid_tokens:   [1] int32
+//   [5]                  num_valid_blocks:   [1] int32
+//   [6]                  seq_lens:           [1] int32
+//   For each layer i in [0, num_layers):
+//     If linear:
+//       [7 + i*4 + 0]    conv_state:         layer's conv state
+//       [7 + i*4 + 1]    recurrent_state:    layer's recurrent state
+//       [7 + i*4 + 2]    placeholder         (unused — keeps stride uniform)
+//       [7 + i*4 + 3]    placeholder         (unused — keeps stride uniform)
+//     If full-attention:
+//       [7 + i*4 + 0]    k_pool:             paged K storage
+//       [7 + i*4 + 1]    v_pool:             paged V storage
+//       [7 + i*4 + 2]    k_scale:            [1] f32
+//       [7 + i*4 + 3]    v_scale:            [1] f32
+//
+// Output vector layout:
+//   [0]                  logits
+//   [1]                  new_offset:         offset_arr + 1
+//   For each layer i:
+//     If linear:
+//       [2 + i*2 + 0]    new_conv_state
+//       [2 + i*2 + 1]    new_recurrent_state
+//     If full-attention:
+//       [2 + i*2 + 0]    new_k_pool          (post-write pool tensor)
+//       [2 + i*2 + 1]    new_v_pool          (post-write pool tensor)
+//
+// The uniform 4-input-per-layer stride keeps the compile cache key stable
+// regardless of which layers are linear vs. full-attention; the
+// `is_linear` switch is a no-op for the cache because all input shapes
+// are fixed at compile time. Output stride is 2-per-layer because scales
+// are inputs only — they don't mutate per step.
+// =====================================================================
+static std::vector<array> moe_compiled_decode_fn_paged(const std::vector<array>& inputs) {
+  const auto& cfg = g_paged_config;
+  auto h          = inputs[0];
+  auto offset_arr = inputs[1];   // [1] int32
+  auto block_table      = inputs[2];
+  auto slot_mapping     = inputs[3];
+  auto num_valid_tokens = inputs[4];
+  auto num_valid_blocks = inputs[5];
+  auto seq_lens         = inputs[6];
+
+  // Phase 4 piece 1 hard-coded contract.
+  constexpr int BLOCK_SIZE = 16;
+
+  constexpr int kHeader = 7;
+  constexpr int kPerLayer = 4;
+
+  // Pre-allocate new_caches with placeholders. Output stride = 2 per layer,
+  // matching the flat graph (scales are NOT mutated by the forward).
+  std::vector<array> new_caches;
+  new_caches.reserve(cfg.num_layers * 2);
+  for (int i = 0; i < cfg.num_layers * 2; i++) {
+    new_caches.push_back(zeros({}, mlx::core::bfloat16));
+  }
+
+  for (int i = 0; i < cfg.num_layers; i++) {
+    bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+    std::string lp = "layers." + std::to_string(i);
+
+    // Pre-norm
+    auto normed = fast::rms_norm(h, get_weight(lp + ".input_layernorm.weight"), cfg.rms_norm_eps);
+
+    int base = kHeader + i * kPerLayer;
+    if (is_linear) {
+      const auto& cs = inputs[base + 0];
+      const auto& rs = inputs[base + 1];
+      auto res = gdn_pure_fn(normed, i, cs, rs, cfg);
+      h = h + res.output;
+      new_caches[i * 2]     = std::move(res.conv_state);
+      new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+    } else {
+      const auto& k_pool  = inputs[base + 0];
+      const auto& v_pool  = inputs[base + 1];
+      const auto& k_scale = inputs[base + 2];
+      const auto& v_scale = inputs[base + 3];
+      auto res = attn_for_compile_paged(
+          normed, i,
+          k_pool, v_pool,
+          k_scale, v_scale,
+          offset_arr,
+          block_table, slot_mapping,
+          num_valid_tokens, num_valid_blocks,
+          seq_lens,
+          BLOCK_SIZE,
+          cfg);
+      h = h + res.output;
+      // attn_for_compile_paged stashes new_k_pool/new_v_pool in keys/values.
+      new_caches[i * 2]     = std::move(res.keys);
+      new_caches[i * 2 + 1] = std::move(res.values);
+    }
+
+    // Post-norm + MLP
+    auto mlp_in = fast::rms_norm(h, get_weight(lp + ".post_attention_layernorm.weight"), cfg.rms_norm_eps);
+
+    bool moe = is_moe_layer(i, cfg);
+    if (moe) {
+      h = h + sparse_moe_fn(mlp_in, i, cfg, g_layer_quant[i]);
+    } else {
+      h = h + dense_mlp_fn(mlp_in, i, cfg, g_dense_quant[i]);
+    }
+  }
+
+  // Final norm + LM head
+  h = fast::rms_norm(h, get_weight("final_norm.weight"), cfg.rms_norm_eps);
+  if (cfg.tie_word_embeddings) {
+    h = linear_proj(h, "embedding");
+  } else {
+    h = linear_proj(h, "lm_head");
+  }
+
+  auto new_offset = offset_arr + array(1, mlx::core::int32);
+
+  std::vector<array> result;
+  result.reserve(2 + cfg.num_layers * 2);
+  result.push_back(std::move(h));
+  result.push_back(std::move(new_offset));
+  for (auto& c : new_caches) result.push_back(std::move(c));
+  return result;
+}
+
+static auto& compiled_moe_decode_paged() {
+  static auto fn = mlx::core::compile(moe_compiled_decode_fn_paged);
+  return fn;
+}
+
 }  // namespace
 
 // =============================================================================
@@ -817,6 +989,346 @@ int mlx_qwen35_moe_get_cache_offset() {
 // Adjust MoE cache offset by delta (for VLM M-RoPE position correction).
 void mlx_qwen35_moe_adjust_offset(int delta) {
   g_moe_offset_int += delta;
+}
+
+// =============================================================================
+// Phase 4 piece 1: paged forward FFI.
+//
+// These coexist alongside `mlx_qwen35_moe_forward` / `_init_from_prefill`
+// while piece 2 swaps the Rust callers. Piece 3 deletes the legacy pair.
+// =============================================================================
+
+// Initialize the paged MoE forward graph from per-layer pool / scale handles.
+//
+// Layout contract:
+//   - `k_pool_handles[i]`: pointer to a `[num_blocks, num_kv_heads,
+//     head_size/x_pack=8, block_size=16, x_pack=8]` bf16 array view.
+//     Phase 4 piece 1 uses bf16 (`KvDtype::Bf16`) and `block_size = 16`.
+//   - `v_pool_handles[i]`: pointer to a `[num_blocks, num_kv_heads,
+//     head_size, block_size=16]` bf16 array view.
+//   - `k_scale_handles[i]` / `v_scale_handles[i]`: pointer to `[1]` f32
+//     scale placeholders (1.0 in Phase 4; FP8 calibration in Phase 10).
+//   - For linear-attention layers (those satisfying
+//     `(i + 1) % full_attention_interval != 0`), the corresponding pool /
+//     scale slots may be null — they're stored as bf16 zero placeholders
+//     and never read by the compiled graph.
+//
+// `linear_cache_arrays` mirrors `cache_arrays` in `mlx_qwen35_moe_init_from_prefill`
+// for linear layers only: pairs of `(conv_state, recurrent_state)` indexed
+// by layer. Full-attn slots are ignored. Pass null for the entire array
+// to skip linear-cache seeding (e.g. for the smoke test, which uses
+// placeholder zeros).
+//
+// `prefill_offset` becomes the initial `g_paged_offset_int`. `mlp_only_layers`
+// follows the same convention as the flat init.
+//
+// Compile-graph configuration (encoded into the new FFI's signature):
+//   - block_size       = 16
+//   - kv_dtype         = Bf16
+//   - x_pack           = 8
+//   - sliding_window   = 0
+//
+// `max_blocks_per_seq` and `chunk_size_max` define the fixed-shape input
+// dimensions threaded into `PagedAttentionInputs` (see `mlx_common.h`).
+// They become part of the compile-cache key — re-tracing with different
+// values yields a new compiled graph.
+void mlx_qwen35_moe_init_paged(
+    // BaseConfig params (mirrors the flat init)
+    int num_layers,
+    int hidden_size,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    float rope_theta,
+    int rope_dims,
+    float rms_norm_eps,
+    int full_attention_interval,
+    int linear_num_k_heads,
+    int linear_num_v_heads,
+    int linear_key_head_dim,
+    int linear_value_head_dim,
+    int linear_conv_kernel_dim,
+    int tie_word_embeddings,
+    int max_kv_len,
+    int batch_size,
+    // MoE-specific params (mirrors the flat init)
+    int num_experts,
+    int num_experts_per_tok,
+    int norm_topk_prob,
+    int decoder_sparse_step,
+    const int* mlp_only_layers,
+    int mlp_only_layers_len,
+    // Per-layer paged storage. Each pointer array is sized `num_layers`.
+    // Linear-layer slots may be null (stored as bf16 zero placeholders).
+    mlx_array** k_pool_handles,
+    mlx_array** v_pool_handles,
+    mlx_array** k_scale_handles,
+    mlx_array** v_scale_handles,
+    // Per-layer linear-attention caches: 2 entries per layer
+    // (conv_state, recurrent_state). Full-attn slots are ignored. May be
+    // null entirely to skip seeding (then linear-layer slots are
+    // placeholder zeros — graph builds but produces meaningless
+    // recurrence output).
+    mlx_array** linear_cache_arrays,
+    int prefill_offset
+) {
+  try {
+    g_paged_config = MoeConfig{{
+      num_layers, hidden_size, num_heads, num_kv_heads, head_dim,
+      rope_theta, rope_dims, rms_norm_eps, full_attention_interval,
+      linear_num_k_heads, linear_num_v_heads, linear_key_head_dim,
+      linear_value_head_dim, linear_conv_kernel_dim,
+      tie_word_embeddings != 0,
+      max_kv_len, batch_size
+    }, num_experts, num_experts_per_tok, norm_topk_prob != 0, decoder_sparse_step};
+
+    // Build mlp_only set
+    std::unordered_set<int> mlp_only_set;
+    if (mlp_only_layers && mlp_only_layers_len > 0) {
+      for (int i = 0; i < mlp_only_layers_len; i++) {
+        mlp_only_set.insert(mlp_only_layers[i]);
+      }
+    }
+
+    // Reset the paged globals.
+    g_k_pools.clear();
+    g_v_pools.clear();
+    g_k_scales.clear();
+    g_v_scales.clear();
+    g_paged_linear_caches.clear();
+    g_k_pools.reserve(num_layers);
+    g_v_pools.reserve(num_layers);
+    g_k_scales.reserve(num_layers);
+    g_v_scales.reserve(num_layers);
+    g_paged_linear_caches.reserve(num_layers * 2);
+
+    auto bf16_placeholder = []() { return zeros({}, mlx::core::bfloat16); };
+    auto f32_placeholder  = []() { return array(1.0f, mlx::core::float32); };
+
+    for (int i = 0; i < num_layers; i++) {
+      bool is_linear = !((i + 1) % full_attention_interval == 0);
+
+      // Pool / scale slots: meaningful for full-attn layers only.
+      if (!is_linear) {
+        if (!k_pool_handles || !v_pool_handles ||
+            !k_scale_handles || !v_scale_handles ||
+            !k_pool_handles[i] || !v_pool_handles[i] ||
+            !k_scale_handles[i] || !v_scale_handles[i]) {
+          g_paged_inited = false;
+          std::cerr << "[MLX] mlx_qwen35_moe_init_paged: missing pool/scale handle for full-attn layer " << i << std::endl;
+          return;
+        }
+        g_k_pools.push_back(*reinterpret_cast<array*>(k_pool_handles[i]));
+        g_v_pools.push_back(*reinterpret_cast<array*>(v_pool_handles[i]));
+        g_k_scales.push_back(*reinterpret_cast<array*>(k_scale_handles[i]));
+        g_v_scales.push_back(*reinterpret_cast<array*>(v_scale_handles[i]));
+      } else {
+        // Linear layer: stash placeholders so per-layer indexing works.
+        g_k_pools.push_back(bf16_placeholder());
+        g_v_pools.push_back(bf16_placeholder());
+        g_k_scales.push_back(f32_placeholder());
+        g_v_scales.push_back(f32_placeholder());
+      }
+
+      // Linear caches: meaningful for linear-attn layers only.
+      if (is_linear && linear_cache_arrays &&
+          linear_cache_arrays[i * 2] && linear_cache_arrays[i * 2 + 1]) {
+        g_paged_linear_caches.push_back(*reinterpret_cast<array*>(linear_cache_arrays[i * 2]));
+        g_paged_linear_caches.push_back(*reinterpret_cast<array*>(linear_cache_arrays[i * 2 + 1]));
+      } else {
+        g_paged_linear_caches.push_back(bf16_placeholder());
+        g_paged_linear_caches.push_back(bf16_placeholder());
+      }
+    }
+
+    // Detect quantization per-layer (same logic as flat init). The paged
+    // graph re-uses the existing g_layer_quant / g_dense_quant arrays
+    // populated by the flat init (or any compatible paged seeding); we
+    // re-detect here so the paged FFI can be called standalone.
+    g_layer_quant.clear();
+    g_layer_quant.reserve(num_layers);
+    g_dense_quant.clear();
+    g_dense_quant.reserve(num_layers);
+
+    auto detect_quant = [](const std::string& prefix) -> std::tuple<bool, int, int, std::string> {
+      if (!has_weight(prefix + ".scales")) {
+        return {false, 0, 0, ""};
+      }
+      bool has_biases = has_weight(prefix + ".biases");
+      if (!has_biases) {
+        return {true, 32, 8, "mxfp8"};
+      }
+      auto w = get_weight(prefix + ".weight");
+      auto scales = get_weight(prefix + ".scales");
+      int bits = infer_affine_bits(w, scales, 64);
+      return {true, 64, bits, "affine"};
+    };
+
+    auto detect_gate_quant = [](const std::string& prefix) -> std::tuple<bool, int, int, std::string> {
+      if (!has_weight(prefix + ".scales")) {
+        return {false, 0, 0, ""};
+      }
+      return {true, 64, 8, "affine"};
+    };
+
+    for (int i = 0; i < num_layers; i++) {
+      std::string pfx = "layers." + std::to_string(i) + ".mlp.";
+      bool moe = (num_experts > 0 && decoder_sparse_step > 0 &&
+                  ((i + 1) % decoder_sparse_step) == 0 &&
+                  mlp_only_set.count(i) == 0);
+
+      if (moe) {
+        auto [sw_q, sw_gs, sw_bits, sw_mode] = detect_quant(pfx + "switch_mlp.gate_proj");
+        auto [sh_q, sh_gs, sh_bits, sh_mode] = detect_quant(pfx + "shared_expert.gate_proj");
+        auto [g_q, g_gs, g_bits, g_mode] = detect_gate_quant(pfx + "gate");
+        auto [sg_q, sg_gs, sg_bits, sg_mode] = detect_gate_quant(pfx + "shared_expert_gate");
+        g_layer_quant.push_back(LayerQuantInfo{
+          sw_q, sw_gs, sw_bits, sw_mode,
+          sh_q, sh_gs, sh_bits, sh_mode,
+          g_q, g_gs, g_bits, g_mode,
+          sg_q, sg_gs, sg_bits, sg_mode,
+        });
+        g_dense_quant.push_back(DenseMLPQuantInfo{false, 0, 0, ""});
+      } else {
+        g_layer_quant.push_back(LayerQuantInfo{});
+        auto [dq, dgs, dbits, dmode] = detect_quant(pfx + "gate_proj");
+        g_dense_quant.push_back(DenseMLPQuantInfo{dq, dgs, dbits, dmode});
+      }
+    }
+
+    g_paged_offset_int = prefill_offset;
+    g_paged_inited = true;
+
+    // Pre-compute 3D transposes for expert weights (same as flat init).
+    g_weight_transposes_3d.clear();
+    {
+      std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
+      for (const auto& [name, w] : g_weights()) {
+        if (w.ndim() == 3) {
+          g_weight_transposes_3d.insert_or_assign(name, transpose(w, {0, 2, 1}));
+        }
+      }
+    }
+
+    // Break the lazy RNG split chain
+    auto rng_key = mlx::core::random::KeySequence::default_().next();
+    mlx::core::eval({rng_key});
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_qwen35_moe_init_paged: " << e.what() << std::endl;
+    g_paged_inited = false;
+  } catch (...) {
+    std::cerr << "[MLX] mlx_qwen35_moe_init_paged: unknown exception" << std::endl;
+    g_paged_inited = false;
+  }
+}
+
+// Single-token paged decode step. Inputs (PagedAttentionInputs) come from
+// the Rust adapter's `build_paged_attention_inputs` (Phase 3); the per-
+// layer pool/scale globals come from `mlx_qwen35_moe_init_paged`.
+//
+// `output_logits` receives a heap-allocated `mlx_array*` (caller owns).
+// `cache_offset_out` receives the post-step offset (== prefill_offset + 1 + n
+// after n successful calls).
+void mlx_qwen35_moe_forward_paged(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    mlx_array* offset_arr_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* slot_mapping_ptr,
+    mlx_array* num_valid_tokens_ptr,
+    mlx_array* num_valid_blocks_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array** output_logits,
+    int* cache_offset_out
+) {
+  if (!g_paged_inited) {
+    if (output_logits) *output_logits = nullptr;
+    return;
+  }
+  if (!input_ids_ptr || !embedding_weight_ptr || !output_logits ||
+      !offset_arr_ptr || !block_table_ptr || !slot_mapping_ptr ||
+      !num_valid_tokens_ptr || !num_valid_blocks_ptr || !seq_lens_ptr) {
+    if (output_logits) *output_logits = nullptr;
+    return;
+  }
+  const auto& cfg = g_paged_config;
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+    auto& offset_arr       = *reinterpret_cast<array*>(offset_arr_ptr);
+    auto& block_table      = *reinterpret_cast<array*>(block_table_ptr);
+    auto& slot_mapping     = *reinterpret_cast<array*>(slot_mapping_ptr);
+    auto& num_valid_tokens = *reinterpret_cast<array*>(num_valid_tokens_ptr);
+    auto& num_valid_blocks = *reinterpret_cast<array*>(num_valid_blocks_ptr);
+    auto& seq_lens         = *reinterpret_cast<array*>(seq_lens_ptr);
+
+    // Embedding lookup: [B, 1] → [B, hidden] (2D)
+    auto flat_ids = reshape(input_ids, {-1});
+    auto h = take(embedding_weight, flat_ids, 0);
+
+    // Build inputs for the compilable paged function.
+    std::vector<array> fn_inputs;
+    fn_inputs.reserve(7 + cfg.num_layers * 4);
+    fn_inputs.push_back(std::move(h));
+    fn_inputs.push_back(offset_arr);
+    fn_inputs.push_back(block_table);
+    fn_inputs.push_back(slot_mapping);
+    fn_inputs.push_back(num_valid_tokens);
+    fn_inputs.push_back(num_valid_blocks);
+    fn_inputs.push_back(seq_lens);
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (is_linear) {
+        fn_inputs.push_back(g_paged_linear_caches[i * 2]);
+        fn_inputs.push_back(g_paged_linear_caches[i * 2 + 1]);
+        fn_inputs.push_back(g_k_scales[i]);   // unused placeholder
+        fn_inputs.push_back(g_v_scales[i]);   // unused placeholder
+      } else {
+        fn_inputs.push_back(g_k_pools[i]);
+        fn_inputs.push_back(g_v_pools[i]);
+        fn_inputs.push_back(g_k_scales[i]);
+        fn_inputs.push_back(g_v_scales[i]);
+      }
+    }
+
+    static bool no_compile = std::getenv("MLX_NO_COMPILE") != nullptr;
+    auto outputs = no_compile
+        ? moe_compiled_decode_fn_paged(fn_inputs)
+        : compiled_moe_decode_paged()(fn_inputs);
+
+    // Extract: [logits, new_offset, new_caches...]
+    *output_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
+    g_paged_offset_int++;
+    // Stash post-step caches back into the per-layer slots. Linear layers
+    // get conv/recurrent state; full-attn layers get the post-write pool
+    // tensor (functionally aliased to the input pool but we update the
+    // slot anyway so the next call's dependency edge flows correctly).
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      auto& a = outputs[2 + i * 2];
+      auto& b = outputs[2 + i * 2 + 1];
+      if (is_linear) {
+        g_paged_linear_caches[i * 2]     = a;
+        g_paged_linear_caches[i * 2 + 1] = b;
+      } else {
+        g_k_pools[i] = a;
+        g_v_pools[i] = b;
+      }
+    }
+
+    if (cache_offset_out) {
+      *cache_offset_out = g_paged_offset_int;
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_forward_paged: %s\n", e.what());
+    fflush(stderr);
+    *output_logits = nullptr;
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in mlx_qwen35_moe_forward_paged\n");
+    fflush(stderr);
+    *output_logits = nullptr;
+  }
 }
 
 }  // extern "C"

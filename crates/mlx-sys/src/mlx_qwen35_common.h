@@ -11,6 +11,7 @@
 // =============================================================================
 
 #include "mlx_common.h"
+#include "mlx_paged_ops.h"
 
 #include <string>
 #include <unordered_map>
@@ -731,6 +732,151 @@ inline GDNPureResult gdn_prefill_fn(
   auto output = reshape(out_flat, {B, T, hidden});
 
   return {output, new_conv_state, new_recurrent_state};
+}
+
+// =====================================================================
+// Paged attention for compiled path — uses paged_kv_write + paged_attention
+//
+// Like attn_for_compile but writes new K/V into a per-layer block-paged pool
+// (instead of a flat slice_update over a fixed [B, Hkv, max_kv_len, D] cache)
+// and gathers attention K/V via PagedAttention (instead of a static
+// additive mask over the flat cache).
+//
+// Inputs:
+//   - x:                 [B, hidden] — 2D activation
+//   - layer_idx:         transformer layer index (used for weight prefix)
+//   - k_pool, v_pool:    per-layer paged K/V storage (shapes per
+//                        `mlx_paged_ops.h`)
+//   - k_scale, v_scale:  [1] f32 scale placeholders (Phase 4 ships 1.0;
+//                        Phase 10 swaps for FP8 calibration)
+//   - offset_arr:        [1] int32 — global token position of the new token
+//                        (used by RoPE; same role as in `attn_for_compile`)
+//   - block_table:       [1, max_blocks_per_seq] int32, sentinel-padded -1
+//   - slot_mapping:      [chunk_size_max] int64, sentinel-padded -1
+//   - num_valid_tokens:  [1] int32 (informational; kernel reads slot table
+//                        directly)
+//   - num_valid_blocks:  [1] int32 (informational)
+//   - seq_lens:          [1] int32 — total context length so far (paged_attn
+//                        kernel reads `seq_lens[seq_idx=0]`)
+//   - cfg:               BaseConfig with num_heads, num_kv_heads, head_dim,
+//                        rope_dims, rope_theta, rms_norm_eps
+//
+// Configuration (Phase 4 piece 1 contract):
+//   - block_size = 16 (passed in via `block_size` parameter for clarity).
+//   - kv_dtype  = Bf16.
+//   - x_pack    = 8 (= 16 / sizeof(bf16)).
+//   - sliding_window = 0 (Phase 7 lifts).
+//
+// Returns the layer output (`AttnPureResult.keys/values` are the post-write
+// pool tensors so the compile graph dependency edges flow through
+// `paged_kv_write` outputs into the next layer's `paged_attention` inputs;
+// the caller plumbs them back into the global pool storage).
+// =====================================================================
+inline AttnPureResult attn_for_compile_paged(
+    const array& x,                  // [B, hidden] — 2D
+    int layer_idx,
+    const array& k_pool,             // [num_blocks, num_kv_heads, head_size/x, block_size, x]
+    const array& v_pool,             // [num_blocks, num_kv_heads, head_size, block_size]
+    const array& k_scale,            // [1] f32 placeholder
+    const array& v_scale,            // [1] f32 placeholder
+    const array& offset_arr,         // [1] int32
+    const array& block_table,        // [1, max_blocks_per_seq] int32
+    const array& slot_mapping,       // [chunk_size_max] int64
+    const array& /*num_valid_tokens*/, // [1] int32 (informational)
+    const array& /*num_valid_blocks*/, // [1] int32 (informational)
+    const array& seq_lens,           // [1] int32
+    int block_size,
+    const BaseConfig& cfg) {
+  int B = x.shape(0);
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
+
+  // Q projection (2x width for per-head gating)
+  auto q_proj = linear_proj(x, pfx + "q_proj");
+  if (has_weight(pfx + "q_proj.bias")) q_proj = q_proj + get_weight(pfx + "q_proj.bias");
+
+  auto qph     = reshape(q_proj, {B, 1, cfg.num_heads, cfg.head_dim * 2});
+  auto queries = slice(qph, {0, 0, 0, 0},            {B, 1, cfg.num_heads, cfg.head_dim});
+  auto gate    = slice(qph, {0, 0, 0, cfg.head_dim}, {B, 1, cfg.num_heads, cfg.head_dim * 2});
+  gate = reshape(gate, {B, cfg.num_heads * cfg.head_dim});
+
+  // K, V projections
+  auto keys   = linear_proj(x, pfx + "k_proj");
+  auto values = linear_proj(x, pfx + "v_proj");
+  if (has_weight(pfx + "k_proj.bias")) keys   = keys   + get_weight(pfx + "k_proj.bias");
+  if (has_weight(pfx + "v_proj.bias")) values = values + get_weight(pfx + "v_proj.bias");
+
+  keys   = reshape(keys,   {B, 1, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, 1, cfg.num_kv_heads, cfg.head_dim});
+
+  // QK norm
+  queries = fast::rms_norm(queries, get_weight(pfx + "q_norm.weight"), cfg.rms_norm_eps);
+  keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
+
+  // RoPE — array offset (graph-safe, no baked-in constant)
+  queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+  keys    = fast::rope(keys,    cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+
+  // Reshape to the layouts paged_kv_write / paged_attention expect:
+  //   new_k / new_v: [num_tokens, num_kv_heads, head_size]
+  //   q:             [num_seqs,   num_q_heads,  head_size]
+  // For decode B == num_tokens == num_seqs == 1 and the time axis is 1.
+  int num_tokens = B;  // single-token decode
+  auto new_k = reshape(keys,    {num_tokens, cfg.num_kv_heads, cfg.head_dim});
+  auto new_v = reshape(values,  {num_tokens, cfg.num_kv_heads, cfg.head_dim});
+  auto q_pa  = reshape(queries, {num_tokens, cfg.num_heads,    cfg.head_dim});
+
+  // Phase 4 piece 1 hard-coded contract: bf16 cache, x_pack=8, sliding=0.
+  constexpr int X_PACK = 8;
+  constexpr int SLIDING_WINDOW = 0;
+  const auto kv_dtype = mlx::core::fast::KvDtype::Bf16;
+
+  // 1) Write the new K/V into the paged pool.
+  auto write_pair = mlx::core::fast::paged_kv_write(
+      k_pool, v_pool,
+      new_k, new_v,
+      slot_mapping,
+      k_scale, v_scale,
+      block_size,
+      cfg.num_kv_heads,
+      cfg.head_dim,
+      X_PACK,
+      kv_dtype);
+  auto new_k_pool = std::move(write_pair.first);
+  auto new_v_pool = std::move(write_pair.second);
+
+  // 2) Gather + attend via paged kernel against the just-written pool.
+  //    The pool tensors are functionally aliased (paged_kv_write writes
+  //    in-place) but using the post-write outputs makes the dependency edge
+  //    explicit so MLX schedules the read after the write.
+  float scale = std::pow((float)cfg.head_dim, -0.5f);
+  auto attn_out = mlx::core::fast::paged_attention(
+      q_pa,
+      new_k_pool, new_v_pool,
+      block_table, seq_lens,
+      k_scale, v_scale,
+      scale,
+      /*softcap=*/0.0f,
+      SLIDING_WINDOW,
+      block_size,
+      cfg.num_heads,
+      cfg.num_kv_heads,
+      cfg.head_dim,
+      kv_dtype);
+
+  // attn_out: [num_tokens, num_q_heads, head_size]. Flatten to [B, H*D] for
+  // the gate + output projection (matches the flat-path layout).
+  attn_out = reshape(attn_out, {B, cfg.num_heads * cfg.head_dim});
+
+  // Gate
+  attn_out = compiled_attn_gate()({attn_out, gate})[0];
+
+  // Output projection
+  auto output = linear_proj(attn_out, pfx + "o_proj");
+  if (has_weight(pfx + "o_proj.bias")) output = output + get_weight(pfx + "o_proj.bias");
+
+  // We re-purpose AttnPureResult.{keys,values} as the post-write pool
+  // tensors so the caller can stash them back into the global pool slot.
+  return {output, new_k_pool, new_v_pool};
 }
 
 }  // namespace qwen35_common
