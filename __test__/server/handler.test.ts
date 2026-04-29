@@ -9979,6 +9979,218 @@ describe('createHandler', () => {
       expect(textDone).toBeDefined();
       expect(textDone!.data.text).toBe('Value is 5 < 10');
     });
+
+    it('recovers full malformed tool_call when finalText is post-</think>-trim cleaned', async () => {
+      // Mirror of the messages.ts regression (commits 53f5b81 + 92f6b55 +
+      // 716e1f5 + 6c99c48): model decode-loops past max_tokens with an
+      // unclosed `<tool_call>`. Streamed chunks include `\n\n` (post-</think>
+      // whitespace) before the suppression triggers. Native finalText is the
+      // cleaned text starting with `<tool_call>` (split_at_think_end trims
+      // the leading `\n\n`). The recovery branch must NOT slice into `<t` —
+      // it must emit a complete `<tool_call>` tag.
+      const streamEvents = [
+        // Post-</think> whitespace flowing as a non-reasoning text delta —
+        // this advances messageText to "\n\n" BEFORE suppression triggers.
+        { done: false, text: '\n\n', isReasoning: false },
+        // Unclosed tool_call — tagBuffer suppresses everything from here on.
+        { done: false, text: '<tool_call>\n<function=Agent>{"q":"x"}', isReasoning: false },
+        {
+          done: true,
+          // Native side trims the leading `\n\n` (split_at_think_end), so
+          // finalText starts with `<tool_call>` — NOT `\n\n<tool_call>`.
+          // toolCalls is empty because the parser failed (no `</tool_call>`).
+          text: '<tool_call>\n<function=Agent>{"q":"x"}',
+          finishReason: 'length',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 30,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          rawText: '\n\n<tool_call>\n<function=Agent>{"q":"x"}',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'use a tool',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const textDeltas = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string);
+      const combined = textDeltas.join('');
+
+      // The combined text deltas must contain a complete `<tool_call>` tag.
+      // The bug emitted "ool_call>\n<function=..." (leading `<t` sliced off
+      // by `finalText.slice(messageText.length)` where messageText.length=2
+      // counted the streamed `\n\n` but finalText had been post-</think>-trim
+      // cleaned to start at `<tool_call>`).
+      expect(combined).toContain('<tool_call>');
+      // Guard against the bug's specific signature: an "ool_call>" with no
+      // "<t" immediately before it.
+      const orphanMatch = /(^|[^t])ool_call>/.exec(combined);
+      expect(orphanMatch, `combined text contains a half-sliced tool_call tag: ${combined}`).toBeNull();
+    });
+
+    it('does not duplicate preamble when closed tool_call parses non-ok and finalText is trimmed', async () => {
+      // Mirror of messages.ts regression: when a CLOSED <tool_call>...
+      // </tool_call> block parses to a non-ok status (e.g. invalid JSON
+      // inside <function>), `okToolCalls` is empty, so the suppression-recovery
+      // branch fires. With a streamed preamble that had trailing whitespace
+      // and a finalText that the native side trimmed via parse_tool_calls,
+      // the previous length-based slice returned the full finalText whole,
+      // duplicating the preamble.
+      const streamEvents = [
+        { done: false, text: 'Let me check. ', isReasoning: false },
+        {
+          done: false,
+          text: '<tool_call>\n<function=lookup>\n<parameter=q>\n{not valid json\n</parameter>\n</function>\n</tool_call>',
+          isReasoning: false,
+        },
+        {
+          done: true,
+          // Native parse_tool_calls strips the closed block AND trims →
+          // finalText is the trimmed preamble.
+          text: 'Let me check.',
+          finishReason: 'stop',
+          // Non-ok tool call — okToolCalls filter returns [].
+          toolCalls: [{ id: 'tool_1', name: 'lookup', arguments: '', status: 'invalid_json', rawContent: '' }],
+          thinking: null,
+          numTokens: 25,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText:
+            'Let me check. <tool_call>\n<function=lookup>\n<parameter=q>\n{not valid json\n</parameter>\n</function>\n</tool_call>',
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'use a tool',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const combined = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+
+      // Preamble must appear exactly once. The bug would emit
+      // "Let me check. Let me check." (streamed prefix + duplicated finalText).
+      const occurrences = combined.match(/Let me check/g) ?? [];
+      expect(occurrences.length, `preamble duplicated; combined text deltas: ${JSON.stringify(combined)}`).toBe(1);
+    });
+
+    it('recovers malformed tool_call when streamed leading-whitespace exceeds finalText length', async () => {
+      // Mirror of messages.ts regression: a `finalText.length >
+      // messageText.length` length guard is wrong when streamed leading
+      // whitespace (e.g. many newlines after `</think>`) is LONGER than the
+      // malformed tool_call body in finalText. With the length guard,
+      // recovery was skipped → client received only whitespace, losing the
+      // malformed `<tool_call>...` text entirely. The fix uses
+      // `!messageText.includes(finalText)` instead, which correctly
+      // distinguishes "trimmed substring of streamed" (duplicate case →
+      // skip) from "different content" (recovery case → emit).
+      const longWhitespace = '\n'.repeat(80); // 80 chars > finalText length below
+      const streamEvents = [
+        { done: false, text: longWhitespace, isReasoning: false },
+        { done: false, text: '<tool_call>\n<function=Agent>{"q":"x"}', isReasoning: false },
+        {
+          done: true,
+          // Native split_at_think_end trims the leading whitespace →
+          // finalText starts with `<tool_call>` (length ~38, less than
+          // messageText's 80 chars of whitespace).
+          text: '<tool_call>\n<function=Agent>{"q":"x"}',
+          finishReason: 'length',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 25,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: `${longWhitespace}<tool_call>\n<function=Agent>{"q":"x"}`,
+        },
+      ];
+
+      const registry = new ModelRegistry();
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('stream-model', mockModel);
+
+      const handler = createHandler(registry);
+      const reqBody = {
+        model: 'stream-model',
+        input: 'x',
+        stream: true,
+      };
+      const req = createMockReq('POST', '/v1/responses', reqBody);
+      const { res, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      const body = getBody();
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      for (const line of body.split('\n')) {
+        if (line.startsWith('event: ')) {
+          events.push({ event: line.slice(7), data: {} });
+        } else if (line.startsWith('data: ') && events.length > 0) {
+          events[events.length - 1].data = JSON.parse(line.slice(6));
+        }
+      }
+
+      const combined = events
+        .filter((e) => e.event === 'response.output_text.delta')
+        .map((e) => e.data.delta as string)
+        .join('');
+
+      // The malformed `<tool_call>` text MUST surface to the client (not
+      // be swallowed by the length guard).
+      expect(combined).toContain('<tool_call>');
+      expect(combined).toContain('<function=Agent>');
+    });
   });
 
   describe('iter-29 findings', () => {
