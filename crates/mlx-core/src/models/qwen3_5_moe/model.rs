@@ -1245,6 +1245,17 @@ impl Qwen35MoeInner {
     /// Block-paged variant of [`Self::chat_sync_core`] for the MoE
     /// model. Mirrors the dense paged dispatch — see
     /// `Qwen35Inner::chat_sync_core_paged` for the full rationale.
+    ///
+    /// Unlike the dense paged path, the MoE paged decode loop dispatches
+    /// through the C++ compiled paged forward (`mlx_qwen35_moe_forward_paged`)
+    /// when the C++ weights are still registered for this model
+    /// (`mlx_qwen35_get_model_id() == self.model_id`). The compiled graph
+    /// reads K/V from the adapter pool via `paged_kv_write` /
+    /// `paged_attention` and reads GDN linear caches from the per-layer
+    /// `Qwen3_5LayerCache::Linear(ArraysCache)` via the
+    /// `linear_cache_arrays` FFI parameter. Falls back to the pure-Rust
+    /// paged decode (`paged_forward::run_paged_decode_step`) when weights
+    /// have been swapped out by another model load.
     fn chat_sync_core_paged(
         &mut self,
         tokens: Vec<u32>,
@@ -1275,6 +1286,39 @@ impl Qwen35MoeInner {
             None
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
+
+        // Detect availability of the C++ compiled paged decode path. The
+        // gating is identical to the flat path: the weights for this
+        // model must still be registered (no other model has overwritten
+        // `g_active_model_id`). We acquire `MOE_COMPILED_MUTEX` to
+        // serialize the compiled lifecycle across model instances —
+        // both the legacy flat init/forward/reset AND the new paged
+        // init/forward/reset share the same C++ `g_paged_*` /
+        // `g_moe_*` globals (see `mlx_qwen35_moe_reset` in
+        // `mlx_qwen35_moe.cpp`), so concurrent dispatchers from
+        // different models would otherwise stomp on each other's state.
+        // Then re-validate the model id under the weights read lock to
+        // avoid a TOCTOU race where another model swapped weights
+        // between the unlocked check and our compiled init.
+        let model_id = self.model_id;
+        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let _moe_lock = if use_cpp_paged {
+            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
+        };
+        let mut _weight_guard = None;
+        let use_cpp_paged = if use_cpp_paged {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
@@ -1354,6 +1398,7 @@ impl Qwen35MoeInner {
             &mut reasoning_tracker,
             report_perf,
             &mut first_token_instant,
+            use_cpp_paged,
         );
 
         let (generated_tokens, finish_reason) = match forward_result {
@@ -1422,6 +1467,7 @@ impl Qwen35MoeInner {
         reasoning_tracker: &mut chat_common::ReasoningTracker,
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
+        use_cpp_paged: bool,
     ) -> Result<(Vec<u32>, String)> {
         if suffix_len == 0 {
             return Err(Error::from_reason(
@@ -1435,6 +1481,11 @@ impl Qwen35MoeInner {
             |i| self.config.is_linear_layer(i),
         );
 
+        // Pure-Rust paged prefill: writes K/V into the adapter pool via
+        // `update_keys_values` per layer (Metal kernel dispatch — direct
+        // buffer mutation, NOT MLX graph) and populates the GDN linear
+        // caches in `Qwen3_5LayerCache::Linear(ArraysCache)`. Both are
+        // exactly what the C++ compiled paged decode reads as inputs.
         let last_logits = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
@@ -1474,9 +1525,62 @@ impl Qwen35MoeInner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
+        // Decide between C++ compiled paged decode (fast) and pure-Rust
+        // paged decode (fallback). C++ paged needs:
+        // 1. `use_cpp_paged` (weights still registered for our model_id —
+        //    re-validated under `COMPILED_WEIGHTS_RWLOCK` in the caller).
+        // 2. `init_paged_moe_compiled_session` to succeed (every linear
+        //    layer must have populated conv/recurrent state from the
+        //    pure-Rust GDN forward above; every full-attn layer must
+        //    have a usable `LayerKVPool` slot).
+        // The `MoeResetGuard` ensures `mlx_qwen35_moe_reset()` runs on
+        // any exit path so the next session starts with cleared
+        // `g_paged_*` globals (`g_paged_inited == false`).
+        let cpp_session_ready = if use_cpp_paged {
+            // We need both immutable borrows for caches+adapter; this
+            // closure scope is the simplest way to satisfy the borrow
+            // checker without ferrying handles up through the function.
+            let caches_ref = self.caches.as_ref().ok_or_else(|| {
+                Error::from_reason("MoE chat_sync_core_paged_inner: caches dropped post-prefill")
+            })?;
+            let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "MoE chat_sync_core_paged_inner: paged_adapter dropped post-prefill",
+                )
+            })?;
+            let prefill_offset = adapter_ref.current_token_count() as i32;
+            init_paged_moe_compiled_session(&self.config, caches_ref, adapter_ref, prefill_offset)
+                .is_ok()
+        } else {
+            false
+        };
+
+        // RAII guard: resets BOTH g_moe_* and g_paged_* globals when this
+        // scope ends. Always installed when we touched `g_paged_inited`
+        // (i.e. on the cpp_session_ready path) so a subsequent flat-mode
+        // turn or another model load doesn't see stale paged state.
+        let _moe_paged_guard = cpp_session_ready.then_some(MoeResetGuard);
+
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
         let mut finish_reason = String::from("length");
+
+        // Compile-cached `max_blocks_per_seq` shape — picking the
+        // adapter's max_seq_len divided by block_size keeps the compile
+        // key stable across all decode steps within one turn (the only
+        // varying inputs are the array contents). For shorter sequences
+        // the trailing block_table entries are sentinel (-1) and the
+        // gather kernel skips them via `num_valid_blocks`.
+        let max_blocks_per_seq: u32 = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "MoE chat_sync_core_paged_inner: paged_adapter dropped pre-decode",
+                )
+            })?;
+            // Round up the model's max position embedding to block size.
+            let max_seq = self.config.max_position_embeddings as u32;
+            max_seq.div_ceil(adapter.block_size())
+        };
 
         for step in 0..max_new_tokens {
             let token_id = y.item_at_int32(0)? as u32;
@@ -1501,7 +1605,27 @@ impl Qwen35MoeInner {
                 break;
             }
 
-            let next_logits = {
+            let next_logits = if cpp_session_ready {
+                // C++ compiled paged decode path. We still advance the
+                // Rust adapter's cursor + lazily allocate any new block
+                // (via `record_tokens`) so `build_paged_attention_inputs`
+                // can produce a valid slot_mapping for the new token.
+                let embedding_weight = self.embedding.get_weight();
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "MoE chat_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
+                    )
+                })?;
+                adapter
+                    .record_tokens(&[token_id])
+                    .map_err(Error::from_reason)?;
+                let inputs = adapter
+                    .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
+                    .map_err(Error::from_reason)?;
+                let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
+                forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs)?
+            } else {
+                // Pure-Rust paged decode fallback.
                 let embed = self.embedding.clone();
                 let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -1512,7 +1636,7 @@ impl Qwen35MoeInner {
                         "MoE chat_sync_core_paged_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
-                super::paged_forward::run_paged_decode_step(
+                let logits = super::paged_forward::run_paged_decode_step(
                     token_id,
                     &embed,
                     &mut self.layers,
@@ -1522,9 +1646,9 @@ impl Qwen35MoeInner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
-                )?
+                )?;
+                logits.squeeze(Some(&[1]))?
             };
-            let next_logits = next_logits.squeeze(Some(&[1]))?;
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
                 let forced_id = reasoning_tracker.forced_token_id() as i32;
@@ -1545,7 +1669,9 @@ impl Qwen35MoeInner {
     }
 
     /// Block-paged streaming variant for MoE — mirrors dense
-    /// `chat_stream_sync_core_paged`.
+    /// `chat_stream_sync_core_paged`. See [`Self::chat_sync_core_paged`]
+    /// for the C++ compiled paged dispatch rationale; the streaming path
+    /// uses the same lock acquisition + fall-back semantics.
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged(
         &mut self,
@@ -1584,6 +1710,29 @@ impl Qwen35MoeInner {
         let mut decode_stream = tokenizer.inner().decode_stream(true);
         let mut streamed_text_len = 0usize;
         let mut last_is_reasoning = thinking_enabled;
+
+        // C++ paged-decode availability + compile-lifecycle locks. See
+        // `chat_sync_core_paged` for the full rationale; this is the
+        // streaming twin.
+        let model_id = self.model_id;
+        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let _moe_lock = if use_cpp_paged {
+            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
+        };
+        let mut _weight_guard = None;
+        let use_cpp_paged = if use_cpp_paged {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
@@ -1669,6 +1818,7 @@ impl Qwen35MoeInner {
             &mut last_is_reasoning,
             cb,
             cancelled,
+            use_cpp_paged,
         );
 
         let (generated_tokens, finish_reason) = match result {
@@ -1798,6 +1948,7 @@ impl Qwen35MoeInner {
         last_is_reasoning: &mut bool,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
+        use_cpp_paged: bool,
     ) -> Result<(Vec<u32>, String)> {
         if suffix_len == 0 {
             return Err(Error::from_reason(
@@ -1811,6 +1962,9 @@ impl Qwen35MoeInner {
             |i| self.config.is_linear_layer(i),
         );
 
+        // Pure-Rust paged prefill — see `chat_sync_core_paged_inner` for
+        // the data-flow contract this populates (pool K/V + GDN linear
+        // caches).
         let last_logits = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
@@ -1848,9 +2002,42 @@ impl Qwen35MoeInner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
+        // C++ compiled paged decode setup (see sync twin for full
+        // explanation). Mirrors the sync path so streaming and sync
+        // dispatchers behave identically when both paths are available.
+        let cpp_session_ready = if use_cpp_paged {
+            let caches_ref = self.caches.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "MoE chat_stream_sync_core_paged_inner: caches dropped post-prefill",
+                )
+            })?;
+            let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped post-prefill",
+                )
+            })?;
+            let prefill_offset = adapter_ref.current_token_count() as i32;
+            init_paged_moe_compiled_session(&self.config, caches_ref, adapter_ref, prefill_offset)
+                .is_ok()
+        } else {
+            false
+        };
+
+        let _moe_paged_guard = cpp_session_ready.then_some(MoeResetGuard);
+
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
         let mut finish_reason = String::from("length");
+
+        let max_blocks_per_seq: u32 = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped pre-decode",
+                )
+            })?;
+            let max_seq = self.config.max_position_embeddings as u32;
+            max_seq.div_ceil(adapter.block_size())
+        };
 
         for step in 0..max_new_tokens {
             let token_id = y.item_at_int32(0)? as u32;
@@ -1907,7 +2094,22 @@ impl Qwen35MoeInner {
                 break;
             }
 
-            let next_logits = {
+            let next_logits = if cpp_session_ready {
+                let embedding_weight = self.embedding.get_weight();
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
+                    )
+                })?;
+                adapter
+                    .record_tokens(&[token_id])
+                    .map_err(Error::from_reason)?;
+                let inputs = adapter
+                    .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
+                    .map_err(Error::from_reason)?;
+                let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
+                forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs)?
+            } else {
                 let embed = self.embedding.clone();
                 let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -1920,7 +2122,7 @@ impl Qwen35MoeInner {
                         "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
-                super::paged_forward::run_paged_decode_step(
+                let logits = super::paged_forward::run_paged_decode_step(
                     token_id,
                     &embed,
                     &mut self.layers,
@@ -1930,9 +2132,9 @@ impl Qwen35MoeInner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
-                )?
+                )?;
+                logits.squeeze(Some(&[1]))?
             };
-            let next_logits = next_logits.squeeze(Some(&[1]))?;
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
                 let forced_id = reasoning_tracker.forced_token_id() as i32;
@@ -6237,6 +6439,262 @@ fn eval_token_and_moe_caches(next_token: &MxArray) {
     }
 }
 
+/// Initialize the C++ paged forward graph from the live `paged_adapter`
+/// pool/scale arrays AND the per-layer linear-attention recurrent caches
+/// already populated by the pure-Rust paged prefill.
+///
+/// # Layer-index contract
+///
+/// The C++ FFI accepts pool/scale handle arrays of size `num_layers`
+/// (absolute decoder count). For each absolute layer index `i`:
+/// * Linear-attention layers: pool/scale slots are null pointers; the
+///   `linear_cache_arrays` pair `[i*2, i*2+1]` holds
+///   `(conv_state, recurrent_state)` from the layer's
+///   `Qwen3_5LayerCache::Linear(ArraysCache)`.
+/// * Full-attention layers: pool/scale slots come from the adapter's
+///   `LayerKVPool` at the COMPACT (full-attention) ordinal; the linear
+///   cache pair is null.
+///
+/// The compact-ordinal mapping is computed via
+/// [`crate::models::qwen3_5::decoder_layer::compute_layer_kinds`], the
+/// same helper the production Rust paged-forward dispatch uses.
+///
+/// # Caller contract
+///
+/// 1. `caches` is fully populated by a prior pure-Rust paged prefill —
+///    full-attention layers already wrote K/V into the adapter pool via
+///    `update_keys_values`; linear layers populated `ArraysCache` via
+///    `GatedDeltaNet::forward`.
+/// 2. The C++ weights for this model are still registered (caller must
+///    have verified `mlx_qwen35_get_model_id() == self.model_id` and
+///    holds the appropriate read locks).
+///
+/// `prefill_offset` is the global token cursor the compiled paged
+/// graph's `g_paged_offset_int` will start incrementing from. After a
+/// fresh prefill it equals `current_token_count`.
+///
+/// On any failure (missing linear cache, missing pool/scale handle), the
+/// helper returns an `Err` so the caller can fall back to the pure-Rust
+/// paged decode path. Mirrors the `mlx_qwen35_moe_init_paged` exception
+/// safety: a non-OK return leaves `g_paged_inited == false`.
+fn init_paged_moe_compiled_session(
+    config: &Qwen3_5MoeConfig,
+    caches: &[Qwen3_5LayerCache],
+    paged_adapter: &PagedKVCacheAdapter,
+    prefill_offset: i32,
+) -> Result<()> {
+    use crate::models::qwen3_5::decoder_layer::{Qwen3_5LayerKind, compute_layer_kinds};
+
+    let num_layers_us = config.num_layers as usize;
+    if caches.len() != num_layers_us {
+        return Err(Error::from_reason(format!(
+            "init_paged_moe_compiled_session: caches.len()={} but config.num_layers={}",
+            caches.len(),
+            num_layers_us
+        )));
+    }
+
+    let layer_kinds = compute_layer_kinds(num_layers_us, |i| config.is_linear_layer(i));
+
+    let mut k_pool_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us];
+    let mut v_pool_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us];
+    let mut k_scale_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us];
+    let mut v_scale_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us];
+    let mut linear_cache_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us * 2];
+
+    // Hold the wrapping `MxArray`s alive across the FFI call so the C++
+    // side has time to copy them into its own globals (the ctor `array(x)`
+    // bumps the refcount; once we return the wrappers drop and decrement
+    // back to whatever the C++ side incremented to).
+    let mut held_arrays: Vec<MxArray> = Vec::with_capacity(num_layers_us * 4);
+
+    for (i, kind) in layer_kinds.iter().enumerate() {
+        match kind {
+            Qwen3_5LayerKind::Linear => {
+                // Pull the live (conv_state, recurrent_state) from the
+                // layer's `Qwen3_5LayerCache::Linear(ArraysCache)`. They
+                // were populated by the pure-Rust GDN forward during
+                // prefill. If a slot is None (e.g. caller forgot to run
+                // prefill, or GDN code path bypassed the cache) we
+                // surface an error so the dispatcher falls back to
+                // pure-Rust paged decode rather than silently producing
+                // garbage from bf16 zero placeholders.
+                let arrays_cache = match &caches[i] {
+                    Qwen3_5LayerCache::Linear(c) => c,
+                    Qwen3_5LayerCache::FullAttention(_) => {
+                        return Err(Error::from_reason(format!(
+                            "init_paged_moe_compiled_session: layer {i} is Linear by config \
+                             but cache slot is FullAttention",
+                        )));
+                    }
+                };
+                let conv = arrays_cache.get(0).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "init_paged_moe_compiled_session: layer {i} conv_state not populated; \
+                         pure-Rust paged prefill must run before C++ paged init",
+                    ))
+                })?;
+                let rec = arrays_cache.get(1).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "init_paged_moe_compiled_session: layer {i} recurrent_state not \
+                         populated; pure-Rust paged prefill must run before C++ paged init",
+                    ))
+                })?;
+                linear_cache_handles[i * 2] = conv.as_raw_ptr();
+                linear_cache_handles[i * 2 + 1] = rec.as_raw_ptr();
+                // No need to push to held_arrays — `arrays_cache` keeps
+                // them alive for the duration of this call (we hold a
+                // shared borrow over `caches`).
+                let _ = (conv, rec);
+            }
+            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                // CRITICAL: index by the COMPACT full-attention ordinal,
+                // NOT the absolute layer index. The pool is sized for
+                // `full_attention_layer_count()` slots.
+                let k_arr = paged_adapter.key_pool_array(*paged_idx).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_moe_compiled_session: key_pool_array(layer={i}, \
+                         paged_idx={paged_idx}): {e}",
+                    ))
+                })?;
+                let v_arr = paged_adapter.value_pool_array(*paged_idx).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_moe_compiled_session: value_pool_array(layer={i}, \
+                         paged_idx={paged_idx}): {e}",
+                    ))
+                })?;
+                let ks_arr = paged_adapter.k_scale_array(*paged_idx).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_moe_compiled_session: k_scale_array(layer={i}, \
+                         paged_idx={paged_idx}): {e}",
+                    ))
+                })?;
+                let vs_arr = paged_adapter.v_scale_array(*paged_idx).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_moe_compiled_session: v_scale_array(layer={i}, \
+                         paged_idx={paged_idx}): {e}",
+                    ))
+                })?;
+                k_pool_handles[i] = k_arr.as_raw_ptr();
+                v_pool_handles[i] = v_arr.as_raw_ptr();
+                k_scale_handles[i] = ks_arr.as_raw_ptr();
+                v_scale_handles[i] = vs_arr.as_raw_ptr();
+                held_arrays.push(k_arr);
+                held_arrays.push(v_arr);
+                held_arrays.push(ks_arr);
+                held_arrays.push(vs_arr);
+            }
+        }
+    }
+
+    let mlp_only: Vec<i32> = config.mlp_only_layers.as_deref().unwrap_or(&[]).to_vec();
+
+    unsafe {
+        mlx_sys::mlx_qwen35_moe_init_paged(
+            config.num_layers,
+            config.hidden_size,
+            config.num_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.rope_theta as f32,
+            config.rope_dims(),
+            config.rms_norm_eps as f32,
+            config.full_attention_interval,
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+            config.linear_conv_kernel_dim,
+            if config.tie_word_embeddings { 1 } else { 0 },
+            // max_kv_len: bound on cumulative tokens; the paged graph
+            // doesn't depend on this for shape (block_table /
+            // max_blocks_per_seq is the real bound) but the FFI takes
+            // it for symmetry with the flat init.
+            config.max_position_embeddings,
+            1, // batch_size
+            config.num_experts,
+            config.num_experts_per_tok,
+            if config.norm_topk_prob { 1 } else { 0 },
+            config.decoder_sparse_step,
+            if mlp_only.is_empty() {
+                std::ptr::null()
+            } else {
+                mlp_only.as_ptr()
+            },
+            mlp_only.len() as i32,
+            k_pool_handles.as_mut_ptr(),
+            v_pool_handles.as_mut_ptr(),
+            k_scale_handles.as_mut_ptr(),
+            v_scale_handles.as_mut_ptr(),
+            linear_cache_handles.as_mut_ptr(),
+            prefill_offset,
+        );
+    }
+
+    // held_arrays drops here; refcounts on the wrapped Metal buffers
+    // settle to whatever the C++ side bumped them to.
+    drop(held_arrays);
+
+    Ok(())
+}
+
+/// Single-token decode step using the C++ compiled paged forward pass.
+///
+/// Mirrors `forward_moe_cpp` but threads through the paged-attention
+/// inputs (offset_arr, block_table, slot_mapping, num_valid_tokens,
+/// num_valid_blocks, seq_lens) so K/V is written into the adapter's
+/// paged Metal pool via `paged_kv_write` and gathered via
+/// `paged_attention`.
+///
+/// Caller contract:
+/// * `init_paged_moe_compiled_session` has been called this turn (sets
+///   `g_paged_inited = true`).
+/// * `paged_adapter.record_tokens(&[token_id])` has been called to
+///   advance the cursor (and lazily allocate any new block).
+/// * `inputs` was just built via `paged_adapter.build_paged_attention_inputs(1, 1, max_blocks_per_seq)`.
+///
+/// On any FFI failure (`output_logits == null`) the helper returns an
+/// `Err` so the dispatcher falls back to pure-Rust paged decode.
+fn forward_moe_cpp_paged(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    inputs: &crate::transformer::paged_attention_inputs::PagedAttentionInputs,
+) -> Result<MxArray> {
+    use mlx_sys as sys;
+
+    let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut cache_offset_out: i32 = 0;
+    unsafe {
+        sys::mlx_qwen35_moe_forward_paged(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            inputs.offset_arr.as_raw_ptr(),
+            inputs.block_table.as_raw_ptr(),
+            inputs.slot_mapping.as_raw_ptr(),
+            inputs.num_valid_tokens.as_raw_ptr(),
+            inputs.num_valid_blocks.as_raw_ptr(),
+            inputs.seq_lens.as_raw_ptr(),
+            &mut output_ptr,
+            &mut cache_offset_out,
+        );
+    }
+
+    if output_ptr.is_null() {
+        return Err(Error::from_reason(
+            "C++ MoE paged forward step returned null — check stderr for diagnostic. \
+             (Common causes: g_paged_inited = false, slot_mapping shape != [1], \
+             input_ids size != 1, or weights cleared by another model load.)",
+        ));
+    }
+
+    MxArray::from_handle(output_ptr, "moe_paged_forward_logits")
+}
+
 /// VLM prefill for MoE model using Rust path with M-RoPE position IDs.
 ///
 /// Processes images through vision encoder, merges features into embeddings,
@@ -6498,5 +6956,67 @@ mod paged_construction_tests {
             "Qwen35MoeInner::new with use_block_paged_cache=true must succeed on Metal host",
         );
         assert!(inner.paged_adapter.is_some());
+    }
+
+    /// Hard-fails fast when caller passes a `caches` slice whose length
+    /// disagrees with `config.num_layers`. The check runs BEFORE any FFI
+    /// dispatch so we don't perturb the C++ paged globals — making this
+    /// the only branch of `init_paged_moe_compiled_session` we can
+    /// exercise from a non-Metal sandbox.
+    ///
+    /// (The other failure branches all require populated `MxArray`
+    /// handles, which need a real Metal allocation. They're covered
+    /// indirectly by the parity test in
+    /// `crates/mlx-core/tests/qwen3_5_moe_paged_vs_flat_parity.rs`.)
+    #[test]
+    fn test_init_paged_moe_compiled_session_rejects_cache_length_mismatch() {
+        let cfg = tiny_moe_cfg(true);
+        // `cfg` has num_layers=8; pass an empty cache slice to trigger
+        // the length check before any FFI / Metal call.
+        let empty_caches: Vec<Qwen3_5LayerCache> = Vec::new();
+        // `paged_adapter` would normally be borrowed from
+        // `Qwen35MoeInner::new`, but `Qwen35MoeInner::new` would
+        // attempt to allocate a Metal LayerKVPool — the same kind of
+        // sandbox-incompatible work the test wants to avoid. So we
+        // construct a pool-free adapter via the `BlockAllocator` +
+        // `LayerKVPool` directly with a tiny shape. On non-Metal hosts
+        // the helper allocator can still be built; the LayerKVPool
+        // construction does require Metal so we skip if that fails.
+        let alloc = std::sync::Arc::new(std::sync::Mutex::new(
+            mlx_paged_attn::BlockAllocator::new(2, 16),
+        ));
+        let pa_cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 8,
+            head_size: cfg.head_dim as u32,
+            num_kv_heads: cfg.num_kv_heads as u32,
+            num_layers: cfg.full_attention_layer_count() as u32,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            pa_cfg,
+            2,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(e) => {
+                eprintln!(
+                    "skipping test_init_paged_moe_compiled_session_rejects_cache_length_mismatch: {e}"
+                );
+                return;
+            }
+        };
+        let adapter = PagedKVCacheAdapter::new(alloc, pool, 16)
+            .expect("paged adapter construction must succeed once pool is built");
+        let res = init_paged_moe_compiled_session(&cfg, &empty_caches, &adapter, 0);
+        let msg = res
+            .expect_err("expected Err on cache length mismatch")
+            .to_string();
+        assert!(
+            msg.contains("caches.len()"),
+            "error must reference caches length contract; got: {msg}"
+        );
     }
 }

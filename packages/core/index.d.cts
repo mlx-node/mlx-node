@@ -1037,8 +1037,13 @@ export declare class QianfanOCRModel {
    * Create a new QianfanOCRModel from config (uninitialized, no weights).
    *
    * This constructor path does not spawn a model thread — the returned
-   * instance is only useful for config inspection. Call
-   * [`QianfanOCRModel::load`] to actually run inference.
+   * instance is only useful for `is_initialized` queries until
+   * [`QianfanOCRModel::load`] is called to actually run inference. The
+   * `config` argument is accepted to preserve the `new
+   * QianfanOCRModel(config)` JS surface; the value is discarded because
+   * nothing on the uninitialized path consults it (any future config
+   * getter would forward to the inner thread state populated by
+   * `load()`).
    */
   constructor(config: QianfanOcrConfig);
   /** Returns true if weights have been loaded via `load()`. */
