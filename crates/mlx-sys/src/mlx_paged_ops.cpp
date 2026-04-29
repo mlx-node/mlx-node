@@ -163,6 +163,63 @@ MetalArrayPtr metal_array_ptr(const array& arr) {
       static_cast<size_t>(arr.offset())};
 }
 
+// Reject non-row-contiguous or nonzero-offset views at the factory.
+//
+// Rationale (Phase 1 review round 8): the Metal kernels (and the Rust
+// shim) read each input as a dense row-major buffer starting at the
+// raw `MTLBuffer` pointer. For pool-side inputs (k_pool/v_pool the
+// kernel writes into) the dispatch carries the BUFFER ONLY — no
+// offset / strides — so a sliced or transposed view would silently
+// alias to offset 0 in the backing allocation and either:
+//   - clobber unrelated regions of the pool (writes), or
+//   - read from the wrong start of a non-zero-offset slice (reads).
+//
+// For read-only inputs (q, new_k/new_v, block_table, seq_lens,
+// slot_mapping) the q-side path forwards `q.offset()` and `out.offset()`
+// to the dispatcher, but never k_pool/v_pool/block_table/seq_lens
+// offsets, and never any strides. Different inputs receive different
+// treatment, which is fragile. Phase-2 dispatch will eventually thread
+// strides and offsets through; Phase 1's contract is simpler: refuse
+// non-row-contiguous / nonzero-offset views and let the caller
+// materialize a `mlx::core::contiguous(...)` copy explicitly.
+//
+// This check passes on:
+//   - tracer arrays from `mlx::core::compile()` (default flags
+//     `{true, true, true}`, default offset 0; see `array.h:495`)
+//   - shape-only arrays from negative-test helpers
+//     (`array(Shape{...}, dtype, nullptr, {})`)
+//   - normal `eval()`-ed arrays before any slice/transpose op
+//
+// It fails on:
+//   - results of `mlx::core::slice(...)` with nonzero start (offset != 0
+//     and/or row_contiguous == false)
+//   - results of `mlx::core::transpose(...)` (row_contiguous == false)
+//   - any view returned by `array::copy_shared_buffer(...)` that
+//     adjusted strides or set a non-default offset
+void require_row_contiguous_zero_offset(
+    const array& arr,
+    const char* op_name,
+    const char* input_name) {
+  if (!arr.flags().row_contiguous) {
+    std::ostringstream msg;
+    msg << "[" << op_name << "] " << input_name
+        << " must be row-contiguous; got non-row-contiguous view "
+        << "(probably from a transpose / non-trivial slice). "
+        << "Materialize a contiguous copy first via "
+        << "`mlx::core::contiguous(arr)` before passing to the primitive.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (arr.offset() != 0) {
+    std::ostringstream msg;
+    msg << "[" << op_name << "] " << input_name
+        << " must have offset 0; got offset " << arr.offset()
+        << " (probably from a sliced view starting partway into the "
+        << "backing buffer). Materialize a contiguous copy first via "
+        << "`mlx::core::contiguous(arr)` before passing to the primitive.";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
 } // namespace
 
 // =============================================================================
@@ -670,6 +727,22 @@ std::pair<array, array> paged_kv_write(
         "paged_kv_write has no fallback implementation (inference-only)");
   };
 
+  // Phase 1 review-round-8 contract: every input must be row-contiguous
+  // and start at offset 0 in its backing buffer. The dispatch carries
+  // raw MTLBuffer pointers + at most a single offset (slot_mapping for
+  // the read side; k_pool/v_pool are written in place and have no
+  // offset plumbed through), so a sliced/transposed view would silently
+  // alias the wrong region of memory. Reject early so the caller knows
+  // to call `mlx::core::contiguous(arr)` first.
+  require_row_contiguous_zero_offset(k_pool, "paged_kv_write", "k_pool");
+  require_row_contiguous_zero_offset(v_pool, "paged_kv_write", "v_pool");
+  require_row_contiguous_zero_offset(new_k, "paged_kv_write", "new_k");
+  require_row_contiguous_zero_offset(new_v, "paged_kv_write", "new_v");
+  require_row_contiguous_zero_offset(
+      slot_mapping, "paged_kv_write", "slot_mapping");
+  require_row_contiguous_zero_offset(k_scale, "paged_kv_write", "k_scale");
+  require_row_contiguous_zero_offset(v_scale, "paged_kv_write", "v_scale");
+
   // Positive-value scalar-state checks. The factory's downstream shape
   // validation divides by `block_size`, multiplies by `num_kv_heads` /
   // `head_size`, and uses these as kernel grid extents. A zero or
@@ -1008,6 +1081,22 @@ array paged_attention(
     throw std::runtime_error(
         "paged_attention has no fallback implementation (inference-only)");
   };
+
+  // Phase 1 review-round-8 contract: every input must be row-contiguous
+  // and start at offset 0 in its backing buffer. `eval_gpu` only
+  // forwards `q.offset()` and `out.offset()` to the dispatcher; k_pool,
+  // v_pool, block_table, and seq_lens are passed as bare buffers, so a
+  // sliced/transposed view of any of them would silently read from the
+  // wrong region of memory. Reject early so the caller knows to call
+  // `mlx::core::contiguous(arr)` first.
+  require_row_contiguous_zero_offset(q, "paged_attention", "q");
+  require_row_contiguous_zero_offset(k_pool, "paged_attention", "k_pool");
+  require_row_contiguous_zero_offset(v_pool, "paged_attention", "v_pool");
+  require_row_contiguous_zero_offset(
+      block_table, "paged_attention", "block_table");
+  require_row_contiguous_zero_offset(seq_lens, "paged_attention", "seq_lens");
+  require_row_contiguous_zero_offset(k_scale, "paged_attention", "k_scale");
+  require_row_contiguous_zero_offset(v_scale, "paged_attention", "v_scale");
 
   // Phase 1 explicitly rejects nonzero sliding_window. The primitive
   // tracks it in scalar state for cache-key stability across phases,
@@ -3319,6 +3408,334 @@ int mlx_paged_attention_compile_cached_oob_throws() {
       stderr,
       "[paged_attention_compile_cached_oob] second-call eval did NOT throw "
       "— the compile-cached path is missing its block-id bounds check\n");
+  return 0;
+}
+
+} // extern "C"
+
+// =============================================================================
+// Phase 1 review-round-8 finding: factory must reject non-row-contiguous
+// or nonzero-offset views for ALL inputs.
+//
+// MLX arrays support strided / sliced / transposed views with valid
+// logical shapes/dtypes. The Metal kernels (and the Rust shim) read
+// each input as a dense row-major buffer, and the dispatch path only
+// forwards a single offset for q/out (and slot_mapping/new_k/new_v on
+// the write side). Pool-side and metadata-side inputs (k_pool, v_pool,
+// block_table, seq_lens) are passed as bare buffers — a sliced view
+// would silently alias to offset 0 in the backing allocation.
+//
+// Reject early at the factory; tests below assert the rejection fires
+// for transposed q / sliced k_pool / sliced block_table / sliced
+// seq_lens. They use real data-backed source arrays (so MLX's
+// `slice` / `transpose` ops actually produce non-row-contiguous /
+// nonzero-offset views) and are gated on `metal::is_available()` because
+// `eval()` is needed to materialize the slice/transpose results.
+// =============================================================================
+
+namespace {
+
+/// Build a small bf16 array of zeros with the given shape, eval it, and
+/// return it. The `eval()` is needed because `slice` and `transpose`
+/// inspect the input's flags / strides during their own eval — but the
+/// FACTORY checks `flags()` / `offset()` which are propagated by the
+/// downstream primitive's output construction. To get a row_contiguous=
+/// false view with offset != 0 we must actually evaluate the slice (so
+/// it sets up its descriptor). That requires Metal.
+mlx::core::array make_bf16_zeros(mlx::core::Shape shape) {
+  using namespace mlx::core;
+  size_t size = 1;
+  for (auto d : shape) {
+    size *= static_cast<size_t>(d);
+  }
+  std::vector<uint16_t> host(size, 0);
+  auto* p = reinterpret_cast<const bfloat16_t*>(host.data());
+  return array(p, std::move(shape), bfloat16);
+}
+
+mlx::core::array make_int32_zeros(mlx::core::Shape shape) {
+  using namespace mlx::core;
+  size_t size = 1;
+  for (auto d : shape) {
+    size *= static_cast<size_t>(d);
+  }
+  std::vector<int32_t> host(size, 0);
+  return array(host.data(), std::move(shape), int32);
+}
+
+} // namespace
+
+extern "C" {
+
+/// Verify the public `paged_kv_write(...)` factory rejects a k_pool
+/// that is non-row-contiguous (taken via `slice(..., {1,...}, {3,...})`
+/// — a sub-region of the original 4-block pool). Returns 1 on
+/// `std::invalid_argument`, 0 otherwise. Returns -3 if Metal is
+/// unavailable (slice eval requires it).
+int mlx_paged_kv_write_factory_rejects_non_contiguous_k_pool() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  // Build a 5-block pool, then slice off the leading block. The result
+  // has shape [4, ...] but its `offset()` is nonzero AND its
+  // row_contiguous flag is false (slicing along axis 0 of a 5-block
+  // pool produces a strided view starting at offset = 1 *
+  // strides[0] in the backing buffer).
+  array k_pool_full = make_bf16_zeros(Shape{5, 4, 8, 16, 8});
+  // Force the source array to be evaluated so the slice has data to
+  // anchor on.
+  eval(k_pool_full);
+  array k_pool_sliced = mlx::core::slice(
+      k_pool_full,
+      Shape{1, 0, 0, 0, 0},
+      Shape{5, 4, 8, 16, 8},
+      Shape{1, 1, 1, 1, 1});
+  eval(k_pool_sliced);
+
+  // Sanity: confirm the slice is actually non-trivial. We don't return
+  // a hard failure here (the factory check is what's under test) — but
+  // log if MLX returned a row-contiguous view (e.g. on some future
+  // optimization), because then the test would not exercise the
+  // intended path.
+  if (k_pool_sliced.flags().row_contiguous && k_pool_sliced.offset() == 0) {
+    fprintf(
+        stderr,
+        "[non_contig_k_pool] WARNING: slice produced a row-contiguous "
+        "view at offset 0; test will not exercise the intended factory "
+        "rejection path.\n");
+  }
+
+  // Well-formed companions for the slice we want to reject.
+  array v_pool = make_bf16_zeros(Shape{4, 4, 64, 16});
+  array new_k = make_bf16_zeros(Shape{2, 4, 64});
+  array new_v = make_bf16_zeros(Shape{2, 4, 64});
+  array slot_mapping(std::vector<int64_t>{0, 1}.data(), Shape{2}, int64);
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    paged_kv_write(
+        k_pool_sliced,
+        v_pool,
+        new_k,
+        new_v,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        /*block_size=*/16,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*x_pack=*/8,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// Verify the public `paged_attention(...)` factory rejects a q that
+/// has been transposed (row_contiguous == false). Transposes the
+/// `[1, 8, 64]` q to `[8, 1, 64]` then transposes back to `[1, 8, 64]`
+/// using a non-trivial axis order, producing a logically correct
+/// shape but a strided view of the original buffer.
+int mlx_paged_attention_factory_rejects_non_contiguous_q() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  // Build q with shape [1, 8, 64], then transpose to [8, 64, 1] then
+  // back to [1, 8, 64] — the result is a non-row-contiguous view. We
+  // can't simply transpose to [1, 8, 64] (that's the identity) so we
+  // round-trip via swapping middle/last axes. Equivalent: swap axes
+  // (1, 2) and back, but use a non-trivial permutation that's
+  // observable as non-row-contiguous after the second swap.
+  //
+  // Simpler: build q' with shape [64, 8, 1] (row-contiguous) and
+  // transpose to [1, 8, 64]. The result has the right logical shape
+  // but the underlying buffer is in [64, 8, 1] order → non-row-
+  // contiguous when viewed as [1, 8, 64].
+  array q_alt = make_bf16_zeros(Shape{64, 8, 1});
+  eval(q_alt);
+  // transpose([2, 1, 0]) yields shape [1, 8, 64]. The view's strides
+  // mirror the input buffer, NOT the new logical layout, so
+  // row_contiguous == false.
+  array q_t = mlx::core::transpose(q_alt, std::vector<int>{2, 1, 0});
+  eval(q_t);
+
+  if (q_t.flags().row_contiguous) {
+    fprintf(
+        stderr,
+        "[non_contig_q] WARNING: transpose produced a row-contiguous "
+        "view; test will not exercise the intended factory rejection "
+        "path.\n");
+  }
+
+  array k_pool = make_bf16_zeros(Shape{4, 4, 8, 16, 8});
+  array v_pool = make_bf16_zeros(Shape{4, 4, 64, 16});
+  array block_table = make_int32_zeros(Shape{1, 4});
+  array seq_lens = make_int32_zeros(Shape{1});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    paged_attention(
+        q_t,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// Verify the public `paged_attention(...)` factory rejects a
+/// block_table sliced along dim 0 (e.g. `block_table[1:3]` from a
+/// `[4, 4]` original). The slice has shape `[2, 4]` but starts partway
+/// into the backing buffer — the kernel would read from the wrong
+/// region.
+int mlx_paged_attention_factory_rejects_non_contiguous_block_table() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  // Build a [4, 4] int32 block_table, slice off rows [1:3] (yielding
+  // [2, 4] with offset != 0). Eval to materialize.
+  array bt_full = make_int32_zeros(Shape{4, 4});
+  eval(bt_full);
+  array bt_sliced = mlx::core::slice(
+      bt_full,
+      Shape{1, 0},
+      Shape{3, 4},
+      Shape{1, 1});
+  eval(bt_sliced);
+
+  if (bt_sliced.flags().row_contiguous && bt_sliced.offset() == 0) {
+    fprintf(
+        stderr,
+        "[non_contig_block_table] WARNING: slice produced a "
+        "row-contiguous view at offset 0; test will not exercise the "
+        "intended factory rejection path.\n");
+  }
+
+  // q must agree with bt_sliced.shape(0) = 2. Everything else is
+  // well-formed.
+  array q = make_bf16_zeros(Shape{2, 8, 64});
+  array k_pool = make_bf16_zeros(Shape{4, 4, 8, 16, 8});
+  array v_pool = make_bf16_zeros(Shape{4, 4, 64, 16});
+  array seq_lens = make_int32_zeros(Shape{2});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        bt_sliced,
+        seq_lens,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// Verify the public `paged_attention(...)` factory rejects a seq_lens
+/// taken via `seq_lens[1:]` — a 1-element slice with nonzero offset.
+int mlx_paged_attention_factory_rejects_non_contiguous_seq_lens() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  // Build a [2] int32 seq_lens, take the trailing element.
+  array sl_full = make_int32_zeros(Shape{2});
+  eval(sl_full);
+  array sl_sliced = mlx::core::slice(
+      sl_full, Shape{1}, Shape{2}, Shape{1});
+  eval(sl_sliced);
+
+  if (sl_sliced.flags().row_contiguous && sl_sliced.offset() == 0) {
+    fprintf(
+        stderr,
+        "[non_contig_seq_lens] WARNING: slice produced a "
+        "row-contiguous view at offset 0; test will not exercise the "
+        "intended factory rejection path.\n");
+  }
+
+  // Everything else well-formed; q matches sl_sliced.shape(0) = 1.
+  array q = make_bf16_zeros(Shape{1, 8, 64});
+  array k_pool = make_bf16_zeros(Shape{4, 4, 8, 16, 8});
+  array v_pool = make_bf16_zeros(Shape{4, 4, 64, 16});
+  array block_table = make_int32_zeros(Shape{1, 4});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        sl_sliced,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
   return 0;
 }
 

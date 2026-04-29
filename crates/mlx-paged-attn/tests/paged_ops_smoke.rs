@@ -1452,3 +1452,98 @@ fn compile_cached_paged_attention_oob_block_throws() {
          out-of-pool K/V memory."
     );
 }
+
+// =============================================================================
+// Phase 1 review-round-8: factory must reject non-row-contiguous /
+// nonzero-offset views for ALL inputs.
+//
+// The dispatch path forwards raw MTLBuffer pointers + at most a single
+// offset (q/out for paged_attention; slot_mapping/new_k/new_v for
+// paged_kv_write). Pool-side and metadata-side inputs (k_pool, v_pool,
+// block_table, seq_lens) are passed as bare buffers with no offset,
+// and strides are never forwarded for any input. A sliced/transposed
+// view with a valid logical shape would silently alias the wrong
+// region of the backing allocation.
+//
+// The factory now requires every input to satisfy
+// `flags().row_contiguous == true && offset() == 0`. Tests below
+// confirm rejection fires for transposed q / sliced k_pool / sliced
+// block_table / sliced seq_lens. Each test is gated on Metal
+// availability (slice/transpose eval requires it) and skips with a
+// log message when unavailable.
+// =============================================================================
+
+#[test]
+fn paged_kv_write_factory_rejects_non_contiguous_k_pool() {
+    let rc = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_non_contiguous_k_pool() };
+    if rc == -3 {
+        eprintln!(
+            "paged_kv_write_factory_rejects_non_contiguous_k_pool: \
+             Metal not available; skipping"
+        );
+        return;
+    }
+    assert_eq!(
+        rc, 1,
+        "paged_kv_write(...) must reject a sliced (non-row-contiguous, \
+         nonzero-offset) k_pool view (got rc={rc}); the dispatch passes \
+         k_pool as a bare MTLBuffer with no offset, so a sliced view \
+         would clobber unrelated regions of the backing allocation."
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_non_contiguous_q() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_non_contiguous_q() };
+    if rc == -3 {
+        eprintln!(
+            "paged_attention_factory_rejects_non_contiguous_q: \
+             Metal not available; skipping"
+        );
+        return;
+    }
+    assert_eq!(
+        rc, 1,
+        "paged_attention(...) must reject a transposed (non-row-contiguous) \
+         q (got rc={rc}); the kernel reads q as a dense row-major buffer \
+         and a transposed view's strides would not match its logical shape."
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_non_contiguous_block_table() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_non_contiguous_block_table() };
+    if rc == -3 {
+        eprintln!(
+            "paged_attention_factory_rejects_non_contiguous_block_table: \
+             Metal not available; skipping"
+        );
+        return;
+    }
+    assert_eq!(
+        rc, 1,
+        "paged_attention(...) must reject a sliced block_table view (got rc={rc}); \
+         the dispatch passes block_table as a bare MTLBuffer with no offset, \
+         so a sliced view would read from offset 0 instead of the logical \
+         slice start."
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_non_contiguous_seq_lens() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_non_contiguous_seq_lens() };
+    if rc == -3 {
+        eprintln!(
+            "paged_attention_factory_rejects_non_contiguous_seq_lens: \
+             Metal not available; skipping"
+        );
+        return;
+    }
+    assert_eq!(
+        rc, 1,
+        "paged_attention(...) must reject a sliced seq_lens view (got rc={rc}); \
+         the dispatch passes seq_lens as a bare MTLBuffer with no offset, \
+         so a `seq_lens[1:]` view would read from offset 0 instead of \
+         the logical slice start."
+    );
+}

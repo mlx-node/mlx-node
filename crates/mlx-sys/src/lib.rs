@@ -1111,6 +1111,34 @@ unsafe extern "C-unwind" {
     ///   -3            — Metal not available; eval-based verification
     ///                   skipped (trace-count check still ran).
     pub fn mlx_paged_kv_write_compile_trace_smoke(num_tokens: i32) -> i32;
+
+    // =============================================================================
+    // Phase 1 review-round-8 finding: factory must reject
+    // non-row-contiguous or nonzero-offset views for ALL inputs.
+    //
+    // Each helper builds a real data-backed array, applies `slice` /
+    // `transpose` to produce a non-row-contiguous or nonzero-offset
+    // view, then calls the public factory. Returns 1 if
+    // `std::invalid_argument` is thrown, 0 otherwise. Returns -3 if
+    // Metal is unavailable (the slice/transpose eval needs it).
+    // =============================================================================
+
+    /// k_pool sliced along axis 0 (`pool[1:5]`) must be rejected by the
+    /// `paged_kv_write` factory.
+    pub fn mlx_paged_kv_write_factory_rejects_non_contiguous_k_pool() -> i32;
+
+    /// q transposed from `[64, 8, 1]` → `[1, 8, 64]` must be rejected
+    /// by the `paged_attention` factory (right shape, wrong stride
+    /// order — row_contiguous == false).
+    pub fn mlx_paged_attention_factory_rejects_non_contiguous_q() -> i32;
+
+    /// block_table sliced along axis 0 (`bt[1:3]`) must be rejected by
+    /// the `paged_attention` factory.
+    pub fn mlx_paged_attention_factory_rejects_non_contiguous_block_table() -> i32;
+
+    /// seq_lens sliced as `seq_lens[1:]` (nonzero offset) must be
+    /// rejected by the `paged_attention` factory.
+    pub fn mlx_paged_attention_factory_rejects_non_contiguous_seq_lens() -> i32;
 }
 
 // ================================================================================
