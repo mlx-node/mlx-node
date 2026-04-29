@@ -1007,6 +1007,45 @@ unsafe extern "C-unwind" {
     ///  -3   — Metal not available; eval-based verification skipped.
     pub fn mlx_paged_kv_write_compile_cached_oob_throws() -> i32;
 
+    // =============================================================================
+    // Phase 1 review-round-5 finding: PagedAttention::eval_gpu must
+    // runtime-bounds-check `seq_lens` and `block_table` contents.
+    //
+    // Each helper builds REAL data-backed arrays with exactly one bad
+    // input value, calls `paged_attention(...)`, and evals the result.
+    // Returns 1 if eval throws `std::invalid_argument`, 0 if no throw,
+    // -1 on setup error, -3 if Metal is unavailable.
+    // =============================================================================
+
+    /// seq_lens with a negative entry must be rejected by eval_gpu.
+    pub fn mlx_paged_attention_eval_gpu_rejects_negative_seq_len() -> i32;
+
+    /// seq_lens larger than `max_blocks_per_seq * block_size` must be
+    /// rejected by eval_gpu.
+    pub fn mlx_paged_attention_eval_gpu_rejects_oversized_seq_len() -> i32;
+
+    /// block_table with a negative entry (within the row's used region)
+    /// must be rejected by eval_gpu.
+    pub fn mlx_paged_attention_eval_gpu_rejects_negative_block_id() -> i32;
+
+    /// block_table with an entry == num_blocks (one past valid) must be
+    /// rejected by eval_gpu.
+    pub fn mlx_paged_attention_eval_gpu_rejects_oob_block_id() -> i32;
+
+    /// Compile a `paged_attention`-emitting function, call it with
+    /// valid inputs (cache miss → factory + eval_gpu pass), then call
+    /// it again with an out-of-range block id (cache HIT bypasses the
+    /// factory). The eval_gpu runtime bounds check MUST throw on the
+    /// second eval.
+    ///
+    /// Return codes:
+    ///   1   — second-call eval threw `std::invalid_argument` (fix
+    ///         working — the compile-cached path is bounds-checked).
+    ///   0   — second-call eval did NOT throw (regression).
+    ///  -1   — internal/setup error (first call failed unexpectedly).
+    ///  -3   — Metal not available; eval-based verification skipped.
+    pub fn mlx_paged_attention_compile_cached_oob_throws() -> i32;
+
     /// Reset the compile-trace counter to 0 before exercising the
     /// `mlx_paged_kv_write_compile_trace_smoke` helper.
     pub fn mlx_paged_kv_write_trace_count_reset();

@@ -1268,3 +1268,101 @@ fn compile_cached_paged_kv_write_oob_slot_throws() {
          the Metal kernel writes past the K/V pool."
     );
 }
+
+// =============================================================================
+// Phase 1 review-round-5: PagedAttention::eval_gpu runtime-content checks.
+//
+// The PagedAttention factory only validates structural (rank/shape/dtype)
+// invariants. Without per-call validation in `eval_gpu`, the Metal
+// kernel reinterprets a negative `seq_lens[i]` as a huge unsigned
+// context length, reads past the row's block-table region for a
+// too-large `seq_lens[i]`, and dereferences arbitrary GPU memory for
+// a `block_table[i,j]` outside `[0, num_blocks)`. The fix puts the
+// runtime check in `PagedAttention::eval_gpu`, so it fires on every
+// replay (factory-direct and compile-cached). These tests verify the
+// check via real-data eval.
+// =============================================================================
+
+/// Helper: interpret a return code from a `paged_attention` eval_gpu
+/// helper. `rc==-3` means Metal unavailable (skip with stderr note);
+/// `rc==1` means the expected throw fired.
+fn assert_paged_attention_eval_gpu_rejects(rc: i32, scenario: &str) {
+    if rc == -3 {
+        eprintln!("paged_attention eval_gpu rejection ({scenario}): Metal not available; skipping");
+        return;
+    }
+    assert_ne!(rc, -1, "{scenario}: helper hit an internal error (rc=-1)");
+    assert_eq!(
+        rc, 1,
+        "{scenario}: PagedAttention::eval_gpu must throw std::invalid_argument \
+         (got rc={rc}). Without the runtime bounds check the Metal kernel \
+         either reads past the row's block-table region or dereferences \
+         out-of-pool K/V memory."
+    );
+}
+
+#[test]
+fn paged_attention_eval_gpu_rejects_negative_seq_len() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_negative_seq_len() };
+    assert_paged_attention_eval_gpu_rejects(rc, "negative seq_lens");
+}
+
+#[test]
+fn paged_attention_eval_gpu_rejects_oversized_seq_len() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_oversized_seq_len() };
+    assert_paged_attention_eval_gpu_rejects(rc, "seq_lens > max_blocks_per_seq*block_size");
+}
+
+#[test]
+fn paged_attention_eval_gpu_rejects_negative_block_id() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_negative_block_id() };
+    assert_paged_attention_eval_gpu_rejects(rc, "negative block_table entry");
+}
+
+#[test]
+fn paged_attention_eval_gpu_rejects_oob_block_id() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_oob_block_id() };
+    assert_paged_attention_eval_gpu_rejects(rc, "block_table entry >= num_blocks");
+}
+
+#[test]
+fn compile_cached_paged_attention_oob_block_throws() {
+    // The C++ helper:
+    //   1. Compiles a function emitting `paged_attention`.
+    //   2. Calls it with valid block_table = [0, 0, 0, 0],
+    //      seq_lens = [16] — cache miss; factory + eval_gpu both pass.
+    //   3. Calls it again with the SAME shapes but
+    //      block_table[0, 0] = num_blocks = 4 — out of range. Cache HIT
+    //      bypasses the factory. `PagedAttention::eval_gpu`'s own
+    //      bounds check MUST throw `std::invalid_argument`.
+    //
+    // Return codes:
+    //   1   → success (eval_gpu threw on the OOB block id).
+    //   0   → regression (eval_gpu did NOT throw — the kernel would
+    //         have addressed out-of-pool K/V memory).
+    //  -1   → internal/setup error (first call failed).
+    //  -3   → Metal not available; verification skipped.
+    let rc = unsafe { mlx_sys::mlx_paged_attention_compile_cached_oob_throws() };
+
+    if rc == -3 {
+        eprintln!(
+            "compile_cached_paged_attention_oob_block_throws: \
+             Metal not available; skipping eval-based verification"
+        );
+        return;
+    }
+
+    assert_ne!(
+        rc, -1,
+        "compile-cached paged_attention OOB helper hit an internal error"
+    );
+    assert_eq!(
+        rc, 1,
+        "PagedAttention::eval_gpu must throw std::invalid_argument when the \
+         compile-cached path receives a block_table with an entry >= num_blocks \
+         (got rc={rc}). The factory check covers only structural shape/dtype, \
+         and `mlx::core::compile`'s cached re-traces bypass the factory entirely. \
+         Without the eval_gpu-side check the kernel would dereference \
+         out-of-pool K/V memory."
+    );
+}

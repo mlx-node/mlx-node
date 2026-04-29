@@ -384,16 +384,98 @@ void PagedAttention::eval_gpu(
   uint32_t num_seqs = static_cast<uint32_t>(q.shape(0));
   uint32_t max_blocks_per_seq = static_cast<uint32_t>(block_table.shape(1));
 
-  // Determine max_context_len from seq_lens (max element). This is
-  // the value that drives the V1/V2 branch. Read host values directly
-  // from the seq_lens buffer — caller must `eval()` seq_lens before
-  // invoking the primitive (Phase 1 contract; calling
+  // Per-runtime dtype + content validation. Read host values directly
+  // from the seq_lens / block_table buffers — caller must `eval()`
+  // them before invoking the primitive (Phase 1 contract; calling
   // `mlx::core::eval(...)` here would recurse into the scheduler and
   // deadlock).
   if (seq_lens.dtype() != mlx::core::int32) {
     throw std::runtime_error("PagedAttention: seq_lens must be int32");
   }
+  if (block_table.dtype() != mlx::core::int32) {
+    throw std::runtime_error(
+        "PagedAttention: block_table must be int32 (kernel reads as int32_t*)");
+  }
   const int32_t* seq_lens_data = seq_lens.data<int32_t>();
+
+  // Per-runtime bounds check on `seq_lens` and `block_table` contents
+  // (Phase 1 safety; runs on EVERY runtime call, including the
+  // compile-cached path).
+  //
+  // The Metal kernel does NOT bounds-check either input. For each
+  // sequence the kernel:
+  //   1. reads `context_lens[seq_idx]` as `uint32_t` (so a negative
+  //      int32 sneaks in as a huge unsigned context length),
+  //   2. derives `num_context_blocks = ceil(context_len / block_size)`,
+  //      and reads `block_tables[seq_idx * max_blocks_per_seq + j]`
+  //      for each j in [0, num_context_blocks),
+  //   3. uses that value directly as `physical_block_number *
+  //      kv_block_stride` for K/V pool reads.
+  //
+  // Without per-call validation, a too-large `seq_lens[i]` reads past
+  // that row's block-table region, and a negative or `>= num_blocks`
+  // entry in `block_table` addresses outside the K/V pool. Mirror the
+  // pattern used immediately above for `PagedKVWrite::eval_gpu`'s
+  // slot-mapping check: the factory's structural validation only
+  // covers shape/dtype, and `mlx::core::compile`'s cached re-traces
+  // bypass the factory entirely, so the runtime-content check must
+  // live in `eval_gpu`.
+  //
+  // Cost: O(num_seqs * max_blocks_per_seq) host-side reads per call.
+  // Acceptable for Phase 1 correctness; Phase 2 may push this
+  // kernel-side or gate it on a configured trust mode.
+  //
+  // Run BEFORE the max-context computation below so a malformed input
+  // surfaces the descriptive `std::invalid_argument` error instead of
+  // the coarser "max_context_len > 0" runtime_error.
+  if (num_seqs > 0 && max_blocks_per_seq > 0) {
+    const int32_t num_blocks = static_cast<int32_t>(k_pool.shape(0));
+    const int64_t max_seq_len_bound =
+        static_cast<int64_t>(max_blocks_per_seq) *
+        static_cast<int64_t>(block_size_);
+    const int32_t* block_table_data = block_table.data<int32_t>();
+    for (uint32_t i = 0; i < num_seqs; ++i) {
+      const int32_t s = seq_lens_data[i];
+      if (s < 0 || static_cast<int64_t>(s) > max_seq_len_bound) {
+        std::ostringstream msg;
+        msg << "PagedAttention::eval_gpu: seq_lens[" << i << "] (" << s
+            << ") out of range [0, max_blocks_per_seq * block_size = "
+            << max_blocks_per_seq << " * " << block_size_ << " = "
+            << max_seq_len_bound
+            << "]. The kernel reads context_lens[seq_idx] as uint32_t and "
+            << "derives num_context_blocks from it; an out-of-range value "
+            << "either reads past the row's block-table region (positive "
+            << "overflow) or is interpreted as a huge unsigned value "
+            << "(negative). This check fires on every runtime call "
+            << "(including the compile-cached path).";
+        throw std::invalid_argument(msg.str());
+      }
+      // ceil(s / block_size_); s >= 0 so integer division is fine.
+      const int32_t num_used_blocks =
+          (s + block_size_ - 1) / block_size_;
+      const size_t row_offset =
+          static_cast<size_t>(i) * static_cast<size_t>(max_blocks_per_seq);
+      for (int32_t j = 0; j < num_used_blocks; ++j) {
+        const int32_t blk = block_table_data[row_offset + static_cast<size_t>(j)];
+        if (blk < 0 || blk >= num_blocks) {
+          std::ostringstream msg;
+          msg << "PagedAttention::eval_gpu: block_table[" << i << ", " << j
+              << "] (" << blk << ") out of range [0, num_blocks = "
+              << num_blocks
+              << "). The kernel uses block_table entries directly as "
+              << "physical_block_number * kv_block_stride for K/V reads; "
+              << "a value outside [0, num_blocks) addresses arbitrary GPU "
+              << "memory. This check fires on every runtime call "
+              << "(including the compile-cached path).";
+          throw std::invalid_argument(msg.str());
+        }
+      }
+    }
+  }
+
+  // Determine max_context_len from seq_lens (max element). This is
+  // the value that drives the V1/V2 branch. By the time we get here
+  // every entry has already been validated as `>= 0` above.
   int32_t max_context_len = 0;
   for (size_t i = 0; i < seq_lens.size(); ++i) {
     if (seq_lens_data[i] > max_context_len) {
@@ -2513,6 +2595,339 @@ int mlx_paged_kv_write_compile_cached_oob_throws() {
       stderr,
       "[compile_cached_oob] second-call eval did NOT throw — the "
       "compile-cached path is missing its slot-bounds check\n");
+  return 0;
+}
+
+} // extern "C"
+
+// =============================================================================
+// Phase 1 review-round-5 finding: PagedAttention::eval_gpu must
+// runtime-bounds-check `seq_lens` and `block_table` contents.
+//
+// The Metal kernel reinterprets seq_lens as `uint32_t*` (so a
+// negative int32 value sneaks in as a huge unsigned context length)
+// and uses block_table entries directly as `physical_block_number *
+// kv_block_stride` for K/V pool reads. The factory does only structural
+// validation (rank/shape/dtype), and `mlx::core::compile`'s cached
+// re-traces bypass the factory entirely. The fix puts the runtime
+// check in `PagedAttention::eval_gpu` so it fires on every replay.
+// These helpers exercise that check end-to-end.
+// =============================================================================
+
+namespace {
+
+/// Layout shared by the eval_gpu rejection helpers. Matches the
+/// `paged_kv_write` compile-trace test: block_size=16, num_kv_heads=4,
+/// head_size=64, x_pack=8, num_q_heads=8, kv_dtype=Bf16, with a
+/// `[4, 4, 8, 16, 8]` K-pool / `[4, 4, 64, 16]` V-pool / `[1, 4]`
+/// block_table / `[1]` seq_lens layout. Builds REAL data-backed arrays
+/// from the supplied seq_lens and block_table contents and invokes
+/// `paged_attention(...)` then evals the result. Returns 1 if eval
+/// throws `std::invalid_argument`, 0 if no throw, -1 on setup error,
+/// -3 if Metal is unavailable.
+int call_paged_attention_eval_expecting_throw(
+    const std::vector<int32_t>& seq_lens_host,
+    const std::vector<int32_t>& block_table_host,
+    int max_blocks_per_seq) {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  const int kBlockSize = 16;
+  const int kNumKvHeads = 4;
+  const int kHeadSize = 64;
+  const int kXPack = 8;
+  const int kNumBlocks = 4;
+  const int kNumQHeads = 8;
+  const int kNumSeqs = 1;
+
+  if (seq_lens_host.size() != static_cast<size_t>(kNumSeqs)) {
+    return -1;
+  }
+  if (block_table_host.size() !=
+      static_cast<size_t>(kNumSeqs) * static_cast<size_t>(max_blocks_per_seq)) {
+    return -1;
+  }
+
+  const size_t k_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      (kHeadSize / kXPack) * kBlockSize * kXPack;
+  const size_t v_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      kHeadSize * kBlockSize;
+  const size_t q_elems =
+      static_cast<size_t>(kNumSeqs) * kNumQHeads * kHeadSize;
+
+  std::vector<uint16_t> k_pool_host(k_pool_elems, 0);
+  std::vector<uint16_t> v_pool_host(v_pool_elems, 0);
+  std::vector<uint16_t> q_host(q_elems, 0x3F80); // bf16(1.0)
+
+  auto bf16_arr = [](const std::vector<uint16_t>& src, Shape shape) {
+    auto* p = reinterpret_cast<const bfloat16_t*>(src.data());
+    return array(p, std::move(shape), bfloat16);
+  };
+  auto i32_arr = [](const std::vector<int32_t>& src, Shape shape) {
+    return array(src.data(), std::move(shape), int32);
+  };
+
+  array q = bf16_arr(q_host, Shape{kNumSeqs, kNumQHeads, kHeadSize});
+  array k_pool = bf16_arr(
+      k_pool_host,
+      Shape{kNumBlocks, kNumKvHeads, kHeadSize / kXPack, kBlockSize, kXPack});
+  array v_pool = bf16_arr(
+      v_pool_host, Shape{kNumBlocks, kNumKvHeads, kHeadSize, kBlockSize});
+  array block_table =
+      i32_arr(block_table_host, Shape{kNumSeqs, max_blocks_per_seq});
+  array seq_lens = i32_arr(seq_lens_host, Shape{kNumSeqs});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  array attn_out = paged_attention(
+      q,
+      k_pool,
+      v_pool,
+      block_table,
+      seq_lens,
+      k_scale,
+      v_scale,
+      /*scale=*/0.125f,
+      /*softcap=*/0.0f,
+      /*sliding_window=*/0,
+      /*block_size=*/kBlockSize,
+      /*num_q_heads=*/kNumQHeads,
+      /*num_kv_heads=*/kNumKvHeads,
+      /*head_size=*/kHeadSize,
+      KvDtype::Bf16,
+      StreamOrDevice{});
+
+  try {
+    mlx::core::eval(attn_out);
+  } catch (const std::invalid_argument& /*e*/) {
+    return 1;
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_attention_eval] eval threw a non-invalid_argument: %s\n",
+        e.what());
+    return 0;
+  }
+  return 0;
+}
+
+/// Trace function for the compile-cached `paged_attention` OOB test.
+/// Hard-coded scalars match `call_paged_attention_eval_expecting_throw`
+/// so the cache key is consistent across compile+replay.
+std::vector<mlx::core::array> paged_attention_oob_trace_fn(
+    const std::vector<mlx::core::array>& inputs) {
+  using namespace mlx::core::fast;
+  if (inputs.size() != 7) {
+    throw std::runtime_error("paged_attention_oob_trace_fn: expected 7 inputs");
+  }
+  auto out = paged_attention(
+      inputs[0], // q
+      inputs[1], // k_pool
+      inputs[2], // v_pool
+      inputs[3], // block_table
+      inputs[4], // seq_lens
+      inputs[5], // k_scale
+      inputs[6], // v_scale
+      /*scale=*/0.125f,
+      /*softcap=*/0.0f,
+      /*sliding_window=*/0,
+      /*block_size=*/16,
+      /*num_q_heads=*/8,
+      /*num_kv_heads=*/4,
+      /*head_size=*/64,
+      KvDtype::Bf16,
+      /*s=*/{});
+  return {out};
+}
+
+} // namespace
+
+extern "C" {
+
+/// seq_lens with a negative entry must be rejected by eval_gpu's
+/// runtime bounds check.
+int mlx_paged_attention_eval_gpu_rejects_negative_seq_len() {
+  // max_blocks_per_seq=4. seq_lens=[-1] is an invalid (negative)
+  // context length; the kernel would reinterpret it as a huge
+  // unsigned value.
+  std::vector<int32_t> seq_lens_host = {-1};
+  std::vector<int32_t> block_table_host = {0, 0, 0, 0};
+  return call_paged_attention_eval_expecting_throw(
+      seq_lens_host, block_table_host, /*max_blocks_per_seq=*/4);
+}
+
+/// seq_lens larger than `max_blocks_per_seq * block_size` must be
+/// rejected by eval_gpu's runtime bounds check.
+int mlx_paged_attention_eval_gpu_rejects_oversized_seq_len() {
+  // max_blocks_per_seq=4, block_size=16 → bound = 64. seq_lens=[65]
+  // exceeds the bound; the kernel would read past the row's
+  // block-table region.
+  std::vector<int32_t> seq_lens_host = {4 * 16 + 1};
+  std::vector<int32_t> block_table_host = {0, 0, 0, 0};
+  return call_paged_attention_eval_expecting_throw(
+      seq_lens_host, block_table_host, /*max_blocks_per_seq=*/4);
+}
+
+/// block_table with a negative entry (within the "used" region for
+/// that row) must be rejected by eval_gpu's runtime bounds check.
+int mlx_paged_attention_eval_gpu_rejects_negative_block_id() {
+  // seq_lens=[16] → num_used_blocks = ceil(16/16) = 1 → only j=0 is
+  // checked. block_table[0,0]=-2 is out of [0, num_blocks=4).
+  std::vector<int32_t> seq_lens_host = {16};
+  std::vector<int32_t> block_table_host = {-2, 0, 0, 0};
+  return call_paged_attention_eval_expecting_throw(
+      seq_lens_host, block_table_host, /*max_blocks_per_seq=*/4);
+}
+
+/// block_table with an entry == num_blocks (one past valid) must be
+/// rejected by eval_gpu's runtime bounds check.
+int mlx_paged_attention_eval_gpu_rejects_oob_block_id() {
+  // seq_lens=[16] → num_used_blocks = 1 → only j=0 is checked.
+  // num_blocks=4, so block_table[0,0]=4 is one past valid.
+  std::vector<int32_t> seq_lens_host = {16};
+  std::vector<int32_t> block_table_host = {4, 0, 0, 0};
+  return call_paged_attention_eval_expecting_throw(
+      seq_lens_host, block_table_host, /*max_blocks_per_seq=*/4);
+}
+
+/// Compile a `paged_attention`-emitting function, call it once with
+/// valid inputs (cache miss → factory check passes, eval_gpu check
+/// passes on valid block ids), then call it again with the SAME shapes
+/// but an out-of-range block id. Cache HIT bypasses the factory; the
+/// eval_gpu runtime bounds check MUST throw on the second eval.
+///
+/// Layout matches `mlx_paged_attention_eval_gpu_rejects_*`.
+///
+/// Return codes:
+///   1   — second-call eval threw `std::invalid_argument` (fix
+///         working — the compile-cached path is bounds-checked).
+///   0   — second-call eval did NOT throw (regression — the
+///         out-of-range block id reached the kernel).
+///  -1   — internal/setup error (first call failed unexpectedly).
+///  -3   — Metal not available; eval-based verification skipped.
+int mlx_paged_attention_compile_cached_oob_throws() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  const int kBlockSize = 16;
+  const int kNumKvHeads = 4;
+  const int kHeadSize = 64;
+  const int kXPack = 8;
+  const int kNumBlocks = 4;
+  const int kNumQHeads = 8;
+  const int kNumSeqs = 1;
+  const int kMaxBlocksPerSeq = 4;
+
+  const size_t k_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      (kHeadSize / kXPack) * kBlockSize * kXPack;
+  const size_t v_pool_elems = static_cast<size_t>(kNumBlocks) * kNumKvHeads *
+      kHeadSize * kBlockSize;
+  const size_t q_elems =
+      static_cast<size_t>(kNumSeqs) * kNumQHeads * kHeadSize;
+
+  std::vector<uint16_t> k_pool_host(k_pool_elems, 0);
+  std::vector<uint16_t> v_pool_host(v_pool_elems, 0);
+  std::vector<uint16_t> q_host(q_elems, 0x3F80); // bf16(1.0)
+
+  auto bf16_arr = [](const std::vector<uint16_t>& src, Shape shape) {
+    auto* p = reinterpret_cast<const bfloat16_t*>(src.data());
+    return array(p, std::move(shape), bfloat16);
+  };
+  auto i32_arr = [](const std::vector<int32_t>& src, Shape shape) {
+    return array(src.data(), std::move(shape), int32);
+  };
+
+  Shape k_pool_shape{kNumBlocks, kNumKvHeads, kHeadSize / kXPack, kBlockSize,
+      kXPack};
+  Shape v_pool_shape{kNumBlocks, kNumKvHeads, kHeadSize, kBlockSize};
+  Shape q_shape{kNumSeqs, kNumQHeads, kHeadSize};
+
+  array q = bf16_arr(q_host, q_shape);
+  array k_pool = bf16_arr(k_pool_host, k_pool_shape);
+  array v_pool = bf16_arr(v_pool_host, v_pool_shape);
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  auto compiled = mlx::core::compile(&paged_attention_oob_trace_fn);
+
+  // First call: valid block_table=[0, 0, 0, 0], seq_lens=[16]. Block
+  // id 0 is in [0, num_blocks=4) and seq_len=16 is within
+  // max_blocks_per_seq * block_size = 64.
+  std::vector<int32_t> good_seq_lens = {16};
+  std::vector<int32_t> good_block_table = {0, 0, 0, 0};
+  array seq_lens_good = i32_arr(good_seq_lens, Shape{kNumSeqs});
+  array block_table_good = i32_arr(
+      good_block_table, Shape{kNumSeqs, kMaxBlocksPerSeq});
+
+  std::vector<array> inputs1{
+      q, k_pool, v_pool, block_table_good, seq_lens_good, k_scale, v_scale};
+
+  std::vector<array> outputs1;
+  try {
+    outputs1 = compiled(inputs1);
+    if (outputs1.size() != 1) {
+      return -1;
+    }
+    mlx::core::eval(outputs1[0]);
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_attention_compile_cached_oob] first call (valid inputs) "
+        "threw unexpectedly: %s\n",
+        e.what());
+    return -1;
+  }
+
+  // Second call: same shapes, but block_table[0,0] = num_blocks = 4
+  // (one past valid). Cache HIT bypasses the factory; eval_gpu's
+  // bounds check MUST throw.
+  std::vector<int32_t> bad_block_table = {kNumBlocks, 0, 0, 0};
+  array block_table_bad = i32_arr(
+      bad_block_table, Shape{kNumSeqs, kMaxBlocksPerSeq});
+  std::vector<array> inputs2{
+      q, k_pool, v_pool, block_table_bad, seq_lens_good, k_scale, v_scale};
+
+  std::vector<array> outputs2;
+  try {
+    outputs2 = compiled(inputs2);
+    if (outputs2.size() != 1) {
+      return -1;
+    }
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_attention_compile_cached_oob] second call (compile) threw "
+        "early: %s\n",
+        e.what());
+    return -1;
+  }
+
+  // The throw should fire on eval, not on the compiled() lambda call
+  // itself.
+  try {
+    mlx::core::eval(outputs2[0]);
+  } catch (const std::invalid_argument& /*e*/) {
+    return 1; // SUCCESS — eval_gpu caught the out-of-range block id.
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[paged_attention_compile_cached_oob] second-call eval threw a "
+        "non-invalid_argument: %s\n",
+        e.what());
+    return 0;
+  }
+  fprintf(
+      stderr,
+      "[paged_attention_compile_cached_oob] second-call eval did NOT throw "
+      "— the compile-cached path is missing its block-id bounds check\n");
   return 0;
 }
 
