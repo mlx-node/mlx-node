@@ -1694,6 +1694,13 @@ unsafe extern "C-unwind" {
     /// `linear_cache_arrays` is a `2 * num_layers` array of
     /// `(conv_state, recurrent_state)` pairs; full-attn slots are
     /// ignored. Pass null for the entire array to skip seeding.
+    ///
+    /// Returns `0` on success, `-1` on failure (e.g. missing pool/scale
+    /// handles, exception during graph build). On failure the C++ side
+    /// clears `g_paged_inited` and emits a stderr diagnostic. The Rust
+    /// caller MUST inspect the return value and fall back to the pure-Rust
+    /// paged path on `-1`; entering the compiled paged decode after init
+    /// failure dispatches against uninitialized globals.
     pub fn mlx_qwen35_moe_init_paged(
         num_layers: i32,
         hidden_size: i32,
@@ -1724,7 +1731,7 @@ unsafe extern "C-unwind" {
         v_scale_handles: *mut *mut mlx_array,
         linear_cache_arrays: *mut *mut mlx_array,
         prefill_offset: i32,
-    );
+    ) -> i32;
 
     /// Single-token paged decode step. Sets `*output_logits` to a heap-
     /// allocated `mlx_array*` (caller owns) on success, or `nullptr` on

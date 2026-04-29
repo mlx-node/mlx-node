@@ -1529,10 +1529,17 @@ impl Qwen35MoeInner {
         // paged decode (fallback). C++ paged needs:
         // 1. `use_cpp_paged` (weights still registered for our model_id —
         //    re-validated under `COMPILED_WEIGHTS_RWLOCK` in the caller).
-        // 2. `init_paged_moe_compiled_session` to succeed (every linear
+        // 2. `adapter.block_size() == 16`. The compiled C++ paged graph
+        //    in `mlx_qwen35_moe.cpp` hard-codes `block_size = 16` (see
+        //    `attn_for_compile_paged` in `mlx_qwen35_common.h` and the
+        //    docstring on `mlx_qwen35_moe_init_paged`). Any other value
+        //    would have Rust encode slot/block tables at the adapter's
+        //    block size while C++ writes/reads at 16, corrupting KV.
+        // 3. `init_paged_moe_compiled_session` to succeed (every linear
         //    layer must have populated conv/recurrent state from the
         //    pure-Rust GDN forward above; every full-attn layer must
-        //    have a usable `LayerKVPool` slot).
+        //    have a usable `LayerKVPool` slot, and the C++ `g_paged_inited`
+        //    must be set after init catches no exceptions).
         // The `MoeResetGuard` ensures `mlx_qwen35_moe_reset()` runs on
         // any exit path so the next session starts with cleared
         // `g_paged_*` globals (`g_paged_inited == false`).
@@ -1548,9 +1555,25 @@ impl Qwen35MoeInner {
                     "MoE chat_sync_core_paged_inner: paged_adapter dropped post-prefill",
                 )
             })?;
-            let prefill_offset = adapter_ref.current_token_count() as i32;
-            init_paged_moe_compiled_session(&self.config, caches_ref, adapter_ref, prefill_offset)
+            if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
+                eprintln!(
+                    "[MLX] Qwen3_5MoE: skipping C++ compiled paged decode — \
+                     adapter block_size={} but compiled graph requires {}; \
+                     falling back to pure-Rust paged decode",
+                    adapter_ref.block_size(),
+                    CPP_PAGED_REQUIRED_BLOCK_SIZE
+                );
+                false
+            } else {
+                let prefill_offset = adapter_ref.current_token_count() as i32;
+                init_paged_moe_compiled_session(
+                    &self.config,
+                    caches_ref,
+                    adapter_ref,
+                    prefill_offset,
+                )
                 .is_ok()
+            }
         } else {
             false
         };
@@ -2016,9 +2039,25 @@ impl Qwen35MoeInner {
                     "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped post-prefill",
                 )
             })?;
-            let prefill_offset = adapter_ref.current_token_count() as i32;
-            init_paged_moe_compiled_session(&self.config, caches_ref, adapter_ref, prefill_offset)
+            if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
+                eprintln!(
+                    "[MLX] Qwen3_5MoE: skipping C++ compiled paged decode — \
+                     adapter block_size={} but compiled graph requires {}; \
+                     falling back to pure-Rust paged decode",
+                    adapter_ref.block_size(),
+                    CPP_PAGED_REQUIRED_BLOCK_SIZE
+                );
+                false
+            } else {
+                let prefill_offset = adapter_ref.current_token_count() as i32;
+                init_paged_moe_compiled_session(
+                    &self.config,
+                    caches_ref,
+                    adapter_ref,
+                    prefill_offset,
+                )
                 .is_ok()
+            }
         } else {
             false
         };
@@ -6439,6 +6478,19 @@ fn eval_token_and_moe_caches(next_token: &MxArray) {
     }
 }
 
+/// Block size hard-coded into the compiled C++ paged graph
+/// (`mlx_qwen35_moe.cpp` — see `attn_for_compile_paged` and the
+/// `mlx_qwen35_moe_init_paged` docstring). The Rust adapter supports
+/// configurable block sizes via `Qwen3_5MoeConfig::paged_block_size`,
+/// but the compiled graph traces against block_size=16 baked into the
+/// `paged_kv_write` / `paged_attention` kernel calls. Mismatched values
+/// would have Rust encode slot/block tables at the adapter's block size
+/// while C++ writes/reads at 16, corrupting KV state. The compile-branch
+/// selectors (`chat_sync_core_paged_inner` / `chat_stream_sync_core_paged_inner`)
+/// gate `cpp_session_ready` on this equality and fall back to the
+/// pure-Rust paged path when the adapter is configured otherwise.
+pub(crate) const CPP_PAGED_REQUIRED_BLOCK_SIZE: u32 = 16;
+
 /// Initialize the C++ paged forward graph from the live `paged_adapter`
 /// pool/scale arrays AND the per-layer linear-attention recurrent caches
 /// already populated by the pure-Rust paged prefill.
@@ -6473,10 +6525,13 @@ fn eval_token_and_moe_caches(next_token: &MxArray) {
 /// graph's `g_paged_offset_int` will start incrementing from. After a
 /// fresh prefill it equals `current_token_count`.
 ///
-/// On any failure (missing linear cache, missing pool/scale handle), the
-/// helper returns an `Err` so the caller can fall back to the pure-Rust
-/// paged decode path. Mirrors the `mlx_qwen35_moe_init_paged` exception
-/// safety: a non-OK return leaves `g_paged_inited == false`.
+/// On any failure (missing linear cache, missing pool/scale handle, or
+/// the C++ FFI returning a non-zero status), the helper returns `Err`
+/// so the caller can fall back to the pure-Rust paged decode path.
+/// Mirrors the `mlx_qwen35_moe_init_paged` exception safety: a non-OK
+/// return leaves `g_paged_inited == false` on the C++ side, AND the
+/// status code is now propagated back to Rust (Phase 4 piece 3 review
+/// fix) so a failed init can never be mistaken for a successful one.
 fn init_paged_moe_compiled_session(
     config: &Qwen3_5MoeConfig,
     caches: &[Qwen3_5LayerCache],
@@ -6594,7 +6649,7 @@ fn init_paged_moe_compiled_session(
 
     let mlp_only: Vec<i32> = config.mlp_only_layers.as_deref().unwrap_or(&[]).to_vec();
 
-    unsafe {
+    let status = unsafe {
         mlx_sys::mlx_qwen35_moe_init_paged(
             config.num_layers,
             config.hidden_size,
@@ -6633,12 +6688,27 @@ fn init_paged_moe_compiled_session(
             v_scale_handles.as_mut_ptr(),
             linear_cache_handles.as_mut_ptr(),
             prefill_offset,
-        );
-    }
+        )
+    };
 
     // held_arrays drops here; refcounts on the wrapped Metal buffers
     // settle to whatever the C++ side bumped them to.
     drop(held_arrays);
+
+    // The C++ side returns 0 on success, -1 on failure. Failure paths
+    // include missing pool/scale handles for full-attention layers and
+    // any exception caught during graph build (compiled trace, RNG split,
+    // etc.). On failure `g_paged_inited` is left cleared so subsequent
+    // `mlx_qwen35_moe_forward_paged` calls would null-out their logits;
+    // surfacing the failure here lets the dispatcher fall back to the
+    // pure-Rust paged path before any decode-step FFI is dispatched.
+    if status != 0 {
+        return Err(Error::from_reason(format!(
+            "init_paged_moe_compiled_session: mlx_qwen35_moe_init_paged returned status={status} \
+             (expected 0); see stderr for the C++ diagnostic. Caller must fall back to the \
+             pure-Rust paged path."
+        )));
+    }
 
     Ok(())
 }
@@ -7018,5 +7088,179 @@ mod paged_construction_tests {
             msg.contains("caches.len()"),
             "error must reference caches length contract; got: {msg}"
         );
+    }
+
+    /// Phase 4 piece 3 review fix (Finding 1): the C++ compiled paged
+    /// graph hard-codes block_size=16. The dispatcher MUST gate
+    /// `cpp_session_ready` on `adapter.block_size() == 16` so a config
+    /// with `paged_block_size: Some(8)` (or 32) falls back to the
+    /// pure-Rust paged path instead of corrupting KV state by mixing
+    /// adapter-encoded slot/block tables (block_size=8) with
+    /// C++-decoded writes (block_size=16).
+    ///
+    /// This test validates the constant + adapter-side contract: the
+    /// FFI compile-key constant is 16, an adapter built with
+    /// `paged_block_size: Some(8)` reports `block_size() == 8`, and the
+    /// equality check the dispatcher uses (`!=`) correctly identifies
+    /// the mismatch. Exercising the dispatcher itself requires loaded
+    /// model weights (covered indirectly by the parity test).
+    #[test]
+    fn test_cpp_paged_required_block_size_is_sixteen() {
+        // The C++ compile-graph constant. If this ever changes (e.g.
+        // we re-trace at block_size=32 for a future tier), the
+        // dispatcher gate, the FFI docstrings in `mlx_qwen35_moe.cpp`,
+        // and the `paged_block_size` validation in PagedKVCacheAdapter
+        // must all agree.
+        assert_eq!(
+            CPP_PAGED_REQUIRED_BLOCK_SIZE, 16,
+            "C++ compiled paged graph in mlx_qwen35_moe.cpp hard-codes block_size=16; \
+             changing this constant requires re-tracing the compiled graph"
+        );
+    }
+
+    /// Build an adapter with `block_size != 16` and verify that the
+    /// dispatcher gate (`adapter.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE`)
+    /// would correctly reject it. The gate runs BEFORE
+    /// `init_paged_moe_compiled_session` is called, so the FFI is never
+    /// touched on the fallback path. Exercises the test-only
+    /// `LayerKVPool::new_for_test` constructor since we don't need real
+    /// Metal allocations to validate the gate logic.
+    #[test]
+    fn test_block_size_eight_adapter_falls_back_to_pure_rust() {
+        let cfg = tiny_moe_cfg(true);
+        // Build an adapter that reports block_size=8 (a valid
+        // `PagedAttentionConfig::validate` value, but mismatched with
+        // the compiled graph's hard-coded 16).
+        let alloc = std::sync::Arc::new(std::sync::Mutex::new(
+            mlx_paged_attn::BlockAllocator::new(2, 8),
+        ));
+        let pa_cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 8,
+            head_size: cfg.head_dim as u32,
+            num_kv_heads: cfg.num_kv_heads as u32,
+            num_layers: cfg.full_attention_layer_count() as u32,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        // `new_for_test` skips full GPU-buffer allocation but still
+        // allocates 1-byte placeholder buffers on macOS so
+        // `key_cache_array_raw` returns Some. We never dispatch a
+        // kernel against this pool — the gate check fires first.
+        let pool = match mlx_paged_attn::LayerKVPool::new_for_test(
+            pa_cfg,
+            2,
+            cfg.full_attention_layer_count() as u32,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_block_size_eight_adapter_falls_back_to_pure_rust: {e}");
+                return;
+            }
+        };
+        let adapter = PagedKVCacheAdapter::new(alloc, pool, 8)
+            .expect("PagedKVCacheAdapter::new must accept block_size=8 (validated by adapter)");
+        assert_eq!(
+            adapter.block_size(),
+            8,
+            "adapter must report the block_size it was constructed with"
+        );
+        // Simulate the dispatcher's gate. We do NOT call
+        // `init_paged_moe_compiled_session` here — that's exactly
+        // what the gate prevents.
+        assert_ne!(
+            adapter.block_size(),
+            CPP_PAGED_REQUIRED_BLOCK_SIZE,
+            "block_size=8 adapter must not match the compiled graph's hard-coded 16; \
+             the dispatcher gate at chat_sync_core_paged_inner / chat_stream_sync_core_paged_inner \
+             relies on this inequality to fall back to the pure-Rust paged path"
+        );
+    }
+
+    /// Phase 4 piece 3 review fix (Finding 2): the C++ FFI now returns
+    /// `int32_t` (0 success / -1 failure) instead of `void`. The Rust
+    /// `init_paged_moe_compiled_session` propagates non-zero status as
+    /// `Err` so the dispatcher's `cpp_session_ready` becomes false on
+    /// init failure and falls back to the pure-Rust paged decode. This
+    /// test forces the C++ side's null-handle rejection branch by
+    /// passing null pool handles for the full-attention layers, and
+    /// asserts the FFI returns -1 (post-fix) instead of silently
+    /// succeeding (pre-fix).
+    ///
+    /// Note: this test bypasses `init_paged_moe_compiled_session` and
+    /// calls the FFI directly with synthetic null handles, because the
+    /// helper would otherwise fail at `key_pool_array(...)` BEFORE
+    /// reaching the FFI when the adapter's pool is unavailable. The
+    /// goal here is to verify the FFI's status contract — the helper's
+    /// guard is exercised by
+    /// `test_init_paged_moe_compiled_session_rejects_cache_length_mismatch`.
+    #[test]
+    fn test_mlx_qwen35_moe_init_paged_returns_negative_on_null_handles() {
+        let cfg = tiny_moe_cfg(true);
+        let num_layers = cfg.num_layers as usize;
+        // All-null pool/scale handles. The C++ side iterates layers
+        // [0..num_layers); for each non-linear (full-attention) layer
+        // the null-handle check fires and the function returns -1.
+        // Layer 0 with full_attention_interval=4 is linear, so the
+        // first full-attn layer is at index 3, where the rejection
+        // fires.
+        let mut k_pool: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
+        let mut v_pool: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
+        let mut k_scale: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
+        let mut v_scale: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
+        let mut linear_caches: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); num_layers * 2];
+
+        let mlp_only: Vec<i32> = cfg.mlp_only_layers.as_deref().unwrap_or(&[]).to_vec();
+        let status = unsafe {
+            mlx_sys::mlx_qwen35_moe_init_paged(
+                cfg.num_layers,
+                cfg.hidden_size,
+                cfg.num_heads,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                cfg.rope_theta as f32,
+                cfg.rope_dims(),
+                cfg.rms_norm_eps as f32,
+                cfg.full_attention_interval,
+                cfg.linear_num_key_heads,
+                cfg.linear_num_value_heads,
+                cfg.linear_key_head_dim,
+                cfg.linear_value_head_dim,
+                cfg.linear_conv_kernel_dim,
+                if cfg.tie_word_embeddings { 1 } else { 0 },
+                cfg.max_position_embeddings,
+                1,
+                cfg.num_experts,
+                cfg.num_experts_per_tok,
+                if cfg.norm_topk_prob { 1 } else { 0 },
+                cfg.decoder_sparse_step,
+                if mlp_only.is_empty() {
+                    std::ptr::null()
+                } else {
+                    mlp_only.as_ptr()
+                },
+                mlp_only.len() as i32,
+                k_pool.as_mut_ptr(),
+                v_pool.as_mut_ptr(),
+                k_scale.as_mut_ptr(),
+                v_scale.as_mut_ptr(),
+                linear_caches.as_mut_ptr(),
+                0,
+            )
+        };
+        assert_eq!(
+            status, -1,
+            "mlx_qwen35_moe_init_paged MUST return -1 when full-attention pool/scale handles \
+             are null. Returning 0 (or void, pre-fix) would let the dispatcher enter the \
+             compiled paged decode against uninitialized globals."
+        );
+        // Reset C++ globals to a clean state so the test doesn't
+        // contaminate any later tests in the same process.
+        unsafe {
+            mlx_sys::mlx_qwen35_moe_reset();
+        }
     }
 }

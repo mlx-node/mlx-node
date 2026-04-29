@@ -1049,7 +1049,13 @@ void mlx_qwen35_moe_adjust_offset(int delta) {
 // dimensions threaded into `PagedAttentionInputs` (see `mlx_common.h`).
 // They become part of the compile-cache key — re-tracing with different
 // values yields a new compiled graph.
-void mlx_qwen35_moe_init_paged(
+//
+// Returns 0 on success; -1 on failure. On failure `g_paged_inited` is
+// cleared and a stderr diagnostic is emitted; the Rust caller MUST
+// inspect the return value and fall back to the pure-Rust paged path
+// rather than entering the compiled paged decode (which would dispatch
+// against uninitialized globals).
+int32_t mlx_qwen35_moe_init_paged(
     // BaseConfig params (mirrors the flat init)
     int num_layers,
     int hidden_size,
@@ -1133,7 +1139,7 @@ void mlx_qwen35_moe_init_paged(
             !k_scale_handles[i] || !v_scale_handles[i]) {
           g_paged_inited = false;
           std::cerr << "[MLX] mlx_qwen35_moe_init_paged: missing pool/scale handle for full-attn layer " << i << std::endl;
-          return;
+          return -1;
         }
         g_k_pools.push_back(*reinterpret_cast<array*>(k_pool_handles[i]));
         g_v_pools.push_back(*reinterpret_cast<array*>(v_pool_handles[i]));
@@ -1230,12 +1236,15 @@ void mlx_qwen35_moe_init_paged(
     // Break the lazy RNG split chain
     auto rng_key = mlx::core::random::KeySequence::default_().next();
     mlx::core::eval({rng_key});
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] mlx_qwen35_moe_init_paged: " << e.what() << std::endl;
     g_paged_inited = false;
+    return -1;
   } catch (...) {
     std::cerr << "[MLX] mlx_qwen35_moe_init_paged: unknown exception" << std::endl;
     g_paged_inited = false;
+    return -1;
   }
 }
 
