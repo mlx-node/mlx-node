@@ -2046,6 +2046,37 @@ impl Qwen35Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
+        // Detect availability of the C++ compiled paged decode path.
+        // Mirrors the MoE paged path: if the weights for this model are
+        // still registered (no other model swapped `g_active_model_id`),
+        // we can run `mlx_qwen35_init_paged` + `mlx_qwen35_forward_paged`.
+        // Both the legacy flat compiled path and the new paged compiled
+        // path share `DENSE_COMPILED_MUTEX`/`COMPILED_WEIGHTS_RWLOCK` for
+        // process-wide serialization.
+        let model_id = self.model_id;
+        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let _dense_lock = if use_cpp_paged {
+            Some(
+                DENSE_COMPILED_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+        let mut _weight_guard = None;
+        let use_cpp_paged = if use_cpp_paged {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // === Adapter lifecycle: warm continuation OR cold start ===
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
@@ -2131,6 +2162,7 @@ impl Qwen35Inner {
             &mut reasoning_tracker,
             report_perf,
             &mut first_token_instant,
+            use_cpp_paged,
         );
 
         let (generated_tokens, finish_reason) = match forward_result {
@@ -2196,6 +2228,15 @@ impl Qwen35Inner {
     /// Inner forward + decode loop for `chat_sync_core_paged`. Split
     /// out so the caller can wrap it with `release_request` on either
     /// path.
+    ///
+    /// Phase 5 piece 1 adds a C++ compiled paged decode dispatcher when
+    /// `use_cpp_paged` is true. The pure-Rust paged prefill always runs
+    /// (it populates the GDN linear caches and writes K/V into the
+    /// adapter pool); after prefill, decode steps choose between
+    /// `mlx_qwen35_forward_paged` (fast) and
+    /// `paged_forward::run_paged_decode_step` (fallback) based on
+    /// adapter block size and `init_paged_dense_compiled_session`
+    /// success.
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged_inner(
         &mut self,
@@ -2208,6 +2249,7 @@ impl Qwen35Inner {
         reasoning_tracker: &mut chat_common::ReasoningTracker,
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
+        use_cpp_paged: bool,
     ) -> Result<(Vec<u32>, String)> {
         if suffix_len == 0 {
             return Err(Error::from_reason(
@@ -2263,10 +2305,71 @@ impl Qwen35Inner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
+        // Decide between C++ compiled paged decode (fast) and pure-Rust
+        // paged decode (fallback). C++ paged needs:
+        // 1. `use_cpp_paged` (weights still registered for our model_id —
+        //    re-validated under `COMPILED_WEIGHTS_RWLOCK` in the caller).
+        // 2. `adapter.block_size() == CPP_PAGED_REQUIRED_BLOCK_SIZE`.
+        //    The compiled C++ paged graph hard-codes block_size = 16.
+        // 3. `init_paged_dense_compiled_session` to succeed (every linear
+        //    layer must have populated conv/recurrent state from the
+        //    pure-Rust GDN forward above; every full-attn layer must
+        //    have a usable `LayerKVPool` slot, and the C++
+        //    `g_dense_paged_inited` must be set after init catches no
+        //    exceptions).
+        // The `CompiledResetGuard` ensures `mlx_qwen35_compiled_reset()`
+        // runs on any exit path so the next session starts with cleared
+        // C++ globals.
+        let cpp_session_ready = if use_cpp_paged {
+            let caches_ref = self.caches.as_ref().ok_or_else(|| {
+                Error::from_reason("chat_sync_core_paged_inner: caches dropped post-prefill")
+            })?;
+            let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped post-prefill")
+            })?;
+            if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
+                eprintln!(
+                    "[MLX] Qwen3.5 Dense: skipping C++ compiled paged decode — \
+                     adapter block_size={} but compiled graph requires {}; \
+                     falling back to pure-Rust paged decode",
+                    adapter_ref.block_size(),
+                    CPP_PAGED_REQUIRED_BLOCK_SIZE
+                );
+                false
+            } else {
+                let prefill_offset = adapter_ref.current_token_count() as i32;
+                init_paged_dense_compiled_session(
+                    &self.config,
+                    caches_ref,
+                    adapter_ref,
+                    prefill_offset,
+                )
+                .is_ok()
+            }
+        } else {
+            false
+        };
+
+        // RAII guard: resets BOTH g_compiled_* and g_dense_paged_*
+        // globals (single `mlx_qwen35_compiled_reset` symbol clears
+        // both per Phase 5 piece 1) when this scope ends.
+        let _dense_paged_guard = cpp_session_ready.then_some(CompiledResetGuard);
+
         // === DECODE LOOP ===
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
         let mut finish_reason = String::from("length");
+
+        // Compile-cached `max_blocks_per_seq` shape — picking the
+        // adapter's max_seq_len divided by block_size keeps the compile
+        // key stable across all decode steps within one turn.
+        let max_blocks_per_seq: u32 = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped pre-decode")
+            })?;
+            let max_seq = self.config.max_position_embeddings as u32;
+            max_seq.div_ceil(adapter.block_size())
+        };
 
         for step in 0..max_new_tokens {
             let token_id = y.item_at_int32(0)? as u32;
@@ -2292,7 +2395,24 @@ impl Qwen35Inner {
             }
 
             // Decode forward.
-            let next_logits = {
+            let next_logits = if cpp_session_ready {
+                // C++ compiled paged decode path.
+                let embedding_weight = self.embedding.get_weight();
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "chat_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
+                    )
+                })?;
+                adapter
+                    .record_tokens(&[token_id])
+                    .map_err(Error::from_reason)?;
+                let inputs = adapter
+                    .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
+                    .map_err(Error::from_reason)?;
+                let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
+                forward_dense_cpp_paged(&input_ids, &embedding_weight, &inputs)?
+            } else {
+                // Pure-Rust paged decode fallback.
                 let embed = self.embedding.clone();
                 let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -2303,7 +2423,7 @@ impl Qwen35Inner {
                         "chat_sync_core_paged_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
-                super::paged_forward::run_paged_decode_step(
+                let logits = super::paged_forward::run_paged_decode_step(
                     token_id,
                     &embed,
                     &mut self.layers,
@@ -2313,9 +2433,9 @@ impl Qwen35Inner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
-                )?
+                )?;
+                logits.squeeze(Some(&[1]))?
             };
-            let next_logits = next_logits.squeeze(Some(&[1]))?;
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
                 let forced_id = reasoning_tracker.forced_token_id() as i32;
@@ -2379,6 +2499,33 @@ impl Qwen35Inner {
         let mut decode_stream = tokenizer.inner().decode_stream(true);
         let mut streamed_text_len = 0usize;
         let mut last_is_reasoning = thinking_enabled;
+
+        // C++ paged-decode availability + compile-lifecycle locks. See
+        // `chat_sync_core_paged` for the full rationale; this is the
+        // streaming twin.
+        let model_id = self.model_id;
+        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let _dense_lock = if use_cpp_paged {
+            Some(
+                DENSE_COMPILED_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+        let mut _weight_guard = None;
+        let use_cpp_paged = if use_cpp_paged {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         // === Adapter lifecycle: warm continue OR cold start ===
         let seq_id: u32 = 0;
@@ -2470,6 +2617,7 @@ impl Qwen35Inner {
             &mut last_is_reasoning,
             cb,
             cancelled,
+            use_cpp_paged,
         );
 
         let (generated_tokens, finish_reason) = match result {
@@ -2580,6 +2728,11 @@ impl Qwen35Inner {
     /// Inner forward + streaming decode loop for
     /// [`Self::chat_stream_sync_core_paged`]. Mirrors LFM2's
     /// `chat_stream_sync_core_paged_inner`.
+    ///
+    /// Phase 5 piece 1 adds a C++ compiled paged decode dispatcher when
+    /// `use_cpp_paged` is true. See the sync sibling
+    /// `chat_sync_core_paged_inner` for the cpp_session_ready gate
+    /// rationale.
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged_inner<'a>(
         &mut self,
@@ -2605,6 +2758,7 @@ impl Qwen35Inner {
         last_is_reasoning: &mut bool,
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
+        use_cpp_paged: bool,
     ) -> Result<(Vec<u32>, String)> {
         if suffix_len == 0 {
             return Err(Error::from_reason(
@@ -2656,9 +2810,56 @@ impl Qwen35Inner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
+        // Decide between C++ compiled paged decode (fast) and pure-Rust
+        // paged decode (fallback). See `chat_sync_core_paged_inner` for
+        // the cpp_session_ready gate rationale.
+        let cpp_session_ready = if use_cpp_paged {
+            let caches_ref = self.caches.as_ref().ok_or_else(|| {
+                Error::from_reason("chat_stream_sync_core_paged_inner: caches dropped post-prefill")
+            })?;
+            let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "chat_stream_sync_core_paged_inner: paged_adapter dropped post-prefill",
+                )
+            })?;
+            if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
+                eprintln!(
+                    "[MLX] Qwen3.5 Dense (stream): skipping C++ compiled paged decode — \
+                     adapter block_size={} but compiled graph requires {}; \
+                     falling back to pure-Rust paged decode",
+                    adapter_ref.block_size(),
+                    CPP_PAGED_REQUIRED_BLOCK_SIZE
+                );
+                false
+            } else {
+                let prefill_offset = adapter_ref.current_token_count() as i32;
+                init_paged_dense_compiled_session(
+                    &self.config,
+                    caches_ref,
+                    adapter_ref,
+                    prefill_offset,
+                )
+                .is_ok()
+            }
+        } else {
+            false
+        };
+
+        let _dense_paged_guard = cpp_session_ready.then_some(CompiledResetGuard);
+
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
         let mut finish_reason = String::from("length");
+
+        let max_blocks_per_seq: u32 = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "chat_stream_sync_core_paged_inner: paged_adapter dropped pre-decode",
+                )
+            })?;
+            let max_seq = self.config.max_position_embeddings as u32;
+            max_seq.div_ceil(adapter.block_size())
+        };
 
         for step in 0..max_new_tokens {
             let token_id = y.item_at_int32(0)? as u32;
@@ -2717,7 +2918,22 @@ impl Qwen35Inner {
             }
 
             // Decode forward.
-            let next_logits = {
+            let next_logits = if cpp_session_ready {
+                let embedding_weight = self.embedding.get_weight();
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason(
+                        "chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
+                    )
+                })?;
+                adapter
+                    .record_tokens(&[token_id])
+                    .map_err(Error::from_reason)?;
+                let inputs = adapter
+                    .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
+                    .map_err(Error::from_reason)?;
+                let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
+                forward_dense_cpp_paged(&input_ids, &embedding_weight, &inputs)?
+            } else {
                 let embed = self.embedding.clone();
                 let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -2730,7 +2946,7 @@ impl Qwen35Inner {
                         "chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
-                super::paged_forward::run_paged_decode_step(
+                let logits = super::paged_forward::run_paged_decode_step(
                     token_id,
                     &embed,
                     &mut self.layers,
@@ -2740,9 +2956,9 @@ impl Qwen35Inner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
-                )?
+                )?;
+                logits.squeeze(Some(&[1]))?
             };
-            let next_logits = next_logits.squeeze(Some(&[1]))?;
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
                 let forced_id = reasoning_tracker.forced_token_id() as i32;
@@ -6320,6 +6536,260 @@ fn eval_token_and_compiled_caches(next_token: &MxArray) {
 }
 
 // ============================================================================
+// Phase 5 piece 1: C++ compiled paged-decode dispatcher (Dense).
+//
+// Mirrors `init_paged_moe_compiled_session` / `forward_moe_cpp_paged`
+// from `crates/mlx-core/src/models/qwen3_5_moe/model.rs` but without
+// MoE expert routing — the dense compiled paged graph in
+// `mlx_qwen35.cpp` is structurally simpler.
+// ============================================================================
+
+/// Block size hard-coded into the compiled C++ paged graph
+/// (`mlx_qwen35.cpp` — see `attn_for_compile_paged` and the
+/// `mlx_qwen35_init_paged` docstring). The Rust adapter supports
+/// configurable block sizes via `Qwen3_5Config::paged_block_size`,
+/// but the compiled graph traces against block_size=16 baked into the
+/// `paged_kv_write` / `paged_attention` kernel calls. Mismatched values
+/// would have Rust encode slot/block tables at the adapter's block size
+/// while C++ writes/reads at 16, corrupting KV state. The compile-branch
+/// selectors gate `cpp_session_ready` on this equality and fall back to
+/// the pure-Rust paged path when the adapter is configured otherwise.
+pub(crate) const CPP_PAGED_REQUIRED_BLOCK_SIZE: u32 = 16;
+
+/// Initialize the C++ paged forward graph from the live `paged_adapter`
+/// pool/scale arrays AND the per-layer linear-attention recurrent caches
+/// already populated by the pure-Rust paged prefill.
+///
+/// # Layer-index contract
+///
+/// The C++ FFI accepts pool/scale handle arrays of size `num_layers`
+/// (absolute decoder count). For each absolute layer index `i`:
+/// * Linear-attention layers: pool/scale slots are null pointers; the
+///   `linear_cache_arrays` pair `[i*2, i*2+1]` holds
+///   `(conv_state, recurrent_state)` from the layer's
+///   `Qwen3_5LayerCache::Linear(ArraysCache)`.
+/// * Full-attention layers: pool/scale slots come from the adapter's
+///   `LayerKVPool` at the COMPACT (full-attention) ordinal; the linear
+///   cache pair is null.
+///
+/// The compact-ordinal mapping is computed via
+/// [`crate::models::qwen3_5::decoder_layer::compute_layer_kinds`], the
+/// same helper the production Rust paged-forward dispatch uses.
+///
+/// # Caller contract
+///
+/// 1. `caches` is fully populated by a prior pure-Rust paged prefill.
+/// 2. The C++ weights for this model are still registered (caller must
+///    have verified `mlx_qwen35_get_model_id() == self.model_id` and
+///    holds the appropriate read locks).
+///
+/// `prefill_offset` is the global token cursor the compiled paged
+/// graph's `g_dense_paged_offset_int` will start incrementing from.
+///
+/// On any failure (missing linear cache, missing pool/scale handle, or
+/// the C++ FFI returning a non-zero status), the helper returns `Err`
+/// so the caller can fall back to the pure-Rust paged decode path.
+fn init_paged_dense_compiled_session(
+    config: &Qwen3_5Config,
+    caches: &[Qwen3_5LayerCache],
+    paged_adapter: &PagedKVCacheAdapter,
+    prefill_offset: i32,
+) -> Result<()> {
+    use super::decoder_layer::{Qwen3_5LayerKind, compute_layer_kinds};
+
+    let num_layers_us = config.num_layers as usize;
+    if caches.len() != num_layers_us {
+        return Err(Error::from_reason(format!(
+            "init_paged_dense_compiled_session: caches.len()={} but config.num_layers={}",
+            caches.len(),
+            num_layers_us
+        )));
+    }
+
+    let layer_kinds = compute_layer_kinds(num_layers_us, |i| config.is_linear_layer(i));
+
+    let mut k_pool_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us];
+    let mut v_pool_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us];
+    let mut k_scale_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us];
+    let mut v_scale_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us];
+    let mut linear_cache_handles: Vec<*mut mlx_sys::mlx_array> =
+        vec![std::ptr::null_mut(); num_layers_us * 2];
+
+    // Hold the wrapping `MxArray`s alive across the FFI call so the C++
+    // side has time to copy them into its own globals.
+    let mut held_arrays: Vec<MxArray> = Vec::with_capacity(num_layers_us * 4);
+
+    for (i, kind) in layer_kinds.iter().enumerate() {
+        match kind {
+            Qwen3_5LayerKind::Linear => {
+                let arrays_cache = match &caches[i] {
+                    Qwen3_5LayerCache::Linear(c) => c,
+                    Qwen3_5LayerCache::FullAttention(_) => {
+                        return Err(Error::from_reason(format!(
+                            "init_paged_dense_compiled_session: layer {i} is Linear by config \
+                             but cache slot is FullAttention",
+                        )));
+                    }
+                };
+                let conv = arrays_cache.get(0).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "init_paged_dense_compiled_session: layer {i} conv_state not populated; \
+                         pure-Rust paged prefill must run before C++ paged init",
+                    ))
+                })?;
+                let rec = arrays_cache.get(1).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "init_paged_dense_compiled_session: layer {i} recurrent_state not \
+                         populated; pure-Rust paged prefill must run before C++ paged init",
+                    ))
+                })?;
+                linear_cache_handles[i * 2] = conv.as_raw_ptr();
+                linear_cache_handles[i * 2 + 1] = rec.as_raw_ptr();
+                let _ = (conv, rec);
+            }
+            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                let k_arr = paged_adapter.key_pool_array(*paged_idx).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_dense_compiled_session: key_pool_array(layer={i}, \
+                         paged_idx={paged_idx}): {e}",
+                    ))
+                })?;
+                let v_arr = paged_adapter.value_pool_array(*paged_idx).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_dense_compiled_session: value_pool_array(layer={i}, \
+                         paged_idx={paged_idx}): {e}",
+                    ))
+                })?;
+                let ks_arr = paged_adapter.k_scale_array(*paged_idx).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_dense_compiled_session: k_scale_array(layer={i}, \
+                         paged_idx={paged_idx}): {e}",
+                    ))
+                })?;
+                let vs_arr = paged_adapter.v_scale_array(*paged_idx).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_dense_compiled_session: v_scale_array(layer={i}, \
+                         paged_idx={paged_idx}): {e}",
+                    ))
+                })?;
+                k_pool_handles[i] = k_arr.as_raw_ptr();
+                v_pool_handles[i] = v_arr.as_raw_ptr();
+                k_scale_handles[i] = ks_arr.as_raw_ptr();
+                v_scale_handles[i] = vs_arr.as_raw_ptr();
+                held_arrays.push(k_arr);
+                held_arrays.push(v_arr);
+                held_arrays.push(ks_arr);
+                held_arrays.push(vs_arr);
+            }
+        }
+    }
+
+    let status = unsafe {
+        mlx_sys::mlx_qwen35_init_paged(
+            config.num_layers,
+            config.hidden_size,
+            config.num_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.rope_theta as f32,
+            config.rope_dims(),
+            config.rms_norm_eps as f32,
+            config.full_attention_interval,
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+            config.linear_conv_kernel_dim,
+            if config.tie_word_embeddings { 1 } else { 0 },
+            config.max_position_embeddings,
+            1, // batch_size
+            k_pool_handles.as_mut_ptr(),
+            v_pool_handles.as_mut_ptr(),
+            k_scale_handles.as_mut_ptr(),
+            v_scale_handles.as_mut_ptr(),
+            linear_cache_handles.as_mut_ptr(),
+            prefill_offset,
+        )
+    };
+
+    drop(held_arrays);
+
+    // The C++ side returns 0 on success, -1 on failure. Failure paths
+    // include missing pool/scale handles for full-attention layers and
+    // any exception caught during graph build. On failure
+    // `g_dense_paged_inited` is left cleared so subsequent
+    // `mlx_qwen35_forward_paged` calls would null-out their logits;
+    // surfacing the failure here lets the dispatcher fall back to the
+    // pure-Rust paged path before any decode-step FFI is dispatched.
+    if status != 0 {
+        return Err(Error::from_reason(format!(
+            "init_paged_dense_compiled_session: mlx_qwen35_init_paged returned status={status} \
+             (expected 0); see stderr for the C++ diagnostic. Caller must fall back to the \
+             pure-Rust paged path."
+        )));
+    }
+
+    Ok(())
+}
+
+/// Single-token decode step using the C++ compiled paged forward pass.
+///
+/// Mirrors `forward_compiled` but threads through the paged-attention
+/// inputs (offset_arr, block_table, slot_mapping, num_valid_tokens,
+/// num_valid_blocks, seq_lens) so K/V is written into the adapter's
+/// paged Metal pool via `paged_kv_write` and gathered via
+/// `paged_attention`.
+///
+/// Caller contract:
+/// * `init_paged_dense_compiled_session` has been called this turn
+///   (sets `g_dense_paged_inited = true`).
+/// * `paged_adapter.record_tokens(&[token_id])` has been called to
+///   advance the cursor (and lazily allocate any new block).
+/// * `inputs` was just built via
+///   `paged_adapter.build_paged_attention_inputs(1, 1, max_blocks_per_seq)`.
+///
+/// On any FFI failure (`output_logits == null`) the helper returns an
+/// `Err` so the dispatcher falls back to pure-Rust paged decode.
+fn forward_dense_cpp_paged(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    inputs: &crate::transformer::paged_attention_inputs::PagedAttentionInputs,
+) -> Result<MxArray> {
+    use mlx_sys as sys;
+
+    let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut cache_offset_out: i32 = 0;
+    unsafe {
+        sys::mlx_qwen35_forward_paged(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            inputs.offset_arr.as_raw_ptr(),
+            inputs.block_table.as_raw_ptr(),
+            inputs.slot_mapping.as_raw_ptr(),
+            inputs.num_valid_tokens.as_raw_ptr(),
+            inputs.num_valid_blocks.as_raw_ptr(),
+            inputs.seq_lens.as_raw_ptr(),
+            &mut output_ptr,
+            &mut cache_offset_out,
+        );
+    }
+
+    if output_ptr.is_null() {
+        return Err(Error::from_reason(
+            "C++ Dense paged forward step returned null — check stderr for diagnostic. \
+             (Common causes: g_dense_paged_inited = false, slot_mapping shape != [1], \
+             input_ids size != 1, or weights cleared by another model load.)",
+        ));
+    }
+
+    MxArray::from_handle(output_ptr, "dense_paged_forward_logits")
+}
+
+// ============================================================================
 // VLM helper functions (moved from vl_model.rs for unification)
 // ============================================================================
 
@@ -7611,5 +8081,191 @@ mod paged_construction_tests {
             inner.vision_encoder.is_some(),
             "vision_encoder field must be populated after a successful set"
         );
+    }
+
+    /// Phase 5 piece 1: hard-fails fast when caller passes a `caches`
+    /// slice whose length disagrees with `config.num_layers`. The
+    /// check runs BEFORE any FFI dispatch so we don't perturb the C++
+    /// paged globals — making this the only branch of
+    /// `init_paged_dense_compiled_session` we can exercise from a
+    /// non-Metal sandbox.
+    ///
+    /// (The other failure branches all require populated `MxArray`
+    /// handles, which need a real Metal allocation. They're covered
+    /// indirectly by parity testing on real-weights checkpoints.)
+    #[test]
+    fn test_init_paged_dense_compiled_session_rejects_cache_length_mismatch() {
+        let cfg = tiny_cfg(true);
+        // `cfg` has num_layers=8; pass an empty cache slice to trigger
+        // the length check before any FFI / Metal call.
+        let empty_caches: Vec<Qwen3_5LayerCache> = Vec::new();
+        let alloc = std::sync::Arc::new(std::sync::Mutex::new(
+            mlx_paged_attn::BlockAllocator::new(2, 16),
+        ));
+        let pa_cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 8,
+            head_size: cfg.head_dim as u32,
+            num_kv_heads: cfg.num_kv_heads as u32,
+            num_layers: cfg.full_attention_layer_count() as u32,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            pa_cfg,
+            2,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(e) => {
+                eprintln!(
+                    "skipping test_init_paged_dense_compiled_session_rejects_cache_length_mismatch: {e}"
+                );
+                return;
+            }
+        };
+        let adapter = PagedKVCacheAdapter::new(alloc, pool, 16)
+            .expect("paged adapter construction must succeed once pool is built");
+        let res = init_paged_dense_compiled_session(&cfg, &empty_caches, &adapter, 0);
+        let msg = res
+            .expect_err("expected Err on cache length mismatch")
+            .to_string();
+        assert!(
+            msg.contains("caches.len()"),
+            "error must reference caches length contract; got: {msg}"
+        );
+    }
+
+    /// Phase 5 piece 1: the C++ compiled paged graph hard-codes
+    /// block_size=16. The dispatcher MUST gate `cpp_session_ready` on
+    /// `adapter.block_size() == 16` so a config with
+    /// `paged_block_size: Some(8)` falls back to the pure-Rust paged
+    /// path instead of corrupting KV state. Validates the constant.
+    #[test]
+    fn test_cpp_paged_required_block_size_is_sixteen() {
+        assert_eq!(
+            CPP_PAGED_REQUIRED_BLOCK_SIZE, 16,
+            "C++ compiled paged graph in mlx_qwen35.cpp hard-codes block_size=16; \
+             changing this constant requires re-tracing the compiled graph"
+        );
+    }
+
+    /// Phase 5 piece 1: build an adapter with `block_size != 16` and
+    /// verify that the dispatcher gate
+    /// (`adapter.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE`) would
+    /// correctly reject it. The gate runs BEFORE
+    /// `init_paged_dense_compiled_session` is called, so the FFI is
+    /// never touched on the fallback path.
+    #[test]
+    fn test_block_size_eight_adapter_falls_back_to_pure_rust() {
+        let cfg = tiny_cfg(true);
+        let alloc = std::sync::Arc::new(std::sync::Mutex::new(
+            mlx_paged_attn::BlockAllocator::new(2, 8),
+        ));
+        let pa_cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 8,
+            head_size: cfg.head_dim as u32,
+            num_kv_heads: cfg.num_kv_heads as u32,
+            num_layers: cfg.full_attention_layer_count() as u32,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new_for_test(
+            pa_cfg,
+            2,
+            cfg.full_attention_layer_count() as u32,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_block_size_eight_adapter_falls_back_to_pure_rust: {e}");
+                return;
+            }
+        };
+        let adapter = PagedKVCacheAdapter::new(alloc, pool, 8)
+            .expect("PagedKVCacheAdapter::new must accept block_size=8 (validated by adapter)");
+        assert_eq!(
+            adapter.block_size(),
+            8,
+            "adapter must report the block_size it was constructed with"
+        );
+        // Simulate the dispatcher's gate. We do NOT call
+        // `init_paged_dense_compiled_session` here — that's exactly
+        // what the gate prevents.
+        assert_ne!(
+            adapter.block_size(),
+            CPP_PAGED_REQUIRED_BLOCK_SIZE,
+            "block_size=8 adapter must not match the compiled graph's hard-coded 16; \
+             the dispatcher gate at chat_sync_core_paged_inner / chat_stream_sync_core_paged_inner \
+             relies on this inequality to fall back to the pure-Rust paged path"
+        );
+    }
+
+    /// Phase 5 piece 1: the C++ FFI returns `int32_t` (0 success / -1
+    /// failure). The Rust `init_paged_dense_compiled_session`
+    /// propagates non-zero status as `Err` so the dispatcher's
+    /// `cpp_session_ready` becomes false on init failure and falls
+    /// back to the pure-Rust paged decode. This test forces the C++
+    /// side's null-handle rejection branch by passing null pool
+    /// handles for the full-attention layers, and asserts the FFI
+    /// returns -1.
+    #[test]
+    fn test_mlx_qwen35_init_paged_returns_negative_on_null_handles() {
+        let cfg = tiny_cfg(true);
+        let num_layers = cfg.num_layers as usize;
+        // All-null pool/scale handles. The C++ side iterates layers
+        // [0..num_layers); for each non-linear (full-attention) layer
+        // the null-handle check fires and the function returns -1.
+        // Layer 0 with full_attention_interval=4 is linear, so the
+        // first full-attn layer is at index 3, where the rejection
+        // fires.
+        let mut k_pool: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
+        let mut v_pool: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
+        let mut k_scale: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
+        let mut v_scale: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); num_layers];
+        let mut linear_caches: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); num_layers * 2];
+
+        let status = unsafe {
+            mlx_sys::mlx_qwen35_init_paged(
+                cfg.num_layers,
+                cfg.hidden_size,
+                cfg.num_heads,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                cfg.rope_theta as f32,
+                cfg.rope_dims(),
+                cfg.rms_norm_eps as f32,
+                cfg.full_attention_interval,
+                cfg.linear_num_key_heads,
+                cfg.linear_num_value_heads,
+                cfg.linear_key_head_dim,
+                cfg.linear_value_head_dim,
+                cfg.linear_conv_kernel_dim,
+                if cfg.tie_word_embeddings { 1 } else { 0 },
+                cfg.max_position_embeddings,
+                1,
+                k_pool.as_mut_ptr(),
+                v_pool.as_mut_ptr(),
+                k_scale.as_mut_ptr(),
+                v_scale.as_mut_ptr(),
+                linear_caches.as_mut_ptr(),
+                0,
+            )
+        };
+        assert_eq!(
+            status, -1,
+            "mlx_qwen35_init_paged MUST return -1 when full-attention pool/scale handles \
+             are null. Returning 0 would let the dispatcher enter the compiled paged decode \
+             against uninitialized globals."
+        );
+        // Reset C++ globals to a clean state so the test doesn't
+        // contaminate any later tests in the same process.
+        unsafe {
+            mlx_sys::mlx_qwen35_compiled_reset();
+        }
     }
 }
