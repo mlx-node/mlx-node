@@ -206,6 +206,26 @@ class PagedAttention : public Custom {
 /// even when `kv_dtype != Fp8` (callers pass `array(1.0f)`
 /// placeholders so the FP8 calibration path can flow through compile
 /// naturally without a separate variant).
+///
+/// Strict input contract — every dimension and dtype is validated at
+/// the factory and a mismatch throws `std::invalid_argument`:
+///
+///   - `k_pool` rank 5 `[num_blocks, num_kv_heads, head_size/x_pack,
+///     block_size, x_pack]`. `x_pack = 16 / sizeof(kv_dtype)`
+///     (Fp16/Bf16 → 8, Fp8 → 16). `x_pack` arg must equal that.
+///   - `v_pool` rank 4 `[num_blocks, num_kv_heads, head_size, block_size]`.
+///   - `k_pool.shape(0) == v_pool.shape(0)` (num_blocks parity).
+///   - `new_k`/`new_v` rank 3 `[num_tokens, num_kv_heads, head_size]`,
+///     identical shape, identical dtype.
+///   - `slot_mapping` rank 1 `[num_tokens]`, dtype `int64`,
+///     `shape(0) == new_k.shape(0)`. The kernel reads
+///     `slot_mapping[token_idx]` as `int64_t*` and uses
+///     `block_idx = slot_idx / block_size`; a mismatch reads/writes
+///     past the K/V allocation.
+///   - `slot_mapping`'s max value MUST be `< num_blocks * block_size`.
+///     The factory eval-checks this for Phase 1 safety (skipped during
+///     MLX tracing); Phase 2 will move it kernel-side.
+///   - `k_scale`/`v_scale` rank 0/1 of size 1, dtype `float32`.
 std::pair<array, array> paged_kv_write(
     const array& k_pool,
     const array& v_pool,
@@ -227,6 +247,25 @@ std::pair<array, array> paged_kv_write(
 /// `sliding_window`: 0 = disabled (only supported value in Phase 1;
 /// Phase 7 adds support for nonzero values for Gemma4). The factory
 /// throws `std::invalid_argument` if a nonzero value is passed.
+///
+/// Strict input contract — every dimension and dtype is validated at
+/// the factory and a mismatch throws `std::invalid_argument`:
+///
+///   - `q` rank 3 `[num_seqs, num_q_heads, head_size]`.
+///   - `k_pool` rank 5 `[num_blocks, num_kv_heads, head_size/x_pack,
+///     block_size, x_pack]`, with `x_pack` derived from `kv_dtype`
+///     (Fp16/Bf16 → 8, Fp8 → 16). `head_size` must be divisible by
+///     `x_pack`.
+///   - `v_pool` rank 4 `[num_blocks, num_kv_heads, head_size, block_size]`.
+///   - `k_pool.shape(0) == v_pool.shape(0)` (num_blocks parity).
+///   - `block_table` rank 2 `[num_seqs, max_blocks_per_seq]`, dtype
+///     `int32`, with `shape(0) == q.shape(0)`. The kernel addresses
+///     `block_tables + seq_idx * max_blocks_per_seq` and reads each
+///     entry as a 32-bit block index.
+///   - `seq_lens` rank 1 `[num_seqs]`, dtype `int32`, with
+///     `shape(0) == q.shape(0)`. The kernel reads
+///     `context_lens[seq_idx]` for every dispatched sequence.
+///   - `k_scale`/`v_scale` size 1, dtype `float32`.
 array paged_attention(
     const array& q,
     const array& k_pool,

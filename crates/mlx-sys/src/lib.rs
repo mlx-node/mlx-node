@@ -905,6 +905,52 @@ unsafe extern "C-unwind" {
     /// interior dims disagree with the primitive's scalar state.
     pub fn mlx_paged_kv_write_factory_rejects_pool_shape_mismatch() -> i32;
 
+    // =============================================================================
+    // Phase 1 review-round-3 negative-validation FFI declarations.
+    //
+    // Each helper constructs `paged_attention` / `paged_kv_write` factory
+    // inputs that are well-formed EXCEPT for one specific dim or dtype,
+    // calls the factory, and returns 1 iff `std::invalid_argument` was
+    // thrown. The Rust unit tests assert the value `1`.
+    // =============================================================================
+
+    /// q rank != 3 must be rejected.
+    pub fn mlx_paged_attention_factory_rejects_q_rank_not_3() -> i32;
+
+    /// block_table.shape(0) != q.shape(0) must be rejected.
+    pub fn mlx_paged_attention_factory_rejects_block_table_batch_mismatch() -> i32;
+
+    /// block_table dtype != int32 must be rejected.
+    pub fn mlx_paged_attention_factory_rejects_block_table_dtype() -> i32;
+
+    /// seq_lens.shape(0) != q.shape(0) must be rejected.
+    pub fn mlx_paged_attention_factory_rejects_seq_lens_batch_mismatch() -> i32;
+
+    /// k_pool.shape(2) != head_size / x_pack must be rejected.
+    pub fn mlx_paged_attention_factory_rejects_k_pool_inner_dim() -> i32;
+
+    /// k_pool.shape(4) != x_pack must be rejected.
+    pub fn mlx_paged_attention_factory_rejects_k_pool_x_pack() -> i32;
+
+    /// v_pool.shape(2) != head_size must be rejected.
+    pub fn mlx_paged_attention_factory_rejects_v_pool_head_dim() -> i32;
+
+    /// k_pool.shape(0) != v_pool.shape(0) must be rejected (num_blocks mismatch).
+    pub fn mlx_paged_attention_factory_rejects_num_blocks_mismatch() -> i32;
+
+    /// slot_mapping rank != 1 must be rejected.
+    pub fn mlx_paged_kv_write_factory_rejects_slot_mapping_rank() -> i32;
+
+    /// slot_mapping dtype != int64 must be rejected.
+    pub fn mlx_paged_kv_write_factory_rejects_slot_mapping_dtype() -> i32;
+
+    /// slot_mapping length != new_k.shape(0) must be rejected.
+    pub fn mlx_paged_kv_write_factory_rejects_slot_mapping_length() -> i32;
+
+    /// slot_mapping with a max value >= num_blocks * block_size must be
+    /// rejected (Phase 1 safety check; eval-based bounds verification).
+    pub fn mlx_paged_kv_write_factory_rejects_slot_mapping_out_of_range() -> i32;
+
     /// Reset the compile-trace counter to 0 before exercising the
     /// `mlx_paged_kv_write_compile_trace_smoke` helper.
     pub fn mlx_paged_kv_write_trace_count_reset();
@@ -915,11 +961,24 @@ unsafe extern "C-unwind" {
 
     /// Build a `mlx::core::compile`-wrapped function around an
     /// internal trace function that emits a `paged_kv_write`
-    /// primitive, call it twice with same-shape inputs but distinct
-    /// array identities, and return the number of times the inner
-    /// trace ran. The caller asserts this is exactly 1 (i.e., the
-    /// second call hit the compile cache and re-used the traced
-    /// graph). Returns -1 on internal error.
+    /// primitive, call it twice with REAL data-backed inputs that
+    /// share shapes/dtypes but differ in contents, and return the
+    /// number of times the inner trace ran.
+    ///
+    /// Beyond counting traces, the helper EVALS each call's outputs
+    /// and inspects the second call's K-pool slots after eval. This
+    /// proves both that the cache HIT (counter==1) AND that runtime
+    /// contents flow through `compile_replace` correctly (the second
+    /// call's K bytes appear at the second call's slot positions, not
+    /// the first call's).
+    ///
+    /// Return codes:
+    ///   `count` (>=0) — trace counter at end (1 on success).
+    ///   -1            — internal/setup error.
+    ///   -2            — second-call slots did NOT contain second-call
+    ///                   K values (compile_replace runtime-thread bug).
+    ///   -3            — Metal not available; eval-based verification
+    ///                   skipped (trace-count check still ran).
     pub fn mlx_paged_kv_write_compile_trace_smoke(num_tokens: i32) -> i32;
 }
 

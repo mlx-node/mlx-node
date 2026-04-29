@@ -30,9 +30,13 @@
 //!    scalar state (NOT echoing q's trailing dims).
 //! 7. **Validation rejection paths** — the public `paged_attention`
 //!    factory rejects (a) `sliding_window != 0`, (b) q whose trailing
-//!    dims disagree with scalar state. The public `paged_kv_write`
-//!    factory rejects K/V pool shapes that disagree with scalar state.
-//!    The Rust extern-C shim independently rejects nonzero
+//!    dims disagree with scalar state, (c) q rank != 3, (d)
+//!    block_table batch / dtype mismatch, (e) seq_lens batch mismatch,
+//!    (f) K/V pool inner-dim / x_pack / num_blocks mismatch. The
+//!    public `paged_kv_write` factory rejects K/V pool shapes that
+//!    disagree with scalar state, plus slot_mapping rank / dtype /
+//!    length / out-of-range mismatches (Phase 1 eval-based bounds
+//!    check). The Rust extern-C shim independently rejects nonzero
 //!    `sliding_window` so a missing C++-side check can never tunnel
 //!    through.
 //!
@@ -935,7 +939,39 @@ fn compile_trace_paged_kv_write_caches_one_trace() {
         0,
         "trace counter must be 0 after reset"
     );
+
+    // The C++ helper now uses REAL data-backed arrays on both calls.
+    // It calls the compiled function twice (different K/V values and
+    // slot ranges), evals each call's outputs, and inspects the second
+    // call's K-pool slots after eval. The return codes are:
+    //   1   → success (one trace, second-call values found at second-
+    //         call slots — both cache hit AND `compile_replace`'s
+    //         runtime-thread is correct).
+    //  -1   → internal/setup error.
+    //  -2   → second-call slots did NOT contain second-call K values
+    //         (compile_replace runtime-thread bug).
+    //  -3   → Metal not available; eval-based verification skipped.
+    //         Trace-count check still ran successfully (count == 1).
+    //         Test passes as a no-op-success on this branch.
     let count = unsafe { mlx_sys::mlx_paged_kv_write_compile_trace_smoke(2) };
+
+    if count == -3 {
+        eprintln!(
+            "compile_trace_paged_kv_write_caches_one_trace: \
+             Metal not available; eval-based verification skipped"
+        );
+        // The trace-count assertion still ran inside the helper before
+        // the Metal check; we only get -3 if `count_after_second == 1`.
+        return;
+    }
+
+    assert_ne!(
+        count, -2,
+        "compile_replace runtime-thread bug: second-call slots did NOT \
+         contain second-call K values (cache returned first-call inputs)"
+    );
+    assert_ne!(count, -1, "compile_trace helper hit an internal error");
+
     assert_eq!(
         count, 1,
         "expected exactly 1 trace across two same-shape calls (got {count}); \
@@ -946,4 +982,136 @@ fn compile_trace_paged_kv_write_caches_one_trace() {
     // Also verify the counter is observable from Rust.
     let observed = unsafe { mlx_sys::mlx_paged_kv_write_trace_count_get() };
     assert_eq!(observed, 1, "trace counter observable from Rust must agree");
+}
+
+// =============================================================================
+// Phase 1 review-round-3 negative-validation tests.
+//
+// Each test calls a C++ helper that constructs `paged_attention` /
+// `paged_kv_write` factory inputs that are well-formed EXCEPT for one
+// specific dim or dtype, then asserts the factory throws
+// `std::invalid_argument`. These guard the kernel buffer-contract
+// requirements at the factory level so a malformed caller cannot
+// tunnel out-of-bounds GPU reads through the dispatcher.
+// =============================================================================
+
+#[test]
+fn paged_attention_factory_rejects_q_rank_not_3() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_q_rank_not_3() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject q with rank != 3 (got {threw})"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_block_table_batch_mismatch() {
+    let threw =
+        unsafe { mlx_sys::mlx_paged_attention_factory_rejects_block_table_batch_mismatch() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject block_table.shape(0) != q.shape(0) \
+         (got {threw}); kernel addresses block_tables[seq_idx*max_blocks_per_seq], \
+         a mismatch reads past the buffer"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_block_table_dtype() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_block_table_dtype() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject non-int32 block_table dtype (got {threw}); \
+         kernel reinterprets the buffer as 32-bit indices"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_seq_lens_batch_mismatch() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_seq_lens_batch_mismatch() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject seq_lens.shape(0) != q.shape(0) (got {threw})"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_k_pool_inner_dim() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_k_pool_inner_dim() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject k_pool.shape(2) != head_size/x_pack (got {threw}); \
+         kernel reads K[block, h, d/x, t, x] and a mismatched inner dim re-routes bytes"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_k_pool_x_pack() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_k_pool_x_pack() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject k_pool.shape(4) != dtype-derived x_pack (got {threw})"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_v_pool_head_dim() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_v_pool_head_dim() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject v_pool.shape(2) != head_size (got {threw})"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_num_blocks_mismatch() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_num_blocks_mismatch() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must reject k_pool.shape(0) != v_pool.shape(0) (got {threw})"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_slot_mapping_rank() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_slot_mapping_rank() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject slot_mapping with rank != 1 (got {threw})"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_slot_mapping_dtype() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_slot_mapping_dtype() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject slot_mapping with dtype != int64 (got {threw}); \
+         kernel reads slot_mapping[token_idx] as `int64_t*`"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_slot_mapping_length() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_slot_mapping_length() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject slot_mapping length != new_k.shape(0) (got {threw}); \
+         a short mapping reads past the buffer for tokens beyond its length"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_slot_mapping_out_of_range() {
+    // Phase 1 safety check: slot value >= num_blocks * block_size is
+    // out-of-pool and must be rejected at the factory. This requires
+    // real data (the eval-based bounds check), so the helper builds
+    // real BF16 / int64 arrays.
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_slot_mapping_out_of_range() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must reject slot_mapping max >= num_blocks*block_size (got {threw}); \
+         a slot beyond the pool capacity writes past the K/V allocation. Phase 2 will move \
+         this check kernel-side."
+    );
 }
