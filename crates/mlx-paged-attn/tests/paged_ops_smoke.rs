@@ -2,24 +2,21 @@
 //! (`PagedKVWrite`, `PagedAttention`) and the `extern "C"` shim that
 //! bridges them to the existing `dispatch_*` Metal pipelines.
 //!
-//! ## Test list (matching the Phase-1 plan)
+//! ## Test list (matching the Phase-1 plan, + post-review additions)
 //!
 //! 1. **Round-trip K/V** — write 2 tokens of synthetic K/V into a
 //!    miniature paged pool through the shim, read the pool back,
 //!    and assert byte-equality at the right slot offsets.
-//! 2. **Compile-trace cache key stability** — currently OUT OF SCOPE
-//!    for the shim-only test surface (compile lives in C++; we'd need
-//!    a C++ runner to exercise it). The C++ `is_equivalent`
-//!    implementation that drives MLX's compile-cache key is exercised
-//!    by tests #4 / #5 below — those tests guarantee the key includes
-//!    every scalar field. A future Phase-2 PR can replace this gap
-//!    with a full `mlx::core::compile` round-trip.
-//! 3. **FP8 scale plumbing** — instead of dispatching the FP8 kernel
-//!    (which requires a metal device + valid `block_size >= 16`), we
-//!    assert that the shim correctly routes FP8 through to the FP8
-//!    kernel name (covered by `MetalState::reshape_and_cache_kernel_name`'s
-//!    own tests) and forwards the `k_scale` / `v_scale` values through
-//!    to the FP8 kernel parameters via the shim's parameter struct.
+//! 2. **Compile-trace cache key stability** — wraps the public
+//!    `paged_kv_write` factory in `mlx::core::compile()` and verifies
+//!    the inner trace function runs ONCE across two same-shape calls
+//!    (i.e., the second call hits the compile cache). Implemented via
+//!    a C++ FFI helper that exposes a static atomic trace counter.
+//! 3. **FP8 scale plumbing** — runs a real FP8 kernel dispatch with
+//!    non-default `k_scale`/`v_scale` and reads the resulting FP8
+//!    bytes back to confirm scales propagated to the kernel (instead
+//!    of being silently dropped). Also keeps the kernel-name
+//!    selection sanity test as supplementary coverage.
 //! 4. **`is_equivalent` correctness** — instantiate two
 //!    `PagedKVWrite` primitives via the C++ FFI helper and assert
 //!    `is_equivalent` correctly distinguishes equal vs. differing
@@ -27,11 +24,22 @@
 //! 5. **VJP throws** — instantiate a `PagedKVWrite` and a
 //!    `PagedAttention` via the C++ FFI helper and assert each
 //!    primitive's `vjp` raises `std::runtime_error`.
+//! 6. **Output shape uses scalar state** — verify that
+//!    `PagedAttention::output_shapes` reports
+//!    `{q_num_tokens, num_q_heads, head_size}` from the primitive's
+//!    scalar state (NOT echoing q's trailing dims).
+//! 7. **Validation rejection paths** — the public `paged_attention`
+//!    factory rejects (a) `sliding_window != 0`, (b) q whose trailing
+//!    dims disagree with scalar state. The public `paged_kv_write`
+//!    factory rejects K/V pool shapes that disagree with scalar state.
+//!    The Rust extern-C shim independently rejects nonzero
+//!    `sliding_window` so a missing C++-side check can never tunnel
+//!    through.
 //!
 //! All Metal-dependent tests gracefully skip on hosts where
 //! `MetalState::get()` fails ("No Metal device found"). The non-Metal
-//! tests (#4, #5) run on every host that successfully linked the
-//! mlx-sys library.
+//! tests run on every host that successfully linked the mlx-sys
+//! library.
 
 #![cfg(target_os = "macos")]
 
@@ -344,14 +352,10 @@ fn fp8_scale_plumbing_rejects_wrong_x_pack() {
 /// pairing check, this proves the FP8 dispatch path is wired through
 /// to the correct Metal kernel instantiation.
 ///
-/// We don't actually fire the FP8 kernel here because the
-/// quantized round-trip would need controlled E4M3-friendly values
-/// and reading back FP8 bytes is value-dependent. The kernel-name
-/// selection covers the dispatch routing, and the shim's parameter
-/// struct (`ReshapeAndCacheParams`) tunnels `k_scale` / `v_scale`
-/// straight into the kernel's buffer arguments — so passing the
-/// values through the shim is equivalent to passing them through to
-/// the kernel.
+/// Supplementary to `fp8_dispatch_uses_runtime_scales` below — this
+/// kernel-name test catches a regression where the kernel suffix is
+/// wired wrong, while the dispatch test catches a regression where
+/// the suffix is right but the scales drop on the floor.
 #[test]
 fn fp8_kernel_name_selected_for_fp8_dtype() {
     use mlx_paged_attn::metal::MetalDtype;
@@ -370,6 +374,271 @@ fn fp8_kernel_name_selected_for_fp8_dtype() {
         MetalState::reshape_and_cache_kernel_name(MetalDtype::BFloat16, MetalDtype::UChar, true);
     assert!(fp8.ends_with("_fp8"));
     assert!(fp8.contains("uchar"));
+}
+
+/// Convert a positive single-precision float to its FP8 E4M3 byte
+/// representation. Mirrors `metal/float8.metal::float_to_fp8_e4m3`
+/// closely enough for the values used in this test (round to nearest
+/// even, no NaN/Inf paths needed).
+fn f32_to_fp8_e4m3_byte(f: f32) -> u8 {
+    if f == 0.0 {
+        return 0;
+    }
+    let bits = f.to_bits();
+    let sign = (bits >> 31) & 1;
+    let abs = bits & 0x7fff_ffff;
+    if abs >= 0x7f80_0000 {
+        // Inf / NaN — mirror metal saturate behavior.
+        let mant = if abs != 0x7f80_0000 { 1 } else { 0 };
+        return ((sign << 7) | (0xf << 3) | mant) as u8;
+    }
+    let e = (((abs >> 23) & 0xff) as i32) - 127;
+    let m = abs & 0x7f_ffff;
+    const EXP_BITS: i32 = 4;
+    const MAN_BITS: i32 = 3;
+    const BIAS: i32 = 7;
+    const EXP_MAX: i32 = (1 << EXP_BITS) - 2; // 14
+    let e_fp8 = e + BIAS;
+    if (1..=EXP_MAX).contains(&e_fp8) {
+        let shift = 23 - MAN_BITS; // 20
+        let mut mant = m >> shift;
+        let lsb = mant & 1;
+        let round = (m >> (shift - 1)) & 1;
+        let sticky = u32::from((m & ((1u32 << (shift - 1)) - 1)) != 0);
+        mant += round & (sticky | lsb);
+        if mant >> MAN_BITS != 0 {
+            // mantissa overflow
+            let e2 = e_fp8 + 1;
+            if e2 > EXP_MAX {
+                return ((sign << 7) | (((1u32 << EXP_BITS) - 1) << MAN_BITS)) as u8;
+            }
+            return ((sign << 7) | ((e2 as u32) << MAN_BITS)) as u8;
+        }
+        return ((sign << 7) | ((e_fp8 as u32) << MAN_BITS) | (mant & ((1u32 << MAN_BITS) - 1)))
+            as u8;
+    }
+    if e_fp8 < 1 - MAN_BITS {
+        return (sign << 7) as u8;
+    }
+    // sub-normal
+    let rshift = (1 - e_fp8) + (23 - MAN_BITS);
+    let mant_full = 0x80_0000 | m;
+    let rounded = (mant_full + (1 << (rshift - 1))) >> rshift;
+    if rounded == 0 {
+        return (sign << 7) as u8;
+    }
+    ((sign << 7) | (rounded & ((1u32 << MAN_BITS) - 1))) as u8
+}
+
+/// Convert f32 to bf16 (truncation — drops 16 LSBs).
+fn f32_to_bf16_bits(x: f32) -> u16 {
+    (x.to_bits() >> 16) as u16
+}
+
+/// Real FP8 kernel dispatch with non-default scales.
+///
+/// Writes K=0.5 BF16, V=0.25 BF16 with `k_scale=0.5`, `v_scale=0.25`.
+/// The kernel computes `to_fp8(K / k_scale) = to_fp8(1.0) = 0x38`
+/// (E4M3, exp=7, mant=0). If the shim silently dropped the scales
+/// (i.e., used 1.0), the cache would hold `to_fp8(0.5)` (= 0x30) for
+/// K and `to_fp8(0.25)` (= 0x28) for V — distinct bytes. Reading the
+/// cache bytes back distinguishes the two cases.
+///
+/// This is the canonical "did the scale plumbing actually work?"
+/// observability test that the previous Phase-1 review found missing.
+#[test]
+fn fp8_dispatch_uses_runtime_scales() {
+    let state = match MetalState::get() {
+        Ok(s) => s,
+        Err(e) if e.contains("No Metal device found") => {
+            eprintln!("skipping fp8_dispatch_uses_runtime_scales: {e}");
+            return;
+        }
+        Err(e) => panic!("unexpected MetalState::get failure: {e}"),
+    };
+
+    // Pool config: 4 blocks, 4 KV heads, head_size 64, block_size 16,
+    // FP8 → x = 16. element_size = 1 byte (FP8 is `uchar` on cache).
+    let num_blocks: u32 = 4;
+    let num_kv_heads: u32 = 4;
+    let head_size: u32 = 64;
+    let block_size: u32 = 16;
+    let x: u32 = 16;
+    let cache_element_size: u64 = 1; // FP8 is 1 byte
+    let input_element_size: u64 = 2; // BF16 inputs
+
+    let key_cache_size = (num_blocks as u64)
+        * (num_kv_heads as u64)
+        * (head_size as u64 / x as u64)
+        * (block_size as u64)
+        * (x as u64)
+        * cache_element_size;
+    let value_cache_size = (num_blocks as u64)
+        * (num_kv_heads as u64)
+        * (head_size as u64)
+        * (block_size as u64)
+        * cache_element_size;
+
+    let key_pool = state
+        .device
+        .new_buffer(key_cache_size, MTLResourceOptions::StorageModeShared);
+    let value_pool = state
+        .device
+        .new_buffer(value_cache_size, MTLResourceOptions::StorageModeShared);
+
+    // Mark every cache byte with a sentinel (0xff) so we can tell
+    // which slots actually got written.
+    unsafe {
+        std::ptr::write_bytes(
+            key_pool.contents() as *mut u8,
+            0xff,
+            key_cache_size as usize,
+        );
+        std::ptr::write_bytes(
+            value_pool.contents() as *mut u8,
+            0xff,
+            value_cache_size as usize,
+        );
+    }
+
+    // 2 tokens of synthetic data — uniform K=0.5, V=0.25.
+    let num_tokens: u32 = 2;
+    let tokens_size_elements =
+        (num_tokens as usize) * (num_kv_heads as usize) * (head_size as usize);
+    let k_value_f32: f32 = 0.5;
+    let v_value_f32: f32 = 0.25;
+    let k_bf16 = f32_to_bf16_bits(k_value_f32);
+    let v_bf16 = f32_to_bf16_bits(v_value_f32);
+    let new_k_host: Vec<u16> = vec![k_bf16; tokens_size_elements];
+    let new_v_host: Vec<u16> = vec![v_bf16; tokens_size_elements];
+
+    let new_k = state.device.new_buffer_with_data(
+        new_k_host.as_ptr() as *const _,
+        (tokens_size_elements as u64) * input_element_size,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let new_v = state.device.new_buffer_with_data(
+        new_v_host.as_ptr() as *const _,
+        (tokens_size_elements as u64) * input_element_size,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    // Slot mapping: token 0 → slot 0, token 1 → slot 1 (block 0,
+    // positions 0/1).
+    let slot_mapping_host: Vec<i64> = vec![0, 1];
+    let slot_mapping = state.device.new_buffer_with_data(
+        slot_mapping_host.as_ptr() as *const _,
+        (slot_mapping_host.len() * std::mem::size_of::<i64>()) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    // Non-default scales chosen so K/k_scale = V/v_scale = 1.0.
+    let k_scale: f32 = 0.5;
+    let v_scale: f32 = 0.25;
+
+    // Dispatch with FP8 + x=16 + non-default scales.
+    let rc = unsafe {
+        mlx_paged_attn_reshape_and_cache_dispatch(
+            key_pool.as_ptr() as *mut c_void,
+            value_pool.as_ptr() as *mut c_void,
+            new_k.as_ptr() as *mut c_void,
+            0,
+            new_v.as_ptr() as *mut c_void,
+            0,
+            slot_mapping.as_ptr() as *mut c_void,
+            0,
+            num_tokens,
+            num_kv_heads,
+            head_size,
+            block_size,
+            x as i32,
+            2, // KvDtypeC::Fp8
+            k_scale,
+            v_scale,
+        )
+    };
+    assert_eq!(rc, 0, "FP8 dispatch must succeed (rc={rc})");
+
+    // Read the FP8 bytes back. Expected:
+    //   to_fp8_e4m3(K / k_scale) = to_fp8_e4m3(0.5/0.5) = to_fp8_e4m3(1.0)
+    //   to_fp8_e4m3(V / v_scale) = to_fp8_e4m3(0.25/0.25) = to_fp8_e4m3(1.0)
+    // If the scales were dropped (treated as 1.0):
+    //   K_bytes would equal to_fp8_e4m3(0.5) = 0x30 (NOT 0x38).
+    //   V_bytes would equal to_fp8_e4m3(0.25) = 0x28 (NOT 0x38).
+    let expected_k_byte = f32_to_fp8_e4m3_byte(1.0);
+    let expected_v_byte = f32_to_fp8_e4m3_byte(1.0);
+    let bad_if_scale_dropped_k = f32_to_fp8_e4m3_byte(0.5);
+    let bad_if_scale_dropped_v = f32_to_fp8_e4m3_byte(0.25);
+    // Sanity: the two must differ — otherwise the test wouldn't
+    // distinguish the two cases.
+    assert_ne!(
+        expected_k_byte, bad_if_scale_dropped_k,
+        "FP8 bytes for 1.0 vs 0.5 must differ to distinguish scale-applied vs scale-dropped"
+    );
+    assert_ne!(expected_v_byte, bad_if_scale_dropped_v);
+
+    let key_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(key_pool.contents() as *const u8, key_cache_size as usize)
+    };
+    let value_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            value_pool.contents() as *const u8,
+            value_cache_size as usize,
+        )
+    };
+
+    // K layout for FP8 (still vLLM):
+    // key_cache[block_idx, head_idx, j/x, block_offset, j%x]
+    let head_per_block_k = (head_size / x) * block_size * x;
+    let stride_block_k = num_kv_heads * head_per_block_k;
+    let stride_head_k = head_per_block_k;
+    let stride_xidx_k = block_size * x;
+    let stride_blockoff_k = x;
+
+    let head_per_block_v = head_size * block_size;
+    let stride_block_v = num_kv_heads * head_per_block_v;
+    let stride_head_v = head_per_block_v;
+    let stride_j_v = block_size;
+
+    // Spot-check the (token=0, head=0, j=0) slot for both K and V
+    // — and a deeper position to confirm the kernel wrote across
+    // all heads/positions, not just head 0.
+    for t in 0..num_tokens {
+        let slot_idx = slot_mapping_host[t as usize];
+        let block_idx = (slot_idx / block_size as i64) as u32;
+        let block_offset = (slot_idx % block_size as i64) as u32;
+        for h in [0u32, 3u32] {
+            for j in [0u32, 32u32, 63u32] {
+                let x_idx = j / x;
+                let x_offset = j % x;
+                let k_idx = (block_idx * stride_block_k
+                    + h * stride_head_k
+                    + x_idx * stride_xidx_k
+                    + block_offset * stride_blockoff_k
+                    + x_offset) as usize;
+                let v_idx = (block_idx * stride_block_v
+                    + h * stride_head_v
+                    + j * stride_j_v
+                    + block_offset) as usize;
+                let actual_k = key_bytes[k_idx];
+                let actual_v = value_bytes[v_idx];
+                assert_eq!(
+                    actual_k, expected_k_byte,
+                    "K FP8 byte at token={t} head={h} j={j}: \
+                     expected 0x{expected_k_byte:02x} (= to_fp8(1.0), proves scale was applied) \
+                     but got 0x{actual_k:02x}. \
+                     If got 0x{bad_if_scale_dropped_k:02x} the kernel ignored k_scale."
+                );
+                assert_eq!(
+                    actual_v, expected_v_byte,
+                    "V FP8 byte at token={t} head={h} j={j}: \
+                     expected 0x{expected_v_byte:02x} (= to_fp8(1.0), proves scale was applied) \
+                     but got 0x{actual_v:02x}. \
+                     If got 0x{bad_if_scale_dropped_v:02x} the kernel ignored v_scale."
+                );
+            }
+        }
+    }
 }
 
 /// Negative test — the C++ layer's `paged_attention` shim must reject
@@ -535,33 +804,146 @@ fn paged_attention_vjp_throws() {
 }
 
 // =============================================================================
-// Test 2 (placeholder): compile-trace cache key stability.
+// Test 6: `PagedAttention::output_shapes` reports scalar-state shape.
 //
-// MLX's `compile` lives entirely in C++; exercising it from Rust in
-// this test crate would require a custom C++ test runner or a wider
-// FFI surface than Phase 1 should add. We instead rely on:
-//   - Tests #4 prove `is_equivalent` includes every relevant scalar
-//     field (so MLX's compile cache key hash function will produce
-//     the same key for two re-traces with matching state).
-//   - Tests #5 prove the primitives throw on `vjp`, ensuring no
-//     unexpected gradient pass mutates the cache key.
-// A Phase 2 follow-up should land a dedicated compile-trace test
-// (likely as a C++ unit test inside `mlx-sys`).
+// MLX uses output_shapes to size the output buffer during compile
+// replay. If `output_shapes` echoes q.shape() (which can disagree
+// with the primitive's scalar state on the trailing dims) instead of
+// `{q_num_tokens, num_q_heads, head_size}` from state, MLX would
+// allocate a buffer of the wrong size — the kernel would then
+// under- or over-write. This test verifies the spec.
 // =============================================================================
 
 #[test]
-fn compile_trace_cache_key_stability_is_covered_by_is_equivalent_tests() {
-    // No-op test that documents the rationale. See module-level
-    // comment for full context.
-    //
-    // The compile-trace cache stability behaviour is a downstream
-    // consequence of `is_equivalent` correctness:
-    //   - Two `compile`-traced primitives with the same scalar state
-    //     hash to the same cache key (via MLX's `state()` tuple).
-    //   - `is_equivalent` then short-circuits the second trace.
-    // Tests #4 above verify the scalar set covered by `is_equivalent`
-    // is comprehensive (block_size, num_kv_heads, head_size, x_pack,
-    // kv_dtype for `PagedKVWrite`; same plus scale/softcap/sliding/
-    // num_q_heads for `PagedAttention` once the `mlx_paged_attention_*`
-    // helpers ship in a follow-up).
+fn paged_attention_output_shapes_uses_scalar_state() {
+    // Pass a q with deliberately-mismatched trailing dims (16 / 16
+    // instead of num_q_heads=8 / head_size=64) and verify
+    // `output_shapes` returns the SCALAR-state shape, not q's.
+    let mut out_shape: [i32; 3] = [-1, -1, -1];
+    let ndim = unsafe {
+        mlx_sys::mlx_paged_attention_test_output_shapes(
+            /*q_num_tokens=*/ 5,
+            /*q_dim1_actual=*/ 16, // disagrees with num_q_heads=8 below
+            /*q_dim2_actual=*/ 16, // disagrees with head_size=64 below
+            /*scale=*/ 0.125,
+            /*softcap=*/ 0.0,
+            /*block_size=*/ 16,
+            /*num_q_heads=*/ 8,
+            /*num_kv_heads=*/ 4,
+            /*head_size=*/ 64,
+            /*sliding_window=*/ 0,
+            /*kv_dtype_raw=*/ 1, // Bf16
+            out_shape.as_mut_ptr(),
+        )
+    };
+    assert_eq!(ndim, 3, "output shape must be rank 3");
+    assert_eq!(
+        out_shape,
+        [5, 8, 64],
+        "output_shapes must report {{q_num_tokens, num_q_heads, head_size}} \
+         from scalar state — got {:?} which means q's trailing dims leaked through",
+        out_shape
+    );
+}
+
+// =============================================================================
+// Test 7: validation rejection paths.
+//
+// The public `paged_attention` and `paged_kv_write` factories must
+// reject inputs that would silently corrupt the kernel dispatch:
+//   - sliding_window != 0 (Phase 1 doesn't implement it)
+//   - q whose trailing dims disagree with primitive scalar state
+//   - K/V pool whose interior dims disagree with primitive state
+// The Rust extern-C shim ALSO rejects sliding_window != 0 so a
+// missing C++-side check can't tunnel through.
+// =============================================================================
+
+#[test]
+fn paged_attention_factory_rejects_sliding_window() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_sliding_window() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must throw std::invalid_argument when \
+         sliding_window != 0 (got {threw}); Phase 7 will add support"
+    );
+}
+
+#[test]
+fn paged_attention_factory_rejects_q_shape_mismatch() {
+    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_q_shape_mismatch() };
+    assert_eq!(
+        threw, 1,
+        "paged_attention(...) must throw when q's trailing dims disagree with \
+         primitive scalar state (got {threw})"
+    );
+}
+
+#[test]
+fn paged_kv_write_factory_rejects_pool_shape_mismatch() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_pool_shape_mismatch() };
+    assert_eq!(
+        threw, 1,
+        "paged_kv_write(...) must throw when K-pool interior dims disagree with \
+         primitive scalar state (got {threw})"
+    );
+}
+
+#[test]
+fn paged_attention_shim_rejects_sliding_window() {
+    // Independent extern-C-side guard: even if some caller bypasses
+    // the C++ factory's rejection (e.g. constructs a primitive
+    // directly) the shim will refuse a nonzero sliding_window.
+    let dummy: *mut c_void = 1 as *mut c_void;
+    let rc = unsafe {
+        mlx_paged_attn::mlx_paged_attn_paged_attention_dispatch(
+            dummy, 0, dummy, dummy, dummy, dummy, dummy, 0, /*num_seqs=*/ 1,
+            /*num_q_heads=*/ 8, /*num_kv_heads=*/ 4, /*head_size=*/ 64,
+            /*block_size=*/ 16, /*max_context_len=*/ 32, /*max_blocks_per_seq=*/ 4,
+            /*scale=*/ 0.125, /*softcap=*/ 0.0, /*sliding_window=*/ 512,
+            /*kv_dtype=Bf16*/ 1, /*k_scale=*/ 1.0, /*v_scale=*/ 1.0,
+        )
+    };
+    assert_eq!(rc, -1, "shim must reject sliding_window != 0");
+}
+
+// =============================================================================
+// Test 2: compile-trace cache key stability.
+//
+// Wraps the public `paged_kv_write` factory in `mlx::core::compile()`
+// (via the `mlx_paged_kv_write_compile_trace_smoke` C++ helper) and
+// asserts that calling the compiled function twice with the same
+// input shapes / dtypes runs the inner trace function exactly ONCE.
+//
+// The C++ helper increments a `static std::atomic<int>` inside the
+// trace function. The first call (cache miss) drives `compile_trace`
+// which invokes the trace fn → counter goes 0 → 1. The second call
+// hits the compile cache via `CompilerCache::find` (keyed on shape +
+// dtype + constants, NOT primitive identity), so the trace fn is
+// NOT re-invoked → counter stays at 1.
+//
+// This is a pure-trace test — we never call `eval()` on the compiled
+// outputs, so the GPU dispatch path never fires and the test passes
+// on hosts without Metal.
+// =============================================================================
+
+#[test]
+fn compile_trace_paged_kv_write_caches_one_trace() {
+    // Reset to defend against earlier tests in the same process.
+    unsafe { mlx_sys::mlx_paged_kv_write_trace_count_reset() };
+    assert_eq!(
+        unsafe { mlx_sys::mlx_paged_kv_write_trace_count_get() },
+        0,
+        "trace counter must be 0 after reset"
+    );
+    let count = unsafe { mlx_sys::mlx_paged_kv_write_compile_trace_smoke(2) };
+    assert_eq!(
+        count, 1,
+        "expected exactly 1 trace across two same-shape calls (got {count}); \
+         this means MLX's compile cache rejected our second call's shapes \
+         (which would mean the cache key is unstable across re-runs)"
+    );
+
+    // Also verify the counter is observable from Rust.
+    let observed = unsafe { mlx_sys::mlx_paged_kv_write_trace_count_get() };
+    assert_eq!(observed, 1, "trace counter observable from Rust must agree");
 }

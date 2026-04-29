@@ -15,10 +15,13 @@
 #include "mlx_paged_ops.h"
 #include "mlx_common.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <utility>
+
+#include "mlx/compile.h"
 
 namespace mlx::core::fast {
 
@@ -397,7 +400,14 @@ std::vector<Shape> PagedAttention::output_shapes(
     throw std::runtime_error(
         "PagedAttention::output_shapes: q must be rank 3");
   }
-  return {q.shape()};
+  // Spec: output shape is {q_num_tokens, num_q_heads, head_size} from
+  // scalar state. We DO NOT echo q.shape() — if q's trailing dims
+  // disagree with our scalar state, we'd allocate a buffer of the
+  // wrong size, which the kernel would then under- or over-write.
+  // Validation against q.shape() lives in `eval_gpu` and the public
+  // `paged_attention` factory; this method just reports the
+  // shape MLX should allocate.
+  return {Shape{q.shape(0), num_q_heads_, head_size_}};
 }
 
 bool PagedAttention::is_equivalent(const Primitive& other) const {
@@ -459,6 +469,117 @@ std::pair<array, array> paged_kv_write(
         "[paged_kv_write] k_scale / v_scale must be 1-element arrays");
   }
 
+  // Shape validation against the primitive's scalar state. Each pool
+  // dimension must agree with what the kernel will read using the
+  // primitive's (block_size, num_kv_heads, head_size, x_pack). A
+  // mismatch here would silently route the wrong slots through the
+  // dispatcher and corrupt downstream attention.
+  //
+  // K-pool layout (vLLM): [num_blocks, num_kv_heads, head_size/x, block_size, x]
+  // V-pool layout       : [num_blocks, num_kv_heads, head_size, block_size]
+  if (k_pool.ndim() != 5) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] k_pool must be rank 5 "
+        << "[num_blocks, num_kv_heads, head_size/x, block_size, x]; got rank "
+        << k_pool.ndim();
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_pool.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] v_pool must be rank 4 "
+        << "[num_blocks, num_kv_heads, head_size, block_size]; got rank "
+        << v_pool.ndim();
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(1) != num_kv_heads) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] k_pool.shape(1) (" << k_pool.shape(1)
+        << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x_pack <= 0 || head_size % x_pack != 0) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] x_pack (" << x_pack
+        << ") must be positive and divide head_size (" << head_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(2) != head_size / x_pack) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] k_pool.shape(2) (" << k_pool.shape(2)
+        << ") disagrees with head_size/x_pack (" << head_size / x_pack << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(3) != block_size) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] k_pool.shape(3) (" << k_pool.shape(3)
+        << ") disagrees with block_size (" << block_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(4) != x_pack) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] k_pool.shape(4) (" << k_pool.shape(4)
+        << ") disagrees with x_pack (" << x_pack << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_pool.shape(1) != num_kv_heads) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] v_pool.shape(1) (" << v_pool.shape(1)
+        << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_pool.shape(2) != head_size) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] v_pool.shape(2) (" << v_pool.shape(2)
+        << ") disagrees with head_size (" << head_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_pool.shape(3) != block_size) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] v_pool.shape(3) (" << v_pool.shape(3)
+        << ") disagrees with block_size (" << block_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(0) != v_pool.shape(0)) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] k_pool num_blocks (" << k_pool.shape(0)
+        << ") disagrees with v_pool num_blocks (" << v_pool.shape(0) << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // new_k / new_v must be rank 3 [num_tokens, num_kv_heads, head_size].
+  if (new_k.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] new_k must be rank 3 "
+        << "[num_tokens, num_kv_heads, head_size]; got rank " << new_k.ndim();
+    throw std::invalid_argument(msg.str());
+  }
+  if (new_v.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] new_v must be rank 3 "
+        << "[num_tokens, num_kv_heads, head_size]; got rank " << new_v.ndim();
+    throw std::invalid_argument(msg.str());
+  }
+  if (new_k.shape(1) != num_kv_heads || new_v.shape(1) != num_kv_heads) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] new_k/new_v shape(1) ("
+        << new_k.shape(1) << "/" << new_v.shape(1)
+        << ") must equal num_kv_heads (" << num_kv_heads << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (new_k.shape(2) != head_size || new_v.shape(2) != head_size) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] new_k/new_v shape(2) ("
+        << new_k.shape(2) << "/" << new_v.shape(2)
+        << ") must equal head_size (" << head_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (new_k.shape(0) != new_v.shape(0)) {
+    std::ostringstream msg;
+    msg << "[paged_kv_write] new_k tokens (" << new_k.shape(0)
+        << ") disagrees with new_v tokens (" << new_v.shape(0) << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
   std::vector<array> inputs = {
       k_pool, v_pool, new_k, new_v, slot_mapping, k_scale, v_scale};
 
@@ -504,6 +625,18 @@ array paged_attention(
         "paged_attention has no fallback implementation (inference-only)");
   };
 
+  // Phase 1 explicitly rejects nonzero sliding_window. The primitive
+  // tracks it in scalar state for cache-key stability across phases,
+  // but the kernel dispatch path doesn't honor it yet — silently
+  // accepting it would produce full-context attention behind the
+  // caller's back. Phase 7 (Gemma4) will lift this restriction.
+  if (sliding_window != 0) {
+    throw std::invalid_argument(
+        "[paged_attention] sliding_window not yet implemented; "
+        "Phase 7 will add it (Gemma4). The only supported value in "
+        "Phase 1 is 0.");
+  }
+
   if (k_scale.dtype() != mlx::core::float32 ||
       v_scale.dtype() != mlx::core::float32) {
     throw std::invalid_argument(
@@ -519,8 +652,67 @@ array paged_attention(
         "[num_seqs, num_q_heads, head_size]");
   }
 
+  // Shape validation against scalar state. q is `[num_seqs,
+  // num_q_heads, head_size]`; both trailing dims must agree with
+  // what the primitive will pass to the dispatcher.
+  if (q.shape(1) != num_q_heads) {
+    std::ostringstream msg;
+    msg << "[paged_attention] q.shape(1) (" << q.shape(1)
+        << ") disagrees with num_q_heads (" << num_q_heads << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (q.shape(2) != head_size) {
+    std::ostringstream msg;
+    msg << "[paged_attention] q.shape(2) (" << q.shape(2)
+        << ") disagrees with head_size (" << head_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Pool shape validation (mirror paged_kv_write's contract).
+  if (k_pool.ndim() != 5) {
+    std::ostringstream msg;
+    msg << "[paged_attention] k_pool must be rank 5 "
+        << "[num_blocks, num_kv_heads, head_size/x, block_size, x]; got rank "
+        << k_pool.ndim();
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_pool.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[paged_attention] v_pool must be rank 4 "
+        << "[num_blocks, num_kv_heads, head_size, block_size]; got rank "
+        << v_pool.ndim();
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(1) != num_kv_heads || v_pool.shape(1) != num_kv_heads) {
+    std::ostringstream msg;
+    msg << "[paged_attention] k_pool/v_pool num_kv_heads ("
+        << k_pool.shape(1) << "/" << v_pool.shape(1)
+        << ") disagrees with num_kv_heads (" << num_kv_heads << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(3) != block_size || v_pool.shape(3) != block_size) {
+    std::ostringstream msg;
+    msg << "[paged_attention] k_pool/v_pool block_size ("
+        << k_pool.shape(3) << "/" << v_pool.shape(3)
+        << ") disagrees with block_size (" << block_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_pool.shape(2) != head_size) {
+    std::ostringstream msg;
+    msg << "[paged_attention] v_pool.shape(2) (" << v_pool.shape(2)
+        << ") disagrees with head_size (" << head_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
   // Output shape and dtype
   auto out_dtype = io_dtype_for_kv_dtype(kv_dtype);
+  // Spec: output shape is {q.shape(0), num_q_heads, head_size} from
+  // scalar state. Even though we just verified q.shape(1)/(2) agree
+  // with state, we use state explicitly so this matches
+  // PagedAttention::output_shapes — they MUST report the same shape
+  // or MLX will allocate a buffer of the wrong size during compile
+  // replay.
+  Shape out_shape = {q.shape(0), num_q_heads, head_size};
 
   std::vector<array> inputs = {
       q, k_pool, v_pool, block_table, seq_lens, k_scale, v_scale};
@@ -537,7 +729,7 @@ array paged_attention(
       sliding_window,
       kv_dtype);
 
-  return array(q.shape(), out_dtype, primitive, std::move(inputs));
+  return array(std::move(out_shape), out_dtype, primitive, std::move(inputs));
 }
 
 } // namespace mlx::core::fast
@@ -706,6 +898,373 @@ int mlx_paged_attention_vjp_throws() {
   try {
     p.vjp(empty_arrays, empty_arrays, empty_argnums, empty_arrays);
   } catch (const std::runtime_error& e) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// Verify that `PagedAttention::output_shapes` ignores q's trailing
+/// dims and instead uses the primitive's scalar state. Constructs a
+/// `PagedAttention` with the supplied scalar state and a tracer-only
+/// q array of shape `[q_num_tokens, q_dim1_actual, q_dim2_actual]`,
+/// then calls `output_shapes` and copies the returned shape to
+/// `out_shape` (caller must size to 3 elements). Returns the number
+/// of dimensions in the returned shape (should always be 3 for
+/// well-formed input).
+int mlx_paged_attention_test_output_shapes(
+    int q_num_tokens,
+    int q_dim1_actual,
+    int q_dim2_actual,
+    float scale,
+    float softcap,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int sliding_window,
+    uint8_t kv_dtype_raw,
+    int32_t* out_shape) {
+  using namespace mlx::core::fast;
+
+  auto stub_fallback = [](std::vector<mlx::core::array> /*ignored*/)
+      -> std::vector<mlx::core::array> {
+    throw std::runtime_error("output_shapes test should not invoke fallback");
+  };
+  auto s = mlx::core::default_stream(mlx::core::default_device());
+
+  PagedAttention prim(
+      s,
+      stub_fallback,
+      scale,
+      softcap,
+      block_size,
+      num_q_heads,
+      num_kv_heads,
+      head_size,
+      sliding_window,
+      static_cast<KvDtype>(kv_dtype_raw));
+
+  // Tracer-only q array — shape encodes potentially-mismatched
+  // dimensions to verify output_shapes doesn't echo them.
+  mlx::core::Shape q_shape{q_num_tokens, q_dim1_actual, q_dim2_actual};
+  mlx::core::array q(std::move(q_shape), mlx::core::bfloat16, nullptr, {});
+
+  std::vector<mlx::core::array> inputs{q};
+  auto shapes = prim.output_shapes(inputs);
+  if (shapes.size() != 1) {
+    return -1;
+  }
+  const auto& out = shapes[0];
+  out_shape[0] = static_cast<int32_t>(out[0]);
+  out_shape[1] = static_cast<int32_t>(out[1]);
+  out_shape[2] = static_cast<int32_t>(out[2]);
+  return static_cast<int>(out.size());
+}
+
+/// Returns 1 iff the public `paged_attention(...)` factory throws
+/// `std::invalid_argument` when called with sliding_window=512.
+/// Returns 0 if it doesn't throw or throws a different exception.
+///
+/// The factory is the earliest validation point; we call it with
+/// well-formed shape inputs and a non-zero sliding_window to confirm
+/// rejection. The pool/q arrays use tracer-only construction (no
+/// backing data needed — the throw fires before eval_gpu).
+int mlx_paged_attention_factory_rejects_sliding_window() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  // Build well-formed tracer arrays so only sliding_window triggers
+  // the throw.
+  // q: [num_seqs=1, num_q_heads=8, head_size=64]
+  // k_pool: [num_blocks=4, num_kv_heads=4, head_size/x=8, block_size=16, x=8]
+  // v_pool: [num_blocks=4, num_kv_heads=4, head_size=64, block_size=16]
+  array q(Shape{1, 8, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/512,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*kv_dtype=*/KvDtype::Bf16,
+        /*s=*/StreamOrDevice{});
+  } catch (const std::invalid_argument& /*e*/) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// Verify the public `paged_attention(...)` factory rejects q whose
+/// trailing dims disagree with the primitive's scalar state.
+/// Returns 1 iff `std::invalid_argument` was thrown, 0 otherwise.
+int mlx_paged_attention_factory_rejects_q_shape_mismatch() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  // q.shape(2) deliberately disagrees with head_size=64 (we pass 32).
+  array q(Shape{1, 8, 32}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{1, 4}, int32, nullptr, {});
+  array seq_lens(Shape{1}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        0.125f,
+        0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+} // extern "C"
+
+/// Counter used by `mlx_paged_kv_write_compile_trace_*` helpers. Each
+/// trace inside the compiled graph increments this counter (a cache
+/// MISS in `compiler_cache().find` triggers a re-trace, which calls
+/// `paged_kv_write_trace_fn` once). Cache HITs do not call the fn.
+///
+/// Callers must reset to 0 before exercising a fresh test.
+namespace {
+std::atomic<int> g_paged_kv_write_trace_count{0};
+} // namespace
+
+extern "C" {
+
+/// Reset the trace counter so a test can exercise compile-cache
+/// behavior in isolation.
+void mlx_paged_kv_write_trace_count_reset() {
+  g_paged_kv_write_trace_count.store(0, std::memory_order_seq_cst);
+}
+
+/// Read the current trace counter.
+int mlx_paged_kv_write_trace_count_get() {
+  return g_paged_kv_write_trace_count.load(std::memory_order_seq_cst);
+}
+
+} // extern "C"
+
+namespace {
+
+/// The function we hand to `mlx::core::compile`. MLX traces it ONCE
+/// per (input shapes, dtypes, constants) tuple — the first call
+/// drains through `compile_trace`, which invokes this function with
+/// tracer inputs. Subsequent calls with the same shapes/dtypes hit
+/// the compile cache and DO NOT call this function. The counter
+/// increment is the canonical "did this compile re-trace?" signal.
+///
+/// The fn itself just emits a `paged_kv_write` primitive on the trace
+/// inputs. We don't actually evaluate; the test's purpose is to count
+/// trace invocations, not to dispatch GPU.
+///
+/// Inputs (positional):
+///   0: k_pool, 1: v_pool, 2: new_k, 3: new_v, 4: slot_mapping,
+///   5: k_scale, 6: v_scale
+///
+/// Outputs: [k_pool', v_pool'] (semantic in-place aliases).
+std::vector<mlx::core::array> paged_kv_write_trace_fn(
+    const std::vector<mlx::core::array>& inputs) {
+  using namespace mlx::core::fast;
+  if (inputs.size() != 7) {
+    throw std::runtime_error("paged_kv_write_trace_fn: expected 7 inputs");
+  }
+  g_paged_kv_write_trace_count.fetch_add(1, std::memory_order_seq_cst);
+
+  // Hard-coded scalar state matches the test inputs in
+  // `paged_ops_smoke.rs::compile_trace_paged_kv_write_caches_one_trace`.
+  // Block_size=16, num_kv_heads=4, head_size=64, x_pack=8, Bf16.
+  auto out = paged_kv_write(
+      inputs[0],
+      inputs[1],
+      inputs[2],
+      inputs[3],
+      inputs[4],
+      inputs[5],
+      inputs[6],
+      /*block_size=*/16,
+      /*num_kv_heads=*/4,
+      /*head_size=*/64,
+      /*x_pack=*/8,
+      KvDtype::Bf16,
+      /*s=*/{});
+  return {out.first, out.second};
+}
+
+} // namespace
+
+extern "C" {
+
+/// Build a `mlx::core::compile`-wrapped function around
+/// `paged_kv_write_trace_fn`, call it twice with same-shape inputs
+/// (but allowing the test to vary `slot_mapping` / `new_k` / `new_v`
+/// contents), and return how many times the inner trace ran. Cache
+/// HITS do not increment the counter; the caller asserts the count
+/// is exactly 1 after two calls (i.e., second call hit the cache).
+///
+/// This is a pure-trace test — we do NOT call `eval()`, so the GPU
+/// dispatch never fires and Metal availability is not required.
+/// Returns the trace count (typically 1 on success), or -1 on error.
+///
+/// Layout used (matches paged_kv_write_trace_fn's hardcoded scalars):
+///   block_size=16, num_kv_heads=4, head_size=64, x_pack=8, Bf16.
+///   k_pool: [4, 4, 8, 16, 8] bf16
+///   v_pool: [4, 4, 64, 16] bf16
+///   new_k:  [num_tokens, 4, 64] bf16
+///   new_v:  [num_tokens, 4, 64] bf16
+///   slot_mapping: [num_tokens] int64
+///
+/// `num_tokens` is fixed across both calls (otherwise we'd hit a
+/// different cache entry). The test exercises that re-tracing does
+/// NOT happen on the second call.
+int mlx_paged_kv_write_compile_trace_smoke(int num_tokens) {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (num_tokens <= 0) {
+    return -1;
+  }
+
+  // Reset counter so caller sees a clean slate (also protects against
+  // earlier tests in the same process having compiled a graph that
+  // happened to share fun_id).
+  g_paged_kv_write_trace_count.store(0, std::memory_order_seq_cst);
+
+  // Compile our trace function. This wraps it in MLX's compile cache
+  // — subsequent calls with the same input shapes/dtypes hit the
+  // cache and skip re-tracing.
+  auto compiled = mlx::core::compile(&paged_kv_write_trace_fn);
+
+  // Build placeholder inputs (tracer-only — we never call eval()).
+  // The shapes encode the layout the trace fn expects.
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array new_k(Shape{num_tokens, 4, 64}, bfloat16, nullptr, {});
+  array new_v(Shape{num_tokens, 4, 64}, bfloat16, nullptr, {});
+  array slot_mapping(Shape{num_tokens}, int64, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  std::vector<array> inputs1{k_pool, v_pool, new_k, new_v, slot_mapping, k_scale, v_scale};
+
+  // First call — cache miss, traces once.
+  try {
+    auto out1 = compiled(inputs1);
+    if (out1.size() != 2) {
+      return -1;
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[compile_trace_smoke] first call threw: %s\n", e.what());
+    return -1;
+  }
+
+  int count_after_first = g_paged_kv_write_trace_count.load(std::memory_order_seq_cst);
+  if (count_after_first != 1) {
+    fprintf(
+        stderr,
+        "[compile_trace_smoke] expected 1 trace after first call, got %d\n",
+        count_after_first);
+    return -1;
+  }
+
+  // Build a SECOND set of placeholder inputs with the SAME shapes
+  // and dtypes but distinct array_desc identities. (MLX's cache key
+  // uses shape+dtype+constants — distinct array identity does NOT
+  // produce a miss.)
+  array k_pool_b(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool_b(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array new_k_b(Shape{num_tokens, 4, 64}, bfloat16, nullptr, {});
+  array new_v_b(Shape{num_tokens, 4, 64}, bfloat16, nullptr, {});
+  array slot_mapping_b(Shape{num_tokens}, int64, nullptr, {});
+  array k_scale_b(1.0f, float32);
+  array v_scale_b(1.0f, float32);
+
+  std::vector<array> inputs2{
+      k_pool_b, v_pool_b, new_k_b, new_v_b, slot_mapping_b, k_scale_b, v_scale_b};
+
+  try {
+    auto out2 = compiled(inputs2);
+    if (out2.size() != 2) {
+      return -1;
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[compile_trace_smoke] second call threw: %s\n", e.what());
+    return -1;
+  }
+
+  int count_after_second = g_paged_kv_write_trace_count.load(std::memory_order_seq_cst);
+  return count_after_second;
+}
+
+/// Verify the public `paged_kv_write(...)` factory rejects k_pool
+/// whose interior dims disagree with the primitive's scalar state.
+int mlx_paged_kv_write_factory_rejects_pool_shape_mismatch() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  // k_pool: [num_blocks=4, num_kv_heads=8 (WRONG, expects 4), 8, 16, 8]
+  array k_pool(Shape{4, 8, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array new_k(Shape{2, 4, 64}, bfloat16, nullptr, {});
+  array new_v(Shape{2, 4, 64}, bfloat16, nullptr, {});
+  array slot_mapping(Shape{2}, int64, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    paged_kv_write(
+        k_pool,
+        v_pool,
+        new_k,
+        new_v,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        /*block_size=*/16,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*x_pack=*/8,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
     return 1;
   } catch (...) {
     return 0;

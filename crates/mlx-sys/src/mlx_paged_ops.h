@@ -224,8 +224,9 @@ std::pair<array, array> paged_kv_write(
 /// Emit a `PagedAttention` primitive. Returns the attention output.
 /// `softcap = 0.0` disables soft-capping (the Rust shim translates to
 /// the kernel's `softcapping = 1.0` "disabled" sentinel).
-/// `sliding_window = 0` disables sliding-window masking (used in
-/// Phase 7 for Gemma4).
+/// `sliding_window`: 0 = disabled (only supported value in Phase 1;
+/// Phase 7 adds support for nonzero values for Gemma4). The factory
+/// throws `std::invalid_argument` if a nonzero value is passed.
 array paged_attention(
     const array& q,
     const array& k_pool,

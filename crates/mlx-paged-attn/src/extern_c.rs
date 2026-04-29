@@ -300,7 +300,7 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
     max_blocks_per_seq: u32,
     scale: f32,
     softcap: f32,
-    _sliding_window: i32,
+    sliding_window: i32,
     kv_dtype_raw: u8,
     k_scale: f32,
     v_scale: f32,
@@ -313,6 +313,17 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
         || output_buffer.is_null()
     {
         eprintln!("mlx_paged_attn_paged_attention_dispatch: null buffer pointer");
+        return -1;
+    }
+    // Phase 1 does not honor sliding_window. Reject nonzero values
+    // here too so a missing C++-side validation can never silently
+    // tunnel a sliding_window setting through to a kernel that
+    // ignores it. Phase 7 (Gemma4) will plumb this end-to-end.
+    if sliding_window != 0 {
+        eprintln!(
+            "mlx_paged_attn_paged_attention_dispatch: sliding_window={sliding_window} \
+             is not implemented in Phase 1 (only 0 is supported; Phase 7 adds Gemma4)"
+        );
         return -1;
     }
     let Some(kv_dtype) = parse_kv_dtype(kv_dtype_raw) else {

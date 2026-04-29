@@ -870,6 +870,57 @@ unsafe extern "C-unwind" {
         sliding_window_rhs: i32,
         kv_dtype_rhs: u8,
     ) -> bool;
+
+    /// Verify `PagedAttention::output_shapes` reports
+    /// `{q_num_tokens, num_q_heads, head_size}` from the primitive's
+    /// scalar state (NOT from q's trailing dims). Writes the resulting
+    /// shape (3 elements) to `out_shape` and returns the number of
+    /// dimensions on the returned shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_attention_test_output_shapes(
+        q_num_tokens: i32,
+        q_dim1_actual: i32,
+        q_dim2_actual: i32,
+        scale: f32,
+        softcap: f32,
+        block_size: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        sliding_window: i32,
+        kv_dtype_raw: u8,
+        out_shape: *mut i32,
+    ) -> i32;
+
+    /// Returns 1 iff `paged_attention(...)` (the public factory)
+    /// throws `std::invalid_argument` when called with
+    /// `sliding_window=512`, 0 otherwise.
+    pub fn mlx_paged_attention_factory_rejects_sliding_window() -> i32;
+
+    /// Returns 1 iff `paged_attention(...)` throws when q's trailing
+    /// dims disagree with the primitive's scalar state.
+    pub fn mlx_paged_attention_factory_rejects_q_shape_mismatch() -> i32;
+
+    /// Returns 1 iff `paged_kv_write(...)` throws when the K-pool's
+    /// interior dims disagree with the primitive's scalar state.
+    pub fn mlx_paged_kv_write_factory_rejects_pool_shape_mismatch() -> i32;
+
+    /// Reset the compile-trace counter to 0 before exercising the
+    /// `mlx_paged_kv_write_compile_trace_smoke` helper.
+    pub fn mlx_paged_kv_write_trace_count_reset();
+
+    /// Read the compile-trace counter. Each cache-miss inside the
+    /// MLX compile cache increments it once via the trace function.
+    pub fn mlx_paged_kv_write_trace_count_get() -> i32;
+
+    /// Build a `mlx::core::compile`-wrapped function around an
+    /// internal trace function that emits a `paged_kv_write`
+    /// primitive, call it twice with same-shape inputs but distinct
+    /// array identities, and return the number of times the inner
+    /// trace ran. The caller asserts this is exactly 1 (i.e., the
+    /// second call hit the compile cache and re-used the traced
+    /// graph). Returns -1 on internal error.
+    pub fn mlx_paged_kv_write_compile_trace_smoke(num_tokens: i32) -> i32;
 }
 
 // ================================================================================
