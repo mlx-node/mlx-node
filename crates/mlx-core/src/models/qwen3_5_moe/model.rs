@@ -730,6 +730,149 @@ impl Qwen35MoeInner {
         Ok(())
     }
 
+    /// Phase 4 piece 2 helper — wire the per-layer paged pool / scale
+    /// MxArrays into the C++ globals consumed by
+    /// `mlx_qwen35_moe_forward_paged`.
+    ///
+    /// The caller is responsible for:
+    /// 1. Having a fully prefilled `paged_adapter` (e.g. via
+    ///    `transfer_flat_to_paged`).
+    /// 2. Owning the lifetime of `self.paged_adapter` (and its
+    ///    underlying `LayerKVPool`) for the entire decode loop until
+    ///    `mlx_qwen35_moe_reset()` clears the C++ globals.
+    ///
+    /// `prefill_offset` is the post-prefill cache offset that decode
+    /// will start incrementing from. For a fresh prefill it equals
+    /// `num_prefill_tokens`; for a delta on top of a cached prefix it
+    /// equals `cached_prefix_len + delta_len`.
+    ///
+    /// Currently unused — Phase 4 piece 2 wired the foundational adapter
+    /// helper (`transfer_flat_to_paged`) and this method, plus the
+    /// per-step dispatcher `forward_moe_cpp_paged`, but did NOT integrate
+    /// them into the 5 chat-session methods. See the piece-2 commit
+    /// message / report for the BLOCKED rationale around the C++ flat
+    /// path's session-continuation handshake mismatch with the paged
+    /// path. Piece 3 picks up the integration after the legacy flat FFI
+    /// (`mlx_qwen35_moe_forward` / `init_from_prefill`) is removed.
+    #[allow(dead_code)]
+    pub(crate) fn init_paged_session(&self, prefill_offset: i32) -> Result<()> {
+        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+            Error::from_reason("init_paged_session: paged_adapter is None (config flag not set?)")
+        })?;
+
+        let num_layers_us = self.config.num_layers as usize;
+        let mut k_pool_handles: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(num_layers_us);
+        let mut v_pool_handles: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(num_layers_us);
+        let mut k_scale_handles: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(num_layers_us);
+        let mut v_scale_handles: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(num_layers_us);
+
+        // Hold the materialized MxArrays alive until the FFI call returns.
+        // Each FFI call dereferences the handle to copy into the C++ globals;
+        // dropping these MxArrays after the call decrements the buffer
+        // refcount back to whatever the C++ side incremented it to.
+        let mut held_arrays: Vec<MxArray> = Vec::with_capacity(num_layers_us * 4);
+
+        for i in 0..num_layers_us {
+            if self.config.is_linear_layer(i) {
+                // Linear layers don't have paged KV. Pass null handles —
+                // the C++ FFI replaces these with internal placeholders.
+                k_pool_handles.push(std::ptr::null_mut());
+                v_pool_handles.push(std::ptr::null_mut());
+                k_scale_handles.push(std::ptr::null_mut());
+                v_scale_handles.push(std::ptr::null_mut());
+            } else {
+                let layer_idx_u32 = i as u32;
+                let k_arr = adapter.key_pool_array(layer_idx_u32).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_session: key_pool_array(layer={i}): {e}"
+                    ))
+                })?;
+                let v_arr = adapter.value_pool_array(layer_idx_u32).map_err(|e| {
+                    Error::from_reason(format!(
+                        "init_paged_session: value_pool_array(layer={i}): {e}"
+                    ))
+                })?;
+                let ks_arr = adapter.k_scale_array(layer_idx_u32).map_err(|e| {
+                    Error::from_reason(format!("init_paged_session: k_scale_array(layer={i}): {e}"))
+                })?;
+                let vs_arr = adapter.v_scale_array(layer_idx_u32).map_err(|e| {
+                    Error::from_reason(format!("init_paged_session: v_scale_array(layer={i}): {e}"))
+                })?;
+                k_pool_handles.push(k_arr.as_raw_ptr());
+                v_pool_handles.push(v_arr.as_raw_ptr());
+                k_scale_handles.push(ks_arr.as_raw_ptr());
+                v_scale_handles.push(vs_arr.as_raw_ptr());
+                held_arrays.push(k_arr);
+                held_arrays.push(v_arr);
+                held_arrays.push(ks_arr);
+                held_arrays.push(vs_arr);
+            }
+        }
+
+        let mlp_only: Vec<i32> = self
+            .config
+            .mlp_only_layers
+            .as_deref()
+            .unwrap_or(&[])
+            .to_vec();
+
+        unsafe {
+            mlx_sys::mlx_qwen35_moe_init_paged(
+                self.config.num_layers,
+                self.config.hidden_size,
+                self.config.num_heads,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+                self.config.rope_theta as f32,
+                self.config.rope_dims(),
+                self.config.rms_norm_eps as f32,
+                self.config.full_attention_interval,
+                self.config.linear_num_key_heads,
+                self.config.linear_num_value_heads,
+                self.config.linear_key_head_dim,
+                self.config.linear_value_head_dim,
+                self.config.linear_conv_kernel_dim,
+                if self.config.tie_word_embeddings {
+                    1
+                } else {
+                    0
+                },
+                /* max_kv_len: not used by paged; pass adapter's block_table capacity */
+                {
+                    let cap_blocks = adapter.num_allocated_blocks() as i32;
+                    cap_blocks
+                        .saturating_mul(adapter.block_size() as i32)
+                        .max(1)
+                },
+                1, // batch_size
+                self.config.num_experts,
+                self.config.num_experts_per_tok,
+                if self.config.norm_topk_prob { 1 } else { 0 },
+                self.config.decoder_sparse_step,
+                if mlp_only.is_empty() {
+                    std::ptr::null()
+                } else {
+                    mlp_only.as_ptr()
+                },
+                mlp_only.len() as i32,
+                k_pool_handles.as_mut_ptr(),
+                v_pool_handles.as_mut_ptr(),
+                k_scale_handles.as_mut_ptr(),
+                v_scale_handles.as_mut_ptr(),
+                std::ptr::null_mut(), // linear_cache_arrays (not seeding)
+                prefill_offset,
+            );
+        }
+
+        // `held_arrays` drops here — safe because the C++ FFI has copied
+        // the MLX `array` (which retains the underlying Metal buffer)
+        // into its globals, and our drop just decrements the original
+        // ref. The underlying buffer survives until reset.
+        drop(held_arrays);
+
+        Ok(())
+    }
+
     /// Core chat implementation (runs on model thread).
     ///
     /// `eos_token_id` is the caller-supplied stop-on token id (typically
@@ -6291,6 +6434,71 @@ fn eval_token_and_moe_caches(next_token: &MxArray) {
     unsafe {
         mlx_sys::mlx_qwen35_moe_eval_token_and_caches(next_token.as_raw_ptr());
     }
+}
+
+/// Phase 4 piece 2 helper — single-token paged decode through the new C++
+/// FFI `mlx_qwen35_moe_forward_paged`. Builds the standardized
+/// `PagedAttentionInputs` from the adapter, dispatches the FFI, and
+/// returns the logits MxArray.
+///
+/// Caller contract:
+/// - `mlx_qwen35_moe_init_paged` MUST have been called previously to
+///   wire up the per-layer pool / scale globals.
+/// - The adapter must have an active request whose `block_table` /
+///   `num_tokens` already reflect the post-decode state (the caller
+///   should `record_tokens(&[token_id])` BEFORE this call so
+///   `build_paged_attention_inputs` produces the correct slot mapping
+///   for the just-recorded token).
+/// - `chunk_size_max` is fixed at 1 (decode-only) and `max_blocks_per_seq`
+///   is the caller's compile-time bound on the longest sequence the
+///   compiled graph supports.
+///
+/// Currently unused — see the doc comment on
+/// `Qwen35MoeInner::init_paged_session` for the Phase 4 piece 2 BLOCKED
+/// status that left this dispatcher unwired into the 5 chat-session
+/// methods. Piece 3 will drive the integration after the flat-path FFI
+/// is removed.
+#[allow(dead_code)]
+fn forward_moe_cpp_paged(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    adapter: &PagedKVCacheAdapter,
+    max_blocks_per_seq: u32,
+) -> Result<MxArray> {
+    use mlx_sys as sys;
+
+    let inputs = adapter
+        .build_paged_attention_inputs(
+            /* num_new_tokens */ 1,
+            /* chunk_size_max */ 1,
+            max_blocks_per_seq,
+        )
+        .map_err(|e| Error::from_reason(format!("forward_moe_cpp_paged: build inputs: {e}")))?;
+
+    let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut cache_offset_out: i32 = 0;
+    unsafe {
+        sys::mlx_qwen35_moe_forward_paged(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            inputs.offset_arr.as_raw_ptr(),
+            inputs.block_table.as_raw_ptr(),
+            inputs.slot_mapping.as_raw_ptr(),
+            inputs.num_valid_tokens.as_raw_ptr(),
+            inputs.num_valid_blocks.as_raw_ptr(),
+            inputs.seq_lens.as_raw_ptr(),
+            &mut output_ptr,
+            &mut cache_offset_out,
+        );
+    }
+
+    if output_ptr.is_null() {
+        return Err(Error::from_reason(
+            "C++ MoE paged forward step returned null — check stderr for exception details",
+        ));
+    }
+
+    MxArray::from_handle(output_ptr, "moe_forward_paged_logits")
 }
 
 /// VLM prefill for MoE model using Rust path with M-RoPE position IDs.
