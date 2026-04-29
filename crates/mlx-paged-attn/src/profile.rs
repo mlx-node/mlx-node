@@ -334,16 +334,43 @@ fn read_total_memory_bytes() -> Result<u64, ProfileError> {
 /// `MLX_KV_MEMORY_UTILIZATION` × `hw.memsize` would otherwise
 /// over-commit the GPU.
 ///
-/// Returns `None` when:
-/// - Metal is unavailable (CPU-only build, no GPU);
-/// - the device_info map doesn't have `max_recommended_working_set_size`;
-/// - the C++ helper threw and returned -1 (defensive: the caller
-///   then falls back to the physical-RAM budget).
+/// Return values:
+/// - `Ok(None)` — the FFI succeeded but reported `0`, meaning the
+///   `mlx_metal_device_info` map literally does NOT contain a
+///   `max_recommended_working_set_size` entry. This is structurally
+///   different from a Metal failure: we just don't have a working-set
+///   bound to clamp against, so the auto-sizer falls back to the
+///   physical-RAM budget alone.
+/// - `Err(MetalUnavailable)` — the FFI returned -1 because the C++
+///   shim caught an exception. Common cause: degraded-Metal hosts
+///   where `mlx_metal_is_available()` lies and reports true but the
+///   underlying `MetalAllocator` constructor still throws.
+///
+/// Previously this function silently masked the FFI failure as `None`,
+/// which the auto-sizer then treated as "use physical RAM budget as-is"
+/// — producing an oversized KV pool that deferred MTLBuffer allocation
+/// failures from profile time to serving time. The fallible signature
+/// makes the failure observable so the caller can short-circuit with
+/// the same `MetalUnavailable` semantics it already uses for
+/// `read_peak_memory` / `reset_peak_memory`.
 #[cfg(target_os = "macos")]
-fn read_working_set_bytes() -> Option<u64> {
+fn read_working_set_bytes() -> Result<Option<u64>, ProfileError> {
     let mut ws: u64 = 0;
     let rc = unsafe { mlx_sys::mlx_max_recommended_working_set_size(&mut ws) };
-    if rc != 0 || ws == 0 { None } else { Some(ws) }
+    if rc != 0 {
+        // Caught C++ exception. The previous infallible signature
+        // collapsed this case into `None`; with the new contract we
+        // surface `MetalUnavailable` so the auto-sizer matches the
+        // peak-memory FFI's failure mode.
+        return Err(ProfileError::MetalUnavailable);
+    }
+    if ws == 0 {
+        // FFI succeeded but the entry isn't in the device_info map —
+        // legitimate "no bound reported" case.
+        Ok(None)
+    } else {
+        Ok(Some(ws))
+    }
 }
 
 /// Pure-formula step that combines the physical-RAM budget with the
@@ -566,7 +593,14 @@ where
         // reports ~75% of unified memory as the upper bound MTLDevice will
         // happily commit — past that we get `MTLBuffer` allocation
         // failures during serving rather than at profile time.
-        let working_set = read_working_set_bytes();
+        //
+        // `read_working_set_bytes` is fallible by the same FFI contract
+        // as `read_peak_memory`: a -1 return means the C++ shim caught
+        // an exception (degraded Metal). Propagate it as
+        // `MetalUnavailable` rather than silently masking it as
+        // `None` — masking would produce an oversized KV pool that
+        // defers MTLBuffer allocation failure to serving time.
+        let working_set = read_working_set_bytes()?;
         let (num_blocks, kv_bytes, physical_bytes, working_set_bytes) =
             compute_num_blocks_with_working_set(
                 total,

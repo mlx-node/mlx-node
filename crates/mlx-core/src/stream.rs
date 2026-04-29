@@ -123,7 +123,24 @@ impl Drop for StreamContext {
 /// // Streams synchronized, original limit restored
 /// ```
 pub struct WiredLimitContext {
-    old_limit: usize,
+    /// Captured prior wired limit, populated only when the constructor
+    /// successfully called `mlx_set_wired_limit`.
+    ///
+    /// - `None`        — constructor failed (Metal unavailable, FFI -1, or
+    ///   model_size_bytes was 0): no wired limit was set, so `Drop` MUST
+    ///   NOT attempt to restore anything. `streams` is also empty in this
+    ///   state so the sync loop is a no-op.
+    /// - `Some(prev)`  — constructor succeeded: `Drop` restores `prev`.
+    ///   `Some(0)` is a legitimate value here (the prior wired limit was
+    ///   genuinely zero, e.g. before `mlx-lm` ever called the API on this
+    ///   process); restoring zero on drop matches the captured state.
+    ///
+    /// This split removes the prior `usize`-only design where `0` was
+    /// overloaded to mean BOTH "constructor failed" AND "prior limit was
+    /// zero", which silently turned a legitimate prior-zero into a
+    /// no-op-restore that left the process-wide wired limit pinned to
+    /// `max_recommended_working_set_size` after the context dropped.
+    old_limit: Option<usize>,
     streams: Vec<Stream>,
 }
 
@@ -136,8 +153,10 @@ impl WiredLimitContext {
     pub fn new(model_size_bytes: usize, streams: Vec<Stream>) -> Self {
         let max_rec_size = Self::get_max_working_set_size();
         if max_rec_size == 0 {
+            // Metal unavailable or device_info missing the entry —
+            // never set a wired limit, so Drop has nothing to restore.
             return Self {
-                old_limit: 0,
+                old_limit: None,
                 streams: Vec::new(),
             };
         }
@@ -164,13 +183,18 @@ impl WiredLimitContext {
         let rc = unsafe { sys::mlx_set_wired_limit(max_rec_size as u64, &mut prev) };
         if rc != 0 {
             return Self {
-                old_limit: 0,
+                old_limit: None,
                 streams: Vec::new(),
             };
         }
 
+        // Constructor succeeded — capture the prior limit verbatim. If
+        // `prev == 0` that means the wired limit was genuinely zero
+        // before this call; Drop restores 0 (which matches mlx-lm's
+        // documented behaviour: `set_wired_limit(0)` returns to the
+        // OS-default unlimited state).
         Self {
-            old_limit: prev as usize,
+            old_limit: Some(prev as usize),
             streams,
         }
     }
@@ -204,10 +228,13 @@ impl WiredLimitContext {
 
 impl Drop for WiredLimitContext {
     fn drop(&mut self) {
-        if self.old_limit == 0 {
-            // No-op context, nothing to restore
+        // `None` means the constructor never successfully set a wired
+        // limit (Metal unavailable, FFI returned -1, or max_rec_size
+        // was 0). Skip both the sync and the restore — there is
+        // nothing to undo.
+        let Some(prev_limit) = self.old_limit else {
             return;
-        }
+        };
 
         // CRITICAL: Synchronize all streams before changing wired limit
         // This prevents race conditions where wired limit changes while GPU ops are pending
@@ -215,12 +242,15 @@ impl Drop for WiredLimitContext {
             stream.synchronize();
         }
 
-        // Restore original wired limit. Best-effort: ignore the fallible
-        // shim's -1 return on degraded-Metal hosts (the constructor
-        // already short-circuited to a no-op context in that case, so
-        // `old_limit` is 0 and the early-return above kicked in — this
-        // line is reachable only on success-path drops).
+        // Restore original wired limit (which may legitimately be 0 —
+        // see `old_limit`'s docs: a captured `Some(0)` means the prior
+        // limit really was zero and the OS-default unlimited state
+        // should be restored). Best-effort: ignore the fallible shim's
+        // -1 return — there is no usable error channel from `Drop`,
+        // and the only consumer that can act on the failure (the
+        // model wrapper that owned this context) is already going
+        // away.
         let mut _prev: u64 = 0;
-        let _rc = unsafe { sys::mlx_set_wired_limit(self.old_limit as u64, &mut _prev) };
+        let _rc = unsafe { sys::mlx_set_wired_limit(prev_limit as u64, &mut _prev) };
     }
 }

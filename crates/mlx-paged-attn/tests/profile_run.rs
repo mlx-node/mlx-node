@@ -296,11 +296,22 @@ fn profile_run_threads_max_position_embeddings_to_closure() {
 /// of pages, which then fail later during serving with MTLBuffer
 /// allocation errors.
 ///
-/// The fallible-FFI contract fixes this STRUCTURALLY: each memory shim
-/// now returns -1 on caught exception, and the Rust caller `?`-propagates
-/// the failure as `ProfileError::MetalUnavailable`. There is no longer
-/// a code path through the auto-sizer that consumes a caught-exception
-/// peak as a real measurement.
+/// The fallible-FFI contract fixes this STRUCTURALLY across the three
+/// memory shims that touch the auto-sizer:
+///   - `mlx_reset_peak_memory` → `reset_peak_memory()` `?`-propagates as
+///     `MetalUnavailable`.
+///   - `mlx_get_peak_memory` → `read_peak_memory()` `?`-propagates as
+///     `MetalUnavailable`.
+///   - `mlx_max_recommended_working_set_size` → `read_working_set_bytes()`
+///     `?`-propagates as `MetalUnavailable` (-1 return = caught exception).
+///     A return of `0` still surfaces as `Ok(None)` because that's the
+///     legitimate "device_info doesn't report this entry" case, NOT a
+///     failure mode.
+///
+/// There is no longer a code path through the auto-sizer that consumes a
+/// caught-exception peak — or a caught-exception working_set — as a real
+/// measurement. See `formula_well_behaved_with_zero_peak_and_no_working_set`
+/// below for the math-layer pin that complements this test.
 ///
 /// What this test verifies given the test cannot synthesize a degraded-
 /// Metal environment from a Metal-equipped host:
@@ -398,6 +409,123 @@ fn profile_run_no_metal_returns_metal_unavailable_without_abort() {
             panic!("unexpected error variant: {other:?}");
         }
     }
+}
+
+/// Pin the formula's behaviour in the precise "peak=0 + working_set=None"
+/// scenario that the fallible-FFI contract is designed to keep the
+/// auto-sizer from ever observing through a caught-exception sentinel.
+///
+/// Why this test exists:
+/// The original bug report's regression scenario was a degraded-Metal host
+/// where `mlx_get_peak_memory()` and `mlx_max_recommended_working_set_size()`
+/// both threw C++ exceptions and the previous infallible FFI signatures
+/// silently returned `0` and `None` respectively. The auto-sizer then
+/// fed those sentinels into `compute_num_blocks_with_working_set` as if
+/// they were real measurements and computed millions of blocks against
+/// the full physical-RAM budget — oversizing the KV pool and deferring
+/// the actual MTLBuffer allocation failure to serving time.
+///
+/// The structural fix lives in the FFI shims and their Rust callers:
+/// `read_peak_memory()` / `read_working_set_bytes()` now return
+/// `Err(MetalUnavailable)` on a -1 return, and `profile_run_and_compute_num_blocks`
+/// `?`-propagates the failure BEFORE the math layer ever runs. So the
+/// math layer should never see a sentinel-zero peak from a caught
+/// exception. But if a caller in some future callsite passes peak=0
+/// from a legitimate measurement (a freshly reset allocator on a
+/// brand-new process) plus `working_set_bytes=None` (CPU-only build),
+/// the formula must still produce a sensible result rather than
+/// degenerate.
+///
+/// What this test verifies:
+/// - The math accepts peak=0 + working_set=None and produces a single
+///   well-defined block count (no panic, no overflow).
+/// - The block count is bounded by `(total * util - safety) /
+///   bytes_per_block` — i.e. it scales linearly with the inputs and
+///   does NOT blow up to `u32::MAX`.
+/// - The chosen budget equals the physical budget (the `None` path)
+///   and `ws_budget` is `None`.
+///
+/// This complements the no-Metal regression test above: that one verifies
+/// the FFI layer prevents the math from ever observing the bug scenario;
+/// this one verifies the math itself is well-behaved if a future caller
+/// does construct that exact input from real measurements.
+#[test]
+fn formula_well_behaved_with_zero_peak_and_no_working_set() {
+    let gib = 1024u64 * 1024 * 1024;
+    let total = 64 * gib;
+    // Simulate the legitimate "peak=0" case: a brand-new process whose
+    // allocator counter has never moved. With the FFI layer fixed, this
+    // is the ONLY way the math layer can observe peak=0 — never via a
+    // caught-exception sentinel.
+    let peak = 0u64;
+    let util = 0.85;
+    let safety = gib;
+    // Per-block 1 MiB. With these inputs the budget is
+    // 64 * 0.85 - 0 - 1 = 53.4 GiB → ~54,700 blocks. NOT millions or
+    // billions; the formula's natural arithmetic bounds the result.
+    let bpb = 1024u64 * 1024;
+
+    let (num_blocks, kv_bytes, phys_budget, ws_budget) =
+        compute_num_blocks_with_working_set(total, None, peak, util, safety, bpb)
+            .expect("formula should handle peak=0 + working_set=None cleanly");
+
+    // working_set was None → ws_budget is None and chosen budget = physical.
+    assert!(
+        ws_budget.is_none(),
+        "ws_budget must be None when working_set_bytes=None"
+    );
+    assert_eq!(kv_bytes, phys_budget);
+
+    // Expected budget: 64 GiB * 0.85 - 0 peak - 1 GiB safety = 53.4 GiB.
+    // That's 54,681 MiB / 1 MiB per block = 54,681 blocks. Bound at ~50–60k.
+    let kv_gib = kv_bytes / gib;
+    assert!(
+        (50..=55).contains(&kv_gib),
+        "expected ~53 GiB KV under peak=0 + working_set=None, got {kv_gib} GiB"
+    );
+    assert!(
+        (50_000..=60_000).contains(&num_blocks),
+        "expected ~54,700 blocks, got {num_blocks} — \
+         this is the regression bound: a future bug producing billions of blocks would fail this assertion"
+    );
+}
+
+/// The fallible FFI contract guarantees the math layer never observes a
+/// `working_set_bytes` value that came from a caught C++ exception (those
+/// surface as `Err(MetalUnavailable)` BEFORE the math runs). But the
+/// formula must still be well-defined for the legitimate edge case where
+/// a working_set bound IS reported but happens to exceed `hw.memsize`
+/// (driver bug, paravirtual VM exposing a misreported recommended limit).
+/// In that case the physical-RAM budget is the tighter of the two and
+/// must win.
+#[test]
+fn formula_picks_physical_when_working_set_exceeds_total() {
+    let gib = 1024u64 * 1024 * 1024;
+    let total = 32 * gib;
+    // Pathological: working_set claims more memory than the system
+    // physically has. The clamp must still produce the smaller of the
+    // two budgets so we don't over-commit `hw.memsize`.
+    let working_set = 64 * gib;
+    let peak = 5 * gib;
+    let util = 0.85;
+    let safety = gib;
+    let bpb = 1024u64 * 1024;
+
+    let (phys_blocks, _) =
+        compute_num_blocks_from_measurements(total, peak, util, safety, bpb).unwrap();
+    let (clamped_blocks, kv_bytes, phys_budget, ws_budget) =
+        compute_num_blocks_with_working_set(total, Some(working_set), peak, util, safety, bpb)
+            .unwrap();
+
+    // Physical budget is the tighter constraint here (32 GiB physical <
+    // 64 GiB working set). The clamp must pick it.
+    assert_eq!(clamped_blocks, phys_blocks);
+    assert_eq!(kv_bytes, phys_budget);
+    let ws_budget = ws_budget.expect("ws_budget reported");
+    assert!(
+        phys_budget <= ws_budget,
+        "physical budget should be the tighter clamp when working_set > total"
+    );
 }
 
 /// Closure failure propagates verbatim to ProfileError::DummyForwardFailed

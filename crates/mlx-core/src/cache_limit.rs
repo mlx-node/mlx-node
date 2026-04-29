@@ -121,7 +121,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use napi_derive::napi;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::array::memory::{
     get_active_memory, get_cache_memory, get_peak_memory, set_cache_limit,
@@ -279,8 +279,16 @@ fn recompute_locked(state: &mut CoordState) {
             Ok(gib) => {
                 let bytes = (gib * ONE_GIB).round() as usize;
                 if state.last_applied != Some(bytes) {
-                    apply_limit(bytes, &format!("env {}={}", CACHE_LIMIT_ENV, trimmed));
-                    state.last_applied = Some(bytes);
+                    // Memoize ONLY when the FFI confirmed the cap was
+                    // applied. A failed `set_cache_limit` (FFI returned
+                    // -1, i.e. the C++ allocator threw) MUST NOT be
+                    // recorded as success — leaving `last_applied`
+                    // unchanged ensures the next register/unregister
+                    // call retries instead of silently treating the
+                    // failure as a stable applied state.
+                    if apply_limit(bytes, &format!("env {}={}", CACHE_LIMIT_ENV, trimmed)) {
+                        state.last_applied = Some(bytes);
+                    }
                 }
                 return;
             }
@@ -355,8 +363,13 @@ fn recompute_locked(state: &mut CoordState) {
         )
     };
 
-    apply_limit(bytes, &source);
-    state.last_applied = Some(bytes);
+    // Same fallible-FFI contract as the env-override branch: only memoize
+    // `last_applied` when `apply_limit` confirms the cap was actually
+    // pushed through the FFI. A failed call leaves `last_applied`
+    // untouched so a later register/unregister retries.
+    if apply_limit(bytes, &source) {
+        state.last_applied = Some(bytes);
+    }
 }
 
 /// Estimate the Metal driver's own overhead footprint for the given
@@ -410,14 +423,40 @@ fn compute_cache_limit(weights: u64, wired: u64) -> u64 {
     (wired - reserved).max(MIN_FREELIST_BYTES)
 }
 
-fn apply_limit(bytes: usize, source: &str) {
-    let prev = set_cache_limit(bytes as f64);
-    info!(
-        "[cache_limit] cache pool cap set to {:.1} GB ({}); previous = {:.1} GB",
-        bytes as f64 / ONE_GIB,
-        source,
-        prev / ONE_GIB,
-    );
+/// Push a freshly computed cap through `set_cache_limit`. Returns `true`
+/// when the FFI succeeded so the caller can update `last_applied`; `false`
+/// indicates the FFI caught a C++ exception (degraded Metal) and the cap
+/// was NOT applied — the caller MUST leave `last_applied` untouched so
+/// the next register/unregister cycle retries.
+///
+/// Logging:
+///   - success → `info!` with the new cap, source, and previous cap.
+///   - failure → `warn!` so an operator can grep logs for the explicit
+///     failure reason instead of having to reason about a silent retry
+///     loop.
+#[must_use]
+fn apply_limit(bytes: usize, source: &str) -> bool {
+    match set_cache_limit(bytes as f64) {
+        Ok(prev) => {
+            info!(
+                "[cache_limit] cache pool cap set to {:.1} GB ({}); previous = {:.1} GB",
+                bytes as f64 / ONE_GIB,
+                source,
+                prev / ONE_GIB,
+            );
+            true
+        }
+        Err(err) => {
+            warn!(
+                "[cache_limit] set_cache_limit({:.1} GB, {}) FAILED ({}); cap NOT applied, will \
+                 retry on next register/unregister",
+                bytes as f64 / ONE_GIB,
+                source,
+                err,
+            );
+            false
+        }
+    }
 }
 
 // ── Minimal JS-facing surface ──────────────────────────────────────

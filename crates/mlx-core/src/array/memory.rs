@@ -1,5 +1,26 @@
 use mlx_sys as sys;
 
+/// Error returned by [`set_cache_limit`] when the underlying FFI shim caught
+/// a C++ exception (e.g. degraded Metal allocator on a misconfigured host).
+///
+/// The cache limit was NOT applied. Callers that memoize the most-recently-
+/// applied cap (e.g. `cache_limit::CacheLimitCoordinator`) must NOT record
+/// the requested value as the new state on receiving this error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetCacheLimitError;
+
+impl std::fmt::Display for SetCacheLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "mlx_set_cache_limit failed: FFI shim caught a C++ exception (likely degraded Metal); \
+             cache limit was not applied"
+        )
+    }
+}
+
+impl std::error::Error for SetCacheLimitError {}
+
 /// Clear the MLX memory cache to prevent memory pressure buildup
 /// Should be called periodically during long-running operations
 /// Internal Rust-only function - memory management is handled automatically by the trainer
@@ -242,21 +263,33 @@ pub fn get_memory_limit() -> f64 {
 
 /// Set cache limit (controls memory pool/cache size).
 /// This limits how much memory MLX pre-allocates for caching.
-/// Returns the previous limit in bytes, or 0.0 if the shim caught an
-/// exception.
+/// Returns the previous limit in bytes on success, or
+/// [`SetCacheLimitError`] when the underlying FFI shim caught a C++
+/// exception (the cap was NOT applied).
 ///
 /// Use this to reduce memory pre-allocation, which can prevent the
 /// "100GB Alloc" issue on high-memory systems.
 ///
+/// The fallible signature lets the [`crate::cache_limit::CacheLimitCoordinator`]
+/// distinguish between "successfully applied a 0-byte cap" (legitimate
+/// disable) and "FFI caught an exception so the cap was never set" — the
+/// prior infallible signature collapsed the latter into `0.0`, which the
+/// coordinator then memoized as `last_applied = Some(0)` and used to
+/// suppress retries on later calls.
+///
 /// # Example
 /// ```ignore
 /// // Limit cache to 32GB
-/// set_cache_limit(32.0 * 1024.0 * 1024.0 * 1024.0);
+/// set_cache_limit(32.0 * 1024.0 * 1024.0 * 1024.0).unwrap();
 /// ```
-pub fn set_cache_limit(limit: f64) -> f64 {
+pub fn set_cache_limit(limit: f64) -> Result<f64, SetCacheLimitError> {
     let mut prev: u64 = 0;
     let rc = unsafe { sys::mlx_set_cache_limit(limit as u64, &mut prev) };
-    if rc != 0 { 0.0 } else { prev as f64 }
+    if rc != 0 {
+        Err(SetCacheLimitError)
+    } else {
+        Ok(prev as f64)
+    }
 }
 
 /// Clear MLX's compiler cache (traced computation graphs)
