@@ -734,10 +734,49 @@ impl Qwen35MoeInner {
     /// MxArrays into the C++ globals consumed by
     /// `mlx_qwen35_moe_forward_paged`.
     ///
-    /// The caller is responsible for:
-    /// 1. Having a fully prefilled `paged_adapter` (e.g. via
+    /// # Layer-index contract
+    ///
+    /// The C++ FFI (`mlx_qwen35_moe_init_paged`) takes pool/scale handle
+    /// arrays of size `num_layers` (absolute decoder count). For each
+    /// absolute layer index `i`:
+    /// * Linear-attention layers (`is_linear_layer(i) == true`) get
+    ///   null pool/scale slots — the C++ FFI substitutes its own
+    ///   bf16/f32 placeholders.
+    /// * Full-attention layers get the adapter's `LayerKVPool` slot at
+    ///   the COMPACT (full-attention) ordinal — which is the count of
+    ///   full-attention layers in `0..i`. This is critical: the
+    ///   `LayerKVPool` is sized for `full_attention_layer_count()`, NOT
+    ///   `num_layers`, so passing absolute `i` as the `key_pool_array`
+    ///   index would miswire early full-attn layers and panic / OOB
+    ///   once `i >= full_attention_layer_count()`.
+    ///
+    /// The compact-ordinal mapping is computed via
+    /// [`crate::models::qwen3_5::decoder_layer::compute_layer_kinds`],
+    /// which is the same helper the production paged-forward dispatch
+    /// uses to route layers through the adapter.
+    ///
+    /// # `linear_cache_arrays` BLOCKED until piece 3
+    ///
+    /// The C++ FFI accepts a `linear_cache_arrays` pointer of length
+    /// `2 * num_layers` (one `(conv_state, recurrent_state)` pair per
+    /// absolute layer). Plumbing the GDN linear-attention recurrent
+    /// state out of the existing flat path's `Qwen3_5LayerCache::Linear`
+    /// variant and into this FFI requires extending the export surface
+    /// of `ArraysCache` and a new caller contract. That work is piece 3
+    /// scope.
+    ///
+    /// To avoid silently producing garbage when callers (e.g. a
+    /// half-wired piece-3 prototype) invoke this with non-trivial
+    /// linear layers, this function panics on any model whose layer
+    /// layout includes linear-attention layers. Models with all
+    /// full-attention layers (synthetic test configs, future
+    /// dense-attention checkpoints) still work.
+    ///
+    /// # Caller contract
+    ///
+    /// 1. `paged_adapter` is fully prefilled (e.g. via
     ///    `transfer_flat_to_paged`).
-    /// 2. Owning the lifetime of `self.paged_adapter` (and its
+    /// 2. The model owns the lifetime of `self.paged_adapter` (and its
     ///    underlying `LayerKVPool`) for the entire decode loop until
     ///    `mlx_qwen35_moe_reset()` clears the C++ globals.
     ///
@@ -745,22 +784,47 @@ impl Qwen35MoeInner {
     /// will start incrementing from. For a fresh prefill it equals
     /// `num_prefill_tokens`; for a delta on top of a cached prefix it
     /// equals `cached_prefix_len + delta_len`.
-    ///
-    /// Currently unused — Phase 4 piece 2 wired the foundational adapter
-    /// helper (`transfer_flat_to_paged`) and this method, plus the
-    /// per-step dispatcher `forward_moe_cpp_paged`, but did NOT integrate
-    /// them into the 5 chat-session methods. See the piece-2 commit
-    /// message / report for the BLOCKED rationale around the C++ flat
-    /// path's session-continuation handshake mismatch with the paged
-    /// path. Piece 3 picks up the integration after the legacy flat FFI
-    /// (`mlx_qwen35_moe_forward` / `init_from_prefill`) is removed.
+    #[doc(hidden)]
+    #[deprecated(
+        note = "Phase 4 piece 2 placeholder; awaiting linear-cache plumbing through the C++ FFI \
+                (piece 3 scope). Calling this on a model with linear-attention layers panics."
+    )]
     #[allow(dead_code)]
     pub(crate) fn init_paged_session(&self, prefill_offset: i32) -> Result<()> {
+        use crate::models::qwen3_5::decoder_layer::{Qwen3_5LayerKind, compute_layer_kinds};
+
         let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
             Error::from_reason("init_paged_session: paged_adapter is None (config flag not set?)")
         })?;
 
         let num_layers_us = self.config.num_layers as usize;
+        let layer_kinds = compute_layer_kinds(num_layers_us, |i| self.config.is_linear_layer(i));
+
+        // Phase 4 piece 2 BLOCKED guardrail: refuse to proceed when any
+        // linear-attention layer exists. The C++ FFI receives a
+        // `linear_cache_arrays = null` pointer below, which means the
+        // GDN recurrent state would be replaced with bf16 zero
+        // placeholders — silently producing garbage decode output.
+        // Piece 3 will plumb `(conv_state, recurrent_state)` per linear
+        // layer through the FFI; until then this is a hard fail rather
+        // than a silent corruption.
+        let has_linear = layer_kinds
+            .iter()
+            .any(|k| matches!(k, Qwen3_5LayerKind::Linear));
+        if has_linear {
+            panic!(
+                "init_paged_session: Phase 4 piece 2 placeholder — linear-attention layers \
+                 require GDN recurrent-state plumbing through the C++ FFI \
+                 (linear_cache_arrays). That work is piece 3 scope. The current call would \
+                 silently zero the recurrent state and produce garbage decode output. \
+                 num_layers={}, full_attention_interval={}, \
+                 full_attention_layer_count={}.",
+                num_layers_us,
+                self.config.full_attention_interval,
+                self.config.full_attention_layer_count(),
+            );
+        }
+
         let mut k_pool_handles: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(num_layers_us);
         let mut v_pool_handles: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(num_layers_us);
         let mut k_scale_handles: Vec<*mut mlx_sys::mlx_array> = Vec::with_capacity(num_layers_us);
@@ -772,40 +836,56 @@ impl Qwen35MoeInner {
         // refcount back to whatever the C++ side incremented it to.
         let mut held_arrays: Vec<MxArray> = Vec::with_capacity(num_layers_us * 4);
 
-        for i in 0..num_layers_us {
-            if self.config.is_linear_layer(i) {
-                // Linear layers don't have paged KV. Pass null handles —
-                // the C++ FFI replaces these with internal placeholders.
-                k_pool_handles.push(std::ptr::null_mut());
-                v_pool_handles.push(std::ptr::null_mut());
-                k_scale_handles.push(std::ptr::null_mut());
-                v_scale_handles.push(std::ptr::null_mut());
-            } else {
-                let layer_idx_u32 = i as u32;
-                let k_arr = adapter.key_pool_array(layer_idx_u32).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_session: key_pool_array(layer={i}): {e}"
-                    ))
-                })?;
-                let v_arr = adapter.value_pool_array(layer_idx_u32).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_paged_session: value_pool_array(layer={i}): {e}"
-                    ))
-                })?;
-                let ks_arr = adapter.k_scale_array(layer_idx_u32).map_err(|e| {
-                    Error::from_reason(format!("init_paged_session: k_scale_array(layer={i}): {e}"))
-                })?;
-                let vs_arr = adapter.v_scale_array(layer_idx_u32).map_err(|e| {
-                    Error::from_reason(format!("init_paged_session: v_scale_array(layer={i}): {e}"))
-                })?;
-                k_pool_handles.push(k_arr.as_raw_ptr());
-                v_pool_handles.push(v_arr.as_raw_ptr());
-                k_scale_handles.push(ks_arr.as_raw_ptr());
-                v_scale_handles.push(vs_arr.as_raw_ptr());
-                held_arrays.push(k_arr);
-                held_arrays.push(v_arr);
-                held_arrays.push(ks_arr);
-                held_arrays.push(vs_arr);
+        for (i, kind) in layer_kinds.iter().enumerate() {
+            match kind {
+                Qwen3_5LayerKind::Linear => {
+                    // Unreachable in this build (the panic above rejects
+                    // any layer kind list with a Linear entry), but
+                    // structurally the C++ FFI accepts null pool/scale
+                    // slots for linear layers. Keep the slot population
+                    // explicit so a future piece-3 patch only has to
+                    // remove the panic guard above + plumb
+                    // linear_cache_arrays.
+                    k_pool_handles.push(std::ptr::null_mut());
+                    v_pool_handles.push(std::ptr::null_mut());
+                    k_scale_handles.push(std::ptr::null_mut());
+                    v_scale_handles.push(std::ptr::null_mut());
+                }
+                Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                    // CRITICAL: index by the COMPACT full-attention
+                    // ordinal (`paged_idx`), NOT the absolute layer
+                    // index `i`. The pool is sized for
+                    // `full_attention_layer_count()` slots — passing `i`
+                    // would miswire early layers and OOB on later ones.
+                    let k_arr = adapter.key_pool_array(*paged_idx).map_err(|e| {
+                        Error::from_reason(format!(
+                            "init_paged_session: key_pool_array(layer={i}, paged_idx={paged_idx}): {e}"
+                        ))
+                    })?;
+                    let v_arr = adapter.value_pool_array(*paged_idx).map_err(|e| {
+                        Error::from_reason(format!(
+                            "init_paged_session: value_pool_array(layer={i}, paged_idx={paged_idx}): {e}"
+                        ))
+                    })?;
+                    let ks_arr = adapter.k_scale_array(*paged_idx).map_err(|e| {
+                        Error::from_reason(format!(
+                            "init_paged_session: k_scale_array(layer={i}, paged_idx={paged_idx}): {e}"
+                        ))
+                    })?;
+                    let vs_arr = adapter.v_scale_array(*paged_idx).map_err(|e| {
+                        Error::from_reason(format!(
+                            "init_paged_session: v_scale_array(layer={i}, paged_idx={paged_idx}): {e}"
+                        ))
+                    })?;
+                    k_pool_handles.push(k_arr.as_raw_ptr());
+                    v_pool_handles.push(v_arr.as_raw_ptr());
+                    k_scale_handles.push(ks_arr.as_raw_ptr());
+                    v_scale_handles.push(vs_arr.as_raw_ptr());
+                    held_arrays.push(k_arr);
+                    held_arrays.push(v_arr);
+                    held_arrays.push(ks_arr);
+                    held_arrays.push(vs_arr);
+                }
             }
         }
 
@@ -859,7 +939,7 @@ impl Qwen35MoeInner {
                 v_pool_handles.as_mut_ptr(),
                 k_scale_handles.as_mut_ptr(),
                 v_scale_handles.as_mut_ptr(),
-                std::ptr::null_mut(), // linear_cache_arrays (not seeding)
+                std::ptr::null_mut(), // linear_cache_arrays — see piece-3 scope above
                 prefill_offset,
             );
         }
@@ -6762,5 +6842,93 @@ mod paged_construction_tests {
             "Qwen35MoeInner::new with use_block_paged_cache=true must succeed on Metal host",
         );
         assert!(inner.paged_adapter.is_some());
+    }
+
+    /// Reproduces the absolute-layer to paged-ordinal mapping that
+    /// `init_paged_session` walks for a real Qwen3.5 MoE 40-layer
+    /// `interval=4` config. Asserts that:
+    ///
+    /// * Linear-attention layers (i+1 not divisible by 4) get NO paged
+    ///   slot.
+    /// * Full-attention layers (i+1 divisible by 4) get paged slot
+    ///   indices [0, 1, 2, ..., 9] in absolute-layer order — the
+    ///   COMPACT ordinal that the adapter's `LayerKVPool` (sized for
+    ///   `full_attention_layer_count = 10`) actually expects.
+    ///
+    /// Pre-fix behavior would index `key_pool_array(absolute_i)` —
+    /// e.g. layer 3 would request slot 3 from a 10-slot pool, then
+    /// layer 39 would request slot 39 and OOB. This test pins the
+    /// compact mapping so a future regression that re-introduces
+    /// absolute-index lookup fails immediately.
+    #[test]
+    fn test_init_paged_session_layer_mapping_40_layer_interval_4() {
+        use crate::models::qwen3_5::decoder_layer::{Qwen3_5LayerKind, compute_layer_kinds};
+
+        // 40 layers, full_attention_interval=4 → layers
+        // 3, 7, 11, 15, 19, 23, 27, 31, 35, 39 (10 layers) are
+        // full-attention, the other 30 are linear.
+        let num_layers = 40usize;
+        let full_attention_interval = 4i32;
+        let kinds = compute_layer_kinds(num_layers, |i| {
+            // Mirrors `Qwen3_5MoeConfig::is_linear_layer`.
+            !(i + 1).is_multiple_of(full_attention_interval as usize)
+        });
+
+        let mut paged_seen = 0u32;
+        let mut full_attn_layers = Vec::new();
+        for (i, kind) in kinds.iter().enumerate() {
+            let is_full = (i + 1).is_multiple_of(full_attention_interval as usize);
+            match kind {
+                Qwen3_5LayerKind::Linear => {
+                    assert!(
+                        !is_full,
+                        "layer {i} is full-attention but compute_layer_kinds said Linear"
+                    );
+                }
+                Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                    assert!(
+                        is_full,
+                        "layer {i} is linear-attention but compute_layer_kinds said \
+                         FullAttentionPaged"
+                    );
+                    // Compact ordinal must equal the running count of
+                    // full-attn layers seen so far (NOT the absolute
+                    // layer index).
+                    assert_eq!(
+                        *paged_idx, paged_seen,
+                        "paged_idx mismatch at absolute layer {i}: expected compact ordinal \
+                         {paged_seen} (count of full-attn layers in 0..{i}), got {paged_idx}"
+                    );
+                    full_attn_layers.push((i, *paged_idx));
+                    paged_seen += 1;
+                }
+            }
+        }
+
+        // 40 / 4 = 10 full-attention layers.
+        assert_eq!(paged_seen, 10);
+        assert_eq!(
+            full_attn_layers,
+            vec![
+                (3, 0),
+                (7, 1),
+                (11, 2),
+                (15, 3),
+                (19, 4),
+                (23, 5),
+                (27, 6),
+                (31, 7),
+                (35, 8),
+                (39, 9),
+            ],
+            "absolute_layer → compact_paged_idx pairs must match the 10-slot pool layout",
+        );
+
+        // Sanity: `full_attention_layer_count` returns the same count
+        // the pool would be sized for.
+        let full_count = (0..num_layers)
+            .filter(|&i| (i + 1).is_multiple_of(full_attention_interval as usize))
+            .count();
+        assert_eq!(full_count, 10);
     }
 }

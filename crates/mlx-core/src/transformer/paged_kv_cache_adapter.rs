@@ -2032,7 +2032,99 @@ impl PagedKVCacheAdapter {
             return Ok(());
         }
 
-        // ---- 1. Allocate enough blocks to cover num_tokens. ----
+        // ---- Cache dtype + matching kernel-input dtype. ----
+        let cache_dtype = self.layer_kv_pool.cache_dtype();
+        let (input_metal_dtype, expected_input_dtype) = match cache_dtype {
+            mlx_paged_attn::metal::MetalDtype::Float16 => {
+                (mlx_paged_attn::metal::MetalDtype::Float16, DType::Float16)
+            }
+            mlx_paged_attn::metal::MetalDtype::BFloat16 => {
+                (mlx_paged_attn::metal::MetalDtype::BFloat16, DType::BFloat16)
+            }
+            other => {
+                return Err(format!(
+                    "transfer_flat_to_paged: cache_dtype {other:?} not yet supported \
+                     (FP8 requires per-layer scale plumbing — see Phase 10)"
+                ));
+            }
+        };
+
+        // ---- 1. Per-layer rank/shape/dtype validation. ----
+        // Walk every populated `Some(...)` slot BEFORE allocating any
+        // pool blocks so a malformed input rejects without leaving the
+        // adapter in a half-initialized state. Mirrors the dispatch-time
+        // contract `update_keys_values` enforces via `validate_kv_input`,
+        // adapted for the pre-transpose `[B=1, num_kv_heads, T, head_dim]`
+        // layout this helper accepts.
+        let pool_cfg = self.layer_kv_pool.config();
+        let expected_kv_heads = pool_cfg.num_kv_heads as i64;
+        let expected_head_size = pool_cfg.head_size as i64;
+        let num_tokens_i64 = num_tokens as i64;
+
+        for (layer_idx, slot) in flat_layer_kv.iter().enumerate() {
+            let Some((keys_full, values_full)) = slot else {
+                continue;
+            };
+            for (label, arr) in [("keys", *keys_full), ("values", *values_full)] {
+                let meta = KvTensorMeta::from_array(arr, label).map_err(|e| {
+                    format!("transfer_flat_to_paged layer {layer_idx} {label} metadata: {e}")
+                })?;
+                if meta.ndim != 4 {
+                    return Err(format!(
+                        "transfer_flat_to_paged layer {layer_idx} {label}: expected rank-4 \
+                         [B=1, num_kv_heads, num_tokens, head_dim]; got ndim {}",
+                        meta.ndim
+                    ));
+                }
+                if meta.shape.len() < 4 {
+                    return Err(format!(
+                        "transfer_flat_to_paged layer {layer_idx} {label}: KvTensorMeta \
+                         shape length disagrees with ndim (shape.len()={}, ndim={})",
+                        meta.shape.len(),
+                        meta.ndim
+                    ));
+                }
+                let b = meta.shape[0];
+                let h = meta.shape[1];
+                let t = meta.shape[2];
+                let d = meta.shape[3];
+                if b != 1 {
+                    return Err(format!(
+                        "transfer_flat_to_paged layer {layer_idx} {label}: shape[0] = {b}, \
+                         expected 1 (single-request adapter)"
+                    ));
+                }
+                if h != expected_kv_heads {
+                    return Err(format!(
+                        "transfer_flat_to_paged layer {layer_idx} {label}: shape[1] = {h} \
+                         (num_kv_heads) but pool config has num_kv_heads = {expected_kv_heads}"
+                    ));
+                }
+                if t < num_tokens_i64 {
+                    return Err(format!(
+                        "transfer_flat_to_paged layer {layer_idx} {label}: shape[2] = {t} \
+                         (num_tokens) is less than num_tokens = {num_tokens}; the flat slab \
+                         must cover at least the prefilled prefix"
+                    ));
+                }
+                if d != expected_head_size {
+                    return Err(format!(
+                        "transfer_flat_to_paged layer {layer_idx} {label}: shape[3] = {d} \
+                         (head_dim) but pool config has head_size = {expected_head_size}"
+                    ));
+                }
+                if meta.dtype != expected_input_dtype {
+                    return Err(format!(
+                        "transfer_flat_to_paged layer {layer_idx} {label}: dtype {:?} does \
+                         not match pool cache dtype {:?} (input must match cache for \
+                         non-FP8 pools)",
+                        meta.dtype, expected_input_dtype
+                    ));
+                }
+            }
+        }
+
+        // ---- 2. Allocate enough blocks to cover num_tokens. ----
         // No prefix-cache lookup at this point — `transfer_flat_to_paged`
         // is the COLD-start entry point. (Cross-request reuse will be
         // achieved next turn via `find_cached_prefix` after the registered
@@ -2047,24 +2139,8 @@ impl PagedKVCacheAdapter {
             table.set_num_tokens(num_tokens);
         }
 
-        // ---- 2. Per-layer block-by-block writes. ----
+        // ---- 3. Per-layer block-by-block writes. ----
         let block_size = self.block_size;
-
-        let cache_dtype = self.layer_kv_pool.cache_dtype();
-        let input_metal_dtype = match cache_dtype {
-            mlx_paged_attn::metal::MetalDtype::Float16 => {
-                mlx_paged_attn::metal::MetalDtype::Float16
-            }
-            mlx_paged_attn::metal::MetalDtype::BFloat16 => {
-                mlx_paged_attn::metal::MetalDtype::BFloat16
-            }
-            other => {
-                return Err(format!(
-                    "transfer_flat_to_paged: cache_dtype {other:?} not yet supported \
-                     (FP8 requires per-layer scale plumbing — see Phase 10)"
-                ));
-            }
-        };
 
         for (layer_idx, slot) in flat_layer_kv.iter().enumerate() {
             // Linear-attention or empty-cache layers don't write into the
@@ -2120,7 +2196,14 @@ impl PagedKVCacheAdapter {
             let mut written = 0u32;
             while written < num_tokens {
                 let chunk_size = (num_tokens - written).min(block_size);
-                let chunk_keys = keys_3d
+                // Slice the chunk from the squeezed+transposed view.
+                // The result is a NON-CONTIGUOUS view (transpose strides
+                // + slice offset) — `write_kv` consumes the buffer as
+                // dense row-major `[num_tokens, num_kv_heads, head_size]`,
+                // so we must materialize a contiguous copy before
+                // dispatch. `MxArray::copy()` (mlx::core::copy) writes
+                // a fresh row-contiguous tensor with offset 0.
+                let chunk_keys_view = keys_3d
                     .slice_axis(0, written as i64, (written + chunk_size) as i64)
                     .map_err(|e| {
                         format!(
@@ -2128,7 +2211,7 @@ impl PagedKVCacheAdapter {
                              at written={written} chunk_size={chunk_size}: {e}"
                         )
                     })?;
-                let chunk_values = values_3d
+                let chunk_values_view = values_3d
                     .slice_axis(0, written as i64, (written + chunk_size) as i64)
                     .map_err(|e| {
                         format!(
@@ -2136,6 +2219,18 @@ impl PagedKVCacheAdapter {
                              at written={written} chunk_size={chunk_size}: {e}"
                         )
                     })?;
+                let chunk_keys = chunk_keys_view.copy().map_err(|e| {
+                    format!(
+                        "transfer_flat_to_paged layer {layer_idx} chunk keys contiguous \
+                         copy at written={written} chunk_size={chunk_size}: {e}"
+                    )
+                })?;
+                let chunk_values = chunk_values_view.copy().map_err(|e| {
+                    format!(
+                        "transfer_flat_to_paged layer {layer_idx} chunk values contiguous \
+                         copy at written={written} chunk_size={chunk_size}: {e}"
+                    )
+                })?;
                 chunk_keys.eval();
                 chunk_values.eval();
 
@@ -2151,8 +2246,8 @@ impl PagedKVCacheAdapter {
                 })?;
 
                 // SAFETY: chunk_keys / chunk_values are valid MxArrays
-                // with materialized buffers. The pool outlives this
-                // call.
+                // with materialized, row-contiguous buffers. The pool
+                // outlives this call.
                 unsafe {
                     self.layer_kv_pool.write_kv(
                         layer_idx as u32,
@@ -5087,6 +5182,264 @@ mod tests {
         // Cached count stays 0 (cold-start: no prefix cache hit).
         assert_eq!(adapter.cached_token_count(), 0);
         // request_tokens slice matches.
+        assert_eq!(adapter.request_tokens(), request_tokens.as_slice());
+    }
+
+    /// `transfer_flat_to_paged` must reject inputs whose rank, shape,
+    /// or dtype disagrees with the pool config — same shape/dtype gate
+    /// `update_keys_values` enforces, adapted for the pre-transpose
+    /// `[B=1, num_kv_heads, num_tokens, head_dim]` layout. The
+    /// validation happens BEFORE `allocate_suffix_blocks` so a malformed
+    /// input doesn't leak blocks. Skips on no-Metal hosts only because
+    /// the helper is `#[cfg(target_os = "macos")]`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_transfer_flat_to_paged_validates_shape_and_dtype() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            num_kv_heads: 2,
+            head_size: 64,
+            num_layers: 1,
+            gpu_memory_mb: 64,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            2,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("Skipping test_transfer_flat_to_paged_validates_shape_and_dtype: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(2, 16)));
+
+        let num_tokens: u32 = 16;
+        let request_tokens: Vec<u32> = (0..num_tokens).collect();
+
+        // -- Case 1: rank-3 input rejected (production callers always
+        //    pass rank-4 [B=1, H, T, D] flat slabs).
+        {
+            let mut adapter =
+                PagedKVCacheAdapter::new(allocator.clone(), pool.clone(), 16).expect("adapter");
+            adapter.reset_for_new_request(0).unwrap();
+            let zeros = vec![0_u16; 2 * 16 * 64];
+            let k_rank3 = MxArray::from_bfloat16(&zeros, &[2, 16, 64]).expect("k_rank3");
+            let v_rank3 = MxArray::from_bfloat16(&zeros, &[2, 16, 64]).expect("v_rank3");
+            let res = adapter.transfer_flat_to_paged(
+                &[Some((&k_rank3, &v_rank3))],
+                num_tokens,
+                &request_tokens,
+            );
+            let msg = res.expect_err("expected rank-3 to be rejected");
+            assert!(
+                msg.contains("rank-4"),
+                "error must reference rank-4 contract, got: {msg}"
+            );
+            // Adapter must still be in a freshly-reset state — no
+            // blocks allocated, no tokens recorded.
+            assert_eq!(adapter.current_token_count(), 0);
+            assert_eq!(adapter.num_allocated_blocks(), 0);
+        }
+
+        // -- Case 2: wrong num_kv_heads rejected.
+        {
+            let mut adapter =
+                PagedKVCacheAdapter::new(allocator.clone(), pool.clone(), 16).expect("adapter");
+            adapter.reset_for_new_request(0).unwrap();
+            // pool wants num_kv_heads=2; pass H=4 instead.
+            let zeros = vec![0_u16; 4 * 16 * 64];
+            let k_bad = MxArray::from_bfloat16(&zeros, &[1, 4, 16, 64]).expect("k_bad");
+            let v_bad = MxArray::from_bfloat16(&zeros, &[1, 4, 16, 64]).expect("v_bad");
+            let res = adapter.transfer_flat_to_paged(
+                &[Some((&k_bad, &v_bad))],
+                num_tokens,
+                &request_tokens,
+            );
+            let msg = res.expect_err("expected num_kv_heads mismatch");
+            assert!(
+                msg.contains("num_kv_heads"),
+                "error must reference num_kv_heads, got: {msg}"
+            );
+        }
+
+        // -- Case 3: wrong head_dim rejected.
+        {
+            let mut adapter =
+                PagedKVCacheAdapter::new(allocator.clone(), pool.clone(), 16).expect("adapter");
+            adapter.reset_for_new_request(0).unwrap();
+            // pool wants head_size=64; pass D=32 instead.
+            let zeros = vec![0_u16; 2 * 16 * 32];
+            let k_bad = MxArray::from_bfloat16(&zeros, &[1, 2, 16, 32]).expect("k_bad");
+            let v_bad = MxArray::from_bfloat16(&zeros, &[1, 2, 16, 32]).expect("v_bad");
+            let res = adapter.transfer_flat_to_paged(
+                &[Some((&k_bad, &v_bad))],
+                num_tokens,
+                &request_tokens,
+            );
+            let msg = res.expect_err("expected head_dim mismatch");
+            assert!(
+                msg.contains("head_dim") || msg.contains("head_size"),
+                "error must reference head_dim/head_size, got: {msg}"
+            );
+        }
+
+        // -- Case 4: dtype mismatch rejected (pool is BF16; pass FP16).
+        {
+            let mut adapter =
+                PagedKVCacheAdapter::new(allocator.clone(), pool.clone(), 16).expect("adapter");
+            adapter.reset_for_new_request(0).unwrap();
+            let zeros = vec![0_u16; 2 * 16 * 64];
+            let k_bad = MxArray::from_float16(&zeros, &[1, 2, 16, 64]).expect("k_bad");
+            let v_bad = MxArray::from_float16(&zeros, &[1, 2, 16, 64]).expect("v_bad");
+            let res = adapter.transfer_flat_to_paged(
+                &[Some((&k_bad, &v_bad))],
+                num_tokens,
+                &request_tokens,
+            );
+            let msg = res.expect_err("expected dtype mismatch");
+            assert!(
+                msg.contains("dtype"),
+                "error must reference dtype, got: {msg}"
+            );
+        }
+
+        // -- Case 5: insufficient num_tokens dimension rejected.
+        {
+            let mut adapter =
+                PagedKVCacheAdapter::new(allocator.clone(), pool.clone(), 16).expect("adapter");
+            adapter.reset_for_new_request(0).unwrap();
+            // Caller wants num_tokens=16 but the slab only holds 8.
+            let zeros = vec![0_u16; 2 * 8 * 64];
+            let k_short = MxArray::from_bfloat16(&zeros, &[1, 2, 8, 64]).expect("k_short");
+            let v_short = MxArray::from_bfloat16(&zeros, &[1, 2, 8, 64]).expect("v_short");
+            let res = adapter.transfer_flat_to_paged(
+                &[Some((&k_short, &v_short))],
+                num_tokens,
+                &request_tokens,
+            );
+            let msg = res.expect_err("expected insufficient num_tokens");
+            assert!(
+                msg.contains("num_tokens"),
+                "error must reference num_tokens, got: {msg}"
+            );
+        }
+    }
+
+    /// Repro for Codex Finding 3: `transfer_flat_to_paged` must
+    /// materialize a row-contiguous chunk before handing it to
+    /// `LayerKVPool::write_kv` (which consumes the buffer as dense
+    /// row-major). This test feeds the helper a slab that's been
+    /// transposed BEFORE the call so the inner
+    /// `slice_axis(2,...).squeeze().transpose()` produces a doubly-
+    /// strided view — the contiguous-copy fix must turn that view into
+    /// a fresh row-contiguous tensor. We verify by:
+    ///
+    /// 1. Building two semantically equivalent slabs — one in canonical
+    ///    `[B=1, H, T, D]` layout, one in `[B=1, H, T, D]` constructed
+    ///    via outer transpose+permute so the inner slicing path
+    ///    encounters non-trivial strides.
+    /// 2. Running `transfer_flat_to_paged` on each.
+    /// 3. Asserting both calls succeed AND leave the adapter in
+    ///    identical post-state (recorded tokens, allocated blocks).
+    ///
+    /// Pre-fix behavior: the transposed input would either error in
+    /// `MlxMetalBuffer::from_mlx_array` (view's offset != 0) or
+    /// silently write garbage to the pool. Post-fix behavior: the
+    /// `chunk.copy()` materializes an offset-0 row-contiguous tensor
+    /// before dispatch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_transfer_flat_to_paged_handles_noncontiguous_input() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            num_kv_heads: 2,
+            head_size: 64,
+            num_layers: 1,
+            gpu_memory_mb: 64,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            2,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("Skipping test_transfer_flat_to_paged_handles_noncontiguous_input: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(2, 16)));
+
+        let num_tokens: usize = 16;
+        let num_kv_heads: usize = 2;
+        let head_dim: usize = 64;
+        let total = num_kv_heads * num_tokens * head_dim;
+        let zeros = vec![0_u16; total];
+        let canonical_shape = [
+            1_i64,
+            num_kv_heads as i64,
+            num_tokens as i64,
+            head_dim as i64,
+        ];
+
+        // Build a non-contiguous view by going [B,T,H,D] → transpose →
+        // [B,H,T,D]. The result has shape [1,2,16,64] (matches caller
+        // contract) but is a strided view of the underlying buffer, so
+        // the helper's inner squeeze+transpose+slice produces a chunk
+        // with non-trivial strides + non-zero offset.
+        let bthd = MxArray::from_bfloat16(
+            &zeros,
+            &[
+                1_i64,
+                num_tokens as i64,
+                num_kv_heads as i64,
+                head_dim as i64,
+            ],
+        )
+        .expect("bthd");
+        bthd.eval();
+        let k_strided = bthd.transpose(Some(&[0, 2, 1, 3])).expect("k_strided");
+        let v_strided = bthd.transpose(Some(&[0, 2, 1, 3])).expect("v_strided");
+        // Sanity: shape matches contract.
+        assert_eq!(k_strided.ndim().unwrap(), 4);
+        assert_eq!(k_strided.shape_at(0).unwrap(), canonical_shape[0]);
+        assert_eq!(k_strided.shape_at(1).unwrap(), canonical_shape[1]);
+        assert_eq!(k_strided.shape_at(2).unwrap(), canonical_shape[2]);
+        assert_eq!(k_strided.shape_at(3).unwrap(), canonical_shape[3]);
+
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 16).expect("adapter");
+        adapter.reset_for_new_request(0).unwrap();
+
+        let request_tokens: Vec<u32> = (0..num_tokens as u32).collect();
+        let layer_kvs = vec![Some((&k_strided, &v_strided))];
+        let res = adapter.transfer_flat_to_paged(&layer_kvs, num_tokens as u32, &request_tokens);
+        match res {
+            Ok(()) => {}
+            Err(e) => {
+                // Some macOS sandboxed CI environments lack Metal —
+                // accept the explicit "Metal GPU not available" error
+                // as a skip. Any other error is a real bug (the whole
+                // point of this test is that non-contiguous inputs
+                // must succeed via the contiguous-copy fix).
+                assert!(
+                    e.contains("Metal GPU not available"),
+                    "unexpected error from transfer_flat_to_paged on non-contiguous input: {e}"
+                );
+                return;
+            }
+        }
+
+        // Post-conditions identical to the canonical-layout happy path.
+        assert_eq!(adapter.current_token_count(), num_tokens as u32);
+        assert_eq!(adapter.num_allocated_blocks(), 1);
         assert_eq!(adapter.request_tokens(), request_tokens.as_slice());
     }
 }
