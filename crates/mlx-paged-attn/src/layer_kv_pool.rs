@@ -779,6 +779,8 @@ impl LayerKVPool {
         num_query_heads: u32,
         scale: f32,
         softcap: f32,
+        k_scale: f32,
+        v_scale: f32,
     ) -> Result<crate::metal::PagedAttentionOutput, String> {
         use crate::metal::{
             MetalState, MlxMetalBuffer, PagedAttentionParams, RawBufferInfo,
@@ -863,9 +865,12 @@ impl LayerKVPool {
             q_stride,
             kv_block_stride,
             kv_head_stride,
-            // FP8 K/V scales are deferred (P1C-3 follow-up).
-            k_scale: 1.0,
-            v_scale: 1.0,
+            // Phase 10: per-layer FP8 K/V scales threaded from
+            // `KvScaleManager` via `PagedKVCacheAdapter::read_layer_scales`,
+            // mirroring the write path in `LayerKVPool::write_kv`. Caller
+            // passes 1.0 when no manager is configured (non-FP8 path).
+            k_scale,
+            v_scale,
             // Phase 7: LayerKVPool's direct attention helper is used by
             // pure-Rust paged forwards that don't need sliding-window
             // masking yet; default off.

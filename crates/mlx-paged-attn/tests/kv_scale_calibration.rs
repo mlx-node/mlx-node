@@ -20,8 +20,13 @@
 //! runs calibration again with freshly-allocated arrays carrying the same
 //! values. Asserts byte-identical (`==`) scale values.
 //!
-//! All Metal-dependent setup gracefully skips on hosts where MLX cannot
-//! allocate Metal buffers; the tests are no-ops there.
+//! These tests require a working Metal backend (the calibration kernels
+//! dispatch through MLX → Metal). They are gated behind `#[ignore]` so
+//! `cargo test -p mlx-paged-attn` on a non-Metal host (or any CI without
+//! GPU access) reports them as "ignored" rather than green-on-skip — the
+//! previous "green when Metal unavailable" pattern silently masked
+//! determinism regressions on those hosts. Run on Metal-capable machines
+//! with `cargo test -p mlx-paged-attn -- --ignored`.
 
 #![cfg(target_os = "macos")]
 
@@ -29,17 +34,23 @@ use mlx_paged_attn::metal::KvScaleManager;
 
 const FLOAT32: i32 = 0;
 
-/// True if the host has a usable Metal backend. `mlx_array_zeros` /
-/// `mlx_array_from_float32` allocate through `metal::allocator()`, which
-/// throws across the FFI on a no-Metal host. Every test that touches
-/// MLX arrays MUST early-return when this returns false.
-fn metal_available() -> bool {
-    unsafe { mlx_sys::mlx_metal_is_available() }
+/// Assert that the host has a working Metal backend, panicking with a
+/// clear message otherwise. The tests below are `#[ignore]`-gated so they
+/// only run when the operator opts in via `--ignored`; in that mode we
+/// fail loudly rather than silently skipping if Metal is unavailable.
+fn require_metal() {
+    let available = unsafe { mlx_sys::mlx_metal_is_available() };
+    assert!(
+        available,
+        "Metal backend is required for kv_scale_calibration tests; \
+         run on an Apple Silicon host with Metal enabled"
+    );
 }
 
 /// Allocate a contiguous fp32 array carrying `values` with the given shape.
-/// Caller deletes via `mlx_array_delete`. MUST only be called when
-/// `metal_available()` returned true.
+/// Caller deletes via `mlx_array_delete`. MUST only be called after
+/// `require_metal()` (i.e. inside an `#[ignore]`-gated `#[test]` body
+/// that has already verified Metal is available).
 fn f32_arr(values: &[f32], shape: &[i64]) -> *mut mlx_sys::mlx_array {
     unsafe { mlx_sys::mlx_array_from_float32(values.as_ptr(), shape.as_ptr(), shape.len()) }
 }
@@ -77,11 +88,9 @@ unsafe fn delete(handle: *mut mlx_sys::mlx_array) {
 /// being pinned — if MLX ever introduces non-determinism here (e.g.
 /// different reduction order between launches), this test catches it.
 #[test]
+#[ignore = "Metal-required calibration determinism test; run with `--ignored` on Metal hosts"]
 fn calibrate_layer_is_deterministic_across_runs() {
-    if !metal_available() {
-        eprintln!("skipping calibrate_layer_is_deterministic_across_runs: Metal unavailable");
-        return;
-    }
+    require_metal();
 
     // Deterministic ramp: -3.0, -2.6, ..., 2.6, 3.0 (16 elements).
     let values: Vec<f32> = (0..16).map(|i| -3.0 + (i as f32) * (6.0 / 15.0)).collect();
@@ -154,11 +163,9 @@ fn calibrate_layer_is_deterministic_across_runs() {
 /// FP8_E4M3_MAX by 0 and produce inf, then the FP8 quantizer would write
 /// NaNs into the cache.
 #[test]
+#[ignore = "Metal-required calibration determinism test; run with `--ignored` on Metal hosts"]
 fn calibrate_layer_returns_unit_scale_for_zero_tensor() {
-    if !metal_available() {
-        eprintln!("skipping calibrate_layer_returns_unit_scale_for_zero_tensor: Metal unavailable");
-        return;
-    }
+    require_metal();
 
     let mut manager = KvScaleManager::new(1);
     let shape: [i64; 2] = [4, 4];
@@ -199,11 +206,9 @@ fn calibrate_layer_returns_unit_scale_for_zero_tensor() {
 /// MUST be reproducible across launches when fed the same warmup prompts;
 /// this test pins that property.
 #[test]
+#[ignore = "Metal-required calibration determinism test; run with `--ignored` on Metal hosts"]
 fn update_layer_ema_is_deterministic_across_runs() {
-    if !metal_available() {
-        eprintln!("skipping update_layer_ema_is_deterministic_across_runs: Metal unavailable");
-        return;
-    }
+    require_metal();
 
     // Two distinct ramps so the EMA blend is nontrivial.
     let ramp_a: Vec<f32> = (0..16).map(|i| -3.0 + (i as f32) * (6.0 / 15.0)).collect();
@@ -264,11 +269,9 @@ fn update_layer_ema_is_deterministic_across_runs() {
 /// calibration call (where floating-point representation could in
 /// principle drift through `mlx_array_max`'s reduction).
 #[test]
+#[ignore = "Metal-required calibration determinism test; run with `--ignored` on Metal hosts"]
 fn calibrated_scales_round_trip_through_serialization() {
-    if !metal_available() {
-        eprintln!("skipping calibrated_scales_round_trip_through_serialization: Metal unavailable");
-        return;
-    }
+    require_metal();
 
     let mut source = KvScaleManager::new(3);
     let shape: [i64; 2] = [4, 4];

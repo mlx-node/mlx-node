@@ -1166,6 +1166,17 @@ impl PagedKVCacheAdapter {
             }
         };
 
+        // 5b. Phase 10 — read per-layer FP8 K/V scales from the configured
+        //     `KvScaleManager` (or `(1.0, 1.0)` when no manager is wired).
+        //     Symmetric with the write path in `update_keys_values`: the
+        //     gather kernel must dequantize cache bytes with the same
+        //     scales the write kernel quantized them with, otherwise an
+        //     FP8 cache produced by a calibrated manager would be read
+        //     back through unit scales and corrupt decode output.
+        //     `read_layer_scales` propagates poisoned-mutex errors instead
+        //     of silently falling back to 1.0 — see Finding 2.
+        let (k_scale, v_scale) = self.read_layer_scales(layer_idx)?;
+
         // 6. Dispatch and wrap output in MxArray. P1C-3 follow-up:
         //    `to_mlx_array` does GPU → host → MLX as Float32; replace with
         //    zero-copy `mlx_array_from_metal_buffer` for on-device decode.
@@ -1185,6 +1196,8 @@ impl PagedKVCacheAdapter {
                 num_query_heads,
                 scale,
                 softcap,
+                k_scale,
+                v_scale,
             )?
         };
 
@@ -2154,7 +2167,7 @@ impl PagedKVCacheAdapter {
     /// while leaving the production wiring point in place for future
     /// FP8 enablement.
     pub fn k_scale_array(&self, layer_idx: u32) -> Result<MxArray, String> {
-        let scale = self.lookup_k_scale(layer_idx);
+        let scale = self.lookup_k_scale(layer_idx)?;
         MxArray::from_float32(&[scale], &[1])
             .map_err(|e| format!("k_scale_array: failed to build scale array: {e}"))
     }
@@ -2162,7 +2175,7 @@ impl PagedKVCacheAdapter {
     /// Return a `[1]` fp32 V scale MxArray for `layer_idx`. See
     /// [`Self::k_scale_array`] for the FP8 / Phase-10 contract.
     pub fn v_scale_array(&self, layer_idx: u32) -> Result<MxArray, String> {
-        let scale = self.lookup_v_scale(layer_idx);
+        let scale = self.lookup_v_scale(layer_idx)?;
         MxArray::from_float32(&[scale], &[1])
             .map_err(|e| format!("v_scale_array: failed to build scale array: {e}"))
     }
@@ -2221,44 +2234,45 @@ impl PagedKVCacheAdapter {
     }
 
     /// Helper for [`Self::k_scale_array`] / [`Self::v_scale_array`].
-    /// On a poisoned mutex falls back to `1.0` — these accessors are
-    /// invoked during graph construction (compile_init), where surfacing
-    /// a `Result` would force every existing call site to thread an
-    /// allocator-poisoned error through the FFI prelude. The poisoned
-    /// state is logged via `tracing::error!` so the failure is visible.
+    ///
+    /// Phase 10 hardening: when a `KvScaleManager` is configured but its
+    /// `Mutex` is poisoned, return `Err` rather than silently falling back
+    /// to `1.0`. A unit-scale fallback would let `k_scale_array` /
+    /// `v_scale_array` initialize the compiled paged graph with placeholder
+    /// scales after a calibration/orchestration panic, while the runtime
+    /// write path (`update_keys_values` → `read_layer_scales`) fails closed
+    /// on the same poison — the asymmetry could silently corrupt FP8 K/V
+    /// writes for the affected layers.
+    ///
+    /// The `1.0` fallback is reserved for the `None` case (no manager
+    /// configured), which is the documented non-FP8 / pre-Phase-10
+    /// behavior.
     #[cfg(target_os = "macos")]
-    fn lookup_k_scale(&self, layer_idx: u32) -> f32 {
+    fn lookup_k_scale(&self, layer_idx: u32) -> Result<f32, String> {
         self.lookup_scale(layer_idx, /* is_key */ true)
     }
 
     #[cfg(target_os = "macos")]
-    fn lookup_v_scale(&self, layer_idx: u32) -> f32 {
+    fn lookup_v_scale(&self, layer_idx: u32) -> Result<f32, String> {
         self.lookup_scale(layer_idx, /* is_key */ false)
     }
 
     #[cfg(target_os = "macos")]
-    fn lookup_scale(&self, layer_idx: u32, is_key: bool) -> f32 {
+    fn lookup_scale(&self, layer_idx: u32, is_key: bool) -> Result<f32, String> {
         let Some(manager) = self.scale_manager.as_ref() else {
-            return 1.0;
+            return Ok(1.0);
         };
-        match manager.lock() {
-            Ok(guard) => {
-                if is_key {
-                    guard.k_scale(layer_idx)
-                } else {
-                    guard.v_scale(layer_idx)
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    "KvScaleManager mutex poisoned during {}scale lookup at layer {}: {e}; \
-                     falling back to 1.0",
-                    if is_key { "k_" } else { "v_" },
-                    layer_idx,
-                );
-                1.0
-            }
-        }
+        let guard = manager.lock().map_err(|e| {
+            format!(
+                "KvScaleManager mutex poisoned during {}scale lookup at layer {layer_idx}: {e}",
+                if is_key { "k_" } else { "v_" },
+            )
+        })?;
+        Ok(if is_key {
+            guard.k_scale(layer_idx)
+        } else {
+            guard.v_scale(layer_idx)
+        })
     }
 
     /// Non-macOS scale lookup (no manager available; always 1.0). The
@@ -2267,13 +2281,13 @@ impl PagedKVCacheAdapter {
     /// behind `#[cfg(target_os = "macos")]` already; this stub keeps the
     /// non-macOS surface compiling for tooling cross-checks.
     #[cfg(not(target_os = "macos"))]
-    fn lookup_k_scale(&self, _layer_idx: u32) -> f32 {
-        1.0
+    fn lookup_k_scale(&self, _layer_idx: u32) -> Result<f32, String> {
+        Ok(1.0)
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn lookup_v_scale(&self, _layer_idx: u32) -> f32 {
-        1.0
+    fn lookup_v_scale(&self, _layer_idx: u32) -> Result<f32, String> {
+        Ok(1.0)
     }
 }
 
@@ -5299,6 +5313,88 @@ mod tests {
         let (k1, v1) = adapter.read_layer_scales(1).unwrap();
         assert_eq!(k1, 3.0);
         assert_eq!(v1, 5.0);
+    }
+
+    /// Phase 10 hardening (Finding 2): when a `KvScaleManager` is wired
+    /// into the adapter but its `Mutex` becomes poisoned, both
+    /// `k_scale_array` and `v_scale_array` MUST surface an error rather
+    /// than silently fall back to `1.0`. The previous behavior (return
+    /// `1.0` and only log via `tracing::error!`) was inconsistent with
+    /// the runtime write path (`update_keys_values` → `read_layer_scales`)
+    /// which fails closed on the same poison; that asymmetry could
+    /// silently corrupt the compiled paged graph initialization with
+    /// placeholder unit scales while the corresponding writes would have
+    /// already aborted.
+    ///
+    /// We poison the mutex by panicking inside a `lock().unwrap()` block
+    /// in a spawned thread, then assert the propagated error contains
+    /// "poisoned" so a future refactor can rely on that token in the
+    /// message.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn k_v_scale_arrays_propagate_poisoned_manager_error() {
+        use mlx_paged_attn::metal::KvScaleManager;
+        use std::thread;
+
+        let allocator = new_allocator(8, 16);
+        let Some(mut adapter) = maybe_adapter(allocator, 16) else {
+            eprintln!(
+                "skipping k_v_scale_arrays_propagate_poisoned_manager_error: Metal unavailable"
+            );
+            return;
+        };
+
+        let manager_arc = Arc::new(Mutex::new(KvScaleManager::new(2)));
+        adapter.set_scale_manager(Some(Arc::clone(&manager_arc)));
+
+        // Poison the mutex by panicking while holding the lock in a
+        // separate thread. After the panic propagates and the thread
+        // joins with `Err`, subsequent `manager_arc.lock()` calls return
+        // `Err(PoisonError)`.
+        let poisoner = Arc::clone(&manager_arc);
+        let join_result = thread::spawn(move || {
+            let _guard = poisoner.lock().expect("acquire lock pre-poison");
+            panic!("intentional panic to poison the KvScaleManager mutex");
+        })
+        .join();
+        assert!(
+            join_result.is_err(),
+            "spawned thread must have panicked to poison the mutex"
+        );
+        assert!(
+            manager_arc.lock().is_err(),
+            "mutex must be poisoned after the spawned thread's panic"
+        );
+
+        // Both accessors must propagate the poison error rather than
+        // returning a `[1.0]` placeholder. (`MxArray` doesn't implement
+        // `Debug`, so we can't use `expect_err` here — match on the
+        // returned `Result` and pull the message out manually.)
+        let k_err = match adapter.k_scale_array(0) {
+            Ok(_) => panic!("k_scale_array must surface poisoned-mutex error, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            k_err.contains("poisoned"),
+            "k_scale_array error must mention 'poisoned' (got: {k_err})"
+        );
+        let v_err = match adapter.v_scale_array(0) {
+            Ok(_) => panic!("v_scale_array must surface poisoned-mutex error, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            v_err.contains("poisoned"),
+            "v_scale_array error must mention 'poisoned' (got: {v_err})"
+        );
+
+        // After clearing the manager, the accessors must succeed again
+        // (the `None` branch is the only place `1.0` is allowed to be
+        // returned without a successful manager lock).
+        adapter.set_scale_manager(None);
+        let k_ok = adapter
+            .k_scale_array(0)
+            .expect("k_scale_array must succeed after set_scale_manager(None)");
+        assert_eq!(k_ok.item_at_float32(0).unwrap(), 1.0_f32);
     }
 }
 
