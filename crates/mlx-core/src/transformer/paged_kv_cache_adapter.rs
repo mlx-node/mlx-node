@@ -759,6 +759,42 @@ impl PagedKVCacheAdapter {
         Ok(())
     }
 
+    /// Roll back the most recent `n` tokens from `request_tokens` and
+    /// `block_table.num_tokens`. Used by the C++ compiled-paged dispatcher
+    /// when a forward step fails after `record_tokens` has already advanced
+    /// the cursor: the caller wants to retry the same token through the
+    /// pure-Rust paged path, which calls `record_tokens(&[token_id])` again
+    /// inside `run_paged_decode_step`. Rolling back here keeps the cursor
+    /// in sync with the actual KV-pool contents (no garbage slot was
+    /// written because the C++ forward returned null before reaching
+    /// `paged_kv_write`).
+    ///
+    /// Note: this DOES NOT free any block that may have been lazily
+    /// allocated by the failing `record_tokens` call. Keeping that block
+    /// alive is harmless — the immediate retry through the pure-Rust path
+    /// will append into it via `ensure_blocks_for_total_tokens`'s no-op
+    /// branch (`needed_total_blocks <= current_blocks`). The block will be
+    /// freed normally on `release_request` at end of turn.
+    ///
+    /// Errors if `n > request_tokens.len()` (caller asked to roll back
+    /// past the start of the request) or if the adapter has no live
+    /// block_table.
+    pub fn rollback_last_tokens(&mut self, n: u32) -> Result<(), String> {
+        let block_table = self.block_table.as_mut().ok_or_else(|| {
+            "rollback_last_tokens called before reset_for_new_request".to_string()
+        })?;
+        let prior_len = self.request_tokens.len() as u32;
+        if n > prior_len {
+            return Err(format!(
+                "rollback_last_tokens: cannot roll back {n} tokens; only {prior_len} recorded"
+            ));
+        }
+        let new_len = prior_len - n;
+        self.request_tokens.truncate(new_len as usize);
+        block_table.set_num_tokens(new_len);
+        Ok(())
+    }
+
     /// Build the slot mapping for a contiguous chunk of tokens starting
     /// at `first_logical_position` in this request. Each entry is the
     /// kernel-encoded slot index `block_id * block_size + position_in_block`
@@ -2312,6 +2348,89 @@ mod tests {
         adapter.record_tokens(&[40]).unwrap();
         assert_eq!(adapter.current_token_count(), 4);
         assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+    }
+
+    #[test]
+    fn test_rollback_last_tokens_reverts_record() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!("skipping test_rollback_last_tokens_reverts_record: Metal unavailable");
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[10, 20, 30, 40]).unwrap();
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+
+        // Rolling back 1 token must restore the cursor and num_tokens
+        // exactly as if record_tokens had never been called for that
+        // last token.
+        adapter.rollback_last_tokens(1).unwrap();
+        assert_eq!(adapter.current_token_count(), 3);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 3);
+        assert_eq!(adapter.request_tokens(), &[10, 20, 30]);
+
+        // Subsequent record_tokens advances the cursor again, simulating
+        // the dispatcher's "C++ failed, retry through pure-Rust" path
+        // where run_paged_decode_step calls record_tokens(&[token_id]).
+        adapter.record_tokens(&[40]).unwrap();
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+        assert_eq!(adapter.request_tokens(), &[10, 20, 30, 40]);
+
+        // Asking to roll back more than recorded must error without
+        // mutating state.
+        let prior = adapter.current_token_count();
+        let err = adapter.rollback_last_tokens(prior + 1).unwrap_err();
+        assert!(err.contains("cannot roll back"), "{err}");
+        assert_eq!(adapter.current_token_count(), prior);
+    }
+
+    /// Regression: when `record_tokens` lazily allocated a new block to
+    /// hold the new token (block_size=4, going from 4 to 5 tokens), and
+    /// then we roll back, the freshly-allocated block stays attached to
+    /// the request — which is fine: the immediate retry through
+    /// `record_tokens` reuses it without re-allocating, and
+    /// `release_request` frees it normally at end-of-turn. This
+    /// reproduces the exact state machinery the dispatcher fallback
+    /// hits when the C++ forward fails on a block-boundary decode step.
+    #[test]
+    fn test_rollback_after_block_boundary_record_keeps_block() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!(
+                "skipping test_rollback_after_block_boundary_record_keeps_block: Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        // Pre-allocate one block (block_size=4 → 4 slots).
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        let blocks_before_boundary = adapter.num_allocated_blocks();
+        assert_eq!(blocks_before_boundary, 1);
+
+        // Crossing the block boundary (5th token) lazily allocates a
+        // second block.
+        adapter.record_tokens(&[5]).unwrap();
+        let blocks_after_boundary = adapter.num_allocated_blocks();
+        assert_eq!(blocks_after_boundary, 2);
+
+        // Rollback. The freshly-allocated 2nd block stays attached
+        // (rollback only touches the cursor, not the block table) so
+        // the next record_tokens call reuses it without re-allocating.
+        adapter.rollback_last_tokens(1).unwrap();
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.num_allocated_blocks(), 2);
+
+        // Retry: record_tokens(&[5]) writes into the still-attached
+        // 2nd block — `ensure_blocks_for_total_tokens` no-ops because
+        // `current_blocks (2) >= needed_total_blocks (2)`.
+        adapter.record_tokens(&[5]).unwrap();
+        assert_eq!(adapter.current_token_count(), 5);
+        assert_eq!(adapter.num_allocated_blocks(), 2);
+        assert_eq!(adapter.request_tokens(), &[1, 2, 3, 4, 5]);
     }
 
     #[test]

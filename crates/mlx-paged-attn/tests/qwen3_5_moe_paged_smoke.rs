@@ -73,9 +73,21 @@ const CHUNK_SIZE_MAX: i64 = 1; // single-token decode
 const INT32: i32 = 1;
 const BFLOAT16: i32 = 3;
 
+/// True if the host has a usable Metal backend. `mlx_array_zeros` (and
+/// every MLX op below) construct via the C++ MLX entry points without a
+/// catch wrapper, so on a no-Metal host the lazy `metal::allocator()`
+/// construction throws a foreign exception and aborts the Rust runtime
+/// (`Rust cannot catch foreign exceptions`). Every test that touches
+/// MLX arrays MUST early-return when this returns false.
+fn metal_available() -> bool {
+    unsafe { mlx_sys::mlx_metal_is_available() }
+}
+
 /// Allocate a contiguous bf16 zero-array of the given shape via
 /// `mlx_array_zeros` (handle is heap-allocated; caller deletes via
-/// `mlx_array_delete`).
+/// `mlx_array_delete`). MUST only be called when `metal_available()`
+/// returned true; otherwise the underlying MLX op throws across the FFI
+/// boundary and aborts.
 fn bf16_zeros(shape: &[i64]) -> *mut mlx_sys::mlx_array {
     unsafe { mlx_sys::mlx_array_zeros(shape.as_ptr(), shape.len(), BFLOAT16) }
 }
@@ -235,6 +247,12 @@ fn forward_paged_before_init_returns_null_no_crash() {
 /// "skip" and exit early without panicking.
 #[test]
 fn forward_paged_graph_builds_without_crash() {
+    if !metal_available() {
+        eprintln!(
+            "skipping forward_paged_graph_builds_without_crash: Metal unavailable on this host"
+        );
+        return;
+    }
     unsafe {
         mlx_qwen35_moe_reset();
         mlx_clear_weights();
@@ -492,6 +510,12 @@ fn forward_paged_graph_builds_without_crash() {
 /// is the regression signal.
 #[test]
 fn forward_paged_after_reset_returns_null() {
+    if !metal_available() {
+        eprintln!(
+            "skipping forward_paged_after_reset_returns_null: Metal unavailable on this host"
+        );
+        return;
+    }
     unsafe {
         mlx_qwen35_moe_reset();
         mlx_clear_weights();
@@ -730,6 +754,12 @@ fn paged_attn_graph_dispatches_on_metal() {
 /// piece 2.
 #[test]
 fn forward_paged_rejects_multi_token_contract_violation() {
+    if !metal_available() {
+        eprintln!(
+            "skipping forward_paged_rejects_multi_token_contract_violation: Metal unavailable on this host"
+        );
+        return;
+    }
     unsafe {
         mlx_qwen35_moe_reset();
         mlx_clear_weights();

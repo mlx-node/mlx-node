@@ -1543,7 +1543,7 @@ impl Qwen35MoeInner {
         // The `MoeResetGuard` ensures `mlx_qwen35_moe_reset()` runs on
         // any exit path so the next session starts with cleared
         // `g_paged_*` globals (`g_paged_inited == false`).
-        let cpp_session_ready = if use_cpp_paged {
+        let mut cpp_session_ready = if use_cpp_paged {
             // We need both immutable borrows for caches+adapter; this
             // closure scope is the simplest way to satisfy the borrow
             // checker without ferrying handles up through the function.
@@ -1582,6 +1582,8 @@ impl Qwen35MoeInner {
         // scope ends. Always installed when we touched `g_paged_inited`
         // (i.e. on the cpp_session_ready path) so a subsequent flat-mode
         // turn or another model load doesn't see stale paged state.
+        // Even if a later forward fails and we flip
+        // `cpp_session_ready=false`, the guard still runs at scope exit.
         let _moe_paged_guard = cpp_session_ready.then_some(MoeResetGuard);
 
         let max_new_tokens = p.max_new_tokens;
@@ -1628,11 +1630,16 @@ impl Qwen35MoeInner {
                 break;
             }
 
+            // Decode forward.
+            //
+            // Defense-in-depth: if the C++ compiled paged forward returns
+            // null (despite init succeeding), we rollback the
+            // `record_tokens` cursor advance, mark `cpp_session_ready =
+            // false` so subsequent steps go straight to pure-Rust without
+            // retrying compiled, and re-run this token through
+            // `run_paged_decode_step` (which re-calls `record_tokens` on
+            // the now-rolled-back cursor).
             let next_logits = if cpp_session_ready {
-                // C++ compiled paged decode path. We still advance the
-                // Rust adapter's cursor + lazily allocate any new block
-                // (via `record_tokens`) so `build_paged_attention_inputs`
-                // can produce a valid slot_mapping for the new token.
                 let embedding_weight = self.embedding.get_weight();
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason(
@@ -1646,7 +1653,44 @@ impl Qwen35MoeInner {
                     .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
                     .map_err(Error::from_reason)?;
                 let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-                forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs)?
+                match forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs) {
+                    Ok(logits) => logits,
+                    Err(e) => {
+                        eprintln!(
+                            "[MLX] Qwen3_5MoE: C++ compiled paged forward failed mid-decode \
+                             (step={step}); rolling back token cursor and falling back to \
+                             pure-Rust paged decode for the rest of this request. cause: {e}"
+                        );
+                        adapter
+                            .rollback_last_tokens(1)
+                            .map_err(Error::from_reason)?;
+                        cpp_session_ready = false;
+                        let embed = self.embedding.clone();
+                        let embedding_weight_pure = embed.get_weight();
+                        let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "MoE chat_sync_core_paged_inner: caches dropped during cpp fallback",
+                            )
+                        })?;
+                        let adapter_mut = self.paged_adapter.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "MoE chat_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
+                            )
+                        })?;
+                        let logits = super::paged_forward::run_paged_decode_step(
+                            token_id,
+                            &embed,
+                            &mut self.layers,
+                            caches_ref,
+                            &self.final_norm,
+                            &self.lm_head,
+                            &embedding_weight_pure,
+                            &layer_kinds,
+                            adapter_mut,
+                        )?;
+                        logits.squeeze(Some(&[1]))?
+                    }
+                }
             } else {
                 // Pure-Rust paged decode fallback.
                 let embed = self.embedding.clone();
@@ -2028,7 +2072,7 @@ impl Qwen35MoeInner {
         // C++ compiled paged decode setup (see sync twin for full
         // explanation). Mirrors the sync path so streaming and sync
         // dispatchers behave identically when both paths are available.
-        let cpp_session_ready = if use_cpp_paged {
+        let mut cpp_session_ready = if use_cpp_paged {
             let caches_ref = self.caches.as_ref().ok_or_else(|| {
                 Error::from_reason(
                     "MoE chat_stream_sync_core_paged_inner: caches dropped post-prefill",
@@ -2062,6 +2106,8 @@ impl Qwen35MoeInner {
             false
         };
 
+        // Even if a later forward fails and we flip
+        // `cpp_session_ready=false`, the guard still runs at scope exit.
         let _moe_paged_guard = cpp_session_ready.then_some(MoeResetGuard);
 
         let max_new_tokens = p.max_new_tokens;
@@ -2133,6 +2179,8 @@ impl Qwen35MoeInner {
                 break;
             }
 
+            // Decode forward. Defense-in-depth fallback: see
+            // `chat_sync_core_paged_inner` for the rollback rationale.
             let next_logits = if cpp_session_ready {
                 let embedding_weight = self.embedding.get_weight();
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
@@ -2147,7 +2195,45 @@ impl Qwen35MoeInner {
                     .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
                     .map_err(Error::from_reason)?;
                 let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-                forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs)?
+                match forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs) {
+                    Ok(logits) => logits,
+                    Err(e) => {
+                        eprintln!(
+                            "[MLX] Qwen3_5MoE (stream): C++ compiled paged forward failed \
+                             mid-decode (step={step}); rolling back token cursor and falling \
+                             back to pure-Rust paged decode for the rest of this request. \
+                             cause: {e}"
+                        );
+                        adapter
+                            .rollback_last_tokens(1)
+                            .map_err(Error::from_reason)?;
+                        cpp_session_ready = false;
+                        let embed = self.embedding.clone();
+                        let embedding_weight_pure = embed.get_weight();
+                        let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "MoE chat_stream_sync_core_paged_inner: caches dropped during cpp fallback",
+                            )
+                        })?;
+                        let adapter_mut = self.paged_adapter.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
+                            )
+                        })?;
+                        let logits = super::paged_forward::run_paged_decode_step(
+                            token_id,
+                            &embed,
+                            &mut self.layers,
+                            caches_ref,
+                            &self.final_norm,
+                            &self.lm_head,
+                            &embedding_weight_pure,
+                            &layer_kinds,
+                            adapter_mut,
+                        )?;
+                        logits.squeeze(Some(&[1]))?
+                    }
+                }
             } else {
                 let embed = self.embedding.clone();
                 let embedding_weight = embed.get_weight();

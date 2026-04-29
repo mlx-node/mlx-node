@@ -1220,7 +1220,6 @@ int32_t mlx_qwen35_moe_init_paged(
     }
 
     g_paged_offset_int = prefill_offset;
-    g_paged_inited = true;
 
     // Pre-compute 3D transposes for expert weights (same as flat init).
     g_weight_transposes_3d.clear();
@@ -1233,9 +1232,58 @@ int32_t mlx_qwen35_moe_init_paged(
       }
     }
 
-    // Break the lazy RNG split chain
-    auto rng_key = mlx::core::random::KeySequence::default_().next();
-    mlx::core::eval({rng_key});
+    // Defense-in-depth: surface layout / dtype / Metal-availability
+    // failures HERE (init time) rather than letting them blow up inside
+    // the first `mlx_qwen35_moe_forward_paged` call where the Rust
+    // caller's `record_tokens` has already mutated adapter state. We
+    // force-eval every full-attn pool / scale handle so the bf16 / f32
+    // layouts are materialized on the Metal queue and any underlying
+    // allocation failure raises a c++ exception we catch below.
+    {
+      std::vector<array> probe;
+      probe.reserve(num_layers * 4 + 1);
+      for (int i = 0; i < num_layers; i++) {
+        bool is_linear = !((i + 1) % full_attention_interval == 0);
+        if (is_linear) continue;
+        // Validate dtype contract: pools must be bf16, scales must be f32.
+        if (g_k_pools[i].dtype() != mlx::core::bfloat16) {
+          std::cerr << "[MLX] mlx_qwen35_moe_init_paged: layer " << i
+                    << " k_pool dtype != bf16" << std::endl;
+          g_paged_inited = false;
+          return -1;
+        }
+        if (g_v_pools[i].dtype() != mlx::core::bfloat16) {
+          std::cerr << "[MLX] mlx_qwen35_moe_init_paged: layer " << i
+                    << " v_pool dtype != bf16" << std::endl;
+          g_paged_inited = false;
+          return -1;
+        }
+        if (g_k_scales[i].dtype() != mlx::core::float32) {
+          std::cerr << "[MLX] mlx_qwen35_moe_init_paged: layer " << i
+                    << " k_scale dtype != f32" << std::endl;
+          g_paged_inited = false;
+          return -1;
+        }
+        if (g_v_scales[i].dtype() != mlx::core::float32) {
+          std::cerr << "[MLX] mlx_qwen35_moe_init_paged: layer " << i
+                    << " v_scale dtype != f32" << std::endl;
+          g_paged_inited = false;
+          return -1;
+        }
+        probe.push_back(g_k_pools[i]);
+        probe.push_back(g_v_pools[i]);
+        probe.push_back(g_k_scales[i]);
+        probe.push_back(g_v_scales[i]);
+      }
+      // Break the lazy RNG split chain, and force-eval the pool / scale
+      // layout in the same batch so any Metal-allocation or layout error
+      // throws here.
+      auto rng_key = mlx::core::random::KeySequence::default_().next();
+      probe.push_back(rng_key);
+      mlx::core::eval(std::move(probe));
+    }
+
+    g_paged_inited = true;
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] mlx_qwen35_moe_init_paged: " << e.what() << std::endl;
