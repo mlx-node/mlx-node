@@ -1580,6 +1580,80 @@ unsafe extern "C-unwind" {
     pub fn mlx_qwen35_get_cache_offset() -> i32;
 
     // ============================================
+    // Phase 5 piece 1: paged Dense forward (coexists with the flat
+    // compiled path). The Rust dispatcher decides per-turn which graph
+    // to run; `mlx_qwen35_compiled_reset` wipes BOTH graphs' state.
+    // ============================================
+
+    /// Initialize the paged Dense forward graph from per-layer pool /
+    /// scale handles. See the C++ docstring on `mlx_qwen35_init_paged`
+    /// for the full layout contract. Phase 5 piece 1 hard-codes
+    /// `block_size = 16`, `kv_dtype = Bf16`, `x_pack = 8`,
+    /// `sliding_window = 0`.
+    ///
+    /// `k_pool_handles`, `v_pool_handles`, `k_scale_handles`,
+    /// `v_scale_handles` are arrays of `num_layers` `mlx_array*` each.
+    /// Linear-layer slots may be null (placeholders are stored).
+    /// `linear_cache_arrays` is a `2 * num_layers` array of
+    /// `(conv_state, recurrent_state)` pairs; full-attn slots are
+    /// ignored. Pass null for the entire array to skip seeding.
+    ///
+    /// Returns `0` on success, `-1` on failure (e.g. missing pool/scale
+    /// handles, exception during graph build). On failure the C++ side
+    /// clears `g_dense_paged_inited` and emits a stderr diagnostic.
+    /// The Rust caller MUST inspect the return value and fall back to
+    /// the pure-Rust paged path on `-1`.
+    pub fn mlx_qwen35_init_paged(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        k_pool_handles: *mut *mut mlx_array,
+        v_pool_handles: *mut *mut mlx_array,
+        k_scale_handles: *mut *mut mlx_array,
+        v_scale_handles: *mut *mut mlx_array,
+        linear_cache_arrays: *mut *mut mlx_array,
+        prefill_offset: i32,
+    ) -> i32;
+
+    /// Single-token paged Dense decode step. Sets `*output_logits` to a
+    /// heap-allocated `mlx_array*` (caller owns) on success, or
+    /// `nullptr` on error / when `mlx_qwen35_init_paged` hasn't been
+    /// called. `cache_offset_out` receives the post-step offset.
+    ///
+    /// **Phase 5 piece 1 contract — decode-only.** `input_ids` MUST
+    /// have exactly one element and `slot_mapping` MUST be `[1]`.
+    /// Multi-token / chunked prefill is reserved for later phases. The
+    /// contract is enforced on the C++ side: violating it returns null
+    /// logits and writes a stderr diagnostic, leaving global state
+    /// untouched so the caller can fall back to the flat path.
+    pub fn mlx_qwen35_forward_paged(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        offset_arr: *mut mlx_array,
+        block_table: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+        num_valid_tokens: *mut mlx_array,
+        num_valid_blocks: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    // ============================================
     // Qwen3.5 VLM Prefill
     // ============================================
 
