@@ -1860,11 +1860,14 @@ impl PagedKVCacheAdapter {
     ///
     /// Pass-through to [`LayerKVPool::key_cache_array_raw`] — converts the
     /// raw `*mut mlx_array` pointer into a managed `MxArray`. The
-    /// resulting MxArray's Drop calls `mlx_array_delete` on the wrapper
-    /// struct only; the underlying Metal buffer is owned by the pool and
-    /// is NOT released. As long as the pool outlives the MxArray (the
-    /// adapter holds `Arc<LayerKVPool>` so this is automatic), the array
-    /// view is sound.
+    /// underlying Metal buffer is reference-counted (the FFI helper calls
+    /// `MTL::Buffer::retain()` for the view and the array's deleter calls
+    /// `MTL::Buffer::release()` on Drop), so the MxArray view holds an
+    /// independent reference and remains valid even if the pool is
+    /// dropped first. The adapter still holds `Arc<LayerKVPool>`
+    /// internally so cross-request adapter reuse stays sound, but
+    /// the lifetime guarantee no longer depends on that Arc — it's
+    /// the buffer refcount that keeps the GPU memory alive.
     #[cfg(target_os = "macos")]
     pub fn key_pool_array(&self, layer_idx: u32) -> Result<MxArray, String> {
         let raw = self.layer_kv_pool.key_cache_array_raw(layer_idx)?;

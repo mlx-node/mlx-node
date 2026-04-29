@@ -126,3 +126,83 @@ fn out_of_range_layer_errors() {
         "expected layer-range error, got: {msg}"
     );
 }
+
+/// LIFETIME FIX (Phase 3 review finding 1): the FFI helper
+/// `mlx_array_from_metal_buffer_view` retains the underlying
+/// `MTL::Buffer*` and the array's deleter releases it on drop, so the
+/// array view is INDEPENDENT of the original `metal::Buffer` holder
+/// lifetime. Previously the deleter was a no-op and dropping the pool
+/// while keeping the array view would leave the array pointing at a
+/// freed Metal buffer (GPU use-after-free).
+///
+/// This test takes a view, drops the pool, evaluates the view by
+/// running an MLX op against it (`astype` + `eval` materializes the
+/// data through the lazy graph), and asserts no crash. If the buffer
+/// were freed when the pool dropped, this would either segfault or
+/// surface a Metal validation-layer error.
+#[test]
+fn buffer_view_outlives_pool_drop() {
+    let Some(pool) = maybe_pool(4, MetalDtype::BFloat16) else {
+        eprintln!("skipping buffer_view_outlives_pool_drop: Metal unavailable");
+        return;
+    };
+
+    // Take a view, then DROP the pool while keeping the view alive.
+    let view_raw = pool.key_cache_array_raw(0).expect("k view");
+    assert!(!view_raw.is_null());
+
+    drop(pool);
+
+    // The view must still be usable. We force an eval so MLX actually
+    // dereferences the underlying Metal buffer; if the buffer were
+    // released by dropping the pool, this would crash. The astype
+    // (BF16 -> F32) is the simplest op that materializes the data
+    // without depending on a specific shape.
+    //
+    // SAFETY: `view_raw` is a valid mlx_array* from
+    // `mlx_array_from_metal_buffer_view`. We delete it after eval.
+    unsafe {
+        let recast = mlx_sys::mlx_array_astype(view_raw, /* float32 */ 0);
+        assert!(
+            !recast.is_null(),
+            "astype on view post-pool-drop must not return null"
+        );
+        mlx_sys::mlx_array_eval(recast);
+        // No crash and `eval` returns successfully → buffer survived
+        // the pool drop.
+        mlx_sys::mlx_array_delete(recast);
+        mlx_sys::mlx_array_delete(view_raw);
+    }
+}
+
+/// Multiple views over the same buffer all hold independent refcount
+/// entries on the MTL::Buffer. Dropping the views in any order must
+/// not crash and must not leave a dangling reference. We drop the
+/// pool first, then walk through several views and free them in
+/// reverse order so the last view to drop is responsible for the
+/// final `release()` (the hardest case for the lifetime contract).
+#[test]
+fn multiple_views_independent_refcounts() {
+    let Some(pool) = maybe_pool(4, MetalDtype::BFloat16) else {
+        eprintln!("skipping multiple_views_independent_refcounts: Metal unavailable");
+        return;
+    };
+
+    // Take 3 views over the same buffer.
+    let v1 = pool.key_cache_array_raw(0).expect("v1");
+    let v2 = pool.key_cache_array_raw(0).expect("v2");
+    let v3 = pool.value_cache_array_raw(1).expect("v3");
+    assert!(!v1.is_null() && !v2.is_null() && !v3.is_null());
+
+    drop(pool);
+
+    // Free in REVERSE order — the last view freed is the one that
+    // drops the final Metal-buffer reference. If any of the
+    // intermediate frees double-released, we'd crash here.
+    unsafe {
+        mlx_sys::mlx_array_delete(v2);
+        mlx_sys::mlx_array_delete(v3);
+        mlx_sys::mlx_array_delete(v1);
+    }
+    // Reaching here without crashing is the assertion.
+}

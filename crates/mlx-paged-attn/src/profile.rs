@@ -291,6 +291,103 @@ fn read_total_memory_bytes() -> Result<u64, ProfileError> {
     }
 }
 
+/// MLX's GPU-visible working-set bound (`MTLDevice
+/// recommendedMaxWorkingSetSize`), if available.
+///
+/// On Apple Silicon this is normally ~75% of unified memory — Metal
+/// will refuse to commit allocations beyond this point (or, worse,
+/// silently page out). The auto-sizer uses it as the upper bound when
+/// `MLX_KV_MEMORY_UTILIZATION` × `hw.memsize` would otherwise
+/// over-commit the GPU.
+///
+/// Returns `None` when:
+/// - Metal is unavailable (CPU-only build, no GPU);
+/// - the device_info map doesn't have `max_recommended_working_set_size`;
+/// - the C++ helper returns 0 for any reason (defensive: the caller
+///   then falls back to the physical-RAM budget).
+#[cfg(target_os = "macos")]
+fn read_working_set_bytes() -> Option<u64> {
+    let ws = unsafe { mlx_sys::mlx_max_recommended_working_set_size() };
+    if ws == 0 { None } else { Some(ws as u64) }
+}
+
+/// Pure-formula step that combines the physical-RAM budget with the
+/// optional working-set budget and returns the smaller. Pulled out of the
+/// main flow so unit tests can pin the clamp behaviour without spawning
+/// a Metal-aware process.
+///
+/// Returns `(num_blocks, kv_bytes, physical_budget_bytes,
+/// working_set_budget_bytes)` so the caller can log all three for
+/// auditability. `working_set_budget_bytes` is `None` when no working-set
+/// bound was reported (the formula then falls through to the physical
+/// budget alone).
+pub fn compute_num_blocks_with_working_set(
+    total_bytes: u64,
+    working_set_bytes: Option<u64>,
+    peak_non_kv_bytes: u64,
+    util: f64,
+    safety_margin_bytes: u64,
+    bytes_per_block: u64,
+) -> Result<(u32, u64, u64, Option<u64>), ProfileError> {
+    // Compute the physical-RAM budget first using the existing math.
+    let (physical_blocks, physical_kv_bytes) = compute_num_blocks_from_measurements(
+        total_bytes,
+        peak_non_kv_bytes,
+        util,
+        safety_margin_bytes,
+        bytes_per_block,
+    )?;
+    let physical_budget_bytes = physical_kv_bytes;
+
+    let Some(ws_total) = working_set_bytes else {
+        // No working-set bound reported → use the physical budget as-is.
+        return Ok((
+            physical_blocks,
+            physical_kv_bytes,
+            physical_budget_bytes,
+            None,
+        ));
+    };
+
+    // Compute the working-set budget the same way: util-haircut against
+    // the working-set total, minus peak, minus safety margin. We treat
+    // the working_set as the "memory ceiling" — util scales it the same
+    // way it scales hw.memsize so the operator's `MLX_KV_MEMORY_UTILIZATION`
+    // intent is preserved across both branches. Underflow here surfaces
+    // as a working-set budget of zero, which falls through to the
+    // physical budget (the only remaining option).
+    let ws_total_f = ws_total as f64;
+    let ws_budget_f = ws_total_f * util;
+    let ws_after_peak = ws_budget_f - peak_non_kv_bytes as f64;
+    let ws_kv_bytes_f = ws_after_peak - safety_margin_bytes as f64;
+    let ws_kv_bytes = if ws_kv_bytes_f <= 0.0 {
+        0u64
+    } else {
+        ws_kv_bytes_f as u64
+    };
+
+    // Choose the smaller of the two budgets. The working-set side is
+    // strictly tighter on Apple Silicon (recommended < total), so it
+    // wins in normal operation; we still keep the physical fallback
+    // for the (rare) case where working_set_bytes is misreported as
+    // larger than hw.memsize (e.g. driver bug, Paravirtual VM).
+    let chosen_kv_bytes = physical_kv_bytes.min(ws_kv_bytes);
+    if chosen_kv_bytes < bytes_per_block {
+        return Err(ProfileError::NotEnoughBlocks {
+            budget_bytes: chosen_kv_bytes,
+            bytes_per_block,
+        });
+    }
+    let num_blocks_u64 = chosen_kv_bytes / bytes_per_block;
+    let num_blocks = u32::try_from(num_blocks_u64).unwrap_or(u32::MAX);
+    Ok((
+        num_blocks,
+        chosen_kv_bytes,
+        physical_budget_bytes,
+        Some(ws_kv_bytes),
+    ))
+}
+
 /// Reset the MLX peak-memory counter. Called immediately before the
 /// caller's dummy forward so the post-forward `mlx_get_peak_memory()` read
 /// reflects only the model's max footprint during one max-seq forward.
@@ -310,8 +407,12 @@ fn read_peak_memory() -> u64 {
 /// Run a caller-supplied dummy forward, measure peak memory, and compute
 /// the auto-sized block count.
 ///
-/// `dummy_forward` MUST:
-/// 1. Construct synthetic input shaped `(batch=1, seq=max_position_embeddings)`.
+/// `dummy_forward(max_position_embeddings)` MUST:
+/// 1. Construct synthetic input shaped `(batch=1, seq=max_position_embeddings)`
+///    using the value passed in (NOT a hard-coded constant — the
+///    auto-sizer derives the right number from the model config and
+///    threads it through here so callers can't accidentally desync the
+///    profile shape from the runtime serving shape).
 /// 2. Run the model forward through to logits.
 /// 3. Call MLX `eval()` so the lazy graph materializes (peak memory only
 ///    accounts for materialized data — without `eval()` the graph never
@@ -319,15 +420,29 @@ fn read_peak_memory() -> u64 {
 ///
 /// Phase 3 makes this caller-supplied because the model loader is a model-
 /// specific concern (Phases 4-9 will plug their own model into this slot).
+/// Passing `max_position_embeddings` as a closure argument (rather than
+/// expecting the caller to capture it) ensures it always reaches the
+/// closure body and matches the value the auto-sizer used in its
+/// budget math.
+///
+/// The peak-memory and budget math is also clamped against MLX's GPU-
+/// visible working-set bound (`MTLDevice
+/// recommendedMaxWorkingSetSize`). On Apple Silicon this is normally
+/// ~75% of unified memory — without the clamp, sizing the pool against
+/// raw `hw.memsize` would over-commit the GPU, surface as
+/// `MTLBuffer` allocation failures during serving rather than at
+/// profile time. The clamp is silent (we just take the smaller of the
+/// two budgets) but logged so the chosen budget is auditable.
 ///
 /// Logging: emits an `info!`-level line on success with the measured peak,
-/// budget, and resulting block count. Errors are returned to the caller —
-/// we don't `error!` here because the caller often wants to fall back to
-/// a static heuristic on `TotalMemoryUnavailable`.
+/// physical/working-set budgets, the chosen budget, and resulting block
+/// count. Errors are returned to the caller — we don't `error!` here
+/// because the caller often wants to fall back to a static heuristic on
+/// `TotalMemoryUnavailable`.
 #[allow(clippy::too_many_arguments)]
 pub fn profile_run_and_compute_num_blocks<F>(
     dummy_forward: F,
-    _max_position_embeddings: u32,
+    max_position_embeddings: u32,
     num_layers: u32,
     num_kv_heads: u32,
     head_size: u32,
@@ -335,7 +450,7 @@ pub fn profile_run_and_compute_num_blocks<F>(
     block_size: u32,
 ) -> Result<u32, ProfileError>
 where
-    F: FnOnce() -> Result<(), String>,
+    F: FnOnce(u32) -> Result<(), String>,
 {
     let total = read_total_memory_bytes()?;
     let util = read_util_env()?;
@@ -345,14 +460,34 @@ where
     #[cfg(target_os = "macos")]
     {
         reset_peak_memory();
-        dummy_forward().map_err(ProfileError::DummyForwardFailed)?;
+        dummy_forward(max_position_embeddings).map_err(ProfileError::DummyForwardFailed)?;
         let peak = read_peak_memory();
-        let (num_blocks, kv_bytes) =
-            compute_num_blocks_from_measurements(total, peak, util, safety_margin, bpb)?;
+        // Clamp against MLX's recommended working-set bound. Apple Silicon
+        // reports ~75% of unified memory as the upper bound MTLDevice will
+        // happily commit — past that we get `MTLBuffer` allocation
+        // failures during serving rather than at profile time.
+        let working_set = read_working_set_bytes();
+        let (num_blocks, kv_bytes, physical_bytes, working_set_bytes) =
+            compute_num_blocks_with_working_set(
+                total,
+                working_set,
+                peak,
+                util,
+                safety_margin,
+                bpb,
+            )?;
 
         let total_mib = total / (1024 * 1024);
         let peak_mib = peak / (1024 * 1024);
         let kv_mib = kv_bytes / (1024 * 1024);
+        let phys_mib = physical_bytes / (1024 * 1024);
+        // `n/a` when no working-set bound was reported (CPU-only build
+        // or device_info missing the entry); the formula then falls
+        // through to the physical budget alone.
+        let ws_str = match working_set_bytes {
+            Some(b) => format!("{} MiB", b / (1024 * 1024)),
+            None => "n/a".to_string(),
+        };
         // MEMORY: log via eprintln rather than tracing because mlx-paged-attn
         // is lower in the dependency tree than the workspace tracing setup
         // and we don't want to drag tracing-subscriber into this crate.
@@ -360,8 +495,9 @@ where
         // when desirable.
         eprintln!(
             "[paged-profile] total {total_mib} MiB, peak_non_kv {peak_mib} MiB, util {util:.3}, \
-             safety_margin {safety_margin} B, kv_budget {kv_mib} MiB, num_blocks {num_blocks}, \
-             block_size {block_size}, bytes_per_block {bpb}"
+             safety_margin {safety_margin} B, physical_budget {phys_mib} MiB, \
+             working_set_budget {ws_str}, kv_budget {kv_mib} MiB, num_blocks {num_blocks}, \
+             block_size {block_size}, bytes_per_block {bpb}, max_seq {max_position_embeddings}"
         );
         Ok(num_blocks)
     }
@@ -373,7 +509,7 @@ where
         // platform-portable model-loading bugs surface deterministically
         // even without MLX/Metal (the closure receives a pre-platform-checked
         // failure and can pass through `Err`s from its own loader).
-        let _ = dummy_forward();
+        let _ = dummy_forward(max_position_embeddings);
         let _ = (total, util, safety_margin, bpb);
         let _: PhantomData<F> = PhantomData;
         Err(ProfileError::TotalMemoryUnavailable)
@@ -514,5 +650,126 @@ mod tests {
         // 72 - 10 - 1 = 61 GiB / 16 MiB ≈ 3904 blocks.
         assert!((3900..=3910).contains(&num_blocks), "got {num_blocks}");
         assert!(kv > 0);
+    }
+
+    /// No working-set bound reported (CPU-only build / device_info missing
+    /// the entry) → the function falls through to the physical-RAM
+    /// budget and returns the same num_blocks as
+    /// `compute_num_blocks_from_measurements`.
+    #[test]
+    fn working_set_none_falls_through_to_physical() {
+        let total = 64u64 * 1024 * 1024 * 1024;
+        let peak = 10u64 * 1024 * 1024 * 1024;
+        let util = 0.85;
+        let safety = 1024u64 * 1024 * 1024;
+        let bpb = 1024u64 * 1024;
+        let (phys_blocks, _) =
+            compute_num_blocks_from_measurements(total, peak, util, safety, bpb).unwrap();
+        let (num_blocks, _, _, ws_bytes) =
+            compute_num_blocks_with_working_set(total, None, peak, util, safety, bpb).unwrap();
+        assert_eq!(num_blocks, phys_blocks);
+        assert_eq!(ws_bytes, None);
+    }
+
+    /// Working set < total → working-set budget bounds the result. The
+    /// Apple-Silicon-typical case: hw.memsize = 64 GiB, working set =
+    /// 48 GiB. A naive auto-sizer would over-commit by 16 GiB; the
+    /// clamp keeps the result inside the working-set budget.
+    #[test]
+    fn working_set_smaller_clamps_blocks() {
+        let total = 64u64 * 1024 * 1024 * 1024;
+        let working_set = 48u64 * 1024 * 1024 * 1024;
+        let peak = 10u64 * 1024 * 1024 * 1024;
+        let util = 0.85;
+        let safety = 1024u64 * 1024 * 1024;
+        let bpb = 1024u64 * 1024;
+
+        // Physical budget alone: 64 * 0.85 - 10 - 1 = 43.4 GiB ≈ 44_447 blocks.
+        // Working-set budget:    48 * 0.85 - 10 - 1 = 29.8 GiB ≈ 30_515 blocks.
+        // Working set is strictly tighter → wins.
+        let (phys_blocks, _) =
+            compute_num_blocks_from_measurements(total, peak, util, safety, bpb).unwrap();
+        let (clamped_blocks, kv_bytes, phys_budget, ws_budget) =
+            compute_num_blocks_with_working_set(total, Some(working_set), peak, util, safety, bpb)
+                .unwrap();
+
+        assert!(
+            clamped_blocks < phys_blocks,
+            "expected clamp to reduce blocks: physical={phys_blocks}, clamped={clamped_blocks}"
+        );
+        // Sanity: ~30,500 blocks for the working-set budget.
+        assert!(
+            (30_000..=31_000).contains(&clamped_blocks),
+            "expected ~30,515 blocks for working-set budget, got {clamped_blocks}"
+        );
+        // kv_bytes equals the working-set budget (since it's the smaller).
+        let ws_kv = ws_budget.expect("working-set budget reported");
+        assert_eq!(kv_bytes, ws_kv.min(phys_budget));
+        assert!(ws_kv < phys_budget);
+    }
+
+    /// Working set >= total (the rare misreport case: VM driver bug) →
+    /// the physical budget is tighter and wins. We still report both
+    /// budgets through the return tuple so the eprintln log can show
+    /// which side dominated.
+    #[test]
+    fn working_set_larger_falls_back_to_physical() {
+        let total = 32u64 * 1024 * 1024 * 1024;
+        let working_set = 64u64 * 1024 * 1024 * 1024; // > total: misreport
+        let peak = 4u64 * 1024 * 1024 * 1024;
+        let util = 0.85;
+        let safety = 1024u64 * 1024 * 1024;
+        let bpb = 1024u64 * 1024;
+        let (phys_blocks, _) =
+            compute_num_blocks_from_measurements(total, peak, util, safety, bpb).unwrap();
+        let (num_blocks, _, _, ws_bytes) =
+            compute_num_blocks_with_working_set(total, Some(working_set), peak, util, safety, bpb)
+                .unwrap();
+        assert_eq!(num_blocks, phys_blocks);
+        // Working-set budget IS still reported, but it's the larger of
+        // the two so the physical budget bounds the result.
+        assert!(ws_bytes.is_some());
+    }
+
+    /// Both budgets reject the same way when peak exceeds the
+    /// utilization haircut: physical leg returns InsufficientMemory
+    /// before we even consider the working set. Verifies the
+    /// short-circuit behaviour.
+    #[test]
+    fn working_set_rejects_when_physical_does() {
+        let total = 32u64 * 1024 * 1024 * 1024;
+        let peak = 30u64 * 1024 * 1024 * 1024; // > 32 * 0.85 = 27.2
+        let util = 0.85;
+        let safety = 0u64;
+        let bpb = 1024u64;
+        let res = compute_num_blocks_with_working_set(
+            total,
+            Some(48u64 * 1024 * 1024 * 1024),
+            peak,
+            util,
+            safety,
+            bpb,
+        );
+        assert!(matches!(res, Err(ProfileError::InsufficientMemory { .. })));
+    }
+
+    /// Physical budget passes, but the working-set budget is too small
+    /// to fit even one block. The auto-sizer refuses to silently
+    /// disable paged attention even with a generous physical budget.
+    #[test]
+    fn working_set_too_small_rejects() {
+        let gib = 1024u64 * 1024 * 1024;
+        let total = 64 * gib;
+        // Working set so small the post-haircut budget can't fit one block.
+        let working_set = 5 * gib; // util * 5 GiB - 4 GiB peak - 1 GiB safety = -0.75 GiB
+        let peak = 4 * gib;
+        let util = 0.85;
+        let safety = gib;
+        let bpb = 4 * gib;
+        let res =
+            compute_num_blocks_with_working_set(total, Some(working_set), peak, util, safety, bpb);
+        // The clamp drives chosen_kv_bytes to 0; we surface NotEnoughBlocks
+        // (NOT InsufficientMemory — that's the physical-only short-circuit).
+        assert!(matches!(res, Err(ProfileError::NotEnoughBlocks { .. })));
     }
 }

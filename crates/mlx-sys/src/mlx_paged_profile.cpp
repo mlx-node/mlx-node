@@ -27,6 +27,10 @@
 #include <sys/sysctl.h>
 #endif
 
+#if defined(__APPLE__)
+#include "mlx/backend/metal/device.h"
+#endif
+
 extern "C" {
 
 // Total physical system memory in bytes (Apple Silicon: unified memory
@@ -50,19 +54,18 @@ size_t mlx_total_system_memory() {
 }
 
 // Wrap an existing MTL::Buffer (passed as `void*` for FFI) as an MLX
-// `array` view — zero-copy, no host roundtrip, ownership stays with the
-// caller via a no-op deleter.
+// `array` view — zero-copy, no host roundtrip.
 //
 // Used by `LayerKVPool::{key,value}_cache_array` (Phase 3) to expose the
 // per-layer K/V pool buffers as MLX-traceable inputs to the compiled
-// forward graph. The pool retains ownership; the array's deleter is a
-// no-op so MLX doesn't try to `free()` the buffer when the array is
-// dropped.
+// forward graph.
 //
 // Inputs:
 // - `metal_buffer_ptr`: an `MTL::Buffer*` (the same pointer
-//   `mlx_array_get_metal_buffer` returns). Must outlive the resulting
-//   array.
+//   `mlx_array_get_metal_buffer` returns). The function retains the
+//   buffer for the array's lifetime, so the caller does NOT need to
+//   keep the original holder alive — though typically callers will
+//   anyway because the same buffer is shared with their own write path.
 // - `dims`/`ndim`: shape of the view (caller is responsible for total
 //   element count being consistent with the buffer's byte length / dtype
 //   size — we don't sanity-check because the caller already knows the
@@ -74,12 +77,27 @@ size_t mlx_total_system_memory() {
 // Returns nullptr on Metal-unavailable hosts, null buffer pointers, or
 // invalid dtype codes.
 //
-// SAFETY: this constructs an `allocator::Buffer{void*}` directly from the
-// MTL::Buffer pointer — same shape MLX uses internally for its own
-// metal-backed arrays (see `MetalAllocator::make_buffer`). The deleter
-// is a no-op, so dropping the array does not release the buffer; the
-// caller (LayerKVPool) keeps the metal::Buffer alive for the entire
-// pool lifetime.
+// SAFETY / lifetime contract:
+// `MTL::Buffer` is reference-counted via Apple's `NS::Referencing`
+// (retain/release). We bump the refcount BEFORE constructing the
+// array, and the array's `Deleter` lambda releases it on Drop. This
+// makes the array view INDEPENDENT of the original holder's
+// lifetime — dropping the holder (e.g. the Rust `LayerKVPool`'s
+// `metal::Buffer`) decrements the refcount, but Metal won't actually
+// free the underlying GPU memory until the array view is also
+// dropped. Without retain/release the original "no-op deleter"
+// version was vulnerable to GPU use-after-free if the holder
+// dropped first.
+//
+// We construct the `allocator::Buffer{void*}` from the MTL::Buffer*
+// the same way MLX uses internally for its own metal-backed arrays
+// (see `MetalAllocator::make_buffer`). MLX's `allocator::free`
+// would do its own retain/release accounting against the MetalAllocator
+// pool — but we bypass that path entirely by supplying our own
+// deleter that calls `MTL::Buffer::release()` directly. The buffer
+// was made by the caller (typically Rust's `metal::Device::new_buffer`),
+// not by the MLX allocator, so MLX's pool accounting must NOT be
+// invoked on it.
 mlx_array* mlx_array_from_metal_buffer_view(
     void* metal_buffer_ptr,
     const int64_t* dims,
@@ -93,9 +111,31 @@ mlx_array* mlx_array_from_metal_buffer_view(
   }
   mlx::core::Dtype dtype = to_mlx_dtype(dtype_code);
 
-  // No-op deleter — the buffer is owned by the caller (LayerKVPool's
-  // `metal::Buffer`). MLX must NOT call `allocator::free` on it.
-  mlx::core::Deleter no_op = [](mlx::core::allocator::Buffer) {};
+#if defined(__APPLE__)
+  // Bump the MTL::Buffer refcount so the array's view holds an independent
+  // reference, then capture the same pointer in the deleter to release()
+  // when the array is dropped. Without this, the array's deleter was a
+  // no-op and the caller's holder (Rust LayerKVPool's metal::Buffer) was
+  // the sole owner — dropping the holder while keeping the array view
+  // would leave the array pointing at a freed Metal buffer (GPU UAF).
+  auto* mtl_buffer = static_cast<MTL::Buffer*>(metal_buffer_ptr);
+  mtl_buffer->retain();
+
+  // Releases the array's retained reference. The original holder's
+  // separate reference is released by the holder's own destructor.
+  // Capture by value (raw pointer) — MTL::Buffer is reference-counted
+  // and the retain() above guarantees the pointer stays valid until
+  // this lambda runs.
+  mlx::core::Deleter retain_release = [mtl_buffer](mlx::core::allocator::Buffer) {
+    mtl_buffer->release();
+  };
+#else
+  // Non-macOS: there is no MTL::Buffer to retain/release. We still take
+  // the no-op path so the file compiles for `cfg(not(target_os = "macos"))`
+  // unit tests, but the function returns null above before reaching
+  // this point because `mlx::core::metal::is_available()` is false.
+  mlx::core::Deleter retain_release = [](mlx::core::allocator::Buffer) {};
+#endif
 
   // Construct array from existing buffer pointer. `allocator::Buffer{ptr}`
   // wraps the MTL::Buffer* as MLX's allocator::Buffer (same as
@@ -104,9 +144,15 @@ mlx_array* mlx_array_from_metal_buffer_view(
     mlx::core::Shape shape = make_shape(dims, ndim);
     auto buf = mlx::core::allocator::Buffer{metal_buffer_ptr};
     auto* arr = new mlx::core::array(
-        buf, std::move(shape), dtype, std::move(no_op));
+        buf, std::move(shape), dtype, std::move(retain_release));
     return reinterpret_cast<mlx_array*>(arr);
   } catch (...) {
+    // Construction failed AFTER we retained — release the bumped
+    // refcount so the buffer doesn't leak. Without this, repeated
+    // failure on the same buffer would slowly leak refcounts.
+#if defined(__APPLE__)
+    mtl_buffer->release();
+#endif
     return nullptr;
   }
 }

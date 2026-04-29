@@ -381,21 +381,18 @@ impl LayerKVPool {
     ///
     /// The returned pointer is owned by the caller; drop it via
     /// `mlx_array_delete` (the typical wrapper is `MxArray::from_handle`,
-    /// which calls delete on Drop). The underlying Metal buffer is NOT
-    /// released — the array uses a no-op deleter so the pool remains the
-    /// sole owner of the buffer.
+    /// which calls delete on Drop). The underlying Metal buffer is
+    /// reference-counted: the FFI helper calls `MTL::Buffer::retain()`
+    /// when building the view and the array's deleter calls
+    /// `MTL::Buffer::release()` on drop, so the array view holds an
+    /// INDEPENDENT reference to the buffer. Dropping the pool while
+    /// keeping the array view is sound — the buffer survives until the
+    /// last reference (pool or array) is released.
     ///
     /// Returns `Err` if:
     /// - `layer_idx` is out of range
     /// - Metal extraction is not supported on this host
     /// - the FFI call fails to build the array
-    ///
-    /// # Safety
-    /// The pool MUST outlive every array view returned by this method.
-    /// Dropping the pool while an array view is live is undefined
-    /// behaviour — the array's MTL::Buffer pointer becomes dangling.
-    /// In practice the adapter holds `Arc<LayerKVPool>` so the pool
-    /// stays alive while any adapter references it.
     #[cfg(target_os = "macos")]
     pub fn key_cache_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
         use crate::metal::is_metal_extraction_supported;
@@ -418,10 +415,10 @@ impl LayerKVPool {
         let dims = self.key_cache_shape(x);
         let dtype_code = bridge_dtype_code(self.cache_dtype)?;
 
-        // SAFETY: `key_cache` is owned by this pool and lives at least
-        // until `&self` becomes invalid; the FFI call wraps the buffer
-        // pointer with a no-op deleter so the array does NOT free the
-        // buffer on Drop.
+        // SAFETY: `key_cache` lives at least as long as `&self`; the FFI
+        // call retains the MTL::Buffer (refcount + 1) and installs a
+        // matching `release()` deleter on the resulting array, so the
+        // array view holds its own reference independently of this pool.
         let arr = unsafe {
             mlx_sys::mlx_array_from_metal_buffer_view(
                 key_cache.as_ptr() as *mut _,
@@ -442,7 +439,9 @@ impl LayerKVPool {
     /// Wrap the V cache buffer for `layer_idx` as a zero-copy MLX `array`
     /// view. Shape: `[num_blocks, num_kv_heads, head_size, block_size]`
     /// (vLLM V layout). See [`Self::key_cache_array_raw`] for ownership
-    /// semantics.
+    /// semantics (the buffer is reference-counted via retain/release;
+    /// the array view holds its own reference and survives drop of
+    /// the pool).
     #[cfg(target_os = "macos")]
     pub fn value_cache_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
         use crate::metal::is_metal_extraction_supported;
