@@ -1418,6 +1418,160 @@ mod tests {
         allocator.free(cached_block0);
     }
 
+    /// Task #48: `cache_salt` composes with non-empty uniform `extra_keys`
+    /// per the contract `[existing_extra_keys..., cache_salt]` (salt
+    /// APPENDED to the existing keys, not prepended, not replacing). This
+    /// test pins down the exact byte composition by registering a chain
+    /// with `cache_full_blocks` (uniform `extra_keys`) and a non-zero
+    /// salt, then probing `lookup_prefix` against `hash_tokens(...)`
+    /// references built with each candidate composition.
+    ///
+    /// The earlier salt tests (`cache_salt_only_affects_first_block_hash`
+    /// and `cache_salt_not_mixed_into_block_n_for_n_gt_0`) only exercise
+    /// the salt path with EMPTY `extra_keys`, so a mutation that drops
+    /// `extra_keys` when `cache_salt != 0`, or reorders them to
+    /// `[cache_salt, existing_extra_keys...]`, would still pass them.
+    /// This test exists to kill those mutants.
+    #[test]
+    fn cache_salt_composes_with_uniform_extra_keys() {
+        let mut allocator = BlockAllocator::new(8, 4);
+        let toks: Vec<u32> = (0..8).collect();
+        const K1: u64 = 0xCAFE_F00D_DEAD_BEEF;
+        const K2: u64 = 0x0123_4567_89AB_CDEF;
+        let salt: u64 = 0xDEAD_BEEF_DEAD_BEEFu64;
+
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        let b0_id = b0.block_id;
+        let b1_id = b1.block_id;
+
+        let blocks = vec![Arc::clone(&b0), Arc::clone(&b1)];
+        let registered = allocator
+            .cache_full_blocks(&toks, &blocks, 4, &[K1, K2], salt)
+            .unwrap();
+        assert_eq!(registered, 2);
+
+        // Property 1: block 0's hash equals
+        // `hash_tokens(tokens[0..block_size], 0, &[K1, K2, salt])`.
+        // Salt is APPENDED to the existing extra_keys.
+        let salted_block0_hash = hash_tokens(&toks[0..4], 0, &[K1, K2, salt]);
+        let cached_block0 = allocator.lookup_prefix(salted_block0_hash).expect(
+            "block 0 must be reachable at hash_tokens(tokens, 0, &[K1, K2, salt]) — \
+             salt is APPENDED to existing extra_keys for the leading block",
+        );
+        assert_eq!(
+            cached_block0.block_id, b0_id,
+            "lookup at the canonical [extra_keys..., salt] composition must resolve to block 0"
+        );
+        allocator.free(cached_block0);
+
+        // Property 2: block 0's hash does NOT equal
+        // `hash_tokens(tokens[0..block_size], 0, &[salt, K1, K2])`.
+        // Order matters — salt is appended, not prepended.
+        let wrong_order_hash = hash_tokens(&toks[0..4], 0, &[salt, K1, K2]);
+        assert!(
+            allocator.lookup_prefix(wrong_order_hash).is_none(),
+            "block 0 must NOT be reachable at hash_tokens(tokens, 0, &[salt, K1, K2]) — \
+             ordering is `[extra_keys..., salt]`, not `[salt, extra_keys...]`"
+        );
+
+        // Property 3: block 0's hash does NOT equal
+        // `hash_tokens(tokens[0..block_size], 0, &[salt])`. Existing
+        // extra_keys are preserved alongside salt, not dropped.
+        let salt_only_hash = hash_tokens(&toks[0..4], 0, &[salt]);
+        assert!(
+            allocator.lookup_prefix(salt_only_hash).is_none(),
+            "block 0 must NOT be reachable at hash_tokens(tokens, 0, &[salt]) — \
+             existing extra_keys MUST NOT be dropped when cache_salt != 0"
+        );
+
+        // Property 4: block 1's hash equals
+        // `hash_tokens(tokens[block_size..2*block_size], salted_block0_hash, &[K1, K2])`.
+        // For n > 0 the salt is NOT mixed in, but the existing extra_keys
+        // STILL ARE — they are uniform per-call.
+        let expected_block1_hash = hash_tokens(&toks[4..8], salted_block0_hash, &[K1, K2]);
+        let cached_block1 = allocator.lookup_prefix(expected_block1_hash).expect(
+            "block 1 must be reachable at hash_tokens(tokens, parent, &[K1, K2]) — \
+             extra_keys still thread through n > 0; salt does not",
+        );
+        assert_eq!(
+            cached_block1.block_id, b1_id,
+            "lookup at the un-salted block-1 hash must resolve to the registered block 1"
+        );
+        allocator.free(cached_block1);
+    }
+
+    /// Task #48: per-block-extra_keys variant of the salt composition
+    /// contract. Each block has its OWN extra_keys vector
+    /// (`extra_keys_per_block[n]`); salt is appended only to block 0's
+    /// per-block keys, and blocks 1+ use their per-block keys verbatim
+    /// without salt. This pins down the exact composition for the
+    /// per-block path so a mutation that mishandles the
+    /// non-empty-per-block-keys + non-zero-salt branch is killed.
+    #[test]
+    fn cache_salt_composes_with_per_block_extra_keys() {
+        let mut allocator = BlockAllocator::new(8, 4);
+        let toks: Vec<u32> = (0..12).collect();
+        let per_block_keys: Vec<Vec<u64>> = vec![vec![0xAA], vec![0xBB], vec![0xCC]];
+        let salt: u64 = 0xDEAD_BEEF_DEAD_BEEFu64;
+
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
+        let b0_id = b0.block_id;
+        let b1_id = b1.block_id;
+        let b2_id = b2.block_id;
+
+        let blocks = vec![Arc::clone(&b0), Arc::clone(&b1), Arc::clone(&b2)];
+        let registered = allocator
+            .cache_full_blocks_per_block(&toks, &blocks, 4, &per_block_keys, salt)
+            .unwrap();
+        assert_eq!(registered, 3);
+
+        // Property 1: block 0's hash equals
+        // `hash_tokens(tokens[0..block_size], 0, &[0xAA, salt])` —
+        // salt appended AFTER block 0's per-block keys.
+        let salted_block0_hash = hash_tokens(&toks[0..4], 0, &[0xAA, salt]);
+        let cached_block0 = allocator.lookup_prefix(salted_block0_hash).expect(
+            "block 0 must be reachable at hash_tokens(tokens, 0, &[0xAA, salt]) — \
+             salt is APPENDED to block 0's per-block extra_keys",
+        );
+        assert_eq!(cached_block0.block_id, b0_id);
+        allocator.free(cached_block0);
+
+        // Property 2: block 1's hash equals
+        // `hash_tokens(tokens[block_size..2*block_size], salted_block0_hash, &[0xBB])`.
+        // Block 1 uses ITS per-block keys, NO salt.
+        let expected_block1_hash = hash_tokens(&toks[4..8], salted_block0_hash, &[0xBB]);
+        let cached_block1 = allocator.lookup_prefix(expected_block1_hash).expect(
+            "block 1 must be reachable at hash_tokens(tokens, parent, &[0xBB]) — \
+             block 1 uses its per-block keys; salt is NOT mixed into n > 0",
+        );
+        assert_eq!(cached_block1.block_id, b1_id);
+        allocator.free(cached_block1);
+
+        // Property 3: block 2's hash equals
+        // `hash_tokens(tokens[2*block_size..3*block_size], expected_block1_hash, &[0xCC])`.
+        let expected_block2_hash = hash_tokens(&toks[8..12], expected_block1_hash, &[0xCC]);
+        let cached_block2 = allocator.lookup_prefix(expected_block2_hash).expect(
+            "block 2 must be reachable at hash_tokens(tokens, parent, &[0xCC]) — \
+             block 2 uses its own per-block keys",
+        );
+        assert_eq!(cached_block2.block_id, b2_id);
+        allocator.free(cached_block2);
+
+        // Wrong-block per-block keys must miss: looking up block 1 with
+        // block 0's keys (`&[0xAA]`) instead of its own (`&[0xBB]`)
+        // should NOT resolve. Guards against any "use block 0's keys for
+        // every block" mutation.
+        let wrong_block1_hash = hash_tokens(&toks[4..8], salted_block0_hash, &[0xAA]);
+        assert!(
+            allocator.lookup_prefix(wrong_block1_hash).is_none(),
+            "block 1 must NOT be reachable with block 0's per-block keys — \
+             per-block keys MUST be applied per-block, not uniformly"
+        );
+    }
+
     #[test]
     fn test_register_lookup_refcount_lifecycle() {
         let mut allocator = BlockAllocator::new(4, 4);
