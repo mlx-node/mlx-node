@@ -149,7 +149,19 @@ impl BlockAllocator {
             prefix_cache: HashMap::new(),
             block_hashes: HashMap::new(),
             lru_order: VecDeque::new(),
-            max_prefix_cache_entries: 1024, // Configurable
+            // Scale the prefix-cache capacity to `num_blocks` so the cache
+            // can accommodate the full live block set. The previous fixed
+            // ceiling of 1024 silently capped cross-turn prefix reuse on
+            // any conversation longer than ~16k tokens at block_size=16:
+            // turn 1's chain registration evicted its own head blocks
+            // (block 0 first), so turn 2's `find_longest_cache_hit` walk
+            // missed at block 0 and reported `cached_prefix_len = 0`.
+            // `num_blocks` is the natural upper bound — no more than that
+            // many blocks can ever be live, so this can't cause additional
+            // eviction beyond what `try_evict_lru_for_allocation` already
+            // performs on physical-pool exhaustion. Per-instance overrides
+            // remain available via `set_max_prefix_cache_entries`.
+            max_prefix_cache_entries: num_blocks as usize,
         }
     }
 
@@ -1992,5 +2004,22 @@ mod tests {
         let (hits, n) = allocator.find_longest_cache_hit_per_block(&tokens, block_size, &too_short);
         assert_eq!(hits.len(), 2);
         assert_eq!(n, 2 * block_size as usize);
+    }
+
+    /// Reproduces task #47: turn 1 of a 31k-token prompt registers ~1942
+    /// blocks at block_size=16. With the previous hardcoded cap of 1024
+    /// prefix-cache entries, the first ~921 blocks evicted before finalize
+    /// returned, so turn 2's lookup walking from block 0 missed instantly
+    /// and reported cached_prefix_len=0. The cap now scales to num_blocks.
+    #[test]
+    fn long_chain_survives_registration_without_head_eviction() {
+        let mut a = BlockAllocator::new(2000, 16);
+        let token_ids: Vec<u32> = (0..1100 * 16).map(|i| i as u32).collect();
+        let blocks: Vec<_> = (0..1100).map(|_| a.allocate().unwrap()).collect();
+        let n = a.cache_full_blocks(&token_ids, &blocks, 16, &[]).unwrap();
+        assert_eq!(n, 1100);
+        let (hits, cached) = a.find_longest_cache_hit(&token_ids, 16, &[]);
+        assert_eq!(hits.len(), 1100, "head blocks must survive registration");
+        assert_eq!(cached, 1100 * 16);
     }
 }
