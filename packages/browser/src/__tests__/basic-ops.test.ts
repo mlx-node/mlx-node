@@ -260,6 +260,16 @@ describe('Basic Operations', () => {
     expect(r.passed, r.error).toBe(true);
   });
 
+  test('MoE gather_sort VLM-sized argsort', async () => {
+    const r = await runTest('MoE gather_sort VLM-sized argsort');
+    expect(r.passed, r.error).toBe(true);
+  }, 180000);
+
+  test('vocab-sized argsort stays bounded', async () => {
+    const r = await runTest('vocab-sized argsort stays bounded');
+    expect(r.passed, r.error).toBe(true);
+  }, 180000);
+
   test('MoE routing argpartition top-k parity', async () => {
     const r = await runTest('MoE routing argpartition top-k parity');
     expect(r.passed, r.error).toBe(true);

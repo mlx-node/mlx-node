@@ -2682,6 +2682,107 @@ async function initAndRun(wasmUrl: string) {
       },
     },
     {
+      name: "MoE gather_sort VLM-sized argsort",
+      run() {
+        // Mirrors Qwen3.6 VLM prefill where roughly 1019 routed tokens with
+        // top_k=8 produce a flattened expert-id argsort of length 8152.
+        const ne = 1019;
+        const k = 8;
+        const n = ne * k;
+        const rawIdx = new Uint32Array(n);
+        for (let i = 0; i < n; i++) {
+          rawIdx[i] = (i * 37 + Math.floor(i / 7) * 13 + (i % k) * 5) % 256;
+        }
+
+        const indices = MxArray.fromUint32(
+          rawIdx,
+          new BigInt64Array([BigInt(ne), BigInt(k)]),
+        );
+        const flat = indices.reshape(new BigInt64Array([BigInt(n)]));
+        const order = flat.argsort(-1);
+        const invOrder = order.argsort(-1);
+        const idxSorted = flat.take(order, 0);
+
+        order.eval();
+        invOrder.eval();
+        idxSorted.eval();
+
+        const gotOrder = [...order.toUint32()];
+        const gotIdx = [...idxSorted.toUint32()];
+        if (gotOrder.length !== n || gotIdx.length !== n) {
+          throw new Error(
+            `unexpected lengths order=${gotOrder.length} idx=${gotIdx.length}`,
+          );
+        }
+
+        const expectedInv = new Array(n);
+        for (let i = 0; i < n; i++) {
+          const src = gotOrder[i];
+          const value = rawIdx[src];
+          if (gotIdx[i] !== value) {
+            throw new Error(`idx_sorted[${i}]=${gotIdx[i]} expected ${value}`);
+          }
+          if (i > 0 && gotIdx[i - 1] > gotIdx[i]) {
+            throw new Error(
+              `idx_sorted is not monotonic at ${i}: ${gotIdx[i - 1]} > ${gotIdx[i]}`,
+            );
+          }
+          expectedInv[src] = i;
+        }
+
+        const gotInv = [...invOrder.toUint32()];
+        for (let i = 0; i < n; i++) {
+          if (gotInv[i] !== expectedInv[i]) {
+            throw new Error(
+              `inv_order[${i}]=${gotInv[i]} expected ${expectedInv[i]}`,
+            );
+          }
+        }
+      },
+    },
+    {
+      name: "vocab-sized argsort stays bounded",
+      run() {
+        // Sampling can argsort a full logits row. This catches regressions
+        // where large-axis sort expands into many global compare-exchange
+        // passes and blocks later readback.
+        const n = 65537;
+        const raw = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+          raw[i] = Math.sin(i * 0.017) + ((i * 31) % 1024) * 0.0001;
+        }
+        const logits = MxArray.fromFloat32(raw, new BigInt64Array([BigInt(n)]));
+        const order = logits.argsort(-1);
+        const sorted = logits.take(order, 0);
+        order.eval();
+        sorted.eval();
+
+        const gotOrder = order.toUint32();
+        const gotSorted = sorted.toFloat32();
+        if (gotOrder.length !== n || gotSorted.length !== n) {
+          throw new Error(
+            `unexpected lengths order=${gotOrder.length} sorted=${gotSorted.length}`,
+          );
+        }
+        for (let i = 1; i < n; i++) {
+          if (gotSorted[i - 1] > gotSorted[i] + 1e-6) {
+            throw new Error(
+              `sorted logits are not monotonic at ${i}: ${gotSorted[i - 1]} > ${gotSorted[i]}`,
+            );
+          }
+        }
+        for (const pos of [0, 1, 2047, 2048, 4097, n - 2, n - 1]) {
+          const src = gotOrder[pos];
+          if (src >= n) throw new Error(`order[${pos}]=${src} >= ${n}`);
+          if (Math.abs(gotSorted[pos] - raw[src]) > 1e-6) {
+            throw new Error(
+              `sorted[${pos}]=${gotSorted[pos]} raw[${src}]=${raw[src]}`,
+            );
+          }
+        }
+      },
+    },
+    {
       name: "MoE routing argpartition top-k parity",
       run() {
         const rows = 3;
