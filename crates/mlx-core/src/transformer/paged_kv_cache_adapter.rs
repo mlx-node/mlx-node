@@ -573,11 +573,33 @@ impl PagedKVCacheAdapter {
     /// — a different salt isolates the first block, so the lookup misses
     /// at block 0 and the rest of the chain doesn't get walked (since the
     /// chain breaks on the first miss).
+    ///
+    /// ## `skip_lookup`
+    ///
+    /// When `true`, the adapter short-circuits the prefix-cache lookup
+    /// before touching the allocator and returns the equivalent of a
+    /// 0-block cache miss: empty `blocks`, `cached_token_count = 0`,
+    /// empty `request_tokens`, `block_table.num_tokens = 0`, and
+    /// `prefix_lookup_done = true`. This mirrors vLLM's
+    /// `Request.skip_reading_prefix_cache` / the `get_computed_blocks`
+    /// skip path (see `vllm/v1/request.py:169` and
+    /// `vllm/v1/core/kv_cache_manager.py:199`): suppression is
+    /// **read-side only** — `register_full_blocks_for_reuse*` are NOT
+    /// gated and will still register the request's blocks for future
+    /// hits. vLLM's use case is prompt-logprobs requests that need the
+    /// model to recompute logprobs over the entire prompt, so reusing
+    /// cached KV would skip that work; pooling-model defaults set the
+    /// flag too (`vllm/v1/sampling_params.py:435`,
+    /// `vllm/v1/pooling_params.py:93`). MLX-Node doesn't currently expose
+    /// prompt-logprobs through the API; the parameter is plumbed for
+    /// vLLM parity. Pass `false` for normal "may use cached prefix"
+    /// behavior — every existing caller does.
     pub fn find_cached_prefix(
         &mut self,
         prompt_tokens: &[u32],
         extra_keys: &[u64],
         cache_salt: u64,
+        skip_lookup: bool,
     ) -> Result<CachedPrefix, String> {
         // Reject re-entrant calls BEFORE touching the allocator. The flag
         // tracks lookup-already-ran regardless of hit/miss outcome, so a
@@ -595,6 +617,24 @@ impl PagedKVCacheAdapter {
             .block_table
             .as_mut()
             .ok_or_else(|| "find_cached_prefix called before reset_for_new_request".to_string())?;
+
+        // vLLM `skip_reading_prefix_cache` short-circuit. Behaves as a
+        // forced 0-block cache miss: same post-conditions as a real
+        // lookup that found nothing. We still mark `prefix_lookup_done`
+        // so re-entrant calls fail loudly as for a miss-then-retry, and
+        // we still seed `request_tokens` (empty, since 0 tokens are
+        // cached) + `block_table.num_tokens = 0` so the caller's
+        // post-call invariants match the miss path bit-for-bit.
+        if skip_lookup {
+            self.cached_token_count = 0;
+            self.request_tokens.clear();
+            block_table.set_num_tokens(0);
+            self.prefix_lookup_done = true;
+            return Ok(CachedPrefix {
+                blocks: Vec::new(),
+                cached_token_count: 0,
+            });
+        }
 
         let (blocks, cached_tokens) = {
             let mut guard = self
@@ -661,11 +701,26 @@ impl PagedKVCacheAdapter {
     /// isolates block 0 and the chain breaks at the first miss, so a
     /// tenant under salt `B` cannot reuse blocks registered under salt
     /// `A`.
+    ///
+    /// ## `skip_lookup`
+    ///
+    /// Same semantics as [`Self::find_cached_prefix`]'s `skip_lookup`:
+    /// when `true`, short-circuit the prefix-cache lookup and return a
+    /// 0-block cache miss (`cached_token_count = 0`, empty blocks,
+    /// `request_tokens` cleared, `block_table.num_tokens = 0`,
+    /// `prefix_lookup_done = true`). Mirrors vLLM's
+    /// `Request.skip_reading_prefix_cache` / the `get_computed_blocks`
+    /// skip path (`vllm/v1/request.py:169`,
+    /// `vllm/v1/core/kv_cache_manager.py:199`). Read-side only —
+    /// `register_full_blocks_for_reuse_per_block` is NOT gated and will
+    /// still register the request's blocks for future hits. Pass `false`
+    /// for normal cache-eligible behavior.
     pub fn find_cached_prefix_per_block(
         &mut self,
         prompt_tokens: &[u32],
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
+        skip_lookup: bool,
     ) -> Result<CachedPrefix, String> {
         if self.prefix_lookup_done {
             return Err(
@@ -677,6 +732,20 @@ impl PagedKVCacheAdapter {
         let block_table = self.block_table.as_mut().ok_or_else(|| {
             "find_cached_prefix_per_block called before reset_for_new_request".to_string()
         })?;
+
+        // vLLM `skip_reading_prefix_cache` short-circuit; see
+        // `find_cached_prefix` for the full rationale. Same 0-block-miss
+        // post-conditions; same read-side-only contract.
+        if skip_lookup {
+            self.cached_token_count = 0;
+            self.request_tokens.clear();
+            block_table.set_num_tokens(0);
+            self.prefix_lookup_done = true;
+            return Ok(CachedPrefix {
+                blocks: Vec::new(),
+                cached_token_count: 0,
+            });
+        }
 
         let (blocks, cached_tokens) = {
             let mut guard = self
@@ -2687,7 +2756,7 @@ mod tests {
         };
         adapter.reset_for_new_request(0).unwrap();
         let res = adapter
-            .find_cached_prefix(&[1, 2, 3, 4, 5], &[], 0)
+            .find_cached_prefix(&[1, 2, 3, 4, 5], &[], 0, false)
             .unwrap();
         assert!(res.blocks.is_empty());
         assert_eq!(res.cached_token_count, 0);
@@ -2707,7 +2776,7 @@ mod tests {
         };
         adapter.reset_for_new_request(1).unwrap();
         // Look up with same 8 tokens — should hit both blocks.
-        let res = adapter.find_cached_prefix(&tokens, &[], 0).unwrap();
+        let res = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
         assert_eq!(res.blocks.len(), 2);
         assert_eq!(res.cached_token_count, 8);
         assert_eq!(adapter.block_table().unwrap().num_blocks(), 2);
@@ -2745,7 +2814,9 @@ mod tests {
             return;
         };
         adapter.reset_for_new_request(2).unwrap();
-        let res = adapter.find_cached_prefix(&prefix_tokens, &[], 0).unwrap();
+        let res = adapter
+            .find_cached_prefix(&prefix_tokens, &[], 0, false)
+            .unwrap();
         assert_eq!(res.cached_token_count, 8);
         assert_eq!(res.blocks.len(), 2);
 
@@ -2878,7 +2949,7 @@ mod tests {
         let mut adapter2 = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2
-            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0)
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0, false)
             .unwrap();
         assert_eq!(res.cached_token_count, 8);
         assert_eq!(res.blocks.len(), 2);
@@ -2959,7 +3030,7 @@ mod tests {
             .expect("PagedKVCacheAdapter::new must succeed for tenant B");
         adapter_b.reset_for_new_request(1).unwrap();
         let res_miss = adapter_b
-            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], salt_b)
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], salt_b, false)
             .unwrap();
         assert_eq!(
             res_miss.cached_token_count, 0,
@@ -2974,13 +3045,124 @@ mod tests {
             .expect("PagedKVCacheAdapter::new must succeed for tenant C");
         adapter_c.reset_for_new_request(2).unwrap();
         let res_hit = adapter_c
-            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], salt_a)
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], salt_a, false)
             .unwrap();
         assert_eq!(
             res_hit.cached_token_count, 8,
             "matching cache_salt must hit the registered prefix"
         );
         assert_eq!(res_hit.blocks.len(), 2);
+    }
+
+    /// Task #49 — adapter-level proof of vLLM's `skip_reading_prefix_cache`
+    /// semantics (`vllm/v1/request.py:169`,
+    /// `vllm/v1/core/kv_cache_manager.py:199`): when `skip_lookup = true`,
+    /// `find_cached_prefix` short-circuits the lookup and returns 0
+    /// cached tokens, even when the data is registered and would
+    /// otherwise hit. Suppression is read-only — the registered blocks
+    /// stay reachable for any future request that doesn't pass the flag.
+    /// This is the spec-required proof of the read-side gate, so it
+    /// constructs the pool directly via `LayerKVPool::new_for_test` and
+    /// `.expect`s success rather than skipping silently
+    /// (mirrors `cache_salt_isolates_prefix_lookup_first_block`).
+    #[test]
+    fn skip_lookup_short_circuits_prefix_cache_read() {
+        let allocator = new_allocator(8, 4);
+        // Project is macOS+Metal-only (CLAUDE.md "Known Limitations"); fail
+        // loudly if a hypothetical Metal-less host hits this — the
+        // suppression contract must not silently green on missing GPU.
+        let pool = mlx_paged_attn::LayerKVPool::new_for_test(
+            mlx_paged_attn::PagedAttentionConfig {
+                block_size: 4,
+                num_kv_heads: 1,
+                head_size: 32,
+                num_layers: 2,
+                ..mlx_paged_attn::PagedAttentionConfig::default()
+            },
+            8,
+            2,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "skip_lookup_short_circuits_prefix_cache_read: this test \
+                 intentionally panics instead of skipping because it is the \
+                 spec-required adapter-level proof of vLLM \
+                 skip_reading_prefix_cache read-side suppression, and the \
+                 project is macOS+Metal-only. LayerKVPool construction \
+                 failed: {e}"
+            )
+        });
+        let pool = Arc::new(pool);
+        let mut adapter_a = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 4)
+            .expect("PagedKVCacheAdapter::new must succeed once the pool exists");
+
+        // Request A registers a fully-formed 2-block (8-token) prefix for
+        // future cross-request reuse. After this point a fresh adapter
+        // looking up the same tokens with skip_lookup=false MUST hit.
+        adapter_a.reset_for_new_request(0).unwrap();
+        adapter_a.allocate_suffix_blocks(8).unwrap();
+        adapter_a.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let registered = adapter_a.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(registered, 2);
+        adapter_a.release_request().unwrap();
+
+        // Assertion 1: same tokens, skip_lookup=false → cache HIT.
+        // Confirms the data is reachable (so assertion 2's miss is
+        // attributable to the gate, not to a missing registration).
+        let mut adapter_b = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 4)
+            .expect("PagedKVCacheAdapter::new must succeed for adapter_b");
+        adapter_b.reset_for_new_request(1).unwrap();
+        let res_hit = adapter_b
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0, false)
+            .expect("find_cached_prefix with skip_lookup=false must succeed");
+        assert!(
+            res_hit.cached_token_count > 0,
+            "skip_lookup=false: registered 8-token prefix must be reachable \
+             (got cached_token_count = {})",
+            res_hit.cached_token_count
+        );
+        assert!(!res_hit.blocks.is_empty());
+        adapter_b.release_request().unwrap();
+
+        // Assertion 2: same tokens, skip_lookup=true → cache MISS even
+        // though the registration is still live. Mirrors vLLM
+        // `kv_cache_manager.py:199` `skip_reading_prefix_cache` short-
+        // circuit.
+        let mut adapter_c = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 4)
+            .expect("PagedKVCacheAdapter::new must succeed for adapter_c");
+        adapter_c.reset_for_new_request(2).unwrap();
+        let res_skip = adapter_c
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0, true)
+            .expect("find_cached_prefix with skip_lookup=true must succeed");
+        assert_eq!(
+            res_skip.cached_token_count, 0,
+            "skip_lookup=true must short-circuit the prefix-cache read; \
+             expected 0 cached tokens, got {}",
+            res_skip.cached_token_count
+        );
+        assert!(
+            res_skip.blocks.is_empty(),
+            "skip_lookup=true must return an empty block list"
+        );
+        adapter_c.release_request().unwrap();
+
+        // Assertion 3: the suppressed lookup MUST NOT have evicted
+        // anything. vLLM's `skip_reading_prefix_cache` is read-side only;
+        // a third request that does not set the flag must still hit.
+        let mut adapter_d = PagedKVCacheAdapter::new(allocator, pool, 4)
+            .expect("PagedKVCacheAdapter::new must succeed for adapter_d");
+        adapter_d.reset_for_new_request(3).unwrap();
+        let res_after = adapter_d
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0, false)
+            .expect("find_cached_prefix after suppressed lookup must succeed");
+        assert!(
+            res_after.cached_token_count > 0,
+            "skip_lookup=true must NOT have evicted the registered prefix; \
+             post-suppression find_cached_prefix(skip_lookup=false) must \
+             still hit (got cached_token_count = {})",
+            res_after.cached_token_count
+        );
     }
 
     #[test]
@@ -3038,7 +3220,7 @@ mod tests {
         // A fresh adapter on the same allocator can resurrect the prefix.
         let mut adapter2 = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(1).unwrap();
-        let res = adapter2.find_cached_prefix(&tokens, &[], 0).unwrap();
+        let res = adapter2.find_cached_prefix(&tokens, &[], 0, false).unwrap();
         assert_eq!(
             res.cached_token_count, 8,
             "prefix cache must survive release_request"
@@ -3080,7 +3262,9 @@ mod tests {
         // Adapter B.
         let mut adapter_b = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter_b.reset_for_new_request(1).unwrap();
-        let res = adapter_b.find_cached_prefix(&full_b, &[], 0).unwrap();
+        let res = adapter_b
+            .find_cached_prefix(&full_b, &[], 0, false)
+            .unwrap();
         // SYS prefix shared (8 tokens / 2 blocks); USER_B differs → miss.
         assert_eq!(
             res.cached_token_count, 8,
@@ -3162,7 +3346,7 @@ mod tests {
         let mut adapter2 = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2
-            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0)
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0, false)
             .unwrap();
         assert_eq!(res.cached_token_count, 8);
         assert_eq!(res.blocks.len(), 2);
@@ -3360,7 +3544,7 @@ mod tests {
         // succeed by evicting the LRU oldest cache-only block (P1's).
         let p3: [u32; 4] = [100, 200, 300, 400];
         adapter.reset_for_new_request(2).unwrap();
-        let cached = adapter.find_cached_prefix(&p3, &[], 0).unwrap();
+        let cached = adapter.find_cached_prefix(&p3, &[], 0, false).unwrap();
         assert_eq!(cached.cached_token_count, 0, "P3 must miss");
 
         let n_alloc = adapter
@@ -3385,7 +3569,7 @@ mod tests {
         let mut adapter2 =
             maybe_adapter(Arc::clone(&allocator), 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(99).unwrap();
-        let p2_lookup = adapter2.find_cached_prefix(&p2, &[], 0).unwrap();
+        let p2_lookup = adapter2.find_cached_prefix(&p2, &[], 0, false).unwrap();
         assert_eq!(
             p2_lookup.cached_token_count, 4,
             "P2's cache entry must survive eviction of P1"
@@ -3395,7 +3579,7 @@ mod tests {
         adapter2.release_request().unwrap();
         let mut adapter3 = maybe_adapter(allocator, 4).expect("first pool succeeded; third must");
         adapter3.reset_for_new_request(100).unwrap();
-        let p1_lookup = adapter3.find_cached_prefix(&p1, &[], 0).unwrap();
+        let p1_lookup = adapter3.find_cached_prefix(&p1, &[], 0, false).unwrap();
         assert_eq!(
             p1_lookup.cached_token_count, 0,
             "P1 was evicted to satisfy allocation; lookup must miss"
@@ -3428,7 +3612,9 @@ mod tests {
         let mut full_prompt = prefix_tokens.clone();
         full_prompt.extend_from_slice(&[100, 101, 102, 103]);
 
-        let res = adapter.find_cached_prefix(&full_prompt, &[], 0).unwrap();
+        let res = adapter
+            .find_cached_prefix(&full_prompt, &[], 0, false)
+            .unwrap();
         assert_eq!(res.cached_token_count, 8, "two-block prefix hit");
         assert_eq!(res.blocks.len(), 2);
 
@@ -3484,7 +3670,7 @@ mod tests {
         adapter.reset_for_new_request(0).unwrap();
 
         // First call: cache hit, populates block_table with 2 blocks.
-        let first = adapter.find_cached_prefix(&tokens, &[], 0).unwrap();
+        let first = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
         assert_eq!(first.cached_token_count, 8);
         assert_eq!(first.blocks.len(), 2);
         assert_eq!(adapter.block_table().unwrap().num_blocks(), 2);
@@ -3494,7 +3680,7 @@ mod tests {
         }
 
         // Second call: must reject without touching state.
-        let res = adapter.find_cached_prefix(&tokens, &[], 0);
+        let res = adapter.find_cached_prefix(&tokens, &[], 0, false);
         assert!(res.is_err(), "second call must error");
         let msg = res.unwrap_err();
         assert!(
@@ -3516,7 +3702,7 @@ mod tests {
         // After release + reset, a fresh lookup is allowed again.
         adapter.release_request().unwrap();
         adapter.reset_for_new_request(1).unwrap();
-        let again = adapter.find_cached_prefix(&tokens, &[], 0).unwrap();
+        let again = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
         assert_eq!(
             again.cached_token_count, 8,
             "lookup must succeed after reset_for_new_request"
@@ -3541,13 +3727,15 @@ mod tests {
         };
         adapter.reset_for_new_request(0).unwrap();
 
-        let first = adapter.find_cached_prefix(&[1, 2, 3, 4], &[], 0).unwrap();
+        let first = adapter
+            .find_cached_prefix(&[1, 2, 3, 4], &[], 0, false)
+            .unwrap();
         assert_eq!(first.cached_token_count, 0, "must miss");
         assert!(first.blocks.is_empty());
         assert_eq!(adapter.block_table().unwrap().num_blocks(), 0);
 
         // Second call must reject even though block_table is still empty.
-        let res = adapter.find_cached_prefix(&[1, 2, 3, 4], &[], 0);
+        let res = adapter.find_cached_prefix(&[1, 2, 3, 4], &[], 0, false);
         assert!(res.is_err(), "second call after miss must error");
         let msg = res.unwrap_err();
         assert!(
@@ -4675,7 +4863,7 @@ mod tests {
         // Turn 1: 5 tokens (1 full block + 1 partial-block token).
         let tokens_t1: [u32; 5] = [10, 20, 30, 40, 50];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0, false).unwrap();
         adapter
             .allocate_suffix_blocks(tokens_t1.len() as u32)
             .unwrap();
@@ -4745,7 +4933,7 @@ mod tests {
 
         let tokens: [u32; 4] = [1, 2, 3, 4];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0, false).unwrap();
         adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
         adapter.record_tokens(&tokens).unwrap();
 
@@ -4771,7 +4959,7 @@ mod tests {
         // Turn 1: 5 tokens, 2 blocks (1 full + 1 partial holding 1 token).
         let tokens_t1: [u32; 5] = [10, 20, 30, 40, 50];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0, false).unwrap();
         adapter
             .allocate_suffix_blocks(tokens_t1.len() as u32)
             .unwrap();
@@ -4847,7 +5035,7 @@ mod tests {
 
         let tokens_t1: [u32; 4] = [10, 20, 30, 40];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0, false).unwrap();
         adapter
             .allocate_suffix_blocks(tokens_t1.len() as u32)
             .unwrap();
@@ -4883,7 +5071,7 @@ mod tests {
 
         let tokens_t1: [u32; 4] = [1, 2, 3, 4];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0, false).unwrap();
         adapter
             .allocate_suffix_blocks(tokens_t1.len() as u32)
             .unwrap();
@@ -4918,7 +5106,7 @@ mod tests {
         // Turn 1: 7 tokens → 1 full block (4) + 1 partial block (3 tokens).
         let t1: [u32; 7] = [1, 2, 3, 4, 5, 6, 7];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0, false).unwrap();
         adapter.allocate_suffix_blocks(t1.len() as u32).unwrap();
         adapter.record_tokens(&t1).unwrap();
         adapter.finalize_turn_keep_live(&[], 0).unwrap();
@@ -4990,7 +5178,7 @@ mod tests {
         adapter.reset_for_new_request(0).unwrap();
         let prompt: Vec<u32> = (0..18).collect();
         adapter
-            .find_cached_prefix(&prompt, &[], 0)
+            .find_cached_prefix(&prompt, &[], 0, false)
             .expect("prefix lookup");
         adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
         adapter.record_tokens(&prompt).unwrap();
@@ -5066,7 +5254,7 @@ mod tests {
 
         adapter.reset_for_new_request(0).unwrap();
         let prompt: Vec<u32> = (0..16).collect();
-        adapter.find_cached_prefix(&prompt, &[], 0).unwrap();
+        adapter.find_cached_prefix(&prompt, &[], 0, false).unwrap();
         adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
         adapter.record_tokens(&prompt).unwrap();
 

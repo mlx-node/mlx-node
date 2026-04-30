@@ -802,7 +802,7 @@ impl Lfm2Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[], 0)
+                            .find_cached_prefix(&tokens, &[], 0, false)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -819,7 +819,7 @@ impl Lfm2Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[], 0)
+                    .find_cached_prefix(&tokens, &[], 0, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -1410,7 +1410,7 @@ impl Lfm2Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[], 0)
+                            .find_cached_prefix(&tokens, &[], 0, false)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -1427,7 +1427,7 @@ impl Lfm2Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[], 0)
+                    .find_cached_prefix(&tokens, &[], 0, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -3804,7 +3804,7 @@ mod paged_adapter_construction_tests {
                 .reset_for_new_request(0)
                 .expect("reset_for_new_request");
             let prefix = adapter
-                .find_cached_prefix(&prompt, &[], 0)
+                .find_cached_prefix(&prompt, &[], 0, false)
                 .expect("find_cached_prefix");
             assert_eq!(prefix.cached_token_count, 0);
             adapter

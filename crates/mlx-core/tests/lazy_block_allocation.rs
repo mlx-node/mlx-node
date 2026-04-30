@@ -62,7 +62,7 @@ fn lazy_alloc_decode_does_not_exhaust_small_pool() {
 
     // Step 1: cold prefix lookup (miss) + suffix-block allocation.
     let prompt: Vec<u32> = (1..=16).collect(); // 1 block
-    let prefix = adapter.find_cached_prefix(&prompt, &[], 0).unwrap();
+    let prefix = adapter.find_cached_prefix(&prompt, &[], 0, false).unwrap();
     assert_eq!(prefix.cached_token_count, 0);
 
     // CRITICAL: pass prompt-only length, NOT prompt + max_new_tokens.
@@ -131,7 +131,7 @@ fn allocate_suffix_blocks_does_not_pre_reserve_max_new_tokens() {
 
     adapter.reset_for_new_request(0).unwrap();
     let prompt: Vec<u32> = (1..=16).collect();
-    let _ = adapter.find_cached_prefix(&prompt, &[], 0).unwrap();
+    let _ = adapter.find_cached_prefix(&prompt, &[], 0, false).unwrap();
     adapter
         .allocate_suffix_blocks(prompt.len() as u32)
         .expect("allocate_suffix_blocks");

@@ -75,7 +75,7 @@ fn run_request(
     let per_block =
         compute_per_block_image_extra_keys(token_image_positions, num_blocks, BLOCK_SIZE);
     let prefix = adapter
-        .find_cached_prefix_per_block(tokens, &per_block, 0)
+        .find_cached_prefix_per_block(tokens, &per_block, 0, false)
         .expect("find_cached_prefix_per_block");
     let cached = prefix.cached_token_count;
     adapter
@@ -195,7 +195,7 @@ fn per_block_empty_matches_uniform_for_text_only() {
     // Register via the uniform API.
     adapter.reset_for_new_request(0).unwrap();
     adapter
-        .find_cached_prefix(&tokens, &[], 0)
+        .find_cached_prefix(&tokens, &[], 0, false)
         .expect("uniform find_cached_prefix");
     adapter
         .allocate_suffix_blocks(tokens.len() as u32)
@@ -210,7 +210,7 @@ fn per_block_empty_matches_uniform_for_text_only() {
     // hit the same blocks the uniform path registered.
     adapter.reset_for_new_request(1).unwrap();
     let prefix = adapter
-        .find_cached_prefix_per_block(&tokens, &empty_per_block, 0)
+        .find_cached_prefix_per_block(&tokens, &empty_per_block, 0, false)
         .expect("per-block find_cached_prefix");
     assert_eq!(
         prefix.cached_token_count,

@@ -1350,7 +1350,7 @@ impl Qwen35MoeInner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0)
+                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -1367,7 +1367,7 @@ impl Qwen35MoeInner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0)
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -1876,7 +1876,7 @@ impl Qwen35MoeInner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0)
+                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -1893,7 +1893,7 @@ impl Qwen35MoeInner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0)
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter

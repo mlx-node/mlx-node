@@ -720,7 +720,7 @@ mod tests {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             adapter.reset_for_new_request(0).expect("reset");
             let prefix = adapter
-                .find_cached_prefix(prompt, &[], 0)
+                .find_cached_prefix(prompt, &[], 0, false)
                 .expect("find_cached_prefix");
             assert_eq!(prefix.cached_token_count, 0);
             adapter
@@ -1094,7 +1094,7 @@ mod tests {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             adapter.reset_for_new_request(0).expect("reset");
             let prefix = adapter
-                .find_cached_prefix(&prompt, &[], 0)
+                .find_cached_prefix(&prompt, &[], 0, false)
                 .expect("find_cached_prefix");
             assert_eq!(prefix.cached_token_count, 0);
             adapter
@@ -1153,7 +1153,7 @@ mod tests {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             adapter.reset_for_new_request(0).expect("reset");
             let prefix = adapter
-                .find_cached_prefix(&prompt, &[], 0)
+                .find_cached_prefix(&prompt, &[], 0, false)
                 .expect("find_cached_prefix");
             assert_eq!(prefix.cached_token_count, 0);
             adapter

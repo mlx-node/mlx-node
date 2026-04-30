@@ -2013,7 +2013,7 @@ impl Gemma4Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[], 0)
+                            .find_cached_prefix(&tokens, &[], 0, false)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -2030,7 +2030,7 @@ impl Gemma4Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[], 0)
+                    .find_cached_prefix(&tokens, &[], 0, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2277,7 +2277,7 @@ impl Gemma4Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[], 0)
+                            .find_cached_prefix(&tokens, &[], 0, false)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -2294,7 +2294,7 @@ impl Gemma4Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[], 0)
+                    .find_cached_prefix(&tokens, &[], 0, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -5882,7 +5882,7 @@ mod tests {
                 eprintln!("skipping (adapter reset failed): {e}");
                 return;
             }
-            if let Err(e) = adapter.find_cached_prefix(&prompt, &[], 0) {
+            if let Err(e) = adapter.find_cached_prefix(&prompt, &[], 0, false) {
                 eprintln!("skipping (find_cached_prefix failed): {e}");
                 return;
             }

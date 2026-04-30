@@ -231,7 +231,7 @@ fn run_adapter(
     // the prefix-reuse test we pass a pre-seeded allocator and this hits.
     let cached = fixture
         .adapter
-        .find_cached_prefix(token_ids, &[], 0)
+        .find_cached_prefix(token_ids, &[], 0, false)
         .expect("find_cached_prefix");
 
     // Always allocate enough suffix blocks to cover the full token range
@@ -621,7 +621,7 @@ fn test_adapter_e2e_prefix_reuse_matches_no_reuse() {
         .expect("reset_for_new_request");
     let cached = fixture
         .adapter
-        .find_cached_prefix(&token_ids, &[], 0)
+        .find_cached_prefix(&token_ids, &[], 0, false)
         .expect("find_cached_prefix on second request must succeed");
     assert_eq!(
         cached.cached_token_count, NUM_TOKENS,
