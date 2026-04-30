@@ -651,8 +651,16 @@ impl PagedKVCacheAdapter {
     /// (single-call lifecycle, token-recording contract, refcount
     /// semantics). See that method's doc for the full contract.
     ///
-    /// `cache_salt` is mixed into the first block's hash only when
-    /// non-zero, with the same semantics as `find_cached_prefix`.
+    /// ## `cache_salt`
+    ///
+    /// `cache_salt` is mixed into the FIRST block's hash only when it is
+    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
+    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// semantics align with vLLM
+    /// (`vllm/v1/core/kv_cache_utils.py:521-531`); a different salt
+    /// isolates block 0 and the chain breaks at the first miss, so a
+    /// tenant under salt `B` cannot reuse blocks registered under salt
+    /// `A`.
     pub fn find_cached_prefix_per_block(
         &mut self,
         prompt_tokens: &[u32],
@@ -1487,11 +1495,18 @@ impl PagedKVCacheAdapter {
     /// Only fully-formed blocks are registered (partial trailing block is
     /// not eligible). `extra_keys` is the same value the caller passed to
     /// `find_cached_prefix`; it MUST match for future cross-request
-    /// reuse to work. Same goes for `cache_salt`: the salt mixed into
-    /// block 0 here MUST match the salt a future `find_cached_prefix`
-    /// passes for the lookup to hit at block 0 (and therefore at all).
-    /// Pass `0` for "no salt" (default; byte-equal to pre-task-#48
-    /// behavior).
+    /// reuse to work.
+    ///
+    /// ## `cache_salt`
+    ///
+    /// `cache_salt` is mixed into the FIRST block's hash only when it is
+    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
+    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// semantics align with vLLM
+    /// (`vllm/v1/core/kv_cache_utils.py:521-531`). The salt the caller
+    /// uses here MUST match the salt a future `find_cached_prefix` passes
+    /// for the lookup to hit at block 0 (and therefore at all) —
+    /// different salts isolate the prefix cache by tenant.
     ///
     /// Returns the number of blocks actually registered. Normally equals
     /// the number of full blocks covered by `request_tokens`; may be
@@ -1633,9 +1648,16 @@ impl PagedKVCacheAdapter {
     /// result here so the registered cache entries are isolated by image
     /// content.
     ///
-    /// `cache_salt` is mixed into the first block's hash only when
-    /// non-zero, with the same semantics as the uniform variant. Pass
-    /// `0` for "no salt" (default).
+    /// ## `cache_salt`
+    ///
+    /// `cache_salt` is mixed into the FIRST block's hash only when it is
+    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
+    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// semantics align with vLLM
+    /// (`vllm/v1/core/kv_cache_utils.py:521-531`). The salt used here
+    /// must match the salt a future `find_cached_prefix_per_block` passes
+    /// for the lookup to hit — different salts isolate the prefix cache
+    /// by tenant.
     pub fn register_full_blocks_for_reuse_per_block(
         &mut self,
         extra_keys_per_block: &[Vec<u64>],
@@ -1750,10 +1772,16 @@ impl PagedKVCacheAdapter {
     /// going through the prefix-cache lookup, which only registers FULL
     /// blocks and so would silently drop the trailing partial block's K/V).
     ///
-    /// `cache_salt` is mixed into the first block's hash only when
-    /// non-zero, with the same semantics as
-    /// [`Self::register_full_blocks_for_reuse`]. Pass `0` for "no salt"
-    /// (default; byte-equal to pre-task-#48 behavior).
+    /// ## `cache_salt`
+    ///
+    /// `cache_salt` is mixed into the FIRST block's hash only when it is
+    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
+    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// semantics align with vLLM
+    /// (`vllm/v1/core/kv_cache_utils.py:521-531`). The salt used here
+    /// must match the salt a future `find_cached_prefix` (in another
+    /// session) passes for cross-request prefix reuse to hit; different
+    /// salts isolate the cache by tenant.
     ///
     /// Behaves like [`Self::register_full_blocks_for_reuse`] — i.e. it
     /// publishes any full blocks the request has accumulated to the
@@ -1828,6 +1856,17 @@ impl PagedKVCacheAdapter {
     /// Pass an all-empty per-block vec to get behavior bit-equal to
     /// `finalize_turn_keep_live(&[], cache_salt)` (when called with the
     /// same `cache_salt`).
+    ///
+    /// ## `cache_salt`
+    ///
+    /// `cache_salt` is mixed into the FIRST block's hash only when it is
+    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
+    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// semantics align with vLLM
+    /// (`vllm/v1/core/kv_cache_utils.py:521-531`). The salt used here
+    /// must match the salt a future `find_cached_prefix_per_block` (in
+    /// another session) passes for cross-request prefix reuse to hit;
+    /// different salts isolate the cache by tenant.
     pub fn finalize_turn_keep_live_per_block(
         &mut self,
         extra_keys_per_block: &[Vec<u64>],
@@ -2866,8 +2905,37 @@ mod tests {
         // verifies the property survives through the adapter's
         // `find_cached_prefix` path on a real `LayerKVPool`. If a hypothetical
         // future Metal-less CI host hits this, fail loudly instead of greening.
-        let mut adapter_a = maybe_adapter(Arc::clone(&allocator), 4)
-            .expect("salt-isolation test requires Metal pool — project is macOS+Metal-only");
+        //
+        // Construct via `maybe_test_pool` directly (instead of `maybe_adapter`)
+        // so a pool-construction failure surfaces the underlying error string
+        // — `maybe_adapter`'s sibling `maybe_test_pool` swallows
+        // "No Metal device found" into `None` (used by every other adapter
+        // test to skip), but here we want the real error in the panic message.
+        let pool = mlx_paged_attn::LayerKVPool::new_for_test(
+            mlx_paged_attn::PagedAttentionConfig {
+                block_size: 4,
+                num_kv_heads: 1,
+                head_size: 32,
+                num_layers: 2,
+                ..mlx_paged_attn::PagedAttentionConfig::default()
+            },
+            8,
+            2,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "cache_salt_isolates_prefix_lookup_first_block: this test \
+                 intentionally panics instead of skipping because it is the \
+                 spec-required adapter-level proof of vLLM first-block-only \
+                 cache_salt isolation, and the project is macOS+Metal-only \
+                 (CLAUDE.md \"Known Limitations\"). LayerKVPool construction \
+                 failed: {e}"
+            )
+        });
+        let pool = Arc::new(pool);
+        let mut adapter_a = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 4)
+            .expect("PagedKVCacheAdapter::new must succeed once the pool exists");
         adapter_a.reset_for_new_request(0).unwrap();
 
         // Tenant A registers a fully-formed 2-block (8-token) prefix
@@ -2887,8 +2955,8 @@ mod tests {
         // tenant A's cached blocks are NOT reused. This is the load-
         // bearing isolation property: cache_salt = "namespace" of the
         // first block of the prefix cache.
-        let mut adapter_b =
-            maybe_adapter(Arc::clone(&allocator), 4).expect("first pool succeeded; second must");
+        let mut adapter_b = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 4)
+            .expect("PagedKVCacheAdapter::new must succeed for tenant B");
         adapter_b.reset_for_new_request(1).unwrap();
         let res_miss = adapter_b
             .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], salt_b)
@@ -2902,7 +2970,8 @@ mod tests {
         // Sanity: same salt on the lookup side hits — proves the miss
         // above wasn't due to anything else (different tokens, missing
         // registration, eviction, etc.).
-        let mut adapter_c = maybe_adapter(allocator, 4).expect("first pool succeeded; third must");
+        let mut adapter_c = PagedKVCacheAdapter::new(allocator, pool, 4)
+            .expect("PagedKVCacheAdapter::new must succeed for tenant C");
         adapter_c.reset_for_new_request(2).unwrap();
         let res_hit = adapter_c
             .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], salt_a)

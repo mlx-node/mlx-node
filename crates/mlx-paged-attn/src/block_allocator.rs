@@ -867,11 +867,13 @@ pub fn hash_tokens(tokens: &[u32], parent_hash: u64, extra_keys: &[u64]) -> u64 
 ///
 /// When `cache_salt == 0` OR `block_index > 0`, this collapses to
 /// `hash_tokens(tokens, parent_hash, extra_keys)` byte-for-byte — no extra
-/// allocation, no salt mixed in. The leading-block branch builds a tiny
-/// stack-allocated effective `extra_keys` (`extra_keys` + the salt) and
-/// then routes through `hash_tokens`. Total cost on the leading block is
-/// one stack `Vec` of `extra_keys.len() + 1` u64s; on every other block
-/// the helper is a thin wrapper around `hash_tokens`.
+/// allocation, no salt mixed in. The leading-block + non-zero-salt branch
+/// drives the `Hasher` directly (`parent_hash`, every token, every
+/// `extra_keys` entry, then `cache_salt`) instead of materializing an
+/// `extra_keys` + `[cache_salt]` slice; the result is bit-equal to
+/// `hash_tokens(tokens, parent_hash, &[extra_keys..., cache_salt])` but
+/// avoids the heap allocation that path used to do. Ordering matches vLLM:
+/// `cache_salt` is hashed AFTER the existing `extra_keys` entries.
 #[inline]
 fn hash_block(
     tokens: &[u32],
@@ -880,16 +882,26 @@ fn hash_block(
     cache_salt: u64,
     block_index: usize,
 ) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
     if cache_salt == 0 || block_index != 0 {
         return hash_tokens(tokens, parent_hash, extra_keys);
     }
-    // First block + non-zero salt → mix the salt in. Build a tiny effective
-    // extra_keys slice with the salt appended; ordering matches vLLM
-    // (cache_salt comes after the existing extra_keys).
-    let mut effective: Vec<u64> = Vec::with_capacity(extra_keys.len() + 1);
-    effective.extend_from_slice(extra_keys);
-    effective.push(cache_salt);
-    hash_tokens(tokens, parent_hash, &effective)
+    // First block + non-zero salt → drive the hasher directly. Bit-equal to
+    // `hash_tokens(tokens, parent_hash, [extra_keys..., cache_salt])` because
+    // `hash_tokens` writes the same prefix in the same order, then iterates
+    // its `extra_keys` slice; appending `cache_salt` here matches that.
+    let mut hasher = DefaultHasher::new();
+    parent_hash.hash(&mut hasher);
+    for &token in tokens {
+        token.hash(&mut hasher);
+    }
+    for &key in extra_keys {
+        key.hash(&mut hasher);
+    }
+    cache_salt.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
