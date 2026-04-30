@@ -2857,10 +2857,17 @@ mod tests {
     #[test]
     fn cache_salt_isolates_prefix_lookup_first_block() {
         let allocator = new_allocator(8, 4);
-        let Some(mut adapter_a) = maybe_adapter(Arc::clone(&allocator), 4) else {
-            eprintln!("skipping cache_salt_isolates_prefix_lookup_first_block: Metal unavailable");
-            return;
-        };
+        // Project is macOS+Metal-only (CLAUDE.md "Known Limitations"), so this
+        // test must never be silently bypassable: it is the spec-required proof
+        // of adapter-level salt isolation. The allocator-level proofs in
+        // `block_allocator.rs` (`cache_salt_only_affects_first_block_hash`,
+        // `cache_salt_not_mixed_into_block_n_for_n_gt_0`) run without Metal and
+        // remain the canonical hash-mixing proofs; this test additionally
+        // verifies the property survives through the adapter's
+        // `find_cached_prefix` path on a real `LayerKVPool`. If a hypothetical
+        // future Metal-less CI host hits this, fail loudly instead of greening.
+        let mut adapter_a = maybe_adapter(Arc::clone(&allocator), 4)
+            .expect("salt-isolation test requires Metal pool — project is macOS+Metal-only");
         adapter_a.reset_for_new_request(0).unwrap();
 
         // Tenant A registers a fully-formed 2-block (8-token) prefix
