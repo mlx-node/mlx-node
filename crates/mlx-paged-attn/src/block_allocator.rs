@@ -1241,7 +1241,10 @@ mod tests {
     /// blocks 1+ — matching vLLM's first-block-only semantics
     /// (`vllm/v1/core/kv_cache_utils.py:521-531`).
     ///
-    /// Three properties are asserted:
+    /// Two properties are asserted here (the "salt is excluded from n > 0"
+    /// invariant lives in [`cache_salt_not_mixed_into_block_n_for_n_gt_0`]
+    /// where it's proved against the un-salted `hash_tokens` reference,
+    /// which avoids the tautology of round-tripping with the same salt):
     ///
     /// 1. With `cache_salt = 0` (the "no salt" sentinel), behavior is
     ///    byte-equal to today: registering with `0` and looking up with `0`
@@ -1250,13 +1253,6 @@ mod tests {
     /// 2. Registering with `cache_salt = A` and looking up with
     ///    `cache_salt = B` (A != B, both non-zero) misses on block 0 — i.e.
     ///    no cross-tenant prefix reuse on the leading block.
-    /// 3. The salt is mixed in ONLY at `n == 0`. We confirm this by direct
-    ///    `hash_block`-equivalent computation: the chained block 1 hash
-    ///    (via the public `hash_tokens` primitive) is unaffected by the
-    ///    salt mix-in for n > 0. The structural test from (2) already
-    ///    proves this end-to-end (block 1 lookup never even runs once
-    ///    block 0 misses), so this property holds by chain semantics
-    ///    alone.
     #[test]
     fn cache_salt_only_affects_first_block_hash() {
         // --- Property 1: cache_salt == 0 is byte-equal to today ---
@@ -1300,37 +1296,6 @@ mod tests {
         let (hits, n) = allocator.find_longest_cache_hit(&tokens, 4, &[], 0xAAAA_AAAA_AAAA_AAAA);
         assert_eq!(hits.len(), 2, "matching cache_salt must hit fully");
         assert_eq!(n, 8);
-
-        // --- Property 3: salt is NOT mixed at n > 0 ---
-        // Compute block 1's hash directly via `hash_tokens` with the
-        // chained parent_hash that block 0 produces under salt=A. The
-        // expected on-cache block 1 hash is the SAME as the one that
-        // would have been produced under salt=B (or salt=0) given the
-        // same parent_hash — i.e. the salt does not appear in block 1's
-        // hash composition. We verify this structurally: cache 3 blocks
-        // under salt=A, then look up the same 3 blocks under salt=A and
-        // observe that block 1 and block 2 are reachable (which they
-        // would not be if the salt got mixed into them too — the chain
-        // would diverge after block 0 because the parent_hash wouldn't
-        // match between cache and lookup paths if their derivations
-        // differed).
-        let mut allocator = BlockAllocator::new(8, 4);
-        let toks: Vec<u32> = (0..12).collect();
-        let b0 = allocator.allocate().unwrap();
-        let b1 = allocator.allocate().unwrap();
-        let b2 = allocator.allocate().unwrap();
-        let salt = 0xDEAD_BEEF_DEAD_BEEFu64;
-        let registered = allocator
-            .cache_full_blocks(&toks, &[b0, b1, b2], 4, &[], salt)
-            .unwrap();
-        assert_eq!(registered, 3);
-        let (hits, n) = allocator.find_longest_cache_hit(&toks, 4, &[], salt);
-        assert_eq!(
-            hits.len(),
-            3,
-            "matching salt must hit all 3 blocks (block 0 hash mixed salt; blocks 1+ chain off parent_hash only)"
-        );
-        assert_eq!(n, 12);
     }
 
     /// Direct-hash assertion that `cache_salt` is NOT mixed into the hash of
