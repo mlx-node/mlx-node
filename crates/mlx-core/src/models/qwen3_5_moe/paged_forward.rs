@@ -720,7 +720,7 @@ mod tests {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             adapter.reset_for_new_request(0).expect("reset");
             let prefix = adapter
-                .find_cached_prefix(prompt, &[])
+                .find_cached_prefix(prompt, &[], 0)
                 .expect("find_cached_prefix");
             assert_eq!(prefix.cached_token_count, 0);
             adapter
@@ -1094,7 +1094,7 @@ mod tests {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             adapter.reset_for_new_request(0).expect("reset");
             let prefix = adapter
-                .find_cached_prefix(&prompt, &[])
+                .find_cached_prefix(&prompt, &[], 0)
                 .expect("find_cached_prefix");
             assert_eq!(prefix.cached_token_count, 0);
             adapter
@@ -1142,7 +1142,7 @@ mod tests {
         // Cleanup before second run.
         {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-            let _ = adapter.register_full_blocks_for_reuse(&[]);
+            let _ = adapter.register_full_blocks_for_reuse(&[], 0);
             adapter.release_request().expect("release_request");
         }
         inner.reset_caches_sync().expect("reset_caches");
@@ -1153,7 +1153,7 @@ mod tests {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             adapter.reset_for_new_request(0).expect("reset");
             let prefix = adapter
-                .find_cached_prefix(&prompt, &[])
+                .find_cached_prefix(&prompt, &[], 0)
                 .expect("find_cached_prefix");
             assert_eq!(prefix.cached_token_count, 0);
             adapter
@@ -1197,7 +1197,7 @@ mod tests {
         // Cleanup.
         {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-            let _ = adapter.register_full_blocks_for_reuse(&[]);
+            let _ = adapter.register_full_blocks_for_reuse(&[], 0);
             adapter.release_request().expect("release_request");
         }
     }

@@ -75,7 +75,7 @@ fn run_request(
     let per_block =
         compute_per_block_image_extra_keys(token_image_positions, num_blocks, BLOCK_SIZE);
     let prefix = adapter
-        .find_cached_prefix_per_block(tokens, &per_block)
+        .find_cached_prefix_per_block(tokens, &per_block, 0)
         .expect("find_cached_prefix_per_block");
     let cached = prefix.cached_token_count;
     adapter
@@ -89,7 +89,7 @@ fn run_request(
     }
     if register_for_reuse {
         adapter
-            .register_full_blocks_for_reuse_per_block(&per_block)
+            .register_full_blocks_for_reuse_per_block(&per_block, 0)
             .expect("register_full_blocks_for_reuse_per_block");
     }
     adapter.release_request().expect("release_request");
@@ -195,14 +195,14 @@ fn per_block_empty_matches_uniform_for_text_only() {
     // Register via the uniform API.
     adapter.reset_for_new_request(0).unwrap();
     adapter
-        .find_cached_prefix(&tokens, &[])
+        .find_cached_prefix(&tokens, &[], 0)
         .expect("uniform find_cached_prefix");
     adapter
         .allocate_suffix_blocks(tokens.len() as u32)
         .expect("allocate_suffix_blocks");
     adapter.record_tokens(&tokens).expect("record_tokens");
     adapter
-        .register_full_blocks_for_reuse(&[])
+        .register_full_blocks_for_reuse(&[], 0)
         .expect("uniform register");
     adapter.release_request().expect("release_request");
 
@@ -210,7 +210,7 @@ fn per_block_empty_matches_uniform_for_text_only() {
     // hit the same blocks the uniform path registered.
     adapter.reset_for_new_request(1).unwrap();
     let prefix = adapter
-        .find_cached_prefix_per_block(&tokens, &empty_per_block)
+        .find_cached_prefix_per_block(&tokens, &empty_per_block, 0)
         .expect("per-block find_cached_prefix");
     assert_eq!(
         prefix.cached_token_count,

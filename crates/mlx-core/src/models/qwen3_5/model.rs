@@ -2115,7 +2115,7 @@ impl Qwen35Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys)
+                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -2132,7 +2132,7 @@ impl Qwen35Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys)
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2189,7 +2189,7 @@ impl Qwen35Inner {
                     let total_for_finalize = adapter.request_tokens().len();
                     let finalize_extra_keys =
                         chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
-                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys);
+                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
                 }
                 t
             }
@@ -2664,7 +2664,7 @@ impl Qwen35Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys)
+                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -2681,7 +2681,7 @@ impl Qwen35Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys)
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2739,7 +2739,7 @@ impl Qwen35Inner {
                     let total_for_finalize = adapter.request_tokens().len();
                     let finalize_extra_keys =
                         chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
-                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys);
+                    let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
                 }
                 t
             }

@@ -34,8 +34,12 @@
 //! Within a session the caller flow is:
 //!
 //! 1. `reset_for_new_request(seq_id)` — releases any prior request.
-//! 2. `find_cached_prefix(prompt_tokens, extra_keys)` — populates block_table
-//!    with reused prefix blocks (refcounts already incremented).
+//! 2. `find_cached_prefix(prompt_tokens, extra_keys, cache_salt)` —
+//!    populates block_table with reused prefix blocks (refcounts already
+//!    incremented). `cache_salt` is mixed into the FIRST block's hash
+//!    only when non-zero (vLLM `cache_salt` semantics — see
+//!    `vllm/v1/core/kv_cache_utils.py:521-531`); pass `0` when no salt
+//!    is needed.
 //! 3. `allocate_suffix_blocks(prompt_tokens.len())` — allocates fresh
 //!    blocks to cover the prompt suffix that prefill will write. Decode
 //!    blocks are NOT pre-reserved here; `record_tokens` grows the block
@@ -48,15 +52,15 @@
 //! 5. End-of-turn options:
 //!    - **Within-session continuation (recommended for chat sessions)**:
 //!      at the end of each successful turn except the last, call
-//!      `finalize_turn_keep_live(extra_keys)` to publish full blocks for
-//!      cross-request prefix reuse WITHOUT releasing the request. This
-//!      keeps the partial trailing block's K/V live across turns. The
-//!      next turn calls `continue_turn(prompt, budget)` (in lieu of step
-//!      1+2) to resume directly on top of the live state, then continues
-//!      at step 4.
+//!      `finalize_turn_keep_live(extra_keys, cache_salt)` to publish full
+//!      blocks for cross-request prefix reuse WITHOUT releasing the
+//!      request. This keeps the partial trailing block's K/V live across
+//!      turns. The next turn calls `continue_turn(prompt, budget)` (in
+//!      lieu of step 1+2) to resume directly on top of the live state,
+//!      then continues at step 4.
 //!    - **Single-turn or session end**: optionally call
-//!      `register_full_blocks_for_reuse(extra_keys)` to publish full
-//!      blocks for cross-request prefix reuse.
+//!      `register_full_blocks_for_reuse(extra_keys, cache_salt)` to
+//!      publish full blocks for cross-request prefix reuse.
 //! 6. `release_request()` — decrefs every block in the table. Blocks
 //!    still referenced by the prefix cache (registered above) survive at
 //!    refcount greater than zero; otherwise return to the free pool.
@@ -556,10 +560,24 @@ impl PagedKVCacheAdapter {
     /// `request_tokens.len() == block_table.num_tokens()` is maintained
     /// by the seed-on-hit + record_tokens flow, and
     /// `register_full_blocks_for_reuse` asserts it as belt-and-suspenders.
+    ///
+    /// ## `cache_salt`
+    ///
+    /// `cache_salt` is mixed into the FIRST block's hash only when it is
+    /// non-zero. Pass `0` for "no salt" (semantically and byte-equal to
+    /// the pre-task-#48 behavior). The first-block-only semantics align
+    /// with vLLM (`vllm/v1/core/kv_cache_utils.py:521-531`); see
+    /// [`mlx_paged_attn::BlockAllocator::find_longest_cache_hit`] for the
+    /// full discussion. Callers that registered cached blocks with
+    /// `cache_salt = A` must look those blocks back up with the same salt
+    /// — a different salt isolates the first block, so the lookup misses
+    /// at block 0 and the rest of the chain doesn't get walked (since the
+    /// chain breaks on the first miss).
     pub fn find_cached_prefix(
         &mut self,
         prompt_tokens: &[u32],
         extra_keys: &[u64],
+        cache_salt: u64,
     ) -> Result<CachedPrefix, String> {
         // Reject re-entrant calls BEFORE touching the allocator. The flag
         // tracks lookup-already-ran regardless of hit/miss outcome, so a
@@ -583,7 +601,7 @@ impl PagedKVCacheAdapter {
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            guard.find_longest_cache_hit(prompt_tokens, self.block_size, extra_keys)
+            guard.find_longest_cache_hit(prompt_tokens, self.block_size, extra_keys, cache_salt)
         };
 
         for block in &blocks {
@@ -626,15 +644,20 @@ impl PagedKVCacheAdapter {
     /// prompt. Pass an all-empty vec (e.g. produced by
     /// `compute_per_block_image_extra_keys(&[], num_blocks, block_size)`)
     /// for text-only requests — the result is bit-equal to
-    /// `find_cached_prefix(prompt_tokens, &[])`.
+    /// `find_cached_prefix(prompt_tokens, &[], cache_salt)` (when called
+    /// with the same `cache_salt`).
     ///
     /// Otherwise behaves identically to [`Self::find_cached_prefix`]
     /// (single-call lifecycle, token-recording contract, refcount
     /// semantics). See that method's doc for the full contract.
+    ///
+    /// `cache_salt` is mixed into the first block's hash only when
+    /// non-zero, with the same semantics as `find_cached_prefix`.
     pub fn find_cached_prefix_per_block(
         &mut self,
         prompt_tokens: &[u32],
         extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
     ) -> Result<CachedPrefix, String> {
         if self.prefix_lookup_done {
             return Err(
@@ -656,6 +679,7 @@ impl PagedKVCacheAdapter {
                 prompt_tokens,
                 self.block_size,
                 extra_keys_per_block,
+                cache_salt,
             )
         };
 
@@ -1463,7 +1487,11 @@ impl PagedKVCacheAdapter {
     /// Only fully-formed blocks are registered (partial trailing block is
     /// not eligible). `extra_keys` is the same value the caller passed to
     /// `find_cached_prefix`; it MUST match for future cross-request
-    /// reuse to work.
+    /// reuse to work. Same goes for `cache_salt`: the salt mixed into
+    /// block 0 here MUST match the salt a future `find_cached_prefix`
+    /// passes for the lookup to hit at block 0 (and therefore at all).
+    /// Pass `0` for "no salt" (default; byte-equal to pre-task-#48
+    /// behavior).
     ///
     /// Returns the number of blocks actually registered. Normally equals
     /// the number of full blocks covered by `request_tokens`; may be
@@ -1503,7 +1531,11 @@ impl PagedKVCacheAdapter {
     /// first), so we set `already_registered = true` even when the
     /// allocator returned a partial count — the call ran, the adapter
     /// has done what it can.
-    pub fn register_full_blocks_for_reuse(&mut self, extra_keys: &[u64]) -> Result<u32, String> {
+    pub fn register_full_blocks_for_reuse(
+        &mut self,
+        extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<u32, String> {
         // Idempotent: subsequent calls within the same request are no-ops.
         if self.already_registered {
             return Ok(0);
@@ -1565,6 +1597,7 @@ impl PagedKVCacheAdapter {
                 blocks_slice,
                 self.block_size,
                 extra_keys,
+                cache_salt,
             )
             .map_err(|e| format!("cache_full_blocks failed: {e}"))?;
 
@@ -1592,15 +1625,21 @@ impl PagedKVCacheAdapter {
     /// `extra_keys_per_block.len()` must be at least the number of full
     /// blocks the request covers (`request_tokens.len() / block_size`).
     /// Pass an all-empty per-block vec for text-only requests — the result
-    /// is bit-equal to `register_full_blocks_for_reuse(&[])`.
+    /// is bit-equal to `register_full_blocks_for_reuse(&[], cache_salt)`
+    /// (when called with the same `cache_salt`).
     ///
     /// Phase 6 multimodal cache isolation: callers building per-block
     /// image hashes via [`compute_per_block_image_extra_keys`] thread the
     /// result here so the registered cache entries are isolated by image
     /// content.
+    ///
+    /// `cache_salt` is mixed into the first block's hash only when
+    /// non-zero, with the same semantics as the uniform variant. Pass
+    /// `0` for "no salt" (default).
     pub fn register_full_blocks_for_reuse_per_block(
         &mut self,
         extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
     ) -> Result<u32, String> {
         if self.already_registered {
             return Ok(0);
@@ -1659,6 +1698,7 @@ impl PagedKVCacheAdapter {
                 blocks_slice,
                 self.block_size,
                 &extra_keys_per_block[..actual_blocks_to_register],
+                cache_salt,
             )
             .map_err(|e| format!("cache_full_blocks_per_block failed: {e}"))?;
 
@@ -1710,6 +1750,11 @@ impl PagedKVCacheAdapter {
     /// going through the prefix-cache lookup, which only registers FULL
     /// blocks and so would silently drop the trailing partial block's K/V).
     ///
+    /// `cache_salt` is mixed into the first block's hash only when
+    /// non-zero, with the same semantics as
+    /// [`Self::register_full_blocks_for_reuse`]. Pass `0` for "no salt"
+    /// (default; byte-equal to pre-task-#48 behavior).
+    ///
     /// Behaves like [`Self::register_full_blocks_for_reuse`] — i.e. it
     /// publishes any full blocks the request has accumulated to the
     /// cross-request prefix cache so a *different* session that shares the
@@ -1730,8 +1775,8 @@ impl PagedKVCacheAdapter {
     ///    (find_cached_prefix → allocate_suffix_blocks → record_tokens →
     ///    forward).
     /// 2. End of every successful turn except the last:
-    ///    `finalize_turn_keep_live(extra_keys)`. The block_table / token
-    ///    list / partial-block K/V stay live.
+    ///    `finalize_turn_keep_live(extra_keys, cache_salt)`. The
+    ///    block_table / token list / partial-block K/V stay live.
     /// 3. Continuation turn: [`Self::continue_turn`] (instead of
     ///    `reset_for_new_request` + `find_cached_prefix`). Allocates any
     ///    new suffix blocks; ready for `record_tokens` + forward.
@@ -1751,7 +1796,11 @@ impl PagedKVCacheAdapter {
     /// differs from sequential decode → argmax flips → token streams
     /// diverge. Keeping the partial block live across turns eliminates the
     /// re-prefill: turn 2 picks up exactly where turn 1 left off.
-    pub fn finalize_turn_keep_live(&mut self, extra_keys: &[u64]) -> Result<u32, String> {
+    pub fn finalize_turn_keep_live(
+        &mut self,
+        extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<u32, String> {
         // Idempotent like `register_full_blocks_for_reuse`: subsequent
         // calls within the same turn return Ok(0) without side effects.
         // This intentionally mirrors the registration-half's idempotency
@@ -1764,7 +1813,7 @@ impl PagedKVCacheAdapter {
         // Reuse `register_full_blocks_for_reuse`'s implementation for the
         // registration half; the only difference is that we do NOT call
         // `release_request` after it.
-        self.register_full_blocks_for_reuse(extra_keys)
+        self.register_full_blocks_for_reuse(extra_keys, cache_salt)
     }
 
     /// Per-block-extra_keys variant of [`Self::finalize_turn_keep_live`].
@@ -1777,15 +1826,17 @@ impl PagedKVCacheAdapter {
     /// by per-block content (multimodal Phase 6).
     ///
     /// Pass an all-empty per-block vec to get behavior bit-equal to
-    /// `finalize_turn_keep_live(&[])`.
+    /// `finalize_turn_keep_live(&[], cache_salt)` (when called with the
+    /// same `cache_salt`).
     pub fn finalize_turn_keep_live_per_block(
         &mut self,
         extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
     ) -> Result<u32, String> {
         if self.already_registered {
             return Ok(0);
         }
-        self.register_full_blocks_for_reuse_per_block(extra_keys_per_block)
+        self.register_full_blocks_for_reuse_per_block(extra_keys_per_block, cache_salt)
     }
 
     /// Continue the current session with a new turn whose full prompt
@@ -2504,7 +2555,7 @@ mod tests {
             blocks.push(guard.allocate().expect("seed_prefix_cache: free block"));
         }
         guard
-            .cache_full_blocks(tokens, &blocks, block_size, extra_keys)
+            .cache_full_blocks(tokens, &blocks, block_size, extra_keys, 0)
             .expect("seed_prefix_cache: cache_full_blocks");
         // Free the request handle; cache's logical ref keeps each block
         // alive at ref_count = 1.
@@ -2596,7 +2647,9 @@ mod tests {
             return;
         };
         adapter.reset_for_new_request(0).unwrap();
-        let res = adapter.find_cached_prefix(&[1, 2, 3, 4, 5], &[]).unwrap();
+        let res = adapter
+            .find_cached_prefix(&[1, 2, 3, 4, 5], &[], 0)
+            .unwrap();
         assert!(res.blocks.is_empty());
         assert_eq!(res.cached_token_count, 0);
         assert_eq!(adapter.block_table().unwrap().num_blocks(), 0);
@@ -2615,7 +2668,7 @@ mod tests {
         };
         adapter.reset_for_new_request(1).unwrap();
         // Look up with same 8 tokens — should hit both blocks.
-        let res = adapter.find_cached_prefix(&tokens, &[]).unwrap();
+        let res = adapter.find_cached_prefix(&tokens, &[], 0).unwrap();
         assert_eq!(res.blocks.len(), 2);
         assert_eq!(res.cached_token_count, 8);
         assert_eq!(adapter.block_table().unwrap().num_blocks(), 2);
@@ -2653,7 +2706,7 @@ mod tests {
             return;
         };
         adapter.reset_for_new_request(2).unwrap();
-        let res = adapter.find_cached_prefix(&prefix_tokens, &[]).unwrap();
+        let res = adapter.find_cached_prefix(&prefix_tokens, &[], 0).unwrap();
         assert_eq!(res.cached_token_count, 8);
         assert_eq!(res.blocks.len(), 2);
 
@@ -2779,17 +2832,79 @@ mod tests {
 
         adapter.allocate_suffix_blocks(8).unwrap();
         adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
-        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(registered, 2, "two full blocks of size 4 = 8 tokens");
 
         // Second adapter on the same allocator should now see the cached prefix.
         let mut adapter2 = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2
-            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[])
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0)
             .unwrap();
         assert_eq!(res.cached_token_count, 8);
         assert_eq!(res.blocks.len(), 2);
+    }
+
+    /// Task #48 — adapter-level proof of vLLM's first-block-only
+    /// `cache_salt` semantics: registering blocks via the adapter under
+    /// `cache_salt = A` does NOT publish them to a tenant looking up
+    /// under `cache_salt = B`. This is the user-facing version of the
+    /// allocator-level `cache_salt_only_affects_first_block_hash` test;
+    /// it exercises the full adapter API surface
+    /// (`find_cached_prefix` + `register_full_blocks_for_reuse`) with
+    /// matching salts on both sides of the registration / lookup, then
+    /// flips one and asserts the cross-tenant miss.
+    #[test]
+    fn cache_salt_isolates_prefix_lookup_first_block() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter_a) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping cache_salt_isolates_prefix_lookup_first_block: Metal unavailable");
+            return;
+        };
+        adapter_a.reset_for_new_request(0).unwrap();
+
+        // Tenant A registers a fully-formed 2-block (8-token) prefix
+        // under cache_salt=A.
+        adapter_a.allocate_suffix_blocks(8).unwrap();
+        adapter_a.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let salt_a: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        let salt_b: u64 = 0xBBBB_BBBB_BBBB_BBBB;
+        let registered = adapter_a
+            .register_full_blocks_for_reuse(&[], salt_a)
+            .unwrap();
+        assert_eq!(registered, 2);
+
+        // Tenant B (different cache_salt) tries to look up the same
+        // tokens. The first-block hash differs because the salt is mixed
+        // into block 0 only — so block 0 misses, the chain breaks, and
+        // tenant A's cached blocks are NOT reused. This is the load-
+        // bearing isolation property: cache_salt = "namespace" of the
+        // first block of the prefix cache.
+        let mut adapter_b =
+            maybe_adapter(Arc::clone(&allocator), 4).expect("first pool succeeded; second must");
+        adapter_b.reset_for_new_request(1).unwrap();
+        let res_miss = adapter_b
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], salt_b)
+            .unwrap();
+        assert_eq!(
+            res_miss.cached_token_count, 0,
+            "different cache_salt must isolate block 0; cross-tenant prefix reuse forbidden"
+        );
+        assert!(res_miss.blocks.is_empty());
+
+        // Sanity: same salt on the lookup side hits — proves the miss
+        // above wasn't due to anything else (different tokens, missing
+        // registration, eviction, etc.).
+        let mut adapter_c = maybe_adapter(allocator, 4).expect("first pool succeeded; third must");
+        adapter_c.reset_for_new_request(2).unwrap();
+        let res_hit = adapter_c
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], salt_a)
+            .unwrap();
+        assert_eq!(
+            res_hit.cached_token_count, 8,
+            "matching cache_salt must hit the registered prefix"
+        );
+        assert_eq!(res_hit.blocks.len(), 2);
     }
 
     #[test]
@@ -2834,7 +2949,7 @@ mod tests {
         adapter.allocate_suffix_blocks(8).unwrap();
         let tokens: Vec<u32> = (10..18).collect();
         adapter.record_tokens(&tokens).unwrap();
-        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(registered, 2);
 
         // Release this request. Because register_prefix doesn't bump the
@@ -2847,7 +2962,7 @@ mod tests {
         // A fresh adapter on the same allocator can resurrect the prefix.
         let mut adapter2 = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(1).unwrap();
-        let res = adapter2.find_cached_prefix(&tokens, &[]).unwrap();
+        let res = adapter2.find_cached_prefix(&tokens, &[], 0).unwrap();
         assert_eq!(
             res.cached_token_count, 8,
             "prefix cache must survive release_request"
@@ -2882,14 +2997,14 @@ mod tests {
             .allocate_suffix_blocks(full_a.len() as u32)
             .unwrap();
         adapter_a.record_tokens(&full_a).unwrap();
-        let reg_a = adapter_a.register_full_blocks_for_reuse(&[]).unwrap();
+        let reg_a = adapter_a.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(reg_a, 3);
         adapter_a.release_request().unwrap();
 
         // Adapter B.
         let mut adapter_b = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter_b.reset_for_new_request(1).unwrap();
-        let res = adapter_b.find_cached_prefix(&full_b, &[]).unwrap();
+        let res = adapter_b.find_cached_prefix(&full_b, &[], 0).unwrap();
         // SYS prefix shared (8 tokens / 2 blocks); USER_B differs → miss.
         assert_eq!(
             res.cached_token_count, 8,
@@ -2919,7 +3034,7 @@ mod tests {
         adapter.allocate_suffix_blocks(8).unwrap();
         adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
 
-        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(registered, 2, "two full blocks of size 4 = 8 tokens");
 
         // After the first registration each freshly-allocated block has
@@ -2936,7 +3051,7 @@ mod tests {
         }
 
         // Second call must be a no-op: returns 0 and does NOT incref again.
-        let registered_again = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        let registered_again = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(registered_again, 0, "second register must be a no-op");
         for b in &first_blocks {
             assert_eq!(
@@ -2971,7 +3086,7 @@ mod tests {
         let mut adapter2 = maybe_adapter(allocator, 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(1).unwrap();
         let res = adapter2
-            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[])
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0)
             .unwrap();
         assert_eq!(res.cached_token_count, 8);
         assert_eq!(res.blocks.len(), 2);
@@ -2992,7 +3107,7 @@ mod tests {
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(8).unwrap();
         adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
-        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(registered, 2);
         adapter.release_request().unwrap();
 
@@ -3003,7 +3118,7 @@ mod tests {
         adapter
             .record_tokens(&[100, 101, 102, 103, 104, 105, 106, 107])
             .unwrap();
-        let registered_again = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        let registered_again = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(
             registered_again, 2,
             "release_request must reset already_registered so the next \
@@ -3030,7 +3145,7 @@ mod tests {
         adapter.reset_for_new_request(0).unwrap();
         adapter.allocate_suffix_blocks(8).unwrap();
         adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
-        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(registered, 2);
 
         // Reset without explicit release — the prior request is auto-released
@@ -3040,7 +3155,7 @@ mod tests {
         adapter
             .record_tokens(&[200, 201, 202, 203, 204, 205, 206, 207])
             .unwrap();
-        let registered_again = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        let registered_again = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(
             registered_again, 2,
             "reset_for_new_request must reset already_registered so the \
@@ -3066,7 +3181,7 @@ mod tests {
             adapter.reset_for_new_request(0).unwrap();
             adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
             adapter.record_tokens(tokens).unwrap();
-            adapter.register_full_blocks_for_reuse(&[]).unwrap();
+            adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
             adapter.release_request().unwrap();
         };
 
@@ -3144,7 +3259,7 @@ mod tests {
         adapter.allocate_suffix_blocks(p1.len() as u32).unwrap();
         let p1_block_id = adapter.block_table().unwrap().blocks()[0].block_id;
         adapter.record_tokens(&p1).unwrap();
-        adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         adapter.release_request().unwrap();
 
         // Cycle 2: register + release for prompt P2. Second block held
@@ -3154,7 +3269,7 @@ mod tests {
         adapter.allocate_suffix_blocks(p2.len() as u32).unwrap();
         let p2_block_id = adapter.block_table().unwrap().blocks()[0].block_id;
         adapter.record_tokens(&p2).unwrap();
-        adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         adapter.release_request().unwrap();
 
         assert_eq!(
@@ -3169,7 +3284,7 @@ mod tests {
         // succeed by evicting the LRU oldest cache-only block (P1's).
         let p3: [u32; 4] = [100, 200, 300, 400];
         adapter.reset_for_new_request(2).unwrap();
-        let cached = adapter.find_cached_prefix(&p3, &[]).unwrap();
+        let cached = adapter.find_cached_prefix(&p3, &[], 0).unwrap();
         assert_eq!(cached.cached_token_count, 0, "P3 must miss");
 
         let n_alloc = adapter
@@ -3194,7 +3309,7 @@ mod tests {
         let mut adapter2 =
             maybe_adapter(Arc::clone(&allocator), 4).expect("first pool succeeded; second must");
         adapter2.reset_for_new_request(99).unwrap();
-        let p2_lookup = adapter2.find_cached_prefix(&p2, &[]).unwrap();
+        let p2_lookup = adapter2.find_cached_prefix(&p2, &[], 0).unwrap();
         assert_eq!(
             p2_lookup.cached_token_count, 4,
             "P2's cache entry must survive eviction of P1"
@@ -3204,7 +3319,7 @@ mod tests {
         adapter2.release_request().unwrap();
         let mut adapter3 = maybe_adapter(allocator, 4).expect("first pool succeeded; third must");
         adapter3.reset_for_new_request(100).unwrap();
-        let p1_lookup = adapter3.find_cached_prefix(&p1, &[]).unwrap();
+        let p1_lookup = adapter3.find_cached_prefix(&p1, &[], 0).unwrap();
         assert_eq!(
             p1_lookup.cached_token_count, 0,
             "P1 was evicted to satisfy allocation; lookup must miss"
@@ -3237,7 +3352,7 @@ mod tests {
         let mut full_prompt = prefix_tokens.clone();
         full_prompt.extend_from_slice(&[100, 101, 102, 103]);
 
-        let res = adapter.find_cached_prefix(&full_prompt, &[]).unwrap();
+        let res = adapter.find_cached_prefix(&full_prompt, &[], 0).unwrap();
         assert_eq!(res.cached_token_count, 8, "two-block prefix hit");
         assert_eq!(res.blocks.len(), 2);
 
@@ -3264,7 +3379,7 @@ mod tests {
         // Register succeeds: invariant `request_tokens.len() ==
         // block_table.num_tokens()` holds (12 == 12). Three full blocks
         // (12 tokens / block_size 4) are eligible.
-        let registered = adapter.register_full_blocks_for_reuse(&[]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(
             registered, 3,
             "12 tokens / block_size 4 = 3 full blocks eligible for registration"
@@ -3293,7 +3408,7 @@ mod tests {
         adapter.reset_for_new_request(0).unwrap();
 
         // First call: cache hit, populates block_table with 2 blocks.
-        let first = adapter.find_cached_prefix(&tokens, &[]).unwrap();
+        let first = adapter.find_cached_prefix(&tokens, &[], 0).unwrap();
         assert_eq!(first.cached_token_count, 8);
         assert_eq!(first.blocks.len(), 2);
         assert_eq!(adapter.block_table().unwrap().num_blocks(), 2);
@@ -3303,7 +3418,7 @@ mod tests {
         }
 
         // Second call: must reject without touching state.
-        let res = adapter.find_cached_prefix(&tokens, &[]);
+        let res = adapter.find_cached_prefix(&tokens, &[], 0);
         assert!(res.is_err(), "second call must error");
         let msg = res.unwrap_err();
         assert!(
@@ -3325,7 +3440,7 @@ mod tests {
         // After release + reset, a fresh lookup is allowed again.
         adapter.release_request().unwrap();
         adapter.reset_for_new_request(1).unwrap();
-        let again = adapter.find_cached_prefix(&tokens, &[]).unwrap();
+        let again = adapter.find_cached_prefix(&tokens, &[], 0).unwrap();
         assert_eq!(
             again.cached_token_count, 8,
             "lookup must succeed after reset_for_new_request"
@@ -3350,13 +3465,13 @@ mod tests {
         };
         adapter.reset_for_new_request(0).unwrap();
 
-        let first = adapter.find_cached_prefix(&[1, 2, 3, 4], &[]).unwrap();
+        let first = adapter.find_cached_prefix(&[1, 2, 3, 4], &[], 0).unwrap();
         assert_eq!(first.cached_token_count, 0, "must miss");
         assert!(first.blocks.is_empty());
         assert_eq!(adapter.block_table().unwrap().num_blocks(), 0);
 
         // Second call must reject even though block_table is still empty.
-        let res = adapter.find_cached_prefix(&[1, 2, 3, 4], &[]);
+        let res = adapter.find_cached_prefix(&[1, 2, 3, 4], &[], 0);
         assert!(res.is_err(), "second call after miss must error");
         let msg = res.unwrap_err();
         assert!(
@@ -4484,7 +4599,7 @@ mod tests {
         // Turn 1: 5 tokens (1 full block + 1 partial-block token).
         let tokens_t1: [u32; 5] = [10, 20, 30, 40, 50];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
         adapter
             .allocate_suffix_blocks(tokens_t1.len() as u32)
             .unwrap();
@@ -4505,7 +4620,7 @@ mod tests {
         );
 
         // Finalize but keep live.
-        let registered = adapter.finalize_turn_keep_live(&[]).unwrap();
+        let registered = adapter.finalize_turn_keep_live(&[], 0).unwrap();
         assert_eq!(
             registered, 1,
             "exactly 1 full block (4 tokens) is eligible for cross-request registration; \
@@ -4554,13 +4669,13 @@ mod tests {
 
         let tokens: [u32; 4] = [1, 2, 3, 4];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
         adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
         adapter.record_tokens(&tokens).unwrap();
 
-        let first = adapter.finalize_turn_keep_live(&[]).unwrap();
+        let first = adapter.finalize_turn_keep_live(&[], 0).unwrap();
         assert_eq!(first, 1);
-        let second = adapter.finalize_turn_keep_live(&[]).unwrap();
+        let second = adapter.finalize_turn_keep_live(&[], 0).unwrap();
         assert_eq!(second, 0, "second call must be a no-op");
 
         adapter.release_request().unwrap();
@@ -4580,12 +4695,12 @@ mod tests {
         // Turn 1: 5 tokens, 2 blocks (1 full + 1 partial holding 1 token).
         let tokens_t1: [u32; 5] = [10, 20, 30, 40, 50];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
         adapter
             .allocate_suffix_blocks(tokens_t1.len() as u32)
             .unwrap();
         adapter.record_tokens(&tokens_t1).unwrap();
-        adapter.finalize_turn_keep_live(&[]).unwrap();
+        adapter.finalize_turn_keep_live(&[], 0).unwrap();
 
         let block_ids_t1: Vec<u32> = adapter
             .block_table()
@@ -4656,12 +4771,12 @@ mod tests {
 
         let tokens_t1: [u32; 4] = [10, 20, 30, 40];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
         adapter
             .allocate_suffix_blocks(tokens_t1.len() as u32)
             .unwrap();
         adapter.record_tokens(&tokens_t1).unwrap();
-        adapter.finalize_turn_keep_live(&[]).unwrap();
+        adapter.finalize_turn_keep_live(&[], 0).unwrap();
 
         // Diverged prompt — token at index 2 differs.
         let diverged: [u32; 5] = [10, 20, 99, 40, 50];
@@ -4692,7 +4807,7 @@ mod tests {
 
         let tokens_t1: [u32; 4] = [1, 2, 3, 4];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
         adapter
             .allocate_suffix_blocks(tokens_t1.len() as u32)
             .unwrap();
@@ -4727,10 +4842,10 @@ mod tests {
         // Turn 1: 7 tokens → 1 full block (4) + 1 partial block (3 tokens).
         let t1: [u32; 7] = [1, 2, 3, 4, 5, 6, 7];
         adapter.reset_for_new_request(0).unwrap();
-        let _ = adapter.find_cached_prefix(&[], &[]).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0).unwrap();
         adapter.allocate_suffix_blocks(t1.len() as u32).unwrap();
         adapter.record_tokens(&t1).unwrap();
-        adapter.finalize_turn_keep_live(&[]).unwrap();
+        adapter.finalize_turn_keep_live(&[], 0).unwrap();
 
         let t1_block_ids: Vec<u32> = adapter
             .block_table()
@@ -4799,7 +4914,7 @@ mod tests {
         adapter.reset_for_new_request(0).unwrap();
         let prompt: Vec<u32> = (0..18).collect();
         adapter
-            .find_cached_prefix(&prompt, &[])
+            .find_cached_prefix(&prompt, &[], 0)
             .expect("prefix lookup");
         adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
         adapter.record_tokens(&prompt).unwrap();
@@ -4875,7 +4990,7 @@ mod tests {
 
         adapter.reset_for_new_request(0).unwrap();
         let prompt: Vec<u32> = (0..16).collect();
-        adapter.find_cached_prefix(&prompt, &[]).unwrap();
+        adapter.find_cached_prefix(&prompt, &[], 0).unwrap();
         adapter.allocate_suffix_blocks(prompt.len() as u32).unwrap();
         adapter.record_tokens(&prompt).unwrap();
 

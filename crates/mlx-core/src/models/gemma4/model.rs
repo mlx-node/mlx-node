@@ -2013,7 +2013,7 @@ impl Gemma4Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[])
+                            .find_cached_prefix(&tokens, &[], 0)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -2030,7 +2030,7 @@ impl Gemma4Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[])
+                    .find_cached_prefix(&tokens, &[], 0)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2077,9 +2077,9 @@ impl Gemma4Inner {
             Ok(t) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     if reuse_cache {
-                        let _ = adapter.finalize_turn_keep_live(&[]);
+                        let _ = adapter.finalize_turn_keep_live(&[], 0);
                     } else {
-                        let _ = adapter.register_full_blocks_for_reuse(&[]);
+                        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
                         let _ = adapter.release_request();
                     }
                 }
@@ -2277,7 +2277,7 @@ impl Gemma4Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[])
+                            .find_cached_prefix(&tokens, &[], 0)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -2294,7 +2294,7 @@ impl Gemma4Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[])
+                    .find_cached_prefix(&tokens, &[], 0)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2341,9 +2341,9 @@ impl Gemma4Inner {
             Ok(t) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     if reuse_cache {
-                        let _ = adapter.finalize_turn_keep_live(&[]);
+                        let _ = adapter.finalize_turn_keep_live(&[], 0);
                     } else {
-                        let _ = adapter.register_full_blocks_for_reuse(&[]);
+                        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
                         let _ = adapter.release_request();
                     }
                 }
@@ -5882,7 +5882,7 @@ mod tests {
                 eprintln!("skipping (adapter reset failed): {e}");
                 return;
             }
-            if let Err(e) = adapter.find_cached_prefix(&prompt, &[]) {
+            if let Err(e) = adapter.find_cached_prefix(&prompt, &[], 0) {
                 eprintln!("skipping (find_cached_prefix failed): {e}");
                 return;
             }

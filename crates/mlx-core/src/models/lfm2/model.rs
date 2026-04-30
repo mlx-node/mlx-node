@@ -802,7 +802,7 @@ impl Lfm2Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[])
+                            .find_cached_prefix(&tokens, &[], 0)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -819,7 +819,7 @@ impl Lfm2Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[])
+                    .find_cached_prefix(&tokens, &[], 0)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -873,7 +873,7 @@ impl Lfm2Inner {
                     // turn's `continue_turn` can pick up the partial
                     // trailing block's K/V. See
                     // `finalize_turn_keep_live` doc for rationale.
-                    let _ = adapter.finalize_turn_keep_live(&[]);
+                    let _ = adapter.finalize_turn_keep_live(&[], 0);
                 }
                 t
             }
@@ -1410,7 +1410,7 @@ impl Lfm2Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[])
+                            .find_cached_prefix(&tokens, &[], 0)
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -1427,7 +1427,7 @@ impl Lfm2Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[])
+                    .find_cached_prefix(&tokens, &[], 0)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -1486,7 +1486,7 @@ impl Lfm2Inner {
                     // Keep request live across turns. See
                     // `finalize_turn_keep_live` doc + the non-streaming
                     // `chat_sync_core_paged`'s terminal block.
-                    let _ = adapter.finalize_turn_keep_live(&[]);
+                    let _ = adapter.finalize_turn_keep_live(&[], 0);
                 }
                 t
             }
@@ -3804,7 +3804,7 @@ mod paged_adapter_construction_tests {
                 .reset_for_new_request(0)
                 .expect("reset_for_new_request");
             let prefix = adapter
-                .find_cached_prefix(&prompt, &[])
+                .find_cached_prefix(&prompt, &[], 0)
                 .expect("find_cached_prefix");
             assert_eq!(prefix.cached_token_count, 0);
             adapter
