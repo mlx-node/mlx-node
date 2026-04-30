@@ -1333,6 +1333,114 @@ mod tests {
         assert_eq!(n, 12);
     }
 
+    /// Direct-hash assertion that `cache_salt` is NOT mixed into the hash of
+    /// any block at position `n > 0`. This is the strong-form proof that
+    /// complements `cache_salt_only_affects_first_block_hash` (which is an
+    /// end-to-end same-salt round-trip and is structurally tautological in
+    /// isolation: registering with `salt=A` and looking up with `salt=A`
+    /// would still pass on a buggy implementation that mixed `cache_salt`
+    /// into every block, so long as the lookup used the same salt).
+    ///
+    /// Strategy: register a 3-block chain via the public
+    /// `cache_full_blocks` API with a non-zero `cache_salt`, then walk the
+    /// chain ourselves using the public `hash_tokens` primitive (no salt)
+    /// and assert that each `n > 0` block is reachable at exactly the
+    /// un-salted hash. We additionally assert that block 0 is NOT
+    /// reachable at the un-salted hash (i.e. salt IS mixed in for n == 0)
+    /// so the test isn't trivially satisfied by a hypothetical
+    /// implementation that ignores salt entirely.
+    ///
+    /// A buggy implementation that mixed `cache_salt` into every block
+    /// would fail this test: the un-salted lookup at block 1 would miss
+    /// because the registered hash would have included the salt, while
+    /// our recomputed reference hash would not.
+    #[test]
+    fn cache_salt_not_mixed_into_block_n_for_n_gt_0() {
+        let mut allocator = BlockAllocator::new(8, 4);
+        let toks: Vec<u32> = (0..12).collect();
+        let salt = 0xDEAD_BEEF_DEAD_BEEFu64;
+
+        let b0 = allocator.allocate().unwrap();
+        let b1 = allocator.allocate().unwrap();
+        let b2 = allocator.allocate().unwrap();
+        let b0_id = b0.block_id;
+        let b1_id = b1.block_id;
+        let b2_id = b2.block_id;
+
+        let blocks = vec![Arc::clone(&b0), Arc::clone(&b1), Arc::clone(&b2)];
+        let registered = allocator
+            .cache_full_blocks(&toks, &blocks, 4, &[], salt)
+            .unwrap();
+        assert_eq!(registered, 3);
+
+        // Recompute the chain ourselves WITHOUT the salt — this is the
+        // exact byte sequence `hash_block` produces for any block with
+        // `block_index > 0` (or `cache_salt == 0`). We use the parent_hash
+        // chain that the registered chain would produce given block 0's
+        // SALTED hash; for n > 0 the salt does not appear in the
+        // composition, so we feed the chained `previous_block_hash`
+        // through plain `hash_tokens` and expect it to match.
+
+        // Block 0: registered hash is the SALTED variant. The un-salted
+        // hash MUST differ (otherwise salt is silently a no-op). Since
+        // `register_prefix` keys the cache by the registered (salted)
+        // hash, an un-salted lookup must miss.
+        let unsalted_block0_hash = hash_tokens(&toks[0..4], 0, &[]);
+        assert!(
+            allocator.lookup_prefix(unsalted_block0_hash).is_none(),
+            "block 0 must NOT be reachable at the un-salted hash when a non-zero cache_salt was registered \
+             (otherwise salt is silently ignored at n == 0)"
+        );
+
+        // Reconstruct the chain's SALTED block-0 hash (parent for block 1)
+        // by re-running the same effective-extra_keys composition that
+        // `hash_block` does internally for the leading block: extra_keys
+        // ++ [cache_salt]. This is the only place we need to know that
+        // composition; for n > 0 we use plain `hash_tokens`.
+        let salted_block0_hash = {
+            let effective = vec![salt];
+            hash_tokens(&toks[0..4], 0, &effective)
+        };
+
+        // Block 1: the registered hash MUST be `hash_tokens(block1_tokens,
+        // salted_block0_hash, &[])` — i.e. NO salt mixed in for n > 0.
+        // If a buggy implementation mixed the salt into every block, the
+        // registered hash would differ from this and the lookup would
+        // miss.
+        let expected_block1_hash = hash_tokens(&toks[4..8], salted_block0_hash, &[]);
+        let cached_block1 = allocator.lookup_prefix(expected_block1_hash).expect(
+            "block 1 must be reachable at the un-salted hash_tokens(block1_tokens, parent_hash, &[]) — \
+             salt MUST NOT be mixed into hashes for n > 0",
+        );
+        assert_eq!(
+            cached_block1.block_id, b1_id,
+            "lookup at the un-salted block-1 hash must resolve to the registered block 1"
+        );
+        // Drop the lookup-incref ref_count bump.
+        allocator.free(cached_block1);
+
+        // Block 2: chain off the un-salted block 1 hash and the same
+        // un-salted composition.
+        let expected_block2_hash = hash_tokens(&toks[8..12], expected_block1_hash, &[]);
+        let cached_block2 = allocator.lookup_prefix(expected_block2_hash).expect(
+            "block 2 must be reachable at the un-salted chained hash — salt MUST NOT be mixed into n > 0",
+        );
+        assert_eq!(
+            cached_block2.block_id, b2_id,
+            "lookup at the un-salted block-2 hash must resolve to the registered block 2"
+        );
+        allocator.free(cached_block2);
+
+        // Sanity: block 0 IS reachable at its salted hash. Together with
+        // the un-salted-block-0 miss above, this confirms salt was
+        // actually mixed in at n == 0.
+        let cached_block0 = allocator.lookup_prefix(salted_block0_hash).expect(
+            "block 0 must be reachable at the salted hash (otherwise registration was a no-op)",
+        );
+        assert_eq!(cached_block0.block_id, b0_id);
+        allocator.free(cached_block0);
+    }
+
     #[test]
     fn test_register_lookup_refcount_lifecycle() {
         let mut allocator = BlockAllocator::new(4, 4);
