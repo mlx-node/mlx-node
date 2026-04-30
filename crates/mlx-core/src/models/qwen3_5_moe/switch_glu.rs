@@ -61,7 +61,17 @@ impl SwitchGLU {
         let idx_shape = indices.shape()?;
 
         let x_expanded = x.reshape(&[ne, 1, 1, d])?;
-        let do_sort = indices.size()? >= 64;
+        let do_sort = {
+            let large_enough_to_sort = indices.size()? >= 64;
+            #[cfg(target_family = "wasm")]
+            {
+                large_enough_to_sort && !self.is_quantized()
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                large_enough_to_sort
+            }
+        };
 
         let out = if do_sort {
             let sorted = gather_sort(&x_expanded, indices)?;

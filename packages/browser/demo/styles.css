@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@source "../../../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -306,12 +307,80 @@
   }
 
   .thinking-content {
-    @apply max-h-72 overflow-y-auto border-t px-3 py-2 text-xs leading-6 text-muted-foreground whitespace-pre-wrap;
+    @apply max-h-72 overflow-y-auto border-t px-3 py-2 text-xs leading-6 text-muted-foreground;
     border-color: color-mix(in oklab, var(--reasoning) 25%, var(--border));
   }
 
   .response-content {
-    @apply min-h-5 whitespace-pre-wrap;
+    @apply min-h-5;
+  }
+
+  .streamdown-render {
+    @apply max-w-full break-words;
+  }
+
+  .streamdown-render > :first-child {
+    margin-top: 0;
+  }
+
+  .streamdown-render > :last-child {
+    margin-bottom: 0;
+  }
+
+  .streamdown-render p {
+    margin: 0.35rem 0;
+  }
+
+  .streamdown-render ul,
+  .streamdown-render ol {
+    margin: 0.45rem 0;
+    padding-left: 1.25rem;
+  }
+
+  .streamdown-render li {
+    margin: 0.15rem 0;
+  }
+
+  .streamdown-render blockquote {
+    margin: 0.55rem 0;
+    padding-left: 0.85rem;
+    border-left: 2px solid var(--border);
+    color: var(--muted-foreground);
+  }
+
+  .streamdown-render code {
+    border-radius: 0.25rem;
+    background: color-mix(in oklab, var(--muted) 70%, transparent);
+    padding: 0.1rem 0.28rem;
+    font-size: 0.86em;
+  }
+
+  .streamdown-render pre {
+    margin: 0.6rem 0;
+    max-width: 100%;
+    overflow-x: auto;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: color-mix(in oklab, black 18%, var(--card));
+    padding: 0.75rem;
+  }
+
+  .streamdown-render pre code {
+    background: transparent;
+    padding: 0;
+  }
+
+  .streamdown-render table {
+    margin: 0.6rem 0;
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.92em;
+  }
+
+  .streamdown-render th,
+  .streamdown-render td {
+    border: 1px solid var(--border);
+    padding: 0.35rem 0.45rem;
   }
 
   .message.assistant .response-content::after {

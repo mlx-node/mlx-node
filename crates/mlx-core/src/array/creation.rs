@@ -739,11 +739,11 @@ impl MxArray {
     }
 
     /// Browser/WebGPU regression test for model-scale affine quantized decode
-        /// shapes. Qwen3.6 MoE quantized checkpoints use K=2048, group_size=64,
-        /// bf16 activations/scales/biases, and 3/4/5/6/8-bit packed rows; the smaller
-        /// smoke test above does not exercise those dispatch and packing paths.
-        #[napi]
-        pub fn test_quantized_affine_model_shape_ops(bits: i32) -> Result<Vec<f64>> {
+    /// shapes. Qwen3.6 MoE quantized checkpoints use K=2048, group_size=64,
+    /// bf16 activations/scales/biases, and 3/4/5/6/8-bit packed rows; the smaller
+    /// smoke test above does not exercise those dispatch and packing paths.
+    #[napi]
+    pub fn test_quantized_affine_model_shape_ops(bits: i32) -> Result<Vec<f64>> {
         if !matches!(bits, 3 | 4 | 5 | 6 | 8) {
             return Err(Error::from_reason(format!(
                 "model-shape affine test supports bits 3, 4, 5, 6, and 8; got {bits}"
@@ -1364,21 +1364,18 @@ impl MxArray {
 
             let sx =
                 MxArray::from_float32(&sx_data, &[1, k_dim as i64])?.astype(DType::BFloat16)?;
-            let qkv_w_arr =
-                MxArray::from_uint32(&qkv_w, &[qkv_rows as i64, w_cols as i64])?;
+            let qkv_w_arr = MxArray::from_uint32(&qkv_w, &[qkv_rows as i64, w_cols as i64])?;
             let z_w_arr = MxArray::from_uint32(&z_w, &[z_rows as i64, w_cols as i64])?;
             let qkv_s_arr =
                 MxArray::from_float32(&qkv_scales, &[qkv_rows as i64, num_groups as i64])?
                     .astype(DType::BFloat16)?;
-            let z_s_arr =
-                MxArray::from_float32(&z_scales, &[z_rows as i64, num_groups as i64])?
-                    .astype(DType::BFloat16)?;
+            let z_s_arr = MxArray::from_float32(&z_scales, &[z_rows as i64, num_groups as i64])?
+                .astype(DType::BFloat16)?;
             let qkv_b_arr =
                 MxArray::from_float32(&qkv_biases, &[qkv_rows as i64, num_groups as i64])?
                     .astype(DType::BFloat16)?;
-            let z_b_arr =
-                MxArray::from_float32(&z_biases, &[z_rows as i64, num_groups as i64])?
-                    .astype(DType::BFloat16)?;
+            let z_b_arr = MxArray::from_float32(&z_biases, &[z_rows as i64, num_groups as i64])?
+                .astype(DType::BFloat16)?;
 
             let merged_w = MxArray::concatenate(&qkv_w_arr, &z_w_arr, 0)?;
             let merged_s = MxArray::concatenate(&qkv_s_arr, &z_s_arr, 0)?;

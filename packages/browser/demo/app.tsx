@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
+import { Streamdown } from "streamdown";
 
 import { createSabRingOverHeap } from "../src/chat-stream-sab.js";
 import { Badge } from "./components/ui/badge";
@@ -37,6 +38,7 @@ import {
   sanitizeThinkingText as sanitizeThinkingMarkup,
   splitAssistantThinking,
 } from "../src/generated-text.js";
+import "streamdown/styles.css";
 import "./styles.css";
 
 type StatusState = "info" | "ready" | "error";
@@ -310,6 +312,7 @@ function App() {
 
     let reasoningBuffer = "";
     let contentQueue = "";
+    let responseRenderText = "";
     let contentPrefixBuffer = "";
     let contentPrefixResolved = false;
     let currentUserPrompt = "";
@@ -320,6 +323,37 @@ function App() {
     let sharedWasmMemory: WebAssembly.Memory | null = null;
     let activeReaderAbort: AbortController | null = null;
     let streamT0 = 0;
+    const markdownRoots = new Map<HTMLElement, ReturnType<typeof createRoot>>();
+
+    function renderStreamdown(
+      container: HTMLElement,
+      text: string,
+      isStreaming: boolean,
+    ) {
+      let root = markdownRoots.get(container);
+      if (!root) {
+        root = createRoot(container);
+        markdownRoots.set(container, root);
+      }
+      root.render(
+        <Streamdown
+          mode={isStreaming ? "streaming" : "static"}
+          className="streamdown-render"
+          animated={false}
+          isAnimating={isStreaming}
+          parseIncompleteMarkdown={isStreaming}
+        >
+          {text}
+        </Streamdown>,
+      );
+    }
+
+    function unmountAllStreamdown() {
+      for (const root of markdownRoots.values()) {
+        root.unmount();
+      }
+      markdownRoots.clear();
+    }
 
     function createAssistantMessage() {
       const assistantDiv = document.createElement("div");
@@ -350,6 +384,7 @@ function App() {
       thinkingDiv.style.display = "none";
       reasoningBuffer = "";
       contentQueue = "";
+      responseRenderText = "";
       contentPrefixBuffer = "";
       contentPrefixResolved = false;
       reasoningHasContent = false;
@@ -417,7 +452,7 @@ function App() {
         "summary",
       ) as HTMLElement | null;
       if (summary) summary.textContent = "Thought process";
-      if (thinkingContentEl) thinkingContentEl.textContent = cleaned;
+      if (thinkingContentEl) renderStreamdown(thinkingContentEl, cleaned, true);
       currentThinkingDiv.style.display = "";
       currentThinkingDiv.open = open;
       reasoningHasContent = true;
@@ -524,7 +559,8 @@ function App() {
           if (summary) summary.textContent = "Thought process";
           currentThinkingDiv.open = false;
         }
-        currentResponseDiv.textContent += slice;
+        responseRenderText += slice;
+        renderStreamdown(currentResponseDiv, responseRenderText, true);
         scrollDirty = true;
       }
 
@@ -549,7 +585,8 @@ function App() {
             if (summary) summary.textContent = "Thought process";
             currentThinkingDiv.open = false;
           }
-          currentResponseDiv.textContent += contentQueue;
+          responseRenderText += contentQueue;
+          renderStreamdown(currentResponseDiv, responseRenderText, true);
         }
       }
       reasoningBuffer = "";
@@ -574,7 +611,8 @@ function App() {
         const thinkingContentEl = currentThinkingDiv.querySelector(
           ".thinking-content",
         ) as HTMLElement | null;
-        if (thinkingContentEl) thinkingContentEl.textContent = trimmedThinking;
+        if (thinkingContentEl)
+          renderStreamdown(thinkingContentEl, trimmedThinking, false);
         const summary = currentThinkingDiv.querySelector(
           "summary",
         ) as HTMLElement | null;
@@ -586,7 +624,8 @@ function App() {
       }
 
       if (text && text.length > 0) {
-        currentResponseDiv.textContent = text;
+        responseRenderText = text;
+        renderStreamdown(currentResponseDiv, responseRenderText, false);
       }
       currentAssistantDiv.classList.add("done");
       chatEl.scrollTop = chatEl.scrollHeight;
@@ -637,6 +676,7 @@ function App() {
     function resetStreamingUi() {
       reasoningBuffer = "";
       contentQueue = "";
+      responseRenderText = "";
       if (rafHandle != null) {
         cancelAnimationFrame(rafHandle);
         rafHandle = null;
@@ -723,7 +763,11 @@ function App() {
               log(`Stream error: ${err.message}`);
               resetStreamingUi();
               if (currentResponseDiv) {
-                currentResponseDiv.textContent = `Error: ${err.message}`;
+                renderStreamdown(
+                  currentResponseDiv,
+                  `Error: ${err.message}`,
+                  false,
+                );
               }
               setStatus("Error", "error");
               sendBtn.disabled = false;
@@ -753,7 +797,11 @@ function App() {
           logStack(data.stack);
           resetStreamingUi();
           if (currentResponseDiv) {
-            currentResponseDiv.textContent = `Error: ${data.message}`;
+            renderStreamdown(
+              currentResponseDiv,
+              `Error: ${data.message}`,
+              false,
+            );
           }
           setStatus("Error", "error");
           sendBtn.disabled = false;
@@ -931,6 +979,7 @@ function App() {
       imageInput.value = "";
       setImageAttached(false);
       resetStreamingUi();
+      unmountAllStreamdown();
       currentAssistantDiv = null;
       currentThinkingDiv = null;
       currentResponseDiv = null;
@@ -1165,6 +1214,7 @@ function App() {
       worker.removeEventListener("messageerror", onMessageError);
       activeReaderAbort?.abort();
       if (rafHandle != null) cancelAnimationFrame(rafHandle);
+      unmountAllStreamdown();
       worker.terminate();
     };
   }, []);

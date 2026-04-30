@@ -422,11 +422,23 @@ export function createBridgeStub(
   // Policy: LIFO reuse (pop hot buffers first), FIFO eviction of the oldest
   // on overflow (shift from the front when the bucket is full).
   const bufferPool = new Map<string, number[]>();
+  const BUFFER_POOL_MAX_BYTES = 128 * 1024 * 1024;
+  const BUFFER_POOL_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+  let bufferPoolBytes = 0;
+
   function poolCapForSize(size: number): number {
     if (size <= 4 * 1024) return 512;
     if (size <= 64 * 1024) return 256;
     if (size <= 1024 * 1024) return 128;
     return 64;
+  }
+
+  function isPoolableSize(size: number): boolean {
+    return size > 0 && size <= BUFFER_POOL_MAX_BUFFER_BYTES;
+  }
+
+  function removeBufferPoolBytes(size: number): void {
+    bufferPoolBytes = Math.max(0, bufferPoolBytes - size);
   }
 
   interface QuarantinedPoolRelease {
@@ -442,6 +454,11 @@ export function createBridgeStub(
     usage: number,
   ): void {
     const bucketSize = roundUpBucket(size);
+    if (!isPoolableSize(bucketSize)) {
+      queueRelease(handle);
+      clearBufferMeta(handle);
+      return;
+    }
     const key = poolKey(usage, bucketSize);
     let stack = bufferPool.get(key);
     if (stack === undefined) {
@@ -450,6 +467,10 @@ export function createBridgeStub(
     }
     if (stack.length < poolCapForSize(bucketSize)) {
       stack.push(handle);
+      bufferPoolBytes += bucketSize;
+      while (bufferPoolBytes > BUFFER_POOL_MAX_BYTES) {
+        if (!evictOnePooledBuffer()) break;
+      }
       return;
     }
     const evicted = stack.shift()!;
@@ -457,6 +478,27 @@ export function createBridgeStub(
     queueRelease(evicted);
     clearBufferMeta(evicted);
     stack.push(handle);
+    // The evicted buffer and the newly parked buffer have the same bucket size,
+    // so total bytes are unchanged here.
+  }
+
+  function evictOnePooledBuffer(): boolean {
+    for (const [key, stack] of bufferPool) {
+      const evicted = stack.shift();
+      if (evicted === undefined) {
+        bufferPool.delete(key);
+        continue;
+      }
+      const sep = key.indexOf(":");
+      const bucketSize = Number(key.slice(sep + 1));
+      removeBufferPoolBytes(bucketSize);
+      bumpPoolStat(POOL_STAT_EVICTIONS);
+      queueRelease(evicted);
+      clearBufferMeta(evicted);
+      if (stack.length === 0) bufferPool.delete(key);
+      return true;
+    }
+    return false;
   }
 
   function promoteSubmitQuarantinedPoolReleases(): void {
@@ -1574,7 +1616,7 @@ export function createBridgeStub(
         // No COPY_DST: fall through to normal RPC (gpu-worker handles mapping)
       }
 
-      if (!mappedAtCreation && size > 0) {
+      if (!mappedAtCreation && isPoolableSize(size)) {
         // Bucket the stub pool so that creates with slightly different
         // logical sizes (e.g., 513 vs 512 bytes) can reuse each other.
         // Use the SAME roundUpBucket as the gpu-worker — invariant: every
@@ -1587,6 +1629,7 @@ export function createBridgeStub(
           const reused = stack.pop()!;
           // Drop empty buckets so bufferPool doesn't accumulate dead keys.
           if (stack.length === 0) bufferPool.delete(key);
+          removeBufferPoolBytes(bucketSize);
           bufferPoolHits++;
           bumpPoolStat(POOL_STAT_HITS);
           // Publish the caller's LOGICAL size via setBufferMeta — the stub
@@ -1609,19 +1652,19 @@ export function createBridgeStub(
         }
         if (h2 > 0 && h2 < FAKE_HANDLE_BASE) {
           // Eager (size, usage) cache — drops BUFFER_GET_SIZE RPCs and gives
-          // the release path the data it needs to pool instead of falling
-          // through to queueRelease. Store LOGICAL size in the stub cache
+          // the release path the data it needs to pool or release without a
+          // BUFFER_GET_SIZE RPC. Store LOGICAL size in the stub cache
           // because that is what C++ callers expect from wgpuBufferGetSize.
           setBufferMeta(h2, size, usage);
         }
         return h2;
       }
 
-      // mappedAtCreation (with or without COPY_DST falling through to RPC):
-      // do NOT bucket. getMappedRange must return exactly `size` bytes —
-      // a bucket-sized shadow would either overrun on write-back or leak
-      // tail bytes. Pass arg1=0 to tell the gpu-worker to use the size
-      // from descPtr verbatim.
+      // mappedAtCreation (with or without COPY_DST falling through to RPC), or
+      // a too-large transient buffer: do NOT bucket. getMappedRange must return
+      // exactly `size` bytes, and large transient buffers should not be retained
+      // in the browser-side pool. Pass arg1=0 to tell the gpu-worker to use the
+      // size from descPtr verbatim.
       const h2 = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr, 0);
       if (h2 <= 0) {
         throw new Error(
@@ -2610,7 +2653,8 @@ export function createBridgeStub(
       if (
         size !== undefined &&
         usage !== undefined &&
-        isPoolable(resolved, usage)
+        isPoolable(resolved, usage) &&
+        isPoolableSize(size)
       ) {
         // Do not make a released buffer available to later creates until the
         // current command buffer has been submitted. Recorded dispatches hold

@@ -5452,6 +5452,9 @@ fn forward_inner(
 /// does not accumulate across chunks.
 pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 
+#[cfg(target_family = "wasm")]
+const VLM_PREFILL_STEP_SIZE: i64 = 1024;
+
 /// Chunked prefill for Qwen3.5 MoE.
 ///
 /// Processes `prompt` (shape `[1, seq_len]`) in chunks of `PREFILL_STEP_SIZE`
@@ -5569,6 +5572,101 @@ fn chunked_prefill_with_size(
     Ok(logits)
 }
 
+#[cfg(target_family = "wasm")]
+#[allow(clippy::too_many_arguments)]
+fn chunked_vlm_prefill_moe(
+    inputs_embeds: &MxArray,
+    position_ids: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    text_model_embedding: &MxArray,
+    fa_idx: usize,
+    embedding_weight_t: Option<&MxArray>,
+    generation_stream: Stream,
+) -> Result<MxArray> {
+    let total_len = inputs_embeds.shape_at(1)?;
+    let mut offset: i64 = 0;
+
+    while offset < total_len {
+        let chunk_end = std::cmp::min(offset + VLM_PREFILL_STEP_SIZE, total_len);
+        let is_final_chunk = chunk_end == total_len;
+        let chunk_embeds = inputs_embeds.slice_axis(1, offset, chunk_end)?;
+        let chunk_pos = position_ids.slice_axis(2, offset, chunk_end)?;
+
+        let final_logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let mut h = chunk_embeds.clone();
+            let seq_len = h.shape_at(1)?;
+
+            let fa_mask = {
+                let has_cache = caches.is_some();
+                if seq_len <= 1 && has_cache {
+                    None
+                } else {
+                    let cache_offset = caches.as_ref().map(|c| c[fa_idx].offset()).unwrap_or(0);
+                    Some(create_causal_mask(
+                        seq_len as i32,
+                        Some(cache_offset),
+                        None,
+                    )?)
+                }
+            };
+
+            let num_layers = layers.len();
+            for i in 0..num_layers {
+                let mask = if layers[i].is_linear() {
+                    None
+                } else {
+                    fa_mask.as_ref()
+                };
+                let cache = caches.as_mut().map(|c| &mut c[i]);
+                let layer_pos = if layers[i].is_linear() {
+                    None
+                } else {
+                    Some(&chunk_pos)
+                };
+                h = layers[i].forward(&h, mask, cache, layer_pos, true)?;
+            }
+
+            if is_final_chunk {
+                let final_hidden = h.slice_axis(1, seq_len - 1, seq_len)?;
+                let final_hidden = final_norm.forward(&final_hidden)?;
+                let logits = match lm_head {
+                    Some(head) => head.forward(&final_hidden)?,
+                    None => match embedding_weight_t {
+                        Some(wt) => final_hidden.matmul(wt)?,
+                        None => {
+                            let wt = text_model_embedding.transpose(Some(&[1, 0]))?;
+                            final_hidden.matmul(&wt)?
+                        }
+                    },
+                };
+                let logits = logits.squeeze(Some(&[1]))?;
+                eval_layer_caches(caches);
+                MxArray::eval_arrays(&[&logits]);
+                crate::array::clear_cache();
+                Some(logits)
+            } else {
+                None
+            }
+        };
+
+        if let Some(logits) = final_logits {
+            return Ok(logits);
+        }
+
+        eval_layer_caches(caches);
+        crate::array::clear_cache();
+        offset = chunk_end;
+    }
+
+    Err(Error::from_reason(
+        "VLM MoE prefill received an empty sequence",
+    ))
+}
+
 /// Single-token decode step using C++ MoE forward pass.
 ///
 /// Unlike the dense model's compiled path, MoE routing is data-dependent so
@@ -5629,8 +5727,6 @@ fn vlm_prefill_moe(
     embedding_weight_t: Option<&MxArray>,
     vision_cache: &VisionCache,
 ) -> Result<(MxArray, i64)> {
-    use crate::array::clear_cache;
-
     let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
         input_ids,
         image_cache_key,
@@ -5643,69 +5739,89 @@ fn vlm_prefill_moe(
     )?;
 
     // === STEP 4: Rust prefill with M-RoPE ===
-    // MoE VLM always uses Rust path for prefill (no C++ VLM prefill for MoE)
-    let logits = {
-        let _stream_ctx = StreamContext::new(generation_stream);
+    // MoE VLM always uses Rust path for prefill (no C++ VLM prefill for MoE).
+    #[cfg(target_family = "wasm")]
+    let last_logits = chunked_vlm_prefill_moe(
+        &inputs_embeds,
+        &position_ids,
+        layers_guard,
+        caches_guard,
+        final_norm_guard,
+        lm_head_guard,
+        text_model_embedding,
+        fa_idx,
+        embedding_weight_t,
+        generation_stream,
+    )?;
 
-        let mut h = inputs_embeds.clone();
-        let seq_len = h.shape_at(1)?;
+    #[cfg(not(target_family = "wasm"))]
+    let last_logits = {
+        use crate::array::clear_cache;
 
-        let fa_mask = if seq_len > 1 {
-            let offset = caches_guard
-                .as_ref()
-                .map(|c| c[fa_idx].offset())
-                .unwrap_or(0);
-            Some(create_causal_mask(seq_len as i32, Some(offset), None)?)
-        } else {
-            None
-        };
+        let logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
 
-        let num_layers = layers_guard.len();
-        for i in 0..num_layers {
-            let mask = if layers_guard[i].is_linear() {
-                None
+            let mut h = inputs_embeds.clone();
+            let seq_len = h.shape_at(1)?;
+
+            let fa_mask = if seq_len > 1 {
+                let offset = caches_guard
+                    .as_ref()
+                    .map(|c| c[fa_idx].offset())
+                    .unwrap_or(0);
+                Some(create_causal_mask(seq_len as i32, Some(offset), None)?)
             } else {
-                fa_mask.as_ref()
-            };
-            let cache = caches_guard.as_mut().map(|c| &mut c[i]);
-            let layer_pos = if layers_guard[i].is_linear() {
                 None
-            } else {
-                Some(&position_ids)
             };
-            h = layers_guard[i].forward(&h, mask, cache, layer_pos, true)?;
-        }
 
-        let h = final_norm_guard.forward(&h)?;
-        let logits = match lm_head_guard {
-            Some(head) => head.forward(&h)?,
-            None => match embedding_weight_t {
-                Some(wt) => h.matmul(wt)?,
-                None => {
-                    let wt = text_model_embedding.transpose(Some(&[1, 0]))?;
-                    h.matmul(&wt)?
+            let num_layers = layers_guard.len();
+            for i in 0..num_layers {
+                let mask = if layers_guard[i].is_linear() {
+                    None
+                } else {
+                    fa_mask.as_ref()
+                };
+                let cache = caches_guard.as_mut().map(|c| &mut c[i]);
+                let layer_pos = if layers_guard[i].is_linear() {
+                    None
+                } else {
+                    Some(&position_ids)
+                };
+                h = layers_guard[i].forward(&h, mask, cache, layer_pos, true)?;
+            }
+
+            let h = final_norm_guard.forward(&h)?;
+            let logits = match lm_head_guard {
+                Some(head) => head.forward(&h)?,
+                None => match embedding_weight_t {
+                    Some(wt) => h.matmul(wt)?,
+                    None => {
+                        let wt = text_model_embedding.transpose(Some(&[1, 0]))?;
+                        h.matmul(&wt)?
+                    }
+                },
+            };
+
+            // Eval caches to break lazy chains
+            if let Some(ref caches) = *caches_guard {
+                let mut cache_arrays: Vec<&MxArray> = Vec::new();
+                for cache in caches.iter() {
+                    cache.collect_arrays(&mut cache_arrays);
                 }
-            },
+                if !cache_arrays.is_empty() {
+                    MxArray::async_eval_arrays(&cache_arrays);
+                }
+            }
+            clear_cache();
+
+            logits
         };
 
-        // Eval caches to break lazy chains
-        if let Some(ref caches) = *caches_guard {
-            let mut cache_arrays: Vec<&MxArray> = Vec::new();
-            for cache in caches.iter() {
-                cache.collect_arrays(&mut cache_arrays);
-            }
-            if !cache_arrays.is_empty() {
-                MxArray::async_eval_arrays(&cache_arrays);
-            }
-        }
-        clear_cache();
-
-        logits
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        last_logits.squeeze(Some(&[1]))?
     };
 
-    let seq_len = logits.shape_at(1)?;
-    let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-    let last_logits = last_logits.squeeze(Some(&[1]))?;
     Ok((last_logits, rope_deltas))
 }
 

@@ -165,18 +165,33 @@ const RECYCLE_DELAY = 256;
 // churns ~870 transient buffers/tok; reusing them eliminates Chrome's
 // createBuffer validation cost on the hot path.
 const bufferPool = new Map<string, number[]>();
+const BUFFER_POOL_MAX_BYTES = 512 * 1024 * 1024;
+const BUFFER_POOL_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 let bufferPoolHitCount = 0;
 let bufferPoolMissCount = 0;
+let bufferPoolBytes = 0;
 const activeCommandEncoders = new Set<number>();
 const pendingCommandBuffers = new Set<number>();
 const quarantinedBufferPoolHandles: number[] = [];
 const quarantinedBufferPoolSet = new Set<number>();
+const quarantinedBufferDestroyHandles: number[] = [];
+const quarantinedBufferDestroySet = new Set<number>();
+const pendingBufferDestroys: GPUBuffer[] = [];
+let pendingBufferDestroyBatchScheduled = false;
 
 function bufferPoolCapForSize(size: number): number {
   if (size <= 4 * 1024) return 512;
   if (size <= 64 * 1024) return 256;
   if (size <= 1024 * 1024) return 128;
   return 64;
+}
+
+function isPoolableSize(size: number): boolean {
+  return size > 0 && size <= BUFFER_POOL_MAX_BUFFER_BYTES;
+}
+
+function removeBufferPoolBytes(size: number): void {
+  bufferPoolBytes = Math.max(0, bufferPoolBytes - size);
 }
 
 // Task C: single-entry LRU bind group cache per pipeline.
@@ -341,6 +356,10 @@ function poolBufferHandleNow(
   size: number,
   usage: number,
 ): void {
+  if (!isPoolableSize(size)) {
+    destroyBufferHandleAfterSubmittedWork(handle);
+    return;
+  }
   const key = poolKey(usage, size);
   let stack = bufferPool.get(key);
   if (stack === undefined) {
@@ -349,9 +368,75 @@ function poolBufferHandleNow(
   }
   if (stack.length < bufferPoolCapForSize(size)) {
     stack.push(handle);
+    bufferPoolBytes += size;
+    while (bufferPoolBytes > BUFFER_POOL_MAX_BYTES) {
+      if (!evictOnePooledBuffer()) break;
+    }
     return;
   }
+  destroyBufferHandleAfterSubmittedWork(handle);
+}
+
+function evictOnePooledBuffer(): boolean {
+  for (const [key, stack] of bufferPool) {
+    const evicted = stack.shift();
+    if (evicted === undefined) {
+      bufferPool.delete(key);
+      continue;
+    }
+    const sep = key.indexOf(":");
+    const size = Number(key.slice(sep + 1));
+    removeBufferPoolBytes(size);
+    destroyBufferHandleAfterSubmittedWork(evicted);
+    if (stack.length === 0) bufferPool.delete(key);
+    return true;
+  }
+  return false;
+}
+
+function destroyBufferHandleAfterSubmittedWork(handle: number): void {
+  const buffer = handles[handle] as GPUBuffer | undefined;
   releaseHandle(handle);
+  if (buffer !== undefined) {
+    pendingBufferDestroys.push(buffer);
+    schedulePendingBufferDestroyBatch();
+  }
+}
+
+function drainPendingBufferDestroys(): void {
+  if (pendingBufferDestroys.length === 0) return;
+  const buffers = pendingBufferDestroys.splice(0);
+  for (const buffer of buffers) {
+    try {
+      buffer.destroy();
+    } catch (err) {
+      console.error("[GPU Worker] GPUBuffer destroy failed:", err);
+    }
+  }
+}
+
+function schedulePendingBufferDestroyBatch(): void {
+  if (pendingBufferDestroyBatchScheduled) return;
+  pendingBufferDestroyBatchScheduled = true;
+  queueMicrotask(() => {
+    pendingBufferDestroyBatchScheduled = false;
+    if (pendingBufferDestroys.length === 0) return;
+    const buffers = pendingBufferDestroys.splice(0);
+    void queue.onSubmittedWorkDone().then(
+      () => {
+        for (const buffer of buffers) {
+          try {
+            buffer.destroy();
+          } catch (err) {
+            console.error("[GPU Worker] deferred GPUBuffer destroy failed:", err);
+          }
+        }
+      },
+      (err) => {
+        console.error("[GPU Worker] deferred GPUBuffer destroy failed:", err);
+      },
+    );
+  });
 }
 
 function promoteQuarantinedBufferPoolHandles(): void {
@@ -359,25 +444,42 @@ function promoteQuarantinedBufferPoolHandles(): void {
   const handlesToPool = quarantinedBufferPoolHandles.splice(0);
   for (const handle of handlesToPool) {
     quarantinedBufferPoolSet.delete(handle);
+    if (quarantinedBufferDestroySet.has(handle)) {
+      continue;
+    }
     const size = bufferSizesArr[handle];
     const usage = bufferUsagesArr[handle];
-    if (
-      handles[handle] !== undefined &&
-      size !== undefined &&
-      usage !== undefined &&
-      size > 0 &&
-      isPoolable(usage)
-    ) {
+    if (handles[handle] === undefined) {
+      continue;
+    }
+    if (size !== undefined && usage !== undefined && isPoolable(usage)) {
       poolBufferHandleNow(handle, size, usage);
-    } else if (handles[handle] !== undefined) {
-      releaseHandle(handle);
+    } else {
+      destroyBufferHandleAfterSubmittedWork(handle);
     }
   }
 }
 
+function promoteQuarantinedBufferDestroyHandles(): void {
+  if (quarantinedBufferDestroyHandles.length === 0) return;
+  const handlesToDestroy = quarantinedBufferDestroyHandles.splice(0);
+  for (const handle of handlesToDestroy) {
+    quarantinedBufferDestroySet.delete(handle);
+    if (handles[handle] !== undefined) {
+      destroyBufferHandleAfterSubmittedWork(handle);
+    }
+  }
+}
+
+function promoteQuarantinedBufferHandles(): void {
+  promoteQuarantinedBufferPoolHandles();
+  promoteQuarantinedBufferDestroyHandles();
+}
+
 // Pool-aware buffer release — shared by BUFFER_RELEASE and BUFFER_RELEASE_BATCH.
-// Never actually destroys GPUBuffers (see comment in BUFFER_RELEASE handler):
-// pooling is just handle-table bookkeeping.
+// Small/medium buffers are parked for reuse; oversized or evicted buffers have
+// their handles released immediately and their GPUBuffer.destroy() deferred until
+// submitted queue work has completed.
 function releaseBufferHandle(handle: number): void {
   // Task E: dedicated uniform buffers attached to a BindGroupCacheEntry are
   // owned by the pipeline's lifecycle, not by a per-dispatch pool release.
@@ -385,14 +487,10 @@ function releaseBufferHandle(handle: number): void {
   // handle we returned from the deferred-uniform HOT MISS path; swallow it
   // here so the GPUBuffer survives until PIPELINE_RELEASE.
   if (dedicatedUniformHandles.has(handle)) return;
+  if (quarantinedBufferDestroySet.has(handle)) return;
   const size = bufferSizesArr[handle];
   const usage = bufferUsagesArr[handle];
-  if (
-    size !== undefined &&
-    usage !== undefined &&
-    size > 0 &&
-    isPoolable(usage)
-  ) {
+  if (size !== undefined && usage !== undefined) {
     if (hasUnsubmittedGpuWork()) {
       if (!quarantinedBufferPoolSet.has(handle)) {
         quarantinedBufferPoolSet.add(handle);
@@ -400,13 +498,21 @@ function releaseBufferHandle(handle: number): void {
       }
       return;
     }
-    poolBufferHandleNow(handle, size, usage);
-    // Keep handles[handle] / bufferSizesArr[handle] / bufferUsagesArr[handle]
-    // populated so a subsequent pool hit can return this handle with its
-    // metadata intact.
+    if (isPoolable(usage)) {
+      poolBufferHandleNow(handle, size, usage);
+    } else {
+      destroyBufferHandleAfterSubmittedWork(handle);
+    }
     return;
   }
-  releaseHandle(handle);
+  if (hasUnsubmittedGpuWork()) {
+    if (!quarantinedBufferPoolSet.has(handle)) {
+      quarantinedBufferPoolSet.add(handle);
+      quarantinedBufferPoolHandles.push(handle);
+    }
+    return;
+  }
+  destroyBufferHandleAfterSubmittedWork(handle);
 }
 
 // ---------- Memory Helpers (1J: cached WASM DataView) ----------
@@ -1490,7 +1596,7 @@ function handleFusedSubmit(): void {
   const cmdBuf = encoder.finish();
   queue.submit([cmdBuf]);
   activeCommandEncoders.delete(encoderHandle);
-  promoteQuarantinedBufferPoolHandles();
+  promoteQuarantinedBufferHandles();
   releaseHandle(encoderHandle);
 
   cmdU32[I_RESULT] = 0;
@@ -1881,7 +1987,7 @@ async function processCommand(fnId: number): Promise<void> {
       // `size` bytes into the mapped range, so the physical allocation on
       // that path MUST stay at logical `size` (a bucket-sized shadow would
       // cause an overrun on unmap copy-back).
-      if (!mappedAtCreation && size > 0 && isPoolable(usage)) {
+      if (!mappedAtCreation && isPoolable(usage) && isPoolableSize(size)) {
         // Prefer the stub-supplied override (already bucketed by the stub's
         // pool logic). Fall back to our own bucketing when the stub didn't
         // pass one (older callers, tests, or non-pooled create paths).
@@ -1891,6 +1997,7 @@ async function processCommand(fnId: number): Promise<void> {
         if (stack !== undefined && stack.length > 0) {
           const reused = stack.pop()!;
           if (stack.length === 0) bufferPool.delete(poolKey(usage, bucketSize));
+          removeBufferPoolBytes(bucketSize);
           bufferPoolHitCount++;
           // Update the logical size so a subsequent BUFFER_GET_SIZE on the
           // reused handle returns the NEW caller's logical size, not a
@@ -2151,7 +2258,7 @@ async function processCommand(fnId: number): Promise<void> {
         pendingCommandBuffers.delete(handle);
       }
       queue.submit(commandBuffers);
-      promoteQuarantinedBufferPoolHandles();
+      promoteQuarantinedBufferHandles();
       setResult(0);
       break;
     }
@@ -2500,20 +2607,17 @@ async function processCommand(fnId: number): Promise<void> {
     }
 
     case RpcFn.BUFFER_DESTROY: {
-      // NO-OP: Don't actually destroy buffers. The old uniform buffer pattern
-      // destroys buffers before queue.submit, causing "Buffer used in submit
-      // while destroyed" validation errors. Buffers are cleaned up on release
-      // (handle table removal) and eventually GC'd.
+      // Keep destroy as a lifecycle no-op in the browser bridge. MLX's WebGPU
+      // allocator commonly calls destroy before release; release is the point
+      // where we either pool or safely defer GPUBuffer.destroy().
       setResult(0);
       break;
     }
 
     case RpcFn.BUFFER_RELEASE: {
-      // Pool fast path: park the GPUBuffer for reuse instead of releasing.
-      // Safe because gpu-worker never actually destroys GPUBuffers on release
-      // (destroying them before queue.submit completes triggers "Buffer used
-      // in submit while destroyed" validation errors) — so pooling is just
-      // handle-table bookkeeping.
+      // Pool fast path: park eligible GPUBuffers for reuse. Buffers that exceed
+      // the byte budget, are too large, or have unpoolable usage are released
+      // from the handle table and destroyed only after submitted work completes.
       releaseBufferHandle(arg0());
       setResult(0);
       break;
@@ -2594,6 +2698,7 @@ async function processCommand(fnId: number): Promise<void> {
       // This is the whole reason for the two-worker architecture:
       // the event loop is free here, so onSubmittedWorkDone() resolves.
       await queue.onSubmittedWorkDone();
+      drainPendingBufferDestroys();
       // NOW it's safe to fire GPU-done callbacks. Move them to the ring
       // so flushCallbacks() writes them to the callback ring for the wasm-worker.
       if (gpuDoneCount > 0) {
@@ -2666,7 +2771,7 @@ async function processCommand(fnId: number): Promise<void> {
       const cmdBuf = encoder.finish();
       queue.submit([cmdBuf]);
       activeCommandEncoders.delete(encoderHandle);
-      promoteQuarantinedBufferPoolHandles();
+      promoteQuarantinedBufferHandles();
       releaseHandle(encoderHandle);
       setResult(0);
       break;
@@ -2817,7 +2922,7 @@ async function processCommand(fnId: number): Promise<void> {
 
       try {
         let handle: number;
-        const poolable = isPoolable(usage);
+        const poolable = isPoolable(usage) && isPoolableSize(size);
         // Only bucket for poolable usages — non-poolable buffers never
         // re-enter the pool, so bucketing would just waste memory with no
         // reuse payoff.
@@ -2829,6 +2934,7 @@ async function processCommand(fnId: number): Promise<void> {
           handle = stack.pop()!;
           if (stack.length === 0)
             bufferPool.delete(poolKey(usage, physicalSize));
+          removeBufferPoolBytes(physicalSize);
           bufferPoolHitCount++;
           // Overwrite the pooled buffer's contents with the new data (only
           // the first `size` bytes; the tail of physicalSize is don't-care
