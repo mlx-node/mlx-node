@@ -156,12 +156,30 @@ export type AnthropicResponseContent =
  *     is implicit and has no `cache_control` breakpoints, so a client
  *     that did not request explicit caching should never see a
  *     non-zero creation count.
+ *
+ * The `time_to_first_token_ms`, `prefill_tokens_per_second`, and
+ * `decode_tokens_per_second` fields are NON-Anthropic extension
+ * fields surfaced for the launcher's verbose log
+ * (`requests.ndjson`) so per-turn decode-rate / TTFT / prefill-rate
+ * telemetry rides the same response envelope. They are emitted only
+ * when the underlying native dispatch produced a finite, positive
+ * value — missing or non-finite metrics are elided rather than
+ * surfaced as zero / null. Anthropic-compatible clients (Claude
+ * Code, official Anthropic SDKs) ignore unknown fields, so the
+ * extension is wire-safe — it parallels how `cache_read_input_tokens`
+ * is treated above.
  */
 export interface AnthropicUsage {
   input_tokens: number;
   output_tokens: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
+  /** Server-extension: time-to-first-token in milliseconds. */
+  time_to_first_token_ms?: number;
+  /** Server-extension: prompt-token throughput during prefill. */
+  prefill_tokens_per_second?: number;
+  /** Server-extension: generated-token throughput during decode. */
+  decode_tokens_per_second?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,12 +256,24 @@ export interface AnthropicMessageDeltaEvent {
    * `AnthropicUsage` above) — `input_tokens` MUST be net of any reused
    * prefix, and `cache_read_input_tokens` is emitted only on a true
    * reuse turn.
+   *
+   * `time_to_first_token_ms`, `prefill_tokens_per_second`, and
+   * `decode_tokens_per_second` are server-extension fields (not in
+   * Anthropic's spec) surfaced for the launcher's verbose log; see
+   * the docstring on `AnthropicUsage`. Clients that do not recognize
+   * them ignore them.
    */
   usage: {
     input_tokens?: number;
     output_tokens: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
+    /** Server-extension: time-to-first-token in milliseconds. */
+    time_to_first_token_ms?: number;
+    /** Server-extension: prompt-token throughput during prefill. */
+    prefill_tokens_per_second?: number;
+    /** Server-extension: generated-token throughput during decode. */
+    decode_tokens_per_second?: number;
   };
 }
 

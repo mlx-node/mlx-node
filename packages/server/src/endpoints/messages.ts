@@ -59,7 +59,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
+import type { ChatConfig, ChatMessage, ChatResult, PerformanceMetrics } from '@mlx-node/core';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
@@ -119,7 +119,13 @@ async function handleNonStreaming(
   visibility: TransportVisibility,
 ): Promise<void> {
   const messageId = genId('msg_');
-  const response = buildAnthropicResponse(result, body, messageId);
+  // `result.performance` is only populated when `reportPerformance: true`
+  // rides on the underlying `ChatConfig`; otherwise the field is
+  // `undefined` and the mapper elides the wire-extension fields. The
+  // launcher wires the flag on for verbose-log builds and leaves it off
+  // by default, matching how `cachedTokens` is treated through
+  // `buildAnthropicResponse`.
+  const response = buildAnthropicResponse(result, body, messageId, result.performance);
 
   // Native `chatSession*` has no AbortSignal surface yet, so a client that
   // disconnects mid-decode still burns every remaining token under the
@@ -192,6 +198,14 @@ async function handleStreamingNative(
   // adopted the surface — so `buildMessageDelta` falls back to the
   // pre-Round-6 behaviour.
   let terminalCachedTokens: number | undefined;
+  // Captured from the terminal `done` chunk so the success-branch
+  // `buildMessageDelta` can attach the server-extension perf fields
+  // (`time_to_first_token_ms`, `prefill_tokens_per_second`,
+  // `decode_tokens_per_second`). Stays `undefined` when the underlying
+  // dispatch did not opt into performance reporting (or when a mock
+  // bridge omits the field) — the mapper elides the fields rather
+  // than emitting zeros.
+  let terminalPerformance: PerformanceMetrics | undefined;
   let terminalErrorMessage: string | null = null;
 
   // `thrownError` sticks on a generator throw; `clientAborted` sticks on
@@ -403,6 +417,7 @@ async function handleStreamingNative(
         terminalNumTokens = event.numTokens;
         terminalPromptTokens = event.promptTokens;
         terminalCachedTokens = event.cachedTokens;
+        terminalPerformance = event.performance;
         break;
       }
 
@@ -501,7 +516,7 @@ async function handleStreamingNative(
     writeSSEEvent(
       res,
       'message_delta',
-      buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens, terminalCachedTokens),
+      buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens, terminalCachedTokens, terminalPerformance),
     );
     // HTTP/1.1 chunked-encoding trailer: report the engine's cache-hit
     // count once the SSE stream has settled. The header has to wait

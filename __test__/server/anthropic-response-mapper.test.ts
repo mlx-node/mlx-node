@@ -178,6 +178,48 @@ describe('buildAnthropicResponse', () => {
     expect(response.usage).not.toHaveProperty('cache_creation_input_tokens');
   });
 
+  it('emits server-extension perf fields when performance is supplied', () => {
+    // Non-Anthropic extension fields surfaced for the launcher's
+    // verbose log. Anthropic-compatible clients ignore unknown
+    // fields, so these stay wire-safe.
+    const result = makeChatResult();
+    const response = buildAnthropicResponse(result, baseReq, 'msg_perf', {
+      ttftMs: 1234,
+      prefillTokensPerSecond: 800,
+      decodeTokensPerSecond: 73.5,
+    });
+
+    expect(response.usage.time_to_first_token_ms).toBe(1234);
+    expect(response.usage.prefill_tokens_per_second).toBe(800);
+    expect(response.usage.decode_tokens_per_second).toBe(73.5);
+  });
+
+  it('elides perf fields when performance is undefined', () => {
+    const result = makeChatResult();
+    const response = buildAnthropicResponse(result, baseReq, 'msg_no_perf', undefined);
+
+    expect(response.usage).not.toHaveProperty('time_to_first_token_ms');
+    expect(response.usage).not.toHaveProperty('prefill_tokens_per_second');
+    expect(response.usage).not.toHaveProperty('decode_tokens_per_second');
+  });
+
+  it('elides invalid / zero perf metrics, keeps finite > 0 values', () => {
+    // Same gating pattern as `cache_read_input_tokens`: a
+    // partially-plumbed driver (or a bf16 NaN slipping through the
+    // native path) must NOT surface a zero / NaN as if it were a
+    // real measurement. Only the finite, positive value lands.
+    const result = makeChatResult();
+    const response = buildAnthropicResponse(result, baseReq, 'msg_partial_perf', {
+      ttftMs: Number.NaN,
+      prefillTokensPerSecond: 0,
+      decodeTokensPerSecond: 73.5,
+    });
+
+    expect(response.usage).not.toHaveProperty('time_to_first_token_ms');
+    expect(response.usage).not.toHaveProperty('prefill_tokens_per_second');
+    expect(response.usage.decode_tokens_per_second).toBe(73.5);
+  });
+
   it('empty text with tool calls produces no text block, only tool_use blocks', () => {
     const result = makeChatResult({
       text: '',
@@ -328,6 +370,45 @@ describe('buildMessageDelta', () => {
     expect(event.usage.cache_read_input_tokens).toBe(7);
     expect(event.usage).not.toHaveProperty('input_tokens');
     expect(event.usage.output_tokens).toBe(5);
+  });
+
+  it('emits server-extension perf fields when performance is supplied', () => {
+    // Non-Anthropic extension fields surfaced for the launcher's
+    // verbose log (`requests.ndjson`). Mirrors the non-streaming
+    // `buildAnthropicResponse` perf path.
+    const event = buildMessageDelta('end_turn', 5, undefined, undefined, {
+      ttftMs: 1234,
+      prefillTokensPerSecond: 800,
+      decodeTokensPerSecond: 73.5,
+    });
+
+    expect(event.usage.time_to_first_token_ms).toBe(1234);
+    expect(event.usage.prefill_tokens_per_second).toBe(800);
+    expect(event.usage.decode_tokens_per_second).toBe(73.5);
+  });
+
+  it('elides perf fields when performance is undefined', () => {
+    const event = buildMessageDelta('end_turn', 5, 11, 0, undefined);
+
+    expect(event.usage).not.toHaveProperty('time_to_first_token_ms');
+    expect(event.usage).not.toHaveProperty('prefill_tokens_per_second');
+    expect(event.usage).not.toHaveProperty('decode_tokens_per_second');
+  });
+
+  it('elides invalid / zero perf metrics, keeps finite > 0 values', () => {
+    // Filtering: a partially-plumbed dispatch returning NaN / 0
+    // must NOT surface those as wire metrics — the launcher reads
+    // absence as "not plumbed", a literal zero would look like a
+    // real measurement.
+    const event = buildMessageDelta('end_turn', 5, undefined, undefined, {
+      ttftMs: Number.NaN,
+      prefillTokensPerSecond: 0,
+      decodeTokensPerSecond: 73.5,
+    });
+
+    expect(event.usage).not.toHaveProperty('time_to_first_token_ms');
+    expect(event.usage).not.toHaveProperty('prefill_tokens_per_second');
+    expect(event.usage.decode_tokens_per_second).toBe(73.5);
   });
 });
 
