@@ -32,10 +32,43 @@ describe('resolvePagedAwareModelPath', () => {
     }
   });
 
-  it('returns the original path when use_block_paged_cache is already true', async () => {
+  it('returns the original path when both the flag and the mem floor are already satisfied', async () => {
+    const src = await makeFixture('qwen3_5', {
+      use_block_paged_cache: true,
+      paged_cache_memory_mb: 32768,
+    });
+    try {
+      const result = await resolvePagedAwareModelPath(src);
+      expect(result).toBe(src);
+    } finally {
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it('clones and bumps paged_cache_memory_mb when flag is set but mem is unset', async () => {
     const src = await makeFixture('qwen3_5', { use_block_paged_cache: true });
     try {
       const result = await resolvePagedAwareModelPath(src);
+      expect(result).not.toBe(src);
+
+      const cfg = JSON.parse(await readFile(join(result, 'config.json'), 'utf-8')) as Record<string, unknown>;
+      expect(cfg.use_block_paged_cache).toBe(true);
+      expect(typeof cfg.paged_cache_memory_mb).toBe('number');
+      expect(cfg.paged_cache_memory_mb as number).toBeGreaterThanOrEqual(16384);
+    } finally {
+      await cleanupPagedOverrides();
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a source paged_cache_memory_mb that already exceeds the floor', async () => {
+    const src = await makeFixture('qwen3_5_moe', {
+      use_block_paged_cache: true,
+      paged_cache_memory_mb: 65536,
+    });
+    try {
+      const result = await resolvePagedAwareModelPath(src);
+      // Both knobs already satisfied → no clone, source path returned as-is.
       expect(result).toBe(src);
     } finally {
       await rm(src, { recursive: true, force: true });
@@ -51,6 +84,7 @@ describe('resolvePagedAwareModelPath', () => {
       const cfg = JSON.parse(await readFile(join(result, 'config.json'), 'utf-8')) as Record<string, unknown>;
       expect(cfg.use_block_paged_cache).toBe(true);
       expect(cfg.model_type).toBe('qwen3_5');
+      expect(cfg.paged_cache_memory_mb as number).toBeGreaterThanOrEqual(16384);
 
       // Weights should be symlinks to the source.
       const weightLink = await readlink(join(result, 'model-00001-of-00001.safetensors'));

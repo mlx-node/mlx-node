@@ -29,6 +29,18 @@
  * that pins `use_block_paged_cache: true`. The cloned path is what
  * `loadModel` sees.
  *
+ * Pool-size bump: the Rust default for `paged_cache_memory_mb` is
+ * 2048 (qwen3_5_moe/model.rs:500, qwen3_5/model.rs:569). On the
+ * Qwen3.6-35b-a3b workload that gives ~4500 blocks ≈ 72k tokens of
+ * total KV across all in-flight conversations — which a single
+ * Claude-Code subagent fanning Reads across a test directory can
+ * blow past in one turn (observed: 386 KB / ~95k-token tool_result
+ * batch from an Explore agent). The launcher floors this to
+ * `DEFAULT_PAGED_CACHE_MB` (16 GB, ~50k blocks ≈ 800k tokens for
+ * Qwen3.6 MoE bf16) so concurrent conversations + long contexts
+ * fit. Override via `MLX_PAGED_CACHE_MEMORY_MB`. A source config
+ * already setting a value ≥ the floor is preserved as-is.
+ *
  * Only Qwen3.5 dense + MoE are intercepted. Qwen3, LFM2, and Gemma4
  * are already default-on for `use_block_paged_cache`; pass-through
  * those untouched. Any other model type (VLMs, OCR, document
@@ -43,6 +55,17 @@ const PAGED_OVERRIDE_ROOT = join(tmpdir(), 'mlx-launch-claude-paged-overrides');
 
 /** Model types whose default `use_block_paged_cache` is `false` and that we want to flip ON for `mlx launch claude`. */
 const QWEN35_MODEL_TYPES = new Set(['qwen3_5', 'qwen3_5_moe']);
+
+/** Floor for `paged_cache_memory_mb` (in MB). Sized for Qwen3.6 MoE on a 128 GB Mac with ~30 GB of weights resident. */
+const DEFAULT_PAGED_CACHE_MB = 16384;
+
+function resolvePagedCacheFloorMb(): number {
+  const raw = process.env.MLX_PAGED_CACHE_MEMORY_MB;
+  if (raw == null || raw === '') return DEFAULT_PAGED_CACHE_MB;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_PAGED_CACHE_MB;
+  return parsed;
+}
 
 /** Tracks every override directory we created so the launcher can clean up on shutdown. */
 const createdOverrides = new Set<string>();
@@ -74,11 +97,18 @@ export async function resolvePagedAwareModelPath(modelPath: string): Promise<str
     return modelPath;
   }
 
-  // Bail out early if the source already has the flag set — no need to clone.
+  const pagedCacheFloorMb = resolvePagedCacheFloorMb();
+
+  // Bail out early only if the source already satisfies BOTH knobs we'd otherwise patch.
   try {
     const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
-    const config = JSON.parse(raw) as { use_block_paged_cache?: boolean };
-    if (config.use_block_paged_cache === true) return modelPath;
+    const config = JSON.parse(raw) as {
+      use_block_paged_cache?: boolean;
+      paged_cache_memory_mb?: number;
+    };
+    const flagOk = config.use_block_paged_cache === true;
+    const memOk = typeof config.paged_cache_memory_mb === 'number' && config.paged_cache_memory_mb >= pagedCacheFloorMb;
+    if (flagOk && memOk) return modelPath;
   } catch {
     return modelPath;
   }
@@ -94,6 +124,9 @@ export async function resolvePagedAwareModelPath(modelPath: string): Promise<str
       const raw = await readFile(src, 'utf-8');
       const config = JSON.parse(raw) as Record<string, unknown>;
       config.use_block_paged_cache = true;
+      const sourceMem = config.paged_cache_memory_mb;
+      const sourceMemNum = typeof sourceMem === 'number' && sourceMem > 0 ? sourceMem : 0;
+      config.paged_cache_memory_mb = Math.max(sourceMemNum, pagedCacheFloorMb);
       await writeFile(dst, JSON.stringify(config, null, 2), 'utf-8');
       continue;
     }
