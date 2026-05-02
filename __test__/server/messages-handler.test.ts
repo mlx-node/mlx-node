@@ -675,6 +675,62 @@ describe('handleCreateMessage', () => {
       expect(toolBlock.name).toBe('get_weather');
       expect(toolBlock.input).toEqual({ location: 'San Francisco' });
     });
+
+    it('drops the warm slot when chatSessionStart resolves with finishReason="error"', async () => {
+      // Defensive-hardening gate: today every native failure throws,
+      // but `runSessionNonStreaming` enforces the invariant locally so
+      // a future Rust change that resolves `chat_session_start_sync`
+      // with `Ok(finish_reason="error")` cannot silently poison the
+      // warm slot. Mirrors the streaming-side dual-gate
+      // (`streamResult.ok && outcome.wasCommitted()`) and the sibling
+      // `/v1/responses` adopt gate.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ finishReason: 'error' }));
+      registry.register('test-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Hello' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      // Native promise resolved cleanly, so the request returns 200
+      // and the body still flushes — only the warm-slot adoption is
+      // gated. The next request that should hit the slot must miss.
+      expect(getStatus()).toBe(200);
+      expect(sessionReg.size).toBe(0);
+    });
+
+    it('adopts the warm slot on a clean finishReason="stop" (regression)', async () => {
+      // Companion to the `finishReason="error"` test above: pin the
+      // happy-path branch of the same gate so a regression that
+      // inverts the predicate fails loudly instead of silently
+      // suppressing every warm-slot adoption.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(makeChatResult({ finishReason: 'stop' }));
+      registry.register('test-model', mockModel);
+      const sessionReg = registry.getSessionRegistry('test-model')!;
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Hello' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      expect(sessionReg.size).toBe(1);
+    });
   });
 
   // -----------------------------------------------------------------------

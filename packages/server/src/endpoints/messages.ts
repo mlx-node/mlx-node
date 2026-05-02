@@ -567,13 +567,26 @@ async function handleStreamingNative(
 
 // Session routing
 
+/**
+ * Non-streaming dispatch outcome. Mirrors the `{ result, committed }`
+ * shape from the sibling `/v1/responses` endpoint
+ * (`responses.ts:1361-1362`) so the warm-slot adopt site can dual-gate
+ * on commit success. `committed` is measured against `initialTurns`
+ * captured AFTER `primeHistory` AND requires a non-error
+ * `finishReason` — see the comment at the gate inside the helper.
+ */
+interface MessagesNonStreamingOutcome {
+  result: ChatResult;
+  committed: boolean;
+}
+
 /** Prime a session with the full history and run a single turn. */
 async function runSessionNonStreaming(
   session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
   config: ChatConfig,
   isFreshSession: boolean,
-): Promise<ChatResult> {
+): Promise<MessagesNonStreamingOutcome> {
   // Dual-branch reset gated on the registry lookup outcome:
   //
   //   * MISS (`isFreshSession === true`) — we MUST run a full
@@ -602,7 +615,19 @@ async function runSessionNonStreaming(
     await resetPreservingNativeCacheForWarmReuse(session);
   }
   session.primeHistory(messages);
-  return await session.startFromHistory(config);
+  const initialTurns = session.turns;
+  const result = await session.startFromHistory(config);
+  // Mirror the streaming-side dual-gate (`streamResult.ok &&
+  // outcome.wasCommitted()`) and the sibling `/v1/responses` adopt
+  // gate. `ChatSession.startFromHistory` advances `turnCount`
+  // unconditionally on a clean resolve, so `session.turns >
+  // initialTurns` alone never trips today — every native error path
+  // throws. The `finishReason !== 'error'` clause defends the
+  // invariant LOCALLY so a future Rust change that resolves
+  // `chat_session_start_sync` with `Ok(finish_reason="error")` cannot
+  // silently poison the warm slot.
+  const committed = session.turns > initialTurns && result.finishReason !== 'error';
+  return { result, committed };
 }
 
 /**
@@ -1062,7 +1087,8 @@ export async function handleCreateMessage(
             const isFreshSession = pagedActive ? true : !lookup.hit;
             // Native `chatSessionStart` has no AbortSignal yet — disconnect handling
             // lives inside `handleNonStreaming` / `endJson`.
-            const result = await runSessionNonStreaming(session, messages, config, isFreshSession);
+            const outcome = await runSessionNonStreaming(session, messages, config, isFreshSession);
+            const result = outcome.result;
             // Re-classify the `X-Session-Cache` header.
             //
             // Non-paged: a warm-slot hit that did NOT actually produce
@@ -1093,18 +1119,32 @@ export async function handleCreateMessage(
               res.setHeader('X-Cached-Tokens', String(result.cachedTokens));
             }
             await handleNonStreaming(res, result, body, visibility);
-            // Non-paged success: adopt the warm slot unconditionally.
-            // Any throw from `runSessionNonStreaming` /
-            // `handleNonStreaming` would have routed through the
-            // inner catch below (which drops the slot) instead of
-            // reaching this point.
+            // Non-paged success: adopt the warm slot only when the
+            // dispatch actually committed. Mirrors the streaming-side
+            // dual-gate at `streamResult.ok && outcome.wasCommitted()`
+            // above and the sibling `/v1/responses` adopt gate, so the
+            // local invariant — "never adopt an uncommitted session"
+            // — is enforced by the same check on both wire formats and
+            // both endpoints. Today every native failure throws (and
+            // routes through the inner catch below), so the gate is
+            // dead code on the current Rust paths; it defends the
+            // invariant LOCALLY so a future native change that
+            // resolves `chat_session_start_sync` with
+            // `Ok(finish_reason="error")` cannot silently poison the
+            // warm slot. Drop on the uncommitted branch matches the
+            // streaming-side `else { drop(...) }` so the sentinel does
+            // not accumulate stale entries from earlier turns.
             //
             // Paged success: never adopt — block-level reuse is
             // already in the native cache, and adopting would
             // re-introduce the cross-endpoint warm-slot eviction
             // that paged is supposed to eliminate.
             if (!pagedActive) {
-              sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+              if (outcome.committed) {
+                sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+              } else {
+                sessionReg.drop(MESSAGES_WARM_SLOT_ID);
+              }
             }
           }
         } catch (err) {
