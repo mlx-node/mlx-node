@@ -137,6 +137,56 @@ describe('mapAnthropicRequest', () => {
       expect(t1).toBe('You are Claude.');
       expect(t1).toBe(t2);
     });
+
+    it('returns null when array system contains only billing header blocks', () => {
+      // A request whose only system block is the rotating Anthropic
+      // billing-header line is semantically equivalent to "no system" —
+      // collapse to `null` rather than the empty string so (a) the
+      // chat template does not emit two extra wrapper tokens for an
+      // empty `system` message, and (b) the warm-slot cache key compares
+      // byte-equal to an absent-system request (`null === null`, where
+      // `'' !== null` would otherwise miss the slot).
+      expect(
+        canonicalizeSystemForCacheKey([
+          { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806;' },
+        ]),
+      ).toBeNull();
+    });
+
+    it('all-stripped array is equivalent to absent system for cache-key purposes', () => {
+      // Cache-key invariant: a request whose system field is absent
+      // and a request whose only system block is the rotating
+      // billing-header line MUST produce the same cache key (both
+      // `null`). Any divergence here re-introduces the warm-slot drift
+      // this fix targets.
+      expect(canonicalizeSystemForCacheKey(undefined)).toBe(
+        canonicalizeSystemForCacheKey([
+          { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=ROT1;' },
+        ]),
+      );
+    });
+  });
+
+  it('mapAnthropicRequest emits no system message when all blocks are stripped', () => {
+    // When every system block is stripped (here the only block is the
+    // rotating `x-anthropic-billing-header` line), the mapper MUST NOT
+    // push a `{ role: 'system', content: '' }` placeholder. The chat
+    // template wraps every pushed message with `<|im_start|>{role}\n
+    // {content}<|im_end|>\n`, so an empty system content emits two extra
+    // wrapper tokens that an absent-system request would not — perturbing
+    // the prefix and breaking prefix caching across two semantically
+    // equivalent requests.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      system: [
+        { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=4a8a9;' },
+      ],
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+
+    expect(messages.some((m) => m.role === 'system')).toBe(false);
+    expect(messages).toEqual([{ role: 'user', content: 'Hi' }]);
   });
 
   it('maps multi-turn conversation (user → assistant → user)', () => {

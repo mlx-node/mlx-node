@@ -56,6 +56,16 @@ export function canonicalizeSystemForCacheKey(system: AnthropicMessagesRequest['
       parts.push(b.text);
     }
   }
+  // An array whose every block is stripped (e.g. a request whose only system
+  // block is the rotating `x-anthropic-billing-header` line) is semantically
+  // equivalent to "no system" — collapse to `null` so it (a) does NOT push an
+  // empty `system` ChatMessage that the chat template wraps with two extra
+  // `<|im_start|>system\n<|im_end|>\n` tokens (perturbing the prefix vs. an
+  // absent-system request), and (b) compares byte-equal to `undefined` /
+  // missing on the warm-slot gate (`SessionRegistry.getOrCreateWarmAny`
+  // checks `entry.instructions !== requestedInstructions`, where `null !==
+  // ''` would otherwise miss the slot).
+  if (parts.length === 0) return null;
   return parts.join('');
 }
 
@@ -127,13 +137,19 @@ export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthro
           throw new Error(`Unsupported system block type: "${(b as { type: string }).type}"`);
         }
       }
-      // Helper returns `string` (possibly empty) for any non-null array
-      // input; the `?? ''` is a defensive default for the unreachable
-      // null branch. Empty content is semantically equivalent to "no
-      // system" once stripped, and downstream tokenization handles it
-      // harmlessly.
-      const content = canonicalizeSystemForCacheKey(req.system) ?? '';
-      messages.push({ role: 'system', content });
+      // Helper returns `null` when every block was stripped (e.g. a
+      // request whose only system block is the rotating
+      // `x-anthropic-billing-header` line). An all-stripped array is
+      // semantically equivalent to "no system", so skip the push
+      // entirely — emitting `{ role: 'system', content: '' }` would
+      // otherwise have the chat template wrap it with two extra
+      // `<|im_start|>system\n<|im_end|>\n` tokens, perturbing the
+      // prefix vs. an absent-system request and breaking prefix
+      // caching across the two semantically-equivalent shapes.
+      const content = canonicalizeSystemForCacheKey(req.system);
+      if (content !== null) {
+        messages.push({ role: 'system', content });
+      }
     }
   }
 
