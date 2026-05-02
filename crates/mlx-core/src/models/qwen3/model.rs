@@ -2013,7 +2013,7 @@ impl Qwen3Inner {
     /// 1. Choose between **cold start** and **warm continuation**:
     ///    - Cold start (first turn, or after reset_caches /
     ///      image-change): `reset_for_new_request(seq_id)` →
-    ///      `find_cached_prefix(prompt_tokens, &[])` →
+    ///      `find_cached_prefix(prompt_tokens, &[], 0, false)` →
     ///      `allocate_suffix_blocks(total_tokens)`. The first looks up
     ///      the longest matching prefix in the shared `BlockAllocator`'s
     ///      prefix cache and pre-populates the block_table; the second
