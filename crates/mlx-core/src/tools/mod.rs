@@ -938,6 +938,13 @@ pub fn parse_generation_output(text: &str) -> (String, Vec<ToolCallResult>, Opti
     (cleaned_text, tool_calls, thinking)
 }
 
+fn strip_leading_think_tag(text: &str) -> &str {
+    text.strip_prefix("<think>")
+        .or_else(|| text.strip_prefix("<longcat_think>"))
+        .unwrap_or(text)
+        .trim()
+}
+
 /// Check if the `</think>` token exists in generated tokens.
 pub fn has_think_end_token(generated_tokens: &[u32], think_end_id: Option<u32>) -> bool {
     think_end_id.is_some_and(|id| generated_tokens.contains(&id))
@@ -996,11 +1003,7 @@ pub fn split_at_think_end(
         let thinking_text = raw_text[..close_pos].trim();
         // Strip opening think tag from old-style templates that emit it
         // in generated text (newer templates inject it in the prompt).
-        let thinking_text = thinking_text
-            .strip_prefix("<think>")
-            .or_else(|| thinking_text.strip_prefix("<longcat_think>"))
-            .unwrap_or(thinking_text)
-            .trim();
+        let thinking_text = strip_leading_think_tag(thinking_text);
         let after_tag = &raw_text[close_pos + tag.len()..];
         let response_text = after_tag.trim_start_matches('\n').trim_start();
         let thinking = if thinking_text.is_empty() {
@@ -1013,6 +1016,42 @@ pub fn split_at_think_end(
     }
     // No token-level confirmation: fall back to generic text-level parsing.
     // This path is used by callers without token-level info (e.g. build_reward_outputs).
+    parse_generation_output(raw_text)
+}
+
+/// Split generated output at a token-confirmed thinking boundary while also
+/// extracting complete tool-call blocks that the model emitted inside
+/// reasoning.
+///
+/// This is intentionally separate from [`split_at_think_end`]. The default
+/// parser keeps tool calls isolated to the post-reasoning response text. This
+/// helper is for explicit tool-capable reasoning surfaces that need tool calls
+/// to execute even when a model places the XML/function block before `</think>`.
+pub fn split_at_think_end_with_reasoning_tools(
+    raw_text: &str,
+    think_end_tag: Option<&str>,
+) -> (String, Vec<ToolCallResult>, Option<String>) {
+    if let Some(tag) = think_end_tag
+        && let Some(close_pos) = raw_text.find(tag)
+    {
+        let thinking_text = strip_leading_think_tag(raw_text[..close_pos].trim());
+        let after_tag = &raw_text[close_pos + tag.len()..];
+        let response_text = after_tag.trim_start_matches('\n').trim_start();
+
+        let (clean_thinking, mut thinking_calls) = parse_tool_calls(thinking_text);
+        let (clean_text, mut response_calls) = parse_tool_calls(response_text);
+        thinking_calls.append(&mut response_calls);
+
+        let clean_thinking = clean_thinking.trim();
+        let thinking = if clean_thinking.is_empty() {
+            None
+        } else {
+            Some(clean_thinking.to_string())
+        };
+
+        return (clean_text.trim().to_string(), thinking_calls, thinking);
+    }
+
     parse_generation_output(raw_text)
 }
 
@@ -2326,6 +2365,44 @@ The weather in Tokyo is sunny."#;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "search");
         assert!(clean.trim().is_empty());
+    }
+
+    #[test]
+    fn test_split_at_think_end_with_reasoning_tools_extracts_json_tool() {
+        let text = "<think>Let me call <tool_call>{\"name\":\"search\",\"arguments\":{\"q\":\"test\"}}</tool_call> now</think>\nThe answer is 42";
+        let (clean, tools, thinking) =
+            split_at_think_end_with_reasoning_tools(text, Some("</think>"));
+        assert_eq!(clean, "The answer is 42");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "search");
+        assert_eq!(tools[0].status, "ok");
+        let t = thinking.unwrap();
+        assert!(!t.contains("<tool_call>"));
+        assert_eq!(t, "Let me call  now");
+    }
+
+    #[test]
+    fn test_split_at_think_end_with_reasoning_tools_extracts_function_tool() {
+        let text = "Plan first.\n<tool_call><function=create_app_preview><parameter=title>Heartbeat</parameter><parameter=html><main>Hi</main></parameter><parameter=css>body{color:red}</parameter><parameter=js>console.log(1)</parameter></function></tool_call></think>";
+        let (clean, tools, thinking) =
+            split_at_think_end_with_reasoning_tools(text, Some("</think>"));
+        assert!(clean.trim().is_empty());
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "create_app_preview");
+        assert_eq!(tools[0].arguments["title"], "Heartbeat");
+        assert_eq!(thinking.unwrap(), "Plan first.");
+    }
+
+    #[test]
+    fn test_split_at_think_end_with_reasoning_tools_preserves_order() {
+        let text = "reason <tool_call>{\"name\":\"first\",\"arguments\":{}}</tool_call></think>\ncontent <tool_call>{\"name\":\"second\",\"arguments\":{}}</tool_call>";
+        let (clean, tools, thinking) =
+            split_at_think_end_with_reasoning_tools(text, Some("</think>"));
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "first");
+        assert_eq!(tools[1].name, "second");
+        assert_eq!(thinking.unwrap(), "reason");
+        assert_eq!(clean.trim(), "content");
     }
 
     #[test]

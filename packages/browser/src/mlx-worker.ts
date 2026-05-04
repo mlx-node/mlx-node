@@ -102,7 +102,18 @@ function normalizeGenerationConfig(
   return out;
 }
 
-const WEIGHT_UPLOAD_BATCH_BYTES = 128 * 1024 * 1024;
+const VERY_LOW_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES = 64 * 1024 * 1024;
+const LOW_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES = 128 * 1024 * 1024;
+const DEFAULT_WEIGHT_UPLOAD_BATCH_BYTES = 256 * 1024 * 1024;
+const HIGH_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES = 384 * 1024 * 1024;
+const VERY_HIGH_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES = 512 * 1024 * 1024;
+const WORKSTATION_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES = 640 * 1024 * 1024;
+const LARGE_WORKSTATION_WEIGHT_UPLOAD_BATCH_BYTES = 768 * 1024 * 1024;
+const HUGE_WORKSTATION_WEIGHT_UPLOAD_BATCH_BYTES = 896 * 1024 * 1024;
+const MAX_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES = 1024 * 1024 * 1024;
+const MIN_WEIGHT_UPLOAD_BATCH_BYTES = 32 * 1024 * 1024;
+const MAX_WEIGHT_UPLOAD_BATCH_BYTES = MAX_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
+const LARGE_TENSOR_SOLO_BATCH_BYTES = 384 * 1024 * 1024;
 const HF_CACHE_NAME = "mlx-browser-huggingface-models-v1";
 const HF_CACHE_ORIGIN = "https://mlx-node-browser.local";
 
@@ -212,8 +223,12 @@ function buildChatConfig(data: {
   );
   const hasImages =
     Array.isArray(data.messages) && hasMessageImages(data.messages);
+  const hasTools =
+    Array.isArray(baseConfig.tools) && baseConfig.tools.length > 0;
   const effort =
-    requestedEffort === "off" && hasImages ? "low" : requestedEffort;
+    requestedEffort === "off" && hasImages && !hasTools
+      ? "low"
+      : requestedEffort;
 
   if (effort === "off") {
     return {
@@ -382,6 +397,34 @@ function uploadItemByteSize(item: UploadItem): number {
     : item.plan.tensor.byteSize;
 }
 
+function defaultWeightUploadBatchBytes(): number {
+  const deviceMemory = (globalThis.navigator as
+    | (Navigator & { deviceMemory?: unknown })
+    | undefined)?.deviceMemory;
+  if (typeof deviceMemory !== "number" || !Number.isFinite(deviceMemory)) {
+    return DEFAULT_WEIGHT_UPLOAD_BATCH_BYTES;
+  }
+  if (deviceMemory >= 64) return MAX_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
+  if (deviceMemory >= 48) return HUGE_WORKSTATION_WEIGHT_UPLOAD_BATCH_BYTES;
+  if (deviceMemory >= 32) return LARGE_WORKSTATION_WEIGHT_UPLOAD_BATCH_BYTES;
+  if (deviceMemory >= 24) return WORKSTATION_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
+  if (deviceMemory >= 16) return VERY_HIGH_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
+  if (deviceMemory >= 8) return HIGH_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
+  if (deviceMemory >= 4) return DEFAULT_WEIGHT_UPLOAD_BATCH_BYTES;
+  if (deviceMemory >= 2) return LOW_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
+  return VERY_LOW_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
+}
+
+function normalizeWeightUploadBatchBytes(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return defaultWeightUploadBatchBytes();
+  }
+  return Math.min(
+    MAX_WEIGHT_UPLOAD_BATCH_BYTES,
+    Math.max(MIN_WEIGHT_UPLOAD_BATCH_BYTES, Math.floor(value)),
+  );
+}
+
 function describeUploadItem(item: UploadItem): UploadTensorInfo {
   if (item.kind === "tensor") {
     return { ...item.tensor };
@@ -413,6 +456,7 @@ async function uploadPreparedWeightItems(
   items: UploadItem[],
   gpuWorker: Worker,
   uploadPackedBf16: boolean,
+  weightUploadBatchBytes: number,
   onProgress: (
     uploaded: UploadWeightsResult,
     tensors: UploadTensorInfo[],
@@ -421,8 +465,10 @@ async function uploadPreparedWeightItems(
   let debugPackedTotal = 0;
   let debugUnpackedBf16Total = 0;
   let uploadedItemCount = 0;
+  let activeBatchBytes = weightUploadBatchBytes;
 
   for (let startIndex = 0; startIndex < items.length; ) {
+    const batchStartIndex = startIndex;
     const batchItems: UploadItem[] = [];
     let batchBytes = 0;
 
@@ -431,17 +477,42 @@ async function uploadPreparedWeightItems(
       const itemBytes = uploadItemByteSize(item);
       if (
         batchItems.length > 0 &&
-        batchBytes + itemBytes > WEIGHT_UPLOAD_BATCH_BYTES
+        batchBytes + itemBytes > activeBatchBytes
       ) {
         break;
       }
       batchItems.push(item);
       batchBytes += itemBytes;
       startIndex++;
-      if (batchBytes >= WEIGHT_UPLOAD_BATCH_BYTES) break;
+      if (batchItems.length === 1 && itemBytes >= LARGE_TENSOR_SOLO_BATCH_BYTES)
+        break;
+      if (batchBytes >= activeBatchBytes) break;
     }
 
-    const batchBuffer = new ArrayBuffer(batchBytes);
+    let batchBuffer: ArrayBuffer;
+    try {
+      batchBuffer = new ArrayBuffer(batchBytes);
+    } catch (error) {
+      if (
+        batchItems.length > 1 &&
+        activeBatchBytes > MIN_WEIGHT_UPLOAD_BATCH_BYTES
+      ) {
+        activeBatchBytes = Math.max(
+          MIN_WEIGHT_UPLOAD_BATCH_BYTES,
+          Math.floor(activeBatchBytes / 2),
+        );
+        startIndex = batchStartIndex;
+        post({
+          type: "progress",
+          step: "init_model",
+          message:
+            `Upload batch allocation failed; retrying ${weightFile} with ` +
+            `${Math.round(activeBatchBytes / 1024 / 1024)} MB batches...`,
+        });
+        continue;
+      }
+      throw error;
+    }
     const batchView = new Uint8Array(batchBuffer);
     const batchTensors: UploadTensorInfo[] = [];
     let cursor = 0;
@@ -1160,6 +1231,7 @@ async function handleInit(data: {
   compileGdnG?: boolean;
   enableVlm?: boolean;
   fuseDispatch?: boolean;
+  weightUploadBatchBytes?: number;
 }) {
   const packBf16 = data.packBf16 === true;
   const sdpaFallback = data.sdpaFallback === true;
@@ -1184,6 +1256,9 @@ async function handleInit(data: {
   const compileGdnG = data.compileGdnG !== false;
   const enableVlm = data.enableVlm !== false;
   const fuseDispatch = data.fuseDispatch !== false;
+  const weightUploadBatchBytes = normalizeWeightUploadBatchBytes(
+    data.weightUploadBatchBytes,
+  );
   configuredFusionEnabled = fuseDispatch;
   configuredDispatchBatchEnabled = dispatchBatch;
   try {
@@ -1513,6 +1588,7 @@ async function handleInit(data: {
       (compileGdnPre ? " compile_gdn_pre=1" : "") +
       (compileGdnPost ? " compile_gdn_post=1" : "") +
       (compileGdnG ? " compile_gdn_g=1" : "") +
+      ` weight_upload_batch=${Math.round(weightUploadBatchBytes / 1024 / 1024)}MB` +
       (fuseDispatch ? "" : " fuse_dispatch=0");
     post({
       type: "progress",
@@ -1669,6 +1745,7 @@ async function handleInit(data: {
         uploadItems,
         gpuWorker,
         uploadPackedBf16,
+        weightUploadBatchBytes,
         (uploaded, batchTensors) => {
           for (let i = 0; i < batchTensors.length; i++) {
             const tensor = batchTensors[i]!;

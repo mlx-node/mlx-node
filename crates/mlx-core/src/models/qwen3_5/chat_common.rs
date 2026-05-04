@@ -243,6 +243,7 @@ pub(crate) struct ChatParams {
     pub reuse_cache: bool,
     pub thinking_token_budget: Option<i32>,
     pub include_reasoning: bool,
+    pub allow_tool_calls_in_reasoning: bool,
 }
 
 /// Resolve the effective `enable_thinking` value from `reasoning_effort`.
@@ -288,6 +289,7 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         reuse_cache: config.reuse_cache.unwrap_or(true),
         thinking_token_budget: config.thinking_token_budget,
         include_reasoning: resolve_include_reasoning(config),
+        allow_tool_calls_in_reasoning: config.allow_tool_calls_in_reasoning.unwrap_or(false),
     }
 }
 
@@ -459,6 +461,7 @@ pub(crate) fn parse_thinking_and_tools(
     think_end_id: Option<u32>,
     think_end_str: Option<&str>,
     include_reasoning: bool,
+    allow_tool_calls_in_reasoning: bool,
 ) -> (String, Vec<tools::ToolCallResult>, Option<String>) {
     let (clean_text, tool_calls, thinking) = if !thinking_enabled {
         // No-thinking mode: all text is content, passed through verbatim.
@@ -467,7 +470,11 @@ pub(crate) fn parse_thinking_and_tools(
         (clean, calls, None)
     } else if tools::has_think_end_token(generated_tokens, think_end_id) {
         // Thinking mode with confirmed </think>: split at token boundary.
-        tools::split_at_think_end(text, think_end_str)
+        if allow_tool_calls_in_reasoning {
+            tools::split_at_think_end_with_reasoning_tools(text, think_end_str)
+        } else {
+            tools::split_at_think_end(text, think_end_str)
+        }
     } else if think_end_id.is_some() {
         // Thinking mode, truncated (no </think> before EOS/max_tokens):
         // entire output is reasoning, no content.
@@ -479,16 +486,26 @@ pub(crate) fn parse_thinking_and_tools(
             .or_else(|| thinking_text.strip_prefix("<longcat_think>"))
             .unwrap_or(thinking_text)
             .trim();
-        let thinking = if thinking_text.is_empty() {
+        let (clean_thinking, tool_calls) = if allow_tool_calls_in_reasoning {
+            tools::parse_tool_calls(thinking_text)
+        } else {
+            (thinking_text.to_string(), vec![])
+        };
+        let clean_thinking = clean_thinking.trim();
+        let thinking = if clean_thinking.is_empty() {
             None
         } else {
-            Some(thinking_text.to_string())
+            Some(clean_thinking.to_string())
         };
-        (String::new(), vec![], thinking)
+        (String::new(), tool_calls, thinking)
     } else {
         // No think_end_id in vocab — cannot do token-level detection.
         // Fall back to text-level parsing via split_at_think_end(None).
-        tools::split_at_think_end(text, None)
+        if allow_tool_calls_in_reasoning {
+            tools::split_at_think_end_with_reasoning_tools(text, None)
+        } else {
+            tools::split_at_think_end(text, None)
+        }
     };
 
     // Suppress reasoning if not requested
@@ -506,6 +523,7 @@ pub(crate) fn finalize_chat_result(
     think_end_str: Option<&str>,
     performance: Option<crate::profiling::PerformanceMetrics>,
     include_reasoning: bool,
+    allow_tool_calls_in_reasoning: bool,
     thinking_enabled: bool,
     prompt_tokens: u32,
     reasoning_tokens: u32,
@@ -526,6 +544,7 @@ pub(crate) fn finalize_chat_result(
         think_end_id,
         think_end_str,
         include_reasoning,
+        allow_tool_calls_in_reasoning,
     );
 
     // If we have valid tool calls, override finish reason
@@ -1054,6 +1073,41 @@ mod tests {
         assert!(tracker.observe_token(THINK_END_ID)); // transitions to content
         assert!(!tracker.should_force_think_end()); // force cleared
         assert!(!tracker.observe_token(300)); // now content
+    }
+
+    #[test]
+    fn test_parse_truncated_reasoning_tool_calls_when_opted_in() {
+        let text = "<think>Need a preview.\n<tool_call>{\"name\":\"create_app_preview\",\"arguments\":{\"title\":\"Demo\",\"html\":\"<main>Hi</main>\"}}</tool_call>";
+        let (clean, tools, thinking) = parse_thinking_and_tools(
+            text,
+            &[100, 200, 300],
+            true,
+            Some(THINK_END_ID),
+            Some("</think>"),
+            true,
+            true,
+        );
+        assert!(clean.is_empty());
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "create_app_preview");
+        assert_eq!(thinking.unwrap(), "Need a preview.");
+    }
+
+    #[test]
+    fn test_parse_truncated_reasoning_tool_calls_default_isolation() {
+        let text = "<think>Need a preview.\n<tool_call>{\"name\":\"create_app_preview\",\"arguments\":{\"title\":\"Demo\"}}</tool_call>";
+        let (clean, tools, thinking) = parse_thinking_and_tools(
+            text,
+            &[100, 200, 300],
+            true,
+            Some(THINK_END_ID),
+            Some("</think>"),
+            true,
+            false,
+        );
+        assert!(clean.is_empty());
+        assert!(tools.is_empty());
+        assert!(thinking.unwrap().contains("<tool_call>"));
     }
 
     #[test]

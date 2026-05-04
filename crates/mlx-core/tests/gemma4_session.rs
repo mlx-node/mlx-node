@@ -42,6 +42,7 @@ fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
         reasoning_effort: None,
         thinking_token_budget: None,
         include_reasoning: Some(false),
+        allow_tool_calls_in_reasoning: None,
         report_performance: Some(true),
         reuse_cache: Some(true),
         enable_mtp: None,

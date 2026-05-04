@@ -1185,6 +1185,7 @@ impl Qwen35MoeInner {
             think_end_str.as_deref(),
             performance,
             p.include_reasoning,
+            p.allow_tool_calls_in_reasoning,
             enable_thinking.unwrap_or(true),
             if has_images {
                 expanded_tokens.len() as u32
@@ -1734,6 +1735,7 @@ impl Qwen35MoeInner {
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
+            p.allow_tool_calls_in_reasoning,
         );
 
         let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -2236,6 +2238,7 @@ impl Qwen35MoeInner {
             think_end_str.as_deref(),
             performance,
             p.include_reasoning,
+            p.allow_tool_calls_in_reasoning,
             enable_thinking.unwrap_or(true),
             prompt_tokens_for_result,
             reasoning_tracker.reasoning_token_count(),
@@ -2910,6 +2913,7 @@ impl Qwen35MoeInner {
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
+            p.allow_tool_calls_in_reasoning,
         );
 
         let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -4775,6 +4779,7 @@ impl Qwen3_5MoeModel {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -4830,6 +4835,7 @@ impl Qwen3_5MoeModel {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -4884,6 +4890,7 @@ impl Qwen3_5MoeModel {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -4936,6 +4943,7 @@ impl Qwen3_5MoeModel {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -5005,6 +5013,7 @@ impl Qwen3_5MoeModel {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -5066,6 +5075,7 @@ impl Qwen3_5MoeModel {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -5358,6 +5368,7 @@ impl Qwen3_5MoeModel {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,

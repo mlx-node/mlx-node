@@ -1,15 +1,19 @@
-import type { ChatStreamChunk } from "@mlx-node/core";
+import type {
+  ChatStreamChunk,
+  ToolCallResult,
+  ToolDefinition,
+} from "@mlx-node/core";
 
 import {
   ArrowUp,
   Cpu,
-  Download,
   FolderOpen,
   ImagePlus,
   Mic,
+  MonitorPlay,
   TerminalSquare,
 } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Streamdown } from "streamdown";
 
@@ -32,6 +36,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./components/ui/select";
+import { Switch } from "./components/ui/switch";
 import { Textarea } from "./components/ui/textarea";
 import {
   sanitizeAssistantText,
@@ -43,15 +48,139 @@ import "./styles.css";
 
 type StatusState = "info" | "ready" | "error";
 type ReasoningEffort = "off" | "low" | "medium" | "high";
-const DEFAULT_MODEL_LABEL = "Qwen3.6-35b-a3b-UD-Q3_K_XL-mlx";
+type PreviewState = "idle" | "calling" | "rendered" | "error";
+const DEFAULT_MODEL_LABEL = "qwen3.5-0.8b-mlx-bf16";
 const MAX_BROWSER_OUTPUT_TOKENS = 36864;
 const DEFAULT_BROWSER_OUTPUT_TOKENS = 1024;
 const DEFAULT_BROWSER_TEMPERATURE = 0.6;
+const APP_PREVIEW_TOOL_NAME = "create_app_preview";
+const MAX_TOOL_CONTINUATIONS = 2;
+const AUTO_CONTINUE_AFTER_APP_PREVIEW = false;
+
+type BrowserToolCall = {
+  id?: string;
+  name: string;
+  arguments: string;
+};
+
+type BrowserChatMessage = {
+  role: string;
+  content: string;
+  images?: Uint8Array[];
+  toolCalls?: BrowserToolCall[];
+  toolCallId?: string;
+};
+
+class ToolCallDisplayBuffer {
+  private pending = "";
+  private suppressing = false;
+  private seenToolCall = false;
+  private readonly openTag = "<tool_call>";
+  private readonly closeTag = "</tool_call>";
+
+  reset() {
+    this.pending = "";
+    this.suppressing = false;
+    this.seenToolCall = false;
+  }
+
+  isToolCallActive() {
+    return this.suppressing || this.seenToolCall;
+  }
+
+  push(delta: string) {
+    this.pending += delta;
+    let visible = "";
+
+    while (this.pending.length > 0) {
+      if (this.suppressing) {
+        const closeIndex = this.pending.indexOf(this.closeTag);
+        if (closeIndex < 0) {
+          this.pending = this.keepPossiblePrefix(this.pending, this.closeTag);
+          return visible;
+        }
+        this.pending = this.pending.slice(closeIndex + this.closeTag.length);
+        this.suppressing = false;
+        continue;
+      }
+
+      const openIndex = this.pending.indexOf(this.openTag);
+      if (openIndex >= 0) {
+        visible += this.pending.slice(0, openIndex);
+        this.pending = this.pending.slice(openIndex + this.openTag.length);
+        this.suppressing = true;
+        this.seenToolCall = true;
+        continue;
+      }
+
+      const keepLength = this.possiblePrefixLength(this.pending, this.openTag);
+      if (keepLength > 0) {
+        visible += this.pending.slice(0, this.pending.length - keepLength);
+        this.pending = this.pending.slice(-keepLength);
+        return visible;
+      }
+
+      visible += this.pending;
+      this.pending = "";
+    }
+
+    return visible;
+  }
+
+  private keepPossiblePrefix(text: string, marker: string) {
+    const keepLength = this.possiblePrefixLength(text, marker);
+    return keepLength > 0 ? text.slice(-keepLength) : "";
+  }
+
+  private possiblePrefixLength(text: string, marker: string) {
+    const maxLength = Math.min(text.length, marker.length - 1);
+    for (let length = maxLength; length > 0; length--) {
+      if (marker.startsWith(text.slice(-length))) return length;
+    }
+    return 0;
+  }
+}
+
+const APP_PREVIEW_TOOL: ToolDefinition = {
+  type: "function",
+  function: {
+    name: APP_PREVIEW_TOOL_NAME,
+    description:
+      "Render a complete, self-contained HTML/CSS/JavaScript app in the browser preview iframe.",
+    parameters: {
+      type: "object",
+      properties: JSON.stringify({
+        title: {
+          type: "string",
+          description: "Short title for the app preview.",
+        },
+        html: {
+          type: "string",
+          description:
+            "Body HTML for the app. Include meaningful semantic structure.",
+        },
+        css: {
+          type: "string",
+          description:
+            "CSS for the app. Keep it self-contained and responsive.",
+        },
+        js: {
+          type: "string",
+          description:
+            "Client-side JavaScript for app interactions. Do not use external dependencies.",
+        },
+      }),
+      required: ["html", "css", "js"],
+    },
+  },
+};
 
 type ChatResult = {
   text?: string;
   rawText?: string;
   thinking?: string | null;
+  finishReason?: string | null;
+  toolCalls?: ToolCallResult[];
   numTokens?: number;
   performance?: {
     ttftMs: number;
@@ -94,24 +223,32 @@ type ProfileStats = {
 
 function App() {
   const statusRef = useRef<HTMLSpanElement>(null);
+  const workspaceGridRef = useRef<HTMLElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
+  const previewSurfaceRef = useRef<HTMLDivElement>(null);
+  const previewFrameRef = useRef<HTMLIFrameElement>(null);
+  const previewTitleRef = useRef<HTMLDivElement>(null);
+  const previewMetaRef = useRef<HTMLDivElement>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const sendRef = useRef<HTMLButtonElement>(null);
   const imageButtonRef = useRef<HTMLButtonElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const modelDirInputRef = useRef<HTMLInputElement>(null);
-  const hfFormRef = useRef<HTMLFormElement>(null);
-  const hfRepoInputRef = useRef<HTMLInputElement>(null);
-  const hfRevisionInputRef = useRef<HTMLInputElement>(null);
-  const hfLoadButtonRef = useRef<HTMLButtonElement>(null);
   const composerModelLabelRef = useRef<HTMLSpanElement>(null);
   const temperatureInputRef = useRef<HTMLInputElement>(null);
   const maxOutputTokensInputRef = useRef<HTMLInputElement>(null);
   const reasoningEffortRef = useRef<ReasoningEffort>("off");
   const initialUrlParams = new URLSearchParams(location.search);
-  const initialHfRepo = initialUrlParams.get("hf") ?? "";
-  const initialHfRevision = initialUrlParams.get("revision") ?? "main";
+  const initialAppToolsEnabled =
+    initialUrlParams.get("tools") === "1" ||
+    initialUrlParams.get("app_preview") === "1";
+  const [appToolsEnabled, setAppToolsEnabledState] = useState(
+    initialAppToolsEnabled,
+  );
+  const [reasoningEffort, setReasoningEffortState] =
+    useState<ReasoningEffort>("off");
+  const appToolsEnabledRef = useRef(initialAppToolsEnabled);
   const initialMaxOutputTokens = Math.min(
     MAX_BROWSER_OUTPUT_TOKENS,
     Math.max(
@@ -135,34 +272,36 @@ function App() {
 
   useEffect(() => {
     const statusEl = statusRef.current!;
+    const workspaceGrid = workspaceGridRef.current!;
     const logEl = logRef.current!;
     const chatEl = chatRef.current!;
+    const previewSurface = previewSurfaceRef.current!;
+    const previewFrame = previewFrameRef.current!;
+    const previewTitle = previewTitleRef.current!;
+    const previewMeta = previewMetaRef.current!;
     const promptEl = promptRef.current!;
     const sendBtn = sendRef.current!;
     const imageBtn = imageButtonRef.current!;
     const imageInput = imageInputRef.current!;
     const modelDirInput = modelDirInputRef.current!;
-    const hfForm = hfFormRef.current!;
-    const hfRepoInput = hfRepoInputRef.current!;
-    const hfRevisionInput = hfRevisionInputRef.current!;
-    const hfLoadBtn = hfLoadButtonRef.current!;
     const composerModelLabel = composerModelLabelRef.current!;
     const temperatureInput = temperatureInputRef.current!;
     const maxOutputTokensInput = maxOutputTokensInputRef.current!;
 
     if (
       !statusEl ||
+      !workspaceGrid ||
       !logEl ||
       !chatEl ||
+      !previewSurface ||
+      !previewFrame ||
+      !previewTitle ||
+      !previewMeta ||
       !promptEl ||
       !sendBtn ||
       !imageBtn ||
       !imageInput ||
       !modelDirInput ||
-      !hfForm ||
-      !hfRepoInput ||
-      !hfRevisionInput ||
-      !hfLoadBtn ||
       !composerModelLabel ||
       !maxOutputTokensInput
     ) {
@@ -192,6 +331,26 @@ function App() {
       statusEl.className = `status-pill ${state}`;
     }
 
+    function setPreviewStatus(state: PreviewState, text: string) {
+      previewSurface.dataset.previewState = state;
+      previewMeta.textContent = text;
+    }
+
+    function setAppToolsEnabled(enabled: boolean) {
+      appToolsEnabledRef.current = enabled;
+      setAppToolsEnabledState(enabled);
+      workspaceGrid.dataset.appTools = enabled ? "on" : "off";
+      previewSurface.hidden = !enabled;
+      if (enabled) {
+        setPreviewStatus(
+          (previewSurface.dataset.previewState as PreviewState) || "idle",
+          previewMeta.textContent || "Waiting for create_app_preview",
+        );
+      } else {
+        setPreviewStatus("idle", "App preview disabled");
+      }
+    }
+
     function log(msg: string) {
       const line = document.createElement("div");
       line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -199,28 +358,8 @@ function App() {
       logEl.scrollTop = logEl.scrollHeight;
     }
 
-    function setHfControlsDisabled(disabled: boolean) {
-      hfRepoInput.disabled = disabled;
-      hfRevisionInput.disabled = disabled;
-      hfLoadBtn.disabled = disabled;
-    }
-
-    function normalizeHfRepoInput(value: string) {
-      return value
-        .trim()
-        .replace(/^https:\/\/huggingface\.co\//i, "")
-        .replace(/^hf:\/\//i, "")
-        .replace(/^models\//i, "")
-        .replace(/\/(?:tree|resolve)\/.*$/i, "")
-        .replace(/^\/+|\/+$/g, "");
-    }
-
     function compactModelLabel(label: string) {
-      if (!label.startsWith("HF ")) return label;
-      const full = label.slice(3);
-      const [repoId, revision] = full.split("@");
-      const name = repoId?.split("/").pop() || repoId || full;
-      return revision ? `${name}@${revision}` : name;
+      return label;
     }
 
     function readMaxOutputTokens() {
@@ -295,20 +434,392 @@ function App() {
       return copy.buffer;
     }
 
-    const messages: Array<{
-      role: string;
-      content: string;
-      images?: Uint8Array[];
-    }> = [
-      { role: "system", content: "You are a helpful assistant. Be concise." },
+    function asRecord(value: unknown): Record<string, unknown> {
+      if (typeof value === "string") {
+        try {
+          const parsed = JSON.parse(value);
+          return asRecord(parsed);
+        } catch {
+          return {};
+        }
+      }
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        return value as Record<string, unknown>;
+      }
+      return {};
+    }
+
+    function stringArg(args: Record<string, unknown>, key: string) {
+      const value = args[key];
+      return typeof value === "string" ? value : "";
+    }
+
+    function stripRawToolMarkupForDisplay(value: string | null | undefined) {
+      let input = value ?? "";
+      let output = "";
+
+      while (input.length > 0) {
+        const openIndex = input.indexOf("<tool_call>");
+        if (openIndex < 0) {
+          output += input;
+          break;
+        }
+
+        output += input.slice(0, openIndex);
+        const bodyStart = openIndex + "<tool_call>".length;
+        const closeIndex = input.indexOf("</tool_call>", bodyStart);
+        if (closeIndex < 0) {
+          break;
+        }
+        input = input.slice(closeIndex + "</tool_call>".length);
+      }
+
+      const orphanMarkers = ["<function=", "<parameter="];
+      let orphanIndex = -1;
+      for (const marker of orphanMarkers) {
+        const index = output.indexOf(marker);
+        if (index >= 0 && (orphanIndex < 0 || index < orphanIndex)) {
+          orphanIndex = index;
+        }
+      }
+      if (orphanIndex >= 0) {
+        output = output.slice(0, orphanIndex);
+      }
+
+      return output.trim();
+    }
+
+    function hasRawToolMarkup(value: string | null | undefined) {
+      const text = value ?? "";
+      return (
+        text.includes("<tool_call>") ||
+        text.includes("<function=") ||
+        text.includes("<parameter=")
+      );
+    }
+
+    function makeUnparsedToolCallCard(finishReason: string): ToolCallResult {
+      return {
+        id: "call_unparsed_app_preview",
+        name: APP_PREVIEW_TOOL_NAME,
+        arguments: {},
+        status: "parse_error",
+        rawContent: "",
+        error:
+          `Incomplete preview tool call: model stopped before emitting a complete ` +
+          `<tool_call>...</tool_call> block (finish_reason=${finishReason}).`,
+      };
+    }
+
+    function escapeHtmlText(text: string) {
+      return text.replace(/[<>&"]/g, (char) => {
+        switch (char) {
+          case "<":
+            return "&lt;";
+          case ">":
+            return "&gt;";
+          case "&":
+            return "&amp;";
+          case '"':
+            return "&quot;";
+          default:
+            return char;
+        }
+      });
+    }
+
+    function escapeStyleBlock(text: string) {
+      return text.replace(/<\/style/gi, "<\\/style");
+    }
+
+    function escapeScriptBlock(text: string) {
+      return text.replace(/<\/script/gi, "<\\/script");
+    }
+
+    function wrapPreviewScript(text: string) {
+      return `(() => {\n${text}\n})();`;
+    }
+
+    function isClassicScript(script: HTMLScriptElement) {
+      const type = script.getAttribute("type")?.trim().toLowerCase();
+      return (
+        !type || type === "text/javascript" || type === "application/javascript"
+      );
+    }
+
+    function wrapInlinePreviewScripts(root: ParentNode) {
+      root.querySelectorAll("script").forEach((script) => {
+        if (
+          !(script instanceof HTMLScriptElement) ||
+          !isClassicScript(script)
+        ) {
+          return;
+        }
+        const source = script.textContent ?? "";
+        if (!source.trim()) return;
+        script.textContent = wrapPreviewScript(source);
+      });
+    }
+
+    function sanitizePreviewHtmlFragment(html: string) {
+      if (!/<script[\s>]/i.test(html)) return html;
+      const template = document.createElement("template");
+      template.innerHTML = html;
+      wrapInlinePreviewScripts(template.content);
+      return template.innerHTML;
+    }
+
+    function sanitizePreviewDocument(html: string) {
+      if (!/<script[\s>]/i.test(html)) return html;
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      wrapInlinePreviewScripts(doc);
+      const doctype = doc.doctype
+        ? `<!doctype ${doc.doctype.name}>`
+        : "<!doctype html>";
+      return `${doctype}\n${doc.documentElement.outerHTML}`;
+    }
+
+    function buildPreviewDocument(args: Record<string, unknown>) {
+      const title = stringArg(args, "title") || "App preview";
+      const rawHtml = stringArg(args, "html");
+      const css = stringArg(args, "css");
+      const js = stringArg(args, "js") || stringArg(args, "javascript");
+      const isDocument = /<!doctype|<html[\s>]/i.test(rawHtml);
+      const html = isDocument
+        ? sanitizePreviewDocument(rawHtml)
+        : sanitizePreviewHtmlFragment(rawHtml);
+      const cssTag = css ? `<style>\n${escapeStyleBlock(css)}\n</style>` : "";
+      const jsTag = js
+        ? `<script>\n${escapeScriptBlock(wrapPreviewScript(js))}\n</script>`
+        : "";
+      if (isDocument) {
+        let doc = html;
+        if (cssTag) {
+          doc = /<\/head>/i.test(doc)
+            ? doc.replace(/<\/head>/i, `${cssTag}\n</head>`)
+            : `${cssTag}\n${doc}`;
+        }
+        if (jsTag) {
+          doc = /<\/body>/i.test(doc)
+            ? doc.replace(/<\/body>/i, `${jsTag}\n</body>`)
+            : `${doc}\n${jsTag}`;
+        }
+        return doc;
+      }
+      return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <base target="_blank" />
+    <title>${escapeHtmlText(title)}</title>
+    ${cssTag}
+  </head>
+  <body>
+    ${html}
+    ${jsTag}
+  </body>
+</html>`;
+    }
+
+    function setEmptyPreview() {
+      previewFrame.srcdoc = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #0f1218;
+        color: #8f96a3;
+        font: 14px/1.5 Inter, system-ui, sans-serif;
+      }
+    </style>
+  </head>
+  <body>App preview will appear here.</body>
+</html>`;
+      previewTitle.textContent = "Preview";
+      setPreviewStatus("idle", "Waiting for create_app_preview");
+    }
+
+    function compactToolArguments(call: ToolCallResult) {
+      const args = asRecord(call.arguments);
+      const title = stringArg(args, "title");
+      const summary = title
+        ? { title }
+        : Object.fromEntries(
+            Object.keys(args)
+              .slice(0, 3)
+              .map((key) => [key, args[key]]),
+          );
+      return JSON.stringify(summary);
+    }
+
+    function appendToolCell(
+      call: ToolCallResult,
+      state: "calling" | "result" | "error",
+    ) {
+      const toolDiv = document.createElement("div");
+      toolDiv.className = `message tool-card ${state}`;
+
+      const header = document.createElement("div");
+      header.className = "tool-card-header";
+
+      const bullet = document.createElement("span");
+      bullet.className = "tool-card-bullet";
+      bullet.setAttribute("aria-hidden", "true");
+      header.appendChild(bullet);
+
+      const title = document.createElement("div");
+      title.className = "tool-card-title";
+      title.textContent = `${state === "calling" ? "Calling" : state === "result" ? "Called" : "Tool error"} ${call.name}`;
+      header.appendChild(title);
+
+      const meta = document.createElement("code");
+      meta.className = "tool-card-meta";
+      meta.textContent = compactToolArguments(call);
+      header.appendChild(meta);
+
+      const body = document.createElement("div");
+      body.className = "tool-card-body";
+
+      toolDiv.appendChild(header);
+      toolDiv.appendChild(body);
+      chatEl.appendChild(toolDiv);
+      chatEl.scrollTop = chatEl.scrollHeight;
+      return toolDiv;
+    }
+
+    function updateToolCell(
+      toolDiv: HTMLElement,
+      call: ToolCallResult,
+      state: "result" | "error",
+      text: string,
+    ) {
+      toolDiv.className = `message tool-card ${state}`;
+      const title = toolDiv.querySelector(".tool-card-title");
+      if (title) {
+        title.textContent = `${state === "result" ? "Called" : "Tool error"} ${call.name}`;
+      }
+      const body = toolDiv.querySelector(".tool-card-body");
+      if (body) {
+        body.textContent = text;
+      }
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    function toAssistantToolCalls(
+      toolCalls: readonly ToolCallResult[],
+    ): BrowserToolCall[] {
+      return toolCalls
+        .filter((call) => call.status === "ok")
+        .map((call) => {
+          const args = asRecord(call.arguments);
+          const title = stringArg(args, "title");
+          const compactArgs =
+            call.name === APP_PREVIEW_TOOL_NAME
+              ? JSON.stringify({
+                  title: title || "App preview",
+                  renderedInBrowserPreview: true,
+                })
+              : typeof call.arguments === "string"
+                ? call.arguments
+                : JSON.stringify(call.arguments ?? {});
+          return {
+            id: call.id,
+            name: call.name,
+            arguments: compactArgs,
+          };
+        });
+    }
+
+    function executeToolCall(call: ToolCallResult): BrowserChatMessage {
+      if (call.status !== "ok") {
+        setPreviewStatus(
+          "error",
+          call.error || `Tool call parse failed: ${call.status}`,
+        );
+        return {
+          role: "tool",
+          toolCallId: call.id,
+          content: JSON.stringify({
+            ok: false,
+            error: call.error || `Tool call parse failed: ${call.status}`,
+          }),
+        };
+      }
+
+      if (call.name !== APP_PREVIEW_TOOL_NAME) {
+        setPreviewStatus("error", `Unknown browser tool: ${call.name}`);
+        return {
+          role: "tool",
+          toolCallId: call.id,
+          content: JSON.stringify({
+            ok: false,
+            error: `Unknown browser tool: ${call.name}`,
+          }),
+        };
+      }
+
+      const args = asRecord(call.arguments);
+      const title = stringArg(args, "title") || "App preview";
+      const html = stringArg(args, "html");
+      const css = stringArg(args, "css");
+      const js = stringArg(args, "js") || stringArg(args, "javascript");
+      if (!html && !css && !js) {
+        setPreviewStatus("error", "create_app_preview missing content");
+        return {
+          role: "tool",
+          toolCallId: call.id,
+          content: JSON.stringify({
+            ok: false,
+            error: "create_app_preview requires html, css, or js content.",
+          }),
+        };
+      }
+
+      previewSequence++;
+      setPreviewStatus("calling", `Rendering ${title}`);
+      previewFrame.srcdoc = buildPreviewDocument(args);
+      previewTitle.textContent = title;
+      setPreviewStatus("rendered", `Rendered preview #${previewSequence}`);
+      log(`[TOOL] ${APP_PREVIEW_TOOL_NAME} rendered "${title}"`);
+
+      return {
+        role: "tool",
+        toolCallId: call.id,
+        content: JSON.stringify({
+          ok: true,
+          previewId: `preview-${previewSequence}`,
+          title,
+          message: "The app is rendered in the browser preview iframe.",
+        }),
+      };
+    }
+
+    setEmptyPreview();
+    setAppToolsEnabled(appToolsEnabledRef.current);
+
+    const messages: BrowserChatMessage[] = [
+      {
+        role: "system",
+        content: "You are a helpful assistant. Be concise.",
+      },
     ];
 
     let currentAssistantDiv: HTMLDivElement | null = null;
     let currentThinkingDiv: HTMLDetailsElement | null = null;
     let currentResponseDiv: HTMLDivElement | null = null;
+    let currentToolCallIndicatorDiv: HTMLDivElement | null = null;
     let currentReasoningVisible = false;
     let isInThinking = false;
     let streamTokenCount = 0;
+    let toolContinuationCount = 0;
+    let previewSequence = 0;
 
     let reasoningBuffer = "";
     let contentQueue = "";
@@ -324,11 +835,14 @@ function App() {
     let activeReaderAbort: AbortController | null = null;
     let streamT0 = 0;
     const markdownRoots = new Map<HTMLElement, ReturnType<typeof createRoot>>();
+    const contentToolCallDisplayBuffer = new ToolCallDisplayBuffer();
+    const reasoningToolCallDisplayBuffer = new ToolCallDisplayBuffer();
 
     function renderStreamdown(
       container: HTMLElement,
       text: string,
       isStreaming: boolean,
+      autoScroll = false,
     ) {
       let root = markdownRoots.get(container);
       if (!root) {
@@ -346,6 +860,13 @@ function App() {
           {text}
         </Streamdown>,
       );
+      if (autoScroll) {
+        requestAnimationFrame(() => {
+          if (container.isConnected) {
+            container.scrollTop = container.scrollHeight;
+          }
+        });
+      }
     }
 
     function unmountAllStreamdown() {
@@ -373,12 +894,33 @@ function App() {
       responseDiv.className = "response-content";
       assistantDiv.appendChild(responseDiv);
 
+      const toolCallIndicator = document.createElement("div");
+      toolCallIndicator.className = "streaming-tool-call";
+      toolCallIndicator.hidden = true;
+      const indicatorPulse = document.createElement("span");
+      indicatorPulse.className = "streaming-tool-call-pulse";
+      indicatorPulse.setAttribute("aria-hidden", "true");
+      toolCallIndicator.appendChild(indicatorPulse);
+      const indicatorLabel = document.createElement("span");
+      indicatorLabel.className = "streaming-tool-call-label";
+      indicatorLabel.textContent = "Creating app preview";
+      toolCallIndicator.appendChild(indicatorLabel);
+      const indicatorDots = document.createElement("span");
+      indicatorDots.className = "streaming-tool-call-dots";
+      indicatorDots.setAttribute("aria-hidden", "true");
+      for (let i = 0; i < 3; i++) {
+        indicatorDots.appendChild(document.createElement("i"));
+      }
+      toolCallIndicator.appendChild(indicatorDots);
+      assistantDiv.appendChild(toolCallIndicator);
+
       chatEl.appendChild(assistantDiv);
       chatEl.scrollTop = chatEl.scrollHeight;
 
       currentAssistantDiv = assistantDiv;
       currentThinkingDiv = thinkingDiv;
       currentResponseDiv = responseDiv;
+      currentToolCallIndicatorDiv = toolCallIndicator;
       isInThinking = false;
 
       thinkingDiv.style.display = "none";
@@ -387,6 +929,8 @@ function App() {
       responseRenderText = "";
       contentPrefixBuffer = "";
       contentPrefixResolved = false;
+      contentToolCallDisplayBuffer.reset();
+      reasoningToolCallDisplayBuffer.reset();
       reasoningHasContent = false;
       contentHasContent = false;
       if (rafHandle != null) {
@@ -452,12 +996,28 @@ function App() {
         "summary",
       ) as HTMLElement | null;
       if (summary) summary.textContent = "Thought process";
-      if (thinkingContentEl) renderStreamdown(thinkingContentEl, cleaned, true);
+      if (thinkingContentEl)
+        renderStreamdown(thinkingContentEl, cleaned, true, true);
       currentThinkingDiv.style.display = "";
       currentThinkingDiv.open = open;
       reasoningHasContent = true;
       scrollDirty = true;
       scheduleFlush();
+    }
+
+    function showStreamingToolCallIndicator() {
+      if (!currentAssistantDiv || !currentToolCallIndicatorDiv) return;
+      currentAssistantDiv.classList.add("tool-streaming");
+      currentToolCallIndicatorDiv.hidden = false;
+      scrollDirty = true;
+      scheduleFlush();
+    }
+
+    function hideStreamingToolCallIndicator() {
+      currentAssistantDiv?.classList.remove("tool-streaming");
+      if (currentToolCallIndicatorDiv) {
+        currentToolCallIndicatorDiv.hidden = true;
+      }
     }
 
     function looksLikeReasoningLeak(text: string) {
@@ -475,8 +1035,34 @@ function App() {
       setStatus(`Generating... ${streamTokenCount} tokens`, "info");
 
       if (isReasoning) {
-        if (!currentReasoningVisible) return;
-        reasoningBuffer += deltaText;
+        const visibleReasoning = appToolsEnabledRef.current
+          ? reasoningToolCallDisplayBuffer.push(deltaText)
+          : deltaText;
+        if (!currentReasoningVisible) {
+          if (
+            appToolsEnabledRef.current &&
+            reasoningToolCallDisplayBuffer.isToolCallActive()
+          ) {
+            showStreamingToolCallIndicator();
+          }
+          return;
+        }
+        if (visibleReasoning.length === 0) {
+          if (
+            appToolsEnabledRef.current &&
+            reasoningToolCallDisplayBuffer.isToolCallActive()
+          ) {
+            showStreamingToolCallIndicator();
+          }
+          return;
+        }
+        if (
+          appToolsEnabledRef.current &&
+          reasoningToolCallDisplayBuffer.isToolCallActive()
+        ) {
+          showStreamingToolCallIndicator();
+        }
+        reasoningBuffer += visibleReasoning;
         setStreamingThinkingText(reasoningBuffer, true);
         return;
       } else {
@@ -532,8 +1118,28 @@ function App() {
             if (text.length === 0) return;
           }
         }
+        const visibleText = appToolsEnabledRef.current
+          ? contentToolCallDisplayBuffer.push(text)
+          : text;
+        if (visibleText.length === 0) {
+          if (
+            appToolsEnabledRef.current &&
+            contentToolCallDisplayBuffer.isToolCallActive()
+          ) {
+            showStreamingToolCallIndicator();
+          }
+          return;
+        }
+        if (
+          appToolsEnabledRef.current &&
+          contentToolCallDisplayBuffer.isToolCallActive()
+        ) {
+          showStreamingToolCallIndicator();
+        } else {
+          hideStreamingToolCallIndicator();
+        }
         contentHasContent = true;
-        contentQueue += text;
+        contentQueue += visibleText;
       }
       scheduleFlush();
     }
@@ -577,6 +1183,7 @@ function App() {
     function drainQueuesSync() {
       if (currentAssistantDiv && currentThinkingDiv && currentResponseDiv) {
         if (contentQueue.length > 0) {
+          hideStreamingToolCallIndicator();
           if (isInThinking) {
             isInThinking = false;
             const summary = currentThinkingDiv.querySelector(
@@ -593,6 +1200,9 @@ function App() {
       contentQueue = "";
       contentPrefixBuffer = "";
       contentPrefixResolved = false;
+      contentToolCallDisplayBuffer.reset();
+      reasoningToolCallDisplayBuffer.reset();
+      hideStreamingToolCallIndicator();
       if (rafHandle != null) {
         cancelAnimationFrame(rafHandle);
         rafHandle = null;
@@ -607,7 +1217,9 @@ function App() {
       drainQueuesSync();
 
       const trimmedThinking = thinking?.trim() || "";
-      if (currentReasoningVisible && trimmedThinking.length > 3) {
+      const shouldShowThinking =
+        currentReasoningVisible && trimmedThinking.length > 3;
+      if (shouldShowThinking) {
         const thinkingContentEl = currentThinkingDiv.querySelector(
           ".thinking-content",
         ) as HTMLElement | null;
@@ -626,6 +1238,18 @@ function App() {
       if (text && text.length > 0) {
         responseRenderText = text;
         renderStreamdown(currentResponseDiv, responseRenderText, false);
+      } else {
+        if (!shouldShowThinking) {
+          currentAssistantDiv.remove();
+          currentAssistantDiv = null;
+          currentThinkingDiv = null;
+          currentResponseDiv = null;
+          currentToolCallIndicatorDiv = null;
+          chatEl.scrollTop = chatEl.scrollHeight;
+          return;
+        }
+        responseRenderText = "";
+        renderStreamdown(currentResponseDiv, "", false);
       }
       currentAssistantDiv.classList.add("done");
       chatEl.scrollTop = chatEl.scrollHeight;
@@ -633,11 +1257,56 @@ function App() {
       currentAssistantDiv = null;
       currentThinkingDiv = null;
       currentResponseDiv = null;
+      currentToolCallIndicatorDiv = null;
     }
 
     let worker = new Worker(new URL("../src/mlx-worker.ts", import.meta.url), {
       type: "module",
     });
+
+    function postChatRequest() {
+      const toolsEnabled = appToolsEnabledRef.current;
+      const requestReasoningEffort: ReasoningEffort =
+        reasoningEffortRef.current;
+      const outboundMessages = messages.map((message, index) =>
+        index === 0 && message.role === "system"
+          ? {
+              ...message,
+              content: toolsEnabled
+                ? "You are a helpful assistant. Be concise. When the user asks you to build, write, prototype, or preview a web app, call create_app_preview with complete self-contained HTML, CSS, and JavaScript instead of only describing the app. If reasoning is enabled, you may call create_app_preview during reasoning. After the tool result, briefly summarize what you built."
+                : "You are a helpful assistant. Be concise.",
+            }
+          : message,
+      );
+      const config: Record<string, unknown> = {
+        maxNewTokens: readMaxOutputTokens(),
+        temperature: readTemperature(),
+        reportPerformance: true,
+      };
+      if (toolsEnabled) {
+        config.tools = [APP_PREVIEW_TOOL];
+        config.allowToolCallsInReasoning = true;
+        config.maxConsecutiveTokens = 256;
+        config.maxNgramRepeats = 8;
+      }
+      worker.postMessage({
+        type: "chat",
+        messages: outboundMessages,
+        config,
+        useSab,
+        mode: modeParam ?? undefined,
+        reasoningEffort: requestReasoningEffort,
+      });
+    }
+
+    function finishChatTurn() {
+      toolContinuationCount = 0;
+      setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, "ready");
+      sendBtn.disabled = false;
+      promptEl.disabled = false;
+      promptEl.focus();
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
 
     function finalizeFromResult(result: ChatResult) {
       const latestUserText =
@@ -645,38 +1314,142 @@ function App() {
           ?.content ?? currentUserPrompt;
       const textParts = splitAssistantThinking(result.text, latestUserText);
       const rawParts = splitAssistantThinking(result.rawText, latestUserText);
+      const toolsEnabled = appToolsEnabledRef.current;
+      const finishReason = result.finishReason || "unknown";
+      const rawToolMarkup =
+        toolsEnabled &&
+        (hasRawToolMarkup(result.text) ||
+          hasRawToolMarkup(result.rawText) ||
+          hasRawToolMarkup(result.thinking) ||
+          hasRawToolMarkup(reasoningBuffer));
       let text =
-        rawParts.text ||
         textParts.text ||
-        sanitizeAssistantText(result.text, latestUserText);
+        sanitizeAssistantText(result.text, latestUserText) ||
+        (toolsEnabled ? "" : rawParts.text);
       let thinking = sanitizeThinkingText(
         result.thinking ?? reasoningBuffer,
         latestUserText,
       );
       thinking = mergeThinkingText(thinking, textParts.thinking);
-      thinking = mergeThinkingText(thinking, rawParts.thinking);
-      const rawText =
-        text || sanitizeAssistantText(result.rawText, latestUserText);
-      finalizeAssistantMessage(text, thinking || null);
-      messages.push({ role: "assistant", content: rawText });
+      if (!toolsEnabled) {
+        thinking = mergeThinkingText(thinking, rawParts.thinking);
+      } else {
+        text = stripRawToolMarkupForDisplay(text);
+        thinking = stripRawToolMarkupForDisplay(thinking);
+      }
+      const toolCalls = (result.toolCalls ?? []).filter(Boolean);
+      const okToolCalls = toolsEnabled
+        ? toolCalls.filter((call) => call.status === "ok")
+        : [];
+      const suppressedToolCalls = toolsEnabled
+        ? []
+        : toolCalls.filter((call) => call.status === "ok");
+      const failedToolCalls = toolCalls.filter((call) => call.status !== "ok");
+      const displayText =
+        text ||
+        (okToolCalls.length > 0
+          ? ""
+          : suppressedToolCalls.length > 0
+            ? "Tool call skipped: app preview is disabled."
+            : "");
+      finalizeAssistantMessage(displayText, thinking || null);
+      messages.push({
+        role: "assistant",
+        content: text,
+        toolCalls:
+          okToolCalls.length > 0
+            ? toAssistantToolCalls(okToolCalls)
+            : undefined,
+      });
 
       if (result.performance) {
+        const prefill =
+          Number.isFinite(result.performance.prefillTokensPerSecond) &&
+          result.performance.prefillTokensPerSecond > 0
+            ? ` | Prefill ${result.performance.prefillTokensPerSecond.toFixed(1)} tok/s`
+            : "";
         log(
-          `${result.numTokens} tokens | TTFT ${result.performance.ttftMs.toFixed(0)}ms | Decode ${result.performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
+          `${result.numTokens} tokens | finish ${finishReason} | TTFT ${result.performance.ttftMs.toFixed(0)}ms${prefill} | Decode ${result.performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
+        );
+      } else {
+        log(`${result.numTokens ?? 0} tokens | finish ${finishReason}`);
+      }
+
+      for (const call of failedToolCalls) {
+        const toolCell = appendToolCell(call, "error");
+        updateToolCell(
+          toolCell,
+          call,
+          "error",
+          call.error || `Tool call parse failed: ${call.status}`,
         );
       }
-      setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, "ready");
-      sendBtn.disabled = false;
-      promptEl.disabled = false;
-      setHfControlsDisabled(false);
-      promptEl.focus();
-      chatEl.scrollTop = chatEl.scrollHeight;
+      if (suppressedToolCalls.length > 0) {
+        for (const call of suppressedToolCalls) {
+          const toolCell = appendToolCell(call, "error");
+          updateToolCell(
+            toolCell,
+            call,
+            "error",
+            "Tool call ignored: app preview is disabled.",
+          );
+        }
+      }
+      if (rawToolMarkup && okToolCalls.length === 0) {
+        const call = makeUnparsedToolCallCard(finishReason);
+        const toolCell = appendToolCell(call, "error");
+        updateToolCell(toolCell, call, "error", call.error || "");
+      }
+
+      if (okToolCalls.length > 0) {
+        for (const call of okToolCalls) {
+          const toolCell = appendToolCell(call, "calling");
+          setPreviewStatus("calling", `Calling ${call.name}`);
+          const toolMessage = executeToolCall(call);
+          const toolResult = asRecord(toolMessage.content);
+          const ok = toolResult.ok === true;
+          updateToolCell(
+            toolCell,
+            call,
+            ok ? "result" : "error",
+            ok
+              ? `Preview updated: ${stringArg(toolResult, "title") || call.name}`
+              : stringArg(toolResult, "error") || `Tool failed: ${call.name}`,
+          );
+          messages.push(toolMessage);
+        }
+        if (!AUTO_CONTINUE_AFTER_APP_PREVIEW) {
+          finishChatTurn();
+          return;
+        }
+        if (toolContinuationCount < MAX_TOOL_CONTINUATIONS) {
+          toolContinuationCount++;
+          setStatus("Tool complete - generating follow-up...", "info");
+          currentReasoningVisible = reasoningEffortRef.current !== "off";
+          createAssistantMessage();
+          postChatRequest();
+          return;
+        }
+        const call = okToolCalls[okToolCalls.length - 1]!;
+        const toolCell = appendToolCell(call, "error");
+        updateToolCell(
+          toolCell,
+          call,
+          "error",
+          "Tool loop stopped: max continuations reached.",
+        );
+      }
+
+      finishChatTurn();
     }
 
     function resetStreamingUi() {
       reasoningBuffer = "";
       contentQueue = "";
       responseRenderText = "";
+      contentToolCallDisplayBuffer.reset();
+      reasoningToolCallDisplayBuffer.reset();
+      hideStreamingToolCallIndicator();
       if (rafHandle != null) {
         cancelAnimationFrame(rafHandle);
         rafHandle = null;
@@ -716,7 +1489,6 @@ function App() {
             null;
           promptEl.disabled = false;
           sendBtn.disabled = false;
-          setHfControlsDisabled(false);
           setImageCapability(
             (data as { supportsImages?: boolean }).supportsImages === true,
           );
@@ -746,6 +1518,8 @@ function App() {
                   text: chunk.text,
                   rawText: chunk.rawText,
                   thinking: chunk.thinking ?? null,
+                  finishReason: chunk.finishReason,
+                  toolCalls: chunk.toolCalls,
                   numTokens: chunk.numTokens,
                   performance: chunk.performance ?? null,
                 });
@@ -772,10 +1546,10 @@ function App() {
               setStatus("Error", "error");
               sendBtn.disabled = false;
               promptEl.disabled = false;
-              setHfControlsDisabled(false);
               currentAssistantDiv = null;
               currentThinkingDiv = null;
               currentResponseDiv = null;
+              currentToolCallIndicatorDiv = null;
               activeReaderAbort?.abort();
               activeReaderAbort = null;
               worker.postMessage({ type: "stream-finalize", numTokens: 0 });
@@ -806,10 +1580,10 @@ function App() {
           setStatus("Error", "error");
           sendBtn.disabled = false;
           promptEl.disabled = false;
-          setHfControlsDisabled(false);
           currentAssistantDiv = null;
           currentThinkingDiv = null;
           currentResponseDiv = null;
+          currentToolCallIndicatorDiv = null;
           if (activeReaderAbort) {
             activeReaderAbort.abort();
             activeReaderAbort = null;
@@ -825,7 +1599,6 @@ function App() {
           sendBtn.disabled = true;
           promptEl.disabled = true;
           imageBtn.disabled = true;
-          setHfControlsDisabled(false);
           break;
         }
       }
@@ -926,7 +1699,6 @@ function App() {
       log(`  line: ${e.lineno}, col: ${e.colno}`);
       if (e.error instanceof Error) logStack(e.error.stack);
       setStatus("Worker error", "error");
-      setHfControlsDisabled(false);
     };
     worker.onerror = handleWorkerError;
 
@@ -948,6 +1720,13 @@ function App() {
     const enableVlm = urlParams.get("disable_vlm") !== "1";
     const fuseDispatch = urlParams.get("fuse_dispatch") !== "0";
     const useSab = urlParams.get("stream_sab") !== "0";
+    const weightUploadBatchMb = Number.parseFloat(
+      urlParams.get("weight_upload_batch_mb") ?? "",
+    );
+    const weightUploadBatchBytes =
+      Number.isFinite(weightUploadBatchMb) && weightUploadBatchMb > 0
+        ? Math.round(weightUploadBatchMb * 1024 * 1024)
+        : undefined;
     const modeParam = urlParams.get("mode") as
       | "sab"
       | "tsfn"
@@ -965,6 +1744,9 @@ function App() {
       (fuseDispatch ? "" : " (fuse_dispatch=0)") +
       (enableVlm ? "" : " (disable_vlm=1)") +
       (useSab ? "" : " (stream_sab=0)") +
+      (weightUploadBatchBytes
+        ? ` (weight_upload_batch_mb=${Math.round(weightUploadBatchBytes / 1024 / 1024)})`
+        : "") +
       (modeParam ? ` (mode=${modeParam})` : "");
 
     function resetForModelLoad(label?: string) {
@@ -983,12 +1765,12 @@ function App() {
       currentAssistantDiv = null;
       currentThinkingDiv = null;
       currentResponseDiv = null;
+      currentToolCallIndicatorDiv = null;
       messages.splice(1);
       chatEl.replaceChildren();
       promptEl.disabled = true;
       sendBtn.disabled = true;
       imageBtn.disabled = true;
-      setHfControlsDisabled(true);
       setStatus("Initializing...", "info");
       log(`Starting MLX Worker${flagBadges}${label ? ` (${label})` : ""}...`);
     }
@@ -996,7 +1778,6 @@ function App() {
     function startWorker(
       source: {
         modelFiles?: File[];
-        hfModel?: { repoId: string; revision?: string };
         label?: string;
       } = {},
     ) {
@@ -1008,7 +1789,6 @@ function App() {
         modelUrl: "/model",
         modelLabel: source.label ?? DEFAULT_MODEL_LABEL,
         modelFiles: source.modelFiles,
-        hfModel: source.hfModel,
         packBf16,
         sdpaFallback,
         profile,
@@ -1019,14 +1799,11 @@ function App() {
         compileGdnG,
         enableVlm,
         fuseDispatch,
+        weightUploadBatchBytes,
       });
     }
 
-    function restartWorker(source: {
-      modelFiles?: File[];
-      hfModel?: { repoId: string; revision?: string };
-      label?: string;
-    }) {
+    function restartWorker(source: { modelFiles?: File[]; label?: string }) {
       worker.removeEventListener("messageerror", onMessageError);
       worker.terminate();
       worker = new Worker(new URL("../src/mlx-worker.ts", import.meta.url), {
@@ -1038,18 +1815,7 @@ function App() {
       startWorker(source);
     }
 
-    const initialRepoId = normalizeHfRepoInput(urlParams.get("hf") ?? "");
-    if (initialRepoId) {
-      const revision = urlParams.get("revision")?.trim() || "main";
-      hfRepoInput.value = initialRepoId;
-      hfRevisionInput.value = revision;
-      startWorker({
-        hfModel: { repoId: initialRepoId, revision },
-        label: `HF ${initialRepoId}@${revision}`,
-      });
-    } else {
-      startWorker();
-    }
+    startWorker();
 
     function handleSend() {
       const text = promptEl.value.trim();
@@ -1078,7 +1844,7 @@ function App() {
       }
       chatEl.appendChild(userDiv);
 
-      const msg: { role: string; content: string; images?: Uint8Array[] } = {
+      const msg: BrowserChatMessage = {
         role: "user",
         content: text,
       };
@@ -1092,23 +1858,13 @@ function App() {
 
       setStatus("Generating...", "info");
       streamTokenCount = 0;
+      toolContinuationCount = 0;
       isInThinking = false;
       currentUserPrompt = text;
       currentReasoningVisible = reasoningEffortRef.current !== "off";
       createAssistantMessage();
 
-      worker.postMessage({
-        type: "chat",
-        messages: [...messages],
-        config: {
-          maxNewTokens: readMaxOutputTokens(),
-          temperature: readTemperature(),
-          reportPerformance: true,
-        },
-        useSab,
-        mode: modeParam ?? undefined,
-        reasoningEffort: reasoningEffortRef.current,
-      });
+      postChatRequest();
     }
 
     const onPromptKeyDown = (e: KeyboardEvent) => {
@@ -1154,23 +1910,6 @@ function App() {
       restartWorker({ modelFiles: files, label });
     };
 
-    const onHfSubmit = (event: Event) => {
-      event.preventDefault();
-      const repoId = normalizeHfRepoInput(hfRepoInput.value);
-      const revision = hfRevisionInput.value.trim() || "main";
-      if (!repoId) {
-        setStatus("Enter a Hugging Face repo", "error");
-        hfRepoInput.focus();
-        return;
-      }
-      hfRepoInput.value = repoId;
-      hfRevisionInput.value = revision;
-      restartWorker({
-        hfModel: { repoId, revision },
-        label: `HF ${repoId}@${revision}`,
-      });
-    };
-
     const onPaste = async (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (!items) return;
@@ -1199,7 +1938,6 @@ function App() {
     imageBtn.addEventListener("click", onImageClick);
     imageInput.addEventListener("change", onImageChange);
     modelDirInput.addEventListener("change", onModelDirChange);
-    hfForm.addEventListener("submit", onHfSubmit);
     document.addEventListener("paste", onPaste);
 
     return () => {
@@ -1209,7 +1947,6 @@ function App() {
       imageBtn.removeEventListener("click", onImageClick);
       imageInput.removeEventListener("change", onImageChange);
       modelDirInput.removeEventListener("change", onModelDirChange);
-      hfForm.removeEventListener("submit", onHfSubmit);
       document.removeEventListener("paste", onPaste);
       worker.removeEventListener("messageerror", onMessageError);
       activeReaderAbort?.abort();
@@ -1228,38 +1965,6 @@ function App() {
           <p>WebGPU model playground</p>
         </div>
         <div className="header-actions">
-          <form ref={hfFormRef} className="header-hf-form">
-            <input
-              ref={hfRepoInputRef}
-              className="hf-input hf-repo-input"
-              type="text"
-              placeholder="Hugging Face repo"
-              defaultValue={initialHfRepo}
-              spellCheck={false}
-              autoCapitalize="none"
-              aria-label="Hugging Face model repository"
-            />
-            <input
-              ref={hfRevisionInputRef}
-              className="hf-input hf-revision-input"
-              type="text"
-              placeholder="main"
-              defaultValue={initialHfRevision}
-              spellCheck={false}
-              autoCapitalize="none"
-              aria-label="Hugging Face model revision"
-            />
-            <Button
-              ref={hfLoadButtonRef}
-              type="submit"
-              variant="outline"
-              size="sm"
-              className="header-hf-btn"
-            >
-              <Download data-icon="inline-start" />
-              <span>Load HF</span>
-            </Button>
-          </form>
           <Button
             type="button"
             variant="outline"
@@ -1276,7 +1981,11 @@ function App() {
         </div>
       </header>
 
-      <main className="workspace-grid">
+      <main
+        ref={workspaceGridRef}
+        className="workspace-grid"
+        data-app-tools={initialAppToolsEnabled ? "on" : "off"}
+      >
         <Card className="surface-card">
           <CardHeader className="surface-header">
             <div className="surface-title-row">
@@ -1293,6 +2002,36 @@ function App() {
           </CardHeader>
           <CardContent className="surface-content">
             <div id="chat" ref={chatRef} />
+          </CardContent>
+        </Card>
+
+        <Card
+          ref={previewSurfaceRef}
+          className="surface-card preview-surface"
+          hidden={!initialAppToolsEnabled}
+        >
+          <CardHeader className="surface-header">
+            <div className="surface-title-row">
+              <div>
+                <CardTitle ref={previewTitleRef} className="surface-title">
+                  Preview
+                </CardTitle>
+                <CardDescription ref={previewMetaRef} className="surface-meta">
+                  Waiting for create_app_preview
+                </CardDescription>
+              </div>
+              <CardAction>
+                <MonitorPlay />
+              </CardAction>
+            </div>
+          </CardHeader>
+          <CardContent className="surface-content preview-content">
+            <iframe
+              ref={previewFrameRef}
+              className="preview-frame"
+              title="Generated app preview"
+              sandbox="allow-scripts allow-forms allow-popups allow-modals allow-downloads"
+            />
           </CardContent>
         </Card>
 
@@ -1342,6 +2081,44 @@ function App() {
               </Button>
             </div>
             <div className="composer-actions-right">
+              <label
+                className="composer-tool-toggle"
+                title="Enable app-preview tool calls"
+              >
+                <span className="composer-tool-toggle-label">Preview</span>
+                <Switch
+                  size="sm"
+                  checked={appToolsEnabled}
+                  aria-label="App preview tool calls"
+                  onCheckedChange={(checked) => {
+                    const enabled = checked === true;
+                    setAppToolsEnabledState(enabled);
+                    appToolsEnabledRef.current = enabled;
+                    if (workspaceGridRef.current) {
+                      workspaceGridRef.current.dataset.appTools = enabled
+                        ? "on"
+                        : "off";
+                    }
+                    if (previewSurfaceRef.current) {
+                      previewSurfaceRef.current.hidden = !enabled;
+                    }
+                    if (previewMetaRef.current) {
+                      if (enabled) {
+                        if (
+                          previewMetaRef.current.textContent ===
+                          "App preview disabled"
+                        ) {
+                          previewMetaRef.current.textContent =
+                            "Waiting for create_app_preview";
+                        }
+                      } else {
+                        previewMetaRef.current.textContent =
+                          "App preview disabled";
+                      }
+                    }
+                  }}
+                />
+              </label>
               <span className="composer-status-dot" aria-hidden="true" />
               <span
                 ref={composerModelLabelRef}
@@ -1372,9 +2149,10 @@ function App() {
                 title={`Max output tokens (1-${MAX_BROWSER_OUTPUT_TOKENS})`}
               />
               <Select
-                defaultValue="off"
+                value={reasoningEffort}
                 onValueChange={(value) => {
                   reasoningEffortRef.current = value as ReasoningEffort;
+                  setReasoningEffortState(value as ReasoningEffort);
                 }}
               >
                 <SelectTrigger

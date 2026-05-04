@@ -428,7 +428,10 @@ function schedulePendingBufferDestroyBatch(): void {
           try {
             buffer.destroy();
           } catch (err) {
-            console.error("[GPU Worker] deferred GPUBuffer destroy failed:", err);
+            console.error(
+              "[GPU Worker] deferred GPUBuffer destroy failed:",
+              err,
+            );
           }
         }
       },
@@ -584,6 +587,27 @@ let hasShaderF16 = false;
 const passEncoderMap = new Map<number, number>(); // passHandle → encoderHandle
 
 const RESTART_PASS_AFTER_EACH_DISPATCH = false;
+
+function endOpenComputePassesForEncoder(
+  encoderHandle: number,
+  keepPassHandle = 0,
+): void {
+  // The bridge stub normally sends the pass handle that must be ended before
+  // copy/finish, but large decode/VLM paths can expose stale stub-side pass
+  // state. WebGPU rejects copyBufferToBuffer/finish while any pass for the same
+  // encoder is still open, so make the worker-side encoder state authoritative.
+  for (const [passHandle, ownerEncoder] of Array.from(passEncoderMap)) {
+    if (ownerEncoder !== encoderHandle) continue;
+    const pass = handles[passHandle] as GPUComputePassEncoder | undefined;
+    if (pass !== undefined) {
+      pass.end();
+    }
+    passEncoderMap.delete(passHandle);
+    if (passHandle !== keepPassHandle) {
+      releaseHandle(passHandle);
+    }
+  }
+}
 
 function endAndRestartPassIfForced(passHandle: number): void {
   if (!RESTART_PASS_AFTER_EACH_DISPATCH) return;
@@ -1584,9 +1608,8 @@ function handleDispatchBatch(): void {
 function handleFusedSubmit(): void {
   const encoderHandle = cmdU32[I_ARG0];
   const passHandle = cmdU32[I_ARG0 + 1];
-  if (passHandle > 0) {
-    getHandle<GPUComputePassEncoder>(passHandle, "fused submit pass").end();
-    passEncoderMap.delete(passHandle);
+  endOpenComputePassesForEncoder(encoderHandle, passHandle);
+  if (passHandle > 0 && handles[passHandle] !== undefined) {
     releaseHandle(passHandle);
   }
   const encoder = getHandle<GPUCommandEncoder>(
@@ -1616,10 +1639,7 @@ function handleFusedCopyBuffer(): void {
     "fused copy encoder",
   );
 
-  if (passHandle !== 0) {
-    getHandle<GPUComputePassEncoder>(passHandle, "fused copy pass").end();
-    passEncoderMap.delete(passHandle);
-  }
+  endOpenComputePassesForEncoder(encoderHandle, passHandle);
 
   encoder.copyBufferToBuffer(
     getHandle<GPUBuffer>(srcHandle, "fused copy src"),
@@ -2345,6 +2365,7 @@ async function processCommand(fnId: number): Promise<void> {
       const dstOffset = dstOffsetLo + dstOffsetHi * 0x100000000;
       const size = sizeLo + sizeHi * 0x100000000;
 
+      endOpenComputePassesForEncoder(encoderHandle);
       encoder.copyBufferToBuffer(src, srcOffset, dst, dstOffset, size);
       setResult(0);
       break;
@@ -2354,6 +2375,7 @@ async function processCommand(fnId: number): Promise<void> {
       // Args: encoderHandle, _descPtr
       const encoderHandle = arg0();
       const encoder = getHandle<GPUCommandEncoder>(encoderHandle);
+      endOpenComputePassesForEncoder(encoderHandle);
       const cmdBuf = encoder.finish();
       activeCommandEncoders.delete(encoderHandle);
       const handle = addHandle(cmdBuf);
@@ -2762,9 +2784,8 @@ async function processCommand(fnId: number): Promise<void> {
       // Replaces up to 6 separate RPCs with 1. Args: encoderHandle, passHandle (0=no pass)
       const encoderHandle = arg0();
       const passHandle = arg1();
-      if (passHandle > 0) {
-        getHandle<GPUComputePassEncoder>(passHandle).end();
-        passEncoderMap.delete(passHandle);
+      endOpenComputePassesForEncoder(encoderHandle, passHandle);
+      if (passHandle > 0 && handles[passHandle] !== undefined) {
         releaseHandle(passHandle);
       }
       const encoder = getHandle<GPUCommandEncoder>(encoderHandle);
@@ -2877,12 +2898,7 @@ async function processCommand(fnId: number): Promise<void> {
 
       const encoder = getHandle<GPUCommandEncoder>(encoderHandle);
 
-      // End active compute pass if provided
-      if (passHandle !== 0) {
-        const pass = getHandle<GPUComputePassEncoder>(passHandle);
-        pass.end();
-        passEncoderMap.delete(passHandle);
-      }
+      endOpenComputePassesForEncoder(encoderHandle, passHandle);
 
       // Perform the copy
       const src = getHandle<GPUBuffer>(srcHandle);

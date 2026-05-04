@@ -2395,6 +2395,11 @@ export interface ChatConfig {
    * Default: true (false when reasoningEffort is "none").
    */
   includeReasoning?: boolean | undefined;
+  /**
+   * Parse and execute complete tool-call blocks that appear inside reasoning.
+   * Default: false.
+   */
+  allowToolCallsInReasoning?: boolean | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
   reportPerformance?: boolean | undefined;
   /**

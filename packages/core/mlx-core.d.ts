@@ -1617,6 +1617,11 @@ export interface ChatConfig {
    * Set to false to suppress thinking by injecting empty <think></think> tags.
    */
   enableThinking?: boolean | undefined;
+  /**
+   * Parse and execute complete tool-call blocks that appear inside reasoning.
+   * Default: false.
+   */
+  allowToolCallsInReasoning?: boolean | undefined;
   /** When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result */
   reportPerformance?: boolean | undefined;
   /**

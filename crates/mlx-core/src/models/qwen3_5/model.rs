@@ -1915,6 +1915,7 @@ impl Qwen35Inner {
             think_end_str.as_deref(),
             performance,
             p.include_reasoning,
+            p.allow_tool_calls_in_reasoning,
             enable_thinking.unwrap_or(true),
             prompt_tokens_for_result,
             reasoning_tracker.reasoning_token_count(),
@@ -2570,6 +2571,7 @@ impl Qwen35Inner {
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
+            p.allow_tool_calls_in_reasoning,
         );
 
         let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -3125,6 +3127,7 @@ impl Qwen35Inner {
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
+            p.allow_tool_calls_in_reasoning,
         );
 
         let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -4613,6 +4616,11 @@ pub struct ChatConfig {
     /// Default: true (false when reasoningEffort is "none").
     #[napi(ts_type = "boolean | undefined")]
     pub include_reasoning: Option<bool>,
+    /// Parse and execute complete tool-call blocks that appear inside reasoning.
+    /// Default: false. Browser app-preview uses this so tool calls can be made
+    /// during chain-of-thought while raw tool markup stays out of the UI.
+    #[napi(ts_type = "boolean | undefined")]
+    pub allow_tool_calls_in_reasoning: Option<bool>,
     /// When true, include performance metrics (TTFT, prefill tok/s, decode tok/s) in the result
     #[napi(ts_type = "boolean | undefined")]
     pub report_performance: Option<bool>,
@@ -4887,6 +4895,7 @@ impl Qwen3_5Model {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -4942,6 +4951,7 @@ impl Qwen3_5Model {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -4994,6 +5004,7 @@ impl Qwen3_5Model {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -5046,6 +5057,7 @@ impl Qwen3_5Model {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -5115,6 +5127,7 @@ impl Qwen3_5Model {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -5176,6 +5189,7 @@ impl Qwen3_5Model {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
@@ -5516,6 +5530,7 @@ impl Qwen3_5Model {
             tools: None,
             thinking_token_budget: None,
             include_reasoning: None,
+            allow_tool_calls_in_reasoning: None,
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,

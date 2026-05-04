@@ -2364,7 +2364,12 @@ export function createBridgeStub(
     },
 
     wgpuComputePassEncoderRelease(handle: number): void {
-      if (activeComputePass === handle) {
+      // With pass caching enabled, release is just wrapper lifetime. The
+      // gpu-worker keeps the underlying pass open in passEncoderMap until End,
+      // fused copy, or fused submit. Clearing the stub's active pass here makes
+      // later copies omit the pass handle and can record copyBufferToBuffer
+      // while the worker-side pass still locks the encoder.
+      if (!passCachingEnabled() && activeComputePass === handle) {
         activeComputePass = -1;
         activeComputePassEncoder = -1;
       }
