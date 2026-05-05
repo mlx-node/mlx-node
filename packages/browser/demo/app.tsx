@@ -23,6 +23,7 @@ import {
   reduceScreen,
   formatLoadingText,
 } from "./lib/screen-state";
+import { Landing } from "./components/landing/Landing";
 import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import {
@@ -225,21 +226,6 @@ type ProfileStats = {
   diagBatchDeferredBlock?: number;
   diagBatchStageRefused?: number;
 };
-
-function LandingPlaceholder({ onLoad }: { onLoad: () => void }) {
-  return (
-    <div className="overlay-screen" style={{ background: "var(--bg)" }}>
-      <button
-        type="button"
-        className="btn-load"
-        onClick={onLoad}
-        style={{ borderRadius: 100 }}
-      >
-        Load Model (placeholder)
-      </button>
-    </div>
-  );
-}
 
 function LoadingPlaceholder({ status }: { status: string | null }) {
   return (
@@ -2254,41 +2240,38 @@ function App() {
           accept="image/*"
           className="hidden"
         />
-        <input
-          id="model-dir-input"
-          ref={modelDirInputRef}
-          type="file"
-          multiple
-          className="hidden"
-        />
       </footer>
     </div>
       </div>
 
+      {/*
+        Always-mounted hidden file input for picking a local model directory.
+        Lives at the App root (outside the screen-conditional Landing/Loading
+        overlays) so that the `useEffect` keyed on `loadKickoff` can attach
+        `webkitdirectory` + `change` listeners regardless of which screen is
+        active when the load is kicked off.
+      */}
+      <input
+        id="model-dir-input"
+        ref={modelDirInputRef}
+        type="file"
+        multiple
+        className="hidden"
+      />
+
       {screen === "landing" && (
-        <LandingPlaceholder
+        <Landing
           onLoad={() => {
+            setErrorBannerState(null);
             setLoadKickoff((k) => k + 1);
             dispatchScreen({ type: "load_kickoff" });
           }}
+          onLocalModel={() => modelDirInputRef.current?.click()}
+          modelDirInputRef={modelDirInputRef}
+          errorBanner={errorBanner}
         />
       )}
       {screen === "loading" && <LoadingPlaceholder status={loadingText} />}
-
-      {screen === "landing" && errorBanner && (
-        <div
-          className="error-banner"
-          style={{
-            position: "absolute",
-            top: 16,
-            left: "50%",
-            transform: "translateX(-50%)",
-            zIndex: 20,
-          }}
-        >
-          {errorBanner}
-        </div>
-      )}
     </div>
   );
 }

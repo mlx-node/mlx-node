@@ -1,0 +1,95 @@
+import { type RefObject } from "react";
+
+export type LandingProps = {
+  onLoad: () => void;
+  onLocalModel: () => void;
+  /**
+   * Ref to the hidden file input used for picking a local model directory.
+   * The input itself is rendered at the App root (always-mounted) so that the
+   * `useEffect` that wires `webkitdirectory` + `change` listeners can find the
+   * DOM node after the screen transitions away from `landing` (e.g. into
+   * `loading`). The prop is retained on Landing for API symmetry / future use.
+   */
+  modelDirInputRef: RefObject<HTMLInputElement | null>;
+  errorBanner: string | null;
+  loadDisabled?: boolean;
+};
+
+const MODEL_LABEL = "0.8B";
+
+export function Landing({
+  onLoad,
+  onLocalModel,
+  modelDirInputRef: _modelDirInputRef,
+  errorBanner,
+  loadDisabled = false,
+}: LandingProps) {
+  return (
+    <div className="overlay-screen">
+      <div className="landing-content">
+        <div className="landing-tag">Multimodal AI · 100% Local · WebGPU</div>
+        <h1 className="landing-title">
+          Qwen 3.5 <em>Vision</em>
+        </h1>
+        <p className="landing-sub">
+          Run a multimodal vision-language model entirely in your browser. No
+          server, no API keys — powered by <code>@mlx-node/browser</code> and
+          WebGPU.
+        </p>
+
+        <div className="landing-specs">
+          <div className="spec">
+            <div className="spec-value">Vision + Language</div>
+            <div className="spec-label">Unified Multimodal</div>
+          </div>
+          <div className="spec">
+            <div className="spec-value">201 Languages</div>
+            <div className="spec-label">Global Coverage</div>
+          </div>
+          <div className="spec">
+            <div className="spec-value">Reasoning</div>
+            <div className="spec-label">Code · Agents · Visual</div>
+          </div>
+        </div>
+
+        <div className="btn-load-group">
+          <button
+            type="button"
+            className="btn-load"
+            onClick={onLoad}
+            disabled={loadDisabled}
+          >
+            Load Model (<span>{MODEL_LABEL}</span>)
+          </button>
+          <button
+            type="button"
+            className="btn-load-arrow"
+            title="Choose model size (coming soon)"
+            disabled
+          >
+            ▾
+          </button>
+        </div>
+
+        {errorBanner && (
+          <div className="error-banner" style={{ marginTop: 24 }}>
+            {errorBanner}
+          </div>
+        )}
+      </div>
+
+      <img
+        className="landing-mascot"
+        src="/capybara.png"
+        alt="Qwen capybara mascot"
+      />
+
+      <div className="landing-footer">
+        Built with <code>@mlx-node/browser</code>
+        <span className="local-link" onClick={onLocalModel}>
+          Local model…
+        </span>
+      </div>
+    </div>
+  );
+}
