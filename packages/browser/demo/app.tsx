@@ -7,7 +7,6 @@ import type {
 import {
   ArrowUp,
   Cpu,
-  FolderOpen,
   ImagePlus,
   Mic,
   MonitorPlay,
@@ -19,9 +18,9 @@ import { Streamdown } from "streamdown";
 
 import { createSabRingOverHeap } from "../src/chat-stream-sab.js";
 import { type ScreenState, reduceScreen } from "./lib/screen-state";
+import { ChatHeader } from "./components/chat/ChatHeader";
 import { Landing } from "./components/landing/Landing";
 import { Loading } from "./components/loading/Loading";
-import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import {
   Card,
@@ -1960,6 +1959,26 @@ function App() {
     modelDirInput.addEventListener("change", onModelDirChange);
     document.addEventListener("paste", onPaste);
 
+    // Expose a global reset hook for the new ChatHeader's "Reset Chat" button.
+    // Clears the chat DOM, resets the local message history (keeping the
+    // system prompt), and tears down any in-flight streaming UI state. The
+    // underlying worker session will get a fresh start on the next chat
+    // message because messages[] now carries only the system prompt.
+    (
+      window as unknown as { __mlxResetChat?: () => void }
+    ).__mlxResetChat = () => {
+      activeReaderAbort?.abort();
+      activeReaderAbort = null;
+      resetStreamingUi();
+      unmountAllStreamdown();
+      currentAssistantDiv = null;
+      currentThinkingDiv = null;
+      currentResponseDiv = null;
+      currentToolCallIndicatorDiv = null;
+      messages.splice(1);
+      chatEl.replaceChildren();
+    };
+
     return () => {
       sendBtn.removeEventListener("click", handleSend);
       promptEl.removeEventListener("keydown", onPromptKeyDown);
@@ -1973,6 +1992,8 @@ function App() {
       if (rafHandle != null) cancelAnimationFrame(rafHandle);
       unmountAllStreamdown();
       worker.terminate();
+      delete (window as unknown as { __mlxResetChat?: () => void })
+        .__mlxResetChat;
     };
   }, [loadKickoff]);
 
@@ -1982,28 +2003,36 @@ function App() {
         className={`chat-layer ${screen === "chat" ? "visible" : ""}`}
       >
     <div className="app-shell">
-      <header className="app-header">
-        <div className="brand-mark">MLX</div>
-        <div className="brand-copy">
-          <h1>MLX Browser</h1>
-          <p>WebGPU model playground</p>
-        </div>
-        <div className="header-actions">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="header-local-btn"
-            onClick={() => modelDirInputRef.current?.click()}
-          >
-            <FolderOpen data-icon="inline-start" />
-            <span>Local model</span>
-          </Button>
-          <Badge ref={statusRef} id="status" className="status-pill info">
-            Initializing...
-          </Badge>
-        </div>
-      </header>
+      <ChatHeader
+        onReset={() => {
+          // The existing useEffect installs a global reset hook on
+          // window.__mlxResetChat when the chat session is established. If
+          // it's set, call it; the chat DOM will clear and the underlying
+          // chat session will be reset.
+          if (
+            (window as unknown as { __mlxResetChat?: () => void })
+              .__mlxResetChat
+          ) {
+            (
+              window as unknown as { __mlxResetChat: () => void }
+            ).__mlxResetChat();
+          }
+          dispatchScreen({ type: "reset_chat" });
+        }}
+      />
+      {/*
+        Hidden ref-only status element. The legacy app-header rendered the
+        Initializing status pill; we kept the ref so the existing useEffect's
+        statusEl.textContent / statusEl.className mutations remain safe. The
+        new ChatHeader shows its own static "Ready on WebGPU" status.
+      */}
+      <span
+        ref={statusRef}
+        id="status"
+        style={{ display: "none" }}
+        aria-hidden="true"
+      />
+
 
       <main
         ref={workspaceGridRef}
