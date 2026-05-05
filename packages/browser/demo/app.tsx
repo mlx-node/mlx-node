@@ -4,7 +4,6 @@ import type {
   ToolDefinition,
 } from "@mlx-node/core";
 
-import { Cpu } from "lucide-react";
 import { useEffect, useReducer, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Streamdown } from "streamdown";
@@ -23,14 +22,6 @@ import { TelemetryStrip } from "./components/chat/TelemetryStrip";
 import { Landing } from "./components/landing/Landing";
 import { Loading } from "./components/loading/Loading";
 import {
-  Card,
-  CardAction,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "./components/ui/card";
-import {
   sanitizeAssistantText,
   sanitizeThinkingText as sanitizeThinkingMarkup,
   splitAssistantThinking,
@@ -40,7 +31,6 @@ import "./styles.css";
 
 type StatusState = "info" | "ready" | "error";
 type ReasoningEffort = "off" | "low" | "medium" | "high";
-type PreviewState = "idle" | "calling" | "rendered" | "error";
 const DEFAULT_MODEL_LABEL = "qwen3.5-0.8b-mlx-bf16";
 const MAX_BROWSER_OUTPUT_TOKENS = 36864;
 const DEFAULT_BROWSER_OUTPUT_TOKENS = 1024;
@@ -215,18 +205,12 @@ type ProfileStats = {
 
 function App() {
   const statusRef = useRef<HTMLSpanElement>(null);
-  const workspaceGridRef = useRef<HTMLElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
-  const previewSurfaceRef = useRef<HTMLDivElement>(null);
-  const previewFrameRef = useRef<HTMLIFrameElement>(null);
-  const previewTitleRef = useRef<HTMLDivElement>(null);
-  const previewMetaRef = useRef<HTMLDivElement>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const sendRef = useRef<HTMLButtonElement>(null);
   const imageButtonRef = useRef<HTMLButtonElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const modelDirInputRef = useRef<HTMLInputElement>(null);
-  const composerModelLabelRef = useRef<HTMLSpanElement>(null);
   const temperatureInputRef = useRef<HTMLInputElement>(null);
   const maxOutputTokensInputRef = useRef<HTMLInputElement>(null);
   const reasoningEffortRef = useRef<ReasoningEffort>("off");
@@ -252,9 +236,7 @@ function App() {
   const [decodeTokensPerSec, setDecodeTokensPerSec] = useState<number | null>(
     null,
   );
-  const [modelLine, setModelLine] = useState<string>(
-    `${DEFAULT_MODEL_LABEL} · bf16`,
-  );
+  const [modelLine, setModelLine] = useState<string>(DEFAULT_MODEL_LABEL);
   const appToolsEnabledRef = useRef(initialAppToolsEnabled);
   const initialMaxOutputTokens = Math.min(
     MAX_BROWSER_OUTPUT_TOKENS,
@@ -286,39 +268,23 @@ function App() {
       return;
     }
     const statusEl = statusRef.current!;
-    const workspaceGrid = workspaceGridRef.current!;
     const chatEl = chatRef.current!;
-    // Legacy preview surface refs are dead after Task 9; route create_app_preview
-    // through renderInlinePreview() into the assistant bubble instead. We keep
-    // detached DOM stubs here so the legacy setPreviewStatus / setEmptyPreview /
-    // executeToolCall paths remain harmless until Task 11 removes them.
-    const previewSurface =
-      previewSurfaceRef.current ?? document.createElement("div");
-    const previewFrame =
-      previewFrameRef.current ?? document.createElement("iframe");
-    const previewTitle =
-      previewTitleRef.current ?? document.createElement("div");
-    const previewMeta =
-      previewMetaRef.current ?? document.createElement("div");
     const promptEl = promptRef.current!;
     const sendBtn = sendRef.current!;
     const imageBtn = imageButtonRef.current!;
     const imageInput = imageInputRef.current!;
     const modelDirInput = modelDirInputRef.current!;
-    const composerModelLabel = composerModelLabelRef.current!;
     const temperatureInput = temperatureInputRef.current!;
     const maxOutputTokensInput = maxOutputTokensInputRef.current!;
 
     if (
       !statusEl ||
-      !workspaceGrid ||
       !chatEl ||
       !promptEl ||
       !sendBtn ||
       !imageBtn ||
       !imageInput ||
       !modelDirInput ||
-      !composerModelLabel ||
       !maxOutputTokensInput
     ) {
       return;
@@ -354,24 +320,9 @@ function App() {
       }
     }
 
-    function setPreviewStatus(state: PreviewState, text: string) {
-      previewSurface.dataset.previewState = state;
-      previewMeta.textContent = text;
-    }
-
     function setAppToolsEnabled(enabled: boolean) {
       appToolsEnabledRef.current = enabled;
       setAppToolsEnabledState(enabled);
-      workspaceGrid.dataset.appTools = enabled ? "on" : "off";
-      previewSurface.hidden = !enabled;
-      if (enabled) {
-        setPreviewStatus(
-          (previewSurface.dataset.previewState as PreviewState) || "idle",
-          previewMeta.textContent || "Waiting for create_app_preview",
-        );
-      } else {
-        setPreviewStatus("idle", "App preview disabled");
-      }
     }
 
     function log(msg: string) {
@@ -665,30 +616,6 @@ function App() {
       root.render(<InlinePreviewCard title={title} srcdoc={srcdoc} />);
     }
 
-    function setEmptyPreview() {
-      previewFrame.srcdoc = `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-        background: #0f1218;
-        color: #8f96a3;
-        font: 14px/1.5 Inter, system-ui, sans-serif;
-      }
-    </style>
-  </head>
-  <body>App preview will appear here.</body>
-</html>`;
-      previewTitle.textContent = "Preview";
-      setPreviewStatus("idle", "Waiting for create_app_preview");
-    }
-
     function compactToolArguments(call: ToolCallResult) {
       const args = asRecord(call.arguments);
       const title = stringArg(args, "title");
@@ -782,10 +709,6 @@ function App() {
 
     function executeToolCall(call: ToolCallResult): BrowserChatMessage {
       if (call.status !== "ok") {
-        setPreviewStatus(
-          "error",
-          call.error || `Tool call parse failed: ${call.status}`,
-        );
         return {
           role: "tool",
           toolCallId: call.id,
@@ -797,7 +720,6 @@ function App() {
       }
 
       if (call.name !== APP_PREVIEW_TOOL_NAME) {
-        setPreviewStatus("error", `Unknown browser tool: ${call.name}`);
         return {
           role: "tool",
           toolCallId: call.id,
@@ -814,7 +736,6 @@ function App() {
       const css = stringArg(args, "css");
       const js = stringArg(args, "js") || stringArg(args, "javascript");
       if (!html && !css && !js) {
-        setPreviewStatus("error", "create_app_preview missing content");
         return {
           role: "tool",
           toolCallId: call.id,
@@ -826,17 +747,13 @@ function App() {
       }
 
       previewSequence++;
-      setPreviewStatus("calling", `Rendering ${title}`);
       const srcdoc = buildPreviewDocument(args);
-      previewFrame.srcdoc = srcdoc;
-      previewTitle.textContent = title;
       // Mount the inline preview card under the assistant bubble that owns
       // this tool call. Falls back to appending under the chat scroll
       // container if there is no current assistant bubble (e.g. the assistant
       // turn has already finalized before the tool fires).
       const previewHost: HTMLElement = currentAssistantDiv ?? chatEl;
       renderInlinePreview(previewHost, title, srcdoc);
-      setPreviewStatus("rendered", `Rendered preview #${previewSequence}`);
       log(`[TOOL] ${APP_PREVIEW_TOOL_NAME} rendered "${title}"`);
 
       return {
@@ -851,7 +768,6 @@ function App() {
       };
     }
 
-    setEmptyPreview();
     setAppToolsEnabled(appToolsEnabledRef.current);
 
     const messages: BrowserChatMessage[] = [
@@ -1459,7 +1375,6 @@ function App() {
       if (okToolCalls.length > 0) {
         for (const call of okToolCalls) {
           const toolCell = appendToolCell(call, "calling");
-          setPreviewStatus("calling", `Calling ${call.name}`);
           const toolMessage = executeToolCall(call);
           const toolResult = asRecord(toolMessage.content);
           const ok = toolResult.ok === true;
@@ -1534,10 +1449,8 @@ function App() {
         case "ready":
           if (typeof data.modelLabel === "string" && data.modelLabel) {
             activeModelLabel = data.modelLabel;
-            composerModelLabel.textContent =
-              compactModelLabel(activeModelLabel);
           }
-          setModelLine(`${activeModelLabel} · bf16`);
+          setModelLine(activeModelLabel);
           log("Model ready!");
           setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, "ready");
           sharedWasmMemory =
@@ -1821,8 +1734,7 @@ function App() {
 
     function resetForModelLoad(label?: string) {
       activeModelLabel = label ?? DEFAULT_MODEL_LABEL;
-      composerModelLabel.textContent = compactModelLabel(activeModelLabel);
-      setModelLine(`${activeModelLabel} · bf16`);
+      setModelLine(activeModelLabel);
       activeReaderAbort?.abort();
       activeReaderAbort = null;
       sharedWasmMemory = null;
@@ -2090,31 +2002,7 @@ function App() {
       />
 
 
-      <main
-        ref={workspaceGridRef}
-        className="workspace-grid"
-        data-app-tools={initialAppToolsEnabled ? "on" : "off"}
-      >
-        <Card className="surface-card">
-          <CardHeader className="surface-header">
-            <div className="surface-title-row">
-              <div>
-                <CardTitle className="surface-title">Chat</CardTitle>
-                <CardDescription className="surface-meta">
-                  Streaming response
-                </CardDescription>
-              </div>
-              <CardAction>
-                <Cpu />
-              </CardAction>
-            </div>
-          </CardHeader>
-          <CardContent className="surface-content">
-            <div id="chat" ref={chatRef} />
-          </CardContent>
-        </Card>
-
-      </main>
+      <div className="chat-messages" id="chat" ref={chatRef} />
 
       <TelemetryStrip
         stats={telemetryStats}
@@ -2156,16 +2044,6 @@ function App() {
         onSendOrStop={() => {
           sendRef.current?.click(); // The legacy send button click handler stays
         }}
-      />
-      {/*
-        Hidden ref-only model label span. The legacy composer-bar rendered
-        the active model label here; we keep the ref so the existing useEffect's
-        composerModelLabel.textContent mutations remain safe.
-      */}
-      <span
-        ref={composerModelLabelRef}
-        style={{ display: "none" }}
-        aria-hidden="true"
       />
     </div>
       </div>
