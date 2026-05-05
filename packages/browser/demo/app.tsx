@@ -4,15 +4,9 @@ import type {
   ToolDefinition,
 } from "@mlx-node/core";
 
-import {
-  ArrowUp,
-  Cpu,
-  ImagePlus,
-  Mic,
-  MonitorPlay,
-} from "lucide-react";
+import { ArrowUp, Cpu, ImagePlus, Mic } from "lucide-react";
 import { useEffect, useReducer, useRef, useState } from "react";
-import { createRoot } from "react-dom/client";
+import { createRoot, type Root } from "react-dom/client";
 import { Streamdown } from "streamdown";
 
 import { createSabRingOverHeap } from "../src/chat-stream-sab.js";
@@ -22,6 +16,7 @@ import {
   reduceScreen,
 } from "./lib/screen-state";
 import { ChatHeader } from "./components/chat/ChatHeader";
+import { InlinePreviewCard } from "./components/chat/InlinePreviewCard";
 import { TelemetryStrip } from "./components/chat/TelemetryStrip";
 import { Landing } from "./components/landing/Landing";
 import { Loading } from "./components/loading/Loading";
@@ -298,10 +293,18 @@ function App() {
     const statusEl = statusRef.current!;
     const workspaceGrid = workspaceGridRef.current!;
     const chatEl = chatRef.current!;
-    const previewSurface = previewSurfaceRef.current!;
-    const previewFrame = previewFrameRef.current!;
-    const previewTitle = previewTitleRef.current!;
-    const previewMeta = previewMetaRef.current!;
+    // Legacy preview surface refs are dead after Task 9; route create_app_preview
+    // through renderInlinePreview() into the assistant bubble instead. We keep
+    // detached DOM stubs here so the legacy setPreviewStatus / setEmptyPreview /
+    // executeToolCall paths remain harmless until Task 11 removes them.
+    const previewSurface =
+      previewSurfaceRef.current ?? document.createElement("div");
+    const previewFrame =
+      previewFrameRef.current ?? document.createElement("iframe");
+    const previewTitle =
+      previewTitleRef.current ?? document.createElement("div");
+    const previewMeta =
+      previewMetaRef.current ?? document.createElement("div");
     const promptEl = promptRef.current!;
     const sendBtn = sendRef.current!;
     const imageBtn = imageButtonRef.current!;
@@ -315,10 +318,6 @@ function App() {
       !statusEl ||
       !workspaceGrid ||
       !chatEl ||
-      !previewSurface ||
-      !previewFrame ||
-      !previewTitle ||
-      !previewMeta ||
       !promptEl ||
       !sendBtn ||
       !imageBtn ||
@@ -649,6 +648,28 @@ function App() {
 </html>`;
     }
 
+    function renderInlinePreview(
+      bubbleEl: HTMLElement,
+      title: string,
+      srcdoc: string,
+    ) {
+      // Create a child div in the bubble, mount React InlinePreviewCard into it
+      let host = bubbleEl.querySelector<HTMLDivElement>(
+        ":scope > .inline-preview-host",
+      );
+      if (!host) {
+        host = document.createElement("div");
+        host.className = "inline-preview-host";
+        bubbleEl.appendChild(host);
+      }
+      // Reuse a previously-mounted root if any (avoid re-creating)
+      const existing = (host as HTMLDivElement & { __reactRoot?: Root })
+        .__reactRoot;
+      const root = existing ?? createRoot(host);
+      (host as HTMLDivElement & { __reactRoot?: Root }).__reactRoot = root;
+      root.render(<InlinePreviewCard title={title} srcdoc={srcdoc} />);
+    }
+
     function setEmptyPreview() {
       previewFrame.srcdoc = `<!doctype html>
 <html>
@@ -811,8 +832,15 @@ function App() {
 
       previewSequence++;
       setPreviewStatus("calling", `Rendering ${title}`);
-      previewFrame.srcdoc = buildPreviewDocument(args);
+      const srcdoc = buildPreviewDocument(args);
+      previewFrame.srcdoc = srcdoc;
       previewTitle.textContent = title;
+      // Mount the inline preview card under the assistant bubble that owns
+      // this tool call. Falls back to appending under the chat scroll
+      // container if there is no current assistant bubble (e.g. the assistant
+      // turn has already finalized before the tool fires).
+      const previewHost: HTMLElement = currentAssistantDiv ?? chatEl;
+      renderInlinePreview(previewHost, title, srcdoc);
       setPreviewStatus("rendered", `Rendered preview #${previewSequence}`);
       log(`[TOOL] ${APP_PREVIEW_TOOL_NAME} rendered "${title}"`);
 
@@ -2074,36 +2102,6 @@ function App() {
           </CardHeader>
           <CardContent className="surface-content">
             <div id="chat" ref={chatRef} />
-          </CardContent>
-        </Card>
-
-        <Card
-          ref={previewSurfaceRef}
-          className="surface-card preview-surface"
-          hidden={!initialAppToolsEnabled}
-        >
-          <CardHeader className="surface-header">
-            <div className="surface-title-row">
-              <div>
-                <CardTitle ref={previewTitleRef} className="surface-title">
-                  Preview
-                </CardTitle>
-                <CardDescription ref={previewMetaRef} className="surface-meta">
-                  Waiting for create_app_preview
-                </CardDescription>
-              </div>
-              <CardAction>
-                <MonitorPlay />
-              </CardAction>
-            </div>
-          </CardHeader>
-          <CardContent className="surface-content preview-content">
-            <iframe
-              ref={previewFrameRef}
-              className="preview-frame"
-              title="Generated app preview"
-              sandbox="allow-scripts allow-forms allow-popups allow-modals allow-downloads"
-            />
           </CardContent>
         </Card>
 
