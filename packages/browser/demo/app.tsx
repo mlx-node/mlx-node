@@ -18,12 +18,9 @@ import { createRoot } from "react-dom/client";
 import { Streamdown } from "streamdown";
 
 import { createSabRingOverHeap } from "../src/chat-stream-sab.js";
-import {
-  type ScreenState,
-  reduceScreen,
-  formatLoadingText,
-} from "./lib/screen-state";
+import { type ScreenState, reduceScreen } from "./lib/screen-state";
 import { Landing } from "./components/landing/Landing";
+import { Loading } from "./components/loading/Loading";
 import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import {
@@ -226,17 +223,6 @@ type ProfileStats = {
   diagBatchDeferredBlock?: number;
   diagBatchStageRefused?: number;
 };
-
-function LoadingPlaceholder({ status }: { status: string | null }) {
-  return (
-    <div className="overlay-screen" style={{ background: "var(--bg)" }}>
-      <div className="loading-stack">
-        <div className="loader-ring" />
-        <div className="loader-text">{formatLoadingText(status)}</div>
-      </div>
-    </div>
-  );
-}
 
 function App() {
   const statusRef = useRef<HTMLSpanElement>(null);
@@ -2271,7 +2257,7 @@ function App() {
           errorBanner={errorBanner}
         />
       )}
-      {screen === "loading" && <LoadingPlaceholder status={loadingText} />}
+      {screen === "loading" && <Loading status={loadingText} />}
     </div>
   );
 }
