@@ -38,12 +38,21 @@ describe('reduceScreen', () => {
 });
 
 describe('formatTelemetry', () => {
-  it('renders dashes when no stats yet', () => {
+  it('renders dashes when no stats and no perf', () => {
     expect(formatTelemetry(null, null, 'qwen3.5-0.8b-mlx-bf16')).toEqual({
       tokPerSec: '—',
       gpuRpc: '—',
       pool: '—',
       modelLine: 'qwen3.5-0.8b-mlx-bf16',
+    });
+  });
+
+  it('renders tok/s from perf even without stats', () => {
+    expect(formatTelemetry(null, 21.42, 'x')).toEqual({
+      tokPerSec: '21 tok/s',
+      gpuRpc: '—',
+      pool: '—',
+      modelLine: 'x',
     });
   });
 

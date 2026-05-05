@@ -48,20 +48,26 @@ export function formatTelemetry(
   decodeTokensPerSecond: number | null | undefined,
   modelLine: string,
 ): TelemetryView {
-  if (!stats || !stats.numTokens) {
-    return { tokPerSec: '—', gpuRpc: '—', pool: '—', modelLine };
-  }
-
   const tps = decodeTokensPerSecond ?? 0;
   const tokPerSec = tps > 0 ? `${Math.round(tps)} tok/s` : '—';
 
-  const rpcPerTok = stats.gpuRpcCount && stats.numTokens ? Math.round(stats.gpuRpcCount / stats.numTokens) : null;
-  const gpuRpc = rpcPerTok != null ? `${rpcPerTok.toLocaleString()} gpu-rpc/tok` : '—';
+  let gpuRpc = '—';
+  let pool = '—';
 
-  const hits = stats.poolHits ?? 0;
-  const misses = stats.poolMisses ?? 0;
-  const total = hits + misses;
-  const pool = total > 0 ? `pool ${Math.round((hits / total) * 100)}%` : '—';
+  if (stats && stats.numTokens) {
+    const rpcPerTok =
+      stats.gpuRpcCount && stats.numTokens ? Math.round(stats.gpuRpcCount / stats.numTokens) : null;
+    if (rpcPerTok != null) {
+      gpuRpc = `${rpcPerTok.toLocaleString()} gpu-rpc/tok`;
+    }
+
+    const hits = stats.poolHits ?? 0;
+    const misses = stats.poolMisses ?? 0;
+    const total = hits + misses;
+    if (total > 0) {
+      pool = `pool ${Math.round((hits / total) * 100)}%`;
+    }
+  }
 
   return { tokPerSec, gpuRpc, pool, modelLine };
 }
