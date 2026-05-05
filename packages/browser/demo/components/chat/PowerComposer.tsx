@@ -54,7 +54,9 @@ export function PowerComposer(props: PowerComposerProps) {
   function onTextareaInput(e: FormEvent<HTMLTextAreaElement>) {
     const ta = e.currentTarget;
     ta.style.height = "auto";
-    ta.style.height = `${Math.min(ta.scrollHeight, 132)}px`;
+    const next = Math.min(ta.scrollHeight, 132);
+    ta.style.height = `${next}px`;
+    ta.dataset.overflow = ta.scrollHeight > 132 ? "true" : "false";
   }
 
   return (

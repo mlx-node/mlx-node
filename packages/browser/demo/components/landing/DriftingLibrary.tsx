@@ -65,15 +65,16 @@ export function DriftingLibrary() {
     renderer.domElement.style.display = "block";
 
     const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0x0F0D11, 9, 22);
     const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
-    camera.position.set(0, 0, 8);
+    camera.position.set(0, 0, 11);
     camera.lookAt(0, 0, 0);
 
-    scene.add(new THREE.HemisphereLight(0xFFE8D8, 0x2A2030, 0.55));
-    const key = new THREE.DirectionalLight(0xFFD8B0, 1.1);
+    scene.add(new THREE.HemisphereLight(0xFFE8D8, 0x2A2030, 0.5));
+    const key = new THREE.DirectionalLight(0xFFD8B0, 1.0);
     key.position.set(3, 4, 4);
     scene.add(key);
-    const rim = new THREE.DirectionalLight(0x8884F6, 0.4);
+    const rim = new THREE.DirectionalLight(0x8884F6, 0.35);
     rim.position.set(-4, 2, -3);
     scene.add(rim);
 
@@ -98,8 +99,8 @@ export function DriftingLibrary() {
       const color = BOOK_COLORS[i % BOOK_COLORS.length];
       const mesh = makeBook(color);
       const a = Math.random() * Math.PI * 2;
-      const r = 2.3 + Math.random() * 3.0;
-      const y0 = (Math.random() - 0.5) * 5;
+      const r = 3.0 + Math.random() * 5.0;
+      const y0 = (Math.random() - 0.5) * 7;
       mesh.position.set(Math.cos(a) * r, y0, Math.sin(a) * r - 1);
       mesh.rotation.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
       scene.add(mesh);
