@@ -220,3 +220,7 @@ __screenshots__/
 
 # MLX source is a local symlink, not tracked in git
 crates/mlx-sys/mlx
+crates/mlx-sys/mlx
+
+# Superpowers brainstorm + visual companion artifacts
+.superpowers/
