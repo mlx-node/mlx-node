@@ -4,7 +4,7 @@ import type {
   ToolDefinition,
 } from "@mlx-node/core";
 
-import { ArrowUp, Cpu, ImagePlus, Mic } from "lucide-react";
+import { Cpu } from "lucide-react";
 import { useEffect, useReducer, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Streamdown } from "streamdown";
@@ -13,14 +13,15 @@ import { createSabRingOverHeap } from "../src/chat-stream-sab.js";
 import {
   type ScreenState,
   type ProfileLikeStats,
+  cycleReasoningEffort,
   reduceScreen,
 } from "./lib/screen-state";
 import { ChatHeader } from "./components/chat/ChatHeader";
 import { InlinePreviewCard } from "./components/chat/InlinePreviewCard";
+import { PowerComposer } from "./components/chat/PowerComposer";
 import { TelemetryStrip } from "./components/chat/TelemetryStrip";
 import { Landing } from "./components/landing/Landing";
 import { Loading } from "./components/loading/Loading";
-import { Button } from "./components/ui/button";
 import {
   Card,
   CardAction,
@@ -29,16 +30,6 @@ import {
   CardHeader,
   CardTitle,
 } from "./components/ui/card";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "./components/ui/select";
-import { Switch } from "./components/ui/switch";
-import { Textarea } from "./components/ui/textarea";
 import {
   sanitizeAssistantText,
   sanitizeThinkingText as sanitizeThinkingMarkup,
@@ -285,6 +276,10 @@ function App() {
   const initialTemperature = Number.isFinite(parsedInitialTemperature)
     ? Math.min(2, Math.max(0, parsedInitialTemperature))
     : DEFAULT_BROWSER_TEMPERATURE;
+  const [temperatureValue, setTemperatureValue] = useState(initialTemperature);
+  const [maxTokensValue, setMaxTokensValue] = useState(initialMaxOutputTokens);
+  const [generating, setGeneratingState] = useState(false);
+  const [sendDisabled, setSendDisabledState] = useState(true);
 
   useEffect(() => {
     if (loadKickoff === 0) {
@@ -1358,6 +1353,8 @@ function App() {
       toolContinuationCount = 0;
       setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, "ready");
       sendBtn.disabled = false;
+      setSendDisabledState(false);
+      setGeneratingState(false);
       promptEl.disabled = false;
       promptEl.focus();
       chatEl.scrollTop = chatEl.scrollHeight;
@@ -1548,6 +1545,8 @@ function App() {
             null;
           promptEl.disabled = false;
           sendBtn.disabled = false;
+          setSendDisabledState(false);
+          setGeneratingState(false);
           setImageCapability(
             (data as { supportsImages?: boolean }).supportsImages === true,
           );
@@ -1604,6 +1603,8 @@ function App() {
               }
               setStatus("Error", "error");
               sendBtn.disabled = false;
+              setSendDisabledState(false);
+              setGeneratingState(false);
               promptEl.disabled = false;
               currentAssistantDiv = null;
               currentThinkingDiv = null;
@@ -1638,6 +1639,8 @@ function App() {
           }
           setStatus("Error", "error");
           sendBtn.disabled = false;
+          setSendDisabledState(false);
+          setGeneratingState(false);
           promptEl.disabled = false;
           currentAssistantDiv = null;
           currentThinkingDiv = null;
@@ -1656,6 +1659,8 @@ function App() {
           );
           setStatus("Bridge poisoned - reload required", "error");
           sendBtn.disabled = true;
+          setSendDisabledState(true);
+          setGeneratingState(false);
           promptEl.disabled = true;
           imageBtn.disabled = true;
           break;
@@ -1836,6 +1841,8 @@ function App() {
       chatEl.replaceChildren();
       promptEl.disabled = true;
       sendBtn.disabled = true;
+      setSendDisabledState(true);
+      setGeneratingState(false);
       imageBtn.disabled = true;
       setStatus("Initializing...", "info");
       log(`Starting MLX Worker${flagBadges}${label ? ` (${label})` : ""}...`);
@@ -1890,6 +1897,8 @@ function App() {
       promptEl.value = "";
       autosizePrompt();
       sendBtn.disabled = true;
+      setSendDisabledState(true);
+      setGeneratingState(true);
       promptEl.disabled = true;
 
       if (pendingImage && !supportsImages) {
@@ -2113,154 +2122,51 @@ function App() {
         modelLine={modelLine}
       />
 
-      <footer className="composer-bar">
-        <div className="composer-shell">
-          <Textarea
-            id="prompt"
-            ref={promptRef}
-            rows={1}
-            placeholder="Message the model..."
-            disabled
-            className="composer-input"
-          />
-          <div className="composer-actions">
-            <div className="composer-actions-left">
-              <Button
-                id="image-btn"
-                ref={imageButtonRef}
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="composer-icon-btn"
-                disabled
-              >
-                <ImagePlus data-icon="inline-start" />
-                <span className="sr-only">Attach image</span>
-              </Button>
-            </div>
-            <div className="composer-actions-right">
-              <label
-                className="composer-tool-toggle"
-                title="Enable app-preview tool calls"
-              >
-                <span className="composer-tool-toggle-label">Preview</span>
-                <Switch
-                  size="sm"
-                  checked={appToolsEnabled}
-                  aria-label="App preview tool calls"
-                  onCheckedChange={(checked) => {
-                    const enabled = checked === true;
-                    setAppToolsEnabledState(enabled);
-                    appToolsEnabledRef.current = enabled;
-                    if (workspaceGridRef.current) {
-                      workspaceGridRef.current.dataset.appTools = enabled
-                        ? "on"
-                        : "off";
-                    }
-                    if (previewSurfaceRef.current) {
-                      previewSurfaceRef.current.hidden = !enabled;
-                    }
-                    if (previewMetaRef.current) {
-                      if (enabled) {
-                        if (
-                          previewMetaRef.current.textContent ===
-                          "App preview disabled"
-                        ) {
-                          previewMetaRef.current.textContent =
-                            "Waiting for create_app_preview";
-                        }
-                      } else {
-                        previewMetaRef.current.textContent =
-                          "App preview disabled";
-                      }
-                    }
-                  }}
-                />
-              </label>
-              <span className="composer-status-dot" aria-hidden="true" />
-              <span
-                ref={composerModelLabelRef}
-                className="composer-model-label"
-              >
-                {DEFAULT_MODEL_LABEL}
-              </span>
-              <input
-                ref={temperatureInputRef}
-                className="composer-temperature-input"
-                type="number"
-                min={0}
-                max={2}
-                step={0.1}
-                defaultValue={initialTemperature}
-                aria-label="Temperature"
-                title="Temperature (0-2)"
-              />
-              <input
-                ref={maxOutputTokensInputRef}
-                className="composer-max-output-input"
-                type="number"
-                min={1}
-                max={MAX_BROWSER_OUTPUT_TOKENS}
-                step={1}
-                defaultValue={initialMaxOutputTokens}
-                aria-label="Max output tokens"
-                title={`Max output tokens (1-${MAX_BROWSER_OUTPUT_TOKENS})`}
-              />
-              <Select
-                value={reasoningEffort}
-                onValueChange={(value) => {
-                  reasoningEffortRef.current = value as ReasoningEffort;
-                  setReasoningEffortState(value as ReasoningEffort);
-                }}
-              >
-                <SelectTrigger
-                  id="reasoning-effort"
-                  size="sm"
-                  className="composer-reasoning-trigger"
-                  aria-label="Reasoning effort"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectItem value="off">Off</SelectItem>
-                    <SelectItem value="low">Low</SelectItem>
-                    <SelectItem value="medium">Medium</SelectItem>
-                    <SelectItem value="high">High</SelectItem>
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="composer-icon-btn"
-                aria-label="Voice input"
-              >
-                <Mic data-icon="inline-start" />
-              </Button>
-              <Button
-                id="send"
-                ref={sendRef}
-                type="button"
-                size="icon"
-                className="composer-send-btn"
-                disabled
-              >
-                <ArrowUp data-icon="inline-start" />
-                <span className="sr-only">Send</span>
-              </Button>
-            </div>
-          </div>
-        </div>
-        <input
-          id="image-input"
-          ref={imageInputRef}
-          type="file"
-          accept="image/*"
-          className="hidden"
-        />
-      </footer>
+      <PowerComposer
+        textareaRef={promptRef}
+        sendRef={sendRef}
+        imageButtonRef={imageButtonRef}
+        imageInputRef={imageInputRef}
+        reasoningEffort={reasoningEffort}
+        onCycleReasoning={() => {
+          const next = cycleReasoningEffort(reasoningEffort);
+          reasoningEffortRef.current = next;
+          setReasoningEffortState(next);
+        }}
+        temperature={temperatureValue}
+        onTemperatureChange={(v) => {
+          setTemperatureValue(v);
+          if (temperatureInputRef.current)
+            temperatureInputRef.current.value = `${v}`;
+        }}
+        maxTokens={maxTokensValue}
+        onMaxTokensChange={(v) => {
+          setMaxTokensValue(v);
+          if (maxOutputTokensInputRef.current)
+            maxOutputTokensInputRef.current.value = `${v}`;
+        }}
+        toolsEnabled={appToolsEnabled}
+        onToggleTools={() => {
+          const next = !appToolsEnabled;
+          setAppToolsEnabledState(next);
+          appToolsEnabledRef.current = next;
+        }}
+        generating={generating}
+        sendDisabled={sendDisabled}
+        onSendOrStop={() => {
+          sendRef.current?.click(); // The legacy send button click handler stays
+        }}
+      />
+      {/*
+        Hidden ref-only model label span. The legacy composer-bar rendered
+        the active model label here; we keep the ref so the existing useEffect's
+        composerModelLabel.textContent mutations remain safe.
+      */}
+      <span
+        ref={composerModelLabelRef}
+        style={{ display: "none" }}
+        aria-hidden="true"
+      />
     </div>
       </div>
 
@@ -2277,6 +2183,22 @@ function App() {
         type="file"
         multiple
         className="hidden"
+      />
+      {/*
+        Hidden inputs preserved so the existing useEffect's readTemperature() and
+        readMaxOutputTokens() helpers (which read from .value) keep working
+        unchanged. The PowerComposer mirrors React state into these via its
+        onTemperatureChange / onMaxTokensChange callbacks.
+      */}
+      <input
+        ref={temperatureInputRef}
+        type="hidden"
+        defaultValue={initialTemperature}
+      />
+      <input
+        ref={maxOutputTokensInputRef}
+        type="hidden"
+        defaultValue={initialMaxOutputTokens}
       />
 
       {screen === "landing" && (
