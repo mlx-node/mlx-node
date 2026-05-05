@@ -1,5 +1,7 @@
 import { type RefObject } from "react";
 
+import { DriftingLibrary } from "./DriftingLibrary";
+
 export type LandingProps = {
   onLoad: () => void;
   onLocalModel: () => void;
@@ -26,6 +28,7 @@ export function Landing({
 }: LandingProps) {
   return (
     <div className="overlay-screen">
+      <DriftingLibrary />
       <div className="landing-content">
         <div className="landing-tag">Multimodal AI · 100% Local · WebGPU</div>
         <h1 className="landing-title">
