@@ -10,15 +10,19 @@ import {
   ImagePlus,
   Mic,
   MonitorPlay,
-  TerminalSquare,
 } from "lucide-react";
 import { useEffect, useReducer, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Streamdown } from "streamdown";
 
 import { createSabRingOverHeap } from "../src/chat-stream-sab.js";
-import { type ScreenState, reduceScreen } from "./lib/screen-state";
+import {
+  type ScreenState,
+  type ProfileLikeStats,
+  reduceScreen,
+} from "./lib/screen-state";
 import { ChatHeader } from "./components/chat/ChatHeader";
+import { TelemetryStrip } from "./components/chat/TelemetryStrip";
 import { Landing } from "./components/landing/Landing";
 import { Loading } from "./components/loading/Loading";
 import { Button } from "./components/ui/button";
@@ -226,7 +230,6 @@ type ProfileStats = {
 function App() {
   const statusRef = useRef<HTMLSpanElement>(null);
   const workspaceGridRef = useRef<HTMLElement>(null);
-  const logRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
   const previewSurfaceRef = useRef<HTMLDivElement>(null);
   const previewFrameRef = useRef<HTMLIFrameElement>(null);
@@ -257,6 +260,15 @@ function App() {
   const [loadKickoff, setLoadKickoff] = useState(0);
   const [loadingText, setLoadingText] = useState<string | null>(null);
   const [errorBanner, setErrorBannerState] = useState<string | null>(null);
+  const [telemetryStats, setTelemetryStats] = useState<ProfileLikeStats | null>(
+    null,
+  );
+  const [decodeTokensPerSec, setDecodeTokensPerSec] = useState<number | null>(
+    null,
+  );
+  const [modelLine, setModelLine] = useState<string>(
+    `${DEFAULT_MODEL_LABEL} · bf16`,
+  );
   const appToolsEnabledRef = useRef(initialAppToolsEnabled);
   const initialMaxOutputTokens = Math.min(
     MAX_BROWSER_OUTPUT_TOKENS,
@@ -285,7 +297,6 @@ function App() {
     }
     const statusEl = statusRef.current!;
     const workspaceGrid = workspaceGridRef.current!;
-    const logEl = logRef.current!;
     const chatEl = chatRef.current!;
     const previewSurface = previewSurfaceRef.current!;
     const previewFrame = previewFrameRef.current!;
@@ -303,7 +314,6 @@ function App() {
     if (
       !statusEl ||
       !workspaceGrid ||
-      !logEl ||
       !chatEl ||
       !previewSurface ||
       !previewFrame ||
@@ -371,10 +381,8 @@ function App() {
     }
 
     function log(msg: string) {
-      const line = document.createElement("div");
-      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-      logEl.appendChild(line);
-      logEl.scrollTop = logEl.scrollHeight;
+      // eslint-disable-next-line no-console
+      console.log(`[mlx] ${msg}`);
     }
 
     function compactModelLabel(label: string) {
@@ -1390,6 +1398,9 @@ function App() {
         log(
           `${result.numTokens} tokens | finish ${finishReason} | TTFT ${result.performance.ttftMs.toFixed(0)}ms${prefill} | Decode ${result.performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
         );
+        setDecodeTokensPerSec(
+          result.performance?.decodeTokensPerSecond ?? null,
+        );
       } else {
         log(`${result.numTokens ?? 0} tokens | finish ${finishReason}`);
       }
@@ -1501,6 +1512,7 @@ function App() {
             composerModelLabel.textContent =
               compactModelLabel(activeModelLabel);
           }
+          setModelLine(`${activeModelLabel} · bf16`);
           log("Model ready!");
           setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, "ready");
           sharedWasmMemory =
@@ -1625,6 +1637,12 @@ function App() {
     worker.onmessage = handleWorkerMessage;
 
     function logProfile(s: ProfileStats) {
+      setTelemetryStats({
+        numTokens: s.numTokens,
+        gpuRpcCount: s.gpuRpcCount,
+        poolHits: s.poolHits,
+        poolMisses: s.poolMisses,
+      });
       const n = Math.max(1, s.numTokens);
       const dpt = s.totalDispatches / n;
       const rpt = s.bridgeRpcCount / n;
@@ -1771,6 +1789,7 @@ function App() {
     function resetForModelLoad(label?: string) {
       activeModelLabel = label ?? DEFAULT_MODEL_LABEL;
       composerModelLabel.textContent = compactModelLabel(activeModelLabel);
+      setModelLine(`${activeModelLabel} · bf16`);
       activeReaderAbort?.abort();
       activeReaderAbort = null;
       sharedWasmMemory = null;
@@ -2088,25 +2107,13 @@ function App() {
           </CardContent>
         </Card>
 
-        <Card className="surface-card">
-          <CardHeader className="surface-header">
-            <div className="surface-title-row">
-              <div>
-                <CardTitle className="surface-title">Telemetry</CardTitle>
-                <CardDescription className="surface-meta">
-                  Worker and decode log
-                </CardDescription>
-              </div>
-              <CardAction>
-                <TerminalSquare />
-              </CardAction>
-            </div>
-          </CardHeader>
-          <CardContent className="surface-content">
-            <div id="log" ref={logRef} />
-          </CardContent>
-        </Card>
       </main>
+
+      <TelemetryStrip
+        stats={telemetryStats}
+        decodeTokensPerSecond={decodeTokensPerSec}
+        modelLine={modelLine}
+      />
 
       <footer className="composer-bar">
         <div className="composer-shell">
