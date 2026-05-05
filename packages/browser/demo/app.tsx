@@ -13,11 +13,16 @@ import {
   MonitorPlay,
   TerminalSquare,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Streamdown } from "streamdown";
 
 import { createSabRingOverHeap } from "../src/chat-stream-sab.js";
+import {
+  type ScreenState,
+  reduceScreen,
+  formatLoadingText,
+} from "./lib/screen-state";
 import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import {
@@ -221,6 +226,32 @@ type ProfileStats = {
   diagBatchStageRefused?: number;
 };
 
+function LandingPlaceholder({ onLoad }: { onLoad: () => void }) {
+  return (
+    <div className="overlay-screen" style={{ background: "var(--bg)" }}>
+      <button
+        type="button"
+        className="btn-load"
+        onClick={onLoad}
+        style={{ borderRadius: 100 }}
+      >
+        Load Model (placeholder)
+      </button>
+    </div>
+  );
+}
+
+function LoadingPlaceholder({ status }: { status: string | null }) {
+  return (
+    <div className="overlay-screen" style={{ background: "var(--bg)" }}>
+      <div className="loading-stack">
+        <div className="loader-ring" />
+        <div className="loader-text">{formatLoadingText(status)}</div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const statusRef = useRef<HTMLSpanElement>(null);
   const workspaceGridRef = useRef<HTMLElement>(null);
@@ -248,6 +279,13 @@ function App() {
   );
   const [reasoningEffort, setReasoningEffortState] =
     useState<ReasoningEffort>("off");
+  const [screen, dispatchScreen] = useReducer(
+    reduceScreen,
+    "landing" as ScreenState,
+  );
+  const [loadKickoff, setLoadKickoff] = useState(0);
+  const [loadingText, setLoadingText] = useState<string | null>(null);
+  const [errorBanner, setErrorBannerState] = useState<string | null>(null);
   const appToolsEnabledRef = useRef(initialAppToolsEnabled);
   const initialMaxOutputTokens = Math.min(
     MAX_BROWSER_OUTPUT_TOKENS,
@@ -271,6 +309,9 @@ function App() {
     : DEFAULT_BROWSER_TEMPERATURE;
 
   useEffect(() => {
+    if (loadKickoff === 0) {
+      return;
+    }
     const statusEl = statusRef.current!;
     const workspaceGrid = workspaceGridRef.current!;
     const logEl = logRef.current!;
@@ -329,6 +370,13 @@ function App() {
     function setStatus(text: string, state: StatusState = "info") {
       statusEl.textContent = text;
       statusEl.className = `status-pill ${state}`;
+      setLoadingText(text);
+      if (state === "ready") {
+        dispatchScreen({ type: "model_ready" });
+      } else if (state === "error") {
+        setErrorBannerState(text);
+        dispatchScreen({ type: "model_error" });
+      }
     }
 
     function setPreviewStatus(state: PreviewState, text: string) {
@@ -1954,9 +2002,13 @@ function App() {
       unmountAllStreamdown();
       worker.terminate();
     };
-  }, []);
+  }, [loadKickoff]);
 
   return (
+    <div className="app-root">
+      <div
+        className={`chat-layer ${screen === "chat" ? "visible" : ""}`}
+      >
     <div className="app-shell">
       <header className="app-header">
         <div className="brand-mark">MLX</div>
@@ -2210,6 +2262,33 @@ function App() {
           className="hidden"
         />
       </footer>
+    </div>
+      </div>
+
+      {screen === "landing" && (
+        <LandingPlaceholder
+          onLoad={() => {
+            setLoadKickoff((k) => k + 1);
+            dispatchScreen({ type: "load_kickoff" });
+          }}
+        />
+      )}
+      {screen === "loading" && <LoadingPlaceholder status={loadingText} />}
+
+      {screen === "landing" && errorBanner && (
+        <div
+          className="error-banner"
+          style={{
+            position: "absolute",
+            top: 16,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 20,
+          }}
+        >
+          {errorBanner}
+        </div>
+      )}
     </div>
   );
 }
