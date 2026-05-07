@@ -69,6 +69,7 @@ pub(crate) fn run_paged_prefill_chunk(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
@@ -83,6 +84,7 @@ pub(crate) fn run_paged_prefill_chunk(
         full_tokens,
         suffix_tokens,
         cached_prefix_len,
+        gdn_prefix_already_primed,
         embed,
         layers,
         caches,
@@ -106,7 +108,10 @@ pub(crate) fn run_paged_prefill_chunk(
 /// 1. **GDN pre-pass runs ONCE, before any chunking.** The GDN
 ///    linear-attention layers consume the cached prefix in one shot
 ///    (this is the existing approximation — orthogonal to suffix
-///    chunking).
+///    chunking). Live continuation callers can pass
+///    `gdn_prefix_already_primed = true` when `caches` already contain
+///    the linear-attention state for `cached_prefix_len`, avoiding this
+///    replay.
 ///
 /// 2. **GDN state propagates in-place across chunks.** When the layer
 ///    loop calls `layer.forward_paged_or_flat` with a Linear-kind
@@ -133,6 +138,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
@@ -154,6 +160,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             full_tokens,
             suffix_tokens,
             cached_prefix_len,
+            gdn_prefix_already_primed,
             embed,
             layers,
             caches,
@@ -170,7 +177,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     // GDN pre-pass over the cached prefix runs ONCE, before any suffix
     // chunking. The GDN linear-attention layers consume the prefix in
     // one shot (existing approximation; orthogonal to chunking).
-    if cached_prefix_len > 0 {
+    if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
     }
@@ -259,6 +266,7 @@ pub(crate) fn run_paged_prefill_single_shot(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
@@ -272,7 +280,7 @@ pub(crate) fn run_paged_prefill_single_shot(
         .record_tokens(suffix_tokens)
         .map_err(Error::from_reason)?;
 
-    if cached_prefix_len > 0 {
+    if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
     }
@@ -737,6 +745,7 @@ mod tests {
                 prompt,
                 prompt,
                 0,
+                false,
                 &embed,
                 &mut inner.layers,
                 caches_ref,
@@ -1110,6 +1119,7 @@ mod tests {
                 &prompt,
                 &prompt,
                 0,
+                false,
                 &embed,
                 &mut inner.layers,
                 caches_ref,
@@ -1169,6 +1179,7 @@ mod tests {
                 &prompt,
                 &prompt,
                 0,
+                false,
                 &embed,
                 &mut inner.layers,
                 caches_ref,

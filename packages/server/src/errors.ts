@@ -99,6 +99,10 @@ export function sendAnthropicInternalError(res: ServerResponse, message: string)
   sendAnthropicError(res, 500, 'api_error', message);
 }
 
+export function sendAnthropicNotImplemented(res: ServerResponse, message: string): void {
+  sendAnthropicError(res, 501, 'not_supported_error', message);
+}
+
 export function sendAnthropicMethodNotAllowed(res: ServerResponse, allowed: string): void {
   res.writeHead(405, { Allow: allowed, 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Method not allowed' } }));

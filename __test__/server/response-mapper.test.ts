@@ -173,6 +173,56 @@ describe('buildUsage', () => {
     expect(usage.output_tokens).toBe(0);
     expect(usage.total_tokens).toBe(0);
   });
+
+  it('emits server/native timing fields with cached-prefix context', () => {
+    const result = makeChatResult({
+      promptTokens: 20,
+      numTokens: 5,
+      cachedTokens: 15,
+      performance: {
+        ttftMs: 250,
+        prefillTokensPerSecond: 20,
+        decodeTokensPerSecond: 40,
+      },
+    });
+    const usage = buildUsage(result);
+
+    expect(usage.input_tokens).toBe(20);
+    expect(usage.input_tokens_details).toEqual({ cached_tokens: 15 });
+    expect(usage.time_to_first_token_ms).toBe(250);
+    expect(usage.server_time_to_first_token_ms).toBe(250);
+    expect(usage.prefill_tokens_per_second).toBe(20);
+    expect(usage.server_prefill_tokens_per_second).toBe(20);
+    expect(usage.decode_tokens_per_second).toBe(40);
+    expect(usage.server_decode_tokens_per_second).toBe(40);
+    expect(usage.prefill_input_tokens).toBe(5);
+    expect(usage.cached_prefix_tokens).toBe(15);
+    expect(usage.server_inference_elapsed_ms).toBe(350);
+  });
+
+  it('elides invalid timing metrics but keeps cache context when performance was requested', () => {
+    const result = makeChatResult({
+      promptTokens: 8,
+      numTokens: 1,
+      cachedTokens: 3,
+      performance: {
+        ttftMs: Number.NaN,
+        prefillTokensPerSecond: 0,
+        decodeTokensPerSecond: -1,
+      },
+    });
+    const usage = buildUsage(result);
+
+    expect(usage).not.toHaveProperty('time_to_first_token_ms');
+    expect(usage).not.toHaveProperty('server_time_to_first_token_ms');
+    expect(usage).not.toHaveProperty('prefill_tokens_per_second');
+    expect(usage).not.toHaveProperty('server_prefill_tokens_per_second');
+    expect(usage).not.toHaveProperty('decode_tokens_per_second');
+    expect(usage).not.toHaveProperty('server_decode_tokens_per_second');
+    expect(usage).not.toHaveProperty('server_inference_elapsed_ms');
+    expect(usage.prefill_input_tokens).toBe(5);
+    expect(usage.cached_prefix_tokens).toBe(3);
+  });
 });
 
 describe('computeOutputText', () => {

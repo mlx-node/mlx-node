@@ -2,6 +2,7 @@
 
 import type { ChatResult } from '@mlx-node/core';
 
+import { mergeTimingUsageExtensions, type PerformanceMetricsForUsage, type ServerTimingForUsage } from '../timing.js';
 import type {
   AnthropicContentBlockDeltaEvent,
   AnthropicContentBlockStartEvent,
@@ -15,49 +16,6 @@ import type {
   AnthropicResponseContent,
 } from '../types-anthropic.js';
 import { genId } from './response.js';
-
-/**
- * Subset of `@mlx-node/core`'s `PerformanceMetrics` consumed by the
- * Anthropic mapper. Defined locally to keep the mapper independent of
- * the native package's exported shape — only the three fields we
- * forward onto the wire are required, and each one is gated through
- * `Number.isFinite(...) && > 0` before emission so a partially-plumbed
- * driver (or a future shape that adds fields) cannot leak invalid
- * values through.
- */
-export interface PerformanceMetricsForUsage {
-  ttftMs?: number;
-  prefillTokensPerSecond?: number;
-  decodeTokensPerSecond?: number;
-}
-
-/**
- * Mirror the cache-field gating pattern: emit `key` on `usage` only
- * when `value` is a finite, strictly-positive number. Missing,
- * non-finite, zero, or negative metrics are elided (the launcher's
- * verbose log treats absence as "unknown / not plumbed", which is
- * the correct read for a turn whose native dispatch did not produce
- * the metric).
- */
-function assignFinitePositive<T extends Record<string, number | undefined>>(
-  usage: T,
-  key: keyof T & string,
-  value: number | undefined,
-): void {
-  if (value != null && Number.isFinite(value) && value > 0) {
-    (usage as Record<string, number | undefined>)[key] = value;
-  }
-}
-
-function mergePerformanceIntoUsage(
-  usage: { time_to_first_token_ms?: number; prefill_tokens_per_second?: number; decode_tokens_per_second?: number },
-  performance: PerformanceMetricsForUsage | undefined,
-): void {
-  if (performance == null) return;
-  assignFinitePositive(usage, 'time_to_first_token_ms', performance.ttftMs);
-  assignFinitePositive(usage, 'prefill_tokens_per_second', performance.prefillTokensPerSecond);
-  assignFinitePositive(usage, 'decode_tokens_per_second', performance.decodeTokensPerSecond);
-}
 
 function parseArguments(args: Record<string, unknown> | string): Record<string, unknown> {
   if (typeof args === 'string') {
@@ -76,18 +34,23 @@ export function mapStopReason(finishReason: string, hasToolCalls: boolean): 'end
   return 'end_turn';
 }
 
-export function buildAnthropicContent(result: ChatResult): AnthropicResponseContent[] {
+export function buildAnthropicContent(result: ChatResult, allowToolUse = true): AnthropicResponseContent[] {
   const content: AnthropicResponseContent[] = [];
 
   if (result.thinking) {
     content.push({ type: 'thinking', thinking: result.thinking });
   }
 
-  const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
+  const parsedToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
+  const okToolCalls = allowToolUse ? parsedToolCalls : [];
+  const text =
+    !allowToolUse && result.text.length === 0 && parsedToolCalls.length > 0 && result.rawText.includes('<tool_call')
+      ? result.rawText
+      : result.text;
 
   // Emit a text block unless tool calls exist and there is no text.
-  if (result.text || okToolCalls.length === 0) {
-    content.push({ type: 'text', text: result.text });
+  if (text || okToolCalls.length === 0) {
+    content.push({ type: 'text', text });
   }
 
   for (const tc of okToolCalls) {
@@ -107,8 +70,10 @@ export function buildAnthropicResponse(
   req: AnthropicMessagesRequest,
   messageId: string,
   performance?: PerformanceMetricsForUsage,
+  allowToolUse = true,
+  serverTiming?: ServerTimingForUsage,
 ): AnthropicMessagesResponse {
-  const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
+  const okToolCalls = allowToolUse ? result.toolCalls.filter((t) => t.status === 'ok') : [];
   const hasToolCalls = okToolCalls.length > 0;
 
   // Cache accounting (Anthropic Messages API spec):
@@ -145,15 +110,17 @@ export function buildAnthropicResponse(
   // dispatch produced a finite, positive value — `undefined` /
   // `NaN` / `0` is elided so the launcher's verbose log can read
   // absence as "not plumbed" instead of treating zero as a real
-  // measurement.
-  mergePerformanceIntoUsage(usage, performance);
+  // measurement. Cache-context fields make the prefill rate explicit:
+  // on cached-prefix turns the denominator is the uncached suffix, not
+  // the full logical prompt.
+  mergeTimingUsageExtensions(usage, performance, result.promptTokens, result.numTokens, cachedTokens, serverTiming);
 
   return {
     id: messageId,
     type: 'message',
     role: 'assistant',
     model: req.model,
-    content: buildAnthropicContent(result),
+    content: buildAnthropicContent(result, allowToolUse),
     stop_reason: mapStopReason(result.finishReason, hasToolCalls),
     stop_sequence: null,
     usage,
@@ -218,6 +185,7 @@ export function buildMessageDelta(
   inputTokens?: number,
   cachedTokens?: number,
   performance?: PerformanceMetricsForUsage,
+  serverTiming?: ServerTimingForUsage,
 ): AnthropicMessageDeltaEvent {
   // Streaming `message_delta` mirrors the non-streaming response's
   // cache accounting: when `cachedTokens > 0` we emit
@@ -239,7 +207,7 @@ export function buildMessageDelta(
   // cache-field block above. See `buildAnthropicResponse` for the
   // matching non-streaming branch and the docstring on
   // `AnthropicUsage` for the wire-format rationale.
-  mergePerformanceIntoUsage(usage, performance);
+  mergeTimingUsageExtensions(usage, performance, inputTokens, outputTokens, cachedTokens, serverTiming);
   return {
     type: 'message_delta',
     delta: {

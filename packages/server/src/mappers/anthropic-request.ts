@@ -4,6 +4,7 @@ import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
 import type {
   AnthropicContentBlock,
+  AnthropicCountTokensRequest,
   AnthropicImageContentBlock,
   AnthropicMessagesRequest,
   AnthropicTextContentBlock,
@@ -116,7 +117,9 @@ function mapTool(tool: AnthropicToolDefinition): ToolDefinition {
   };
 }
 
-export function mapAnthropicRequest(req: AnthropicMessagesRequest): MappedAnthropicRequest {
+export function mapAnthropicRequest(
+  req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
+): MappedAnthropicRequest {
   const messages: ChatMessage[] = [];
 
   if (req.system != null) {

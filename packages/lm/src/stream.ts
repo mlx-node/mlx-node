@@ -1,6 +1,9 @@
+import { join } from 'node:path';
+
 import {
   Gemma4Model as Gemma4ModelNative,
   Lfm2Model as Lfm2ModelNative,
+  Qwen3Tokenizer,
   Qwen3Model as Qwen3ModelNative,
   Qwen35Model as Qwen35ModelNative,
   Qwen35MoeModel as Qwen35MoeModelNative,
@@ -11,6 +14,7 @@ import type {
   ChatStreamChunk,
   ChatStreamHandle,
   PerformanceMetrics,
+  ToolDefinition,
   ToolCallResult,
 } from '@mlx-node/core';
 
@@ -59,6 +63,33 @@ export interface ChatStreamFinal {
 }
 
 export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
+
+const modelPathsForTokenizers = new WeakMap<object, string>();
+const tokenizerPromises = new WeakMap<object, Promise<Qwen3Tokenizer>>();
+
+function rememberModelPath(model: object, modelPath: string): void {
+  modelPathsForTokenizers.set(model, modelPath);
+}
+
+async function applyChatTemplateFromModelPath(
+  model: object,
+  messages: ChatMessage[],
+  addGenerationPrompt?: boolean | null,
+  tools?: ToolDefinition[] | null,
+  enableThinking?: boolean | null,
+): Promise<Uint32Array> {
+  const modelPath = modelPathsForTokenizers.get(model);
+  if (modelPath == null) {
+    throw new Error('applyChatTemplate unavailable: model path was not recorded when this model was loaded');
+  }
+  let tokenizerPromise = tokenizerPromises.get(model);
+  if (tokenizerPromise == null) {
+    tokenizerPromise = Qwen3Tokenizer.fromPretrained(join(modelPath, 'tokenizer.json'));
+    tokenizerPromises.set(model, tokenizerPromise);
+  }
+  const tokenizer = await tokenizerPromise;
+  return tokenizer.applyChatTemplate(messages, addGenerationPrompt, tools, enableThinking);
+}
 
 // Save references to the native callback-based session streaming methods
 // before we override them. The legacy `chatStream` surface was removed in
@@ -302,7 +333,17 @@ export class Qwen35Model extends Qwen35ModelNative {
   static override async load(modelPath: string): Promise<Qwen35Model> {
     const instance = await Qwen35ModelNative.load(modelPath);
     Object.setPrototypeOf(instance, Qwen35Model.prototype);
+    rememberModelPath(instance, modelPath);
     return instance as unknown as Qwen35Model;
+  }
+
+  applyChatTemplate(
+    messages: ChatMessage[],
+    addGenerationPrompt?: boolean | null,
+    tools?: ToolDefinition[] | null,
+    enableThinking?: boolean | null,
+  ): Promise<Uint32Array> {
+    return applyChatTemplateFromModelPath(this, messages, addGenerationPrompt, tools, enableThinking);
   }
 
   /**
@@ -392,7 +433,17 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
   static override async load(modelPath: string): Promise<Qwen35MoeModel> {
     const instance = await Qwen35MoeModelNative.load(modelPath);
     Object.setPrototypeOf(instance, Qwen35MoeModel.prototype);
+    rememberModelPath(instance, modelPath);
     return instance as unknown as Qwen35MoeModel;
+  }
+
+  applyChatTemplate(
+    messages: ChatMessage[],
+    addGenerationPrompt?: boolean | null,
+    tools?: ToolDefinition[] | null,
+    enableThinking?: boolean | null,
+  ): Promise<Uint32Array> {
+    return applyChatTemplateFromModelPath(this, messages, addGenerationPrompt, tools, enableThinking);
   }
 
   /** Streaming variant of {@link Qwen35MoeModel#chatSessionStart}. */
@@ -451,7 +502,17 @@ export class Lfm2Model extends Lfm2ModelNative {
   static override async load(modelPath: string): Promise<Lfm2Model> {
     const instance = await Lfm2ModelNative.load(modelPath);
     Object.setPrototypeOf(instance, Lfm2Model.prototype);
+    rememberModelPath(instance, modelPath);
     return instance as unknown as Lfm2Model;
+  }
+
+  applyChatTemplate(
+    messages: ChatMessage[],
+    addGenerationPrompt?: boolean | null,
+    tools?: ToolDefinition[] | null,
+    enableThinking?: boolean | null,
+  ): Promise<Uint32Array> {
+    return applyChatTemplateFromModelPath(this, messages, addGenerationPrompt, tools, enableThinking);
   }
 
   /** Streaming variant of {@link Lfm2Model#chatSessionStart}. */
@@ -510,7 +571,17 @@ export class Gemma4Model extends Gemma4ModelNative {
   static override async load(modelPath: string): Promise<Gemma4Model> {
     const instance = await Gemma4ModelNative.load(modelPath);
     Object.setPrototypeOf(instance, Gemma4Model.prototype);
+    rememberModelPath(instance, modelPath);
     return instance as unknown as Gemma4Model;
+  }
+
+  applyChatTemplate(
+    messages: ChatMessage[],
+    addGenerationPrompt?: boolean | null,
+    tools?: ToolDefinition[] | null,
+    enableThinking?: boolean | null,
+  ): Promise<Uint32Array> {
+    return applyChatTemplateFromModelPath(this, messages, addGenerationPrompt, tools, enableThinking);
   }
 
   /** Streaming variant of {@link Gemma4Model#chatSessionStart}. */
@@ -570,6 +641,7 @@ export class Qwen3Model extends Qwen3ModelNative {
   static override async load(modelPath: string): Promise<Qwen3Model> {
     const instance = await Qwen3ModelNative.load(modelPath);
     Object.setPrototypeOf(instance, Qwen3Model.prototype);
+    rememberModelPath(instance, modelPath);
     return instance as unknown as Qwen3Model;
   }
 

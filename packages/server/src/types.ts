@@ -250,6 +250,31 @@ export interface ResponseUsage {
    * in-band number is the authoritative signal).
    */
   input_tokens_details?: { cached_tokens: number };
+  /**
+   * Server-extension timing fields surfaced for verbose logs. These
+   * are native/server inference measurements, distinct from the HTTP
+   * logger's outer `elapsedMs` envelope. Unknown fields are ignored by
+   * OpenAI-compatible clients.
+   */
+  time_to_first_token_ms?: number;
+  prefill_tokens_per_second?: number;
+  decode_tokens_per_second?: number;
+  server_inference_elapsed_ms?: number;
+  server_time_to_first_token_ms?: number;
+  server_prefill_tokens_per_second?: number;
+  server_decode_tokens_per_second?: number;
+  server_model_resolve_ms?: number;
+  server_queue_ms?: number;
+  server_pre_inference_ms?: number;
+  /**
+   * Server-extension cache context for `prefill_tokens_per_second`.
+   * On cached-prefix turns, `prefill_input_tokens` is the uncached
+   * suffix that was actually prefetched and `cached_prefix_tokens`
+   * is the skipped prefix, so verbose logs do not mistake suffix-only
+   * prefill throughput for full-prompt throughput.
+   */
+  prefill_input_tokens?: number;
+  cached_prefix_tokens?: number;
 }
 
 // ---------------------------------------------------------------------------

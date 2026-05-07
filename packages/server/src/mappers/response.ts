@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 import type { ChatResult } from '@mlx-node/core';
 
+import { mergeTimingUsageExtensions } from '../timing.js';
 import type {
   FunctionCallOutputItem,
   MessageOutputItem,
@@ -85,6 +86,7 @@ export function buildUsage(result: ChatResult): ResponseUsage {
   if (result.cachedTokens > 0) {
     usage.input_tokens_details = { cached_tokens: result.cachedTokens };
   }
+  mergeTimingUsageExtensions(usage, result.performance, result.promptTokens, result.numTokens, result.cachedTokens);
   return usage;
 }
 

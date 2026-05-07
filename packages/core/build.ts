@@ -1,5 +1,5 @@
 import { readFile, writeFile, copyFile, readdir, stat } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { NapiCli, createBuildCommand } from '@napi-rs/cli';
@@ -35,6 +35,7 @@ for (const output of outputs) {
   }
 }
 
+await copyNativeAddon(outputs);
 // Copy mlx.metallib for colocated Metal shader loading
 // MLX looks for metallib next to the binary, so we copy it here.
 // Also copy paged_attn.metallib (Phase 2 of the paged-attention
@@ -62,6 +63,25 @@ for (const output of outputs) {
 // surfaces immediately rather than as a runtime throw at first use
 // in a published install.
 await copyMetallibs();
+
+async function copyNativeAddon(outputs: Awaited<typeof task>) {
+  const nodeOutput = outputs.find((output) => output.kind === 'node');
+  if (!nodeOutput) {
+    throw new Error('[build.ts smoke check] native addon output missing from napi build');
+  }
+  const expectedName = 'mlx-core.darwin-arm64.node';
+  const actualName = basename(nodeOutput.path);
+  if (actualName !== expectedName) {
+    throw new Error(
+      `[build.ts smoke check] expected native addon output ${expectedName}, got ${actualName} at ${nodeOutput.path}`,
+    );
+  }
+
+  const npmDarwinDir = join(__dirname, 'npm', 'darwin-arm64');
+  const dst = join(npmDarwinDir, expectedName);
+  await copyFile(nodeOutput.path, dst);
+  console.log(`Copied ${expectedName} -> ${dst}`);
+}
 
 async function copyMetallibs() {
   const npmDarwinDir = join(__dirname, 'npm', 'darwin-arm64');

@@ -83,7 +83,7 @@
  * await session.reset();
  * ```
  */
-import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult } from '@mlx-node/core';
+import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, ToolDefinition } from '@mlx-node/core';
 
 import type { ChatStreamEvent } from './stream.js';
 
@@ -181,6 +181,17 @@ function countOkToolCalls(toolCalls: readonly ToolCallResult[] | undefined): num
  * fully structural.
  */
 export interface SessionCapableModel {
+  /**
+   * Optional non-generating chat-template tokenizer. Exposed by
+   * wrappers that can count prompt tokens without running inference
+   * (used by Anthropic `/v1/messages/count_tokens`).
+   */
+  applyChatTemplate?(
+    messages: ChatMessage[],
+    addGenerationPrompt?: boolean | null,
+    tools?: ToolDefinition[] | null,
+    enableThinking?: boolean | null,
+  ): Promise<Uint32Array> | Uint32Array;
   chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   chatSessionContinue(
     userMessage: string,

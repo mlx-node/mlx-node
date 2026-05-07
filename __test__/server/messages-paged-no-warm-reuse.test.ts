@@ -162,7 +162,8 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     // adopts a warm entry. The size invariant is the load-bearing
     // proof: 0 before AND 0 after a successful dispatch.
     const registry = new ModelRegistry();
-    registry.register('paged-model', createMockModel(/* paged */ true));
+    const mockModel = createMockModel(/* paged */ true);
+    registry.register('paged-model', mockModel);
     const sessionReg = registry.getSessionRegistry('paged-model')!;
     expect(sessionReg.size).toBe(0);
 
@@ -181,6 +182,11 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     expect(getStatus()).toBe(200);
     // The load-bearing assertion: paged path NEVER adopts the warm slot.
     expect(sessionReg.size).toBe(0);
+    // Paged reuse is native/content-addressed. A fresh JS ChatSession is
+    // still allocated, but the endpoint must not call the public full
+    // native reset because that clears MoE GDN prefix checkpoints between
+    // otherwise cacheable stateless turns.
+    expect(mockModel.resetCaches).not.toHaveBeenCalled();
     // Pre-dispatch header is `fresh` because `lookup.hit` is always
     // false on the paged path; no `cachedTokens > 0` promotion fired
     // because the mock returned `cachedTokens: 0`.
@@ -274,7 +280,8 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     // the sentinel id, otherwise non-paged models lose their only
     // cross-conversation reuse mechanism.
     const registry = new ModelRegistry();
-    registry.register('flat-model', createMockModel(/* paged */ false));
+    const mockModel = createMockModel(/* paged */ false);
+    registry.register('flat-model', mockModel);
     const sessionReg = registry.getSessionRegistry('flat-model')!;
 
     const { res, getStatus } = createMockRes();
@@ -292,6 +299,9 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     expect(getStatus()).toBe(200);
     // Load-bearing: non-paged path DID adopt the warm slot.
     expect(sessionReg.size).toBe(1);
+    // Non-paged MISS still takes the public full reset branch. Its only
+    // authorized native-cache-preserving path is a warm-slot HIT.
+    expect(mockModel.resetCaches).toHaveBeenCalledTimes(1);
   });
 
   it('two parallel paged-active requests with the same system both get fresh sessions and BOTH commit (no warm-slot serialization)', async () => {

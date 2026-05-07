@@ -86,6 +86,7 @@ import type { ModelRegistry } from '../registry.js';
 import { QueueFullError, type SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
+import type { ServerTimingForUsage } from '../timing.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
   createVisibility,
@@ -110,6 +111,14 @@ import { validateAndCanonicalizeHistoryToolOrder } from './responses.js';
  */
 const MESSAGES_WARM_SLOT_ID = '__msg_warm__';
 
+function requestAllowsToolUse(body: AnthropicMessagesRequest): boolean {
+  return Array.isArray(body.tools) && body.tools.length > 0;
+}
+
+function hasSuppressedToolCalls(result: Pick<ChatResult, 'toolCalls'>, body: AnthropicMessagesRequest): boolean {
+  return !requestAllowsToolUse(body) && result.toolCalls.some((t) => t.status === 'ok');
+}
+
 // Non-streaming path
 
 async function handleNonStreaming(
@@ -117,6 +126,7 @@ async function handleNonStreaming(
   result: ChatResult,
   body: AnthropicMessagesRequest,
   visibility: TransportVisibility,
+  serverTiming?: ServerTimingForUsage,
 ): Promise<void> {
   const messageId = genId('msg_');
   // `result.performance` is only populated when `reportPerformance: true`
@@ -125,7 +135,14 @@ async function handleNonStreaming(
   // launcher wires the flag on for verbose-log builds and leaves it off
   // by default, matching how `cachedTokens` is treated through
   // `buildAnthropicResponse`.
-  const response = buildAnthropicResponse(result, body, messageId, result.performance);
+  const response = buildAnthropicResponse(
+    result,
+    body,
+    messageId,
+    result.performance,
+    requestAllowsToolUse(body),
+    serverTiming,
+  );
 
   // Native `chatSession*` has no AbortSignal surface yet, so a client that
   // disconnects mid-decode still burns every remaining token under the
@@ -148,6 +165,7 @@ async function handleNonStreaming(
  */
 interface MessagesStreamingHandlerResult {
   ok: boolean;
+  suppressedToolCalls: boolean;
 }
 
 async function handleStreamingNative(
@@ -157,6 +175,7 @@ async function handleStreamingNative(
   wasCommitted: () => boolean,
   httpReq: IncomingMessage | undefined,
   visibility: TransportVisibility,
+  serverTiming?: ServerTimingForUsage,
 ): Promise<MessagesStreamingHandlerResult> {
   const messageId = genId('msg_');
   beginSSE(res);
@@ -207,6 +226,8 @@ async function handleStreamingNative(
   // than emitting zeros.
   let terminalPerformance: PerformanceMetrics | undefined;
   let terminalErrorMessage: string | null = null;
+  const allowToolUse = requestAllowsToolUse(body);
+  let suppressedToolCalls = false;
 
   // `thrownError` sticks on a generator throw; `clientAborted` sticks on
   // HTTP `close`/`error` on req, res, or res.socket. Either one routes the
@@ -278,8 +299,15 @@ async function handleStreamingNative(
           writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
         }
 
-        const finalText = event.text;
-        const okToolCalls = event.toolCalls.filter((t) => t.status === 'ok');
+        const parsedToolCalls = event.toolCalls.filter((t) => t.status === 'ok');
+        if (!allowToolUse && parsedToolCalls.length > 0) {
+          suppressedToolCalls = true;
+        }
+        const finalText =
+          !allowToolUse && event.text.length === 0 && parsedToolCalls.length > 0 && event.rawText.includes('<tool_call')
+            ? event.rawText
+            : event.text;
+        const okToolCalls = allowToolUse ? parsedToolCalls : [];
         const hasToolCalls = okToolCalls.length > 0;
 
         // Recovery: suppression triggered but no tool calls parsed — emit final text as a text block.
@@ -441,7 +469,32 @@ async function handleStreamingNative(
           buildContentBlockDelta(contentBlockIndex - 1, { type: 'thinking_delta', thinking: deltaText }),
         );
       } else {
-        // Text delta with `<tool_call>` buffering.
+        // Text delta with `<tool_call>` buffering. Requests that did not
+        // advertise tools must treat model-emitted markup as literal text.
+        if (!allowToolUse) {
+          if (event.text) {
+            if (!hasEmittedText) {
+              if (hasEmittedThinking) {
+                writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+              }
+              hasEmittedText = true;
+              writeSSEEvent(
+                res,
+                'content_block_start',
+                buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+              );
+            }
+            emittedText += event.text;
+            emittedTextLength += event.text.length;
+            writeSSEEvent(
+              res,
+              'content_block_delta',
+              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: event.text }),
+            );
+          }
+          continue;
+        }
+
         const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
         if (tagFound) {
           if (cleanPrefix.trim()) {
@@ -516,7 +569,14 @@ async function handleStreamingNative(
     writeSSEEvent(
       res,
       'message_delta',
-      buildMessageDelta(stopReason, terminalNumTokens, terminalPromptTokens, terminalCachedTokens, terminalPerformance),
+      buildMessageDelta(
+        stopReason,
+        terminalNumTokens,
+        terminalPromptTokens,
+        terminalCachedTokens,
+        terminalPerformance,
+        serverTiming,
+      ),
     );
     // HTTP/1.1 chunked-encoding trailer: report the engine's cache-hit
     // count once the SSE stream has settled. The header has to wait
@@ -537,7 +597,7 @@ async function handleStreamingNative(
     }
     await flushTerminalSSE(res, 'message_stop', buildMessageStop(), visibility);
     endSSE(res);
-    return { ok: true };
+    return { ok: true, suppressedToolCalls };
   }
   // Close any dangling content block so the error frame lands at a clean state,
   // then emit the streaming error. Never emit `message_stop` here — pairing it
@@ -562,7 +622,7 @@ async function handleStreamingNative(
   // The streaming `error` event is the Anthropic terminal on the failure path.
   await flushTerminalSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } }, visibility);
   endSSE(res);
-  return { ok: false };
+  return { ok: false, suppressedToolCalls };
 }
 
 // Session routing
@@ -585,11 +645,11 @@ async function runSessionNonStreaming(
   session: ChatSession<SessionCapableModel>,
   messages: ChatMessage[],
   config: ChatConfig,
-  isFreshSession: boolean,
+  resetNativeCache: boolean,
 ): Promise<MessagesNonStreamingOutcome> {
-  // Dual-branch reset gated on the registry lookup outcome:
+  // Dual-branch reset gated by the caller's native-cache policy:
   //
-  //   * MISS (`isFreshSession === true`) — we MUST run a full
+  //   * Full native reset (`resetNativeCache === true`) — run a full
   //     `session.reset()`. A fresh JS session does NOT imply a fresh
   //     native cache — the underlying `SessionCapableModel` is shared
   //     across `ChatSession` lifetimes via `ModelRegistry`, and its
@@ -603,13 +663,14 @@ async function runSessionNonStreaming(
   //     `responses.ts` (around the matching `runSessionNonStreaming`
   //     branches). Only registry HITS are authorized for cache reuse.
   //
-  //   * HIT (`isFreshSession === false`) — we run the JS-only
+  //   * Preserve native cache (`resetNativeCache === false`) — run the JS-only
   //     `resetPreservingNativeCacheForWarmReuse` so the registry-leased
-  //     native KV cache stays alive for `verify_cache_prefix_direct` to
-  //     recover the reused prefix on this turn. `primeHistory`
-  //     requires `turnCount === 0`, which the helper guarantees by
-  //     wiping JS-side state only.
-  if (isFreshSession) {
+  //     native KV cache stays alive for `verify_cache_prefix_direct` or
+  //     the paged adapter's content-addressed prefix lookup to recover
+  //     the reused prefix on this turn. `primeHistory` requires
+  //     `turnCount === 0`, which the helper guarantees by wiping
+  //     JS-side state only.
+  if (resetNativeCache) {
     await session.reset();
   } else {
     await resetPreservingNativeCacheForWarmReuse(session);
@@ -646,15 +707,16 @@ async function runSessionStreaming(
   messages: ChatMessage[],
   config: ChatConfig,
   signal: AbortSignal | undefined,
-  isFreshSession: boolean,
+  resetNativeCache: boolean,
 ): Promise<MessagesStreamingOutcome> {
-  // Same dual-branch reset as `runSessionNonStreaming`: MISS wipes
-  // both JS and native state to block the cross-request
-  // cache-affinity leak described at length in `responses.ts`; HIT
-  // wipes JS-only so `verify_cache_prefix_direct` can recover the
-  // leased native prefix. `initialTurns` MUST be captured AFTER the
-  // reset zeroes `turns` so the committed check reads correctly.
-  if (isFreshSession) {
+  // Same dual-branch reset as `runSessionNonStreaming`: native-reset
+  // requests wipe both JS and native state to block the cross-request
+  // cache-affinity leak described at length in `responses.ts`; native-
+  // preserving requests wipe JS-only so the non-paged warm slot or the
+  // paged content-addressed cache can recover a verified native prefix.
+  // `initialTurns` MUST be captured AFTER the reset zeroes `turns` so
+  // the committed check reads correctly.
+  if (resetNativeCache) {
     await session.reset();
   } else {
     await resetPreservingNativeCacheForWarmReuse(session);
@@ -677,6 +739,9 @@ export async function handleCreateMessage(
   idleSweeper?: IdleSweeper | null,
   resolveModel?: (name: string) => Promise<void>,
 ): Promise<void> {
+  const handlerStartedAt = Date.now();
+  let serverModelResolveMs: number | undefined;
+
   if (body == null || typeof body !== 'object') {
     sendAnthropicBadRequest(res, 'Request body must be a JSON object');
     return;
@@ -744,11 +809,13 @@ export async function handleCreateMessage(
     // serialize the failure through `sendAnthropicInternalError` here. Mirrors
     // the `mapAnthropicRequest` try/catch above.
     try {
+      const resolveStartedAt = Date.now();
       if (idleSweeper) {
         await idleSweeper.withSuspendedDrains(() => resolveModel(body.model));
       } else {
         await resolveModel(body.model);
       }
+      serverModelResolveMs = Date.now() - resolveStartedAt;
     } catch (err) {
       sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
@@ -889,7 +956,13 @@ export async function handleCreateMessage(
     idleListenersAttached = true;
 
     try {
+      const mutexQueuedAt = Date.now();
       await sessionReg.withExclusive(async () => {
+        const serverTiming: ServerTimingForUsage = {
+          server_model_resolve_ms: serverModelResolveMs,
+          server_queue_ms: Date.now() - mutexQueuedAt,
+          server_pre_inference_ms: Date.now() - handlerStartedAt,
+        };
         // Hot-swap race guard. `ModelRegistry.register()` is not coordinated with
         // `withExclusive`, so a concurrent re-register of the same friendly name
         // could silently dispatch this request through a stale model. Any drift
@@ -1029,14 +1102,15 @@ export async function handleCreateMessage(
         try {
           if (body.stream === true) {
             // On the paged path the underlying native cache is the
-            // sole reuse mechanism, so pass `isFreshSession = true`
-            // unconditionally — the dual-branch reset in
-            // `runSessionStreaming` collapses to the full
-            // `session.reset()` arm. Non-paged keeps the original
-            // `!lookup.hit` semantics so warm-slot hits route through
-            // `resetPreservingNativeCacheForWarmReuse`.
-            const isFreshSession = pagedActive ? true : !lookup.hit;
-            const outcome = await runSessionStreaming(session, messages, config, streamSignal, isFreshSession);
+            // sole reuse mechanism, so preserve it even though the JS
+            // `ChatSession` is freshly allocated. The native paged
+            // adapter validates reuse by token/hash before any cached
+            // prefix is trusted, and the MoE GDN checkpoint layer now
+            // follows the same content-checked policy. Non-paged keeps
+            // the original `!lookup.hit` semantics so only warm-slot
+            // hits preserve native cache.
+            const resetNativeCache = pagedActive ? false : !lookup.hit;
+            const outcome = await runSessionStreaming(session, messages, config, streamSignal, resetNativeCache);
             const streamResult = await handleStreamingNative(
               res,
               outcome.stream,
@@ -1044,6 +1118,7 @@ export async function handleCreateMessage(
               outcome.wasCommitted,
               httpReq,
               visibility,
+              serverTiming,
             );
             // Warm-slot adopt/drop only applies to the non-paged
             // path. On the paged path the JS-side warm slot plays no
@@ -1075,7 +1150,7 @@ export async function handleCreateMessage(
             // and a clean handler-side terminal must both hold before
             // the session is reachable from a subsequent request.
             if (!pagedActive) {
-              if (streamResult.ok && outcome.wasCommitted()) {
+              if (streamResult.ok && outcome.wasCommitted() && !streamResult.suppressedToolCalls) {
                 sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
               } else {
                 sessionReg.drop(MESSAGES_WARM_SLOT_ID);
@@ -1083,11 +1158,11 @@ export async function handleCreateMessage(
             }
           } else {
             // See the streaming branch above for the rationale on
-            // collapsing `isFreshSession` to `true` on the paged path.
-            const isFreshSession = pagedActive ? true : !lookup.hit;
+            // preserving native cache on the paged path.
+            const resetNativeCache = pagedActive ? false : !lookup.hit;
             // Native `chatSessionStart` has no AbortSignal yet — disconnect handling
             // lives inside `handleNonStreaming` / `endJson`.
-            const outcome = await runSessionNonStreaming(session, messages, config, isFreshSession);
+            const outcome = await runSessionNonStreaming(session, messages, config, resetNativeCache);
             const result = outcome.result;
             // Re-classify the `X-Session-Cache` header.
             //
@@ -1118,7 +1193,7 @@ export async function handleCreateMessage(
             if (result.cachedTokens > 0) {
               res.setHeader('X-Cached-Tokens', String(result.cachedTokens));
             }
-            await handleNonStreaming(res, result, body, visibility);
+            await handleNonStreaming(res, result, body, visibility, serverTiming);
             // Non-paged success: adopt the warm slot only when the
             // dispatch actually committed. Mirrors the streaming-side
             // dual-gate at `streamResult.ok && outcome.wasCommitted()`
@@ -1140,7 +1215,7 @@ export async function handleCreateMessage(
             // re-introduce the cross-endpoint warm-slot eviction
             // that paged is supposed to eliminate.
             if (!pagedActive) {
-              if (outcome.committed) {
+              if (outcome.committed && !hasSuppressedToolCalls(result, body)) {
                 sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
               } else {
                 sessionReg.drop(MESSAGES_WARM_SLOT_ID);

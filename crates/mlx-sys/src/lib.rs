@@ -1736,6 +1736,21 @@ unsafe extern "C-unwind" {
     /// Returns number of arrays exported, or 0 if not initialized.
     pub fn mlx_qwen35_moe_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
 
+    /// Export paged MoE linear-attention caches for live-session continuation.
+    /// Full-attention K/V stays in the Rust paged adapter pools; this returns
+    /// the paged graph's per-layer `(conv_state, recurrent_state)` slots so
+    /// Rust can seed the next turn without replaying the cached prefix through
+    /// GDN. Returns number of arrays exported, or 0 if paged state is not
+    /// initialized.
+    pub fn mlx_qwen35_moe_export_paged_linear_caches(
+        out_ptrs: *mut *mut mlx_array,
+        max_count: i32,
+    ) -> i32;
+
+    /// Get current paged MoE cache offset (tokens processed by the compiled
+    /// paged decode graph).
+    pub fn mlx_qwen35_moe_get_paged_cache_offset() -> i32;
+
     /// Get current MoE cache offset (tokens processed).
     pub fn mlx_qwen35_moe_get_cache_offset() -> i32;
 

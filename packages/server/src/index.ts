@@ -62,6 +62,8 @@ export type {
 } from './types.js';
 
 export type {
+  AnthropicCountTokensRequest,
+  AnthropicCountTokensResponse,
   AnthropicMessagesRequest,
   AnthropicMessagesResponse,
   AnthropicMessage,

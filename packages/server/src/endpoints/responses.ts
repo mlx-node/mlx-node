@@ -30,6 +30,8 @@ import type { ModelRegistry } from '../registry.js';
 import { maybeWarnPromptCacheKeyIneligible, QueueFullError, type SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
+import type { ServerTimingForUsage } from '../timing.js';
+import { mergeTimingUsageExtensions } from '../timing.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
   createVisibility,
@@ -202,8 +204,17 @@ async function handleNonStreaming(
   responseId: string,
   previousResponseId: string | undefined,
   visibility: TransportVisibility,
+  serverTiming?: ServerTimingForUsage,
 ): Promise<NonStreamingHandlerOutcome> {
   const response = buildResponseObject(result, req, responseId, previousResponseId);
+  mergeTimingUsageExtensions(
+    response.usage,
+    result.performance,
+    result.promptTokens,
+    result.numTokens,
+    result.cachedTokens,
+    serverTiming,
+  );
 
   // `chatSession*` has no AbortSignal surface yet, so a mid-decode
   // client disconnect still burns the full decode budget — peer loss
@@ -308,6 +319,7 @@ async function handleStreamingNative(
   wasCommitted: () => boolean,
   httpReq: IncomingMessage | undefined,
   visibility: TransportVisibility,
+  serverTiming?: ServerTimingForUsage,
 ): Promise<StreamingHandlerOutcome> {
   beginSSE(res);
   // Commit to SSE wire format synchronously so the outer catch
@@ -715,6 +727,7 @@ async function handleStreamingNative(
         if (cachedTokens != null && cachedTokens > 0) {
           usage.input_tokens_details = { cached_tokens: cachedTokens };
         }
+        mergeTimingUsageExtensions(usage, event.performance, promptTokens, event.numTokens, cachedTokens, serverTiming);
 
         const finalOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
         completedResponse = {
@@ -1621,6 +1634,8 @@ export async function handleCreateResponse(
   responseRetentionSec?: number,
   idleSweeper?: IdleSweeper | null,
 ): Promise<void> {
+  const handlerStartedAt = Date.now();
+
   // Validate required fields
   if (body == null || typeof body !== 'object') {
     sendBadRequest(res, 'Request body must be a JSON object', 'body');
@@ -2330,7 +2345,13 @@ export async function handleCreateResponse(
     idleListenersAttached = true;
 
     try {
+      const mutexQueuedAt = Date.now();
       await sessionReg.withExclusive(async () => {
+        const serverTiming: ServerTimingForUsage = {
+          server_queue_ms: Date.now() - mutexQueuedAt,
+          server_pre_inference_ms: Date.now() - handlerStartedAt,
+        };
+
         // Hot-swap race guard inside the mutex.
         //
         // `withExclusive` can park this waiter behind a long-running
@@ -2805,6 +2826,7 @@ export async function handleCreateResponse(
                 streamingWasCommitted,
                 httpReq,
                 visibility,
+                serverTiming,
               );
               streamFailureMode = handlerOutcome.failureMode;
               if (handlerOutcome.terminalToPersist != null && store && body.store !== false) {
@@ -3070,6 +3092,7 @@ export async function handleCreateResponse(
                 responseId,
                 previousResponseId,
                 visibility,
+                serverTiming,
               );
               if (store && body.store !== false) {
                 // Same in-lock-initiate / off-lock-await split as the

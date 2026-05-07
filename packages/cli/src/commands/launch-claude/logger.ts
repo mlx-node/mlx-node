@@ -23,6 +23,133 @@ export interface Logger {
   close(): Promise<void>;
 }
 
+interface UsageSummary {
+  input_tokens?: number;
+  cache_read_input_tokens?: number;
+  input_tokens_details?: { cached_tokens?: number };
+  output_tokens?: number;
+  time_to_first_token_ms?: number;
+  prefill_tokens_per_second?: number;
+  decode_tokens_per_second?: number;
+  server_inference_elapsed_ms?: number;
+  prefill_input_tokens?: number;
+  cached_prefix_tokens?: number;
+  server_model_resolve_ms?: number;
+  server_queue_ms?: number;
+  server_pre_inference_ms?: number;
+}
+
+function parseJsonObject(value: string | null): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed != null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function asUsage(value: unknown): UsageSummary | undefined {
+  return value != null && typeof value === 'object' ? (value as UsageSummary) : undefined;
+}
+
+function fmtMs(ms: number | undefined): string | undefined {
+  return typeof ms === 'number' && Number.isFinite(ms) ? `${Math.round(ms)}ms` : undefined;
+}
+
+function fmtRate(rate: number | undefined): string | undefined {
+  return typeof rate === 'number' && Number.isFinite(rate) ? `${rate.toFixed(2)}/s` : undefined;
+}
+
+function extractUsageSummary(resBody: string): { model?: string; usage?: UsageSummary; stop?: string } {
+  let model: string | undefined;
+  let usage: UsageSummary | undefined;
+  let stop: string | undefined;
+
+  const trimmed = resBody.trimStart();
+  if (trimmed.startsWith('{')) {
+    const json = parseJsonObject(trimmed);
+    if (json) {
+      const response =
+        json.response != null && typeof json.response === 'object' ? (json.response as Record<string, unknown>) : json;
+      model = typeof response.model === 'string' ? response.model : undefined;
+      usage = asUsage(response.usage);
+      stop = typeof response.stop_reason === 'string' ? response.stop_reason : undefined;
+      return { model, usage, stop };
+    }
+  }
+
+  for (const line of resBody.split('\n')) {
+    if (!line.startsWith('data: ')) continue;
+    const payload = line.slice(6);
+    if (payload === '[DONE]') continue;
+    const event = parseJsonObject(payload);
+    if (!event) continue;
+    if (event.type === 'message_start' && event.message != null && typeof event.message === 'object') {
+      const message = event.message as Record<string, unknown>;
+      if (typeof message.model === 'string') model = message.model;
+    }
+    if (event.type === 'message_delta') {
+      usage = asUsage(event.usage) ?? usage;
+      const delta =
+        event.delta != null && typeof event.delta === 'object' ? (event.delta as Record<string, unknown>) : null;
+      if (typeof delta?.stop_reason === 'string') stop = delta.stop_reason;
+    }
+    if (
+      (event.type === 'response.completed' || event.type === 'response.failed') &&
+      event.response != null &&
+      typeof event.response === 'object'
+    ) {
+      const response = event.response as Record<string, unknown>;
+      if (typeof response.model === 'string') model = response.model;
+      usage = asUsage(response.usage) ?? usage;
+      if (typeof response.status === 'string') stop = response.status;
+    }
+  }
+
+  return { model, usage, stop };
+}
+
+function buildTimingSummary(reqBody: string, resBody: string): string {
+  const request = parseJsonObject(reqBody);
+  const response = extractUsageSummary(resBody);
+  const model = typeof request?.model === 'string' ? request.model : response.model;
+  const usage = response.usage;
+  if (!usage && !model) return '';
+
+  const parts: string[] = [];
+  if (model) parts.push(`model=${model}`);
+  if (usage) {
+    const cachedTokens =
+      usage.cache_read_input_tokens ?? usage.cached_prefix_tokens ?? usage.input_tokens_details?.cached_tokens;
+    const tokenParts = [
+      typeof usage.input_tokens === 'number' ? `in=${usage.input_tokens}` : undefined,
+      typeof cachedTokens === 'number' ? `cache=${cachedTokens}` : undefined,
+      typeof usage.prefill_input_tokens === 'number' ? `prefill=${usage.prefill_input_tokens}` : undefined,
+      typeof usage.output_tokens === 'number' ? `out=${usage.output_tokens}` : undefined,
+    ].filter((part): part is string => part != null);
+    if (tokenParts.length > 0) parts.push(`tok(${tokenParts.join(' ')})`);
+
+    const timingParts = [
+      fmtMs(usage.time_to_first_token_ms) ? `ttft=${fmtMs(usage.time_to_first_token_ms)}` : undefined,
+      fmtRate(usage.prefill_tokens_per_second) ? `prefill=${fmtRate(usage.prefill_tokens_per_second)}` : undefined,
+      fmtRate(usage.decode_tokens_per_second) ? `decode=${fmtRate(usage.decode_tokens_per_second)}` : undefined,
+      fmtMs(usage.server_inference_elapsed_ms) ? `infer=${fmtMs(usage.server_inference_elapsed_ms)}` : undefined,
+    ].filter((part): part is string => part != null);
+    if (timingParts.length > 0) parts.push(`perf(${timingParts.join(' ')})`);
+
+    const serverParts = [
+      fmtMs(usage.server_model_resolve_ms) ? `resolve=${fmtMs(usage.server_model_resolve_ms)}` : undefined,
+      fmtMs(usage.server_queue_ms) ? `queue=${fmtMs(usage.server_queue_ms)}` : undefined,
+      fmtMs(usage.server_pre_inference_ms) ? `pre=${fmtMs(usage.server_pre_inference_ms)}` : undefined,
+    ].filter((part): part is string => part != null);
+    if (serverParts.length > 0) parts.push(`server(${serverParts.join(' ')})`);
+  }
+  if (response.stop) parts.push(`stop=${response.stop}`);
+
+  return parts.length > 0 ? ` ${parts.join(' ')}` : '';
+}
+
 /**
  * Attach request/response capture to `server`. The caller is responsible
  * for calling `close()` before `server.close()` completes so the tail of
@@ -45,6 +172,9 @@ export function attachLogger(server: Server, logDir: string): Logger {
   writePretty(`[logging] writing to ${logDir}`);
   writePretty(`[logging]   requests.ndjson  — one JSON line per HTTP turn (full body in/out, SSE chunks)`);
   writePretty(`[logging]   session.log      — human-readable chronological trace`);
+  if (process.env.MLX_INFERENCE_TRACE_FILE) {
+    writePretty(`[logging]   inference trace — ${process.env.MLX_INFERENCE_TRACE_FILE}`);
+  }
 
   // Node's http.Server multicasts request events — our listener fires
   // alongside the createServer handler. Dedupe in case the same
@@ -129,8 +259,9 @@ export function attachLogger(server: Server, logDir: string): Logger {
       } catch {
         /* never block the response */
       }
+      const timingSummary = buildTimingSummary(reqBody, resBody);
       writePretty(
-        `[req ${rid}] ${res.statusCode} ${req.method ?? '?'} ${req.url ?? '?'} ${entry.elapsedMs}ms ${resBody.length}B`,
+        `[req ${rid}] ${res.statusCode} ${req.method ?? '?'} ${req.url ?? '?'} ${entry.elapsedMs}ms ${resBody.length}B${timingSummary}`,
       );
     };
     req.on('end', () => {

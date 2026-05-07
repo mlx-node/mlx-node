@@ -980,6 +980,35 @@ int mlx_qwen35_moe_export_caches(mlx_array** out_ptrs, int max_count) {
   return count;
 }
 
+// Export paged linear-attention caches for live-session continuation.
+//
+// The block-paged path keeps full-attention K/V in the Rust adapter pools, but
+// compiled paged decode advances GDN conv/recurrent state in
+// `g_paged_linear_caches`. Rust needs those arrays back before
+// `mlx_qwen35_moe_reset()` clears the globals, otherwise the next turn has to
+// replay the whole cached prefix through GDN.
+int mlx_qwen35_moe_export_paged_linear_caches(mlx_array** out_ptrs, int max_count) {
+  if (!g_paged_inited || g_paged_linear_caches.empty()) return 0;
+  int expected = static_cast<int>(g_paged_linear_caches.size());
+  int count = std::min(expected, max_count);
+  for (int i = 0; i < count; i++) {
+    out_ptrs[i] = nullptr;
+  }
+  for (int layer = 0; layer < g_paged_config.num_layers; layer++) {
+    int base = layer * 2;
+    if (base + 1 >= count) break;
+    bool is_linear = !((layer + 1) % g_paged_config.full_attention_interval == 0);
+    if (!is_linear) continue;
+    out_ptrs[base] = reinterpret_cast<mlx_array*>(new array(g_paged_linear_caches[base]));
+    out_ptrs[base + 1] = reinterpret_cast<mlx_array*>(new array(g_paged_linear_caches[base + 1]));
+  }
+  return count;
+}
+
+int mlx_qwen35_moe_get_paged_cache_offset() {
+  return g_paged_offset_int;
+}
+
 // Get current MoE cache offset (number of tokens processed).
 int mlx_qwen35_moe_get_cache_offset() {
   return g_moe_offset_int;

@@ -192,6 +192,44 @@ describe('buildAnthropicResponse', () => {
     expect(response.usage.time_to_first_token_ms).toBe(1234);
     expect(response.usage.prefill_tokens_per_second).toBe(800);
     expect(response.usage.decode_tokens_per_second).toBe(73.5);
+    expect(response.usage.server_time_to_first_token_ms).toBe(1234);
+    expect(response.usage.server_prefill_tokens_per_second).toBe(800);
+    expect(response.usage.server_decode_tokens_per_second).toBe(73.5);
+    expect(response.usage.prefill_input_tokens).toBe(5);
+    expect(response.usage).not.toHaveProperty('cached_prefix_tokens');
+  });
+
+  it('adds cached-prefix context for perf fields on cache hits', () => {
+    const result = makeChatResult({
+      promptTokens: 20,
+      numTokens: 5,
+      cachedTokens: 15,
+    });
+    const response = buildAnthropicResponse(
+      result,
+      baseReq,
+      'msg_cache_perf',
+      {
+        ttftMs: 250,
+        prefillTokensPerSecond: 20,
+        decodeTokensPerSecond: 40,
+      },
+      true,
+      {
+        server_model_resolve_ms: 57,
+        server_queue_ms: 5,
+        server_pre_inference_ms: 62,
+      },
+    );
+
+    expect(response.usage.input_tokens).toBe(5);
+    expect(response.usage.cache_read_input_tokens).toBe(15);
+    expect(response.usage.prefill_input_tokens).toBe(5);
+    expect(response.usage.cached_prefix_tokens).toBe(15);
+    expect(response.usage.server_inference_elapsed_ms).toBe(350);
+    expect(response.usage.server_model_resolve_ms).toBe(57);
+    expect(response.usage.server_queue_ms).toBe(5);
+    expect(response.usage.server_pre_inference_ms).toBe(62);
   });
 
   it('elides perf fields when performance is undefined', () => {
@@ -385,6 +423,37 @@ describe('buildMessageDelta', () => {
     expect(event.usage.time_to_first_token_ms).toBe(1234);
     expect(event.usage.prefill_tokens_per_second).toBe(800);
     expect(event.usage.decode_tokens_per_second).toBe(73.5);
+    expect(event.usage.server_time_to_first_token_ms).toBe(1234);
+    expect(event.usage.server_prefill_tokens_per_second).toBe(800);
+    expect(event.usage.server_decode_tokens_per_second).toBe(73.5);
+  });
+
+  it('adds cached-prefix context to streaming perf usage', () => {
+    const event = buildMessageDelta(
+      'end_turn',
+      5,
+      20,
+      15,
+      {
+        ttftMs: 250,
+        prefillTokensPerSecond: 20,
+        decodeTokensPerSecond: 40,
+      },
+      {
+        server_model_resolve_ms: 57,
+        server_queue_ms: 5,
+        server_pre_inference_ms: 62,
+      },
+    );
+
+    expect(event.usage.input_tokens).toBe(5);
+    expect(event.usage.cache_read_input_tokens).toBe(15);
+    expect(event.usage.prefill_input_tokens).toBe(5);
+    expect(event.usage.cached_prefix_tokens).toBe(15);
+    expect(event.usage.server_inference_elapsed_ms).toBe(350);
+    expect(event.usage.server_model_resolve_ms).toBe(57);
+    expect(event.usage.server_queue_ms).toBe(5);
+    expect(event.usage.server_pre_inference_ms).toBe(62);
   });
 
   it('elides perf fields when performance is undefined', () => {

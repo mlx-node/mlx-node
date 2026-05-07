@@ -45,12 +45,16 @@ Options:
   --                 Everything after this separator is forwarded to the
                      spawned \`claude\` binary verbatim.
 
-Environment variables:
-  MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
-                                4096 under \`mlx launch claude\` to bound
-                                cold-prefill memory peaks; set to 0 to
-                                disable chunking, or to a smaller value
-                                (e.g. 1024 / 512) if 4096 still peaks.
+	Environment variables:
+	  MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
+	                                4096 under \`mlx launch claude\` to bound
+	                                cold-prefill memory peaks; set to 0 to
+	                                disable chunking, or to a smaller value
+	                                (e.g. 1024 / 512) if 4096 still peaks.
+	  MLX_INFERENCE_TRACE           Set to 1/true/on to write native inference
+	                                phase traces to a file.
+	  MLX_INFERENCE_TRACE_FILE      Override the native trace file path.
+	                                Defaults to <log-dir>/inference-trace.log.
 
 Examples:
   mlx launch claude
@@ -94,6 +98,19 @@ function findClaudeOnPath(): string | null {
     }
   }
   return null;
+}
+
+function envFlagEnabled(value: string | undefined): boolean {
+  if (value == null) return false;
+  switch (value.trim().toLowerCase()) {
+    case '1':
+    case 'true':
+    case 'yes':
+    case 'on':
+      return true;
+    default:
+      return false;
+  }
 }
 
 export async function run(argv: string[]): Promise<void> {
@@ -189,10 +206,17 @@ export async function run(argv: string[]): Promise<void> {
   // Verbose logging: attach AFTER `createServer` so we wrap every
   // incoming request (including `GET /v1/models` which claude fires
   // on startup). `--log-dir` implies `--verbose`.
-  const verbose = args.verbose || args['log-dir'] != null || process.env.MLX_LOG_DIR != null;
+  const traceRequested = envFlagEnabled(process.env.MLX_INFERENCE_TRACE);
+  const verbose = args.verbose || args['log-dir'] != null || process.env.MLX_LOG_DIR != null || traceRequested;
   let logger: Logger | null = null;
   if (verbose) {
     const logDir = resolveLogDir(args['log-dir'], resolveMlxNodeHome());
+    if (
+      traceRequested &&
+      (process.env.MLX_INFERENCE_TRACE_FILE == null || process.env.MLX_INFERENCE_TRACE_FILE.trim() === '')
+    ) {
+      process.env.MLX_INFERENCE_TRACE_FILE = join(logDir, 'inference-trace.log');
+    }
     logger = attachLogger(server.server, logDir);
   }
 

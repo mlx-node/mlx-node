@@ -676,6 +676,54 @@ describe('handleCreateMessage', () => {
       expect(toolBlock.input).toEqual({ location: 'San Francisco' });
     });
 
+    it('does not emit tool_use blocks when request has no tools', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: '',
+          toolCalls: [
+            {
+              status: 'ok',
+              id: 'toolu_no_tools',
+              name: 'get_weather',
+              arguments: '{"location":"San Francisco"}',
+              rawContent: '{"name":"get_weather","arguments":{"location":"San Francisco"}}',
+            } as ToolCallResult,
+          ],
+          numTokens: 20,
+          promptTokens: 10,
+          reasoningTokens: 0,
+          finishReason: 'stop',
+          rawText: '<tool_call>{"name":"get_weather","arguments":{"location":"San Francisco"}}</tool_call>',
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const noToolsSessionReg = registry.getSessionRegistry('test-model')!;
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'What is the weather?' }],
+          max_tokens: 100,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.stop_reason).toBe('end_turn');
+      expect(parsed.content.some((b: any) => b.type === 'tool_use')).toBe(false);
+      expect(parsed.content).toEqual([
+        {
+          type: 'text',
+          text: '<tool_call>{"name":"get_weather","arguments":{"location":"San Francisco"}}</tool_call>',
+        },
+      ]);
+      expect(noToolsSessionReg.size).toBe(0);
+    });
+
     it('drops the warm slot when chatSessionStart resolves with finishReason="error"', async () => {
       // Defensive-hardening gate: today every native failure throws,
       // but `runSessionNonStreaming` enforces the invariant locally so
@@ -907,6 +955,7 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'Weather?' }],
           max_tokens: 100,
           stream: true,
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
         },
         registry,
       );
@@ -972,6 +1021,7 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'Search' }],
           max_tokens: 100,
           stream: true,
+          tools: [{ name: 'search', input_schema: { type: 'object', properties: {} } }],
         },
         registry,
       );
@@ -989,6 +1039,67 @@ describe('handleCreateMessage', () => {
         (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
       );
       expect(toolStarts).toHaveLength(1);
+    });
+
+    it('streams literal tool_call markup as text when request has no tools', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: '<tool_call>', done: false, isReasoning: false },
+        { text: '{"name":"search"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [
+            {
+              status: 'ok',
+              id: 'toolu_no_tools',
+              name: 'search',
+              arguments: '{"query":"test"}',
+            },
+          ],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: '<tool_call>{"name":"search"}</tool_call>',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const noToolsStreamSessionReg = registry.getSessionRegistry('test-model')!;
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Search' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(combined).toBe('<tool_call>{"name":"search"}</tool_call>');
+
+      const toolStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+      );
+      expect(toolStarts).toHaveLength(0);
+
+      const jsonDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'input_json_delta',
+      );
+      expect(jsonDeltas).toHaveLength(0);
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
+      expect(noToolsStreamSessionReg.size).toBe(0);
     });
 
     it('recovers suppressed text after false-alarm tool_call tag when text was already emitted', async () => {
@@ -1173,6 +1284,7 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'use a tool' }],
           max_tokens: 30,
           stream: true,
+          tools: [{ name: 'lookup', input_schema: { type: 'object', properties: {} } }],
         },
         registry,
       );
@@ -1288,6 +1400,7 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'use a tool' }],
           max_tokens: 30,
           stream: true,
+          tools: [{ name: 'lookup', input_schema: { type: 'object', properties: {} } }],
         },
         registry,
       );
@@ -3615,6 +3728,7 @@ describe('handleCreateMessage', () => {
             messages: [{ role: 'user', content: 'hi' }],
             max_tokens: 100,
             stream: true,
+            tools: [{ name: 'do_thing', input_schema: { type: 'object', properties: {} } }],
           },
           registry,
         );

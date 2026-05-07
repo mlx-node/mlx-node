@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ResponseStore } from '@mlx-node/core';
 
+import { handleCountMessageTokens } from './endpoints/messages-count-tokens.js';
 import { handleCreateMessage } from './endpoints/messages.js';
 import { handleListModels } from './endpoints/models.js';
 import { handleCreateResponse } from './endpoints/responses.js';
@@ -17,7 +18,7 @@ import {
 import type { PublicModelEntry } from './handler.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelRegistry } from './registry.js';
-import type { AnthropicMessagesRequest } from './types-anthropic.js';
+import type { AnthropicCountTokensRequest, AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';
 
 /** Max request body size (10 MB). */
@@ -81,6 +82,27 @@ export async function routeRequest(
     }
 
     await handleCreateResponse(res, body, registry, store, req, responseRetentionSec, idleSweeper);
+    return;
+  }
+
+  if (path === '/v1/messages/count_tokens') {
+    if (req.method !== 'POST') {
+      sendAnthropicMethodNotAllowed(res, 'POST');
+      return;
+    }
+
+    let body: AnthropicCountTokensRequest;
+    try {
+      const raw = await readBody(req);
+      body = JSON.parse(raw) as AnthropicCountTokensRequest;
+    } catch (err) {
+      const msg =
+        err instanceof Error && err.message === 'Request body too large' ? err.message : 'Invalid JSON in request body';
+      sendAnthropicBadRequest(res, msg);
+      return;
+    }
+
+    await handleCountMessageTokens(res, body, registry, idleSweeper, resolveModel);
     return;
   }
 
