@@ -1295,6 +1295,82 @@ array paged_attention(
 
 } // namespace mlx::core::fast
 
+extern "C" {
+
+/// Production FFI: emit a `PagedAttention` MLX Custom primitive and return
+/// the resulting on-device array. This is intentionally a tiny bridge over
+/// the C++ factory so Rust model code can use the same MLX-graph paged
+/// attention primitive as the compiled Qwen path without copying attention
+/// outputs through host memory.
+///
+/// Returns nullptr on bridge/factory validation errors; Rust callers keep the
+/// existing read_kv_range + SDPA path as fallback. The returned array is still
+/// lazy, so GPU dispatch errors surface later when MLX evaluates the graph.
+mlx_array* mlx_paged_attention_forward(
+    mlx_array* q_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype_raw) {
+  if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !block_table_ptr ||
+      !seq_lens_ptr || !k_scale_ptr || !v_scale_ptr) {
+    return nullptr;
+  }
+
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::fast;
+
+    auto& q_raw           = *reinterpret_cast<array*>(q_ptr);
+    auto& k_pool          = *reinterpret_cast<array*>(k_pool_ptr);
+    auto& v_pool          = *reinterpret_cast<array*>(v_pool_ptr);
+    auto& block_table_raw = *reinterpret_cast<array*>(block_table_ptr);
+    auto& seq_lens_raw    = *reinterpret_cast<array*>(seq_lens_ptr);
+    auto& k_scale         = *reinterpret_cast<array*>(k_scale_ptr);
+    auto& v_scale         = *reinterpret_cast<array*>(v_scale_ptr);
+
+    auto kv_dtype = static_cast<KvDtype>(kv_dtype_raw);
+
+    // The public factory rejects non-row-contiguous/nonzero-offset inputs.
+    // `q` is often produced by reshape/slice/rope chains in Rust model code,
+    // so materialize cheap metadata tensors and q explicitly at this bridge.
+    auto q = contiguous(q_raw);
+    auto block_table = contiguous(block_table_raw);
+    auto seq_lens = contiguous(seq_lens_raw);
+
+    auto out = paged_attention(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        scale,
+        softcap,
+        sliding_window,
+        block_size,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+        kv_dtype);
+
+    return reinterpret_cast<mlx_array*>(new array(std::move(out)));
+  } catch (...) {
+    return nullptr;
+  }
+}
+
 // =============================================================================
 // FFI test helpers (Phase 1 only)
 //
@@ -1305,8 +1381,6 @@ array paged_attention(
 // these once the dispatch path is C++-native and unit tests live in
 // mlx-sys directly.
 // =============================================================================
-
-extern "C" {
 
 /// Construct two `PagedKVWrite` primitives with the supplied scalar
 /// state and return whether `lhs.is_equivalent(rhs)` is true.

@@ -37,6 +37,9 @@ interface UsageSummary {
   server_model_resolve_ms?: number;
   server_queue_ms?: number;
   server_pre_inference_ms?: number;
+  server_paged_prefill_chunk_size?: number;
+  server_paged_prefill_eval_interval?: number;
+  server_paged_decode_cache_clear_interval?: number;
 }
 
 function parseJsonObject(value: string | null): Record<string, unknown> | null {
@@ -144,6 +147,19 @@ function buildTimingSummary(reqBody: string, resBody: string): string {
       fmtMs(usage.server_pre_inference_ms) ? `pre=${fmtMs(usage.server_pre_inference_ms)}` : undefined,
     ].filter((part): part is string => part != null);
     if (serverParts.length > 0) parts.push(`server(${serverParts.join(' ')})`);
+
+    const tuningParts = [
+      typeof usage.server_paged_prefill_chunk_size === 'number'
+        ? `prefill_chunk=${usage.server_paged_prefill_chunk_size}`
+        : undefined,
+      typeof usage.server_paged_prefill_eval_interval === 'number'
+        ? `prefill_eval=${usage.server_paged_prefill_eval_interval}`
+        : undefined,
+      typeof usage.server_paged_decode_cache_clear_interval === 'number'
+        ? `decode_clear=${usage.server_paged_decode_cache_clear_interval}`
+        : undefined,
+    ].filter((part): part is string => part != null);
+    if (tuningParts.length > 0) parts.push(`tune(${tuningParts.join(' ')})`);
   }
   if (response.stop) parts.push(`stop=${response.stop}`);
 

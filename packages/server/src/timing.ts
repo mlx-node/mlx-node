@@ -31,6 +31,12 @@ export interface TimingUsageExtensions {
   server_queue_ms?: number;
   /** Server-extension: handler time before native inference begins, including resolve and queue wait. */
   server_pre_inference_ms?: number;
+  /** Server-extension: effective process-level paged-prefill chunk size. */
+  server_paged_prefill_chunk_size?: number;
+  /** Server-extension: effective process-level paged-prefill eval/clear cadence. */
+  server_paged_prefill_eval_interval?: number;
+  /** Server-extension: effective process-level paged-decode cache-clear cadence. */
+  server_paged_decode_cache_clear_interval?: number;
 }
 
 function finitePositive(value: number | undefined): number | undefined {
@@ -49,6 +55,42 @@ export interface ServerTimingForUsage {
   server_model_resolve_ms?: number;
   server_queue_ms?: number;
   server_pre_inference_ms?: number;
+  server_paged_prefill_chunk_size?: number;
+  server_paged_prefill_eval_interval?: number;
+  server_paged_decode_cache_clear_interval?: number;
+}
+
+const I32_MAX = 0x7fff_ffff;
+
+function parseI32(value: string | undefined): number | undefined {
+  if (value == null) return undefined;
+  const trimmed = value.trim();
+  if (!/^[+-]?\d+$/.test(trimmed)) return undefined;
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isSafeInteger(parsed) && parsed >= -0x8000_0000 && parsed <= I32_MAX ? parsed : undefined;
+}
+
+function parseNonNegativeI32(value: string | undefined, fallback: number): number {
+  const parsed = parseI32(value);
+  return parsed != null && parsed >= 0 ? parsed : fallback;
+}
+
+function parsePositiveI32(value: string | undefined, fallback: number): number {
+  const parsed = parseI32(value);
+  return parsed != null && parsed > 0 ? parsed : fallback;
+}
+
+export function resolveServerTuningForUsage(
+  env: Record<string, string | undefined> = process.env,
+): Pick<
+  ServerTimingForUsage,
+  'server_paged_prefill_chunk_size' | 'server_paged_prefill_eval_interval' | 'server_paged_decode_cache_clear_interval'
+> {
+  return {
+    server_paged_prefill_chunk_size: parseNonNegativeI32(env.MLX_PAGED_PREFILL_CHUNK_SIZE, 0),
+    server_paged_prefill_eval_interval: parsePositiveI32(env.MLX_PAGED_PREFILL_EVAL_INTERVAL, 8),
+    server_paged_decode_cache_clear_interval: parsePositiveI32(env.MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL, 64),
+  };
 }
 
 function computeServerInferenceElapsedMs(
@@ -123,6 +165,20 @@ export function buildTimingUsageExtensions(
   const preInferenceMs = finiteNonNegative(serverTiming?.server_pre_inference_ms);
   if (preInferenceMs != null) {
     extensions.server_pre_inference_ms = preInferenceMs;
+  }
+  const pagedPrefillChunkSize = finiteNonNegativeInteger(serverTiming?.server_paged_prefill_chunk_size);
+  if (pagedPrefillChunkSize != null) {
+    extensions.server_paged_prefill_chunk_size = pagedPrefillChunkSize;
+  }
+  const pagedPrefillEvalInterval = finiteNonNegativeInteger(serverTiming?.server_paged_prefill_eval_interval);
+  if (pagedPrefillEvalInterval != null) {
+    extensions.server_paged_prefill_eval_interval = pagedPrefillEvalInterval;
+  }
+  const pagedDecodeCacheClearInterval = finiteNonNegativeInteger(
+    serverTiming?.server_paged_decode_cache_clear_interval,
+  );
+  if (pagedDecodeCacheClearInterval != null) {
+    extensions.server_paged_decode_cache_clear_interval = pagedDecodeCacheClearInterval;
   }
 
   return extensions;

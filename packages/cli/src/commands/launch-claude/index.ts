@@ -51,6 +51,14 @@ Options:
 	                                cold-prefill memory peaks; set to 0 to
 	                                disable chunking, or to a smaller value
 	                                (e.g. 1024 / 512) if 4096 still peaks.
+	  MLX_PAGED_PREFILL_EVAL_INTERVAL
+	                                Layer cadence for eval+clear during paged
+	                                prefill. Defaults to 8.
+	  MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL
+	                                Token cadence for paged decode cache clear.
+	                                Defaults to 64.
+	  MLX_PAGED_CACHE_MEMORY_MB      Paged KV cache memory budget override for
+	                                paged-aware Qwen3.5 launch.
 	  MLX_INFERENCE_TRACE           Set to 1/true/on to write native inference
 	                                phase traces to a file.
 	  MLX_INFERENCE_TRACE_FILE      Override the native trace file path.
@@ -222,35 +230,6 @@ export async function run(argv: string[]): Promise<void> {
 
   console.log(
     `[mlx] models dir: ${modelsDir} | listening on http://${host}:${port} | discovered ${discovered.length} model(s) | default: ${boundModel.name}`,
-  );
-  // Mirror the Rust-side parser in crates/mlx-core/src/array/memory.rs::
-  // paged_prefill_chunk_size: trim whitespace, parse i32, reject negative
-  // and unparseable; fall back to 0 (disabled). Logging the EFFECTIVE value
-  // — not the raw env string — prevents misleading "abc tokens" output when
-  // the user typo'd a non-numeric value (which the parser silently maps to
-  // 0/disabled).
-  const rawChunkSize = process.env.MLX_PAGED_PREFILL_CHUNK_SIZE;
-  let effectiveChunkSize = 0;
-  if (rawChunkSize != null) {
-    const trimmed = rawChunkSize.trim();
-    // Mirror Rust's `s.trim().parse::<i32>()`: integer-only, signed,
-    // i32 range [-2^31, 2^31). The TS parser must reject anything Rust
-    // would, otherwise the log shows "N tokens" while chunking is
-    // actually disabled.
-    const I32_MAX = 0x7fff_ffff;
-    // Rust's parse::<i32>() accepts an optional leading '+' or '-'.
-    const parsed = /^[+-]?\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) : Number.NaN;
-    if (Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= I32_MAX) {
-      effectiveChunkSize = parsed;
-    } else {
-      console.warn(
-        `[mlx] warning: MLX_PAGED_PREFILL_CHUNK_SIZE=${JSON.stringify(rawChunkSize)} is not a non-negative i32 integer; treating as 0 (disabled)`,
-      );
-    }
-  }
-  const chunkLabel = effectiveChunkSize === 0 ? '0 (disabled)' : String(effectiveChunkSize);
-  console.log(
-    `[mlx] paged-prefill chunk size: ${chunkLabel} tokens (set MLX_PAGED_PREFILL_CHUNK_SIZE=N to override; 0 disables)`,
   );
   if (logger) {
     console.log(`[mlx] verbose logging → ${logger.logDir}`);

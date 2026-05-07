@@ -86,7 +86,7 @@ import type { ModelRegistry } from '../registry.js';
 import { QueueFullError, type SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
-import type { ServerTimingForUsage } from '../timing.js';
+import { resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
   createVisibility,
@@ -962,6 +962,7 @@ export async function handleCreateMessage(
           server_model_resolve_ms: serverModelResolveMs,
           server_queue_ms: Date.now() - mutexQueuedAt,
           server_pre_inference_ms: Date.now() - handlerStartedAt,
+          ...resolveServerTuningForUsage(),
         };
         // Hot-swap race guard. `ModelRegistry.register()` is not coordinated with
         // `withExclusive`, so a concurrent re-register of the same friendly name

@@ -870,6 +870,29 @@ unsafe extern "C-unwind" {
 // ================================================================================
 
 unsafe extern "C-unwind" {
+    /// Emit the MLX C++ `paged_attention(...)` Custom primitive and return the
+    /// lazy on-device output array. Returns null for bridge/factory validation
+    /// errors so callers can fall back to a conservative attention path. GPU
+    /// dispatch errors still occur later when MLX evaluates the returned array.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_attention_forward(
+        q: *mut mlx_array,
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        block_table: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        scale: f32,
+        softcap: f32,
+        sliding_window: i32,
+        block_size: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        kv_dtype: u8,
+    ) -> *mut mlx_array;
+
     /// Compare two `PagedKVWrite` primitives via `is_equivalent`.
     /// Returns `true` iff both are equivalent (same scalar state).
     pub fn mlx_paged_kv_write_is_equivalent(

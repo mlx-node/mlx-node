@@ -4,15 +4,32 @@
 //! the MoE `DecoderLayer` (which holds an MoE/dense MLP variant) and
 //! its own `forward_paged_or_flat` method.
 
+use std::time::Instant;
+
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
+use crate::inference_trace::{
+    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
+};
 use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
 use super::layer_cache::Qwen3_5LayerCache;
 use super::quantized_linear::LinearProj;
+
+fn bytes_to_mib(bytes: f64) -> f64 {
+    bytes / (1024.0 * 1024.0)
+}
+
+fn trace_memory_mib() -> (f64, f64, f64) {
+    (
+        bytes_to_mib(crate::array::get_active_memory()),
+        bytes_to_mib(crate::array::get_cache_memory()),
+        bytes_to_mib(crate::array::get_peak_memory()),
+    )
+}
 
 /// Forward the cached-prefix tokens through GDN (linear-attention)
 /// layers ONLY. Same pattern as the dense helper.
@@ -155,6 +172,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         ));
     }
 
+    let trace_enabled = inference_trace_enabled();
+
     if chunk_size <= 0 || suffix_tokens.len() <= chunk_size as usize {
         return run_paged_prefill_single_shot(
             full_tokens,
@@ -178,8 +197,21 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     // chunking. The GDN linear-attention layers consume the prefix in
     // one shot (existing approximation; orthogonal to chunking).
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
+        let gdn_trace_start = trace_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        if let Some(start) = gdn_trace_start {
+            let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe paged_prefill_gdn_prefix_done \
+                 prefix_tokens={} elapsed_ms={:.1} active_mib={:.1} cache_mib={:.1} peak_mib={:.1}",
+                cached_prefix_len,
+                elapsed_ms(start),
+                active_mib,
+                cache_mib,
+                peak_mib
+            ));
+        }
     }
 
     let total_chunks = suffix_tokens.len().div_ceil(chunk_size_usize);
@@ -188,6 +220,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
 
     for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
         let is_last_chunk = chunk_idx + 1 == total_chunks;
+        let chunk_trace_start = trace_enabled.then(Instant::now);
 
         // 1. Advance cursor + grow blocks for this chunk. Must happen
         //    BEFORE calling the per-chunk helper so `update_keys_values`
@@ -225,6 +258,24 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 lm_head,
                 embedding_weight,
             )?);
+            if let Some(start) = chunk_trace_start {
+                let chunk_elapsed_ms = elapsed_ms(start);
+                let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe paged_prefill_chunk_final_graph_built \
+                     chunk_index={} total_chunks={} chunk_tokens={} context_before={} context_after={} \
+                     elapsed_ms={:.1} active_mib={:.1} cache_mib={:.1} peak_mib={:.1}",
+                    chunk_idx + 1,
+                    total_chunks,
+                    chunk.len(),
+                    chunk_start_position,
+                    chunk_start_position + chunk.len() as u32,
+                    chunk_elapsed_ms,
+                    active_mib,
+                    cache_mib,
+                    peak_mib
+                ));
+            }
         } else {
             // Force materialize the residual stream so MLX can release
             // the upstream graph nodes (embedding + every prior layer's
@@ -236,6 +287,30 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             // skip — those projections would be discarded anyway.
             hidden.eval();
             crate::array::synchronize_and_clear_cache();
+            if let Some(start) = chunk_trace_start {
+                let chunk_elapsed_ms = elapsed_ms(start);
+                let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+                let chunk_tok_s = if chunk_elapsed_ms > 0.0 {
+                    chunk.len() as f64 / (chunk_elapsed_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe paged_prefill_chunk_done \
+                     chunk_index={} total_chunks={} chunk_tokens={} context_before={} context_after={} \
+                     elapsed_ms={:.1} tok_s={:.2} active_mib={:.1} cache_mib={:.1} peak_mib={:.1}",
+                    chunk_idx + 1,
+                    total_chunks,
+                    chunk.len(),
+                    chunk_start_position,
+                    chunk_start_position + chunk.len() as u32,
+                    chunk_elapsed_ms,
+                    chunk_tok_s,
+                    active_mib,
+                    cache_mib,
+                    peak_mib
+                ));
+            }
         }
 
         chunk_start_position += chunk.len() as u32;

@@ -76,6 +76,7 @@
 //! flat path. See `finalize_turn_keep_live` for full discussion.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[cfg(target_os = "macos")]
 use mlx_paged_attn::metal::KvScaleManager;
@@ -84,6 +85,9 @@ use mlx_paged_attn::{
 };
 
 use crate::array::{DType, MxArray};
+use crate::inference_trace::{
+    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
+};
 
 /// Outcome of `validate_kv_input`: the (kernel-input dtype, num_tokens) tuple
 /// the caller needs after a successful validation. Splitting validation off
@@ -448,9 +452,31 @@ pub struct PagedKVCacheAdapter {
     /// `Mutex` is the conservative choice over `RwLock` here.
     #[cfg(target_os = "macos")]
     scale_manager: Option<Arc<Mutex<KvScaleManager>>>,
+
+    /// Cached per-prefill-chunk metadata for the MLX `paged_attention`
+    /// bridge. The metadata is identical for every full-attention layer in a
+    /// chunk, so rebuilding a duplicated block table per layer would make the
+    /// optimized prefill path pay avoidable host allocation/upload cost.
+    #[cfg(target_os = "macos")]
+    prefill_attention_inputs_cache: Option<PrefillPagedAttentionInputsCache>,
+}
+
+#[cfg(target_os = "macos")]
+struct PrefillPagedAttentionInputsCache {
+    token_count: u32,
+    cached_prefix_len: u32,
+    num_new_tokens: u32,
+    block_count: u32,
+    block_table: MxArray,
+    seq_lens: MxArray,
 }
 
 impl PagedKVCacheAdapter {
+    #[cfg(target_os = "macos")]
+    fn clear_prefill_attention_inputs_cache(&mut self) {
+        self.prefill_attention_inputs_cache = None;
+    }
+
     /// Construct a new adapter sharing the given allocator and layer
     /// KV-buffer pool.
     ///
@@ -504,6 +530,8 @@ impl PagedKVCacheAdapter {
             prefix_lookup_done: false,
             #[cfg(target_os = "macos")]
             scale_manager: None,
+            #[cfg(target_os = "macos")]
+            prefill_attention_inputs_cache: None,
         })
     }
 
@@ -519,6 +547,10 @@ impl PagedKVCacheAdapter {
         self.block_table = Some(SequenceBlockTable::new(seq_id, self.block_size));
         self.cached_token_count = 0;
         self.request_tokens.clear();
+        #[cfg(target_os = "macos")]
+        {
+            self.prefill_attention_inputs_cache = None;
+        }
         // Reset registration flag AFTER release so a subsequent
         // register_full_blocks_for_reuse on the new request runs.
         self.already_registered = false;
@@ -946,6 +978,10 @@ impl PagedKVCacheAdapter {
             .ok_or_else(|| "record_tokens: block_table disappeared mid-call".to_string())?;
         self.request_tokens.extend_from_slice(tokens);
         block_table.set_num_tokens(new_total);
+        #[cfg(target_os = "macos")]
+        {
+            self.prefill_attention_inputs_cache = None;
+        }
         Ok(())
     }
 
@@ -982,6 +1018,10 @@ impl PagedKVCacheAdapter {
         let new_len = prior_len - n;
         self.request_tokens.truncate(new_len as usize);
         block_table.set_num_tokens(new_len);
+        #[cfg(target_os = "macos")]
+        {
+            self.prefill_attention_inputs_cache = None;
+        }
         Ok(())
     }
 
@@ -1309,6 +1349,239 @@ impl PagedKVCacheAdapter {
             .map_err(|e| format!("gather_kv_for_decode: failed to wrap output array: {e}"))
     }
 
+    /// Run MLX-graph paged attention for a multi-token prefill suffix chunk.
+    ///
+    /// `queries` must be `[num_new_tokens, num_query_heads, head_size]`.
+    /// The current request must already have recorded the whole chunk, so the
+    /// active block table covers `cached_prefix_len + num_new_tokens` tokens.
+    ///
+    /// This represents each suffix token as one paged-attention "sequence"
+    /// with a different `seq_len`, which gives token `i` access to
+    /// `[0, cached_prefix_len + i]` and preserves causal prefill semantics
+    /// without reading full K/V back through host memory.
+    #[cfg(target_os = "macos")]
+    pub fn gather_kv_for_prefill_chunk(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        cached_prefix_len: u32,
+        scale: f32,
+    ) -> Result<MxArray, String> {
+        let q_meta = KvTensorMeta::from_array(queries, "prefill_queries")?;
+        if (layer_idx as usize) >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "gather_kv_for_prefill_chunk: layer_idx {layer_idx} out of range \
+                 (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        if q_meta.ndim != 3 || q_meta.shape.len() < 3 {
+            return Err(format!(
+                "gather_kv_for_prefill_chunk: queries must be rank 3 \
+                 [num_new_tokens, num_query_heads, head_size]; got ndim={} shape_len={}",
+                q_meta.ndim,
+                q_meta.shape.len()
+            ));
+        }
+
+        let num_new_tokens = u32::try_from(q_meta.shape[0]).map_err(|_| {
+            format!(
+                "gather_kv_for_prefill_chunk: num_new_tokens shape is negative/too large: {}",
+                q_meta.shape[0]
+            )
+        })?;
+        if num_new_tokens == 0 {
+            return Err("gather_kv_for_prefill_chunk: num_new_tokens must be > 0".to_string());
+        }
+        let num_query_heads = u32::try_from(q_meta.shape[1]).map_err(|_| {
+            format!(
+                "gather_kv_for_prefill_chunk: num_query_heads shape is negative/too large: {}",
+                q_meta.shape[1]
+            )
+        })?;
+        if num_query_heads == 0 {
+            return Err("gather_kv_for_prefill_chunk: num_query_heads must be > 0".to_string());
+        }
+
+        let expected_head_size = self.layer_kv_pool.config().head_size as i64;
+        if q_meta.shape[2] != expected_head_size {
+            return Err(format!(
+                "gather_kv_for_prefill_chunk: query head_size {} != expected {}",
+                q_meta.shape[2], expected_head_size
+            ));
+        }
+
+        let query_dtype = match q_meta.dtype {
+            DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
+            DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
+            other => {
+                return Err(format!(
+                    "gather_kv_for_prefill_chunk: query dtype {other:?} is not supported"
+                ));
+            }
+        };
+        let cache_dtype = self.layer_kv_pool.cache_dtype();
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+            return Err(format!(
+                "gather_kv_for_prefill_chunk: query_dtype ({query_dtype:?}) must equal \
+                 cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+            ));
+        }
+        let kv_dtype_raw = match cache_dtype {
+            mlx_paged_attn::metal::MetalDtype::Float16 => 0u8,
+            mlx_paged_attn::metal::MetalDtype::BFloat16 => 1u8,
+            mlx_paged_attn::metal::MetalDtype::UChar => 2u8,
+            mlx_paged_attn::metal::MetalDtype::Float32 => {
+                return Err(
+                    "gather_kv_for_prefill_chunk: Float32 KV cache is unsupported".to_string(),
+                );
+            }
+        };
+
+        let (block_table, seq_lens, block_count) =
+            self.prefill_attention_inputs(cached_prefix_len, num_new_tokens)?;
+        let k_pool = self.key_pool_array(layer_idx)?;
+        let v_pool = self.value_pool_array(layer_idx)?;
+        let k_scale = self.k_scale_array(layer_idx)?;
+        let v_scale = self.v_scale_array(layer_idx)?;
+
+        let raw = unsafe {
+            mlx_sys::mlx_paged_attention_forward(
+                queries.as_raw_ptr(),
+                k_pool.as_raw_ptr(),
+                v_pool.as_raw_ptr(),
+                block_table.as_raw_ptr(),
+                seq_lens.as_raw_ptr(),
+                k_scale.as_raw_ptr(),
+                v_scale.as_raw_ptr(),
+                scale,
+                0.0, // softcap disabled in the MLX C++ paged_attention factory.
+                0,   // sliding-window disabled for Qwen3.5 full attention.
+                self.block_size as i32,
+                num_query_heads as i32,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+                self.layer_kv_pool.config().head_size as i32,
+                kv_dtype_raw,
+            )
+        };
+        if raw.is_null() {
+            return Err(format!(
+                "gather_kv_for_prefill_chunk: mlx_paged_attention_forward returned null \
+                 (layer={layer_idx}, num_new_tokens={num_new_tokens}, block_count={block_count})"
+            ));
+        }
+
+        MxArray::from_handle(raw, "gather_kv_for_prefill_chunk")
+            .map_err(|e| format!("gather_kv_for_prefill_chunk: failed to wrap output array: {e}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prefill_attention_inputs(
+        &mut self,
+        cached_prefix_len: u32,
+        num_new_tokens: u32,
+    ) -> Result<(MxArray, MxArray, u32), String> {
+        let block_table = self.block_table.as_ref().ok_or_else(|| {
+            "gather_kv_for_prefill_chunk called before reset_for_new_request".to_string()
+        })?;
+        let recorded = block_table.num_tokens();
+        let expected_total = cached_prefix_len
+            .checked_add(num_new_tokens)
+            .ok_or_else(|| "gather_kv_for_prefill_chunk: token count overflow".to_string())?;
+        if recorded != expected_total {
+            return Err(format!(
+                "gather_kv_for_prefill_chunk: recorded token count {recorded} != \
+                 cached_prefix_len + num_new_tokens ({cached_prefix_len} + {num_new_tokens} = \
+                 {expected_total}); call record_tokens for the whole chunk first"
+            ));
+        }
+
+        if let Some(cache) = self.prefill_attention_inputs_cache.as_ref()
+            && cache.token_count == recorded
+            && cache.cached_prefix_len == cached_prefix_len
+            && cache.num_new_tokens == num_new_tokens
+        {
+            return Ok((
+                cache.block_table.clone(),
+                cache.seq_lens.clone(),
+                cache.block_count,
+            ));
+        }
+
+        let block_ids = build_decode_block_ids(block_table);
+        if block_ids.is_empty() {
+            return Err(
+                "gather_kv_for_prefill_chunk: active request has no allocated blocks".to_string(),
+            );
+        }
+        let block_count = u32::try_from(block_ids.len()).map_err(|_| {
+            format!(
+                "gather_kv_for_prefill_chunk: too many blocks for i32 shape: {}",
+                block_ids.len()
+            )
+        })?;
+        let pool_block_count = self.layer_kv_pool.num_blocks();
+        for (idx, &block_id) in block_ids.iter().enumerate() {
+            if block_id < 0 || block_id as u32 >= pool_block_count {
+                return Err(format!(
+                    "gather_kv_for_prefill_chunk: block_table[{idx}]={block_id} out of \
+                     range for pool block count {pool_block_count}"
+                ));
+            }
+        }
+        let max_seq_len = block_count
+            .checked_mul(self.block_size)
+            .ok_or_else(|| "gather_kv_for_prefill_chunk: max seq len overflow".to_string())?;
+        if expected_total > max_seq_len {
+            return Err(format!(
+                "gather_kv_for_prefill_chunk: expected total tokens {expected_total} exceeds \
+                 block table capacity {block_count} * {} = {max_seq_len}",
+                self.block_size
+            ));
+        }
+
+        let num_new_usize = num_new_tokens as usize;
+        let block_count_usize = block_count as usize;
+        let mut duplicated_blocks = Vec::with_capacity(num_new_usize * block_count_usize);
+        for _ in 0..num_new_tokens {
+            duplicated_blocks.extend_from_slice(&block_ids);
+        }
+
+        let mut seq_lens = Vec::with_capacity(num_new_usize);
+        for i in 0..num_new_tokens {
+            let seq_len = cached_prefix_len
+                .checked_add(i + 1)
+                .ok_or_else(|| "gather_kv_for_prefill_chunk: seq_len overflow".to_string())?;
+            seq_lens.push(seq_len as i32);
+        }
+
+        let block_table_arr = MxArray::from_int32(
+            &duplicated_blocks,
+            &[num_new_tokens as i64, block_count as i64],
+        )
+        .map_err(|e| format!("gather_kv_for_prefill_chunk block_table: {e}"))?;
+        let seq_lens_arr = MxArray::from_int32(&seq_lens, &[num_new_tokens as i64])
+            .map_err(|e| format!("gather_kv_for_prefill_chunk seq_lens: {e}"))?;
+
+        self.prefill_attention_inputs_cache = Some(PrefillPagedAttentionInputsCache {
+            token_count: recorded,
+            cached_prefix_len,
+            num_new_tokens,
+            block_count,
+            block_table: block_table_arr,
+            seq_lens: seq_lens_arr,
+        });
+        let cache = self
+            .prefill_attention_inputs_cache
+            .as_ref()
+            .expect("prefill_attention_inputs_cache was just populated");
+        Ok((
+            cache.block_table.clone(),
+            cache.seq_lens.clone(),
+            cache.block_count,
+        ))
+    }
+
     /// Non-macOS stub.
     #[cfg(not(target_os = "macos"))]
     pub fn gather_kv_for_decode(
@@ -1319,6 +1592,17 @@ impl PagedKVCacheAdapter {
         _softcap: f32,
     ) -> Result<MxArray, String> {
         Err("gather_kv_for_decode is only supported on macOS (Metal backend)".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn gather_kv_for_prefill_chunk(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _cached_prefix_len: u32,
+        _scale: f32,
+    ) -> Result<MxArray, String> {
+        Err("gather_kv_for_prefill_chunk is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Read K/V back from the pool for a contiguous range of logical
@@ -1428,9 +1712,13 @@ impl PagedKVCacheAdapter {
 
         // 5. Read blocks. Returns concat'd bytes per block in the order
         //    requested.
+        let trace_enabled = inference_trace_enabled();
+        let trace_start = trace_enabled.then(Instant::now);
+        let read_blocks_start = trace_enabled.then(Instant::now);
         let (key_bytes, value_bytes) = self
             .layer_kv_pool
             .read_blocks_to_host(layer_idx, &block_ids)?;
+        let read_blocks_ms = read_blocks_start.map(elapsed_ms);
 
         // 6. Layout constants.
         // Cache dtype is 2 bytes per element here (we rejected FP8 above).
@@ -1462,6 +1750,7 @@ impl PagedKVCacheAdapter {
         // 8. Per-token gather. For token at logical position `pos`:
         //    block_table_idx = pos / block_size, offset_in_block = pos % block_size,
         //    block_id_local_idx (within `block_ids`) = block_table_idx - first_table_idx.
+        let unpack_start = trace_enabled.then(Instant::now);
         for t in 0..num_tokens_us {
             let pos = start_pos as usize + t;
             let table_idx = pos / block_size_us;
@@ -1513,10 +1802,12 @@ impl PagedKVCacheAdapter {
                 }
             }
         }
+        let unpack_ms = unpack_start.map(elapsed_ms);
 
         // 9. Construct MxArrays in [1, num_kv_heads, num_tokens, head_size]
         //    layout. Use the dtype-matching constructor so the bits are
         //    interpreted correctly (`from_float16` for FP16 cache, etc).
+        let array_build_start = trace_enabled.then(Instant::now);
         let shape: [i64; 4] = [1, num_kv_heads as i64, num_tokens as i64, head_size as i64];
         let (k_arr, v_arr) = match cache_dtype {
             mlx_paged_attn::metal::MetalDtype::Float16 => (
@@ -1542,6 +1833,23 @@ impl PagedKVCacheAdapter {
                 ));
             }
         };
+        let array_build_ms = array_build_start.map(elapsed_ms);
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged_kv read_kv_range layer={} start_pos={} num_tokens={} \
+                 block_count={} block_size={} read_blocks_ms={:.1} unpack_ms={:.1} \
+                 array_build_ms={:.1} elapsed_ms={:.1}",
+                layer_idx,
+                start_pos,
+                num_tokens,
+                block_ids.len(),
+                block_size,
+                read_blocks_ms.unwrap_or(0.0),
+                unpack_ms.unwrap_or(0.0),
+                array_build_ms.unwrap_or(0.0),
+                trace_start.map(elapsed_ms).unwrap_or(0.0)
+            ));
+        }
         Ok((k_arr, v_arr))
     }
 
@@ -1828,6 +2136,10 @@ impl PagedKVCacheAdapter {
 
         self.cached_token_count = 0;
         self.request_tokens.clear();
+        #[cfg(target_os = "macos")]
+        {
+            self.prefill_attention_inputs_cache = None;
+        }
         // Defense-in-depth: clear the registration flag so a subsequent
         // reset_for_new_request → register flow on this adapter works
         // even if the caller skips the explicit reset.
@@ -1905,12 +2217,17 @@ impl PagedKVCacheAdapter {
         // failure (the caller flow becomes: forward → finalize_turn_keep_live;
         // a duplicate finalize after an error path doesn't double-register).
         if self.already_registered {
+            #[cfg(target_os = "macos")]
+            self.clear_prefill_attention_inputs_cache();
             return Ok(0);
         }
         // Reuse `register_full_blocks_for_reuse`'s implementation for the
         // registration half; the only difference is that we do NOT call
         // `release_request` after it.
-        self.register_full_blocks_for_reuse(extra_keys, cache_salt)
+        let result = self.register_full_blocks_for_reuse(extra_keys, cache_salt);
+        #[cfg(target_os = "macos")]
+        self.clear_prefill_attention_inputs_cache();
+        result
     }
 
     /// Per-block-extra_keys variant of [`Self::finalize_turn_keep_live`].
@@ -1942,9 +2259,15 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
     ) -> Result<u32, String> {
         if self.already_registered {
+            #[cfg(target_os = "macos")]
+            self.clear_prefill_attention_inputs_cache();
             return Ok(0);
         }
-        self.register_full_blocks_for_reuse_per_block(extra_keys_per_block, cache_salt)
+        let result =
+            self.register_full_blocks_for_reuse_per_block(extra_keys_per_block, cache_salt);
+        #[cfg(target_os = "macos")]
+        self.clear_prefill_attention_inputs_cache();
+        result
     }
 
     /// Continue the current session with a new turn whose full prompt
@@ -2073,6 +2396,10 @@ impl PagedKVCacheAdapter {
         // future caller that mixes patterns isn't tripped by stale state.
         self.already_registered = false;
         self.prefix_lookup_done = true; // already implicitly "done" — no fresh lookup is allowed
+        #[cfg(target_os = "macos")]
+        {
+            self.prefill_attention_inputs_cache = None;
+        }
 
         Ok((prior_token_count, newly_allocated))
     }
@@ -2563,6 +2890,7 @@ pub fn compute_per_block_image_extra_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use half::f16;
 
     fn new_allocator(num_blocks: u32, block_size: u32) -> Arc<Mutex<BlockAllocator>> {
         Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)))
@@ -4489,6 +4817,161 @@ mod tests {
             "to_mlx_array materializes Float32 (GPU host roundtrip); P1C-3 \
              follow-up: zero-copy via mlx_array_from_metal_buffer"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gather_kv_for_prefill_chunk_writes_succeed_on_metal() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_gather_kv_for_prefill_chunk_writes_succeed_on_metal: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+
+        let k = MxArray::zeros(&[4, 1, 64], Some(DType::Float16)).expect("k zeros");
+        let v = MxArray::zeros(&[4, 1, 64], Some(DType::Float16)).expect("v zeros");
+        k.eval();
+        v.eval();
+        match adapter.update_keys_values(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_gather_kv_for_prefill_chunk_writes_succeed_on_metal: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+        }
+
+        let q = MxArray::zeros(&[2, 2, 64], Some(DType::Float16)).expect("q zeros");
+        q.eval();
+        let scale = 1.0_f32 / (64.0_f32).sqrt();
+        let out = match adapter.gather_kv_for_prefill_chunk(0, &q, 2, scale) {
+            Ok(arr) => arr,
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_gather_kv_for_prefill_chunk_writes_succeed_on_metal: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from gather_kv_for_prefill_chunk: {e}"),
+        };
+
+        assert_eq!(out.ndim().unwrap(), 3, "output must be 3-D");
+        assert_eq!(out.shape_at(0).unwrap(), 2);
+        assert_eq!(out.shape_at(1).unwrap(), 2);
+        assert_eq!(out.shape_at(2).unwrap(), 64);
+        assert_eq!(
+            out.dtype().unwrap(),
+            DType::Float16,
+            "MLX paged_attention bridge should keep output on-device in the IO dtype"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gather_kv_for_prefill_chunk_respects_causal_prefix_lengths() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!(
+                    "skipping test_gather_kv_for_prefill_chunk_respects_causal_prefix_lengths: {e}"
+                );
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+
+        // Q/K = 0 makes attention scores uniform. V[token] = token + 1, so
+        // the first suffix token at prefix len 2 should average [1,2,3] = 2,
+        // and the second should average [1,2,3,4] = 2.5.
+        let k = MxArray::zeros(&[4, 1, 64], Some(DType::Float16)).expect("k zeros");
+        let mut v_bits = Vec::with_capacity(4 * 64);
+        for token_idx in 0..4 {
+            let bits = f16::from_f32((token_idx + 1) as f32).to_bits();
+            v_bits.extend(std::iter::repeat(bits).take(64));
+        }
+        let v = MxArray::from_float16(&v_bits, &[4, 1, 64]).expect("v values");
+        k.eval();
+        v.eval();
+        match adapter.update_keys_values(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping test_gather_kv_for_prefill_chunk_respects_causal_prefix_lengths: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+        }
+
+        let q = MxArray::zeros(&[2, 2, 64], Some(DType::Float16)).expect("q zeros");
+        q.eval();
+        let scale = 1.0_f32 / (64.0_f32).sqrt();
+        let out = match adapter.gather_kv_for_prefill_chunk(0, &q, 2, scale) {
+            Ok(arr) => arr,
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping test_gather_kv_for_prefill_chunk_respects_causal_prefix_lengths: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error from gather_kv_for_prefill_chunk: {e}"),
+        };
+
+        assert_eq!(out.ndim().unwrap(), 3, "output must be 3-D");
+        assert_eq!(out.shape_at(0).unwrap(), 2);
+        assert_eq!(out.shape_at(1).unwrap(), 2);
+        assert_eq!(out.shape_at(2).unwrap(), 64);
+
+        let values = out.to_float32().expect("prefill output to_float32");
+        let expected_by_token = [2.0_f32, 2.5_f32];
+        for token_idx in 0..2 {
+            for head_idx in 0..2 {
+                let base = (token_idx * 2 + head_idx) * 64;
+                let actual = values[base];
+                let expected = expected_by_token[token_idx];
+                assert!(
+                    (actual - expected).abs() < 0.05,
+                    "token {token_idx} head {head_idx}: got {actual}, expected {expected}"
+                );
+            }
+        }
     }
 
     /// **BF16 numerical correctness on Metal.** Production Qwen3.5 runs in

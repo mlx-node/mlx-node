@@ -210,6 +210,12 @@ export interface AnthropicUsage {
   server_queue_ms?: number;
   /** Server-extension: handler time before native inference begins, including resolve and queue wait. */
   server_pre_inference_ms?: number;
+  /** Server-extension: effective process-level paged-prefill chunk size. */
+  server_paged_prefill_chunk_size?: number;
+  /** Server-extension: effective process-level paged-prefill eval/clear cadence. */
+  server_paged_prefill_eval_interval?: number;
+  /** Server-extension: effective process-level paged-decode cache-clear cadence. */
+  server_paged_decode_cache_clear_interval?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +327,12 @@ export interface AnthropicMessageDeltaEvent {
     server_queue_ms?: number;
     /** Server-extension: handler time before native inference begins, including resolve and queue wait. */
     server_pre_inference_ms?: number;
+    /** Server-extension: effective process-level paged-prefill chunk size. */
+    server_paged_prefill_chunk_size?: number;
+    /** Server-extension: effective process-level paged-prefill eval/clear cadence. */
+    server_paged_prefill_eval_interval?: number;
+    /** Server-extension: effective process-level paged-decode cache-clear cadence. */
+    server_paged_decode_cache_clear_interval?: number;
   };
 }
 

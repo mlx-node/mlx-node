@@ -266,6 +266,9 @@ export interface ResponseUsage {
   server_model_resolve_ms?: number;
   server_queue_ms?: number;
   server_pre_inference_ms?: number;
+  server_paged_prefill_chunk_size?: number;
+  server_paged_prefill_eval_interval?: number;
+  server_paged_decode_cache_clear_interval?: number;
   /**
    * Server-extension cache context for `prefill_tokens_per_second`.
    * On cached-prefix turns, `prefill_input_tokens` is the uncached

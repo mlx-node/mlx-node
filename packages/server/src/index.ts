@@ -28,6 +28,7 @@ export type { ServableModel, ModelEntry, ModelRegistryOptions, RegisterOptions }
 
 export { QueueFullError, SessionRegistry } from './session-registry.js';
 export type { SessionLookupResult, SessionRegistryOptions } from './session-registry.js';
+export { resolveServerTuningForUsage } from './timing.js';
 // NOTE: `__resetPromptCacheKeyNonceForTests` is intentionally NOT
 // re-exported here. It is a test-only helper that nukes the module-
 // scoped HMAC nonce (and the once-per-process single-tenant warning

@@ -30,8 +30,7 @@ import type { ModelRegistry } from '../registry.js';
 import { maybeWarnPromptCacheKeyIneligible, QueueFullError, type SessionRegistry } from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
-import type { ServerTimingForUsage } from '../timing.js';
-import { mergeTimingUsageExtensions } from '../timing.js';
+import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
   createVisibility,
@@ -2350,6 +2349,7 @@ export async function handleCreateResponse(
         const serverTiming: ServerTimingForUsage = {
           server_queue_ms: Date.now() - mutexQueuedAt,
           server_pre_inference_ms: Date.now() - handlerStartedAt,
+          ...resolveServerTuningForUsage(),
         };
 
         // Hot-swap race guard inside the mutex.

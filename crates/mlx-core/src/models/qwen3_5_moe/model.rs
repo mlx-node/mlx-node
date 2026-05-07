@@ -1,6 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -9,6 +7,9 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use tracing::{info, warn};
 
+use crate::inference_trace::{
+    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
+};
 use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
@@ -38,45 +39,6 @@ use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
-
-fn inference_trace_enabled() -> bool {
-    inference_trace_file().is_some()
-}
-
-fn inference_trace_file() -> Option<&'static str> {
-    static TRACE_FILE: OnceLock<Option<String>> = OnceLock::new();
-    TRACE_FILE
-        .get_or_init(|| {
-            let enabled = match std::env::var("MLX_INFERENCE_TRACE") {
-                Ok(value) => matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                ),
-                Err(_) => false,
-            };
-            if !enabled {
-                return None;
-            }
-            std::env::var("MLX_INFERENCE_TRACE_FILE")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-        .as_deref()
-}
-
-fn write_inference_trace(args: std::fmt::Arguments<'_>) {
-    let Some(path) = inference_trace_file() else {
-        return;
-    };
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{args}");
-    }
-}
-
-fn elapsed_ms(start: std::time::Instant) -> f64 {
-    start.elapsed().as_secs_f64() * 1000.0
-}
 
 fn fresh_moe_layer_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
     (0..config.num_layers as usize)
@@ -108,6 +70,72 @@ struct MoeGdnHistoryCheckpoint {
 struct MoeGdnPrefixPreparation {
     state: &'static str,
     already_primed: bool,
+}
+
+#[derive(Default)]
+struct MoeGdnCheckpointStoreTrace {
+    stored: bool,
+    hash_ms: f64,
+    eval_ms: f64,
+    clone_ms: f64,
+    token_clone_ms: f64,
+    update_ms: f64,
+    total_ms: f64,
+}
+
+impl MoeGdnCheckpointStoreTrace {
+    fn finish(mut self, start: Option<std::time::Instant>) -> Self {
+        self.total_ms = start.map(elapsed_ms).unwrap_or(0.0);
+        self
+    }
+}
+
+fn moe_gdn_store_replayed_prefix_checkpoint_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MLX_MOE_GDN_REPLAY_PREFIX_CHECKPOINT")
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct TokenPrefixMismatchTrace {
+    index: i64,
+    prompt_token: i64,
+    cached_token: i64,
+}
+
+impl Default for TokenPrefixMismatchTrace {
+    fn default() -> Self {
+        Self {
+            index: -1,
+            prompt_token: -1,
+            cached_token: -1,
+        }
+    }
+}
+
+fn token_prefix_mismatch_trace(prompt: &[u32], cached: &[u32]) -> TokenPrefixMismatchTrace {
+    let common_len = prompt.len().min(cached.len());
+    for i in 0..common_len {
+        if prompt[i] != cached[i] {
+            return TokenPrefixMismatchTrace {
+                index: i as i64,
+                prompt_token: prompt[i] as i64,
+                cached_token: cached[i] as i64,
+            };
+        }
+    }
+
+    TokenPrefixMismatchTrace {
+        index: common_len as i64,
+        prompt_token: prompt.get(common_len).map_or(-1, |token| *token as i64),
+        cached_token: cached.get(common_len).map_or(-1, |token| *token as i64),
+    }
 }
 
 fn moe_paged_linear_caches_ready(
@@ -871,27 +899,38 @@ impl Qwen35MoeInner {
         clone_moe_linear_layer_caches(&self.config, &checkpoint.caches)
     }
 
-    fn remember_moe_gdn_history_checkpoint(&mut self) -> bool {
+    fn remember_moe_gdn_history_checkpoint(&mut self) -> MoeGdnCheckpointStoreTrace {
+        let trace_enabled = inference_trace_enabled();
+        let total_start = trace_enabled.then(std::time::Instant::now);
+        let mut trace = MoeGdnCheckpointStoreTrace::default();
         if self.cached_token_history.is_empty() {
             self.gdn_last_history_checkpoint = None;
-            return false;
+            return trace.finish(total_start);
         }
 
+        let eval_start = trace_enabled.then(std::time::Instant::now);
         eval_layer_caches(&self.caches);
+        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
+        let clone_start = trace_enabled.then(std::time::Instant::now);
         let Some(caches) = self
             .caches
             .as_ref()
             .and_then(|caches| clone_moe_linear_layer_caches(&self.config, caches))
         else {
             self.gdn_last_history_checkpoint = None;
-            return false;
+            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+            return trace.finish(total_start);
         };
+        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+        let token_clone_start = trace_enabled.then(std::time::Instant::now);
+        let tokens = self.cached_token_history.clone();
+        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
 
-        self.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint {
-            tokens: self.cached_token_history.clone(),
-            caches,
-        });
-        true
+        let update_start = trace_enabled.then(std::time::Instant::now);
+        self.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint { tokens, caches });
+        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
+        trace.stored = true;
+        trace.finish(total_start)
     }
 
     fn find_moe_gdn_prefix_checkpoint(
@@ -932,7 +971,11 @@ impl Qwen35MoeInner {
         block_size: u32,
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
-    ) -> bool {
+    ) -> MoeGdnCheckpointStoreTrace {
+        let trace_enabled = inference_trace_enabled();
+        let total_start = trace_enabled.then(std::time::Instant::now);
+        let mut trace = MoeGdnCheckpointStoreTrace::default();
+        let hash_start = trace_enabled.then(std::time::Instant::now);
         let Some(final_block_hash) = compute_paged_prefix_block_hash(
             tokens,
             prefix_len,
@@ -940,22 +983,32 @@ impl Qwen35MoeInner {
             extra_keys_per_block,
             cache_salt,
         ) else {
-            return false;
+            trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
+            return trace.finish(total_start);
         };
+        trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return false;
+            return trace.finish(total_start);
         };
 
+        let eval_start = trace_enabled.then(std::time::Instant::now);
         eval_layer_caches(&self.caches);
+        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
+        let clone_start = trace_enabled.then(std::time::Instant::now);
         let Some(caches) = self
             .caches
             .as_ref()
             .and_then(|caches| clone_moe_linear_layer_caches(&self.config, caches))
         else {
-            return false;
+            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+            return trace.finish(total_start);
         };
+        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+        let token_clone_start = trace_enabled.then(std::time::Instant::now);
         let prefix_tokens = prefix_tokens.to_vec();
+        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
 
+        let update_start = trace_enabled.then(std::time::Instant::now);
         self.gdn_prefix_checkpoints.retain(|checkpoint| {
             !(checkpoint.prefix_len == prefix_len
                 && checkpoint.block_size == block_size
@@ -973,8 +1026,10 @@ impl Qwen35MoeInner {
         while self.gdn_prefix_checkpoints.len() > MOE_GDN_PREFIX_CHECKPOINT_LIMIT {
             self.gdn_prefix_checkpoints.pop_front();
         }
+        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
+        trace.stored = true;
 
-        true
+        trace.finish(total_start)
     }
 
     fn prepare_moe_gdn_prefix_state(
@@ -986,8 +1041,18 @@ impl Qwen35MoeInner {
         cache_salt: u64,
         continued_live_prefix: bool,
     ) -> Result<MoeGdnPrefixPreparation> {
+        let trace_enabled = inference_trace_enabled();
+        let prepare_trace_start = trace_enabled.then(std::time::Instant::now);
         let gdn_caches_ready = moe_paged_linear_caches_ready(&self.config, self.caches.as_deref());
         if gdn_caches_ready && continued_live_prefix {
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=live \
+                     cached_prefix_tokens={} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    elapsed_ms(start)
+                ));
+            }
             return Ok(MoeGdnPrefixPreparation {
                 state: "live",
                 already_primed: true,
@@ -998,45 +1063,83 @@ impl Qwen35MoeInner {
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
         if gdn_caches_ready && gdn_prefix_from_history {
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=last_history \
+                     cached_prefix_tokens={} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    elapsed_ms(start)
+                ));
+            }
             return Ok(MoeGdnPrefixPreparation {
                 state: "last_history",
                 already_primed: true,
             });
         }
         if cached_prefix_len > 0 {
-            if let Some(checkpoint) =
-                self.find_moe_gdn_history_checkpoint(tokens, cached_prefix_len)
-            {
+            let history_lookup_start = trace_enabled.then(std::time::Instant::now);
+            let history_checkpoint =
+                self.find_moe_gdn_history_checkpoint(tokens, cached_prefix_len);
+            let history_lookup_ms = history_lookup_start.map(elapsed_ms);
+            if let Some(checkpoint) = history_checkpoint {
                 self.caches = Some(checkpoint);
+                if let Some(start) = prepare_trace_start {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=last_history_checkpoint \
+                         cached_prefix_tokens={} history_lookup_ms={:.1} elapsed_ms={:.1}",
+                        cached_prefix_len,
+                        history_lookup_ms.unwrap_or(0.0),
+                        elapsed_ms(start)
+                    ));
+                }
                 return Ok(MoeGdnPrefixPreparation {
                     state: "last_history_checkpoint",
                     already_primed: true,
                 });
-            } else if inference_trace_enabled() {
+            } else if trace_enabled {
                 let history_checkpoint_len = self
                     .gdn_last_history_checkpoint
                     .as_ref()
                     .map_or(0, |checkpoint| checkpoint.tokens.len());
+                let history_mismatch =
+                    token_prefix_mismatch_trace(tokens, &self.cached_token_history);
                 write_inference_trace(format_args!(
                     "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint_miss \
                      cached_prefix_tokens={} history_len={} checkpoint_len={} \
-                     history_match={}",
+                     history_match={} history_mismatch_at={} prompt_token={} \
+                     history_token={} history_lookup_ms={:.1}",
                     cached_prefix_len,
                     self.cached_token_history.len(),
                     history_checkpoint_len,
-                    gdn_prefix_from_history
+                    gdn_prefix_from_history,
+                    history_mismatch.index,
+                    history_mismatch.prompt_token,
+                    history_mismatch.cached_token,
+                    history_lookup_ms.unwrap_or(0.0)
                 ));
             }
         }
 
-        if let Some(checkpoint) = self.find_moe_gdn_prefix_checkpoint(
+        let prefix_lookup_start = trace_enabled.then(std::time::Instant::now);
+        let prefix_checkpoint = self.find_moe_gdn_prefix_checkpoint(
             tokens,
             cached_prefix_len,
             block_size,
             extra_keys_per_block,
             cache_salt,
-        ) {
+        );
+        let prefix_lookup_ms = prefix_lookup_start.map(elapsed_ms);
+        if let Some(checkpoint) = prefix_checkpoint {
             self.caches = Some(checkpoint);
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=checkpoint \
+                     cached_prefix_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    prefix_lookup_ms.unwrap_or(0.0),
+                    elapsed_ms(start)
+                ));
+            }
             return Ok(MoeGdnPrefixPreparation {
                 state: "checkpoint",
                 already_primed: true,
@@ -1045,6 +1148,14 @@ impl Qwen35MoeInner {
 
         self.caches = Some(fresh_moe_layer_caches(&self.config));
         if cached_prefix_len == 0 {
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=replay \
+                     cached_prefix_tokens=0 prefix_lookup_ms={:.1} elapsed_ms={:.1}",
+                    prefix_lookup_ms.unwrap_or(0.0),
+                    elapsed_ms(start)
+                ));
+            }
             return Ok(MoeGdnPrefixPreparation {
                 state: "replay",
                 already_primed: false,
@@ -1060,17 +1171,52 @@ impl Qwen35MoeInner {
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("MoE paged GDN prefix caches not initialized"))?;
+        let replay_trace_start = trace_enabled.then(std::time::Instant::now);
         super::paged_forward::run_gdn_only_prefill(prefix, &embed, &mut self.layers, caches_ref)?;
-        let stored = self.remember_moe_gdn_prefix_checkpoint(
-            tokens,
-            cached_prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        );
+        let replay_ms = replay_trace_start.map(elapsed_ms);
+        let store_trace = if moe_gdn_store_replayed_prefix_checkpoint_enabled() {
+            self.remember_moe_gdn_prefix_checkpoint(
+                tokens,
+                cached_prefix_len,
+                block_size,
+                extra_keys_per_block,
+                cache_salt,
+            )
+        } else {
+            MoeGdnCheckpointStoreTrace::default()
+        };
+        if let Some(start) = prepare_trace_start {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state={} \
+                 cached_prefix_tokens={} prefix_lookup_ms={:.1} replay_ms={:.1} stored={} \
+                 store_hash_ms={:.1} store_eval_ms={:.1} store_clone_ms={:.1} \
+                 store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} \
+                 elapsed_ms={:.1}",
+                if store_trace.stored {
+                    "replay_store"
+                } else {
+                    "replay"
+                },
+                cached_prefix_len,
+                prefix_lookup_ms.unwrap_or(0.0),
+                replay_ms.unwrap_or(0.0),
+                store_trace.stored,
+                store_trace.hash_ms,
+                store_trace.eval_ms,
+                store_trace.clone_ms,
+                store_trace.token_clone_ms,
+                store_trace.update_ms,
+                store_trace.total_ms,
+                elapsed_ms(start)
+            ));
+        }
 
         Ok(MoeGdnPrefixPreparation {
-            state: if stored { "replay_store" } else { "replay" },
+            state: if store_trace.stored {
+                "replay_store"
+            } else {
+                "replay"
+            },
             already_primed: true,
         })
     }
@@ -1692,6 +1838,7 @@ impl Qwen35MoeInner {
         }
 
         let prompt_token_count = tokens.len() as u32;
+        let trace_enabled = inference_trace_enabled();
         let sampling_config = p.sampling_config;
 
         let think_end_id = tokenizer.think_end_id();
@@ -1759,12 +1906,22 @@ impl Qwen35MoeInner {
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
+        let live_ready;
+        let live_prefix_match;
+        let live_tokens_len;
+        let mut live_mismatch = TokenPrefixMismatchTrace::default();
         let (cached_prefix_len, continued_live_prefix) = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("MoE chat_sync_core_paged: paged_adapter is None")
             })?;
-            let can_continue =
-                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            live_ready = adapter.is_live_for_continue();
+            let live_tokens = adapter.request_tokens();
+            live_tokens_len = live_tokens.len();
+            live_prefix_match = tokens.starts_with(live_tokens);
+            if trace_enabled && live_ready && !live_prefix_match {
+                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
+            }
+            let can_continue = live_ready && live_prefix_match;
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
                     Ok((prior, _)) => (prior, true),
@@ -1805,6 +1962,22 @@ impl Qwen35MoeInner {
                 (cached, false)
             }
         };
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe paged_prefix_lookup prompt_tokens={} \
+                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
+                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
+                tokens.len(),
+                cached_prefix_len,
+                continued_live_prefix,
+                live_ready,
+                live_prefix_match,
+                live_tokens_len,
+                live_mismatch.index,
+                live_mismatch.prompt_token,
+                live_mismatch.cached_token
+            ));
+        }
 
         let gdn_prefix_preparation = self.prepare_moe_gdn_prefix_state(
             &tokens,
@@ -1870,12 +2043,18 @@ impl Qwen35MoeInner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
-        let gdn_history_checkpoint_stored = self.remember_moe_gdn_history_checkpoint();
+        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint();
         if inference_trace_enabled() {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={}",
-                gdn_history_checkpoint_stored,
-                self.cached_token_history.len()
+                "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \
+                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                gdn_history_checkpoint_store.stored,
+                self.cached_token_history.len(),
+                gdn_history_checkpoint_store.eval_ms,
+                gdn_history_checkpoint_store.clone_ms,
+                gdn_history_checkpoint_store.token_clone_ms,
+                gdn_history_checkpoint_store.update_ms,
+                gdn_history_checkpoint_store.total_ms
             ));
         }
 
@@ -2321,12 +2500,22 @@ impl Qwen35MoeInner {
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
+        let live_ready;
+        let live_prefix_match;
+        let live_tokens_len;
+        let mut live_mismatch = TokenPrefixMismatchTrace::default();
         let (cached_prefix_len, continued_live_prefix) = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("MoE chat_stream_sync_core_paged: paged_adapter is None")
             })?;
-            let can_continue =
-                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            live_ready = adapter.is_live_for_continue();
+            let live_tokens = adapter.request_tokens();
+            live_tokens_len = live_tokens.len();
+            live_prefix_match = tokens.starts_with(live_tokens);
+            if trace_enabled && live_ready && !live_prefix_match {
+                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
+            }
+            let can_continue = live_ready && live_prefix_match;
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
                     Ok((prior, _)) => (prior, true),
@@ -2367,6 +2556,22 @@ impl Qwen35MoeInner {
                 (cached, false)
             }
         };
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-moe paged_prefix_lookup prompt_tokens={} \
+                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
+                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
+                tokens.len(),
+                cached_prefix_len,
+                continued_live_prefix,
+                live_ready,
+                live_prefix_match,
+                live_tokens_len,
+                live_mismatch.index,
+                live_mismatch.prompt_token,
+                live_mismatch.cached_token
+            ));
+        }
 
         let prefill_trace_start = trace_enabled.then(std::time::Instant::now);
         let gdn_prefix_preparation = self.prepare_moe_gdn_prefix_state(
@@ -2480,12 +2685,18 @@ impl Qwen35MoeInner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
-        let gdn_history_checkpoint_stored = self.remember_moe_gdn_history_checkpoint();
+        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint();
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={}",
-                gdn_history_checkpoint_stored,
-                self.cached_token_history.len()
+                "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \
+                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                gdn_history_checkpoint_store.stored,
+                self.cached_token_history.len(),
+                gdn_history_checkpoint_store.eval_ms,
+                gdn_history_checkpoint_store.clone_ms,
+                gdn_history_checkpoint_store.token_clone_ms,
+                gdn_history_checkpoint_store.update_ms,
+                gdn_history_checkpoint_store.total_ms
             ));
         }
 
@@ -2730,6 +2941,18 @@ impl Qwen35MoeInner {
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
         let mut finish_reason = String::from("length");
         let decode_trace_start = trace_enabled.then(std::time::Instant::now);
+        let decode_progress_interval = if trace_enabled {
+            crate::array::paged_decode_cache_clear_interval().max(1) as usize
+        } else {
+            usize::MAX
+        };
+        let mut decode_progress_last = decode_trace_start.unwrap_or_else(std::time::Instant::now);
+        let mut decode_progress_last_count = 0usize;
+        let mut decode_build_inputs_ms = 0.0;
+        let mut decode_forward_ms = 0.0;
+        let mut decode_sample_build_ms = 0.0;
+        let mut decode_token_eval_ms = 0.0;
+        let mut decode_cache_clear_ms = 0.0;
 
         let max_blocks_per_seq: u32 = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
@@ -2810,11 +3033,20 @@ impl Qwen35MoeInner {
                 adapter
                     .record_tokens(&[token_id])
                     .map_err(Error::from_reason)?;
+                let build_inputs_trace_start = trace_enabled.then(std::time::Instant::now);
                 let inputs = adapter
                     .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
                     .map_err(Error::from_reason)?;
+                if let Some(start) = build_inputs_trace_start {
+                    decode_build_inputs_ms += elapsed_ms(start);
+                }
                 let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-                match forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs) {
+                let forward_trace_start = trace_enabled.then(std::time::Instant::now);
+                let forward_result = forward_moe_cpp_paged(&input_ids, &embedding_weight, &inputs);
+                if let Some(start) = forward_trace_start {
+                    decode_forward_ms += elapsed_ms(start);
+                }
+                match forward_result {
                     Ok(logits) => {
                         cpp_compiled_step_completed = true;
                         logits
@@ -2857,6 +3089,7 @@ impl Qwen35MoeInner {
                                 "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
                             )
                         })?;
+                        let fallback_trace_start = trace_enabled.then(std::time::Instant::now);
                         let logits = super::paged_forward::run_paged_decode_step(
                             token_id,
                             &embed,
@@ -2868,6 +3101,9 @@ impl Qwen35MoeInner {
                             &layer_kinds,
                             adapter_mut,
                         )?;
+                        if let Some(start) = fallback_trace_start {
+                            decode_forward_ms += elapsed_ms(start);
+                        }
                         logits.squeeze(Some(&[1]))?
                     }
                 }
@@ -2884,6 +3120,7 @@ impl Qwen35MoeInner {
                         "MoE chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
+                let forward_trace_start = trace_enabled.then(std::time::Instant::now);
                 let logits = super::paged_forward::run_paged_decode_step(
                     token_id,
                     &embed,
@@ -2895,6 +3132,9 @@ impl Qwen35MoeInner {
                     &layer_kinds,
                     adapter,
                 )?;
+                if let Some(start) = forward_trace_start {
+                    decode_forward_ms += elapsed_ms(start);
+                }
                 logits.squeeze(Some(&[1]))?
             };
 
@@ -2907,20 +3147,84 @@ impl Qwen35MoeInner {
                 apply_all_penalties(next_logits, &token_history, p)?
             };
 
+            let sample_trace_start = trace_enabled.then(std::time::Instant::now);
             y = sample(&next_logits, sampling_config)?;
+            if let Some(start) = sample_trace_start {
+                decode_sample_build_ms += elapsed_ms(start);
+            }
+            let token_eval_trace_start = trace_enabled.then(std::time::Instant::now);
             y.eval();
+            if let Some(start) = token_eval_trace_start {
+                decode_token_eval_ms += elapsed_ms(start);
+            }
 
+            let cache_clear_trace_start = trace_enabled.then(std::time::Instant::now);
             crate::array::maybe_clear_cache_for_paged_step(step);
+            if let Some(start) = cache_clear_trace_start {
+                decode_cache_clear_ms += elapsed_ms(start);
+            }
+            if trace_enabled
+                && generated_tokens
+                    .len()
+                    .is_multiple_of(decode_progress_interval)
+            {
+                let window_ms = elapsed_ms(decode_progress_last);
+                let window_tokens = generated_tokens
+                    .len()
+                    .saturating_sub(decode_progress_last_count);
+                let window_tok_s = if window_ms > 0.0 {
+                    window_tokens as f64 / (window_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                let elapsed_decode_ms = decode_trace_start.map(elapsed_ms).unwrap_or(0.0);
+                let active_mib = crate::array::get_active_memory() / (1024.0 * 1024.0);
+                let cache_mib = crate::array::get_cache_memory() / (1024.0 * 1024.0);
+                let peak_mib = crate::array::get_peak_memory() / (1024.0 * 1024.0);
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-moe paged_decode_progress generated_tokens={} \
+                     context_tokens={} window_tokens={} window_ms={:.1} window_tok_s={:.2} \
+                     elapsed_ms={:.1} cpp_ready={} build_inputs_ms={:.1} forward_ms={:.1} \
+                     sample_ms={:.1} sample_build_ms={:.1} token_eval_ms={:.1} \
+                     cache_clear_ms={:.1} active_mib={:.1} cache_mib={:.1} peak_mib={:.1}",
+                    generated_tokens.len(),
+                    token_history.len(),
+                    window_tokens,
+                    window_ms,
+                    window_tok_s,
+                    elapsed_decode_ms,
+                    cpp_session_ready,
+                    decode_build_inputs_ms,
+                    decode_forward_ms,
+                    decode_sample_build_ms + decode_token_eval_ms,
+                    decode_sample_build_ms,
+                    decode_token_eval_ms,
+                    decode_cache_clear_ms,
+                    active_mib,
+                    cache_mib,
+                    peak_mib
+                ));
+                decode_progress_last = std::time::Instant::now();
+                decode_progress_last_count = generated_tokens.len();
+            }
         }
 
         if let Some(start) = decode_trace_start {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-moe paged_decode_done generated_tokens={} finish_reason={} \
-                 decode_loop_ms={:.1} cpp_compiled_step_completed={}",
+                 decode_loop_ms={:.1} cpp_compiled_step_completed={} build_inputs_ms={:.1} \
+                 forward_ms={:.1} sample_ms={:.1} sample_build_ms={:.1} \
+                 token_eval_ms={:.1} cache_clear_ms={:.1}",
                 generated_tokens.len(),
                 finish_reason,
                 elapsed_ms(start),
-                cpp_compiled_step_completed
+                cpp_compiled_step_completed,
+                decode_build_inputs_ms,
+                decode_forward_ms,
+                decode_sample_build_ms + decode_token_eval_ms,
+                decode_sample_build_ms,
+                decode_token_eval_ms,
+                decode_cache_clear_ms
             ));
         }
 

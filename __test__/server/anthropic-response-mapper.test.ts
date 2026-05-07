@@ -219,6 +219,9 @@ describe('buildAnthropicResponse', () => {
         server_model_resolve_ms: 57,
         server_queue_ms: 5,
         server_pre_inference_ms: 62,
+        server_paged_prefill_chunk_size: 4096,
+        server_paged_prefill_eval_interval: 8,
+        server_paged_decode_cache_clear_interval: 64,
       },
     );
 
@@ -230,6 +233,9 @@ describe('buildAnthropicResponse', () => {
     expect(response.usage.server_model_resolve_ms).toBe(57);
     expect(response.usage.server_queue_ms).toBe(5);
     expect(response.usage.server_pre_inference_ms).toBe(62);
+    expect(response.usage.server_paged_prefill_chunk_size).toBe(4096);
+    expect(response.usage.server_paged_prefill_eval_interval).toBe(8);
+    expect(response.usage.server_paged_decode_cache_clear_interval).toBe(64);
   });
 
   it('elides perf fields when performance is undefined', () => {
@@ -443,6 +449,9 @@ describe('buildMessageDelta', () => {
         server_model_resolve_ms: 57,
         server_queue_ms: 5,
         server_pre_inference_ms: 62,
+        server_paged_prefill_chunk_size: 4096,
+        server_paged_prefill_eval_interval: 8,
+        server_paged_decode_cache_clear_interval: 64,
       },
     );
 
@@ -454,6 +463,9 @@ describe('buildMessageDelta', () => {
     expect(event.usage.server_model_resolve_ms).toBe(57);
     expect(event.usage.server_queue_ms).toBe(5);
     expect(event.usage.server_pre_inference_ms).toBe(62);
+    expect(event.usage.server_paged_prefill_chunk_size).toBe(4096);
+    expect(event.usage.server_paged_prefill_eval_interval).toBe(8);
+    expect(event.usage.server_paged_decode_cache_clear_interval).toBe(64);
   });
 
   it('elides perf fields when performance is undefined', () => {

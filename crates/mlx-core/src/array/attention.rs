@@ -94,3 +94,59 @@ pub fn scaled_dot_product_attention_causal(
     };
     MxArray::from_handle(handle, "scaled_dot_product_attention_causal")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::array::mask::create_causal_mask;
+
+    fn deterministic_data(len: usize, phase: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let x = i as f32 + phase;
+                (x.sin() * 0.5) + (x.cos() * 0.25)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn causal_attention_matches_explicit_offset_mask_when_kv_is_longer() {
+        let batch = 1;
+        let heads = 2;
+        let q_len = 4;
+        let kv_len = 9;
+        let head_dim = 8;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        let q = MxArray::from_float32(
+            &deterministic_data(batch * heads * q_len * head_dim, 0.0),
+            &[batch as i64, heads as i64, q_len as i64, head_dim as i64],
+        )
+        .unwrap();
+        let k = MxArray::from_float32(
+            &deterministic_data(batch * heads * kv_len * head_dim, 1.0),
+            &[batch as i64, heads as i64, kv_len as i64, head_dim as i64],
+        )
+        .unwrap();
+        let v = MxArray::from_float32(
+            &deterministic_data(batch * heads * kv_len * head_dim, 2.0),
+            &[batch as i64, heads as i64, kv_len as i64, head_dim as i64],
+        )
+        .unwrap();
+
+        let mask = create_causal_mask(q_len as i32, Some((kv_len - q_len) as i32), None).unwrap();
+        let explicit = scaled_dot_product_attention(&q, &k, &v, scale, Some(&mask)).unwrap();
+        let causal = scaled_dot_product_attention_causal(&q, &k, &v, scale).unwrap();
+
+        let explicit = explicit.to_float32().unwrap();
+        let causal = causal.to_float32().unwrap();
+        assert_eq!(explicit.len(), causal.len());
+        for (idx, (a, b)) in explicit.iter().zip(causal.iter()).enumerate() {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= 1e-4,
+                "causal SDPA diverged from explicit offset mask at {idx}: {a} vs {b} (diff {diff})"
+            );
+        }
+    }
+}
