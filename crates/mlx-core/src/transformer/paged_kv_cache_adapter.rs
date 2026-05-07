@@ -4924,7 +4924,7 @@ mod tests {
         let mut v_bits = Vec::with_capacity(4 * 64);
         for token_idx in 0..4 {
             let bits = f16::from_f32((token_idx + 1) as f32).to_bits();
-            v_bits.extend(std::iter::repeat(bits).take(64));
+            v_bits.extend(std::iter::repeat_n(bits, 64));
         }
         let v = MxArray::from_float16(&v_bits, &[4, 1, 64]).expect("v values");
         k.eval();
@@ -4961,11 +4961,10 @@ mod tests {
 
         let values = out.to_float32().expect("prefill output to_float32");
         let expected_by_token = [2.0_f32, 2.5_f32];
-        for token_idx in 0..2 {
+        for (token_idx, expected) in expected_by_token.iter().copied().enumerate() {
             for head_idx in 0..2 {
                 let base = (token_idx * 2 + head_idx) * 64;
                 let actual = values[base];
-                let expected = expected_by_token[token_idx];
                 assert!(
                     (actual - expected).abs() < 0.05,
                     "token {token_idx} head {head_idx}: got {actual}, expected {expected}"

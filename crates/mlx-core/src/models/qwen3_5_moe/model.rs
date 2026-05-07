@@ -190,7 +190,7 @@ fn compute_paged_prefix_block_hash(
     extra_keys_per_block: &[Vec<u64>],
     cache_salt: u64,
 ) -> Option<u64> {
-    if prefix_len == 0 || block_size == 0 || prefix_len % block_size != 0 {
+    if prefix_len == 0 || block_size == 0 || !prefix_len.is_multiple_of(block_size) {
         return None;
     }
 

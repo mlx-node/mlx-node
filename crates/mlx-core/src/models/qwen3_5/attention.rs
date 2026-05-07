@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::mask::create_causal_mask;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -421,7 +422,7 @@ impl Qwen3_5Attention {
                     None
                 };
 
-                let attn = match maybe_paged_attn {
+                match maybe_paged_attn {
                     Some(attn) => attn,
                     None => {
                         let read_trace_start = trace_enabled.then(Instant::now);
@@ -429,32 +430,39 @@ impl Qwen3_5Attention {
                             .read_kv_range(attn_layer_idx, 0, total_ctx)
                             .map_err(napi::Error::from_reason)?;
                         let read_kv_range_ms = read_trace_start.map(elapsed_ms);
+                        let mask_trace_start = trace_enabled.then(Instant::now);
+                        let mask = create_causal_mask(
+                            seq_len as i32,
+                            Some(cached_prefix_len as i32),
+                            None,
+                        )?;
+                        let mask_ms = mask_trace_start.map(elapsed_ms);
                         let sdpa_trace_start = trace_enabled.then(Instant::now);
-                        let attn = scaled_dot_product_attention_causal(
+                        let attn = scaled_dot_product_attention(
                             &queries_bhtd,
                             &k_full,
                             &v_full,
                             self.scale as f64,
+                            Some(&mask),
                         )?;
                         if trace_enabled {
                             write_inference_trace(format_args!(
                                 "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
                                  layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                 path=read_kv_range read_kv_range_ms={:.1} mask_ms=0.0 \
-                                 sdpa_mode=causal sdpa_graph_ms={:.1}",
+                                 path=read_kv_range read_kv_range_ms={:.1} mask_ms={:.1} \
+                                 sdpa_mode=explicit_mask sdpa_graph_ms={:.1}",
                                 attn_layer_idx,
                                 seq_len,
                                 cached_prefix_len,
                                 total_ctx,
                                 read_kv_range_ms.unwrap_or(0.0),
+                                mask_ms.unwrap_or(0.0),
                                 sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
                             ));
                         }
                         attn
                     }
-                };
-
-                attn
+                }
             }
         } else {
             // Decode: dispatch `gather_kv_for_decode` Metal kernel

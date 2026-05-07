@@ -45,24 +45,24 @@ Options:
   --                 Everything after this separator is forwarded to the
                      spawned \`claude\` binary verbatim.
 
-	Environment variables:
-	  MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
-	                                4096 under \`mlx launch claude\` to bound
-	                                cold-prefill memory peaks; set to 0 to
-	                                disable chunking, or to a smaller value
-	                                (e.g. 1024 / 512) if 4096 still peaks.
-	  MLX_PAGED_PREFILL_EVAL_INTERVAL
-	                                Layer cadence for eval+clear during paged
-	                                prefill. Defaults to 8.
-	  MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL
-	                                Token cadence for paged decode cache clear.
-	                                Defaults to 64.
-	  MLX_PAGED_CACHE_MEMORY_MB      Paged KV cache memory budget override for
-	                                paged-aware Qwen3.5 launch.
-	  MLX_INFERENCE_TRACE           Set to 1/true/on to write native inference
-	                                phase traces to a file.
-	  MLX_INFERENCE_TRACE_FILE      Override the native trace file path.
-	                                Defaults to <log-dir>/inference-trace.log.
+  Environment variables:
+    MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
+                                  4096 under \`mlx launch claude\` to bound
+                                  cold-prefill memory peaks; set to 0 to
+                                  disable chunking, or to a smaller value
+                                  (e.g. 1024 / 512) if 4096 still peaks.
+    MLX_PAGED_PREFILL_EVAL_INTERVAL
+                                  Layer cadence for eval+clear during paged
+                                  prefill. Defaults to 8.
+    MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL
+                                  Token cadence for paged decode cache clear.
+                                  Defaults to 64.
+    MLX_PAGED_CACHE_MEMORY_MB      Paged KV cache memory budget override for
+                                  paged-aware Qwen3.5 launch.
+    MLX_INFERENCE_TRACE           Set to 1/true/on to write native inference
+                                  phase traces to a file.
+    MLX_INFERENCE_TRACE_FILE      Override the native trace file path.
+                                  Defaults to <log-dir>/inference-trace.log.
 
 Examples:
   mlx launch claude
