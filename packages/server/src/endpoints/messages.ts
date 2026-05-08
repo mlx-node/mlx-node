@@ -119,6 +119,19 @@ function hasSuppressedToolCalls(result: Pick<ChatResult, 'toolCalls'>, body: Ant
   return !requestAllowsToolUse(body) && result.toolCalls.some((t) => t.status === 'ok');
 }
 
+function applyOutputTokenLimit(config: ChatConfig, limit: number | undefined): ChatConfig {
+  if (
+    limit == null ||
+    !Number.isFinite(limit) ||
+    limit <= 0 ||
+    config.maxNewTokens == null ||
+    config.maxNewTokens <= limit
+  ) {
+    return config;
+  }
+  return { ...config, maxNewTokens: Math.floor(limit) };
+}
+
 // Non-streaming path
 
 async function handleNonStreaming(
@@ -283,7 +296,10 @@ async function handleStreamingNative(
             writeSSEEvent(
               res,
               'content_block_start',
-              buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+              buildContentBlockStart(contentBlockIndex, {
+                type: 'text',
+                text: '',
+              }),
             );
           }
           emittedText += remainingText;
@@ -291,7 +307,10 @@ async function handleStreamingNative(
           writeSSEEvent(
             res,
             'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: remainingText }),
+            buildContentBlockDelta(contentBlockIndex, {
+              type: 'text_delta',
+              text: remainingText,
+            }),
           );
         }
 
@@ -317,14 +336,20 @@ async function handleStreamingNative(
           writeSSEEvent(
             res,
             'content_block_start',
-            buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+            buildContentBlockStart(contentBlockIndex, {
+              type: 'text',
+              text: '',
+            }),
           );
           emittedText += finalText;
           emittedTextLength += finalText.length;
           writeSSEEvent(
             res,
             'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
+            buildContentBlockDelta(contentBlockIndex, {
+              type: 'text_delta',
+              text: finalText,
+            }),
           );
         } else if (
           tagBuffer.suppressed &&
@@ -363,7 +388,10 @@ async function handleStreamingNative(
             writeSSEEvent(
               res,
               'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
+              buildContentBlockDelta(contentBlockIndex, {
+                type: 'text_delta',
+                text: unsent,
+              }),
             );
           }
         } else if (hasEmittedText && finalText && !emittedText.includes(finalText)) {
@@ -386,7 +414,10 @@ async function handleStreamingNative(
             writeSSEEvent(
               res,
               'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: unsent }),
+              buildContentBlockDelta(contentBlockIndex, {
+                type: 'text_delta',
+                text: unsent,
+              }),
             );
           }
         }
@@ -401,14 +432,20 @@ async function handleStreamingNative(
           writeSSEEvent(
             res,
             'content_block_start',
-            buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+            buildContentBlockStart(contentBlockIndex, {
+              type: 'text',
+              text: '',
+            }),
           );
           emittedText += finalText;
           emittedTextLength += finalText.length;
           writeSSEEvent(
             res,
             'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: finalText }),
+            buildContentBlockDelta(contentBlockIndex, {
+              type: 'text_delta',
+              text: finalText,
+            }),
           );
           writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
           contentBlockIndex++;
@@ -424,7 +461,12 @@ async function handleStreamingNative(
           writeSSEEvent(
             res,
             'content_block_start',
-            buildContentBlockStart(contentBlockIndex, { type: 'tool_use', id: toolId, name: tc.name, input: {} }),
+            buildContentBlockStart(contentBlockIndex, {
+              type: 'tool_use',
+              id: toolId,
+              name: tc.name,
+              input: {},
+            }),
           );
           writeSSEEvent(
             res,
@@ -459,14 +501,20 @@ async function handleStreamingNative(
           writeSSEEvent(
             res,
             'content_block_start',
-            buildContentBlockStart(contentBlockIndex, { type: 'thinking', thinking: '' }),
+            buildContentBlockStart(contentBlockIndex, {
+              type: 'thinking',
+              thinking: '',
+            }),
           );
           contentBlockIndex++;
         }
         writeSSEEvent(
           res,
           'content_block_delta',
-          buildContentBlockDelta(contentBlockIndex - 1, { type: 'thinking_delta', thinking: deltaText }),
+          buildContentBlockDelta(contentBlockIndex - 1, {
+            type: 'thinking_delta',
+            thinking: deltaText,
+          }),
         );
       } else {
         // Text delta with `<tool_call>` buffering. Requests that did not
@@ -481,7 +529,10 @@ async function handleStreamingNative(
               writeSSEEvent(
                 res,
                 'content_block_start',
-                buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+                buildContentBlockStart(contentBlockIndex, {
+                  type: 'text',
+                  text: '',
+                }),
               );
             }
             emittedText += event.text;
@@ -489,7 +540,10 @@ async function handleStreamingNative(
             writeSSEEvent(
               res,
               'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: event.text }),
+              buildContentBlockDelta(contentBlockIndex, {
+                type: 'text_delta',
+                text: event.text,
+              }),
             );
           }
           continue;
@@ -506,7 +560,10 @@ async function handleStreamingNative(
               writeSSEEvent(
                 res,
                 'content_block_start',
-                buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+                buildContentBlockStart(contentBlockIndex, {
+                  type: 'text',
+                  text: '',
+                }),
               );
             }
             emittedText += cleanPrefix;
@@ -514,7 +571,10 @@ async function handleStreamingNative(
             writeSSEEvent(
               res,
               'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: cleanPrefix }),
+              buildContentBlockDelta(contentBlockIndex, {
+                type: 'text_delta',
+                text: cleanPrefix,
+              }),
             );
           }
         } else if (safeText) {
@@ -526,7 +586,10 @@ async function handleStreamingNative(
             writeSSEEvent(
               res,
               'content_block_start',
-              buildContentBlockStart(contentBlockIndex, { type: 'text', text: '' }),
+              buildContentBlockStart(contentBlockIndex, {
+                type: 'text',
+                text: '',
+              }),
             );
           }
           emittedText += safeText;
@@ -534,7 +597,10 @@ async function handleStreamingNative(
           writeSSEEvent(
             res,
             'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, { type: 'text_delta', text: safeText }),
+            buildContentBlockDelta(contentBlockIndex, {
+              type: 'text_delta',
+              text: safeText,
+            }),
           );
         }
       }
@@ -881,6 +947,7 @@ export async function handleCreateMessage(
   };
   try {
     const sessionReg: SessionRegistry = lease.registry;
+    mappedConfig = applyOutputTokenLimit(mappedConfig, sessionReg.outputTokenLimit);
     // Snapshot the monotonic instance id so the in-mutex re-read can detect a
     // hot-swap that lands between lease acquisition and mutex entry. Unlike
     // `/v1/responses`, the Anthropic handler has no stored-identity check
@@ -1249,7 +1316,9 @@ export async function handleCreateMessage(
             // SSE: best-effort streaming `error`, but only if no terminal landed
             // (a double terminal would confuse the client state machine).
             if (!visibility.terminalEmitted) {
-              writeFallbackErrorSSE(res, 'error', { error: { type: 'api_error', message } });
+              writeFallbackErrorSSE(res, 'error', {
+                error: { type: 'api_error', message },
+              });
             }
             try {
               endSSE(res);

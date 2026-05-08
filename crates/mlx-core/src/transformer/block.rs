@@ -481,10 +481,10 @@ impl TransformerBlock {
             // `read_kv_range` performs and that was driving a ~40 GB
             // memory regression in long-context decode (see Fix #2 spec).
             //
-            // The kernel returns Float32; cast back to x's dtype so the
-            // rest of the block stays homogeneous (matches LFM2's paged
-            // decode path). This is a zero-extra-host-buffer path — the
-            // K/V are not materialized as MxArrays at all.
+            // The kernel returns the query/io dtype. Cast back to x's dtype
+            // so the rest of the block stays homogeneous. This is a
+            // zero-extra-host-buffer path — the K/V are not materialized as
+            // MxArrays at all.
             //
             // `gather_kv_for_decode` expects queries shape
             // `[1, num_query_heads, head_size]` (3-D). `qkv.queries` from
@@ -501,7 +501,7 @@ impl TransformerBlock {
                 )
                 .map_err(napi::Error::from_reason)?;
 
-            // Cast back to x's dtype (gather currently returns Float32).
+            // Cast back to x's dtype.
             // `gather_kv_for_decode` returns `[1, n_heads, head_dim]`, which
             // is exactly the layout `output_projection` expects for
             // `batch * seq_len = 1`.

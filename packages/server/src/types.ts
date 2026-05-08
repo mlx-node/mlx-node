@@ -261,6 +261,7 @@ export interface ResponseUsage {
   decode_tokens_per_second?: number;
   server_inference_elapsed_ms?: number;
   server_time_to_first_token_ms?: number;
+  server_total_time_to_first_token_ms?: number;
   server_prefill_tokens_per_second?: number;
   server_decode_tokens_per_second?: number;
   server_model_resolve_ms?: number;

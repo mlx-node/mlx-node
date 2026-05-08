@@ -31,9 +31,9 @@ void mlx_array_eval(mlx_array* handle) {
       arr->eval();
     }
   } catch (const std::exception& e) {
-    std::cerr << "[MLX] Exception in array_eval: " << e.what() << std::endl;
+    mlx_trace_native_error("array_eval", e.what());
   } catch (...) {
-    std::cerr << "[MLX] Unknown exception in array_eval" << std::endl;
+    mlx_trace_native_error("array_eval", "unknown exception");
   }
 }
 
@@ -48,23 +48,32 @@ void mlx_async_eval(mlx_array** handles, size_t count) {
     }
     mlx::core::async_eval(std::move(arrays));
   } catch (const std::exception& e) {
-    std::cerr << "[MLX] Exception in async_eval: " << e.what() << std::endl;
+    mlx_trace_native_error("async_eval", e.what());
   } catch (...) {
-    std::cerr << "[MLX] Unknown exception in async_eval" << std::endl;
+    mlx_trace_native_error("async_eval", "unknown exception");
   }
 }
 
 // Synchronous eval — matches Python's mx.eval(arrays).
 // Unlike async_eval, this blocks until all arrays are materialized.
-void mlx_eval(mlx_array** handles, size_t count) {
-  std::vector<array> arrays;
-  arrays.reserve(count);
-  for (size_t i = 0; i < count; ++i) {
-    if (handles[i]) {
-      arrays.push_back(*reinterpret_cast<array*>(handles[i]));
+bool mlx_eval(mlx_array** handles, size_t count) {
+  try {
+    std::vector<array> arrays;
+    arrays.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      if (handles[i]) {
+        arrays.push_back(*reinterpret_cast<array*>(handles[i]));
+      }
     }
+    mlx::core::eval(std::move(arrays));
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("eval", e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error("eval", "unknown exception");
+    return false;
   }
-  mlx::core::eval(std::move(arrays));
 }
 
 size_t mlx_array_size(mlx_array* handle) {
@@ -932,9 +941,17 @@ mlx_array* mlx_fast_scaled_dot_product_attention(mlx_array* queries,
     }
   }
 
-  array result = fast::scaled_dot_product_attention(
-      *q, *k, *v, scale, mask_mode, mask_arr, std::nullopt);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  try {
+    array result = fast::scaled_dot_product_attention(
+        *q, *k, *v, scale, mask_mode, mask_arr, std::nullopt);
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("fast_scaled_dot_product_attention", e.what());
+    return nullptr;
+  } catch (...) {
+    mlx_trace_native_error("fast_scaled_dot_product_attention", "unknown exception");
+    return nullptr;
+  }
 }
 
 mlx_array* mlx_fast_rms_norm(mlx_array* x,

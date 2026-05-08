@@ -345,7 +345,7 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
     pub fn mlx_array_eval(handle: *mut mlx_array);
     pub fn mlx_async_eval(handles: *mut *mut mlx_array, count: usize);
-    pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize);
+    pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize) -> bool;
     pub fn mlx_array_size(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_ndim(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_shape(handle: *mut mlx_array, out: *mut i64);
@@ -700,9 +700,9 @@ unsafe extern "C-unwind" {
 
     // Wrap an existing MTL::Buffer (`void*` MTLBuffer pointer — the same
     // shape `mlx_array_get_metal_buffer` returns) as an MLX `array` view.
-    // Zero-copy: the deleter is a no-op so dropping the resulting array
-    // does NOT free the buffer. Caller (typically LayerKVPool) retains
-    // ownership and must keep the buffer alive for the array's lifetime.
+    // Zero-copy: the returned array retains the underlying MTL::Buffer and
+    // releases that retain when the array is dropped, so the view survives the
+    // original Rust buffer holder.
     //
     // - `metal_buffer_ptr`: MTL::Buffer* as `void*`
     // - `dims`/`ndim`: view shape (caller validates element-count vs

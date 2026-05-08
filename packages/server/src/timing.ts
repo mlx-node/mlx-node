@@ -17,6 +17,8 @@ export interface TimingUsageExtensions {
   server_inference_elapsed_ms?: number;
   /** Server-extension alias for disambiguating native TTFT from request/HTTP elapsed time. */
   server_time_to_first_token_ms?: number;
+  /** Server-extension: handler-start to first native token, including model resolve/load and queue wait. */
+  server_total_time_to_first_token_ms?: number;
   /** Server-extension alias for native prefill throughput. */
   server_prefill_tokens_per_second?: number;
   /** Server-extension alias for native decode throughput. */
@@ -124,11 +126,15 @@ export function buildTimingUsageExtensions(
   const prefillTokensPerSecond = finitePositive(performance?.prefillTokensPerSecond);
   const decodeTokensPerSecond = finitePositive(performance?.decodeTokensPerSecond);
   const serverInferenceElapsedMs = computeServerInferenceElapsedMs(ttftMs, decodeTokensPerSecond, outputTokens);
+  const preInferenceMs = finiteNonNegative(serverTiming?.server_pre_inference_ms);
 
   const extensions: TimingUsageExtensions = {};
   if (ttftMs != null) {
     extensions.time_to_first_token_ms = ttftMs;
     extensions.server_time_to_first_token_ms = ttftMs;
+    if (preInferenceMs != null) {
+      extensions.server_total_time_to_first_token_ms = preInferenceMs + ttftMs;
+    }
   }
   if (prefillTokensPerSecond != null) {
     extensions.prefill_tokens_per_second = prefillTokensPerSecond;
@@ -162,7 +168,6 @@ export function buildTimingUsageExtensions(
   if (queueMs != null) {
     extensions.server_queue_ms = queueMs;
   }
-  const preInferenceMs = finiteNonNegative(serverTiming?.server_pre_inference_ms);
   if (preInferenceMs != null) {
     extensions.server_pre_inference_ms = preInferenceMs;
   }

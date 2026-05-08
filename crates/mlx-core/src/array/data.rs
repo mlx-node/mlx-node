@@ -1,5 +1,6 @@
 use super::handle::MxHandle;
 use super::{DType, MxArray};
+use crate::inference_trace::write as write_inference_trace;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -40,13 +41,23 @@ impl MxArray {
 
     /// Synchronously evaluate multiple arrays (blocking).
     /// Used between prefill chunks to materialize KV caches and break lazy dependency chains.
-    pub(crate) fn eval_arrays(arrays: &[&MxArray]) {
+    pub(crate) fn eval_arrays(arrays: &[&MxArray]) -> Result<()> {
         if arrays.is_empty() {
-            return;
+            return Ok(());
         }
         let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
-        unsafe {
-            sys::mlx_eval(handles.as_mut_ptr(), handles.len());
+        let ok = unsafe { sys::mlx_eval(handles.as_mut_ptr(), handles.len()) };
+        if ok {
+            Ok(())
+        } else {
+            write_inference_trace(format_args!(
+                "native_error context=eval_arrays count={}",
+                handles.len()
+            ));
+            Err(Error::from_reason(format!(
+                "MLX eval failed while materializing {} arrays; see MLX_INFERENCE_TRACE_FILE",
+                handles.len()
+            )))
         }
     }
 

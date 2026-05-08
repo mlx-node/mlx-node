@@ -596,6 +596,50 @@ describe('handleCreateMessage', () => {
       expect(parsed.usage.output_tokens).toBe(10);
     });
 
+    it('clamps max_tokens to the registered output cap before dispatch', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      registry.register('test-model', mockModel, { maxOutputTokens: 16 });
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Hello' }],
+          max_tokens: 128000,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      const config = startSpy.mock.calls[0]?.[1] as { maxNewTokens?: number };
+      expect(config.maxNewTokens).toBe(16);
+    });
+
+    it('leaves max_tokens unchanged when no registered output cap exists', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel();
+      registry.register('test-model', mockModel);
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Hello' }],
+          max_tokens: 128000,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+      const config = startSpy.mock.calls[0]?.[1] as { maxNewTokens?: number };
+      expect(config.maxNewTokens).toBe(128000);
+    });
+
     it('returns thinking + text content blocks', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel(
@@ -846,6 +890,43 @@ describe('handleCreateMessage', () => {
       // message_stop
       const msgStop = events.find((e) => e.event === 'message_stop');
       expect(msgStop).toBeDefined();
+    });
+
+    it('clamps max_tokens to the registered output cap before streaming dispatch', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'Hello', done: false, isReasoning: false },
+        {
+          text: 'Hello',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 1,
+          promptTokens: 1,
+          reasoningTokens: 0,
+          rawText: 'Hello',
+        },
+      ];
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('test-model', mockModel, { maxOutputTokens: 16 });
+      const { res, getStatus } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Hi' }],
+          max_tokens: 128000,
+          stream: true,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const streamSpy = mockModel.chatStreamSessionStart as unknown as ReturnType<typeof vi.fn>;
+      const config = streamSpy.mock.calls[0]?.[1] as { maxNewTokens?: number };
+      expect(config.maxNewTokens).toBe(16);
     });
 
     it('emits thinking + text with correct content block indices', async () => {

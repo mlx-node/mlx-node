@@ -616,6 +616,39 @@ impl PagedAttentionOutput {
 
         Ok(arr)
     }
+
+    /// Convert output to an MLX array view without a GPU → host roundtrip.
+    ///
+    /// The returned MLX array retains the underlying `MTL::Buffer` through
+    /// `mlx_array_from_metal_buffer_view`, so it remains valid after this
+    /// `PagedAttentionOutput` wrapper is dropped.
+    ///
+    /// # Safety
+    /// The returned pointer must be managed by the caller (typically wrapped in
+    /// `MxArray`).
+    pub unsafe fn to_mlx_array_view(&self) -> Result<*mut mlx_sys::mlx_array, String> {
+        let shape = self.shape();
+        let dtype_code = match self.dtype {
+            MetalDtype::Float32 => 0,
+            MetalDtype::Float16 => 2,
+            MetalDtype::BFloat16 => 3,
+            MetalDtype::UChar => 5,
+        };
+        let arr = unsafe {
+            mlx_sys::mlx_array_from_metal_buffer_view(
+                self.buffer_ptr(),
+                shape.as_ptr(),
+                shape.len(),
+                dtype_code,
+            )
+        };
+        if arr.is_null() {
+            return Err(
+                "Failed to create zero-copy MLX view from paged attention output".to_string(),
+            );
+        }
+        Ok(arr)
+    }
 }
 
 /// Dispatch paged_attention V1 with raw buffer pointers

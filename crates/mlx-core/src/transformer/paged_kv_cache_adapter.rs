@@ -1159,6 +1159,20 @@ impl PagedKVCacheAdapter {
 
         // 5. Build slot mapping and dispatch.
         let slot_mapping = self.build_slot_mapping(first_logical_position, num_tokens)?;
+        let trace_enabled = inference_trace_enabled();
+        let write_trace_start = trace_enabled.then(Instant::now);
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged_kv update_keys_values_start layer={} first_position={} num_tokens={} current_tokens={} blocks={} first_slot={} last_slot={}",
+                layer_idx,
+                first_logical_position,
+                num_tokens,
+                self.request_tokens.len(),
+                self.num_allocated_blocks(),
+                slot_mapping.first().copied().unwrap_or(-1),
+                slot_mapping.last().copied().unwrap_or(-1)
+            ));
+        }
 
         // Phase 10: read per-layer FP8 scales from `KvScaleManager` when
         // configured. Defaults to 1.0 (no-op for non-FP8 caches) when no
@@ -1181,7 +1195,17 @@ impl PagedKVCacheAdapter {
                 k_scale,
                 v_scale,
             )
+        }?;
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged_kv update_keys_values_done layer={} first_position={} num_tokens={} elapsed_ms={:.1}",
+                layer_idx,
+                first_logical_position,
+                num_tokens,
+                write_trace_start.map(elapsed_ms).unwrap_or(0.0)
+            ));
         }
+        Ok(())
     }
 
     /// Non-macOS stub: the underlying Metal kernel is macOS-only. Calling
@@ -1215,11 +1239,9 @@ impl PagedKVCacheAdapter {
     /// `softcap`: `1.0` disables softcapping.
     ///
     /// Returns the attention output as an `MxArray` of shape
-    /// `[1, num_query_heads, head_size]`, dtype Float32. The kernel writes
-    /// io-typed elements (matching the queries dtype); we copy GPU → host
-    /// → MLX as Float32 to keep the conversion trivial — **P1C-3
-    /// follow-up**: replace with zero-copy `mlx_array_from_metal_buffer`
-    /// so the result stays on-device in its native precision.
+    /// `[1, num_query_heads, head_size]`, in the kernel's io dtype (matching
+    /// the queries dtype). The returned array is a retained MLX view over the
+    /// Metal output buffer, so decode stays on-device.
     ///
     /// ## Single-request semantics
     ///
@@ -1318,9 +1340,8 @@ impl PagedKVCacheAdapter {
         //     of silently falling back to 1.0 — see Finding 2.
         let (k_scale, v_scale) = self.read_layer_scales(layer_idx)?;
 
-        // 6. Dispatch and wrap output in MxArray. P1C-3 follow-up:
-        //    `to_mlx_array` does GPU → host → MLX as Float32; replace with
-        //    zero-copy `mlx_array_from_metal_buffer` for on-device decode.
+        // 6. Dispatch and wrap output in an MLX view over the Metal buffer.
+        //    This avoids the old GPU → host → MLX copy in the decode hot path.
         // SAFETY:
         // - queries.as_raw_ptr() is borrowed from `queries: &MxArray` and
         //   stays valid for the synchronous dispatch.
@@ -1342,9 +1363,10 @@ impl PagedKVCacheAdapter {
             )?
         };
 
-        // SAFETY: `to_mlx_array` materializes a fresh mlx_array (heap
-        // allocated by mlx_sys); ownership transfers to the MxArray below.
-        let raw = unsafe { output.to_mlx_array()? };
+        // SAFETY: `to_mlx_array_view` materializes a fresh mlx_array wrapper
+        // and retains the underlying Metal buffer. Ownership transfers to the
+        // MxArray below.
+        let raw = unsafe { output.to_mlx_array_view()? };
         MxArray::from_handle(raw, "gather_kv_for_decode")
             .map_err(|e| format!("gather_kv_for_decode: failed to wrap output array: {e}"))
     }
@@ -1562,6 +1584,11 @@ impl PagedKVCacheAdapter {
         .map_err(|e| format!("gather_kv_for_prefill_chunk block_table: {e}"))?;
         let seq_lens_arr = MxArray::from_int32(&seq_lens, &[num_new_tokens as i64])
             .map_err(|e| format!("gather_kv_for_prefill_chunk seq_lens: {e}"))?;
+        // The paged-attention output is lazy and may not evaluate until after
+        // this function returns. Materialize host-built metadata before the
+        // Rust backing Vecs are dropped so eval_gpu cannot observe stale data.
+        MxArray::eval_arrays(&[&block_table_arr, &seq_lens_arr])
+            .map_err(|e| format!("gather_kv_for_prefill_chunk metadata eval: {e}"))?;
 
         self.prefill_attention_inputs_cache = Some(PrefillPagedAttentionInputsCache {
             token_count: recorded,
@@ -1715,10 +1742,31 @@ impl PagedKVCacheAdapter {
         let trace_enabled = inference_trace_enabled();
         let trace_start = trace_enabled.then(Instant::now);
         let read_blocks_start = trace_enabled.then(Instant::now);
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged_kv read_kv_range_start layer={} start_pos={} num_tokens={} block_count={} block_size={} cache_dtype={:?}",
+                layer_idx,
+                start_pos,
+                num_tokens,
+                block_ids.len(),
+                block_size,
+                cache_dtype
+            ));
+        }
         let (key_bytes, value_bytes) = self
             .layer_kv_pool
             .read_blocks_to_host(layer_idx, &block_ids)?;
         let read_blocks_ms = read_blocks_start.map(elapsed_ms);
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged_kv read_kv_range_blocks_done layer={} block_count={} key_bytes={} value_bytes={} elapsed_ms={:.1}",
+                layer_idx,
+                block_ids.len(),
+                key_bytes.len(),
+                value_bytes.len(),
+                read_blocks_ms.unwrap_or(0.0)
+            ));
+        }
 
         // 6. Layout constants.
         // Cache dtype is 2 bytes per element here (we rejected FP8 above).
@@ -4804,19 +4852,12 @@ mod tests {
         };
 
         // Output shape: [1, num_query_heads, head_size]. The kernel writes
-        // Float16 internally; `PagedAttentionOutput::to_mlx_array` does a
-        // GPU → host → MLX-Float32 conversion (P1C-3 follow-up: zero-copy
-        // via mlx_array_from_metal_buffer).
+        // Float16 and the adapter wraps that Metal buffer as an MLX view.
         assert_eq!(out.ndim().unwrap(), 3, "output must be 3-D");
         assert_eq!(out.shape_at(0).unwrap(), 1);
         assert_eq!(out.shape_at(1).unwrap(), 2);
         assert_eq!(out.shape_at(2).unwrap(), 64);
-        assert_eq!(
-            out.dtype().unwrap(),
-            DType::Float32,
-            "to_mlx_array materializes Float32 (GPU host roundtrip); P1C-3 \
-             follow-up: zero-copy via mlx_array_from_metal_buffer"
-        );
+        assert_eq!(out.dtype().unwrap(), DType::Float16);
     }
 
     #[cfg(target_os = "macos")]
@@ -5052,20 +5093,22 @@ mod tests {
             Err(e) => panic!("unexpected error from gather_kv_for_decode (BF16): {e}"),
         };
 
-        // `to_mlx_array` materializes Float32 via the host roundtrip.
+        // The zero-copy output view preserves the BF16 io dtype.
         assert_eq!(out.ndim().unwrap(), 3, "output must be 3-D");
         assert_eq!(out.shape_at(0).unwrap(), 1);
         assert_eq!(out.shape_at(1).unwrap(), 1);
         assert_eq!(out.shape_at(2).unwrap(), 64);
-        assert_eq!(out.dtype().unwrap(), DType::Float32);
+        assert_eq!(out.dtype().unwrap(), DType::BFloat16);
 
         // The misrouted path (BF16 cache → half kernel) would produce
         // ~1.875 per element (half(0x3F80) = 1.875). Correct routing
         // produces 1.0 exactly. Any value below 1.5 is unambiguously the
         // correct route.
         let mut max_diff = 0.0_f32;
+        let out_f32 = out.astype(DType::Float32).expect("astype f32");
+        out_f32.eval();
         for i in 0..64 {
-            let v = out
+            let v = out_f32
                 .item_at_float32(i)
                 .unwrap_or_else(|e| panic!("item_at_float32({i}): {e}"));
             // 1.0 with BF16 round-trip + accumulator noise is ≤ 0.05 off.

@@ -32,6 +32,7 @@ interface UsageSummary {
   prefill_tokens_per_second?: number;
   decode_tokens_per_second?: number;
   server_inference_elapsed_ms?: number;
+  server_total_time_to_first_token_ms?: number;
   prefill_input_tokens?: number;
   cached_prefix_tokens?: number;
   server_model_resolve_ms?: number;
@@ -62,6 +63,12 @@ function fmtMs(ms: number | undefined): string | undefined {
 
 function fmtRate(rate: number | undefined): string | undefined {
   return typeof rate === 'number' && Number.isFinite(rate) ? `${rate.toFixed(2)}/s` : undefined;
+}
+
+function addMs(left: number | undefined, right: number | undefined): number | undefined {
+  return typeof left === 'number' && Number.isFinite(left) && typeof right === 'number' && Number.isFinite(right)
+    ? left + right
+    : undefined;
 }
 
 function extractUsageSummary(resBody: string): { model?: string; usage?: UsageSummary; stop?: string } {
@@ -133,7 +140,10 @@ function buildTimingSummary(reqBody: string, resBody: string): string {
     ].filter((part): part is string => part != null);
     if (tokenParts.length > 0) parts.push(`tok(${tokenParts.join(' ')})`);
 
+    const totalFirstTokenMs =
+      usage.server_total_time_to_first_token_ms ?? addMs(usage.server_pre_inference_ms, usage.time_to_first_token_ms);
     const timingParts = [
+      fmtMs(totalFirstTokenMs) ? `ttfb=${fmtMs(totalFirstTokenMs)}` : undefined,
       fmtMs(usage.time_to_first_token_ms) ? `ttft=${fmtMs(usage.time_to_first_token_ms)}` : undefined,
       fmtRate(usage.prefill_tokens_per_second) ? `prefill=${fmtRate(usage.prefill_tokens_per_second)}` : undefined,
       fmtRate(usage.decode_tokens_per_second) ? `decode=${fmtRate(usage.decode_tokens_per_second)}` : undefined,
@@ -162,6 +172,25 @@ function buildTimingSummary(reqBody: string, resBody: string): string {
     if (tuningParts.length > 0) parts.push(`tune(${tuningParts.join(' ')})`);
   }
   if (response.stop) parts.push(`stop=${response.stop}`);
+
+  return parts.length > 0 ? ` ${parts.join(' ')}` : '';
+}
+
+function buildRequestBodySummary(reqBody: string): string {
+  const request = parseJsonObject(reqBody);
+  if (!request) return '';
+
+  const parts: string[] = [];
+  if (typeof request.model === 'string') parts.push(`model=${request.model}`);
+  if (typeof request.max_tokens === 'number') parts.push(`max_tokens=${request.max_tokens}`);
+  if (typeof request.stream === 'boolean') parts.push(`stream=${request.stream}`);
+  if (Array.isArray(request.messages)) parts.push(`messages=${request.messages.length}`);
+  if (Array.isArray(request.tools)) parts.push(`tools=${request.tools.length}`);
+  if (typeof request.system === 'string') {
+    parts.push(`system=string`);
+  } else if (Array.isArray(request.system)) {
+    parts.push(`system=blocks:${request.system.length}`);
+  }
 
   return parts.length > 0 ? ` ${parts.join(' ')}` : '';
 }
@@ -254,6 +283,14 @@ export function attachLogger(server: Server, logDir: string): Logger {
     let reqDone = false;
     let resDone = false;
     let emitted = false;
+    let requestBodyLogged = false;
+    const logRequestBody = (phase: 'end' | 'close'): void => {
+      if (requestBodyLogged) return;
+      requestBodyLogged = true;
+      writePretty(
+        `[req ${rid}] request_body_${phase} ${Buffer.byteLength(reqBody, 'utf8')}B${buildRequestBodySummary(reqBody)}`,
+      );
+    };
     const tryEmit = (): void => {
       if (emitted || !reqDone || !resDone) return;
       emitted = true;
@@ -282,11 +319,13 @@ export function attachLogger(server: Server, logDir: string): Logger {
     };
     req.on('end', () => {
       reqDone = true;
+      logRequestBody('end');
       tryEmit();
     });
     req.on('close', () => {
       // Client may drop the body mid-flight; emit whatever we have.
       reqDone = true;
+      logRequestBody('close');
       tryEmit();
     });
     res.on('finish', () => {

@@ -230,6 +230,7 @@ describe('buildAnthropicResponse', () => {
     expect(response.usage.prefill_input_tokens).toBe(5);
     expect(response.usage.cached_prefix_tokens).toBe(15);
     expect(response.usage.server_inference_elapsed_ms).toBe(350);
+    expect(response.usage.server_total_time_to_first_token_ms).toBe(312);
     expect(response.usage.server_model_resolve_ms).toBe(57);
     expect(response.usage.server_queue_ms).toBe(5);
     expect(response.usage.server_pre_inference_ms).toBe(62);
@@ -460,6 +461,7 @@ describe('buildMessageDelta', () => {
     expect(event.usage.prefill_input_tokens).toBe(5);
     expect(event.usage.cached_prefix_tokens).toBe(15);
     expect(event.usage.server_inference_elapsed_ms).toBe(350);
+    expect(event.usage.server_total_time_to_first_token_ms).toBe(312);
     expect(event.usage.server_model_resolve_ms).toBe(57);
     expect(event.usage.server_queue_ms).toBe(5);
     expect(event.usage.server_pre_inference_ms).toBe(62);

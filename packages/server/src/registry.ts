@@ -128,6 +128,13 @@ export interface RegisterOptions {
    * per-binding state.
    */
   samplingDefaults?: ChatConfig;
+  /**
+   * Optional per-model upper bound for generated output tokens. This is
+   * intentionally separate from `samplingDefaults.maxNewTokens`: client
+   * requests still provide the desired length, while endpoint handlers can
+   * clamp pathological values before dispatch.
+   */
+  maxOutputTokens?: number;
 }
 
 export class ModelRegistry {
@@ -212,6 +219,7 @@ export class ModelRegistry {
    */
   register(name: string, model: ServableModel, opts?: RegisterOptions): void {
     const samplingDefaults = opts?.samplingDefaults;
+    const maxOutputTokens = opts?.maxOutputTokens;
     const existing = this.models.get(name);
     if (existing && existing.model === model) {
       // Same name + same model object: leave the binding and refcount
@@ -222,6 +230,9 @@ export class ModelRegistry {
       existing.createdAt = Math.floor(Date.now() / 1000);
       if (opts && 'samplingDefaults' in opts) {
         existing.sessionRegistry.setSamplingDefaults(samplingDefaults);
+      }
+      if (opts && 'maxOutputTokens' in opts) {
+        existing.sessionRegistry.setMaxOutputTokens(maxOutputTokens);
       }
       return;
     }
@@ -240,7 +251,12 @@ export class ModelRegistry {
     let binding = this.sessionRegistriesByModel.get(model);
     if (!binding) {
       binding = {
-        registry: new SessionRegistry({ model, maxQueueDepth: this.maxQueueDepth, samplingDefaults }),
+        registry: new SessionRegistry({
+          model,
+          maxQueueDepth: this.maxQueueDepth,
+          samplingDefaults,
+          maxOutputTokens,
+        }),
         refCount: 0,
         inFlight: 0,
         pendingPersists: 0,
@@ -258,6 +274,9 @@ export class ModelRegistry {
       // intact.
       if (opts && 'samplingDefaults' in opts) {
         binding.registry.setSamplingDefaults(samplingDefaults);
+      }
+      if (opts && 'maxOutputTokens' in opts) {
+        binding.registry.setMaxOutputTokens(maxOutputTokens);
       }
     }
     binding.refCount += 1;
@@ -583,7 +602,12 @@ export class ModelRegistry {
    * List all registered models in the OpenAI /v1/models format.
    */
   list(): { id: string; object: string; created: number; owned_by: string }[] {
-    const result: { id: string; object: string; created: number; owned_by: string }[] = [];
+    const result: {
+      id: string;
+      object: string;
+      created: number;
+      owned_by: string;
+    }[] = [];
     for (const entry of this.models.values()) {
       result.push({
         id: entry.id,

@@ -141,4 +141,41 @@ describe('attachLogger', () => {
     const row = JSON.parse(readFileSync(join(logDir, 'requests.ndjson'), 'utf-8').trim()) as { resBody: string };
     expect(row.resBody).toBe('data: a\n\ndata: b\n\ndata: [DONE]\n\n');
   });
+
+  it('logs total first-token latency separately from native ttft', async () => {
+    const logDir = makeTmpDir();
+    const port = await pickFreePort();
+
+    const srv = createServer((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        JSON.stringify({
+          model: 'gemma-test',
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: 20,
+            output_tokens: 5,
+            time_to_first_token_ms: 250,
+            prefill_tokens_per_second: 20,
+            decode_tokens_per_second: 40,
+            server_inference_elapsed_ms: 350,
+            server_total_time_to_first_token_ms: 312,
+            server_model_resolve_ms: 57,
+            server_queue_ms: 5,
+            server_pre_inference_ms: 62,
+          },
+        }),
+      );
+    });
+    const logger = attachLogger(srv, logDir);
+    await new Promise<void>((resolve) => srv.listen(port, '127.0.0.1', resolve));
+
+    await postJson(port, { model: 'gemma-test' });
+    await logger.close();
+    await closeServer(srv);
+
+    const pretty = readFileSync(join(logDir, 'session.log'), 'utf-8');
+    expect(pretty).toContain('perf(ttfb=312ms ttft=250ms prefill=20.00/s decode=40.00/s infer=350ms)');
+    expect(pretty).toContain('server(resolve=57ms queue=5ms pre=62ms)');
+  });
 });

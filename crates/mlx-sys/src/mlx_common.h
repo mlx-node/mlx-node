@@ -13,9 +13,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
+#include <cctype>
 #include <cstring>
+#include <fstream>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 #include <iostream>
@@ -116,6 +120,31 @@ using mlx::core::sum;
 using mlx::core::take;
 using mlx::core::transpose;
 using mlx::core::zeros;
+
+inline bool mlx_env_flag_enabled(const char* value) {
+  if (!value) return false;
+  std::string v(value);
+  std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+inline void mlx_trace_native_error(const char* context, const char* detail) {
+  if (!mlx_env_flag_enabled(std::getenv("MLX_INFERENCE_TRACE"))) return;
+  const char* path = std::getenv("MLX_INFERENCE_TRACE_FILE");
+  if (!path || !*path) return;
+  std::ofstream out(path, std::ios::app);
+  if (!out) return;
+  out << "native_error context=" << (context ? context : "unknown") << " detail=\"";
+  if (detail) {
+    for (const char* p = detail; *p; ++p) {
+      char c = *p;
+      out << ((c == '\n' || c == '\r' || c == '"') ? ' ' : c);
+    }
+  }
+  out << "\"\n";
+}
 
 // Comparison operations
 using mlx::core::equal;

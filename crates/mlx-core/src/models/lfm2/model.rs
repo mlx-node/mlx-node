@@ -372,7 +372,7 @@ impl Lfm2Inner {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 let _logits = self.forward(&chunk)?;
             }
-            eval_lfm2_caches(&self.caches);
+            eval_lfm2_caches(&self.caches)?;
             crate::array::clear_cache();
             offset += PREFILL_STEP_SIZE;
         }
@@ -600,7 +600,7 @@ impl Lfm2Inner {
         y.eval();
 
         // Eval all caches after prefill
-        eval_lfm2_caches(&self.caches);
+        eval_lfm2_caches(&self.caches)?;
 
         // Mark first token time
         if report_perf {
@@ -1839,7 +1839,7 @@ impl Lfm2Inner {
         let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
         let mut y = sample(&last_logits, sampling_config)?;
         y.eval();
-        eval_lfm2_caches(&self.caches);
+        eval_lfm2_caches(&self.caches)?;
 
         if report_perf {
             first_token_instant = Some(std::time::Instant::now());
@@ -2181,7 +2181,7 @@ impl Lfm2Inner {
         y.eval();
 
         // Eval all caches after prefill so the prefix is materialized.
-        eval_lfm2_caches(&self.caches);
+        eval_lfm2_caches(&self.caches)?;
 
         if report_perf {
             first_token_instant = Some(std::time::Instant::now());
@@ -2666,7 +2666,7 @@ impl Lfm2Inner {
         let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
         let mut y = sample(&last_logits, sampling_config)?;
         y.eval();
-        eval_lfm2_caches(&self.caches);
+        eval_lfm2_caches(&self.caches)?;
 
         if report_perf {
             first_token_instant = Some(std::time::Instant::now());
@@ -2945,14 +2945,15 @@ fn init_caches(config: &Lfm2Config) -> Vec<Lfm2LayerCache> {
 const PREFILL_STEP_SIZE: i64 = 2048;
 
 /// Evaluate all cache arrays (after prefill).
-fn eval_lfm2_caches(caches: &[Lfm2LayerCache]) {
+fn eval_lfm2_caches(caches: &[Lfm2LayerCache]) -> Result<()> {
     let mut arrays: Vec<&MxArray> = Vec::new();
     for cache in caches {
         cache.collect_arrays(&mut arrays);
     }
     if !arrays.is_empty() {
-        MxArray::eval_arrays(&arrays);
+        MxArray::eval_arrays(&arrays)?;
     }
+    Ok(())
 }
 
 /// LFM2 language model (LFM2.5-1.2B-Thinking).

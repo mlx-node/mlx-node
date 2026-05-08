@@ -36,6 +36,54 @@ use crate::metal::MetalDtype;
 #[cfg(target_os = "macos")]
 use metal::Buffer;
 
+#[cfg(target_os = "macos")]
+fn inference_trace_file() -> Option<&'static str> {
+    static TRACE_FILE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TRACE_FILE
+        .get_or_init(|| {
+            let enabled = match std::env::var("MLX_INFERENCE_TRACE") {
+                Ok(value) => matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                ),
+                Err(_) => false,
+            };
+            if !enabled {
+                return None;
+            }
+            std::env::var("MLX_INFERENCE_TRACE_FILE")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .as_deref()
+}
+
+#[cfg(target_os = "macos")]
+fn inference_trace_enabled() -> bool {
+    inference_trace_file().is_some()
+}
+
+#[cfg(target_os = "macos")]
+fn write_inference_trace(args: std::fmt::Arguments<'_>) {
+    let Some(path) = inference_trace_file() else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{args}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn elapsed_ms(start: std::time::Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
 /// Convert a `MetalDtype` to the matching `BridgeDType` code understood by
 /// `mlx_array_from_metal_buffer_view`. Mirrors the enum in
 /// `crates/mlx-sys/src/mlx_common.h`:
@@ -648,23 +696,79 @@ impl LayerKVPool {
             return Ok(());
         }
 
+        let trace_enabled = inference_trace_enabled();
+        let trace_start = trace_enabled.then(std::time::Instant::now);
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] layer_kv_pool write_kv_start layer={} num_tokens={} input_dtype={:?} cache_dtype={:?} first_slot={} last_slot={}",
+                layer_idx,
+                slot_mapping.len(),
+                input_dtype,
+                self.cache_dtype,
+                slot_mapping.first().copied().unwrap_or(-1),
+                slot_mapping.last().copied().unwrap_or(-1)
+            ));
+        }
+
         // Synchronize MLX so the K/V tensors are materialized before we
         // dereference their backing buffers.
+        let sync_start = trace_enabled.then(std::time::Instant::now);
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] layer_kv_pool write_kv_mlx_sync_start layer={} num_tokens={}",
+                layer_idx,
+                slot_mapping.len()
+            ));
+        }
         synchronize_mlx();
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] layer_kv_pool write_kv_mlx_sync_done layer={} elapsed_ms={:.1}",
+                layer_idx,
+                sync_start.map(elapsed_ms).unwrap_or(0.0)
+            ));
+        }
 
         // SAFETY: caller guarantees handles are valid + evaluated.
+        let extract_start = trace_enabled.then(std::time::Instant::now);
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] layer_kv_pool write_kv_extract_start layer={}",
+                layer_idx
+            ));
+        }
         let key_info = unsafe { MlxMetalBuffer::from_mlx_array(keys) }
             .ok_or_else(|| "Failed to extract Metal buffer from keys".to_string())?;
         let value_info = unsafe { MlxMetalBuffer::from_mlx_array(values) }
             .ok_or_else(|| "Failed to extract Metal buffer from values".to_string())?;
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] layer_kv_pool write_kv_extract_done layer={} key_offset={} key_bytes={} value_offset={} value_bytes={} elapsed_ms={:.1}",
+                layer_idx,
+                key_info.offset,
+                key_info.data_size,
+                value_info.offset,
+                value_info.data_size,
+                extract_start.map(elapsed_ms).unwrap_or(0.0)
+            ));
+        }
 
         // Upload slot_mapping as a shared Metal buffer (kernel expects i64).
+        let slot_upload_start = trace_enabled.then(std::time::Instant::now);
         let state = MetalState::get()?;
         let slot_buffer = state.device.new_buffer_with_data(
             slot_mapping.as_ptr() as *const _,
             std::mem::size_of_val(slot_mapping) as u64,
             MTLResourceOptions::StorageModeShared,
         );
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] layer_kv_pool write_kv_slot_upload_done layer={} bytes={} elapsed_ms={:.1}",
+                layer_idx,
+                std::mem::size_of_val(slot_mapping),
+                slot_upload_start.map(elapsed_ms).unwrap_or(0.0)
+            ));
+        }
 
         // `x` follows the cache element width: 8 for 2-byte (half/bf16),
         // 16 for 1-byte (FP8). Mirrors the cache-buffer math in
@@ -715,6 +819,20 @@ impl LayerKVPool {
         // SAFETY: all buffer pointers are extracted above; they remain
         // valid until command_buffer.wait_until_completed inside the
         // dispatcher returns.
+        let dispatch_start = trace_enabled.then(std::time::Instant::now);
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] layer_kv_pool write_kv_dispatch_start layer={} num_tokens={} block_size={} heads={} head_size={} x={} input_dtype={:?} cache_dtype={:?}",
+                layer_idx,
+                params.num_tokens,
+                params.block_size,
+                params.num_heads,
+                params.head_size,
+                params.x,
+                input_dtype,
+                cache_dtype
+            ));
+        }
         unsafe {
             dispatch_reshape_and_cache_raw(
                 &key_raw,
@@ -726,7 +844,16 @@ impl LayerKVPool {
                 input_dtype,
                 cache_dtype,
             )
+        }?;
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] layer_kv_pool write_kv_dispatch_done layer={} elapsed_ms={:.1} total_ms={:.1}",
+                layer_idx,
+                dispatch_start.map(elapsed_ms).unwrap_or(0.0),
+                trace_start.map(elapsed_ms).unwrap_or(0.0)
+            ));
         }
+        Ok(())
     }
 
     /// Run paged attention against this layer's K/V buffers for a single
@@ -755,8 +882,8 @@ impl LayerKVPool {
     /// → half misroute on the gather side (the corresponding `write_kv` was
     /// already fixed in P1C-2).
     ///
-    /// Returns the attention output as a `PagedAttentionOutput`. The caller
-    /// converts to an `MxArray` via `to_mlx_array` (GPU → host roundtrip).
+    /// Returns the attention output as a `PagedAttentionOutput`. Hot-path
+    /// callers convert it to an `MxArray` view without a host roundtrip.
     ///
     /// # Safety
     /// - `queries` must be a valid evaluated `mlx_array` pointer with shape

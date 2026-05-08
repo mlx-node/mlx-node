@@ -138,6 +138,13 @@ impl RotatingKVCache {
         let current_len = ordered_keys.shape_at(2)? as i32;
         self.idx = current_len;
 
+        // For multi-token prefill, attention must see the previous sliding
+        // window plus the entire current chunk. Store the trimmed rotating
+        // window below, but return the untrimmed attention view just like the
+        // empty-cache branch does for an over-window initial prefill.
+        let attention_keys = MxArray::concatenate(&ordered_keys, keys, 2)?;
+        let attention_values = MxArray::concatenate(&ordered_values, values, 2)?;
+
         let total = current_len + seq_len;
         let trim_size = if total > self.max_size {
             total - self.max_size
@@ -153,7 +160,7 @@ impl RotatingKVCache {
         self.offset += seq_len;
         self.idx = new_keys.shape_at(2)? as i32;
 
-        Ok(vec![new_keys, new_values])
+        Ok(vec![attention_keys, attention_values])
     }
 
     /// Update in-place (single-token updates)
@@ -545,7 +552,12 @@ mod tests {
 
         let k2 = MxArray::ones(&[1, 1, 6, 4], None).unwrap();
         let v2 = k2.clone();
-        cache.update_and_fetch(&k2, &v2).unwrap();
+        let r2 = cache.update_and_fetch(&k2, &v2).unwrap();
+        assert_eq!(
+            r2[0].shape_at(2).unwrap(),
+            12,
+            "prefill attention sees previous window plus current chunk"
+        );
 
         // Single token after should yield window-bounded cache
         let k3 = MxArray::ones(&[1, 1, 1, 4], None).unwrap();
@@ -554,6 +566,11 @@ mod tests {
         assert!(
             r[0].shape_at(2).unwrap() <= 8,
             "cache must not exceed window"
+        );
+        let (stored_k, _) = cache.fetch_current_kv().unwrap();
+        assert!(
+            stored_k.shape_at(2).unwrap() <= 8,
+            "stored rotating cache must remain window bounded"
         );
     }
 }

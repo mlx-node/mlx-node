@@ -139,6 +139,7 @@ export function makeSwapController(
               const oldEntry = byName.get(oldResident.name);
               registry.register(oldResident.name, oldInstance, {
                 samplingDefaults: oldEntry?.preset.sampling,
+                maxOutputTokens: oldEntry?.preset.maxOutputTokens,
               });
               resident = oldResident;
             }
@@ -148,6 +149,7 @@ export function makeSwapController(
         instance = loaded as unknown as SessionCapableModel;
         registry.register(targetEntry.name, instance, {
           samplingDefaults: targetEntry.preset.sampling,
+          maxOutputTokens: targetEntry.preset.maxOutputTokens,
         });
         resident = { name: targetEntry.name };
       } else if (!resident) {
@@ -163,6 +165,7 @@ export function makeSwapController(
         if (aliasName === targetEntry.name) continue;
         registry.register(aliasName, instance, {
           samplingDefaults: targetEntry.preset.sampling,
+          maxOutputTokens: targetEntry.preset.maxOutputTokens,
         });
         aliases.add(aliasName);
       }
@@ -172,6 +175,7 @@ export function makeSwapController(
       if (isAlias) {
         registry.register(name, instance, {
           samplingDefaults: targetEntry.preset.sampling,
+          maxOutputTokens: targetEntry.preset.maxOutputTokens,
         });
         aliases.add(name);
       }

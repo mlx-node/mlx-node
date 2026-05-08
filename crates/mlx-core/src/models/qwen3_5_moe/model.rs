@@ -899,17 +899,17 @@ impl Qwen35MoeInner {
         clone_moe_linear_layer_caches(&self.config, &checkpoint.caches)
     }
 
-    fn remember_moe_gdn_history_checkpoint(&mut self) -> MoeGdnCheckpointStoreTrace {
+    fn remember_moe_gdn_history_checkpoint(&mut self) -> Result<MoeGdnCheckpointStoreTrace> {
         let trace_enabled = inference_trace_enabled();
         let total_start = trace_enabled.then(std::time::Instant::now);
         let mut trace = MoeGdnCheckpointStoreTrace::default();
         if self.cached_token_history.is_empty() {
             self.gdn_last_history_checkpoint = None;
-            return trace.finish(total_start);
+            return Ok(trace.finish(total_start));
         }
 
         let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_layer_caches(&self.caches);
+        eval_layer_caches(&self.caches)?;
         trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
         let clone_start = trace_enabled.then(std::time::Instant::now);
         let Some(caches) = self
@@ -919,7 +919,7 @@ impl Qwen35MoeInner {
         else {
             self.gdn_last_history_checkpoint = None;
             trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-            return trace.finish(total_start);
+            return Ok(trace.finish(total_start));
         };
         trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
         let token_clone_start = trace_enabled.then(std::time::Instant::now);
@@ -930,7 +930,7 @@ impl Qwen35MoeInner {
         self.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint { tokens, caches });
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
-        trace.finish(total_start)
+        Ok(trace.finish(total_start))
     }
 
     fn find_moe_gdn_prefix_checkpoint(
@@ -971,7 +971,7 @@ impl Qwen35MoeInner {
         block_size: u32,
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
-    ) -> MoeGdnCheckpointStoreTrace {
+    ) -> Result<MoeGdnCheckpointStoreTrace> {
         let trace_enabled = inference_trace_enabled();
         let total_start = trace_enabled.then(std::time::Instant::now);
         let mut trace = MoeGdnCheckpointStoreTrace::default();
@@ -984,15 +984,15 @@ impl Qwen35MoeInner {
             cache_salt,
         ) else {
             trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
-            return trace.finish(total_start);
+            return Ok(trace.finish(total_start));
         };
         trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return trace.finish(total_start);
+            return Ok(trace.finish(total_start));
         };
 
         let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_layer_caches(&self.caches);
+        eval_layer_caches(&self.caches)?;
         trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
         let clone_start = trace_enabled.then(std::time::Instant::now);
         let Some(caches) = self
@@ -1001,7 +1001,7 @@ impl Qwen35MoeInner {
             .and_then(|caches| clone_moe_linear_layer_caches(&self.config, caches))
         else {
             trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-            return trace.finish(total_start);
+            return Ok(trace.finish(total_start));
         };
         trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
         let token_clone_start = trace_enabled.then(std::time::Instant::now);
@@ -1029,7 +1029,7 @@ impl Qwen35MoeInner {
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
 
-        trace.finish(total_start)
+        Ok(trace.finish(total_start))
     }
 
     fn prepare_moe_gdn_prefix_state(
@@ -1181,7 +1181,7 @@ impl Qwen35MoeInner {
                 block_size,
                 extra_keys_per_block,
                 cache_salt,
-            )
+            )?
         } else {
             MoeGdnCheckpointStoreTrace::default()
         };
@@ -1721,7 +1721,7 @@ impl Qwen35MoeInner {
                     // compile init would feed stale handles to the GPU —
                     // triggering Metal page-faults / innocent-victim hangs
                     // on the first forward of the next turn.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
             // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
@@ -2043,7 +2043,7 @@ impl Qwen35MoeInner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
-        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint();
+        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint()?;
         if inference_trace_enabled() {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \
@@ -2402,7 +2402,7 @@ impl Qwen35MoeInner {
             match export_paged_moe_linear_caches(&self.config) {
                 Ok(Some(new_caches)) => {
                     self.caches = Some(new_caches);
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
                 Ok(None) => {
                     self.caches = None;
@@ -2685,7 +2685,7 @@ impl Qwen35MoeInner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
-        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint();
+        let gdn_history_checkpoint_store = self.remember_moe_gdn_history_checkpoint()?;
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \
@@ -3232,7 +3232,7 @@ impl Qwen35MoeInner {
             match export_paged_moe_linear_caches(&self.config) {
                 Ok(Some(new_caches)) => {
                     self.caches = Some(new_caches);
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                     write_inference_trace(format_args!(
                         "[MLX_TRACE] qwen3.5-moe paged_linear_cache_export ok=true"
                     ));
@@ -3702,7 +3702,7 @@ impl Qwen35MoeInner {
                     // See the chat path for rationale: force-eval the
                     // exported lazy handles before `MoeResetGuard` clears
                     // `g_compiled_caches_moe` at end of scope.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
             // _moe_guard dropped here
@@ -4223,7 +4223,7 @@ impl Qwen35MoeInner {
                     // See the chat path for rationale: force-eval the
                     // exported lazy handles before `MoeResetGuard` clears
                     // `g_compiled_caches_moe` at end of scope.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
             // _moe_guard dropped here, calling mlx_qwen35_moe_reset()
@@ -4883,7 +4883,7 @@ impl Qwen35MoeInner {
                     // See the chat path for rationale: force-eval the
                     // exported lazy handles before `MoeResetGuard` clears
                     // `g_compiled_caches_moe` at end of scope.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
             // _moe_guard dropped here
@@ -7478,7 +7478,7 @@ fn chunked_prefill_with_size(
         }
         // Materialize all cache arrays on GPU so the next chunk doesn't
         // extend a giant lazy graph rooted at the prior chunk's inputs.
-        eval_layer_caches(caches);
+        eval_layer_caches(caches)?;
         crate::array::clear_cache();
         offset += chunk_size;
     }

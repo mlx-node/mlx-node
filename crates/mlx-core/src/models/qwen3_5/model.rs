@@ -1873,7 +1873,7 @@ impl Qwen35Inner {
                     // compile init would feed stale handles to the GPU —
                     // triggering Metal page-faults / innocent-victim hangs
                     // on the first forward of the next turn.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
         } else {
@@ -3689,7 +3689,7 @@ impl Qwen35Inner {
                     // See `chat_with_caches_inner` for rationale: force-eval
                     // the exported lazy handles before `CompiledResetGuard`
                     // clears `g_compiled_caches` at end of scope.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
         } else {
@@ -4249,7 +4249,7 @@ impl Qwen35Inner {
                     // See `chat_with_caches_inner` for rationale: force-eval
                     // the exported lazy handles before `CompiledResetGuard`
                     // clears `g_compiled_caches` at end of scope.
-                    eval_layer_caches(&self.caches);
+                    eval_layer_caches(&self.caches)?;
                 }
             }
         } else {
@@ -6585,14 +6585,15 @@ const PREFILL_STEP_SIZE: i64 = 2048;
 
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
-pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
+pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Result<()> {
     if let Some(caches) = caches {
         let mut arrays: Vec<&MxArray> = Vec::new();
         for cache in caches.iter() {
             cache.collect_arrays(&mut arrays);
         }
-        MxArray::eval_arrays(&arrays);
+        MxArray::eval_arrays(&arrays)?;
     }
+    Ok(())
 }
 
 /// Chunked prefill: process prompt in chunks of `PREFILL_STEP_SIZE`, evaluating
@@ -6627,7 +6628,7 @@ fn chunked_prefill(
                 embedding_weight_t,
             )?;
         }
-        eval_layer_caches(caches);
+        eval_layer_caches(caches)?;
         crate::array::clear_cache();
         offset += PREFILL_STEP_SIZE;
     }

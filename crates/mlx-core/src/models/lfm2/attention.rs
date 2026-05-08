@@ -298,8 +298,7 @@ impl Lfm2Attention {
                     /* softcap */ 1.0,
                 )
                 .map_err(napi::Error::from_reason)?;
-            // Cast back to x's dtype so the residual stays homogeneous
-            // (gather currently returns Float32).
+            // Cast back to x's dtype so the residual stays homogeneous.
             let target_dtype = x.dtype()?;
             let attn_3d = attn_3d.astype(target_dtype)?;
             // Reshape [1, H, D] -> [1, H, 1, D] for the standard

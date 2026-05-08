@@ -208,9 +208,9 @@ fn reference_attention_f32(
 
 /// Run the FULL adapter flow: reset, find_cached_prefix (miss), allocate
 /// suffix, record_tokens, batch update_keys_values, gather_kv_for_decode.
-/// Returns the gather output as `Vec<f32>` (gather output is f32 — the
-/// adapter currently routes through `PagedAttentionOutput::to_mlx_array`
-/// which does GPU → host → MLX as f32).
+/// Returns the gather output as `Vec<f32>` for comparison. The adapter's
+/// decode output stays in the query/io dtype, so tests cast before copying
+/// back to host.
 #[allow(clippy::too_many_arguments)]
 fn run_adapter(
     fixture: &mut Fixture,
@@ -303,9 +303,11 @@ fn run_adapter(
     out.eval();
     synchronize();
 
-    // gather_kv_for_decode returns f32 (PagedAttentionOutput::to_mlx_array
-    // path). Pull straight to host.
-    let out_f32 = out.to_float32().expect("to_float32");
+    let out_f32 = out
+        .astype(DType::Float32)
+        .expect("astype f32")
+        .to_float32()
+        .expect("to_float32");
     let result: Vec<f32> = (out_f32.as_ref() as &[f32]).to_vec();
 
     if register_for_reuse {

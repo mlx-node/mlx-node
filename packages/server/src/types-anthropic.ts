@@ -196,6 +196,8 @@ export interface AnthropicUsage {
   server_inference_elapsed_ms?: number;
   /** Server-extension alias for disambiguating native TTFT from request/HTTP elapsed time. */
   server_time_to_first_token_ms?: number;
+  /** Server-extension: handler-start to first native token, including model resolve/load and queue wait. */
+  server_total_time_to_first_token_ms?: number;
   /** Server-extension alias for native prefill throughput. */
   server_prefill_tokens_per_second?: number;
   /** Server-extension alias for native decode throughput. */
@@ -313,6 +315,8 @@ export interface AnthropicMessageDeltaEvent {
     server_inference_elapsed_ms?: number;
     /** Server-extension alias for disambiguating native TTFT from request/HTTP elapsed time. */
     server_time_to_first_token_ms?: number;
+    /** Server-extension: handler-start to first native token, including model resolve/load and queue wait. */
+    server_total_time_to_first_token_ms?: number;
     /** Server-extension alias for native prefill throughput. */
     server_prefill_tokens_per_second?: number;
     /** Server-extension alias for native decode throughput. */

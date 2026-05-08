@@ -334,6 +334,11 @@ export interface SessionRegistryOptions {
    * (each `new ChatSession(model)` uses an empty `defaultConfig`).
    */
   samplingDefaults?: ChatConfig;
+  /**
+   * Optional per-model cap for generated output tokens. Endpoint handlers
+   * apply it after request mapping, before dispatching into native decode.
+   */
+  maxOutputTokens?: number;
 }
 
 /**
@@ -413,6 +418,7 @@ export class SessionRegistry {
    * {@link SessionRegistryOptions.samplingDefaults}.
    */
   private samplingDefaults: ChatConfig | undefined;
+  private maxOutputTokens: number | undefined;
   /**
    * Number of callers that are currently WAITING for the per-model
    * execution mutex — i.e. have entered `withExclusive` but have not
@@ -473,6 +479,7 @@ export class SessionRegistry {
     this.ttlSec = opts.ttlSec ?? 1800;
     this.maxQueueDepth = opts.maxQueueDepth;
     this.samplingDefaults = opts.samplingDefaults;
+    this.maxOutputTokens = opts.maxOutputTokens;
   }
 
   /**
@@ -487,7 +494,9 @@ export class SessionRegistry {
     if (this.samplingDefaults === undefined) {
       return new ChatSession(this.model);
     }
-    return new ChatSession(this.model, { defaultConfig: this.samplingDefaults });
+    return new ChatSession(this.model, {
+      defaultConfig: this.samplingDefaults,
+    });
   }
 
   /**
@@ -507,6 +516,10 @@ export class SessionRegistry {
     return this.samplingDefaults;
   }
 
+  get outputTokenLimit(): number | undefined {
+    return this.maxOutputTokens;
+  }
+
   /**
    * Replace the sampling defaults forwarded into every future
    * `ChatSession` this registry allocates. Called by `ModelRegistry`
@@ -518,6 +531,10 @@ export class SessionRegistry {
    */
   setSamplingDefaults(defaults: ChatConfig | undefined): void {
     this.samplingDefaults = defaults;
+  }
+
+  setMaxOutputTokens(limit: number | undefined): void {
+    this.maxOutputTokens = limit;
   }
 
   /** Number of sessions currently cached. Primarily for tests and diagnostics. Always 0 or 1. */
