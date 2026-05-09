@@ -2730,20 +2730,20 @@ impl Gemma4Inner {
         cached_prefix_len: u32,
         trace_enabled: bool,
     ) -> Result<u32> {
-        let max_sliding_restore_tokens =
-            gemma4_max_sliding_restore_tokens(self.config.sliding_window);
-        if cached_prefix_len <= max_sliding_restore_tokens {
+        let Some(max_sliding_restore_tokens) =
+            gemma4_large_sliding_restore_suppression_limit(cached_prefix_len)
+        else {
             return Ok(cached_prefix_len);
-        }
+        };
 
-        // Global K/V can be reused from the paged pool, but Gemma4 sliding
-        // layers still need flat sliding caches reconstructed before prefill.
-        // Keep an upper bound because the restore pass still has to replay the
-        // residual stream through the prefix, even though global attention now
-        // reads paged K/V instead of rebuilding throwaway flat K/V.
+        // Emergency operator override. By default, large prefix hits stay enabled:
+        // the sliding restore pass is chunked, and global attention reads paged K/V
+        // instead of rebuilding throwaway global K/V. If a deployment hits a
+        // restore-specific issue, MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS can force
+        // full prefill above the configured limit.
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {}_prefix_reuse_suppressed reason=large_sliding_restore cached_prefix_tokens={} limit={}",
+                "[MLX_TRACE] gemma4 {}_prefix_reuse_suppressed reason=large_sliding_restore_env_limit cached_prefix_tokens={} limit={}",
                 trace_label, cached_prefix_len, max_sliding_restore_tokens
             ));
         }
@@ -2765,7 +2765,7 @@ impl Gemma4Inner {
             .map_err(Error::from_reason)?;
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {}_adapter_reset_done reason=large_sliding_restore_suppressed cached_prefix_tokens={} cached_blocks={} allocated_blocks={} request_tokens={} blocks={}",
+                "[MLX_TRACE] gemma4 {}_adapter_reset_done reason=large_sliding_restore_env_limit_suppressed cached_prefix_tokens={} cached_blocks={} allocated_blocks={} request_tokens={} blocks={}",
                 trace_label,
                 prefix.cached_token_count,
                 prefix.blocks.len(),
@@ -6674,23 +6674,37 @@ fn physical_full_attention_layer_count(specs: &[LayerKVCacheSpec]) -> usize {
 const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
-const GEMMA4_SLIDING_RESTORE_DEFAULT_MAX_TOKENS: u32 = 32_768;
-const GEMMA4_SLIDING_RESTORE_DEFAULT_WINDOW_MULTIPLIER: u32 = 32;
 
-fn gemma4_max_sliding_restore_tokens(sliding_window: i32) -> u32 {
+fn parse_gemma4_sliding_restore_limit(value: &str) -> Option<u32> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<u32>().ok()
+}
+
+fn gemma4_sliding_restore_limit_override() -> Option<u32> {
     static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
-    let sliding_window = sliding_window.max(0) as u32;
-    let default = sliding_window
-        .saturating_mul(GEMMA4_SLIDING_RESTORE_DEFAULT_WINDOW_MULTIPLIER)
-        .min(GEMMA4_SLIDING_RESTORE_DEFAULT_MAX_TOKENS)
-        .max(sliding_window);
-    OVERRIDE
-        .get_or_init(|| {
-            std::env::var("MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS")
-                .ok()
-                .and_then(|value| value.trim().parse::<u32>().ok())
-        })
-        .unwrap_or(default)
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS")
+            .ok()
+            .and_then(|value| parse_gemma4_sliding_restore_limit(&value))
+    })
+}
+
+fn gemma4_large_sliding_restore_suppression_limit_for_override(
+    override_limit: Option<u32>,
+    cached_prefix_len: u32,
+) -> Option<u32> {
+    let limit = override_limit?;
+    (cached_prefix_len > limit).then_some(limit)
+}
+
+fn gemma4_large_sliding_restore_suppression_limit(cached_prefix_len: u32) -> Option<u32> {
+    gemma4_large_sliding_restore_suppression_limit_for_override(
+        gemma4_sliding_restore_limit_override(),
+        cached_prefix_len,
+    )
 }
 
 fn gemma4_paged_prefill_group_max_chunk() -> u32 {
@@ -7363,9 +7377,44 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma4_sliding_restore_default_limit_is_bounded() {
-        assert_eq!(super::gemma4_max_sliding_restore_tokens(1024), 32_768);
-        assert_eq!(super::gemma4_max_sliding_restore_tokens(4096), 32_768);
+    fn test_gemma4_sliding_restore_default_is_uncapped() {
+        assert_eq!(
+            super::gemma4_large_sliding_restore_suppression_limit_for_override(None, 44_512),
+            None
+        );
+        assert_eq!(
+            super::gemma4_large_sliding_restore_suppression_limit_for_override(None, 1_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn test_gemma4_sliding_restore_env_limit_is_opt_in() {
+        assert_eq!(
+            super::parse_gemma4_sliding_restore_limit("32768"),
+            Some(32_768)
+        );
+        assert_eq!(
+            super::parse_gemma4_sliding_restore_limit(" 44512 "),
+            Some(44_512)
+        );
+        assert_eq!(super::parse_gemma4_sliding_restore_limit(""), None);
+        assert_eq!(super::parse_gemma4_sliding_restore_limit("off"), None);
+
+        assert_eq!(
+            super::gemma4_large_sliding_restore_suppression_limit_for_override(
+                Some(32_768),
+                32_768
+            ),
+            None
+        );
+        assert_eq!(
+            super::gemma4_large_sliding_restore_suppression_limit_for_override(
+                Some(32_768),
+                44_512
+            ),
+            Some(32_768)
+        );
     }
 
     #[test]
