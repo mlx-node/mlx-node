@@ -407,7 +407,7 @@ pub(crate) enum PrefixCacheDecision {
     Miss,
 }
 
-const GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT: usize = 4;
+const GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT: usize = 16;
 
 struct Gemma4SlidingPrefixCheckpoint {
     prefix_len: u32,
@@ -7994,6 +7994,81 @@ mod tests {
         assert!(
             restored.is_some(),
             "prompt-boundary checkpoint must not be evicted by decode-boundary checkpoints"
+        );
+    }
+
+    #[test]
+    fn test_gemma4_decode_checkpoint_retains_recent_retokenization_drift() {
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let block_size = 16;
+        let target_tokens: Vec<u32> = (1000..1016).collect();
+        let target_hash = super::compute_gemma4_paged_prefix_block_hash(
+            &target_tokens,
+            target_tokens.len() as u32,
+            block_size,
+            0,
+        )
+        .expect("target hash");
+        inner
+            .sliding_prefix_checkpoints
+            .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                prefix_len: target_tokens.len() as u32,
+                block_size,
+                final_block_hash: target_hash,
+                tokens: target_tokens.clone(),
+                snapshots: vec![None; inner.config.num_hidden_layers as usize],
+            });
+
+        // The observed Gemma4 tool-call retokenization drift needed the
+        // checkpoint five block boundaries behind the final decode state:
+        // 46272 was requested after 46288, 46304, 46320, and 46336 had
+        // also been checkpointed.
+        for i in 0..4 {
+            let tokens: Vec<u32> = (0..16).map(|token| 2000 + i as u32 + token).collect();
+            let hash = super::compute_gemma4_paged_prefix_block_hash(
+                &tokens,
+                tokens.len() as u32,
+                block_size,
+                0,
+            )
+            .expect("newer hash");
+            inner
+                .sliding_prefix_checkpoints
+                .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                    prefix_len: tokens.len() as u32,
+                    block_size,
+                    final_block_hash: hash,
+                    tokens,
+                    snapshots: vec![None; inner.config.num_hidden_layers as usize],
+                });
+            while inner.sliding_prefix_checkpoints.len() > GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT {
+                inner.sliding_prefix_checkpoints.pop_front();
+            }
+        }
+
+        let restored = inner
+            .find_gemma4_sliding_prefix_checkpoint(
+                &target_tokens,
+                target_tokens.len() as u32,
+                block_size,
+                0,
+            )
+            .expect("prefix lookup");
+        assert!(
+            restored.is_some(),
+            "decode checkpoints must retain the block needed after modest retokenization drift"
         );
     }
 
