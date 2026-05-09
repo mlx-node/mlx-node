@@ -47,10 +47,10 @@ Options:
 
   Environment variables:
     MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
-                                  4096 under \`mlx launch claude\` to bound
+                                  1024 under \`mlx launch claude\` to bound
                                   cold-prefill memory peaks; set to 0 to
-                                  disable chunking, or to a smaller value
-                                  (e.g. 1024 / 512) if 4096 still peaks.
+                                  disable chunking, or tune explicitly for
+                                  your workload.
     MLX_PAGED_PREFILL_EVAL_INTERVAL
                                   Layer cadence for eval+clear during paged
                                   prefill. Defaults to 8.
@@ -149,19 +149,16 @@ export async function run(argv: string[]): Promise<void> {
     return;
   }
 
-  // Bound paged-prefill memory peak by chunking the prompt: default of
-  // 4096 tokens/chunk caps per-chunk SDPA + MoE intermediates to
-  // chunk-sized tiles instead of full-prompt tiles. Empirically 4096
-  // keeps Qwen3.6-35b-a3b 28-43K-token cold prefills at ~50 GB wired
-  // memory with zero swap (vs. the unchunked 117 GB / 39 GB swap), and
-  // halves the per-chunk synchronize_and_clear_cache + host-roundtrip
-  // K/V replay overhead vs. 1024. Respect any user-provided value (set
-  // in shell) so power users can tune down (e.g. 1024 / 512) if a
-  // larger context still peaks. The MLX env var is read via OnceLock on
-  // first paged-prefill call, so setting `process.env` here — before any
-  // model loads — is sufficient to apply the default.
+  // Bound paged-prefill memory peak by chunking the prompt. Keep this as a
+  // launcher default, not a Rust default: the shared native env var still uses
+  // 0 as "disable chunking", and non-Claude callers may want single-shot
+  // behavior. On Gemma4 26B Q8, a 36K-token cold-prefill sweep on this machine
+  // measured 1024 faster than 512 / 2048 / 4096 while preserving the same
+  // final-token split. Respect any user-provided value (set in shell). The MLX
+  // env var is read via OnceLock on first paged-prefill call, so setting
+  // `process.env` here before model load is sufficient.
   if (process.env.MLX_PAGED_PREFILL_CHUNK_SIZE == null) {
-    process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '4096';
+    process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '1024';
   }
 
   const modelsDir = resolveModelsDir(args['models-dir']);
