@@ -407,7 +407,8 @@ pub(crate) enum PrefixCacheDecision {
     Miss,
 }
 
-const GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT: usize = 16;
+const GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT: usize = 16;
+const GEMMA4_SLIDING_PREFIX_CHECKPOINT_MAX_DEFAULT_LIMIT: usize = 64;
 
 struct Gemma4SlidingPrefixCheckpoint {
     prefix_len: u32,
@@ -1062,7 +1063,8 @@ impl Gemma4Inner {
                 tokens: prefix_tokens,
                 snapshots,
             });
-        while self.sliding_prefix_checkpoints.len() > GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT {
+        let checkpoint_limit = gemma4_sliding_prefix_checkpoint_limit(&self.config, block_size);
+        while self.sliding_prefix_checkpoints.len() > checkpoint_limit {
             self.sliding_prefix_checkpoints.pop_front();
         }
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
@@ -1129,7 +1131,8 @@ impl Gemma4Inner {
                 tokens: prefix_tokens,
                 snapshots,
             });
-        while self.sliding_prefix_checkpoints.len() > GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT {
+        let checkpoint_limit = gemma4_sliding_prefix_checkpoint_limit(&self.config, block_size);
+        while self.sliding_prefix_checkpoints.len() > checkpoint_limit {
             self.sliding_prefix_checkpoints.pop_front();
         }
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
@@ -6707,6 +6710,50 @@ fn gemma4_large_sliding_restore_suppression_limit(cached_prefix_len: u32) -> Opt
     )
 }
 
+fn parse_gemma4_sliding_checkpoint_limit(value: &str) -> Option<usize> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<usize>().ok().filter(|limit| *limit > 0)
+}
+
+fn gemma4_sliding_checkpoint_limit_override() -> Option<usize> {
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("MLX_GEMMA4_SLIDING_CHECKPOINT_LIMIT")
+            .ok()
+            .and_then(|value| parse_gemma4_sliding_checkpoint_limit(&value))
+    })
+}
+
+fn gemma4_sliding_prefix_checkpoint_limit_for_override(
+    config: &Gemma4Config,
+    block_size: u32,
+    override_limit: Option<usize>,
+) -> usize {
+    if let Some(limit) = override_limit {
+        return limit;
+    }
+    let sliding_window = config.sliding_window.max(0) as usize;
+    let block_size = block_size as usize;
+    if sliding_window == 0 || block_size == 0 {
+        return GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT;
+    }
+    sliding_window.div_ceil(block_size).clamp(
+        GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT,
+        GEMMA4_SLIDING_PREFIX_CHECKPOINT_MAX_DEFAULT_LIMIT,
+    )
+}
+
+fn gemma4_sliding_prefix_checkpoint_limit(config: &Gemma4Config, block_size: u32) -> usize {
+    gemma4_sliding_prefix_checkpoint_limit_for_override(
+        config,
+        block_size,
+        gemma4_sliding_checkpoint_limit_override(),
+    )
+}
+
 fn gemma4_paged_prefill_group_max_chunk() -> u32 {
     let configured_chunk_size = crate::array::paged_prefill_chunk_size();
     if configured_chunk_size > 0 {
@@ -8017,7 +8064,12 @@ mod tests {
             snapshots: vec![None; inner.config.num_hidden_layers as usize],
         });
 
-        for i in 0..(GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT + 3) {
+        let checkpoint_limit = super::gemma4_sliding_prefix_checkpoint_limit_for_override(
+            &inner.config,
+            block_size,
+            None,
+        );
+        for i in 0..(checkpoint_limit + 3) {
             let tokens: Vec<u32> = (0..16).map(|token| 100 + i as u32 + token).collect();
             inner
                 .sliding_prefix_checkpoints
@@ -8028,14 +8080,11 @@ mod tests {
                     tokens,
                     snapshots: vec![None; inner.config.num_hidden_layers as usize],
                 });
-            while inner.sliding_prefix_checkpoints.len() > GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT {
+            while inner.sliding_prefix_checkpoints.len() > checkpoint_limit {
                 inner.sliding_prefix_checkpoints.pop_front();
             }
         }
-        assert_eq!(
-            inner.sliding_prefix_checkpoints.len(),
-            GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT
-        );
+        assert_eq!(inner.sliding_prefix_checkpoints.len(), checkpoint_limit);
 
         let restored = inner
             .find_gemma4_sliding_prefix_checkpoint(&prompt, prompt.len() as u32, block_size, 0)
@@ -8102,7 +8151,12 @@ mod tests {
                     tokens,
                     snapshots: vec![None; inner.config.num_hidden_layers as usize],
                 });
-            while inner.sliding_prefix_checkpoints.len() > GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT {
+            let checkpoint_limit = super::gemma4_sliding_prefix_checkpoint_limit_for_override(
+                &inner.config,
+                block_size,
+                None,
+            );
+            while inner.sliding_prefix_checkpoints.len() > checkpoint_limit {
                 inner.sliding_prefix_checkpoints.pop_front();
             }
         }
@@ -8118,6 +8172,92 @@ mod tests {
         assert!(
             restored.is_some(),
             "decode checkpoints must retain the block needed after modest retokenization drift"
+        );
+    }
+
+    #[test]
+    fn test_gemma4_decode_checkpoint_retains_sliding_window_drift() {
+        let mut cfg = paged_tiny_config(Some(true));
+        cfg.sliding_window = 512;
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let block_size = 16;
+        let checkpoint_limit = super::gemma4_sliding_prefix_checkpoint_limit_for_override(
+            &inner.config,
+            block_size,
+            None,
+        );
+        assert_eq!(
+            checkpoint_limit, 32,
+            "512-token sliding window with 16-token blocks should retain 32 decode checkpoints"
+        );
+        let target_tokens: Vec<u32> = (3000..3016).collect();
+        let target_hash = super::compute_gemma4_paged_prefix_block_hash(
+            &target_tokens,
+            target_tokens.len() as u32,
+            block_size,
+            0,
+        )
+        .expect("target hash");
+        inner
+            .sliding_prefix_checkpoints
+            .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                prefix_len: target_tokens.len() as u32,
+                block_size,
+                final_block_hash: target_hash,
+                tokens: target_tokens.clone(),
+                snapshots: vec![None; inner.config.num_hidden_layers as usize],
+            });
+
+        // The live 2026-05-09 Gemma4 trace needed a checkpoint eighteen
+        // block boundaries behind the final decode state (57072 requested
+        // after decode reached 57360). A one-window default retains that
+        // level of retokenization drift instead of forcing a full replay.
+        for i in 0..18 {
+            let token_base = 4000 + (i as u32 * block_size);
+            let tokens: Vec<u32> = (0..block_size).map(|token| token_base + token).collect();
+            let hash = super::compute_gemma4_paged_prefix_block_hash(
+                &tokens,
+                tokens.len() as u32,
+                block_size,
+                0,
+            )
+            .expect("newer hash");
+            inner
+                .sliding_prefix_checkpoints
+                .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                    prefix_len: tokens.len() as u32,
+                    block_size,
+                    final_block_hash: hash,
+                    tokens,
+                    snapshots: vec![None; inner.config.num_hidden_layers as usize],
+                });
+            while inner.sliding_prefix_checkpoints.len() > checkpoint_limit {
+                inner.sliding_prefix_checkpoints.pop_front();
+            }
+        }
+
+        let restored = inner
+            .find_gemma4_sliding_prefix_checkpoint(
+                &target_tokens,
+                target_tokens.len() as u32,
+                block_size,
+                0,
+            )
+            .expect("prefix lookup");
+        assert!(
+            restored.is_some(),
+            "decode checkpoints must retain one sliding-window worth of retokenization drift"
         );
     }
 

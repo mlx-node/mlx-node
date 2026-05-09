@@ -65,6 +65,10 @@ Options:
                                   Optional emergency cap on cached Gemma4
                                   prefix tokens replayed for sliding-cache
                                   restore. Unset by default.
+    MLX_GEMMA4_SLIDING_CHECKPOINT_LIMIT
+                                  Override retained Gemma4 sliding-cache
+                                  checkpoints. Defaults dynamically from the
+                                  sliding window and paged block size.
     MLX_INFERENCE_TRACE           Set to 1/true/on to write native inference
                                   phase traces to a file.
     MLX_INFERENCE_TRACE_FILE      Override the native trace file path.
