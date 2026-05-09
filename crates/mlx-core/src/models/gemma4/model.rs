@@ -2602,7 +2602,8 @@ impl Gemma4Inner {
     // * Text-only — vision turns dispatch through the flat path.
     // * Sliding layers still use flat rotating caches; true paged sliding
     //   storage is a separate kernel/storage step.
-    // * Zero-delta prompts (every prompt token cached) are rejected.
+    // * Exact prefix hits are capped at `prompt_len - 1` so the final
+    //   prompt token is always recomputed to produce logits.
     // =================================================================
 
     fn suppress_large_sliding_prefix_reuse_if_needed(
@@ -2693,8 +2694,18 @@ impl Gemma4Inner {
                     reuse_cache
                 ));
             }
+            let max_cache_hit_tokens = total_budget.saturating_sub(1);
             let plan = adapter
-                .prepare_turn(seq_id, tokens, total_budget, reuse_cache, &[], 0, false)
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    tokens,
+                    total_budget,
+                    reuse_cache,
+                    &[],
+                    0,
+                    false,
+                    max_cache_hit_tokens,
+                )
                 .map_err(Error::from_reason)?;
             if trace_enabled {
                 write_inference_trace(format_args!(

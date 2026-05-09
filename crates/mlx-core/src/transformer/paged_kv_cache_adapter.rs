@@ -729,9 +729,68 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         skip_lookup: bool,
     ) -> Result<PagedTurnPlan, String> {
+        self.prepare_turn_inner(
+            seq_id,
+            prompt_tokens,
+            total_budget,
+            reuse_cache,
+            extra_keys,
+            cache_salt,
+            skip_lookup,
+            None,
+        )
+    }
+
+    /// Variant of [`Self::prepare_turn`] that caps the cache-hit prefix length.
+    ///
+    /// This mirrors vLLM's exact-prefix handling: when all prompt tokens are
+    /// cached, the model still needs to recompute at least the final prompt
+    /// token to produce logits. Callers can pass `prompt_len - 1`; because the
+    /// block cache is block-granular, the actual hit length is rounded down by
+    /// the allocator to full blocks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_turn_with_max_cache_hit_tokens(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+        reuse_cache: bool,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: u32,
+    ) -> Result<PagedTurnPlan, String> {
+        self.prepare_turn_inner(
+            seq_id,
+            prompt_tokens,
+            total_budget,
+            reuse_cache,
+            extra_keys,
+            cache_salt,
+            skip_lookup,
+            Some(max_cache_hit_tokens),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_turn_inner(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+        reuse_cache: bool,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: Option<u32>,
+    ) -> Result<PagedTurnPlan, String> {
+        let max_live_continue_tokens = max_cache_hit_tokens
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            .unwrap_or(usize::MAX);
         let can_continue = reuse_cache
             && self.is_live_for_continue()
-            && prompt_tokens.starts_with(self.request_tokens());
+            && prompt_tokens.starts_with(self.request_tokens())
+            && self.request_tokens().len() <= max_live_continue_tokens;
 
         let (cached_prefix_len, continued_live_prefix, allocated_blocks, cached_blocks, reason) =
             if can_continue {
@@ -746,11 +805,12 @@ impl PagedKVCacheAdapter {
                     Err(_) => {
                         let _ = self.release_request();
                         self.reset_for_new_request(seq_id)?;
-                        let prefix = self.find_cached_prefix(
+                        let prefix = self.find_cached_prefix_inner(
                             prompt_tokens,
                             extra_keys,
                             cache_salt,
                             skip_lookup,
+                            max_cache_hit_tokens,
                         )?;
                         let allocated = self.allocate_suffix_blocks(total_budget)?;
                         (
@@ -767,8 +827,13 @@ impl PagedKVCacheAdapter {
                     let _ = self.release_request();
                 }
                 self.reset_for_new_request(seq_id)?;
-                let prefix =
-                    self.find_cached_prefix(prompt_tokens, extra_keys, cache_salt, skip_lookup)?;
+                let prefix = self.find_cached_prefix_inner(
+                    prompt_tokens,
+                    extra_keys,
+                    cache_salt,
+                    skip_lookup,
+                    max_cache_hit_tokens,
+                )?;
                 let allocated = self.allocate_suffix_blocks(total_budget)?;
                 (
                     prefix.cached_token_count,
@@ -872,6 +937,37 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         skip_lookup: bool,
     ) -> Result<CachedPrefix, String> {
+        self.find_cached_prefix_inner(prompt_tokens, extra_keys, cache_salt, skip_lookup, None)
+    }
+
+    /// Variant of [`Self::find_cached_prefix`] that caps the lookup length
+    /// before touching the allocator. This prevents over-incrementing block
+    /// refcounts for cached blocks the caller plans to recompute.
+    pub fn find_cached_prefix_with_max_tokens(
+        &mut self,
+        prompt_tokens: &[u32],
+        extra_keys: &[u64],
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: u32,
+    ) -> Result<CachedPrefix, String> {
+        self.find_cached_prefix_inner(
+            prompt_tokens,
+            extra_keys,
+            cache_salt,
+            skip_lookup,
+            Some(max_cache_hit_tokens),
+        )
+    }
+
+    fn find_cached_prefix_inner(
+        &mut self,
+        prompt_tokens: &[u32],
+        extra_keys: &[u64],
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: Option<u32>,
+    ) -> Result<CachedPrefix, String> {
         // Reject re-entrant calls BEFORE touching the allocator. The flag
         // tracks lookup-already-ran regardless of hit/miss outcome, so a
         // miss-then-call sequence is rejected too — block_table.num_blocks()
@@ -907,19 +1003,28 @@ impl PagedKVCacheAdapter {
             });
         }
 
+        let lookup_len = max_cache_hit_tokens
+            .map(|max_tokens| {
+                usize::try_from(max_tokens)
+                    .unwrap_or(usize::MAX)
+                    .min(prompt_tokens.len())
+            })
+            .unwrap_or(prompt_tokens.len());
+        let lookup_tokens = &prompt_tokens[..lookup_len];
+
         let (blocks, cached_tokens) = {
             let mut guard = self
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            guard.find_longest_cache_hit(prompt_tokens, self.block_size, extra_keys, cache_salt)
+            guard.find_longest_cache_hit(lookup_tokens, self.block_size, extra_keys, cache_salt)
         };
 
         for block in &blocks {
             block_table.add_block(Arc::clone(block));
         }
 
-        let cached_token_count = cached_tokens as u32;
+        let cached_token_count = cached_tokens.min(lookup_len) as u32;
         self.cached_token_count = cached_token_count;
 
         // Seed `request_tokens` with the cached prefix so subsequent
@@ -3996,6 +4101,32 @@ mod tests {
     }
 
     #[test]
+    fn test_find_cached_prefix_with_max_tokens_caps_before_lookup() {
+        let allocator = new_allocator(8, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        seed_prefix_cache(&allocator, &tokens, 4, &[]);
+
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!(
+                "skipping test_find_cached_prefix_with_max_tokens_caps_before_lookup: Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(1).unwrap();
+
+        // Exact 8-token prompt with max hit length 7 should reuse only the
+        // first 4-token block. The final block must be recomputed.
+        let res = adapter
+            .find_cached_prefix_with_max_tokens(&tokens, &[], 0, false, 7)
+            .unwrap();
+        assert_eq!(res.blocks.len(), 1);
+        assert_eq!(res.cached_token_count, 4);
+        assert_eq!(adapter.cached_token_count(), 4);
+        assert_eq!(adapter.current_token_count(), 4);
+        assert_eq!(adapter.block_table().unwrap().num_blocks(), 1);
+    }
+
+    #[test]
     fn test_allocate_suffix_blocks_no_prefix() {
         let allocator = new_allocator(8, 4);
         let Some(mut adapter) = maybe_adapter(allocator, 4) else {
@@ -6541,6 +6672,45 @@ mod tests {
         assert!(!plan.continued_live_prefix);
         assert_eq!(plan.cached_prefix_len, 0);
         assert_eq!(plan.suffix_len, diverged.len() as u32);
+
+        adapter.release_request().unwrap();
+    }
+
+    #[test]
+    fn test_prepare_turn_with_max_cache_hit_tokens_recomputes_exact_live_suffix() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_prepare_turn_with_max_cache_hit_tokens_recomputes_exact_live_suffix: Metal unavailable"
+            );
+            return;
+        };
+
+        let tokens: [u32; 5] = [10, 20, 30, 40, 50];
+        adapter.reset_for_new_request(0).unwrap();
+        let _ = adapter.find_cached_prefix(&[], &[], 0, false).unwrap();
+        adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        adapter.finalize_turn_keep_live(&[], 0).unwrap();
+
+        let plan = adapter
+            .prepare_turn_with_max_cache_hit_tokens(
+                0,
+                &tokens,
+                tokens.len() as u32,
+                true,
+                &[],
+                0,
+                false,
+                tokens.len() as u32 - 1,
+            )
+            .unwrap();
+
+        assert_eq!(plan.reason, PagedTurnPlanReason::FreshReset);
+        assert!(!plan.continued_live_prefix);
+        assert_eq!(plan.cached_prefix_len, 4);
+        assert_eq!(plan.suffix_len, 1);
+        assert_eq!(adapter.current_token_count(), 4);
 
         adapter.release_request().unwrap();
     }
