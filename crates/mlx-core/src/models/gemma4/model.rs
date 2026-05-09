@@ -240,6 +240,7 @@ pub(crate) struct Gemma4Inner {
     /// back to the flat `Gemma4LayerCache` path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
+    sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
     pub(crate) model_id: u64,
 }
@@ -806,6 +807,7 @@ impl Gemma4Inner {
             cached_image_key: None,
             paged_adapter,
             sliding_prefix_checkpoints: VecDeque::new(),
+            sliding_prompt_boundary_checkpoint: None,
             sliding_last_history_checkpoint: None,
             model_id,
         })
@@ -874,6 +876,7 @@ impl Gemma4Inner {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.sliding_prefix_checkpoints.clear();
+        self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
     }
 
@@ -962,6 +965,20 @@ impl Gemma4Inner {
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
             return Ok(None);
         };
+
+        if let Some(checkpoint) = self.sliding_prompt_boundary_checkpoint.as_ref() {
+            if checkpoint.prefix_len == prefix_len
+                && checkpoint.block_size == block_size
+                && checkpoint.final_block_hash == final_block_hash
+                && checkpoint.tokens.as_slice() == prefix_tokens
+            {
+                if let Some(caches) =
+                    restore_gemma4_sliding_caches(&self.config, &checkpoint.snapshots, prefix_len)?
+                {
+                    return Ok(Some(caches));
+                }
+            }
+        }
 
         for checkpoint in self.sliding_prefix_checkpoints.iter().rev() {
             if checkpoint.prefix_len != prefix_len
@@ -1120,6 +1137,67 @@ impl Gemma4Inner {
         Ok(trace.finish(total_start))
     }
 
+    fn remember_gemma4_sliding_materialized_prompt_boundary_checkpoint(
+        &mut self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        cache_salt: u64,
+    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
+        let trace_enabled = inference_trace_enabled();
+        let total_start = trace_enabled.then(std::time::Instant::now);
+        let mut trace = Gemma4SlidingCheckpointStoreTrace::default();
+        let Some(final_block_hash) =
+            compute_gemma4_paged_prefix_block_hash(tokens, prefix_len, block_size, cache_salt)
+        else {
+            self.sliding_prompt_boundary_checkpoint = None;
+            return Ok(trace.finish(total_start));
+        };
+        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
+            self.sliding_prompt_boundary_checkpoint = None;
+            return Ok(trace.finish(total_start));
+        };
+        if !gemma4_sliding_caches_ready_at(&self.config, self.caches.as_deref(), prefix_len)? {
+            self.sliding_prompt_boundary_checkpoint = None;
+            return Ok(trace.finish(total_start));
+        }
+
+        let snapshot_start = trace_enabled.then(std::time::Instant::now);
+        let Some(mut snapshots) = snapshot_gemma4_sliding_caches(
+            &self.config,
+            self.caches
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Gemma4 sliding prefix caches missing"))?,
+            prefix_len,
+        )?
+        else {
+            self.sliding_prompt_boundary_checkpoint = None;
+            trace.snapshot_ms = snapshot_start.map(elapsed_ms).unwrap_or(0.0);
+            return Ok(trace.finish(total_start));
+        };
+        trace.snapshot_ms = snapshot_start.map(elapsed_ms).unwrap_or(0.0);
+
+        let eval_start = trace_enabled.then(std::time::Instant::now);
+        materialize_gemma4_sliding_snapshots(&mut snapshots)?;
+        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
+
+        let token_clone_start = trace_enabled.then(std::time::Instant::now);
+        let prefix_tokens = prefix_tokens.to_vec();
+        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
+
+        let update_start = trace_enabled.then(std::time::Instant::now);
+        self.sliding_prompt_boundary_checkpoint = Some(Gemma4SlidingPrefixCheckpoint {
+            prefix_len,
+            block_size,
+            final_block_hash,
+            tokens: prefix_tokens,
+            snapshots,
+        });
+        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
+        trace.stored = true;
+        Ok(trace.finish(total_start))
+    }
+
     fn maybe_remember_gemma4_sliding_decode_boundary_checkpoint(
         &mut self,
         trace_label: &str,
@@ -1145,6 +1223,43 @@ impl Gemma4Inner {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] gemma4 {trace_label}_sliding_block_checkpoint boundary_tokens={} block_size={} stored={} materialize_ms={:.1} snapshot_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
                 prefix_len,
+                block_size,
+                store_trace.stored,
+                store_trace.eval_ms,
+                store_trace.snapshot_ms,
+                store_trace.token_clone_ms,
+                store_trace.update_ms,
+                store_trace.total_ms
+            ));
+        }
+        Ok(())
+    }
+
+    fn maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
+        &mut self,
+        trace_label: &str,
+        tokens: &[u32],
+        boundary_len: u32,
+        trace_enabled: bool,
+    ) -> Result<()> {
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return Ok(());
+        };
+        let block_size = adapter.block_size();
+        if boundary_len == 0 || block_size == 0 || !boundary_len.is_multiple_of(block_size) {
+            return Ok(());
+        }
+
+        let store_trace = self.remember_gemma4_sliding_materialized_prompt_boundary_checkpoint(
+            tokens,
+            boundary_len,
+            block_size,
+            0,
+        )?;
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] gemma4 {trace_label}_sliding_prompt_checkpoint boundary_tokens={} block_size={} stored={} materialize_ms={:.1} snapshot_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                boundary_len,
                 block_size,
                 store_trace.stored,
                 store_trace.eval_ms,
@@ -3740,6 +3855,13 @@ impl Gemma4Inner {
                 pass2_layer_loop_start.map(elapsed_ms).unwrap_or(0.0)
             ));
         }
+
+        self.maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
+            "paged_prefill",
+            full_tokens,
+            full_tokens.len() as u32,
+            trace_enabled,
+        )?;
 
         // Final norm + lm_head + softcap (only for the final token).
         hidden_states = self.final_norm.forward(&hidden_states)?;
@@ -7735,6 +7857,67 @@ mod tests {
         if let Some(adapter) = inner.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
+    }
+
+    #[test]
+    fn test_gemma4_prompt_boundary_checkpoint_survives_decode_checkpoint_eviction() {
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let block_size = 16;
+        let prompt: Vec<u32> = (10..26).collect();
+        let prompt_hash = super::compute_gemma4_paged_prefix_block_hash(
+            &prompt,
+            prompt.len() as u32,
+            block_size,
+            0,
+        )
+        .expect("prompt hash");
+        inner.sliding_prompt_boundary_checkpoint = Some(super::Gemma4SlidingPrefixCheckpoint {
+            prefix_len: prompt.len() as u32,
+            block_size,
+            final_block_hash: prompt_hash,
+            tokens: prompt.clone(),
+            snapshots: vec![None; inner.config.num_hidden_layers as usize],
+        });
+
+        for i in 0..(GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT + 3) {
+            let tokens: Vec<u32> = (0..16).map(|token| 100 + i as u32 + token).collect();
+            inner
+                .sliding_prefix_checkpoints
+                .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                    prefix_len: tokens.len() as u32,
+                    block_size,
+                    final_block_hash: i as u64 + 1,
+                    tokens,
+                    snapshots: vec![None; inner.config.num_hidden_layers as usize],
+                });
+            while inner.sliding_prefix_checkpoints.len() > GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT {
+                inner.sliding_prefix_checkpoints.pop_front();
+            }
+        }
+        assert_eq!(
+            inner.sliding_prefix_checkpoints.len(),
+            GEMMA4_SLIDING_PREFIX_CHECKPOINT_LIMIT
+        );
+
+        let restored = inner
+            .find_gemma4_sliding_prefix_checkpoint(&prompt, prompt.len() as u32, block_size, 0)
+            .expect("prefix lookup");
+        assert!(
+            restored.is_some(),
+            "prompt-boundary checkpoint must not be evicted by decode-boundary checkpoints"
+        );
     }
 
     /// KV-shared layers must resolve their anchor's pool slot
