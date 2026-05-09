@@ -1604,6 +1604,67 @@ fn paged_attention_factory_rejects_non_contiguous_seq_lens() {
     );
 }
 
+#[test]
+fn paged_attention_forward_rejects_non_contiguous_metadata() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_forward_rejects_non_contiguous_metadata() };
+    if rc == -3 {
+        eprintln!(
+            "paged_attention_forward_rejects_non_contiguous_metadata: \
+             Metal not available; skipping"
+        );
+        return;
+    }
+    assert_eq!(
+        rc, 1,
+        "mlx_paged_attention_forward must reject sliced metadata (got rc={rc}); \
+         the bridge must not mask block_table/seq_lens views with lazy \
+         contiguous copies because eval_gpu reads metadata host-side."
+    );
+}
+
+#[test]
+fn paged_attention_forward_accepts_materialized_metadata() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_forward_eval_accepts_materialized_metadata() };
+    if rc == -3 {
+        eprintln!(
+            "paged_attention_forward_accepts_materialized_metadata: \
+             Metal not available; skipping"
+        );
+        return;
+    }
+    assert_ne!(
+        rc, -1,
+        "mlx_paged_attention_forward valid-metadata helper hit an internal error"
+    );
+    assert_eq!(
+        rc, 1,
+        "mlx_paged_attention_forward must accept materialized, row-contiguous \
+         block_table/seq_lens and evaluate the lazy output successfully \
+         (got rc={rc})."
+    );
+}
+
+#[test]
+fn paged_kv_write_forward_accepts_materialized_metadata() {
+    let rc = unsafe { mlx_sys::mlx_paged_kv_write_forward_eval_smoke() };
+    if rc == -3 {
+        eprintln!(
+            "paged_kv_write_forward_accepts_materialized_metadata: \
+             Metal not available; skipping"
+        );
+        return;
+    }
+    assert_ne!(
+        rc, -1,
+        "mlx_paged_kv_write_forward smoke hit an eval-time error"
+    );
+    assert_eq!(
+        rc, 1,
+        "mlx_paged_kv_write_forward must accept materialized slot_mapping \
+         metadata and evaluate the lazy pool outputs successfully (got rc={rc})."
+    );
+}
+
 // =============================================================================
 // Phase 1 review-round-9: compile-cached eval_gpu must mirror the
 // factory's row-contiguous / zero-offset check.

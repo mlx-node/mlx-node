@@ -893,6 +893,26 @@ unsafe extern "C-unwind" {
         kv_dtype: u8,
     ) -> *mut mlx_array;
 
+    /// Emit the MLX C++ `paged_kv_write(...)` Custom primitive and return the
+    /// lazy K/V pool output arrays through `out_k_pool` / `out_v_pool`.
+    /// Returns false for bridge/factory validation errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_kv_write_forward(
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        new_k: *mut mlx_array,
+        new_v: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        block_size: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        kv_dtype: u8,
+        out_k_pool: *mut *mut mlx_array,
+        out_v_pool: *mut *mut mlx_array,
+    ) -> bool;
+
     /// Compare two `PagedKVWrite` primitives via `is_equivalent`.
     /// Returns `true` iff both are equivalent (same scalar state).
     pub fn mlx_paged_kv_write_is_equivalent(
@@ -1214,6 +1234,18 @@ unsafe extern "C-unwind" {
     /// seq_lens sliced as `seq_lens[1:]` (nonzero offset) must be
     /// rejected by the `paged_attention` factory.
     pub fn mlx_paged_attention_factory_rejects_non_contiguous_seq_lens() -> i32;
+
+    /// Production FFI bridge must reject non-contiguous metadata instead
+    /// of hiding it behind lazy `contiguous(...)` metadata copies.
+    pub fn mlx_paged_attention_forward_rejects_non_contiguous_metadata() -> i32;
+
+    /// Production FFI bridge must accept already-materialized metadata and
+    /// evaluate the returned lazy paged-attention output successfully.
+    pub fn mlx_paged_attention_forward_eval_accepts_materialized_metadata() -> i32;
+
+    /// Production FFI bridge must emit and evaluate lazy paged-kv-write pool
+    /// outputs without forcing Rust-side Metal buffer extraction.
+    pub fn mlx_paged_kv_write_forward_eval_smoke() -> i32;
 
     // =============================================================================
     // Phase 1 review-round-9 finding: PagedKVWrite::eval_gpu and

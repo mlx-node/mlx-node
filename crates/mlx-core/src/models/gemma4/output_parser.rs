@@ -4,6 +4,8 @@
 //!
 //! * `<|channel>thought\n...\n<channel|>` — reasoning/"chain-of-thought" block
 //! * `<|tool_call>call:NAME{K:V,K:V,...}<tool_call|>` — zero or more tool calls
+//! * `<|turn>role\n...\n<turn|>` — chat-template turn framing, stripped
+//!   defensively if the decode includes it.
 //! * `<|tool_response>...<tool_response|>`, `<|tool>...<tool|>` — input-only
 //!   tokens that should not appear on the model's output; this module still
 //!   strips them defensively if it ever sees them so they never leak through
@@ -47,6 +49,8 @@ const CHANNEL_OPEN: &str = "<|channel>";
 const CHANNEL_CLOSE: &str = "<channel|>";
 const TOOL_CALL_OPEN: &str = "<|tool_call>";
 const TOOL_CALL_CLOSE: &str = "<tool_call|>";
+const TURN_OPEN: &str = "<|turn>";
+const TURN_CLOSE: &str = "<turn|>";
 /// Input-only token — stripped defensively on output.
 const TOOL_RESPONSE_OPEN: &str = "<|tool_response>";
 /// Input-only token — stripped defensively on output.
@@ -58,10 +62,29 @@ const TOOL_CLOSE: &str = "<tool|>";
 /// String-delimiter used inside the DSL: `<|"|>str<|"|>`.
 const DSL_STRING_DELIM: &str = "<|\"|>";
 
-/// The set of opening delimiters the stream parser must watch for. Ordered
-/// longest-first so an in-progress prefix of a longer token is preferred
-/// over a shorter prefix that is always ambiguous (e.g. a literal `<`).
-const OPEN_MARKERS: &[&str] = &[TOOL_RESPONSE_OPEN, TOOL_CALL_OPEN, CHANNEL_OPEN, TOOL_OPEN];
+/// Closing delimiters are normally consumed only after their matching open
+/// marker. Keep watching for them in message state too so a malformed
+/// generation or a prompt/template mismatch cannot leak a bare structural
+/// close token into the user-visible text stream.
+const CLOSE_MARKERS: &[&str] = &[
+    TURN_CLOSE,
+    TOOL_RESPONSE_CLOSE,
+    TOOL_CALL_CLOSE,
+    CHANNEL_CLOSE,
+    TOOL_CLOSE,
+];
+const MESSAGE_MARKERS: &[&str] = &[
+    TURN_OPEN,
+    TURN_CLOSE,
+    TOOL_RESPONSE_OPEN,
+    TOOL_RESPONSE_CLOSE,
+    TOOL_CALL_OPEN,
+    TOOL_CALL_CLOSE,
+    CHANNEL_OPEN,
+    CHANNEL_CLOSE,
+    TOOL_OPEN,
+    TOOL_CLOSE,
+];
 
 // ---------------------------------------------------------------------------
 // DSL parsing
@@ -543,15 +566,15 @@ impl Gemma4StreamParser {
         }
     }
 
-    /// Message state: emit plain text up to the next opening marker, or
+    /// Message state: emit plain text up to the next marker, or
     /// buffer a possible partial marker at the tail. Returns `true` if
     /// the state transitioned (another iteration of the outer loop is
     /// needed) or the buffer is fully drained; `false` if we're waiting
     /// for more input.
     fn drain_until_open_marker(&mut self, out: &mut Vec<StreamSegment>, flushing: bool) -> bool {
-        // Search for the earliest opening marker.
+        // Search for the earliest message-state marker.
         let mut best: Option<(usize, &'static str)> = None;
-        for marker in OPEN_MARKERS {
+        for marker in MESSAGE_MARKERS {
             if let Some(idx) = self.pending.find(marker) {
                 match best {
                     Some((bi, _)) if bi <= idx => {}
@@ -567,6 +590,10 @@ impl Gemma4StreamParser {
             }
             // Consume the marker.
             self.pending.drain(..marker.len());
+            if CLOSE_MARKERS.contains(&marker) {
+                // Stray close marker. Drop it and keep scanning in Message.
+                return true;
+            }
             self.state = match marker {
                 m if m == CHANNEL_OPEN => {
                     self.saw_channel = true;
@@ -585,7 +612,8 @@ impl Gemma4StreamParser {
                     close: TOOL_RESPONSE_CLOSE,
                 },
                 m if m == TOOL_OPEN => StreamState::Swallow { close: TOOL_CLOSE },
-                _ => unreachable!("OPEN_MARKERS entry without matching branch"),
+                m if m == TURN_OPEN => StreamState::Swallow { close: "\n" },
+                _ => unreachable!("MESSAGE_MARKERS entry without matching branch"),
             };
             return true;
         }
@@ -599,7 +627,7 @@ impl Gemma4StreamParser {
             }
             return false;
         }
-        let hold = longest_prefix_hold(&self.pending, OPEN_MARKERS);
+        let hold = longest_prefix_hold(&self.pending, MESSAGE_MARKERS);
         if hold > 0 {
             let emit_len = self.pending.len() - hold;
             if emit_len > 0 {
@@ -1292,6 +1320,53 @@ mod tests {
             "short body that isn't the full label passes through unchanged",
         );
         assert_eq!(parser.thinking().as_deref(), Some("tho"));
+    }
+
+    #[test]
+    fn stream_parser_swallows_stray_close_markers_in_message_state() {
+        let mut parser = Gemma4StreamParser::new();
+        let mut all = Vec::new();
+        all.extend(parser.feed("before<chan"));
+        all.extend(parser.feed("nel|>middle<tool_call|>after"));
+        all.extend(parser.flush());
+
+        let text: String = all
+            .iter()
+            .filter_map(|s| {
+                if let StreamSegment::Text(t) = s {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(text, "beforemiddleafter");
+        assert!(parser.thinking().is_none());
+        assert!(parser.tool_calls().is_empty());
+    }
+
+    #[test]
+    fn stream_parser_swallows_stray_turn_markers_in_message_state() {
+        let mut parser = Gemma4StreamParser::new();
+        let mut all = Vec::new();
+        all.extend(parser.feed("before<tu"));
+        all.extend(parser.feed("rn|>middle<|tu"));
+        all.extend(parser.feed("rn>model\ninside<turn|>after"));
+        all.extend(parser.flush());
+
+        let text: String = all
+            .iter()
+            .filter_map(|s| {
+                if let StreamSegment::Text(t) = s {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(text, "beforemiddleinsideafter");
+        assert!(parser.thinking().is_none());
+        assert!(parser.tool_calls().is_empty());
     }
 
     #[test]

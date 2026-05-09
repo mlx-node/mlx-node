@@ -3019,14 +3019,13 @@ export interface Gemma4Config {
   /**
    * Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
    *
-   * When `Some(true)` or unset (the default), `Gemma4Inner` allocates
-   * a `BlockAllocator` + `LayerKVPool` pair and constructs a
-   * `PagedKVCacheAdapter`. Sliding-window layers stay on the existing
-   * flat `RotatingKVCache` path (window-trimmed semantics don't map
-   * onto the paged pool), while full_attention (global) layers route
-   * through the adapter — including `KV-shared` layers whose anchor
-   * is global (read via `read_kv_range`) and KV-shared layers whose
-   * anchor is sliding (pull from the flat anchor's stash).
+   * When `Some(true)` or unset (the default), `Gemma4Inner` builds
+   * model-independent KV-cache specs, groups them, and allocates a
+   * `BlockAllocator` + `LayerKVPool` pair for physical full-attention
+   * layers. Sliding-window layers still use `RotatingKVCache` until
+   * true paged sliding-window groups are wired. KV-shared layers are
+   * aliases: they reuse their anchor's cache slot and do not allocate
+   * separate physical storage.
    *
    * Default: `true` (paged adapter on; opt-out via
    * `use_block_paged_cache: false` in `config.json` to fall back to

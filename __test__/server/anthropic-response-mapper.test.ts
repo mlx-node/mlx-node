@@ -83,14 +83,25 @@ describe('buildAnthropicResponse', () => {
     const response = buildAnthropicResponse(result, baseReq, 'msg_thinking');
 
     expect(response.content).toHaveLength(2);
-    expect(response.content[0]).toEqual({ type: 'thinking', thinking: 'Let me reason through this.' });
+    expect(response.content[0]).toEqual({
+      type: 'thinking',
+      thinking: 'Let me reason through this.',
+    });
     expect(response.content[1]).toEqual({ type: 'text', text: 'Hello!' });
   });
 
   it('tool use response produces tool_use blocks with parsed input', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ id: 'toolu_01', name: 'get_weather', arguments: '{"city":"SF"}', status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_01',
+          name: 'get_weather',
+          arguments: '{"city":"SF"}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_tool');
 
@@ -104,10 +115,48 @@ describe('buildAnthropicResponse', () => {
     expect(response.stop_reason).toBe('tool_use');
   });
 
+  it('recovers Gemma4 raw tool-call text without duplicating reasoning when tools are not allowed', () => {
+    const result = makeChatResult({
+      text: '',
+      thinking: 'I should inspect files.',
+      toolCalls: [
+        {
+          id: 'toolu_01',
+          name: 'read_file',
+          arguments: '{"path":"Cargo.toml"}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
+      rawText:
+        '<|channel>thought\nI should inspect files.\n<channel|><|tool_call>call:read_file{path:<|"|>Cargo.toml<|"|>}<tool_call|><turn|>',
+    });
+    const response = buildAnthropicResponse(result, baseReq, 'msg_no_tools', undefined, false);
+
+    expect(response.stop_reason).toBe('end_turn');
+    expect(response.content).toHaveLength(2);
+    expect(response.content[0]).toEqual({
+      type: 'thinking',
+      thinking: 'I should inspect files.',
+    });
+    expect(response.content[1]).toEqual({
+      type: 'text',
+      text: '<|tool_call>call:read_file{path:<|"|>Cargo.toml<|"|>}<tool_call|>',
+    });
+  });
+
   it('tool use with object arguments uses them directly', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ id: 'toolu_02', name: 'search', arguments: { query: 'MLX' }, status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_02',
+          name: 'search',
+          arguments: { query: 'MLX' },
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_obj_args');
 
@@ -123,7 +172,15 @@ describe('buildAnthropicResponse', () => {
     const result = makeChatResult({
       thinking: 'I should call a tool.',
       text: 'Let me look that up.',
-      toolCalls: [{ id: 'toolu_03', name: 'lookup', arguments: '{"term":"foo"}', status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_03',
+          name: 'lookup',
+          arguments: '{"term":"foo"}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_mixed');
 
@@ -152,7 +209,11 @@ describe('buildAnthropicResponse', () => {
     // Anthropic spec leaves the cache fields OPTIONAL and other
     // Anthropic-compatible servers omit them on misses — so a wire
     // emitting `cache_read_input_tokens: 0` would diverge.
-    const result = makeChatResult({ promptTokens: 11, numTokens: 4, cachedTokens: 0 });
+    const result = makeChatResult({
+      promptTokens: 11,
+      numTokens: 4,
+      cachedTokens: 0,
+    });
     const response = buildAnthropicResponse(result, baseReq, 'msg_no_cache');
 
     expect(response.usage.input_tokens).toBe(11);
@@ -166,7 +227,11 @@ describe('buildAnthropicResponse', () => {
     // cost on the turn, so on a cache HIT it MUST be the unsuffixed
     // remainder (`promptTokens - cachedTokens`) — billing UIs read
     // these fields directly.
-    const result = makeChatResult({ promptTokens: 20, numTokens: 5, cachedTokens: 7 });
+    const result = makeChatResult({
+      promptTokens: 20,
+      numTokens: 5,
+      cachedTokens: 7,
+    });
     const response = buildAnthropicResponse(result, baseReq, 'msg_cache_hit');
 
     expect(response.usage.cache_read_input_tokens).toBe(7);
@@ -268,7 +333,15 @@ describe('buildAnthropicResponse', () => {
   it('empty text with tool calls produces no text block, only tool_use blocks', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ id: 'toolu_04', name: 'fn', arguments: '{}', status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_04',
+          name: 'fn',
+          arguments: '{}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_no_text');
 
@@ -280,7 +353,15 @@ describe('buildAnthropicResponse', () => {
   it('skips tool calls with status !== "ok"', () => {
     const result = makeChatResult({
       text: 'Done.',
-      toolCalls: [{ id: 'toolu_err', name: 'broken', arguments: '{}', status: 'error', rawContent: '' }],
+      toolCalls: [
+        {
+          id: 'toolu_err',
+          name: 'broken',
+          arguments: '{}',
+          status: 'error',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_err_tool');
 
@@ -291,7 +372,15 @@ describe('buildAnthropicResponse', () => {
   it('generates a toolu_ prefixed id when tool call id is missing', () => {
     const result = makeChatResult({
       text: '',
-      toolCalls: [{ id: undefined as unknown as string, name: 'fn', arguments: '{}', status: 'ok', rawContent: '' }],
+      toolCalls: [
+        {
+          id: undefined as unknown as string,
+          name: 'fn',
+          arguments: '{}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
     });
     const response = buildAnthropicResponse(result, baseReq, 'msg_gen_id');
 

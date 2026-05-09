@@ -443,7 +443,7 @@ fn run_paged_prefill_one_chunk_moe(
         // from the cache pool. Without this the in-flight lazy graph
         // accumulates ~50 GB on long contexts before the post-prefill
         // sync fires. Cadence is `MLX_PAGED_PREFILL_EVAL_INTERVAL` (default 8).
-        crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden);
+        crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden)?;
     }
     Ok(hidden)
 }

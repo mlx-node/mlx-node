@@ -59,6 +59,12 @@ Options:
                                   Defaults to 64.
     MLX_PAGED_CACHE_MEMORY_MB      Paged KV cache memory budget override for
                                   paged-aware Qwen3.5 launch.
+    MLX_GEMMA4_NATIVE_KV_WRITE    Set to 0/false/off to disable graph-native
+                                  Gemma4 global KV writes.
+    MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS
+                                  Max cached Gemma4 prefix tokens to replay
+                                  for sliding-cache restore. Defaults to 32768
+                                  for the 1024-token sliding window.
     MLX_INFERENCE_TRACE           Set to 1/true/on to write native inference
                                   phase traces to a file.
     MLX_INFERENCE_TRACE_FILE      Override the native trace file path.

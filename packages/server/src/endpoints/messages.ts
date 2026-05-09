@@ -79,6 +79,8 @@ import {
   buildMessageDelta,
   buildMessageStartEvent,
   buildMessageStop,
+  containsToolCallMarkup,
+  recoverSuppressedToolCallText,
   mapStopReason,
 } from '../mappers/anthropic-response.js';
 import { genId } from '../mappers/response.js';
@@ -323,8 +325,11 @@ async function handleStreamingNative(
           suppressedToolCalls = true;
         }
         const finalText =
-          !allowToolUse && event.text.length === 0 && parsedToolCalls.length > 0 && event.rawText.includes('<tool_call')
-            ? event.rawText
+          !allowToolUse &&
+          event.text.length === 0 &&
+          parsedToolCalls.length > 0 &&
+          containsToolCallMarkup(event.rawText)
+            ? recoverSuppressedToolCallText(event.rawText)
             : event.text;
         const okToolCalls = allowToolUse ? parsedToolCalls : [];
         const hasToolCalls = okToolCalls.length > 0;

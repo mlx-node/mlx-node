@@ -18,15 +18,27 @@ use super::quantized_linear::{LinearProj, QuantizedLinear};
 fn paged_prefill_paged_attention_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        // Gemma4's long-context traces showed this bridge can regress
-        // stability/memory independently from Qwen. Keep it behind a
-        // Gemma4-specific opt-in instead of the global experiment flag.
+        // Keep cache-hit suffix attention on the paged K/V pool by default.
+        // The fallback path materializes the full cached prefix through
+        // read_kv_range and dominates long-context prefill traces.
         std::env::var("MLX_GEMMA4_PAGED_PREFILL_PAGED_ATTENTION")
             .map(|value| {
                 let normalized = value.trim().to_ascii_lowercase();
                 !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
+    })
+}
+
+fn native_kv_write_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MLX_GEMMA4_NATIVE_KV_WRITE")
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+            })
+            .unwrap_or(true)
     })
 }
 
@@ -35,10 +47,14 @@ fn trim_mask(mask: Option<&MxArray>, kv_len: i64) -> Result<Option<MxArray>> {
     match mask {
         Some(m) => {
             let mask_len = m.shape_at(3)?;
-            if mask_len != kv_len {
+            if mask_len == kv_len {
+                Ok(Some(m.clone()))
+            } else if mask_len > kv_len {
                 Ok(Some(m.slice_axis(3, mask_len - kv_len, mask_len)?))
             } else {
-                Ok(Some(m.clone()))
+                Err(Error::from_reason(format!(
+                    "Gemma4 attention mask is shorter than K/V: mask_len={mask_len}, kv_len={kv_len}"
+                )))
             }
         }
         None => Ok(None),
@@ -553,20 +569,50 @@ impl Gemma4Attention {
                 adapter.num_allocated_blocks()
             ));
         }
-        adapter
-            .update_keys_values(
+        let write_path = if native_kv_write_enabled() {
+            match adapter.update_keys_values_native(
                 paged_idx,
                 &keys_paged,
                 &values_paged,
                 first_logical_position,
-            )
-            .map_err(napi::Error::from_reason)?;
+            ) {
+                Ok(()) => "native",
+                Err(err) => {
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 attention_paged_kv_write_fallback paged_idx={} first_position={} seq_len={} error={}",
+                            paged_idx, first_logical_position, seq_len, err
+                        ));
+                    }
+                    adapter
+                        .update_keys_values(
+                            paged_idx,
+                            &keys_paged,
+                            &values_paged,
+                            first_logical_position,
+                        )
+                        .map_err(napi::Error::from_reason)?;
+                    "legacy"
+                }
+            }
+        } else {
+            adapter
+                .update_keys_values(
+                    paged_idx,
+                    &keys_paged,
+                    &values_paged,
+                    first_logical_position,
+                )
+                .map_err(napi::Error::from_reason)?;
+            "legacy"
+        };
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 attention_paged_kv_write_done paged_idx={} first_position={} seq_len={} elapsed_ms={:.1}",
+                "[MLX_TRACE] gemma4 attention_paged_kv_write_done paged_idx={} first_position={} seq_len={} path={} elapsed_ms={:.1}",
                 paged_idx,
                 first_logical_position,
                 seq_len,
+                write_path,
                 write_trace_start.map(elapsed_ms).unwrap_or(0.0)
             ));
         }
@@ -617,16 +663,19 @@ impl Gemma4Attention {
                 }
                 out
             } else {
-                // Cache-hit multi-token prefill: by default use materialized
-                // K/V because the current paged-prefill bridge is slower for
-                // Gemma4 26B. Keep the bridge opt-in for memory experiments.
+                // Cache-hit multi-token prefill: prefer the MLX paged-attention
+                // bridge so each suffix token attends directly against the
+                // on-GPU paged pool. The helper represents token i with
+                // seq_len = cached_prefix_len + i + 1, matching the explicit
+                // offset causal mask used by the materialized fallback without
+                // copying full prefix K/V back through host memory.
                 let total_ctx = cached_prefix_len + (seq_len as u32);
                 let maybe_paged_attn = if batch == 1 && paged_prefill_paged_attention_enabled() {
                     let gather_trace_start = trace_enabled.then(std::time::Instant::now);
                     if trace_enabled {
                         write_inference_trace(format_args!(
-                            "[MLX_TRACE] gemma4 attention_paged_prefill_gather_start paged_idx={} cached_prefix={} seq_len={}",
-                            paged_idx, cached_prefix_len, seq_len
+                            "[MLX_TRACE] gemma4 attention_paged_prefill_gather_start paged_idx={} cached_prefix={} seq_len={} total_ctx={}",
+                            paged_idx, cached_prefix_len, seq_len, total_ctx
                         ));
                     }
 
@@ -652,10 +701,11 @@ impl Gemma4Attention {
                             ])?;
                             if trace_enabled {
                                 write_inference_trace(format_args!(
-                                    "[MLX_TRACE] gemma4 attention_paged_prefill_gather_done paged_idx={} cached_prefix={} seq_len={} elapsed_ms={:.1}",
+                                    "[MLX_TRACE] gemma4 attention_paged_prefill_gather_done paged_idx={} cached_prefix={} seq_len={} total_ctx={} path=paged_attention elapsed_ms={:.1}",
                                     paged_idx,
                                     cached_prefix_len,
                                     seq_len,
+                                    total_ctx,
                                     gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
                                 ));
                             }
@@ -664,8 +714,8 @@ impl Gemma4Attention {
                         Err(err) => {
                             if trace_enabled {
                                 write_inference_trace(format_args!(
-                                    "[MLX_TRACE] gemma4 attention_paged_prefill_gather_fallback paged_idx={} cached_prefix={} seq_len={} error={}",
-                                    paged_idx, cached_prefix_len, seq_len, err
+                                    "[MLX_TRACE] gemma4 attention_paged_prefill_gather_fallback paged_idx={} cached_prefix={} seq_len={} total_ctx={} error={}",
+                                    paged_idx, cached_prefix_len, seq_len, total_ctx, err
                                 ));
                             }
                             None
@@ -730,13 +780,13 @@ impl Gemma4Attention {
             }
         } else {
             // Single-token path (decode OR split-prefill pass 2):
-            // dispatch the `gather_kv_for_decode` Metal kernel directly
-            // against the on-GPU paged buffers. Avoids the per-step host
-            // roundtrip (~57 MB per layer per K/V on long contexts) that
-            // `read_kv_range` performs and that was driving a ~40 GB
-            // memory regression in long-context decode (see Fix #2 spec).
+            // dispatch graph-native paged attention directly against the
+            // on-GPU paged buffers. That keeps the native paged-kv-write
+            // outputs and the attention read in one MLX dependency graph,
+            // avoiding the per-layer sync that the raw gather fallback must
+            // do before it reads the pool outside MLX's scheduler.
             //
-            // `gather_kv_for_decode` expects queries shape
+            // `gather_kv_for_decode_graph` expects queries shape
             // `[1, num_query_heads, head_size]` (3-D). For seq_len=1
             // `queries_bhtd` is `[1, n_heads, 1, head_dim]`, so squeeze
             // axis 2 to land on the expected layout. Returns
@@ -747,9 +797,34 @@ impl Gemma4Attention {
                 self.num_heads as i64,
                 self.head_dim as i64,
             ])?;
-            let attn_3d = adapter
-                .gather_kv_for_decode(paged_idx, &queries_3d, 1.0, /* softcap */ 1.0)
-                .map_err(napi::Error::from_reason)?;
+            let gather_trace_start = trace_enabled.then(std::time::Instant::now);
+            let attn_3d = match adapter.gather_kv_for_decode_graph(paged_idx, &queries_3d, 1.0, 1.0)
+            {
+                Ok(attn_3d) => {
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 attention_paged_decode_gather_done paged_idx={} path=graph total_ctx={} elapsed_ms={:.1}",
+                            paged_idx,
+                            adapter.current_token_count(),
+                            gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                        ));
+                    }
+                    attn_3d
+                }
+                Err(err) => {
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 attention_paged_decode_gather_fallback paged_idx={} path=raw total_ctx={} error={}",
+                            paged_idx,
+                            adapter.current_token_count(),
+                            err
+                        ));
+                    }
+                    adapter
+                        .gather_kv_for_decode(paged_idx, &queries_3d, 1.0, /* softcap */ 1.0)
+                        .map_err(napi::Error::from_reason)?
+                }
+            };
             // Cast back to x's dtype so the residual stays homogeneous.
             let target_dtype = x.dtype()?;
             let attn_3d = attn_3d.astype(target_dtype)?;
@@ -794,6 +869,7 @@ impl Gemma4Attention {
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
+        let trace_enabled = inference_trace_enabled();
 
         // Q-only path (mirrors flat `forward_shared`).
         let queries = self.q_proj.forward(x)?;
@@ -803,16 +879,24 @@ impl Gemma4Attention {
         let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
         let queries_bhtd = self.rope.forward(&queries, cache_offset)?;
 
-        // SDPA. Same scale=1.0 as `forward_paged`. For prefill on a
-        // suffix, keep the on-GPU paged prefill helper opt-in; the default
-        // materialized path is currently faster for Gemma4. For decode
-        // (seq_len == 1), dispatch the on-GPU decode helper — every cached
-        // key is at a strictly earlier position, so mask=None is implicit.
+        // SDPA. Same scale=1.0 as `forward_paged`. For cache-hit suffix
+        // prefill, prefer the on-GPU paged prefill helper and fall back to
+        // materialized K/V only if the bridge rejects this shape/request. For
+        // decode (seq_len == 1), dispatch the on-GPU decode helper — every
+        // cached key is at a strictly earlier position, so mask=None is
+        // implicit.
         let attn_bhtd = if is_prefill && seq_len > 1 {
             let cached_prefix_len = total_ctx
                 .checked_sub(seq_len as u32)
                 .ok_or_else(|| Error::from_reason("forward_paged_shared: total_ctx < seq_len"))?;
             let maybe_paged_attn = if batch == 1 && paged_prefill_paged_attention_enabled() {
+                let gather_trace_start = trace_enabled.then(std::time::Instant::now);
+                if trace_enabled {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] gemma4 attention_paged_shared_prefill_gather_start anchor_paged_idx={} cached_prefix={} seq_len={} total_ctx={}",
+                        anchor_paged_idx, cached_prefix_len, seq_len, total_ctx
+                    ));
+                }
                 let queries_3d = queries_bhtd
                     .squeeze(Some(&[0]))?
                     .transpose(Some(&[1, 0, 2]))?;
@@ -825,14 +909,33 @@ impl Gemma4Attention {
                     Ok(attn_3d) => {
                         let target_dtype = x.dtype()?;
                         let attn_3d = attn_3d.astype(target_dtype)?;
-                        Some(attn_3d.transpose(Some(&[1, 0, 2]))?.reshape(&[
+                        let out = attn_3d.transpose(Some(&[1, 0, 2]))?.reshape(&[
                             1,
                             self.num_heads as i64,
                             seq_len,
                             self.head_dim as i64,
-                        ])?)
+                        ])?;
+                        if trace_enabled {
+                            write_inference_trace(format_args!(
+                                "[MLX_TRACE] gemma4 attention_paged_shared_prefill_gather_done anchor_paged_idx={} cached_prefix={} seq_len={} total_ctx={} path=paged_attention elapsed_ms={:.1}",
+                                anchor_paged_idx,
+                                cached_prefix_len,
+                                seq_len,
+                                total_ctx,
+                                gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                            ));
+                        }
+                        Some(out)
                     }
-                    Err(_) => None,
+                    Err(err) => {
+                        if trace_enabled {
+                            write_inference_trace(format_args!(
+                                "[MLX_TRACE] gemma4 attention_paged_shared_prefill_gather_fallback anchor_paged_idx={} cached_prefix={} seq_len={} total_ctx={} error={}",
+                                anchor_paged_idx, cached_prefix_len, seq_len, total_ctx, err
+                            ));
+                        }
+                        None
+                    }
                 }
             } else {
                 None
@@ -841,32 +944,97 @@ impl Gemma4Attention {
             match maybe_paged_attn {
                 Some(out) => out,
                 None => {
+                    let read_trace_start = trace_enabled.then(std::time::Instant::now);
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 attention_paged_shared_read_kv_start anchor_paged_idx={} total_ctx={} cached_prefix={} seq_len={}",
+                            anchor_paged_idx, total_ctx, cached_prefix_len, seq_len
+                        ));
+                    }
                     let (shared_keys, shared_values) = adapter
                         .read_kv_range(anchor_paged_idx, 0, total_ctx)
                         .map_err(napi::Error::from_reason)?;
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 attention_paged_shared_read_kv_done anchor_paged_idx={} total_ctx={} elapsed_ms={:.1}",
+                            anchor_paged_idx,
+                            total_ctx,
+                            read_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                        ));
+                    }
                     let mask =
                         create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
-                    scaled_dot_product_attention(
+                    let sdpa_trace_start = trace_enabled.then(std::time::Instant::now);
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 attention_paged_shared_sdpa_masked_start anchor_paged_idx={} q_len={} kv_len={} cached_prefix={}",
+                            anchor_paged_idx, seq_len, total_ctx, cached_prefix_len
+                        ));
+                    }
+                    let out = scaled_dot_product_attention(
                         &queries_bhtd,
                         &shared_keys,
                         &shared_values,
                         1.0,
                         Some(&mask),
-                    )?
+                    )?;
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 attention_paged_shared_sdpa_masked_done anchor_paged_idx={} q_len={} kv_len={} elapsed_ms={:.1}",
+                            anchor_paged_idx,
+                            seq_len,
+                            total_ctx,
+                            sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                        ));
+                    }
+                    out
                 }
             }
         } else {
             // Single-token path (decode OR split-prefill pass 2):
-            // dispatch `gather_kv_for_decode` against the anchor's paged
-            // slot. Queries shape: `[1, num_heads, head_dim]` (squeeze T=1).
+            // dispatch graph-native paged attention against the anchor's
+            // paged slot. Queries shape: `[1, num_heads, head_dim]`
+            // (squeeze T=1).
             let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
                 1,
                 self.num_heads as i64,
                 self.head_dim as i64,
             ])?;
-            let attn_3d = adapter
-                .gather_kv_for_decode(anchor_paged_idx, &queries_3d, 1.0, /* softcap */ 1.0)
-                .map_err(napi::Error::from_reason)?;
+            let gather_trace_start = trace_enabled.then(std::time::Instant::now);
+            let attn_3d = match adapter.gather_kv_for_decode_graph(
+                anchor_paged_idx,
+                &queries_3d,
+                1.0,
+                1.0,
+            ) {
+                Ok(attn_3d) => {
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 attention_paged_shared_decode_gather_done anchor_paged_idx={} path=graph total_ctx={} elapsed_ms={:.1}",
+                            anchor_paged_idx,
+                            total_ctx,
+                            gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                        ));
+                    }
+                    attn_3d
+                }
+                Err(err) => {
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] gemma4 attention_paged_shared_decode_gather_fallback anchor_paged_idx={} path=raw total_ctx={} error={}",
+                            anchor_paged_idx, total_ctx, err
+                        ));
+                    }
+                    adapter
+                        .gather_kv_for_decode(
+                            anchor_paged_idx,
+                            &queries_3d,
+                            1.0,
+                            /* softcap */ 1.0,
+                        )
+                        .map_err(napi::Error::from_reason)?
+                }
+            };
             let target_dtype = x.dtype()?;
             let attn_3d = attn_3d.astype(target_dtype)?;
             attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
@@ -959,5 +1127,34 @@ impl Gemma4Attention {
     }
     pub fn set_quantized_o_proj(&mut self, ql: QuantizedLinear) {
         self.o_proj.set_quantized(ql);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_mask_rejects_mask_shorter_than_kv() {
+        let mask = MxArray::zeros(&[1, 1, 2, 3], None).unwrap();
+        let err = match trim_mask(Some(&mask), 4) {
+            Ok(_) => panic!("expected trim_mask to reject a short mask"),
+            Err(err) => err,
+        };
+        assert!(
+            err.reason.contains("mask is shorter than K/V"),
+            "unexpected error: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn trim_mask_trims_longer_mask_to_kv_len() {
+        let mask = MxArray::zeros(&[1, 1, 2, 5], None).unwrap();
+        let trimmed = trim_mask(Some(&mask), 3).unwrap().unwrap();
+        assert_eq!(trimmed.shape_at(0).unwrap(), 1);
+        assert_eq!(trimmed.shape_at(1).unwrap(), 1);
+        assert_eq!(trimmed.shape_at(2).unwrap(), 2);
+        assert_eq!(trimmed.shape_at(3).unwrap(), 3);
     }
 }

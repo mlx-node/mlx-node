@@ -906,6 +906,7 @@ impl LayerKVPool {
         num_query_heads: u32,
         scale: f32,
         softcap: f32,
+        sliding_window: i32,
         k_scale: f32,
         v_scale: f32,
     ) -> Result<crate::metal::PagedAttentionOutput, String> {
@@ -998,10 +999,9 @@ impl LayerKVPool {
             // passes 1.0 when no manager is configured (non-FP8 path).
             k_scale,
             v_scale,
-            // Phase 7: LayerKVPool's direct attention helper is used by
-            // pure-Rust paged forwards that don't need sliding-window
-            // masking yet; default off.
-            sliding_window: 0,
+            // Phase 7: 0 means full context; positive values mask K/V older
+            // than `context_len - sliding_window`.
+            sliding_window,
         };
 
         // Cache dtype is the one declared at pool construction time; for

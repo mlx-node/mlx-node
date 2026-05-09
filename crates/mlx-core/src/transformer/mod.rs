@@ -15,7 +15,9 @@ mod attention_vjp_test;
 pub mod batch_kv_cache;
 pub mod block;
 pub mod fused_attention;
+pub mod hybrid_kv_cache_manager;
 pub mod kv_cache;
+pub mod kv_cache_spec;
 pub mod mlp;
 #[cfg(test)]
 mod mlp_test;
@@ -32,7 +34,19 @@ pub use attention::{Attention, QKVResult};
 pub use batch_kv_cache::BatchKVCache;
 pub use block::TransformerBlock;
 pub use fused_attention::FusedAttention;
+pub use hybrid_kv_cache_manager::{
+    HybridKVCacheManager, KVCacheGroupConfig as HybridKVCacheGroupConfig,
+    KVCacheGroupId as HybridKVCacheGroupId, KVCacheGroupState as HybridKVCacheGroupState,
+    LayerKVCacheKind as HybridLayerKVCacheKind,
+};
 pub use kv_cache::KVCache;
+pub use kv_cache_spec::{
+    AttentionKind, KVCacheDType, KVCacheGroup, KVCacheGroupPrefixHit, KVCachePhysicalLayout,
+    KVCacheSpecError, LayerKVCacheRoute, LayerKVCacheSpec, align_prefix_len_to_kv_cache_groups,
+    common_kv_cache_block_alignment, derive_layer_kv_cache_routes,
+    derive_layer_kv_cache_routes_from_groups, group_layer_kv_cache_specs,
+    intersect_kv_cache_group_prefix_hits, validate_layer_kv_cache_specs,
+};
 pub use mlp::MLP;
 pub use paged_attention::{
     CompletedSequence, ContinuousBatchingScheduler, MemoryStats, PagedAttentionConfig,

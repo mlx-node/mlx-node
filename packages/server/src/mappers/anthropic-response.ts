@@ -34,6 +34,23 @@ export function mapStopReason(finishReason: string, hasToolCalls: boolean): 'end
   return 'end_turn';
 }
 
+export function containsToolCallMarkup(rawText: string): boolean {
+  return (
+    rawText.includes('<tool_call') ||
+    rawText.includes('</tool_call') ||
+    rawText.includes('<|tool_call') ||
+    rawText.includes('<tool_call|>')
+  );
+}
+
+export function recoverSuppressedToolCallText(rawText: string): string {
+  return rawText
+    .replace(/<\|channel>[\s\S]*?(?:<channel\|>|$)/g, '')
+    .replace(/<channel\|>/g, '')
+    .replace(/<\|turn>[^\n]*(?:\n|$)/g, '')
+    .replace(/<turn\|>/g, '');
+}
+
 export function buildAnthropicContent(result: ChatResult, allowToolUse = true): AnthropicResponseContent[] {
   const content: AnthropicResponseContent[] = [];
 
@@ -44,8 +61,8 @@ export function buildAnthropicContent(result: ChatResult, allowToolUse = true): 
   const parsedToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
   const okToolCalls = allowToolUse ? parsedToolCalls : [];
   const text =
-    !allowToolUse && result.text.length === 0 && parsedToolCalls.length > 0 && result.rawText.includes('<tool_call')
-      ? result.rawText
+    !allowToolUse && result.text.length === 0 && parsedToolCalls.length > 0 && containsToolCallMarkup(result.rawText)
+      ? recoverSuppressedToolCallText(result.rawText)
       : result.text;
 
   // Emit a text block unless tool calls exist and there is no text.
@@ -194,7 +211,9 @@ export function buildMessageDelta(
   // omitted by an in-process driver / mock) the cache fields stay
   // off the wire. See the matching block on `buildAnthropicResponse`
   // and the field-level docstrings on `AnthropicUsage`.
-  const usage: AnthropicMessageDeltaEvent['usage'] = { output_tokens: outputTokens };
+  const usage: AnthropicMessageDeltaEvent['usage'] = {
+    output_tokens: outputTokens,
+  };
   if (cachedTokens != null && cachedTokens > 0) {
     if (inputTokens != null) {
       usage.input_tokens = inputTokens - cachedTokens;

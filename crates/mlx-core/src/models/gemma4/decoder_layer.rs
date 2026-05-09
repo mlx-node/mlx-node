@@ -22,8 +22,9 @@ use super::quantized_linear::{Gemma4MLPVariant, QuantizedLinear, QuantizedSwitch
 /// Indexing rules:
 /// * `paged_idx` is the GLOBAL-LAYER ORDINAL into the paged adapter's
 ///   `LayerKVPool` (NOT the absolute decoder index). The pool is sized
-///   for the count of `full_attention` layers in `config.layer_types`,
-///   so global layers are numbered 0..N_global in their original order.
+///   for physical non-shared `full_attention` layers in `config.layer_types`,
+///   so global owner layers are numbered 0..N_global in their original order.
+///   KV-shared global layers reuse their anchor's ordinal.
 /// * `anchor_layer_idx` (in `SharedOnSliding`) is the ABSOLUTE decoder
 ///   index of the anchor whose flat `Gemma4LayerCache::Sliding` slot
 ///   feeds the shared layer's K/V via `take_stashed_kv`.

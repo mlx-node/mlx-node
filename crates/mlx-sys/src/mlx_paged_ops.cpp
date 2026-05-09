@@ -1343,17 +1343,22 @@ mlx_array* mlx_paged_attention_forward(
 
     // The public factory rejects non-row-contiguous/nonzero-offset inputs.
     // `q` is often produced by reshape/slice/rope chains in Rust model code,
-    // so materialize cheap metadata tensors and q explicitly at this bridge.
+    // so materialize q explicitly at this bridge.
+    //
+    // Metadata is different: `PagedAttention::eval_gpu` performs host-side
+    // content checks on block_table/seq_lens before dispatch. Wrapping those
+    // arrays in lazy `contiguous(...)` nodes can make the validator read lazy
+    // metadata copies rather than the adapter-owned materialized arrays. Keep
+    // the metadata contract strict here: Rust owns materialized, row-contiguous,
+    // zero-offset metadata arrays, and the factory validates that contract.
     auto q = contiguous(q_raw);
-    auto block_table = contiguous(block_table_raw);
-    auto seq_lens = contiguous(seq_lens_raw);
 
     auto out = paged_attention(
         q,
         k_pool,
         v_pool,
-        block_table,
-        seq_lens,
+        block_table_raw,
+        seq_lens_raw,
         k_scale,
         v_scale,
         scale,
@@ -1372,6 +1377,89 @@ mlx_array* mlx_paged_attention_forward(
   } catch (...) {
     mlx_trace_native_error("paged_attention_forward", "unknown exception");
     return nullptr;
+  }
+}
+
+/// Production FFI: emit a `PagedKVWrite` MLX Custom primitive and return the
+/// dependency-carrying K/V pool output arrays. The returned arrays share the
+/// same Metal buffers as the input pools, but they also carry the MLX graph edge
+/// from `new_k/new_v` -> cache write. Rust callers must feed these arrays into
+/// subsequent MLX paged-attention reads, or explicitly eval them before raw
+/// Metal readers touch the pool.
+///
+/// Returns false on bridge/factory validation errors. GPU dispatch errors still
+/// surface later when MLX evaluates the returned arrays.
+bool mlx_paged_kv_write_forward(
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* new_k_ptr,
+    mlx_array* new_v_ptr,
+    mlx_array* slot_mapping_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    int block_size,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype_raw,
+    mlx_array** out_k_pool_ptr,
+    mlx_array** out_v_pool_ptr) {
+  if (out_k_pool_ptr) {
+    *out_k_pool_ptr = nullptr;
+  }
+  if (out_v_pool_ptr) {
+    *out_v_pool_ptr = nullptr;
+  }
+  if (!k_pool_ptr || !v_pool_ptr || !new_k_ptr || !new_v_ptr ||
+      !slot_mapping_ptr || !k_scale_ptr || !v_scale_ptr || !out_k_pool_ptr ||
+      !out_v_pool_ptr) {
+    return false;
+  }
+
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::fast;
+
+    auto& k_pool       = *reinterpret_cast<array*>(k_pool_ptr);
+    auto& v_pool       = *reinterpret_cast<array*>(v_pool_ptr);
+    auto& new_k_raw    = *reinterpret_cast<array*>(new_k_ptr);
+    auto& new_v_raw    = *reinterpret_cast<array*>(new_v_ptr);
+    auto& slot_mapping = *reinterpret_cast<array*>(slot_mapping_ptr);
+    auto& k_scale      = *reinterpret_cast<array*>(k_scale_ptr);
+    auto& v_scale      = *reinterpret_cast<array*>(v_scale_ptr);
+
+    auto kv_dtype = static_cast<KvDtype>(kv_dtype_raw);
+
+    // Rust model code commonly produces K/V via transpose/reshape chains.
+    // Keep these as lazy MLX `contiguous(...)` nodes instead of extracting
+    // Metal buffers on the Rust side; this is the point of the bridge.
+    auto new_k = contiguous(new_k_raw);
+    auto new_v = contiguous(new_v_raw);
+
+    auto out = paged_kv_write(
+        k_pool,
+        v_pool,
+        new_k,
+        new_v,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        block_size,
+        num_kv_heads,
+        head_size,
+        x_pack_for(kv_dtype),
+        kv_dtype);
+
+    *out_k_pool_ptr = reinterpret_cast<mlx_array*>(
+        new array(std::move(out.first)));
+    *out_v_pool_ptr = reinterpret_cast<mlx_array*>(
+        new array(std::move(out.second)));
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("paged_kv_write_forward", e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error("paged_kv_write_forward", "unknown exception");
+    return false;
   }
 }
 
@@ -3805,6 +3893,185 @@ int mlx_paged_attention_factory_rejects_non_contiguous_seq_lens() {
     return 0;
   }
   return 0;
+}
+
+/// Regression for the production FFI bridge: it must not hide invalid
+/// metadata views by wrapping block_table/seq_lens in `contiguous(...)`.
+/// Metadata is host-read inside `PagedAttention::eval_gpu`, so the bridge
+/// preserves the adapter-owned metadata arrays and lets the factory reject
+/// non-row-contiguous / nonzero-offset metadata. Returns 1 when the bridge
+/// rejects the sliced block_table, 0 if it incorrectly returns a lazy output,
+/// and -3 if Metal is unavailable for slice materialization.
+int mlx_paged_attention_forward_rejects_non_contiguous_metadata() {
+  using namespace mlx::core;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  array bt_full = make_int32_zeros(Shape{2, 4});
+  eval(bt_full);
+  array bt_sliced = mlx::core::slice(
+      bt_full,
+      Shape{1, 0},
+      Shape{2, 4},
+      Shape{1, 1});
+  eval(bt_sliced);
+
+  array q = make_bf16_zeros(Shape{1, 8, 64});
+  array k_pool = make_bf16_zeros(Shape{4, 4, 8, 16, 8});
+  array v_pool = make_bf16_zeros(Shape{4, 4, 64, 16});
+  std::vector<int32_t> seq_host = {1};
+  array seq_lens(seq_host.data(), Shape{1}, int32);
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  auto* out_ptr = mlx_paged_attention_forward(
+      reinterpret_cast<mlx_array*>(&q),
+      reinterpret_cast<mlx_array*>(&k_pool),
+      reinterpret_cast<mlx_array*>(&v_pool),
+      reinterpret_cast<mlx_array*>(&bt_sliced),
+      reinterpret_cast<mlx_array*>(&seq_lens),
+      reinterpret_cast<mlx_array*>(&k_scale),
+      reinterpret_cast<mlx_array*>(&v_scale),
+      /*scale=*/0.125f,
+      /*softcap=*/0.0f,
+      /*sliding_window=*/0,
+      /*block_size=*/16,
+      /*num_q_heads=*/8,
+      /*num_kv_heads=*/4,
+      /*head_size=*/64,
+      /*kv_dtype_raw=*/1);
+
+  if (out_ptr == nullptr) {
+    return 1;
+  }
+  delete reinterpret_cast<array*>(out_ptr);
+  return 0;
+}
+
+/// Valid bridge smoke: materialized, row-contiguous metadata should survive
+/// the FFI wrapper and evaluate later as a lazy paged-attention output.
+/// Returns 1 on success, 0 on eval-time metadata validation failure, -1 on
+/// internal setup/dispatch errors, and -3 if Metal is unavailable.
+int mlx_paged_attention_forward_eval_accepts_materialized_metadata() {
+  using namespace mlx::core;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  array q = make_bf16_zeros(Shape{2, 8, 64});
+  array k_pool = make_bf16_zeros(Shape{4, 4, 8, 16, 8});
+  array v_pool = make_bf16_zeros(Shape{4, 4, 64, 16});
+  std::vector<int32_t> blocks = {
+      0, -1, -1, -1,
+      0,  1, -1, -1,
+  };
+  std::vector<int32_t> seqs = {1, 17};
+  array block_table(blocks.data(), Shape{2, 4}, int32);
+  array seq_lens(seqs.data(), Shape{2}, int32);
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  auto* out_ptr = mlx_paged_attention_forward(
+      reinterpret_cast<mlx_array*>(&q),
+      reinterpret_cast<mlx_array*>(&k_pool),
+      reinterpret_cast<mlx_array*>(&v_pool),
+      reinterpret_cast<mlx_array*>(&block_table),
+      reinterpret_cast<mlx_array*>(&seq_lens),
+      reinterpret_cast<mlx_array*>(&k_scale),
+      reinterpret_cast<mlx_array*>(&v_scale),
+      /*scale=*/0.125f,
+      /*softcap=*/0.0f,
+      /*sliding_window=*/0,
+      /*block_size=*/16,
+      /*num_q_heads=*/8,
+      /*num_kv_heads=*/4,
+      /*head_size=*/64,
+      /*kv_dtype_raw=*/1);
+
+  if (out_ptr == nullptr) {
+    return -1;
+  }
+
+  auto* out = reinterpret_cast<array*>(out_ptr);
+  try {
+    eval(*out);
+  } catch (const std::invalid_argument& e) {
+    fprintf(stderr, "[paged_attention_forward_valid_metadata] %s\n", e.what());
+    delete out;
+    return 0;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[paged_attention_forward_valid_metadata] %s\n", e.what());
+    delete out;
+    return -1;
+  } catch (...) {
+    delete out;
+    return -1;
+  }
+
+  delete out;
+  return 1;
+}
+
+/// Valid bridge smoke: materialized metadata and lazy K/V inputs should emit
+/// dependency-carrying pool outputs and evaluate successfully.
+/// Returns 1 on success, 0 when the production bridge rejects the setup, -1 on
+/// eval-time failure, and -3 if Metal is unavailable.
+int mlx_paged_kv_write_forward_eval_smoke() {
+  using namespace mlx::core;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+
+  try {
+    array k_pool = make_bf16_zeros(Shape{4, 4, 8, 16, 8});
+    array v_pool = make_bf16_zeros(Shape{4, 4, 64, 16});
+    array new_k = make_bf16_zeros(Shape{2, 4, 64});
+    array new_v = make_bf16_zeros(Shape{2, 4, 64});
+    std::vector<int64_t> slots = {0, 1};
+    array slot_mapping(slots.data(), Shape{2}, int64);
+    array k_scale(1.0f, float32);
+    array v_scale(1.0f, float32);
+    eval(slot_mapping);
+
+    mlx_array* out_k = nullptr;
+    mlx_array* out_v = nullptr;
+    bool ok = mlx_paged_kv_write_forward(
+        reinterpret_cast<mlx_array*>(&k_pool),
+        reinterpret_cast<mlx_array*>(&v_pool),
+        reinterpret_cast<mlx_array*>(&new_k),
+        reinterpret_cast<mlx_array*>(&new_v),
+        reinterpret_cast<mlx_array*>(&slot_mapping),
+        reinterpret_cast<mlx_array*>(&k_scale),
+        reinterpret_cast<mlx_array*>(&v_scale),
+        /*block_size=*/16,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        /*kv_dtype_raw=*/1,
+        &out_k,
+        &out_v);
+    if (!ok || out_k == nullptr || out_v == nullptr) {
+      if (out_k) {
+        delete reinterpret_cast<array*>(out_k);
+      }
+      if (out_v) {
+        delete reinterpret_cast<array*>(out_v);
+      }
+      return 0;
+    }
+
+    auto* k_out = reinterpret_cast<array*>(out_k);
+    auto* v_out = reinterpret_cast<array*>(out_v);
+    eval(*k_out, *v_out);
+    delete k_out;
+    delete v_out;
+    return 1;
+  } catch (...) {
+    return -1;
+  }
 }
 
 } // extern "C"

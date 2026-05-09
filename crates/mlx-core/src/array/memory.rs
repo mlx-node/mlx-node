@@ -193,15 +193,19 @@ fn parse_chunk_size(env_value: Option<String>) -> i32 {
 /// tensor (e.g. an attention K/V) lets MLX skip the rest of the graph
 /// and the memory peak persists.
 #[inline]
-pub fn maybe_eval_clear_for_paged_prefill_layer(layer_idx: usize, hidden_states: &super::MxArray) {
+pub fn maybe_eval_clear_for_paged_prefill_layer(
+    layer_idx: usize,
+    hidden_states: &super::MxArray,
+) -> napi::Result<()> {
     let interval = paged_prefill_eval_interval();
     if interval <= 0 {
-        return;
+        return Ok(());
     }
     if (layer_idx + 1).is_multiple_of(interval as usize) {
-        hidden_states.eval();
+        super::MxArray::eval_arrays(&[hidden_states])?;
         clear_cache();
     }
+    Ok(())
 }
 
 /// Get actively used memory in bytes (excludes cached memory).
