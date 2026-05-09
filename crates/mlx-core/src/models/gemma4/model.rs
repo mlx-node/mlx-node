@@ -3657,7 +3657,17 @@ impl Gemma4Inner {
                 })?;
             let paged_attention_enabled =
                 gemma4_paged_prefill_paged_attention_enabled_for_chunking();
-            let body_chunk_plan = gemma4_paged_prefill_body_chunk_plan(
+            let block_size = self
+                .paged_adapter
+                .as_ref()
+                .map(|adapter| adapter.block_size())
+                .unwrap_or(0);
+            let prompt_checkpoint_boundary_len = if block_size > 0 {
+                (full_tokens.len() as u32 / block_size) * block_size
+            } else {
+                0
+            };
+            let mut body_chunk_plan = gemma4_paged_prefill_body_chunk_plan(
                 configured_chunk_size,
                 pass1_tokens.len(),
                 pass2_first_position,
@@ -3665,6 +3675,10 @@ impl Gemma4Inner {
                 global_head_size,
                 paged_attention_enabled,
             )?;
+            gemma4_split_body_chunk_plan_at_position(
+                &mut body_chunk_plan,
+                prompt_checkpoint_boundary_len,
+            );
             let total_body_chunks = body_chunk_plan.len();
             let first_body_chunk_size = body_chunk_plan.first().map(|chunk| chunk.len).unwrap_or(0);
             let min_body_chunk_size = body_chunk_plan
@@ -3788,6 +3802,14 @@ impl Gemma4Inner {
                     .ok_or_else(|| {
                         Error::from_reason("Gemma4 paged prefill token position overflow")
                     })?;
+                if pass2_first_position == prompt_checkpoint_boundary_len {
+                    self.maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
+                        "paged_prefill",
+                        full_tokens,
+                        prompt_checkpoint_boundary_len,
+                        trace_enabled,
+                    )?;
+                }
                 if trace_enabled {
                     write_inference_trace(format_args!(
                         "[MLX_TRACE] gemma4 paged_prefill_body_chunk_done chunk={}/{} next_position={} elapsed_ms={:.1}",
@@ -3859,7 +3881,7 @@ impl Gemma4Inner {
         self.maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
             "paged_prefill",
             full_tokens,
-            full_tokens.len() as u32,
+            pass2_first_position + pass2_tokens.len() as u32,
             trace_enabled,
         )?;
 
@@ -6738,6 +6760,35 @@ fn gemma4_coalesce_single_token_restore_chunks(chunks: &mut Vec<Gemma4PagedPrefi
     *chunks = merged;
 }
 
+fn gemma4_split_body_chunk_plan_at_position(
+    chunks: &mut Vec<Gemma4PagedPrefillBodyChunk>,
+    boundary_position: u32,
+) {
+    if boundary_position == 0 {
+        return;
+    }
+
+    let Some(idx) = chunks.iter().position(|chunk| {
+        let first = chunk.first_position as u64;
+        let end = first + chunk.len as u64;
+        boundary_position as u64 > first && (boundary_position as u64) < end
+    }) else {
+        return;
+    };
+
+    let chunk = &mut chunks[idx];
+    let before_len = (boundary_position - chunk.first_position) as usize;
+    let after_len = chunk.len - before_len;
+    let after_chunk = Gemma4PagedPrefillBodyChunk {
+        start: chunk.start + before_len,
+        len: after_len,
+        first_position: boundary_position,
+        capped_by_v2_aux_limit: chunk.capped_by_v2_aux_limit,
+    };
+    chunk.len = before_len;
+    chunks.insert(idx + 1, after_chunk);
+}
+
 fn gemma4_paged_attention_v2_aux_fits(
     num_new_tokens: usize,
     first_position: u32,
@@ -7283,6 +7334,32 @@ mod tests {
             vec![2, 3]
         );
         assert_eq!(one_token_chunks[1].first_position, 2);
+    }
+
+    #[test]
+    fn test_gemma4_paged_prefill_chunk_plan_splits_prompt_cache_boundary() {
+        let mut plan =
+            super::gemma4_paged_prefill_body_chunk_plan(1024, 1432, 44_320, 16, 512, false)
+                .unwrap();
+        super::gemma4_split_body_chunk_plan_at_position(&mut plan, 45_744);
+        assert_eq!(
+            plan.iter().map(|chunk| chunk.len).collect::<Vec<_>>(),
+            vec![1024, 400, 8]
+        );
+        assert_eq!(
+            plan.iter()
+                .map(|chunk| chunk.first_position)
+                .collect::<Vec<_>>(),
+            vec![44_320, 45_344, 45_744]
+        );
+        assert_eq!(
+            plan.iter().map(|chunk| chunk.start).collect::<Vec<_>>(),
+            vec![0, 1024, 1424]
+        );
+
+        let mut unchanged = plan.clone();
+        super::gemma4_split_body_chunk_plan_at_position(&mut unchanged, 45_344);
+        assert_eq!(unchanged, plan);
     }
 
     #[test]
