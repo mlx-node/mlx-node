@@ -1001,6 +1001,82 @@ describe('handleCreateMessage', () => {
       expect(config.maxNewTokens).toBe(16);
     });
 
+    it('uses a short non-thinking config for Claude Code title generation requests', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: '{', done: false, isReasoning: true },
+        { text: '{"title": "Analyze codebase architecture"}', done: false, isReasoning: false },
+        {
+          text: '{"title": "Analyze codebase architecture"}',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 32,
+          reasoningTokens: 0,
+          rawText: '{"title": "Analyze codebase architecture"}',
+        },
+      ];
+      const mockModel = createMockStreamModel(streamEvents);
+      registry.register('test-model', mockModel, { maxOutputTokens: 81920 });
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'Deepresearch the whole codebase, describe the architecture' }],
+          system: [
+            { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.138; cch=d2ad0;' },
+            { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+            {
+              type: 'text',
+              text:
+                'Generate a concise, sentence-case title (3-7 words) that captures the main topic. ' +
+                'Return JSON with a single "title" field.',
+            },
+          ],
+          tools: [],
+          max_tokens: 64000,
+          output_config: {
+            format: {
+              type: 'json_schema',
+              schema: {
+                type: 'object',
+                properties: { title: { type: 'string' } },
+                required: ['title'],
+                additionalProperties: false,
+              },
+            },
+          },
+          stream: true,
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const streamSpy = mockModel.chatStreamSessionStart as unknown as ReturnType<typeof vi.fn>;
+      const config = streamSpy.mock.calls[0]?.[1] as {
+        maxNewTokens?: number;
+        reasoningEffort?: string;
+        thinkingTokenBudget?: number;
+        includeReasoning?: boolean;
+      };
+      expect(config.maxNewTokens).toBe(128);
+      expect(config.reasoningEffort).toBe('none');
+      expect(config.thinkingTokenBudget).toBe(0);
+      expect(config.includeReasoning).toBe(false);
+
+      const events = parseSSE(getBody());
+      const thinkingStart = events.find(
+        (event) =>
+          event.event === 'content_block_start' &&
+          (event.data['content_block'] as Record<string, unknown> | undefined)?.['type'] === 'thinking',
+      );
+      expect(thinkingStart).toBeUndefined();
+    });
+
     it('emits thinking + text with correct content block indices', async () => {
       const registry = new ModelRegistry();
       const streamEvents = [

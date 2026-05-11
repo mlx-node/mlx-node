@@ -752,16 +752,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     &per_layer_quant,
                 )?;
 
-                // Register weights with C++
-                if !is_quantized_checkpoint(&params) && !is_mxfp8_checkpoint(&params) {
-                    register_weights_with_cpp(&params, inner.model_id);
-                } else {
-                    info!(
-                        "Skipping C++ compiled path for quantized model (using Rust quantized_matmul)"
-                    );
-                    let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
-                    unsafe { mlx_sys::mlx_clear_weights() };
-                }
+                // Register weights with C++. The dense compiled graph uses the
+                // shared quant-aware `linear_proj` helper for projections, so
+                // Q8/MXFP8 checkpoints can take the same compiled decode path
+                // as bf16 checkpoints.
+                register_weights_with_cpp(&params, inner.model_id);
 
                 // Materialize mmap-backed weights
                 {

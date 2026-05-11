@@ -1631,6 +1631,21 @@ unsafe extern "C-unwind" {
     /// Get current compiled cache offset (tokens processed).
     pub fn mlx_qwen35_get_cache_offset() -> i32;
 
+    /// Export paged dense linear-attention caches for live-session continuation.
+    /// Full-attention K/V stays in the Rust paged adapter pools; this returns
+    /// the paged graph's per-layer `(conv_state, recurrent_state)` slots so
+    /// Rust can seed the next turn without replaying the cached prefix through
+    /// GDN. Returns number of arrays exported, or 0 if paged state is not
+    /// initialized.
+    pub fn mlx_qwen35_export_paged_linear_caches(
+        out_ptrs: *mut *mut mlx_array,
+        max_count: i32,
+    ) -> i32;
+
+    /// Get current paged dense cache offset (tokens processed by the compiled
+    /// paged decode graph).
+    pub fn mlx_qwen35_get_paged_cache_offset() -> i32;
+
     // ============================================
     // Phase 5 piece 1: paged Dense forward (coexists with the flat
     // compiled path). The Rust dispatcher decides per-turn which graph

@@ -47,7 +47,7 @@ Options:
 
   Environment variables:
     MLX_PAGED_PREFILL_CHUNK_SIZE  Tokens per paged-prefill chunk. Defaults to
-                                  1024 under \`mlx launch claude\` to bound
+                                  2048 under \`mlx launch claude\` to bound
                                   cold-prefill memory peaks; set to 0 to
                                   disable chunking, or tune explicitly for
                                   your workload.
@@ -156,13 +156,13 @@ export async function run(argv: string[]): Promise<void> {
   // Bound paged-prefill memory peak by chunking the prompt. Keep this as a
   // launcher default, not a Rust default: the shared native env var still uses
   // 0 as "disable chunking", and non-Claude callers may want single-shot
-  // behavior. On Gemma4 26B Q8, a 36K-token cold-prefill sweep on this machine
-  // measured 1024 faster than 512 / 2048 / 4096 while preserving the same
-  // final-token split. Respect any user-provided value (set in shell). The MLX
-  // env var is read via OnceLock on first paged-prefill call, so setting
-  // `process.env` here before model load is sufficient.
+  // behavior. 2048 matches the mlx-lm / mlx-vlm default and reduces per-chunk
+  // overhead versus the previous 1024 default for long Qwen dense contexts.
+  // Respect any user-provided value (set in shell). The MLX env var is read via
+  // OnceLock on first paged-prefill call, so setting `process.env` here before
+  // model load is sufficient.
   if (process.env.MLX_PAGED_PREFILL_CHUNK_SIZE == null) {
-    process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '1024';
+    process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '2048';
   }
 
   const modelsDir = resolveModelsDir(args['models-dir']);

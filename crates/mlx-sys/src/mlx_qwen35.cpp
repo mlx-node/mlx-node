@@ -61,6 +61,11 @@ static std::vector<array> g_dense_paged_linear_caches;  // [num_layers * 2]
 static int g_dense_paged_offset_int = 0;
 static bool g_dense_paged_inited = false;
 
+static bool dense_paged_is_linear_layer(int layer) {
+  int interval = g_dense_paged_config.full_attention_interval;
+  return interval <= 0 || ((layer + 1) % interval != 0);
+}
+
 // =============================================================================
 // The compilable forward function
 // inputs: [h, offset_arr, cache[0].a, cache[0].b, ..., cache[N-1].a, cache[N-1].b]
@@ -114,18 +119,18 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
     // MLP (SwiGLU)
     std::string mp = lp + ".mlp.";
     auto mlp_in  = fast::rms_norm(h, get_weight(lp + ".post_attention_layernorm.weight"), cfg.rms_norm_eps);
-    auto gate    = matmul(mlp_in, get_weight_t(mp + "gate_proj.weight"));
-    auto up      = matmul(mlp_in, get_weight_t(mp + "up_proj.weight"));
-    auto mlp_out = matmul(swiglu(gate, up), get_weight_t(mp + "down_proj.weight"));
+    auto gate    = linear_proj(mlp_in, mp + "gate_proj");
+    auto up      = linear_proj(mlp_in, mp + "up_proj");
+    auto mlp_out = linear_proj(swiglu(gate, up), mp + "down_proj");
     h = h + mlp_out;
   }
 
   // Final norm + LM head
   h = fast::rms_norm(h, get_weight("final_norm.weight"), cfg.rms_norm_eps);
   if (cfg.tie_word_embeddings) {
-    h = matmul(h, get_weight_t("embedding.weight"));
+    h = linear_proj(h, "embedding");
   } else {
-    h = matmul(h, get_weight_t("lm_head.weight"));
+    h = linear_proj(h, "lm_head");
   }
 
   auto new_offset = array(offset + 1, mlx::core::int32);
@@ -254,18 +259,18 @@ static std::vector<array> dense_compiled_decode_fn_paged(const std::vector<array
     // Dense MLP (SwiGLU) — no MoE routing.
     std::string mp = lp + ".mlp.";
     auto mlp_in  = fast::rms_norm(h, get_weight(lp + ".post_attention_layernorm.weight"), cfg.rms_norm_eps);
-    auto gate    = matmul(mlp_in, get_weight_t(mp + "gate_proj.weight"));
-    auto up      = matmul(mlp_in, get_weight_t(mp + "up_proj.weight"));
-    auto mlp_out = matmul(swiglu(gate, up), get_weight_t(mp + "down_proj.weight"));
+    auto gate    = linear_proj(mlp_in, mp + "gate_proj");
+    auto up      = linear_proj(mlp_in, mp + "up_proj");
+    auto mlp_out = linear_proj(swiglu(gate, up), mp + "down_proj");
     h = h + mlp_out;
   }
 
   // Final norm + LM head
   h = fast::rms_norm(h, get_weight("final_norm.weight"), cfg.rms_norm_eps);
   if (cfg.tie_word_embeddings) {
-    h = matmul(h, get_weight_t("embedding.weight"));
+    h = linear_proj(h, "embedding");
   } else {
-    h = matmul(h, get_weight_t("lm_head.weight"));
+    h = linear_proj(h, "lm_head");
   }
 
   auto new_offset = offset_arr + array(1, mlx::core::int32);
@@ -485,6 +490,27 @@ int mlx_qwen35_get_cache_offset() {
   return g_offset_int;
 }
 
+int mlx_qwen35_export_paged_linear_caches(mlx_array** out_ptrs, int max_count) {
+  if (!g_dense_paged_inited || g_dense_paged_linear_caches.empty()) return 0;
+  int expected = static_cast<int>(g_dense_paged_linear_caches.size());
+  int count = std::min(expected, max_count);
+  for (int i = 0; i < count; i++) {
+    out_ptrs[i] = nullptr;
+  }
+  for (int layer = 0; layer < g_dense_paged_config.num_layers; layer++) {
+    int base = layer * 2;
+    if (base + 1 >= count) break;
+    if (!dense_paged_is_linear_layer(layer)) continue;
+    out_ptrs[base] = reinterpret_cast<mlx_array*>(new array(g_dense_paged_linear_caches[base]));
+    out_ptrs[base + 1] = reinterpret_cast<mlx_array*>(new array(g_dense_paged_linear_caches[base + 1]));
+  }
+  return count;
+}
+
+int mlx_qwen35_get_paged_cache_offset() {
+  return g_dense_paged_offset_int;
+}
+
 // =============================================================================
 // Phase 5 piece 1: paged Dense forward FFI.
 //
@@ -588,7 +614,7 @@ int32_t mlx_qwen35_init_paged(
     auto f32_placeholder  = []() { return array(1.0f, mlx::core::float32); };
 
     for (int i = 0; i < num_layers; i++) {
-      bool is_linear = !((i + 1) % full_attention_interval == 0);
+      bool is_linear = dense_paged_is_linear_layer(i);
 
       // Pool / scale slots: meaningful for full-attn layers only.
       if (!is_linear) {
@@ -636,7 +662,7 @@ int32_t mlx_qwen35_init_paged(
       std::vector<array> probe;
       probe.reserve(num_layers * 4 + 1);
       for (int i = 0; i < num_layers; i++) {
-        bool is_linear = !((i + 1) % full_attention_interval == 0);
+        bool is_linear = dense_paged_is_linear_layer(i);
         if (is_linear) continue;
         // Validate dtype contract: pools must be bf16, scales must be f32.
         if (g_dense_k_pools[i].dtype() != mlx::core::bfloat16) {
@@ -779,7 +805,7 @@ void mlx_qwen35_forward_paged(
     fn_inputs.push_back(num_valid_blocks);
     fn_inputs.push_back(seq_lens);
     for (int i = 0; i < cfg.num_layers; i++) {
-      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      bool is_linear = dense_paged_is_linear_layer(i);
       if (is_linear) {
         fn_inputs.push_back(g_dense_paged_linear_caches[i * 2]);
         fn_inputs.push_back(g_dense_paged_linear_caches[i * 2 + 1]);
@@ -803,7 +829,7 @@ void mlx_qwen35_forward_paged(
     g_dense_paged_offset_int++;
     // Stash post-step caches back into the per-layer slots.
     for (int i = 0; i < cfg.num_layers; i++) {
-      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      bool is_linear = dense_paged_is_linear_layer(i);
       auto& a = outputs[2 + i * 2];
       auto& b = outputs[2 + i * 2 + 1];
       if (is_linear) {

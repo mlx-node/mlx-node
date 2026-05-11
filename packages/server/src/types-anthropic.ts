@@ -93,6 +93,12 @@ export interface AnthropicMessagesRequest {
   stream?: boolean;
   stop_sequences?: string[];
   metadata?: { user_id?: string };
+  output_config?: {
+    format?: {
+      type?: string;
+      schema?: unknown;
+    };
+  };
   // NOTE: `prompt_cache_key` is intentionally NOT advertised on this
   // endpoint. KV-cache reuse on `/v1/messages` is delivered via the
   // server-side `getOrCreateWarmAny` warm-slot mechanism keyed on the

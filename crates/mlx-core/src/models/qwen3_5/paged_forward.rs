@@ -16,11 +16,11 @@
 //! The decode step is a single-token forward through every layer,
 //! gathering K/V from the paged pool for attention layers.
 //!
-//! Strategy notes (mirrors LFM2):
-//! * GDN layers do NOT participate in cross-request prefix reuse — the
-//!   recurrent state cannot be rewound, so each paged turn re-prefills
-//!   GDN over the entire prompt. Only the attention layers benefit
-//!   from the paged adapter's refcounted block reuse.
+//! Strategy notes (mirrors LFM2/Qwen3.5-MoE):
+//! * Full-attention layers reuse K/V through the paged adapter. GDN
+//!   layers can only skip prefix replay when the caller has restored a
+//!   matching sidecar checkpoint (`gdn_prefix_already_primed=true`);
+//!   otherwise this helper replays the cached prefix through GDN.
 //! * The two-pass scheme is approximate for GDN over the cached
 //!   prefix: the prefix's GDN forward sees a hidden-state stream
 //!   produced by passing through ALL layers (including attention)
@@ -112,6 +112,7 @@ pub(crate) fn run_paged_prefill_chunk(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
@@ -126,6 +127,7 @@ pub(crate) fn run_paged_prefill_chunk(
         full_tokens,
         suffix_tokens,
         cached_prefix_len,
+        gdn_prefix_already_primed,
         embed,
         layers,
         caches,
@@ -150,6 +152,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
@@ -171,6 +174,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             full_tokens,
             suffix_tokens,
             cached_prefix_len,
+            gdn_prefix_already_primed,
             embed,
             layers,
             caches,
@@ -187,7 +191,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
 
     // Pass 1: GDN-only prefill over the cached prefix. This runs once before
     // suffix chunking; GDN recurrent state then advances in-place across chunks.
-    if cached_prefix_len > 0 {
+    if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let gdn_trace_start = trace_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
@@ -296,6 +300,7 @@ fn run_paged_prefill_single_shot(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
@@ -309,7 +314,7 @@ fn run_paged_prefill_single_shot(
         .record_tokens(suffix_tokens)
         .map_err(Error::from_reason)?;
 
-    if cached_prefix_len > 0 {
+    if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
     }

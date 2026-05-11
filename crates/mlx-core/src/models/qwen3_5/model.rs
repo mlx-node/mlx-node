@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -8,6 +8,9 @@ use napi_derive::napi;
 use tracing::{info, warn};
 
 use crate::array::MxArray;
+use crate::inference_trace::{
+    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
+};
 use crate::model_thread::{ResponseTx, StreamTx};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
@@ -63,6 +66,224 @@ pub(crate) static COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()> = std::sync::Rw
 /// calls from different model threads can collide on process-wide globals.
 static DENSE_COMPILED_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
+    (0..config.num_layers as usize)
+        .map(|i| {
+            if config.is_linear_layer(i) {
+                Qwen3_5LayerCache::new_linear()
+            } else {
+                Qwen3_5LayerCache::new_full_attention()
+            }
+        })
+        .collect()
+}
+
+const DENSE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 8;
+
+struct DenseGdnPrefixCheckpoint {
+    prefix_len: u32,
+    block_size: u32,
+    final_block_hash: u64,
+    tokens: Vec<u32>,
+    caches: Vec<Qwen3_5LayerCache>,
+}
+
+struct DenseGdnHistoryCheckpoint {
+    tokens: Vec<u32>,
+    caches: Vec<Qwen3_5LayerCache>,
+}
+
+struct DenseGdnPrefixPreparation {
+    state: &'static str,
+    already_primed: bool,
+}
+
+#[derive(Default)]
+struct DenseGdnCheckpointStoreTrace {
+    stored: bool,
+    hash_ms: f64,
+    eval_ms: f64,
+    clone_ms: f64,
+    token_clone_ms: f64,
+    update_ms: f64,
+    total_ms: f64,
+}
+
+impl DenseGdnCheckpointStoreTrace {
+    fn finish(mut self, start: Option<std::time::Instant>) -> Self {
+        self.total_ms = start.map(elapsed_ms).unwrap_or(0.0);
+        self
+    }
+}
+
+fn dense_gdn_store_replayed_prefix_checkpoint_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MLX_DENSE_GDN_REPLAY_PREFIX_CHECKPOINT")
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct TokenPrefixMismatchTrace {
+    index: i64,
+    prompt_token: i64,
+    cached_token: i64,
+}
+
+impl Default for TokenPrefixMismatchTrace {
+    fn default() -> Self {
+        Self {
+            index: -1,
+            prompt_token: -1,
+            cached_token: -1,
+        }
+    }
+}
+
+fn token_prefix_mismatch_trace(prompt: &[u32], cached: &[u32]) -> TokenPrefixMismatchTrace {
+    let common_len = prompt.len().min(cached.len());
+    for i in 0..common_len {
+        if prompt[i] != cached[i] {
+            return TokenPrefixMismatchTrace {
+                index: i as i64,
+                prompt_token: prompt[i] as i64,
+                cached_token: cached[i] as i64,
+            };
+        }
+    }
+
+    TokenPrefixMismatchTrace {
+        index: common_len as i64,
+        prompt_token: prompt.get(common_len).map_or(-1, |token| *token as i64),
+        cached_token: cached.get(common_len).map_or(-1, |token| *token as i64),
+    }
+}
+
+fn dense_paged_linear_caches_ready(
+    config: &Qwen3_5Config,
+    caches: Option<&[Qwen3_5LayerCache]>,
+) -> bool {
+    let Some(caches) = caches else {
+        return false;
+    };
+    if caches.len() != config.num_layers as usize {
+        return false;
+    }
+    for (i, cache) in caches.iter().enumerate() {
+        if !config.is_linear_layer(i) {
+            continue;
+        }
+        let Qwen3_5LayerCache::Linear(arrays) = cache else {
+            return false;
+        };
+        if arrays.get(0).is_none() || arrays.get(1).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+fn clone_dense_linear_layer_caches(
+    config: &Qwen3_5Config,
+    caches: &[Qwen3_5LayerCache],
+) -> Option<Vec<Qwen3_5LayerCache>> {
+    if !dense_paged_linear_caches_ready(config, Some(caches)) {
+        return None;
+    }
+
+    let mut cloned = fresh_dense_layer_caches(config);
+    for i in 0..config.num_layers as usize {
+        if !config.is_linear_layer(i) {
+            continue;
+        }
+        let Qwen3_5LayerCache::Linear(arrays) = &caches[i] else {
+            return None;
+        };
+        cloned[i] = Qwen3_5LayerCache::Linear(arrays.clone());
+    }
+    Some(cloned)
+}
+
+fn compute_paged_prefix_block_hash(
+    tokens: &[u32],
+    prefix_len: u32,
+    block_size: u32,
+    extra_keys_per_block: &[Vec<u64>],
+    cache_salt: u64,
+) -> Option<u64> {
+    if prefix_len == 0 || block_size == 0 || !prefix_len.is_multiple_of(block_size) {
+        return None;
+    }
+
+    let prefix_len = prefix_len as usize;
+    let block_size = block_size as usize;
+    if prefix_len > tokens.len() {
+        return None;
+    }
+
+    let num_blocks = prefix_len / block_size;
+    let mut parent_hash = 0;
+    for block_idx in 0..num_blocks {
+        let extra_keys = extra_keys_per_block.get(block_idx)?;
+        let start = block_idx * block_size;
+        let end = start + block_size;
+        parent_hash = if block_idx == 0 && cache_salt != 0 {
+            let mut salted_keys = Vec::with_capacity(extra_keys.len() + 1);
+            salted_keys.extend_from_slice(extra_keys);
+            salted_keys.push(cache_salt);
+            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &salted_keys)
+        } else {
+            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, extra_keys)
+        };
+    }
+
+    Some(parent_hash)
+}
+
+fn export_paged_dense_linear_caches(
+    config: &Qwen3_5Config,
+) -> Result<Option<Vec<Qwen3_5LayerCache>>> {
+    let num_layers = config.num_layers as usize;
+    let expected = num_layers
+        .checked_mul(2)
+        .ok_or_else(|| Error::from_reason("paged dense cache export size overflow"))?;
+    let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); expected];
+    let exported = unsafe {
+        mlx_sys::mlx_qwen35_export_paged_linear_caches(export_ptrs.as_mut_ptr(), expected as i32)
+    };
+    if exported == 0 {
+        return Ok(None);
+    }
+    if exported != expected as i32 {
+        return Err(Error::from_reason(format!(
+            "paged dense linear cache export returned {exported} arrays; expected {expected}"
+        )));
+    }
+
+    let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_paged_cache_offset() };
+    let mut new_caches = fresh_dense_layer_caches(config);
+    for i in 0..num_layers {
+        if !config.is_linear_layer(i) {
+            continue;
+        }
+        let p0 = export_ptrs[i * 2];
+        let p1 = export_ptrs[i * 2 + 1];
+        if p0.is_null() || p1.is_null() {
+            return Err(Error::from_reason(format!(
+                "paged dense linear cache export missing layer {i}"
+            )));
+        }
+        new_caches[i].import_ptrs(p0, p1, cache_offset);
+    }
+
+    Ok(Some(new_caches))
+}
+
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
 /// No `Arc<RwLock<>>` — the model thread has sole ownership of all inference
@@ -83,6 +304,8 @@ pub(crate) struct Qwen35Inner {
     pub(crate) cached_image_key: Option<u64>,
     pub(crate) cached_rope_deltas: Option<i32>,
     pub(crate) model_id: u64,
+    gdn_prefix_checkpoints: VecDeque<DenseGdnPrefixCheckpoint>,
+    gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
     /// full-attention layers.
     ///
@@ -641,6 +864,8 @@ impl Qwen35Inner {
             cached_image_key: None,
             cached_rope_deltas: None,
             model_id,
+            gdn_prefix_checkpoints: VecDeque::new(),
+            gdn_last_history_checkpoint: None,
             paged_adapter,
             training_state: None,
         })
@@ -648,16 +873,7 @@ impl Qwen35Inner {
 
     /// Initialize KV caches.
     pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
-        let caches = (0..self.config.num_layers as usize)
-            .map(|i| {
-                if self.config.is_linear_layer(i) {
-                    Qwen3_5LayerCache::new_linear()
-                } else {
-                    Qwen3_5LayerCache::new_full_attention()
-                }
-            })
-            .collect();
-        self.caches = Some(caches);
+        self.caches = Some(fresh_dense_layer_caches(&self.config));
         self.clear_reuse_state();
         Ok(())
     }
@@ -679,6 +895,8 @@ impl Qwen35Inner {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
+        self.gdn_prefix_checkpoints.clear();
+        self.gdn_last_history_checkpoint = None;
     }
 
     /// Take the KV cache from the model, returning a `PromptCache` handle.
@@ -689,6 +907,8 @@ impl Qwen35Inner {
             return None;
         }
         let caches = self.caches.take()?;
+        self.gdn_prefix_checkpoints.clear();
+        self.gdn_last_history_checkpoint = None;
         Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
             caches,
             self.cached_token_history.clone(),
@@ -712,7 +932,347 @@ impl Qwen35Inner {
         self.cached_token_history = cache.token_history().to_vec();
         self.cached_image_key = cache.image_cache_key();
         self.cached_rope_deltas = cache.rope_deltas();
+        self.gdn_prefix_checkpoints.clear();
+        self.gdn_last_history_checkpoint = None;
         Ok(())
+    }
+
+    fn find_dense_gdn_history_checkpoint(
+        &self,
+        tokens: &[u32],
+        prefix_len: u32,
+    ) -> Option<Vec<Qwen3_5LayerCache>> {
+        let prefix_tokens = tokens.get(..prefix_len as usize)?;
+        let checkpoint = self.gdn_last_history_checkpoint.as_ref()?;
+        if checkpoint.tokens.as_slice() != prefix_tokens {
+            return None;
+        }
+        clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
+    }
+
+    fn remember_dense_gdn_history_checkpoint(&mut self) -> Result<DenseGdnCheckpointStoreTrace> {
+        let trace_enabled = inference_trace_enabled();
+        let total_start = trace_enabled.then(std::time::Instant::now);
+        let mut trace = DenseGdnCheckpointStoreTrace::default();
+        if self.cached_token_history.is_empty() {
+            self.gdn_last_history_checkpoint = None;
+            return Ok(trace.finish(total_start));
+        }
+
+        let eval_start = trace_enabled.then(std::time::Instant::now);
+        eval_layer_caches(&self.caches)?;
+        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
+        let clone_start = trace_enabled.then(std::time::Instant::now);
+        let Some(caches) = self
+            .caches
+            .as_ref()
+            .and_then(|caches| clone_dense_linear_layer_caches(&self.config, caches))
+        else {
+            self.gdn_last_history_checkpoint = None;
+            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+            return Ok(trace.finish(total_start));
+        };
+        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+        let token_clone_start = trace_enabled.then(std::time::Instant::now);
+        let tokens = self.cached_token_history.clone();
+        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
+
+        let update_start = trace_enabled.then(std::time::Instant::now);
+        self.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint { tokens, caches });
+        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
+        trace.stored = true;
+        Ok(trace.finish(total_start))
+    }
+
+    fn find_dense_gdn_prefix_checkpoint(
+        &self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Option<Vec<Qwen3_5LayerCache>> {
+        let final_block_hash = compute_paged_prefix_block_hash(
+            tokens,
+            prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        )?;
+        let prefix_tokens = tokens.get(..prefix_len as usize)?;
+
+        self.gdn_prefix_checkpoints
+            .iter()
+            .rev()
+            .find(|checkpoint| {
+                checkpoint.prefix_len == prefix_len
+                    && checkpoint.block_size == block_size
+                    && checkpoint.final_block_hash == final_block_hash
+                    && checkpoint.tokens.as_slice() == prefix_tokens
+                    && dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
+            })
+            .and_then(|checkpoint| {
+                clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
+            })
+    }
+
+    fn remember_dense_gdn_prefix_checkpoint(
+        &mut self,
+        tokens: &[u32],
+        prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Result<DenseGdnCheckpointStoreTrace> {
+        let trace_enabled = inference_trace_enabled();
+        let total_start = trace_enabled.then(std::time::Instant::now);
+        let mut trace = DenseGdnCheckpointStoreTrace::default();
+        let hash_start = trace_enabled.then(std::time::Instant::now);
+        let Some(final_block_hash) = compute_paged_prefix_block_hash(
+            tokens,
+            prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        ) else {
+            trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
+            return Ok(trace.finish(total_start));
+        };
+        trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
+        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
+            return Ok(trace.finish(total_start));
+        };
+
+        let eval_start = trace_enabled.then(std::time::Instant::now);
+        eval_layer_caches(&self.caches)?;
+        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
+        let clone_start = trace_enabled.then(std::time::Instant::now);
+        let Some(caches) = self
+            .caches
+            .as_ref()
+            .and_then(|caches| clone_dense_linear_layer_caches(&self.config, caches))
+        else {
+            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+            return Ok(trace.finish(total_start));
+        };
+        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
+        let token_clone_start = trace_enabled.then(std::time::Instant::now);
+        let prefix_tokens = prefix_tokens.to_vec();
+        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
+
+        let update_start = trace_enabled.then(std::time::Instant::now);
+        self.gdn_prefix_checkpoints.retain(|checkpoint| {
+            !(checkpoint.prefix_len == prefix_len
+                && checkpoint.block_size == block_size
+                && checkpoint.final_block_hash == final_block_hash
+                && checkpoint.tokens == prefix_tokens)
+        });
+        self.gdn_prefix_checkpoints
+            .push_back(DenseGdnPrefixCheckpoint {
+                prefix_len,
+                block_size,
+                final_block_hash,
+                tokens: prefix_tokens,
+                caches,
+            });
+        while self.gdn_prefix_checkpoints.len() > DENSE_GDN_PREFIX_CHECKPOINT_LIMIT {
+            self.gdn_prefix_checkpoints.pop_front();
+        }
+        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
+        trace.stored = true;
+
+        Ok(trace.finish(total_start))
+    }
+
+    fn prepare_dense_gdn_prefix_state(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        continued_live_prefix: bool,
+    ) -> Result<DenseGdnPrefixPreparation> {
+        let trace_enabled = inference_trace_enabled();
+        let prepare_trace_start = trace_enabled.then(std::time::Instant::now);
+        let gdn_caches_ready =
+            dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
+        if gdn_caches_ready && continued_live_prefix {
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=live \
+                     cached_prefix_tokens={} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    elapsed_ms(start)
+                ));
+            }
+            return Ok(DenseGdnPrefixPreparation {
+                state: "live",
+                already_primed: true,
+            });
+        }
+
+        let gdn_prefix_from_history = cached_prefix_len > 0
+            && self.cached_token_history.len() == cached_prefix_len as usize
+            && tokens.starts_with(&self.cached_token_history);
+        if gdn_caches_ready && gdn_prefix_from_history {
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=last_history \
+                     cached_prefix_tokens={} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    elapsed_ms(start)
+                ));
+            }
+            return Ok(DenseGdnPrefixPreparation {
+                state: "last_history",
+                already_primed: true,
+            });
+        }
+
+        if cached_prefix_len > 0 {
+            let history_lookup_start = trace_enabled.then(std::time::Instant::now);
+            let history_checkpoint =
+                self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len);
+            let history_lookup_ms = history_lookup_start.map(elapsed_ms);
+            if let Some(checkpoint) = history_checkpoint {
+                self.caches = Some(checkpoint);
+                if let Some(start) = prepare_trace_start {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done \
+                         state=last_history_checkpoint cached_prefix_tokens={} \
+                         history_lookup_ms={:.1} elapsed_ms={:.1}",
+                        cached_prefix_len,
+                        history_lookup_ms.unwrap_or(0.0),
+                        elapsed_ms(start)
+                    ));
+                }
+                return Ok(DenseGdnPrefixPreparation {
+                    state: "last_history_checkpoint",
+                    already_primed: true,
+                });
+            } else if trace_enabled {
+                let history_checkpoint_len = self
+                    .gdn_last_history_checkpoint
+                    .as_ref()
+                    .map_or(0, |checkpoint| checkpoint.tokens.len());
+                let history_mismatch =
+                    token_prefix_mismatch_trace(tokens, &self.cached_token_history);
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint_miss \
+                     cached_prefix_tokens={} history_len={} checkpoint_len={} \
+                     history_match={} history_mismatch_at={} prompt_token={} \
+                     history_token={} history_lookup_ms={:.1}",
+                    cached_prefix_len,
+                    self.cached_token_history.len(),
+                    history_checkpoint_len,
+                    gdn_prefix_from_history,
+                    history_mismatch.index,
+                    history_mismatch.prompt_token,
+                    history_mismatch.cached_token,
+                    history_lookup_ms.unwrap_or(0.0)
+                ));
+            }
+        }
+
+        let prefix_lookup_start = trace_enabled.then(std::time::Instant::now);
+        let prefix_checkpoint = self.find_dense_gdn_prefix_checkpoint(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+        );
+        let prefix_lookup_ms = prefix_lookup_start.map(elapsed_ms);
+        if let Some(checkpoint) = prefix_checkpoint {
+            self.caches = Some(checkpoint);
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=checkpoint \
+                     cached_prefix_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    prefix_lookup_ms.unwrap_or(0.0),
+                    elapsed_ms(start)
+                ));
+            }
+            return Ok(DenseGdnPrefixPreparation {
+                state: "checkpoint",
+                already_primed: true,
+            });
+        }
+
+        self.caches = Some(fresh_dense_layer_caches(&self.config));
+        if cached_prefix_len == 0 {
+            if let Some(start) = prepare_trace_start {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=replay \
+                     cached_prefix_tokens=0 prefix_lookup_ms={:.1} elapsed_ms={:.1}",
+                    prefix_lookup_ms.unwrap_or(0.0),
+                    elapsed_ms(start)
+                ));
+            }
+            return Ok(DenseGdnPrefixPreparation {
+                state: "replay",
+                already_primed: false,
+            });
+        }
+
+        let prefix = tokens.get(..cached_prefix_len as usize).ok_or_else(|| {
+            Error::from_reason("dense paged GDN prefix replay length exceeds prompt length")
+        })?;
+        let embed = self.embedding.clone();
+        let caches_ref = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("dense paged GDN prefix caches not initialized"))?;
+        let replay_trace_start = trace_enabled.then(std::time::Instant::now);
+        super::paged_forward::run_gdn_only_prefill(prefix, &embed, &mut self.layers, caches_ref)?;
+        let replay_ms = replay_trace_start.map(elapsed_ms);
+        let store_trace = if dense_gdn_store_replayed_prefix_checkpoint_enabled() {
+            self.remember_dense_gdn_prefix_checkpoint(
+                tokens,
+                cached_prefix_len,
+                block_size,
+                extra_keys_per_block,
+                cache_salt,
+            )?
+        } else {
+            DenseGdnCheckpointStoreTrace::default()
+        };
+        if let Some(start) = prepare_trace_start {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state={} \
+                 cached_prefix_tokens={} prefix_lookup_ms={:.1} replay_ms={:.1} stored={} \
+                 store_hash_ms={:.1} store_eval_ms={:.1} store_clone_ms={:.1} \
+                 store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} \
+                 elapsed_ms={:.1}",
+                if store_trace.stored {
+                    "replay_store"
+                } else {
+                    "replay"
+                },
+                cached_prefix_len,
+                prefix_lookup_ms.unwrap_or(0.0),
+                replay_ms.unwrap_or(0.0),
+                store_trace.stored,
+                store_trace.hash_ms,
+                store_trace.eval_ms,
+                store_trace.clone_ms,
+                store_trace.token_clone_ms,
+                store_trace.update_ms,
+                store_trace.total_ms,
+                elapsed_ms(start)
+            ));
+        }
+
+        Ok(DenseGdnPrefixPreparation {
+            state: if store_trace.stored {
+                "replay_store"
+            } else {
+                "replay"
+            },
+            already_primed: true,
+        })
     }
 
     /// Save model weights and configuration to a directory (synchronous).
@@ -1999,8 +2559,8 @@ impl Qwen35Inner {
     /// 1. Adapter lifecycle: warm-continue when the prior turn ended
     ///    via `finalize_turn_keep_live`; cold-start (reset →
     ///    find_cached_prefix → allocate_suffix) otherwise.
-    /// 2. Reset GDN caches and the cached token history. The paged
-    ///    path does not carry GDN state across turns.
+    /// 2. Prepare GDN prefix state from live/session checkpoints when
+    ///    available; otherwise replay the cached prefix through GDN.
     /// 3. Prefill via `paged_forward::run_paged_prefill_chunk`.
     /// 4. Decode loop via `paged_forward::run_paged_decode_step`.
     /// 5. End-of-turn: `finalize_turn_keep_live` keeps the partial
@@ -2009,8 +2569,9 @@ impl Qwen35Inner {
     ///
     /// Limitations:
     /// * VLM is rejected upstream — paged dispatch is text-only.
-    /// * Cross-turn GDN prefix reuse is NOT supported — every paged
-    ///   turn re-prefills GDN state from token 0.
+    /// * Cross-turn GDN prefix reuse is limited to live/history/prefix
+    ///   checkpoints whose identity matches the paged KV prefix. Misses
+    ///   fall back to GDN replay from token 0.
     /// * Pure-cache prompt (every prompt token already in the paged
     ///   pool) is rejected — same caveat as LFM2 / Qwen3 paged paths.
     /// * The compiled C++ forward path is bypassed — paged turns run
@@ -2045,6 +2606,7 @@ impl Qwen35Inner {
             None
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
+        let trace_enabled = inference_trace_enabled();
 
         // Detect availability of the C++ compiled paged decode path.
         // Mirrors the MoE paged path: if the weights for this model are
@@ -2095,7 +2657,12 @@ impl Qwen35Inner {
             adapter.block_size()
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
-        let cached_prefix_len = {
+        let cache_salt = 0;
+        let live_ready;
+        let live_prefix_match;
+        let live_tokens_len;
+        let mut live_mismatch = TokenPrefixMismatchTrace::default();
+        let (cached_prefix_len, continued_live_prefix) = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
                     "chat_sync_core_paged: paged_adapter is None — caller must check \
@@ -2103,25 +2670,36 @@ impl Qwen35Inner {
                 )
             })?;
 
-            let can_continue =
-                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            live_ready = adapter.is_live_for_continue();
+            let live_tokens = adapter.request_tokens();
+            live_tokens_len = live_tokens.len();
+            live_prefix_match = tokens.starts_with(live_tokens);
+            if trace_enabled && live_ready && !live_prefix_match {
+                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
+            }
+            let can_continue = live_ready && live_prefix_match;
 
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => prior_token_count,
+                    Ok((prior_token_count, _newly_alloc)) => (prior_token_count, true),
                     Err(_drift) => {
                         let _ = adapter.release_request();
                         adapter
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
+                            .find_cached_prefix_per_block(
+                                &tokens,
+                                &lookup_extra_keys,
+                                cache_salt,
+                                false,
+                            )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
                             .allocate_suffix_blocks(total_budget)
                             .map_err(Error::from_reason)?;
-                        cached
+                        (cached, false)
                     }
                 }
             } else {
@@ -2132,30 +2710,41 @@ impl Qwen35Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, cache_salt, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
                     .allocate_suffix_blocks(total_budget)
                     .map_err(Error::from_reason)?;
-                cached
+                (cached, false)
             }
         };
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
+                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
+                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
+                tokens.len(),
+                cached_prefix_len,
+                continued_live_prefix,
+                live_ready,
+                live_prefix_match,
+                live_tokens_len,
+                live_mismatch.index,
+                live_mismatch.prompt_token,
+                live_mismatch.cached_token
+            ));
+        }
 
-        // Reset GDN state for this turn. The paged path does not carry
-        // GDN prefix state across turns — every turn re-prefills GDN
-        // state over the entire prompt (see method docstring).
-        self.caches = Some(
-            (0..self.config.num_layers as usize)
-                .map(|i| {
-                    if self.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect(),
-        );
+        let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
+            &tokens,
+            cached_prefix_len,
+            block_size,
+            &lookup_extra_keys,
+            cache_salt,
+            continued_live_prefix,
+        )?;
+        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
@@ -2177,6 +2766,7 @@ impl Qwen35Inner {
             report_perf,
             &mut first_token_instant,
             use_cpp_paged,
+            gdn_prefix_already_primed,
         );
 
         let (generated_tokens, finish_reason) = match forward_result {
@@ -2218,6 +2808,20 @@ impl Qwen35Inner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
+        let gdn_history_checkpoint_store = self.remember_dense_gdn_history_checkpoint()?;
+        if inference_trace_enabled() {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
+                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                gdn_history_checkpoint_store.stored,
+                self.cached_token_history.len(),
+                gdn_history_checkpoint_store.eval_ms,
+                gdn_history_checkpoint_store.clone_ms,
+                gdn_history_checkpoint_store.token_clone_ms,
+                gdn_history_checkpoint_store.update_ms,
+                gdn_history_checkpoint_store.total_ms
+            ));
+        }
 
         let performance = if report_perf {
             compute_performance_metrics(
@@ -2271,6 +2875,7 @@ impl Qwen35Inner {
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
         use_cpp_paged: bool,
+        gdn_prefix_already_primed: bool,
     ) -> Result<(Vec<u32>, String)> {
         if suffix_len == 0 {
             return Err(Error::from_reason(
@@ -2299,6 +2904,7 @@ impl Qwen35Inner {
                 tokens,
                 suffix,
                 cached_prefix_len,
+                gdn_prefix_already_primed,
                 &embed,
                 &mut self.layers,
                 caches_ref,
@@ -2556,6 +3162,31 @@ impl Qwen35Inner {
             crate::array::maybe_clear_cache_for_paged_step(step);
         }
 
+        if cpp_compiled_step_completed {
+            match export_paged_dense_linear_caches(&self.config) {
+                Ok(Some(new_caches)) => {
+                    self.caches = Some(new_caches);
+                    eval_layer_caches(&self.caches)?;
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=true"
+                    ));
+                }
+                Ok(None) => {
+                    self.caches = None;
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false reason=not_initialized"
+                    ));
+                }
+                Err(err) => {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false error={}",
+                        err
+                    ));
+                    self.caches = None;
+                }
+            }
+        }
+
         Ok((generated_tokens, finish_reason))
     }
 
@@ -2598,6 +3229,7 @@ impl Qwen35Inner {
             None
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
+        let trace_enabled = inference_trace_enabled();
 
         // Streaming decode state.
         let mut decode_stream = tokenizer.inner().decode_stream(true);
@@ -2644,7 +3276,12 @@ impl Qwen35Inner {
             adapter.block_size()
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
-        let cached_prefix_len = {
+        let cache_salt = 0;
+        let live_ready;
+        let live_prefix_match;
+        let live_tokens_len;
+        let mut live_mismatch = TokenPrefixMismatchTrace::default();
+        let (cached_prefix_len, continued_live_prefix) = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
                     "chat_stream_sync_core_paged: paged_adapter is None — caller must check \
@@ -2652,25 +3289,36 @@ impl Qwen35Inner {
                 )
             })?;
 
-            let can_continue =
-                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            live_ready = adapter.is_live_for_continue();
+            let live_tokens = adapter.request_tokens();
+            live_tokens_len = live_tokens.len();
+            live_prefix_match = tokens.starts_with(live_tokens);
+            if trace_enabled && live_ready && !live_prefix_match {
+                live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
+            }
+            let can_continue = live_ready && live_prefix_match;
 
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => prior_token_count,
+                    Ok((prior_token_count, _newly_alloc)) => (prior_token_count, true),
                     Err(_drift) => {
                         let _ = adapter.release_request();
                         adapter
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
+                            .find_cached_prefix_per_block(
+                                &tokens,
+                                &lookup_extra_keys,
+                                cache_salt,
+                                false,
+                            )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
                             .allocate_suffix_blocks(total_budget)
                             .map_err(Error::from_reason)?;
-                        cached
+                        (cached, false)
                     }
                 }
             } else {
@@ -2681,27 +3329,42 @@ impl Qwen35Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, 0, false)
+                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, cache_salt, false)
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
                     .allocate_suffix_blocks(total_budget)
                     .map_err(Error::from_reason)?;
-                cached
+                (cached, false)
             }
         };
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
+                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
+                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
+                tokens.len(),
+                cached_prefix_len,
+                continued_live_prefix,
+                live_ready,
+                live_prefix_match,
+                live_tokens_len,
+                live_mismatch.index,
+                live_mismatch.prompt_token,
+                live_mismatch.cached_token
+            ));
+        }
 
-        self.caches = Some(
-            (0..self.config.num_layers as usize)
-                .map(|i| {
-                    if self.config.is_linear_layer(i) {
-                        Qwen3_5LayerCache::new_linear()
-                    } else {
-                        Qwen3_5LayerCache::new_full_attention()
-                    }
-                })
-                .collect(),
-        );
+        let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
+            &tokens,
+            cached_prefix_len,
+            block_size,
+            &lookup_extra_keys,
+            cache_salt,
+            continued_live_prefix,
+        )?;
+        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        let gdn_prefix_state = gdn_prefix_preparation.state;
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
@@ -2713,6 +3376,24 @@ impl Qwen35Inner {
                     "chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
                 )
             })?;
+
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense stream_paged_start prompt_tokens={} \
+                 cached_prefix_tokens={} suffix_tokens={} block_size={} \
+                 prefill_chunk_size={} prefill_eval_interval={} decode_clear_interval={} \
+                 cpp_paged_candidate={} gdn_prefix_state={}",
+                prompt_token_count,
+                cached_prefix_len,
+                suffix_len,
+                block_size,
+                crate::array::paged_prefill_chunk_size(),
+                crate::array::paged_prefill_eval_interval(),
+                crate::array::paged_decode_cache_clear_interval(),
+                use_cpp_paged,
+                gdn_prefix_state
+            ));
+        }
 
         let result = self.chat_stream_sync_core_paged_inner(
             &tokens,
@@ -2731,6 +3412,7 @@ impl Qwen35Inner {
             cb,
             cancelled,
             use_cpp_paged,
+            gdn_prefix_already_primed,
         );
 
         let (generated_tokens, finish_reason) = match result {
@@ -2763,6 +3445,20 @@ impl Qwen35Inner {
             full_history.extend_from_slice(&generated_tokens[..upto]);
         }
         self.cached_token_history = full_history;
+        let gdn_history_checkpoint_store = self.remember_dense_gdn_history_checkpoint()?;
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
+                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                gdn_history_checkpoint_store.stored,
+                self.cached_token_history.len(),
+                gdn_history_checkpoint_store.eval_ms,
+                gdn_history_checkpoint_store.clone_ms,
+                gdn_history_checkpoint_store.token_clone_ms,
+                gdn_history_checkpoint_store.update_ms,
+                gdn_history_checkpoint_store.total_ms
+            ));
+        }
 
         // Flush residual buffered bytes (mirrors flat streaming).
         let full_text = tokenizer
@@ -2875,6 +3571,7 @@ impl Qwen35Inner {
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
         use_cpp_paged: bool,
+        gdn_prefix_already_primed: bool,
     ) -> Result<(Vec<u32>, String)> {
         if suffix_len == 0 {
             return Err(Error::from_reason(
@@ -2902,6 +3599,7 @@ impl Qwen35Inner {
                 tokens,
                 suffix,
                 cached_prefix_len,
+                gdn_prefix_already_primed,
                 &embed,
                 &mut self.layers,
                 caches_ref,
@@ -3161,6 +3859,31 @@ impl Qwen35Inner {
             y.eval();
 
             crate::array::maybe_clear_cache_for_paged_step(step);
+        }
+
+        if cpp_compiled_step_completed {
+            match export_paged_dense_linear_caches(&self.config) {
+                Ok(Some(new_caches)) => {
+                    self.caches = Some(new_caches);
+                    eval_layer_caches(&self.caches)?;
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=true"
+                    ));
+                }
+                Ok(None) => {
+                    self.caches = None;
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false reason=not_initialized"
+                    ));
+                }
+                Err(err) => {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export ok=false error={}",
+                        err
+                    ));
+                    self.caches = None;
+                }
+            }
         }
 
         Ok((generated_tokens, finish_reason))
@@ -8362,6 +9085,7 @@ mod paged_construction_tests {
             full_tokens,
             suffix_tokens,
             cached_prefix_len,
+            false,
             &embed,
             &mut inner.layers,
             caches,
@@ -8467,6 +9191,77 @@ mod paged_construction_tests {
         assert!(
             inner.paged_adapter.is_none(),
             "paged_adapter must be None when use_block_paged_cache is None"
+        );
+    }
+
+    #[test]
+    fn test_fresh_dense_layer_caches_are_not_gdn_reuse_ready() {
+        let cfg = tiny_cfg(true);
+        let caches = fresh_dense_layer_caches(&cfg);
+        assert_eq!(caches.len(), cfg.num_layers as usize);
+        assert!(
+            !dense_paged_linear_caches_ready(&cfg, Some(&caches)),
+            "fresh linear caches have empty conv/recurrent slots, so a live continuation must replay GDN"
+        );
+        assert!(matches!(caches[0], Qwen3_5LayerCache::Linear(_)));
+        assert!(matches!(caches[3], Qwen3_5LayerCache::FullAttention(_)));
+    }
+
+    #[test]
+    fn test_paged_dense_linear_cache_export_uninitialized_returns_none() {
+        unsafe {
+            mlx_sys::mlx_qwen35_compiled_reset();
+        }
+        let cfg = tiny_cfg(true);
+        let exported = export_paged_dense_linear_caches(&cfg)
+            .expect("uninitialized paged dense export should not fail");
+        assert!(exported.is_none());
+    }
+
+    #[test]
+    fn test_dense_paged_prefix_block_hash_matches_allocator_chain() {
+        let tokens: Vec<u32> = (1..=12).collect();
+        let per_block = vec![vec![11], vec![], vec![33, 44]];
+
+        let h0 = mlx_paged_attn::hash_tokens(&tokens[0..4], 0, &per_block[0]);
+        let h1 = mlx_paged_attn::hash_tokens(&tokens[4..8], h0, &per_block[1]);
+        let h2 = mlx_paged_attn::hash_tokens(&tokens[8..12], h1, &per_block[2]);
+
+        assert_eq!(
+            compute_paged_prefix_block_hash(&tokens, 12, 4, &per_block, 0),
+            Some(h2)
+        );
+    }
+
+    #[test]
+    fn test_dense_paged_prefix_block_hash_applies_salt_to_first_block_only() {
+        let tokens: Vec<u32> = (1..=8).collect();
+        let per_block = vec![vec![11], vec![22]];
+        let salt = 99;
+
+        let mut first_block_keys = per_block[0].clone();
+        first_block_keys.push(salt);
+        let h0 = mlx_paged_attn::hash_tokens(&tokens[0..4], 0, &first_block_keys);
+        let h1 = mlx_paged_attn::hash_tokens(&tokens[4..8], h0, &per_block[1]);
+
+        assert_eq!(
+            compute_paged_prefix_block_hash(&tokens, 8, 4, &per_block, salt),
+            Some(h1)
+        );
+    }
+
+    #[test]
+    fn test_dense_paged_prefix_block_hash_rejects_non_full_or_unkeyed_prefix() {
+        let tokens: Vec<u32> = (1..=8).collect();
+        let per_block = vec![vec![]];
+
+        assert_eq!(
+            compute_paged_prefix_block_hash(&tokens, 6, 4, &per_block, 0),
+            None
+        );
+        assert_eq!(
+            compute_paged_prefix_block_hash(&tokens, 8, 4, &per_block, 0),
+            None
         );
     }
 

@@ -113,6 +113,7 @@ import { validateAndCanonicalizeHistoryToolOrder } from './responses.js';
  * non-streaming) in lockstep.
  */
 const MESSAGES_WARM_SLOT_ID = '__msg_warm__';
+const CLAUDE_CODE_TITLE_MAX_TOKENS = 128;
 
 function requestAllowsToolUse(body: AnthropicMessagesRequest): boolean {
   return Array.isArray(body.tools) && body.tools.length > 0;
@@ -133,6 +134,60 @@ function applyOutputTokenLimit(config: ChatConfig, limit: number | undefined): C
     return config;
   }
   return { ...config, maxNewTokens: Math.floor(limit) };
+}
+
+function systemText(system: AnthropicMessagesRequest['system']): string {
+  if (system == null) return '';
+  if (typeof system === 'string') return system;
+  return system
+    .filter((block): block is Extract<(typeof system)[number], { type: 'text' }> => block.type === 'text')
+    .map((block) => block.text)
+    .join('\n');
+}
+
+function hasTitleJsonSchema(schema: unknown): boolean {
+  if (schema == null || typeof schema !== 'object') return false;
+  const obj = schema as {
+    type?: unknown;
+    properties?: unknown;
+    required?: unknown;
+  };
+  if (obj.type !== 'object') return false;
+  if (obj.properties == null || typeof obj.properties !== 'object') return false;
+  const properties = obj.properties as Record<string, unknown>;
+  const title = properties['title'];
+  if (title == null || typeof title !== 'object') return false;
+  if ((title as { type?: unknown }).type !== 'string') return false;
+  return Array.isArray(obj.required) && obj.required.includes('title');
+}
+
+function isClaudeCodeTitleGenerationRequest(body: AnthropicMessagesRequest): boolean {
+  if (requestAllowsToolUse(body)) return false;
+  const format = body.output_config?.format;
+  if (format?.type !== 'json_schema' || !hasTitleJsonSchema(format.schema)) return false;
+
+  const prompt = systemText(body.system).toLowerCase();
+  return (
+    prompt.includes('generate a concise') &&
+    prompt.includes('title') &&
+    prompt.includes('return json') &&
+    prompt.includes('"title"')
+  );
+}
+
+function applyClaudeCodeTitleFastPath(config: ChatConfig, body: AnthropicMessagesRequest): ChatConfig {
+  if (!isClaudeCodeTitleGenerationRequest(body)) return config;
+  const cappedMax =
+    config.maxNewTokens == null
+      ? CLAUDE_CODE_TITLE_MAX_TOKENS
+      : Math.min(config.maxNewTokens, CLAUDE_CODE_TITLE_MAX_TOKENS);
+  return {
+    ...config,
+    maxNewTokens: cappedMax,
+    reasoningEffort: 'none',
+    thinkingTokenBudget: 0,
+    includeReasoning: false,
+  };
 }
 
 // Non-streaming path
@@ -191,6 +246,7 @@ async function handleStreamingNative(
   wasCommitted: () => boolean,
   httpReq: IncomingMessage | undefined,
   visibility: TransportVisibility,
+  emitReasoning: boolean,
   serverTiming?: ServerTimingForUsage,
 ): Promise<MessagesStreamingHandlerResult> {
   const messageId = genId('msg_');
@@ -499,6 +555,7 @@ async function handleStreamingNative(
 
       // Delta event
       if (event.isReasoning) {
+        if (!emitReasoning) continue;
         const deltaText = event.text.replace(/<\/think>/g, '');
         if (!deltaText) continue;
 
@@ -925,6 +982,7 @@ export async function handleCreateMessage(
   try {
     const sessionReg: SessionRegistry = lease.registry;
     mappedConfig = applyOutputTokenLimit(mappedConfig, sessionReg.outputTokenLimit);
+    mappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
     // Snapshot the monotonic instance id so the in-mutex re-read can detect a
     // hot-swap that lands between lease acquisition and mutex entry. Unlike
     // `/v1/responses`, the Anthropic handler has no stored-identity check
@@ -1164,6 +1222,7 @@ export async function handleCreateMessage(
                 outcome.wasCommitted,
                 httpReq,
                 visibility,
+                config.includeReasoning !== false,
                 serverTiming,
               );
               // Warm-slot adopt/drop only applies to the non-paged
