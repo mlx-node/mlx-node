@@ -115,6 +115,14 @@ import { validateAndCanonicalizeHistoryToolOrder } from './responses.js';
 const MESSAGES_WARM_SLOT_ID = '__msg_warm__';
 const CLAUDE_CODE_TITLE_MAX_TOKENS = 128;
 
+function withAdmissionControlledInference<T>(
+  sessionReg: SessionRegistry,
+  modelWorkCoordinator: ModelWorkCoordinator | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return sessionReg.withExclusive(() => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn()));
+}
+
 function requestAllowsToolUse(body: AnthropicMessagesRequest): boolean {
   return Array.isArray(body.tools) && body.tools.length > 0;
 }
@@ -1060,7 +1068,7 @@ export async function handleCreateMessage(
     try {
       const mutexQueuedAt = Date.now();
       const runInference = () =>
-        sessionReg.withExclusive(async () => {
+        withAdmissionControlledInference(sessionReg, modelWorkCoordinator, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_model_resolve_ms: serverModelResolveMs,
             server_queue_ms: Date.now() - mutexQueuedAt,
@@ -1365,8 +1373,7 @@ export async function handleCreateMessage(
             }
           }
         });
-      if (modelWorkCoordinator) await modelWorkCoordinator.withInference(runInference);
-      else await runInference();
+      await runInference();
     } catch (err) {
       // Admission-control rejection from the per-model queue cap
       // (`SessionRegistry.withExclusive` threw before chaining into

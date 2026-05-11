@@ -58,6 +58,14 @@ import type {
  */
 const RESPONSE_TTL_SECONDS = 1800;
 
+function withAdmissionControlledInference<T>(
+  sessionReg: SessionRegistry,
+  modelWorkCoordinator: ModelWorkCoordinator | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return sessionReg.withExclusive(() => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn()));
+}
+
 /**
  * Value of the `X-Session-Cache` response header emitted on every
  * `/v1/responses` and `/v1/messages` response. Advertises whether the
@@ -2348,7 +2356,7 @@ export async function handleCreateResponse(
     try {
       const mutexQueuedAt = Date.now();
       const runInference = () =>
-        sessionReg.withExclusive(async () => {
+        withAdmissionControlledInference(sessionReg, modelWorkCoordinator, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_queue_ms: Date.now() - mutexQueuedAt,
             server_pre_inference_ms: Date.now() - handlerStartedAt,
@@ -3427,8 +3435,7 @@ export async function handleCreateResponse(
             }
           }
         });
-      if (modelWorkCoordinator) await modelWorkCoordinator.withInference(runInference);
-      else await runInference();
+      await runInference();
     } catch (err) {
       // Admission-control rejection from the per-model queue cap
       // (`SessionRegistry.withExclusive` threw before chaining into
