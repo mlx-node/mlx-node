@@ -44,12 +44,10 @@ pub struct Qwen3_5Attention {
 fn paged_prefill_paged_attention_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("MLX_PAGED_PREFILL_PAGED_ATTENTION")
-            .map(|value| {
-                let normalized = value.trim().to_ascii_lowercase();
-                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-            })
-            .unwrap_or(true)
+        crate::inference_trace::env_flag_enabled_or_default(
+            "MLX_PAGED_PREFILL_PAGED_ATTENTION",
+            true,
+        )
     })
 }
 
@@ -58,10 +56,7 @@ fn native_kv_write_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("MLX_QWEN35_NATIVE_KV_WRITE")
             .or_else(|_| std::env::var("MLX_NATIVE_KV_WRITE"))
-            .map(|value| {
-                let normalized = value.trim().to_ascii_lowercase();
-                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-            })
+            .map(|value| crate::inference_trace::env_flag_value_enabled(&value))
             .unwrap_or(true)
     })
 }

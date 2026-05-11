@@ -119,12 +119,7 @@ impl DenseGdnCheckpointStoreTrace {
 fn dense_gdn_store_replayed_prefix_checkpoint_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("MLX_DENSE_GDN_REPLAY_PREFIX_CHECKPOINT")
-            .map(|value| {
-                let normalized = value.trim().to_ascii_lowercase();
-                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-            })
-            .unwrap_or(false)
+        crate::inference_trace::env_flag_enabled("MLX_DENSE_GDN_REPLAY_PREFIX_CHECKPOINT")
     })
 }
 

@@ -7146,12 +7146,10 @@ fn gemma4_paged_prefill_body_chunk_size(configured_chunk_size: i32, body_tokens:
 fn gemma4_paged_prefill_paged_attention_enabled_for_chunking() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("MLX_GEMMA4_PAGED_PREFILL_PAGED_ATTENTION")
-            .map(|value| {
-                let normalized = value.trim().to_ascii_lowercase();
-                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-            })
-            .unwrap_or(true)
+        crate::inference_trace::env_flag_enabled_or_default(
+            "MLX_GEMMA4_PAGED_PREFILL_PAGED_ATTENTION",
+            true,
+        )
     })
 }
 

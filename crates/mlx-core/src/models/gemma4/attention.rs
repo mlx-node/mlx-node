@@ -18,27 +18,17 @@ use super::quantized_linear::{LinearProj, QuantizedLinear};
 fn paged_prefill_paged_attention_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        // Keep cache-hit suffix attention on the paged K/V pool by default.
-        // The fallback path materializes the full cached prefix through
-        // read_kv_range and dominates long-context prefill traces.
-        std::env::var("MLX_GEMMA4_PAGED_PREFILL_PAGED_ATTENTION")
-            .map(|value| {
-                let normalized = value.trim().to_ascii_lowercase();
-                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-            })
-            .unwrap_or(true)
+        crate::inference_trace::env_flag_enabled_or_default(
+            "MLX_GEMMA4_PAGED_PREFILL_PAGED_ATTENTION",
+            true,
+        )
     })
 }
 
 fn native_kv_write_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("MLX_GEMMA4_NATIVE_KV_WRITE")
-            .map(|value| {
-                let normalized = value.trim().to_ascii_lowercase();
-                !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-            })
-            .unwrap_or(true)
+        crate::inference_trace::env_flag_enabled_or_default("MLX_GEMMA4_NATIVE_KV_WRITE", true)
     })
 }
 
