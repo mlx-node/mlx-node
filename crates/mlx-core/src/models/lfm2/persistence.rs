@@ -427,7 +427,7 @@ impl Lfm2Inner {
         // timeouts. Without this, weights remain as lazy mmap references.
         {
             let weight_refs: Vec<&MxArray> = params.values().collect();
-            crate::array::memory::materialize_weights(&weight_refs);
+            crate::array::memory::materialize_weights(&weight_refs)?;
         }
 
         // NOTE: the cache-limit coordinator registration happens in

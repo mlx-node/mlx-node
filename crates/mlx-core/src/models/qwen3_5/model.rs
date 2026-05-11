@@ -8162,11 +8162,15 @@ mod paged_construction_tests {
     //! / `chat_stream_sync_core_paged`; these tests cover the
     //! Inner-construction surface in isolation.
     //!
-    //! Tests that allocate a `LayerKVPool` require Metal and are
-    //! `#[ignore]`-marked behind `MLX_TEST_PAGED=1`.
+    //! Tests that allocate a `LayerKVPool` require Metal. Construction-only
+    //! cases are `#[ignore]`-marked behind `MLX_TEST_PAGED=1`; forward-path
+    //! checks are also ignored because no-Metal hosts can abort inside MLX
+    //! before Rust receives an `Err`.
 
     use super::*;
+    use crate::array::DType;
     use crate::models::qwen3_5::config::Qwen3_5Config;
+    use crate::models::qwen3_5::decoder_layer::{self, AttentionType};
 
     fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
         Qwen3_5Config {
@@ -8195,6 +8199,200 @@ mod paged_construction_tests {
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
             use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+        }
+    }
+
+    fn tiny_paged_forward_cfg() -> Qwen3_5Config {
+        let mut cfg = tiny_cfg(true);
+        // Paged attention's Metal kernels require head_dim=32+; keep the
+        // production-forward tests on a separate shape so construction tests
+        // preserve their smaller historical config.
+        cfg.hidden_size = 128;
+        cfg.intermediate_size = 256;
+        cfg.head_dim = 32;
+        cfg.linear_key_head_dim = 32;
+        cfg.linear_value_head_dim = 32;
+        cfg.paged_cache_memory_mb = Some(256);
+        cfg
+    }
+
+    fn paged_inner_or_skip(test_name: &str) -> Option<(Qwen35Inner, Qwen3_5Config)> {
+        let cfg = tiny_paged_forward_cfg();
+        match Qwen35Inner::new(cfg.clone()) {
+            Ok(inner) => Some((inner, cfg)),
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool") {
+                    eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
+                    None
+                } else {
+                    panic!("unexpected Qwen35Inner::new failure in {test_name}: {msg}");
+                }
+            }
+        }
+    }
+
+    fn cast_qwen35_inner_weights_bf16(inner: &mut Qwen35Inner) {
+        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype bf16") };
+
+        let w = inner.embedding.get_weight();
+        inner.embedding.set_weight(&cast(&w)).expect("set embed");
+
+        let w = inner.final_norm.get_weight();
+        inner
+            .final_norm
+            .set_weight(&cast(&w))
+            .expect("set final_norm");
+
+        if let Some(head) = inner.lm_head.as_mut() {
+            let w = head.get_weight();
+            head.set_weight(&cast(&w)).expect("set lm_head");
+        }
+
+        for layer in inner.layers.iter_mut() {
+            let w = layer.get_input_layernorm_weight();
+            layer
+                .set_input_layernorm_weight(&cast(&w))
+                .expect("set input_layernorm");
+            let w = layer.get_post_attention_layernorm_weight();
+            layer
+                .set_post_attention_layernorm_weight(&cast(&w))
+                .expect("set post_attention_layernorm");
+
+            match &mut layer.attn {
+                AttentionType::Linear(gdn) => {
+                    let w = gdn.get_dt_bias();
+                    gdn.set_dt_bias(&cast(&w));
+                    let w = gdn.get_a_log();
+                    gdn.set_a_log(&cast(&w)).expect("set a_log");
+                    let w = gdn.get_in_proj_qkvz_weight();
+                    gdn.set_in_proj_qkvz_weight(&cast(&w))
+                        .expect("set in_proj_qkvz");
+                    let w = gdn.get_in_proj_ba_weight();
+                    gdn.set_in_proj_ba_weight(&cast(&w))
+                        .expect("set in_proj_ba");
+                    let w = gdn.get_conv1d_weight();
+                    gdn.set_conv1d_weight(&cast(&w)).expect("set conv1d");
+                    let w = gdn.get_norm_weight();
+                    gdn.set_norm_weight(&cast(&w)).expect("set gdn norm");
+                    let w = gdn.get_out_proj_weight();
+                    gdn.set_out_proj_weight(&cast(&w)).expect("set out_proj");
+                }
+                AttentionType::Full(attn) => {
+                    let w = attn.get_q_proj_weight();
+                    attn.set_q_proj_weight(&cast(&w)).expect("set q_proj");
+                    let w = attn.get_k_proj_weight();
+                    attn.set_k_proj_weight(&cast(&w)).expect("set k_proj");
+                    let w = attn.get_v_proj_weight();
+                    attn.set_v_proj_weight(&cast(&w)).expect("set v_proj");
+                    let w = attn.get_o_proj_weight();
+                    attn.set_o_proj_weight(&cast(&w)).expect("set o_proj");
+                    let w = attn.get_q_norm_weight();
+                    attn.set_q_norm_weight(&cast(&w)).expect("set q_norm");
+                    let w = attn.get_k_norm_weight();
+                    attn.set_k_norm_weight(&cast(&w)).expect("set k_norm");
+                }
+            }
+
+            let w = layer.mlp.get_gate_proj_weight();
+            layer
+                .mlp
+                .set_gate_proj_weight(&cast(&w))
+                .expect("set gate_proj");
+            let w = layer.mlp.get_up_proj_weight();
+            layer
+                .mlp
+                .set_up_proj_weight(&cast(&w))
+                .expect("set up_proj");
+            let w = layer.mlp.get_down_proj_weight();
+            layer
+                .mlp
+                .set_down_proj_weight(&cast(&w))
+                .expect("set down_proj");
+        }
+    }
+
+    fn reset_paged_request(inner: &mut Qwen35Inner, prompt: &[u32]) {
+        inner.caches = Some(
+            (0..inner.config.num_layers as usize)
+                .map(|i| {
+                    if inner.config.is_linear_layer(i) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    }
+                })
+                .collect(),
+        );
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        if adapter.block_table().is_some() {
+            adapter.release_request().expect("release_request");
+        }
+        adapter.reset_for_new_request(0).expect("reset request");
+        let prefix = adapter
+            .find_cached_prefix(prompt, &[], 0, false)
+            .expect("find_cached_prefix");
+        assert_eq!(
+            prefix.cached_token_count, 0,
+            "dense chunking tests must start from a cold adapter prefix"
+        );
+        adapter
+            .allocate_suffix_blocks(prompt.len() as u32)
+            .expect("allocate suffix blocks");
+    }
+
+    fn run_dense_paged_prefill_with_size(
+        inner: &mut Qwen35Inner,
+        full_tokens: &[u32],
+        suffix_tokens: &[u32],
+        cached_prefix_len: u32,
+        chunk_size: i32,
+    ) -> Result<MxArray> {
+        let layer_kinds =
+            decoder_layer::compute_layer_kinds(inner.config.num_layers as usize, |i| {
+                inner.config.is_linear_layer(i)
+            });
+        let embed = inner.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let caches = inner.caches.as_mut().expect("qwen35 caches initialized");
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+
+        super::super::paged_forward::run_paged_prefill_chunk_with_size(
+            full_tokens,
+            suffix_tokens,
+            cached_prefix_len,
+            &embed,
+            &mut inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &embedding_weight,
+            &layer_kinds,
+            adapter,
+            chunk_size,
+        )
+    }
+
+    fn logits_to_f32_vec(logits: &MxArray) -> Vec<f32> {
+        let f32_arr = logits.astype(DType::Float32).expect("astype f32");
+        f32_arr.eval();
+        let n = f32_arr.shape_at(0).expect("shape_at(0)") as usize;
+        (0..n)
+            .map(|i| f32_arr.item_at_float32(i).expect("item_at_float32"))
+            .collect()
+    }
+
+    fn assert_finite_vocab_logits(logits: &MxArray, vocab_size: i32, context: &str) {
+        assert_eq!(logits.ndim().expect("ndim"), 1, "{context}: logits ndim");
+        assert_eq!(
+            logits.shape_at(0).expect("shape_at(0)"),
+            vocab_size as i64,
+            "{context}: logits shape"
+        );
+        let values = logits_to_f32_vec(logits);
+        for (i, v) in values.iter().enumerate() {
+            assert!(v.is_finite(), "{context}: logits[{i}] is not finite: {v}");
         }
     }
 
@@ -8448,6 +8646,166 @@ mod paged_construction_tests {
              the dispatcher gate at chat_sync_core_paged_inner / chat_stream_sync_core_paged_inner \
              relies on this inequality to fall back to the pure-Rust paged path"
         );
+    }
+
+    /// Dense Qwen3.5 paged-prefill chunking state test. This drives the
+    /// production chunk-size worker once and asserts the adapter cursor,
+    /// request token log, and block table cover the whole prompt after all
+    /// chunks have been recorded.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_dense_paged_prefill_chunks_advance_adapter_state() {
+        let Some((mut inner, cfg)) =
+            paged_inner_or_skip("test_dense_paged_prefill_chunks_advance_adapter_state")
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+
+        let prompt: Vec<u32> = (0u32..64).map(|i| (i * 5 + 7) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+
+        let logits = match run_dense_paged_prefill_with_size(
+            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 16,
+        ) {
+            Ok(logits) => logits,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
+                    eprintln!(
+                        "skipping test_dense_paged_prefill_chunks_advance_adapter_state: {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected dense paged chunk failure: {msg}");
+            }
+        };
+
+        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+        assert_eq!(
+            adapter.current_token_count() as usize,
+            prompt.len(),
+            "adapter cursor after chunked prefill"
+        );
+        assert_eq!(
+            adapter.request_tokens(),
+            prompt.as_slice(),
+            "request token log after chunked prefill"
+        );
+        let block_table = adapter.block_table().expect("block_table");
+        let expected_min_blocks = prompt.len().div_ceil(adapter.block_size() as usize);
+        assert!(
+            block_table.num_blocks() >= expected_min_blocks,
+            "block table has {} blocks, expected at least {expected_min_blocks}",
+            block_table.num_blocks()
+        );
+        assert_finite_vocab_logits(&logits, cfg.vocab_size, "final dense paged chunk prefill");
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        adapter.release_request().expect("release_request");
+    }
+
+    /// Uneven-tail coverage for dense Qwen3.5 paged prefill: a 33-token
+    /// prompt with chunk_size=16 must record two full chunks plus a
+    /// one-token tail and return valid logits for the tail chunk.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_dense_paged_prefill_chunks_handle_uneven_tail() {
+        let Some((mut inner, cfg)) =
+            paged_inner_or_skip("test_dense_paged_prefill_chunks_handle_uneven_tail")
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+
+        let prompt: Vec<u32> = (0u32..33).map(|i| (i * 11 + 3) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+
+        let final_logits = run_dense_paged_prefill_with_size(
+            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 16,
+        )
+        .expect("dense paged uneven-tail chunked prefill");
+
+        assert_eq!(
+            prompt.len(),
+            33,
+            "test setup must exercise a one-token tail"
+        );
+        let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+        assert_eq!(
+            adapter.current_token_count(),
+            33,
+            "adapter cursor must include the uneven tail"
+        );
+        assert_eq!(
+            adapter.request_tokens(),
+            prompt.as_slice(),
+            "request token log must include the uneven tail"
+        );
+        assert_finite_vocab_logits(
+            &final_logits,
+            cfg.vocab_size,
+            "uneven-tail dense paged chunk prefill",
+        );
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        adapter.release_request().expect("release_request");
+    }
+
+    /// Compatibility guard for the current/default dense Qwen3.5 paged
+    /// prefill behavior: a full suffix passed in one call remains a valid
+    /// single-shot prefill and is stable across a fresh adapter reset.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_dense_paged_prefill_single_shot_default_still_works() {
+        let Some((mut inner, cfg)) =
+            paged_inner_or_skip("test_dense_paged_prefill_single_shot_default_still_works")
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+
+        let prompt: Vec<u32> = vec![5, 11, 21, 33, 47, 60, 71, 83];
+
+        reset_paged_request(&mut inner, &prompt);
+        let logits_a = run_dense_paged_prefill_with_size(
+            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
+        )
+        .expect("single-shot A");
+        assert_finite_vocab_logits(&logits_a, cfg.vocab_size, "single-shot A");
+        {
+            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+            assert_eq!(
+                adapter.current_token_count() as usize,
+                prompt.len(),
+                "single-shot cursor"
+            );
+            assert_eq!(adapter.request_tokens(), prompt.as_slice());
+        }
+
+        reset_paged_request(&mut inner, &prompt);
+        let logits_b = run_dense_paged_prefill_with_size(
+            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
+        )
+        .expect("single-shot B");
+        let a = logits_to_f32_vec(&logits_a);
+        let b = logits_to_f32_vec(&logits_b);
+        assert_eq!(a.len(), cfg.vocab_size as usize);
+        assert_eq!(b.len(), cfg.vocab_size as usize);
+        for (i, (left, right)) in a.iter().zip(b.iter()).enumerate() {
+            let abs_diff = (left - right).abs();
+            assert!(
+                abs_diff <= 1e-6,
+                "single-shot dense paged prefill changed after fresh reset at index {i}: \
+                 first={left}, second={right}, abs_diff={abs_diff}"
+            );
+        }
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        adapter.release_request().expect("release_request");
     }
 
     /// Phase 5 piece 1: the C++ FFI returns `int32_t` (0 success / -1

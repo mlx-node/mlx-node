@@ -67,6 +67,14 @@ export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 const modelPathsForTokenizers = new WeakMap<object, string>();
 const tokenizerPromises = new WeakMap<object, Promise<Qwen3Tokenizer>>();
 
+function getNativeIsReasoning(chunk: ChatStreamChunk): boolean | undefined {
+  if (typeof chunk.isReasoning === 'boolean') {
+    return chunk.isReasoning;
+  }
+  const snakeCaseChunk = chunk as ChatStreamChunk & { is_reasoning?: unknown };
+  return typeof snakeCaseChunk.is_reasoning === 'boolean' ? snakeCaseChunk.is_reasoning : undefined;
+}
+
 function rememberModelPath(model: object, modelPath: string): void {
   modelPathsForTokenizers.set(model, modelPath);
 }
@@ -304,7 +312,12 @@ export async function* _runChatStream(
           yield finalEvent;
           return;
         }
-        yield { text: chunk.text, done: false, isReasoning: chunk.isReasoning ?? undefined } as ChatStreamDelta;
+        const delta: ChatStreamDelta = { text: chunk.text, done: false };
+        const isReasoning = getNativeIsReasoning(chunk);
+        if (isReasoning !== undefined) {
+          delta.isReasoning = isReasoning;
+        }
+        yield delta;
       }
     }
   } finally {

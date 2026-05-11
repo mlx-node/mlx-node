@@ -12,6 +12,7 @@ import {
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
+import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry, ServableModel } from '../registry.js';
 import type { AnthropicCountTokensRequest, AnthropicCountTokensResponse } from '../types-anthropic.js';
 
@@ -40,6 +41,7 @@ export async function handleCountMessageTokens(
   registry: ModelRegistry,
   idleSweeper?: IdleSweeper | null,
   resolveModel?: (name: string) => Promise<void>,
+  modelWorkCoordinator?: ModelWorkCoordinator,
 ): Promise<void> {
   if (body == null || typeof body !== 'object') {
     sendAnthropicBadRequest(res, 'Request body must be a JSON object');
@@ -71,11 +73,10 @@ export async function handleCountMessageTokens(
 
   if (resolveModel) {
     try {
-      if (idleSweeper) {
-        await idleSweeper.withSuspendedDrains(() => resolveModel(body.model));
-      } else {
-        await resolveModel(body.model);
-      }
+      const runResolve = () =>
+        idleSweeper ? idleSweeper.withSuspendedDrains(() => resolveModel(body.model)) : resolveModel(body.model);
+      if (modelWorkCoordinator) await modelWorkCoordinator.withModelLoad(runResolve);
+      else await runResolve();
     } catch (err) {
       sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;

@@ -17,6 +17,7 @@ import {
 } from './errors.js';
 import type { PublicModelEntry } from './handler.js';
 import type { IdleSweeper } from './idle-sweeper.js';
+import type { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
 import type { AnthropicCountTokensRequest, AnthropicMessagesRequest } from './types-anthropic.js';
 import type { ResponsesAPIRequest } from './types.js';
@@ -51,6 +52,7 @@ export async function routeRequest(
   idleSweeper?: IdleSweeper | null,
   resolveModel?: (name: string) => Promise<void>,
   listModels?: () => PublicModelEntry[],
+  modelWorkCoordinator?: ModelWorkCoordinator,
 ): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const path = url.pathname;
@@ -81,7 +83,16 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateResponse(res, body, registry, store, req, responseRetentionSec, idleSweeper);
+    await handleCreateResponse(
+      res,
+      body,
+      registry,
+      store,
+      req,
+      responseRetentionSec,
+      idleSweeper,
+      modelWorkCoordinator,
+    );
     return;
   }
 
@@ -102,7 +113,7 @@ export async function routeRequest(
       return;
     }
 
-    await handleCountMessageTokens(res, body, registry, idleSweeper, resolveModel);
+    await handleCountMessageTokens(res, body, registry, idleSweeper, resolveModel, modelWorkCoordinator);
     return;
   }
 
@@ -123,7 +134,7 @@ export async function routeRequest(
       return;
     }
 
-    await handleCreateMessage(res, body, registry, req, idleSweeper, resolveModel);
+    await handleCreateMessage(res, body, registry, req, idleSweeper, resolveModel, modelWorkCoordinator);
     return;
   }
 

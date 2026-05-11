@@ -133,62 +133,109 @@ impl StreamSender {
     }
 }
 
-/// Emit the text/reasoning deltas collected by the stream parser on this
-/// step, and fold any surfaced `ToolCall` segments into the shared
-/// accumulator. Tool calls do NOT stream out as deltas — they land on the
-/// terminal `done=true` chunk.
-fn dispatch_stream_segments(segments: Vec<super::output_parser::StreamSegment>, cb: &StreamSender) {
-    use super::output_parser::StreamSegment;
-    for seg in segments {
-        match seg {
-            StreamSegment::Text(text) => {
-                if text.is_empty() {
-                    continue;
+fn emit_stream_delta(text: String, is_reasoning: bool, cb: &StreamSender) {
+    if text.is_empty() {
+        return;
+    }
+    cb.call(
+        Ok(ChatStreamChunk {
+            text,
+            done: false,
+            finish_reason: None,
+            tool_calls: None,
+            thinking: None,
+            num_tokens: None,
+            prompt_tokens: None,
+            reasoning_tokens: None,
+            raw_text: None,
+            cached_tokens: None,
+            performance: None,
+            is_reasoning: Some(is_reasoning),
+        }),
+        ThreadsafeFunctionCallMode::NonBlocking,
+    );
+}
+
+/// Gemma4 marks both hidden reasoning and some answer-only turns with
+/// `<|channel>thought\n...<channel|>`. Once a reasoning delta has been
+/// streamed to Anthropic SSE we cannot re-label that content as visible
+/// text, so keep leading channel bytes pending until a visible text/tool
+/// segment proves the channel was real reasoning. If generation ends
+/// with only that pending channel body, surface it as normal text.
+#[derive(Default)]
+struct Gemma4StreamDispatchState {
+    pending_reasoning: String,
+    visible_text_emitted: bool,
+    tool_call_seen: bool,
+}
+
+impl Gemma4StreamDispatchState {
+    fn dispatch_segments(
+        &mut self,
+        segments: Vec<super::output_parser::StreamSegment>,
+        cb: &StreamSender,
+    ) {
+        use super::output_parser::StreamSegment;
+        for seg in segments {
+            match seg {
+                StreamSegment::Text(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    self.flush_pending_reasoning(cb);
+                    self.visible_text_emitted = true;
+                    emit_stream_delta(text, false, cb);
                 }
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(false),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-            StreamSegment::Reasoning(text) => {
-                if text.is_empty() {
-                    continue;
+                StreamSegment::Reasoning(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if self.visible_text_emitted || self.tool_call_seen {
+                        emit_stream_delta(text, true, cb);
+                    } else {
+                        self.pending_reasoning.push_str(&text);
+                    }
                 }
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(true),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-            StreamSegment::ToolCall(_) => {
-                // Accumulated on `parser.tool_calls()` for the terminal chunk.
+                StreamSegment::ToolCall(_) => {
+                    self.tool_call_seen = true;
+                    self.flush_pending_reasoning(cb);
+                    // Accumulated on `parser.tool_calls()` for the terminal chunk.
+                }
             }
         }
+    }
+
+    fn finish(&mut self, cb: &StreamSender) {
+        if self.pending_reasoning.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.pending_reasoning);
+        if self.visible_text_emitted || self.tool_call_seen {
+            emit_stream_delta(text, true, cb);
+        } else {
+            self.visible_text_emitted = true;
+            emit_stream_delta(text, false, cb);
+        }
+    }
+
+    fn flush_pending_reasoning(&mut self, cb: &StreamSender) {
+        if self.pending_reasoning.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.pending_reasoning);
+        emit_stream_delta(text, true, cb);
+    }
+}
+
+fn promote_channel_only_output(parsed: &mut super::output_parser::Gemma4ParsedOutput) {
+    if parsed.text.trim().is_empty()
+        && parsed.tool_calls.is_empty()
+        && parsed
+            .thinking
+            .as_deref()
+            .is_some_and(|thinking| !thinking.trim().is_empty())
+    {
+        parsed.text = parsed.thinking.take().unwrap_or_default();
     }
 }
 
@@ -408,7 +455,10 @@ pub(crate) enum PrefixCacheDecision {
 }
 
 const GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT: usize = 16;
-const GEMMA4_SLIDING_PREFIX_CHECKPOINT_MAX_DEFAULT_LIMIT: usize = 64;
+const GEMMA4_SLIDING_PREFIX_CHECKPOINT_WINDOW_MULTIPLIER: usize = 2;
+const GEMMA4_SLIDING_PREFIX_CHECKPOINT_MAX_DEFAULT_LIMIT: usize = 128;
+const GEMMA4_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB: u32 = 256;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 struct Gemma4SlidingPrefixCheckpoint {
     prefix_len: u32,
@@ -421,6 +471,11 @@ struct Gemma4SlidingPrefixCheckpoint {
 struct Gemma4SlidingHistoryCheckpoint {
     tokens: Vec<u32>,
     snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
+}
+
+struct Gemma4SlidingPrefixCheckpointHit {
+    prefix_len: u32,
+    caches: Vec<Gemma4LayerCache>,
 }
 
 #[derive(Default)]
@@ -442,13 +497,13 @@ impl Gemma4SlidingCheckpointStoreTrace {
 
 struct Gemma4SlidingPrefixPreparation {
     state: &'static str,
-    already_primed: bool,
+    primed_prefix_len: u32,
 }
 
 struct Gemma4PagedTurnPreparation {
     cached_prefix_len: u32,
     suffix_len: u32,
-    sliding_prefix_already_primed: bool,
+    sliding_primed_prefix_len: u32,
 }
 
 fn compute_gemma4_paged_prefix_block_hash(
@@ -733,9 +788,32 @@ impl Gemma4Inner {
                 ));
             }
 
-            let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
             let head_size = full_group.physical_layout.head_size;
             let num_kv_heads = full_group.physical_layout.num_kv_heads;
+            let max_seq_len = u32::try_from(config.max_position_embeddings).map_err(|_| {
+                napi::Error::from_reason(format!(
+                    "Gemma4 block-paged adapter: invalid max_position_embeddings={}",
+                    config.max_position_embeddings
+                ))
+            })?;
+            if max_seq_len == 0 {
+                return Err(napi::Error::from_reason(
+                    "Gemma4 block-paged adapter: max_position_embeddings must be > 0",
+                ));
+            }
+            let default_gpu_memory_mb = gemma4_default_paged_cache_memory_mb(
+                max_seq_len,
+                block_size,
+                head_size,
+                num_kv_heads,
+                num_global_layers,
+            );
+            let (gpu_memory_mb, paged_cache_memory_source) =
+                if let Some(configured_memory_mb) = config.paged_cache_memory_mb {
+                    (configured_memory_mb, "config")
+                } else {
+                    (default_gpu_memory_mb, "auto_full_context")
+                };
 
             let pa_config = mlx_paged_attn::PagedAttentionConfig {
                 block_size,
@@ -746,7 +824,7 @@ impl Gemma4Inner {
                 // aliases reuse their anchor's slot and do not allocate.
                 num_layers: num_global_layers,
                 use_fp8_cache: Some(false),
-                max_seq_len: Some(config.max_position_embeddings as u32),
+                max_seq_len: Some(max_seq_len),
                 max_batch_size: Some(32),
             };
 
@@ -781,8 +859,11 @@ impl Gemma4Inner {
             tracing::info!(
                 "Gemma4 block-paged adapter enabled: num_blocks={num_blocks}, \
                  block_size={block_size}, gpu_memory_mb={gpu_memory_mb}, \
+                 paged_cache_memory_source={paged_cache_memory_source}, \
+                 max_seq_len={max_seq_len}, max_cached_tokens={}, \
                  physical_full_layers={num_global_layers}, kv_groups={}, \
                  full_group_max_admission_blocks={}, cache_dtype=BFloat16",
+                num_blocks.saturating_mul(block_size),
                 kv_cache_groups.len(),
                 full_group.max_admission_blocks
             );
@@ -957,47 +1038,86 @@ impl Gemma4Inner {
         prefix_len: u32,
         block_size: u32,
         cache_salt: u64,
-    ) -> Result<Option<Vec<Gemma4LayerCache>>> {
-        let Some(final_block_hash) =
-            compute_gemma4_paged_prefix_block_hash(tokens, prefix_len, block_size, cache_salt)
-        else {
-            return Ok(None);
-        };
-        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return Ok(None);
-        };
-
-        if let Some(checkpoint) = self.sliding_prompt_boundary_checkpoint.as_ref() {
-            if checkpoint.prefix_len == prefix_len
-                && checkpoint.block_size == block_size
-                && checkpoint.final_block_hash == final_block_hash
-                && checkpoint.tokens.as_slice() == prefix_tokens
-            {
-                if let Some(caches) =
-                    restore_gemma4_sliding_caches(&self.config, &checkpoint.snapshots, prefix_len)?
-                {
-                    return Ok(Some(caches));
-                }
+    ) -> Result<Option<Gemma4SlidingPrefixCheckpointHit>> {
+        fn try_restore_checkpoint(
+            config: &Gemma4Config,
+            checkpoint: &Gemma4SlidingPrefixCheckpoint,
+            tokens: &[u32],
+            target_prefix_len: u32,
+            block_size: u32,
+            cache_salt: u64,
+        ) -> Result<Option<Gemma4SlidingPrefixCheckpointHit>> {
+            if checkpoint.prefix_len > target_prefix_len || checkpoint.block_size != block_size {
+                return Ok(None);
             }
+            let Some(prefix_tokens) = tokens.get(..checkpoint.prefix_len as usize) else {
+                return Ok(None);
+            };
+            if checkpoint.tokens.as_slice() != prefix_tokens {
+                return Ok(None);
+            }
+            let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash(
+                tokens,
+                checkpoint.prefix_len,
+                block_size,
+                cache_salt,
+            ) else {
+                return Ok(None);
+            };
+            if checkpoint.final_block_hash != final_block_hash {
+                return Ok(None);
+            }
+            let Some(caches) = restore_gemma4_sliding_caches(
+                config,
+                &checkpoint.snapshots,
+                checkpoint.prefix_len,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(Gemma4SlidingPrefixCheckpointHit {
+                prefix_len: checkpoint.prefix_len,
+                caches,
+            }))
+        }
+
+        let mut best_hit: Option<Gemma4SlidingPrefixCheckpointHit> = None;
+        if let Some(checkpoint) = self.sliding_prompt_boundary_checkpoint.as_ref()
+            && let Some(hit) = try_restore_checkpoint(
+                &self.config,
+                checkpoint,
+                tokens,
+                prefix_len,
+                block_size,
+                cache_salt,
+            )?
+        {
+            best_hit = Some(hit);
         }
 
         for checkpoint in self.sliding_prefix_checkpoints.iter().rev() {
-            if checkpoint.prefix_len != prefix_len
-                || checkpoint.block_size != block_size
-                || checkpoint.final_block_hash != final_block_hash
-                || checkpoint.tokens.as_slice() != prefix_tokens
+            if best_hit
+                .as_ref()
+                .is_some_and(|hit| hit.prefix_len >= checkpoint.prefix_len)
             {
                 continue;
             }
-            let Some(caches) =
-                restore_gemma4_sliding_caches(&self.config, &checkpoint.snapshots, prefix_len)?
-            else {
-                continue;
-            };
-            return Ok(Some(caches));
+            if let Some(hit) = try_restore_checkpoint(
+                &self.config,
+                checkpoint,
+                tokens,
+                prefix_len,
+                block_size,
+                cache_salt,
+            )? {
+                if hit.prefix_len == prefix_len {
+                    return Ok(Some(hit));
+                }
+                best_hit = Some(hit);
+            }
         }
 
-        Ok(None)
+        Ok(best_hit)
     }
 
     fn remember_gemma4_sliding_prefix_checkpoint(
@@ -1064,9 +1184,11 @@ impl Gemma4Inner {
                 snapshots,
             });
         let checkpoint_limit = gemma4_sliding_prefix_checkpoint_limit(&self.config, block_size);
-        while self.sliding_prefix_checkpoints.len() > checkpoint_limit {
-            self.sliding_prefix_checkpoints.pop_front();
-        }
+        trim_gemma4_sliding_prefix_checkpoints(
+            &mut self.sliding_prefix_checkpoints,
+            checkpoint_limit,
+            trace_enabled,
+        );
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
@@ -1132,9 +1254,11 @@ impl Gemma4Inner {
                 snapshots,
             });
         let checkpoint_limit = gemma4_sliding_prefix_checkpoint_limit(&self.config, block_size);
-        while self.sliding_prefix_checkpoints.len() > checkpoint_limit {
-            self.sliding_prefix_checkpoints.pop_front();
-        }
+        trim_gemma4_sliding_prefix_checkpoints(
+            &mut self.sliding_prefix_checkpoints,
+            checkpoint_limit,
+            trace_enabled,
+        );
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
@@ -1211,7 +1335,12 @@ impl Gemma4Inner {
         };
         let block_size = adapter.block_size();
         let prefix_len = adapter.current_token_count();
-        if prefix_len == 0 || block_size == 0 || !prefix_len.is_multiple_of(block_size) {
+        let checkpoint_interval =
+            gemma4_sliding_decode_checkpoint_interval(&self.config, block_size);
+        if prefix_len == 0
+            || checkpoint_interval == 0
+            || !prefix_len.is_multiple_of(checkpoint_interval)
+        {
             return Ok(());
         }
         let request_tokens = adapter.request_tokens().to_vec();
@@ -1224,9 +1353,10 @@ impl Gemma4Inner {
         )?;
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {trace_label}_sliding_block_checkpoint boundary_tokens={} block_size={} stored={} materialize_ms={:.1} snapshot_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                "[MLX_TRACE] gemma4 {trace_label}_sliding_block_checkpoint boundary_tokens={} block_size={} checkpoint_interval={} stored={} materialize_ms={:.1} snapshot_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
                 prefix_len,
                 block_size,
+                checkpoint_interval,
                 store_trace.stored,
                 store_trace.eval_ms,
                 store_trace.snapshot_ms,
@@ -1294,7 +1424,7 @@ impl Gemma4Inner {
             }
             return Ok(Gemma4SlidingPrefixPreparation {
                 state: "fresh",
-                already_primed: false,
+                primed_prefix_len: 0,
             });
         }
 
@@ -1314,7 +1444,7 @@ impl Gemma4Inner {
             }
             return Ok(Gemma4SlidingPrefixPreparation {
                 state: "live",
-                already_primed: true,
+                primed_prefix_len: cached_prefix_len,
             });
         }
 
@@ -1336,7 +1466,7 @@ impl Gemma4Inner {
             }
             return Ok(Gemma4SlidingPrefixPreparation {
                 state: "last_history",
-                already_primed: true,
+                primed_prefix_len: cached_prefix_len,
             });
         }
 
@@ -1355,7 +1485,7 @@ impl Gemma4Inner {
             }
             return Ok(Gemma4SlidingPrefixPreparation {
                 state: "last_history_checkpoint",
-                already_primed: true,
+                primed_prefix_len: cached_prefix_len,
             });
         }
 
@@ -1365,21 +1495,30 @@ impl Gemma4Inner {
             .map(|adapter| adapter.block_size())
             .unwrap_or(0);
         let prefix_lookup_start = trace_enabled.then(std::time::Instant::now);
-        if let Some(caches) =
+        if let Some(hit) =
             self.find_gemma4_sliding_prefix_checkpoint(tokens, cached_prefix_len, block_size, 0)?
         {
-            self.caches = Some(caches);
+            let hit_prefix_len = hit.prefix_len;
+            self.caches = Some(hit.caches);
+            let state = if hit_prefix_len == cached_prefix_len {
+                "prefix_checkpoint"
+            } else {
+                "partial_prefix_checkpoint"
+            };
             if trace_enabled {
                 write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 sliding_prefix_prepare_done state=prefix_checkpoint cached_prefix_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
+                    "[MLX_TRACE] gemma4 sliding_prefix_prepare_done state={} cached_prefix_tokens={} primed_prefix_tokens={} replay_delta_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
+                    state,
                     cached_prefix_len,
+                    hit_prefix_len,
+                    cached_prefix_len.saturating_sub(hit_prefix_len),
                     prefix_lookup_start.map(elapsed_ms).unwrap_or(0.0),
                     prepare_start.map(elapsed_ms).unwrap_or(0.0)
                 ));
             }
             return Ok(Gemma4SlidingPrefixPreparation {
-                state: "prefix_checkpoint",
-                already_primed: true,
+                state,
+                primed_prefix_len: hit_prefix_len,
             });
         }
 
@@ -1395,7 +1534,7 @@ impl Gemma4Inner {
         }
         Ok(Gemma4SlidingPrefixPreparation {
             state: "replay",
-            already_primed: false,
+            primed_prefix_len: 0,
         })
     }
 
@@ -2076,7 +2215,7 @@ impl Gemma4Inner {
         let performance = Some(crate::profiling::PerformanceMetrics {
             ttft_ms,
             prefill_tokens_per_second: if ttft_ms > 0.0 {
-                prompt_token_count as f64 / (ttft_ms / 1000.0)
+                prefill_len as f64 / (ttft_ms / 1000.0)
             } else {
                 0.0
             },
@@ -2087,7 +2226,8 @@ impl Gemma4Inner {
             },
         });
 
-        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        promote_channel_only_output(&mut parsed);
         let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
         } else {
@@ -2410,6 +2550,7 @@ impl Gemma4Inner {
         let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
         let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
+        let mut stream_dispatch = Gemma4StreamDispatchState::default();
 
         if use_compiled {
             let _compiled_guard = COMPILED_FORWARD_MUTEX.lock().unwrap();
@@ -2507,7 +2648,7 @@ impl Gemma4Inner {
                 streamed_text_len += token_text.len();
 
                 let segments = stream_parser.feed(&token_text);
-                dispatch_stream_segments(segments, cb);
+                stream_dispatch.dispatch_segments(segments, cb);
 
                 if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
@@ -2580,7 +2721,7 @@ impl Gemma4Inner {
                 streamed_text_len += token_text.len();
 
                 let segments = stream_parser.feed(&token_text);
-                dispatch_stream_segments(segments, cb);
+                stream_dispatch.dispatch_segments(segments, cb);
 
                 if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = "stop".to_string();
@@ -2615,11 +2756,12 @@ impl Gemma4Inner {
             let residual = raw_text[streamed_text_len..].to_string();
             let mut segments = stream_parser.feed(&residual);
             segments.extend(stream_parser.flush());
-            dispatch_stream_segments(segments, cb);
+            stream_dispatch.dispatch_segments(segments, cb);
         } else {
             let tail = stream_parser.flush();
-            dispatch_stream_segments(tail, cb);
+            stream_dispatch.dispatch_segments(tail, cb);
         }
+        stream_dispatch.finish(cb);
 
         // Save session state so subsequent
         // `chat_stream_session_continue_sync` / `chat_session_continue_sync`
@@ -2650,7 +2792,7 @@ impl Gemma4Inner {
         let performance = Some(crate::profiling::PerformanceMetrics {
             ttft_ms,
             prefill_tokens_per_second: if ttft_ms > 0.0 {
-                prompt_token_count as f64 / (ttft_ms / 1000.0)
+                prefill_len as f64 / (ttft_ms / 1000.0)
             } else {
                 0.0
             },
@@ -2730,24 +2872,32 @@ impl Gemma4Inner {
         tokens: &[u32],
         total_budget: u32,
         seq_id: u32,
-        cached_prefix_len: u32,
+        restore_tokens: u32,
         trace_enabled: bool,
-    ) -> Result<u32> {
-        let Some(max_sliding_restore_tokens) =
-            gemma4_large_sliding_restore_suppression_limit(cached_prefix_len)
-        else {
-            return Ok(cached_prefix_len);
+    ) -> Result<bool> {
+        let block_size = self
+            .paged_adapter
+            .as_ref()
+            .map(|adapter| adapter.block_size())
+            .unwrap_or(0);
+        let Some(suppression) = gemma4_large_sliding_restore_suppression_limit(
+            &self.config,
+            block_size,
+            restore_tokens,
+        ) else {
+            return Ok(false);
         };
 
-        // Emergency operator override. By default, large prefix hits stay enabled:
-        // the sliding restore pass is chunked, and global attention reads paged K/V
-        // instead of rebuilding throwaway global K/V. If a deployment hits a
-        // restore-specific issue, MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS can force
-        // full prefill above the configured limit.
+        // Sliding layers are recursive: without a close sliding checkpoint,
+        // restoring a large paged-prefix hit can be slower than simply
+        // recomputing the prompt. Keep prefix reuse only when the missing
+        // sliding delta fits within the normal checkpoint interval; otherwise
+        // fall back to a coherent cold prefill. Operators can set
+        // MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS=off for debugging.
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {}_prefix_reuse_suppressed reason=large_sliding_restore_env_limit cached_prefix_tokens={} limit={}",
-                trace_label, cached_prefix_len, max_sliding_restore_tokens
+                "[MLX_TRACE] gemma4 {}_prefix_reuse_suppressed reason=large_sliding_restore_limit restore_tokens={} limit={} limit_source={} block_size={}",
+                trace_label, restore_tokens, suppression.limit, suppression.source, block_size
             ));
         }
         let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
@@ -2768,7 +2918,7 @@ impl Gemma4Inner {
             .map_err(Error::from_reason)?;
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {}_adapter_reset_done reason=large_sliding_restore_env_limit_suppressed cached_prefix_tokens={} cached_blocks={} allocated_blocks={} request_tokens={} blocks={}",
+                "[MLX_TRACE] gemma4 {}_adapter_reset_done reason=large_sliding_restore_suppressed cached_prefix_tokens={} cached_blocks={} allocated_blocks={} request_tokens={} blocks={}",
                 trace_label,
                 prefix.cached_token_count,
                 prefix.blocks.len(),
@@ -2777,7 +2927,7 @@ impl Gemma4Inner {
                 adapter.num_allocated_blocks()
             ));
         }
-        Ok(0)
+        Ok(true)
     }
 
     fn prepare_gemma4_paged_turn(
@@ -2846,21 +2996,26 @@ impl Gemma4Inner {
             cached_prefix_len,
             plan.continued_live_prefix,
         )?;
-        if !sliding_preparation.already_primed {
-            let prepared_prefix_len = self.suppress_large_sliding_prefix_reuse_if_needed(
+        if sliding_preparation.primed_prefix_len < cached_prefix_len {
+            let suppressed = self.suppress_large_sliding_prefix_reuse_if_needed(
                 trace_label,
                 tokens,
                 total_budget,
                 seq_id,
-                cached_prefix_len,
+                cached_prefix_len.saturating_sub(sliding_preparation.primed_prefix_len),
                 trace_enabled,
             )?;
-            if prepared_prefix_len != cached_prefix_len {
-                cached_prefix_len = prepared_prefix_len;
+            if suppressed {
+                let previous_cached_prefix_len = cached_prefix_len;
+                cached_prefix_len = 0;
                 sliding_preparation =
                     self.prepare_gemma4_sliding_prefix_state(tokens, cached_prefix_len, false)?;
-            } else {
-                cached_prefix_len = prepared_prefix_len;
+                if trace_enabled {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] gemma4 {trace_label}_cached_prefix_reset previous_cached_prefix_tokens={} reason=sliding_restore_limit",
+                        previous_cached_prefix_len
+                    ));
+                }
             }
         }
 
@@ -2871,12 +3026,15 @@ impl Gemma4Inner {
             ))
         })?;
         if trace_enabled {
+            let already_primed = sliding_preparation.primed_prefix_len == cached_prefix_len;
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {trace_label}_sliding_prefix_state state={} cached_prefix_tokens={} suffix_tokens={} already_primed={} continued_live={}",
+                "[MLX_TRACE] gemma4 {trace_label}_sliding_prefix_state state={} cached_prefix_tokens={} sliding_primed_prefix_tokens={} replay_delta_tokens={} suffix_tokens={} already_primed={} continued_live={}",
                 sliding_preparation.state,
                 cached_prefix_len,
+                sliding_preparation.primed_prefix_len,
+                cached_prefix_len.saturating_sub(sliding_preparation.primed_prefix_len),
                 suffix_len,
-                sliding_preparation.already_primed,
+                already_primed,
                 plan.continued_live_prefix
             ));
         }
@@ -2884,7 +3042,7 @@ impl Gemma4Inner {
         Ok(Gemma4PagedTurnPreparation {
             cached_prefix_len,
             suffix_len,
-            sliding_prefix_already_primed: sliding_preparation.already_primed,
+            sliding_primed_prefix_len: sliding_preparation.primed_prefix_len,
         })
     }
 
@@ -2914,6 +3072,20 @@ impl Gemma4Inner {
         let eos_ids = self.config.eos_token_ids.clone();
         let generation_start = std::time::Instant::now();
         let trace_enabled = inference_trace_enabled();
+        let effective_max_new_tokens = gemma4_context_limited_max_new_tokens(
+            max_new_tokens,
+            prompt_token_count,
+            self.config.max_position_embeddings,
+        )
+        .map_err(Error::from_reason)?;
+        gemma4_trace_context_limited_max_new_tokens(
+            "sync_paged",
+            max_new_tokens,
+            effective_max_new_tokens,
+            prompt_token_count,
+            self.config.max_position_embeddings,
+            trace_enabled,
+        );
 
         let seq_id: u32 = 0;
         let total_budget = tokens.len() as u32;
@@ -2942,9 +3114,9 @@ impl Gemma4Inner {
         let forward_result = self.chat_sync_core_paged_inner(
             &tokens,
             cached_prefix_len,
-            paged_turn.sliding_prefix_already_primed,
+            paged_turn.sliding_primed_prefix_len,
             sampling_config,
-            max_new_tokens,
+            effective_max_new_tokens,
             eos_token_id,
             &eos_ids,
             repetition_cutoff,
@@ -3018,7 +3190,7 @@ impl Gemma4Inner {
             .map(|fti| generation_end.duration_since(fti).as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         let gen_toks = generated_tokens.len() as f64;
-        let actual_prefill_count = (tokens.len() as f64) - cached_prefix_len as f64;
+        let actual_prefill_count = paged_turn.suffix_len as f64;
         let performance = Some(crate::profiling::PerformanceMetrics {
             ttft_ms,
             prefill_tokens_per_second: if ttft_ms > 0.0 {
@@ -3033,7 +3205,8 @@ impl Gemma4Inner {
             },
         });
 
-        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        promote_channel_only_output(&mut parsed);
         let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
         } else {
@@ -3061,7 +3234,7 @@ impl Gemma4Inner {
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
-        sliding_prefix_already_primed: bool,
+        sliding_primed_prefix_len: u32,
         sampling_config: Option<SamplingConfig>,
         max_new_tokens: i32,
         eos_token_id: u32,
@@ -3083,7 +3256,7 @@ impl Gemma4Inner {
                 tokens,
                 suffix,
                 cached_prefix_len,
-                sliding_prefix_already_primed,
+                sliding_primed_prefix_len,
             )?
         };
 
@@ -3172,10 +3345,24 @@ impl Gemma4Inner {
         let generation_start = std::time::Instant::now();
         let trace_enabled = inference_trace_enabled();
         let trace_start = trace_enabled.then(std::time::Instant::now);
+        let effective_max_new_tokens = gemma4_context_limited_max_new_tokens(
+            max_new_tokens,
+            prompt_token_count,
+            self.config.max_position_embeddings,
+        )
+        .map_err(Error::from_reason)?;
+        gemma4_trace_context_limited_max_new_tokens(
+            "stream_paged",
+            max_new_tokens,
+            effective_max_new_tokens,
+            prompt_token_count,
+            self.config.max_position_embeddings,
+            trace_enabled,
+        );
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 stream_paged_start prompt_tokens={} reuse_cache={} max_new_tokens={}",
-                prompt_token_count, reuse_cache, max_new_tokens
+                "[MLX_TRACE] gemma4 stream_paged_start prompt_tokens={} reuse_cache={} max_new_tokens={} requested_max_new_tokens={}",
+                prompt_token_count, reuse_cache, effective_max_new_tokens, max_new_tokens
             ));
         }
 
@@ -3209,9 +3396,9 @@ impl Gemma4Inner {
         let stream_result = self.chat_stream_sync_core_paged_inner(
             &tokens,
             cached_prefix_len,
-            paged_turn.sliding_prefix_already_primed,
+            paged_turn.sliding_primed_prefix_len,
             sampling_config,
-            max_new_tokens,
+            effective_max_new_tokens,
             eos_token_id,
             &eos_ids,
             tokenizer.clone(),
@@ -3293,7 +3480,8 @@ impl Gemma4Inner {
 
         // Terminal stream chunk.
         let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
-        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        promote_channel_only_output(&mut parsed);
         let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
         } else {
@@ -3308,7 +3496,7 @@ impl Gemma4Inner {
             .map(|fti| generation_end.duration_since(fti).as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         let gen_toks = generated_tokens.len() as f64;
-        let actual_prefill_count = (tokens.len() as f64) - cached_prefix_len as f64;
+        let actual_prefill_count = suffix_len as f64;
         let performance = Some(crate::profiling::PerformanceMetrics {
             ttft_ms,
             prefill_tokens_per_second: if ttft_ms > 0.0 {
@@ -3356,7 +3544,7 @@ impl Gemma4Inner {
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
-        sliding_prefix_already_primed: bool,
+        sliding_primed_prefix_len: u32,
         sampling_config: Option<SamplingConfig>,
         max_new_tokens: i32,
         eos_token_id: u32,
@@ -3379,7 +3567,7 @@ impl Gemma4Inner {
                 tokens,
                 suffix,
                 cached_prefix_len,
-                sliding_prefix_already_primed,
+                sliding_primed_prefix_len,
             )?
         };
 
@@ -3403,6 +3591,7 @@ impl Gemma4Inner {
         // Streaming detokenizer + parser.
         let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
+        let mut stream_dispatch = Gemma4StreamDispatchState::default();
 
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
         let mut finish_reason = String::from("length");
@@ -3444,7 +3633,7 @@ impl Gemma4Inner {
                 .map_err(|e| Error::from_reason(format!("decode_stream: {e}")))?
             {
                 let segments = stream_parser.feed(&piece);
-                dispatch_stream_segments(segments, cb);
+                stream_dispatch.dispatch_segments(segments, cb);
             }
 
             if is_eos_token(token_id, eos_ids, eos_token_id) {
@@ -3513,7 +3702,8 @@ impl Gemma4Inner {
         // Flush any residual segments accumulated by the parser but not
         // yet emitted.
         let residual_segments = stream_parser.flush();
-        dispatch_stream_segments(residual_segments, cb);
+        stream_dispatch.dispatch_segments(residual_segments, cb);
+        stream_dispatch.finish(cb);
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] gemma4 stream_paged_decode_done finish_reason={} generated_tokens={} elapsed_ms={:.1}",
@@ -3563,12 +3753,18 @@ impl Gemma4Inner {
         full_tokens: &[u32],
         suffix_tokens: &[u32],
         cached_prefix_len: u32,
-        sliding_prefix_already_primed: bool,
+        sliding_primed_prefix_len: u32,
     ) -> Result<MxArray> {
         if suffix_tokens.is_empty() {
             return Err(Error::from_reason(
                 "run_paged_prefill_chunk called with empty suffix",
             ));
+        }
+        if sliding_primed_prefix_len > cached_prefix_len {
+            return Err(Error::from_reason(format!(
+                "Gemma4 paged prefill sliding_primed_prefix_len {} exceeds cached_prefix_len {}",
+                sliding_primed_prefix_len, cached_prefix_len
+            )));
         }
 
         let suffix_len = suffix_tokens.len() as u32;
@@ -3586,13 +3782,14 @@ impl Gemma4Inner {
 
         // For sliding layers we need state at position cached_prefix_len.
         // Sliding layers are restored each turn via reset_caches_sync, so
-        // we need to reprefill the cached prefix through them BEFORE the
-        // suffix can attend. Run a "sliding-only" pass over the prefix
-        // tokens, then the suffix passes below.
-        if cached_prefix_len > 0 && !sliding_prefix_already_primed {
-            let prefix = &full_tokens[..(cached_prefix_len as usize)];
+        // we need to reprefill any unprimed cached-prefix delta through
+        // them BEFORE the suffix can attend. When a sparse checkpoint hits,
+        // this is only the delta from that checkpoint to cached_prefix_len.
+        if sliding_primed_prefix_len < cached_prefix_len {
+            let prefix =
+                &full_tokens[(sliding_primed_prefix_len as usize)..(cached_prefix_len as usize)];
             let sliding_trace_start = trace_enabled.then(std::time::Instant::now);
-            self.run_sliding_only_prefill(prefix, &layer_kinds)?;
+            self.run_sliding_only_prefill(prefix, sliding_primed_prefix_len, &layer_kinds)?;
             let block_size = self
                 .paged_adapter
                 .as_ref()
@@ -3606,7 +3803,9 @@ impl Gemma4Inner {
             )?;
             if trace_enabled {
                 write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 paged_prefill_sliding_prefix_done prefix_tokens={} checkpoint_stored={} store_eval_ms={:.1} store_snapshot_ms={:.1} store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} elapsed_ms={:.1}",
+                    "[MLX_TRACE] gemma4 paged_prefill_sliding_prefix_done cached_prefix_tokens={} restored_prefix_tokens={} replay_tokens={} checkpoint_stored={} store_eval_ms={:.1} store_snapshot_ms={:.1} store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} elapsed_ms={:.1}",
+                    cached_prefix_len,
+                    sliding_primed_prefix_len,
                     prefix.len(),
                     store_trace.stored,
                     store_trace.eval_ms,
@@ -3619,8 +3818,8 @@ impl Gemma4Inner {
             }
         } else if cached_prefix_len > 0 && trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 paged_prefill_sliding_prefix_skipped cached_prefix_tokens={} reason=already_primed",
-                cached_prefix_len
+                "[MLX_TRACE] gemma4 paged_prefill_sliding_prefix_skipped cached_prefix_tokens={} sliding_primed_prefix_tokens={} reason=already_primed",
+                cached_prefix_len, sliding_primed_prefix_len
             ));
         }
 
@@ -3665,19 +3864,24 @@ impl Gemma4Inner {
                 .as_ref()
                 .map(|adapter| adapter.block_size())
                 .unwrap_or(0);
-            let prompt_checkpoint_boundary_len = if block_size > 0 {
-                (full_tokens.len() as u32 / block_size) * block_size
-            } else {
-                0
-            };
-            let mut body_chunk_plan = gemma4_paged_prefill_body_chunk_plan(
-                configured_chunk_size,
-                pass1_tokens.len(),
-                pass2_first_position,
-                num_query_heads,
-                global_head_size,
-                paged_attention_enabled,
-            )?;
+            let full_tokens_len = u32::try_from(full_tokens.len())
+                .map_err(|_| Error::from_reason("Gemma4 paged prefill token count exceeds u32"))?;
+            let prompt_checkpoint_boundary_len = full_tokens_len
+                .checked_div(block_size)
+                .map(|blocks| blocks.saturating_mul(block_size))
+                .unwrap_or(0);
+            let checkpoint_interval =
+                gemma4_sliding_decode_checkpoint_interval(&self.config, block_size);
+            let mut body_chunk_plan =
+                gemma4_paged_prefill_body_chunk_plan_with_checkpoint_interval(
+                    configured_chunk_size,
+                    pass1_tokens.len(),
+                    pass2_first_position,
+                    num_query_heads,
+                    global_head_size,
+                    paged_attention_enabled,
+                    checkpoint_interval,
+                )?;
             gemma4_split_body_chunk_plan_at_position(
                 &mut body_chunk_plan,
                 prompt_checkpoint_boundary_len,
@@ -3805,6 +4009,16 @@ impl Gemma4Inner {
                     .ok_or_else(|| {
                         Error::from_reason("Gemma4 paged prefill token position overflow")
                     })?;
+                // Global paged-cache hits can land at any prior full-block
+                // prefix, not just the previous prompt boundary. Persist
+                // sliding snapshots at the normal window stride during
+                // prefill too, so a later branch switch can restore from a
+                // nearby sliding state instead of replaying tens of thousands
+                // of sliding tokens or falling back to a full cold prefill.
+                self.maybe_remember_gemma4_sliding_decode_boundary_checkpoint(
+                    "paged_prefill",
+                    trace_enabled,
+                )?;
                 if pass2_first_position == prompt_checkpoint_boundary_len {
                     self.maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
                         "paged_prefill",
@@ -4358,6 +4572,7 @@ impl Gemma4Inner {
     fn run_sliding_only_prefill(
         &mut self,
         prefix_tokens: &[u32],
+        first_logical_position: u32,
         layer_kinds: &[Gemma4LayerKind],
     ) -> Result<()> {
         if prefix_tokens.is_empty() {
@@ -4381,7 +4596,7 @@ impl Gemma4Inner {
         let mut chunk_plan = gemma4_paged_prefill_body_chunk_plan(
             configured_chunk_size,
             prefix_tokens.len(),
-            0,
+            first_logical_position,
             num_query_heads,
             global_head_size,
             paged_attention_enabled,
@@ -4399,7 +4614,8 @@ impl Gemma4Inner {
                 .filter(|chunk| chunk.capped_by_v2_aux_limit)
                 .count();
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 sliding_prefix_restore_start prefix_tokens={} chunks={} chunk_size={} min_chunk_size={} max_chunk_size={} configured_chunk_size={} dynamic_v2_aux_caps={} path=paged_global_readonly",
+                "[MLX_TRACE] gemma4 sliding_prefix_restore_start first_position={} prefix_tokens={} chunks={} chunk_size={} min_chunk_size={} max_chunk_size={} configured_chunk_size={} dynamic_v2_aux_caps={} path=paged_global_readonly",
+                first_logical_position,
                 prefix_tokens.len(),
                 chunk_plan.len(),
                 first_chunk_size,
@@ -4457,7 +4673,8 @@ impl Gemma4Inner {
 
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 sliding_prefix_restore_done prefix_tokens={} chunks={} elapsed_ms={:.1}",
+                "[MLX_TRACE] gemma4 sliding_prefix_restore_done first_position={} prefix_tokens={} chunks={} elapsed_ms={:.1}",
+                first_logical_position,
                 prefix_tokens.len(),
                 total_chunks,
                 total_trace_start.map(elapsed_ms).unwrap_or(0.0)
@@ -5063,7 +5280,8 @@ impl Gemma4Inner {
             },
         });
 
-        let parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        promote_channel_only_output(&mut parsed);
         let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
         } else {
@@ -5393,6 +5611,7 @@ impl Gemma4Inner {
         let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
         let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
+        let mut stream_dispatch = Gemma4StreamDispatchState::default();
 
         let mut current_y = y;
         for step in 0..max_new_tokens {
@@ -5439,7 +5658,7 @@ impl Gemma4Inner {
             streamed_text_len += token_text.len();
 
             let segments = stream_parser.feed(&token_text);
-            dispatch_stream_segments(segments, cb);
+            stream_dispatch.dispatch_segments(segments, cb);
 
             if is_eos_token(token_id, &eos_ids, turn_end_id) {
                 finish_reason = "stop".to_string();
@@ -5469,11 +5688,12 @@ impl Gemma4Inner {
             let residual = raw_text[streamed_text_len..].to_string();
             let mut segments = stream_parser.feed(&residual);
             segments.extend(stream_parser.flush());
-            dispatch_stream_segments(segments, cb);
+            stream_dispatch.dispatch_segments(segments, cb);
         } else {
             let tail = stream_parser.flush();
-            dispatch_stream_segments(tail, cb);
+            stream_dispatch.dispatch_segments(tail, cb);
         }
+        stream_dispatch.finish(cb);
 
         // Save cache state for the next session turn.
         let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
@@ -6670,6 +6890,75 @@ fn physical_full_attention_layer_count(specs: &[LayerKVCacheSpec]) -> usize {
         .count()
 }
 
+fn gemma4_default_paged_cache_memory_mb(
+    max_seq_len: u32,
+    block_size: u32,
+    head_size: u32,
+    num_kv_heads: u32,
+    num_layers: u32,
+) -> u32 {
+    if max_seq_len == 0 || block_size == 0 || head_size == 0 || num_kv_heads == 0 || num_layers == 0
+    {
+        return GEMMA4_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB;
+    }
+
+    let max_blocks = u64::from(max_seq_len.div_ceil(block_size));
+    let bytes_per_block = 2u64
+        .saturating_mul(u64::from(num_kv_heads))
+        .saturating_mul(u64::from(head_size))
+        .saturating_mul(u64::from(block_size))
+        .saturating_mul(2)
+        .saturating_mul(u64::from(num_layers));
+    let required_mb = bytes_per_block
+        .saturating_mul(max_blocks)
+        .div_ceil(BYTES_PER_MIB)
+        .max(u64::from(GEMMA4_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB));
+    u32::try_from(required_mb).unwrap_or(u32::MAX)
+}
+
+fn gemma4_context_limited_max_new_tokens(
+    requested_max_new_tokens: i32,
+    prompt_tokens: usize,
+    max_position_embeddings: i32,
+) -> std::result::Result<i32, String> {
+    if requested_max_new_tokens <= 0 {
+        return Ok(0);
+    }
+    let max_positions = u32::try_from(max_position_embeddings)
+        .map_err(|_| format!("Gemma4 invalid max_position_embeddings={max_position_embeddings}"))?;
+    if max_positions == 0 {
+        return Err("Gemma4 max_position_embeddings must be > 0".to_string());
+    }
+    let prompt_tokens_u32 = u32::try_from(prompt_tokens)
+        .map_err(|_| format!("Gemma4 prompt token count {prompt_tokens} exceeds u32"))?;
+    if prompt_tokens_u32 > max_positions {
+        return Err(format!(
+            "Gemma4 prompt_tokens={prompt_tokens_u32} exceeds max_position_embeddings={max_positions}"
+        ));
+    }
+    let remaining = max_positions - prompt_tokens_u32;
+    Ok(requested_max_new_tokens.min(i32::try_from(remaining).unwrap_or(i32::MAX)))
+}
+
+fn gemma4_trace_context_limited_max_new_tokens(
+    trace_label: &str,
+    requested_max_new_tokens: i32,
+    effective_max_new_tokens: i32,
+    prompt_tokens: usize,
+    max_position_embeddings: i32,
+    trace_enabled: bool,
+) {
+    if trace_enabled && effective_max_new_tokens != requested_max_new_tokens {
+        write_inference_trace(format_args!(
+            "[MLX_TRACE] gemma4 {trace_label}_max_new_tokens_clamped requested={} effective={} prompt_tokens={} max_position_embeddings={}",
+            requested_max_new_tokens,
+            effective_max_new_tokens,
+            prompt_tokens,
+            max_position_embeddings
+        ));
+    }
+}
+
 /// Default prefill chunk size (tokens per chunk).
 /// Note: mlx-lm uses 2048 but the first eval triggers Metal shader compilation
 /// which can GPU-timeout with very large graphs. Using 512 keeps individual
@@ -6678,16 +6967,37 @@ const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
 
-fn parse_gemma4_sliding_restore_limit(value: &str) -> Option<u32> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gemma4SlidingRestoreLimitOverride {
+    Cap(u32),
+    Uncapped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gemma4SlidingRestoreSuppression {
+    limit: u32,
+    source: &'static str,
+}
+
+fn parse_gemma4_sliding_restore_limit(value: &str) -> Option<Gemma4SlidingRestoreLimitOverride> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
-    value.parse::<u32>().ok()
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "off" | "none" | "false" | "no" | "unlimited" | "uncapped"
+    ) {
+        return Some(Gemma4SlidingRestoreLimitOverride::Uncapped);
+    }
+    value
+        .parse::<u32>()
+        .ok()
+        .map(Gemma4SlidingRestoreLimitOverride::Cap)
 }
 
-fn gemma4_sliding_restore_limit_override() -> Option<u32> {
-    static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+fn gemma4_sliding_restore_limit_override() -> Option<Gemma4SlidingRestoreLimitOverride> {
+    static OVERRIDE: OnceLock<Option<Gemma4SlidingRestoreLimitOverride>> = OnceLock::new();
     *OVERRIDE.get_or_init(|| {
         std::env::var("MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS")
             .ok()
@@ -6695,18 +7005,38 @@ fn gemma4_sliding_restore_limit_override() -> Option<u32> {
     })
 }
 
-fn gemma4_large_sliding_restore_suppression_limit_for_override(
-    override_limit: Option<u32>,
-    cached_prefix_len: u32,
-) -> Option<u32> {
-    let limit = override_limit?;
-    (cached_prefix_len > limit).then_some(limit)
+fn gemma4_default_sliding_restore_limit(config: &Gemma4Config, block_size: u32) -> Option<u32> {
+    let interval = gemma4_sliding_decode_checkpoint_interval(config, block_size);
+    (interval > 0).then_some(interval)
 }
 
-fn gemma4_large_sliding_restore_suppression_limit(cached_prefix_len: u32) -> Option<u32> {
+fn gemma4_large_sliding_restore_suppression_limit_for_override(
+    config: &Gemma4Config,
+    block_size: u32,
+    override_limit: Option<Gemma4SlidingRestoreLimitOverride>,
+    restore_tokens: u32,
+) -> Option<Gemma4SlidingRestoreSuppression> {
+    let (limit, source) = match override_limit {
+        Some(Gemma4SlidingRestoreLimitOverride::Uncapped) => return None,
+        Some(Gemma4SlidingRestoreLimitOverride::Cap(limit)) => (limit, "env"),
+        None => (
+            gemma4_default_sliding_restore_limit(config, block_size)?,
+            "default",
+        ),
+    };
+    (restore_tokens > limit).then_some(Gemma4SlidingRestoreSuppression { limit, source })
+}
+
+fn gemma4_large_sliding_restore_suppression_limit(
+    config: &Gemma4Config,
+    block_size: u32,
+    restore_tokens: u32,
+) -> Option<Gemma4SlidingRestoreSuppression> {
     gemma4_large_sliding_restore_suppression_limit_for_override(
+        config,
+        block_size,
         gemma4_sliding_restore_limit_override(),
-        cached_prefix_len,
+        restore_tokens,
     )
 }
 
@@ -6740,10 +7070,13 @@ fn gemma4_sliding_prefix_checkpoint_limit_for_override(
     if sliding_window == 0 || block_size == 0 {
         return GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT;
     }
-    sliding_window.div_ceil(block_size).clamp(
-        GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT,
-        GEMMA4_SLIDING_PREFIX_CHECKPOINT_MAX_DEFAULT_LIMIT,
-    )
+    sliding_window
+        .div_ceil(block_size)
+        .saturating_mul(GEMMA4_SLIDING_PREFIX_CHECKPOINT_WINDOW_MULTIPLIER)
+        .clamp(
+            GEMMA4_SLIDING_PREFIX_CHECKPOINT_MIN_LIMIT,
+            GEMMA4_SLIDING_PREFIX_CHECKPOINT_MAX_DEFAULT_LIMIT,
+        )
 }
 
 fn gemma4_sliding_prefix_checkpoint_limit(config: &Gemma4Config, block_size: u32) -> usize {
@@ -6752,6 +7085,45 @@ fn gemma4_sliding_prefix_checkpoint_limit(config: &Gemma4Config, block_size: u32
         block_size,
         gemma4_sliding_checkpoint_limit_override(),
     )
+}
+
+fn gemma4_sliding_decode_checkpoint_interval(config: &Gemma4Config, block_size: u32) -> u32 {
+    if block_size == 0 {
+        return 0;
+    }
+    let sliding_window = config.sliding_window.max(0) as u32;
+    let target = sliding_window.max(block_size);
+    target.div_ceil(block_size).saturating_mul(block_size)
+}
+
+fn trim_gemma4_sliding_prefix_checkpoints(
+    checkpoints: &mut VecDeque<Gemma4SlidingPrefixCheckpoint>,
+    limit: usize,
+    trace_enabled: bool,
+) {
+    if limit == 0 {
+        return;
+    }
+    let mut evicted = 0usize;
+    let mut first_prefix_len = None;
+    let mut last_prefix_len = None;
+    while checkpoints.len() > limit {
+        if let Some(checkpoint) = checkpoints.pop_front() {
+            first_prefix_len.get_or_insert(checkpoint.prefix_len);
+            last_prefix_len = Some(checkpoint.prefix_len);
+            evicted += 1;
+        }
+    }
+    if trace_enabled && evicted > 0 {
+        write_inference_trace(format_args!(
+            "[MLX_TRACE] gemma4 sliding_prefix_checkpoint_evict evicted={} limit={} remaining={} first_prefix_tokens={} last_prefix_tokens={}",
+            evicted,
+            limit,
+            checkpoints.len(),
+            first_prefix_len.unwrap_or(0),
+            last_prefix_len.unwrap_or(0)
+        ));
+    }
 }
 
 fn gemma4_paged_prefill_group_max_chunk() -> u32 {
@@ -6915,12 +7287,52 @@ fn gemma4_paged_prefill_body_chunk_plan(
     head_size: u32,
     paged_attention_enabled: bool,
 ) -> Result<Vec<Gemma4PagedPrefillBodyChunk>> {
+    gemma4_paged_prefill_body_chunk_plan_inner(
+        configured_chunk_size,
+        body_tokens,
+        first_position,
+        num_query_heads,
+        head_size,
+        paged_attention_enabled,
+        0,
+    )
+}
+
+fn gemma4_paged_prefill_body_chunk_plan_with_checkpoint_interval(
+    configured_chunk_size: i32,
+    body_tokens: usize,
+    first_position: u32,
+    num_query_heads: u32,
+    head_size: u32,
+    paged_attention_enabled: bool,
+    checkpoint_interval: u32,
+) -> Result<Vec<Gemma4PagedPrefillBodyChunk>> {
+    gemma4_paged_prefill_body_chunk_plan_inner(
+        configured_chunk_size,
+        body_tokens,
+        first_position,
+        num_query_heads,
+        head_size,
+        paged_attention_enabled,
+        checkpoint_interval,
+    )
+}
+
+fn gemma4_paged_prefill_body_chunk_plan_inner(
+    configured_chunk_size: i32,
+    body_tokens: usize,
+    first_position: u32,
+    num_query_heads: u32,
+    head_size: u32,
+    paged_attention_enabled: bool,
+    checkpoint_interval: u32,
+) -> Result<Vec<Gemma4PagedPrefillBodyChunk>> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
     let mut position = first_position;
     while start < body_tokens {
         let remaining = body_tokens - start;
-        let (len, capped_by_v2_aux_limit) = gemma4_paged_prefill_aux_limited_chunk_size(
+        let (mut len, capped_by_v2_aux_limit) = gemma4_paged_prefill_aux_limited_chunk_size(
             configured_chunk_size,
             remaining,
             position,
@@ -6928,6 +7340,23 @@ fn gemma4_paged_prefill_body_chunk_plan(
             head_size,
             paged_attention_enabled,
         );
+        if checkpoint_interval > 0 {
+            let position_u64 = position as u64;
+            let interval_u64 = checkpoint_interval as u64;
+            let chunk_end = position_u64
+                .checked_add(len as u64)
+                .ok_or_else(|| Error::from_reason("Gemma4 paged prefill chunk end overflow"))?;
+            let next_checkpoint = ((position_u64 / interval_u64) + 1)
+                .checked_mul(interval_u64)
+                .ok_or_else(|| {
+                    Error::from_reason("Gemma4 paged prefill checkpoint boundary overflow")
+                })?;
+            if next_checkpoint > position_u64 && next_checkpoint < chunk_end {
+                len = usize::try_from(next_checkpoint - position_u64).map_err(|_| {
+                    Error::from_reason("Gemma4 paged prefill checkpoint chunk length overflow")
+                })?;
+            }
+        }
         if len == 0 {
             return Err(Error::from_reason(
                 "Gemma4 paged prefill dynamic chunking produced an empty chunk",
@@ -7294,6 +7723,86 @@ fn prefill_body_gemma4_with_embeds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
+
+    #[test]
+    fn stream_dispatch_promotes_channel_only_output_to_visible_text() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = StreamSender(tx);
+        let mut state = Gemma4StreamDispatchState::default();
+
+        state.dispatch_segments(
+            vec![StreamSegment::Reasoning("final answer".into())],
+            &sender,
+        );
+        assert!(rx.try_recv().is_err());
+
+        state.finish(&sender);
+        let chunk = rx.try_recv().unwrap().unwrap();
+        assert_eq!(chunk.text, "final answer");
+        assert_eq!(chunk.is_reasoning, Some(false));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_dispatch_keeps_reasoning_when_visible_text_follows() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = StreamSender(tx);
+        let mut state = Gemma4StreamDispatchState::default();
+
+        state.dispatch_segments(
+            vec![
+                StreamSegment::Reasoning("scratch".into()),
+                StreamSegment::Text("answer".into()),
+            ],
+            &sender,
+        );
+        state.finish(&sender);
+
+        let reasoning = rx.try_recv().unwrap().unwrap();
+        assert_eq!(reasoning.text, "scratch");
+        assert_eq!(reasoning.is_reasoning, Some(true));
+
+        let text = rx.try_recv().unwrap().unwrap();
+        assert_eq!(text.text, "answer");
+        assert_eq!(text.is_reasoning, Some(false));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stream_dispatch_keeps_reasoning_when_tool_call_follows() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = StreamSender(tx);
+        let mut state = Gemma4StreamDispatchState::default();
+
+        state.dispatch_segments(
+            vec![
+                StreamSegment::Reasoning("scratch".into()),
+                StreamSegment::ToolCall(crate::tools::ToolCallResult::ok(
+                    "tool".into(),
+                    serde_json::json!({}),
+                    String::new(),
+                )),
+            ],
+            &sender,
+        );
+        state.finish(&sender);
+
+        let reasoning = rx.try_recv().unwrap().unwrap();
+        assert_eq!(reasoning.text, "scratch");
+        assert_eq!(reasoning.is_reasoning, Some(true));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn promote_channel_only_output_moves_thinking_to_text() {
+        let mut parsed = parse_gemma4_output("<|channel>thought\nvisible answer<channel|>");
+        promote_channel_only_output(&mut parsed);
+
+        assert_eq!(parsed.text, "visible answer");
+        assert!(parsed.thinking.is_none());
+        assert!(parsed.tool_calls.is_empty());
+    }
 
     #[test]
     fn sliding_mask_is_valid_for_bf16_gqa_attention() {
@@ -7424,43 +7933,112 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma4_sliding_restore_default_is_uncapped() {
+    fn test_gemma4_paged_prefill_chunk_plan_splits_decode_checkpoint_boundaries() {
+        let plan = super::gemma4_paged_prefill_body_chunk_plan_with_checkpoint_interval(
+            1024, 3000, 16, 16, 512, false, 1024,
+        )
+        .unwrap();
+
         assert_eq!(
-            super::gemma4_large_sliding_restore_suppression_limit_for_override(None, 44_512),
+            plan.iter().map(|chunk| chunk.len).collect::<Vec<_>>(),
+            vec![1008, 1024, 968]
+        );
+        assert_eq!(
+            plan.iter()
+                .map(|chunk| chunk.first_position)
+                .collect::<Vec<_>>(),
+            vec![16, 1024, 2048]
+        );
+        assert_eq!(
+            plan.iter().map(|chunk| chunk.start).collect::<Vec<_>>(),
+            vec![0, 1008, 2032]
+        );
+
+        let capped = super::gemma4_paged_prefill_body_chunk_plan_with_checkpoint_interval(
+            512, 1600, 768, 16, 512, false, 1024,
+        )
+        .unwrap();
+        assert_eq!(
+            capped.iter().map(|chunk| chunk.len).collect::<Vec<_>>(),
+            vec![256, 512, 512, 320]
+        );
+        assert!(capped.iter().all(|chunk| chunk.len <= 512));
+    }
+
+    #[test]
+    fn test_gemma4_sliding_restore_default_is_checkpoint_bounded() {
+        let cfg = super::Gemma4Config {
+            sliding_window: 1024,
+            ..paged_tiny_config(Some(true))
+        };
+
+        assert_eq!(
+            super::gemma4_large_sliding_restore_suppression_limit_for_override(
+                &cfg, 16, None, 1024
+            ),
             None
         );
         assert_eq!(
-            super::gemma4_large_sliding_restore_suppression_limit_for_override(None, 1_000_000),
-            None
+            super::gemma4_large_sliding_restore_suppression_limit_for_override(
+                &cfg, 16, None, 24_336
+            ),
+            Some(super::Gemma4SlidingRestoreSuppression {
+                limit: 1024,
+                source: "default"
+            })
         );
     }
 
     #[test]
-    fn test_gemma4_sliding_restore_env_limit_is_opt_in() {
+    fn test_gemma4_sliding_restore_env_limit_overrides_default() {
+        let cfg = super::Gemma4Config {
+            sliding_window: 1024,
+            ..paged_tiny_config(Some(true))
+        };
+
         assert_eq!(
             super::parse_gemma4_sliding_restore_limit("32768"),
-            Some(32_768)
+            Some(super::Gemma4SlidingRestoreLimitOverride::Cap(32_768))
         );
         assert_eq!(
             super::parse_gemma4_sliding_restore_limit(" 44512 "),
-            Some(44_512)
+            Some(super::Gemma4SlidingRestoreLimitOverride::Cap(44_512))
         );
         assert_eq!(super::parse_gemma4_sliding_restore_limit(""), None);
-        assert_eq!(super::parse_gemma4_sliding_restore_limit("off"), None);
+        assert_eq!(
+            super::parse_gemma4_sliding_restore_limit("off"),
+            Some(super::Gemma4SlidingRestoreLimitOverride::Uncapped)
+        );
 
         assert_eq!(
             super::gemma4_large_sliding_restore_suppression_limit_for_override(
-                Some(32_768),
+                &cfg,
+                16,
+                Some(super::Gemma4SlidingRestoreLimitOverride::Cap(32_768)),
                 32_768
             ),
             None
         );
         assert_eq!(
             super::gemma4_large_sliding_restore_suppression_limit_for_override(
-                Some(32_768),
+                &cfg,
+                16,
+                Some(super::Gemma4SlidingRestoreLimitOverride::Cap(32_768)),
                 44_512
             ),
-            Some(32_768)
+            Some(super::Gemma4SlidingRestoreSuppression {
+                limit: 32_768,
+                source: "env"
+            })
+        );
+        assert_eq!(
+            super::gemma4_large_sliding_restore_suppression_limit_for_override(
+                &cfg,
+                16,
+                Some(super::Gemma4SlidingRestoreLimitOverride::Uncapped),
+                1_000_000
+            ),
+            None
         );
     }
 
@@ -7753,6 +8331,65 @@ mod tests {
         assert_eq!(cfg.use_block_paged_cache, Some(true));
     }
 
+    #[test]
+    fn test_default_paged_cache_memory_covers_gemma4_full_context() {
+        let memory_mb = super::gemma4_default_paged_cache_memory_mb(131_072, 16, 512, 2, 5);
+        assert_eq!(
+            memory_mb, 2560,
+            "Gemma4 26B-A4B global KV cache needs 2560MiB to cover 128k tokens"
+        );
+
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: memory_mb,
+            head_size: 512,
+            num_kv_heads: 2,
+            num_layers: 5,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(131_072),
+            max_batch_size: Some(32),
+        };
+        assert_eq!(cfg.calculate_num_blocks(), 8192);
+        assert_eq!(cfg.max_cached_tokens(), 131_072);
+
+        let undersized_cfg = mlx_paged_attn::PagedAttentionConfig {
+            gpu_memory_mb: 2048,
+            ..cfg
+        };
+        assert!(
+            undersized_cfg.max_cached_tokens() < 124_920,
+            "the previous fixed 2048MiB default cannot hold the failed 124,920-token prompt"
+        );
+    }
+
+    #[test]
+    fn test_default_paged_cache_memory_respects_minimum() {
+        assert_eq!(
+            super::gemma4_default_paged_cache_memory_mb(128, 16, 32, 2, 2),
+            256
+        );
+    }
+
+    #[test]
+    fn test_context_limited_max_new_tokens_clamps_to_remaining_window() {
+        assert_eq!(
+            super::gemma4_context_limited_max_new_tokens(128_000, 124_920, 131_072)
+                .expect("limit max_new_tokens"),
+            6_152
+        );
+        assert_eq!(
+            super::gemma4_context_limited_max_new_tokens(2048, 1_000, 131_072)
+                .expect("unchanged max_new_tokens"),
+            2048
+        );
+        assert_eq!(
+            super::gemma4_context_limited_max_new_tokens(-1, 1_000, 131_072)
+                .expect("negative max_new_tokens"),
+            0
+        );
+        assert!(super::gemma4_context_limited_max_new_tokens(1, 131_073, 131_072).is_err());
+    }
+
     /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged
     /// adapter. The previous "None means no adapter" assertion was removed
     /// when the default flipped from `unwrap_or(false)` to `unwrap_or(true)`
@@ -7993,7 +8630,7 @@ mod tests {
             }
         }
 
-        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, false) {
+        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, 0) {
             Ok(l) => l,
             Err(e) => {
                 let msg = e.reason.to_string();
@@ -8198,8 +8835,8 @@ mod tests {
             None,
         );
         assert_eq!(
-            checkpoint_limit, 32,
-            "512-token sliding window with 16-token blocks should retain 32 decode checkpoints"
+            checkpoint_limit, 64,
+            "512-token sliding window with 16-token blocks should retain two windows of decode checkpoints"
         );
         let target_tokens: Vec<u32> = (3000..3016).collect();
         let target_hash = super::compute_gemma4_paged_prefix_block_hash(
@@ -8259,6 +8896,278 @@ mod tests {
             restored.is_some(),
             "decode checkpoints must retain one sliding-window worth of retokenization drift"
         );
+    }
+
+    #[test]
+    fn test_gemma4_decode_checkpoint_retains_auxiliary_branch_interleaving() {
+        let mut cfg = paged_tiny_config(Some(true));
+        cfg.sliding_window = 1024;
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let block_size = 16;
+        let checkpoint_limit = super::gemma4_sliding_prefix_checkpoint_limit_for_override(
+            &inner.config,
+            block_size,
+            None,
+        );
+        assert_eq!(
+            checkpoint_limit, 128,
+            "1024-token sliding window with 16-token blocks should retain two windows"
+        );
+        let target_tokens: Vec<u32> = (10_000..10_016).collect();
+        let target_hash = super::compute_gemma4_paged_prefix_block_hash(
+            &target_tokens,
+            target_tokens.len() as u32,
+            block_size,
+            0,
+        )
+        .expect("target hash");
+        inner
+            .sliding_prefix_checkpoints
+            .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                prefix_len: target_tokens.len() as u32,
+                block_size,
+                final_block_hash: target_hash,
+                tokens: target_tokens.clone(),
+                snapshots: vec![None; inner.config.num_hidden_layers as usize],
+            });
+
+        // The 2026-05-09 live trace stored the needed 48,416-token
+        // checkpoint, then 93 checkpoints from auxiliary 29k/33k branches
+        // before the main branch asked for 48,416 again. A one-window FIFO
+        // cap evicted it; two windows retains it without unbounded growth.
+        for i in 0..93 {
+            let token_base = 20_000 + (i as u32 * block_size);
+            let tokens: Vec<u32> = (0..block_size).map(|token| token_base + token).collect();
+            let hash = super::compute_gemma4_paged_prefix_block_hash(
+                &tokens,
+                tokens.len() as u32,
+                block_size,
+                0,
+            )
+            .expect("newer hash");
+            inner
+                .sliding_prefix_checkpoints
+                .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                    prefix_len: tokens.len() as u32,
+                    block_size,
+                    final_block_hash: hash,
+                    tokens,
+                    snapshots: vec![None; inner.config.num_hidden_layers as usize],
+                });
+            super::trim_gemma4_sliding_prefix_checkpoints(
+                &mut inner.sliding_prefix_checkpoints,
+                checkpoint_limit,
+                false,
+            );
+        }
+
+        let restored = inner
+            .find_gemma4_sliding_prefix_checkpoint(
+                &target_tokens,
+                target_tokens.len() as u32,
+                block_size,
+                0,
+            )
+            .expect("prefix lookup");
+        assert!(
+            restored.is_some(),
+            "decode checkpoints must survive auxiliary branch interleaving seen in live sessions"
+        );
+    }
+
+    #[test]
+    fn test_gemma4_sliding_decode_checkpoint_interval_uses_window_stride() {
+        let mut cfg = paged_tiny_config(Some(true));
+        cfg.sliding_window = 1024;
+        assert_eq!(
+            super::gemma4_sliding_decode_checkpoint_interval(&cfg, 16),
+            1024
+        );
+
+        cfg.sliding_window = 1000;
+        assert_eq!(
+            super::gemma4_sliding_decode_checkpoint_interval(&cfg, 16),
+            1008,
+            "checkpoint interval should stay aligned to paged block boundaries"
+        );
+    }
+
+    #[test]
+    fn test_gemma4_sliding_prefix_checkpoint_restores_nearest_prefix() {
+        let cfg = paged_tiny_config(Some(true));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let block_size = 16;
+        let tokens: Vec<u32> = (0..1280).map(|token| 50_000 + token).collect();
+        let checkpoint_len = 1024;
+        let checkpoint_hash =
+            super::compute_gemma4_paged_prefix_block_hash(&tokens, checkpoint_len, block_size, 0)
+                .expect("checkpoint hash");
+        inner
+            .sliding_prefix_checkpoints
+            .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                prefix_len: checkpoint_len,
+                block_size,
+                final_block_hash: checkpoint_hash,
+                tokens: tokens[..checkpoint_len as usize].to_vec(),
+                snapshots: vec![None; inner.config.num_hidden_layers as usize],
+            });
+
+        let hit = inner
+            .find_gemma4_sliding_prefix_checkpoint(&tokens, tokens.len() as u32, block_size, 0)
+            .expect("prefix lookup")
+            .expect("nearest checkpoint hit");
+        assert_eq!(hit.prefix_len, checkpoint_len);
+    }
+
+    #[test]
+    fn test_gemma4_mid_prompt_prefix_hit_uses_near_prefill_checkpoint() {
+        let mut cfg = paged_tiny_config(Some(true));
+        cfg.sliding_window = 1024;
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let block_size = 16;
+        let cached_prefix_len = 24_352;
+        let checkpoint_len = 23_552;
+        let tokens: Vec<u32> = (0..cached_prefix_len).map(|token| 90_000 + token).collect();
+        let checkpoint_hash =
+            super::compute_gemma4_paged_prefix_block_hash(&tokens, checkpoint_len, block_size, 0)
+                .expect("checkpoint hash");
+        inner
+            .sliding_prefix_checkpoints
+            .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                prefix_len: checkpoint_len,
+                block_size,
+                final_block_hash: checkpoint_hash,
+                tokens: tokens[..checkpoint_len as usize].to_vec(),
+                snapshots: vec![None; inner.config.num_hidden_layers as usize],
+            });
+
+        let hit = inner
+            .find_gemma4_sliding_prefix_checkpoint(&tokens, cached_prefix_len, block_size, 0)
+            .expect("prefix lookup")
+            .expect("near checkpoint hit");
+        assert_eq!(hit.prefix_len, checkpoint_len);
+        assert_eq!(cached_prefix_len - hit.prefix_len, 800);
+        assert_eq!(
+            super::gemma4_large_sliding_restore_suppression_limit(
+                &inner.config,
+                block_size,
+                cached_prefix_len - hit.prefix_len
+            ),
+            None,
+            "a one-window prefill checkpoint should prevent cold-prefill suppression"
+        );
+    }
+
+    #[test]
+    fn test_gemma4_window_stride_checkpoints_retain_old_branch_prefix() {
+        let mut cfg = paged_tiny_config(Some(true));
+        cfg.sliding_window = 1024;
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let block_size = 16;
+        let target_len = 36_096;
+        let target_tokens: Vec<u32> = (0..target_len).map(|token| 70_000 + token).collect();
+        let target_hash = super::compute_gemma4_paged_prefix_block_hash(
+            &target_tokens,
+            target_len,
+            block_size,
+            0,
+        )
+        .expect("target hash");
+        inner
+            .sliding_prefix_checkpoints
+            .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                prefix_len: target_len,
+                block_size,
+                final_block_hash: target_hash,
+                tokens: target_tokens.clone(),
+                snapshots: vec![None; inner.config.num_hidden_layers as usize],
+            });
+
+        let checkpoint_limit = super::gemma4_sliding_prefix_checkpoint_limit_for_override(
+            &inner.config,
+            block_size,
+            None,
+        );
+        let interval = super::gemma4_sliding_decode_checkpoint_interval(&inner.config, block_size);
+        assert_eq!(interval, 1024);
+        assert_eq!(checkpoint_limit, 128);
+
+        for i in 0..96 {
+            let prefix_len = 80_000 + i as u32 * interval;
+            let tokens: Vec<u32> = (0..prefix_len).map(|token| 200_000 + token).collect();
+            let hash =
+                super::compute_gemma4_paged_prefix_block_hash(&tokens, prefix_len, block_size, 0)
+                    .expect("newer hash");
+            inner
+                .sliding_prefix_checkpoints
+                .push_back(super::Gemma4SlidingPrefixCheckpoint {
+                    prefix_len,
+                    block_size,
+                    final_block_hash: hash,
+                    tokens,
+                    snapshots: vec![None; inner.config.num_hidden_layers as usize],
+                });
+            super::trim_gemma4_sliding_prefix_checkpoints(
+                &mut inner.sliding_prefix_checkpoints,
+                checkpoint_limit,
+                false,
+            );
+        }
+
+        let hit = inner
+            .find_gemma4_sliding_prefix_checkpoint(
+                &target_tokens,
+                target_tokens.len() as u32,
+                block_size,
+                0,
+            )
+            .expect("prefix lookup")
+            .expect("old branch checkpoint hit");
+        assert_eq!(hit.prefix_len, target_len);
     }
 
     /// KV-shared layers must resolve their anchor's pool slot

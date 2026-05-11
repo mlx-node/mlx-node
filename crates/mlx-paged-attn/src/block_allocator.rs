@@ -45,8 +45,12 @@
 //!
 //! Mitigations:
 //! - `cache_full_blocks` aborts registration on the first colliding
-//!   block (so we don't WRITE a corrupted chain), see `register_prefix`
-//!   `bool` return.
+//!   block (so we don't WRITE a corrupted chain), unless the existing
+//!   entry carries verified identical block identity metadata. In that
+//!   case the caller is recomputing an already-cached prefix and can
+//!   continue publishing the new tail.
+//! - `find_longest_cache_hit` verifies stored block identity metadata
+//!   when available before returning a cache hit.
 //! - For multi-tenant deployments and adversarial settings, switch to
 //!   SHA-256 by replacing `hash_tokens`'s hasher (small mechanical
 //!   change). Tracked as future work.
@@ -122,6 +126,16 @@ pub struct BlockAllocator {
     /// Prefix cache: hash -> block for reuse
     prefix_cache: HashMap<u64, Arc<PhysicalBlock>>,
 
+    /// Prefix-cache block identity metadata for entries registered
+    /// through `cache_full_blocks`.
+    ///
+    /// Direct `register_prefix` callers do not provide enough context to
+    /// populate this table, so absence means "unknown" rather than
+    /// "matching". The metadata lets a cold-prefill replay skip an
+    /// already-cached leading prefix while still rejecting true hash
+    /// collisions.
+    prefix_cache_identities: HashMap<u64, PrefixCacheBlockIdentity>,
+
     /// Reverse mapping: block_id -> hash (for cleanup during free)
     block_hashes: HashMap<u32, u64>,
 
@@ -130,6 +144,48 @@ pub struct BlockAllocator {
 
     /// Maximum entries in prefix cache
     max_prefix_cache_entries: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrefixCacheBlockIdentity {
+    token_ids: Vec<u32>,
+    parent_hash: u64,
+    extra_keys: Vec<u64>,
+    cache_salt: u64,
+    block_index: usize,
+}
+
+impl PrefixCacheBlockIdentity {
+    fn new(
+        token_ids: &[u32],
+        parent_hash: u64,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        block_index: usize,
+    ) -> Self {
+        Self {
+            token_ids: token_ids.to_vec(),
+            parent_hash,
+            extra_keys: extra_keys.to_vec(),
+            cache_salt,
+            block_index,
+        }
+    }
+
+    fn matches(
+        &self,
+        token_ids: &[u32],
+        parent_hash: u64,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        block_index: usize,
+    ) -> bool {
+        self.token_ids.as_slice() == token_ids
+            && self.parent_hash == parent_hash
+            && self.extra_keys.as_slice() == extra_keys
+            && self.cache_salt == cache_salt
+            && self.block_index == block_index
+    }
 }
 
 impl BlockAllocator {
@@ -147,6 +203,7 @@ impl BlockAllocator {
             num_blocks,
             block_size,
             prefix_cache: HashMap::new(),
+            prefix_cache_identities: HashMap::new(),
             block_hashes: HashMap::new(),
             lru_order: VecDeque::new(),
             // Scale the prefix-cache capacity to `num_blocks` so the cache
@@ -219,6 +276,7 @@ impl BlockAllocator {
             let _ = block.decref();
             // Remove all bookkeeping for this entry.
             self.prefix_cache.remove(&hash);
+            self.prefix_cache_identities.remove(&hash);
             self.block_hashes.remove(&block_id);
             self.lru_order.retain(|&h| h != hash);
             self.allocated.remove(&block_id);
@@ -241,6 +299,7 @@ impl BlockAllocator {
             // Remove from prefix cache if present
             if let Some(hash) = self.block_hashes.remove(&block_id) {
                 self.prefix_cache.remove(&hash);
+                self.prefix_cache_identities.remove(&hash);
                 self.lru_order.retain(|&h| h != hash);
             }
 
@@ -381,6 +440,7 @@ impl BlockAllocator {
             && existing_hash != hash
         {
             if self.prefix_cache.remove(&existing_hash).is_some() {
+                self.prefix_cache_identities.remove(&existing_hash);
                 // Decref the cache's logical reference for the old alias.
                 // We deliberately ignore a true return here: callers that
                 // re-register a block they still hold (the common case)
@@ -411,6 +471,7 @@ impl BlockAllocator {
                         // drops ref_count to 0 the block goes back to the
                         // free pool — same cleanup `free()` performs.
                         if let Some(evicted_block) = self.prefix_cache.remove(&old_hash) {
+                            self.prefix_cache_identities.remove(&old_hash);
                             let evicted_id = evicted_block.block_id;
                             self.block_hashes.remove(&evicted_id);
                             if evicted_block.decref() {
@@ -439,6 +500,11 @@ impl BlockAllocator {
         self.block_hashes.insert(block.block_id, hash);
 
         if is_new_insertion {
+            // Direct register_prefix callers do not provide enough
+            // identity material to verify future duplicate-hash attempts.
+            // cache_full_blocks repopulates this immediately after a
+            // successful insertion.
+            self.prefix_cache_identities.remove(&hash);
             block.incref();
         }
 
@@ -462,6 +528,59 @@ impl BlockAllocator {
         } else {
             None
         }
+    }
+
+    fn prefix_identity_matches(
+        &self,
+        hash: u64,
+        token_ids: &[u32],
+        parent_hash: u64,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        block_index: usize,
+    ) -> bool {
+        self.prefix_cache_identities
+            .get(&hash)
+            .is_some_and(|identity| {
+                identity.matches(token_ids, parent_hash, extra_keys, cache_salt, block_index)
+            })
+    }
+
+    fn prefix_identity_mismatches(
+        &self,
+        hash: u64,
+        token_ids: &[u32],
+        parent_hash: u64,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        block_index: usize,
+    ) -> bool {
+        self.prefix_cache_identities
+            .get(&hash)
+            .is_some_and(|identity| {
+                !identity.matches(token_ids, parent_hash, extra_keys, cache_salt, block_index)
+            })
+    }
+
+    fn remember_prefix_identity(
+        &mut self,
+        hash: u64,
+        token_ids: &[u32],
+        parent_hash: u64,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        block_index: usize,
+    ) {
+        self.prefix_cache_identities.insert(
+            hash,
+            PrefixCacheBlockIdentity::new(
+                token_ids,
+                parent_hash,
+                extra_keys,
+                cache_salt,
+                block_index,
+            ),
+        );
     }
 
     /// Walk a token sequence in `block_size`-aligned chunks, looking up each
@@ -507,14 +626,20 @@ impl BlockAllocator {
         for n in 0..num_full_blocks {
             let start = n * block_size_us;
             let end = start + block_size_us;
+            let block_tokens = &token_ids[start..end];
             let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-            let block_hash = hash_block(
-                &token_ids[start..end],
+            let block_hash = hash_block(block_tokens, parent_hash, extra_keys, cache_salt, n);
+
+            if self.prefix_identity_mismatches(
+                block_hash,
+                block_tokens,
                 parent_hash,
                 extra_keys,
                 cache_salt,
                 n,
-            );
+            ) {
+                break;
+            }
 
             match self.lookup_prefix(block_hash) {
                 Some(block) => {
@@ -580,14 +705,20 @@ impl BlockAllocator {
             };
             let start = n * block_size_us;
             let end = start + block_size_us;
+            let block_tokens = &token_ids[start..end];
             let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-            let block_hash = hash_block(
-                &token_ids[start..end],
+            let block_hash = hash_block(block_tokens, parent_hash, per_block, cache_salt, n);
+
+            if self.prefix_identity_mismatches(
+                block_hash,
+                block_tokens,
                 parent_hash,
                 per_block,
                 cache_salt,
                 n,
-            );
+            ) {
+                break;
+            }
 
             match self.lookup_prefix(block_hash) {
                 Some(block) => {
@@ -627,22 +758,31 @@ impl BlockAllocator {
     ///
     /// Mirrors vLLM `vllm/v1/core/block_pool.py:211-320` (`cache_full_blocks`).
     ///
-    /// # Aborting on collision
+    /// # Collision and duplicate-prefix handling
     ///
     /// If `register_prefix` rejects a block partway through the chain
     /// (Case 2 hash collision — `hash_n` is already authoritative for a
-    /// different block), the chain is aborted immediately. We do NOT
-    /// continue computing `hash_{n+1} = H(hash_n, ...)` and registering
-    /// later blocks — those would link to a predecessor (`hash_n`) that
-    /// resolves to someone else's block, so a future
-    /// `find_longest_cache_hit` walking the chain would mix blocks
-    /// across registration intents (silent KV corruption).
+    /// different block), we continue only when the existing cache entry
+    /// has verified-identical block identity metadata. That is the normal
+    /// cold-prefill replay case: the prefix was already cached under old
+    /// physical blocks, and this request recomputed the same leading
+    /// blocks before producing a new tail. The duplicate leading blocks
+    /// are skipped, and later tail blocks can still be published.
+    ///
+    /// If identity is missing or different, the chain is aborted
+    /// immediately. We do NOT continue computing
+    /// `hash_{n+1} = H(hash_n, ...)` and registering later blocks — those
+    /// would link to a predecessor (`hash_n`) that resolves to someone
+    /// else's block, so a future `find_longest_cache_hit` walking the
+    /// chain would mix blocks across registration intents (silent KV
+    /// corruption).
     ///
     /// Returns the number of blocks actually registered. May be less than
-    /// `blocks.len()` if the chain was aborted mid-way; callers can treat
-    /// any value as success — the partial registration is still
-    /// internally consistent. Subsequent lookups simply miss at the first
-    /// dropped block, which forces a fresh prefill (correct behavior).
+    /// `blocks.len()` if the chain was aborted mid-way or if verified
+    /// duplicate leading blocks were skipped; callers can treat any value
+    /// as success — the partial registration is still internally
+    /// consistent. Subsequent lookups simply miss at the first dropped
+    /// block, which forces a fresh prefill (correct behavior).
     pub fn cache_full_blocks(
         &mut self,
         token_ids: &[u32],
@@ -665,23 +805,43 @@ impl BlockAllocator {
         for (n, block) in blocks.iter().enumerate() {
             let start = n * block_size_us;
             let end = start + block_size_us;
+            let block_tokens = &token_ids[start..end];
             let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-            let block_hash = hash_block(
-                &token_ids[start..end],
+            let block_hash = hash_block(block_tokens, parent_hash, extra_keys, cache_salt, n);
+            if !self.register_prefix(Arc::clone(block), block_hash) {
+                if self.prefix_identity_matches(
+                    block_hash,
+                    block_tokens,
+                    parent_hash,
+                    extra_keys,
+                    cache_salt,
+                    n,
+                ) {
+                    // The same logical block is already cached under a
+                    // different physical block. This happens after a cold
+                    // prefill recomputes an existing prefix: skip the
+                    // duplicate leading block but keep walking so the new
+                    // tail can be published.
+                    previous_block_hash = block_hash;
+                    continue;
+                } else {
+                    // Chain broke (collision drop or cache disabled). Stop
+                    // here: any further block we register would chain off a
+                    // hash that resolves to someone else's block, which
+                    // corrupts future find_longest_cache_hit walks. Return
+                    // the count of accepted registrations up to (but not
+                    // including) the dropped block.
+                    break;
+                }
+            }
+            self.remember_prefix_identity(
+                block_hash,
+                block_tokens,
                 parent_hash,
                 extra_keys,
                 cache_salt,
                 n,
             );
-            if !self.register_prefix(Arc::clone(block), block_hash) {
-                // Chain broke (collision drop or cache disabled). Stop
-                // here: any further block we register would chain off a
-                // hash that resolves to someone else's block, which
-                // corrupts future find_longest_cache_hit walks. Return
-                // the count of accepted registrations up to (but not
-                // including) the dropped block.
-                break;
-            }
             previous_block_hash = block_hash;
             registered += 1;
         }
@@ -703,7 +863,8 @@ impl BlockAllocator {
     /// token positions to their owning block.
     ///
     /// Returns the number of blocks actually registered. May be less than
-    /// `blocks.len()` if the chain aborted on a hash collision mid-way.
+    /// `blocks.len()` if the chain aborted on a hash collision mid-way or
+    /// skipped verified duplicate leading blocks.
     ///
     /// `cache_salt` is mixed into the FIRST block's hash only (when it is
     /// non-zero), with the same semantics as
@@ -735,17 +896,33 @@ impl BlockAllocator {
         for (n, block) in blocks.iter().enumerate() {
             let start = n * block_size_us;
             let end = start + block_size_us;
+            let block_tokens = &token_ids[start..end];
+            let extra_keys = &extra_keys_per_block[n];
             let parent_hash = if n == 0 { 0 } else { previous_block_hash };
-            let block_hash = hash_block(
-                &token_ids[start..end],
+            let block_hash = hash_block(block_tokens, parent_hash, extra_keys, cache_salt, n);
+            if !self.register_prefix(Arc::clone(block), block_hash) {
+                if self.prefix_identity_matches(
+                    block_hash,
+                    block_tokens,
+                    parent_hash,
+                    extra_keys,
+                    cache_salt,
+                    n,
+                ) {
+                    previous_block_hash = block_hash;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            self.remember_prefix_identity(
+                block_hash,
+                block_tokens,
                 parent_hash,
-                &extra_keys_per_block[n],
+                extra_keys,
                 cache_salt,
                 n,
             );
-            if !self.register_prefix(Arc::clone(block), block_hash) {
-                break;
-            }
             previous_block_hash = block_hash;
             registered += 1;
         }
@@ -833,12 +1010,12 @@ impl BlockAllocator {
 ///
 // FIXME(p1c-followup): SipHash u64 is not cryptographically collision-resistant.
 // `find_longest_cache_hit` walks chained block hashes via `lookup_prefix`, so a
-// mid-chain collision between two different token chains can cause a
-// mixed-prefix lookup → silent KV corruption. The `cache_full_blocks` chain
-// abort prevents WRITING a corrupted chain, but lookup-side defense requires
-// switching to SHA-256 (cryptographic) or storing per-block content metadata
-// for verification on lookup. See the module-level "SipHash collision
-// limitation" doc above for details.
+// mid-chain collision between two different token chains could cause a
+// mixed-prefix lookup for entries registered without block identity metadata.
+// cache_full_blocks/cache_full_blocks_per_block entries are verified on lookup
+// and duplicate registration, but direct register_prefix callers still have no
+// token/extra-key metadata. See the module-level "SipHash collision limitation"
+// doc above for details.
 pub fn hash_tokens(tokens: &[u32], parent_hash: u64, extra_keys: &[u64]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -2254,6 +2431,66 @@ mod tests {
         // The key invariant we're testing is that we did NOT register
         // ghost descendants — chain_b2's hash isn't cached.
         assert!(!allocator.prefix_cache.contains_key(&block2_hash));
+    }
+
+    /// Cold-prefill replay can recompute a leading prefix whose blocks are
+    /// already cached under older physical blocks. That must not abort the
+    /// whole registration chain; otherwise the newly computed tail never
+    /// becomes reusable and the next request keeps falling back to cold
+    /// prefill at the same stale prefix.
+    #[test]
+    fn test_cache_full_blocks_continues_past_verified_existing_prefix() {
+        let mut allocator = BlockAllocator::new(12, 4);
+        let block_size = 4u32;
+
+        let old_tokens: Vec<u32> = (0..8).collect();
+        let old_blocks: Vec<_> = (0..2).map(|_| allocator.allocate().unwrap()).collect();
+        let old_ids: Vec<_> = old_blocks.iter().map(|block| block.block_id).collect();
+        let old_registered = allocator
+            .cache_full_blocks(&old_tokens, &old_blocks, block_size, &[], 0)
+            .unwrap();
+        assert_eq!(old_registered, 2);
+
+        // Simulate end-of-request: the prefix cache keeps the old blocks
+        // alive while the request's direct handles are released.
+        for block in old_blocks {
+            allocator.free(block);
+        }
+
+        let new_tokens: Vec<u32> = (0..16).collect();
+        let new_blocks: Vec<_> = (0..4).map(|_| allocator.allocate().unwrap()).collect();
+        let new_ids: Vec<_> = new_blocks.iter().map(|block| block.block_id).collect();
+        assert_ne!(new_ids[0], old_ids[0]);
+        assert_ne!(new_ids[1], old_ids[1]);
+
+        let new_registered = allocator
+            .cache_full_blocks(&new_tokens, &new_blocks, block_size, &[], 0)
+            .unwrap();
+        assert_eq!(
+            new_registered, 2,
+            "only the new tail blocks should be newly registered"
+        );
+
+        let (hits, cached_tokens) =
+            allocator.find_longest_cache_hit(&new_tokens, block_size, &[], 0);
+        assert_eq!(cached_tokens, new_tokens.len());
+        let hit_ids: Vec<_> = hits.iter().map(|block| block.block_id).collect();
+        assert_eq!(
+            hit_ids,
+            vec![old_ids[0], old_ids[1], new_ids[2], new_ids[3]],
+            "lookup should reuse the old cached prefix and the newly published tail"
+        );
+
+        assert!(
+            !allocator.block_hashes.contains_key(&new_ids[0]),
+            "duplicate leading block 0 must not be inserted as a cache alias"
+        );
+        assert!(
+            !allocator.block_hashes.contains_key(&new_ids[1]),
+            "duplicate leading block 1 must not be inserted as a cache alias"
+        );
+        assert!(allocator.block_hashes.contains_key(&new_ids[2]));
+        assert!(allocator.block_hashes.contains_key(&new_ids[3]));
     }
 
     // -------------------------------------------------------------------

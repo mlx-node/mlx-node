@@ -3007,7 +3007,8 @@ export interface Gemma4Config {
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
+   * Default: auto-sized to cover `max_position_embeddings` for the
+   * physical full-attention layers.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**

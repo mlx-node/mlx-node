@@ -1307,7 +1307,7 @@ impl Gemma4Inner {
         // references and every decode step re-reads ~48GB from disk.
         {
             let weight_refs: Vec<&MxArray> = params.values().collect();
-            crate::array::memory::materialize_weights(&weight_refs);
+            crate::array::memory::materialize_weights(&weight_refs)?;
         }
 
         // Register weights with C++ compiled forward pass

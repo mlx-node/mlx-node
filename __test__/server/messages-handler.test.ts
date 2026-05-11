@@ -684,7 +684,7 @@ describe('handleCreateMessage', () => {
       expect(parsed.content[1].text).toBe('The answer is 42.');
     });
 
-    it('streaming recovers Gemma4 raw tool-call text without leaking channel markers when tools are absent', async () => {
+    it('streaming suppresses Gemma4 parsed tool-call markup when tools are absent', async () => {
       const rawText =
         '<|channel>thought\nI should inspect files.\n<channel|><|tool_call>call:read_file{path:<|"|>Cargo.toml<|"|>}<tool_call|><turn|>';
       const registry = new ModelRegistry();
@@ -733,9 +733,11 @@ describe('handleCreateMessage', () => {
         .map((delta) => delta.text ?? '')
         .join('');
 
-      expect(text).toBe('<|tool_call>call:read_file{path:<|"|>Cargo.toml<|"|>}<tool_call|>');
+      expect(text).toBe('');
       expect(text).not.toContain('<|channel>');
       expect(text).not.toContain('<channel|>');
+      expect(text).not.toContain('<|tool_call>');
+      expect(text).not.toContain('<tool_call|>');
 
       const stop = events.find((e) => e.event === 'message_delta')?.data['delta'] as { stop_reason?: string };
       expect(stop.stop_reason).toBe('end_turn');
@@ -790,7 +792,7 @@ describe('handleCreateMessage', () => {
       expect(toolBlock.input).toEqual({ location: 'San Francisco' });
     });
 
-    it('does not emit tool_use blocks when request has no tools', async () => {
+    it('does not emit tool_use blocks or parsed tool markup when request has no tools', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel(
         makeChatResult({
@@ -832,7 +834,7 @@ describe('handleCreateMessage', () => {
       expect(parsed.content).toEqual([
         {
           type: 'text',
-          text: '<tool_call>{"name":"get_weather","arguments":{"location":"San Francisco"}}</tool_call>',
+          text: '',
         },
       ]);
       expect(noToolsSessionReg.size).toBe(0);
@@ -1202,7 +1204,7 @@ describe('handleCreateMessage', () => {
       expect(toolStarts).toHaveLength(1);
     });
 
-    it('streams literal tool_call markup as text when request has no tools', async () => {
+    it('suppresses parsed tool_call markup when request has no tools', async () => {
       const registry = new ModelRegistry();
       const streamEvents = [
         { text: '<tool_call>', done: false, isReasoning: false },
@@ -1242,11 +1244,16 @@ describe('handleCreateMessage', () => {
       );
 
       const events = parseSSE(getBody());
+      const textStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
+      );
+      expect(textStarts).toHaveLength(0);
+
       const textDeltas = events.filter(
         (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
       );
       const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
-      expect(combined).toBe('<tool_call>{"name":"search"}</tool_call>');
+      expect(combined).toBe('');
 
       const toolStarts = events.filter(
         (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',

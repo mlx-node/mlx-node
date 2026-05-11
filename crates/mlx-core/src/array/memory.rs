@@ -1,4 +1,6 @@
+use crate::inference_trace::{elapsed_ms, write as write_inference_trace};
 use mlx_sys as sys;
+use napi::Error;
 
 /// Error returned by [`set_cache_limit`] when the underlying FFI shim caught
 /// a C++ exception (e.g. degraded Metal allocator on a misconfigured host).
@@ -316,40 +318,106 @@ pub fn heavy_cleanup() {
     }
 }
 
+const WEIGHT_MATERIALIZE_DEFAULT_CHUNK_MB: usize = 512;
+const WEIGHT_MATERIALIZE_MIN_CHUNK_MB: usize = 64;
+const WEIGHT_MATERIALIZE_MAX_CHUNK_MB: usize = 1024;
+
+fn weight_materialize_chunk_budget(max_working_set: usize) -> (usize, &'static str) {
+    if let Ok(raw) = std::env::var("MLX_WEIGHT_MATERIALIZE_CHUNK_MB")
+        && let Ok(mb) = raw.trim().parse::<usize>()
+        && mb > 0
+    {
+        return (mb.saturating_mul(1 << 20), "env");
+    }
+
+    if max_working_set > 0 {
+        let dynamic = max_working_set / 128;
+        let clamped = dynamic.clamp(
+            WEIGHT_MATERIALIZE_MIN_CHUNK_MB << 20,
+            WEIGHT_MATERIALIZE_MAX_CHUNK_MB << 20,
+        );
+        return (clamped, "auto_working_set");
+    }
+
+    (WEIGHT_MATERIALIZE_DEFAULT_CHUNK_MB << 20, "fallback")
+}
+
+fn eval_weight_materialize_chunk(
+    chunk_index: u32,
+    total_chunks_hint: u32,
+    chunk: &[&super::MxArray],
+    chunk_bytes: usize,
+) -> napi::Result<()> {
+    let chunk_start = std::time::Instant::now();
+    write_inference_trace(format_args!(
+        "[MLX_TRACE] weight_materialize_chunk_start index={} total_hint={} arrays={} bytes_mb={:.1}",
+        chunk_index,
+        total_chunks_hint,
+        chunk.len(),
+        chunk_bytes as f64 / (1u64 << 20) as f64,
+    ));
+
+    let mut handles: Vec<*mut sys::mlx_array> = chunk.iter().map(|arr| arr.handle.0).collect();
+    let ok = unsafe { sys::mlx_eval(handles.as_mut_ptr(), handles.len()) };
+    if !ok {
+        write_inference_trace(format_args!(
+            "[MLX_TRACE] weight_materialize_chunk_error index={} arrays={} bytes_mb={:.1}",
+            chunk_index,
+            chunk.len(),
+            chunk_bytes as f64 / (1u64 << 20) as f64,
+        ));
+        return Err(Error::from_reason(format!(
+            "MLX eval failed while materializing weight chunk {chunk_index} ({:.1} MB, {} arrays); see MLX_INFERENCE_TRACE_FILE",
+            chunk_bytes as f64 / (1u64 << 20) as f64,
+            chunk.len(),
+        )));
+    }
+
+    write_inference_trace(format_args!(
+        "[MLX_TRACE] weight_materialize_chunk_done index={} arrays={} bytes_mb={:.1} elapsed_ms={:.1}",
+        chunk_index,
+        chunk.len(),
+        chunk_bytes as f64 / (1u64 << 20) as f64,
+        elapsed_ms(chunk_start),
+    ));
+    Ok(())
+}
+
 /// Materialize mmap-backed weight arrays in byte-budgeted chunks.
 ///
 /// A single eval on all weights can cause Metal command buffer timeouts
 /// on large models (e.g. 65GB bf16). This function queries GPU memory
 /// via `max_recommended_working_set_size` and chunks eval calls so each
 /// batch stays within a fraction of available GPU memory.
-pub fn materialize_weights(arrays: &[&super::MxArray]) {
+pub fn materialize_weights(arrays: &[&super::MxArray]) -> napi::Result<()> {
     use tracing::info;
 
     if arrays.is_empty() {
-        return;
+        return Ok(());
     }
 
     let start = std::time::Instant::now();
     let total = arrays.len();
 
     let max_working_set = crate::stream::WiredLimitContext::get_max_working_set_size();
-
-    // Budget per chunk: 1/4 of max working set, clamped to [512MB, 4GB]
-    let budget = if max_working_set > 0 {
-        (max_working_set / 4).clamp(512 << 20, 4 << 30)
-    } else {
-        1 << 30 // 1GB fallback
-    };
+    let (budget, budget_source) = weight_materialize_chunk_budget(max_working_set);
 
     // Sum total bytes to decide: single eval or chunked
     let total_bytes: usize = arrays.iter().map(|a| a.nbytes()).sum();
+    let total_chunks_hint = u32::try_from(total_bytes.div_ceil(budget.max(1))).unwrap_or(u32::MAX);
+
+    write_inference_trace(format_args!(
+        "[MLX_TRACE] weight_materialize_start arrays={} total_gb={:.2} budget_mb={:.0} budget_source={} max_working_set_gb={:.1}",
+        total,
+        total_bytes as f64 / (1u64 << 30) as f64,
+        budget as f64 / (1u64 << 20) as f64,
+        budget_source,
+        max_working_set as f64 / (1u64 << 30) as f64,
+    ));
 
     if total_bytes <= budget {
         // Small enough for a single eval call
-        let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
-        unsafe {
-            sys::mlx_eval(handles.as_mut_ptr(), handles.len());
-        }
+        eval_weight_materialize_chunk(1, 1, arrays, total_bytes)?;
         info!(
             "Materialized {} weight arrays ({:.1} GB) in {:.2}s",
             total,
@@ -367,12 +435,8 @@ pub fn materialize_weights(arrays: &[&super::MxArray]) {
 
             if chunk_bytes >= budget || i == total - 1 {
                 let chunk = &arrays[chunk_start..=i];
-                let mut handles: Vec<*mut sys::mlx_array> =
-                    chunk.iter().map(|arr| arr.handle.0).collect();
-                unsafe {
-                    sys::mlx_eval(handles.as_mut_ptr(), handles.len());
-                }
                 num_chunks += 1;
+                eval_weight_materialize_chunk(num_chunks, total_chunks_hint, chunk, chunk_bytes)?;
                 chunk_start = i + 1;
                 chunk_bytes = 0;
             }
@@ -387,6 +451,13 @@ pub fn materialize_weights(arrays: &[&super::MxArray]) {
             budget as f64 / (1u64 << 20) as f64,
         );
     }
+    write_inference_trace(format_args!(
+        "[MLX_TRACE] weight_materialize_done arrays={} total_gb={:.2} elapsed_ms={:.1}",
+        total,
+        total_bytes as f64 / (1u64 << 30) as f64,
+        elapsed_ms(start),
+    ));
+    Ok(())
 }
 
 /// Check if memory is safe for autograd graph construction

@@ -766,7 +766,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // Materialize mmap-backed weights
                 {
                     let arrays: Vec<&MxArray> = params.values().collect();
-                    crate::array::memory::materialize_weights(&arrays);
+                    crate::array::memory::materialize_weights(&arrays)?;
                 }
 
                 // Set tokenizer

@@ -60,6 +60,54 @@ describe.sequential('_runChatStream bridge', () => {
     expect(events[3].done).toBe(true);
   });
 
+  it('should preserve native reasoning flags on delta chunks', async () => {
+    const native = (
+      _messages: unknown[],
+      _config: unknown,
+      callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    ): Promise<ChatStreamHandle> => {
+      const handle = { cancel: () => {} } as ChatStreamHandle;
+      setTimeout(() => {
+        callback(null, {
+          text: 'camel',
+          done: false,
+          isReasoning: true,
+        } as ChatStreamChunk);
+        callback(null, {
+          text: 'snake',
+          done: false,
+          is_reasoning: true,
+        } as unknown as ChatStreamChunk);
+        callback(null, {
+          text: 'done',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          numTokens: 2,
+          rawText: 'done',
+        } as ChatStreamChunk);
+      }, 0);
+      return Promise.resolve(handle);
+    };
+
+    const events: ChatStreamEvent[] = [];
+    const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];
+    for await (const event of _runChatStream((callback) => native(messages, null, callback))) {
+      events.push(event);
+    }
+
+    expect(events[0]).toEqual({
+      text: 'camel',
+      done: false,
+      isReasoning: true,
+    });
+    expect(events[1]).toEqual({
+      text: 'snake',
+      done: false,
+      isReasoning: true,
+    });
+  });
+
   it('should populate final chunk fields correctly', async () => {
     let finalEvent: ChatStreamEvent | null = null;
     const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];

@@ -33,14 +33,31 @@
 //!   For the **no-cache** case (cached_prefix_len = 0), pass 1 is
 //!   skipped entirely and the result is exact.
 
+use std::time::Instant;
+
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
+use crate::inference_trace::{
+    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
+};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
 use super::layer_cache::Qwen3_5LayerCache;
+
+fn bytes_to_mib(bytes: f64) -> f64 {
+    bytes / (1024.0 * 1024.0)
+}
+
+fn trace_memory_mib() -> (f64, f64, f64) {
+    (
+        bytes_to_mib(crate::array::get_active_memory()),
+        bytes_to_mib(crate::array::get_cache_memory()),
+        bytes_to_mib(crate::array::get_peak_memory()),
+    )
+}
 
 /// Forward the cached-prefix tokens through GDN layers ONLY. Used as
 /// "pass 1" of the paged prefill when there is a non-zero cached
@@ -104,73 +121,261 @@ pub(crate) fn run_paged_prefill_chunk(
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
 ) -> Result<MxArray> {
+    let chunk_size = crate::array::paged_prefill_chunk_size();
+    run_paged_prefill_chunk_with_size(
+        full_tokens,
+        suffix_tokens,
+        cached_prefix_len,
+        embed,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embedding_weight,
+        layer_kinds,
+        paged_adapter,
+        chunk_size,
+    )
+}
+
+/// Chunk-size-parameterized worker for `run_paged_prefill_chunk`.
+///
+/// `chunk_size <= 0` keeps the single-shot path. Positive chunk sizes split
+/// only the uncached suffix. Each chunk writes its K/V into the paged adapter,
+/// attends over the cumulative cached range, then clears MLX's transient graph
+/// before the next chunk. This matches the Qwen3/Qwen3.5 MoE driver shape and
+/// keeps dense Qwen from building one giant prefill graph for 30k+ suffixes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_paged_prefill_chunk_with_size(
+    full_tokens: &[u32],
+    suffix_tokens: &[u32],
+    cached_prefix_len: u32,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    chunk_size: i32,
+) -> Result<MxArray> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
             "run_paged_prefill_chunk called with empty suffix",
         ));
     }
 
-    // 1. Record SUFFIX tokens in the paged adapter (the cached prefix
-    //    already lives in the pool from a prior request).
+    if chunk_size <= 0 || suffix_tokens.len() <= chunk_size as usize {
+        return run_paged_prefill_single_shot(
+            full_tokens,
+            suffix_tokens,
+            cached_prefix_len,
+            embed,
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            embedding_weight,
+            layer_kinds,
+            paged_adapter,
+        );
+    }
+
+    let trace_enabled = inference_trace_enabled();
+    let chunk_size_usize = chunk_size as usize;
+
+    // Pass 1: GDN-only prefill over the cached prefix. This runs once before
+    // suffix chunking; GDN recurrent state then advances in-place across chunks.
+    if cached_prefix_len > 0 {
+        let gdn_trace_start = trace_enabled.then(Instant::now);
+        let prefix = &full_tokens[..(cached_prefix_len as usize)];
+        run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        if let Some(start) = gdn_trace_start {
+            let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense paged_prefill_gdn_prefix_done \
+                 prefix_tokens={} elapsed_ms={:.1} active_mib={:.1} cache_mib={:.1} peak_mib={:.1}",
+                cached_prefix_len,
+                elapsed_ms(start),
+                active_mib,
+                cache_mib,
+                peak_mib
+            ));
+        }
+    }
+
+    let total_chunks = suffix_tokens.len().div_ceil(chunk_size_usize);
+    let mut last_logits: Option<MxArray> = None;
+    let mut chunk_start_position = cached_prefix_len;
+
+    for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
+        let is_last_chunk = chunk_idx + 1 == total_chunks;
+        let chunk_trace_start = trace_enabled.then(Instant::now);
+
+        paged_adapter
+            .record_tokens(chunk)
+            .map_err(Error::from_reason)?;
+
+        let hidden_states = run_paged_prefill_one_chunk(
+            chunk,
+            chunk_start_position,
+            embed,
+            layers,
+            caches,
+            layer_kinds,
+            paged_adapter,
+        )?;
+
+        if is_last_chunk {
+            last_logits = Some(project_last_token_logits(
+                &hidden_states,
+                final_norm,
+                lm_head,
+                embedding_weight,
+            )?);
+            if let Some(start) = chunk_trace_start {
+                let chunk_elapsed_ms = elapsed_ms(start);
+                let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-dense paged_prefill_chunk_final_graph_built \
+                     chunk_index={} total_chunks={} chunk_tokens={} context_before={} context_after={} \
+                     elapsed_ms={:.1} active_mib={:.1} cache_mib={:.1} peak_mib={:.1}",
+                    chunk_idx + 1,
+                    total_chunks,
+                    chunk.len(),
+                    chunk_start_position,
+                    chunk_start_position + chunk.len() as u32,
+                    chunk_elapsed_ms,
+                    active_mib,
+                    cache_mib,
+                    peak_mib
+                ));
+            }
+        } else {
+            hidden_states.eval();
+            crate::array::synchronize_and_clear_cache();
+            if let Some(start) = chunk_trace_start {
+                let chunk_elapsed_ms = elapsed_ms(start);
+                let chunk_tok_s = if chunk_elapsed_ms > 0.0 {
+                    chunk.len() as f64 / (chunk_elapsed_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-dense paged_prefill_chunk_done \
+                     chunk_index={} total_chunks={} chunk_tokens={} context_before={} context_after={} \
+                     elapsed_ms={:.1} tok_s={:.2} active_mib={:.1} cache_mib={:.1} peak_mib={:.1}",
+                    chunk_idx + 1,
+                    total_chunks,
+                    chunk.len(),
+                    chunk_start_position,
+                    chunk_start_position + chunk.len() as u32,
+                    chunk_elapsed_ms,
+                    chunk_tok_s,
+                    active_mib,
+                    cache_mib,
+                    peak_mib
+                ));
+            }
+        }
+
+        chunk_start_position += chunk.len() as u32;
+    }
+
+    last_logits.ok_or_else(|| {
+        Error::from_reason(
+            "chunked prefill produced no last chunk (unreachable for non-empty suffix)",
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paged_prefill_single_shot(
+    full_tokens: &[u32],
+    suffix_tokens: &[u32],
+    cached_prefix_len: u32,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+) -> Result<MxArray> {
     paged_adapter
         .record_tokens(suffix_tokens)
         .map_err(Error::from_reason)?;
 
-    // 2. Pass 1: GDN-only prefill over the cached prefix (no-op when
-    //    cached_prefix_len == 0).
     if cached_prefix_len > 0 {
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
     }
 
-    // 3. Pass 2: full forward (GDN + paged-attention) over the
-    //    suffix.
-    let suffix_len = suffix_tokens.len() as i64;
-    let input_ids = MxArray::from_uint32(suffix_tokens, &[1, suffix_len])?;
+    let hidden_states = run_paged_prefill_one_chunk(
+        suffix_tokens,
+        cached_prefix_len,
+        embed,
+        layers,
+        caches,
+        layer_kinds,
+        paged_adapter,
+    )?;
+
+    project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
+}
+
+fn run_paged_prefill_one_chunk(
+    chunk_tokens: &[u32],
+    chunk_first_position: u32,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+) -> Result<MxArray> {
+    debug_assert_eq!(layers.len(), caches.len());
+    debug_assert_eq!(layers.len(), layer_kinds.len());
+
+    let chunk_len = chunk_tokens.len() as i64;
+    let input_ids = MxArray::from_uint32(chunk_tokens, &[1, chunk_len])?;
     let mut hidden_states = embed.forward(&input_ids)?;
 
-    let num_layers = layers.len();
-    let first_logical_position = cached_prefix_len;
-
-    #[allow(clippy::needless_range_loop)]
-    for layer_idx in 0..num_layers {
-        let kind = layer_kinds[layer_idx];
-
-        // Split-borrow: layers[layer_idx] (mutable per layer) +
-        // caches[layer_idx] (mutable for GDN) + paged_adapter
-        // (mutable for attention).
-        let layer = unsafe {
-            let ptr = layers.as_mut_ptr().add(layer_idx);
-            &mut *ptr
-        };
-        let cache_slot = unsafe {
-            let ptr = caches.as_mut_ptr().add(layer_idx);
-            &mut *ptr
-        };
-
+    for (layer_idx, ((layer, cache_slot), kind)) in layers
+        .iter_mut()
+        .zip(caches.iter_mut())
+        .zip(layer_kinds.iter().copied())
+        .enumerate()
+    {
         hidden_states = layer.forward_paged_or_flat(
             &hidden_states,
             kind,
             paged_adapter,
-            first_logical_position,
-            cached_prefix_len,
+            chunk_first_position,
+            chunk_first_position,
             /* is_prefill */ true,
             /* mask */ None,
             Some(cache_slot),
             /* position_ids */ None,
             /* use_kernel */ true,
         )?;
-        // Smooth the prefill memory peak: every K layers, materialize the
-        // residual stream so MLX can release the upstream graph nodes
-        // (embedding + every prior layer's attention/MLP intermediates)
-        // from the cache pool. Without this the in-flight lazy graph
-        // accumulates ~50 GB on long contexts before the post-prefill
-        // sync fires. Cadence is `MLX_PAGED_PREFILL_EVAL_INTERVAL` (default 8).
         crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
     }
+    Ok(hidden_states)
+}
 
-    // 4. Output norm + lm_head / tied embeddings.
-    let h = final_norm.forward(&hidden_states)?;
+fn project_last_token_logits(
+    hidden_states: &MxArray,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+) -> Result<MxArray> {
+    let seq_len = hidden_states.shape_at(1)?;
+    let last_hidden = hidden_states.slice_axis(1, seq_len - 1, seq_len)?;
+
+    let h = final_norm.forward(&last_hidden)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
     } else {
@@ -178,11 +383,7 @@ pub(crate) fn run_paged_prefill_chunk(
         h.matmul(&weight_t)?
     };
 
-    let seq_len = logits.shape_at(1)?;
-    let last = logits
-        .slice_axis(1, seq_len - 1, seq_len)?
-        .squeeze(Some(&[0, 1]))?;
-    Ok(last)
+    logits.squeeze(Some(&[0, 1]))
 }
 
 /// Run one paged decode step: feed `[token_id]` through the model.

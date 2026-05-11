@@ -11,6 +11,7 @@ import { ResponseStore } from '@mlx-node/core';
 import type { PublicModelEntry } from './handler.js';
 import { createHandler } from './handler.js';
 import { createIdleSweeper, DEFAULT_IDLE_CLEAR_CACHE_MS, parseIdleClearCacheEnv } from './idle-sweeper.js';
+import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import { ModelRegistry } from './registry.js';
 
 /** Cleanup interval for expired responses (ms). */
@@ -244,6 +245,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   // request will not fire `clearCache()`. See the `idle-sweeper.ts`
   // module doc (section "Drain is post-request only") for rationale.
   const registry = new ModelRegistry({ maxQueueDepth: maxQueueDepthPerModel });
+  const modelWorkCoordinator = new ModelWorkCoordinator();
 
   let store: ResponseStore | null = null;
   if (!disableStore) {
@@ -270,6 +272,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     responseRetentionSec,
     idleSweeper,
     resolveModel: config?.resolveModel,
+    modelWorkCoordinator,
     listModels: config?.listModels,
   });
   const server = httpCreateServer(handler);

@@ -107,7 +107,8 @@ pub struct Gemma4Config {
     // Paged attention options (opt-in)
     /// GPU memory budget for paged KV cache in megabytes.
     /// Only used when `use_block_paged_cache` is true.
-    /// Default: 2048 (2GB).
+    /// Default: auto-sized to cover `max_position_embeddings` for the
+    /// physical full-attention layers.
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_cache_memory_mb: Option<u32>,

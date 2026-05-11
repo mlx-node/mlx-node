@@ -6,6 +6,7 @@ import type { ResponseStore } from '@mlx-node/core';
 
 import { sendInternalError } from './errors.js';
 import type { IdleSweeper } from './idle-sweeper.js';
+import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
 import { routeRequest } from './router.js';
 
@@ -52,6 +53,11 @@ export interface HandlerOptions {
    */
   resolveModel?: (name: string) => Promise<void>;
   /**
+   * Coordinates process-wide MLX work so lazy model loads / warmups do not
+   * overlap live inference on another model.
+   */
+  modelWorkCoordinator?: ModelWorkCoordinator;
+  /**
    * Optional override for `GET /v1/models`. When provided, that endpoint
    * returns this list instead of `registry.list()`.
    */
@@ -67,6 +73,7 @@ export function createHandler(
   const responseRetentionSec = options?.responseRetentionSec;
   const idleSweeper = options?.idleSweeper ?? null;
   const resolveModel = options?.resolveModel;
+  const modelWorkCoordinator = options?.modelWorkCoordinator ?? (resolveModel ? new ModelWorkCoordinator() : undefined);
   const listModels = options?.listModels;
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -86,7 +93,17 @@ export function createHandler(
     // post-`res.end()` bookkeeping (e.g. `SessionRegistry.adopt`). `http.createServer`
     // ignores the return value, so this is transparent to production callers.
     try {
-      await routeRequest(req, res, registry, store, responseRetentionSec, idleSweeper, resolveModel, listModels);
+      await routeRequest(
+        req,
+        res,
+        registry,
+        store,
+        responseRetentionSec,
+        idleSweeper,
+        resolveModel,
+        listModels,
+        modelWorkCoordinator,
+      );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';
       if (!res.headersSent) {

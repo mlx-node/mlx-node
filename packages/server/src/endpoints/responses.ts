@@ -25,6 +25,7 @@ import {
   genId,
   mapFinishReasonToStatus,
 } from '../mappers/response.js';
+import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import { getPendingWritesFor } from '../pending-writes.js';
 import type { ModelRegistry } from '../registry.js';
 import { maybeWarnPromptCacheKeyIneligible, QueueFullError, type SessionRegistry } from '../session-registry.js';
@@ -1632,6 +1633,7 @@ export async function handleCreateResponse(
   httpReq?: IncomingMessage,
   responseRetentionSec?: number,
   idleSweeper?: IdleSweeper | null,
+  modelWorkCoordinator?: ModelWorkCoordinator,
 ): Promise<void> {
   const handlerStartedAt = Date.now();
 
@@ -2345,1084 +2347,1088 @@ export async function handleCreateResponse(
 
     try {
       const mutexQueuedAt = Date.now();
-      await sessionReg.withExclusive(async () => {
-        const serverTiming: ServerTimingForUsage = {
-          server_queue_ms: Date.now() - mutexQueuedAt,
-          server_pre_inference_ms: Date.now() - handlerStartedAt,
-          ...resolveServerTuningForUsage(),
-        };
+      const runInference = () =>
+        sessionReg.withExclusive(async () => {
+          const serverTiming: ServerTimingForUsage = {
+            server_queue_ms: Date.now() - mutexQueuedAt,
+            server_pre_inference_ms: Date.now() - handlerStartedAt,
+            ...resolveServerTuningForUsage(),
+          };
 
-        // Hot-swap race guard inside the mutex.
-        //
-        // `withExclusive` can park this waiter behind a long-running
-        // dispatch on the same model, and `ModelRegistry.register()` is
-        // NOT coordinated with that lock — a concurrent
-        // `registry.register(body.model, newModel)` can re-point the
-        // friendly name while we are parked. Without this in-lock re-read
-        // the closure would still lease a session out of the already-
-        // captured `preLockSessionReg`, adopt under the dead
-        // `preLockInstanceId`, and persist the new chain under a binding
-        // that `body.model` no longer resolves to. The pre-lock
-        // re-read only covered the `store.getChain()` await window; the
-        // mutex-wait window is strictly later and equally unsafe.
-        //
-        // Compare the live binding to the pre-lock snapshot (captured
-        // just before entering the mutex — already refreshed on the
-        // continuation path, identical to the handler-top snapshot
-        // on the stateless path). Any drift — nullable or value — is
-        // fatal and rejected with the same 400 envelope the pre-lock
-        // guard uses, so clients see a consistent "binding changed"
-        // error regardless of which await window caught the race.
-        const lockedSessionReg = registry.getSessionRegistry(body.model);
-        const lockedInstanceId = registry.getInstanceId(body.model);
-        if (
-          lockedSessionReg === undefined ||
-          lockedInstanceId === undefined ||
-          lockedSessionReg !== preLockSessionReg ||
-          lockedInstanceId !== preLockInstanceId
-        ) {
-          sendBadRequest(
-            res,
-            `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
-              `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
-              `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
-              `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
-              `route the request through the wrong model — priming, decoding, and persisting under a dead ` +
-              `binding. Retry the request — if the swap was intentional, the new binding will service the ` +
-              `retry cleanly.`,
-            'model',
-          );
-          return;
-        }
-
-        // Route the request through a `ChatSession` looked up by the prior
-        // response id. A miss (null id, unknown id, expired entry, or
-        // prefix-state mismatch) returns a fresh session; a hit leases the
-        // cached session out of the registry (single-use — the entry is
-        // removed on hit so overlapping requests against the same prior id
-        // cannot race on the same single-flight ChatSession).
-        //
-        // Hot-path eligibility gate: the chat-session delta API only
-        // serves a SINGLE `user` or `tool` continuation message — the
-        // `send` / `sendToolResult` entry points cover exactly that
-        // shape. A single `assistant` / `system` continuation cannot
-        // be advanced incrementally against the warm KV cache and
-        // must be handled via reset + cold re-prime. That branch is
-        // still VALID — it just routes through `runSession*`'s
-        // `session.turns === 0` fall-through (`primeHistory` +
-        // `startFromHistory*`) instead of the `send` / `sendToolResult`
-        // delta path. Crucially, a tier-1 HIT on this branch is still
-        // useful: `resetPreservingNativeCacheForWarmReuse(session)` keeps
-        // the warm native KV cache, and the subsequent
-        // `chat_session_start_sync` -> `verify_cache_prefix_direct`
-        // recovers the reused prefix even across a full-history
-        // replay. So we must NOT rewrite `previousResponseId` to null
-        // to force a cold-replay lookup — the tier-1 lease is exactly
-        // what makes warm reuse work. (Pre-Round 5 this branch passed
-        // `null` to force a miss, but that was wrong: it threw away a
-        // usable warm lease AND mislabeled the turn as `cold_replay`
-        // when the native prefix verifier was about to reuse the
-        // entire previous-turn prefix.) The hot-path-ineligibility
-        // condition (single non-user/non-tool continuation) is no
-        // longer consulted at lookup time — it's just the natural
-        // fall-through to the `session.turns === 0 || multi-message`
-        // cold-re-prime branch in `runSession*`, which correctly
-        // preserves the warm native cache on HIT via
-        // `resetPreservingNativeCacheForWarmReuse(session)`.
-        // Normalize the caller-supplied `prompt_cache_key` into the
-        // `string | null` shape the registry expects. `undefined` and
-        // missing both map to `null`; an explicit empty string is
-        // preserved distinct from `null` so the registry's tier-2
-        // scan treats "no key" and "empty key" as different tenants
-        // (prevents an unkeyed client from accidentally colliding
-        // with one that explicitly empty-keyed).
-        const promptCacheKey: string | null = typeof body.prompt_cache_key === 'string' ? body.prompt_cache_key : null;
-        // Precedence gate: when `previous_response_id` is present, tier-2
-        // (prompt-cache-key) lookup is DISABLED — even if the request is
-        // hot-path ineligible (single `assistant` / `system` continuation).
-        // The documented precedence is "prev-id wins; tier-1 miss falls
-        // through to FRESH, not tier-2", and that rule has to hold whether
-        // we take the hot path or the ineligible cold-replay branch. If we
-        // let the ineligible branch fall through to tier-2, a mis-routed
-        // prev-id request could lease an UNRELATED warm session that
-        // happens to share `prompt_cache_key`, then cold-replay on top of
-        // it — which `session.reset()` + `primeHistory()` would destroy,
-        // corrupting an unrelated chain. Force `null` for the cache key on
-        // both branches whenever a prev-id is set; tier-2 only runs for
-        // requests with no prev-id at all.
-        const effectivePromptCacheKey = previousResponseId != null ? null : promptCacheKey;
-        // Integrator nudge: if the caller supplied a non-empty
-        // `prompt_cache_key` but tier-2 prerequisites are missing
-        // (env gate off or key below the min-length floor) the turn
-        // silently cold-starts. Emit a once-per-distinct-raw-key
-        // stderr warning so `X-Session-Cache: fresh` on every request
-        // can be diagnosed without reading source. Gated on
-        // `effectivePromptCacheKey` (not raw `promptCacheKey`) so a
-        // request that suppresses the key via `previous_response_id`
-        // precedence does not also log a misleading "key ignored"
-        // message — that case is documented precedence, not a
-        // misconfiguration.
-        if (effectivePromptCacheKey !== null) {
-          maybeWarnPromptCacheKeyIneligible(effectivePromptCacheKey);
-        }
-        const lookup = sessionReg.getOrCreate(
-          previousResponseId ?? null,
-          requestedInstructions,
-          effectivePromptCacheKey,
-        );
-        const session = lookup.session;
-        // `X-Session-Cache` observability header: classify this turn as
-        // `fresh` (no `previous_response_id` on the request and tier-2
-        // prompt-cache-key did not hit), `hit` (prev-id warm-cache
-        // lease consumed on tier 1), `prefix_hit` (tier-2 warm-cache
-        // lease consumed — only promoted from `fresh` later once the
-        // native `cachedTokens > 0` confirms real prefix reuse), or
-        // `cold_replay` (request carried `previous_response_id` but
-        // the warm entry was missing / expired / instructions-
-        // mismatched / already leased, OR the request shape is
-        // ineligible for the hot path — the endpoint will rebuild the
-        // session from the `ResponseStore` below). Set before any
-        // `writeHead` / SSE `beginSSE` so both JSON and SSE responses
-        // carry it. See `endpoints/messages.ts` for the matching
-        // emission on `/v1/messages`.
-        //
-        // The `prefix_hit` promotion and the companion
-        // `X-Cached-Tokens: N` header both depend on the native
-        // ChatResult's `cachedTokens` field, which is only authoritative
-        // AFTER the native dispatch completes. We therefore emit the
-        // initial `fresh` / `hit` / `cold_replay` value here and let
-        // the post-dispatch branch below promote a `fresh`+tier2-hit
-        // classification to `prefix_hit` once the cached-tokens count
-        // is known.
-        const tier2Hit = previousResponseId == null && lookup.hit;
-        // Optimistic pre-dispatch classification. SSE flushes headers on
-        // `beginSSE` inside `handleStreamingNative`, so the streaming
-        // path has exactly one shot to commit the header value — before
-        // the dispatch runs, i.e. BEFORE the native prefix verifier has
-        // reported whether any tokens were actually reused.
-        //
-        // For non-streaming we still commit optimistically to
-        // `prefix_hit` on tier-2 hit and demote to `fresh` post-dispatch
-        // if `cachedTokens === 0` (template drift, tokenizer change,
-        // image-set change, etc.) — `res.end` has not fired yet so the
-        // header is still settable.
-        //
-        // For streaming we deliberately do NOT promote to `prefix_hit`
-        // on tier-2 hit. Once SSE headers flush they cannot be
-        // corrected, and a false-positive `prefix_hit` would contradict
-        // consumers that read `cachedTokens` from the terminal event.
-        // Approach B (this path): emit `fresh` on streaming even when
-        // tier-2 found a warm session — the cache reuse still happens,
-        // only the observability header is conservative. A future
-        // refactor can thread `cached_tokens` through the native
-        // streaming `start` chunk so the server knows authoritatively
-        // before `beginSSE()` flushes, at which point streaming can
-        // commit `prefix_hit` too (Approach A). Until then,
-        // `prefix_hit` is a non-streaming-only signal.
-        const isStreaming = mappedBody.stream === true;
-        // Prev-id branch classification. A tier-1 HIT is labeled `hit`
-        // regardless of whether the request is hot-path-eligible: the
-        // warm native KV cache is reused in both paths (the cheap
-        // `send` / `sendToolResult` delta on the eligible branch; the
-        // full-history `primeHistory` + `startFromHistory*` replay on
-        // the ineligible branch, where `resetPreservingNativeCacheForWarmReuse`
-        // keeps the cache alive for `verify_cache_prefix_direct` to
-        // recover). Only a registry MISS on the prev-id branch
-        // downgrades to `cold_replay` (no warm cache to reuse, the
-        // request must rebuild from `ResponseStore`).
-        let sessionCacheStatus: SessionCacheStatus =
-          previousResponseId == null
-            ? tier2Hit && !isStreaming
-              ? 'prefix_hit'
-              : 'fresh'
-            : lookup.hit
-              ? 'hit'
-              : 'cold_replay';
-        res.setHeader('X-Session-Cache', sessionCacheStatus);
-
-        // Multi-tool-call fan-out gate.
-        //
-        // The chat-session API cannot interleave tool results for a
-        // multi-call fan-out turn (each `sendToolResult` dispatch re-opens
-        // the assistant turn, so responding to the siblings would weave new
-        // assistant replies between the results — see
-        // `ChatSession.pendingUnresolvedToolCallCount`). The only valid forward
-        // progress from such a turn is an atomic replay that resolves every
-        // sibling call in one cold-restart, so we reject any continuation
-        // whose submitted `function_call_output` set does not exactly match
-        // the outstanding call ids.
-        //
-        // The gate only runs for `previous_response_id` continuations, where
-        // the STORED prior chain (`priorMessages`, reconstructed via
-        // `reconstructMessagesFromChain`) is the authoritative view of the
-        // trailing assistant turn and `newInputMessages` contains only the
-        // caller's continuation delta. Stateless requests (no
-        // `previous_response_id`) carry a full self-contained history in
-        // `input`, and historical tool outputs for prior resolved turns
-        // would otherwise be misclassified against the latest assistant's
-        // outstanding id set — leave cold-start histories to the jinja
-        // template / chat-session prefill to handle as-is.
-        const expectedOutstandingIds = priorMessages ? extractOutstandingToolCallIds(priorMessages) : null;
-
-        // Forged-tool-output guard. A `previous_response_id` continuation that
-        // submits any `function_call_output` when the stored prior chain has
-        // ZERO outstanding tool calls is structurally invalid: there is no
-        // assistant tool call for the result to resolve, so dispatching it
-        // would inject a synthetic `<tool_response>` delta into a thread the
-        // model never asked to call. Native backends do not authenticate
-        // `tool_call_id` against prior state — several just append the
-        // delta verbatim — so the gate must live here. Stateless requests
-        // (no `previous_response_id`) carry a full self-contained history
-        // and are left to the jinja template / chat-session prefill.
-        if (previousResponseId && expectedOutstandingIds === null) {
-          for (const m of newInputMessages) {
-            if (m.role === 'tool') {
-              sendBadRequest(
-                res,
-                `function_call_output submitted against a thread with no outstanding tool call. ` +
-                  `The prior assistant turn either never emitted a tool call or every sibling call has ` +
-                  `already been resolved, so there is nothing for this function_call_output to answer. ` +
-                  `Dispatching it anyway would synthesize a tool-response delta for a call the model ` +
-                  `never made and corrupt the conversation structure. Drop the function_call_output, ` +
-                  `or start a new chain without previous_response_id.`,
-                'input',
-              );
-              return;
-            }
+          // Hot-swap race guard inside the mutex.
+          //
+          // `withExclusive` can park this waiter behind a long-running
+          // dispatch on the same model, and `ModelRegistry.register()` is
+          // NOT coordinated with that lock — a concurrent
+          // `registry.register(body.model, newModel)` can re-point the
+          // friendly name while we are parked. Without this in-lock re-read
+          // the closure would still lease a session out of the already-
+          // captured `preLockSessionReg`, adopt under the dead
+          // `preLockInstanceId`, and persist the new chain under a binding
+          // that `body.model` no longer resolves to. The pre-lock
+          // re-read only covered the `store.getChain()` await window; the
+          // mutex-wait window is strictly later and equally unsafe.
+          //
+          // Compare the live binding to the pre-lock snapshot (captured
+          // just before entering the mutex — already refreshed on the
+          // continuation path, identical to the handler-top snapshot
+          // on the stateless path). Any drift — nullable or value — is
+          // fatal and rejected with the same 400 envelope the pre-lock
+          // guard uses, so clients see a consistent "binding changed"
+          // error regardless of which await window caught the race.
+          const lockedSessionReg = registry.getSessionRegistry(body.model);
+          const lockedInstanceId = registry.getInstanceId(body.model);
+          if (
+            lockedSessionReg === undefined ||
+            lockedInstanceId === undefined ||
+            lockedSessionReg !== preLockSessionReg ||
+            lockedInstanceId !== preLockInstanceId
+          ) {
+            sendBadRequest(
+              res,
+              `Model "${body.model}" binding changed while the request was queued behind the per-model ` +
+                `execution mutex. A concurrent register() re-pointed the name at a different model instance ` +
+                `(or released it entirely) while this waiter was parked, so the session registry and instance ` +
+                `id captured before the mutex wait no longer match the live binding. Dispatching anyway would ` +
+                `route the request through the wrong model — priming, decoding, and persisting under a dead ` +
+                `binding. Retry the request — if the swap was intentional, the new binding will service the ` +
+                `retry cleanly.`,
+              'model',
+            );
+            return;
           }
-        }
 
-        if (expectedOutstandingIds !== null) {
-          // Contiguous-prefix guard: function_call_output items must appear
-          // as an unbroken prefix of the continuation delta, before any
-          // user/assistant/system message. A shape like
-          // `[tool(call_a), user(hi), tool(call_b)]` would otherwise pass
-          // every id-set check below (both outstanding ids present, no
-          // duplicates, no stale ids) while still orphaning the fan-out,
-          // because the interleaved user turn re-opens the assistant turn
-          // between the two tool results. Reject early so the caller cannot
-          // smuggle a user turn into the middle of a resolved fan-out.
-          let seenNonTool = false;
-          for (const m of newInputMessages) {
-            if (m.role === 'tool') {
-              if (seenNonTool) {
+          // Route the request through a `ChatSession` looked up by the prior
+          // response id. A miss (null id, unknown id, expired entry, or
+          // prefix-state mismatch) returns a fresh session; a hit leases the
+          // cached session out of the registry (single-use — the entry is
+          // removed on hit so overlapping requests against the same prior id
+          // cannot race on the same single-flight ChatSession).
+          //
+          // Hot-path eligibility gate: the chat-session delta API only
+          // serves a SINGLE `user` or `tool` continuation message — the
+          // `send` / `sendToolResult` entry points cover exactly that
+          // shape. A single `assistant` / `system` continuation cannot
+          // be advanced incrementally against the warm KV cache and
+          // must be handled via reset + cold re-prime. That branch is
+          // still VALID — it just routes through `runSession*`'s
+          // `session.turns === 0` fall-through (`primeHistory` +
+          // `startFromHistory*`) instead of the `send` / `sendToolResult`
+          // delta path. Crucially, a tier-1 HIT on this branch is still
+          // useful: `resetPreservingNativeCacheForWarmReuse(session)` keeps
+          // the warm native KV cache, and the subsequent
+          // `chat_session_start_sync` -> `verify_cache_prefix_direct`
+          // recovers the reused prefix even across a full-history
+          // replay. So we must NOT rewrite `previousResponseId` to null
+          // to force a cold-replay lookup — the tier-1 lease is exactly
+          // what makes warm reuse work. (Pre-Round 5 this branch passed
+          // `null` to force a miss, but that was wrong: it threw away a
+          // usable warm lease AND mislabeled the turn as `cold_replay`
+          // when the native prefix verifier was about to reuse the
+          // entire previous-turn prefix.) The hot-path-ineligibility
+          // condition (single non-user/non-tool continuation) is no
+          // longer consulted at lookup time — it's just the natural
+          // fall-through to the `session.turns === 0 || multi-message`
+          // cold-re-prime branch in `runSession*`, which correctly
+          // preserves the warm native cache on HIT via
+          // `resetPreservingNativeCacheForWarmReuse(session)`.
+          // Normalize the caller-supplied `prompt_cache_key` into the
+          // `string | null` shape the registry expects. `undefined` and
+          // missing both map to `null`; an explicit empty string is
+          // preserved distinct from `null` so the registry's tier-2
+          // scan treats "no key" and "empty key" as different tenants
+          // (prevents an unkeyed client from accidentally colliding
+          // with one that explicitly empty-keyed).
+          const promptCacheKey: string | null =
+            typeof body.prompt_cache_key === 'string' ? body.prompt_cache_key : null;
+          // Precedence gate: when `previous_response_id` is present, tier-2
+          // (prompt-cache-key) lookup is DISABLED — even if the request is
+          // hot-path ineligible (single `assistant` / `system` continuation).
+          // The documented precedence is "prev-id wins; tier-1 miss falls
+          // through to FRESH, not tier-2", and that rule has to hold whether
+          // we take the hot path or the ineligible cold-replay branch. If we
+          // let the ineligible branch fall through to tier-2, a mis-routed
+          // prev-id request could lease an UNRELATED warm session that
+          // happens to share `prompt_cache_key`, then cold-replay on top of
+          // it — which `session.reset()` + `primeHistory()` would destroy,
+          // corrupting an unrelated chain. Force `null` for the cache key on
+          // both branches whenever a prev-id is set; tier-2 only runs for
+          // requests with no prev-id at all.
+          const effectivePromptCacheKey = previousResponseId != null ? null : promptCacheKey;
+          // Integrator nudge: if the caller supplied a non-empty
+          // `prompt_cache_key` but tier-2 prerequisites are missing
+          // (env gate off or key below the min-length floor) the turn
+          // silently cold-starts. Emit a once-per-distinct-raw-key
+          // stderr warning so `X-Session-Cache: fresh` on every request
+          // can be diagnosed without reading source. Gated on
+          // `effectivePromptCacheKey` (not raw `promptCacheKey`) so a
+          // request that suppresses the key via `previous_response_id`
+          // precedence does not also log a misleading "key ignored"
+          // message — that case is documented precedence, not a
+          // misconfiguration.
+          if (effectivePromptCacheKey !== null) {
+            maybeWarnPromptCacheKeyIneligible(effectivePromptCacheKey);
+          }
+          const lookup = sessionReg.getOrCreate(
+            previousResponseId ?? null,
+            requestedInstructions,
+            effectivePromptCacheKey,
+          );
+          const session = lookup.session;
+          // `X-Session-Cache` observability header: classify this turn as
+          // `fresh` (no `previous_response_id` on the request and tier-2
+          // prompt-cache-key did not hit), `hit` (prev-id warm-cache
+          // lease consumed on tier 1), `prefix_hit` (tier-2 warm-cache
+          // lease consumed — only promoted from `fresh` later once the
+          // native `cachedTokens > 0` confirms real prefix reuse), or
+          // `cold_replay` (request carried `previous_response_id` but
+          // the warm entry was missing / expired / instructions-
+          // mismatched / already leased, OR the request shape is
+          // ineligible for the hot path — the endpoint will rebuild the
+          // session from the `ResponseStore` below). Set before any
+          // `writeHead` / SSE `beginSSE` so both JSON and SSE responses
+          // carry it. See `endpoints/messages.ts` for the matching
+          // emission on `/v1/messages`.
+          //
+          // The `prefix_hit` promotion and the companion
+          // `X-Cached-Tokens: N` header both depend on the native
+          // ChatResult's `cachedTokens` field, which is only authoritative
+          // AFTER the native dispatch completes. We therefore emit the
+          // initial `fresh` / `hit` / `cold_replay` value here and let
+          // the post-dispatch branch below promote a `fresh`+tier2-hit
+          // classification to `prefix_hit` once the cached-tokens count
+          // is known.
+          const tier2Hit = previousResponseId == null && lookup.hit;
+          // Optimistic pre-dispatch classification. SSE flushes headers on
+          // `beginSSE` inside `handleStreamingNative`, so the streaming
+          // path has exactly one shot to commit the header value — before
+          // the dispatch runs, i.e. BEFORE the native prefix verifier has
+          // reported whether any tokens were actually reused.
+          //
+          // For non-streaming we still commit optimistically to
+          // `prefix_hit` on tier-2 hit and demote to `fresh` post-dispatch
+          // if `cachedTokens === 0` (template drift, tokenizer change,
+          // image-set change, etc.) — `res.end` has not fired yet so the
+          // header is still settable.
+          //
+          // For streaming we deliberately do NOT promote to `prefix_hit`
+          // on tier-2 hit. Once SSE headers flush they cannot be
+          // corrected, and a false-positive `prefix_hit` would contradict
+          // consumers that read `cachedTokens` from the terminal event.
+          // Approach B (this path): emit `fresh` on streaming even when
+          // tier-2 found a warm session — the cache reuse still happens,
+          // only the observability header is conservative. A future
+          // refactor can thread `cached_tokens` through the native
+          // streaming `start` chunk so the server knows authoritatively
+          // before `beginSSE()` flushes, at which point streaming can
+          // commit `prefix_hit` too (Approach A). Until then,
+          // `prefix_hit` is a non-streaming-only signal.
+          const isStreaming = mappedBody.stream === true;
+          // Prev-id branch classification. A tier-1 HIT is labeled `hit`
+          // regardless of whether the request is hot-path-eligible: the
+          // warm native KV cache is reused in both paths (the cheap
+          // `send` / `sendToolResult` delta on the eligible branch; the
+          // full-history `primeHistory` + `startFromHistory*` replay on
+          // the ineligible branch, where `resetPreservingNativeCacheForWarmReuse`
+          // keeps the cache alive for `verify_cache_prefix_direct` to
+          // recover). Only a registry MISS on the prev-id branch
+          // downgrades to `cold_replay` (no warm cache to reuse, the
+          // request must rebuild from `ResponseStore`).
+          let sessionCacheStatus: SessionCacheStatus =
+            previousResponseId == null
+              ? tier2Hit && !isStreaming
+                ? 'prefix_hit'
+                : 'fresh'
+              : lookup.hit
+                ? 'hit'
+                : 'cold_replay';
+          res.setHeader('X-Session-Cache', sessionCacheStatus);
+
+          // Multi-tool-call fan-out gate.
+          //
+          // The chat-session API cannot interleave tool results for a
+          // multi-call fan-out turn (each `sendToolResult` dispatch re-opens
+          // the assistant turn, so responding to the siblings would weave new
+          // assistant replies between the results — see
+          // `ChatSession.pendingUnresolvedToolCallCount`). The only valid forward
+          // progress from such a turn is an atomic replay that resolves every
+          // sibling call in one cold-restart, so we reject any continuation
+          // whose submitted `function_call_output` set does not exactly match
+          // the outstanding call ids.
+          //
+          // The gate only runs for `previous_response_id` continuations, where
+          // the STORED prior chain (`priorMessages`, reconstructed via
+          // `reconstructMessagesFromChain`) is the authoritative view of the
+          // trailing assistant turn and `newInputMessages` contains only the
+          // caller's continuation delta. Stateless requests (no
+          // `previous_response_id`) carry a full self-contained history in
+          // `input`, and historical tool outputs for prior resolved turns
+          // would otherwise be misclassified against the latest assistant's
+          // outstanding id set — leave cold-start histories to the jinja
+          // template / chat-session prefill to handle as-is.
+          const expectedOutstandingIds = priorMessages ? extractOutstandingToolCallIds(priorMessages) : null;
+
+          // Forged-tool-output guard. A `previous_response_id` continuation that
+          // submits any `function_call_output` when the stored prior chain has
+          // ZERO outstanding tool calls is structurally invalid: there is no
+          // assistant tool call for the result to resolve, so dispatching it
+          // would inject a synthetic `<tool_response>` delta into a thread the
+          // model never asked to call. Native backends do not authenticate
+          // `tool_call_id` against prior state — several just append the
+          // delta verbatim — so the gate must live here. Stateless requests
+          // (no `previous_response_id`) carry a full self-contained history
+          // and are left to the jinja template / chat-session prefill.
+          if (previousResponseId && expectedOutstandingIds === null) {
+            for (const m of newInputMessages) {
+              if (m.role === 'tool') {
                 sendBadRequest(
                   res,
-                  `function_call_output items must appear as a contiguous prefix of the continuation ` +
-                    `before any user, assistant, or system message. Interleaving a non-tool message ` +
-                    `between sibling function_call_output items orphans the fan-out by weaving a new ` +
-                    `assistant turn between the tool results. Reorder the submission so every ` +
-                    `function_call_output precedes any subsequent message, or start a new chain ` +
-                    `without previous_response_id.`,
+                  `function_call_output submitted against a thread with no outstanding tool call. ` +
+                    `The prior assistant turn either never emitted a tool call or every sibling call has ` +
+                    `already been resolved, so there is nothing for this function_call_output to answer. ` +
+                    `Dispatching it anyway would synthesize a tool-response delta for a call the model ` +
+                    `never made and corrupt the conversation structure. Drop the function_call_output, ` +
+                    `or start a new chain without previous_response_id.`,
                   'input',
                 );
                 return;
               }
-            } else {
-              seenNonTool = true;
             }
           }
 
-          const submittedIds: string[] = [];
-          for (const m of newInputMessages) {
-            if (m.role === 'tool' && typeof m.toolCallId === 'string' && m.toolCallId.length > 0) {
-              submittedIds.push(m.toolCallId);
+          if (expectedOutstandingIds !== null) {
+            // Contiguous-prefix guard: function_call_output items must appear
+            // as an unbroken prefix of the continuation delta, before any
+            // user/assistant/system message. A shape like
+            // `[tool(call_a), user(hi), tool(call_b)]` would otherwise pass
+            // every id-set check below (both outstanding ids present, no
+            // duplicates, no stale ids) while still orphaning the fan-out,
+            // because the interleaved user turn re-opens the assistant turn
+            // between the two tool results. Reject early so the caller cannot
+            // smuggle a user turn into the middle of a resolved fan-out.
+            let seenNonTool = false;
+            for (const m of newInputMessages) {
+              if (m.role === 'tool') {
+                if (seenNonTool) {
+                  sendBadRequest(
+                    res,
+                    `function_call_output items must appear as a contiguous prefix of the continuation ` +
+                      `before any user, assistant, or system message. Interleaving a non-tool message ` +
+                      `between sibling function_call_output items orphans the fan-out by weaving a new ` +
+                      `assistant turn between the tool results. Reorder the submission so every ` +
+                      `function_call_output precedes any subsequent message, or start a new chain ` +
+                      `without previous_response_id.`,
+                    'input',
+                  );
+                  return;
+                }
+              } else {
+                seenNonTool = true;
+              }
             }
-          }
 
-          // Short-circuit: a plain user continuation (zero tool results)
-          // would orphan the outstanding call(s) just as surely as a
-          // partial tool-result submission. Reject both paths with the
-          // same 400.
-          const plural = expectedOutstandingIds.length > 1;
-          if (submittedIds.length === 0) {
-            sendBadRequest(
-              res,
-              `Previous assistant turn has ${expectedOutstandingIds.length} unresolved tool call${plural ? 's' : ''} ` +
-                `(${expectedOutstandingIds.join(', ')}); the chat-session API requires every outstanding ` +
-                `function_call_output to be submitted before the thread can advance. A plain user turn ` +
-                `would orphan the unresolved call${plural ? 's' : ''}. Submit function_call_output items for ` +
-                `every outstanding id, or start a new chain without previous_response_id.`,
-              'input',
-            );
-            return;
-          }
+            const submittedIds: string[] = [];
+            for (const m of newInputMessages) {
+              if (m.role === 'tool' && typeof m.toolCallId === 'string' && m.toolCallId.length > 0) {
+                submittedIds.push(m.toolCallId);
+              }
+            }
 
-          const expectedSet = new Set(expectedOutstandingIds);
-          const seen = new Set<string>();
-          for (const id of submittedIds) {
-            if (seen.has(id)) {
+            // Short-circuit: a plain user continuation (zero tool results)
+            // would orphan the outstanding call(s) just as surely as a
+            // partial tool-result submission. Reject both paths with the
+            // same 400.
+            const plural = expectedOutstandingIds.length > 1;
+            if (submittedIds.length === 0) {
               sendBadRequest(
                 res,
-                `Duplicate function_call_output call_id "${id}" — each outstanding tool call must be answered exactly once.`,
+                `Previous assistant turn has ${expectedOutstandingIds.length} unresolved tool call${plural ? 's' : ''} ` +
+                  `(${expectedOutstandingIds.join(', ')}); the chat-session API requires every outstanding ` +
+                  `function_call_output to be submitted before the thread can advance. A plain user turn ` +
+                  `would orphan the unresolved call${plural ? 's' : ''}. Submit function_call_output items for ` +
+                  `every outstanding id, or start a new chain without previous_response_id.`,
                 'input',
               );
               return;
             }
-            seen.add(id);
-            if (!expectedSet.has(id)) {
+
+            const expectedSet = new Set(expectedOutstandingIds);
+            const seen = new Set<string>();
+            for (const id of submittedIds) {
+              if (seen.has(id)) {
+                sendBadRequest(
+                  res,
+                  `Duplicate function_call_output call_id "${id}" — each outstanding tool call must be answered exactly once.`,
+                  'input',
+                );
+                return;
+              }
+              seen.add(id);
+              if (!expectedSet.has(id)) {
+                sendBadRequest(
+                  res,
+                  `Unexpected function_call_output call_id "${id}"; the outstanding multi-tool-call set is ` +
+                    `${expectedOutstandingIds.join(', ')}. Submitting an unrelated or stale call_id would advance ` +
+                    `the chain past an unresolved turn.`,
+                  'input',
+                );
+                return;
+              }
+            }
+            if (seen.size !== expectedSet.size) {
+              const missing: string[] = [];
+              for (const id of expectedOutstandingIds) {
+                if (!seen.has(id)) missing.push(id);
+              }
               sendBadRequest(
                 res,
-                `Unexpected function_call_output call_id "${id}"; the outstanding multi-tool-call set is ` +
-                  `${expectedOutstandingIds.join(', ')}. Submitting an unrelated or stale call_id would advance ` +
-                  `the chain past an unresolved turn.`,
+                `Missing function_call_output items for outstanding tool calls: ${missing.join(', ')}. ` +
+                  `Partial submissions would orphan the sibling tool calls and advance the chain past an ` +
+                  `unresolved turn. Resubmit with every sibling output, or start a new chain without ` +
+                  `previous_response_id.`,
                 'input',
               );
               return;
             }
-          }
-          if (seen.size !== expectedSet.size) {
-            const missing: string[] = [];
-            for (const id of expectedOutstandingIds) {
-              if (!seen.has(id)) missing.push(id);
+
+            // All outstanding ids are accounted for. Canonicalize the submitted
+            // tool-message order to the stored sibling order before the replay
+            // runs — both `messages` (primed into the fresh session on the cold
+            // path) and `newInputMessages` (persisted verbatim into the store
+            // for future chain reconstruction) must reflect the canonical
+            // order, otherwise a caller can swap outputs and silently poison
+            // replay even after the id-set gate passes.
+            //
+            // Compute the tool block's end as the contiguous-prefix run of
+            // `role === 'tool'` messages starting at `priorOffset`. The
+            // contiguous-prefix guard above already rejected any shape that
+            // interleaves a non-tool message inside the delta's tool block,
+            // so this simple forward scan matches the exact block the gate
+            // just authenticated. Passing an explicit `blockEnd` keeps the
+            // helper from accidentally walking into any later turn that
+            // `mapRequest` may have appended to `messages`.
+            let deltaBlockEnd = priorOffset;
+            while (deltaBlockEnd < messages.length && messages[deltaBlockEnd]!.role === 'tool') {
+              deltaBlockEnd++;
             }
-            sendBadRequest(
-              res,
-              `Missing function_call_output items for outstanding tool calls: ${missing.join(', ')}. ` +
-                `Partial submissions would orphan the sibling tool calls and advance the chain past an ` +
-                `unresolved turn. Resubmit with every sibling output, or start a new chain without ` +
-                `previous_response_id.`,
-              'input',
-            );
-            return;
+            canonicalizeToolMessageOrder(messages, priorOffset, deltaBlockEnd, expectedOutstandingIds);
+            newInputMessages = messages.slice(priorOffset);
           }
 
-          // All outstanding ids are accounted for. Canonicalize the submitted
-          // tool-message order to the stored sibling order before the replay
-          // runs — both `messages` (primed into the fresh session on the cold
-          // path) and `newInputMessages` (persisted verbatim into the store
-          // for future chain reconstruction) must reflect the canonical
-          // order, otherwise a caller can swap outputs and silently poison
-          // replay even after the id-set gate passes.
+          // Walk the full merged history and canonicalize every assistant
+          // fan-out's trailing tool block against its declared sibling order.
           //
-          // Compute the tool block's end as the contiguous-prefix run of
-          // `role === 'tool'` messages starting at `priorOffset`. The
-          // contiguous-prefix guard above already rejected any shape that
-          // interleaves a non-tool message inside the delta's tool block,
-          // so this simple forward scan matches the exact block the gate
-          // just authenticated. Passing an explicit `blockEnd` keeps the
-          // helper from accidentally walking into any later turn that
-          // `mapRequest` may have appended to `messages`.
-          let deltaBlockEnd = priorOffset;
-          while (deltaBlockEnd < messages.length && messages[deltaBlockEnd]!.role === 'tool') {
-            deltaBlockEnd++;
+          // The multi-tool-call gate above only fires on `previous_response_id`
+          // continuations, and even there it only handles the caller's delta
+          // block against the STORED prior chain's trailing assistant. That
+          // leaves two cases uncovered:
+          //
+          //   1. Stateless cold-start histories (no `previous_response_id`).
+          //      The caller ships a full self-contained conversation through
+          //      `input`; the gate is skipped entirely and the caller-supplied
+          //      tool-message order flows straight into `primeHistory()`. A
+          //      caller can reverse two sibling tool outputs, and since
+          //      several native session backends pair tool results to
+          //      fan-out calls POSITIONALLY (not by id), each result binds
+          //      to the wrong sibling call.
+          //   2. Earlier fan-outs embedded inside the stored prior history
+          //      on a continuation. Those came from the server's own store
+          //      so they should already be canonical, but defense in depth
+          //      is cheap — a single full-history walk covers every shape.
+          //
+          // Malformed histories (missing/duplicate/unknown ids, orphan tool
+          // messages, unresolved trailing fan-out in a stateless request)
+          // are rejected with a clear 400 instead of silently rewritten.
+          const historyError = validateAndCanonicalizeHistoryToolOrder(messages);
+          if (historyError !== null) {
+            sendBadRequest(res, historyError, 'input');
+            return;
           }
-          canonicalizeToolMessageOrder(messages, priorOffset, deltaBlockEnd, expectedOutstandingIds);
+          // Canonicalization may have reordered tool messages inside the
+          // continuation delta (on the stateless-history walk over the
+          // post-priorOffset portion), so recompute `newInputMessages` from
+          // the now-canonical `messages`.
           newInputMessages = messages.slice(priorOffset);
-        }
 
-        // Walk the full merged history and canonicalize every assistant
-        // fan-out's trailing tool block against its declared sibling order.
-        //
-        // The multi-tool-call gate above only fires on `previous_response_id`
-        // continuations, and even there it only handles the caller's delta
-        // block against the STORED prior chain's trailing assistant. That
-        // leaves two cases uncovered:
-        //
-        //   1. Stateless cold-start histories (no `previous_response_id`).
-        //      The caller ships a full self-contained conversation through
-        //      `input`; the gate is skipped entirely and the caller-supplied
-        //      tool-message order flows straight into `primeHistory()`. A
-        //      caller can reverse two sibling tool outputs, and since
-        //      several native session backends pair tool results to
-        //      fan-out calls POSITIONALLY (not by id), each result binds
-        //      to the wrong sibling call.
-        //   2. Earlier fan-outs embedded inside the stored prior history
-        //      on a continuation. Those came from the server's own store
-        //      so they should already be canonical, but defense in depth
-        //      is cheap — a single full-history walk covers every shape.
-        //
-        // Malformed histories (missing/duplicate/unknown ids, orphan tool
-        // messages, unresolved trailing fan-out in a stateless request)
-        // are rejected with a clear 400 instead of silently rewritten.
-        const historyError = validateAndCanonicalizeHistoryToolOrder(messages);
-        if (historyError !== null) {
-          sendBadRequest(res, historyError, 'input');
-          return;
-        }
-        // Canonicalization may have reordered tool messages inside the
-        // continuation delta (on the stateless-history walk over the
-        // post-priorOffset portion), so recompute `newInputMessages` from
-        // the now-canonical `messages`.
-        newInputMessages = messages.slice(priorOffset);
+          // Visibility / wire-format tracker shared between the handler
+          // body and the outer catch. Declared outside the `try` so the
+          // catch can branch on `responseMode` (JSON vs SSE) and know
+          // whether a terminal artefact already landed — both signals
+          // are authoritative, unlike `res.headersSent`.
+          const visibility = createVisibility();
 
-        // Visibility / wire-format tracker shared between the handler
-        // body and the outer catch. Declared outside the `try` so the
-        // catch can branch on `responseMode` (JSON vs SSE) and know
-        // whether a terminal artefact already landed — both signals
-        // are authoritative, unlike `res.headersSent`.
-        const visibility = createVisibility();
+          try {
+            // `runSession*` plumbs an honest commit signal out of the helper:
+            // `ChatSession` only advances `turns` on a successful non-error
+            // final chunk (streaming) or a resolved native promise
+            // (non-streaming). The streaming safety-net path (generator
+            // exhausts without a `done` event, see `handleStreamingNative`
+            // fallback) and the `finishReason === 'error'` final chunk both
+            // leave `turns` unchanged. The helper captures its baseline
+            // AFTER any internal `session.reset()` on the multi-message
+            // reset-and-cold-restart branch, so the signal is honest there
+            // too — a pre-helper snapshot would be stale.
+            let committed: boolean;
+            // Pass `mappedBody` (not the raw `body`) so the response
+            // object and the persisted record carry the EFFECTIVE
+            // instructions, including any value inherited from the
+            // trailing stored record via instruction inheritance.
+            // Using `body` here
+            // would re-drop the inherited value on the wire — the
+            // client's response would report `instructions: null` even
+            // though the turn was run against the inherited system
+            // context, and the next cold replay would have nothing to
+            // re-inherit from.
+            // Wrap the handler call in its own try/catch so that a
+            // post-commit persistence failure does not prevent adopt.
+            // Post-commit store failures are caught inside the handlers
+            // themselves (handleNonStreaming / handleStreamingNative) and
+            // demoted to log-only. A handlerError at this level therefore
+            // comes from non-persistence failures (response construction,
+            // SSE write, res.writeHead/end crash).
+            //
+            // `res.headersSent` is NOT a reliable proxy for "the client
+            // received the response": Node's `writeHead` flips
+            // `headersSent = true` synchronously before any body bytes
+            // leave the buffer, and the sync return of `res.end()` /
+            // `writeSSEEvent` only proves the bytes were queued — an
+            // async socket failure after the queue could still leave
+            // the client with no terminal. Picking JSON-vs-SSE fallback
+            // from `res.headersSent` is also unsafe because a
+            // `writeHead(200, 'application/json')` → `res.end()` crash
+            // would otherwise emit SSE frames into a JSON-declared
+            // response.
+            //
+            // The `TransportVisibility` record instead tracks both the
+            // wire format the handler committed to (`responseMode`)
+            // AND whether the client observed a terminal artefact
+            // (`responseBodyWritten` / `terminalEmitted`). Both flags
+            // are flipped only from the kernel-ack callback of the
+            // underlying `res.end` / `res.write` — synchronous return
+            // is NOT treated as proof of visibility. The outer catch
+            // branches on `responseMode` to choose the clean-up shape
+            // (JSON error, SSE `error` frame, or socket destroy).
+            let handlerError: Error | null = null;
 
-        try {
-          // `runSession*` plumbs an honest commit signal out of the helper:
-          // `ChatSession` only advances `turns` on a successful non-error
-          // final chunk (streaming) or a resolved native promise
-          // (non-streaming). The streaming safety-net path (generator
-          // exhausts without a `done` event, see `handleStreamingNative`
-          // fallback) and the `finishReason === 'error'` final chunk both
-          // leave `turns` unchanged. The helper captures its baseline
-          // AFTER any internal `session.reset()` on the multi-message
-          // reset-and-cold-restart branch, so the signal is honest there
-          // too — a pre-helper snapshot would be stale.
-          let committed: boolean;
-          // Pass `mappedBody` (not the raw `body`) so the response
-          // object and the persisted record carry the EFFECTIVE
-          // instructions, including any value inherited from the
-          // trailing stored record via instruction inheritance.
-          // Using `body` here
-          // would re-drop the inherited value on the wire — the
-          // client's response would report `instructions: null` even
-          // though the turn was run against the inherited system
-          // context, and the next cold replay would have nothing to
-          // re-inherit from.
-          // Wrap the handler call in its own try/catch so that a
-          // post-commit persistence failure does not prevent adopt.
-          // Post-commit store failures are caught inside the handlers
-          // themselves (handleNonStreaming / handleStreamingNative) and
-          // demoted to log-only. A handlerError at this level therefore
-          // comes from non-persistence failures (response construction,
-          // SSE write, res.writeHead/end crash).
-          //
-          // `res.headersSent` is NOT a reliable proxy for "the client
-          // received the response": Node's `writeHead` flips
-          // `headersSent = true` synchronously before any body bytes
-          // leave the buffer, and the sync return of `res.end()` /
-          // `writeSSEEvent` only proves the bytes were queued — an
-          // async socket failure after the queue could still leave
-          // the client with no terminal. Picking JSON-vs-SSE fallback
-          // from `res.headersSent` is also unsafe because a
-          // `writeHead(200, 'application/json')` → `res.end()` crash
-          // would otherwise emit SSE frames into a JSON-declared
-          // response.
-          //
-          // The `TransportVisibility` record instead tracks both the
-          // wire format the handler committed to (`responseMode`)
-          // AND whether the client observed a terminal artefact
-          // (`responseBodyWritten` / `terminalEmitted`). Both flags
-          // are flipped only from the kernel-ack callback of the
-          // underlying `res.end` / `res.write` — synchronous return
-          // is NOT treated as proof of visibility. The outer catch
-          // branches on `responseMode` to choose the clean-up shape
-          // (JSON error, SSE `error` frame, or socket destroy).
-          let handlerError: Error | null = null;
-
-          if (mappedBody.stream) {
-            const outcome = await runSessionStreaming(
-              session,
-              messages,
-              newInputMessages,
-              config,
-              streamSignal,
-              !lookup.hit,
-            );
-            const streamingWasCommitted = () => outcome.wasCommitted();
-            try {
-              const handlerOutcome = await handleStreamingNative(
-                res,
-                outcome.stream,
-                mappedBody,
-                responseId,
-                previousResponseId,
-                streamingWasCommitted,
-                httpReq,
-                visibility,
-                serverTiming,
+            if (mappedBody.stream) {
+              const outcome = await runSessionStreaming(
+                session,
+                messages,
+                newInputMessages,
+                config,
+                streamSignal,
+                !lookup.hit,
               );
-              streamFailureMode = handlerOutcome.failureMode;
-              if (handlerOutcome.terminalToPersist != null && store && body.store !== false) {
-                // Initiate the write SYNCHRONOUSLY inside the mutex so
-                // the pending-write tracker observes it before the
-                // mutex releases. The promise is awaited off-lock in
-                // the outer finally block.
-                const record = buildResponseRecord(
-                  handlerOutcome.terminalToPersist,
-                  newInputMessages,
+              const streamingWasCommitted = () => outcome.wasCommitted();
+              try {
+                const handlerOutcome = await handleStreamingNative(
+                  res,
+                  outcome.stream,
+                  mappedBody,
+                  responseId,
                   previousResponseId,
-                  currentInstanceId,
-                  effectiveRetentionSec,
+                  streamingWasCommitted,
+                  httpReq,
+                  visibility,
+                  serverTiming,
                 );
-                // Pair a `retainBinding` against the persist promise
-                // so the binding's `modelInstanceId` survives a
-                // concurrent same-model unregister + re-register that
-                // races the post-commit write. `releaseBinding` runs
-                // in the persist's `.finally(...)` regardless of
-                // outcome, so the retention counter stays balanced
-                // whether the write fulfils or rejects.
-                //
-                // Leaving the retain pinned forever on a wedged write
-                // would make the binding unreclaimable until process
-                // restart, so an INDEPENDENT hard-timeout timer is
-                // armed alongside the persist (see
-                // `getPostCommitPersistHardTimeoutMs` for the default).
-                // If the persist settles naturally the timer is
-                // cancelled via `clearTimeout` inside the same
-                // `.finally(...)` — slow-but-eventual writes are
-                // unaffected. If the persist is still wedged past the
-                // hard bound, the timer fires and force-releases the
-                // retain via the idempotent `persistRetainBox`. The
-                // hard timer is armed off the handler's await path, so
-                // the response is never delayed by it.
-                //
-                // Before the hard timeout force-releases the retain
-                // (which unblocks binding teardown), it calls
-                // `registry.retireInstanceIdForForceRelease(leaseModel)`
-                // to tombstone the binding's current instance id on
-                // the model object. A subsequent `register()` of the
-                // SAME model object inherits that retired id rather
-                // than minting fresh — so the late-landing persist's
-                // record (stamped with the retired id) still matches
-                // the live binding and stays chainable through
-                // `previous_response_id`. Only a true hot-swap
-                // (re-register with a DIFFERENT model object) mints a
-                // fresh id, and the 400 instance-mismatch that results
-                // is the correct semantic outcome because the new
-                // model is semantically different from the one that
-                // produced the stored record. Retirement MUST happen
-                // BEFORE release so `instanceIds.get(model)` still
-                // returns the live id the record carries.
-                //
-                // The tombstone's lifetime is scoped to the pending
-                // persists that installed it — the `.finally(...)`
-                // calls `registry.releaseTombstone(leaseModel)` so
-                // that when the late write eventually settles
-                // (fulfills or rejects), the shared refcount drops
-                // and, once every outstanding persist has released,
-                // any subsequent re-registration correctly mints a
-                // fresh id. Without this scoping, a past hard-timeout
-                // event would permanently re-enable id inheritance
-                // across unrelated later lifecycles — reopening
-                // stale-chain replay across what should be logically
-                // dead bindings. The refcounted single-entry layout
-                // handles OVERLAPPING hard-timeouts on the same live
-                // instance id in bounded space: every breaker targets
-                // the SAME retired id (the register-inherit path
-                // keeps using it while the tombstone is alive) so one
-                // shared refcount safely collapses every in-flight
-                // retire, and memory stays O(1) per model even under
-                // a truly wedged store that never settles.
-                registry.retainBinding(leaseModel);
-                let persistRetainReleased = false;
-                persistRetainBox.release = () => {
-                  if (persistRetainReleased) return;
-                  persistRetainReleased = true;
-                  registry.releaseBinding(leaseModel);
-                };
-                const streamingPersistMode = 'streaming' as const;
-                const streamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
-                let retiredTombstone: { instanceId: number } | undefined;
-                // Compute the scalar `absoluteExpiresAtMs` ONCE up
-                // front — the MINIMUM of the newly produced record's
-                // own row expiry and the earliest expiry across any
-                // resolved ancestor chain. This value is threaded
-                // into both the pending-write tracker at
-                // `initiatePersist()` time (so the pre-breaker
-                // `awaitPending` path can short-circuit to 404 once
-                // the bound is crossed) AND the hard-timeout marker
-                // at breaker-fire time (absolute cap). The
-                // hard-timeout closure captures ONLY this scalar —
-                // NOT the full resolved chain — so the closure's
-                // retained heap stays O(1) under sustained pending
-                // continuations against a degraded backend.
-                //
-                // `record.expiresAt` is epoch-seconds (see
-                // `buildResponseRecord` — it adds
-                // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now() /
-                // 1000)`); convert to ms at this boundary. If both
-                // the record and the chain lack a finite expiry
-                // (legacy rows), fall back to
-                // `Number.POSITIVE_INFINITY` at the marker call site
-                // so TTL-only bounding still holds.
-                const recordExpiresAtMs =
-                  record.expiresAt != null && Number.isFinite(record.expiresAt) ? record.expiresAt * 1000 : undefined;
-                const absoluteExpiresAtMs =
-                  recordExpiresAtMs !== undefined && chainEarliestExpiresAtMs !== undefined
-                    ? Math.min(recordExpiresAtMs, chainEarliestExpiresAtMs)
-                    : (recordExpiresAtMs ?? chainEarliestExpiresAtMs);
-                const streamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
-                  streamingHardTimeoutMs > 0
-                    ? setTimeout(() => {
-                        if (persistRetainReleased) return;
-                        console.error(
-                          `[responses] post-commit persist HARD timeout (${streamingHardTimeoutMs}ms, ` +
-                            `${streamingPersistMode}): underlying store.store(...) has not settled; assuming ` +
-                            `wedged backend, force-releasing the binding retain so the binding can be torn ` +
-                            `down. Retiring the current instance id via tombstone so a same-object ` +
-                            `re-registration inherits it and a late-landing persist remains chainable; a ` +
-                            `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
-                            `will correctly fail with 400 instance-mismatch.`,
-                        );
-                        // Move the pending-write tracker entry into
-                        // the hard-timed-out marker state for this
-                        // response id. The pending entry is dropped
-                        // so a wedged store.store(...) does not pin
-                        // one promise closure + tracker entry per
-                        // hard-timed-out request, AND the id is added
-                        // to the `hardTimedOut` marker so a concurrent
-                        // `previous_response_id` continuation can
-                        // tell the difference between a permanent
-                        // 404 and a slow-but-eventual persist that
-                        // crossed the hard timeout. The continuation
-                        // path consults `isHardTimedOut(id)` before
-                        // falling through to `sendNotFound(...)` and
-                        // returns retryable 503 `storage_timeout`
-                        // instead, so clients keep retrying rather
-                        // than discarding the chain. The marker has
-                        // two cleanup paths: (1) fast — the underlying
-                        // store promise's `.finally(...)` inside
-                        // `track()` fires when the wedged store
-                        // unwedges; (2) slow — an independent TTL
-                        // (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`, default
-                        // 300s) bounds memory at O(requestRate × TTL)
-                        // even against a truly wedged store that
-                        // NEVER settles. Marker lifetime =
-                        // min(settlement, TTL expiry).
-                        //
-                        // Pass the record's absolute row expiry as a
-                        // hard cap on the marker. The record's
-                        // `expiresAt` field is epoch-seconds (see
-                        // `buildResponseRecord` — it adds
-                        // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now()
-                        // / 1000)`), so convert to ms for the marker
-                        // map. Once the absolute bound passes,
-                        // `ResponseStore.getChain()` hides the row and
-                        // the retryable-503 classification is factually
-                        // wrong — the marker must flip to 404 regardless
-                        // of ongoing client retries.
-                        //
-                        // Capture ONLY the precomputed scalar
-                        // `absoluteExpiresAtMs` in this closure — NOT
-                        // the full resolved chain. The scalar is
-                        // `min(record.expiresAt * 1000,
-                        // chainEarliestExpiresAtMs)`, computed once
-                        // when the hard-timeout handle was armed
-                        // above. `ResponseStore.getChain()` walks
-                        // ancestors and aborts on the first expired
-                        // link (see
-                        // `crates/mlx-db/src/response_store/reader.rs:44-59`),
-                        // so clamping the marker at whichever link
-                        // would disappear from `getChain()` first is
-                        // the authoritative bound. Capturing only
-                        // the scalar means background pending
-                        // continuations under a degraded store do
-                        // not retain ancestor transcripts —
-                        // heap growth stays O(1) per hard-timed-out
-                        // persist regardless of chain length.
-                        getPendingWritesFor(store).markHardTimedOut(
-                          record.id,
-                          getHardTimedOutMarkerTtlMs(),
-                          absoluteExpiresAtMs ?? Number.POSITIVE_INFINITY,
-                        );
-                        // Retire the id FIRST (binding is still alive
-                        // here — retirement reads the live id) then
-                        // drop the retain, which may trigger the
-                        // deferred teardown. Capture the retired id so
-                        // the persist's `.finally(...)` can release
-                        // the tombstone once the late write eventually
-                        // settles. The registry stores one refcounted
-                        // tombstone per model regardless of how many
-                        // hard-timeouts overlap — each retire
-                        // increments the shared counter and each
-                        // release decrements it — so the returned
-                        // `{ instanceId }` is captured as a presence
-                        // flag and `releaseTombstone(leaseModel)` is
-                        // called in the persist's `.finally(...)`.
-                        retiredTombstone = registry.retireInstanceIdForForceRelease(leaseModel);
-                        persistRetainBox.release?.();
-                      }, streamingHardTimeoutMs)
-                    : null;
-                pendingPersistOuter = initiatePersist(store, record, absoluteExpiresAtMs).finally(() => {
-                  if (streamingHardTimeoutHandle !== null) {
-                    clearTimeout(streamingHardTimeoutHandle);
-                  }
-                  // If the hard-timeout breaker fired and installed a
-                  // tombstone on `leaseModel`, decrement the shared
-                  // refcount now that this persist has settled. The
-                  // single-entry refcount layout means overlapping
-                  // breakers share one slot — releasing one balances
-                  // one retire, and the entry survives until the
-                  // last outstanding persist releases.
-                  if (retiredTombstone !== undefined) {
-                    registry.releaseTombstone(leaseModel);
-                  }
-                  persistRetainBox.release?.();
-                });
-                persistMode = streamingPersistMode;
+                streamFailureMode = handlerOutcome.failureMode;
+                if (handlerOutcome.terminalToPersist != null && store && body.store !== false) {
+                  // Initiate the write SYNCHRONOUSLY inside the mutex so
+                  // the pending-write tracker observes it before the
+                  // mutex releases. The promise is awaited off-lock in
+                  // the outer finally block.
+                  const record = buildResponseRecord(
+                    handlerOutcome.terminalToPersist,
+                    newInputMessages,
+                    previousResponseId,
+                    currentInstanceId,
+                    effectiveRetentionSec,
+                  );
+                  // Pair a `retainBinding` against the persist promise
+                  // so the binding's `modelInstanceId` survives a
+                  // concurrent same-model unregister + re-register that
+                  // races the post-commit write. `releaseBinding` runs
+                  // in the persist's `.finally(...)` regardless of
+                  // outcome, so the retention counter stays balanced
+                  // whether the write fulfils or rejects.
+                  //
+                  // Leaving the retain pinned forever on a wedged write
+                  // would make the binding unreclaimable until process
+                  // restart, so an INDEPENDENT hard-timeout timer is
+                  // armed alongside the persist (see
+                  // `getPostCommitPersistHardTimeoutMs` for the default).
+                  // If the persist settles naturally the timer is
+                  // cancelled via `clearTimeout` inside the same
+                  // `.finally(...)` — slow-but-eventual writes are
+                  // unaffected. If the persist is still wedged past the
+                  // hard bound, the timer fires and force-releases the
+                  // retain via the idempotent `persistRetainBox`. The
+                  // hard timer is armed off the handler's await path, so
+                  // the response is never delayed by it.
+                  //
+                  // Before the hard timeout force-releases the retain
+                  // (which unblocks binding teardown), it calls
+                  // `registry.retireInstanceIdForForceRelease(leaseModel)`
+                  // to tombstone the binding's current instance id on
+                  // the model object. A subsequent `register()` of the
+                  // SAME model object inherits that retired id rather
+                  // than minting fresh — so the late-landing persist's
+                  // record (stamped with the retired id) still matches
+                  // the live binding and stays chainable through
+                  // `previous_response_id`. Only a true hot-swap
+                  // (re-register with a DIFFERENT model object) mints a
+                  // fresh id, and the 400 instance-mismatch that results
+                  // is the correct semantic outcome because the new
+                  // model is semantically different from the one that
+                  // produced the stored record. Retirement MUST happen
+                  // BEFORE release so `instanceIds.get(model)` still
+                  // returns the live id the record carries.
+                  //
+                  // The tombstone's lifetime is scoped to the pending
+                  // persists that installed it — the `.finally(...)`
+                  // calls `registry.releaseTombstone(leaseModel)` so
+                  // that when the late write eventually settles
+                  // (fulfills or rejects), the shared refcount drops
+                  // and, once every outstanding persist has released,
+                  // any subsequent re-registration correctly mints a
+                  // fresh id. Without this scoping, a past hard-timeout
+                  // event would permanently re-enable id inheritance
+                  // across unrelated later lifecycles — reopening
+                  // stale-chain replay across what should be logically
+                  // dead bindings. The refcounted single-entry layout
+                  // handles OVERLAPPING hard-timeouts on the same live
+                  // instance id in bounded space: every breaker targets
+                  // the SAME retired id (the register-inherit path
+                  // keeps using it while the tombstone is alive) so one
+                  // shared refcount safely collapses every in-flight
+                  // retire, and memory stays O(1) per model even under
+                  // a truly wedged store that never settles.
+                  registry.retainBinding(leaseModel);
+                  let persistRetainReleased = false;
+                  persistRetainBox.release = () => {
+                    if (persistRetainReleased) return;
+                    persistRetainReleased = true;
+                    registry.releaseBinding(leaseModel);
+                  };
+                  const streamingPersistMode = 'streaming' as const;
+                  const streamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
+                  let retiredTombstone: { instanceId: number } | undefined;
+                  // Compute the scalar `absoluteExpiresAtMs` ONCE up
+                  // front — the MINIMUM of the newly produced record's
+                  // own row expiry and the earliest expiry across any
+                  // resolved ancestor chain. This value is threaded
+                  // into both the pending-write tracker at
+                  // `initiatePersist()` time (so the pre-breaker
+                  // `awaitPending` path can short-circuit to 404 once
+                  // the bound is crossed) AND the hard-timeout marker
+                  // at breaker-fire time (absolute cap). The
+                  // hard-timeout closure captures ONLY this scalar —
+                  // NOT the full resolved chain — so the closure's
+                  // retained heap stays O(1) under sustained pending
+                  // continuations against a degraded backend.
+                  //
+                  // `record.expiresAt` is epoch-seconds (see
+                  // `buildResponseRecord` — it adds
+                  // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now() /
+                  // 1000)`); convert to ms at this boundary. If both
+                  // the record and the chain lack a finite expiry
+                  // (legacy rows), fall back to
+                  // `Number.POSITIVE_INFINITY` at the marker call site
+                  // so TTL-only bounding still holds.
+                  const recordExpiresAtMs =
+                    record.expiresAt != null && Number.isFinite(record.expiresAt) ? record.expiresAt * 1000 : undefined;
+                  const absoluteExpiresAtMs =
+                    recordExpiresAtMs !== undefined && chainEarliestExpiresAtMs !== undefined
+                      ? Math.min(recordExpiresAtMs, chainEarliestExpiresAtMs)
+                      : (recordExpiresAtMs ?? chainEarliestExpiresAtMs);
+                  const streamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
+                    streamingHardTimeoutMs > 0
+                      ? setTimeout(() => {
+                          if (persistRetainReleased) return;
+                          console.error(
+                            `[responses] post-commit persist HARD timeout (${streamingHardTimeoutMs}ms, ` +
+                              `${streamingPersistMode}): underlying store.store(...) has not settled; assuming ` +
+                              `wedged backend, force-releasing the binding retain so the binding can be torn ` +
+                              `down. Retiring the current instance id via tombstone so a same-object ` +
+                              `re-registration inherits it and a late-landing persist remains chainable; a ` +
+                              `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
+                              `will correctly fail with 400 instance-mismatch.`,
+                          );
+                          // Move the pending-write tracker entry into
+                          // the hard-timed-out marker state for this
+                          // response id. The pending entry is dropped
+                          // so a wedged store.store(...) does not pin
+                          // one promise closure + tracker entry per
+                          // hard-timed-out request, AND the id is added
+                          // to the `hardTimedOut` marker so a concurrent
+                          // `previous_response_id` continuation can
+                          // tell the difference between a permanent
+                          // 404 and a slow-but-eventual persist that
+                          // crossed the hard timeout. The continuation
+                          // path consults `isHardTimedOut(id)` before
+                          // falling through to `sendNotFound(...)` and
+                          // returns retryable 503 `storage_timeout`
+                          // instead, so clients keep retrying rather
+                          // than discarding the chain. The marker has
+                          // two cleanup paths: (1) fast — the underlying
+                          // store promise's `.finally(...)` inside
+                          // `track()` fires when the wedged store
+                          // unwedges; (2) slow — an independent TTL
+                          // (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`, default
+                          // 300s) bounds memory at O(requestRate × TTL)
+                          // even against a truly wedged store that
+                          // NEVER settles. Marker lifetime =
+                          // min(settlement, TTL expiry).
+                          //
+                          // Pass the record's absolute row expiry as a
+                          // hard cap on the marker. The record's
+                          // `expiresAt` field is epoch-seconds (see
+                          // `buildResponseRecord` — it adds
+                          // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now()
+                          // / 1000)`), so convert to ms for the marker
+                          // map. Once the absolute bound passes,
+                          // `ResponseStore.getChain()` hides the row and
+                          // the retryable-503 classification is factually
+                          // wrong — the marker must flip to 404 regardless
+                          // of ongoing client retries.
+                          //
+                          // Capture ONLY the precomputed scalar
+                          // `absoluteExpiresAtMs` in this closure — NOT
+                          // the full resolved chain. The scalar is
+                          // `min(record.expiresAt * 1000,
+                          // chainEarliestExpiresAtMs)`, computed once
+                          // when the hard-timeout handle was armed
+                          // above. `ResponseStore.getChain()` walks
+                          // ancestors and aborts on the first expired
+                          // link (see
+                          // `crates/mlx-db/src/response_store/reader.rs:44-59`),
+                          // so clamping the marker at whichever link
+                          // would disappear from `getChain()` first is
+                          // the authoritative bound. Capturing only
+                          // the scalar means background pending
+                          // continuations under a degraded store do
+                          // not retain ancestor transcripts —
+                          // heap growth stays O(1) per hard-timed-out
+                          // persist regardless of chain length.
+                          getPendingWritesFor(store).markHardTimedOut(
+                            record.id,
+                            getHardTimedOutMarkerTtlMs(),
+                            absoluteExpiresAtMs ?? Number.POSITIVE_INFINITY,
+                          );
+                          // Retire the id FIRST (binding is still alive
+                          // here — retirement reads the live id) then
+                          // drop the retain, which may trigger the
+                          // deferred teardown. Capture the retired id so
+                          // the persist's `.finally(...)` can release
+                          // the tombstone once the late write eventually
+                          // settles. The registry stores one refcounted
+                          // tombstone per model regardless of how many
+                          // hard-timeouts overlap — each retire
+                          // increments the shared counter and each
+                          // release decrements it — so the returned
+                          // `{ instanceId }` is captured as a presence
+                          // flag and `releaseTombstone(leaseModel)` is
+                          // called in the persist's `.finally(...)`.
+                          retiredTombstone = registry.retireInstanceIdForForceRelease(leaseModel);
+                          persistRetainBox.release?.();
+                        }, streamingHardTimeoutMs)
+                      : null;
+                  pendingPersistOuter = initiatePersist(store, record, absoluteExpiresAtMs).finally(() => {
+                    if (streamingHardTimeoutHandle !== null) {
+                      clearTimeout(streamingHardTimeoutHandle);
+                    }
+                    // If the hard-timeout breaker fired and installed a
+                    // tombstone on `leaseModel`, decrement the shared
+                    // refcount now that this persist has settled. The
+                    // single-entry refcount layout means overlapping
+                    // breakers share one slot — releasing one balances
+                    // one retire, and the entry survives until the
+                    // last outstanding persist releases.
+                    if (retiredTombstone !== undefined) {
+                      registry.releaseTombstone(leaseModel);
+                    }
+                    persistRetainBox.release?.();
+                  });
+                  persistMode = streamingPersistMode;
+                }
+              } catch (err) {
+                handlerError = err instanceof Error ? err : new Error(String(err));
               }
-            } catch (err) {
-              handlerError = err instanceof Error ? err : new Error(String(err));
-            }
-            committed = streamingWasCommitted();
-          } else {
-            // The non-streaming native path has NO AbortSignal surface
-            // (plain `chatSession*` returns a Promise, no cancel), so a
-            // client that disconnects mid-generation still burns the
-            // full decode budget under this mutex. TODO: native
-            // cancellation for `chatSession*` — until then the best we
-            // can do is the disconnect-aware skip inside
-            // `handleNonStreaming` (short-circuits `endJson` and
-            // signals the outer persist gate) plus this documented
-            // limitation.
-            const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config, !lookup.hit);
-            // Prefix-cache observability headers for the non-streaming
-            // path. `res.end` has not fired yet (the handler's
-            // `endJson` call below is what flushes), so `setHeader`
-            // still lands on the wire. We re-classify the
-            // `X-Session-Cache` header here so a tier-2 lookup that
-            // did NOT actually produce native prefix reuse
-            // (`cachedTokens === 0`) gets demoted from the optimistic
-            // `prefix_hit` back to `fresh` — matching the plan's
-            // contract that `prefix_hit` only fires when the registry
-            // served a match via `promptCacheKey` AND the ChatResult
-            // reports `cachedTokens > 0`. The companion
-            // `X-Cached-Tokens: N` header reports the exact count for
-            // operators and downstream telemetry whenever reuse
-            // happened.
-            if (tier2Hit && outcome.result.cachedTokens === 0) {
-              sessionCacheStatus = 'fresh';
-              res.setHeader('X-Session-Cache', sessionCacheStatus);
-            }
-            if (outcome.result.cachedTokens > 0) {
-              res.setHeader('X-Cached-Tokens', String(outcome.result.cachedTokens));
-            }
-            try {
-              const handlerOutcome = await handleNonStreaming(
-                res,
-                outcome.result,
-                mappedBody,
-                responseId,
-                previousResponseId,
-                visibility,
-                serverTiming,
-              );
-              if (store && body.store !== false) {
-                // Same in-lock-initiate / off-lock-await split as the
-                // streaming branch. The non-streaming handler only
-                // returns when the JSON body's `res.end()` callback
-                // has fired, so reaching this point means the client
-                // observed the turn — the pending-write tracker
-                // protects a back-to-back continuation from a
-                // transient 404.
-                const record = buildResponseRecord(
-                  handlerOutcome.response,
-                  newInputMessages,
+              committed = streamingWasCommitted();
+            } else {
+              // The non-streaming native path has NO AbortSignal surface
+              // (plain `chatSession*` returns a Promise, no cancel), so a
+              // client that disconnects mid-generation still burns the
+              // full decode budget under this mutex. TODO: native
+              // cancellation for `chatSession*` — until then the best we
+              // can do is the disconnect-aware skip inside
+              // `handleNonStreaming` (short-circuits `endJson` and
+              // signals the outer persist gate) plus this documented
+              // limitation.
+              const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config, !lookup.hit);
+              // Prefix-cache observability headers for the non-streaming
+              // path. `res.end` has not fired yet (the handler's
+              // `endJson` call below is what flushes), so `setHeader`
+              // still lands on the wire. We re-classify the
+              // `X-Session-Cache` header here so a tier-2 lookup that
+              // did NOT actually produce native prefix reuse
+              // (`cachedTokens === 0`) gets demoted from the optimistic
+              // `prefix_hit` back to `fresh` — matching the plan's
+              // contract that `prefix_hit` only fires when the registry
+              // served a match via `promptCacheKey` AND the ChatResult
+              // reports `cachedTokens > 0`. The companion
+              // `X-Cached-Tokens: N` header reports the exact count for
+              // operators and downstream telemetry whenever reuse
+              // happened.
+              if (tier2Hit && outcome.result.cachedTokens === 0) {
+                sessionCacheStatus = 'fresh';
+                res.setHeader('X-Session-Cache', sessionCacheStatus);
+              }
+              if (outcome.result.cachedTokens > 0) {
+                res.setHeader('X-Cached-Tokens', String(outcome.result.cachedTokens));
+              }
+              try {
+                const handlerOutcome = await handleNonStreaming(
+                  res,
+                  outcome.result,
+                  mappedBody,
+                  responseId,
                   previousResponseId,
-                  currentInstanceId,
-                  effectiveRetentionSec,
+                  visibility,
+                  serverTiming,
                 );
-                // See the streaming branch for the retain/release
-                // rationale — a same-model unregister + re-register
-                // during the slow persist must not mint a fresh
-                // `modelInstanceId` that invalidates the row this
-                // write is about to land. The idempotent-release
-                // scaffolding is a structural hook for a future split
-                // teardown; the post-commit SOFT timeout arm does not
-                // force-fire it.
-                //
-                // A wedged persist would otherwise leak the binding
-                // retain for the lifetime of the process, so the
-                // hard-timeout timer is armed here in the same shape
-                // as the streaming branch, cancelled from the
-                // persist's own `.finally(...)` when the write settles
-                // naturally, and fires a force-release through the
-                // idempotent `persistRetainBox` otherwise. Default
-                // 60s, override via
-                // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`, `'0'`
-                // disables. Empty string is treated as unset (falls
-                // back to the 60000ms default) so a config-templating
-                // typo cannot silently disable the breaker.
-                //
-                // The force-release path also calls
-                // `registry.retireInstanceIdForForceRelease(leaseModel)`
-                // BEFORE releasing the retain so a same-object
-                // re-registration AFTER teardown inherits the retired
-                // instance id from the tombstone — a late-landing
-                // persist against the retired id stays chainable. A
-                // hot-swap to a DIFFERENT model object mints a fresh
-                // id and the 400 instance-mismatch is correct.
-                //
-                // The tombstone's lifetime is scoped to the pending
-                // persists that installed it — the `.finally(...)`
-                // calls `registry.releaseTombstone(leaseModel)` so
-                // that when the late write eventually settles, the
-                // shared refcount drops and, once every outstanding
-                // persist has released, any subsequent
-                // re-registration correctly mints a fresh id. Without
-                // this scoping, a past hard-timeout event would
-                // permanently re-enable id inheritance across
-                // unrelated later lifecycles — reopening stale-chain
-                // replay across what should be logically dead
-                // bindings. The refcounted single-entry layout
-                // handles OVERLAPPING hard-timeouts on the same live
-                // instance id in bounded space: every breaker targets
-                // the SAME retired id (the register-inherit path
-                // keeps using it while the tombstone is alive) so one
-                // shared refcount safely collapses every in-flight
-                // retire, and memory stays O(1) per model even under
-                // a truly wedged store that never settles.
-                registry.retainBinding(leaseModel);
-                let persistRetainReleased = false;
-                persistRetainBox.release = () => {
-                  if (persistRetainReleased) return;
-                  persistRetainReleased = true;
-                  registry.releaseBinding(leaseModel);
-                };
-                const nonStreamingPersistMode = 'non-streaming' as const;
-                const nonStreamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
-                let retiredTombstone: { instanceId: number } | undefined;
-                // See the matching streaming-path comment above —
-                // precompute the scalar `absoluteExpiresAtMs`
-                // (`min(record.expiresAt * 1000,
-                // chainEarliestExpiresAtMs)`) ONCE, thread it into
-                // the tracker at `initiatePersist()` time, and capture
-                // ONLY this scalar in the hard-timeout closure.
-                const recordExpiresAtMs =
-                  record.expiresAt != null && Number.isFinite(record.expiresAt) ? record.expiresAt * 1000 : undefined;
-                const absoluteExpiresAtMs =
-                  recordExpiresAtMs !== undefined && chainEarliestExpiresAtMs !== undefined
-                    ? Math.min(recordExpiresAtMs, chainEarliestExpiresAtMs)
-                    : (recordExpiresAtMs ?? chainEarliestExpiresAtMs);
-                const nonStreamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
-                  nonStreamingHardTimeoutMs > 0
-                    ? setTimeout(() => {
-                        if (persistRetainReleased) return;
-                        console.error(
-                          `[responses] post-commit persist HARD timeout (${nonStreamingHardTimeoutMs}ms, ` +
-                            `${nonStreamingPersistMode}): underlying store.store(...) has not settled; ` +
-                            `assuming wedged backend, force-releasing the binding retain so the binding can ` +
-                            `be torn down. Retiring the current instance id via tombstone so a same-object ` +
-                            `re-registration inherits it and a late-landing persist remains chainable; a ` +
-                            `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
-                            `will correctly fail with 400 instance-mismatch.`,
-                        );
-                        // Move the pending-write tracker entry into
-                        // the hard-timed-out marker state for this
-                        // response id. The pending entry is dropped
-                        // so a wedged store.store(...) does not pin
-                        // one promise closure + tracker entry per
-                        // hard-timed-out request, AND the id is added
-                        // to the `hardTimedOut` marker so a concurrent
-                        // `previous_response_id` continuation can
-                        // tell the difference between a permanent
-                        // 404 and a slow-but-eventual persist that
-                        // crossed the hard timeout. The continuation
-                        // path consults `isHardTimedOut(id)` before
-                        // falling through to `sendNotFound(...)` and
-                        // returns retryable 503 `storage_timeout`
-                        // instead, so clients keep retrying rather
-                        // than discarding the chain. The marker has
-                        // two cleanup paths: (1) fast — the
-                        // underlying store promise's `.finally(...)`
-                        // inside `track()` fires when the wedged
-                        // store unwedges; (2) slow — an independent
-                        // TTL (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`,
-                        // default 300s) bounds memory at
-                        // O(requestRate × TTL) even against a truly
-                        // wedged store that NEVER settles. Marker
-                        // lifetime = min(settlement, TTL expiry).
-                        //
-                        // Pass the record's absolute row expiry as a
-                        // hard cap on the marker. The record's
-                        // `expiresAt` field is epoch-seconds (see
-                        // `buildResponseRecord` — it adds
-                        // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now()
-                        // / 1000)`), so convert to ms for the marker
-                        // map. Once the absolute bound passes,
-                        // `ResponseStore.getChain()` hides the row and
-                        // the retryable-503 classification is factually
-                        // wrong — the marker must flip to 404 regardless
-                        // of ongoing client retries.
-                        //
-                        // Capture ONLY the precomputed scalar
-                        // `absoluteExpiresAtMs` in this closure — see
-                        // the matching streaming-path comment for the
-                        // full rationale. The scalar was computed
-                        // above when the hard-timeout handle was
-                        // armed.
-                        getPendingWritesFor(store).markHardTimedOut(
-                          record.id,
-                          getHardTimedOutMarkerTtlMs(),
-                          absoluteExpiresAtMs ?? Number.POSITIVE_INFINITY,
-                        );
-                        // Retire the id FIRST (binding is still alive
-                        // here — retirement reads the live id) then
-                        // drop the retain, which may trigger the
-                        // deferred teardown. Capture the retired id so
-                        // the persist's `.finally(...)` can release
-                        // the tombstone once the late write eventually
-                        // settles. The registry stores one refcounted
-                        // tombstone per model regardless of how many
-                        // hard-timeouts overlap — each retire
-                        // increments the shared counter and each
-                        // release decrements it — so the returned
-                        // `{ instanceId }` is captured as a presence
-                        // flag and `releaseTombstone(leaseModel)` is
-                        // called in the persist's `.finally(...)`.
-                        retiredTombstone = registry.retireInstanceIdForForceRelease(leaseModel);
-                        persistRetainBox.release?.();
-                      }, nonStreamingHardTimeoutMs)
-                    : null;
-                pendingPersistOuter = initiatePersist(store, record, absoluteExpiresAtMs).finally(() => {
-                  if (nonStreamingHardTimeoutHandle !== null) {
-                    clearTimeout(nonStreamingHardTimeoutHandle);
-                  }
-                  // If the hard-timeout breaker fired and installed a
-                  // tombstone on `leaseModel`, decrement the shared
-                  // refcount now that this persist has settled. The
-                  // single-entry refcount layout means overlapping
-                  // breakers share one slot — releasing one balances
-                  // one retire, and the entry survives until the
-                  // last outstanding persist releases.
-                  if (retiredTombstone !== undefined) {
-                    registry.releaseTombstone(leaseModel);
-                  }
-                  persistRetainBox.release?.();
-                });
-                persistMode = nonStreamingPersistMode;
+                if (store && body.store !== false) {
+                  // Same in-lock-initiate / off-lock-await split as the
+                  // streaming branch. The non-streaming handler only
+                  // returns when the JSON body's `res.end()` callback
+                  // has fired, so reaching this point means the client
+                  // observed the turn — the pending-write tracker
+                  // protects a back-to-back continuation from a
+                  // transient 404.
+                  const record = buildResponseRecord(
+                    handlerOutcome.response,
+                    newInputMessages,
+                    previousResponseId,
+                    currentInstanceId,
+                    effectiveRetentionSec,
+                  );
+                  // See the streaming branch for the retain/release
+                  // rationale — a same-model unregister + re-register
+                  // during the slow persist must not mint a fresh
+                  // `modelInstanceId` that invalidates the row this
+                  // write is about to land. The idempotent-release
+                  // scaffolding is a structural hook for a future split
+                  // teardown; the post-commit SOFT timeout arm does not
+                  // force-fire it.
+                  //
+                  // A wedged persist would otherwise leak the binding
+                  // retain for the lifetime of the process, so the
+                  // hard-timeout timer is armed here in the same shape
+                  // as the streaming branch, cancelled from the
+                  // persist's own `.finally(...)` when the write settles
+                  // naturally, and fires a force-release through the
+                  // idempotent `persistRetainBox` otherwise. Default
+                  // 60s, override via
+                  // `MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS`, `'0'`
+                  // disables. Empty string is treated as unset (falls
+                  // back to the 60000ms default) so a config-templating
+                  // typo cannot silently disable the breaker.
+                  //
+                  // The force-release path also calls
+                  // `registry.retireInstanceIdForForceRelease(leaseModel)`
+                  // BEFORE releasing the retain so a same-object
+                  // re-registration AFTER teardown inherits the retired
+                  // instance id from the tombstone — a late-landing
+                  // persist against the retired id stays chainable. A
+                  // hot-swap to a DIFFERENT model object mints a fresh
+                  // id and the 400 instance-mismatch is correct.
+                  //
+                  // The tombstone's lifetime is scoped to the pending
+                  // persists that installed it — the `.finally(...)`
+                  // calls `registry.releaseTombstone(leaseModel)` so
+                  // that when the late write eventually settles, the
+                  // shared refcount drops and, once every outstanding
+                  // persist has released, any subsequent
+                  // re-registration correctly mints a fresh id. Without
+                  // this scoping, a past hard-timeout event would
+                  // permanently re-enable id inheritance across
+                  // unrelated later lifecycles — reopening stale-chain
+                  // replay across what should be logically dead
+                  // bindings. The refcounted single-entry layout
+                  // handles OVERLAPPING hard-timeouts on the same live
+                  // instance id in bounded space: every breaker targets
+                  // the SAME retired id (the register-inherit path
+                  // keeps using it while the tombstone is alive) so one
+                  // shared refcount safely collapses every in-flight
+                  // retire, and memory stays O(1) per model even under
+                  // a truly wedged store that never settles.
+                  registry.retainBinding(leaseModel);
+                  let persistRetainReleased = false;
+                  persistRetainBox.release = () => {
+                    if (persistRetainReleased) return;
+                    persistRetainReleased = true;
+                    registry.releaseBinding(leaseModel);
+                  };
+                  const nonStreamingPersistMode = 'non-streaming' as const;
+                  const nonStreamingHardTimeoutMs = getPostCommitPersistHardTimeoutMs();
+                  let retiredTombstone: { instanceId: number } | undefined;
+                  // See the matching streaming-path comment above —
+                  // precompute the scalar `absoluteExpiresAtMs`
+                  // (`min(record.expiresAt * 1000,
+                  // chainEarliestExpiresAtMs)`) ONCE, thread it into
+                  // the tracker at `initiatePersist()` time, and capture
+                  // ONLY this scalar in the hard-timeout closure.
+                  const recordExpiresAtMs =
+                    record.expiresAt != null && Number.isFinite(record.expiresAt) ? record.expiresAt * 1000 : undefined;
+                  const absoluteExpiresAtMs =
+                    recordExpiresAtMs !== undefined && chainEarliestExpiresAtMs !== undefined
+                      ? Math.min(recordExpiresAtMs, chainEarliestExpiresAtMs)
+                      : (recordExpiresAtMs ?? chainEarliestExpiresAtMs);
+                  const nonStreamingHardTimeoutHandle: ReturnType<typeof setTimeout> | null =
+                    nonStreamingHardTimeoutMs > 0
+                      ? setTimeout(() => {
+                          if (persistRetainReleased) return;
+                          console.error(
+                            `[responses] post-commit persist HARD timeout (${nonStreamingHardTimeoutMs}ms, ` +
+                              `${nonStreamingPersistMode}): underlying store.store(...) has not settled; ` +
+                              `assuming wedged backend, force-releasing the binding retain so the binding can ` +
+                              `be torn down. Retiring the current instance id via tombstone so a same-object ` +
+                              `re-registration inherits it and a late-landing persist remains chainable; a ` +
+                              `hot-swap to a DIFFERENT model object will mint a fresh id and the stale chain ` +
+                              `will correctly fail with 400 instance-mismatch.`,
+                          );
+                          // Move the pending-write tracker entry into
+                          // the hard-timed-out marker state for this
+                          // response id. The pending entry is dropped
+                          // so a wedged store.store(...) does not pin
+                          // one promise closure + tracker entry per
+                          // hard-timed-out request, AND the id is added
+                          // to the `hardTimedOut` marker so a concurrent
+                          // `previous_response_id` continuation can
+                          // tell the difference between a permanent
+                          // 404 and a slow-but-eventual persist that
+                          // crossed the hard timeout. The continuation
+                          // path consults `isHardTimedOut(id)` before
+                          // falling through to `sendNotFound(...)` and
+                          // returns retryable 503 `storage_timeout`
+                          // instead, so clients keep retrying rather
+                          // than discarding the chain. The marker has
+                          // two cleanup paths: (1) fast — the
+                          // underlying store promise's `.finally(...)`
+                          // inside `track()` fires when the wedged
+                          // store unwedges; (2) slow — an independent
+                          // TTL (`MLX_HARD_TIMEOUT_MARKER_TTL_MS`,
+                          // default 300s) bounds memory at
+                          // O(requestRate × TTL) even against a truly
+                          // wedged store that NEVER settles. Marker
+                          // lifetime = min(settlement, TTL expiry).
+                          //
+                          // Pass the record's absolute row expiry as a
+                          // hard cap on the marker. The record's
+                          // `expiresAt` field is epoch-seconds (see
+                          // `buildResponseRecord` — it adds
+                          // `RESPONSE_TTL_SECONDS` to `Math.floor(Date.now()
+                          // / 1000)`), so convert to ms for the marker
+                          // map. Once the absolute bound passes,
+                          // `ResponseStore.getChain()` hides the row and
+                          // the retryable-503 classification is factually
+                          // wrong — the marker must flip to 404 regardless
+                          // of ongoing client retries.
+                          //
+                          // Capture ONLY the precomputed scalar
+                          // `absoluteExpiresAtMs` in this closure — see
+                          // the matching streaming-path comment for the
+                          // full rationale. The scalar was computed
+                          // above when the hard-timeout handle was
+                          // armed.
+                          getPendingWritesFor(store).markHardTimedOut(
+                            record.id,
+                            getHardTimedOutMarkerTtlMs(),
+                            absoluteExpiresAtMs ?? Number.POSITIVE_INFINITY,
+                          );
+                          // Retire the id FIRST (binding is still alive
+                          // here — retirement reads the live id) then
+                          // drop the retain, which may trigger the
+                          // deferred teardown. Capture the retired id so
+                          // the persist's `.finally(...)` can release
+                          // the tombstone once the late write eventually
+                          // settles. The registry stores one refcounted
+                          // tombstone per model regardless of how many
+                          // hard-timeouts overlap — each retire
+                          // increments the shared counter and each
+                          // release decrements it — so the returned
+                          // `{ instanceId }` is captured as a presence
+                          // flag and `releaseTombstone(leaseModel)` is
+                          // called in the persist's `.finally(...)`.
+                          retiredTombstone = registry.retireInstanceIdForForceRelease(leaseModel);
+                          persistRetainBox.release?.();
+                        }, nonStreamingHardTimeoutMs)
+                      : null;
+                  pendingPersistOuter = initiatePersist(store, record, absoluteExpiresAtMs).finally(() => {
+                    if (nonStreamingHardTimeoutHandle !== null) {
+                      clearTimeout(nonStreamingHardTimeoutHandle);
+                    }
+                    // If the hard-timeout breaker fired and installed a
+                    // tombstone on `leaseModel`, decrement the shared
+                    // refcount now that this persist has settled. The
+                    // single-entry refcount layout means overlapping
+                    // breakers share one slot — releasing one balances
+                    // one retire, and the entry survives until the
+                    // last outstanding persist releases.
+                    if (retiredTombstone !== undefined) {
+                      registry.releaseTombstone(leaseModel);
+                    }
+                    persistRetainBox.release?.();
+                  });
+                  persistMode = nonStreamingPersistMode;
+                }
+              } catch (err) {
+                handlerError = err instanceof Error ? err : new Error(String(err));
               }
-            } catch (err) {
-              handlerError = err instanceof Error ? err : new Error(String(err));
+              committed = outcome.committed;
             }
-            committed = outcome.committed;
-          }
 
-          // "Safe to suppress" collapses to: did the client observe a
-          // terminal artefact for this responseId? On the non-
-          // streaming path that is the JSON body landing cleanly on
-          // the wire; on the streaming path it is a terminal SSE
-          // event (`response.completed` or `response.failed`) landing
-          // cleanly on the wire. In either case the client can see
-          // the responseId and knows the turn is over, so adopting
-          // the committed session under that id is safe and
-          // swallowing the (already-surfaced-via-failed-event)
-          // handler error is the only option that does not produce a
-          // malformed double-response.
-          const safeToSuppress = visibility.responseBodyWritten || visibility.terminalEmitted;
+            // "Safe to suppress" collapses to: did the client observe a
+            // terminal artefact for this responseId? On the non-
+            // streaming path that is the JSON body landing cleanly on
+            // the wire; on the streaming path it is a terminal SSE
+            // event (`response.completed` or `response.failed`) landing
+            // cleanly on the wire. In either case the client can see
+            // the responseId and knows the turn is over, so adopting
+            // the committed session under that id is safe and
+            // swallowing the (already-surfaced-via-failed-event)
+            // handler error is the only option that does not produce a
+            // malformed double-response.
+            const safeToSuppress = visibility.responseBodyWritten || visibility.terminalEmitted;
 
-          if (previousResponseId) {
-            sessionReg.drop(previousResponseId);
-          }
-          // Only adopt if the turn committed AND either the handler
-          // succeeded or a terminal artefact is already on the wire.
-          // A committed turn whose handler threw before the client
-          // saw anything it can chain off of must NOT be adopted —
-          // the responseId is unreachable from the client, so caching
-          // the session under it creates a permanently dangling warm
-          // session.
-          //
-          // Refuse to adopt whenever the streaming handler took ANY
-          // failure epilogue, not just `client_abort`. The streaming
-          // handler writes `failureMode` for every path that does
-          // not produce a clean `response.completed`:
-          //
-          //   * `'client_abort'`  — client dropped the socket after
-          //     the decode loop committed but before the success
-          //     terminal was flushed; `response.failed` goes on the
-          //     wire under a responseId the client has abandoned.
-          //
-          //   * `'error'`         — post-final teardown threw in
-          //     the stream adapter's `finally` after the decode
-          //     loop had already committed; `terminalToPersist` is
-          //     null and the client saw `response.failed`, so the
-          //     responseId is not a chainable artefact from the
-          //     client's perspective.
-          //
-          //   * `'finish_reason_error'` / `'stream_exhausted'` —
-          //     terminal derived from a non-clean end of stream.
-          //     Same reasoning: `response.failed` on the wire, no
-          //     chainable success terminal.
-          //
-          // In every non-null `failureMode` case the session
-          // committed at the native level but the observable wire
-          // state is a failure, so adopting the session under the
-          // responseId would evict the last good hot session for
-          // this model under the single-warm invariant even
-          // though the adopted slot is unreachable.
-          //
-          // `failureMode === null` is the sole signal that the
-          // stream path completed cleanly and the adopted session
-          // is genuinely reachable via the responseId.
-          if (committed && (handlerError == null || safeToSuppress) && streamFailureMode === null) {
-            // Adopt under the SAME `effectivePromptCacheKey` that was
-            // used for `getOrCreate` above — not the raw
-            // `promptCacheKey` from the request body. When a request
-            // carries `previous_response_id` (tier-1 path), tier-2 is
-            // deliberately disabled on the lookup side by forcing
-            // `effectivePromptCacheKey = null`; the adopt side must
-            // follow the same rule or a mixed-mode request
-            // (`previous_response_id=rA + prompt_cache_key=K`) would
-            // store the adopted session under `K` even though the
-            // lookup was resolved via `rA`. A subsequent keyless/
-            // prev-idless request with `prompt_cache_key=K` would then
-            // tier-2 hit and lease rA's chain session — a cross-chain
-            // corruption the precedence rule was explicitly designed
-            // to prevent. Keep adopt's key aligned with lookup's key.
-            sessionReg.adopt(responseId, session, requestedInstructions, effectivePromptCacheKey);
-          }
+            if (previousResponseId) {
+              sessionReg.drop(previousResponseId);
+            }
+            // Only adopt if the turn committed AND either the handler
+            // succeeded or a terminal artefact is already on the wire.
+            // A committed turn whose handler threw before the client
+            // saw anything it can chain off of must NOT be adopted —
+            // the responseId is unreachable from the client, so caching
+            // the session under it creates a permanently dangling warm
+            // session.
+            //
+            // Refuse to adopt whenever the streaming handler took ANY
+            // failure epilogue, not just `client_abort`. The streaming
+            // handler writes `failureMode` for every path that does
+            // not produce a clean `response.completed`:
+            //
+            //   * `'client_abort'`  — client dropped the socket after
+            //     the decode loop committed but before the success
+            //     terminal was flushed; `response.failed` goes on the
+            //     wire under a responseId the client has abandoned.
+            //
+            //   * `'error'`         — post-final teardown threw in
+            //     the stream adapter's `finally` after the decode
+            //     loop had already committed; `terminalToPersist` is
+            //     null and the client saw `response.failed`, so the
+            //     responseId is not a chainable artefact from the
+            //     client's perspective.
+            //
+            //   * `'finish_reason_error'` / `'stream_exhausted'` —
+            //     terminal derived from a non-clean end of stream.
+            //     Same reasoning: `response.failed` on the wire, no
+            //     chainable success terminal.
+            //
+            // In every non-null `failureMode` case the session
+            // committed at the native level but the observable wire
+            // state is a failure, so adopting the session under the
+            // responseId would evict the last good hot session for
+            // this model under the single-warm invariant even
+            // though the adopted slot is unreachable.
+            //
+            // `failureMode === null` is the sole signal that the
+            // stream path completed cleanly and the adopted session
+            // is genuinely reachable via the responseId.
+            if (committed && (handlerError == null || safeToSuppress) && streamFailureMode === null) {
+              // Adopt under the SAME `effectivePromptCacheKey` that was
+              // used for `getOrCreate` above — not the raw
+              // `promptCacheKey` from the request body. When a request
+              // carries `previous_response_id` (tier-1 path), tier-2 is
+              // deliberately disabled on the lookup side by forcing
+              // `effectivePromptCacheKey = null`; the adopt side must
+              // follow the same rule or a mixed-mode request
+              // (`previous_response_id=rA + prompt_cache_key=K`) would
+              // store the adopted session under `K` even though the
+              // lookup was resolved via `rA`. A subsequent keyless/
+              // prev-idless request with `prompt_cache_key=K` would then
+              // tier-2 hit and lease rA's chain session — a cross-chain
+              // corruption the precedence rule was explicitly designed
+              // to prevent. Keep adopt's key aligned with lookup's key.
+              sessionReg.adopt(responseId, session, requestedInstructions, effectivePromptCacheKey);
+            }
 
-          // Rethrow handler errors when the client hasn't seen a
-          // terminal yet, regardless of commit state. The outer
-          // catch will send a proper 500 (non-streaming) or a last-
-          // ditch SSE `error` event (streaming, after `beginSSE` but
-          // before any terminal). Without this the request would
-          // hang from the client's perspective.
-          if (handlerError && !safeToSuppress) {
-            throw handlerError;
-          }
-          // If a terminal is on the wire but the handler still
-          // threw: log only. Rethrowing would produce a malformed
-          // double-response; the client already has a terminal event
-          // it can parse.
-          if (handlerError) {
-            console.error('[responses] handler error after terminal response already delivered:', handlerError);
-          }
-        } catch (err) {
-          const message = err instanceof Error ? err.message : 'Unknown error during inference';
-          // Branch on `responseMode` (the wire format the handler
-          // committed to), NOT `res.headersSent`
-          // (which flips synchronously in `writeHead` and lies about
-          // which format the client is consuming). Each branch
-          // produces output that matches the Content-Type the client
-          // already received — or no output at all if the terminal
-          // already landed.
-          if (visibility.responseMode === null) {
-            // Headers never went out. Safe to emit a clean 500 JSON
-            // error.
-            sendInternalError(res, message);
-          } else if (visibility.responseMode === 'json') {
-            // We already wrote `Content-Type: application/json` and
-            // possibly some body bytes; emitting an SSE frame here
-            // would corrupt the response. Best we can do is destroy
-            // the socket so the client sees a truncated JSON
-            // response instead of a malformed document with an
-            // unexpected MIME type. If the body was fully written
-            // (`responseBodyWritten === true`) the outcome gate
-            // above already returned without rethrowing, so reaching
-            // this branch means the JSON never fully landed.
-            try {
-              res.destroy(err instanceof Error ? err : new Error(message));
-            } catch {
-              // Socket may already be gone; nothing more we can do.
+            // Rethrow handler errors when the client hasn't seen a
+            // terminal yet, regardless of commit state. The outer
+            // catch will send a proper 500 (non-streaming) or a last-
+            // ditch SSE `error` event (streaming, after `beginSSE` but
+            // before any terminal). Without this the request would
+            // hang from the client's perspective.
+            if (handlerError && !safeToSuppress) {
+              throw handlerError;
             }
-          } else {
-            // `responseMode === 'sse'`: headers advertise SSE and
-            // some (or all) of the stream already went out. If a
-            // terminal event already landed, emitting another frame
-            // is a no-op from the client's perspective but we still
-            // close the stream cleanly. If no terminal landed (early
-            // `writeSSEEvent` crash before `response.created`), emit
-            // a best-effort streaming `error` frame so the client
-            // sees SOMETHING it can parse.
-            if (!visibility.terminalEmitted) {
-              writeFallbackErrorSSE(res, 'error', { error_type: 'server_error', message });
+            // If a terminal is on the wire but the handler still
+            // threw: log only. Rethrowing would produce a malformed
+            // double-response; the client already has a terminal event
+            // it can parse.
+            if (handlerError) {
+              console.error('[responses] handler error after terminal response already delivered:', handlerError);
             }
-            try {
-              endSSE(res);
-            } catch {
-              // Already closed / destroyed.
+          } catch (err) {
+            const message = err instanceof Error ? err.message : 'Unknown error during inference';
+            // Branch on `responseMode` (the wire format the handler
+            // committed to), NOT `res.headersSent`
+            // (which flips synchronously in `writeHead` and lies about
+            // which format the client is consuming). Each branch
+            // produces output that matches the Content-Type the client
+            // already received — or no output at all if the terminal
+            // already landed.
+            if (visibility.responseMode === null) {
+              // Headers never went out. Safe to emit a clean 500 JSON
+              // error.
+              sendInternalError(res, message);
+            } else if (visibility.responseMode === 'json') {
+              // We already wrote `Content-Type: application/json` and
+              // possibly some body bytes; emitting an SSE frame here
+              // would corrupt the response. Best we can do is destroy
+              // the socket so the client sees a truncated JSON
+              // response instead of a malformed document with an
+              // unexpected MIME type. If the body was fully written
+              // (`responseBodyWritten === true`) the outcome gate
+              // above already returned without rethrowing, so reaching
+              // this branch means the JSON never fully landed.
+              try {
+                res.destroy(err instanceof Error ? err : new Error(message));
+              } catch {
+                // Socket may already be gone; nothing more we can do.
+              }
+            } else {
+              // `responseMode === 'sse'`: headers advertise SSE and
+              // some (or all) of the stream already went out. If a
+              // terminal event already landed, emitting another frame
+              // is a no-op from the client's perspective but we still
+              // close the stream cleanly. If no terminal landed (early
+              // `writeSSEEvent` crash before `response.created`), emit
+              // a best-effort streaming `error` frame so the client
+              // sees SOMETHING it can parse.
+              if (!visibility.terminalEmitted) {
+                writeFallbackErrorSSE(res, 'error', { error_type: 'server_error', message });
+              }
+              try {
+                endSSE(res);
+              } catch {
+                // Already closed / destroyed.
+              }
             }
           }
-        }
-      });
+        });
+      if (modelWorkCoordinator) await modelWorkCoordinator.withInference(runInference);
+      else await runInference();
     } catch (err) {
       // Admission-control rejection from the per-model queue cap
       // (`SessionRegistry.withExclusive` threw before chaining into

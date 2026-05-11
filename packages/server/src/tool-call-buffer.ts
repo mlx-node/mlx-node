@@ -1,11 +1,24 @@
 /**
- * Buffers streaming text to detect and suppress `<tool_call>` tags. Text
+ * Buffers streaming text to detect and suppress model structural tags. Text
  * that cannot be part of a partial tag is released immediately; once a
- * full tag is seen, everything after it is suppressed until the stream
- * ends.
+ * full structural tag is seen, everything after it is suppressed until
+ * the stream ends.
  */
 export class ToolCallTagBuffer {
-  private static readonly TAG = '<tool_call>';
+  private static readonly TAGS = [
+    '<tool_call>',
+    '</tool_call>',
+    '<|tool_call>',
+    '<tool_call|>',
+    '<|tool_response>',
+    '<tool_response|>',
+    '<|tool>',
+    '<tool|>',
+    '<|channel>',
+    '<channel|>',
+    '<|turn>',
+    '<turn|>',
+  ] as const;
   private pendingText = '';
   private _suppressed = false;
 
@@ -15,7 +28,7 @@ export class ToolCallTagBuffer {
 
   /**
    * Feed text in. Returns `safeText` (emit as delta), `tagFound` (a full
-   * `<tool_call>` was just seen), and `cleanPrefix` (text before the tag
+   * structural tag was just seen), and `cleanPrefix` (text before the tag
    * when `tagFound` — may contain whitespace; use `.trim()` only for
    * emptiness checks, never for emission).
    */
@@ -26,7 +39,13 @@ export class ToolCallTagBuffer {
 
     this.pendingText += text;
 
-    const tagIdx = this.pendingText.indexOf(ToolCallTagBuffer.TAG);
+    let tagIdx = -1;
+    for (const tag of ToolCallTagBuffer.TAGS) {
+      const idx = this.pendingText.indexOf(tag);
+      if (idx >= 0 && (tagIdx < 0 || idx < tagIdx)) {
+        tagIdx = idx;
+      }
+    }
     if (tagIdx >= 0) {
       const cleanPrefix = this.pendingText.slice(0, tagIdx);
       this._suppressed = true;
@@ -36,9 +55,10 @@ export class ToolCallTagBuffer {
 
     // Hold back any suffix that could be the start of the tag.
     let safeLen = this.pendingText.length;
-    for (let i = 1; i <= Math.min(this.pendingText.length, ToolCallTagBuffer.TAG.length - 1); i++) {
+    const maxTagLength = Math.max(...ToolCallTagBuffer.TAGS.map((tag) => tag.length));
+    for (let i = 1; i <= Math.min(this.pendingText.length, maxTagLength - 1); i++) {
       const suffix = this.pendingText.slice(-i);
-      if (ToolCallTagBuffer.TAG.startsWith(suffix)) {
+      if (ToolCallTagBuffer.TAGS.some((tag) => tag.startsWith(suffix))) {
         safeLen = this.pendingText.length - i;
         break;
       }

@@ -115,7 +115,7 @@ describe('buildAnthropicResponse', () => {
     expect(response.stop_reason).toBe('tool_use');
   });
 
-  it('recovers Gemma4 raw tool-call text without duplicating reasoning when tools are not allowed', () => {
+  it('suppresses Gemma4 parsed tool-call text without duplicating reasoning when tools are not allowed', () => {
     const result = makeChatResult({
       text: '',
       thinking: 'I should inspect files.',
@@ -141,7 +141,7 @@ describe('buildAnthropicResponse', () => {
     });
     expect(response.content[1]).toEqual({
       type: 'text',
-      text: '<|tool_call>call:read_file{path:<|"|>Cargo.toml<|"|>}<tool_call|>',
+      text: '',
     });
   });
 

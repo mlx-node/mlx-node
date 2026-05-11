@@ -85,6 +85,7 @@ const MESSAGE_MARKERS: &[&str] = &[
     TOOL_OPEN,
     TOOL_CLOSE,
 ];
+const TOOL_CALL_CLOSE_MARKERS: &[&str] = &[TOOL_CALL_CLOSE, TURN_CLOSE];
 
 // ---------------------------------------------------------------------------
 // DSL parsing
@@ -249,6 +250,7 @@ impl<'a> DslParser<'a> {
             _ if bytes_starts_with(self.src, self.pos, DSL_STRING_DELIM) => {
                 self.parse_quoted_string().map(Value::String)
             }
+            Some(b'"') => self.parse_json_quoted_string().map(Value::String),
             _ => self.parse_bare_value(),
         }
     }
@@ -304,6 +306,41 @@ impl<'a> DslParser<'a> {
         Ok(body.to_string())
     }
 
+    fn parse_json_quoted_string(&mut self) -> Result<String, DslParseError> {
+        let start = self.pos;
+        self.pos += 1; // opening quote
+        let bytes = self.src.as_bytes();
+        let mut escaped = false;
+        while self.pos < bytes.len() {
+            let b = bytes[self.pos];
+            if escaped {
+                escaped = false;
+                self.pos += 1;
+                continue;
+            }
+            if b == b'\\' {
+                escaped = true;
+                self.pos += 1;
+                continue;
+            }
+            if b == b'"' {
+                self.pos += 1;
+                let raw = &self.src[start..self.pos];
+                return serde_json::from_str::<String>(raw).map_err(|e| {
+                    DslParseError(format!(
+                        "invalid quoted string at position {}: {}",
+                        start, e
+                    ))
+                });
+            }
+            self.pos += 1;
+        }
+        Err(DslParseError(format!(
+            "unterminated quoted string at position {}",
+            start
+        )))
+    }
+
     /// Parse a bare value — number, bool, null, or bare string. A bare
     /// string runs up to the next `,`, `}`, or `]` at the current nesting
     /// level (which is always 0 inside this helper, since nested objects /
@@ -332,19 +369,29 @@ fn bare_scalar_to_json(raw: &str) -> Value {
     match raw {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
-        "null" => Value::Null,
+        _ if raw.eq_ignore_ascii_case("null")
+            || raw.eq_ignore_ascii_case("none")
+            || raw.eq_ignore_ascii_case("nil") =>
+        {
+            Value::Null
+        }
         _ => {
-            // Try integer first to preserve precision for large ints.
-            if let Ok(n) = raw.parse::<i64>() {
-                return Value::from(n);
-            }
-            if let Ok(n) = raw.parse::<u64>() {
-                return Value::from(n);
-            }
-            if let Ok(f) = raw.parse::<f64>()
-                && let Some(n) = serde_json::Number::from_f64(f)
-            {
-                return Value::Number(n);
+            if raw.contains('.') {
+                if let Ok(f) = raw.parse::<f64>()
+                    && let Some(n) = serde_json::Number::from_f64(f)
+                {
+                    return Value::Number(n);
+                }
+            } else {
+                // Try integer first to preserve precision for large ints. Match
+                // vLLM's scanner by leaving exponent-only values like `1e3` as
+                // strings unless they include a decimal point.
+                if let Ok(n) = raw.parse::<i64>() {
+                    return Value::from(n);
+                }
+                if let Ok(n) = raw.parse::<u64>() {
+                    return Value::from(n);
+                }
             }
             Value::String(raw.to_string())
         }
@@ -421,6 +468,11 @@ enum StreamState {
     /// Inside a `<|channel>...<channel|>` block. Bytes flow out as
     /// `Reasoning` segments and accumulate into `thinking`.
     Channel,
+    /// Some Gemma4 generations omit the `<|channel>` opener and start with the
+    /// fixed channel label (`thought\n`) before a tool call. Treat everything
+    /// after that bare label as provisional reasoning until a structural marker
+    /// or end-of-stream proves where the segment ends.
+    BareChannel,
     /// Inside a `<|tool_call>...<tool_call|>` block. Bytes are buffered in
     /// `tool_call_buf` until the closing marker is seen, then parsed and
     /// emitted as a single `ToolCall` segment.
@@ -552,6 +604,11 @@ impl Gemma4StreamParser {
                         return;
                     }
                 }
+                StreamState::BareChannel => {
+                    if !self.drain_bare_channel(out, flushing) {
+                        return;
+                    }
+                }
                 StreamState::ToolCall => {
                     if !self.drain_tool_call(out, flushing) {
                         return;
@@ -583,38 +640,20 @@ impl Gemma4StreamParser {
             }
         }
 
+        if best.is_none()
+            && let Some(entered) = self.maybe_enter_bare_channel(flushing)
+        {
+            return entered;
+        }
+
         if let Some((idx, marker)) = best {
             if idx > 0 {
                 let prefix: String = self.pending.drain(..idx).collect();
-                out.push(StreamSegment::Text(prefix));
+                self.emit_message_prefix_before_marker(out, prefix, marker);
             }
             // Consume the marker.
             self.pending.drain(..marker.len());
-            if CLOSE_MARKERS.contains(&marker) {
-                // Stray close marker. Drop it and keep scanning in Message.
-                return true;
-            }
-            self.state = match marker {
-                m if m == CHANNEL_OPEN => {
-                    self.saw_channel = true;
-                    // Fresh channel block — arm the label stripper so
-                    // the first reasoning emit consumes the hardcoded
-                    // `thought\n` label the chat template re-emits on
-                    // echo. See `strip_channel_label`.
-                    self.channel_label_stripped = false;
-                    StreamState::Channel
-                }
-                m if m == TOOL_CALL_OPEN => {
-                    self.tool_call_buf.clear();
-                    StreamState::ToolCall
-                }
-                m if m == TOOL_RESPONSE_OPEN => StreamState::Swallow {
-                    close: TOOL_RESPONSE_CLOSE,
-                },
-                m if m == TOOL_OPEN => StreamState::Swallow { close: TOOL_CLOSE },
-                m if m == TURN_OPEN => StreamState::Swallow { close: "\n" },
-                _ => unreachable!("MESSAGE_MARKERS entry without matching branch"),
-            };
+            self.transition_after_message_marker(marker);
             return true;
         }
 
@@ -639,6 +678,85 @@ impl Gemma4StreamParser {
             out.push(StreamSegment::Text(emit));
         }
         false
+    }
+
+    fn emit_message_prefix_before_marker(
+        &mut self,
+        out: &mut Vec<StreamSegment>,
+        prefix: String,
+        marker: &'static str,
+    ) {
+        if marker == TOOL_CALL_OPEN
+            && let Some(body) = strip_bare_thought_label(&prefix)
+        {
+            self.saw_channel = true;
+            self.channel_label_stripped = true;
+            self.emit_reasoning(out, body.to_string());
+            return;
+        }
+        out.push(StreamSegment::Text(prefix));
+    }
+
+    fn maybe_enter_bare_channel(&mut self, flushing: bool) -> Option<bool> {
+        const BARE_THOUGHT_LABEL: &str = "thought";
+        if !flushing && !self.pending.is_empty() && BARE_THOUGHT_LABEL.starts_with(&self.pending) {
+            return Some(false);
+        }
+        if !self.pending.starts_with(BARE_THOUGHT_LABEL) {
+            return None;
+        }
+
+        let Some(separator_len) = bare_thought_label_separator_len(&self.pending) else {
+            if !flushing && self.pending.len() == BARE_THOUGHT_LABEL.len() {
+                return Some(false);
+            }
+            return None;
+        };
+        if separator_len == 0 {
+            if !flushing {
+                return Some(false);
+            }
+            return None;
+        }
+        if !flushing && self.pending.len() == BARE_THOUGHT_LABEL.len() {
+            return Some(false);
+        }
+
+        self.pending
+            .drain(..BARE_THOUGHT_LABEL.len() + separator_len);
+        self.saw_channel = true;
+        self.channel_label_stripped = true;
+        self.state = StreamState::BareChannel;
+        Some(true)
+    }
+
+    fn transition_after_message_marker(&mut self, marker: &'static str) {
+        if CLOSE_MARKERS.contains(&marker) {
+            // Stray close marker. Drop it and keep scanning in Message.
+            self.state = StreamState::Message;
+            return;
+        }
+        self.state = match marker {
+            m if m == CHANNEL_OPEN => {
+                self.saw_channel = true;
+                // Fresh channel block — arm the label stripper so
+                // the first reasoning emit consumes the hardcoded
+                // `thought\n` label the chat template re-emits on
+                // echo. See `strip_channel_label`.
+                self.channel_label_stripped = false;
+                StreamState::Channel
+            }
+            m if m == TOOL_CALL_OPEN => {
+                self.tool_call_buf.clear();
+                StreamState::ToolCall
+            }
+            m if m == TOOL_RESPONSE_OPEN => StreamState::Swallow {
+                close: TOOL_RESPONSE_CLOSE,
+            },
+            m if m == TOOL_OPEN => StreamState::Swallow { close: TOOL_CLOSE },
+            m if m == TURN_OPEN => StreamState::Swallow { close: "\n" },
+            _ => unreachable!("MESSAGE_MARKERS entry without matching branch"),
+        };
     }
 
     /// Emit a reasoning chunk, stripping the hardcoded `thought\n`
@@ -740,14 +858,58 @@ impl Gemma4StreamParser {
         false
     }
 
+    fn drain_bare_channel(&mut self, out: &mut Vec<StreamSegment>, flushing: bool) -> bool {
+        let mut best: Option<(usize, &'static str)> = None;
+        for marker in MESSAGE_MARKERS {
+            if let Some(idx) = self.pending.find(marker) {
+                match best {
+                    Some((bi, _)) if bi <= idx => {}
+                    _ => best = Some((idx, marker)),
+                }
+            }
+        }
+
+        if let Some((idx, marker)) = best {
+            if idx > 0 {
+                let body: String = self.pending.drain(..idx).collect();
+                self.emit_reasoning(out, body);
+            }
+            self.pending.drain(..marker.len());
+            self.transition_after_message_marker(marker);
+            return true;
+        }
+
+        if flushing {
+            if !self.pending.is_empty() {
+                let body = std::mem::take(&mut self.pending);
+                self.emit_reasoning(out, body);
+            }
+            self.state = StreamState::Message;
+            return false;
+        }
+
+        let hold = longest_prefix_hold(&self.pending, MESSAGE_MARKERS);
+        if hold == self.pending.len() {
+            return false;
+        }
+        let emit_len = self.pending.len() - hold;
+        if emit_len > 0 {
+            let body: String = self.pending.drain(..emit_len).collect();
+            self.emit_reasoning(out, body);
+        }
+        false
+    }
+
     /// Drain bytes in the tool-call state: accumulate into `tool_call_buf`
     /// until the closing marker is seen, then parse and emit a single
     /// `ToolCall` segment. Bytes do NOT stream out incrementally — a
     /// partial tool call is useless without its closing brace.
     fn drain_tool_call(&mut self, out: &mut Vec<StreamSegment>, flushing: bool) -> bool {
-        if let Some(idx) = self.pending.find(TOOL_CALL_CLOSE) {
+        if let Some((idx, close_marker)) =
+            find_earliest_marker(&self.pending, TOOL_CALL_CLOSE_MARKERS)
+        {
             let body: String = self.pending.drain(..idx).collect();
-            self.pending.drain(..TOOL_CALL_CLOSE.len());
+            self.pending.drain(..close_marker.len());
             self.tool_call_buf.push_str(&body);
             let raw = std::mem::take(&mut self.tool_call_buf);
             let tc = parse_tool_call_body(&raw);
@@ -765,7 +927,7 @@ impl Gemma4StreamParser {
             self.state = StreamState::Message;
             return false;
         }
-        let hold = longest_prefix_hold(&self.pending, &[TOOL_CALL_CLOSE]);
+        let hold = longest_prefix_hold(&self.pending, TOOL_CALL_CLOSE_MARKERS);
         if hold == self.pending.len() {
             return false;
         }
@@ -805,6 +967,26 @@ fn strip_channel_label(body: &str) -> &str {
     body.strip_prefix(THOUGHT_LABEL).unwrap_or(body)
 }
 
+fn bare_thought_label_separator_len(body: &str) -> Option<usize> {
+    const THOUGHT_LABEL: &str = "thought";
+    let rest = body.strip_prefix(THOUGHT_LABEL)?;
+    if rest.starts_with("\r\n") {
+        Some(2)
+    } else if rest.starts_with('\n') || rest.starts_with('\r') {
+        Some(1)
+    } else if rest.is_empty() {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn strip_bare_thought_label(body: &str) -> Option<&str> {
+    const THOUGHT_LABEL: &str = "thought";
+    let separator_len = bare_thought_label_separator_len(body)?;
+    Some(&body[THOUGHT_LABEL.len() + separator_len..])
+}
+
 /// Longest suffix of `buf` that is a non-empty prefix of any marker in
 /// `markers`. Used by the stream parser to hold back ambiguous tail bytes
 /// across feed boundaries.
@@ -825,6 +1007,19 @@ fn longest_prefix_hold(buf: &str, markers: &[&str]) -> usize {
         }
     }
     0
+}
+
+fn find_earliest_marker<'a>(buf: &str, markers: &'a [&'static str]) -> Option<(usize, &'a str)> {
+    let mut best: Option<(usize, &'a str)> = None;
+    for marker in markers {
+        if let Some(idx) = buf.find(marker) {
+            match best {
+                Some((best_idx, _)) if best_idx <= idx => {}
+                _ => best = Some((idx, *marker)),
+            }
+        }
+    }
+    best
 }
 
 /// Parse the body of a tool-call block: `call:NAME{K:V,...}`.
@@ -982,6 +1177,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_call_accepts_dotted_and_hyphenated_name() {
+        let parsed = parse_gemma4_output("<|tool_call>call:my-tool.search{query:test}<tool_call|>");
+
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "my-tool.search");
+        let args = parsed.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(args.get("query").and_then(|v| v.as_str()), Some("test"));
+    }
+
+    #[test]
+    fn parse_tool_call_accepts_turn_close_marker() {
+        let parsed = parse_gemma4_output("<|tool_call>call:bash{command:ls}<turn|>");
+
+        assert_eq!(parsed.text, "");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "bash");
+        let args = parsed.tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(args.get("command").and_then(|v| v.as_str()), Some("ls"));
+    }
+
+    #[test]
     fn parse_tool_call_with_array() {
         let parsed = parse_gemma4_output(
             "<|tool_call>call:edit{path:/a,edits:[{oldText:x,newText:y}]}<tool_call|>",
@@ -1010,6 +1226,30 @@ mod tests {
         let tc = &parsed.tool_calls[0];
         assert_eq!(tc.name, "bash");
         assert_eq!(tc.status, "ok");
+    }
+
+    #[test]
+    fn parse_bare_thought_before_tool_call_as_reasoning() {
+        let parsed = parse_gemma4_output(
+            "thought\nThe user wants me to inspect logs.\n<|tool_call>call:bash{command:ls}<tool_call|>",
+        );
+
+        assert_eq!(parsed.text, "");
+        assert_eq!(
+            parsed.thinking.as_deref(),
+            Some("The user wants me to inspect logs.")
+        );
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "bash");
+    }
+
+    #[test]
+    fn parse_plain_text_starting_with_thoughtful_stays_text() {
+        let parsed = parse_gemma4_output("thoughtful answer without a tool call");
+
+        assert_eq!(parsed.text, "thoughtful answer without a tool call");
+        assert!(parsed.thinking.is_none());
+        assert!(parsed.tool_calls.is_empty());
     }
 
     #[test]
@@ -1165,6 +1405,30 @@ mod tests {
     }
 
     #[test]
+    fn stream_parser_tool_call_closes_on_split_turn_marker() {
+        let mut parser = Gemma4StreamParser::new();
+        let mut all = Vec::new();
+        all.extend(parser.feed("before<|tool_call>"));
+        all.extend(parser.feed("call:bash{command:ls}<tu"));
+        all.extend(parser.feed("rn|>after"));
+        all.extend(parser.flush());
+
+        let text: String = all
+            .iter()
+            .filter_map(|s| {
+                if let StreamSegment::Text(t) = s {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(text, "beforeafter");
+        assert_eq!(parser.tool_calls().len(), 1);
+        assert_eq!(parser.tool_calls()[0].name, "bash");
+    }
+
+    #[test]
     fn stream_parser_flush_empties_buffer() {
         // Pure trailing text that was never followed by a marker should
         // show up on flush().
@@ -1260,6 +1524,100 @@ mod tests {
             parser.thinking().as_deref(),
             Some("The user wants me to upgrade"),
         );
+    }
+
+    #[test]
+    fn stream_parser_preserves_channel_body_when_thought_prefix_diverges() {
+        let mut parser = Gemma4StreamParser::new();
+        let mut all = Vec::new();
+
+        for chunk in [
+            "<|channel>",
+            "thoughtful output from the model",
+            "\n<channel|>",
+            "rest",
+        ] {
+            all.extend(parser.feed(chunk));
+        }
+        all.extend(parser.flush());
+
+        let reasoning: String = all
+            .iter()
+            .filter_map(|s| {
+                if let StreamSegment::Reasoning(t) = s {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(reasoning, "thoughtful output from the model\n");
+        assert_eq!(
+            parser.thinking().as_deref(),
+            Some("thoughtful output from the model"),
+        );
+    }
+
+    #[test]
+    fn stream_parser_recovers_bare_thought_before_tool_call() {
+        let mut parser = Gemma4StreamParser::new();
+        let mut all = Vec::new();
+
+        for chunk in [
+            "thought",
+            "\n",
+            "The user wants",
+            " me to research.",
+            "\n<|tool_call>",
+            "call:Agent{description:Explore}",
+            "<tool_call|>",
+        ] {
+            all.extend(parser.feed(chunk));
+        }
+        all.extend(parser.flush());
+
+        let text: String = all
+            .iter()
+            .filter_map(|s| {
+                if let StreamSegment::Text(t) = s {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let reasoning: String = all
+            .iter()
+            .filter_map(|s| {
+                if let StreamSegment::Reasoning(t) = s {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(text, "");
+        assert_eq!(reasoning, "The user wants me to research.\n");
+        assert_eq!(
+            parser.thinking().as_deref(),
+            Some("The user wants me to research."),
+        );
+        assert_eq!(parser.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn stream_parser_keeps_partial_thought_prefix_until_disambiguated() {
+        let mut parser = Gemma4StreamParser::new();
+
+        assert!(parser.feed("tho").is_empty());
+        let all = parser.feed("ughtful answer");
+
+        assert_eq!(all.len(), 1);
+        match &all[0] {
+            StreamSegment::Text(text) => assert_eq!(text, "thoughtful answer"),
+            other => panic!("expected text, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1419,6 +1777,19 @@ mod tests {
         assert_eq!(m.get("active").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(m.get("flag").and_then(|v| v.as_bool()), Some(false));
         assert!(m.get("empty").unwrap().is_null());
+    }
+
+    #[test]
+    fn parse_dsl_args_matches_vllm_scalar_edges() {
+        let v =
+            parse_gemma4_dsl_args(r#"a:none,b:nil,c:NULL,d:1e3,e:1.5,f:"quoted\nvalue""#).unwrap();
+        let m = v.as_object().unwrap();
+        assert!(m.get("a").unwrap().is_null());
+        assert!(m.get("b").unwrap().is_null());
+        assert!(m.get("c").unwrap().is_null());
+        assert_eq!(m.get("d").and_then(|v| v.as_str()), Some("1e3"));
+        assert_eq!(m.get("e").and_then(|v| v.as_f64()), Some(1.5));
+        assert_eq!(m.get("f").and_then(|v| v.as_str()), Some("quoted\nvalue"));
     }
 
     #[test]

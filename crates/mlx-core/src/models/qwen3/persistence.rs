@@ -604,7 +604,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     // Materialize all mmap-backed weight arrays
                     {
                         let arrays: Vec<&MxArray> = mapped_params.values().collect();
-                        crate::array::memory::materialize_weights(&arrays);
+                        crate::array::memory::materialize_weights(&arrays)?;
                     }
 
                     // Deterministic weight-byte total for the cache-limit
