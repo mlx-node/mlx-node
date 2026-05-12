@@ -944,7 +944,13 @@ impl PagedKVCacheAdapter {
     /// Variant of [`Self::find_cached_prefix`] that caps the lookup length
     /// before touching the allocator. This prevents over-incrementing block
     /// refcounts for cached blocks the caller plans to recompute.
-    #[cfg(test)]
+    ///
+    /// Production callers pass `max_cache_hit_tokens = prompt_tokens.len() - 1`
+    /// to guarantee at least one suffix token survives for the prefill chunk
+    /// — vLLM's exact-prefix corner-case fix. With the cap in place the model
+    /// never sees `suffix_len == 0` on the paged path even when an earlier
+    /// turn left a full superset of the new prompt in the live cache (e.g.
+    /// client retries after a timeout).
     pub fn find_cached_prefix_with_max_tokens(
         &mut self,
         prompt_tokens: &[u32],
@@ -1100,6 +1106,46 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         skip_lookup: bool,
     ) -> Result<CachedPrefix, String> {
+        self.find_cached_prefix_per_block_inner(
+            prompt_tokens,
+            extra_keys_per_block,
+            cache_salt,
+            skip_lookup,
+            None,
+        )
+    }
+
+    /// Variant of [`Self::find_cached_prefix_per_block`] that caps the lookup
+    /// length before touching the allocator. Production callers pass
+    /// `max_cache_hit_tokens = prompt_tokens.len() - 1` to guarantee at least
+    /// one suffix token survives for the prefill chunk — vLLM's exact-prefix
+    /// corner-case fix (mirrors the non-per-block
+    /// [`Self::find_cached_prefix_with_max_tokens`]).
+    pub fn find_cached_prefix_per_block_with_max_tokens(
+        &mut self,
+        prompt_tokens: &[u32],
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: u32,
+    ) -> Result<CachedPrefix, String> {
+        self.find_cached_prefix_per_block_inner(
+            prompt_tokens,
+            extra_keys_per_block,
+            cache_salt,
+            skip_lookup,
+            Some(max_cache_hit_tokens),
+        )
+    }
+
+    fn find_cached_prefix_per_block_inner(
+        &mut self,
+        prompt_tokens: &[u32],
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: Option<u32>,
+    ) -> Result<CachedPrefix, String> {
         if self.prefix_lookup_done {
             return Err(
                 "find_cached_prefix_per_block already called on this request. \
@@ -1125,13 +1171,22 @@ impl PagedKVCacheAdapter {
             });
         }
 
+        let lookup_len = max_cache_hit_tokens
+            .map(|max_tokens| {
+                usize::try_from(max_tokens)
+                    .unwrap_or(usize::MAX)
+                    .min(prompt_tokens.len())
+            })
+            .unwrap_or(prompt_tokens.len());
+        let lookup_tokens = &prompt_tokens[..lookup_len];
+
         let (blocks, cached_tokens) = {
             let mut guard = self
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
             guard.find_longest_cache_hit_per_block(
-                prompt_tokens,
+                lookup_tokens,
                 self.block_size,
                 extra_keys_per_block,
                 cache_salt,
@@ -1142,7 +1197,7 @@ impl PagedKVCacheAdapter {
             block_table.add_block(Arc::clone(block));
         }
 
-        let cached_token_count = cached_tokens as u32;
+        let cached_token_count = cached_tokens.min(lookup_len) as u32;
         self.cached_token_count = cached_token_count;
 
         self.request_tokens.clear();
@@ -4126,6 +4181,96 @@ mod tests {
         assert_eq!(adapter.cached_token_count(), 4);
         assert_eq!(adapter.current_token_count(), 4);
         assert_eq!(adapter.block_table().unwrap().num_blocks(), 1);
+    }
+
+    /// Regression: the vLLM-style `max_cache_hit_tokens = prompt.len() - 1`
+    /// cap is what production callers use to avoid the zero-delta corner
+    /// case. With the cap applied, even when the entire prompt is already
+    /// cached, the lookup must leave at least the trailing block out of the
+    /// reuse set so the model has a non-empty prefill suffix to forward.
+    /// Without this cap the paged forward used to error with
+    /// `chat_*_core_paged: zero-delta prompt (every token cached) is not
+    /// yet supported` for client retries of an earlier identical turn.
+    #[test]
+    fn test_find_cached_prefix_with_max_tokens_zero_delta_regression() {
+        let allocator = new_allocator(8, 4);
+        // Cache a full 8-token (2-block) prompt — same shape a previous
+        // turn would have registered.
+        let tokens: Vec<u32> = (0..8).collect();
+        seed_prefix_cache(&allocator, &tokens, 4, &[]);
+
+        let Some(mut adapter) = maybe_adapter(allocator, 4) else {
+            eprintln!(
+                "skipping test_find_cached_prefix_with_max_tokens_zero_delta_regression: Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(1).unwrap();
+
+        // Production call shape: `max_cache_hit_tokens = prompt.len() - 1`
+        // (= 7 here). The cache holds the full 8 tokens but the cap rounds
+        // the lookup down to the first full block (4 tokens), so the model
+        // sees 4 cached tokens + 4 suffix tokens → safe to prefill.
+        let max_cap = (tokens.len() - 1) as u32;
+        let res = adapter
+            .find_cached_prefix_with_max_tokens(&tokens, &[], 0, false, max_cap)
+            .unwrap();
+        // Strictly less than prompt length — the cap MUST leave room for
+        // the prefill.
+        assert!(
+            (res.cached_token_count as usize) < tokens.len(),
+            "max_cache_hit_tokens cap must guarantee suffix_len > 0; got \
+             cached_token_count={}, prompt_len={}",
+            res.cached_token_count,
+            tokens.len()
+        );
+    }
+
+    #[test]
+    fn test_find_cached_prefix_per_block_with_max_tokens_zero_delta_regression() {
+        let allocator = new_allocator(8, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        // 2 full blocks of size 4 → 2 per-block extra-key vecs. Empty
+        // per-block keys produce hashes bit-equal to the flat variant
+        // with `extra_keys = &[]` — exactly the text-only paged dispatch
+        // path Qwen3.5 dense / MoE use today.
+        let per_block: Vec<Vec<u64>> = vec![Vec::new(), Vec::new()];
+        {
+            let mut guard = allocator.lock().unwrap();
+            let num_full = tokens.len() / 4;
+            let mut blocks = Vec::with_capacity(num_full);
+            for _ in 0..num_full {
+                blocks.push(guard.allocate().expect("free block"));
+            }
+            guard
+                .cache_full_blocks_per_block(&tokens, &blocks, 4, &per_block, 0)
+                .expect("cache_full_blocks_per_block");
+            // Free the seed handles; the cache's logical ref keeps each
+            // block alive at refcount = 1 so a subsequent lookup hits.
+            for b in blocks {
+                guard.free(b);
+            }
+        }
+
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_find_cached_prefix_per_block_with_max_tokens_zero_delta_regression: Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(1).unwrap();
+
+        let max_cap = (tokens.len() - 1) as u32;
+        let res = adapter
+            .find_cached_prefix_per_block_with_max_tokens(&tokens, &per_block, 0, false, max_cap)
+            .unwrap();
+        assert!(
+            (res.cached_token_count as usize) < tokens.len(),
+            "per-block max_cache_hit_tokens cap must guarantee suffix_len > 0; got \
+             cached_token_count={}, prompt_len={}",
+            res.cached_token_count,
+            tokens.len()
+        );
     }
 
     #[test]

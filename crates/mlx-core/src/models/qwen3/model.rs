@@ -1228,6 +1228,14 @@ impl Qwen3Inner {
         // max_tokens=128000 even though actual generation rarely
         // exceeded ~10K tokens).
         let total_budget = token_ids_vec.len() as u32;
+        // vLLM-style exact-prefix cap: leave at least one prompt token to
+        // prefill so the decoder always has something to consume. Without
+        // this cap the live cache or the shared block cache can cover every
+        // prompt token (e.g. a client retrying the same turn after an
+        // earlier 600 s timeout), and the prefill chunk runs with zero
+        // tokens — which the paged forward cannot handle. See vLLM
+        // `vllm/v1/core/kv_cache_manager.py:202-208` for the same fix.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 napi::Error::from_reason(
@@ -1240,10 +1248,16 @@ impl Qwen3Inner {
             // its recorded tokens are a strict prefix of the new prompt.
             // We do the prefix check eagerly here so the cold-start
             // fallback path (which has to release + reset + lookup
-            // again) only runs when truly necessary.
+            // again) only runs when truly necessary. The
+            // `<=max_cache_hit_tokens` cap mirrors the lookup cap above:
+            // when the live prefix already covers every prompt token,
+            // we reject the warm path so the cold-start branch runs
+            // with the capped lookup and leaves at least one suffix
+            // token for prefill.
             let can_continue = reuse_cache
                 && adapter.is_live_for_continue()
-                && token_ids_vec.starts_with(adapter.request_tokens());
+                && token_ids_vec.starts_with(adapter.request_tokens())
+                && adapter.request_tokens().len() <= max_cache_hit_tokens as usize;
 
             if can_continue {
                 match adapter.continue_turn(&token_ids_vec, total_budget) {
@@ -1257,7 +1271,13 @@ impl Qwen3Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(napi::Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&token_ids_vec, &[], 0, false)
+                            .find_cached_prefix_with_max_tokens(
+                                &token_ids_vec,
+                                &[],
+                                0,
+                                false,
+                                max_cache_hit_tokens,
+                            )
                             .map_err(napi::Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -1278,7 +1298,13 @@ impl Qwen3Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(napi::Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&token_ids_vec, &[], 0, false)
+                    .find_cached_prefix_with_max_tokens(
+                        &token_ids_vec,
+                        &[],
+                        0,
+                        false,
+                        max_cache_hit_tokens,
+                    )
                     .map_err(napi::Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 // Allocate ALL blocks needed (cached prefix + suffix + max
@@ -1497,22 +1523,15 @@ impl Qwen3Inner {
             None
         };
 
-        if suffix_len == 0 {
-            // Pure-cache prompt: every prompt token already lives in the
-            // pool. The flat path's "zero delta" branch rewinds the cache
-            // index by 1 and re-runs the last token to produce logits;
-            // the block-paged adapter doesn't expose a rewind API in P1.
-            //
-            // In normal chat usage every turn appends at least the new
-            // user message + assistant turn delimiter, so suffix_len is
-            // always > 0. Documented as a P1 limitation and rejected with
-            // a clear error so production callers don't silently get the
-            // wrong logits.
-            return Err(napi::Error::from_reason(
-                "chat_sync_core_paged: zero-delta prompt (every token cached) is not yet \
-                 supported on the block-paged path; flat path required for this corner case",
-            ));
-        }
+        // Invariant: caller applies the vLLM-style `max_cache_hit_tokens =
+        // total_budget - 1` cap to both the warm-continue precondition and
+        // the cold-start `find_cached_prefix*` lookup, so `cached_prefix_len`
+        // is bounded above by `total_prompt_tokens - 1` and the suffix is
+        // always non-empty for any prompt of length >= 1.
+        debug_assert!(
+            suffix_len > 0,
+            "chat_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+        );
         let suffix = &token_ids_vec[(cached_prefix_len as usize)..];
         let last_logits =
             self.run_paged_prefill_chunk(suffix, cached_prefix_len, num_layers, &positions_dummy)?;
@@ -1976,10 +1995,12 @@ impl Qwen3Inner {
     ///    aggregated `tool_calls`, `thinking`, performance metrics, and
     ///    the matched cached-prefix length.
     ///
-    /// Same Phase 2 caveats as `chat_sync_core_paged`: zero-delta prompts
-    /// (every token cached) are rejected; numerical equivalence to the
-    /// flat path is not asserted here (validated separately via
-    /// random-init smoke tests).
+    /// Applies the same vLLM-style `max_cache_hit_tokens = prompt.len() - 1`
+    /// cap as `chat_sync_core_paged` so zero-delta prompts (every prompt
+    /// token already cached, e.g. retries of an earlier timed-out turn)
+    /// still produce at least one suffix token to prefill. Numerical
+    /// equivalence to the flat path is not asserted here (validated
+    /// separately via random-init smoke tests).
     fn chat_stream_sync_core_paged(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -2030,6 +2051,8 @@ impl Qwen3Inner {
         // blocks grow on-demand via `record_tokens` (no pre-reserve of
         // `p.max_new_tokens`).
         let total_budget = token_ids_vec.len() as u32;
+        // See `chat_sync_core_paged` for the vLLM-style cap rationale.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 napi::Error::from_reason(
@@ -2040,7 +2063,8 @@ impl Qwen3Inner {
 
             let can_continue = reuse_cache
                 && adapter.is_live_for_continue()
-                && token_ids_vec.starts_with(adapter.request_tokens());
+                && token_ids_vec.starts_with(adapter.request_tokens())
+                && adapter.request_tokens().len() <= max_cache_hit_tokens as usize;
 
             if can_continue {
                 match adapter.continue_turn(&token_ids_vec, total_budget) {
@@ -2051,7 +2075,13 @@ impl Qwen3Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(napi::Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&token_ids_vec, &[], 0, false)
+                            .find_cached_prefix_with_max_tokens(
+                                &token_ids_vec,
+                                &[],
+                                0,
+                                false,
+                                max_cache_hit_tokens,
+                            )
                             .map_err(napi::Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -2068,7 +2098,13 @@ impl Qwen3Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(napi::Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&token_ids_vec, &[], 0, false)
+                    .find_cached_prefix_with_max_tokens(
+                        &token_ids_vec,
+                        &[],
+                        0,
+                        false,
+                        max_cache_hit_tokens,
+                    )
                     .map_err(napi::Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2157,17 +2193,13 @@ impl Qwen3Inner {
             return Err(napi::Error::from_reason("Empty prompt"));
         }
 
-        if suffix_len == 0 {
-            // Same Phase 2 limitation as the non-streaming paged path:
-            // pure-cache prompts (every token already cached) need a cache
-            // rewind primitive that the block-paged adapter doesn't expose
-            // yet. Rejected with a clear error so callers don't get
-            // mis-aligned logits.
-            return Err(napi::Error::from_reason(
-                "chat_stream_sync_core_paged: zero-delta prompt (every token cached) is not yet \
-                 supported on the block-paged path; flat path required for this corner case",
-            ));
-        }
+        // Invariant: see the non-streaming sibling. Caller-applied vLLM
+        // exact-prefix cap guarantees `suffix_len > 0` for any prompt of
+        // length >= 1.
+        debug_assert!(
+            suffix_len > 0,
+            "chat_stream_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+        );
 
         let positions_dummy = MxArray::from_int32(&[0], &[1])?;
 

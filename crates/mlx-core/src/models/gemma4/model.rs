@@ -2861,17 +2861,13 @@ impl Gemma4Inner {
             trace_enabled,
         )?;
         let cached_prefix_len = paged_turn.cached_prefix_len;
-        if paged_turn.suffix_len == 0 {
-            // Zero-delta: every prompt token cached. Same caveat as
-            // Qwen3 / LFM2 — flat path required for this corner case.
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
-            }
-            return Err(Error::from_reason(
-                "Gemma4 paged: zero-delta prompt (every token cached) is not yet \
-                 supported on the block-paged path",
-            ));
-        }
+        // Invariant: `prepare_gemma4_paged_turn` already applies the vLLM
+        // `max_cache_hit_tokens = total_budget - 1` cap, so `suffix_len` is
+        // guaranteed > 0 for any non-empty prompt.
+        debug_assert!(
+            paged_turn.suffix_len > 0,
+            "gemma4 chat_sync_core_paged: prepare_gemma4_paged_turn must enforce max_cache_hit_tokens cap"
+        );
 
         // Wrap forward in a try-style flow for proper adapter cleanup.
         let forward_result = self.chat_sync_core_paged_inner(
@@ -3141,14 +3137,12 @@ impl Gemma4Inner {
         )?;
         let cached_prefix_len = paged_turn.cached_prefix_len;
         let suffix_len = paged_turn.suffix_len;
-        if suffix_len == 0 {
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
-            }
-            return Err(Error::from_reason(
-                "Gemma4 paged streaming: zero-delta prompt (every token cached) is not yet supported",
-            ));
-        }
+        // Invariant: `prepare_gemma4_paged_turn` enforces the vLLM
+        // `max_cache_hit_tokens = total_budget - 1` cap, so `suffix_len > 0`.
+        debug_assert!(
+            suffix_len > 0,
+            "gemma4 chat_stream_sync_core_paged: prepare_gemma4_paged_turn must enforce max_cache_hit_tokens cap"
+        );
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] gemma4 stream_paged_prefill_dispatch cached_prefix_tokens={} suffix_tokens={} total_prompt_tokens={}",

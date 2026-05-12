@@ -778,6 +778,12 @@ impl Lfm2Inner {
         // `max_new_tokens`). The inner decode loop reads `p.max_new_tokens`
         // directly when it needs the budget bound.
         let total_budget = tokens.len() as u32;
+        // vLLM-style exact-prefix cap — see qwen3/model.rs:chat_sync_core_paged
+        // for the full rationale. Forces the cache lookup (and the live-prefix
+        // continue check) to leave at least one suffix token for the prefill
+        // chunk, so retries of an earlier identical turn never produce a
+        // zero-delta prompt.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
@@ -786,8 +792,9 @@ impl Lfm2Inner {
                 )
             })?;
 
-            let can_continue =
-                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            let can_continue = adapter.is_live_for_continue()
+                && tokens.starts_with(adapter.request_tokens())
+                && adapter.request_tokens().len() <= max_cache_hit_tokens as usize;
 
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
@@ -798,7 +805,13 @@ impl Lfm2Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[], 0, false)
+                            .find_cached_prefix_with_max_tokens(
+                                &tokens,
+                                &[],
+                                0,
+                                false,
+                                max_cache_hit_tokens,
+                            )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -815,7 +828,13 @@ impl Lfm2Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[], 0, false)
+                    .find_cached_prefix_with_max_tokens(
+                        &tokens,
+                        &[],
+                        0,
+                        false,
+                        max_cache_hit_tokens,
+                    )
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -941,12 +960,11 @@ impl Lfm2Inner {
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
     ) -> Result<(Vec<u32>, String)> {
-        if suffix_len == 0 {
-            return Err(Error::from_reason(
-                "chat_sync_core_paged: zero-delta prompt (every token cached) is not yet \
-                 supported on the block-paged path; flat path required for this corner case",
-            ));
-        }
+        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
+        debug_assert!(
+            suffix_len > 0,
+            "chat_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+        );
 
         // === PREFILL ===
         // Run conv prefill on the FULL prompt (since conv state must
@@ -1343,9 +1361,10 @@ impl Lfm2Inner {
     ///   aggregated `tool_calls`, `thinking`, performance metrics, and
     ///   the matched cached-prefix length.
     ///
-    /// Same caveats as `chat_sync_core_paged`: zero-delta prompts (every
-    /// token cached) are rejected; numerical equivalence to the flat
-    /// path is not asserted.
+    /// Applies the same vLLM `max_cache_hit_tokens = prompt.len() - 1`
+    /// cap as `chat_sync_core_paged` so zero-delta prompts still produce
+    /// at least one suffix token to prefill. Numerical equivalence to the
+    /// flat path is not asserted here.
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged(
         &mut self,
@@ -1386,6 +1405,8 @@ impl Lfm2Inner {
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
+        // See `chat_sync_core_paged` for the vLLM-style cap rationale.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
@@ -1394,8 +1415,9 @@ impl Lfm2Inner {
                 )
             })?;
 
-            let can_continue =
-                adapter.is_live_for_continue() && tokens.starts_with(adapter.request_tokens());
+            let can_continue = adapter.is_live_for_continue()
+                && tokens.starts_with(adapter.request_tokens())
+                && adapter.request_tokens().len() <= max_cache_hit_tokens as usize;
 
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
@@ -1406,7 +1428,13 @@ impl Lfm2Inner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix(&tokens, &[], 0, false)
+                            .find_cached_prefix_with_max_tokens(
+                                &tokens,
+                                &[],
+                                0,
+                                false,
+                                max_cache_hit_tokens,
+                            )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
                         adapter
@@ -1423,7 +1451,13 @@ impl Lfm2Inner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix(&tokens, &[], 0, false)
+                    .find_cached_prefix_with_max_tokens(
+                        &tokens,
+                        &[],
+                        0,
+                        false,
+                        max_cache_hit_tokens,
+                    )
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -1611,12 +1645,11 @@ impl Lfm2Inner {
         cb: &StreamSender,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<(Vec<u32>, String)> {
-        if suffix_len == 0 {
-            return Err(Error::from_reason(
-                "chat_stream_sync_core_paged: zero-delta prompt (every token cached) is not yet \
-                 supported on the block-paged path; flat path required for this corner case",
-            ));
-        }
+        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
+        debug_assert!(
+            suffix_len > 0,
+            "chat_stream_sync_core_paged: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+        );
 
         // === PREFILL ===
         let suffix = &tokens[(cached_prefix_len as usize)..];

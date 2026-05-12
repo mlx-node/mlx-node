@@ -1844,6 +1844,8 @@ impl Qwen35MoeInner {
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
+        // vLLM exact-prefix cap — see qwen3/model.rs:chat_sync_core_paged.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let live_ready;
         let live_prefix_match;
         let live_tokens_len;
@@ -1859,7 +1861,8 @@ impl Qwen35MoeInner {
             if trace_enabled && live_ready && !live_prefix_match {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
-            let can_continue = live_ready && live_prefix_match;
+            let can_continue =
+                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
                     Ok((prior, _)) => (prior, true),
@@ -1869,11 +1872,12 @@ impl Qwen35MoeInner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(
+                            .find_cached_prefix_per_block_with_max_tokens(
                                 &tokens,
                                 &lookup_extra_keys,
                                 cache_salt,
                                 false,
+                                max_cache_hit_tokens,
                             )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
@@ -1891,7 +1895,13 @@ impl Qwen35MoeInner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, cache_salt, false)
+                    .find_cached_prefix_per_block_with_max_tokens(
+                        &tokens,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2038,11 +2048,11 @@ impl Qwen35MoeInner {
         use_cpp_paged: bool,
         gdn_prefix_already_primed: bool,
     ) -> Result<(Vec<u32>, String)> {
-        if suffix_len == 0 {
-            return Err(Error::from_reason(
-                "MoE chat_sync_core_paged: zero-delta prompt is not supported on the paged path",
-            ));
-        }
+        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
+        debug_assert!(
+            suffix_len > 0,
+            "MoE chat_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+        );
 
         let suffix = &tokens[(cached_prefix_len as usize)..];
         let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
@@ -2440,6 +2450,8 @@ impl Qwen35MoeInner {
         };
         let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
+        // See `chat_sync_core_paged` for the vLLM exact-prefix cap rationale.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let live_ready;
         let live_prefix_match;
         let live_tokens_len;
@@ -2455,7 +2467,8 @@ impl Qwen35MoeInner {
             if trace_enabled && live_ready && !live_prefix_match {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
-            let can_continue = live_ready && live_prefix_match;
+            let can_continue =
+                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
             if can_continue {
                 match adapter.continue_turn(&tokens, total_budget) {
                     Ok((prior, _)) => (prior, true),
@@ -2465,11 +2478,12 @@ impl Qwen35MoeInner {
                             .reset_for_new_request(seq_id)
                             .map_err(Error::from_reason)?;
                         let prefix = adapter
-                            .find_cached_prefix_per_block(
+                            .find_cached_prefix_per_block_with_max_tokens(
                                 &tokens,
                                 &lookup_extra_keys,
                                 cache_salt,
                                 false,
+                                max_cache_hit_tokens,
                             )
                             .map_err(Error::from_reason)?;
                         let cached = prefix.cached_token_count;
@@ -2487,7 +2501,13 @@ impl Qwen35MoeInner {
                     .reset_for_new_request(seq_id)
                     .map_err(Error::from_reason)?;
                 let prefix = adapter
-                    .find_cached_prefix_per_block(&tokens, &lookup_extra_keys, cache_salt, false)
+                    .find_cached_prefix_per_block_with_max_tokens(
+                        &tokens,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
                     .map_err(Error::from_reason)?;
                 let cached = prefix.cached_token_count;
                 adapter
@@ -2744,11 +2764,11 @@ impl Qwen35MoeInner {
         gdn_prefix_already_primed: bool,
         prefill_trace_start: Option<std::time::Instant>,
     ) -> Result<(Vec<u32>, String)> {
-        if suffix_len == 0 {
-            return Err(Error::from_reason(
-                "MoE chat_stream_sync_core_paged: zero-delta prompt is not supported on the paged path",
-            ));
-        }
+        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
+        debug_assert!(
+            suffix_len > 0,
+            "MoE chat_stream_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+        );
 
         let trace_enabled = inference_trace_enabled();
         let suffix = &tokens[(cached_prefix_len as usize)..];
