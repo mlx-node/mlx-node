@@ -1764,9 +1764,6 @@ impl GRPOTrainingEngine {
             eos_token_id: Some(self.model_type.eos_token_id()),
             return_logprobs: Some(true),
             prefill_step_size: None,
-            kv_cache_bits: None,
-            kv_cache_group_size: None,
-            num_draft_tokens: None,
             report_performance: None,
         }
     }

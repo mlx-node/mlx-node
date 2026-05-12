@@ -156,19 +156,6 @@ int32_t mlx_set_wired_limit(uint64_t limit, uint64_t* out_old_limit) {
   }
 }
 
-// Get the current wired memory limit. Writes the value through `out_value`
-// (which may be null).
-//
-// Note: MLX doesn't expose a getter for the wired limit. We always write 0
-// and return 0 — semantically "no value", but distinct from the fallible
-// sibling shims because nothing ever throws here.
-int32_t mlx_get_wired_limit(uint64_t* out_value) {
-  if (out_value != nullptr) {
-    *out_value = 0;
-  }
-  return 0;
-}
-
 // Get peak memory usage (works with any backend). Writes the result through
 // `out_value` on success. Returns 0 on success, -1 on caught exception
 // (out_value is left untouched on failure).

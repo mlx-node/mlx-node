@@ -67,9 +67,6 @@ export type {
   VlmBatchItem,
 } from '@mlx-node/core';
 
-// Model-specific configs
-export { PADDLEOCR_VL_CONFIGS, type PaddleOCRVLConfig } from './models/paddleocr-vl-configs.js';
-
 // Qianfan-OCR model (InternVL architecture)
 export { QianfanOCRModel } from './models/qianfan-ocr.js';
 export { createQianfanOcrConfig } from '@mlx-node/core';
@@ -95,7 +92,3 @@ export {
 
 // XLSX export (Rust implementation)
 export { documentToXlsx, saveToXlsx } from '@mlx-node/core';
-
-// Re-export shared utilities
-export { Qwen3Tokenizer as Tokenizer } from '@mlx-node/lm';
-export { MxArray, type DType } from '@mlx-node/core';

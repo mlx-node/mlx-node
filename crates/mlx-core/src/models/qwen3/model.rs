@@ -14,7 +14,7 @@ use napi_derive::napi;
 use tracing::{debug, info, warn};
 
 use crate::array::{MxArray, heavy_cleanup, synchronize_and_clear_cache};
-use crate::model_thread::{ModelThread, ResponseTx, StreamTx, send_and_await, send_and_block};
+use crate::model_thread::{ModelThread, ResponseTx, StreamTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
@@ -25,10 +25,7 @@ use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
 use crate::training_model::ModelType;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
-use crate::transformer::{
-    ContinuousBatchingScheduler, KVCache, PagedAttentionConfig, PagedKVCache, PendingRequest,
-    SchedulerConfig, TransformerBlock,
-};
+use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
 use crate::models::qwen3_5::chat_common::{
@@ -37,80 +34,21 @@ use crate::models::qwen3_5::chat_common::{
 };
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 
-/// Paged attention memory statistics (NAPI-compatible)
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct PagedCacheStats {
-    /// Total number of blocks in the pool
-    pub total_blocks: u32,
-    /// Number of free blocks
-    pub free_blocks: u32,
-    /// Number of allocated blocks
-    pub allocated_blocks: u32,
-    /// Total memory in MB
-    pub total_memory_mb: u32,
-    /// Used memory in MB
-    pub used_memory_mb: u32,
-    /// Utilization percentage
-    pub utilization_percent: f64,
-}
-
-/// Scheduler statistics (NAPI-compatible)
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct SchedulerStatsNapi {
-    /// Number of requests waiting to be scheduled
-    pub num_waiting: u32,
-    /// Number of sequences currently running
-    pub num_running: u32,
-    /// Number of completed sequences
-    pub num_completed: u32,
-    /// Number of sequences in prefill phase
-    pub num_prefill: u32,
-    /// Number of sequences in decode phase
-    pub num_decode: u32,
-    /// Total tokens across all running sequences
-    pub total_running_tokens: u32,
-}
-
-/// Output from a single token generation step in paged attention
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct PagedTokenOutput {
-    /// Sequence ID in the scheduler
-    pub seq_id: u32,
-    /// Request ID for this sequence
-    pub request_id: String,
-    /// Generated token ID
-    pub token: u32,
-    /// Log probability of the token (f64 for NAPI compatibility)
-    pub logprob: f64,
-    /// Whether this sequence has finished
-    pub is_finished: bool,
-}
-
-/// Result of a paged generation step
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct PagedGenerationStep {
-    /// Token outputs for each sequence in the batch
-    pub outputs: Vec<PagedTokenOutput>,
-    /// Number of sequences that were in prefill phase
-    pub num_prefill: u32,
-    /// Number of sequences that were in decode phase
-    pub num_decode: u32,
-}
-
-/// A completed sequence from paged generation
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct PagedCompletedSequence {
-    /// Original request ID
-    pub request_id: String,
-    /// All generated tokens (excluding prompt)
-    pub tokens: Vec<u32>,
-    /// Reason for completion ("stop", "length", "repetition", "tool_calls")
-    pub finish_reason: String,
+/// Pump streaming chunks from a tokio mpsc receiver into a NAPI threadsafe
+/// callback. Shared by `chat_stream_session_start`, `chat_stream_session_continue`,
+/// and `chat_stream_session_continue_tool` — the three streaming NAPI entry
+/// points have byte-identical pump bodies, so this helper exists to avoid the
+/// duplication.
+fn pump_stream_to_callback(
+    mut stream_rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+) {
+    let callback = Arc::new(callback);
+    tokio::spawn(async move {
+        while let Some(result) = stream_rx.recv().await {
+            callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+        }
+    });
 }
 
 /// Wrapper around `StreamTx` that provides a `.call()` method matching the
@@ -141,12 +79,9 @@ pub(crate) struct Qwen3Inner {
     pub(crate) lm_head: Linear,
     pub(crate) kv_caches: Option<Vec<KVCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
-    pub(crate) paged_cache: Option<PagedKVCache>,
-    pub(crate) scheduler: Option<ContinuousBatchingScheduler>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
     ///
-    /// **Opt-in via `Qwen3Config::use_block_paged_cache`** — separate from
-    /// the legacy `paged_cache`/`scheduler` pair above. When `Some`,
+    /// **Opt-in via `Qwen3Config::use_block_paged_cache`**. When `Some`,
     /// chat-session methods route through `forward_paged_adapter` for
     /// cross-request prefix reuse. Defaults to `None` so the existing flat
     /// `Vec<KVCache>` path stays untouched.
@@ -243,55 +178,6 @@ pub(crate) enum Qwen3Cmd {
         group_size: u32,
         config: Option<GenerationConfig>,
         reply: ResponseTx<BatchGenerationResult>,
-    },
-    Decode {
-        token_ids: Vec<u32>,
-        skip_special_tokens: bool,
-        reply: ResponseTx<String>,
-    },
-    InitKvCaches {
-        reply: ResponseTx<()>,
-    },
-    ResetKvCaches {
-        reply: ResponseTx<()>,
-    },
-    ResetCache {
-        reply: ResponseTx<()>,
-    },
-    ForwardPaged {
-        input_ids: MxArray,
-        slot_mapping: MxArray,
-        seq_ids: Vec<u32>,
-        positions: MxArray,
-        reply: ResponseTx<MxArray>,
-    },
-    PrefillPaged {
-        prompt_tokens: Vec<u32>,
-        seq_id: u32,
-        reply: ResponseTx<MxArray>,
-    },
-    AddPagedRequest {
-        request_id: String,
-        prompt_tokens: Vec<u32>,
-        max_new_tokens: u32,
-        priority: Option<i32>,
-        reply: ResponseTx<u32>,
-    },
-    StepPagedGeneration {
-        config: Option<GenerationConfig>,
-        reply: ResponseTx<Option<PagedGenerationStep>>,
-    },
-    GetCompletedSequences {
-        reply: ResponseTx<Vec<PagedCompletedSequence>>,
-    },
-    HasPagedWork {
-        reply: ResponseTx<bool>,
-    },
-    PagedCacheStats {
-        reply: ResponseTx<Option<PagedCacheStats>>,
-    },
-    SchedulerStats {
-        reply: ResponseTx<Option<SchedulerStatsNapi>>,
     },
     // --- Training commands ---
     InitTraining {
@@ -441,72 +327,6 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
             reply,
         } => {
             let _ = reply.send(inner.generate_batch_sync(prompts, group_size, config));
-        }
-        Qwen3Cmd::Decode {
-            token_ids,
-            skip_special_tokens,
-            reply,
-        } => {
-            let _ = reply.send(inner.decode_sync(&token_ids, skip_special_tokens));
-        }
-        Qwen3Cmd::InitKvCaches { reply } => {
-            let _ = reply.send(inner.init_kv_caches_sync());
-        }
-        Qwen3Cmd::ResetKvCaches { reply } => {
-            let _ = reply.send(inner.reset_kv_caches_sync());
-        }
-        Qwen3Cmd::ResetCache { reply } => {
-            let _ = reply.send(inner.reset_cache_sync());
-        }
-        Qwen3Cmd::ForwardPaged {
-            input_ids,
-            slot_mapping,
-            seq_ids,
-            positions,
-            reply,
-        } => {
-            let _ = reply.send(inner.forward_paged_sync(
-                &input_ids,
-                &slot_mapping,
-                seq_ids,
-                &positions,
-            ));
-        }
-        Qwen3Cmd::PrefillPaged {
-            prompt_tokens,
-            seq_id,
-            reply,
-        } => {
-            let _ = reply.send(inner.prefill_paged_sync(prompt_tokens, seq_id));
-        }
-        Qwen3Cmd::AddPagedRequest {
-            request_id,
-            prompt_tokens,
-            max_new_tokens,
-            priority,
-            reply,
-        } => {
-            let _ = reply.send(inner.add_paged_request_sync(
-                request_id,
-                prompt_tokens,
-                max_new_tokens,
-                priority,
-            ));
-        }
-        Qwen3Cmd::StepPagedGeneration { config, reply } => {
-            let _ = reply.send(inner.step_paged_generation_sync(config));
-        }
-        Qwen3Cmd::GetCompletedSequences { reply } => {
-            let _ = reply.send(inner.get_completed_sequences_sync());
-        }
-        Qwen3Cmd::HasPagedWork { reply } => {
-            let _ = reply.send(inner.has_paged_work_sync());
-        }
-        Qwen3Cmd::PagedCacheStats { reply } => {
-            let _ = reply.send(Ok(inner.paged_cache_stats_sync()));
-        }
-        Qwen3Cmd::SchedulerStats { reply } => {
-            let _ = reply.send(Ok(inner.scheduler_stats_sync()));
         }
         // --- Training commands ---
         Qwen3Cmd::InitTraining {
@@ -661,68 +481,16 @@ impl Qwen3Inner {
             Some(false),
         )?;
 
-        // Initialize paged attention if enabled
-        let (paged_cache, scheduler) = if config.use_paged_attention.unwrap_or(false) {
-            let paged_config = PagedAttentionConfig {
-                block_size: config.paged_block_size.unwrap_or(16),
-                gpu_memory_mb: config.paged_cache_memory_mb.unwrap_or(2048),
-                head_size: config.head_dim as u32,
-                num_kv_heads: config.num_kv_heads as u32,
-                num_layers: config.num_layers as u32,
-                use_fp8_cache: config.use_fp8_cache,
-                max_seq_len: Some(config.max_position_embeddings as u32),
-                max_batch_size: Some(32),
-            };
-
-            let mut cache = PagedKVCache::new(paged_config.clone()).map_err(|e| {
-                napi::Error::from_reason(format!("Failed to create PagedKVCache: {}", e))
-            })?;
-
-            #[cfg(target_os = "macos")]
-            cache.initialize().map_err(|e| {
-                napi::Error::from_reason(format!(
-                    "Failed to initialize PagedKVCache GPU buffers: {}",
-                    e
-                ))
-            })?;
-
-            let scheduler_config = SchedulerConfig {
-                max_batch_size: 32,
-                max_tokens_per_step: Some(4096),
-                max_prefill_per_step: Some(1),
-                prioritize_decode: Some(true),
-                eos_token_id: Some(config.eos_token_id as u32),
-            };
-            let sched =
-                ContinuousBatchingScheduler::new(paged_config.block_size, Some(scheduler_config));
-
-            info!(
-                "Paged attention enabled with {}MB cache, block_size={}, fp8={}",
-                paged_config.gpu_memory_mb,
-                paged_config.block_size,
-                paged_config.use_fp8()
-            );
-
-            (Some(cache), Some(sched))
-        } else {
-            (None, None)
-        };
-
         // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
         //
-        // This is independent of `use_paged_attention` above (which drives the
-        // legacy `PagedKVCache` + `ContinuousBatchingScheduler` infrastructure).
         // The adapter pairs an `Arc<Mutex<BlockAllocator>>` (logical
         // refcounted block lifecycle + prefix hash table) with an
         // `Arc<LayerKVPool>` (per-layer Metal K/V buffers). Together they
         // supersede the flat `Vec<KVCache>` storage when wired through the
         // forward path.
         //
-        // Memory budget: derived from `paged_cache_memory_mb` (same knob as
-        // the legacy paged cache) → divided by per-block size to compute
-        // `num_blocks`. We keep the budget knob shared so users don't have to
-        // tune two separate values; the legacy path and the adapter are not
-        // expected to co-exist on the same Qwen3Inner instance.
+        // Memory budget: derived from `paged_cache_memory_mb` — divided by
+        // per-block size to compute `num_blocks`.
         //
         // Cache dtype: BFloat16 (Qwen3's production dtype). FP16 is also
         // supported by `LayerKVPool` for non-Qwen3 callers, but Qwen3 weights
@@ -743,8 +511,7 @@ impl Qwen3Inner {
                 num_kv_heads: config.num_kv_heads as u32,
                 num_layers: config.num_layers as u32,
                 // FP8 mode for the adapter is gated separately on a follow-up
-                // (KvScaleManager); always false here. The legacy
-                // `use_fp8_cache` knob still drives the legacy `PagedKVCache`.
+                // (KvScaleManager); always false here.
                 use_fp8_cache: Some(false),
                 max_seq_len: Some(config.max_position_embeddings as u32),
                 max_batch_size: Some(32),
@@ -799,8 +566,6 @@ impl Qwen3Inner {
             lm_head,
             kv_caches: None,
             tokenizer: None,
-            paged_cache,
-            scheduler,
             paged_adapter,
             cached_kv_keys: Vec::new(),
             cached_kv_values: Vec::new(),
@@ -813,13 +578,6 @@ impl Qwen3Inner {
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
         self.tokenizer = Some(tokenizer);
-    }
-
-    fn init_kv_caches_sync(&mut self) -> Result<()> {
-        let num_layers = self.layers.len();
-        let caches: Vec<KVCache> = (0..num_layers).map(|_| KVCache::new()).collect();
-        self.kv_caches = Some(caches);
-        Ok(())
     }
 
     fn reset_kv_caches_sync(&mut self) -> Result<()> {
@@ -838,20 +596,6 @@ impl Qwen3Inner {
         // call from a prior session would leave block_table populated and
         // a subsequent `chat_sync_core_paged` could mistakenly take the
         // warm-continue path against stale tokens.
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
-        }
-        Ok(())
-    }
-
-    fn reset_cache_sync(&mut self) -> Result<()> {
-        self.cached_kv_keys.clear();
-        self.cached_kv_values.clear();
-        self.cached_cache_idx = 0;
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
-        // Same rationale as `reset_kv_caches_sync`: ensure the paged
-        // adapter doesn't keep stale live state across a session reset.
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
@@ -880,631 +624,6 @@ impl Qwen3Inner {
             !self.cached_kv_keys.is_empty() && !self.cached_kv_values.is_empty(),
             reuse_cache,
         )
-    }
-
-    fn paged_cache_stats_sync(&self) -> Option<PagedCacheStats> {
-        let cache = self.paged_cache.as_ref()?;
-        let stats = cache.get_memory_stats();
-        Some(PagedCacheStats {
-            total_blocks: stats.total_blocks,
-            free_blocks: stats.free_blocks,
-            allocated_blocks: stats.allocated_blocks,
-            total_memory_mb: stats.total_memory_mb,
-            used_memory_mb: stats.used_memory_mb,
-            utilization_percent: stats.utilization_percent,
-        })
-    }
-
-    fn scheduler_stats_sync(&self) -> Option<SchedulerStatsNapi> {
-        let sched = self.scheduler.as_ref()?;
-        let stats = sched.get_stats();
-        Some(SchedulerStatsNapi {
-            num_waiting: stats.num_waiting,
-            num_running: stats.num_running,
-            num_completed: stats.num_completed,
-            num_prefill: stats.num_prefill,
-            num_decode: stats.num_decode,
-            total_running_tokens: stats.total_running_tokens,
-        })
-    }
-
-    fn has_paged_work_sync(&self) -> Result<bool> {
-        let sched = self
-            .scheduler
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
-        Ok(!sched.is_empty())
-    }
-
-    fn get_completed_sequences_sync(&mut self) -> Result<Vec<PagedCompletedSequence>> {
-        let sched = self
-            .scheduler
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
-        let completed = sched.get_completed();
-        Ok(completed
-            .into_iter()
-            .map(|c| PagedCompletedSequence {
-                request_id: c.request_id,
-                tokens: c.generated_tokens,
-                finish_reason: c.finish_reason,
-            })
-            .collect())
-    }
-
-    fn add_paged_request_sync(
-        &mut self,
-        request_id: String,
-        prompt_tokens: Vec<u32>,
-        max_new_tokens: u32,
-        priority: Option<i32>,
-    ) -> Result<u32> {
-        if max_new_tokens == 0 {
-            return Err(napi::Error::from_reason(
-                "max_new_tokens must be > 0 for paged generation",
-            ));
-        }
-        if prompt_tokens.is_empty() {
-            return Err(napi::Error::from_reason(
-                "prompt_tokens must not be empty for paged generation",
-            ));
-        }
-        let sched = self
-            .scheduler
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
-        let request = PendingRequest {
-            request_id,
-            prompt_tokens,
-            max_new_tokens,
-            priority,
-        };
-        sched.add_request(request);
-        Ok(sched.num_waiting())
-    }
-
-    fn forward_paged_sync(
-        &self,
-        input_ids: &MxArray,
-        slot_mapping: &MxArray,
-        seq_ids: Vec<u32>,
-        positions: &MxArray,
-    ) -> Result<MxArray> {
-        let paged_cache = self.paged_cache.as_ref().ok_or_else(|| {
-            napi::Error::from_reason(
-                "Paged attention not enabled. Set use_paged_attention: true in config.",
-            )
-        })?;
-        Self::forward_paged_with_cache(
-            &self.config,
-            &self.embedding,
-            &self.layers,
-            &self.final_norm,
-            &self.lm_head,
-            input_ids,
-            slot_mapping,
-            seq_ids,
-            positions,
-            paged_cache,
-        )
-    }
-
-    /// Forward pass with paged KV cache.
-    /// Takes individual field references to avoid borrow conflicts when scheduler/paged_cache
-    /// are already mutably borrowed in step_paged_generation_sync.
-    fn forward_paged_with_cache(
-        config: &Qwen3Config,
-        embedding: &Embedding,
-        layers: &[TransformerBlock],
-        final_norm: &RMSNorm,
-        lm_head: &Linear,
-        input_ids: &MxArray,
-        slot_mapping: &MxArray,
-        seq_ids: Vec<u32>,
-        positions: &MxArray,
-        paged_cache: &mlx_paged_attn::PagedKVCache,
-    ) -> Result<MxArray> {
-        let mut hidden_states = embedding.forward(input_ids)?;
-        let num_seqs = hidden_states.shape_at(0)?;
-        let seq_len = hidden_states.shape_at(1)?;
-        let num_query_heads = config.num_heads as u32;
-
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            hidden_states = layer.forward_paged_metal(
-                &hidden_states,
-                paged_cache,
-                layer_idx as u32,
-                slot_mapping,
-                &seq_ids,
-                num_query_heads,
-                positions,
-                num_seqs,
-                seq_len,
-            )?;
-        }
-
-        hidden_states = final_norm.forward(&hidden_states)?;
-
-        let logits = if config.tie_word_embeddings {
-            let embedding_weight = embedding.get_weight();
-            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
-        } else {
-            lm_head.forward(&hidden_states)?
-        };
-
-        Ok(logits)
-    }
-
-    fn prefill_paged_sync(&mut self, prompt_tokens: Vec<u32>, seq_id: u32) -> Result<MxArray> {
-        let prompt_len = prompt_tokens.len();
-        if prompt_len == 0 {
-            return Err(napi::Error::from_reason("Empty prompt"));
-        }
-
-        let input_ids = MxArray::from_uint32(&prompt_tokens, &[1, prompt_len as i64])?;
-        let mut hidden_states = self.embedding.forward(&input_ids)?;
-
-        let paged_cache = self
-            .paged_cache
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
-
-        let slot_mapping = paged_cache
-            .get_slot_mapping(seq_id, 0, prompt_len as u32)
-            .map_err(napi::Error::from_reason)?;
-        let slot_mapping_arr = MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let (output, keys, values) = layer.forward_for_prefill(&hidden_states)?;
-
-            #[cfg(target_os = "macos")]
-            unsafe {
-                paged_cache
-                    .update(
-                        layer_idx as u32,
-                        keys.handle.0,
-                        values.handle.0,
-                        slot_mapping_arr.handle.0,
-                    )
-                    .map_err(napi::Error::from_reason)?;
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            {
-                return Err(napi::Error::from_reason(
-                    "Paged attention Metal kernels are only available on macOS",
-                ));
-            }
-
-            hidden_states = output;
-        }
-
-        hidden_states = self.final_norm.forward(&hidden_states)?;
-
-        let logits = if self.config.tie_word_embeddings {
-            let embedding_weight = self.embedding.get_weight();
-            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
-        } else {
-            self.lm_head.forward(&hidden_states)?
-        };
-
-        let vocab_size = logits.shape_at(2)?;
-        let last_logits = logits.slice(
-            &[0, prompt_len as i64 - 1, 0],
-            &[1, prompt_len as i64, vocab_size],
-        )?;
-        let last_logits = last_logits.reshape(&[1, vocab_size])?;
-
-        Ok(last_logits)
-    }
-
-    /// Synchronous step_paged_generation (runs on model thread).
-    /// This is a direct port of the old NAPI method but using direct field access.
-    fn step_paged_generation_sync(
-        &mut self,
-        config: Option<GenerationConfig>,
-    ) -> Result<Option<PagedGenerationStep>> {
-        let sched = self
-            .scheduler
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
-        let paged_cache = self
-            .paged_cache
-            .as_mut()
-            .ok_or_else(|| napi::Error::from_reason("Paged attention not enabled"))?;
-
-        let config = config.unwrap_or_default();
-
-        let batch = match sched.schedule_step(paged_cache) {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-
-        if batch.seq_ids.is_empty() {
-            return Ok(None);
-        }
-
-        let sampling_config = SamplingConfig {
-            temperature: config.temperature,
-            top_k: config.top_k,
-            top_p: config.top_p,
-            min_p: config.min_p,
-        };
-        let eos_token_id = config.eos_token_id.unwrap_or(self.config.eos_token_id);
-
-        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
-        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size = config.presence_context_size.unwrap_or(20);
-        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size = config.ngram_size.unwrap_or(64);
-
-        let mut finish_reason_overrides: HashMap<u32, &'static str> = HashMap::new();
-
-        let mut prefill_indices: Vec<usize> = Vec::new();
-        let mut decode_indices: Vec<usize> = Vec::new();
-
-        for (i, &is_prefill) in batch.is_prefill.iter().enumerate() {
-            if is_prefill {
-                prefill_indices.push(i);
-            } else {
-                decode_indices.push(i);
-            }
-        }
-
-        let mut outputs = Vec::with_capacity(batch.seq_ids.len());
-
-        // PREFILL PATH
-        for &idx in &prefill_indices {
-            let seq_id = batch.seq_ids[idx];
-            let request_id = &batch.request_ids[idx];
-            let prompt_tokens = &batch.input_tokens[idx];
-            let prompt_len = prompt_tokens.len();
-
-            if prompt_len == 0 {
-                return Err(napi::Error::from_reason(format!(
-                    "Empty prompt for sequence {}",
-                    seq_id
-                )));
-            }
-
-            let input_ids = MxArray::from_uint32(prompt_tokens, &[1, prompt_len as i64])?;
-            let mut hidden_states = self.embedding.forward(&input_ids)?;
-
-            let slot_mapping = paged_cache
-                .get_slot_mapping(seq_id, 0, prompt_len as u32)
-                .map_err(napi::Error::from_reason)?;
-            let slot_mapping_arr =
-                MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
-
-            for (layer_idx, layer) in self.layers.iter().enumerate() {
-                let (output, keys, values) = layer.forward_for_prefill(&hidden_states)?;
-
-                #[cfg(target_os = "macos")]
-                unsafe {
-                    paged_cache
-                        .update(
-                            layer_idx as u32,
-                            keys.handle.0,
-                            values.handle.0,
-                            slot_mapping_arr.handle.0,
-                        )
-                        .map_err(napi::Error::from_reason)?;
-                }
-
-                #[cfg(not(target_os = "macos"))]
-                {
-                    return Err(napi::Error::from_reason(
-                        "Paged attention Metal kernels are only available on macOS",
-                    ));
-                }
-
-                hidden_states = output;
-            }
-
-            hidden_states = self.final_norm.forward(&hidden_states)?;
-
-            let logits = if self.config.tie_word_embeddings {
-                let embedding_weight = self.embedding.get_weight();
-                hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)?
-            } else {
-                self.lm_head.forward(&hidden_states)?
-            };
-
-            let vocab_size = logits.shape_at(2)?;
-            logits.eval();
-            let logits_data = logits.to_float32()?;
-            let start = (prompt_len - 1) * vocab_size as usize;
-            let end = start + vocab_size as usize;
-
-            if end > logits_data.len() {
-                return Err(napi::Error::from_reason(format!(
-                    "Logits buffer size mismatch in prefill: expected {} elements (end), got {}",
-                    end,
-                    logits_data.len()
-                )));
-            }
-
-            let logit_slice = &logits_data[start..end];
-            let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
-
-            if let Some((prompt, generated)) = sched.get_penalty_context(seq_id) {
-                let max_ctx = repetition_context_size
-                    .max(presence_context_size)
-                    .max(frequency_context_size) as usize;
-                let total = prompt.len() + generated.len();
-                let skip = total.saturating_sub(max_ctx);
-                let prompt_skip = skip.min(prompt.len());
-                let ctx: Vec<u32> = prompt[prompt_skip..]
-                    .iter()
-                    .chain(generated.iter())
-                    .copied()
-                    .collect();
-                if !ctx.is_empty() {
-                    if repetition_penalty != 1.0 {
-                        logit_arr = apply_repetition_penalty(
-                            &logit_arr,
-                            &ctx,
-                            repetition_penalty,
-                            Some(repetition_context_size),
-                        )?;
-                    }
-                    if presence_penalty != 0.0 {
-                        logit_arr = apply_presence_penalty(
-                            &logit_arr,
-                            &ctx,
-                            presence_penalty,
-                            Some(presence_context_size),
-                        )?;
-                    }
-                    if frequency_penalty != 0.0 {
-                        logit_arr = apply_frequency_penalty(
-                            &logit_arr,
-                            &ctx,
-                            frequency_penalty,
-                            Some(frequency_context_size),
-                        )?;
-                    }
-                }
-            }
-
-            let (next_token_arr, logprobs_arr) =
-                sample_and_logprobs(&logit_arr, Some(sampling_config))?;
-
-            next_token_arr.eval();
-            logprobs_arr.eval();
-            let next_token = next_token_arr.item_at_int32(0)? as u32;
-            let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
-            let is_eos = next_token == eos_token_id as u32;
-            let mut finish_reason_override: Option<&'static str> = None;
-
-            if !is_eos && let Some(gen_tokens) = sched.get_generated_tokens(seq_id) {
-                let mut history = gen_tokens.to_vec();
-                history.push(next_token);
-                if let Some(reason) = check_repetition_cutoff(
-                    &history,
-                    max_consecutive_tokens,
-                    max_ngram_repeats,
-                    ngram_size,
-                ) {
-                    finish_reason_override = Some(reason);
-                }
-            }
-
-            if finish_reason_override.is_none() && !is_eos && sched.would_hit_length_limit(seq_id) {
-                finish_reason_override = Some("length");
-            }
-
-            let is_finished = is_eos || finish_reason_override.is_some();
-            if let Some(reason) = finish_reason_override {
-                finish_reason_overrides.insert(seq_id, reason);
-            }
-
-            outputs.push(PagedTokenOutput {
-                seq_id,
-                request_id: request_id.clone(),
-                token: next_token,
-                logprob,
-                is_finished,
-            });
-        }
-
-        // DECODE PATH
-        if !decode_indices.is_empty() {
-            let num_decode_seqs = decode_indices.len();
-            let decode_seq_ids: Vec<u32> =
-                decode_indices.iter().map(|&i| batch.seq_ids[i]).collect();
-            let decode_input_tokens: Vec<u32> = decode_indices
-                .iter()
-                .map(|&i| batch.input_tokens[i].first().copied().unwrap_or(0))
-                .collect();
-            let decode_context_lens: Vec<u32> = decode_indices
-                .iter()
-                .map(|&i| batch.context_lens[i])
-                .collect();
-
-            for (i, &ctx_len) in decode_context_lens.iter().enumerate() {
-                if ctx_len == 0 {
-                    return Err(napi::Error::from_reason(format!(
-                        "Decode sequence {} (seq_id={}) has context_len=0. Prefill must complete before decode.",
-                        i, decode_seq_ids[i]
-                    )));
-                }
-            }
-
-            let input_ids =
-                MxArray::from_uint32(&decode_input_tokens, &[num_decode_seqs as i64, 1])?;
-            let positions_vec: Vec<i32> = decode_context_lens
-                .iter()
-                .map(|&ctx| if ctx > 0 { ctx as i32 - 1 } else { 0 })
-                .collect();
-            let positions_arr = MxArray::from_int32(&positions_vec, &[num_decode_seqs as i64])?;
-
-            let input_lens: Vec<u32> = vec![1; num_decode_seqs];
-            let is_prefill_flags: Vec<bool> = vec![false; num_decode_seqs];
-            let slot_mapping = paged_cache
-                .get_slot_mapping_batch(
-                    &decode_seq_ids,
-                    &decode_context_lens,
-                    &is_prefill_flags,
-                    &input_lens,
-                )
-                .map_err(napi::Error::from_reason)?;
-            let slot_mapping_arr =
-                MxArray::from_int64(&slot_mapping, &[slot_mapping.len() as i64])?;
-
-            let logits = Self::forward_paged_with_cache(
-                &self.config,
-                &self.embedding,
-                &self.layers,
-                &self.final_norm,
-                &self.lm_head,
-                &input_ids,
-                &slot_mapping_arr,
-                decode_seq_ids.clone(),
-                &positions_arr,
-                paged_cache,
-            )?;
-
-            let vocab_size = logits.shape_at(2)?;
-            logits.eval();
-            let logits_data = logits.to_float32()?;
-
-            for (i, &idx) in decode_indices.iter().enumerate() {
-                let seq_id = batch.seq_ids[idx];
-                let request_id = &batch.request_ids[idx];
-
-                let start = i * vocab_size as usize;
-                let end = start + vocab_size as usize;
-
-                if end > logits_data.len() {
-                    return Err(napi::Error::from_reason(format!(
-                        "Logits buffer size mismatch in decode: expected {} elements (end), got {}",
-                        end,
-                        logits_data.len()
-                    )));
-                }
-
-                let logit_slice = &logits_data[start..end];
-                let mut logit_arr = MxArray::from_float32(logit_slice, &[1, 1, vocab_size])?;
-
-                if let Some((prompt, generated)) = sched.get_penalty_context(seq_id) {
-                    let max_ctx = repetition_context_size
-                        .max(presence_context_size)
-                        .max(frequency_context_size) as usize;
-                    let total = prompt.len() + generated.len();
-                    let skip = total.saturating_sub(max_ctx);
-                    let prompt_skip = skip.min(prompt.len());
-                    let gen_skip = skip.saturating_sub(prompt.len());
-                    let ctx: Vec<u32> = prompt[prompt_skip..]
-                        .iter()
-                        .chain(generated[gen_skip..].iter())
-                        .copied()
-                        .collect();
-                    if !ctx.is_empty() {
-                        if repetition_penalty != 1.0 {
-                            logit_arr = apply_repetition_penalty(
-                                &logit_arr,
-                                &ctx,
-                                repetition_penalty,
-                                Some(repetition_context_size),
-                            )?;
-                        }
-                        if presence_penalty != 0.0 {
-                            logit_arr = apply_presence_penalty(
-                                &logit_arr,
-                                &ctx,
-                                presence_penalty,
-                                Some(presence_context_size),
-                            )?;
-                        }
-                        if frequency_penalty != 0.0 {
-                            logit_arr = apply_frequency_penalty(
-                                &logit_arr,
-                                &ctx,
-                                frequency_penalty,
-                                Some(frequency_context_size),
-                            )?;
-                        }
-                    }
-                }
-
-                let (next_token_arr, logprobs_arr) =
-                    sample_and_logprobs(&logit_arr, Some(sampling_config))?;
-
-                next_token_arr.eval();
-                logprobs_arr.eval();
-                let next_token = next_token_arr.item_at_int32(0)? as u32;
-                let logprob = logprobs_arr.item_at_float32(next_token as usize)? as f64;
-                let is_eos = next_token == eos_token_id as u32;
-                let mut finish_reason_override: Option<&'static str> = None;
-
-                if !is_eos && let Some(gen_tokens) = sched.get_generated_tokens(seq_id) {
-                    let mut history = gen_tokens.to_vec();
-                    history.push(next_token);
-                    if let Some(reason) = check_repetition_cutoff(
-                        &history,
-                        max_consecutive_tokens,
-                        max_ngram_repeats,
-                        ngram_size,
-                    ) {
-                        finish_reason_override = Some(reason);
-                    }
-                }
-
-                if finish_reason_override.is_none()
-                    && !is_eos
-                    && sched.would_hit_length_limit(seq_id)
-                {
-                    finish_reason_override = Some("length");
-                }
-
-                let is_finished = is_eos || finish_reason_override.is_some();
-                if let Some(reason) = finish_reason_override {
-                    finish_reason_overrides.insert(seq_id, reason);
-                }
-
-                outputs.push(PagedTokenOutput {
-                    seq_id,
-                    request_id: request_id.clone(),
-                    token: next_token,
-                    logprob,
-                    is_finished,
-                });
-            }
-        }
-
-        let token_outputs: Vec<_> = outputs
-            .iter()
-            .map(|o| {
-                let override_reason = finish_reason_overrides.get(&o.seq_id).copied();
-                crate::transformer::TokenOutput {
-                    seq_id: o.seq_id,
-                    token: o.token,
-                    is_eos: o.is_finished && override_reason.is_none(),
-                    finish_reason_override: override_reason,
-                }
-            })
-            .collect();
-        sched
-            .process_outputs(token_outputs, paged_cache)
-            .map_err(napi::Error::from_reason)?;
-
-        Ok(Some(PagedGenerationStep {
-            outputs,
-            num_prefill: batch.num_prefill,
-            num_decode: batch.num_decode,
-        }))
-    }
-
-    fn decode_sync(&self, token_ids: &[u32], skip_special: bool) -> Result<String> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-            napi::Error::from_reason("Tokenizer not available. Model must be loaded via load().")
-        })?;
-        tokenizer.decode_sync(token_ids, skip_special)
     }
 
     /// Core synchronous chat implementation.
@@ -1547,9 +666,6 @@ impl Qwen3Inner {
             eos_token_id: None,
             return_logprobs: None,
             prefill_step_size: None,
-            kv_cache_bits: None,
-            kv_cache_group_size: None,
-            num_draft_tokens: None,
             report_performance: config.report_performance,
         };
 
@@ -3858,9 +2974,6 @@ impl Qwen3Inner {
                 eos_token_id: None,
                 return_logprobs: None,
                 prefill_step_size: None,
-                kv_cache_bits: None,
-                kv_cache_group_size: None,
-                num_draft_tokens: None,
                 report_performance: config.report_performance,
             };
             let report_perf = config.report_performance.unwrap_or(false);
@@ -6585,13 +5698,6 @@ pub struct Qwen3Model {
 
 #[napi]
 impl Qwen3Model {
-    /// Reset the KV cache used for cache reuse across chat-session turns.
-    /// Call this when starting a new conversation to ensure a full prefill.
-    #[napi]
-    pub fn reset_cache(&self) -> Result<()> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::ResetCache { reply })
-    }
-
     /// Whether the block-paged KV cache adapter is active on this model
     /// instance.
     ///
@@ -6608,166 +5714,6 @@ impl Qwen3Model {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
-    }
-
-    /// Initialize KV caches for incremental generation
-    ///
-    /// Creates one KV cache per transformer layer. Call this before starting generation.
-    #[napi]
-    pub fn init_kv_caches(&self) -> Result<()> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::InitKvCaches { reply })
-    }
-
-    /// Reset all KV caches
-    ///
-    /// Clears cached key-value states. Call this between different generation sequences.
-    #[napi]
-    pub fn reset_kv_caches(&self) -> Result<()> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::ResetKvCaches { reply })
-    }
-
-    /// Get paged attention memory statistics (if enabled)
-    ///
-    /// Returns memory usage statistics for the paged KV cache.
-    #[napi]
-    pub fn paged_cache_stats(&self) -> Result<Option<PagedCacheStats>> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::PagedCacheStats { reply })
-    }
-
-    /// Get scheduler statistics (if paged attention is enabled)
-    ///
-    /// Returns the number of waiting, running, and completed sequences.
-    #[napi]
-    pub fn scheduler_stats(&self) -> Result<Option<SchedulerStatsNapi>> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::SchedulerStats { reply })
-    }
-
-    /// Forward pass with paged attention for memory-efficient inference.
-    ///
-    /// This method uses block-based KV cache management via Metal kernels for:
-    /// - Variable-length sequences with efficient memory usage
-    /// - Continuous batching with dynamic batch composition
-    /// - Long context support beyond GPU memory limits
-    ///
-    /// # Arguments
-    /// * `input_ids` - Token IDs, shape: [num_seqs, 1] for decode
-    /// * `slot_mapping` - Slot indices for cache updates, shape: [num_seqs]
-    /// * `seq_ids` - Sequence IDs in the batch (for looking up block tables/context lens)
-    /// * `positions` - Token positions for RoPE, shape: [num_seqs] (per-sequence positions)
-    ///
-    /// # Returns
-    /// * Logits, shape: [num_seqs, 1, vocab_size] for decode
-    #[napi]
-    pub fn forward_paged(
-        &self,
-        input_ids: &MxArray, // [num_seqs, 1] for decode
-        slot_mapping: &MxArray,
-        seq_ids: Vec<u32>,
-        positions: &MxArray, // [num_seqs] - per-sequence RoPE positions
-    ) -> Result<MxArray> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::ForwardPaged {
-            input_ids: input_ids.clone(),
-            slot_mapping: slot_mapping.clone(),
-            seq_ids,
-            positions: positions.clone(),
-            reply,
-        })
-    }
-
-    /// Prefill a sequence using standard attention and write K/V to paged cache.
-    ///
-    /// This method should be called before `step_paged_generation()` for each
-    /// new prompt. It runs the full forward pass using standard attention
-    /// (which is faster for long sequences), then writes the K/V cache to
-    /// the paged cache for subsequent decode steps.
-    ///
-    /// # Arguments
-    /// * `prompt_tokens` - Token IDs for the prompt (as u32 array)
-    /// * `seq_id` - Sequence ID (obtained from scheduler)
-    ///
-    /// # Returns
-    /// * Logits for the last token, shape: [1, vocab_size]
-    #[napi]
-    pub fn prefill_paged(&self, prompt_tokens: Vec<u32>, seq_id: u32) -> Result<MxArray> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::PrefillPaged {
-            prompt_tokens,
-            seq_id,
-            reply,
-        })
-    }
-
-    /// Add a request to the paged attention scheduler.
-    ///
-    /// The scheduler queues requests and allocates blocks for KV cache.
-    /// Use `step_paged_generation()` to process the scheduled batch.
-    ///
-    /// Note: The actual sequence ID is assigned during scheduling, not when the
-    /// request is added. Use the `request_id` to track your requests through
-    /// the generation process.
-    ///
-    /// # Arguments
-    /// * `request_id` - Unique identifier for the request (returned in outputs)
-    /// * `prompt_tokens` - Token IDs for the prompt
-    /// * `max_new_tokens` - Maximum new tokens to generate
-    /// * `priority` - Optional priority (higher = scheduled first)
-    ///
-    /// # Returns
-    /// * Number of pending requests in the queue
-    #[napi]
-    pub fn add_paged_request(
-        &self,
-        request_id: String,
-        prompt_tokens: Vec<u32>,
-        max_new_tokens: u32,
-        priority: Option<i32>,
-    ) -> Result<u32> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::AddPagedRequest {
-            request_id,
-            prompt_tokens,
-            max_new_tokens,
-            priority,
-            reply,
-        })
-    }
-
-    /// Schedule and execute one step of paged generation.
-    ///
-    /// This method:
-    /// 1. Schedules the next batch of sequences
-    /// 2. Runs forward pass with paged attention
-    /// 3. Samples next tokens
-    /// 4. Returns the generated tokens for each sequence
-    ///
-    /// # Arguments
-    /// * `config` - Generation configuration (temperature, top_k, etc.)
-    ///
-    /// # Returns
-    /// * `PagedGenerationStep` with token outputs for each sequence
-    #[napi]
-    pub fn step_paged_generation(
-        &self,
-        config: Option<GenerationConfig>,
-    ) -> Result<Option<PagedGenerationStep>> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::StepPagedGeneration {
-            config,
-            reply,
-        })
-    }
-
-    /// Get completed sequences from the scheduler.
-    ///
-    /// Call this after `step_paged_generation()` returns outputs with `is_finished: true`.
-    #[napi]
-    pub fn get_completed_sequences(&self) -> Result<Vec<PagedCompletedSequence>> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::GetCompletedSequences {
-            reply,
-        })
-    }
-
-    /// Check if the scheduler has pending work.
-    #[napi]
-    pub fn has_paged_work(&self) -> Result<bool> {
-        send_and_block(&self.thread, |reply| Qwen3Cmd::HasPagedWork { reply })
     }
 
     /// Fused forward pass using C++ implementation for maximum performance.
@@ -6930,10 +5876,6 @@ impl Qwen3Model {
         self.config.clone()
     }
 }
-
-// Shell-only dead code (generate_batch_parallel_sync, apply_batch_repetition_penalty)
-// removed in P6b — batched generation is handled on the model thread via
-// Qwen3Cmd::GenerateBatch -> Qwen3Inner::generate_batch_sync().
 
 #[napi]
 impl Qwen3Model {
@@ -7104,7 +6046,7 @@ impl Qwen3Model {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
+        let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
         self.thread.send(Qwen3Cmd::ChatStreamSessionStart {
@@ -7114,12 +6056,7 @@ impl Qwen3Model {
             cancelled: cancelled_inner,
         })?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
+        pump_stream_to_callback(stream_rx, callback);
 
         Ok(ChatStreamHandle { cancelled })
     }
@@ -7139,7 +6076,7 @@ impl Qwen3Model {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
+        let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
         self.thread.send(Qwen3Cmd::ChatStreamSessionContinue {
@@ -7150,12 +6087,7 @@ impl Qwen3Model {
             cancelled: cancelled_inner,
         })?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
+        pump_stream_to_callback(stream_rx, callback);
 
         Ok(ChatStreamHandle { cancelled })
     }
@@ -7175,7 +6107,7 @@ impl Qwen3Model {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
+        let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
         self.thread.send(Qwen3Cmd::ChatStreamSessionContinueTool {
@@ -7186,12 +6118,7 @@ impl Qwen3Model {
             cancelled: cancelled_inner,
         })?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
+        pump_stream_to_callback(stream_rx, callback);
 
         Ok(ChatStreamHandle { cancelled })
     }
@@ -7239,34 +6166,6 @@ impl Qwen3Model {
             prompts,
             group_size,
             config,
-            reply,
-        })
-        .await
-    }
-
-    /// Decode token IDs to text using the internal tokenizer
-    ///
-    /// Helper method for decoding generated tokens. The model must have been loaded
-    /// via load() to have a tokenizer available.
-    ///
-    /// # Arguments
-    /// * `token_ids` - Token IDs to decode as Uint32Array
-    /// * `skip_special_tokens` - Whether to skip special tokens (default: true)
-    ///
-    /// # Returns
-    /// * Decoded text string
-    #[napi]
-    pub async fn decode(
-        &self,
-        token_ids: Uint32Array,
-        skip_special_tokens: Option<bool>,
-    ) -> Result<String> {
-        let skip_special = skip_special_tokens.unwrap_or(true);
-        let token_ids_vec = token_ids.to_vec();
-
-        send_and_await(&self.thread, |reply| Qwen3Cmd::Decode {
-            token_ids: token_ids_vec,
-            skip_special_tokens: skip_special,
             reply,
         })
         .await
@@ -7545,55 +6444,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------
-    // chat_session_start reuse-on-append integration tests
-    //
-    // These require a loaded Qwen3 model (weights + tokenizer) so
-    // they are marked #[ignore] and stay out of the default `cargo
-    // test` run. Run explicitly with:
-    //
-    //   cargo test -p mlx-core --release \
-    //       qwen3_chat_session_prefix_reuse -- --ignored --nocapture
-    //
-    // Both tests exercise the reset-on-miss refactor end-to-end:
-    //
-    //   * append-hit: two back-to-back `chat_session_start_sync`
-    //     calls where the second's tokens = first's tokens + delta.
-    //     Assert `cached_tokens > 0` on the second result, only the
-    //     delta re-prefilled, and generation matches a fresh-session
-    //     reference.
-    //
-    //   * divergence-miss: two calls with divergent histories.
-    //     Assert `cached_tokens == 0` on the second result, full
-    //     reset + prefill, and generation is unchanged from a
-    //     cold-start call.
-    //
-    // Wiring these up requires `Qwen3Inner::new_from_weights` plus a
-    // tokenizer — follow the pattern in `__test__/models/*.test.ts`
-    // once this PR lands. Left as TODOs so the shape is documented.
-    // -------------------------------------------------------------
-
-    #[ignore = "Requires a loaded Qwen3 model (tokenizer + weights) — see comment"]
-    #[test]
-    fn qwen3_chat_session_prefix_reuse_append_hit() {
-        // TODO: build a test harness that loads Qwen3-0.6B or similar,
-        // runs chat_session_start once with messages A, then runs it
-        // again with messages A + user_turn_B, and asserts
-        // `cached_tokens` equals the token length of the first turn's
-        // `cached_token_history`. Also assert generated text is
-        // deterministic under temperature=0 and equals a reference
-        // computed from a fresh session on A + B.
-    }
-
-    #[ignore = "Requires a loaded Qwen3 model (tokenizer + weights) — see comment"]
-    #[test]
-    fn qwen3_chat_session_prefix_reuse_divergence_miss() {
-        // TODO: same harness, but second call uses divergent messages
-        // A' that share no prefix with A beyond the system prompt
-        // template header. Assert `cached_tokens == 0` and that
-        // generation matches a fresh cold-start run.
-    }
-
     #[test]
     fn test_repetition_cutoff_range_detection() {
         // Range detection: a 5-token pattern repeated 3 times should be caught
@@ -7680,11 +6530,8 @@ mod tests {
             pad_token_id: 0,
             eos_token_id: 1,
             bos_token_id: 0,
-            // Legacy paged-attention path — not exercised here.
-            use_paged_attention: None,
             paged_cache_memory_mb: Some(256), // smallest valid budget
             paged_block_size: Some(16),
-            use_fp8_cache: None,
             // The flag under test.
             use_block_paged_cache: use_block_paged,
         }

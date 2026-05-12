@@ -1,15 +1,6 @@
 #include "mlx_common.h"
-#include <fstream>
-#include <mlx/graph_utils.h>
 
 extern "C" {
-
-// Export computation graph to DOT file for debugging
-void mlx_export_to_dot(const char* path, mlx_array* handle) {
-    auto& arr = *reinterpret_cast<array*>(handle);
-    std::ofstream ofs(path);
-    mlx::core::export_to_dot(ofs, arr);
-}
 
 mlx_array* mlx_array_transpose(mlx_array* handle,
                                const int32_t* axes,
@@ -217,17 +208,6 @@ bool mlx_array_to_float32(mlx_array* handle, float* out, size_t len) {
   return copy_to_buffer(*arr, out, len);
 }
 
-bool mlx_array_to_float32_noeval(mlx_array* handle, float* out, size_t len) {
-  if (!out) {
-    return false;
-  }
-  auto arr = reinterpret_cast<array*>(handle);
-  if (!arr) {
-    return false;
-  }
-  return copy_to_buffer_noeval(*arr, out, len);
-}
-
 bool mlx_array_to_int32(mlx_array* handle, int32_t* out, size_t len) {
   if (!out) {
     return false;
@@ -237,17 +217,6 @@ bool mlx_array_to_int32(mlx_array* handle, int32_t* out, size_t len) {
     return false;
   }
   return copy_to_buffer(*arr, out, len);
-}
-
-bool mlx_array_to_int32_noeval(mlx_array* handle, int32_t* out, size_t len) {
-  if (!out) {
-    return false;
-  }
-  auto arr = reinterpret_cast<array*>(handle);
-  if (!arr) {
-    return false;
-  }
-  return copy_to_buffer_noeval(*arr, out, len);
 }
 
 bool mlx_array_to_uint32(mlx_array* handle, uint32_t* out, size_t len) {

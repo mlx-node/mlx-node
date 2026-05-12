@@ -1,5 +1,7 @@
 use crate::array::MxArray;
-use crate::nn::{Activations, Linear};
+#[cfg(test)]
+use crate::nn::Activations;
+use crate::nn::Linear;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
@@ -63,6 +65,7 @@ impl MLP {
     /// - up: up_proj(x)
     /// - gate_act: silu(gate)
     /// - gated: gate_act * up
+    #[cfg(test)]
     pub fn forward_with_cache(&self, x: &MxArray) -> Result<Vec<MxArray>> {
         // Compute gate and up projections
         let gate = self.gate_proj.forward(x)?;

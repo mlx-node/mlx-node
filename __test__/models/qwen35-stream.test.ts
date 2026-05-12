@@ -76,8 +76,8 @@ describe.sequential('_runChatStream bridge', () => {
         callback(null, {
           text: 'snake',
           done: false,
-          is_reasoning: true,
-        } as unknown as ChatStreamChunk);
+          isReasoning: true,
+        } as ChatStreamChunk);
         callback(null, {
           text: 'done',
           done: true,

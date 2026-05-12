@@ -23,47 +23,28 @@ pub struct Qwen3Config {
     pub eos_token_id: i32,
     pub bos_token_id: i32,
 
-    // Paged attention options (opt-in)
-    /// Enable paged attention for memory-efficient inference.
-    /// Default: false (use standard KVCache)
-    #[serde(default)]
-    #[napi(ts_type = "boolean | undefined")]
-    pub use_paged_attention: Option<bool>,
-
+    // Block-paged KV cache options
     /// GPU memory budget for paged KV cache in megabytes.
-    /// Only used when use_paged_attention is true.
     /// Default: 2048 (2GB)
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_cache_memory_mb: Option<u32>,
 
     /// Block size for paged attention (tokens per block).
-    /// Only used when use_paged_attention is true.
     /// Default: 16
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_block_size: Option<u32>,
 
-    /// Use FP8 cache for 2x memory reduction (experimental).
-    /// Only used when use_paged_attention is true.
-    /// Default: false
-    #[serde(default)]
-    #[napi(ts_type = "boolean | undefined")]
-    pub use_fp8_cache: Option<bool>,
-
-    /// Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
+    /// Use the block-paged KV cache adapter (`PagedKVCacheAdapter`).
     ///
-    /// **OPT-IN — experimental.** When `Some(true)`, `Qwen3Inner` allocates a
+    /// When `Some(true)` (the default for Qwen3), `Qwen3Inner` allocates a
     /// `BlockAllocator` + `LayerKVPool` pair and constructs a
     /// `PagedKVCacheAdapter` for cross-request KV prefix reuse (vLLM-style
-    /// block-paged storage with refcounted prefix caching). This flag is
-    /// independent of `use_paged_attention`, which drives the legacy
-    /// `PagedKVCache` + `ContinuousBatchingScheduler` path. The adapter is
-    /// wired through `chat_sync_core` separately; defaulting to `false`
-    /// keeps the existing flat `Vec<KVCache>` path entirely unchanged until
-    /// the integration is proven on real weights.
+    /// block-paged storage with refcounted prefix caching). When
+    /// `Some(false)`, the legacy flat `Vec<KVCache>` path is used instead.
     ///
-    /// Default: false (use the existing flat KVCache path).
+    /// Default: true.
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,

@@ -11,7 +11,6 @@ pub(crate) mod paged_forward;
 pub mod persistence;
 pub(crate) mod persistence_common;
 pub mod processing;
-pub mod prompt_cache;
 pub mod quantized_linear;
 pub mod rms_norm_gated;
 pub mod vision;

@@ -384,16 +384,6 @@ pub(crate) enum Qwen35MoeCmd {
         config: Qwen3_5MoeGenerationConfig,
         reply: ResponseTx<Qwen3_5MoeGenerationResult>,
     },
-    TakeCache {
-        reply: ResponseTx<Option<crate::models::qwen3_5::prompt_cache::PromptCache>>,
-    },
-    SetCache {
-        cache: crate::models::qwen3_5::prompt_cache::PromptCache,
-        reply: ResponseTx<()>,
-    },
-    InitCaches {
-        reply: ResponseTx<()>,
-    },
     ResetCaches {
         reply: ResponseTx<()>,
     },
@@ -534,15 +524,6 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
             reply,
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
-        }
-        Qwen35MoeCmd::TakeCache { reply } => {
-            let _ = reply.send(Ok(inner.take_cache_sync()));
-        }
-        Qwen35MoeCmd::SetCache { cache, reply } => {
-            let _ = reply.send(inner.set_cache_sync(cache));
-        }
-        Qwen35MoeCmd::InitCaches { reply } => {
-            let _ = reply.send(inner.init_caches_sync());
         }
         Qwen35MoeCmd::ResetCaches { reply } => {
             let _ = reply.send(inner.reset_caches_sync());
@@ -841,44 +822,6 @@ impl Qwen35MoeInner {
         self.cached_rope_deltas = None;
         self.gdn_prefix_checkpoints.clear();
         self.gdn_last_history_checkpoint = None;
-    }
-
-    /// Take the KV cache from the model, returning a `PromptCache` handle.
-    pub(crate) fn take_cache_sync(
-        &mut self,
-    ) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
-        if self.cached_token_history.is_empty() {
-            return None;
-        }
-        let caches = self.caches.take()?;
-        self.gdn_prefix_checkpoints.clear();
-        self.gdn_last_history_checkpoint = None;
-        Some(crate::models::qwen3_5::prompt_cache::PromptCache::new(
-            caches,
-            self.cached_token_history.clone(),
-            "qwen3_5_moe",
-            self.config.num_layers as usize,
-            self.cached_image_key,
-            self.cached_rope_deltas,
-            self.model_id,
-        ))
-    }
-
-    /// Restore a previously taken `PromptCache` into the model.
-    pub(crate) fn set_cache_sync(
-        &mut self,
-        mut cache: crate::models::qwen3_5::prompt_cache::PromptCache,
-    ) -> Result<()> {
-        let restored_caches = cache.take_caches().ok_or_else(|| {
-            Error::from_reason("PromptCache is empty (already consumed or disposed)")
-        })?;
-        self.caches = Some(restored_caches);
-        self.cached_token_history = cache.token_history().to_vec();
-        self.cached_image_key = cache.image_cache_key();
-        self.cached_rope_deltas = cache.rope_deltas();
-        self.gdn_prefix_checkpoints.clear();
-        self.gdn_last_history_checkpoint = None;
-        Ok(())
     }
 
     fn find_moe_gdn_history_checkpoint(
@@ -2301,7 +2244,9 @@ impl Qwen35MoeInner {
                         logits
                     }
                     Err(e) => {
-                        if should_propagate_compiled_paged_error(cpp_compiled_step_completed) {
+                        if chat_common::should_propagate_compiled_paged_error(
+                            cpp_compiled_step_completed,
+                        ) {
                             eprintln!(
                                 "[MLX] Qwen3_5MoE: C++ compiled paged forward failed \
                                  mid-decode (step={step}) AFTER an earlier compiled step \
@@ -3047,7 +2992,9 @@ impl Qwen35MoeInner {
                         logits
                     }
                     Err(e) => {
-                        if should_propagate_compiled_paged_error(cpp_compiled_step_completed) {
+                        if chat_common::should_propagate_compiled_paged_error(
+                            cpp_compiled_step_completed,
+                        ) {
                             eprintln!(
                                 "[MLX] Qwen3_5MoE (stream): C++ compiled paged forward \
                                  failed mid-decode (step={step}) AFTER an earlier compiled \
@@ -6676,7 +6623,6 @@ pub struct Qwen3_5MoeModel {
     pub(crate) thread: crate::model_thread::ModelThread<Qwen35MoeCmd>,
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5MoeConfig,
-    pub(crate) model_id: u64,
     /// Snapshot of `Qwen35MoeInner::paged_adapter.is_some()` captured at
     /// construction time. Currently default-OFF on Qwen3.5 MoE
     /// (parity-pending — see CLAUDE.md and
@@ -6692,14 +6638,6 @@ pub struct Qwen3_5MoeModel {
 
 #[napi]
 impl Qwen3_5MoeModel {
-    /// Initialize caches for incremental generation.
-    #[napi]
-    pub fn init_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::InitCaches {
-            reply,
-        })
-    }
-
     /// Reset all caches.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
@@ -6723,56 +6661,6 @@ impl Qwen3_5MoeModel {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
-    }
-
-    /// Take the KV cache from the model, returning a `PromptCache` handle.
-    #[napi]
-    pub fn take_cache(&self) -> Option<crate::models::qwen3_5::prompt_cache::PromptCache> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::TakeCache { reply })
-            .ok()?
-    }
-
-    /// Restore a previously taken `PromptCache` into the model.
-    #[napi]
-    pub fn set_cache(
-        &self,
-        cache: &mut crate::models::qwen3_5::prompt_cache::PromptCache,
-    ) -> Result<()> {
-        // Validate before sending (these checks don't need model-thread state)
-        if cache.model_type() != "qwen3_5_moe" {
-            return Err(Error::from_reason(format!(
-                "Cache type '{}' doesn't match model type 'qwen3_5_moe'",
-                cache.model_type()
-            )));
-        }
-        if cache.num_layers() != self.config.num_layers as usize {
-            return Err(Error::from_reason(format!(
-                "Cache has {} layers but model has {} layers",
-                cache.num_layers(),
-                self.config.num_layers
-            )));
-        }
-        if cache.model_id() != self.model_id {
-            return Err(Error::from_reason(
-                "Cache was created by a different model instance (different checkpoint or config)",
-            ));
-        }
-        // Extract the cache data to send to model thread
-        let owned_cache = crate::models::qwen3_5::prompt_cache::PromptCache::new(
-            cache.take_caches().ok_or_else(|| {
-                Error::from_reason("PromptCache is empty (already consumed or disposed)")
-            })?,
-            cache.token_history().to_vec(),
-            "qwen3_5_moe",
-            cache.num_layers(),
-            cache.image_cache_key(),
-            cache.rope_deltas(),
-            cache.model_id(),
-        );
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::SetCache {
-            cache: owned_cache,
-            reply,
-        })
     }
 
     /// Load a pretrained model from a directory.
@@ -7821,61 +7709,6 @@ fn forward_moe_cpp_paged(
     }
 
     MxArray::from_handle(output_ptr, "moe_paged_forward_logits")
-}
-
-/// Policy decision for the C++ compiled paged forward fallback.
-///
-/// Inputs:
-/// * `compiled_step_completed` — whether ANY compiled C++ paged step
-///   has succeeded earlier in this turn.
-///
-/// Output:
-/// * `true` — propagate the forward error as fatal. Returned when a
-///   compiled step has previously succeeded; the C++ side has advanced
-///   its per-layer GDN linear-cache globals (conv_state /
-///   recurrent_state) but those updates are never imported back into
-///   `self.caches`. Falling back to the pure-Rust paged decode after
-///   that point would read stale pre-step state and silently corrupt
-///   the response.
-/// * `false` — safe to fall back to the pure-Rust paged decode.
-///   Returned when no compiled step has succeeded yet; the only failure
-///   mode at that point is an init/configuration mismatch caught at
-///   first dispatch, which leaves `self.caches` consistent with
-///   `paged_adapter` after a `rollback_last_tokens(1)`.
-///
-/// Mirrors the dense helper in `crates/mlx-core/src/models/qwen3_5/model.rs`.
-#[inline]
-fn should_propagate_compiled_paged_error(compiled_step_completed: bool) -> bool {
-    compiled_step_completed
-}
-
-#[cfg(test)]
-mod compiled_paged_fallback_policy_tests {
-    use super::should_propagate_compiled_paged_error;
-
-    /// Regression test for review Finding 1 (HIGH): mid-turn fallback
-    /// after a successful compiled step would corrupt the GDN linear
-    /// cache state. The policy must propagate the error as fatal once
-    /// any compiled step has completed; only the first-step failure is
-    /// safe to fall back to pure-Rust decode.
-    #[test]
-    fn no_compiled_step_yet_allows_fallback() {
-        assert!(
-            !should_propagate_compiled_paged_error(false),
-            "first-step compiled forward failure must allow fallback to pure-Rust paged decode \
-             (self.caches is still consistent with paged_adapter pre-rollback)"
-        );
-    }
-
-    #[test]
-    fn after_successful_compiled_step_propagates_as_fatal() {
-        assert!(
-            should_propagate_compiled_paged_error(true),
-            "compiled forward failure AFTER a successful compiled step must propagate as fatal: \
-             the C++ GDN linear-cache globals advanced but self.caches is stale, so a pure-Rust \
-             fallback would silently corrupt the response"
-        );
-    }
 }
 
 /// VLM prefill for MoE model using Rust path with M-RoPE position IDs.

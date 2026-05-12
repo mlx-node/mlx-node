@@ -12,17 +12,9 @@ pub mod persistence;
 pub mod processing;
 pub mod vision;
 
-// Re-export public items
-pub use chat::{
-    ChatRole, VLMBatchItem, VLMChatConfig, VLMChatMessage, VLMChatResult, format_vlm_chat,
-};
-pub use config::{ModelConfig, TextConfig, VisionConfig};
-pub use language::{ERNIELanguageModel, MultimodalRoPE, PaddleOCRAttention, PaddleOCRDecoderLayer};
-pub use model::VLModel;
-pub use parser::{
-    DocumentElement, ElementType, OutputFormat, Paragraph, ParsedDocument, ParserConfig, Table,
-    TableCell, TableRow, format_document, parse_paddle_response, parse_vlm_output,
-};
+// Re-export public items used cross-module
+pub use language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
 pub use persistence::load_paddleocr_vl_weights;
-pub use processing::{ImageProcessor, smart_resize};
-pub use vision::PaddleOCRVisionModel;
+pub use processing::{
+    ImageProcessorConfig, ProcessedImage, ProcessedImages, aggregate_processed_images, smart_resize,
+};

@@ -126,10 +126,6 @@ impl PaddleOCRVisionEmbeddings {
             MxArray::concatenate_many(refs, Some(0))
         }
     }
-
-    pub fn weight(&self) -> MxArray {
-        self.patch_embedding.weight()
-    }
 }
 
 /// PaddleOCR Vision Model (internal)

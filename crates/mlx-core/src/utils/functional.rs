@@ -1739,17 +1739,13 @@ mod forward_pass_equivalence_tests {
             eos_token_id: 1,
             bos_token_id: 0,
             // Paged attention options (disabled for test)
-            use_paged_attention: None,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            use_fp8_cache: None,
             // Explicit opt-out: these forward-pass equivalence tests assert
             // numerical equality between the stateful flat path and the
             // functional flat path. The block-paged adapter is a different
             // codepath (Metal pool + per-layer dispatch), so we MUST stay
-            // on the flat path to keep the assertion meaningful. After the
-            // 2026-04-28 default flip (`unwrap_or(false)` → `unwrap_or(true)`),
-            // a `None` here would silently route through the paged adapter.
+            // on the flat path to keep the assertion meaningful.
             use_block_paged_cache: Some(false),
         }
     }
@@ -2175,16 +2171,11 @@ mod chunked_forward_tests {
             pad_token_id: 0,
             eos_token_id: 1,
             bos_token_id: 0,
-            use_paged_attention: None,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            use_fp8_cache: None,
             // Explicit opt-out: chunked-forward tests assert numerical
             // equality against the full flat forward. The block-paged
             // adapter is a different codepath, so stay on the flat path.
-            // After the 2026-04-28 default flip (`unwrap_or(false)` →
-            // `unwrap_or(true)`), `None` would silently route through the
-            // paged adapter and break these tests.
             use_block_paged_cache: Some(false),
         }
     }

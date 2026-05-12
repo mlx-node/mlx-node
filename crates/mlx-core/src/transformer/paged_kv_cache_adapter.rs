@@ -145,7 +145,7 @@ impl KvTensorMeta {
     /// Extract metadata from a live `MxArray`. Only called from the
     /// production `update_keys_values` path; tests construct `KvTensorMeta`
     /// directly so they don't need the MLX runtime.
-    pub fn from_array(array: &MxArray, label: &str) -> Result<Self, String> {
+    pub(crate) fn from_array(array: &MxArray, label: &str) -> Result<Self, String> {
         let ndim = array
             .ndim()
             .map_err(|e| format!("{label}.ndim() failed: {e}"))?;
@@ -719,6 +719,7 @@ impl PagedKVCacheAdapter {
     /// `finalize_turn_keep_live`, preserving the partial trailing block) and
     /// a fresh prefix-cache lookup. It does not record suffix tokens; callers
     /// still feed those through `record_tokens` in their prefill loop.
+    #[cfg(test)]
     pub fn prepare_turn(
         &mut self,
         seq_id: u32,
@@ -943,6 +944,7 @@ impl PagedKVCacheAdapter {
     /// Variant of [`Self::find_cached_prefix`] that caps the lookup length
     /// before touching the allocator. This prevents over-incrementing block
     /// refcounts for cached blocks the caller plans to recompute.
+    #[cfg(test)]
     pub fn find_cached_prefix_with_max_tokens(
         &mut self,
         prompt_tokens: &[u32],
@@ -3659,7 +3661,7 @@ impl PagedKVCacheAdapter {
     /// its own clone for orchestration (e.g. driving an EMA warmup pass
     /// from a calibration runner) while the adapter shares ownership for
     /// the inference path.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(test, target_os = "macos"))]
     pub fn set_scale_manager(&mut self, manager: Option<Arc<Mutex<KvScaleManager>>>) {
         self.scale_manager = manager;
     }
@@ -3672,7 +3674,7 @@ impl PagedKVCacheAdapter {
     /// Returns an `Arc` clone so the caller can extend the manager's
     /// lifetime past `&self` borrows (e.g. take the lock in a different
     /// task / thread).
-    #[cfg(target_os = "macos")]
+    #[cfg(all(test, target_os = "macos"))]
     pub fn scale_manager(&self) -> Option<Arc<Mutex<KvScaleManager>>> {
         self.scale_manager.as_ref().map(Arc::clone)
     }

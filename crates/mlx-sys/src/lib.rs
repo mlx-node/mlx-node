@@ -14,7 +14,6 @@ pub struct mlx_stream {
 }
 
 unsafe extern "C-unwind" {
-    pub fn mlx_version() -> *const std::os::raw::c_char;
     pub fn mlx_seed(seed: u64);
     pub fn mlx_array_from_int32(data: *const i32, shape: *const i64, ndim: usize)
     -> *mut mlx_array;
@@ -116,49 +115,6 @@ unsafe extern "C-unwind" {
         w_down: *mut mlx_array,
     ) -> *mut mlx_array;
 
-    // Fused Multi-Head Attention forward (without KV cache)
-    pub fn mlx_fused_attention_forward(
-        x: *mut mlx_array,
-        w_q: *mut mlx_array,
-        w_k: *mut mlx_array,
-        w_v: *mut mlx_array,
-        w_o: *mut mlx_array,
-        q_norm_w: *mut mlx_array, // Can be null
-        k_norm_w: *mut mlx_array, // Can be null
-        n_heads: i32,
-        n_kv_heads: i32,
-        head_dim: i32,
-        scale: f32,
-        rope_base: f32,
-        rope_dims: i32,
-        qk_norm_eps: f32,
-        use_causal: bool,
-        rope_offset: i32,
-    ) -> *mut mlx_array;
-
-    // Fused Multi-Head Attention forward with KV cache
-    pub fn mlx_fused_attention_forward_cached(
-        x: *mut mlx_array,
-        w_q: *mut mlx_array,
-        w_k: *mut mlx_array,
-        w_v: *mut mlx_array,
-        w_o: *mut mlx_array,
-        q_norm_w: *mut mlx_array,
-        k_norm_w: *mut mlx_array,
-        n_heads: i32,
-        n_kv_heads: i32,
-        head_dim: i32,
-        scale: f32,
-        rope_base: f32,
-        rope_dims: i32,
-        qk_norm_eps: f32,
-        use_causal: bool,
-        cached_keys: *mut *mut mlx_array,
-        cached_values: *mut *mut mlx_array,
-        cache_offset: i32,
-        output: *mut *mut mlx_array,
-    );
-
     // Fused Transformer Block forward (without KV cache)
     pub fn mlx_fused_transformer_block_forward(
         x: *mut mlx_array,
@@ -184,35 +140,6 @@ unsafe extern "C-unwind" {
         use_causal: bool,
         rope_offset: i32,
     ) -> *mut mlx_array;
-
-    // Fused Transformer Block forward with KV cache
-    pub fn mlx_fused_transformer_block_forward_cached(
-        x: *mut mlx_array,
-        input_norm_w: *mut mlx_array,
-        post_attn_norm_w: *mut mlx_array,
-        w_q: *mut mlx_array,
-        w_k: *mut mlx_array,
-        w_v: *mut mlx_array,
-        w_o: *mut mlx_array,
-        q_norm_w: *mut mlx_array,
-        k_norm_w: *mut mlx_array,
-        w_gate: *mut mlx_array,
-        w_up: *mut mlx_array,
-        w_down: *mut mlx_array,
-        n_heads: i32,
-        n_kv_heads: i32,
-        head_dim: i32,
-        attn_scale: f32,
-        rope_base: f32,
-        rope_dims: i32,
-        norm_eps: f32,
-        qk_norm_eps: f32,
-        use_causal: bool,
-        cached_keys: *mut *mut mlx_array,
-        cached_values: *mut *mut mlx_array,
-        cache_offset: i32,
-        output: *mut *mut mlx_array,
-    );
 
     // Fused Q/K/V projection with RoPE for cached attention
     pub fn mlx_fused_attention_qkv(
@@ -282,20 +209,6 @@ unsafe extern "C-unwind" {
         stops: *const i64,
         ndim: usize,
     ) -> *mut mlx_array;
-    pub fn mlx_array_slice_update(
-        src_handle: *mut mlx_array,
-        update_handle: *mut mlx_array,
-        starts: *const i64,
-        stops: *const i64,
-        ndim: usize,
-    ) -> *mut mlx_array;
-    pub fn mlx_array_slice_update_inplace(
-        src_handle: *mut mlx_array,
-        update_handle: *mut mlx_array,
-        starts: *const i64,
-        stops: *const i64,
-        ndim: usize,
-    );
     // Optimized slice assignment functions - no shape allocation
     pub fn mlx_array_slice_assign_axis(
         src_handle: *mut mlx_array,
@@ -317,12 +230,6 @@ unsafe extern "C-unwind" {
         axis: usize,
         start: i64,
         end: i64,
-    ) -> *mut mlx_array;
-    pub fn mlx_array_scatter(
-        src_handle: *mut mlx_array,
-        indices_handle: *mut mlx_array,
-        updates_handle: *mut mlx_array,
-        axis: i32,
     ) -> *mut mlx_array;
     pub fn mlx_array_concatenate(
         handles: *const *mut mlx_array,
@@ -366,9 +273,7 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_item_at_float32(handle: *mut mlx_array, index: usize, out: *mut f32) -> bool;
     pub fn mlx_array_dtype(handle: *mut mlx_array) -> i32;
     pub fn mlx_array_to_float32(handle: *mut mlx_array, out: *mut f32, len: usize) -> bool;
-    pub fn mlx_array_to_float32_noeval(handle: *mut mlx_array, out: *mut f32, len: usize) -> bool;
     pub fn mlx_array_to_int32(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
-    pub fn mlx_array_to_int32_noeval(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
     pub fn mlx_array_to_uint32(handle: *mut mlx_array, out: *mut u32, len: usize) -> bool;
     pub fn mlx_array_to_uint8(handle: *mut mlx_array, out: *mut u8, len: usize) -> bool;
     pub fn mlx_array_to_uint16(handle: *mut mlx_array, out: *mut u16, len: usize) -> bool;
@@ -377,17 +282,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_clear_cache();
     pub fn mlx_compile_clear_cache() -> bool;
     pub fn mlx_stop_gradient(a: *mut mlx_array) -> *mut mlx_array;
-    pub fn mlx_compiled_categorical_sample(
-        logits: *mut mlx_array,
-        temperature: f32,
-    ) -> *mut mlx_array;
-    pub fn mlx_compiled_top_k(logprobs: *mut mlx_array, k: i32) -> *mut mlx_array;
-    pub fn mlx_compiled_top_p(logprobs: *mut mlx_array, p: f32) -> *mut mlx_array;
-    pub fn mlx_compiled_min_p(
-        logprobs: *mut mlx_array,
-        min_p: f32,
-        min_tokens_to_keep: i32,
-    ) -> *mut mlx_array;
 
     // Random number generation
     pub fn mlx_array_random_uniform(
@@ -566,9 +460,6 @@ unsafe extern "C-unwind" {
     // Create scalar with specific dtype (no AsType node)
     pub fn mlx_array_scalar_float_dtype(value: f64, dtype: i32) -> *mut mlx_array;
 
-    // Debug: export computation graph to DOT file
-    pub fn mlx_export_to_dot(path: *const std::os::raw::c_char, handle: *mut mlx_array);
-
     // Compiled GELU approximate (fused kernel, matches Python nn.gelu_approx)
     pub fn mlx_gelu_approx(handle: *mut mlx_array) -> *mut mlx_array;
     // Compiled GeGLU: gelu_approx(gate) * up (fused kernel)
@@ -617,10 +508,6 @@ unsafe extern "C-unwind" {
         bias: *mut mlx_array,   // nullable
         eps: f32,
     ) -> *mut mlx_array;
-    pub fn mlx_compiled_apply_temperature(
-        logits: *mut mlx_array,
-        temperature: f32,
-    ) -> *mut mlx_array;
     pub fn mlx_compiled_sample_full(
         logits: *mut mlx_array,
         temperature: f32,
@@ -628,18 +515,6 @@ unsafe extern "C-unwind" {
         top_p: f32,
         min_p: f32,
     ) -> *mut mlx_array;
-
-    /// Optimized sampling that returns BOTH token and logprobs
-    /// This eliminates redundant logprobs computation by computing once and returning both.
-    pub fn mlx_sample_and_logprobs(
-        logits: *mut mlx_array,
-        temperature: f32,
-        top_k: i32,
-        top_p: f32,
-        min_p: f32,
-        out_token: *mut *mut mlx_array,
-        out_logprobs: *mut *mut mlx_array,
-    );
 
     /// Compiled sampling using mlx::core::compile for the categorical step
     /// This matches mlx-lm's @partial(mx.compile, ...) approach
@@ -674,7 +549,6 @@ unsafe extern "C-unwind" {
     pub fn mlx_metal_is_available() -> bool;
     pub fn mlx_metal_device_info() -> *const std::os::raw::c_char;
     pub fn mlx_set_wired_limit(limit: u64, out_old_limit: *mut u64) -> i32;
-    pub fn mlx_get_wired_limit(out_value: *mut u64) -> i32;
     pub fn mlx_get_peak_memory(out_value: *mut u64) -> i32;
     pub fn mlx_get_active_memory(out_value: *mut u64) -> i32;
     pub fn mlx_get_cache_memory(out_value: *mut u64) -> i32;
@@ -716,41 +590,6 @@ unsafe extern "C-unwind" {
         dtype_code: i32,
     ) -> *mut mlx_array;
 
-    // Fused generation loop - entire generation in one FFI call
-    // This matches mlx-lm's async pipelining pattern for maximum performance
-    pub fn mlx_qwen3_generate(
-        // Input
-        input_ids: *mut mlx_array, // [1, prompt_len]
-        // Model weights
-        embedding_weight: *mut mlx_array,     // [vocab, hidden]
-        layer_weights: *const *mut mlx_array, // [num_layers * 11] weights per layer
-        num_layers: i32,
-        final_norm_weight: *mut mlx_array, // [hidden]
-        lm_head_weight: *mut mlx_array,    // [vocab, hidden] or null if tied
-        tie_word_embeddings: bool,
-        // Model config
-        hidden_size: i32,
-        num_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        rope_theta: f32,
-        norm_eps: f32,
-        // Generation config
-        max_new_tokens: i32,
-        temperature: f32,
-        top_k: i32,
-        top_p: f32,
-        min_p: f32,
-        repetition_penalty: f32,
-        repetition_context_size: i32,
-        eos_token_id: i32,
-        // Outputs (caller allocates)
-        out_tokens: *mut i32,   // [max_new_tokens]
-        out_logprobs: *mut f32, // [max_new_tokens]
-        out_num_tokens: *mut i32,
-        out_finish_reason: *mut i32, // 0=length, 1=eos
-    );
-
     // Fused forward step - single FFI call for entire forward pass
     // This reduces FFI overhead from ~300 calls to 1 call per token
     // Uses array offsets for batched generation with proper per-sequence RoPE positions.
@@ -785,39 +624,6 @@ unsafe extern "C-unwind" {
         out_cache_idx: *mut i32,            // Updated write position
     );
 
-    // Batched forward step - true batch generation with array RoPE offsets
-    // Enables parallel batch generation with left-padded variable-length sequences
-    pub fn mlx_qwen3_forward_step_batched(
-        // Input
-        input_ids: *mut mlx_array, // [batch, seq_len]
-        // Model weights
-        embedding_weight: *mut mlx_array,     // [vocab, hidden]
-        layer_weights: *const *mut mlx_array, // [num_layers * 11]
-        num_layers: i32,
-        final_norm_weight: *mut mlx_array, // [hidden]
-        lm_head_weight: *mut mlx_array,    // null if tied
-        tie_word_embeddings: bool,
-        // Model config
-        hidden_size: i32,
-        num_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        rope_theta: f32,
-        norm_eps: f32,
-        // Batched RoPE offsets (key difference from scalar version)
-        rope_offsets: *mut mlx_array, // [batch] - per-sequence offsets
-        // Left padding info for attention mask
-        left_padding: *mut mlx_array, // [batch] - left padding amounts
-        // KV cache inputs (shared across batch, indexed by cache_idx)
-        kv_keys_in: *const *mut mlx_array,   // [num_layers] or null
-        kv_values_in: *const *mut mlx_array, // [num_layers] or null
-        cache_idx_in: i32,                   // Current write position (shared)
-        // Outputs
-        out_logits: *mut *mut mlx_array,    // [batch, seq_len, vocab]
-        out_kv_keys: *mut *mut mlx_array,   // [num_layers]
-        out_kv_values: *mut *mut mlx_array, // [num_layers]
-        out_cache_idx: *mut i32,            // Updated write position
-    );
 }
 
 // ============================================================================
@@ -1926,52 +1732,6 @@ unsafe extern "C-unwind" {
     /// `mlx_clear_weights()` before/after to avoid contaminating other
     /// model state.
     pub fn mlx_qwen35_moe_trace_paged_attn_helper() -> i32;
-
-    // ============================================
-    // Gemma4 Forward Pass (compiled)
-    // ============================================
-
-    /// Initialize Gemma4 forward pass from post-prefill caches.
-    pub fn mlx_gemma4_init_from_prefill(
-        num_layers: i32,
-        hidden_size: i32,
-        num_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        global_num_kv_heads: i32,
-        global_head_dim: i32,
-        rope_theta: f32,
-        rope_local_base_freq: f32,
-        partial_rotary_factor: f32,
-        rms_norm_eps: f32,
-        sliding_window: i32,
-        tie_word_embeddings: i32,
-        max_kv_len: i32,
-        batch_size: i32,
-        num_experts: i32,
-        top_k_experts: i32,
-        moe_intermediate_size: i32,
-        intermediate_size: i32,
-        final_logit_softcapping: f32,
-        layer_types: *const i32,
-        layer_types_len: i32,
-        cache_arrays: *mut *mut mlx_array,
-        prefill_offset: i32,
-    );
-
-    /// Gemma4 single-token decode step.
-    pub fn mlx_gemma4_forward(
-        input_ids: *mut mlx_array,
-        embedding_weight: *mut mlx_array,
-        output_logits: *mut *mut mlx_array,
-        cache_offset_out: *mut i32,
-    );
-
-    /// Eval next_token and all Gemma4 cache arrays to prevent graph accumulation.
-    pub fn mlx_gemma4_eval_token_and_caches(next_token: *mut mlx_array);
-
-    /// Reset Gemma4 state.
-    pub fn mlx_gemma4_reset();
 
     /// Load safetensors file using MLX's lazy loading (data read on eval, not upfront).
     /// Calls `callback` for each tensor with (name, name_len, array_handle, ctx).

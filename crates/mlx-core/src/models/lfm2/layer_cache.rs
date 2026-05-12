@@ -22,25 +22,6 @@ impl Lfm2LayerCache {
         Lfm2LayerCache::Attention(KVCache::new())
     }
 
-    /// Reset the cache.
-    pub fn reset(&mut self) {
-        match self {
-            Lfm2LayerCache::Conv(c) => c.reset(),
-            Lfm2LayerCache::Attention(c) => c.reset(),
-        }
-    }
-
-    /// Get the current offset.
-    ///
-    /// For attention layers: returns the number of cached tokens (KV offset).
-    /// For conv layers: returns 0 (conv state doesn't track position).
-    pub fn get_offset(&self) -> i32 {
-        match self {
-            Lfm2LayerCache::Conv(_) => 0,
-            Lfm2LayerCache::Attention(c) => c.get_offset(),
-        }
-    }
-
     /// Collect cache arrays for eval.
     ///
     /// Gathers references to all internal arrays so they can be
@@ -85,32 +66,6 @@ impl Lfm2LayerCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_conv_cache_offset() {
-        let cache = Lfm2LayerCache::new_conv();
-        assert_eq!(cache.get_offset(), 0);
-    }
-
-    #[test]
-    fn test_attention_cache_offset() {
-        let cache = Lfm2LayerCache::new_attention();
-        assert_eq!(cache.get_offset(), 0);
-    }
-
-    #[test]
-    fn test_conv_cache_reset() {
-        let mut cache = Lfm2LayerCache::new_conv();
-        cache.reset();
-        assert_eq!(cache.get_offset(), 0);
-    }
-
-    #[test]
-    fn test_attention_cache_reset() {
-        let mut cache = Lfm2LayerCache::new_attention();
-        cache.reset();
-        assert_eq!(cache.get_offset(), 0);
-    }
 
     #[test]
     fn test_as_kv_cache_mut_attention() {

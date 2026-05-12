@@ -10,10 +10,8 @@ mod config;
 mod generation;
 mod model;
 pub mod persistence;
-mod speculative;
 
 // Public re-exports
 pub use config::*;
 pub use generation::*;
 pub use model::*;
-pub use speculative::*;

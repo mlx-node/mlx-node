@@ -41,7 +41,7 @@ use super::model::{ChatConfig, ChatResult, ChatStreamChunk};
 pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESSION_RESTART:";
 
 /// Hash raw image bytes to a u64 key for cache lookup.
-pub(crate) fn hash_image_bytes(bytes: &[u8]) -> u64 {
+fn hash_image_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
@@ -49,7 +49,7 @@ pub(crate) fn hash_image_bytes(bytes: &[u8]) -> u64 {
 
 /// Combine individual image hashes into a single cache key.
 /// Order matters: different orderings of the same images produce different keys.
-pub(crate) fn combine_image_hashes(hashes: &[u64]) -> u64 {
+fn combine_image_hashes(hashes: &[u64]) -> u64 {
     let mut hasher = DefaultHasher::new();
     for h in hashes {
         h.hash(&mut hasher);
@@ -924,6 +924,63 @@ macro_rules! decode_loop {
 }
 
 pub(crate) use decode_loop;
+
+/// Policy decision for the C++ compiled paged forward fallback.
+///
+/// Inputs:
+/// * `compiled_step_completed` — whether ANY compiled C++ paged step
+///   has succeeded earlier in this turn.
+///
+/// Output:
+/// * `true` — propagate the forward error as fatal. Returned when a
+///   compiled step has previously succeeded; the C++ side has advanced
+///   its per-layer GDN linear-cache globals (conv_state /
+///   recurrent_state) but those updates are never imported back into
+///   `self.caches`. Falling back to the pure-Rust paged decode after
+///   that point would read stale pre-step state and silently corrupt
+///   the response.
+/// * `false` — safe to fall back to the pure-Rust paged decode.
+///   Returned when no compiled step has succeeded yet; the only failure
+///   mode at that point is an init/configuration mismatch caught at
+///   first dispatch, which leaves `self.caches` consistent with
+///   `paged_adapter` after a `rollback_last_tokens(1)`.
+///
+/// This mirrors the policy applied identically in the dense and MoE
+/// sync + streaming decode loops; extracting it as a stand-alone helper
+/// keeps the tests in lockstep.
+#[inline]
+pub(crate) fn should_propagate_compiled_paged_error(compiled_step_completed: bool) -> bool {
+    compiled_step_completed
+}
+
+#[cfg(test)]
+mod compiled_paged_fallback_policy_tests {
+    use super::should_propagate_compiled_paged_error;
+
+    /// Regression test for review Finding 1 (HIGH): mid-turn fallback
+    /// after a successful compiled step would corrupt the GDN linear
+    /// cache state. The policy must propagate the error as fatal once
+    /// any compiled step has completed; only the first-step failure is
+    /// safe to fall back to pure-Rust decode.
+    #[test]
+    fn no_compiled_step_yet_allows_fallback() {
+        assert!(
+            !should_propagate_compiled_paged_error(false),
+            "first-step compiled forward failure must allow fallback to pure-Rust paged decode \
+             (self.caches is still consistent with paged_adapter pre-rollback)"
+        );
+    }
+
+    #[test]
+    fn after_successful_compiled_step_propagates_as_fatal() {
+        assert!(
+            should_propagate_compiled_paged_error(true),
+            "compiled forward failure AFTER a successful compiled step must propagate as fatal: \
+             the C++ GDN linear-cache globals advanced but self.caches is stale, so a pure-Rust \
+             fallback would silently corrupt the response"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

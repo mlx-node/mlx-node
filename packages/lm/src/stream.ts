@@ -68,11 +68,7 @@ const modelPathsForTokenizers = new WeakMap<object, string>();
 const tokenizerPromises = new WeakMap<object, Promise<Qwen3Tokenizer>>();
 
 function getNativeIsReasoning(chunk: ChatStreamChunk): boolean | undefined {
-  if (typeof chunk.isReasoning === 'boolean') {
-    return chunk.isReasoning;
-  }
-  const snakeCaseChunk = chunk as ChatStreamChunk & { is_reasoning?: unknown };
-  return typeof snakeCaseChunk.is_reasoning === 'boolean' ? snakeCaseChunk.is_reasoning : undefined;
+  return typeof chunk.isReasoning === 'boolean' ? chunk.isReasoning : undefined;
 }
 
 function rememberModelPath(model: object, modelPath: string): void {
@@ -99,15 +95,7 @@ async function applyChatTemplateFromModelPath(
   return tokenizer.applyChatTemplate(messages, addGenerationPrompt, tools, enableThinking);
 }
 
-// Save references to the native callback-based session streaming methods
-// before we override them. The legacy `chatStream` surface was removed in
-// the chat-session refactor; the remaining session entry points below
-// drive all streaming via the `ChatSession` API.
-//
-// Each wrapper class re-declares these three methods as
-// `AsyncGenerator<ChatStreamEvent>` overrides that delegate through the
-// shared `_runChatStream` bridge, so the wrapper structurally satisfies
-// `SessionCapableModel` and can be passed to `ChatSession<M>`.
+// Capture native callback-based session-streaming methods before subclass overrides shadow them.
 
 // Dense
 // oxlint-disable-next-line @typescript-eslint/unbound-method
@@ -141,7 +129,7 @@ const _nativeGemma4ChatStreamSessionContinue = Gemma4ModelNative.prototype.chatS
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeGemma4ChatStreamSessionContinueTool = Gemma4ModelNative.prototype.chatStreamSessionContinueTool;
 
-// Qwen3 (legacy, text-only)
+// Qwen3 (first-gen, text-only)
 // oxlint-disable-next-line @typescript-eslint/unbound-method
 const _nativeQwen3ChatStreamSessionStart = Qwen3ModelNative.prototype.chatStreamSessionStart;
 // oxlint-disable-next-line @typescript-eslint/unbound-method
@@ -641,7 +629,7 @@ export class Gemma4Model extends Gemma4ModelNative {
 }
 
 /**
- * Qwen3 (legacy) model wrapper.
+ * Qwen3 (first-gen) model wrapper.
  *
  * Streaming is driven through the `ChatSession` API — overrides below
  * adapt the callback-based native methods to

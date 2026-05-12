@@ -221,32 +221,28 @@ impl Lfm2Inner {
         // Initialize caches
         let caches = init_caches(&config);
 
-        // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
+        // Block-paged KV adapter — default ON since 2026-04-28.
         //
-        // Construction-only plumbing. The chat dispatch is NOT yet wired
-        // through this adapter — see the doc comment on
-        // `Lfm2Inner::paged_adapter` for the architectural rationale
-        // (hybrid conv + attention requires a bespoke per-layer dispatch
-        // and an attention-ordinal-indexed cache wrapper). We still
-        // allocate here so:
-        // 1. The construction surface (config flag + JSON parsing +
-        //    NAPI-typed field) is testable in isolation.
-        // 2. A follow-up commit can light up the forward path without
-        //    re-churning every persistence/test/example file.
+        // Chat dispatch is wired through this adapter at every chat-entry
+        // site (see the `self.paged_adapter.is_some()` early-returns in
+        // `chat_sync_core` / `chat_stream_sync_core` that hand off to
+        // `chat_sync_core_paged` / `chat_stream_sync_core_paged`).
         //
         // KV-pool sizing: ONLY full_attention layers participate. LFM2's
         // hybrid layer mix is parsed from `config.layer_types`; conv
-        // layers don't consume KV slots. The pool's `num_layers` is
-        // therefore the count of `full_attention` entries, NOT the
-        // absolute `num_hidden_layers`. A future paged-aware forward
-        // path will index this pool by attention-ordinal, mapping
-        // absolute layer index → ordinal via `config.full_attn_idxs()`.
+        // layers don't consume KV slots and continue to use the flat
+        // `Lfm2LayerCache::Conv(ArraysCache)` storage on the paged path
+        // too. The pool's `num_layers` is therefore the count of
+        // `full_attention` entries, NOT the absolute `num_hidden_layers`;
+        // the paged forward indexes this pool by attention-ordinal,
+        // mapping absolute layer index → ordinal via
+        // `config.full_attn_idxs()`.
         //
-        // Cache dtype: BFloat16 (LFM2's production dtype).
-        // Default to ON: paged-vs-flat parity verified via
-        // `lfm2_paged_vs_flat_parity` integration test (greedy byte-equal +
-        // prefix-reuse byte-equal at BF16 against real LFM2.5-1.2B weights).
-        // Callers can still opt out with `use_block_paged_cache: Some(false)`.
+        // Cache dtype: BFloat16 (LFM2's production dtype). Parity
+        // verified via `lfm2_paged_vs_flat_parity` integration test
+        // (greedy byte-equal + prefix-reuse byte-equal at BF16 against
+        // real LFM2.5-1.2B weights). Callers can opt out with
+        // `use_block_paged_cache: Some(false)`.
         let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
             let attn_layer_count = config.full_attn_idxs().len() as u32;
             if attn_layer_count == 0 {
@@ -3348,90 +3344,6 @@ impl Lfm2Model {
         }
 
         total
-    }
-}
-
-#[cfg(test)]
-mod prefix_cache_reuse_integration_tests {
-    //! End-to-end tests for the prefix KV cache reuse refactor on LFM2.
-    //! These verify that `chat_session_start_sync` no longer unconditionally
-    //! wipes the cache — stateless agent clients that resend the full
-    //! transcript on every turn should hit the `verify_cache_prefix`
-    //! exact-append path and skip redundant prefill work.
-    //!
-    //! The LFM2 variant additionally locks in the exact-match policy:
-    //! when the new prompt equals the cached one (`cached_prefix_len ==
-    //! tokens.len()`), we fall through to the miss branch and do a full
-    //! reset + re-prefill. LFM2's short-conv layers carry non-invertible
-    //! left-padded state, so there is no safe "rewind-by-1" primitive;
-    //! reprefilling the last cached token on top of the live caches would
-    //! advance state to `prompt + last_token` (duplicated) while
-    //! `save_cache_state` writes only `tokens`, corrupting the next warm
-    //! turn.
-    //!
-    //! These tests are `#[ignore]`-marked because they require loading a
-    //! real LFM2 model file and a tokenizer. Run them with:
-    //!
-    //!     cargo test -p mlx-core --test '*' -- --ignored prefix_cache_reuse_integration
-    //!
-    //! with `MLX_NODE_LFM2_MODEL_DIR` set to a local LFM2 model dir.
-
-    /// Append hit: two back-to-back session-start calls where the second
-    /// extends the first by exactly one user turn. Must report
-    /// `cached_tokens > 0` and only prefill the delta.
-    #[ignore = "requires a real LFM2 model directory; run with --ignored"]
-    #[test]
-    fn append_hit_reuses_cached_prefix() {
-        // Pseudocode:
-        //
-        //   let p = vec![ChatMessage::user("Hi")];
-        //   let r1 = model.chat_session_start_sync(p.clone(), cfg())?;
-        //   let mut p2 = p.clone();
-        //   p2.push(ChatMessage::assistant(&r1.text));
-        //   p2.push(ChatMessage::user("Follow-up"));
-        //   let r2 = model.chat_session_start_sync(p2, cfg())?;
-        //   assert!(r2.cached_tokens > 0);
-    }
-
-    /// Divergence miss: second call's history is unrelated. Must report
-    /// `cached_tokens == 0` and do a full-history prefill.
-    #[ignore = "requires a real LFM2 model directory; run with --ignored"]
-    #[test]
-    fn divergence_miss_resets_and_full_prefills() {
-        // Pseudocode:
-        //
-        //   let p1 = vec![ChatMessage::user("Ping")];
-        //   let p2 = vec![ChatMessage::user("Totally unrelated")];
-        //   let _ = model.chat_session_start_sync(p1, cfg())?;
-        //   let r2 = model.chat_session_start_sync(p2, cfg())?;
-        //   assert_eq!(r2.cached_tokens, 0);
-    }
-
-    /// Exact-match: the new prompt is byte-equal to the cached one.
-    /// With the exact-match-as-miss fix, the second call must report
-    /// `cached_tokens == 0` (full reset + full re-prefill). A subsequent
-    /// strict-extension must then hit the warm path with
-    /// `cached_tokens == len(P)`.
-    #[ignore = "requires a real LFM2 model directory; run with --ignored"]
-    #[test]
-    fn exact_match_falls_through_to_cache_miss() {
-        // Pseudocode:
-        //
-        //   let p = vec![ChatMessage::user("Ping")];
-        //   let _ = model.chat_session_start_sync(p.clone(), cfg())?;
-        //   let r2 = model.chat_session_start_sync(p.clone(), cfg())?;
-        //   assert_eq!(r2.cached_tokens, 0); // miss, not exact-match reuse
-        //
-        //   // After the miss, the caches represent `p` cleanly. A strict
-        //   // extension should warm-hit against that fresh state.
-        //   let prompt_token_count_p = r2.prompt_token_count;
-        //   let mut p3 = p.clone();
-        //   p3.push(ChatMessage::assistant(&r2.text));
-        //   p3.push(ChatMessage::user("Follow-up"));
-        //   let r3 = model.chat_session_start_sync(p3, cfg())?;
-        //   // cached_tokens reflects the persisted history (prompt + r2
-        //   // response), so it must be >= prompt_token_count_p.
-        //   assert!(r3.cached_tokens >= prompt_token_count_p);
     }
 }
 

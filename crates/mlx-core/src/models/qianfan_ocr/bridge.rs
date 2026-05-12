@@ -33,7 +33,7 @@ use crate::models::pp_doclayout_v3::persistence::get_tensor;
 ///
 /// Input:  `[B, seq_len, hidden_size]` where `seq_len = H*W` (e.g. 1024 = 32x32)
 /// Output: `[B, new_h * new_w, new_c]` where spatial dims are halved and channels 4x
-pub fn pixel_shuffle_v2(x: &MxArray, scale_factor: f64) -> Result<MxArray> {
+fn pixel_shuffle_v2(x: &MxArray, scale_factor: f64) -> Result<MxArray> {
     let shape = x.shape()?;
     let n = shape[0];
     let seq_len = shape[1];

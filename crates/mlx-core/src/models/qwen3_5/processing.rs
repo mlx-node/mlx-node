@@ -12,7 +12,7 @@ use image::{DynamicImage, GenericImageView, RgbImage};
 use napi::bindgen_prelude::*;
 
 /// Qwen3.5-VL image processor configuration
-pub fn qwen35_vl_processor_config() -> ImageProcessorConfig {
+fn qwen35_vl_processor_config() -> ImageProcessorConfig {
     ImageProcessorConfig {
         min_pixels: 147384,
         max_pixels: 2822400,
@@ -43,7 +43,7 @@ impl Qwen35VLImageProcessor {
     }
 
     /// Get the resize factor (patch_size * merge_size)
-    pub fn resize_factor(&self) -> i32 {
+    fn resize_factor(&self) -> i32 {
         self.config.patch_size * self.config.merge_size
     }
 

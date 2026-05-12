@@ -307,24 +307,6 @@ impl BlockAllocator {
         }
     }
 
-    /// Perform copy-on-write for a shared block
-    ///
-    /// If the block is shared (ref_count > 1), allocates a new block
-    /// and returns it. Otherwise returns None (no copy needed).
-    pub fn copy_on_write(&mut self, block: &Arc<PhysicalBlock>) -> Option<Arc<PhysicalBlock>> {
-        if !block.is_shared() {
-            return None;
-        }
-
-        // Allocate new block
-        let new_block = self.allocate()?;
-
-        // Decrement old block's ref count
-        block.decref();
-
-        Some(new_block)
-    }
-
     /// Register a block in the prefix cache
     ///
     /// The block will be reused when a sequence has matching prefix tokens.
@@ -408,7 +390,7 @@ impl BlockAllocator {
     /// means subsequent block hashes would link to ghost predecessors,
     /// producing a future `find_longest_cache_hit` return that mixes
     /// blocks across registration intents (silent KV corruption).
-    pub fn register_prefix(&mut self, block: Arc<PhysicalBlock>, hash: u64) -> bool {
+    pub(crate) fn register_prefix(&mut self, block: Arc<PhysicalBlock>, hash: u64) -> bool {
         // If prefix caching is disabled (max_prefix_cache_entries == 0), do nothing
         if self.max_prefix_cache_entries == 0 {
             return false;
@@ -516,7 +498,7 @@ impl BlockAllocator {
     /// Look up a block in the prefix cache
     ///
     /// Returns the cached block if found, incrementing its ref count
-    pub fn lookup_prefix(&mut self, hash: u64) -> Option<Arc<PhysicalBlock>> {
+    pub(crate) fn lookup_prefix(&mut self, hash: u64) -> Option<Arc<PhysicalBlock>> {
         if let Some(block) = self.prefix_cache.get(&hash) {
             // Update LRU order
             self.lru_order.retain(|&h| h != hash);
@@ -985,11 +967,6 @@ impl BlockAllocator {
     pub fn set_max_prefix_cache_entries(&mut self, max_entries: usize) {
         self.max_prefix_cache_entries = max_entries;
     }
-
-    /// Get the current prefix-cache capacity ceiling.
-    pub fn max_prefix_cache_entries(&self) -> usize {
-        self.max_prefix_cache_entries
-    }
 }
 
 /// Hash function for token sequences (for prefix caching).
@@ -1119,30 +1096,6 @@ mod tests {
         // Second free returns to pool
         allocator.free(block2);
         assert_eq!(allocator.num_free_blocks(), 10);
-    }
-
-    #[test]
-    fn test_copy_on_write() {
-        let mut allocator = BlockAllocator::new(10, 32);
-
-        let block = allocator.allocate().unwrap();
-
-        // No copy needed when not shared
-        assert!(allocator.copy_on_write(&block).is_none());
-
-        // Share the block (like for beam search)
-        block.incref();
-        let block2 = Arc::clone(&block);
-
-        // Now copy-on-write should allocate new block
-        let new_block = allocator.copy_on_write(&block).unwrap();
-        assert_ne!(new_block.block_id, block.block_id);
-        assert_eq!(block.get_ref_count(), 1); // Decremented by copy_on_write
-        assert_eq!(new_block.get_ref_count(), 1);
-
-        // Clean up
-        allocator.free(block2);
-        allocator.free(new_block);
     }
 
     #[test]

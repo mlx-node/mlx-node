@@ -184,8 +184,13 @@ impl Qwen3_5Attention {
             // Transpose to [B, H, T, D] for apply_multimodal_rotary_pos_emb
             let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
             let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let (q_out, k_out) =
-                apply_multimodal_rotary_pos_emb(&q_t, &k_t, &cos, &sin, mrope.mrope_section())?;
+            let (q_out, k_out) = apply_multimodal_rotary_pos_emb(
+                &q_t,
+                &k_t,
+                &cos,
+                &sin,
+                mrope.mrope_section_arr().to_vec(),
+            )?;
             // Transpose back to [B, T, H, D]
             let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
             let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;

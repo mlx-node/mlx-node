@@ -841,14 +841,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         handle_qwen35_cmd,
     );
 
-    let (config, model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) = init_rx
-        .await
-        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+    let (config, _model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) =
+        init_rx
+            .await
+            .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
     Ok(Qwen3_5Model {
         thread,
         config,
-        model_id,
         paged_active,
         _cache_limit_guard: cache_limit_guard,
     })
@@ -1036,13 +1036,6 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
             .map(|v| v as u32),
         use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
     })
-}
-
-/// Check if weights contain vision encoder tensors.
-pub fn has_vision_weights(params: &HashMap<String, MxArray>) -> bool {
-    params
-        .keys()
-        .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."))
 }
 
 /// Parse vision config from JSON.

@@ -36,10 +36,6 @@ impl KVCachePhysicalLayout {
     pub fn is_valid(&self) -> bool {
         self.block_size > 0 && self.num_kv_heads > 0 && self.head_size > 0
     }
-
-    pub fn is_compatible_with(&self, other: &Self) -> bool {
-        self == other
-    }
 }
 
 /// Attention behavior that determines KV admission pressure.
@@ -150,9 +146,8 @@ impl LayerKVCacheSpec {
         self.shared_kv_anchor.unwrap_or(self.layer_index)
     }
 
-    pub fn is_physical_layout_compatible_with(&self, other: &Self) -> bool {
-        self.physical_layout
-            .is_compatible_with(&other.physical_layout)
+    fn is_physical_layout_compatible_with(&self, other: &Self) -> bool {
+        self.physical_layout == other.physical_layout
     }
 
     pub fn max_admission_blocks(
@@ -196,30 +191,6 @@ pub struct LayerKVCacheRoute {
     pub physical_layer_index: usize,
     pub physical_layer_ordinal: usize,
     pub shared_kv_anchor: Option<usize>,
-}
-
-impl LayerKVCacheRoute {
-    pub fn is_shared(&self) -> bool {
-        self.shared_kv_anchor.is_some()
-    }
-
-    pub fn is_full_attention(&self) -> bool {
-        matches!(self.attention_kind, AttentionKind::Full)
-    }
-
-    pub fn sliding_window(&self) -> Option<u32> {
-        match self.attention_kind {
-            AttentionKind::Full => None,
-            AttentionKind::SlidingWindow { sliding_window } => Some(sliding_window),
-        }
-    }
-}
-
-/// Per-group prefix cache hit used by hybrid cache coordinators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KVCacheGroupPrefixHit {
-    pub group_id: usize,
-    pub cached_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,7 +343,7 @@ pub fn derive_layer_kv_cache_routes(
     derive_layer_kv_cache_routes_from_groups(specs, &groups)
 }
 
-pub fn derive_layer_kv_cache_routes_from_groups(
+pub(crate) fn derive_layer_kv_cache_routes_from_groups(
     specs: &[LayerKVCacheSpec],
     groups: &[KVCacheGroup],
 ) -> Result<Vec<LayerKVCacheRoute>, KVCacheSpecError> {
@@ -420,48 +391,6 @@ pub fn derive_layer_kv_cache_routes_from_groups(
     }
 
     Ok(routes.into_values().collect())
-}
-
-pub fn common_kv_cache_block_alignment(groups: &[KVCacheGroup]) -> u32 {
-    groups
-        .iter()
-        .map(|group| group.physical_layout.block_size)
-        .filter(|block_size| *block_size > 0)
-        .fold(1, lcm_u32)
-}
-
-pub fn align_prefix_len_to_kv_cache_groups(prefix_len: u32, groups: &[KVCacheGroup]) -> u32 {
-    let alignment = common_kv_cache_block_alignment(groups);
-    if alignment == 0 {
-        return prefix_len;
-    }
-    prefix_len / alignment * alignment
-}
-
-/// Intersect per-group prefix hits using vLLM's hybrid-cache rule: every
-/// active group must accept the prefix, then the result is aligned to a block
-/// boundary that is valid for every group.
-pub fn intersect_kv_cache_group_prefix_hits(
-    groups: &[KVCacheGroup],
-    hits: &[KVCacheGroupPrefixHit],
-) -> u32 {
-    if groups.is_empty() || hits.is_empty() {
-        return 0;
-    }
-
-    let by_group: BTreeMap<usize, u32> = hits
-        .iter()
-        .map(|hit| (hit.group_id, hit.cached_tokens))
-        .collect();
-    let mut candidate = u32::MAX;
-    for group in groups {
-        let Some(hit) = by_group.get(&group.group_id) else {
-            return 0;
-        };
-        candidate = candidate.min(*hit);
-    }
-
-    align_prefix_len_to_kv_cache_groups(candidate, groups)
 }
 
 pub fn validate_layer_kv_cache_specs(specs: &[LayerKVCacheSpec]) -> Result<(), KVCacheSpecError> {
@@ -513,22 +442,6 @@ fn div_ceil(n: u32, d: u32) -> u32 {
     if n == 0 { 0 } else { 1 + (n - 1) / d }
 }
 
-fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
-    while b != 0 {
-        let rem = a % b;
-        a = b;
-        b = rem;
-    }
-    a
-}
-
-fn lcm_u32(a: u32, b: u32) -> u32 {
-    if a == 0 || b == 0 {
-        return 0;
-    }
-    a / gcd_u32(a, b) * b
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,8 +456,8 @@ mod tests {
         let b = layout(16);
         let c = KVCachePhysicalLayout::new(32, 4, 128, KVCacheDType::BFloat16);
 
-        assert!(a.is_compatible_with(&b));
-        assert!(!a.is_compatible_with(&c));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]
@@ -641,48 +554,6 @@ mod tests {
         assert_eq!(routes[5].shared_kv_anchor, Some(3));
         assert_eq!(routes[5].physical_layer_index, 3);
         assert_eq!(routes[5].physical_layer_ordinal, 1);
-    }
-
-    #[test]
-    fn hybrid_prefix_hits_intersect_and_align_to_common_block() {
-        let specs = vec![
-            LayerKVCacheSpec::full(0, layout(16)),
-            LayerKVCacheSpec::sliding_window(
-                1,
-                128,
-                KVCachePhysicalLayout::new(32, 4, 128, KVCacheDType::BFloat16),
-            ),
-        ];
-        let groups = group_layer_kv_cache_specs(&specs, 4096, 512).unwrap();
-
-        assert_eq!(common_kv_cache_block_alignment(&groups), 32);
-        assert_eq!(
-            intersect_kv_cache_group_prefix_hits(
-                &groups,
-                &[
-                    KVCacheGroupPrefixHit {
-                        group_id: groups[0].group_id,
-                        cached_tokens: 160,
-                    },
-                    KVCacheGroupPrefixHit {
-                        group_id: groups[1].group_id,
-                        cached_tokens: 96,
-                    },
-                ],
-            ),
-            96
-        );
-        assert_eq!(
-            intersect_kv_cache_group_prefix_hits(
-                &groups,
-                &[KVCacheGroupPrefixHit {
-                    group_id: groups[0].group_id,
-                    cached_tokens: 160,
-                }],
-            ),
-            0,
-            "missing a group hit means the hybrid prefix cannot be reused"
-        );
     }
 
     #[test]

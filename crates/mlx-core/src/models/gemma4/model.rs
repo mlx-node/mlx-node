@@ -417,10 +417,6 @@ pub struct Gemma4Model {
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Serializes compiled C++ forward calls across model instances.
-/// Only matters if two Gemma4 models are loaded simultaneously (rare).
-static COMPILED_FORWARD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Classification of the prefix-cache decision made from a
 /// [`Gemma4Inner::verify_cache_prefix`] return value plus the incoming
 /// token count.
@@ -1985,127 +1981,18 @@ impl Gemma4Inner {
         // 2. async_eval the output token (caches materialize through dependency graph)
         // 3. Double-buffer: build step N+1 while GPU executes step N
         //
-        // Set GEMMA4_USE_COMPILE=1 to use the old compiled C++ path for A/B testing.
+        // Double-buffered: build step N+1's graph while GPU executes step N.
+        // Cache mutations (slice_assign_axis_inplace) are lazy side effects
+        // in the computation graph — evaluating the token implicitly
+        // materializes caches (no explicit cache eval needed during decode).
+        //
+        // Pattern from mlx-lm generate.py:
+        //   mx.async_eval(next_y)   # fire and forget
+        //   if n == 0: mx.eval(y)   # sync only for TTFT
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = "length".to_string();
 
-        let use_compiled = std::env::var("GEMMA4_USE_COMPILE").is_ok()
-            && self.config.num_kv_shared_layers.is_none_or(|n| n <= 0)
-            && unsafe { mlx_sys::mlx_qwen35_get_model_id() } == self.model_id;
-
-        if use_compiled {
-            // Legacy compiled C++ path (opt-in via GEMMA4_USE_COMPILE=1)
-            let _compiled_guard = COMPILED_FORWARD_MUTEX.lock().unwrap();
-            let caches_ref = self
-                .caches
-                .as_ref()
-                .expect("caches populated by init_caches_sync above");
-            let mut cache_arrays_owned: Vec<MxArray> = Vec::with_capacity(caches_ref.len() * 2);
-            for (layer_idx, cache) in caches_ref.iter().enumerate() {
-                let (k, v) = cache.get_cached_kv().ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Compiled Gemma4 decode expected cache for layer {} after prefill",
-                        layer_idx
-                    ))
-                })?;
-                cache_arrays_owned.push(k);
-                cache_arrays_owned.push(v);
-            }
-            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
-                cache_arrays_owned.iter().map(|a| a.as_raw_ptr()).collect();
-
-            let layer_types_i32: Vec<i32> = (0..self.config.num_hidden_layers as usize)
-                .map(|i| if self.config.is_global_layer(i) { 1 } else { 0 })
-                .collect();
-
-            let max_kv_len =
-                (tokens.len() as i32 + max_new_tokens).min(self.config.max_position_embeddings);
-
-            unsafe {
-                mlx_sys::mlx_gemma4_init_from_prefill(
-                    self.config.num_hidden_layers,
-                    self.config.hidden_size,
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
-                    self.config.effective_kv_heads(true),
-                    self.config.effective_head_dim(true),
-                    self.config.rope_theta as f32,
-                    self.config.rope_local_base_freq as f32,
-                    self.config.partial_rotary_factor as f32,
-                    self.config.rms_norm_eps as f32,
-                    self.config.sliding_window,
-                    if self.config.tie_word_embeddings {
-                        1
-                    } else {
-                        0
-                    },
-                    max_kv_len,
-                    1,
-                    self.config.num_experts.unwrap_or(0),
-                    self.config.top_k_experts.unwrap_or(0),
-                    self.config.moe_intermediate_size.unwrap_or(0),
-                    self.config.intermediate_size,
-                    self.config.final_logit_softcapping.unwrap_or(0.0) as f32,
-                    layer_types_i32.as_ptr(),
-                    layer_types_i32.len() as i32,
-                    cache_ptrs.as_mut_ptr(),
-                    tokens.len() as i32,
-                );
-            }
-
-            let embed_weight = self.embed_tokens.get_weight();
-            let mut current_y = y;
-            for step in 0..max_new_tokens {
-                let next_y = if step + 1 < max_new_tokens {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let next_ids = current_y.reshape(&[1, 1])?;
-                    let logits = forward_gemma4_cpp(&next_ids, &embed_weight)?;
-                    let next_token = sample_next_token(&logits, sampling_config)?;
-                    eval_token_and_gemma4_caches(&next_token);
-                    Some(next_token)
-                } else {
-                    None
-                };
-
-                // See `chat_sync_core_paged_inner` for the rationale.
-                current_y.eval();
-                let token_id = current_y.item_at_int32(0)? as u32;
-                generated_tokens.push(token_id);
-
-                if is_eos_token(token_id, &eos_ids, eos_token_id) {
-                    finish_reason = "stop".to_string();
-                    break;
-                }
-                if let Some(reason) =
-                    check_gemma4_repetition_cutoff(&generated_tokens, repetition_cutoff)
-                {
-                    finish_reason = reason.to_string();
-                    break;
-                }
-                if let Some(next_token) = next_y {
-                    current_y = next_token;
-                } else {
-                    break;
-                }
-                if (step + 1) % 256 == 0 {
-                    crate::array::synchronize_and_clear_cache();
-                }
-            }
-            unsafe {
-                mlx_sys::mlx_gemma4_reset();
-            }
-        } else {
-            // Default: lazy eval decode (matches mlx-lm pattern)
-            //
-            // Double-buffered: build step N+1's graph while GPU executes step N.
-            // Cache mutations (slice_assign_axis_inplace) are lazy side effects
-            // in the computation graph — evaluating the token implicitly
-            // materializes caches (no explicit cache eval needed during decode).
-            //
-            // Pattern from mlx-lm generate.py:
-            //   mx.async_eval(next_y)   # fire and forget
-            //   if n == 0: mx.eval(y)   # sync only for TTFT
+        {
             let mut current_y = y;
             for step in 0..max_new_tokens {
                 let next_y = if step + 1 < max_new_tokens {
@@ -2539,10 +2426,6 @@ impl Gemma4Inner {
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = "length".to_string();
 
-        let use_compiled = std::env::var("GEMMA4_USE_COMPILE").is_ok()
-            && self.config.num_kv_shared_layers.is_none_or(|n| n <= 0)
-            && unsafe { mlx_sys::mlx_qwen35_get_model_id() } == self.model_id;
-
         // `decode_stream(false)` preserves Gemma4 special tokens
         // (`<|channel>`, `<|tool_call>`, …) in the streamed text so the
         // stream parser can see them. The final `decode_sync(…, false)`
@@ -2552,127 +2435,7 @@ impl Gemma4Inner {
         let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
         let mut stream_dispatch = Gemma4StreamDispatchState::default();
 
-        if use_compiled {
-            let _compiled_guard = COMPILED_FORWARD_MUTEX.lock().unwrap();
-            let caches_ref = self
-                .caches
-                .as_ref()
-                .expect("caches populated by init_caches_sync above");
-            let mut cache_arrays_owned: Vec<MxArray> = Vec::with_capacity(caches_ref.len() * 2);
-            for (layer_idx, cache) in caches_ref.iter().enumerate() {
-                let (k, v) = cache.get_cached_kv().ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Compiled Gemma4 decode expected cache for layer {}",
-                        layer_idx
-                    ))
-                })?;
-                cache_arrays_owned.push(k);
-                cache_arrays_owned.push(v);
-            }
-            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
-                cache_arrays_owned.iter().map(|a| a.as_raw_ptr()).collect();
-            let layer_types_i32: Vec<i32> = (0..self.config.num_hidden_layers as usize)
-                .map(|i| if self.config.is_global_layer(i) { 1 } else { 0 })
-                .collect();
-            let max_kv_len =
-                (tokens.len() as i32 + max_new_tokens).min(self.config.max_position_embeddings);
-
-            unsafe {
-                mlx_sys::mlx_gemma4_init_from_prefill(
-                    self.config.num_hidden_layers,
-                    self.config.hidden_size,
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
-                    self.config.effective_kv_heads(true),
-                    self.config.effective_head_dim(true),
-                    self.config.rope_theta as f32,
-                    self.config.rope_local_base_freq as f32,
-                    self.config.partial_rotary_factor as f32,
-                    self.config.rms_norm_eps as f32,
-                    self.config.sliding_window,
-                    if self.config.tie_word_embeddings {
-                        1
-                    } else {
-                        0
-                    },
-                    max_kv_len,
-                    1,
-                    self.config.num_experts.unwrap_or(0),
-                    self.config.top_k_experts.unwrap_or(0),
-                    self.config.moe_intermediate_size.unwrap_or(0),
-                    self.config.intermediate_size,
-                    self.config.final_logit_softcapping.unwrap_or(0.0) as f32,
-                    layer_types_i32.as_ptr(),
-                    layer_types_i32.len() as i32,
-                    cache_ptrs.as_mut_ptr(),
-                    tokens.len() as i32,
-                );
-            }
-
-            let embed_weight = self.embed_tokens.get_weight();
-            let mut current_y = y;
-            for step in 0..max_new_tokens {
-                let next_y = if step + 1 < max_new_tokens {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let next_ids = current_y.reshape(&[1, 1])?;
-                    let logits = forward_gemma4_cpp(&next_ids, &embed_weight)?;
-                    let next_token = sample_next_token(&logits, sampling_config)?;
-                    eval_token_and_gemma4_caches(&next_token);
-                    Some(next_token)
-                } else {
-                    None
-                };
-
-                // See `chat_sync_core_paged_inner` for the rationale —
-                // `read_scalar` reads `arr.data<T>()` directly without
-                // forcing eval, so the previous iteration's async-eval'd
-                // `current_y` (or the final iteration's no-forward case)
-                // can hand back uninitialized bits.
-                current_y.eval();
-                let token_id = current_y.item_at_int32(0)? as u32;
-                generated_tokens.push(token_id);
-
-                if cancelled.load(Ordering::Relaxed) {
-                    finish_reason = "cancelled".to_string();
-                    break;
-                }
-
-                let token_text = Qwen3Tokenizer::step_decode_stream(
-                    &mut decode_stream,
-                    tokenizer.inner(),
-                    token_id,
-                    &generated_tokens,
-                    streamed_text_len,
-                );
-                streamed_text_len += token_text.len();
-
-                let segments = stream_parser.feed(&token_text);
-                stream_dispatch.dispatch_segments(segments, cb);
-
-                if is_eos_token(token_id, &eos_ids, eos_token_id) {
-                    finish_reason = "stop".to_string();
-                    break;
-                }
-                if let Some(reason) =
-                    check_gemma4_repetition_cutoff(&generated_tokens, repetition_cutoff)
-                {
-                    finish_reason = reason.to_string();
-                    break;
-                }
-                if let Some(next_token) = next_y {
-                    current_y = next_token;
-                } else {
-                    break;
-                }
-                if (step + 1) % 256 == 0 {
-                    crate::array::synchronize_and_clear_cache();
-                }
-            }
-            unsafe {
-                mlx_sys::mlx_gemma4_reset();
-            }
-        } else {
+        {
             let mut current_y = y;
             for step in 0..max_new_tokens {
                 let next_y = if step + 1 < max_new_tokens {
@@ -4983,7 +4746,7 @@ impl Gemma4Inner {
             .clone();
 
         // Subject the session path to the same sanitization as the
-        // legacy chat path so role/content injection guards stay
+        // session start path so role/content injection guards stay
         // uniform across all entry points.
         let synthetic = chat_common::build_synthetic_user_message(&user_message);
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
@@ -6400,30 +6163,6 @@ fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
             && cfg.top_p.is_none()
             && cfg.min_p.is_none()
     })
-}
-
-/// Call the compiled C++ forward for a single Gemma4 decode step.
-fn forward_gemma4_cpp(input_ids: &MxArray, embedding_weight: &MxArray) -> Result<MxArray> {
-    let mut logits_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-    let mut cache_offset: i32 = 0;
-    unsafe {
-        mlx_sys::mlx_gemma4_forward(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            &mut logits_ptr,
-            &mut cache_offset,
-        );
-    }
-    if logits_ptr.is_null() {
-        return Err(Error::from_reason("Gemma4 compiled forward returned null"));
-    }
-    MxArray::from_handle(logits_ptr, "gemma4_compiled_forward")
-}
-
-fn eval_token_and_gemma4_caches(next_token: &MxArray) {
-    unsafe {
-        mlx_sys::mlx_gemma4_eval_token_and_caches(next_token.as_raw_ptr());
-    }
 }
 
 /// Transformer body: embedding through decoder layers and final norm.

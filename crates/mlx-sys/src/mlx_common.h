@@ -349,40 +349,4 @@ bool copy_to_buffer(const array& arr, uint32_t* out, size_t len) {
   return true;
 }
 
-// NO-EVAL versions: assume input array is already evaluated (for async pipeline)
-// Skips the add(zeros) materialization step, only evals transformations
-bool copy_to_buffer_noeval(const array& arr, float* out, size_t len) {
-  // Input arr is already evaluated by async_eval
-  // Skip the add(zeros) step - assume no broadcast expansion needed
-  auto flat = flatten(arr);
-  auto host = (flat.dtype() == mlx::core::float32)
-                  ? flat
-                  : astype(flat, mlx::core::float32);
-  host.eval();  // Only eval the transformation (flatten/astype)
-
-  if (host.size() != len) {
-    return false;
-  }
-  const float* data = host.data<float>();
-  std::copy(data, data + len, out);
-  return true;
-}
-
-bool copy_to_buffer_noeval(const array& arr, int32_t* out, size_t len) {
-  // Input arr is already evaluated by async_eval
-  // Skip the add(zeros) step - assume no broadcast expansion needed
-  auto flat = flatten(arr);
-  auto host = (flat.dtype() == mlx::core::int32)
-                  ? flat
-                  : astype(flat, mlx::core::int32);
-  host.eval();  // Only eval the transformation (flatten/astype)
-
-  if (host.size() != len) {
-    return false;
-  }
-  const int32_t* data = host.data<int32_t>();
-  std::copy(data, data + len, out);
-  return true;
-}
-
 }  // namespace

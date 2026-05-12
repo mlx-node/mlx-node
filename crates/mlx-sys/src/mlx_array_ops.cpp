@@ -2,10 +2,6 @@
 
 extern "C" {
 
-const char* mlx_version() {
-  return mlx::core::version();
-}
-
 void mlx_seed(uint64_t seed) {
   mlx::core::random::seed(seed);
 }
@@ -419,35 +415,6 @@ mlx_array* mlx_array_slice(mlx_array* handle,
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
-mlx_array* mlx_array_slice_update(mlx_array* src_handle,
-                                   mlx_array* update_handle,
-                                   const int64_t* starts,
-                                   const int64_t* stops,
-                                   size_t ndim) {
-  auto src = reinterpret_cast<array*>(src_handle);
-  auto update = reinterpret_cast<array*>(update_handle);
-  Shape start_shape = make_shape(starts, ndim);
-  Shape stop_shape = make_shape(stops, ndim);
-  array result = slice_update(*src, *update, std::move(start_shape), std::move(stop_shape));
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-}
-
-// In-place slice update - modifies src directly instead of creating new array
-// This matches Python's behavior: self.keys[..., prev:offset, :] = keys
-void mlx_array_slice_update_inplace(mlx_array* src_handle,
-                                     mlx_array* update_handle,
-                                     const int64_t* starts,
-                                     const int64_t* stops,
-                                     size_t ndim) {
-  auto src = reinterpret_cast<array*>(src_handle);
-  auto update = reinterpret_cast<array*>(update_handle);
-  Shape start_shape = make_shape(starts, ndim);
-  Shape stop_shape = make_shape(stops, ndim);
-  array result = slice_update(*src, *update, std::move(start_shape), std::move(stop_shape));
-  // Use overwrite_descriptor to modify src in-place (no new allocation!)
-  src->overwrite_descriptor(result);
-}
-
 // Optimized slice assignment along a single axis - no allocation for shape access
 // Returns new array with the slice updated
 mlx_array* mlx_array_slice_assign_axis(mlx_array* src_handle,
@@ -521,17 +488,6 @@ mlx_array* mlx_array_slice_axis(mlx_array* src_handle,
 
   // Perform slice and return new array
   array result = slice(*src, std::move(start_shape), std::move(stop_shape));
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-}
-
-mlx_array* mlx_array_scatter(mlx_array* src_handle,
-                             mlx_array* indices_handle,
-                             mlx_array* updates_handle,
-                             int32_t axis) {
-  auto src = reinterpret_cast<array*>(src_handle);
-  auto indices = reinterpret_cast<array*>(indices_handle);
-  auto updates = reinterpret_cast<array*>(updates_handle);
-  array result = scatter(*src, *indices, *updates, axis);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 

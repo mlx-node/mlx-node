@@ -183,7 +183,7 @@ impl QianfanImageProcessor {
     ///
     /// Returns pixel values as [num_tiles, 448, 448, 3] in bf16 (NHWC format
     /// for MLX's vision encoder).
-    pub fn process(&self, image_bytes: &[u8]) -> Result<ProcessedImage> {
+    fn process(&self, image_bytes: &[u8]) -> Result<ProcessedImage> {
         let img = image::load_from_memory(image_bytes).map_err(|e| {
             Error::new(
                 Status::GenericFailure,

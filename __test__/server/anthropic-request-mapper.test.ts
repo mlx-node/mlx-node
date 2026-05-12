@@ -147,9 +147,7 @@ describe('mapAnthropicRequest', () => {
       // byte-equal to an absent-system request (`null === null`, where
       // `'' !== null` would otherwise miss the slot).
       expect(
-        canonicalizeSystemForCacheKey([
-          { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806;' },
-        ]),
+        canonicalizeSystemForCacheKey([{ type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806;' }]),
       ).toBeNull();
     });
 
@@ -179,9 +177,7 @@ describe('mapAnthropicRequest', () => {
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
-      system: [
-        { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=4a8a9;' },
-      ],
+      system: [{ type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.119.806; cch=4a8a9;' }],
       messages: [{ role: 'user', content: 'Hi' }],
     });
 

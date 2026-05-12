@@ -6,7 +6,7 @@ export interface PerformanceMetricsForUsage {
   decodeTokensPerSecond?: number;
 }
 
-export interface TimingUsageExtensions {
+interface TimingUsageExtensions {
   /** Server-extension: native time-to-first-token in milliseconds. */
   time_to_first_token_ms?: number;
   /** Server-extension: prompt-token throughput for the tokens actually prefetched this turn. */
@@ -115,7 +115,7 @@ function computeServerInferenceElapsedMs(
   return ttftMs + ((generatedTokens - 1) / decodeTokensPerSecond) * 1000;
 }
 
-export function buildTimingUsageExtensions(
+function buildTimingUsageExtensions(
   performance: PerformanceMetricsForUsage | undefined,
   promptTokens: number | undefined,
   outputTokens: number | undefined,

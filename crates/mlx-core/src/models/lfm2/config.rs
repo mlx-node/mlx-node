@@ -72,20 +72,22 @@ pub struct Lfm2Config {
 
     /// Use the new block-paged KV cache adapter (`PagedKVCacheAdapter`).
     ///
-    /// **OPT-IN — experimental and currently a no-op for chat dispatch.**
-    /// When `Some(true)`, `Lfm2Inner` allocates a `BlockAllocator` +
-    /// `LayerKVPool` pair sized for the model's full_attention layers
-    /// only and constructs a `PagedKVCacheAdapter` field. The chat-session
-    /// forward dispatch is NOT yet wired through this adapter — LFM2's
-    /// hybrid conv + attention architecture means only attention layers
-    /// can use the block-paged path; conv layers continue to use the
-    /// existing `Lfm2LayerCache::Conv(ArraysCache)` storage. A bespoke
-    /// per-layer dispatch on `Lfm2DecoderLayer` (mirroring the Qwen3
-    /// `forward_paged_adapter` pattern) plus a hybrid cache wrapper that
-    /// indexes the adapter by attention-layer ordinal (not absolute
-    /// layer index) is required before forward wiring can land.
+    /// Default: `true` since 2026-04-28 (parity-verified via
+    /// `crates/mlx-core/tests/lfm2_paged_vs_flat_parity.rs` against real
+    /// LFM2.5-1.2B weights: byte-equal greedy decode + prefix-reuse
+    /// byte-equal at BF16). Wired through
+    /// `Lfm2DecoderLayer::forward_paged_or_flat`.
     ///
-    /// Default: false (use the existing `Lfm2LayerCache` path).
+    /// Per-layer routing: LFM2's hybrid architecture means only
+    /// `full_attention` layers go through the paged adapter; conv layers
+    /// stay on the existing flat `Lfm2LayerCache::Conv(ArraysCache)`
+    /// storage regardless of this flag. The `LayerKVPool` is sized to
+    /// the count of `full_attention` layers and indexed by
+    /// attention-ordinal (via `config.full_attn_idxs()`), not by absolute
+    /// layer index.
+    ///
+    /// Opt out with `use_block_paged_cache: Some(false)` to revert to the
+    /// fully flat `Lfm2LayerCache` path on all layers.
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,

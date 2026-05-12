@@ -66,13 +66,6 @@ impl LinearProj {
             LinearProj::Quantized(ql) => ql.get_weight().clone(),
         }
     }
-
-    pub fn get_bias(&self) -> Option<MxArray> {
-        match self {
-            LinearProj::Standard(l) => l.get_bias(),
-            LinearProj::Quantized(_) => None,
-        }
-    }
 }
 
 /// An MLP that can be either standard or quantized.

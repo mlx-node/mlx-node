@@ -1029,14 +1029,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         handle_qwen35_moe_cmd,
     );
 
-    let (config, model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) = init_rx
-        .await
-        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+    let (config, _model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) =
+        init_rx
+            .await
+            .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
     Ok(Qwen3_5MoeModel {
         thread,
         config,
-        model_id,
         paged_active,
         _cache_limit_guard: cache_limit_guard,
     })

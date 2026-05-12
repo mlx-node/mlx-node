@@ -148,11 +148,7 @@ inline array rms_norm_no_weight(const array& x, float eps) {
   return fast::rms_norm(x, std::nullopt, eps);
 }
 
-inline array silu(const array& x) {
-  return x * sigmoid(x);
-}
-
-// SwiGLU: silu(gate) * up — compiled for kernel fusion
+// SwiGLU: sigmoid(gate) * gate * up — compiled for kernel fusion
 inline std::vector<array> swiglu_impl(const std::vector<array>& inputs) {
   const auto& gate = inputs[0];
   const auto& up = inputs[1];

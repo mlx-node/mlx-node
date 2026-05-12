@@ -38,7 +38,7 @@ impl ClippableLinear {
 
     /// Set clip bounds from checkpoint scalar arrays.
     /// Each array should be a scalar (0-d or 1-element).
-    pub fn set_clip_bounds(
+    pub(super) fn set_clip_bounds(
         &mut self,
         input_min: f64,
         input_max: f64,

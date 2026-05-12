@@ -4,11 +4,9 @@
  * The language model component uses multimodal RoPE (mRoPE) which splits
  * the head dimension into sections for temporal, height, and width positions.
  */
-use crate::array::{MxArray, scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::MxArray;
 use crate::models::paddleocr_vl::config::TextConfig;
-use crate::nn::activations::Activations;
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::transformer::KVCache;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use std::sync::Arc;
@@ -148,11 +146,6 @@ impl MultimodalRoPE {
         };
 
         Ok((cos, sin))
-    }
-
-    /// Get mRoPE sections
-    pub fn mrope_section(&self) -> Vec<i32> {
-        self.mrope_section.to_vec()
     }
 
     /// Get raw inv_freq pointer for C++ forward pass
@@ -304,11 +297,6 @@ pub struct PaddleOCRAttention {
     k_proj: Arc<Linear>,
     v_proj: Arc<Linear>,
     o_proj: Arc<Linear>,
-    n_heads: i32,
-    n_kv_heads: i32,
-    head_dim: i32,
-    scale: f32,
-    mrope_section: Vec<i32>,
 }
 
 impl PaddleOCRAttention {
@@ -323,7 +311,7 @@ impl PaddleOCRAttention {
     }
 
     pub fn new(
-        config: TextConfig,
+        _config: TextConfig,
         q_weight: &MxArray,
         k_weight: &MxArray,
         v_weight: &MxArray,
@@ -334,107 +322,12 @@ impl PaddleOCRAttention {
         let v_proj = Linear::from_weights(v_weight, None)?;
         let o_proj = Linear::from_weights(o_weight, None)?;
 
-        let head_dim = config.head_dim;
-        let scale = (head_dim as f32).powf(-0.5);
-
         Ok(Self {
             q_proj: Arc::new(q_proj),
             k_proj: Arc::new(k_proj),
             v_proj: Arc::new(v_proj),
             o_proj: Arc::new(o_proj),
-            n_heads: config.num_attention_heads,
-            n_kv_heads: config.num_key_value_heads,
-            head_dim,
-            scale,
-            mrope_section: config.mrope_section.clone(),
         })
-    }
-
-    /// Forward pass without KV caching (for compatibility)
-    pub fn forward(
-        &self,
-        x: &MxArray,
-        mask: Option<&MxArray>,
-        position_embeddings: &MxArray,
-    ) -> Result<MxArray> {
-        self.forward_with_cache(x, mask, position_embeddings, None)
-    }
-
-    /// Forward pass with optional KV caching
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor [batch, seq_len, hidden_size]
-    /// * `mask` - Optional attention mask
-    /// * `position_embeddings` - Position embeddings [2, 3, batch, seq, dim]
-    /// * `cache` - Optional KV cache for incremental generation
-    ///
-    /// # Returns
-    /// * Output tensor [batch, seq_len, hidden_size]
-    pub fn forward_with_cache(
-        &self,
-        x: &MxArray,
-        _mask: Option<&MxArray>,
-        position_embeddings: &MxArray,
-        cache: Option<&mut KVCache>,
-    ) -> Result<MxArray> {
-        let shape = x.shape()?;
-        let batch = shape[0];
-        let seq_len = shape[1];
-
-        // Project Q, K, V
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
-
-        // Reshape for multi-head attention
-        let q = q
-            .reshape(&[batch, seq_len, self.n_heads as i64, self.head_dim as i64])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = k
-            .reshape(&[batch, seq_len, self.n_kv_heads as i64, self.head_dim as i64])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let v = v
-            .reshape(&[batch, seq_len, self.n_kv_heads as i64, self.head_dim as i64])?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-
-        // Extract cos and sin from position embeddings (packed as [2, 3, batch, seq, dim])
-        let cos = position_embeddings
-            .slice_axis(0, 0, 1)?
-            .squeeze(Some(&[0]))?;
-        let sin = position_embeddings
-            .slice_axis(0, 1, 2)?
-            .squeeze(Some(&[0]))?;
-
-        // Apply mRoPE
-        let (q, k) =
-            apply_multimodal_rotary_pos_emb(&q, &k, &cos, &sin, self.mrope_section.clone())?;
-
-        // Update KV cache if provided
-        let (k, v) = if let Some(cache) = cache {
-            cache.update_and_fetch(&k, &v)?
-        } else {
-            (k, v)
-        };
-
-        // Compute attention with causal masking
-        // Note: MLX's SDPA handles GQA broadcasting internally - no need to
-        // tile/reshape KV heads to match Q heads. Q has n_heads, K/V have n_kv_heads.
-        // Use causal SDPA for prefill (seq_len > 1) to enforce causality
-        // For generation with cache (seq_len == 1), single token can attend to all cached K/V
-        let output = if seq_len > 1 {
-            // Prefill: use causal attention
-            scaled_dot_product_attention_causal(&q, &k, &v, self.scale as f64)?
-        } else {
-            // Decode: use fused SDPA with no mask (most optimized Metal kernel path)
-            // For single-token generation, the token can attend to all cached K/V
-            scaled_dot_product_attention(&q, &k, &v, self.scale as f64, None)?
-        };
-
-        // Reshape back
-        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
-        let output = output.reshape(&[batch, seq_len, (self.n_heads * self.head_dim) as i64])?;
-
-        self.o_proj.forward(&output)
     }
 }
 
@@ -502,51 +395,6 @@ impl PaddleOCRDecoderLayer {
             post_attention_layernorm: Arc::new(post_attention_layernorm),
         })
     }
-
-    /// Forward pass without KV caching (for compatibility)
-    pub fn forward(
-        &self,
-        x: &MxArray,
-        mask: Option<&MxArray>,
-        position_embeddings: &MxArray,
-    ) -> Result<MxArray> {
-        self.forward_with_cache(x, mask, position_embeddings, None)
-    }
-
-    /// Forward pass with optional KV caching
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor [batch, seq_len, hidden_size]
-    /// * `mask` - Optional attention mask
-    /// * `position_embeddings` - Position embeddings [2, 3, batch, seq, dim]
-    /// * `cache` - Optional KV cache for incremental generation
-    ///
-    /// # Returns
-    /// * Output tensor [batch, seq_len, hidden_size]
-    pub fn forward_with_cache(
-        &self,
-        x: &MxArray,
-        mask: Option<&MxArray>,
-        position_embeddings: &MxArray,
-        cache: Option<&mut KVCache>,
-    ) -> Result<MxArray> {
-        // Self attention with residual
-        let normed = self.input_layernorm.forward(x)?;
-        let attn_out =
-            self.self_attn
-                .forward_with_cache(&normed, mask, position_embeddings, cache)?;
-        let h = x.add(&attn_out)?;
-
-        // MLP with residual (SiLU gated)
-        let normed = self.post_attention_layernorm.forward(&h)?;
-        let gate_proj = self.mlp_gate.forward(&normed)?;
-        let gate = Activations::silu(&gate_proj)?;
-        let up = self.mlp_up.forward(&normed)?;
-        let hidden = gate.mul(&up)?;
-        let mlp_out = self.mlp_down.forward(&hidden)?;
-
-        h.add(&mlp_out)
-    }
 }
 
 /// ERNIE Language Model (internal)
@@ -560,8 +408,6 @@ pub struct ERNIELanguageModel {
     lm_head: Arc<Linear>,
     rotary_emb: Arc<MultimodalRoPE>,
     config: TextConfig,
-    /// KV caches for incremental generation (one per layer)
-    kv_caches: Option<Vec<KVCache>>,
     /// Stored position IDs for decode phase (computed during prefill with images)
     position_ids: Option<MxArray>,
     /// Stored rope deltas for decode phase offset calculation
@@ -601,7 +447,6 @@ impl ERNIELanguageModel {
             lm_head: Arc::new(lm_head),
             rotary_emb: Arc::new(rotary_emb),
             config,
-            kv_caches: None,
             position_ids: None,
             rope_deltas: None,
             fused_kv_keys: Vec::new(),
@@ -622,70 +467,6 @@ impl ERNIELanguageModel {
         }));
     }
 
-    /// Forward pass without KV caching (for compatibility)
-    pub fn forward(
-        &self,
-        input_ids: &MxArray,
-        inputs_embeds: Option<&MxArray>,
-        mask: Option<&MxArray>,
-        position_ids: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        // Get embeddings
-        let h = if let Some(embeds) = inputs_embeds {
-            embeds.clone()
-        } else {
-            self.embed_tokens.forward(input_ids)?
-        };
-
-        // Compute position embeddings
-        let pos_ids = if let Some(ids) = position_ids {
-            ids.clone()
-        } else {
-            // Default position IDs: [3, batch, seq_len] all same positions
-            let shape = h.shape()?;
-            let batch = shape[0];
-            let seq_len = shape[1];
-            let pos = MxArray::arange(0.0, seq_len as f64, Some(1.0), None)?;
-            let pos = pos.reshape(&[1, 1, seq_len])?;
-            pos.broadcast_to(&[3, batch, seq_len])?
-        };
-
-        let (cos, sin) = self.rotary_emb.forward(&h, &pos_ids)?;
-        // Pack cos and sin together for passing to layers
-        let position_embeddings = MxArray::stack(vec![&cos, &sin], Some(0))?;
-
-        // Forward through layers
-        let mut h = h;
-        for layer in &self.layers {
-            h = layer.forward(&h, mask, &position_embeddings)?;
-        }
-
-        // Final norm
-        h = self.norm.forward(&h)?;
-
-        // LM head
-        self.lm_head.forward(&h)
-    }
-
-    /// Initialize KV caches for incremental generation
-    ///
-    /// Creates one KV cache per transformer layer. Call this before starting generation.
-    pub fn init_kv_caches(&mut self) {
-        let num_layers = self.layers.len();
-        self.kv_caches = Some((0..num_layers).map(|_| KVCache::new()).collect());
-    }
-
-    /// Reset all KV caches
-    ///
-    /// Clears cached key-value states. Call this between different generation sequences.
-    pub fn reset_kv_caches(&mut self) {
-        if let Some(ref mut caches) = self.kv_caches {
-            for cache in caches.iter_mut() {
-                cache.reset();
-            }
-        }
-    }
-
     /// Set position IDs for the current generation sequence
     ///
     /// These are stored during prefill and used for proper position slicing during decode.
@@ -703,121 +484,6 @@ impl ERNIELanguageModel {
     /// Get stored rope deltas
     pub fn get_rope_deltas(&self) -> Option<i64> {
         self.rope_deltas
-    }
-
-    /// Get the current cache offset (number of cached tokens)
-    pub fn get_cache_offset(&self) -> i32 {
-        self.kv_caches
-            .as_ref()
-            .and_then(|caches| caches.first())
-            .map(|cache| cache.get_offset())
-            .unwrap_or(0)
-    }
-
-    /// Forward pass with KV caching for incremental generation
-    ///
-    /// # Arguments
-    /// * `input_ids` - Token IDs [batch, seq_len]
-    /// * `inputs_embeds` - Optional pre-computed embeddings
-    /// * `mask` - Optional attention mask
-    /// * `position_ids` - Optional position IDs [3, batch, seq_len]
-    /// * `use_cache` - Whether to use KV caching (must call init_kv_caches() first)
-    ///
-    /// # Returns
-    /// * Logits [batch, seq_len, vocab_size]
-    pub fn forward_with_cache(
-        &mut self,
-        input_ids: &MxArray,
-        inputs_embeds: Option<&MxArray>,
-        mask: Option<&MxArray>,
-        position_ids: Option<&MxArray>,
-        use_cache: bool,
-    ) -> Result<MxArray> {
-        // Get embeddings
-        let h = if let Some(embeds) = inputs_embeds {
-            embeds.clone()
-        } else {
-            self.embed_tokens.forward(input_ids)?
-        };
-
-        // Get cache offset for position calculation
-        let cache_offset = if use_cache {
-            self.get_cache_offset()
-        } else {
-            0
-        };
-
-        // Compute position embeddings
-        // Priority: 1) Passed position_ids (prefill) 2) Stored position_ids (decode with multimodal) 3) Sequential (text-only)
-        let shape = h.shape()?;
-        let batch = shape[0];
-        let seq_len = shape[1];
-
-        let pos_ids = if let Some(ids) = position_ids {
-            // Prefill case: use provided position_ids directly
-            ids.clone()
-        } else if self.position_ids.is_some() {
-            // Decode case with multimodal: position_ids being set indicates mRoPE mode
-            // We don't use the stored value directly - instead compute fresh positions with rope_deltas offset
-            // During decode, we compute position = arange(seq_len) + cache_offset + rope_deltas
-            let rope_deltas = self.rope_deltas.unwrap_or(0);
-            let delta = (cache_offset as i64 + rope_deltas) as f64;
-            if seq_len == 1 {
-                // Fast path for single-token decode: create [3, batch, 1] directly
-                // Avoids arange + scalar_float + add + reshape (4 FFI calls → 2)
-                let pos = MxArray::from_float32(&[delta as f32], &[1, 1, 1])?;
-                pos.broadcast_to(&[3, batch, 1])?
-            } else {
-                let pos = MxArray::arange(delta, delta + seq_len as f64, Some(1.0), None)?;
-                let pos = pos.reshape(&[1, 1, seq_len])?;
-                pos.broadcast_to(&[3, batch, seq_len])?
-            }
-        } else {
-            // Text-only decode: simple sequential positions with cache offset
-            if seq_len == 1 {
-                // Fast path for single-token decode
-                let pos = MxArray::from_float32(&[cache_offset as f32], &[1, 1, 1])?;
-                pos.broadcast_to(&[3, batch, 1])?
-            } else {
-                let pos = MxArray::arange(
-                    cache_offset as f64,
-                    (cache_offset as i64 + seq_len) as f64,
-                    Some(1.0),
-                    None,
-                )?;
-                let pos = pos.reshape(&[1, 1, seq_len])?;
-                pos.broadcast_to(&[3, batch, seq_len])?
-            }
-        };
-
-        let (cos, sin) = self.rotary_emb.forward(&h, &pos_ids)?;
-        // Pack cos and sin together for passing to layers
-        let position_embeddings = MxArray::stack(vec![&cos, &sin], Some(0))?;
-
-        // Forward through layers with optional caching
-        let mut h = h;
-        if use_cache {
-            if let Some(ref mut caches) = self.kv_caches {
-                for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-                    h = layer.forward_with_cache(&h, mask, &position_embeddings, Some(cache))?;
-                }
-            } else {
-                return Err(Error::new(
-                    Status::GenericFailure,
-                    "KV caches not initialized. Call init_kv_caches() first.",
-                ));
-            }
-        } else {
-            for layer in &self.layers {
-                h = layer.forward(&h, mask, &position_embeddings)?;
-            }
-        }
-
-        // Final norm
-        h = self.norm.forward(&h)?;
-
-        // LM head
-        self.lm_head.forward(&h)
     }
 
     /// Get token embeddings without passing through the model
@@ -1154,7 +820,6 @@ impl Clone for ERNIELanguageModel {
             lm_head: self.lm_head.clone(),
             rotary_emb: self.rotary_emb.clone(),
             config: self.config.clone(),
-            kv_caches: None, // Don't clone caches - they should be initialized fresh
             position_ids: None, // Don't clone position state
             rope_deltas: None,
             fused_kv_keys: Vec::new(),
@@ -1224,7 +889,7 @@ mod tests {
     fn test_mrope_getter() {
         // Test mRoPE section getter
         let mrope = MultimodalRoPE::new(128, 131072, Some(500000.0), vec![16, 24, 24]).unwrap();
-        assert_eq!(mrope.mrope_section(), vec![16, 24, 24]);
+        assert_eq!(mrope.mrope_section_arr(), &[16, 24, 24]);
     }
 
     #[test]
@@ -1316,29 +981,6 @@ mod tests {
         // Add another layer
         lm.add_layer(&layer);
         assert_eq!(lm.num_layers(), 2);
-    }
-
-    #[test]
-    fn test_ernie_language_model_kv_cache_management() {
-        // Test KV cache initialization and reset
-        let config = test_text_config();
-
-        let embed_weight =
-            MxArray::random_uniform(&[1000, 256], 0.0, 1.0, Some(DType::Float32)).unwrap();
-        let norm_weight = MxArray::ones(&[256], Some(DType::Float32)).unwrap();
-        let lm_head_weight =
-            MxArray::random_uniform(&[1000, 256], 0.0, 1.0, Some(DType::Float32)).unwrap();
-
-        let mut lm =
-            ERNIELanguageModel::new(config, &embed_weight, &norm_weight, &lm_head_weight).unwrap();
-
-        // Initialize caches
-        lm.init_kv_caches();
-        assert_eq!(lm.get_cache_offset(), 0);
-
-        // Reset caches
-        lm.reset_kv_caches();
-        assert_eq!(lm.get_cache_offset(), 0);
     }
 
     #[test]

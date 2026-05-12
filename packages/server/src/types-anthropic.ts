@@ -103,12 +103,15 @@ export interface AnthropicMessagesRequest {
   // endpoint. KV-cache reuse on `/v1/messages` is delivered via the
   // server-side `getOrCreateWarmAny` warm-slot mechanism keyed on the
   // mapped system/instructions string and a per-model sentinel id —
-  // see the block comment on `endpoints/messages.ts`. The
-  // `prompt_cache_key` field is therefore unnecessary on this surface
-  // and re-adding it without a per-key tier-2 path on the handler
-  // would be a no-op that silently misleads clients. The equivalent
-  // field on `/v1/responses` is still honoured for that endpoint's
-  // tier-2 lookup.
+  // see the block comment on `endpoints/messages.ts`. Paged-active
+  // models (Qwen3 / LFM2 / Gemma4, default-on) additionally benefit
+  // from native `BlockAllocator` content-addressed prefix reuse, which
+  // recovers shared SYS/user prefixes across requests without any
+  // client-supplied key. The `prompt_cache_key` field is therefore
+  // unnecessary on this surface and re-adding it without a per-key
+  // tier-2 path on the handler would be a no-op that silently misleads
+  // clients. The equivalent field on `/v1/responses` is still honoured
+  // for that endpoint's tier-2 lookup.
 }
 
 export type AnthropicCountTokensRequest = Omit<AnthropicMessagesRequest, 'max_tokens'> & {

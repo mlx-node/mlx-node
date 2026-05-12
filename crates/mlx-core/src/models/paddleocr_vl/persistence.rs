@@ -5,14 +5,13 @@
  * with key transformations specific to PaddleOCR-VL.
  */
 use crate::array::MxArray;
-use napi_derive::napi;
 use std::collections::HashMap;
 
 /// Keys to ignore when loading weights
 const KEYS_TO_IGNORE: &[&str] = &["packing_position_embedding", "vision_model.head"];
 
 /// Transform weight keys from HuggingFace format to our format
-pub fn transform_key(key: &str) -> String {
+fn transform_key(key: &str) -> String {
     let mut result = key.to_string();
 
     // Vision model transformations
@@ -42,7 +41,7 @@ pub fn transform_key(key: &str) -> String {
 }
 
 /// Check if a key should be ignored
-pub fn should_ignore_key(key: &str) -> bool {
+fn should_ignore_key(key: &str) -> bool {
     for ignore in KEYS_TO_IGNORE {
         if key.contains(ignore) {
             return true;
@@ -212,91 +211,6 @@ pub fn load_paddleocr_vl_weights(
     Ok(new_weights)
 }
 
-/// Get expected weight keys for PaddleOCR-VL model
-#[napi]
-pub fn get_expected_weight_keys() -> Vec<String> {
-    let mut keys = Vec::new();
-
-    // Vision embeddings
-    keys.push("visual.embeddings.patch_embedding.weight".to_string());
-    keys.push("visual.embeddings.patch_embedding.bias".to_string());
-    keys.push("visual.embeddings.position_embedding.weight".to_string());
-
-    // Vision encoder layers (27 layers)
-    for i in 0..27 {
-        keys.push(format!("visual.layers.{}.layer_norm1.weight", i));
-        keys.push(format!("visual.layers.{}.layer_norm1.bias", i));
-        keys.push(format!("visual.layers.{}.layer_norm2.weight", i));
-        keys.push(format!("visual.layers.{}.layer_norm2.bias", i));
-        keys.push(format!("visual.layers.{}.self_attn.qkv.weight", i));
-        keys.push(format!("visual.layers.{}.self_attn.qkv.bias", i));
-        keys.push(format!("visual.layers.{}.self_attn.out_proj.weight", i));
-        keys.push(format!("visual.layers.{}.self_attn.out_proj.bias", i));
-        keys.push(format!("visual.layers.{}.mlp.fc1.weight", i));
-        keys.push(format!("visual.layers.{}.mlp.fc1.bias", i));
-        keys.push(format!("visual.layers.{}.mlp.fc2.weight", i));
-        keys.push(format!("visual.layers.{}.mlp.fc2.bias", i));
-    }
-
-    // Vision post-norm and projector
-    keys.push("visual.post_layernorm.weight".to_string());
-    keys.push("visual.post_layernorm.bias".to_string());
-    keys.push("visual.projector.pre_norm.weight".to_string());
-    keys.push("visual.projector.pre_norm.bias".to_string());
-    keys.push("visual.projector.linear_1.weight".to_string());
-    keys.push("visual.projector.linear_1.bias".to_string());
-    keys.push("visual.projector.linear_2.weight".to_string());
-    keys.push("visual.projector.linear_2.bias".to_string());
-
-    // Language model
-    keys.push("language_model.model.embed_tokens.weight".to_string());
-
-    // Language model layers (18 layers)
-    for i in 0..18 {
-        keys.push(format!(
-            "language_model.model.layers.{}.input_layernorm.weight",
-            i
-        ));
-        keys.push(format!(
-            "language_model.model.layers.{}.post_attention_layernorm.weight",
-            i
-        ));
-        keys.push(format!(
-            "language_model.model.layers.{}.self_attn.q_proj.weight",
-            i
-        ));
-        keys.push(format!(
-            "language_model.model.layers.{}.self_attn.k_proj.weight",
-            i
-        ));
-        keys.push(format!(
-            "language_model.model.layers.{}.self_attn.v_proj.weight",
-            i
-        ));
-        keys.push(format!(
-            "language_model.model.layers.{}.self_attn.o_proj.weight",
-            i
-        ));
-        keys.push(format!(
-            "language_model.model.layers.{}.mlp.gate_proj.weight",
-            i
-        ));
-        keys.push(format!(
-            "language_model.model.layers.{}.mlp.up_proj.weight",
-            i
-        ));
-        keys.push(format!(
-            "language_model.model.layers.{}.mlp.down_proj.weight",
-            i
-        ));
-    }
-
-    keys.push("language_model.model.norm.weight".to_string());
-    keys.push("language_model.lm_head.weight".to_string());
-
-    keys
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,90 +265,5 @@ mod tests {
 
         // PyTorch format (out_ch, in_ch, kH, kW)
         assert!(!is_mlx_conv_format(&[1152, 3, 14, 14]));
-    }
-
-    #[test]
-    fn test_expected_weight_keys_not_empty() {
-        let keys = get_expected_weight_keys();
-        assert!(!keys.is_empty());
-    }
-
-    #[test]
-    fn test_expected_weight_keys_vision_embeddings() {
-        let keys = get_expected_weight_keys();
-        assert!(keys.contains(&"visual.embeddings.patch_embedding.weight".to_string()));
-        assert!(keys.contains(&"visual.embeddings.position_embedding.weight".to_string()));
-    }
-
-    #[test]
-    fn test_expected_weight_keys_vision_post_norm() {
-        let keys = get_expected_weight_keys();
-        assert!(keys.contains(&"visual.post_layernorm.weight".to_string()));
-        assert!(keys.contains(&"visual.post_layernorm.bias".to_string()));
-    }
-
-    #[test]
-    fn test_expected_weight_keys_projector() {
-        let keys = get_expected_weight_keys();
-        assert!(keys.contains(&"visual.projector.pre_norm.weight".to_string()));
-        assert!(keys.contains(&"visual.projector.pre_norm.bias".to_string()));
-        assert!(keys.contains(&"visual.projector.linear_1.weight".to_string()));
-        assert!(keys.contains(&"visual.projector.linear_1.bias".to_string()));
-        assert!(keys.contains(&"visual.projector.linear_2.weight".to_string()));
-        assert!(keys.contains(&"visual.projector.linear_2.bias".to_string()));
-    }
-
-    #[test]
-    fn test_expected_weight_keys_language_model() {
-        let keys = get_expected_weight_keys();
-        assert!(keys.contains(&"language_model.model.embed_tokens.weight".to_string()));
-        assert!(keys.contains(&"language_model.model.norm.weight".to_string()));
-        assert!(keys.contains(&"language_model.lm_head.weight".to_string()));
-    }
-
-    #[test]
-    fn test_expected_weight_keys_vision_layer_count() {
-        let keys = get_expected_weight_keys();
-
-        // Count vision layer keys (27 layers)
-        let layer_keys: Vec<_> = keys
-            .iter()
-            .filter(|k| k.starts_with("visual.layers."))
-            .collect();
-
-        // Each layer has 12 keys: layer_norm1 (weight, bias), layer_norm2 (weight, bias),
-        // self_attn (qkv weight, qkv bias, out_proj weight, out_proj bias),
-        // mlp (fc1 weight, fc1 bias, fc2 weight, fc2 bias)
-        assert_eq!(layer_keys.len(), 27 * 12);
-    }
-
-    #[test]
-    fn test_expected_weight_keys_language_layer_count() {
-        let keys = get_expected_weight_keys();
-
-        // Count language layer keys (18 layers)
-        let layer_keys: Vec<_> = keys
-            .iter()
-            .filter(|k| k.starts_with("language_model.model.layers."))
-            .collect();
-
-        // Each layer has 9 keys: input_layernorm, post_attention_layernorm,
-        // q/k/v/o_proj, gate/up/down_proj
-        assert_eq!(layer_keys.len(), 18 * 9);
-    }
-
-    #[test]
-    fn test_expected_weight_keys_specific_layers() {
-        let keys = get_expected_weight_keys();
-
-        // Check specific vision layer keys exist
-        assert!(keys.contains(&"visual.layers.0.layer_norm1.weight".to_string()));
-        assert!(keys.contains(&"visual.layers.26.self_attn.qkv.weight".to_string()));
-
-        // Check specific language layer keys exist
-        assert!(
-            keys.contains(&"language_model.model.layers.0.self_attn.q_proj.weight".to_string())
-        );
-        assert!(keys.contains(&"language_model.model.layers.17.mlp.down_proj.weight".to_string()));
     }
 }

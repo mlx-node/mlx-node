@@ -62,8 +62,8 @@
  *     atomically appends the new user turn, so cold replay is
  *     indistinguishable from a hot hit.
  *
- *   - **TTL.** Default 1800 seconds mirrors `RESPONSE_TTL_SECONDS`
- *     in `packages/server/src/endpoints/responses.ts` so the cached
+ *   - **TTL.** Default 1800 seconds mirrors `DEFAULT_RESPONSE_RETENTION_SECONDS`
+ *     in `packages/server/src/server.ts` so the cached
  *     entry ages out alongside its stored response metadata. With
  *     at most one entry there is no LRU bookkeeping — just a single
  *     expiry check on lookup.
@@ -670,6 +670,40 @@ export class SessionRegistry {
   }
 
   /**
+   * Allocate a fresh `ChatSession` bound to this registry's model
+   * without touching the warm slot. Intended for the `/v1/messages`
+   * endpoint when the underlying model has a block-paged KV cache
+   * active: the native cache already reuses SYS blocks across requests
+   * via content-addressing in `BlockAllocator`'s prefix-hash table, so
+   * the JS-side warm slot in
+   * {@link SessionRegistry.getOrCreateWarmAny} is redundant.
+   *
+   * Crucially, this call is purely additive — it does **NOT** clear,
+   * read, or evict the warm slot. Two parallel `/v1/messages` requests
+   * sharing a system prompt both call `createFreshSession` and both
+   * get distinct sessions; the native cache transparently refcounts
+   * the shared SYS blocks across them. This is the routing decision
+   * the long block comment in `packages/server/src/endpoints/messages.ts`
+   * documents: paged → fresh session, non-paged → warm-any lookup.
+   *
+   * The returned session is pre-seeded with the operator-configured
+   * `samplingDefaults` (matching every other cache-miss branch) so a
+   * client that picks the paged path does not silently stray from the
+   * server's pinned sampling knobs.
+   *
+   * Returned with `hit: false` to keep the result shape uniform with
+   * {@link SessionRegistry.getOrCreate} and
+   * {@link SessionRegistry.getOrCreateWarmAny}; callers that care
+   * about the cache header semantics should observe
+   * `result.cachedTokens` from the dispatch instead — that's the
+   * authoritative signal for whether the native engine recovered any
+   * prefix on this turn (paged or otherwise).
+   */
+  createFreshSession(): SessionLookupResult {
+    return { session: this.newSession(), hit: false };
+  }
+
+  /**
    * @deprecated **Redundant on `/v1/messages` for paged-active models.**
    * Phase 7 of the messages-kv-reuse plan removed the only call site
    * for paged-active full-attention models (Qwen3 + LFM2 + Gemma4
@@ -749,40 +783,6 @@ export class SessionRegistry {
    * `responses.ts` (around the `runSessionNonStreaming` /
    * `runSessionStreaming` branches) describes.
    */
-  /**
-   * Allocate a fresh `ChatSession` bound to this registry's model
-   * without touching the warm slot. Intended for the `/v1/messages`
-   * endpoint when the underlying model has a block-paged KV cache
-   * active: the native cache already reuses SYS blocks across requests
-   * via content-addressing in `BlockAllocator`'s prefix-hash table, so
-   * the JS-side warm slot in
-   * {@link SessionRegistry.getOrCreateWarmAny} is redundant.
-   *
-   * Crucially, this call is purely additive — it does **NOT** clear,
-   * read, or evict the warm slot. Two parallel `/v1/messages` requests
-   * sharing a system prompt both call `createFreshSession` and both
-   * get distinct sessions; the native cache transparently refcounts
-   * the shared SYS blocks across them. This is the routing decision
-   * the long block comment in `packages/server/src/endpoints/messages.ts`
-   * documents: paged → fresh session, non-paged → warm-any lookup.
-   *
-   * The returned session is pre-seeded with the operator-configured
-   * `samplingDefaults` (matching every other cache-miss branch) so a
-   * client that picks the paged path does not silently stray from the
-   * server's pinned sampling knobs.
-   *
-   * Returned with `hit: false` to keep the result shape uniform with
-   * {@link SessionRegistry.getOrCreate} and
-   * {@link SessionRegistry.getOrCreateWarmAny}; callers that care
-   * about the cache header semantics should observe
-   * `result.cachedTokens` from the dispatch instead — that's the
-   * authoritative signal for whether the native engine recovered any
-   * prefix on this turn (paged or otherwise).
-   */
-  createFreshSession(): SessionLookupResult {
-    return { session: this.newSession(), hit: false };
-  }
-
   getOrCreateWarmAny(requestedInstructions: string | null): SessionLookupResult {
     // Single-warm invariant: at most one entry. Walk it once, lease
     // on a fresh + instructions-matched hit, otherwise clear and

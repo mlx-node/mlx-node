@@ -382,16 +382,6 @@ impl Qwen3_5VisionEncoder {
         )?;
         interpolated.reshape(&[target_patches, embed_dim])
     }
-
-    /// Get spatial merge size
-    pub fn spatial_merge_size(&self) -> i32 {
-        self.config.spatial_merge_size
-    }
-
-    /// Get the config
-    pub fn config(&self) -> &Qwen3_5VisionConfig {
-        &self.config
-    }
 }
 
 impl Clone for Qwen3_5VisionEncoder {

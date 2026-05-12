@@ -39,10 +39,6 @@ impl DecoderLayer {
         matches!(self.attn, AttentionType::Linear(_))
     }
 
-    pub fn is_moe(&self) -> bool {
-        matches!(self.mlp, MLPType::MoE(_))
-    }
-
     pub fn new(config: &Qwen3_5MoeConfig, layer_idx: usize) -> Result<Self> {
         let is_linear = config.is_linear_layer(layer_idx);
 

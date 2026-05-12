@@ -386,11 +386,13 @@ impl RotatingKVCache {
     }
 
     /// Returns the maximum cache size.
+    #[cfg(test)]
     pub fn get_max_size(&self) -> i32 {
         self.max_size
     }
 
     /// Returns the number of tokens to keep.
+    #[cfg(test)]
     pub fn get_keep(&self) -> i32 {
         self.keep
     }

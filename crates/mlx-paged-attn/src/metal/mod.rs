@@ -24,21 +24,13 @@ mod mlx_integration;
 mod paged_attention;
 mod reshape_and_cache;
 mod state;
-mod swap_blocks;
 
-pub use copy_blocks::{
-    CopyBlocksParams, RawCopyBlocksBuffers, dispatch_copy_blocks, dispatch_copy_blocks_raw,
-};
+pub use copy_blocks::CopyBlocksParams;
 pub use kv_scale::{KvScaleManager, KvScaleStats};
 pub use mlx_integration::{MlxMetalBuffer, is_metal_extraction_supported, synchronize_mlx};
 pub use paged_attention::{
     PagedAttentionOutput, PagedAttentionParams, dispatch_paged_attention_auto,
-    dispatch_paged_attention_v1, dispatch_paged_attention_v1_raw, dispatch_paged_attention_v2,
-    dispatch_paged_attention_v2_raw,
+    dispatch_paged_attention_v1_raw, dispatch_paged_attention_v2_raw,
 };
-pub use reshape_and_cache::{
-    RawBufferInfo, ReshapeAndCacheParams, dispatch_reshape_and_cache,
-    dispatch_reshape_and_cache_raw,
-};
+pub use reshape_and_cache::{RawBufferInfo, ReshapeAndCacheParams, dispatch_reshape_and_cache_raw};
 pub use state::{MetalDtype, MetalState};
-pub use swap_blocks::{CpuBlockCache, SwapBlocksParams, swap_in, swap_out};
