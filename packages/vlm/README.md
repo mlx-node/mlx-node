@@ -290,7 +290,6 @@ const buffer = documentToXlsx(doc);
 
 | Export                      | Description                                      |
 | --------------------------- | ------------------------------------------------ |
-| `PADDLEOCR_VL_CONFIGS`      | Pre-defined PaddleOCR-VL 1.5 config              |
 | `createPaddleocrVlConfig()` | Default config factory                           |
 | `OutputFormat`              | Enum: `Raw`, `Plain`, `Markdown`, `Html`, `Json` |
 
