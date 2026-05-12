@@ -225,61 +225,6 @@ describe('POST /v1/messages/count_tokens', () => {
     expect(parsed.error.message).toContain('applyChatTemplate');
   });
 
-  it('rejects a queued token-count request when the model binding is re-registered before counting starts', async () => {
-    const registry = new ModelRegistry();
-    const originalModel = createCountingModel(17);
-    const swappedModel = createCountingModel(29);
-    registry.register('race-model', originalModel);
-
-    const sessionReg = registry.getSessionRegistry('race-model');
-    expect(sessionReg).toBeDefined();
-
-    let releaseBlocker!: () => void;
-    const blockerGate = new Promise<void>((resolve) => {
-      releaseBlocker = resolve;
-    });
-    let blockerEntered!: () => void;
-    const blockerEnteredPromise = new Promise<void>((resolve) => {
-      blockerEntered = resolve;
-    });
-    const blockerDone = sessionReg!.withExclusive(async () => {
-      blockerEntered();
-      await blockerGate;
-    });
-    await blockerEnteredPromise;
-
-    const handler = createHandler(registry);
-    const req = createMockReq('POST', '/v1/messages/count_tokens', {
-      model: 'race-model',
-      messages: [{ role: 'user', content: 'queued count' }],
-    });
-    const { res, getStatus, getBody, waitForEnd } = createMockRes();
-    const queuedDone = (async () => {
-      await handler(req, res);
-      await waitForEnd();
-    })();
-
-    for (let i = 0; i < 10 && sessionReg!.queueDepth !== 1; i++) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    expect(sessionReg!.queueDepth).toBe(1);
-
-    registry.register('race-model', swappedModel);
-    releaseBlocker();
-    await blockerDone;
-    await queuedDone;
-
-    expect(getStatus()).toBe(400);
-    const parsed = JSON.parse(getBody());
-    expect(parsed.type).toBe('error');
-    expect(parsed.error.type).toBe('invalid_request_error');
-    expect(parsed.error.message).toContain('race-model');
-    expect(parsed.error.message).toMatch(/binding changed/i);
-    expect(parsed.error.message).toMatch(/token-count request was queued/i);
-    expect(originalModel.applyChatTemplate).not.toHaveBeenCalled();
-    expect(swappedModel.applyChatTemplate).not.toHaveBeenCalled();
-  });
-
   it('rejects a token-count result when the model binding changes while counting is running', async () => {
     const registry = new ModelRegistry();
     const originalModel = createCountingModel(17);

@@ -9,13 +9,11 @@ import {
   sendAnthropicInternalError,
   sendAnthropicNotFound,
   sendAnthropicNotImplemented,
-  sendAnthropicRateLimit,
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry, ServableModel } from '../registry.js';
-import { QueueFullError } from '../session-registry.js';
 import type { AnthropicCountTokensRequest, AnthropicCountTokensResponse } from '../types-anthropic.js';
 
 interface ChatTemplateTokenCounter {
@@ -99,6 +97,13 @@ export async function handleCountMessageTokens(
   const preLockInstanceId = lease.instanceId;
 
   try {
+    // Token counting is a pure-CPU tokenize-and-template operation; it must NOT
+    // queue behind the per-model generation FIFO (`sessionReg.withExclusive`)
+    // because that serializes against multi-minute decode passes and turns a
+    // millisecond call into a multi-hundred-second wait. The dispatch lease
+    // already pins the model object + binding for the duration of this call,
+    // and `withInference` (a shared reader lock against `withModelLoad`) is
+    // enough to keep the model from being swapped out mid-tokenize.
     const bindingStillMatchesLease = () => {
       const lockedSessionReg = registry.getSessionRegistry(body.model);
       const lockedInstanceId = registry.getInstanceId(body.model);
@@ -121,47 +126,38 @@ export async function handleCountMessageTokens(
       );
     };
 
-    const runCount = () =>
-      sessionReg.withExclusive(async () => {
-        const runCountWithModelRead = async () => {
-          if (!bindingStillMatchesLease()) {
-            rejectChangedBinding('queued behind the per-model execution mutex');
-            return;
-          }
+    const runCountWithModelRead = async () => {
+      if (!bindingStillMatchesLease()) {
+        rejectChangedBinding('waiting for the model-load reader gate');
+        return;
+      }
 
-          const counter = getChatTemplateTokenCounter(leaseModel);
-          if (!counter) {
-            sendAnthropicNotImplemented(
-              res,
-              `Model "${body.model}" does not expose applyChatTemplate(); token counting requires a ` +
-                `non-generating chat-template tokenizer API on the registered model.`,
-            );
-            return;
-          }
+      const counter = getChatTemplateTokenCounter(leaseModel);
+      if (!counter) {
+        sendAnthropicNotImplemented(
+          res,
+          `Model "${body.model}" does not expose applyChatTemplate(); token counting requires a ` +
+            `non-generating chat-template tokenizer API on the registered model.`,
+        );
+        return;
+      }
 
-          try {
-            const tokens = await counter.applyChatTemplate(mapped.messages, true, mapped.config.tools ?? null);
-            if (!bindingStillMatchesLease()) {
-              rejectChangedBinding('running');
-              return;
-            }
-            endJson(res, { input_tokens: tokens.length });
-          } catch (err) {
-            sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to count tokens');
-          }
-        };
+      try {
+        const tokens = await counter.applyChatTemplate(mapped.messages, true, mapped.config.tools ?? null);
+        if (!bindingStillMatchesLease()) {
+          rejectChangedBinding('running');
+          return;
+        }
+        endJson(res, { input_tokens: tokens.length });
+      } catch (err) {
+        sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to count tokens');
+      }
+    };
 
-        if (modelWorkCoordinator) await modelWorkCoordinator.withInference(runCountWithModelRead);
-        else await runCountWithModelRead();
-      });
-
-    await runCount();
+    if (modelWorkCoordinator) await modelWorkCoordinator.withInference(runCountWithModelRead);
+    else await runCountWithModelRead();
   } catch (err) {
-    if (err instanceof QueueFullError) {
-      sendAnthropicRateLimit(res, `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`);
-    } else {
-      sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to count tokens');
-    }
+    sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to count tokens');
   } finally {
     registry.releaseDispatchLease(leaseModel);
   }
