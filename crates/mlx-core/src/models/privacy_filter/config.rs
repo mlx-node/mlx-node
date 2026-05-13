@@ -89,12 +89,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires .cache/models/privacy-filter/config.json — run with --ignored"]
     fn parses_real_config_json() {
-        let json = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../.cache/models/privacy-filter/config.json"
-        ));
-        let cfg: PrivacyFilterConfig = serde_json::from_str(json).expect("config.json");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".cache/models/privacy-filter/config.json");
+        let json = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read config.json from {path:?}: {e}"));
+        let cfg: PrivacyFilterConfig = serde_json::from_str(&json).expect("parse config.json");
 
         assert_eq!(cfg.model_type, "openai_privacy_filter");
         assert_eq!(cfg.hidden_size, 640);
