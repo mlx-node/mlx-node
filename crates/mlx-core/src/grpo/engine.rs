@@ -1540,6 +1540,7 @@ impl GRPOTrainingEngine {
                         content: m.content.clone(),
                         tool_calls: m.tool_calls.clone(),
                         tool_call_id: m.tool_call_id.clone(),
+                        is_error: None,
                         reasoning_content: m.reasoning_content.clone(),
                         images: None, // Images not used in training
                     })

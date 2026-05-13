@@ -347,9 +347,17 @@ pub(crate) enum Qwen35Cmd {
     /// [`Qwen35Inner::chat_session_continue_tool_sync`] — builds a
     /// ChatML `<tool_response>` delta and prefills on top of the live
     /// caches.
+    ///
+    /// `is_error` is the structured tool-error signal threaded through
+    /// from the NAPI surface (`chatSessionContinueTool(..., isError)`).
+    /// When `Some(true)`, the renderer prepends the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<tool_response>` wrapper. `None` / `Some(false)` produce the
+    /// pre-feature byte-equal output.
     ChatSessionContinueTool {
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
@@ -375,10 +383,12 @@ pub(crate) enum Qwen35Cmd {
     },
     /// Streaming tool-result continuation: same semantics as
     /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
-    /// streams token deltas through `stream_tx`.
+    /// streams token deltas through `stream_tx`. Carries the same
+    /// structured `is_error` signal.
     ChatStreamSessionContinueTool {
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -478,11 +488,16 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         Qwen35Cmd::ChatSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             reply,
         } => {
-            let _ =
-                reply.send(inner.chat_session_continue_tool_sync(tool_call_id, content, config));
+            let _ = reply.send(inner.chat_session_continue_tool_sync(
+                tool_call_id,
+                content,
+                is_error,
+                config,
+            ));
         }
         Qwen35Cmd::ChatStreamSessionStart {
             messages,
@@ -510,6 +525,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         Qwen35Cmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             stream_tx,
             config,
             cancelled,
@@ -517,6 +533,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             inner.chat_stream_session_continue_tool_sync(
                 tool_call_id,
                 content,
+                is_error,
                 config,
                 stream_tx,
                 cancelled,
@@ -2145,10 +2162,17 @@ impl Qwen35Inner {
     /// Text-only; delegates to [`Self::chat_tokens_delta_sync`] which
     /// inherits the same text-only-delta invariant (errors if the
     /// session currently holds image state).
+    ///
+    /// `is_error` is forwarded verbatim to
+    /// [`chat_common::build_chatml_tool_delta_text`]: `Some(true)` injects
+    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<tool_response>` wrapper; `None` / `Some(false)` keep the
+    /// pre-feature byte-equal output.
     pub(crate) fn chat_session_continue_tool_sync(
         &mut self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
         let tokenizer = self
@@ -2158,8 +2182,12 @@ impl Qwen35Inner {
             .clone();
 
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text =
-            chat_common::build_chatml_tool_delta_text(&tool_call_id, &content, enable_thinking);
+        let delta_text = chat_common::build_chatml_tool_delta_text(
+            &tool_call_id,
+            &content,
+            enable_thinking,
+            is_error,
+        );
 
         let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
 
@@ -3992,11 +4020,14 @@ impl Qwen35Inner {
     ///
     /// Builds a ChatML tool-response delta, tokenizes it, and delegates
     /// to [`Self::chat_stream_tokens_delta_sync`]. Inherits the same
-    /// text-only-delta invariant.
+    /// text-only-delta invariant. `is_error` is forwarded verbatim to
+    /// the wire-format renderer; see the non-streaming entry point for
+    /// the marker semantics.
     pub(crate) fn chat_stream_session_continue_tool_sync(
         &mut self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -4018,8 +4049,12 @@ impl Qwen35Inner {
         };
 
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text =
-            chat_common::build_chatml_tool_delta_text(&tool_call_id, &content, enable_thinking);
+        let delta_text = chat_common::build_chatml_tool_delta_text(
+            &tool_call_id,
+            &content,
+            enable_thinking,
+            is_error,
+        );
 
         let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
             Ok(t) => t,
@@ -6837,12 +6872,20 @@ impl Qwen3_5Model {
     /// wrapper tags, not an explicit id. Callers may still log it for
     /// their own bookkeeping.
     ///
+    /// `is_error` is the structured tool-error signal. When `Some(true)`,
+    /// the renderer prepends the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<tool_response>` wrapper so the model receives a clear text-level
+    /// cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+    /// pre-feature output.
+    ///
     /// Requires a live session started via `chatSessionStart`.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
         let config = config.unwrap_or(ChatConfig {
@@ -6872,6 +6915,7 @@ impl Qwen3_5Model {
             Qwen35Cmd::ChatSessionContinueTool {
                 tool_call_id,
                 content,
+                is_error,
                 config,
                 reply,
             }
@@ -7017,13 +7061,18 @@ impl Qwen3_5Model {
     /// Builds a ChatML tool-response delta on top of the live session
     /// caches and streams the decoded reply. Requires a live session
     /// started via `chatSessionStart` / `chatStreamSessionStart`.
+    /// `is_error` mirrors the non-streaming entry point — when
+    /// `Some(true)`, the renderer prepends the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<tool_response>` wrapper.
     #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "toolCallId: string, content: string, isError: boolean | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
@@ -7058,6 +7107,7 @@ impl Qwen3_5Model {
         self.thread.send(Qwen35Cmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             stream_tx,
             cancelled: cancelled_inner,

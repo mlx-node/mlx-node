@@ -128,9 +128,16 @@ pub(crate) enum QianfanOCRCmd {
     /// [`QianfanOCRInner::chat_session_continue_tool_sync`] — builds a
     /// ChatML `<tool_response>` delta and prefills on top of the live
     /// caches.
+    ///
+    /// `is_error` is the structured tool-error signal threaded through
+    /// from the NAPI surface. When `Some(true)`, the renderer prepends
+    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<tool_response>` wrapper. `None` / `Some(false)` produce the
+    /// pre-feature byte-equal output.
     ChatSessionContinueTool {
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
@@ -156,10 +163,12 @@ pub(crate) enum QianfanOCRCmd {
     },
     /// Streaming tool-result continuation: same semantics as
     /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
-    /// streams token deltas through `stream_tx`.
+    /// streams token deltas through `stream_tx`. Carries the same
+    /// structured `is_error` signal.
     ChatStreamSessionContinueTool {
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -205,11 +214,16 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
         QianfanOCRCmd::ChatSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             reply,
         } => {
-            let _ =
-                reply.send(inner.chat_session_continue_tool_sync(tool_call_id, content, config));
+            let _ = reply.send(inner.chat_session_continue_tool_sync(
+                tool_call_id,
+                content,
+                is_error,
+                config,
+            ));
         }
         QianfanOCRCmd::ChatStreamSessionStart {
             messages,
@@ -237,6 +251,7 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
         QianfanOCRCmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             stream_tx,
             cancelled,
@@ -244,6 +259,7 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             inner.chat_stream_session_continue_tool_sync(
                 tool_call_id,
                 content,
+                is_error,
                 config,
                 stream_tx,
                 cancelled,
@@ -1240,10 +1256,18 @@ impl QianfanOCRInner {
     /// Text-only; delegates to [`Self::chat_tokens_delta_sync`] which
     /// inherits the same text-only-delta invariant (errors if the
     /// session currently holds image state).
+    ///
+    /// `is_error` is forwarded verbatim to
+    /// [`crate::models::qwen3_5::chat_common::build_chatml_tool_delta_text`]:
+    /// `Some(true)` injects the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<tool_response>` wrapper; `None` / `Some(false)` keep the
+    /// pre-feature byte-equal output.
     pub(crate) fn chat_session_continue_tool_sync(
         &mut self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
         let tokenizer = self.tokenizer.clone();
@@ -1253,6 +1277,7 @@ impl QianfanOCRInner {
             &tool_call_id,
             &content,
             enable_thinking,
+            is_error,
         );
         let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
 
@@ -1653,10 +1678,13 @@ impl QianfanOCRInner {
     }
 
     /// Streaming variant of [`Self::chat_session_continue_tool_sync`].
+    /// `is_error` is forwarded verbatim to the wire-format renderer;
+    /// see the non-streaming entry point for the marker semantics.
     pub(crate) fn chat_stream_session_continue_tool_sync(
         &mut self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -1676,6 +1704,7 @@ impl QianfanOCRInner {
             &tool_call_id,
             &content,
             enable_thinking,
+            is_error,
         );
 
         let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
@@ -2323,12 +2352,20 @@ impl QianfanOCRModel {
     /// decodes the model reply. Stops on `<|im_end|>` so the cache stays
     /// on a clean turn boundary for the next turn.
     ///
+    /// `is_error` is the structured tool-error signal. When `Some(true)`,
+    /// the renderer prepends the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<tool_response>` wrapper so the model receives a clear text-level
+    /// cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+    /// pre-feature output.
+    ///
     /// Requires a live session started via `chatSessionStart`.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
         let thread = self.thread.as_ref().ok_or_else(|| {
@@ -2341,6 +2378,7 @@ impl QianfanOCRModel {
             QianfanOCRCmd::ChatSessionContinueTool {
                 tool_call_id,
                 content,
+                is_error,
                 config,
                 reply,
             }
@@ -2427,13 +2465,19 @@ impl QianfanOCRModel {
     }
 
     /// Streaming variant of `chatSessionContinueTool`.
+    ///
+    /// `is_error` mirrors the non-streaming entry point — when
+    /// `Some(true)`, the renderer prepends the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<tool_response>` wrapper.
     #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "toolCallId: string, content: string, isError: boolean | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
@@ -2451,6 +2495,7 @@ impl QianfanOCRModel {
         thread.send(QianfanOCRCmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             stream_tx,
             cancelled: cancelled_inner,

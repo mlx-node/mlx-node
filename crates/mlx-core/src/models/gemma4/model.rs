@@ -329,9 +329,16 @@ pub(crate) enum Gemma4Cmd {
     /// [`Gemma4Inner::chat_session_continue_tool_sync`] — builds a
     /// Gemma4-format tool delta (`\n<|turn>tool\n{content}<turn|>\n<|turn>model\n`)
     /// and prefills on top of the live caches.
+    ///
+    /// `is_error` is the structured tool-error signal threaded through
+    /// from the NAPI surface. When `Some(true)`, the renderer prepends
+    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<|turn>tool` block. `None` / `Some(false)` produce the
+    /// pre-feature byte-equal output.
     ChatSessionContinueTool {
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
@@ -357,10 +364,12 @@ pub(crate) enum Gemma4Cmd {
     },
     /// Streaming tool-result continuation: same semantics as
     /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
-    /// streams token deltas through `stream_tx`.
+    /// streams token deltas through `stream_tx`. Carries the same
+    /// structured `is_error` signal.
     ChatStreamSessionContinueTool {
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -4762,10 +4771,17 @@ impl Gemma4Inner {
     /// Qwen3.5-specific). The `tool_call_id` is intentionally dropped
     /// from the wire format — Gemma4's template identifies tool
     /// responses positionally, not via an explicit id.
+    ///
+    /// `is_error` is forwarded to [`build_gemma4_tool_delta_text`]:
+    /// `Some(true)` injects the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<|turn>tool` block; `None` / `Some(false)` keep the
+    /// pre-feature byte-equal output.
     pub(crate) fn chat_session_continue_tool_sync(
         &mut self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
         let tokenizer = self
@@ -4775,7 +4791,8 @@ impl Gemma4Inner {
             .clone();
 
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = build_gemma4_tool_delta_text(&tool_call_id, &content, enable_thinking);
+        let delta_text =
+            build_gemma4_tool_delta_text(&tool_call_id, &content, enable_thinking, is_error);
         let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
 
         self.chat_tokens_delta_sync(delta_tokens, config)
@@ -5149,10 +5166,13 @@ impl Gemma4Inner {
     }
 
     /// Streaming variant of [`Self::chat_session_continue_tool_sync`].
+    /// `is_error` is forwarded verbatim to the wire-format renderer;
+    /// see the non-streaming entry point for the marker semantics.
     pub(crate) fn chat_stream_session_continue_tool_sync(
         &mut self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -5174,7 +5194,8 @@ impl Gemma4Inner {
         };
 
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = build_gemma4_tool_delta_text(&tool_call_id, &content, enable_thinking);
+        let delta_text =
+            build_gemma4_tool_delta_text(&tool_call_id, &content, enable_thinking, is_error);
 
         let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
             Ok(t) => t,
@@ -5552,17 +5573,23 @@ fn build_gemma4_continue_delta_text(sanitized_user: &str, enable_thinking: Optio
 ///
 /// Tool content is passed through [`escape_gemma4_content`] so
 /// malicious tool output containing Gemma4 delimiter tokens can't
-/// escape the tool turn and inject synthetic structure.
+/// escape the tool turn and inject synthetic structure. The shared
+/// [`crate::tokenizer::TOOL_ERROR_MARKER`] (when `is_error == Some(true)`)
+/// is prepended BEFORE escaping so the marker text — which contains
+/// no Gemma4 delimiter tokens — passes through verbatim and the
+/// downstream escaping still protects any user content that follows.
 fn build_gemma4_tool_delta_text(
     _tool_call_id: &str,
     content: &str,
     enable_thinking: Option<bool>,
+    is_error: Option<bool>,
 ) -> String {
     // `enable_thinking` intentionally unused: see
     // `build_gemma4_continue_delta_text` for why the raw delta path
     // ignores reasoning mode.
     let _ = enable_thinking;
-    let escaped = escape_gemma4_content(content);
+    let rendered_content = crate::tokenizer::apply_tool_error_marker(content, is_error);
+    let escaped = escape_gemma4_content(&rendered_content);
     format!("\n<|turn>tool\n{escaped}<turn|>\n<|turn>model\n")
 }
 
@@ -5592,11 +5619,16 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
         Gemma4Cmd::ChatSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             reply,
         } => {
-            let _ =
-                reply.send(inner.chat_session_continue_tool_sync(tool_call_id, content, config));
+            let _ = reply.send(inner.chat_session_continue_tool_sync(
+                tool_call_id,
+                content,
+                is_error,
+                config,
+            ));
         }
         Gemma4Cmd::ChatStreamSessionStart {
             messages,
@@ -5624,6 +5656,7 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
         Gemma4Cmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             stream_tx,
             cancelled,
@@ -5631,6 +5664,7 @@ pub(crate) fn handle_gemma4_cmd(inner: &mut Gemma4Inner, cmd: Gemma4Cmd) {
             inner.chat_stream_session_continue_tool_sync(
                 tool_call_id,
                 content,
+                is_error,
                 config,
                 stream_tx,
                 cancelled,
@@ -5831,12 +5865,20 @@ impl Gemma4Model {
     /// not via an explicit id. Callers may still log it for their own
     /// bookkeeping.
     ///
+    /// `is_error` is the structured tool-error signal. When `Some(true)`,
+    /// the renderer prepends the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<|turn>tool` block so the model receives a clear text-level
+    /// cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+    /// pre-feature output.
+    ///
     /// Requires a live session started via `chatSessionStart`.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
         let thread = self.thread.as_ref().ok_or_else(|| {
@@ -5847,6 +5889,7 @@ impl Gemma4Model {
         crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::ChatSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             reply,
         })
@@ -5941,13 +5984,19 @@ impl Gemma4Model {
     }
 
     /// Streaming variant of `chatSessionContinueTool`.
+    ///
+    /// `is_error` mirrors the non-streaming entry point — when
+    /// `Some(true)`, the renderer prepends the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<|turn>tool` block.
     #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "toolCallId: string, content: string, isError: boolean | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
@@ -5964,6 +6013,7 @@ impl Gemma4Model {
         thread.send(Gemma4Cmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             stream_tx,
             cancelled: cancelled_inner,
@@ -9224,6 +9274,80 @@ mod prefix_cache_decision_tests {
             classify_prefix_cache_decision(10, 5),
             PrefixCacheDecision::Miss,
             "cached_prefix_len > tokens_len must be Miss (defensive fallthrough)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_delta_marker_tests {
+    //! Guard the structured `is_error` channel on Gemma4's tool-result
+    //! wire format. The shared
+    //! [`crate::tokenizer::TOOL_ERROR_MARKER`] must be injected inside
+    //! the `<|turn>tool` block only when the caller passes
+    //! `Some(true)`. `None` and `Some(false)` keep the output
+    //! byte-equal to the pre-feature behavior — guarding both the hot
+    //! (successful) path and the explicit-false path against
+    //! accidental drift. The marker text contains no Gemma4 delimiter
+    //! tokens so the downstream `escape_gemma4_content` step is a
+    //! no-op on it.
+
+    use super::build_gemma4_tool_delta_text;
+    use crate::tokenizer::TOOL_ERROR_MARKER;
+
+    #[test]
+    fn injects_marker_when_is_error_true() {
+        let payload = "boom: connection refused";
+        let rendered = build_gemma4_tool_delta_text("call_fail", payload, None, Some(true));
+        let expected_inner = format!("{TOOL_ERROR_MARKER}{payload}");
+        assert!(
+            rendered.contains(&expected_inner),
+            "expected error marker inside <|turn>tool block; got:\n{rendered}",
+        );
+        // Wrapper integrity stays correct on the marked path.
+        assert!(
+            rendered.contains("<|turn>tool\n"),
+            "tool block opener missing"
+        );
+        assert!(rendered.contains("<turn|>"), "turn closer missing");
+        assert!(rendered.contains("<|turn>model\n"), "model opener missing");
+    }
+
+    #[test]
+    fn skips_marker_when_is_error_none() {
+        let payload = "{\"temperature\": 72}";
+        let rendered = build_gemma4_tool_delta_text("call_ok", payload, None, None);
+        assert!(
+            !rendered.contains(TOOL_ERROR_MARKER),
+            "marker leaked into unflagged delta:\n{rendered}",
+        );
+        assert!(
+            rendered.contains(payload),
+            "original content missing from delta:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn skips_marker_when_is_error_some_false() {
+        let payload = "ok";
+        let rendered = build_gemma4_tool_delta_text("call_ok", payload, None, Some(false));
+        assert!(
+            !rendered.contains(TOOL_ERROR_MARKER),
+            "marker leaked into Some(false) delta:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn does_not_remark_content_that_resembles_marker() {
+        // The structured channel removes the collision concern: a
+        // successful tool result whose literal content begins with the
+        // marker text must NOT double-prefix the marker on its way
+        // through the renderer.
+        let suspicious = format!("{TOOL_ERROR_MARKER}this is a successful payload");
+        let rendered = build_gemma4_tool_delta_text("call_ok", &suspicious, None, None);
+        let occurrences = rendered.matches(TOOL_ERROR_MARKER).count();
+        assert_eq!(
+            occurrences, 1,
+            "marker count should be 1 (the original literal); got {occurrences} in:\n{rendered}",
         );
     }
 }

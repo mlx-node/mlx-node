@@ -198,7 +198,12 @@ export interface SessionCapableModel {
     images: Uint8Array[] | null,
     config?: ChatConfig | null,
   ): Promise<ChatResult>;
-  chatSessionContinueTool(toolCallId: string, content: string, config?: ChatConfig | null): Promise<ChatResult>;
+  chatSessionContinueTool(
+    toolCallId: string,
+    content: string,
+    isError?: boolean | null,
+    config?: ChatConfig | null,
+  ): Promise<ChatResult>;
   /**
    * The optional `signal` parameter on every streaming entry point is
    * plumbed into the `_runChatStream` fast-abort path in the wrapper
@@ -222,6 +227,7 @@ export interface SessionCapableModel {
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError?: boolean | null,
     config?: ChatConfig | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
@@ -628,9 +634,26 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * hit this must tighten the prompt / tool spec or reset the
    * session.
    *
+   * `isError` is the structured tool-error signal. When `true`, the
+   * native renderer prepends a short, model-facing error marker to
+   * `content` inside the wire-format tool block so the model
+   * receives a clear text-level cue that the tool result represents
+   * a failure. The structured field is stored verbatim on the
+   * appended `{ role: 'tool', ... }` history entry so cold-replay
+   * (image-change restart, `startFromHistory*`, server-side
+   * `SessionRegistry` cache-miss rebuild) re-renders the marker
+   * consistently with the live turn. Defaults to `undefined` (no
+   * marker). Pass through verbatim — we do NOT infer error from
+   * `content`.
+   *
    * Appends a `{ role: 'tool', ... }` message to history on success.
    */
-  async sendToolResult(toolCallId: string, content: string, opts: { config?: ChatConfig } = {}): Promise<ChatResult> {
+  async sendToolResult(
+    toolCallId: string,
+    content: string,
+    isError?: boolean,
+    opts: { config?: ChatConfig } = {},
+  ): Promise<ChatResult> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
     }
@@ -638,8 +661,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.inFlight = true;
     try {
       const mergedConfig = this.mergeConfig(opts.config);
-      const result = await this.model.chatSessionContinueTool(toolCallId, content, mergedConfig);
-      this.history.push({ role: 'tool', content, toolCallId });
+      const result = await this.model.chatSessionContinueTool(toolCallId, content, isError ?? null, mergedConfig);
+      this.history.push({ role: 'tool', content, toolCallId, isError });
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
       this.recordToolCallFanout(result.toolCalls);
@@ -649,10 +672,20 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     }
   }
 
-  /** Streaming variant of {@link ChatSession#sendToolResult}. */
+  /**
+   * Streaming variant of {@link ChatSession#sendToolResult}.
+   *
+   * `isError` mirrors the non-streaming entry point — when `true`,
+   * the native renderer prepends a short, model-facing error marker
+   * to `content` inside the wire-format tool block. The structured
+   * field is stored verbatim on the appended `{ role: 'tool', ... }`
+   * history entry so cold-replay re-renders the marker consistently
+   * with the live streaming turn.
+   */
   async *sendToolResultStream(
     toolCallId: string,
     content: string,
+    isError?: boolean,
     opts: { config?: ChatConfig; signal?: AbortSignal } = {},
   ): AsyncGenerator<ChatStreamEvent> {
     if (this.inFlight) {
@@ -670,6 +703,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         for await (const event of this.model.chatStreamSessionContinueTool(
           toolCallId,
           content,
+          isError ?? null,
           mergedConfig,
           opts.signal,
         )) {
@@ -690,7 +724,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // and error-finish chunks alike. Tool turns never touch
         // history until commit, so the rollback branch is a no-op.
         if (sawFinal) {
-          this.history.push({ role: 'tool', content, toolCallId });
+          this.history.push({ role: 'tool', content, toolCallId, isError });
           this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
           this.turnCount++;
           this.recordToolCallFanout(finalToolCalls);

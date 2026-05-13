@@ -145,6 +145,7 @@ pub(crate) fn build_synthetic_user_message(user: &str) -> ChatMessage {
         content: user.to_string(),
         tool_calls: None,
         tool_call_id: None,
+        is_error: None,
         reasoning_content: None,
         images: None,
     }
@@ -210,10 +211,19 @@ pub(crate) fn build_chatml_continue_delta_text(
 /// matching what the Qwen3.5 jinja template does after the assistant
 /// opener. Callers resolve `enable_thinking` from the current
 /// `ChatConfig` via `resolve_enable_thinking` before calling this helper.
+///
+/// `is_error` is the model-facing failure cue: when `Some(true)`, the
+/// shared [`crate::tokenizer::TOOL_ERROR_MARKER`] is prepended to
+/// `content` inside the `<tool_response>` wrapper. The structured
+/// `ChatMessage::is_error` field on the originating message is the
+/// authoritative signal; the marker injection here only affects the
+/// wire bytes the model decodes. `None` / `Some(false)` produce the
+/// unmarked wire format and stay byte-equal to the pre-feature output.
 pub(crate) fn build_chatml_tool_delta_text(
     _tool_call_id: &str,
     content: &str,
     enable_thinking: Option<bool>,
+    is_error: Option<bool>,
 ) -> String {
     let thinking_prefix = match enable_thinking {
         Some(false) => "",
@@ -221,8 +231,9 @@ pub(crate) fn build_chatml_tool_delta_text(
         // Some(true) both take the thinking path.
         _ => "<think>\n",
     };
+    let rendered_content = crate::tokenizer::apply_tool_error_marker(content, is_error);
     format!(
-        "\n<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n<|im_start|>assistant\n{thinking_prefix}",
+        "\n<|im_start|>user\n<tool_response>\n{rendered_content}\n</tool_response><|im_end|>\n<|im_start|>assistant\n{thinking_prefix}",
     )
 }
 
@@ -978,6 +989,107 @@ mod compiled_paged_fallback_policy_tests {
             "compiled forward failure AFTER a successful compiled step must propagate as fatal: \
              the C++ GDN linear-cache globals advanced but self.caches is stale, so a pure-Rust \
              fallback would silently corrupt the response"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_delta_marker_tests {
+    //! Guard the structured `is_error` channel on
+    //! `build_chatml_tool_delta_text`. The renderer injects the
+    //! `TOOL_ERROR_MARKER` cue into the `<tool_response>` wire content
+    //! only when the caller passes `Some(true)`. `None` and
+    //! `Some(false)` keep the output byte-equal to the pre-feature
+    //! behavior — guarding both the hot (successful) path and the
+    //! explicit-false path against accidental drift.
+
+    use super::build_chatml_tool_delta_text;
+    use crate::tokenizer::TOOL_ERROR_MARKER;
+
+    #[test]
+    fn tool_delta_injects_marker_when_is_error_true() {
+        // `Some(true)` must produce the marker prefix inside the
+        // `<tool_response>` wrapper. The marker is the single shared
+        // constant — using it directly here keeps the test in sync
+        // with any future rename.
+        let payload = "boom: connection refused";
+        let rendered = build_chatml_tool_delta_text("call_fail", payload, None, Some(true));
+        let expected_inner = format!("{TOOL_ERROR_MARKER}{payload}");
+        assert!(
+            rendered.contains(&expected_inner),
+            "expected error marker inside <tool_response> wrapper; got:\n{rendered}",
+        );
+        // The wrapper itself must stay correct (we don't want to ship
+        // a malformed delta that only the unflagged path renders right).
+        assert!(
+            rendered.contains("<tool_response>\n"),
+            "wrapper open missing"
+        );
+        assert!(
+            rendered.contains("</tool_response>"),
+            "wrapper close missing"
+        );
+    }
+
+    #[test]
+    fn tool_delta_skips_marker_when_is_error_none() {
+        // None = default; pre-feature output. The marker MUST NOT
+        // appear anywhere in the wire text.
+        let payload = "{\"temperature\": 72}";
+        let rendered = build_chatml_tool_delta_text("call_ok", payload, None, None);
+        assert!(
+            !rendered.contains(TOOL_ERROR_MARKER),
+            "marker leaked into unflagged delta:\n{rendered}",
+        );
+        assert!(
+            rendered.contains(payload),
+            "original content missing from delta:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn tool_delta_skips_marker_when_is_error_some_false() {
+        // Explicit `Some(false)` is the same as `None` — only
+        // `Some(true)` flips the marker on.
+        let payload = "ok";
+        let rendered = build_chatml_tool_delta_text("call_ok", payload, None, Some(false));
+        assert!(
+            !rendered.contains(TOOL_ERROR_MARKER),
+            "marker leaked into Some(false) delta:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn tool_delta_does_not_remark_content_that_resembles_marker() {
+        // The structured channel removes the collision concern: a
+        // successful tool result whose literal content begins with the
+        // marker text must NOT double-prefix the marker on its way
+        // through the renderer.
+        let suspicious = format!("{TOOL_ERROR_MARKER}this is a successful payload");
+        let rendered = build_chatml_tool_delta_text("call_ok", &suspicious, None, None);
+        // Exactly one occurrence — the original payload — no extra
+        // prefix.
+        let occurrences = rendered.matches(TOOL_ERROR_MARKER).count();
+        assert_eq!(
+            occurrences, 1,
+            "marker count should be 1 (the original literal); got {occurrences} in:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn tool_delta_marker_interacts_correctly_with_thinking_prefix() {
+        // The marker and the `<think>\n` prefix occupy different slots
+        // in the delta. Both must render together when both are active:
+        // marker inside `<tool_response>`, `<think>\n` after the
+        // assistant opener.
+        let rendered = build_chatml_tool_delta_text("call_fail", "boom", Some(true), Some(true));
+        assert!(
+            rendered.contains(&format!("{TOOL_ERROR_MARKER}boom")),
+            "marker missing from thinking-enabled delta:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("<|im_start|>assistant\n<think>\n"),
+            "thinking prefix missing from thinking-enabled delta:\n{rendered}",
         );
     }
 }

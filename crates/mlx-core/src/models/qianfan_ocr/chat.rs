@@ -421,6 +421,7 @@ mod tests {
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: None,
+            is_error: None,
             reasoning_content: None,
             images: None,
         }
@@ -433,6 +434,7 @@ mod tests {
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: None,
+            is_error: None,
             reasoning_content: None,
             images: Some(images),
         }
@@ -448,6 +450,7 @@ mod tests {
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: None,
+            is_error: None,
             reasoning_content: Some(reasoning.to_string()),
             images: None,
         }
@@ -469,6 +472,7 @@ mod tests {
                     .collect(),
             ),
             tool_call_id: None,
+            is_error: None,
             reasoning_content: None,
             images: None,
         }
@@ -480,6 +484,7 @@ mod tests {
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: None,
+            is_error: None,
             reasoning_content: None,
             images: None,
         }

@@ -70,12 +70,20 @@ export class QianfanOCRModel extends QianfanOCRModelNative {
   async *chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError?: boolean | null,
     config?: ChatConfig | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
       (callback) =>
-        _nativeQianfanOcrChatStreamSessionContinueTool.call(this, toolCallId, content, config ?? null, callback),
+        _nativeQianfanOcrChatStreamSessionContinueTool.call(
+          this,
+          toolCallId,
+          content,
+          isError ?? null,
+          config ?? null,
+          callback,
+        ),
       signal,
     );
   }

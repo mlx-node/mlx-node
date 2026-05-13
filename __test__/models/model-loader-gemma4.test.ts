@@ -158,7 +158,7 @@ describe('Gemma4Model(config) stub (round-5 Finding B)', () => {
 
   it('rejects chatStreamSessionContinueTool with a "not initialized" error', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    await expect(stub.chatStreamSessionContinueTool('tool_123', '{"ok":true}', null, () => {})).rejects.toThrow(
+    await expect(stub.chatStreamSessionContinueTool('tool_123', '{"ok":true}', null, null, () => {})).rejects.toThrow(
       /not initialized/i,
     );
   });

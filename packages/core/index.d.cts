@@ -235,11 +235,19 @@ export declare class Gemma4Model {
    * not via an explicit id. Callers may still log it for their own
    * bookkeeping.
    *
+   * `is_error` is the structured tool-error signal. When `Some(true)`,
+   * the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<|turn>tool` block so the model receives a clear text-level
+   * cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+   * pre-feature output.
+   *
    * Requires a live session started via `chatSessionStart`.
    */
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
@@ -255,10 +263,18 @@ export declare class Gemma4Model {
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /** Streaming variant of `chatSessionContinueTool`. */
+  /**
+   * Streaming variant of `chatSessionContinueTool`.
+   *
+   * `is_error` mirrors the non-streaming entry point — when
+   * `Some(true)`, the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<|turn>tool` block.
+   */
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError: boolean | null | undefined,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -591,11 +607,19 @@ export declare class Lfm2Model {
  * not via an explicit id. Callers may still log it for their own
  * bookkeeping.
  *
+ * `is_error` is the structured tool-error signal. When `Some(true)`,
+ * the renderer prepends the shared
+ * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+ * `<|im_start|>tool` block so the model receives a clear text-level
+ * cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+ * pre-feature output.
+ *
  * Requires a live session started via `chatSessionStart`.
  */
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
@@ -611,10 +635,18 @@ export declare class Lfm2Model {
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /** Streaming variant of `chatSessionContinueTool`. */
+  /**
+   * Streaming variant of `chatSessionContinueTool`.
+   *
+   * `is_error` mirrors the non-streaming entry point — when
+   * `Some(true)`, the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<|im_start|>tool` block.
+   */
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError: boolean | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1098,11 +1130,19 @@ export declare class QianfanOCRModel {
    * decodes the model reply. Stops on `<|im_end|>` so the cache stays
    * on a clean turn boundary for the next turn.
    *
+   * `is_error` is the structured tool-error signal. When `Some(true)`,
+   * the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<tool_response>` wrapper so the model receives a clear text-level
+   * cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+   * pre-feature output.
+   *
    * Requires a live session started via `chatSessionStart`.
    */
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
@@ -1118,10 +1158,18 @@ export declare class QianfanOCRModel {
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /** Streaming variant of `chatSessionContinueTool`. */
+  /**
+   * Streaming variant of `chatSessionContinueTool`.
+   *
+   * `is_error` mirrors the non-streaming entry point — when
+   * `Some(true)`, the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<tool_response>` wrapper.
+   */
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError: boolean | null | undefined,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1218,11 +1266,19 @@ export declare class Qwen35Model {
    * wrapper tags, not an explicit id. Callers may still log it for
    * their own bookkeeping.
    *
+   * `is_error` is the structured tool-error signal. When `Some(true)`,
+   * the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<tool_response>` wrapper so the model receives a clear text-level
+   * cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+   * pre-feature output.
+   *
    * Requires a live session started via `chatSessionStart`.
    */
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
   ): Promise<ChatResult>;
   /**
@@ -1269,10 +1325,15 @@ export declare class Qwen35Model {
    * Builds a ChatML tool-response delta on top of the live session
    * caches and streams the decoded reply. Requires a live session
    * started via `chatSessionStart` / `chatStreamSessionStart`.
+   * `is_error` mirrors the non-streaming entry point — when
+   * `Some(true)`, the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<tool_response>` wrapper.
    */
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError: boolean | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1374,11 +1435,19 @@ export declare class Qwen35MoeModel {
    * wrapper tags, not an explicit id. Callers may still log it for
    * their own bookkeeping.
    *
+   * `is_error` is the structured tool-error signal. When `Some(true)`,
+   * the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<tool_response>` wrapper so the model receives a clear text-level
+   * cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+   * pre-feature output.
+   *
    * Requires a live session started via `chatSessionStart`.
    */
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
   ): Promise<ChatResult>;
   /**
@@ -1425,10 +1494,15 @@ export declare class Qwen35MoeModel {
    * Builds a ChatML tool-response delta on top of the live session
    * caches and streams the decoded reply. Requires a live session
    * started via `chatSessionStart` / `chatStreamSessionStart`.
+   * `is_error` mirrors the non-streaming entry point — when
+   * `Some(true)`, the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<tool_response>` wrapper.
    */
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError: boolean | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1553,11 +1627,19 @@ export declare class Qwen3Model {
    * caches, then decodes the assistant reply. Stops on `<|im_end|>`
    * so the cache stays on a clean boundary for the next turn.
    *
+   * `is_error` is the structured tool-error signal. When `Some(true)`,
+   * the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<tool_response>` wrapper so the model receives a clear text-level
+   * cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+   * pre-feature output.
+   *
    * Requires a live session started via `chatSessionStart`.
    */
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
@@ -1573,10 +1655,18 @@ export declare class Qwen3Model {
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /** Streaming variant of `chatSessionContinueTool`. */
+  /**
+   * Streaming variant of `chatSessionContinueTool`.
+   *
+   * `is_error` mirrors the non-streaming entry point — when
+   * `Some(true)`, the renderer prepends the shared
+   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+   * `<tool_response>` wrapper.
+   */
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
+    isError: boolean | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -2314,6 +2404,23 @@ export interface ChatMessage {
   toolCalls?: Array<ToolCall>;
   /** Tool call ID this message is responding to (for tool messages) */
   toolCallId?: string;
+  /**
+   * Whether this tool-role message represents an errored tool result.
+   *
+   * Authoritative, structured signal of tool-call failure. Set to
+   * `Some(true)` when the caller (e.g. the Anthropic
+   * `tool_result.is_error === true` translator) wants the model to
+   * treat the tool output as an error. The renderer prepends a short
+   * `[tool error]` prefix to `content` when emitting the wire-format
+   * tool response so the model receives a clear text-level cue, but
+   * the original `content` stays byte-for-byte intact in the
+   * structured form — no JSON wrapping, no in-band marker that could
+   * collide with a successful tool result whose literal content
+   * happens to start with the same prefix.
+   *
+   * `None` / `Some(false)` produce the unmarked wire format.
+   */
+  isError?: boolean;
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */

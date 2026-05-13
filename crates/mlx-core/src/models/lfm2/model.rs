@@ -90,9 +90,16 @@ pub(crate) enum Lfm2Cmd {
     /// `<|im_start|>tool\n{content}<|im_end|>` delta (matching LFM2's
     /// template which does NOT use Qwen3.5's `<tool_response>` wrapping)
     /// and prefills on top of the live caches.
+    ///
+    /// `is_error` is the structured tool-error signal threaded through
+    /// from the NAPI surface. When `Some(true)`, the renderer prepends
+    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<|im_start|>tool` block. `None` / `Some(false)` produce the
+    /// pre-feature byte-equal output.
     ChatSessionContinueTool {
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
@@ -118,10 +125,12 @@ pub(crate) enum Lfm2Cmd {
     },
     /// Streaming tool-result continuation: same semantics as
     /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
-    /// streams token deltas through `stream_tx`.
+    /// streams token deltas through `stream_tx`. Carries the same
+    /// structured `is_error` signal.
     ChatStreamSessionContinueTool {
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -195,6 +204,31 @@ pub(crate) fn classify_prefix_cache_decision(
     } else {
         PrefixCacheDecision::Miss
     }
+}
+
+/// Build the LFM2 wire-format delta text for a tool-result turn.
+///
+/// LFM2's chat template renders tool-role messages as plain
+/// `<|im_start|>tool\n{content}<|im_end|>` blocks — no
+/// `<tool_response>` wrapping (unlike Qwen3.5). Leading `\n` closes
+/// the cached `<|im_end|>` line, then we open the `tool` turn, close
+/// it, and open an assistant turn ready for generation. No
+/// `<think>\n` prefix because LFM2's template never injects one.
+///
+/// `is_error` is the structured tool-error signal. When `Some(true)`,
+/// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] is prepended to
+/// `content` via [`crate::tokenizer::apply_tool_error_marker`]; `None`
+/// / `Some(false)` keep the wire bytes byte-equal to the pre-feature
+/// output.
+///
+/// Extracted from
+/// [`Lfm2Inner::chat_session_continue_tool_sync`] /
+/// [`Lfm2Inner::chat_stream_session_continue_tool_sync`] so the
+/// wire-format choice can be pinned by pure-string unit tests that
+/// don't need a loaded LFM2 model.
+pub(crate) fn build_lfm2_tool_delta_text(content: &str, is_error: Option<bool>) -> String {
+    let rendered_content = crate::tokenizer::apply_tool_error_marker(content, is_error);
+    format!("\n<|im_start|>tool\n{rendered_content}<|im_end|>\n<|im_start|>assistant\n")
 }
 
 impl Lfm2Inner {
@@ -2381,10 +2415,18 @@ impl Lfm2Inner {
     /// Delegates to [`Self::chat_tokens_delta_sync`] which inherits the
     /// same text-only-delta invariant (errors if the session currently
     /// holds image state).
+    ///
+    /// `is_error` is the structured tool-error signal. When `Some(true)`,
+    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] is prepended
+    /// to `content` inside the `<|im_start|>tool` block via
+    /// [`crate::tokenizer::apply_tool_error_marker`]. `None` /
+    /// `Some(false)` keep the wire bytes byte-equal to the pre-feature
+    /// output.
     pub(crate) fn chat_session_continue_tool_sync(
         &mut self,
         _tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
         let tokenizer = self
@@ -2393,14 +2435,7 @@ impl Lfm2Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        // Build the LFM2-specific tool delta inline. Leading `\n`
-        // closes the cached `<|im_end|>` line, then we open a `tool`
-        // role turn, close it, and open an assistant turn ready for
-        // generation. No `<think>\n` prefix because LFM2's template
-        // does not inject one.
-        let delta_text =
-            format!("\n<|im_start|>tool\n{content}<|im_end|>\n<|im_start|>assistant\n");
-
+        let delta_text = build_lfm2_tool_delta_text(&content, is_error);
         let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
 
         self.chat_tokens_delta_sync(delta_tokens, config)
@@ -2512,10 +2547,13 @@ impl Lfm2Inner {
     }
 
     /// Streaming analog of [`Self::chat_session_continue_tool_sync`].
+    /// `is_error` is forwarded verbatim to the wire-format renderer;
+    /// see the non-streaming entry point for the marker semantics.
     pub(crate) fn chat_stream_session_continue_tool_sync(
         &mut self,
         _tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -2539,8 +2577,7 @@ impl Lfm2Inner {
         // LFM2-specific plain tool delta (no `<tool_response>`
         // wrapper). See `chat_session_continue_tool_sync` for the
         // rationale.
-        let delta_text =
-            format!("\n<|im_start|>tool\n{content}<|im_end|>\n<|im_start|>assistant\n");
+        let delta_text = build_lfm2_tool_delta_text(&content, is_error);
 
         let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
             Ok(t) => t,
@@ -2906,11 +2943,16 @@ pub(crate) fn handle_lfm2_cmd(inner: &mut Lfm2Inner, cmd: Lfm2Cmd) {
         Lfm2Cmd::ChatSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             reply,
         } => {
-            let _ =
-                reply.send(inner.chat_session_continue_tool_sync(tool_call_id, content, config));
+            let _ = reply.send(inner.chat_session_continue_tool_sync(
+                tool_call_id,
+                content,
+                is_error,
+                config,
+            ));
         }
         Lfm2Cmd::ChatStreamSessionStart {
             messages,
@@ -2938,6 +2980,7 @@ pub(crate) fn handle_lfm2_cmd(inner: &mut Lfm2Inner, cmd: Lfm2Cmd) {
         Lfm2Cmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             stream_tx,
             cancelled,
@@ -2945,6 +2988,7 @@ pub(crate) fn handle_lfm2_cmd(inner: &mut Lfm2Inner, cmd: Lfm2Cmd) {
             inner.chat_stream_session_continue_tool_sync(
                 tool_call_id,
                 content,
+                is_error,
                 config,
                 stream_tx,
                 cancelled,
@@ -3129,12 +3173,20 @@ impl Lfm2Model {
     /// not via an explicit id. Callers may still log it for their own
     /// bookkeeping.
     ///
+    /// `is_error` is the structured tool-error signal. When `Some(true)`,
+    /// the renderer prepends the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<|im_start|>tool` block so the model receives a clear text-level
+    /// cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
+    /// pre-feature output.
+    ///
     /// Requires a live session started via `chatSessionStart`.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
         let config = config.unwrap_or_default();
@@ -3143,6 +3195,7 @@ impl Lfm2Model {
             Lfm2Cmd::ChatSessionContinueTool {
                 tool_call_id,
                 content,
+                is_error,
                 config,
                 reply,
             }
@@ -3230,13 +3283,19 @@ impl Lfm2Model {
     }
 
     /// Streaming variant of `chatSessionContinueTool`.
+    ///
+    /// `is_error` mirrors the non-streaming entry point — when
+    /// `Some(true)`, the renderer prepends the shared
+    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
+    /// `<|im_start|>tool` block.
     #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "toolCallId: string, content: string, isError: boolean | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
+        is_error: Option<bool>,
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
@@ -3250,6 +3309,7 @@ impl Lfm2Model {
         self.thread.send(Lfm2Cmd::ChatStreamSessionContinueTool {
             tool_call_id,
             content,
+            is_error,
             config,
             stream_tx,
             cancelled: cancelled_inner,
@@ -3494,6 +3554,83 @@ mod prefix_cache_decision_tests {
             classify_prefix_cache_decision(10, 5),
             PrefixCacheDecision::Miss,
             "cached_prefix_len > tokens_len must be Miss (defensive fallthrough)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_delta_marker_tests {
+    //! Guard the structured `is_error` channel on LFM2's tool-result
+    //! wire format. The shared
+    //! [`crate::tokenizer::TOOL_ERROR_MARKER`] must be injected inside
+    //! the `<|im_start|>tool` block only when the caller passes
+    //! `Some(true)`. `None` and `Some(false)` keep the output
+    //! byte-equal to the pre-feature behavior — guarding both the hot
+    //! (successful) path and the explicit-false path against
+    //! accidental drift.
+
+    use super::build_lfm2_tool_delta_text;
+    use crate::tokenizer::TOOL_ERROR_MARKER;
+
+    #[test]
+    fn injects_marker_when_is_error_true() {
+        let payload = "boom: connection refused";
+        let rendered = build_lfm2_tool_delta_text(payload, Some(true));
+        let expected_inner = format!("{TOOL_ERROR_MARKER}{payload}");
+        assert!(
+            rendered.contains(&expected_inner),
+            "expected error marker inside <|im_start|>tool block; got:\n{rendered}",
+        );
+        // Wrapper integrity stays correct on the marked path so we
+        // don't ship a malformed delta that only the unflagged path
+        // renders right.
+        assert!(
+            rendered.contains("<|im_start|>tool\n"),
+            "tool block opener missing"
+        );
+        assert!(rendered.contains("<|im_end|>"), "im_end closer missing");
+        assert!(
+            rendered.contains("<|im_start|>assistant\n"),
+            "assistant opener missing"
+        );
+    }
+
+    #[test]
+    fn skips_marker_when_is_error_none() {
+        let payload = "{\"temperature\": 72}";
+        let rendered = build_lfm2_tool_delta_text(payload, None);
+        assert!(
+            !rendered.contains(TOOL_ERROR_MARKER),
+            "marker leaked into unflagged delta:\n{rendered}",
+        );
+        assert!(
+            rendered.contains(payload),
+            "original content missing from delta:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn skips_marker_when_is_error_some_false() {
+        let payload = "ok";
+        let rendered = build_lfm2_tool_delta_text(payload, Some(false));
+        assert!(
+            !rendered.contains(TOOL_ERROR_MARKER),
+            "marker leaked into Some(false) delta:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn does_not_remark_content_that_resembles_marker() {
+        // The structured channel removes the collision concern: a
+        // successful tool result whose literal content begins with the
+        // marker text must NOT double-prefix the marker on its way
+        // through the renderer.
+        let suspicious = format!("{TOOL_ERROR_MARKER}this is a successful payload");
+        let rendered = build_lfm2_tool_delta_text(&suspicious, None);
+        let occurrences = rendered.matches(TOOL_ERROR_MARKER).count();
+        assert_eq!(
+            occurrences, 1,
+            "marker count should be 1 (the original literal); got {occurrences} in:\n{rendered}",
         );
     }
 }

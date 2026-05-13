@@ -51,6 +51,7 @@ fn user_message(content: &str) -> ChatMessage {
         content: content.to_string(),
         tool_calls: None,
         tool_call_id: None,
+        is_error: None,
         reasoning_content: None,
         images: None,
     }
@@ -106,6 +107,7 @@ async fn gemma4_session_start_prefix_reuse_append_hit() {
             content: r1.text.clone(),
             tool_calls: None,
             tool_call_id: None,
+            is_error: None,
             reasoning_content: None,
             images: None,
         },

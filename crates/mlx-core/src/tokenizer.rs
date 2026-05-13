@@ -120,6 +120,22 @@ pub struct ChatMessage {
     /// Tool call ID this message is responding to (for tool messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Whether this tool-role message represents an errored tool result.
+    ///
+    /// Authoritative, structured signal of tool-call failure. Set to
+    /// `Some(true)` when the caller (e.g. the Anthropic
+    /// `tool_result.is_error === true` translator) wants the model to
+    /// treat the tool output as an error. The renderer prepends a short
+    /// `[tool error]` prefix to `content` when emitting the wire-format
+    /// tool response so the model receives a clear text-level cue, but
+    /// the original `content` stays byte-for-byte intact in the
+    /// structured form — no JSON wrapping, no in-band marker that could
+    /// collide with a successful tool result whose literal content
+    /// happens to start with the same prefix.
+    ///
+    /// `None` / `Some(false)` produce the unmarked wire format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
     /// Reasoning content for thinking mode (used with <think> tags)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -136,6 +152,7 @@ impl std::fmt::Debug for ChatMessage {
             .field("content", &self.content)
             .field("tool_calls", &self.tool_calls)
             .field("tool_call_id", &self.tool_call_id)
+            .field("is_error", &self.is_error)
             .field("reasoning_content", &self.reasoning_content)
             .field(
                 "images",
@@ -145,6 +162,38 @@ impl std::fmt::Debug for ChatMessage {
                     .map(|imgs| imgs.iter().map(|i| i.len()).collect::<Vec<_>>()),
             )
             .finish()
+    }
+}
+
+/// Marker prepended to a tool-role message's wire content when
+/// [`ChatMessage::is_error`] is `Some(true)`.
+///
+/// The marker is a **model-facing cue** — a short, conventional prefix
+/// that gives the model a clear text-level signal that the tool result
+/// represents an error. The structured `is_error` field on the message
+/// is the authoritative source of truth; the marker is purely a
+/// presentation choice for what reaches the model's prompt.
+///
+/// This constant is shared by every renderer (the Jinja serializer used
+/// by the cold-start path, the ChatML fallback formatter, and the
+/// per-variant `chat_session_continue_tool` delta builders) so the
+/// marker stays consistent across all entry points.
+pub const TOOL_ERROR_MARKER: &str = "[tool error] ";
+
+/// Apply [`TOOL_ERROR_MARKER`] to `content` when `is_error == Some(true)`.
+///
+/// Used by every wire-format renderer that consumes a tool-role
+/// `ChatMessage`: the Jinja serializer ([`serialize_message_for_jinja`])
+/// for the cold-start replay path, the ChatML fallback formatter, and
+/// each per-variant `chat_session_continue_tool` delta builder.
+///
+/// Returning `Cow<str>` keeps the unmarked path (the overwhelmingly
+/// common case) free of allocations.
+pub fn apply_tool_error_marker(content: &str, is_error: Option<bool>) -> std::borrow::Cow<'_, str> {
+    if is_error == Some(true) {
+        std::borrow::Cow::Owned(format!("{TOOL_ERROR_MARKER}{content}"))
+    } else {
+        std::borrow::Cow::Borrowed(content)
     }
 }
 
@@ -712,6 +761,7 @@ impl Qwen3Tokenizer {
                 content: Self::sanitize_chatml_content(&msg.content),
                 tool_calls: msg.tool_calls.clone(),
                 tool_call_id: msg.tool_call_id.clone(),
+                is_error: msg.is_error,
                 reasoning_content: msg.reasoning_content.clone(),
                 images: msg.images.as_ref().map(|imgs| {
                     imgs.iter()
@@ -736,9 +786,18 @@ impl Qwen3Tokenizer {
         let mut formatted = String::new();
 
         for msg in messages {
+            // For tool-role messages flagged with the structured
+            // `is_error` field, prepend the model-facing error marker
+            // to the wire content. The structured field stays
+            // authoritative; this rendering step is purely a model cue.
+            let content = if msg.role == "tool" {
+                apply_tool_error_marker(&msg.content, msg.is_error)
+            } else {
+                std::borrow::Cow::Borrowed(msg.content.as_str())
+            };
             formatted.push_str(&format!(
                 "<|im_start|>{}\n{}<|im_end|>\n",
-                msg.role, msg.content
+                msg.role, content
             ));
         }
 
@@ -1330,10 +1389,21 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
 
     let has_images = msg.images.as_ref().is_some_and(|imgs| !imgs.is_empty());
 
+    // For tool-role messages flagged with the structured `is_error`
+    // field, prepend the model-facing error marker to the wire content
+    // before the template sees it. The structured field stays the
+    // source of truth — this only affects what the model reads in its
+    // prompt context.
+    let rendered_content: std::borrow::Cow<'_, str> = if msg.role == "tool" {
+        apply_tool_error_marker(&msg.content, msg.is_error)
+    } else {
+        std::borrow::Cow::Borrowed(msg.content.as_str())
+    };
+
     if has_images && msg.role == "user" {
         let mut parts: Vec<serde_json::Value> = Vec::new();
-        if !msg.content.is_empty() {
-            parts.push(serde_json::json!({ "type": "text", "text": msg.content }));
+        if !rendered_content.is_empty() {
+            parts.push(serde_json::json!({ "type": "text", "text": rendered_content.as_ref() }));
         }
         // SAFETY: `is_some_and` above ensured this is Some and non-empty.
         for _ in msg.images.as_ref().unwrap() {
@@ -1341,7 +1411,10 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
         }
         obj.insert("content".to_string(), serde_json::Value::Array(parts));
     } else {
-        obj.insert("content".to_string(), serde_json::json!(msg.content));
+        obj.insert(
+            "content".to_string(),
+            serde_json::json!(rendered_content.as_ref()),
+        );
     }
 
     if let Some(tool_calls) = &msg.tool_calls {
@@ -1424,6 +1497,7 @@ mod tests {
             content: content.to_string(),
             tool_calls: None,
             tool_call_id: None,
+            is_error: None,
             reasoning_content: None,
             images,
         }
@@ -1576,6 +1650,7 @@ mod tests {
                 content: "describe these".to_string(),
                 tool_calls: None,
                 tool_call_id: None,
+                is_error: None,
                 reasoning_content: None,
                 images: Some(vec![
                     Uint8Array::new(vec![0x01, 0x02, 0x03, 0x04]),
@@ -1587,6 +1662,7 @@ mod tests {
                 content: "ok".to_string(),
                 tool_calls: None,
                 tool_call_id: None,
+                is_error: None,
                 reasoning_content: None,
                 images: None,
             },
@@ -1640,6 +1716,7 @@ mod tests {
             content: "What is this?".to_string(),
             tool_calls: None,
             tool_call_id: None,
+            is_error: None,
             reasoning_content: None,
             images: Some(vec![Uint8Array::new(vec![0; 4])]),
         }];
@@ -1827,6 +1904,7 @@ mod tests {
             content: "hello".to_string(),
             tool_calls: None,
             tool_call_id: None,
+            is_error: None,
             reasoning_content: None,
             images: None,
         }];
@@ -1885,6 +1963,7 @@ mod tests {
             content: "hello".to_string(),
             tool_calls: None,
             tool_call_id: None,
+            is_error: None,
             reasoning_content: Some("because".to_string()),
             images: None,
         };
@@ -1927,6 +2006,7 @@ mod tests {
             content: "Making the edit.".to_string(),
             tool_calls: Some(vec![call]),
             tool_call_id: None,
+            is_error: None,
             reasoning_content: Some("think".to_string()),
             images: None,
         };
@@ -2046,6 +2126,7 @@ mod tests {
                     content: "Run ls.".to_string(),
                     tool_calls: None,
                     tool_call_id: None,
+                    is_error: None,
                     reasoning_content: None,
                     images: None,
                 },
@@ -2058,6 +2139,7 @@ mod tests {
                         arguments: r#"{"command":"ls"}"#.to_string(),
                     }]),
                     tool_call_id: None,
+                    is_error: None,
                     reasoning_content: Some(reasoning.to_string()),
                     images: None,
                 },
@@ -2102,5 +2184,176 @@ mod tests {
             !rendered_fix.contains("thought\nthought\n"),
             "fixed shape must NOT double `thought\\n`:\n{rendered_fix}"
         );
+    }
+
+    // ----- Tool-error marker tests -----
+    //
+    // These guard the structured `is_error` channel on `ChatMessage`. The
+    // structured field is the authoritative failure signal; the rendered
+    // wire content carries a `[tool error]` prefix purely as a model cue,
+    // so the `content` field itself stays byte-for-byte intact and
+    // successful tool results whose literal text happens to start with
+    // the marker cannot be confused with errored ones on read-back.
+
+    fn tool_msg_with_error(content: &str, is_error: Option<bool>) -> ChatMessage {
+        ChatMessage {
+            role: "tool".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: Some("call_xyz".to_string()),
+            is_error,
+            reasoning_content: None,
+            images: None,
+        }
+    }
+
+    #[test]
+    fn apply_tool_error_marker_prepends_only_for_some_true() {
+        // Some(true) prepends; None / Some(false) pass through unchanged.
+        // The marker is the single shared constant — keep tests in sync
+        // with the constant so any rename trips the suite, not the
+        // models silently.
+        let payload = "boom: connection refused";
+        let marked = apply_tool_error_marker(payload, Some(true));
+        assert_eq!(marked, format!("{TOOL_ERROR_MARKER}{payload}"));
+        let unmarked_none = apply_tool_error_marker(payload, None);
+        assert_eq!(unmarked_none, payload);
+        let unmarked_false = apply_tool_error_marker(payload, Some(false));
+        assert_eq!(unmarked_false, payload);
+    }
+
+    #[test]
+    fn apply_tool_error_marker_borrows_on_pass_through() {
+        // The unmarked branch returns a `Cow::Borrowed` to keep the hot
+        // (non-error) path free of allocations.
+        let payload = "{\"temperature\": 72}";
+        let cow = apply_tool_error_marker(payload, None);
+        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
+        let cow_false = apply_tool_error_marker(payload, Some(false));
+        assert!(matches!(cow_false, std::borrow::Cow::Borrowed(_)));
+        let cow_err = apply_tool_error_marker(payload, Some(true));
+        assert!(matches!(cow_err, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn jinja_serializer_injects_marker_for_errored_tool_message() {
+        // The Jinja serializer is the cold-start path's wire-format
+        // renderer (consumed by `chatSessionStart`). When the structured
+        // `is_error` flag is set, the rendered `content` field that the
+        // template sees must carry the `[tool error]` cue.
+        let msg = tool_msg_with_error("boom", Some(true));
+        let v = serialize_message_for_jinja(&msg);
+        assert_eq!(v["role"], "tool");
+        assert_eq!(
+            v["content"]
+                .as_str()
+                .expect("tool-role content is a flat string"),
+            format!("{TOOL_ERROR_MARKER}boom")
+        );
+    }
+
+    #[test]
+    fn jinja_serializer_skips_marker_when_is_error_is_none() {
+        // No flag → no marker, even if the literal content happens to
+        // begin with the marker text (the collision case Codex flagged).
+        let suspicious = format!("{TOOL_ERROR_MARKER}this is a successful payload");
+        let msg = tool_msg_with_error(&suspicious, None);
+        let v = serialize_message_for_jinja(&msg);
+        assert_eq!(
+            v["content"]
+                .as_str()
+                .expect("tool-role content is a flat string"),
+            suspicious,
+            "successful tool_result whose text resembles the marker must round-trip verbatim",
+        );
+    }
+
+    #[test]
+    fn jinja_serializer_skips_marker_when_is_error_is_some_false() {
+        let msg = tool_msg_with_error("ok", Some(false));
+        let v = serialize_message_for_jinja(&msg);
+        assert_eq!(v["content"].as_str().unwrap(), "ok");
+    }
+
+    #[test]
+    fn jinja_serializer_keeps_tool_call_id_alongside_marker() {
+        // The marker channel must coexist with `tool_call_id` — the
+        // structured field is the parallel addition that motivated this
+        // change.
+        let msg = tool_msg_with_error("boom", Some(true));
+        let v = serialize_message_for_jinja(&msg);
+        assert_eq!(v["tool_call_id"], "call_xyz");
+        assert_eq!(
+            v["content"].as_str().unwrap(),
+            format!("{TOOL_ERROR_MARKER}boom"),
+        );
+    }
+
+    #[test]
+    fn jinja_serializer_does_not_mark_non_tool_roles() {
+        // Defensive: the marker is reserved for `role == "tool"`. A
+        // user / assistant / system message with `is_error: Some(true)`
+        // (an unusual but possible direct construction) must not get
+        // the prefix — the field's contract is "errored tool result",
+        // and applying it to a user message would silently corrupt the
+        // turn the template renders.
+        for role in &["user", "assistant", "system"] {
+            let mut msg = tool_msg_with_error("hello", Some(true));
+            msg.role = (*role).to_string();
+            msg.tool_call_id = None;
+            let v = serialize_message_for_jinja(&msg);
+            assert_eq!(
+                v["content"].as_str().unwrap(),
+                "hello",
+                "role={role} must not receive the tool-error marker",
+            );
+        }
+    }
+
+    #[test]
+    fn format_chatml_presanitized_injects_marker_for_errored_tool_message() {
+        // The fallback ChatML formatter is the no-template path. The
+        // marker must apply equally there.
+        let msgs = vec![tool_msg_with_error("boom", Some(true))];
+        let rendered = Qwen3Tokenizer::format_chatml_presanitized(&msgs, false);
+        assert!(
+            rendered.contains(&format!("{TOOL_ERROR_MARKER}boom")),
+            "ChatML fallback formatter must inject the marker:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn format_chatml_presanitized_skips_marker_when_unflagged() {
+        // The hot (successful) path must remain byte-equal to the
+        // pre-feature output: same content, no prefix.
+        let msgs = vec![tool_msg_with_error("ok", None)];
+        let rendered = Qwen3Tokenizer::format_chatml_presanitized(&msgs, false);
+        assert!(
+            !rendered.contains(TOOL_ERROR_MARKER),
+            "ChatML fallback must not inject the marker on unflagged messages:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("ok"),
+            "content must still appear:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn sanitize_messages_preserves_is_error() {
+        // The structured field must round-trip through sanitization the
+        // same way `tool_call_id` does — otherwise the marker injection
+        // would never see the flag for any caller that passes messages
+        // through `sanitize_messages_public` first (which is every
+        // production caller).
+        let original = vec![
+            tool_msg_with_error("boom", Some(true)),
+            tool_msg_with_error("ok-explicit", Some(false)),
+            tool_msg_with_error("ok-default", None),
+        ];
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(&original);
+        assert_eq!(sanitized.len(), 3);
+        assert_eq!(sanitized[0].is_error, Some(true));
+        assert_eq!(sanitized[1].is_error, Some(false));
+        assert_eq!(sanitized[2].is_error, None);
     }
 }
