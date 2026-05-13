@@ -15,6 +15,7 @@ pub mod grpo;
 pub(crate) mod inference_trace;
 pub mod model_thread;
 pub mod models;
+pub mod moe;
 pub mod nn;
 pub mod optimizers;
 pub mod output_store;
