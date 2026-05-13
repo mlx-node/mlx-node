@@ -17,7 +17,7 @@ mod shape;
 
 // Re-exports from existing submodules
 pub use attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
-pub use banded_attention::banded_attention_reference;
+pub use banded_attention::{banded_attention, banded_attention_reference};
 pub(crate) use handle::{MxHandle, check_handle};
 pub use padding::{
     LeftPaddedSequences, PaddedSequences, left_pad_sequences, pad_float_sequences, pad_sequences,
