@@ -36,6 +36,8 @@ interface UsageSummary {
   prefill_input_tokens?: number;
   cached_prefix_tokens?: number;
   server_model_resolve_ms?: number;
+  server_load_wait_ms?: number;
+  server_load_owner?: boolean;
   server_queue_ms?: number;
   server_pre_inference_ms?: number;
   server_paged_prefill_chunk_size?: number;
@@ -153,6 +155,8 @@ function buildTimingSummary(reqBody: string, resBody: string): string {
 
     const serverParts = [
       fmtMs(usage.server_model_resolve_ms) ? `resolve=${fmtMs(usage.server_model_resolve_ms)}` : undefined,
+      fmtMs(usage.server_load_wait_ms) ? `load_wait=${fmtMs(usage.server_load_wait_ms)}` : undefined,
+      typeof usage.server_load_owner === 'boolean' ? `load_owner=${usage.server_load_owner}` : undefined,
       fmtMs(usage.server_queue_ms) ? `queue=${fmtMs(usage.server_queue_ms)}` : undefined,
       fmtMs(usage.server_pre_inference_ms) ? `pre=${fmtMs(usage.server_pre_inference_ms)}` : undefined,
     ].filter((part): part is string => part != null);

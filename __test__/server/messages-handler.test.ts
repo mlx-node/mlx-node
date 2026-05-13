@@ -1747,6 +1747,124 @@ describe('handleCreateMessage', () => {
       const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
       expect(combined).toBe('<tool_call>just text');
     });
+
+    it('drops whitespace-only text emitted right before a tool_call tag (no stray text block)', async () => {
+      // Symptom from the production log: when the model emits `</think>\n\n<tool_call>...`,
+      // the streaming buffer flushed the `\n\n` as `safeText` BEFORE the
+      // `<tool_call>` tag opened, ratifying a content_block_start(text) /
+      // content_block_delta(\n\n) / content_block_stop triple right before
+      // the tool_use frame — which clients render as visible whitespace.
+      // The fix holds back leading whitespace-only text until either real
+      // content arrives (flushed together) or a non-text block opens
+      // (dropped silently).
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: '\n\n', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              status: 'ok',
+              id: 'call_weather',
+              name: 'get_weather',
+              arguments: '{"city":"SF"}',
+            } as ToolCallResult,
+          ],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: '\n\n',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'weather?' }],
+          max_tokens: 100,
+          stream: true,
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+
+      // No text content_block_start at all — the leading `\n\n` was held
+      // back and dropped when the tool_use opened.
+      const textStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
+      );
+      expect(textStarts).toHaveLength(0);
+
+      // The tool_use frame opens at index 0 (no text block was emitted
+      // ahead of it). Its id is rewritten to the Anthropic `toolu_*` shape.
+      const toolStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+      );
+      expect(toolStarts).toHaveLength(1);
+      expect((toolStarts[0].data['content_block'] as any).id).toBe('toolu_weather');
+
+      // No stray whitespace text_delta on the wire.
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      expect(textDeltas).toHaveLength(0);
+    });
+
+    it('flushes buffered leading whitespace alongside the first real text delta', async () => {
+      // The opposite end of the spectrum: when whitespace IS followed by
+      // real content, the buffered prefix must be flushed as part of the
+      // first text block so the wire-content matches what the model
+      // produced. Exactly one text block opens, with combined `"\n\nhello"`.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: '\n\n', done: false, isReasoning: false },
+        { text: 'hello', done: false, isReasoning: false },
+        {
+          text: '\n\nhello',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 3,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: '\n\nhello',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
+      );
+      expect(textStarts).toHaveLength(1);
+
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(combined).toBe('\n\nhello');
+    });
   });
 
   // -----------------------------------------------------------------------
@@ -2833,10 +2951,16 @@ describe('handleCreateMessage', () => {
       expect(afterTool.content).toContain('here are outputs');
     });
 
-    it('primes tool_result.is_error=true content with a JSON envelope through the full /v1/messages dispatch', async () => {
-      // End-to-end smoke test: the Anthropic mapper wraps `tool_result.is_error ===
-      // true` content as `{"is_error":true,"content":<original>}`, and the primed
-      // history passed to `chatSessionStart` carries exactly that envelope.
+    it('primes tool_result.is_error=true via the structured isError field through the full /v1/messages dispatch', async () => {
+      // End-to-end smoke test: the Anthropic mapper translates
+      // `tool_result.is_error === true` into the structured `isError`
+      // field on the internal `ChatMessage` (mirroring `toolCallId`) and
+      // leaves `content` byte-for-byte equal to the original payload.
+      // The Rust-side wire renderer injects the model-facing
+      // `[tool error]` cue at serialization time, but the primed history
+      // visible to the test never contains an in-band marker — replay
+      // and audit paths see the unmodified bytes plus the structured
+      // failure signal.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'ack' }));
       registry.register('test-model', mockModel);
@@ -2882,18 +3006,13 @@ describe('handleCreateMessage', () => {
       const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
       expect(startSpy).toHaveBeenCalledTimes(1);
       const [primedMessages] = startSpy.mock.calls[0] as [
-        Array<{ role: string; content: string; toolCallId?: string }>,
+        Array<{ role: string; content: string; toolCallId?: string; isError?: boolean }>,
       ];
       const toolMsg = primedMessages.find((m) => m.role === 'tool' && m.toolCallId === 'call_fail');
       expect(toolMsg).toBeDefined();
-      expect(toolMsg!.content).toBe(JSON.stringify({ is_error: true, content: 'boom: connection refused' }));
-      // Envelope content is valid JSON and round-trips cleanly.
-      const parsed = JSON.parse(toolMsg!.content) as {
-        is_error: boolean;
-        content: string;
-      };
-      expect(parsed.is_error).toBe(true);
-      expect(parsed.content).toBe('boom: connection refused');
+      // Structured field carries the failure signal; content is verbatim.
+      expect(toolMsg!.isError).toBe(true);
+      expect(toolMsg!.content).toBe('boom: connection refused');
     });
   });
 

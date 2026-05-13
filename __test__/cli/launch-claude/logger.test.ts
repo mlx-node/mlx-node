@@ -178,4 +178,42 @@ describe('attachLogger', () => {
     expect(pretty).toContain('perf(ttfb=312ms ttft=250ms prefill=20.00/s decode=40.00/s infer=350ms)');
     expect(pretty).toContain('server(resolve=57ms queue=5ms pre=62ms)');
   });
+
+  it('surfaces load_wait and load_owner in the server(...) summary when present', async () => {
+    // Observability split: a follower request that arrives during a peer's
+    // cold load gets `load_wait_ms` ≈ cold load latency and
+    // `load_owner=false`. Without surfacing the split, the follower's
+    // `resolve_ms` would be indistinguishable from a request that drove
+    // the load itself.
+    const logDir = makeTmpDir();
+    const port = await pickFreePort();
+
+    const srv = createServer((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        JSON.stringify({
+          model: 'gemma-test',
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: 20,
+            output_tokens: 5,
+            server_model_resolve_ms: 60_300,
+            server_load_wait_ms: 60_290,
+            server_load_owner: false,
+            server_queue_ms: 1,
+            server_pre_inference_ms: 60_302,
+          },
+        }),
+      );
+    });
+    const logger = attachLogger(srv, logDir);
+    await new Promise<void>((resolve) => srv.listen(port, '127.0.0.1', resolve));
+
+    await postJson(port, { model: 'gemma-test' });
+    await logger.close();
+    await closeServer(srv);
+
+    const pretty = readFileSync(join(logDir, 'session.log'), 'utf-8');
+    expect(pretty).toContain('server(resolve=60300ms load_wait=60290ms load_owner=false queue=1ms pre=60302ms)');
+  });
 });

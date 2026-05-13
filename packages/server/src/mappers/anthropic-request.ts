@@ -11,6 +11,7 @@ import type {
   AnthropicToolDefinition,
   SystemBlock,
 } from '../types-anthropic.js';
+import { anthropicToolUseIdToInternal } from './anthropic-response.js';
 
 export interface MappedAnthropicRequest {
   messages: ChatMessage[];
@@ -200,8 +201,15 @@ export function mapAnthropicRequest(
             }
             seenToolResult = true;
             const resolved = resolveToolResultContent(block.content);
+            // Anthropic clients echo back the same `toolu_<uuid>` we
+            // emitted on the prior assistant turn. Translate it back to
+            // the internal `call_<uuid>` shape so the native session
+            // store's tool_call_id lookup (which sees the original
+            // `call_*` id) still matches. Ids that lack the `toolu_`
+            // prefix (legacy callers that already speak the internal
+            // shape) pass through unchanged.
             toolResults.push({
-              toolCallId: block.tool_use_id,
+              toolCallId: anthropicToolUseIdToInternal(block.tool_use_id),
               content: resolved.text,
               isError: block.is_error === true,
             });
@@ -226,20 +234,32 @@ export function mapAnthropicRequest(
         }
 
         if (seenToolResult) {
-          // `ChatMessage` (NAPI-generated) has no `isError` field, so
-          // Anthropic's `tool_result.is_error=true` is encoded as a JSON
-          // envelope `{ "is_error": true, "content": <original> }`. The
-          // envelope preserves the raw payload verbatim (unlike a text
-          // prefix, which would corrupt JSON payloads and collide with
-          // strings that legitimately start with the prefix). Every other
-          // wire shape is a successful tool result.
+          // The structured `isError` field on the internal `ChatMessage`
+          // is the authoritative signal of tool-call failure (mirroring
+          // the existing `toolCallId` pattern). Pass `tr.content`
+          // through verbatim — no JSON envelope, no in-band marker — and
+          // surface the error condition via the dedicated structured
+          // field. The Rust-side wire-format renderers (Jinja serializer
+          // for the cold-start path, ChatML formatter for the fallback
+          // template) inject a short model-facing `[tool error]` cue
+          // into the prompt when `isError === true`, but the
+          // `ChatMessage.content` itself stays byte-for-byte equal to
+          // the original payload so a successful tool result whose
+          // content happens to start with the same marker text cannot
+          // be confused with an errored one on read-back. Neither
+          // mlx-lm nor mlx-vlm have a precedent for an in-band marker
+          // here; the structured-field approach matches how
+          // `toolCallId` is plumbed and survives round-tripping cleanly.
           for (const tr of toolResults) {
-            const encoded = tr.isError ? JSON.stringify({ is_error: true, content: tr.content }) : tr.content;
-            messages.push({
+            const msg: ChatMessage = {
               role: 'tool',
-              content: encoded,
+              content: tr.content,
               toolCallId: tr.toolCallId,
-            });
+            };
+            if (tr.isError) {
+              msg.isError = true;
+            }
+            messages.push(msg);
           }
           // Trailing suffix after a tool_result prefix: accept either
           // (a) text-only (concatenated) or (b) exactly one image block.
@@ -301,8 +321,12 @@ export function mapAnthropicRequest(
             reasoningContent = (reasoningContent ?? '') + block.thinking;
           } else if (block.type === 'tool_use') {
             seenToolUse = true;
+            // Anthropic clients echo back the `toolu_<uuid>` we emitted
+            // on the prior assistant turn. Translate to the internal
+            // `call_<uuid>` shape so the native session store and the
+            // Qwen chat template paths see a consistent id family.
             toolCalls.push({
-              id: block.id,
+              id: anthropicToolUseIdToInternal(block.id),
               name: block.name,
               arguments: JSON.stringify(block.input),
             });

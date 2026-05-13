@@ -217,6 +217,10 @@ export interface AnthropicUsage {
   cached_prefix_tokens?: number;
   /** Server-extension: time spent resolving/loading/aliasing the requested model before registry lookup. */
   server_model_resolve_ms?: number;
+  /** Server-extension: wall-clock time blocked on the process-wide model-load writer lock. */
+  server_load_wait_ms?: number;
+  /** Server-extension: true when this request acquired the model-load lock without contention. */
+  server_load_owner?: boolean;
   /** Server-extension: time spent waiting behind the per-model execution mutex. */
   server_queue_ms?: number;
   /** Server-extension: handler time before native inference begins, including resolve and queue wait. */
@@ -336,6 +340,10 @@ export interface AnthropicMessageDeltaEvent {
     cached_prefix_tokens?: number;
     /** Server-extension: time spent resolving/loading/aliasing the requested model before registry lookup. */
     server_model_resolve_ms?: number;
+    /** Server-extension: wall-clock time blocked on the process-wide model-load writer lock. */
+    server_load_wait_ms?: number;
+    /** Server-extension: true when this request acquired the model-load lock without contention. */
+    server_load_owner?: boolean;
     /** Server-extension: time spent waiting behind the per-model execution mutex. */
     server_queue_ms?: number;
     /** Server-extension: handler time before native inference begins, including resolve and queue wait. */

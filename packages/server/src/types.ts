@@ -265,6 +265,8 @@ export interface ResponseUsage {
   server_prefill_tokens_per_second?: number;
   server_decode_tokens_per_second?: number;
   server_model_resolve_ms?: number;
+  server_load_wait_ms?: number;
+  server_load_owner?: boolean;
   server_queue_ms?: number;
   server_pre_inference_ms?: number;
   server_paged_prefill_chunk_size?: number;

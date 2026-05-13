@@ -1406,7 +1406,12 @@ async function runSessionNonStreaming(
         throw new Error('tool message missing toolCallId');
       }
       const initialTurns = session.turns;
-      const result = await session.sendToolResult(last.toolCallId, last.content, { config });
+      // Forward the structured `isError` field through to the native
+      // renderer so the wire-format `[tool error]` marker stays in sync
+      // with the Anthropic `tool_result.is_error === true` source field
+      // (the structured channel is the authoritative signal — see
+      // `ChatMessage.isError` rustdoc).
+      const result = await session.sendToolResult(last.toolCallId, last.content, last.isError, { config });
       return { result, committed: session.turns > initialTurns };
     }
     // Non-user / non-tool single-message continuation (assistant /
@@ -1488,7 +1493,11 @@ async function runSessionStreaming(
       }
       const initialTurns = session.turns;
       return {
-        stream: session.sendToolResultStream(last.toolCallId, last.content, { config, signal }),
+        // Forward the structured `isError` field through to the native
+        // renderer so the streaming wire-format `[tool error]` marker
+        // stays in sync with the Anthropic `tool_result.is_error === true`
+        // source field — same contract as the non-streaming path above.
+        stream: session.sendToolResultStream(last.toolCallId, last.content, last.isError, { config, signal }),
         wasCommitted: () => session.turns > initialTurns,
       };
     }

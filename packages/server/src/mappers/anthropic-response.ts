@@ -24,6 +24,34 @@ function parseArguments(args: Record<string, unknown> | string): Record<string, 
   return args;
 }
 
+/**
+ * Translate a native tool-call id (minted as `call_<uuid>` by the Rust
+ * parser, which keeps the OpenAI Responses convention) to the Anthropic
+ * Messages wire convention (`toolu_<uuid>`). The uuid body is preserved
+ * verbatim so the inverse `anthropicToolUseIdToInternal` round-trips
+ * losslessly when clients echo the id back via `tool_result.tool_use_id`.
+ *
+ * Defensive: ids that do not have the expected `call_` prefix (e.g. a
+ * legacy caller, an in-process driver constructing its own id, or a
+ * future variant) pass through unchanged so this function never
+ * synthesizes a wrong id.
+ */
+export function internalToolCallIdToAnthropic(id: string): string {
+  return id.startsWith('call_') ? `toolu_${id.slice('call_'.length)}` : id;
+}
+
+/**
+ * Inverse of `internalToolCallIdToAnthropic`: translate an incoming
+ * Anthropic `tool_use_id` (`toolu_<uuid>`) back to the internal `call_*`
+ * shape so historical assistant turns and the tool_call_id lookup in
+ * the native session store keep matching. Ids without the expected
+ * `toolu_` prefix pass through unchanged for the same defensive reason
+ * (some legacy callers send raw `call_*` directly).
+ */
+export function anthropicToolUseIdToInternal(id: string): string {
+  return id.startsWith('toolu_') ? `call_${id.slice('toolu_'.length)}` : id;
+}
+
 export function mapStopReason(finishReason: string, hasToolCalls: boolean): 'end_turn' | 'max_tokens' | 'tool_use' {
   if (finishReason === 'length') {
     return 'max_tokens';
@@ -75,9 +103,13 @@ export function buildAnthropicContent(result: ChatResult, allowToolUse = true): 
   }
 
   for (const tc of okToolCalls) {
+    // Translate native `call_<uuid>` to Anthropic `toolu_<uuid>` at the
+    // wire boundary. The fallback `genId('toolu_')` covers the case where
+    // the native parser did not mint an id (an in-process driver or a
+    // legacy bridge — present-day Rust paths always populate it).
     content.push({
       type: 'tool_use',
-      id: tc.id ?? genId('toolu_'),
+      id: tc.id != null ? internalToolCallIdToAnthropic(tc.id) : genId('toolu_'),
       name: tc.name,
       input: parseArguments(tc.arguments),
     });

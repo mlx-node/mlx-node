@@ -557,11 +557,79 @@ describe('mapAnthropicRequest', () => {
     expect(messages[0].images).toHaveLength(1);
   });
 
-  it('wraps tool_result.is_error=true content in a JSON envelope', () => {
-    // `ChatMessage.content` is a string with no `isError` field, so errored
-    // tool_result content is wrapped as `{"is_error":true,"content":<original>}` —
-    // an unambiguous, lossless, non-colliding encoding that preserves the raw
-    // payload verbatim. Successful tool_result is passed through untouched.
+  it('rewrites incoming toolu_<uuid> ids back to internal call_<uuid> on tool_result blocks', () => {
+    // Anthropic-spec clients echo back the same `toolu_<uuid>` we emitted
+    // on the prior assistant turn. The internal session store and the
+    // native session continue paths see `call_<uuid>` ids, so the
+    // mapper must translate inbound `toolu_*` back to `call_*` to keep
+    // historical tool_call_id lookups matching.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_abc123', content: 'sunny' }],
+        },
+      ],
+    });
+    expect(messages).toEqual([{ role: 'tool', content: 'sunny', toolCallId: 'call_abc123' }]);
+  });
+
+  it('rewrites incoming toolu_<uuid> ids on assistant.tool_use blocks too', () => {
+    // Assistant turns the client echoes back carry the `toolu_*` ids
+    // we previously emitted. The mapper must translate them back so
+    // the internal `ChatMessage.toolCalls[].id` stays in the `call_*`
+    // family the native paths expect.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'toolu_xyz789', name: 'get_weather', input: { city: 'SF' } }],
+        },
+      ],
+    });
+    expect(messages).toEqual([
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'call_xyz789', name: 'get_weather', arguments: '{"city":"SF"}' }],
+      },
+    ]);
+  });
+
+  it('passes through tool_use_id values that do not have the toolu_ prefix', () => {
+    // Defensive: legacy callers that already speak the internal `call_*`
+    // shape (or any other unrecognised id family) must round-trip
+    // unchanged.
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'call_already', content: 'ok' }],
+        },
+      ],
+    });
+    expect(messages).toEqual([{ role: 'tool', content: 'ok', toolCallId: 'call_already' }]);
+  });
+
+  it('encodes tool_result.is_error=true via the structured isError field, leaving content verbatim', () => {
+    // Earlier revisions used an in-band `[error] ` content prefix to
+    // surface tool-call failure. Codex review flagged the in-band marker
+    // as theoretically collision-prone — a successful tool_result whose
+    // literal content begins with the same prefix would be
+    // indistinguishable from an errored one on later read-back. The fix
+    // is the structured `isError` field on `ChatMessage` (mirroring
+    // `toolCallId`): the mapper passes content through unchanged and
+    // surfaces the error condition on a dedicated field, eliminating
+    // the read-back ambiguity. The wire-format renderers on the Rust
+    // side still inject a `[tool error]` cue into the model prompt at
+    // serialization time, but the structured field stays the source of
+    // truth and the original payload is preserved byte-for-byte.
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -583,16 +651,18 @@ describe('mapAnthropicRequest', () => {
     expect(messages).toEqual([
       {
         role: 'tool',
-        content: JSON.stringify({ is_error: true, content: 'boom: connection refused' }),
+        content: 'boom: connection refused',
         toolCallId: 'call_fail',
+        isError: true,
       },
     ]);
   });
 
-  it('preserves a JSON tool_result payload losslessly inside the is_error envelope', () => {
-    // The envelope preserves the raw payload verbatim as the `content` field, so a
-    // downstream reader can either pass the whole envelope through or `JSON.parse`
-    // it and recover both the flag and the original JSON text.
+  it('preserves a JSON tool_result payload verbatim under isError=true', () => {
+    // The structured `isError` field is the failure signal; `content`
+    // stays byte-for-byte equal to the original payload so downstream
+    // consumers (replay logic, audit logs, the model's own template
+    // rendering) get the unmodified bytes back.
     const jsonPayload = '{"error_code":500,"message":"upstream unavailable"}';
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
@@ -616,16 +686,17 @@ describe('mapAnthropicRequest', () => {
     const toolMsg = messages[0]!;
     expect(toolMsg.role).toBe('tool');
     expect(toolMsg.toolCallId).toBe('call_json_fail');
-    // Encoded content is itself valid JSON and `content` inside equals the original.
-    const parsed = JSON.parse(toolMsg.content) as { is_error: boolean; content: string };
-    expect(parsed).toEqual({ is_error: true, content: jsonPayload });
+    expect(toolMsg.content).toBe(jsonPayload);
+    expect(toolMsg.isError).toBe(true);
   });
 
-  it('does not wrap successful tool_result content that looks like a JSON envelope', () => {
-    // A successful tool_result whose content happens to be a JSON object — even one
-    // structurally resembling `{"is_error":true,"content":...}` — MUST NOT be
-    // rewrapped. The envelope shape is reserved exclusively for `is_error === true`.
-    const suspicious = '{"is_error":true,"content":"this was supplied by a tool that returned success"}';
+  it('does not set isError on successful tool_result content even when it resembles a legacy error marker', () => {
+    // A successful tool_result whose content happens to start with the
+    // legacy `[error]` text MUST NOT be re-marked. With the structured
+    // field, this case can no longer be confused with an errored result —
+    // `isError` is undefined (or false) on success regardless of what the
+    // content text looks like. Guard the round-trip explicitly.
+    const suspicious = '[error] this was supplied by a tool that returned success';
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -638,11 +709,14 @@ describe('mapAnthropicRequest', () => {
     });
 
     expect(messages).toEqual([{ role: 'tool', content: suspicious, toolCallId: 'call_ok' }]);
+    expect(messages[0]!.isError).toBeUndefined();
   });
 
-  it('leaves tool_result content untouched when is_error is absent or false', () => {
-    // The envelope MUST NOT leak into successful tool_result content — including
-    // content that literally starts with `[tool error] `.
+  it('leaves tool_result content untouched and isError unset when is_error is absent or false', () => {
+    // Successful tool_result entries — including ones whose content text
+    // happens to begin with `[error] ` or the new model-facing
+    // `[tool error] ` cue — must survive verbatim and MUST NOT carry an
+    // `isError` flag.
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -652,7 +726,8 @@ describe('mapAnthropicRequest', () => {
           content: [
             { type: 'tool_result', tool_use_id: 'call_ok_1', content: '72F and sunny', is_error: false },
             { type: 'tool_result', tool_use_id: 'call_ok_2', content: '68F and cloudy' },
-            { type: 'tool_result', tool_use_id: 'call_ok_3', content: '[tool error] this is a legitimate payload' },
+            { type: 'tool_result', tool_use_id: 'call_ok_3', content: '[error] this is a legitimate payload' },
+            { type: 'tool_result', tool_use_id: 'call_ok_4', content: '[tool error] also legitimate' },
           ],
         },
       ],
@@ -661,8 +736,12 @@ describe('mapAnthropicRequest', () => {
     expect(messages).toEqual([
       { role: 'tool', content: '72F and sunny', toolCallId: 'call_ok_1' },
       { role: 'tool', content: '68F and cloudy', toolCallId: 'call_ok_2' },
-      { role: 'tool', content: '[tool error] this is a legitimate payload', toolCallId: 'call_ok_3' },
+      { role: 'tool', content: '[error] this is a legitimate payload', toolCallId: 'call_ok_3' },
+      { role: 'tool', content: '[tool error] also legitimate', toolCallId: 'call_ok_4' },
     ]);
+    for (const m of messages) {
+      expect(m.isError).toBeUndefined();
+    }
   });
 
   it('maps assistant message with tool_use to assistant with toolCalls', () => {

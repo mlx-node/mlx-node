@@ -37,6 +37,89 @@ describe('ModelWorkCoordinator', () => {
     expect(events).toEqual(['a:start', 'b:start', 'a:end', 'b:end']);
   });
 
+  it('flags the first writer as load_owner=true and a follower as load_owner=false', async () => {
+    // Observability split: request A drives a cold load while request B
+    // arrives microseconds later. Without the split, B's `resolve_ms`
+    // looks like the full load latency even though A actually paid the
+    // cost. `withModelLoadInstrumented` returns `owner=true` only when
+    // the lock was free at sync-time; the follower observes `owner=false`
+    // because A's `acquireWrite` already incremented `waitingWriters`.
+    const coordinator = new ModelWorkCoordinator();
+    const releaseA = deferred();
+    const order: string[] = [];
+
+    const aPromise = coordinator.withModelLoadInstrumented(async () => {
+      order.push('a:start');
+      await releaseA.promise;
+      order.push('a:end');
+      return 'A';
+    });
+
+    // Let A acquire the writer slot before B arrives. After this tick,
+    // A is parked inside `fn` (awaiting `releaseA.promise`); the writer
+    // lock is held synchronously so B will observe contention.
+    await tick();
+
+    const bPromise = coordinator.withModelLoadInstrumented(async () => {
+      order.push('b:start');
+      return 'B';
+    });
+
+    await tick();
+    expect(order).toEqual(['a:start']);
+
+    releaseA.resolve();
+    const [a, b] = await Promise.all([aPromise, bPromise]);
+
+    expect(a.owner).toBe(true);
+    expect(a.result).toBe('A');
+    expect(b.owner).toBe(false);
+    expect(b.result).toBe('B');
+    expect(order).toEqual(['a:start', 'a:end', 'b:start']);
+  });
+
+  it('partitions wait vs own-execution time in the instrumented outcome', async () => {
+    // Regression: `serverLoadWaitMs` and `serverModelResolveMs` used to
+    // both subtract from the same end timestamp, so a follower request
+    // saw both fields report the full cold-load duration. The
+    // coordinator now measures the two phases internally and exposes
+    // them as `waitMs` (time blocked in `acquireWrite`) and `ownMs`
+    // (time inside `fn` with the writer lock held). Together they
+    // partition the call without overlap.
+    const coordinator = new ModelWorkCoordinator();
+    const aStarted = deferred();
+    const releaseA = deferred();
+    const OWN_DURATION_MS = 50;
+
+    const aPromise = coordinator.withModelLoadInstrumented(async () => {
+      aStarted.resolve();
+      // Sleep inside the writer-held region so A's `ownMs` measures
+      // the load-like work and B's `waitMs` measures the same span
+      // from the other side of the lock.
+      await new Promise<void>((resolve) => setTimeout(resolve, OWN_DURATION_MS));
+      await releaseA.promise;
+      return 'A';
+    });
+
+    // Wait until A has the writer slot and is parked inside `fn`.
+    // Otherwise B might arrive before A's synchronous `acquireWrite`
+    // increments `waitingWriters`, and the owner check would mis-fire.
+    await aStarted.promise;
+
+    const bPromise = coordinator.withModelLoadInstrumented(async () => 'B');
+
+    releaseA.resolve();
+    const [a, b] = await Promise.all([aPromise, bPromise]);
+
+    expect(a.owner).toBe(true);
+    expect(a.waitMs).toBeLessThan(20);
+    expect(a.ownMs).toBeGreaterThanOrEqual(OWN_DURATION_MS - 5);
+
+    expect(b.owner).toBe(false);
+    expect(b.waitMs).toBeGreaterThanOrEqual(OWN_DURATION_MS - 5);
+    expect(b.ownMs).toBeLessThan(20);
+  });
+
   it('gives pending model loads priority over new inference readers', async () => {
     const coordinator = new ModelWorkCoordinator();
     const releaseRead = deferred();

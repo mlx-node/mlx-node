@@ -27,8 +27,34 @@ interface TimingUsageExtensions {
   prefill_input_tokens?: number;
   /** Server-extension: prompt tokens skipped because a cached prefix was reused. */
   cached_prefix_tokens?: number;
-  /** Server-extension: time spent resolving/loading/aliasing the requested model before registry lookup. */
+  /**
+   * Server-extension: time spent resolving/loading/aliasing the requested model
+   * before registry lookup. Includes both the synchronous lookup AND any time
+   * spent driving the load. Excludes time spent blocked behind a peer
+   * request's in-flight load — that wait is reported separately via
+   * `server_load_wait_ms` so a fast follower request is not mis-attributed
+   * a long resolve when it merely inherited a cold-load wait.
+   */
   server_model_resolve_ms?: number;
+  /**
+   * Server-extension: wall-clock time this request spent blocked on the
+   * process-wide model-load writer lock. Set when the load was already
+   * in flight when this request arrived (a peer drove the load and we
+   * waited for it to finish) AND when this request itself drove the
+   * load. Inspect `server_load_owner` to disambiguate. When the writer
+   * lock was free and the resolve was a no-op (model already loaded),
+   * this field is elided.
+   */
+  server_load_wait_ms?: number;
+  /**
+   * Server-extension: `true` when this request acquired the model-load
+   * writer lock with no contention (i.e. either the model was already
+   * loaded and the call was a no-op, or this request itself drove the
+   * load). `false` when the request was parked behind a peer's in-flight
+   * load. Elided when no load coordinator is wired (single-process
+   * tests, embedded callers).
+   */
+  server_load_owner?: boolean;
   /** Server-extension: time spent waiting behind the per-model execution mutex. */
   server_queue_ms?: number;
   /** Server-extension: handler time before native inference begins, including resolve and queue wait. */
@@ -55,6 +81,8 @@ function finiteNonNegative(value: number | undefined): number | undefined {
 
 export interface ServerTimingForUsage {
   server_model_resolve_ms?: number;
+  server_load_wait_ms?: number;
+  server_load_owner?: boolean;
   server_queue_ms?: number;
   server_pre_inference_ms?: number;
   server_paged_prefill_chunk_size?: number;
@@ -163,6 +191,13 @@ function buildTimingUsageExtensions(
   const modelResolveMs = finiteNonNegative(serverTiming?.server_model_resolve_ms);
   if (modelResolveMs != null) {
     extensions.server_model_resolve_ms = modelResolveMs;
+  }
+  const loadWaitMs = finiteNonNegative(serverTiming?.server_load_wait_ms);
+  if (loadWaitMs != null) {
+    extensions.server_load_wait_ms = loadWaitMs;
+  }
+  if (typeof serverTiming?.server_load_owner === 'boolean') {
+    extensions.server_load_owner = serverTiming.server_load_owner;
   }
   const queueMs = finiteNonNegative(serverTiming?.server_queue_ms);
   if (queueMs != null) {

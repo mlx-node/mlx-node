@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
+  anthropicToolUseIdToInternal,
   buildAnthropicResponse,
   buildContentBlockDelta,
   buildContentBlockStart,
@@ -8,6 +9,7 @@ import {
   buildMessageDelta,
   buildMessageStartEvent,
   buildMessageStop,
+  internalToolCallIdToAnthropic,
   mapStopReason,
 } from '../../packages/server/src/mappers/anthropic-response.js';
 
@@ -369,6 +371,53 @@ describe('buildAnthropicResponse', () => {
     expect(response.content[0].type).toBe('text');
   });
 
+  it('translates native call_<uuid> ids to Anthropic toolu_<uuid> on the wire', () => {
+    // The native parser mints `call_<uuid>` (the OpenAI Responses
+    // convention, kept stable on the OpenAI endpoint). The Anthropic
+    // wire spec uses `toolu_<uuid>`. Translation happens at the wire
+    // boundary only — the uuid body is preserved verbatim so a client
+    // that echoes the id back via `tool_result.tool_use_id` round-trips
+    // losslessly through `anthropicToolUseIdToInternal`.
+    const result = makeChatResult({
+      text: '',
+      toolCalls: [
+        {
+          id: 'call_abc123def456',
+          name: 'get_weather',
+          arguments: '{"city":"SF"}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
+    });
+    const response = buildAnthropicResponse(result, baseReq, 'msg_translate');
+
+    const toolBlock = response.content[0] as { type: 'tool_use'; id: string };
+    expect(toolBlock.id).toBe('toolu_abc123def456');
+  });
+
+  it('passes through tool_use ids without the call_ prefix unchanged', () => {
+    // Defensive: an in-process driver or legacy bridge that already
+    // emits a non-`call_*` id must not have it mangled. The translator
+    // is a no-op on any id that does not match the expected prefix.
+    const result = makeChatResult({
+      text: '',
+      toolCalls: [
+        {
+          id: 'custom_xyz',
+          name: 'fn',
+          arguments: '{}',
+          status: 'ok',
+          rawContent: '',
+        },
+      ],
+    });
+    const response = buildAnthropicResponse(result, baseReq, 'msg_passthrough');
+
+    const toolBlock = response.content[0] as { type: 'tool_use'; id: string };
+    expect(toolBlock.id).toBe('custom_xyz');
+  });
+
   it('generates a toolu_ prefixed id when tool call id is missing', () => {
     const result = makeChatResult({
       text: '',
@@ -386,6 +435,34 @@ describe('buildAnthropicResponse', () => {
 
     const toolBlock = response.content[0] as { type: 'tool_use'; id: string };
     expect(toolBlock.id).toMatch(/^toolu_/);
+  });
+});
+
+describe('tool-call id translation helpers', () => {
+  it('rewrites internal call_<uuid> ids to Anthropic toolu_<uuid>', () => {
+    expect(internalToolCallIdToAnthropic('call_abc123')).toBe('toolu_abc123');
+  });
+
+  it('rewrites Anthropic toolu_<uuid> ids back to internal call_<uuid>', () => {
+    expect(anthropicToolUseIdToInternal('toolu_abc123')).toBe('call_abc123');
+  });
+
+  it('round-trips losslessly across the wire boundary', () => {
+    const internal = 'call_0123456789abcdef';
+    expect(anthropicToolUseIdToInternal(internalToolCallIdToAnthropic(internal))).toBe(internal);
+  });
+
+  it('passes unrecognised ids through unchanged in both directions', () => {
+    // A legacy caller that ships raw `call_*` over the Anthropic wire,
+    // or any in-process driver constructing its own id, must not have
+    // the value mangled. Both translators are no-ops outside the
+    // expected prefix.
+    expect(internalToolCallIdToAnthropic('legacy_xyz')).toBe('legacy_xyz');
+    expect(anthropicToolUseIdToInternal('legacy_xyz')).toBe('legacy_xyz');
+    expect(internalToolCallIdToAnthropic('toolu_already')).toBe('toolu_already');
+    expect(anthropicToolUseIdToInternal('call_already')).toBe('call_already');
+    expect(internalToolCallIdToAnthropic('')).toBe('');
+    expect(anthropicToolUseIdToInternal('')).toBe('');
   });
 });
 

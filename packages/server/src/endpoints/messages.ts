@@ -80,6 +80,7 @@ import {
   buildMessageStartEvent,
   buildMessageStop,
   containsToolCallMarkup,
+  internalToolCallIdToAnthropic,
   recoverSuppressedToolCallText,
   mapStopReason,
 } from '../mappers/anthropic-response.js';
@@ -269,6 +270,16 @@ async function handleStreamingNative(
   let hasEmittedThinking = false;
   let hasEmittedText = false;
   let emittedTextLength = 0;
+  // Whitespace-only text seen before any non-whitespace content is buffered
+  // here so we don't open a text content block that the client would have
+  // to render as a stray `"\n\n"` immediately before a tool_use block.
+  // Flushed lazily when the first non-whitespace text delta arrives;
+  // dropped silently when a non-text block (tool_use) is about to open or
+  // when the stream ends without further text. Once `hasEmittedText` flips
+  // true (a real text block exists) this buffer is no longer consulted —
+  // subsequent whitespace-only deltas pass through to keep streamed text
+  // byte-accurate.
+  let pendingLeadingWhitespace = '';
   // Mirror of the actual streamed text body, used by the malformed-tool-call
   // recovery branches below. `emittedTextLength` counts bytes of streamed text
   // — but `event.text` on the terminal `done` chunk is the post-</think>-trim
@@ -355,30 +366,40 @@ async function handleStreamingNative(
 
         const remainingText = tagBuffer.flush();
         if (!tagBuffer.suppressed && remainingText) {
-          if (!hasEmittedText) {
-            if (hasEmittedThinking) {
-              writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+          // Flush any pending leading whitespace alongside the residual
+          // text — once a real text block opens, its declared content
+          // must be byte-accurate, so the buffered whitespace is
+          // promoted to the head of that block. If `remainingText`
+          // itself is whitespace-only and there is no buffered
+          // whitespace, `combined.trim()` is empty and we drop both.
+          const combined = pendingLeadingWhitespace + remainingText;
+          pendingLeadingWhitespace = '';
+          if (hasEmittedText || combined.trim().length > 0) {
+            if (!hasEmittedText) {
+              if (hasEmittedThinking) {
+                writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+              }
+              hasEmittedText = true;
+              writeSSEEvent(
+                res,
+                'content_block_start',
+                buildContentBlockStart(contentBlockIndex, {
+                  type: 'text',
+                  text: '',
+                }),
+              );
             }
-            hasEmittedText = true;
+            emittedText += combined;
+            emittedTextLength += combined.length;
             writeSSEEvent(
               res,
-              'content_block_start',
-              buildContentBlockStart(contentBlockIndex, {
-                type: 'text',
-                text: '',
+              'content_block_delta',
+              buildContentBlockDelta(contentBlockIndex, {
+                type: 'text_delta',
+                text: combined,
               }),
             );
           }
-          emittedText += remainingText;
-          emittedTextLength += remainingText.length;
-          writeSSEEvent(
-            res,
-            'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, {
-              type: 'text_delta',
-              text: remainingText,
-            }),
-          );
         }
 
         if (hasEmittedThinking && !hasEmittedText) {
@@ -495,10 +516,17 @@ async function handleStreamingNative(
         if (hasEmittedText) {
           writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
           contentBlockIndex++;
+          pendingLeadingWhitespace = '';
         } else if (!finalText && hasToolCalls) {
-          // Pure tool-call turn — no text block.
+          // Pure tool-call turn — no text block. Drop any leading
+          // whitespace we had buffered before the `<tool_call>` tag.
+          pendingLeadingWhitespace = '';
         } else if (finalText) {
-          // All text arrived in the final event; emit it as a single block.
+          // All text arrived in the final event; emit it as a single
+          // block. Prepend any pending leading whitespace so the block's
+          // byte-content matches what the model actually produced.
+          const combined = pendingLeadingWhitespace + finalText;
+          pendingLeadingWhitespace = '';
           writeSSEEvent(
             res,
             'content_block_start',
@@ -507,22 +535,31 @@ async function handleStreamingNative(
               text: '',
             }),
           );
-          emittedText += finalText;
-          emittedTextLength += finalText.length;
+          emittedText += combined;
+          emittedTextLength += combined.length;
           writeSSEEvent(
             res,
             'content_block_delta',
             buildContentBlockDelta(contentBlockIndex, {
               type: 'text_delta',
-              text: finalText,
+              text: combined,
             }),
           );
           writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
           contentBlockIndex++;
+        } else {
+          // No text emission at all this turn — drop the buffer.
+          pendingLeadingWhitespace = '';
         }
 
         for (const tc of okToolCalls) {
-          const toolId = tc.id ?? genId('toolu_');
+          // Translate native `call_<uuid>` ids (minted by the Rust parser,
+          // which keeps the OpenAI Responses convention) into the
+          // Anthropic-spec `toolu_<uuid>` shape at the wire boundary.
+          // The `genId('toolu_')` fallback covers the case where the
+          // native side did not populate an id (an in-process driver or
+          // a legacy bridge).
+          const toolId = tc.id != null ? internalToolCallIdToAnthropic(tc.id) : genId('toolu_');
           const parsedInput =
             typeof tc.arguments === 'string'
               ? (JSON.parse(tc.arguments) as Record<string, unknown>)
@@ -593,6 +630,13 @@ async function handleStreamingNative(
         // markers are transport structure, not user-visible text.
         const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
         if (tagFound) {
+          // A structural tag (`<tool_call>` etc.) follows. Any pending
+          // leading whitespace we were holding back semantically belongs
+          // to the tool-call transition, not to a user-visible text
+          // block — drop it so the SSE wire never carries a stray
+          // whitespace-only `content_block_start`/`_stop` pair before
+          // the tool_use frame.
+          pendingLeadingWhitespace = '';
           if (cleanPrefix.trim()) {
             if (!hasEmittedText) {
               if (hasEmittedThinking) {
@@ -621,29 +665,55 @@ async function handleStreamingNative(
           }
         } else if (safeText) {
           if (!hasEmittedText) {
-            if (hasEmittedThinking) {
-              writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+            // Hold back leading whitespace-only text so a `\n\n` emitted
+            // right before a `<tool_call>` tag never gets ratified into a
+            // standalone text content block. We can't open the block now
+            // because we don't yet know whether the next event is a real
+            // text delta (in which case the buffered prefix is flushed
+            // together with it) or a structural tag (in which case the
+            // buffer is dropped silently at tag-found / done time). When
+            // any non-whitespace arrives we ratify the block exactly
+            // once with `pendingLeadingWhitespace + safeText`.
+            const combined = pendingLeadingWhitespace + safeText;
+            if (combined.trim().length === 0) {
+              pendingLeadingWhitespace = combined;
+            } else {
+              if (hasEmittedThinking) {
+                writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+              }
+              hasEmittedText = true;
+              writeSSEEvent(
+                res,
+                'content_block_start',
+                buildContentBlockStart(contentBlockIndex, {
+                  type: 'text',
+                  text: '',
+                }),
+              );
+              pendingLeadingWhitespace = '';
+              emittedText += combined;
+              emittedTextLength += combined.length;
+              writeSSEEvent(
+                res,
+                'content_block_delta',
+                buildContentBlockDelta(contentBlockIndex, {
+                  type: 'text_delta',
+                  text: combined,
+                }),
+              );
             }
-            hasEmittedText = true;
+          } else {
+            emittedText += safeText;
+            emittedTextLength += safeText.length;
             writeSSEEvent(
               res,
-              'content_block_start',
-              buildContentBlockStart(contentBlockIndex, {
-                type: 'text',
-                text: '',
+              'content_block_delta',
+              buildContentBlockDelta(contentBlockIndex, {
+                type: 'text_delta',
+                text: safeText,
               }),
             );
           }
-          emittedText += safeText;
-          emittedTextLength += safeText.length;
-          writeSSEEvent(
-            res,
-            'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, {
-              type: 'text_delta',
-              text: safeText,
-            }),
-          );
         }
       }
     }
@@ -850,6 +920,14 @@ export async function handleCreateMessage(
 ): Promise<void> {
   const handlerStartedAt = Date.now();
   let serverModelResolveMs: number | undefined;
+  // Split observability for the resolve path: a request that arrives
+  // milliseconds after a peer's cold-load should not be billed the full
+  // load latency as if it drove the load itself. `serverLoadWaitMs`
+  // captures wall-clock spent blocked on the writer lock (whether
+  // waiting on a peer or self-loading); `serverLoadOwner` is true only
+  // when this request acquired the lock without contention.
+  let serverLoadWaitMs: number | undefined;
+  let serverLoadOwner: boolean | undefined;
 
   if (body == null || typeof body !== 'object') {
     sendAnthropicBadRequest(res, 'Request body must be a JSON object');
@@ -921,9 +999,32 @@ export async function handleCreateMessage(
       const resolveStartedAt = Date.now();
       const runResolve = () =>
         idleSweeper ? idleSweeper.withSuspendedDrains(() => resolveModel(body.model)) : resolveModel(body.model);
-      if (modelWorkCoordinator) await modelWorkCoordinator.withModelLoad(runResolve);
-      else await runResolve();
-      serverModelResolveMs = Date.now() - resolveStartedAt;
+      if (modelWorkCoordinator) {
+        // Use the instrumented variant so we can tell whether this
+        // request actually drove the load (owner) or merely parked
+        // behind a peer's in-flight load. Without the split, two
+        // requests racing into a 60s cold-load both report
+        // `resolve_ms=60000` and observers can't tell which one paid
+        // the cost vs. inherited the wait.
+        //
+        // The coordinator internally partitions the call into a wait
+        // phase (`acquireWrite()`) and an own-execution phase (`fn`)
+        // so `waitMs + ownMs` covers the total elapsed time without
+        // overlap. We plumb them straight through into the matching
+        // observability fields:
+        //  - owner driving a cold load → waitMs ≈ 0, ownMs ≈ load duration
+        //  - follower parked behind peer → waitMs ≈ peer load, ownMs ≈ 0
+        //  - already-loaded fast path  → waitMs ≈ 0, ownMs ≈ 0
+        // This matches the documented contract in `timing.ts` where
+        // `server_model_resolve_ms` excludes peer-wait time.
+        const outcome = await modelWorkCoordinator.withModelLoadInstrumented(runResolve);
+        serverLoadOwner = outcome.owner;
+        serverLoadWaitMs = outcome.waitMs;
+        serverModelResolveMs = outcome.ownMs;
+      } else {
+        await runResolve();
+        serverModelResolveMs = Date.now() - resolveStartedAt;
+      }
     } catch (err) {
       sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
@@ -1071,6 +1172,8 @@ export async function handleCreateMessage(
         withAdmissionControlledInference(sessionReg, modelWorkCoordinator, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_model_resolve_ms: serverModelResolveMs,
+            server_load_wait_ms: serverLoadWaitMs,
+            server_load_owner: serverLoadOwner,
             server_queue_ms: Date.now() - mutexQueuedAt,
             server_pre_inference_ms: Date.now() - handlerStartedAt,
             ...resolveServerTuningForUsage(),
