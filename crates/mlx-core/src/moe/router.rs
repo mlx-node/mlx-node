@@ -1,18 +1,47 @@
-//! Shared top-k softmax router for Mixture-of-Experts.
+//! Shared top-k router for Mixture-of-Experts.
 //!
-//! Convention (gpt-oss / Qwen3.5 MoE):
-//! 1. Linear projection: `logits = hidden @ weight.T + bias`  → `[B, T, E]`
-//! 2. Softmax over all experts (axis=-1).
-//! 3. Take top-k indices via `argpartition(-k)` and `take_along_axis`.
-//! 4. Renormalize the top-k weights so they sum to 1 along axis=-1.
+//! Two routing conventions are supported, mirroring the upstream Python
+//! implementations in `mlx-lm`:
+//!
+//! - [`RoutingMode::Qwen35`] — softmax-then-top-k, with conditional
+//!   renormalization (mirrors `Qwen3MoeSparseMoeBlock` in
+//!   `mlx-lm/mlx_lm/models/qwen3_moe.py` and that model's
+//!   `config.norm_topk_prob` flag):
+//!     1. `logits = hidden @ weight.T + bias`  → `[B, T, E]`
+//!     2. `probs = softmax(logits, axis=-1)`
+//!     3. `(top_probs, top_indices) = topk(probs)` along axis=-1
+//!     4. If `renormalize_topk`, divide `top_probs` by their sum.
+//!
+//! - [`RoutingMode::GptOss`] — top-k-then-softmax (mirrors `MLPBlock` in
+//!   `mlx-lm/mlx_lm/models/gpt_oss.py`):
+//!     1. `logits = hidden @ weight.T + bias`  → `[B, T, E]`
+//!     2. `(top_logits, top_indices) = topk(logits)` along axis=-1
+//!     3. `weights = softmax(top_logits, axis=-1)` — auto-sums to 1, no
+//!        renormalization needed. Mathematically the cheaper path because
+//!        softmax is taken over `k`, not the full `E`.
+//!
+//! Both modes return `(weights, indices)` with shape `[B, T, top_k]` each.
 //!
 //! This module is intentionally minimal: it owns no expert MLPs and no
 //! shared-expert branch. Dispatch (token → expert routing) lives in
-//! `crate::moe::dispatch`.
+//! [`crate::moe::dispatch`].
 
 use crate::array::MxArray;
 use crate::nn::Activations;
 use napi::bindgen_prelude::*;
+
+/// Routing convention selector.
+#[derive(Debug, Clone, Copy)]
+pub enum RoutingMode {
+    /// gpt-oss style: top-k of logits, then softmax over top-k. No
+    /// renormalization (softmax over the top-k already sums to 1).
+    GptOss,
+    /// Qwen3.5 style: softmax over all experts, then top-k.
+    ///
+    /// If `renormalize_topk` is true, divide the top-k weights by their sum
+    /// (so they sum to 1.0). Mirrors Qwen3.5's `config.norm_topk_prob`.
+    Qwen35 { renormalize_topk: bool },
+}
 
 /// Static configuration for a [`TopKRouter`].
 #[derive(Debug, Clone, Copy)]
@@ -20,17 +49,25 @@ pub struct RouterConfig {
     pub num_experts: usize,
     pub hidden: usize,
     pub top_k: usize,
+    pub mode: RoutingMode,
 }
 
-/// Top-k softmax router.
+/// Top-k MoE router.
 ///
 /// Stores its own `weight` (`[num_experts, hidden]`) and `bias`
-/// (`[num_experts]`) tensors. The `route` method computes routing
-/// weights and indices for an input `hidden [B, T, H]`.
+/// (`[num_experts]`) tensors plus a cached transposed view of the weight to
+/// avoid rebuilding the transpose graph node on every forward pass. The
+/// `route` method computes routing weights and indices for an input
+/// `hidden [B, T, H]` according to `config.mode`.
 pub struct TopKRouter {
     pub config: RouterConfig,
     /// Router gate weight, shape `[num_experts, hidden]`.
     pub weight: MxArray,
+    /// Cached transposed weight, shape `[hidden, num_experts]`. Built once
+    /// at construction; used by `route` via `addmm` for the fused matmul +
+    /// bias add. Mirrors the `weight_t` caching pattern in
+    /// `crate::nn::linear::Linear`.
+    weight_t: MxArray,
     /// Router gate bias, shape `[num_experts]`.
     pub bias: MxArray,
 }
@@ -39,22 +76,22 @@ impl TopKRouter {
     /// Construct a new router. The caller is responsible for the weight and
     /// bias shapes matching `config`; validation happens lazily on the first
     /// `route` call (via MLX shape errors) to avoid evaluating lazy tensors.
-    pub fn new(config: RouterConfig, weight: MxArray, bias: MxArray) -> Self {
-        Self {
+    pub fn new(config: RouterConfig, weight: MxArray, bias: MxArray) -> Result<Self> {
+        let weight_t = weight.transpose(Some(&[1, 0]))?;
+        Ok(Self {
             config,
             weight,
+            weight_t,
             bias,
-        }
+        })
     }
 
     /// Compute the top-k routing weights and indices for `hidden`.
     ///
     /// `hidden` must have shape `[B, T, H]`. The result is
     /// `(top_k_weights, top_k_indices)` with shape `[B, T, top_k]` each.
-    ///
-    /// `top_k_weights` are softmax-then-top-k normalized: a full softmax is
-    /// taken across all `num_experts`, the top-`k` are kept, and the kept
-    /// values are renormalized to sum to 1 along the last axis.
+    /// The dispatch on `self.config.mode` selects between the gpt-oss and
+    /// Qwen3.5 conventions described in the module docs.
     pub fn route(&self, hidden: &MxArray) -> Result<(MxArray, MxArray)> {
         let shape = hidden.shape()?;
         if shape.len() != 3 {
@@ -80,22 +117,39 @@ impl TopKRouter {
         let ne = batch * seq_len;
         let x_flat = hidden.reshape(&[ne, hidden_dim])?;
 
-        // logits = x_flat @ weight.T + bias  → [ne, num_experts]
-        let weight_t = self.weight.transpose(Some(&[1, 0]))?;
-        let logits = x_flat.matmul(&weight_t)?.add(&self.bias)?;
+        // Fused logits = x_flat @ weight_t + bias  → [ne, num_experts]
+        // weight_t is cached; addmm fuses the bias add. Mirrors
+        // `Linear::forward` in `crate::nn::linear`.
+        let logits = x_flat.addmm(&self.bias, &self.weight_t, None, None)?;
 
-        // Softmax over all experts along the last axis.
-        let routing_weights = Activations::softmax(&logits, Some(-1))?;
-
-        // Top-k via argpartition: kth = -k partitions so the last k positions
-        // along axis=-1 are the k largest. slice_axis on axis=1 keeps those.
-        let top_indices_full = routing_weights.argpartition(-(top_k as i32), Some(-1))?;
-        let top_indices_flat = top_indices_full.slice_axis(1, num_experts - top_k, num_experts)?;
-        let top_weights_flat = routing_weights.take_along_axis(&top_indices_flat, -1)?;
-
-        // Renormalize the top-k weights to sum to 1 along axis=-1.
-        let sum = top_weights_flat.sum(Some(&[-1]), Some(true))?;
-        let top_weights_flat = top_weights_flat.div(&sum)?;
+        let (top_weights_flat, top_indices_flat) = match self.config.mode {
+            RoutingMode::GptOss => {
+                // Top-k of logits, then softmax over the k selected logits.
+                // argpartition with kth=-k puts the k largest at the tail.
+                let top_indices_full = logits.argpartition(-(top_k as i32), Some(-1))?;
+                let top_indices_flat =
+                    top_indices_full.slice_axis(1, num_experts - top_k, num_experts)?;
+                let top_logits_flat = logits.take_along_axis(&top_indices_flat, -1)?;
+                let top_weights_flat = Activations::softmax(&top_logits_flat, Some(-1))?;
+                (top_weights_flat, top_indices_flat)
+            }
+            RoutingMode::Qwen35 { renormalize_topk } => {
+                // Softmax over all experts, then top-k of probs, with
+                // optional renormalization.
+                let routing_weights = Activations::softmax(&logits, Some(-1))?;
+                let top_indices_full = routing_weights.argpartition(-(top_k as i32), Some(-1))?;
+                let top_indices_flat =
+                    top_indices_full.slice_axis(1, num_experts - top_k, num_experts)?;
+                let top_weights_flat = routing_weights.take_along_axis(&top_indices_flat, -1)?;
+                let top_weights_flat = if renormalize_topk {
+                    let sum = top_weights_flat.sum(Some(&[-1]), Some(true))?;
+                    top_weights_flat.div(&sum)?
+                } else {
+                    top_weights_flat
+                };
+                (top_weights_flat, top_indices_flat)
+            }
+        };
 
         // Reshape back to [B, T, top_k].
         let out_shape = [batch, seq_len, top_k];
@@ -111,11 +165,12 @@ mod tests {
     use super::*;
     use crate::array::DType;
 
-    fn router(num_experts: usize, hidden: usize, top_k: usize) -> TopKRouter {
+    fn router(num_experts: usize, hidden: usize, top_k: usize, mode: RoutingMode) -> TopKRouter {
         let config = RouterConfig {
             num_experts,
             hidden,
             top_k,
+            mode,
         };
         let weight = MxArray::random_normal(
             &[num_experts as i64, hidden as i64],
@@ -125,12 +180,19 @@ mod tests {
         )
         .expect("random_normal weight");
         let bias = MxArray::zeros(&[num_experts as i64], Some(DType::Float32)).expect("zeros bias");
-        TopKRouter::new(config, weight, bias)
+        TopKRouter::new(config, weight, bias).expect("router new")
     }
 
     #[test]
     fn test_route_shapes() {
-        let r = router(8, 4, 2);
+        let r = router(
+            8,
+            4,
+            2,
+            RoutingMode::Qwen35 {
+                renormalize_topk: true,
+            },
+        );
         let hidden = MxArray::random_normal(&[2, 3, 4], 0.0, 1.0, Some(DType::Float32))
             .expect("random_normal hidden");
         let (weights, indices) = r.route(&hidden).expect("route");
@@ -142,10 +204,12 @@ mod tests {
     }
 
     #[test]
-    fn test_route_renormalization_sums_to_one() {
+    fn test_route_gptoss_mode_no_renormalization() {
+        // gpt-oss mode: softmax-over-top-k auto-normalizes, so per-token
+        // weight sum must be ~1.0 with no explicit renormalization.
         let num_experts = 8usize;
-        let top_k = 2usize;
-        let r = router(num_experts, 4, top_k);
+        let top_k = 4usize;
+        let r = router(num_experts, 4, top_k, RoutingMode::GptOss);
         let hidden = MxArray::random_normal(&[2, 3, 4], 0.0, 1.0, Some(DType::Float32))
             .expect("random_normal hidden");
         let (weights, _indices) = r.route(&hidden).expect("route");
@@ -157,7 +221,73 @@ mod tests {
         for (i, &v) in flat.iter().enumerate() {
             assert!(
                 (v - 1.0).abs() < 1e-4,
-                "row {} of weight sum is {} (expected 1.0 +/- 1e-4)",
+                "gpt-oss row {} weight sum is {} (expected 1.0 +/- 1e-4)",
+                i,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_route_qwen35_renormalize_off_does_not_sum_to_one() {
+        // Qwen35 mode without renormalization: weights are the top-k probs
+        // of the full softmax distribution. Their sum equals the mass of
+        // the top-k experts, which is < 1.0 unless top_k == num_experts.
+        let num_experts = 16usize;
+        let top_k = 4usize;
+        let r = router(
+            num_experts,
+            8,
+            top_k,
+            RoutingMode::Qwen35 {
+                renormalize_topk: false,
+            },
+        );
+        let hidden = MxArray::random_normal(&[2, 3, 8], 0.0, 1.0, Some(DType::Float32))
+            .expect("random_normal hidden");
+        let (weights, _indices) = r.route(&hidden).expect("route");
+
+        let sums = weights.sum(Some(&[-1]), Some(false)).expect("sum over -1");
+        sums.eval();
+        let flat = sums.to_float32().expect("to_float32");
+        assert_eq!(flat.len(), 2 * 3);
+        for (i, &v) in flat.iter().enumerate() {
+            // Strictly less than 1.0 (some mass lives outside the top-k).
+            // Also positive: softmax values are non-negative and at least
+            // one entry is selected.
+            assert!(
+                v > 0.0 && v < 1.0 - 1e-6,
+                "qwen35(renorm=false) row {} weight sum is {} (expected (0, 1))",
+                i,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_route_qwen35_renormalize_on_sums_to_one() {
+        let num_experts = 8usize;
+        let top_k = 2usize;
+        let r = router(
+            num_experts,
+            4,
+            top_k,
+            RoutingMode::Qwen35 {
+                renormalize_topk: true,
+            },
+        );
+        let hidden = MxArray::random_normal(&[2, 3, 4], 0.0, 1.0, Some(DType::Float32))
+            .expect("random_normal hidden");
+        let (weights, _indices) = r.route(&hidden).expect("route");
+
+        let sums = weights.sum(Some(&[-1]), Some(false)).expect("sum over -1");
+        sums.eval();
+        let flat = sums.to_float32().expect("to_float32");
+        assert_eq!(flat.len(), 2 * 3);
+        for (i, &v) in flat.iter().enumerate() {
+            assert!(
+                (v - 1.0).abs() < 1e-4,
+                "qwen35(renorm=true) row {} weight sum is {} (expected 1.0 +/- 1e-4)",
                 i,
                 v
             );
@@ -166,10 +296,13 @@ mod tests {
 
     #[test]
     fn test_route_indices_in_range() {
-        let num_experts = 8usize;
-        let r = router(num_experts, 4, 2);
-        let hidden = MxArray::random_normal(&[2, 3, 4], 0.0, 1.0, Some(DType::Float32))
-            .expect("random_normal hidden");
+        let num_experts = 32usize;
+        let top_k = 4usize;
+        let hidden_dim = 8usize;
+        let r = router(num_experts, hidden_dim, top_k, RoutingMode::GptOss);
+        let hidden =
+            MxArray::random_normal(&[4, 16, hidden_dim as i64], 0.0, 1.0, Some(DType::Float32))
+                .expect("random_normal hidden");
         let (_weights, indices) = r.route(&hidden).expect("route");
 
         indices.eval();
