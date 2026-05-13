@@ -1,0 +1,202 @@
+//! End-to-end forward pass for the OpenAI Privacy Filter model.
+//!
+//! Wires the 8 transformer [`Block`]s together with the input embedding,
+//! the final RMSNorm, and the classifier head to produce per-token
+//! logits ready for Viterbi decoding.
+//!
+//! ```text
+//!   input_ids [B, T]
+//!         │
+//!         ├── embed_tokens[input_ids]   → hidden [B, T, 640]
+//!         │
+//!         ├── for layer in 0..8:
+//!         │     Block { input_layernorm → AttentionLayer
+//!         │             post_attention_layernorm → GptOssMlp }
+//!         │
+//!         ├── final RMSNorm (model.norm)
+//!         └── classifier head (score.weight / score.bias)
+//!                                       → logits [B, T, 33]
+//! ```
+//!
+//! Shared per-model state (YaRN frequencies) is computed once at load
+//! time and threaded through every block as a `&MxArray`. The runtime
+//! call sequence is identical to mlx-lm's reference forward pass — see
+//! `mlx-lm/mlx_lm/models/gpt_oss.py` — modulo bidirectional banded
+//! attention (no KV cache) and the per-token classifier output instead
+//! of an LM head.
+
+use crate::array::MxArray;
+use crate::nn::RMSNorm;
+use napi::bindgen_prelude::*;
+use std::path::Path;
+
+use super::classifier::classifier_forward;
+use super::persistence::{LoadedModel, load_from_directory};
+use super::transformer::Block;
+use super::yarn::compute_yarn_freqs;
+
+/// A loaded privacy-filter model plus its precomputed YaRN frequencies.
+///
+/// The frequencies depend only on `head_dim` and `rope_parameters` so we
+/// build them once at load time and share the resulting `[head_dim/2]`
+/// f32 array across all 8 attention layers.
+pub struct PrivacyFilterModel {
+    pub loaded: LoadedModel,
+    /// Shared YaRN frequencies (`[head_dim / 2]`, f32).
+    pub yarn_freqs: MxArray,
+}
+
+impl PrivacyFilterModel {
+    /// Load a privacy-filter checkpoint from a directory and precompute
+    /// the shared YaRN frequencies.
+    pub fn load_from_dir(path: &Path) -> Result<Self> {
+        let loaded = load_from_directory(path)?;
+        let yarn_freqs =
+            compute_yarn_freqs(loaded.config.head_dim, &loaded.config.rope_parameters)?;
+        Ok(Self { loaded, yarn_freqs })
+    }
+
+    /// Run the full forward pass and return per-token logits.
+    ///
+    /// - `input_ids` shape `[B, T]`, dtype int32 / int64 / uint32 (anything
+    ///   `mx.take` accepts as an integer index).
+    /// - Output shape `[B, T, num_classes]` (33 for the shipped
+    ///   privacy-filter checkpoint).
+    /// - Output dtype is the model's native weight dtype (bf16 for the
+    ///   shipped checkpoint); callers wanting f32 should `astype` the
+    ///   result themselves.
+    pub fn forward_logits(&self, input_ids: &MxArray) -> Result<MxArray> {
+        let weights = &self.loaded.weights;
+        let cfg = &self.loaded.config;
+
+        // 1. Embedding lookup: hidden = embed_tokens[input_ids].
+        //    `take(axis=0)` on `[vocab, hidden]` with `[B, T]` indices
+        //    produces `[B, T, hidden]`. Same pattern as
+        //    `crate::nn::Embedding::forward`.
+        let mut hidden = weights.embed_tokens.take(input_ids, 0)?;
+
+        // 2. Run all 8 transformer blocks.
+        for layer in &weights.layers {
+            let block = Block {
+                weights: layer,
+                config: cfg,
+                yarn_freqs: &self.yarn_freqs,
+            };
+            hidden = block.forward(&hidden)?;
+        }
+
+        // 3. Final RMSNorm (model.norm).
+        let final_norm = RMSNorm::from_weight(&weights.final_norm, Some(cfg.rms_norm_eps as f64))?;
+        let hidden = final_norm.forward(&hidden)?;
+
+        // 4. Classifier head — `score.weight` `[33, hidden]`,
+        //    `score.bias` `[33]`. See [`classifier_forward`].
+        classifier_forward(&hidden, &weights.score_weight, &weights.score_bias)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::array::DType;
+
+    fn checkpoint_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".cache/models/privacy-filter")
+    }
+
+    /// Shape + finiteness check on a tiny real-tokenized input.
+    /// Guards against accidental shape regressions and any NaN/Inf
+    /// escaping the 8-block pipeline.
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter — run with --ignored"]
+    fn forward_logits_shape_and_finite() {
+        let model = PrivacyFilterModel::load_from_dir(&checkpoint_dir()).expect("load model");
+
+        let text = "Hi I am Alice.";
+        let ids_u32 = model
+            .loaded
+            .tokenizer
+            .encode_sync(text, Some(false))
+            .expect("encode");
+        let ids: Vec<i32> = ids_u32.iter().map(|&id| id as i32).collect();
+        let t = ids.len() as i64;
+        let input_ids = MxArray::from_int32(&ids, &[1, t]).expect("from_int32");
+
+        let logits = model.forward_logits(&input_ids).expect("forward");
+        let shape: Vec<i64> = logits.shape().unwrap().to_vec();
+        assert_eq!(shape, vec![1, t, model.loaded.label_strs.len() as i64]);
+
+        // Finiteness check via GPU reduction (promote to f32 first so
+        // bf16's wider exponent range doesn't paper over an actual Inf).
+        let logits_f32 = logits.astype(DType::Float32).expect("astype");
+        assert!(
+            !logits_f32.has_nan_or_inf().expect("has_nan_or_inf"),
+            "forward_logits produced NaN or Inf"
+        );
+    }
+
+    /// End-to-end correctness: classify a PII-laden sentence and verify
+    /// that the predicted tag sequence contains the expected entity
+    /// starts (`B-private_person` for the name, `B-private_email` for
+    /// the email).
+    ///
+    /// On failure the test prints the actual tokens and tags so the
+    /// caller can diagnose whether the bug lives in YaRN, attention
+    /// sinks, MoE routing, etc. **Do not loosen this assertion** — a
+    /// failure here is a real algorithmic bug.
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter — run with --ignored"]
+    fn forward_classify_alice_smith_email() {
+        let model = PrivacyFilterModel::load_from_dir(&checkpoint_dir()).expect("load model");
+
+        let text = "Hi I am Alice Smith, email alice@example.com";
+        let ids_u32 = model
+            .loaded
+            .tokenizer
+            .encode_sync(text, Some(false))
+            .expect("encode");
+        let ids: Vec<i32> = ids_u32.iter().map(|&id| id as i32).collect();
+        let t = ids.len() as i64;
+        let input_ids = MxArray::from_int32(&ids, &[1, t]).expect("from_int32");
+
+        let logits = model.forward_logits(&input_ids).expect("forward");
+
+        // argmax over the last axis. `argmax(axis=-1)` reduces the
+        // `num_classes` axis, leaving `[1, T]` int indices.
+        let pred = logits.argmax(-1, Some(false)).expect("argmax");
+        let pred_i32 = pred.to_int32().expect("to_int32");
+
+        // Decode each token id back to a string for the debug print.
+        let tok_strs: Vec<String> = ids_u32
+            .iter()
+            .map(|&id| {
+                model
+                    .loaded
+                    .tokenizer
+                    .decode_sync(&[id], false)
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        let pred_tags: Vec<&str> = pred_i32
+            .iter()
+            .map(|&i| model.loaded.label_strs[i as usize].as_str())
+            .collect();
+
+        println!("Tokens: {:?}", tok_strs);
+        println!("Tags:   {:?}", pred_tags);
+
+        assert!(
+            pred_tags.contains(&"B-private_person"),
+            "expected B-private_person in tag sequence; got {:?}",
+            pred_tags
+        );
+        assert!(
+            pred_tags.contains(&"B-private_email"),
+            "expected B-private_email in tag sequence; got {:?}",
+            pred_tags
+        );
+    }
+}
