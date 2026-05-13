@@ -1,4 +1,5 @@
 use crate::array::MxArray;
+use crate::moe::{RoutingMode, topk_from_logits};
 use crate::nn::{Activations, Linear};
 use crate::transformer::MLP;
 use napi::bindgen_prelude::*;
@@ -100,22 +101,22 @@ impl SparseMoeBlock {
         let hidden_size = shape[2];
         let ne = batch * seq_len;
         let k = self.num_experts_per_tok as i64;
-        let num_exp = self.num_experts as i64;
 
         let x_flat = x.reshape(&[ne, hidden_size])?;
         let router_logits = self.gate.forward(&x_flat)?;
-        let routing_weights = Activations::softmax(&router_logits, Some(-1))?;
 
-        let top_indices_full = routing_weights.argpartition(-(k as i32), Some(-1))?;
-        let top_indices = top_indices_full.slice_axis(1, num_exp - k, num_exp)?;
-        let top_weights = routing_weights.take_along_axis(&top_indices, -1)?;
-
-        let top_weights = if self.norm_topk_prob {
-            let sum = top_weights.sum(Some(&[-1]), Some(true))?;
-            top_weights.div(&sum)?
-        } else {
-            top_weights
-        };
+        // Routing math (softmax-then-topk, optionally renormalized) is shared
+        // with the gpt-oss / privacy-filter path via `moe::topk_from_logits`.
+        // The gate matmul stays here because it may be quantized (MXFP8) —
+        // the shared `TopKRouter` only handles plain `MxArray` gate weights.
+        let (top_weights, top_indices) = topk_from_logits(
+            &router_logits,
+            self.num_experts,
+            self.num_experts_per_tok,
+            RoutingMode::Qwen35 {
+                renormalize_topk: self.norm_topk_prob,
+            },
+        )?;
 
         let expert_out = self.switch_mlp.forward(&x_flat, &top_indices)?;
         let weights_expanded = top_weights.reshape(&[ne, k, 1])?;
