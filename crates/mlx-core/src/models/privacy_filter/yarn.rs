@@ -133,6 +133,8 @@ mod tests {
             beta_slow: 1.0,
             original_max_position_embeddings: 4096,
             truncate: false,
+            mscale: 1.0,
+            mscale_all_dim: 0.0,
         }
     }
 

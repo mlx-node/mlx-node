@@ -82,6 +82,56 @@ pub struct RopeParameters {
     /// in upstream configs; defaults to `false`.
     #[serde(default)]
     pub truncate: bool,
+    /// YaRN `mscale` (numerator of the attention factor). Defaults to
+    /// `1.0` — matches HF transformers and mlx-lm when the field is
+    /// absent from `config.json` (as it is for privacy-filter).
+    #[serde(default = "default_mscale")]
+    pub mscale: f32,
+    /// YaRN `mscale_all_dim` (denominator of the attention factor).
+    /// Defaults to `0.0` — matches HF transformers and mlx-lm when the
+    /// field is absent. With this default `_get_mscale(scale, 0.0)` is
+    /// always `1.0`, so the denominator vanishes.
+    #[serde(default = "default_mscale_all_dim")]
+    pub mscale_all_dim: f32,
+}
+
+fn default_mscale() -> f32 {
+    1.0
+}
+
+fn default_mscale_all_dim() -> f32 {
+    0.0
+}
+
+impl RopeParameters {
+    /// YaRN `attention_factor` (a.k.a. `mscale`) — the multiplier applied
+    /// to Q and K immediately before the RoPE rotation.
+    ///
+    /// Mirrors mlx-lm (`YarnRoPE.mscale`, see
+    /// `mlx-lm/mlx_lm/models/rope_utils.py:171`) and HF transformers
+    /// (`_compute_yarn_parameters`):
+    ///
+    /// ```text
+    /// _get_mscale(scale, m) = 0.1 * m * ln(scale) + 1     if scale > 1
+    ///                       = 1                            otherwise
+    ///
+    /// attention_factor       = _get_mscale(factor, mscale)
+    ///                          / _get_mscale(factor, mscale_all_dim)
+    /// ```
+    ///
+    /// For privacy-filter the config sets only `factor = 32`, so the
+    /// defaults `mscale = 1.0`, `mscale_all_dim = 0.0` apply and the
+    /// result is `0.1 * ln(32) + 1 ≈ 1.3465735902`.
+    pub fn attention_factor(&self) -> f32 {
+        fn get_mscale(scale: f32, m: f32) -> f32 {
+            if scale > 1.0 {
+                0.1 * m * scale.ln() + 1.0
+            } else {
+                1.0
+            }
+        }
+        get_mscale(self.factor, self.mscale) / get_mscale(self.factor, self.mscale_all_dim)
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +170,49 @@ mod tests {
             Some("B-private_email")
         );
         assert_eq!(cfg.id2label.get("32").map(String::as_str), Some("S-secret"));
+    }
+
+    /// privacy-filter ships `factor=32` and no `mscale` / `mscale_all_dim`
+    /// fields, so defaults (`1.0`, `0.0`) apply. Expected attention
+    /// factor: `0.1 * 1.0 * ln(32) + 1 ≈ 1.3465735902`. The denominator
+    /// `_get_mscale(32, 0.0) = 1.0`, so it has no effect.
+    #[test]
+    fn attention_factor_for_privacy_filter_defaults() {
+        let params = RopeParameters {
+            rope_type: "yarn".into(),
+            rope_theta: 150000.0,
+            factor: 32.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position_embeddings: 4096,
+            truncate: false,
+            mscale: 1.0,
+            mscale_all_dim: 0.0,
+        };
+        let af = params.attention_factor();
+        let expected = 0.1f32 * 1.0 * 32.0_f32.ln() + 1.0;
+        assert!(
+            (af - expected).abs() < 1e-6,
+            "got {af}, expected {expected}"
+        );
+    }
+
+    /// When the extrapolation factor is `1.0` (no YaRN scaling),
+    /// `_get_mscale` short-circuits to `1.0` for both numerator and
+    /// denominator, so the attention factor must be exactly `1.0`.
+    #[test]
+    fn attention_factor_returns_1_when_factor_is_1() {
+        let params = RopeParameters {
+            rope_type: "yarn".into(),
+            rope_theta: 150000.0,
+            factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position_embeddings: 4096,
+            truncate: false,
+            mscale: 1.0,
+            mscale_all_dim: 0.0,
+        };
+        assert!((params.attention_factor() - 1.0).abs() < 1e-7);
     }
 }

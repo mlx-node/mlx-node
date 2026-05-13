@@ -67,7 +67,27 @@ impl<'a> AttentionLayer<'a> {
             .reshape(&[batch, seq_len, num_kv_heads, head_dim])?
             .transpose(Some(&[0, 2, 1, 3]))?;
 
-        // 3. YaRN RoPE on Q and K. Offset is always 0 (bidirectional
+        // 3. YaRN `attention_factor` (a.k.a. `mscale`) — multiply Q and K
+        //    by the YaRN attention factor BEFORE the rotation. This
+        //    mirrors mlx-lm `YarnRoPE.__call__`
+        //    (`x[..., :dims] = self.mscale * x[..., :dims]` then
+        //    `mx.fast.rope(...)`) and HF transformers
+        //    (`cos *= attention_factor; sin *= attention_factor`, which
+        //    is algebraically equivalent to pre-scaling Q/K). Without it,
+        //    rotated Q/K are ~1.35× smaller than reference for
+        //    `factor=32`. `mul_scalar` keeps the bf16 dtype intact —
+        //    MLX handles the scalar promotion internally rather than
+        //    materialising an f32 constant that would force bf16→f32.
+        let attention_factor = self.config.rope_parameters.attention_factor();
+        let (q, k) = if (attention_factor - 1.0).abs() > 1e-7 {
+            let q = q.mul_scalar(attention_factor as f64)?;
+            let k = k.mul_scalar(attention_factor as f64)?;
+            (q, k)
+        } else {
+            (q, k)
+        };
+
+        // 4. YaRN RoPE on Q and K. Offset is always 0 (bidirectional
         //    self-attention over a single chunk — no KV cache). `dims` is the
         //    full head dimension; the freqs array is `[head_dim/2]`.
         //
@@ -99,7 +119,7 @@ impl<'a> AttentionLayer<'a> {
         };
         let k = MxArray::from_handle(k, "privacy_filter yarn rope (k)")?;
 
-        // 4. Banded attention with per-head sinks. Sliding window is
+        // 5. Banded attention with per-head sinks. Sliding window is
         //    bidirectional: |q - k| <= band.
         if self.config.sliding_window < 0 {
             return Err(Error::from_reason(format!(
@@ -110,7 +130,7 @@ impl<'a> AttentionLayer<'a> {
         let band = self.config.sliding_window;
         let attn = banded_attention(&q, &k, &v, &self.weights.sinks, band)?;
 
-        // 5. Merge heads `[B, H, T, D]` → `[B, T, H*D]` and apply the output
+        // 6. Merge heads `[B, H, T, D]` → `[B, T, H*D]` and apply the output
         //    projection (`o_proj.weight` shape `[hidden_size, num_q_heads *
         //    head_dim]`, so its transpose maps `q_dim → hidden_size`).
         let merged = attn
