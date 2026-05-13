@@ -1,12 +1,14 @@
 //! OpenAI Privacy Filter — token-classification PII detector.
 pub mod attention;
 pub mod config;
+pub mod experts;
 pub mod persistence;
 pub mod spans;
 pub mod viterbi;
 pub mod yarn;
 pub use attention::AttentionLayer;
 pub use config::{PrivacyFilterConfig, RopeParameters};
+pub use experts::GptOssMlp;
 pub use persistence::{
     AttnWeights, LayerWeights, LoadedModel, MlpWeights, ModelWeights, load_from_directory,
 };
