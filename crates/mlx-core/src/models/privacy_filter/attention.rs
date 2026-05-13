@@ -35,7 +35,15 @@ impl<'a> AttentionLayer<'a> {
     ///
     /// Input shape:  `[B, T, hidden_size]`
     /// Output shape: `[B, T, hidden_size]`
-    pub fn forward(&self, hidden: &MxArray) -> Result<MxArray> {
+    ///
+    /// `band` is the bidirectional attention window in tokens —
+    /// `|q_pos - k_pos| <= band`. For `sliding_attention` layers pass
+    /// `config.sliding_window`; for `full_attention` layers pass an
+    /// effectively-unbounded value (use
+    /// [`PrivacyFilterConfig::band_for_layer`]). Per gpt-oss defaults,
+    /// half the layers alternate to full attention — applying the sliding
+    /// band to every layer cripples the bidirectional receptive field.
+    pub fn forward(&self, hidden: &MxArray, band: i32) -> Result<MxArray> {
         let batch = hidden.shape_at(0)?;
         let seq_len = hidden.shape_at(1)?;
 
@@ -120,14 +128,14 @@ impl<'a> AttentionLayer<'a> {
         let k = MxArray::from_handle(k, "privacy_filter yarn rope (k)")?;
 
         // 5. Banded attention with per-head sinks. Sliding window is
-        //    bidirectional: |q - k| <= band.
-        if self.config.sliding_window < 0 {
+        //    bidirectional: |q - k| <= band. `band` is supplied by the
+        //    caller because gpt-oss alternates sliding / full attention
+        //    per layer — see [`PrivacyFilterConfig::band_for_layer`].
+        if band < 0 {
             return Err(Error::from_reason(format!(
-                "privacy_filter::AttentionLayer: sliding_window must be non-negative, got {}",
-                self.config.sliding_window
+                "privacy_filter::AttentionLayer: band must be non-negative, got {band}",
             )));
         }
-        let band = self.config.sliding_window;
         let attn = banded_attention(&q, &k, &v, &self.weights.sinks, band)?;
 
         // 6. Merge heads `[B, H, T, D]` → `[B, T, H*D]` and apply the output
@@ -199,7 +207,8 @@ mod tests {
         )
         .expect("random hidden");
 
-        let out = layer.forward(&hidden).expect("attention forward");
+        let band = loaded.config.band_for_layer(0);
+        let out = layer.forward(&hidden, band).expect("attention forward");
 
         let shape = out.shape().unwrap().to_vec();
         assert_eq!(shape, vec![1, 8, loaded.config.hidden_size as i64]);
@@ -244,8 +253,9 @@ mod tests {
         )
         .expect("random hidden");
 
-        let a = layer.forward(&hidden).expect("forward 1");
-        let b = layer.forward(&hidden).expect("forward 2");
+        let band = loaded.config.band_for_layer(0);
+        let a = layer.forward(&hidden, band).expect("forward 1");
+        let b = layer.forward(&hidden, band).expect("forward 2");
 
         let av = a.astype(DType::Float32).unwrap().to_float32().unwrap();
         let bv = b.astype(DType::Float32).unwrap().to_float32().unwrap();

@@ -60,6 +60,60 @@ pub struct PrivacyFilterConfig {
     /// optional in upstream configs so we default to `false`.
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    /// Optional explicit per-layer attention type. When absent (as for
+    /// privacy-filter `config.json`), the gpt-oss default of alternating
+    /// `"sliding_attention"` / `"full_attention"` is used — starting with
+    /// `"sliding_attention"` at layer 0. Mirrors
+    /// `transformers/models/gpt_oss/configuration_gpt_oss.py:102-105` and
+    /// `mlx-lm/mlx_lm/models/gpt_oss.py:197-204`.
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+}
+
+impl PrivacyFilterConfig {
+    /// Per-layer attention type for layer `idx`.
+    ///
+    /// If `config.layer_types` is set, returns the entry at `idx` (or
+    /// `"sliding_attention"` as a fallback if the index is out of range —
+    /// which would itself be a config bug we surface elsewhere).
+    /// Otherwise applies the gpt-oss default: even indices →
+    /// `"sliding_attention"`, odd indices → `"full_attention"`.
+    ///
+    /// Verified against both references:
+    /// - `mlx-lm/mlx_lm/models/gpt_oss.py:197-204` —
+    ///   `["sliding_attention", "full_attention"] * (num_hidden_layers // 2)`
+    ///   ⇒ idx 0 sliding, idx 1 full, ...
+    /// - `transformers/models/gpt_oss/configuration_gpt_oss.py:102-105` —
+    ///   `"sliding_attention" if bool((i + 1) % 2) else "full_attention"`
+    ///   ⇒ i=0 sliding, i=1 full, ...
+    pub fn attention_type_for_layer(&self, idx: usize) -> &str {
+        if let Some(types) = &self.layer_types {
+            return types
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or("sliding_attention");
+        }
+        if idx.is_multiple_of(2) {
+            "sliding_attention"
+        } else {
+            "full_attention"
+        }
+    }
+
+    /// Effective attention band for layer `idx`.
+    ///
+    /// - `sliding_attention` ⇒ `self.sliding_window`
+    /// - `full_attention`    ⇒ an effectively-unbounded band
+    ///   (`i32::MAX / 2` — large enough that
+    ///   `|q_pos - k_pos| <= band` admits every pair for any plausible
+    ///   sequence length while leaving headroom against overflow in
+    ///   downstream arithmetic).
+    pub fn band_for_layer(&self, idx: usize) -> i32 {
+        match self.attention_type_for_layer(idx) {
+            "sliding_attention" => self.sliding_window,
+            _ => i32::MAX / 2,
+        }
+    }
 }
 
 /// YaRN RoPE parameters as stored in the privacy-filter `config.json`.
@@ -137,6 +191,91 @@ impl RopeParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal config wired up with the privacy-filter shipping
+    /// shape — only the helpers under test need to be meaningful.
+    fn dummy_config(layer_types: Option<Vec<String>>) -> PrivacyFilterConfig {
+        PrivacyFilterConfig {
+            model_type: "openai_privacy_filter".into(),
+            hidden_size: 640,
+            head_dim: 64,
+            num_attention_heads: 14,
+            num_key_value_heads: 2,
+            num_hidden_layers: 8,
+            num_local_experts: 128,
+            num_experts_per_tok: 4,
+            intermediate_size: 640,
+            sliding_window: 128,
+            attention_bias: true,
+            rms_norm_eps: 1e-5,
+            vocab_size: 200_064,
+            max_position_embeddings: 4096,
+            rope_parameters: RopeParameters {
+                rope_type: "yarn".into(),
+                rope_theta: 150000.0,
+                factor: 32.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max_position_embeddings: 4096,
+                truncate: false,
+                mscale: 1.0,
+                mscale_all_dim: 0.0,
+            },
+            id2label: BTreeMap::new(),
+            label2id: BTreeMap::new(),
+            tie_word_embeddings: false,
+            layer_types,
+        }
+    }
+
+    /// Without an explicit override, layers must alternate starting from
+    /// `sliding_attention` at idx 0 — matches both mlx-lm and HF
+    /// transformers gpt-oss reference (see [`PrivacyFilterConfig::
+    /// attention_type_for_layer`] for citations).
+    #[test]
+    fn default_layer_types_alternate_sliding_full() {
+        let cfg = dummy_config(None);
+        for idx in 0usize..8 {
+            let expected = if idx.is_multiple_of(2) {
+                "sliding_attention"
+            } else {
+                "full_attention"
+            };
+            assert_eq!(
+                cfg.attention_type_for_layer(idx),
+                expected,
+                "layer {idx} should be {expected}"
+            );
+        }
+    }
+
+    /// An explicit `layer_types` array wins over the default alternation.
+    #[test]
+    fn explicit_layer_types_overrides_default() {
+        let cfg = dummy_config(Some(vec!["full_attention".into(); 8]));
+        for idx in 0..8 {
+            assert_eq!(
+                cfg.attention_type_for_layer(idx),
+                "full_attention",
+                "layer {idx} should be full_attention when overridden"
+            );
+        }
+    }
+
+    /// Sliding layers report `sliding_window`; full layers report a band
+    /// large enough to admit every (q, k) pair for any plausible
+    /// sequence length.
+    #[test]
+    fn band_for_full_attention_layer_is_unbounded() {
+        let cfg = dummy_config(None);
+        let band_sliding = cfg.band_for_layer(0);
+        let band_full = cfg.band_for_layer(1);
+        assert_eq!(band_sliding, 128);
+        assert!(
+            band_full > 100_000,
+            "full-attention band should be effectively unbounded, got {band_full}"
+        );
+    }
 
     #[test]
     #[ignore = "requires .cache/models/privacy-filter/config.json — run with --ignored"]

@@ -75,12 +75,15 @@ impl PrivacyFilterModel {
         //    `crate::nn::Embedding::forward`.
         let mut hidden = weights.embed_tokens.take(input_ids, 0)?;
 
-        // 2. Run all 8 transformer blocks.
-        for layer in &weights.layers {
+        // 2. Run all 8 transformer blocks. Each block needs its index to
+        //    decide whether to apply the sliding band or run full
+        //    bidirectional attention — gpt-oss alternates by default.
+        for (layer_idx, layer) in weights.layers.iter().enumerate() {
             let block = Block {
                 weights: layer,
                 config: cfg,
                 yarn_freqs: &self.yarn_freqs,
+                layer_idx,
             };
             hidden = block.forward(&hidden)?;
         }
