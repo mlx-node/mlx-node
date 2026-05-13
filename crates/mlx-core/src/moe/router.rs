@@ -43,6 +43,68 @@ pub enum RoutingMode {
     Qwen35 { renormalize_topk: bool },
 }
 
+/// Compute top-k routing weights and indices from raw router logits.
+///
+/// `logits` must be 2D with shape `[N, num_experts]` where `N` is any flat
+/// batch (typically `batch * seq_len`). Returns `(weights, indices)` each of
+/// shape `[N, top_k]`. Indices are MLX `uint32` (the dtype returned by
+/// `argpartition`).
+///
+/// This function is the single source of truth for the topk + softmax +
+/// renormalize math. It is consumed in two places:
+///
+/// - [`TopKRouter::route`], the all-in-one router used by models that own
+///   their gate weight as a plain `MxArray` (e.g. privacy-filter, gpt-oss).
+/// - `Qwen3_5MoeSparseMoeBlock::forward`, which retains its own
+///   `LinearProj` gate so it can run a quantized router matmul, but
+///   delegates the routing math here for parity with the shared router.
+///
+/// The dispatch on `mode` mirrors the description in this module's docs.
+pub fn topk_from_logits(
+    logits: &MxArray,
+    num_experts: i32,
+    top_k: i32,
+    mode: RoutingMode,
+) -> Result<(MxArray, MxArray)> {
+    if top_k <= 0 || top_k > num_experts {
+        return Err(Error::from_reason(format!(
+            "topk_from_logits requires 0 < top_k <= num_experts, got top_k={}, num_experts={}",
+            top_k, num_experts
+        )));
+    }
+    let num_experts_i64 = num_experts as i64;
+    let top_k_i64 = top_k as i64;
+
+    match mode {
+        RoutingMode::GptOss => {
+            // Top-k of logits, then softmax over the k selected logits.
+            // argpartition with kth=-k puts the k largest at the tail.
+            let top_indices_full = logits.argpartition(-top_k, Some(-1))?;
+            let top_indices =
+                top_indices_full.slice_axis(1, num_experts_i64 - top_k_i64, num_experts_i64)?;
+            let top_logits = logits.take_along_axis(&top_indices, -1)?;
+            let top_weights = Activations::softmax(&top_logits, Some(-1))?;
+            Ok((top_weights, top_indices))
+        }
+        RoutingMode::Qwen35 { renormalize_topk } => {
+            // Softmax over all experts, then top-k of probs, with
+            // optional renormalization.
+            let routing_weights = Activations::softmax(logits, Some(-1))?;
+            let top_indices_full = routing_weights.argpartition(-top_k, Some(-1))?;
+            let top_indices =
+                top_indices_full.slice_axis(1, num_experts_i64 - top_k_i64, num_experts_i64)?;
+            let top_weights = routing_weights.take_along_axis(&top_indices, -1)?;
+            let top_weights = if renormalize_topk {
+                let sum = top_weights.sum(Some(&[-1]), Some(true))?;
+                top_weights.div(&sum)?
+            } else {
+                top_weights
+            };
+            Ok((top_weights, top_indices))
+        }
+    }
+}
+
 /// Static configuration for a [`TopKRouter`].
 #[derive(Debug, Clone, Copy)]
 pub struct RouterConfig {
@@ -90,8 +152,9 @@ impl TopKRouter {
     ///
     /// `hidden` must have shape `[B, T, H]`. The result is
     /// `(top_k_weights, top_k_indices)` with shape `[B, T, top_k]` each.
-    /// The dispatch on `self.config.mode` selects between the gpt-oss and
-    /// Qwen3.5 conventions described in the module docs.
+    /// Internally this flattens the leading dims to a 2D `[B*T, H]` matmul,
+    /// then delegates the topk + softmax + (optional) renormalize math to
+    /// [`topk_from_logits`], reshaping the result back to `[B, T, top_k]`.
     pub fn route(&self, hidden: &MxArray) -> Result<(MxArray, MxArray)> {
         let shape = hidden.shape()?;
         if shape.len() != 3 {
@@ -104,14 +167,8 @@ impl TopKRouter {
         let seq_len = shape[1];
         let hidden_dim = shape[2];
 
-        let num_experts = self.config.num_experts as i64;
-        let top_k = self.config.top_k as i64;
-        if top_k <= 0 || top_k > num_experts {
-            return Err(Error::from_reason(format!(
-                "TopKRouter::route requires 0 < top_k <= num_experts, got top_k={}, num_experts={}",
-                top_k, num_experts
-            )));
-        }
+        let num_experts = self.config.num_experts as i32;
+        let top_k = self.config.top_k as i32;
 
         // Flatten leading dims for the matmul, like sparse_moe.rs.
         let ne = batch * seq_len;
@@ -122,37 +179,11 @@ impl TopKRouter {
         // `Linear::forward` in `crate::nn::linear`.
         let logits = x_flat.addmm(&self.bias, &self.weight_t, None, None)?;
 
-        let (top_weights_flat, top_indices_flat) = match self.config.mode {
-            RoutingMode::GptOss => {
-                // Top-k of logits, then softmax over the k selected logits.
-                // argpartition with kth=-k puts the k largest at the tail.
-                let top_indices_full = logits.argpartition(-(top_k as i32), Some(-1))?;
-                let top_indices_flat =
-                    top_indices_full.slice_axis(1, num_experts - top_k, num_experts)?;
-                let top_logits_flat = logits.take_along_axis(&top_indices_flat, -1)?;
-                let top_weights_flat = Activations::softmax(&top_logits_flat, Some(-1))?;
-                (top_weights_flat, top_indices_flat)
-            }
-            RoutingMode::Qwen35 { renormalize_topk } => {
-                // Softmax over all experts, then top-k of probs, with
-                // optional renormalization.
-                let routing_weights = Activations::softmax(&logits, Some(-1))?;
-                let top_indices_full = routing_weights.argpartition(-(top_k as i32), Some(-1))?;
-                let top_indices_flat =
-                    top_indices_full.slice_axis(1, num_experts - top_k, num_experts)?;
-                let top_weights_flat = routing_weights.take_along_axis(&top_indices_flat, -1)?;
-                let top_weights_flat = if renormalize_topk {
-                    let sum = top_weights_flat.sum(Some(&[-1]), Some(true))?;
-                    top_weights_flat.div(&sum)?
-                } else {
-                    top_weights_flat
-                };
-                (top_weights_flat, top_indices_flat)
-            }
-        };
+        let (top_weights_flat, top_indices_flat) =
+            topk_from_logits(&logits, num_experts, top_k, self.config.mode)?;
 
         // Reshape back to [B, T, top_k].
-        let out_shape = [batch, seq_len, top_k];
+        let out_shape = [batch, seq_len, top_k as i64];
         let top_weights = top_weights_flat.reshape(&out_shape)?;
         let top_indices = top_indices_flat.reshape(&out_shape)?;
 
@@ -337,5 +368,174 @@ mod tests {
             }
             other => panic!("unexpected index dtype: {:?}", other),
         }
+    }
+
+    // ---------- topk_from_logits direct tests ----------
+    //
+    // These cover the shared helper's public contract (used by both
+    // `TopKRouter` and `Qwen3_5MoeSparseMoeBlock`) without going through
+    // the router's matmul. Shape: 2D `[N, num_experts]` logits in;
+    // `[N, top_k]` weights + indices out.
+
+    fn logits(n: i64, num_experts: i64) -> MxArray {
+        MxArray::random_normal(&[n, num_experts], 0.0, 1.0, Some(DType::Float32))
+            .expect("random_normal logits")
+    }
+
+    #[test]
+    fn test_topk_from_logits_shapes() {
+        let num_experts = 8i32;
+        let top_k = 3i32;
+        let n: i64 = 7;
+        let l = logits(n, num_experts as i64);
+        let (weights, indices) = topk_from_logits(
+            &l,
+            num_experts,
+            top_k,
+            RoutingMode::Qwen35 {
+                renormalize_topk: true,
+            },
+        )
+        .expect("topk_from_logits");
+
+        let w_shape: Vec<i64> = weights.shape().expect("weights shape").as_ref().to_vec();
+        let i_shape: Vec<i64> = indices.shape().expect("indices shape").as_ref().to_vec();
+        assert_eq!(w_shape, vec![n, top_k as i64]);
+        assert_eq!(i_shape, vec![n, top_k as i64]);
+    }
+
+    #[test]
+    fn test_topk_from_logits_gptoss_sums_to_one() {
+        let num_experts = 8i32;
+        let top_k = 4i32;
+        let n: i64 = 6;
+        let l = logits(n, num_experts as i64);
+        let (weights, _indices) = topk_from_logits(&l, num_experts, top_k, RoutingMode::GptOss)
+            .expect("topk_from_logits");
+
+        let sums = weights.sum(Some(&[-1]), Some(false)).expect("sum over -1");
+        sums.eval();
+        let flat = sums.to_float32().expect("to_float32");
+        assert_eq!(flat.len(), n as usize);
+        for (i, &v) in flat.iter().enumerate() {
+            assert!(
+                (v - 1.0).abs() < 1e-4,
+                "gpt-oss row {} weight sum is {} (expected 1.0 +/- 1e-4)",
+                i,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_topk_from_logits_qwen35_renorm_off_in_open_unit() {
+        let num_experts = 16i32;
+        let top_k = 4i32;
+        let n: i64 = 6;
+        let l = logits(n, num_experts as i64);
+        let (weights, _indices) = topk_from_logits(
+            &l,
+            num_experts,
+            top_k,
+            RoutingMode::Qwen35 {
+                renormalize_topk: false,
+            },
+        )
+        .expect("topk_from_logits");
+
+        let sums = weights.sum(Some(&[-1]), Some(false)).expect("sum over -1");
+        sums.eval();
+        let flat = sums.to_float32().expect("to_float32");
+        assert_eq!(flat.len(), n as usize);
+        for (i, &v) in flat.iter().enumerate() {
+            assert!(
+                v > 0.0 && v < 1.0 - 1e-6,
+                "qwen35(renorm=false) row {} weight sum is {} (expected (0, 1))",
+                i,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_topk_from_logits_qwen35_renorm_on_sums_to_one() {
+        let num_experts = 8i32;
+        let top_k = 2i32;
+        let n: i64 = 6;
+        let l = logits(n, num_experts as i64);
+        let (weights, _indices) = topk_from_logits(
+            &l,
+            num_experts,
+            top_k,
+            RoutingMode::Qwen35 {
+                renormalize_topk: true,
+            },
+        )
+        .expect("topk_from_logits");
+
+        let sums = weights.sum(Some(&[-1]), Some(false)).expect("sum over -1");
+        sums.eval();
+        let flat = sums.to_float32().expect("to_float32");
+        assert_eq!(flat.len(), n as usize);
+        for (i, &v) in flat.iter().enumerate() {
+            assert!(
+                (v - 1.0).abs() < 1e-4,
+                "qwen35(renorm=true) row {} weight sum is {} (expected 1.0 +/- 1e-4)",
+                i,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_topk_from_logits_indices_in_range() {
+        let num_experts = 32i32;
+        let top_k = 5i32;
+        let n: i64 = 12;
+        let l = logits(n, num_experts as i64);
+        let (_weights, indices) = topk_from_logits(&l, num_experts, top_k, RoutingMode::GptOss)
+            .expect("topk_from_logits");
+        indices.eval();
+        let dtype = indices.dtype().expect("indices dtype");
+        match dtype {
+            DType::Uint32 => {
+                let flat = indices.to_uint32().expect("to_uint32");
+                let max_exclusive = num_experts as u32;
+                for (i, &idx) in flat.iter().enumerate() {
+                    assert!(
+                        idx < max_exclusive,
+                        "index {} at pos {} is out of range [0, {})",
+                        idx,
+                        i,
+                        max_exclusive
+                    );
+                }
+            }
+            DType::Int32 => {
+                let flat = indices.to_int32().expect("to_int32");
+                let max_exclusive = num_experts;
+                for (i, &idx) in flat.iter().enumerate() {
+                    assert!(
+                        idx >= 0 && idx < max_exclusive,
+                        "index {} at pos {} is out of range [0, {})",
+                        idx,
+                        i,
+                        max_exclusive
+                    );
+                }
+            }
+            other => panic!("unexpected index dtype: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_topk_from_logits_rejects_bad_top_k() {
+        let l = logits(2, 4);
+        // top_k > num_experts
+        let r = topk_from_logits(&l, 4, 5, RoutingMode::GptOss);
+        assert!(r.is_err(), "expected error when top_k > num_experts");
+        // top_k = 0
+        let r = topk_from_logits(&l, 4, 0, RoutingMode::GptOss);
+        assert!(r.is_err(), "expected error when top_k == 0");
     }
 }

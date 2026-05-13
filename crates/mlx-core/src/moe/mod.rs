@@ -2,4 +2,4 @@
 pub mod dispatch;
 pub mod router;
 
-pub use router::{RouterConfig, RoutingMode, TopKRouter};
+pub use router::{RouterConfig, RoutingMode, TopKRouter, topk_from_logits};
