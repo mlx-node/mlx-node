@@ -119,6 +119,7 @@ jobs:
         env:
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 1
+          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
 
   lint:
     name: Rust Lint
