@@ -26,9 +26,12 @@ jobs:
           cache: 'yarn'
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          targets: aarch64-apple-darwin
+          toolchain: stable
+          target: aarch64-apple-darwin
+          cache: false
+          rustflags: ''
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -86,9 +89,12 @@ jobs:
           cache: 'yarn'
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          targets: aarch64-apple-darwin
+          toolchain: stable
+          target: aarch64-apple-darwin
+          cache: false
+          rustflags: ''
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -119,6 +125,7 @@ jobs:
         env:
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 1
+          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
 
   lint:
     name: Rust Lint
@@ -135,10 +142,13 @@ jobs:
           cache: 'yarn'
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: stable
           components: clippy, rustfmt
-          targets: aarch64-apple-darwin
+          target: aarch64-apple-darwin
+          cache: false
+          rustflags: ''
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2

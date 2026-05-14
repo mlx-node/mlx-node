@@ -422,7 +422,7 @@ export async function run(argv: string[]) {
   const modelSlug = modelName.split('/').pop()!.toLowerCase();
   const outputDir = resolve(args.output ?? join(resolveModelsDir(), modelSlug));
 
-  const HUGGINGFACE_TOKEN = (await keyringEntry.getPassword()) ?? undefined;
+  const HUGGINGFACE_TOKEN = (await keyringEntry.getPassword()) ?? process.env.HUGGINGFACE_TOKEN ?? undefined;
 
   if (!HUGGINGFACE_TOKEN) {
     console.warn('No HuggingFace token found, the model will download with anonymous access');

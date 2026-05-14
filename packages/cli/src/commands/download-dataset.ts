@@ -102,10 +102,12 @@ export async function run(argv: string[]) {
   console.log(`Downloading ${dataset}@${revision} snapshot from Hugging Face…`);
 
   const cacheDir = args['cache-dir'] ? resolve(args['cache-dir']) : DEFAULT_CACHE_DIR;
+  const accessToken = process.env.HUGGINGFACE_TOKEN ?? undefined;
   const snapshotPath = await snapshotDownload({
     repo: { type: 'dataset', name: dataset },
     revision,
     cacheDir,
+    accessToken,
   });
 
   console.log(`Snapshot available at ${snapshotPath}`);
