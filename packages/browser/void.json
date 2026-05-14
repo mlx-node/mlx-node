@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/void/schema.json",
+  "inference": {
+    "appType": "spa",
+    "outputDir": "dist"
+  },
+  "routing": {
+    "headers": {
+      "/*": [
+        "Cross-Origin-Opener-Policy: same-origin",
+        "Cross-Origin-Embedder-Policy: require-corp",
+        "Cross-Origin-Resource-Policy: cross-origin"
+      ]
+    }
+  },
+  "worker": {
+    "compatibility_date": "2026-05-14"
+  }
+}

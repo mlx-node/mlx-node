@@ -19,6 +19,7 @@ import { PowerComposer } from './components/chat/PowerComposer';
 import { TelemetryStrip } from './components/chat/TelemetryStrip';
 import { Landing } from './components/landing/Landing';
 import { Loading } from './components/loading/Loading';
+import { BrowserChatSessionAdapter, type BrowserChatMessage } from './lib/browser-chat-session';
 import { type ScreenState, type ProfileLikeStats, cycleReasoningEffort, reduceScreen } from './lib/screen-state';
 import 'streamdown/styles.css';
 import './styles.css';
@@ -32,25 +33,21 @@ const DEFAULT_BROWSER_TEMPERATURE = 0.6;
 const APP_PREVIEW_TOOL_NAME = 'create_app_preview';
 const MAX_TOOL_CONTINUATIONS = 2;
 const AUTO_CONTINUE_AFTER_APP_PREVIEW = false;
+const BASE_SYSTEM_PROMPT = 'You are a helpful assistant. Be concise.';
+const APP_PREVIEW_SYSTEM_PROMPT = [
+  BASE_SYSTEM_PROMPT,
+  `When tools are enabled and the user asks you to build, write, prototype, preview, or render an app, UI, animation, game, or HTML/CSS/JS demo, call ${APP_PREVIEW_TOOL_NAME} exactly once with a complete self-contained runnable HTML document in the html argument.`,
+  'Do not print raw HTML/CSS/JS outside the tool call.',
+].join(' ');
 const streamdownPlugins = {
   code: createCodePlugin({
     themes: ['github-dark-high-contrast', 'github-dark-high-contrast'],
   }),
 };
 
-type BrowserToolCall = {
-  id?: string;
-  name: string;
-  arguments: string;
-};
-
-type BrowserChatMessage = {
-  role: string;
-  content: string;
-  images?: Uint8Array[];
-  toolCalls?: BrowserToolCall[];
-  toolCallId?: string;
-};
+function systemPromptForTools(toolsEnabled: boolean) {
+  return toolsEnabled ? APP_PREVIEW_SYSTEM_PROMPT : BASE_SYSTEM_PROMPT;
+}
 
 type ModelSource = {
   modelFiles?: File[];
@@ -77,28 +74,30 @@ const APP_PREVIEW_TOOL: ToolDefinition = {
   type: 'function',
   function: {
     name: APP_PREVIEW_TOOL_NAME,
-    description: 'Render a complete, self-contained HTML/CSS/JavaScript app in the browser preview iframe.',
+    description:
+      'Create or update the live browser preview when the user asks to build, write, prototype, preview, or render an app, UI, animation, game, or HTML/CSS/JS demo. For those requests, call this function instead of returning a markdown code block.',
     parameters: {
       type: 'object',
       properties: JSON.stringify({
         title: {
           type: 'string',
-          description: 'Short title for the app preview.',
+          description: 'Short display title for the preview.',
         },
         html: {
           type: 'string',
-          description: 'Body HTML for the app. Include meaningful semantic structure.',
+          description:
+            'Complete self-contained runnable HTML document for the preview iframe. Include all required markup and inline <style> and <script> unless separate css/js fields make the call shorter.',
         },
         css: {
           type: 'string',
-          description: 'CSS for the app. Keep it self-contained and responsive.',
+          description: 'Optional CSS for the app. Keep it self-contained and responsive.',
         },
         js: {
           type: 'string',
-          description: 'Client-side JavaScript for app interactions. Do not use external dependencies.',
+          description: 'Optional client-side JavaScript. Do not use external dependencies.',
         },
       }),
-      required: ['html', 'css', 'js'],
+      required: ['title', 'html'],
     },
   },
 };
@@ -231,6 +230,7 @@ function App() {
       return;
     }
     let activeModelLabel = DEFAULT_MODEL_LABEL;
+    let activeChatMaxNewTokens = DEFAULT_BROWSER_OUTPUT_TOKENS;
 
     if (navigator.storage?.persist) {
       void navigator.storage
@@ -394,7 +394,7 @@ function App() {
       return text.includes('<tool_call>') || text.includes('<function=') || text.includes('<parameter=');
     }
 
-    function makeUnparsedToolCallCard(finishReason: string): ToolCallResult {
+    function makeUnparsedToolCallCard(finishReason: string, maxNewTokens: number): ToolCallResult {
       return {
         id: 'call_unparsed_app_preview',
         name: APP_PREVIEW_TOOL_NAME,
@@ -403,7 +403,7 @@ function App() {
         rawContent: '',
         error:
           `Incomplete preview tool call: model stopped before emitting a complete ` +
-          `<tool_call>...</tool_call> block (finish_reason=${finishReason}).`,
+          `<tool_call>...</tool_call> block (finish_reason=${finishReason}, max_new_tokens=${maxNewTokens}).`,
       };
     }
 
@@ -576,29 +576,6 @@ function App() {
       chatEl.scrollTop = chatEl.scrollHeight;
     }
 
-    function toAssistantToolCalls(toolCalls: readonly ToolCallResult[]): BrowserToolCall[] {
-      return toolCalls
-        .filter((call) => call.status === 'ok')
-        .map((call) => {
-          const args = asRecord(call.arguments);
-          const title = stringArg(args, 'title');
-          const compactArgs =
-            call.name === APP_PREVIEW_TOOL_NAME
-              ? JSON.stringify({
-                  title: title || 'App preview',
-                  renderedInBrowserPreview: true,
-                })
-              : typeof call.arguments === 'string'
-                ? call.arguments
-                : JSON.stringify(call.arguments ?? {});
-          return {
-            id: call.id,
-            name: call.name,
-            arguments: compactArgs,
-          };
-        });
-    }
-
     function executeToolCall(call: ToolCallResult): BrowserChatMessage {
       if (call.status !== 'ok') {
         return {
@@ -628,12 +605,21 @@ function App() {
       const css = stringArg(args, 'css');
       const js = stringArg(args, 'js') || stringArg(args, 'javascript');
       if (!html && !css && !js) {
+        const keys = Object.keys(args);
+        const rawPreview = (call.rawContent ?? '').slice(0, 500);
+        log(
+          `[TOOL] ${APP_PREVIEW_TOOL_NAME} missing content keys=${keys.join(',') || '(none)'} raw=${
+            rawPreview || '(empty)'
+          }`,
+        );
         return {
           role: 'tool',
           toolCallId: call.id,
           content: JSON.stringify({
             ok: false,
-            error: 'create_app_preview requires html, css, or js content.',
+            error: `create_app_preview requires html, css, or js content. Parsed keys: ${
+              keys.join(', ') || '(none)'
+            }.`,
           }),
         };
       }
@@ -662,12 +648,7 @@ function App() {
 
     setAppToolsEnabled(appToolsEnabledRef.current);
 
-    const messages: BrowserChatMessage[] = [
-      {
-        role: 'system',
-        content: 'You are a helpful assistant. Be concise.',
-      },
-    ];
+    const chatSession = new BrowserChatSessionAdapter(BASE_SYSTEM_PROMPT, systemPromptForTools);
 
     let currentAssistantDiv: HTMLDivElement | null = null;
     let currentThinkingDiv: HTMLDetailsElement | null = null;
@@ -1103,18 +1084,10 @@ function App() {
     function postChatRequest() {
       const toolsEnabled = appToolsEnabledRef.current;
       const requestReasoningEffort: ReasoningEffort = reasoningEffortRef.current;
-      const outboundMessages = messages.map((message, index) =>
-        index === 0 && message.role === 'system'
-          ? {
-              ...message,
-              content: toolsEnabled
-                ? 'You are a helpful assistant. Be concise. When the user asks you to build, write, prototype, or preview a web app, call create_app_preview with complete self-contained HTML, CSS, and JavaScript instead of only describing the app. If reasoning is enabled, you may call create_app_preview during reasoning. After the tool result, briefly summarize what you built.'
-                : 'You are a helpful assistant. Be concise.',
-            }
-          : message,
-      );
+      const maxNewTokens = readMaxOutputTokens();
+      activeChatMaxNewTokens = maxNewTokens;
       const config: Record<string, unknown> = {
-        maxNewTokens: readMaxOutputTokens(),
+        maxNewTokens,
         temperature: readTemperature(),
         reportPerformance: true,
       };
@@ -1126,7 +1099,7 @@ function App() {
       }
       worker.postMessage({
         type: 'chat',
-        messages: outboundMessages,
+        messages: chatSession.requestMessages(toolsEnabled),
         config,
         useSab,
         mode: modeParam ?? undefined,
@@ -1146,8 +1119,7 @@ function App() {
     }
 
     function finalizeFromResult(result: ChatResult) {
-      const latestUserText =
-        [...messages].reverse().find((message) => message.role === 'user')?.content ?? currentUserPrompt;
+      const latestUserText = chatSession.latestUserContent() ?? currentUserPrompt;
       const textParts = splitAssistantThinking(result.text, latestUserText);
       const rawParts = splitAssistantThinking(result.rawText, latestUserText);
       const toolsEnabled = appToolsEnabledRef.current;
@@ -1180,11 +1152,11 @@ function App() {
             ? 'Tool call skipped: app preview is disabled.'
             : '');
       finalizeAssistantMessage(displayText, thinking || null);
-      messages.push({
-        role: 'assistant',
-        content: text,
-        toolCalls: okToolCalls.length > 0 ? toAssistantToolCalls(okToolCalls) : undefined,
-      });
+      if (finishReason === 'error') {
+        chatSession.rollbackPendingTurn();
+      } else {
+        chatSession.commitAssistantResult(text, okToolCalls);
+      }
 
       if (result.performance) {
         const prefillTps = positiveFiniteNumber(result.performance.prefillTokensPerSecond);
@@ -1217,7 +1189,7 @@ function App() {
         }
       }
       if (rawToolMarkup && okToolCalls.length === 0) {
-        const call = makeUnparsedToolCallCard(finishReason);
+        const call = makeUnparsedToolCallCard(finishReason, activeChatMaxNewTokens);
         const toolCell = appendToolCell(call, 'error');
         updateToolCell(toolCell, call, 'error', call.error || '');
       }
@@ -1236,7 +1208,13 @@ function App() {
               ? `Preview updated: ${stringArg(toolResult, 'title') || call.name}`
               : stringArg(toolResult, 'error') || `Tool failed: ${call.name}`,
           );
-          messages.push(toolMessage);
+          try {
+            chatSession.commitToolResult(toolMessage);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            updateToolCell(toolCell, call, 'error', message);
+            log(`[TOOL] ${message}`);
+          }
         }
         if (!AUTO_CONTINUE_AFTER_APP_PREVIEW) {
           finishChatTurn();
@@ -1341,6 +1319,7 @@ function App() {
             },
             (err: Error) => {
               log(`Stream error: ${err.message}`);
+              chatSession.rollbackPendingTurn();
               resetStreamingUi();
               if (currentResponseDiv) {
                 renderStreamdown(currentResponseDiv, `Error: ${err.message}`, false);
@@ -1373,6 +1352,7 @@ function App() {
         case 'error':
           log(`Error: ${data.message}`);
           logStack(data.stack);
+          chatSession.rollbackPendingTurn();
           resetStreamingUi();
           if (currentResponseDiv) {
             renderStreamdown(currentResponseDiv, `Error: ${data.message}`, false);
@@ -1395,6 +1375,7 @@ function App() {
         case 'bridge-poisoned': {
           const reason = (data as { reason?: string }).reason ?? 'unknown';
           log(`Bridge poisoned (${reason}). The GPU worker is unresponsive - reload the page to recover.`);
+          chatSession.rollbackPendingTurn();
           setStatus('Bridge poisoned - reload required', 'error');
           sendBtn.disabled = true;
           setSendDisabledState(true);
@@ -1501,12 +1482,19 @@ function App() {
       log(`  file: ${e.filename}`);
       log(`  line: ${e.lineno}, col: ${e.colno}`);
       if (e.error instanceof Error) logStack(e.error.stack);
+      chatSession.rollbackPendingTurn();
       setStatus('Worker error', 'error');
     };
     worker.onerror = handleWorkerError;
 
     const onMessageError = (e: MessageEvent) => {
       log(`Worker messageerror: ${e}`);
+      chatSession.rollbackPendingTurn();
+      setStatus('Worker error', 'error');
+      sendBtn.disabled = false;
+      setSendDisabledState(false);
+      setGeneratingState(false);
+      promptEl.disabled = false;
     };
 
     worker.addEventListener('messageerror', onMessageError);
@@ -1564,7 +1552,7 @@ function App() {
       currentThinkingDiv = null;
       currentResponseDiv = null;
       currentToolCallIndicatorDiv = null;
-      messages.splice(1);
+      chatSession.reset();
       chatEl.replaceChildren();
       promptEl.disabled = true;
       sendBtn.disabled = true;
@@ -1646,7 +1634,18 @@ function App() {
         imageInput.value = '';
         setImageAttached(false);
       }
-      messages.push(msg);
+      try {
+        chatSession.beginUserTurn(msg);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log(`Error: ${message}`);
+        setStatus('Session error', 'error');
+        sendBtn.disabled = false;
+        setSendDisabledState(false);
+        setGeneratingState(false);
+        promptEl.disabled = false;
+        return;
+      }
 
       setStatus('Generating...', 'info');
       streamTokenCount = 0;
@@ -1717,10 +1716,8 @@ function App() {
     document.addEventListener('paste', onPaste);
 
     // Expose a global reset hook for the new ChatHeader's "Reset Chat" button.
-    // Clears the chat DOM, resets the local message history (keeping the
-    // system prompt), and tears down any in-flight streaming UI state. The
-    // underlying worker session will get a fresh start on the next chat
-    // message because messages[] now carries only the system prompt.
+    // Clears the chat DOM, resets the local session history (keeping the
+    // system prompt), and tears down any in-flight streaming UI state.
     (window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat = () => {
       activeReaderAbort?.abort();
       activeReaderAbort = null;
@@ -1730,7 +1727,7 @@ function App() {
       currentThinkingDiv = null;
       currentResponseDiv = null;
       currentToolCallIndicatorDiv = null;
-      messages.splice(1);
+      chatSession.reset();
       chatEl.replaceChildren();
     };
 

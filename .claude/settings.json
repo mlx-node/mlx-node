@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "void": {
+      "command": "yarn",
+      "args": [
+        "workspace",
+        "@mlx-node/browser",
+        "exec",
+        "vp",
+        "exec",
+        "void",
+        "mcp"
+      ]
+    }
+  }
+}

@@ -10,9 +10,11 @@
   "type": "module",
   "scripts": {
     "build": "yarn build:native && yarn build:ts",
+    "build:browser": "yarn workspace @mlx-node/browser build",
     "build:native": "yarn workspace @mlx-node/core build",
     "build:ts": "tsc -b",
     "clean": "rm -rf packages/*/dist",
+    "deploy:browser:void": "yarn workspace @mlx-node/browser deploy:void",
     "lint": "vp lint",
     "format": "vp fmt",
     "test": "vp test",

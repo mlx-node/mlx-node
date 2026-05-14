@@ -8,9 +8,11 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "dev": "vite dev",
+    "dev": "vp exec vite dev",
     "test": "vp test --config vitest.config.ts",
-    "build": "echo 'TODO: build WASM + bundle'"
+    "build": "vp exec vite build",
+    "preview": "vp exec vite preview --host 127.0.0.1",
+    "deploy:void": "yarn build && vp exec void deploy --dir dist --spa"
   },
   "dependencies": {
     "@mlx-node/lm": "workspace:*",
@@ -35,6 +37,7 @@
     "@vitejs/plugin-react": "^6.0.1",
     "tailwindcss": "^4.2.4",
     "typescript": "^5.7.0",
-    "vite": "^6.3.0"
+    "vite": "^6.3.0",
+    "void": "0.7.5"
   }
 }

@@ -642,6 +642,7 @@ export function createBridgeStub(
     entries: BgEntryData[];
   }
   const pendingBgData = new Map<number, ParsedBgDesc>();
+  const releasedPendingBindGroups = new Set<number>();
   let fakeBgCounter = 0x7e000000;
 
   // Pipeline bind group layout cache (JS-F017). Map outperforms Record for
@@ -689,8 +690,12 @@ export function createBridgeStub(
   /** Materialize a fake bind group handle into a real one via RPC. */
   function materializeBg(handle: number): number {
     const bgDesc = pendingBgData.get(handle);
-    if (!bgDesc) return handle; // already real
+    if (!bgDesc) {
+      releasedPendingBindGroups.delete(handle);
+      return handle; // already real
+    }
     pendingBgData.delete(handle);
+    releasedPendingBindGroups.delete(handle);
     // Reconstruct the descriptor in WASM scratch memory and send CREATE_BIND_GROUP RPC
     const ENTRY_SIZE = 40; // WGPUBindGroupEntry is 40 bytes on WASM32
     const descSize = 20; // WGPUBindGroupDescriptor is 20 bytes on WASM32
@@ -731,6 +736,13 @@ export function createBridgeStub(
     return realHandle;
   }
 
+  function finishPendingBindGroupUse(handle: number): void {
+    if (handle < 0) return;
+    if (releasedPendingBindGroups.delete(handle)) {
+      pendingBgData.delete(handle);
+    }
+  }
+
   function flushPendingCompute() {
     // Flush any deferred writeBuffer calls that weren't inlined into a fused dispatch
     flushPendingWrites();
@@ -739,14 +751,18 @@ export function createBridgeStub(
       pendingPipeline = -1;
     }
     if (pendingBindGroup >= 0) {
-      const realBg = materializeBg(pendingBindGroup);
+      const usedBg = pendingBindGroup;
+      const realBg = materializeBg(usedBg);
       rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, pendingPass, 0, realBg, 0, 0);
       pendingBindGroup = -1;
+      finishPendingBindGroupUse(usedBg);
     }
     if (pendingBindGroup1 >= 0) {
-      const realBg1 = materializeBg(pendingBindGroup1);
+      const usedBg1 = pendingBindGroup1;
+      const realBg1 = materializeBg(usedBg1);
       rpcCall(RpcFn.COMPUTE_PASS_SET_BIND_GROUP, pendingPass, 1, realBg1, 0, 0);
       pendingBindGroup1 = -1;
+      finishPendingBindGroupUse(usedBg1);
     }
   }
 
@@ -2029,8 +2045,12 @@ export function createBridgeStub(
       }
       pendingPass = passHandle;
       pendingPipeline = pipelineHandle;
+      const droppedBg0 = pendingBindGroup;
+      const droppedBg1 = pendingBindGroup1;
       pendingBindGroup = -1; // Reset bind group — new pipeline needs new bind group
       pendingBindGroup1 = -1;
+      finishPendingBindGroupUse(droppedBg0);
+      finishPendingBindGroupUse(droppedBg1);
     },
 
     wgpuComputePassEncoderSetBindGroup(
@@ -2110,9 +2130,11 @@ export function createBridgeStub(
         pendingBindGroup1 >= 0
       ) {
         // 2 bind groups: materialize any fake handles and use FUSED_DISPATCH_2BG
+        const usedBg0 = pendingBindGroup;
+        const usedBg1 = pendingBindGroup1;
         flushPendingWrites();
-        const realBg0 = materializeBg(pendingBindGroup);
-        const realBg1 = materializeBg(pendingBindGroup1);
+        const realBg0 = materializeBg(usedBg0);
+        const realBg1 = materializeBg(usedBg1);
         rpcCall(
           RpcFn.FUSED_DISPATCH_2BG,
           pendingPass,
@@ -2126,11 +2148,14 @@ export function createBridgeStub(
         pendingPipeline = -1;
         pendingBindGroup = -1;
         pendingBindGroup1 = -1;
+        finishPendingBindGroupUse(usedBg0);
+        finishPendingBindGroupUse(usedBg1);
       } else if (pendingPipeline >= 0 && pendingBindGroup >= 0) {
-        const bgDesc = pendingBgData.get(pendingBindGroup);
+        const usedBg = pendingBindGroup;
+        const bgDesc = pendingBgData.get(usedBg);
         if (bgDesc) {
           // FUSED dispatch: inline bind group creation + dispatch in one RPC
-          pendingBgData.delete(pendingBindGroup);
+          pendingBgData.delete(usedBg);
           const entryCount = bgDesc.entries.length;
 
           // Check if any bind group entry has a pending writeBuffer or deferred creation
@@ -2333,13 +2358,16 @@ export function createBridgeStub(
             }
           }
         } else {
-          // Real bind group handle — use existing FUSED_DISPATCH
+          // Real bind group handle — use existing FUSED_DISPATCH.
+          // Still run through materializeBg so a retained fake bind group whose
+          // release was deferred until dispatch cannot reach the gpu-worker.
           flushPendingWrites();
+          const realBg = materializeBg(usedBg);
           rpcCall(
             RpcFn.FUSED_DISPATCH,
             pendingPass,
             pendingPipeline,
-            pendingBindGroup,
+            realBg,
             x,
             y,
             z,
@@ -2347,6 +2375,7 @@ export function createBridgeStub(
         }
         pendingPipeline = -1;
         pendingBindGroup = -1;
+        finishPendingBindGroupUse(usedBg);
       } else {
         // No pending state or incomplete — flush and dispatch separately
         flushPendingCompute();
@@ -2701,8 +2730,18 @@ export function createBridgeStub(
 
     // ===== Release =====
     wgpuBindGroupRelease(handle: number): void {
-      // Clean up eagerly-parsed bind group data if it was never dispatched
+      if (
+        pendingBgData.has(handle) &&
+        (handle === pendingBindGroup || handle === pendingBindGroup1)
+      ) {
+        // A compute pass retains the bind group after setBindGroup. Keep the
+        // eagerly parsed descriptor alive until the pending dispatch/flush uses it.
+        releasedPendingBindGroups.add(handle);
+        return;
+      }
+      // Clean up eagerly-parsed bind group data if it was never dispatched.
       pendingBgData.delete(handle);
+      releasedPendingBindGroups.delete(handle);
       // No RPC: bind groups are lightweight JS objects, no GPU resources to free.
       // Skipping this RPC saves ~28K roundtrips per generation.
     },
