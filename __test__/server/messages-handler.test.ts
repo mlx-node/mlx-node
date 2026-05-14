@@ -1865,6 +1865,128 @@ describe('handleCreateMessage', () => {
       const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
       expect(combined).toBe('\n\nhello');
     });
+
+    it('preserves buffered leading whitespace when tool_call is preceded by visible text in the same chunk', async () => {
+      // Regression: when the stream is `["\n\n", "Let me check.<tool_call>..."]`,
+      // the buffered `\n\n` (held back because the first delta is whitespace-only)
+      // semantically belongs to the visible `Let me check.` prefix that arrives
+      // in the same chunk as the `<tool_call>` tag. The previous implementation
+      // unconditionally cleared `pendingLeadingWhitespace` in the `tagFound`
+      // branch before deciding whether to emit `cleanPrefix`, so the wire
+      // received `"Let me check."` instead of `"\n\nLet me check."` and the
+      // leading whitespace was silently dropped (or duplicated downstream
+      // depending on `</think>` trimming).
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: '\n\n', done: false, isReasoning: false },
+        {
+          text: 'Let me check.<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>',
+          done: false,
+          isReasoning: false,
+        },
+        {
+          text: '\n\nLet me check.',
+          done: true,
+          finishReason: 'tool_calls',
+          toolCalls: [
+            {
+              status: 'ok',
+              id: 'call_weather',
+              name: 'get_weather',
+              arguments: '{"city":"SF"}',
+            } as ToolCallResult,
+          ],
+          thinking: null,
+          numTokens: 12,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: '\n\nLet me check.<tool_call>{"name":"get_weather","arguments":{"city":"SF"}}</tool_call>',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'weather?' }],
+          max_tokens: 100,
+          stream: true,
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+
+      // The text block opens BEFORE the tool_use frame and its deltas join to
+      // `"\n\nLet me check."` — the leading `\n\n` survives the tag transition.
+      const textStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
+      );
+      expect(textStarts).toHaveLength(1);
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(combined).toBe('\n\nLet me check.');
+
+      // The tool_use frame still follows and carries the parsed call.
+      const toolStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+      );
+      expect(toolStarts).toHaveLength(1);
+    });
+
+    it('does not double leading whitespace when only whitespace deltas precede the done event', async () => {
+      // Regression: `finalText` on the terminal done chunk is the FULL
+      // accumulated text from the native side, not a delta. When the only
+      // intermediate delta is whitespace (`"\n\n"`) and gets buffered into
+      // `pendingLeadingWhitespace`, the same whitespace is already part of
+      // `finalText`. The previous implementation prepended the buffer onto
+      // `finalText` and emitted `"\n\n\n\nhello"` (4 newlines) instead of
+      // `"\n\nhello"` (2 newlines, the byte-accurate model output).
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: '\n\n', done: false, isReasoning: false },
+        {
+          text: '\n\nhello',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 3,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: '\n\nhello',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
+      );
+      expect(textStarts).toHaveLength(1);
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const combined = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(combined).toBe('\n\nhello');
+    });
   });
 
   // -----------------------------------------------------------------------

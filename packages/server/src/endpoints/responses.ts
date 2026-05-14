@@ -1411,7 +1411,7 @@ async function runSessionNonStreaming(
       // with the Anthropic `tool_result.is_error === true` source field
       // (the structured channel is the authoritative signal — see
       // `ChatMessage.isError` rustdoc).
-      const result = await session.sendToolResult(last.toolCallId, last.content, last.isError, { config });
+      const result = await session.sendToolResult(last.toolCallId, last.content, { config, isError: last.isError });
       return { result, committed: session.turns > initialTurns };
     }
     // Non-user / non-tool single-message continuation (assistant /
@@ -1497,7 +1497,7 @@ async function runSessionStreaming(
         // renderer so the streaming wire-format `[tool error]` marker
         // stays in sync with the Anthropic `tool_result.is_error === true`
         // source field — same contract as the non-streaming path above.
-        stream: session.sendToolResultStream(last.toolCallId, last.content, last.isError, { config, signal }),
+        stream: session.sendToolResultStream(last.toolCallId, last.content, { config, signal, isError: last.isError }),
         wasCommitted: () => session.turns > initialTurns,
       };
     }

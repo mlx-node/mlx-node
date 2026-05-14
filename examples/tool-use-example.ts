@@ -137,7 +137,7 @@ async function runToolConversation(session: ChatSession<Qwen35Model>, userPrompt
       console.log(`   [<-] ${displayResult}`);
 
       console.log('\n[->] Generating follow-up response with tool result...');
-      finalResult = await session.sendToolResult(call.id, toolResult, undefined, {
+      finalResult = await session.sendToolResult(call.id, toolResult, {
         config: {
           tools,
           maxNewTokens: 2048,

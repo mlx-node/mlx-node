@@ -45,7 +45,7 @@
  * const call = okCalls[0];
  * if (call) {
  *   const toolOutput = await executeMyTool(call.name, call.arguments);
- *   const followUp = await session.sendToolResult(call.id, JSON.stringify(toolOutput), undefined, {
+ *   const followUp = await session.sendToolResult(call.id, JSON.stringify(toolOutput), {
  *     config: { tools: [weatherTool] },
  *   });
  *   console.log(followUp.text);

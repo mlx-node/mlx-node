@@ -523,9 +523,12 @@ async function handleStreamingNative(
           pendingLeadingWhitespace = '';
         } else if (finalText) {
           // All text arrived in the final event; emit it as a single
-          // block. Prepend any pending leading whitespace so the block's
-          // byte-content matches what the model actually produced.
-          const combined = pendingLeadingWhitespace + finalText;
+          // block. `finalText` is the FULL accumulated text from the
+          // native side, NOT a delta — any whitespace we buffered in
+          // `pendingLeadingWhitespace` from intermediate whitespace-only
+          // deltas is already part of `finalText`, so prepending the
+          // buffer here would double-emit those bytes. Drop the buffer
+          // and emit `finalText` verbatim.
           pendingLeadingWhitespace = '';
           writeSSEEvent(
             res,
@@ -535,14 +538,14 @@ async function handleStreamingNative(
               text: '',
             }),
           );
-          emittedText += combined;
-          emittedTextLength += combined.length;
+          emittedText += finalText;
+          emittedTextLength += finalText.length;
           writeSSEEvent(
             res,
             'content_block_delta',
             buildContentBlockDelta(contentBlockIndex, {
               type: 'text_delta',
-              text: combined,
+              text: finalText,
             }),
           );
           writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
@@ -630,14 +633,20 @@ async function handleStreamingNative(
         // markers are transport structure, not user-visible text.
         const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
         if (tagFound) {
-          // A structural tag (`<tool_call>` etc.) follows. Any pending
-          // leading whitespace we were holding back semantically belongs
-          // to the tool-call transition, not to a user-visible text
-          // block — drop it so the SSE wire never carries a stray
+          // A structural tag (`<tool_call>` etc.) follows. When the
+          // chunk has visible text BEFORE the tag (`cleanPrefix.trim()`
+          // non-empty), the buffered leading whitespace semantically
+          // belongs to that visible text — they were one logical text
+          // run that just happened to land split across deltas. Combine
+          // them and emit as a single text_delta so the wire preserves
+          // exactly what the model produced. When the chunk is a pure
+          // tag transition (no visible prefix), the buffered whitespace
+          // is dropped so the wire never carries a stray
           // whitespace-only `content_block_start`/`_stop` pair before
           // the tool_use frame.
-          pendingLeadingWhitespace = '';
           if (cleanPrefix.trim()) {
+            const combined = pendingLeadingWhitespace + cleanPrefix;
+            pendingLeadingWhitespace = '';
             if (!hasEmittedText) {
               if (hasEmittedThinking) {
                 writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
@@ -652,16 +661,18 @@ async function handleStreamingNative(
                 }),
               );
             }
-            emittedText += cleanPrefix;
-            emittedTextLength += cleanPrefix.length;
+            emittedText += combined;
+            emittedTextLength += combined.length;
             writeSSEEvent(
               res,
               'content_block_delta',
               buildContentBlockDelta(contentBlockIndex, {
                 type: 'text_delta',
-                text: cleanPrefix,
+                text: combined,
               }),
             );
+          } else {
+            pendingLeadingWhitespace = '';
           }
         } else if (safeText) {
           if (!hasEmittedText) {

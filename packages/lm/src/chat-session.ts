@@ -651,8 +651,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   async sendToolResult(
     toolCallId: string,
     content: string,
-    isError?: boolean,
-    opts: { config?: ChatConfig } = {},
+    opts: { isError?: boolean; config?: ChatConfig } = {},
   ): Promise<ChatResult> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
@@ -660,7 +659,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.assertCanSendToolResult('sendToolResult');
     this.inFlight = true;
     try {
-      const mergedConfig = this.mergeConfig(opts.config);
+      const { isError, config } = opts;
+      const mergedConfig = this.mergeConfig(config);
       const result = await this.model.chatSessionContinueTool(toolCallId, content, isError ?? null, mergedConfig);
       this.history.push({ role: 'tool', content, toolCallId, isError });
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
@@ -685,8 +685,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   async *sendToolResultStream(
     toolCallId: string,
     content: string,
-    isError?: boolean,
-    opts: { config?: ChatConfig; signal?: AbortSignal } = {},
+    opts: { isError?: boolean; config?: ChatConfig; signal?: AbortSignal } = {},
   ): AsyncGenerator<ChatStreamEvent> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
@@ -694,7 +693,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.assertCanSendToolResult('sendToolResultStream');
     this.inFlight = true;
     try {
-      const mergedConfig = this.mergeConfig(opts.config);
+      const { isError, config, signal } = opts;
+      const mergedConfig = this.mergeConfig(config);
       let sawFinal = false;
       let accumulated = '';
       let finalRaw: string | null = null;
@@ -705,7 +705,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           content,
           isError ?? null,
           mergedConfig,
-          opts.signal,
+          signal,
         )) {
           if (event.done) {
             if (event.finishReason !== 'error') {
