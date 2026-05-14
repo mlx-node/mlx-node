@@ -54,6 +54,26 @@ type ModelSource = {
   label?: string;
 };
 
+async function hasHostedModel(): Promise<boolean> {
+  try {
+    const resp = await fetch(`/model/config.json?probe=${Date.now()}`, {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+    });
+    if (!resp.ok) return false;
+    const contentType = resp.headers.get('content-type') ?? '';
+    const text = await resp.text();
+    if (contentType.includes('text/html')) return false;
+    return !text.trimStart().startsWith('<!doctype');
+  } catch {
+    return false;
+  }
+}
+
+function isLocalDevHost() {
+  return location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.hostname === '::1';
+}
+
 function modelSourceFromLocalFiles(files: File[]): ModelSource | null {
   if (files.length === 0) return null;
   const firstPath = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath || files[0]!.name;
@@ -172,6 +192,9 @@ function App() {
   const [decodeTokensPerSec, setDecodeTokensPerSec] = useState<number | null>(null);
   const [pendingModelSource, setPendingModelSource] = useState<ModelSource | null>(null);
   const [modelLine, setModelLine] = useState<string>(DEFAULT_MODEL_LABEL);
+  const [hostedModelAvailable, setHostedModelAvailable] = useState<boolean | null>(() =>
+    isLocalDevHost() ? null : false,
+  );
   const appToolsEnabledRef = useRef(initialAppToolsEnabled);
   const initialMaxOutputTokens = Math.min(
     MAX_BROWSER_OUTPUT_TOKENS,
@@ -201,6 +224,17 @@ function App() {
     if (!modelDirInput) return;
     modelDirInput.setAttribute('webkitdirectory', '');
     modelDirInput.setAttribute('directory', '');
+  }, []);
+
+  useEffect(() => {
+    if (!isLocalDevHost()) return;
+    let cancelled = false;
+    hasHostedModel().then((available) => {
+      if (!cancelled) setHostedModelAvailable(available);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   function handleLocalModelInputChange(event: ChangeEvent<HTMLInputElement>) {
@@ -1839,6 +1873,10 @@ function App() {
       {screen === 'landing' && (
         <Landing
           onLoad={() => {
+            if (hostedModelAvailable === false) {
+              modelDirInputRef.current?.click();
+              return;
+            }
             setPendingModelSource(null);
             setErrorBannerState(null);
             setLoadKickoff((k) => k + 1);
@@ -1846,6 +1884,7 @@ function App() {
           }}
           onLocalModel={() => modelDirInputRef.current?.click()}
           errorBanner={errorBanner}
+          hostedModelAvailable={hostedModelAvailable}
         />
       )}
       {screen === 'loading' && <Loading status={loadingText} />}

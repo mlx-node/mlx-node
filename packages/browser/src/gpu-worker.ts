@@ -41,6 +41,10 @@ import {
   MAX_DISPATCH_BATCH_UNIFORM,
 } from "./rpc-protocol.js";
 
+// Revision marker: changes worker asset URLs after enabling COOP/COEP headers
+// on Void, avoiding stale immutable edge-cache entries without those headers.
+(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = "2026-05-14";
+
 // ---------- Phase 0 RPC Histogram (?profile=1 observability) ----------
 //
 // Per-opcode count of RpcFn dispatches handled by this worker. Bumped at

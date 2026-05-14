@@ -4,6 +4,7 @@ export type LandingProps = {
   onLoad: () => void;
   onLocalModel: () => void;
   errorBanner: string | null;
+  hostedModelAvailable?: boolean | null;
   loadDisabled?: boolean;
 };
 
@@ -13,8 +14,18 @@ export function Landing({
   onLoad,
   onLocalModel,
   errorBanner,
+  hostedModelAvailable = null,
   loadDisabled = false,
 }: LandingProps) {
+  const primaryLabel =
+    hostedModelAvailable === false ? (
+      "Choose Local Model"
+    ) : (
+      <>
+        Load Model (<span>{MODEL_LABEL}</span>)
+      </>
+    );
+
   return (
     <div className="overlay-screen">
       <DriftingLibrary />
@@ -49,9 +60,9 @@ export function Landing({
             type="button"
             className="btn-load"
             onClick={onLoad}
-            disabled={loadDisabled}
+            disabled={loadDisabled || hostedModelAvailable === null}
           >
-            Load Model (<span>{MODEL_LABEL}</span>)
+            {hostedModelAvailable === null ? "Checking Model..." : primaryLabel}
           </button>
           <button
             type="button"

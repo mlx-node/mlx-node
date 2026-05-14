@@ -12,6 +12,10 @@
 import { Buffer } from "buffer";
 (globalThis as any).Buffer = Buffer;
 
+// Revision marker: changes worker asset URLs after enabling COOP/COEP headers
+// on Void, avoiding stale immutable edge-cache entries without those headers.
+(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = "2026-05-14";
+
 // Patch TextDecoder to handle SharedArrayBuffer views.
 // WASM memory is a SharedArrayBuffer (for threads support), but TextDecoder
 // rejects shared views. Copy to a non-shared buffer before decoding.
@@ -1021,11 +1025,13 @@ async function readSourceText(
   const text = await resp.text();
   const contentType = resp.headers.get("content-type") ?? "";
   if (
-    optional &&
     contentType.includes("text/html") &&
     text.trimStart().startsWith("<!doctype")
   ) {
-    return undefined;
+    if (optional) return undefined;
+    throw new Error(
+      `Model source ${source.baseUrl} served the app HTML for ${normalizedPath}; the hosted /model files are not deployed. Choose a local model directory or deploy the model assets separately.`,
+    );
   }
   return text;
 }
