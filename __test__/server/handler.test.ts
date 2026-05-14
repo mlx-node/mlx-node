@@ -9445,6 +9445,45 @@ describe('createHandler', () => {
     });
   });
 
+  describe('root liveness probe', () => {
+    it('returns 200 for HEAD /', async () => {
+      const registry = new ModelRegistry();
+      const handler = createHandler(registry);
+      const req = createMockReq('HEAD', '/');
+      const { res, getStatus, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+    });
+
+    it('returns 200 JSON for GET /', async () => {
+      const registry = new ModelRegistry();
+      const handler = createHandler(registry);
+      const req = createMockReq('GET', '/');
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+      expect(JSON.parse(getBody())).toEqual({ service: 'mlx-node' });
+    });
+
+    it('returns 405 for POST /', async () => {
+      const registry = new ModelRegistry();
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/');
+      const { res, getStatus, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(405);
+    });
+  });
+
   describe('streaming with tool calls', () => {
     it('does not leak <tool_call> markup in text deltas', async () => {
       // Simulate a model that streams normal text, then tool-call markup, then final event

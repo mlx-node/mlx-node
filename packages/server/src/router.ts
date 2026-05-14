@@ -144,5 +144,17 @@ export async function routeRequest(
     return;
   }
 
+  // Liveness probe at `/`. Claude Code issues `HEAD /` before its first
+  // request; respond 200 so the probe doesn't leave a 404 in the logs.
+  if (path === '/') {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      sendMethodNotAllowed(res, 'GET, HEAD');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(req.method === 'HEAD' ? undefined : JSON.stringify({ service: 'mlx-node' }));
+    return;
+  }
+
   sendNotFound(res, `No route matches ${req.method} ${path}`);
 }
