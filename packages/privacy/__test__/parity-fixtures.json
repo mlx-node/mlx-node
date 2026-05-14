@@ -1,0 +1,489 @@
+[
+  {
+    "input": "Hi I am Alice Smith, email alice@example.com",
+    "tokens": [
+      {
+        "text": "Hi",
+        "tag": "O",
+        "start": 0,
+        "end": 2
+      },
+      {
+        "text": "\u0120I",
+        "tag": "O",
+        "start": 2,
+        "end": 4
+      },
+      {
+        "text": "\u0120am",
+        "tag": "O",
+        "start": 4,
+        "end": 7
+      },
+      {
+        "text": "\u0120Alice",
+        "tag": "B-private_person",
+        "start": 7,
+        "end": 13
+      },
+      {
+        "text": "\u0120Smith",
+        "tag": "E-private_person",
+        "start": 13,
+        "end": 19
+      },
+      {
+        "text": ",",
+        "tag": "O",
+        "start": 19,
+        "end": 20
+      },
+      {
+        "text": "\u0120email",
+        "tag": "O",
+        "start": 20,
+        "end": 26
+      },
+      {
+        "text": "\u0120alice",
+        "tag": "B-private_email",
+        "start": 26,
+        "end": 32
+      },
+      {
+        "text": "@example",
+        "tag": "I-private_email",
+        "start": 32,
+        "end": 40
+      },
+      {
+        "text": ".com",
+        "tag": "E-private_email",
+        "start": 40,
+        "end": 44
+      }
+    ]
+  },
+  {
+    "input": "Call me at +1 555 123 4567 anytime",
+    "tokens": [
+      {
+        "text": "Call",
+        "tag": "O",
+        "start": 0,
+        "end": 4
+      },
+      {
+        "text": "\u0120me",
+        "tag": "O",
+        "start": 4,
+        "end": 7
+      },
+      {
+        "text": "\u0120at",
+        "tag": "O",
+        "start": 7,
+        "end": 10
+      },
+      {
+        "text": "\u0120+",
+        "tag": "B-private_phone",
+        "start": 10,
+        "end": 12
+      },
+      {
+        "text": "1",
+        "tag": "I-private_phone",
+        "start": 12,
+        "end": 13
+      },
+      {
+        "text": "\u0120",
+        "tag": "I-private_phone",
+        "start": 13,
+        "end": 14
+      },
+      {
+        "text": "555",
+        "tag": "I-private_phone",
+        "start": 14,
+        "end": 17
+      },
+      {
+        "text": "\u0120",
+        "tag": "I-private_phone",
+        "start": 17,
+        "end": 18
+      },
+      {
+        "text": "123",
+        "tag": "I-private_phone",
+        "start": 18,
+        "end": 21
+      },
+      {
+        "text": "\u0120",
+        "tag": "I-private_phone",
+        "start": 21,
+        "end": 22
+      },
+      {
+        "text": "456",
+        "tag": "I-private_phone",
+        "start": 22,
+        "end": 25
+      },
+      {
+        "text": "7",
+        "tag": "E-private_phone",
+        "start": 25,
+        "end": 26
+      },
+      {
+        "text": "\u0120anytime",
+        "tag": "O",
+        "start": 26,
+        "end": 34
+      }
+    ]
+  },
+  {
+    "input": "Ship the package to 742 Evergreen Terrace, Springfield",
+    "tokens": [
+      {
+        "text": "Ship",
+        "tag": "O",
+        "start": 0,
+        "end": 4
+      },
+      {
+        "text": "\u0120the",
+        "tag": "O",
+        "start": 4,
+        "end": 8
+      },
+      {
+        "text": "\u0120package",
+        "tag": "O",
+        "start": 8,
+        "end": 16
+      },
+      {
+        "text": "\u0120to",
+        "tag": "O",
+        "start": 16,
+        "end": 19
+      },
+      {
+        "text": "\u0120",
+        "tag": "O",
+        "start": 19,
+        "end": 20
+      },
+      {
+        "text": "742",
+        "tag": "O",
+        "start": 20,
+        "end": 23
+      },
+      {
+        "text": "\u0120Evergreen",
+        "tag": "O",
+        "start": 23,
+        "end": 33
+      },
+      {
+        "text": "\u0120Terrace",
+        "tag": "O",
+        "start": 33,
+        "end": 41
+      },
+      {
+        "text": ",",
+        "tag": "O",
+        "start": 41,
+        "end": 42
+      },
+      {
+        "text": "\u0120Springfield",
+        "tag": "E-private_address",
+        "start": 42,
+        "end": 54
+      }
+    ]
+  },
+  {
+    "input": "Born 1990-03-14, profile at https://example.org/profile/jdoe",
+    "tokens": [
+      {
+        "text": "Born",
+        "tag": "O",
+        "start": 0,
+        "end": 4
+      },
+      {
+        "text": "\u0120",
+        "tag": "O",
+        "start": 4,
+        "end": 5
+      },
+      {
+        "text": "199",
+        "tag": "B-private_date",
+        "start": 5,
+        "end": 8
+      },
+      {
+        "text": "0",
+        "tag": "I-private_date",
+        "start": 8,
+        "end": 9
+      },
+      {
+        "text": "-",
+        "tag": "I-private_date",
+        "start": 9,
+        "end": 10
+      },
+      {
+        "text": "03",
+        "tag": "I-private_date",
+        "start": 10,
+        "end": 12
+      },
+      {
+        "text": "-",
+        "tag": "I-private_date",
+        "start": 12,
+        "end": 13
+      },
+      {
+        "text": "14",
+        "tag": "E-private_date",
+        "start": 13,
+        "end": 15
+      },
+      {
+        "text": ",",
+        "tag": "O",
+        "start": 15,
+        "end": 16
+      },
+      {
+        "text": "\u0120profile",
+        "tag": "O",
+        "start": 16,
+        "end": 24
+      },
+      {
+        "text": "\u0120at",
+        "tag": "O",
+        "start": 24,
+        "end": 27
+      },
+      {
+        "text": "\u0120https",
+        "tag": "B-private_url",
+        "start": 27,
+        "end": 33
+      },
+      {
+        "text": "://",
+        "tag": "I-private_url",
+        "start": 33,
+        "end": 36
+      },
+      {
+        "text": "example",
+        "tag": "I-private_url",
+        "start": 36,
+        "end": 43
+      },
+      {
+        "text": ".org",
+        "tag": "I-private_url",
+        "start": 43,
+        "end": 47
+      },
+      {
+        "text": "/profile",
+        "tag": "I-private_url",
+        "start": 47,
+        "end": 55
+      },
+      {
+        "text": "/j",
+        "tag": "I-private_url",
+        "start": 55,
+        "end": 57
+      },
+      {
+        "text": "do",
+        "tag": "I-private_url",
+        "start": 57,
+        "end": 59
+      },
+      {
+        "text": "e",
+        "tag": "E-private_url",
+        "start": 59,
+        "end": 60
+      }
+    ]
+  },
+  {
+    "input": "Account 1234567890; api key sk-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+    "tokens": [
+      {
+        "text": "Account",
+        "tag": "O",
+        "start": 0,
+        "end": 7
+      },
+      {
+        "text": "\u0120",
+        "tag": "O",
+        "start": 7,
+        "end": 8
+      },
+      {
+        "text": "123",
+        "tag": "I-account_number",
+        "start": 8,
+        "end": 11
+      },
+      {
+        "text": "456",
+        "tag": "I-account_number",
+        "start": 11,
+        "end": 14
+      },
+      {
+        "text": "789",
+        "tag": "I-account_number",
+        "start": 14,
+        "end": 17
+      },
+      {
+        "text": "0",
+        "tag": "E-account_number",
+        "start": 17,
+        "end": 18
+      },
+      {
+        "text": ";",
+        "tag": "O",
+        "start": 18,
+        "end": 19
+      },
+      {
+        "text": "\u0120api",
+        "tag": "O",
+        "start": 19,
+        "end": 23
+      },
+      {
+        "text": "\u0120key",
+        "tag": "O",
+        "start": 23,
+        "end": 27
+      },
+      {
+        "text": "\u0120sk",
+        "tag": "B-secret",
+        "start": 27,
+        "end": 30
+      },
+      {
+        "text": "-Z",
+        "tag": "I-secret",
+        "start": 30,
+        "end": 32
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 32,
+        "end": 34
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 34,
+        "end": 36
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 36,
+        "end": 38
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 38,
+        "end": 40
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 40,
+        "end": 42
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 42,
+        "end": 44
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 44,
+        "end": 46
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 46,
+        "end": 48
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 48,
+        "end": 50
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 50,
+        "end": 52
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 52,
+        "end": 54
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 54,
+        "end": 56
+      },
+      {
+        "text": "ZZ",
+        "tag": "I-secret",
+        "start": 56,
+        "end": 58
+      },
+      {
+        "text": "Z",
+        "tag": "E-secret",
+        "start": 58,
+        "end": 59
+      }
+    ]
+  }
+]
