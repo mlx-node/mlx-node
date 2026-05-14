@@ -1365,12 +1365,15 @@ pub async fn convert_gguf_to_safetensors(
         .as_deref()
         .unwrap_or("affine")
         .to_string();
-    let quant_bits = options
-        .quant_bits
-        .unwrap_or(if quant_mode_str == "mxfp8" { 8 } else { 4 });
-    let quant_group_size = options
-        .quant_group_size
-        .unwrap_or(if quant_mode_str == "mxfp8" { 32 } else { 64 });
+    let (default_bits, default_group_size) = match quant_mode_str.as_str() {
+        "affine" => (4, 64),
+        "mxfp4" => (4, 32),
+        "mxfp8" => (8, 32),
+        "nvfp4" => (4, 16),
+        _ => (4, 64),
+    };
+    let quant_bits = options.quant_bits.unwrap_or(default_bits);
+    let quant_group_size = options.quant_group_size.unwrap_or(default_group_size);
 
     if do_quantize {
         if let Some(ref recipe) = options.quant_recipe {

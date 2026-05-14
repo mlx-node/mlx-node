@@ -4,6 +4,15 @@ import { parseArgs } from 'node:util';
 
 import { convertModel, convertForeignWeights, convertGgufToSafetensors } from '@mlx-node/core';
 
+// Canonical per-mode defaults for quantization bits/group_size.
+// Mirrors crates/mlx-core/src/convert.rs and crates/mlx-core/src/utils/gguf.rs.
+const QUANT_MODE_DEFAULTS: Record<string, [number, number]> = {
+  affine: [4, 64],
+  mxfp4: [4, 32],
+  mxfp8: [8, 32],
+  nvfp4: [4, 16],
+};
+
 function printHelp() {
   console.log(`
 Convert Model Weights to MLX Format
@@ -202,8 +211,9 @@ export async function run(argv: string[]) {
     console.log(`Dtype:      ${dtype}`);
     if (args.quantize) {
       const qMode = quantMode || 'affine';
-      const qBits = effectiveQuantBits || (qMode === 'mxfp8' ? 8 : 4);
-      const qGs = quantGroupSize || (qMode === 'mxfp8' ? 32 : 64);
+      const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
+      const qBits = effectiveQuantBits || defaultBits;
+      const qGs = quantGroupSize || defaultGs;
       console.log(
         `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}`,
       );
@@ -332,8 +342,9 @@ export async function run(argv: string[]) {
   }
   if (args.quantize) {
     const qMode = quantMode || 'affine';
-    const qBits = effectiveQuantBits || (qMode === 'mxfp8' ? 8 : 4);
-    const qGs = quantGroupSize || (qMode === 'mxfp8' ? 32 : 64);
+    const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
+    const qBits = effectiveQuantBits || defaultBits;
+    const qGs = quantGroupSize || defaultGs;
     console.log(`Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}`);
   }
   if (imatrixPath) {
