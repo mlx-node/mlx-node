@@ -333,6 +333,10 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     // (e.g. qwen3_5_moe), skip the generic dtype conversion and let the sanitizer do it.
     let has_custom_sanitizer = matches!(model_type.as_deref(), Some("qwen3_5_moe" | "qwen3_5"));
 
+    // True for models whose sanitizer arm manages quantization itself — the
+    // generic quantize block below must skip these to avoid double-quantizing.
+    let is_privacy_filter = matches!(model_type.as_deref(), Some("privacy-filter"));
+
     // Convert tensors to target dtype
     info!("Converting tensors to {}...", target_dtype);
 
@@ -440,6 +444,10 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             info!("Privacy-filter model: identity pass (no sanitization required).");
             converted_tensors
         }
+        // NOTE: privacy-filter quantization is handled below in the dedicated
+        // sanitizer-managed quantize block (gated by `is_privacy_filter`),
+        // because it needs access to the bits/group_size/mode from the outer
+        // scope and we want to suppress the generic quantize pass for it.
         Some(other) => {
             return Err(Error::from_reason(format!(
                 "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr, gemma4, privacy-filter",
@@ -471,7 +479,61 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
                 .unwrap_or_default()
         );
 
-        if let Some(ref recipe) = quant_recipe {
+        if is_privacy_filter {
+            // Privacy-filter has a dedicated predicate: quantize attention
+            // projections (q/k/v/o) and MoE experts (gate_up_proj, down_proj);
+            // quantize routers at 8-bit affine when --q-mode affine; leave
+            // embeddings, classifier head, norms, biases, and attention sinks
+            // at bf16. Inference path is bf16-only until Phase C lands.
+            let preserved_extra = if quant_mode == "affine" {
+                "8-bit-affine routers"
+            } else {
+                "bf16 routers"
+            };
+            info!(
+                "Quantizing privacy-filter (mode={}, bits={}, group_size={}) — projections + \
+                 MoE experts only; embeddings, classifier head, norms, biases, sinks preserved \
+                 ({}).",
+                quant_mode, quant_bits, quant_group_size, preserved_extra
+            );
+            let predicate =
+                build_privacy_filter_predicate(quant_bits, quant_group_size, &quant_mode);
+            // Discard any per-tensor overrides emitted by the inner quantizer
+            // (it only records when bits/group_size/mode differ from defaults,
+            // which is too sparse for our needs); we re-derive a complete
+            // override map below from the resulting `.scales` keys.
+            let _custom_overrides = quantize_weights_with_recipe_pub(
+                &mut converted_tensors,
+                quant_bits,
+                quant_group_size,
+                &quant_mode,
+                &*predicate,
+            )?;
+
+            // Build per-layer overrides for ALL quantized tensors so that the
+            // downstream loader can discover which tensors are quantized and
+            // with which parameters. Unlike Qwen3.5, we want every quantized
+            // tensor recorded — not only non-default ones.
+            for key in converted_tensors.keys() {
+                let Some(prefix) = key.strip_suffix(".scales") else {
+                    continue;
+                };
+                let (bits, group_size, mode) = if key.contains(".mlp.router.") {
+                    // Routers are only quantized in affine mode (8-bit, group=quant_group_size)
+                    (8, quant_group_size, "affine".to_string())
+                } else {
+                    (quant_bits, quant_group_size, quant_mode.clone())
+                };
+                per_layer_overrides.insert(
+                    prefix.to_string(),
+                    serde_json::json!({
+                        "bits": bits,
+                        "group_size": group_size,
+                        "mode": mode,
+                    }),
+                );
+            }
+        } else if let Some(ref recipe) = quant_recipe {
             let weight_keys: Vec<String> = converted_tensors.keys().cloned().collect();
             let predicate =
                 build_predicate_for_recipe(recipe, &weight_keys, quant_bits, quant_group_size)
@@ -515,10 +577,14 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         });
         if let Some(obj) = quant_obj.as_object_mut() {
             for (path, override_val) in &per_layer_overrides {
-                obj.insert(
-                    crate::utils::normalize_override_key(path),
-                    override_val.clone(),
-                );
+                // Privacy-filter uses bare `model.*` keys natively; other models
+                // need the `language_model.model.*` prefix expected by mlx-lm.
+                let key = if is_privacy_filter {
+                    path.clone()
+                } else {
+                    crate::utils::normalize_override_key(path)
+                };
+                obj.insert(key, override_val.clone());
             }
         }
         output_config["quantization"] = quant_obj.clone();
@@ -1131,6 +1197,62 @@ pub(crate) fn build_unsloth_recipe(
 
         // Everything else (ffn_gate_proj, ffn_up_proj, etc.) → default bits
         QuantDecision::Default
+    })
+}
+
+/// Build a quantization predicate for the openai/privacy-filter checkpoint.
+///
+/// Privacy-filter is a small MoE classifier (8 layers, 33-class head) shipped
+/// in bf16. The right tensors to quantize are:
+///
+/// - **Quantize at default mode/bits**: attention projections
+///   (`q_proj`, `k_proj`, `v_proj`, `o_proj`) and MoE expert tensors
+///   (`mlp.experts.gate_up_proj`, `mlp.experts.down_proj`).
+/// - **Router (`mlp.router.weight`)**: 8-bit affine **only** when default mode
+///   is `affine`. Skipped under `mxfp4`/`mxfp8`/`nvfp4` because FP modes have
+///   no biases and the router's small `[128, 640]` shape is not worth a
+///   second quantization scheme. This mirrors the Qwen3.5 convention of
+///   keeping routers higher-precision than projections.
+/// - **Skip everything else**: token embeddings (lookup table — quantizing
+///   hurts), classifier head (`score.weight`/`score.bias` — small + sensitive),
+///   norms, biases, and attention sinks (f32, shape `[14]`).
+pub(crate) fn build_privacy_filter_predicate(
+    default_bits: i32,
+    default_group_size: i32,
+    default_mode: &str,
+) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
+    let default_mode = default_mode.to_string();
+    Box::new(move |key: &str| -> QuantDecision {
+        // Always-quantize tensors: attention projections and MoE experts.
+        let is_attn_proj = key.ends_with(".self_attn.q_proj.weight")
+            || key.ends_with(".self_attn.k_proj.weight")
+            || key.ends_with(".self_attn.v_proj.weight")
+            || key.ends_with(".self_attn.o_proj.weight");
+        let is_moe_expert =
+            key.ends_with(".mlp.experts.gate_up_proj") || key.ends_with(".mlp.experts.down_proj");
+        if is_attn_proj || is_moe_expert {
+            return QuantDecision::Custom {
+                bits: default_bits,
+                group_size: default_group_size,
+                mode: default_mode.clone(),
+            };
+        }
+
+        // Router: 8-bit affine ONLY under affine mode; bf16 under FP modes.
+        if key.ends_with(".mlp.router.weight") {
+            if default_mode == "affine" {
+                return QuantDecision::Custom {
+                    bits: 8,
+                    group_size: default_group_size,
+                    mode: "affine".to_string(),
+                };
+            }
+            return QuantDecision::Skip;
+        }
+
+        // Everything else (embed_tokens, score.*, layernorms, biases, sinks,
+        // router.bias, post_attention_layernorm, model.norm) — leave at bf16.
+        QuantDecision::Skip
     })
 }
 
@@ -2220,4 +2342,209 @@ pub(crate) fn infer_num_layers_from_weights(weights: &HashMap<String, MxArray>) 
         }
     }
     max_layer.map_or(0, |m| m + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Convenience: classify a key under a given mode.
+    fn classify(
+        predicate: &(dyn Fn(&str) -> QuantDecision + Send + Sync),
+        key: &str,
+    ) -> QuantDecision {
+        predicate(key)
+    }
+
+    fn assert_skip(predicate: &(dyn Fn(&str) -> QuantDecision + Send + Sync), key: &str) {
+        match classify(predicate, key) {
+            QuantDecision::Skip => {}
+            other => panic!("expected Skip for {key}, got {other:?}"),
+        }
+    }
+
+    fn assert_custom(
+        predicate: &(dyn Fn(&str) -> QuantDecision + Send + Sync),
+        key: &str,
+        expect_bits: i32,
+        expect_group: i32,
+        expect_mode: &str,
+    ) {
+        match classify(predicate, key) {
+            QuantDecision::Custom {
+                bits,
+                group_size,
+                mode,
+            } => {
+                assert_eq!(bits, expect_bits, "bits mismatch for {key}");
+                assert_eq!(group_size, expect_group, "group_size mismatch for {key}");
+                assert_eq!(mode, expect_mode, "mode mismatch for {key}");
+            }
+            other => panic!(
+                "expected Custom({expect_bits},{expect_group},{expect_mode}) for {key}, got {other:?}"
+            ),
+        }
+    }
+
+    /// Tensor inventory mirroring the shipped privacy-filter checkpoint.
+    fn inventory_keys() -> Vec<&'static str> {
+        vec![
+            // Top-level
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "score.weight",
+            "score.bias",
+            // Per-layer (layer 0; predicate is layer-agnostic)
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.bias",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.k_proj.bias",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.v_proj.bias",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.self_attn.o_proj.bias",
+            "model.layers.0.self_attn.sinks",
+            "model.layers.0.mlp.router.weight",
+            "model.layers.0.mlp.router.bias",
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.gate_up_proj_bias",
+            "model.layers.0.mlp.experts.down_proj",
+            "model.layers.0.mlp.experts.down_proj_bias",
+        ]
+    }
+
+    /// Keys we expect the predicate to **always** skip, regardless of mode.
+    fn always_skip_keys() -> Vec<&'static str> {
+        vec![
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "score.weight",
+            "score.bias",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.bias",
+            "model.layers.0.self_attn.k_proj.bias",
+            "model.layers.0.self_attn.v_proj.bias",
+            "model.layers.0.self_attn.o_proj.bias",
+            "model.layers.0.self_attn.sinks",
+            "model.layers.0.mlp.router.bias",
+            "model.layers.0.mlp.experts.gate_up_proj_bias",
+            "model.layers.0.mlp.experts.down_proj_bias",
+        ]
+    }
+
+    /// Keys we expect to be quantized at default (bits, group_size, mode) in any mode.
+    fn always_quantize_at_default_keys() -> Vec<&'static str> {
+        vec![
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.down_proj",
+        ]
+    }
+
+    #[test]
+    fn privacy_filter_predicate_affine_default_recipe() {
+        let predicate = build_privacy_filter_predicate(4, 64, "affine");
+        // Projections + experts at default
+        for key in always_quantize_at_default_keys() {
+            assert_custom(&*predicate, key, 4, 64, "affine");
+        }
+        // Router quantized at 8-bit affine in affine mode
+        assert_custom(
+            &*predicate,
+            "model.layers.0.mlp.router.weight",
+            8,
+            64,
+            "affine",
+        );
+        // Always-skip set
+        for key in always_skip_keys() {
+            assert_skip(&*predicate, key);
+        }
+        // Sanity: every inventory key got a decision (no panic)
+        for key in inventory_keys() {
+            let _ = classify(&*predicate, key);
+        }
+    }
+
+    #[test]
+    fn privacy_filter_predicate_mxfp4_skips_router() {
+        let predicate = build_privacy_filter_predicate(4, 32, "mxfp4");
+        for key in always_quantize_at_default_keys() {
+            assert_custom(&*predicate, key, 4, 32, "mxfp4");
+        }
+        // Router skipped under FP modes
+        assert_skip(&*predicate, "model.layers.0.mlp.router.weight");
+        for key in always_skip_keys() {
+            assert_skip(&*predicate, key);
+        }
+    }
+
+    #[test]
+    fn privacy_filter_predicate_mxfp8_skips_router() {
+        let predicate = build_privacy_filter_predicate(8, 32, "mxfp8");
+        for key in always_quantize_at_default_keys() {
+            assert_custom(&*predicate, key, 8, 32, "mxfp8");
+        }
+        assert_skip(&*predicate, "model.layers.0.mlp.router.weight");
+        for key in always_skip_keys() {
+            assert_skip(&*predicate, key);
+        }
+    }
+
+    #[test]
+    fn privacy_filter_predicate_nvfp4_skips_router() {
+        let predicate = build_privacy_filter_predicate(4, 16, "nvfp4");
+        for key in always_quantize_at_default_keys() {
+            assert_custom(&*predicate, key, 4, 16, "nvfp4");
+        }
+        assert_skip(&*predicate, "model.layers.0.mlp.router.weight");
+        for key in always_skip_keys() {
+            assert_skip(&*predicate, key);
+        }
+    }
+
+    /// Predicate applies to any layer index, not just layer 0.
+    #[test]
+    fn privacy_filter_predicate_layer_agnostic() {
+        let predicate = build_privacy_filter_predicate(8, 32, "mxfp8");
+        for layer in [0_usize, 3, 7] {
+            assert_custom(
+                &*predicate,
+                &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                8,
+                32,
+                "mxfp8",
+            );
+            assert_custom(
+                &*predicate,
+                &format!("model.layers.{layer}.mlp.experts.down_proj"),
+                8,
+                32,
+                "mxfp8",
+            );
+            assert_skip(
+                &*predicate,
+                &format!("model.layers.{layer}.mlp.router.weight"),
+            );
+            assert_skip(
+                &*predicate,
+                &format!("model.layers.{layer}.input_layernorm.weight"),
+            );
+        }
+    }
+
+    /// Routers can have substring `router` appearing elsewhere — make sure we
+    /// only match `.mlp.router.weight` exactly.
+    #[test]
+    fn privacy_filter_predicate_router_match_is_exact() {
+        let predicate = build_privacy_filter_predicate(4, 32, "mxfp4");
+        // A hypothetical key containing "router" but not the right suffix.
+        assert_skip(&*predicate, "model.layers.0.mlp.router.bias");
+    }
 }

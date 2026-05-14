@@ -2593,7 +2593,7 @@ export interface ConversionOptions {
   quantBits?: number;
   /** Quantization group size (default: 64 for affine, 32 for mxfp8) */
   quantGroupSize?: number;
-  /** Quantization mode: "affine" (default) or "mxfp8" */
+  /** Quantization mode: "affine" (default), "mxfp4", "mxfp8", or "nvfp4" */
   quantMode?: string;
   /**
    * Quantization recipe for per-layer mixed-bit quantization.
