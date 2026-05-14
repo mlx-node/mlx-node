@@ -38,8 +38,9 @@ use std::path::Path;
 ///
 /// `start`/`end` are byte offsets into the input string (Hugging Face
 /// `tokenizers` convention). `label` is the privacy class without the
-/// BIOES prefix (e.g. `"private_email"`). `score` is the mean of the
-/// per-token max-softmax probabilities across the span's tokens.
+/// BIOES prefix (e.g. `"private_email"`). `score` is the mean — across
+/// the span's tokens — of the softmax probability of the Viterbi-emitted
+/// tag at each token.
 #[napi(object)]
 pub struct PrivacyEntity {
     pub label: String,
@@ -51,8 +52,10 @@ pub struct PrivacyEntity {
 
 /// Per-token output emitted when [`PrivacyClassifyOptions::return_tokens`]
 /// is `true`. `tag` is the full BIOES tag (`"O"` or `"B-..."`/`"I-..."`/
-/// `"E-..."`/`"S-..."`). `score` is the softmax probability of the
-/// argmax class at that token.
+/// `"E-..."`/`"S-..."`) chosen by the Viterbi decoder. `score` is the
+/// softmax probability of that emitted tag at this token, so `tag` and
+/// `score` always share decoders (at boundary tokens the Viterbi tag can
+/// differ from the local argmax).
 #[napi(object)]
 pub struct PrivacyToken {
     pub text: String,
@@ -127,13 +130,17 @@ impl PrivacyFilterModelJs {
     /// Pipeline:
     /// 1. Tokenize the text with byte offsets, no special tokens.
     /// 2. Run the forward pass to get `[1, T, 33]` logits.
-    /// 3. Softmax + argmax per token → tag id and max-prob per token.
+    /// 3. Compute softmax (for per-tag confidences) and log-softmax (for
+    ///    Viterbi emissions) over the class axis.
     /// 4. Build the transition matrix from the default calibration
     ///    merged with any per-call overrides.
     /// 5. Viterbi-decode using log-softmax emissions to get the BIOES
     ///    tag sequence.
-    /// 6. Walk the tags + offsets + per-token probabilities to extract
-    ///    coherent spans whose mean probability clears `threshold`.
+    /// 6. For each token, take the softmax probability of the
+    ///    Viterbi-emitted tag (so per-token `tag` and `score` share
+    ///    decoders), then walk the tags + offsets + those probabilities
+    ///    to extract coherent spans whose mean probability clears
+    ///    `threshold`.
     #[napi]
     pub fn classify(
         &self,
@@ -186,8 +193,9 @@ impl PrivacyFilterModelJs {
         // f32 internally for its own softmax — see `modeling_opf.py`).
         let logits_f32 = logits.astype(DType::Float32)?;
 
-        // ---- 3. Softmax for per-token argmax probabilities; log-softmax
-        //         for Viterbi emissions. ----
+        // ---- 3. Softmax (for per-tag probabilities, indexed by the
+        //         Viterbi pick below) and log-softmax (for Viterbi
+        //         emissions). ----
         //
         // Why log-softmax for emissions: the Viterbi decoder adds
         // emission + transition scalars, and transition biases come in
@@ -219,16 +227,6 @@ impl PrivacyFilterModelJs {
         drop(input_ids);
         crate::array::memory::synchronize_and_clear_cache();
 
-        // Per-token max-softmax-prob. These are the "per-token
-        // confidence" values that `extract_spans` averages over each
-        // span.
-        let mut per_token_probs: Vec<f32> = Vec::with_capacity(n_tokens);
-        for t in 0..n_tokens {
-            let row = &probs_flat[t * num_classes..(t + 1) * num_classes];
-            let best_val = row.iter().copied().fold(f32::MIN, f32::max);
-            per_token_probs.push(best_val);
-        }
-
         // ---- 4. Build the emission matrix [T, num_classes] from
         //         log-softmax. ----
         let mut emit: Vec<Vec<f32>> = Vec::with_capacity(n_tokens);
@@ -247,12 +245,28 @@ impl PrivacyFilterModelJs {
         // ---- 6. Viterbi decode. ----
         let tags = viterbi_decode(&emit, &transitions);
 
+        // Per-token confidence aligned to the Viterbi-emitted tag.
+        //
+        // We deliberately index `probs_flat` by `tags[t]` (the Viterbi
+        // pick) rather than by the local argmax. At boundary tokens the
+        // Viterbi tag can differ from the argmax tag (transition biases
+        // win), so reporting the argmax-class probability would mix
+        // semantics: the `tag` would come from Viterbi while the `score`
+        // would come from a different class. Using the Viterbi tag's
+        // softmax probability keeps both the per-token output and the
+        // span-mean score consistent with the emitted tag sequence.
+        let mut per_token_tag_probs: Vec<f32> = Vec::with_capacity(n_tokens);
+        for t in 0..n_tokens {
+            let tag_id = tags[t];
+            per_token_tag_probs.push(probs_flat[t * num_classes + tag_id]);
+        }
+
         // ---- 7. Extract spans. ----
         let id2label = self.inner.loaded.label_strs.clone();
         let entities_internal = extract_spans(
             &tags,
             &id2label,
-            &per_token_probs,
+            &per_token_tag_probs,
             &offsets,
             &text,
             threshold,
@@ -274,8 +288,9 @@ impl PrivacyFilterModelJs {
         // We report:
         // - `tag`:   the Viterbi-decoded BIOES tag (consistent with the
         //            sequence used to extract entities).
-        // - `score`: the per-token max-softmax probability (same value
-        //            that feeds into the span mean).
+        // - `score`: the softmax probability of that Viterbi-emitted tag
+        //            at this token — the same value that feeds into the
+        //            span mean, so `tag` and `score` share semantics.
         // - `text`:  the byte slice from `source_text[start..end]`. For
         //            special tokens HF emits `(0, 0)`; we fall back to
         //            the tokenizer's `id_to_token` in that case so the
@@ -302,7 +317,7 @@ impl PrivacyFilterModelJs {
                         .get(tag_id)
                         .cloned()
                         .unwrap_or_else(|| "O".to_string()),
-                    score: per_token_probs[t] as f64,
+                    score: per_token_tag_probs[t] as f64,
                     start: start as u32,
                     end: end as u32,
                 });

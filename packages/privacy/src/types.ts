@@ -25,8 +25,9 @@ export type PrivacyLabel =
 
 /**
  * A detected PII span. `start`/`end` are byte offsets into the original
- * input string (Hugging Face `tokenizers` convention). `score` is the mean
- * of the per-token max-softmax probabilities across the span's tokens.
+ * input string (Hugging Face `tokenizers` convention). `score` is the mean —
+ * across the span's tokens — of the softmax probability of the Viterbi-emitted
+ * tag at each token.
  */
 export interface Entity {
   start: number;
@@ -71,12 +72,14 @@ export interface ClassifyOptions {
 }
 
 /**
- * A single token with its argmax tag. Emitted by
+ * A single token with its Viterbi-decoded tag. Emitted by
  * {@link PrivacyFilter.classify} when `returnTokens: true`.
  *
  * `tag` is the full BIOES tag (`'O'` or `'B-...'`/`'I-...'`/`'E-...'`/
- * `'S-...'`). `score` is the softmax probability of the argmax class at
- * that token.
+ * `'S-...'`) chosen by the Viterbi decoder. `score` is the softmax
+ * probability of that emitted tag at this token, so `tag` and `score`
+ * always share decoders (at boundary tokens the Viterbi pick can differ
+ * from the local argmax).
  */
 export interface Token {
   text: string;
