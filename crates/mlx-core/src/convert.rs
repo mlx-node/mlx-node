@@ -421,9 +421,16 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             );
             sanitize_gemma4_convert(converted_tensors, tie_word_embeddings, verbose)?
         }
+        Some("privacy-filter") => {
+            // openai/privacy-filter ships with MLX-loadable safetensors already.
+            // No tensor renaming, no FP8 dequant, no expert stacking — the
+            // generic dtype pass above is the only transformation needed.
+            info!("Privacy-filter model: identity pass (no sanitization required).");
+            converted_tensors
+        }
         Some(other) => {
             return Err(Error::from_reason(format!(
-                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr, gemma4",
+                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr, gemma4, privacy-filter",
                 other
             )));
         }

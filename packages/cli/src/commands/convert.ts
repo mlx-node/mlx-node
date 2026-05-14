@@ -19,7 +19,7 @@ Optional Arguments:
   --dtype, -d <type>    Target dtype (default: bfloat16)
                         Options: float32, float16, bfloat16
   --model-type, -m      Model type (auto-detected if not specified)
-                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, qianfan-ocr
+                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, qianfan-ocr, privacy-filter
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -278,6 +278,9 @@ export async function run(argv: string[]) {
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'gemma4' || config.model_type === 'gemma4_text') {
         modelType = 'gemma4';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'openai_privacy_filter') {
+        modelType = 'privacy-filter';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {
