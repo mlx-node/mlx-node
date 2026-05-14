@@ -18,31 +18,31 @@ Bring OpenAI's `privacy-filter` token-classification model to MLX-Node so that J
 
 Source: `.cache/models/privacy-filter/config.json` and `model.safetensors` (140 tensors, bf16).
 
-| Field | Value |
-|---|---|
-| `model_type` | `openai_privacy_filter` |
-| Architecture string | `OpenAIPrivacyFilterForTokenClassification` |
-| `hidden_size` | 640 |
-| `head_dim` | 64 |
-| `num_attention_heads` | 14 (Q heads) |
-| `num_key_value_heads` | 2 (KV heads, GQA group=7) |
-| `num_hidden_layers` | 8 |
-| `num_local_experts` | 128 |
-| `num_experts_per_tok` | 4 |
-| `intermediate_size` | 640 (per-expert FFN) |
-| `hidden_act` | `silu` (→ SwiGLU) |
-| `attention_bias` | `true` (Q/K/V/O all have biases) |
-| `sliding_window` | 128 (band size; ±128 → 257-token effective window) |
-| `rope_parameters.rope_type` | `yarn` |
-| `rope_parameters.factor` | 32.0 |
-| `rope_parameters.original_max_position_embeddings` | 4096 |
-| `rope_parameters.rope_theta` | 150000.0 |
-| `rope_parameters.beta_fast` / `beta_slow` | 32.0 / 1.0 |
-| `max_position_embeddings` | 131072 |
-| `vocab_size` | 200064 (o200k-harmony / gpt-oss tokenizer) |
-| `tie_word_embeddings` | `false` |
-| Number of output classes | 33 (1 background + 8 labels × 4 BIOES tags) |
-| Weight dtype | bf16 (sinks are f32) |
+| Field                                              | Value                                              |
+| -------------------------------------------------- | -------------------------------------------------- |
+| `model_type`                                       | `openai_privacy_filter`                            |
+| Architecture string                                | `OpenAIPrivacyFilterForTokenClassification`        |
+| `hidden_size`                                      | 640                                                |
+| `head_dim`                                         | 64                                                 |
+| `num_attention_heads`                              | 14 (Q heads)                                       |
+| `num_key_value_heads`                              | 2 (KV heads, GQA group=7)                          |
+| `num_hidden_layers`                                | 8                                                  |
+| `num_local_experts`                                | 128                                                |
+| `num_experts_per_tok`                              | 4                                                  |
+| `intermediate_size`                                | 640 (per-expert FFN)                               |
+| `hidden_act`                                       | `silu` (→ SwiGLU)                                  |
+| `attention_bias`                                   | `true` (Q/K/V/O all have biases)                   |
+| `sliding_window`                                   | 128 (band size; ±128 → 257-token effective window) |
+| `rope_parameters.rope_type`                        | `yarn`                                             |
+| `rope_parameters.factor`                           | 32.0                                               |
+| `rope_parameters.original_max_position_embeddings` | 4096                                               |
+| `rope_parameters.rope_theta`                       | 150000.0                                           |
+| `rope_parameters.beta_fast` / `beta_slow`          | 32.0 / 1.0                                         |
+| `max_position_embeddings`                          | 131072                                             |
+| `vocab_size`                                       | 200064 (o200k-harmony / gpt-oss tokenizer)         |
+| `tie_word_embeddings`                              | `false`                                            |
+| Number of output classes                           | 33 (1 background + 8 labels × 4 BIOES tags)        |
+| Weight dtype                                       | bf16 (sinks are f32)                               |
 
 **Per-layer weight shapes** (verified):
 
@@ -64,7 +64,7 @@ Top-level: `model.embed_tokens.weight (200064, 640)`, `model.norm.weight (640,)`
 **Architectural notes that diverge from anything else in the repo:**
 
 - **Attention sinks** — per-head learned scalar (`sinks[h]`) appended to the softmax denominator only. No new K/V row; the sink contributes to normalization but its V-projection is zero. This is gpt-oss-specific.
-- **Bidirectional banded attention** — query *i* attends to keys in `[max(0, i-128), min(T, i+128)]`. Not causal. Long context (128K) works natively since per-token attention is O(band) = O(257).
+- **Bidirectional banded attention** — query _i_ attends to keys in `[max(0, i-128), min(T, i+128)]`. Not causal. Long context (128K) works natively since per-token attention is O(band) = O(257).
 - **Fused `gate_up_proj`** — gate and up are a single `(E, in, 2·hidden)` tensor; split to two halves after matmul. Different layout from Qwen3.5 MoE.
 - **No KV cache** — single forward pass per input. Bypasses all paged-attention machinery.
 - **YaRN RoPE** — `factor=32, original_max=4096, theta=150000`. Same family as Qwen-style YaRN but parameters differ; needs an mlx-core RoPE path that already supports YaRN (Qwen3.5 uses YaRN; can reuse with new params).
@@ -113,7 +113,7 @@ input_ids [B, T]
 
 ### 3.2 Banded attention with sinks (kernel)
 
-**Semantics:** for query token *q*, key index *k*:
+**Semantics:** for query token _q_, key index _k_:
 
 ```
 mask(q, k) = 0       if |q - k| ≤ band     (band = 128)
@@ -137,7 +137,7 @@ banded_attention_with_sinks(
 ) -> O[B, H, T, D]
 ```
 
-Each threadgroup handles one `(batch, head, query_block)`. For each query *q*, iterate `k ∈ [q-band, q+band] ∩ [0, T)`. GQA: `kv_head = h / group` (group=7). Two-pass softmax inside the kernel (max-subtract → exp+sum → normalize).
+Each threadgroup handles one `(batch, head, query_block)`. For each query _q_, iterate `k ∈ [q-band, q+band] ∩ [0, T)`. GQA: `kv_head = h / group` (group=7). Two-pass softmax inside the kernel (max-subtract → exp+sum → normalize).
 
 **CPU fallback (correctness oracle):** Build a `[T, T]` band mask plus an additional sink column with logit `sinks[h]`; call existing `scaled_dot_product_attention` and add the sink contribution analytically. Gated by env var `MLX_BANDED_ATTN_FALLBACK=1` for tests.
 
@@ -171,23 +171,25 @@ If the parity gate fails, the refactor PR is held; privacy-filter ships with `mo
 Pure Rust, no MLX. Lives at `crates/mlx-core/src/models/privacy_filter/viterbi.rs`.
 
 **Transition matrix `T[33, 33]` built at load time:**
+
 - BIOES legality: `O → {O, B-*, S-*}`, `B-X → {I-X, E-X}`, `I-X → {I-X, E-X}`, `E-X → {O, B-*, S-*}`, `S-X → {O, B-*, S-*}`. All other entries = `-inf`.
 - Calibration biases applied to allowed transitions:
 
-| Bias key | Applies to |
-|---|---|
-| `transition_bias_background_stay` | `O → O` |
-| `transition_bias_background_to_start` | `O → {B-*, S-*}` |
-| `transition_bias_end_to_background` | `{E-*, S-*} → O` |
-| `transition_bias_end_to_start` | `{E-*, S-*} → {B-*, S-*}` |
-| `transition_bias_inside_to_continue` | `{B-*, I-*} → I-*` (same class) |
-| `transition_bias_inside_to_end` | `{B-*, I-*} → E-*` (same class) |
+| Bias key                              | Applies to                      |
+| ------------------------------------- | ------------------------------- |
+| `transition_bias_background_stay`     | `O → O`                         |
+| `transition_bias_background_to_start` | `O → {B-*, S-*}`                |
+| `transition_bias_end_to_background`   | `{E-*, S-*} → O`                |
+| `transition_bias_end_to_start`        | `{E-*, S-*} → {B-*, S-*}`       |
+| `transition_bias_inside_to_continue`  | `{B-*, I-*} → I-*` (same class) |
+| `transition_bias_inside_to_end`       | `{B-*, I-*} → E-*` (same class) |
 
 Default values come from `viterbi_calibration.json` (`operating_points.default.biases`). Per-call override exposed via `pf.classify(text, { calibration: {...} })` and `pf.redact(text, { calibration: {...} })`.
 
 **Viterbi step:** standard `forward[t, j] = max_i (forward[t-1, i] + T[i, j]) + emit[t, j]`. Backtrack to get best path. O(T·33²); cheap.
 
 After tagging, span extraction:
+
 - A span starts at `B-X` or `S-X` and ends at `E-X` (B…E) or is a singleton (`S-X`).
 - Span score = mean of per-token logit-softmax probabilities over the span.
 - Output: `{ start, end, label, score, text }` where `start`/`end` are **character** offsets (computed from tokenizer offset mapping).
@@ -235,13 +237,18 @@ const { redacted, entities } = await pf.redact(text, {
 
 ```typescript
 export type PrivacyLabel =
-  | 'account_number' | 'private_address' | 'private_date'
-  | 'private_email'  | 'private_person'  | 'private_phone'
-  | 'private_url'    | 'secret';
+  | 'account_number'
+  | 'private_address'
+  | 'private_date'
+  | 'private_email'
+  | 'private_person'
+  | 'private_phone'
+  | 'private_url'
+  | 'secret';
 
 export interface Entity {
-  start: number;       // inclusive char offset
-  end: number;         // exclusive char offset
+  start: number; // inclusive char offset
+  end: number; // exclusive char offset
   label: PrivacyLabel;
   score: number;
   text: string;
@@ -356,6 +363,7 @@ packages/cli/src/commands/redact.ts       # NEW
 ## 6. Testing strategy
 
 **Rust:**
+
 - `cargo test -p mlx-core moe::router` — router top-k correctness + dispatch parity vs. naive implementation.
 - `cargo test -p mlx-core moe::dispatch` — scatter-aggregate matches dense reference.
 - `cargo test -p mlx-core models::privacy_filter::viterbi` — BIOES decoder: legality enforced, calibration biases applied, known traces match expected paths.
@@ -363,6 +371,7 @@ packages/cli/src/commands/redact.ts       # NEW
 - `cargo test -p mlx-core models::qwen3_5::moe` — **all pre-existing tests pass byte-identical** post-refactor.
 
 **TS:**
+
 - `packages/privacy/__test__/classify.test.ts` — end-to-end on small fixtures: known sentences with hand-labeled spans, assert ≥X recall (X TBD after first benchmark, will set the threshold in the implementation plan).
 - `packages/privacy/__test__/redact.test.ts` — replacement strategies, label filter, calibration override.
 - `packages/privacy/__test__/parity.test.ts` (slow, gated by env): compare a handful of outputs against the HuggingFace `pipeline('token-classification', 'openai/privacy-filter')` reference saved as a JSON fixture. Drives confidence that our forward pass is correct.

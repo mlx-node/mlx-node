@@ -13,7 +13,6 @@ private_person   private_phone     private_url      secret
 
 1. Build the native addon: `yarn build:native`.
 2. Acquire the checkpoint from Hugging Face (`openai/privacy-filter`). The loader expects a directory containing:
-
    - `config.json`
    - `model.safetensors`
    - `tokenizer.json`
@@ -47,21 +46,21 @@ Static async factory. Returns a `PrivacyFilter` bound to the checkpoint at `mode
 
 ### `pf.classify(text, opts?) → { entities, tokens? }`
 
-| Option         | Type                              | Default | Purpose                                                                |
-| -------------- | --------------------------------- | ------- | ---------------------------------------------------------------------- |
-| `threshold`    | `number`                          | `0.5`   | Minimum mean per-token probability for a span to be kept.              |
-| `calibration`  | `Partial<ViterbiCalibration>`     | —       | Per-call overrides on top of the checkpoint default (see Calibration). |
-| `returnTokens` | `boolean`                         | `false` | When `true`, the result includes a `tokens` array.                     |
+| Option         | Type                          | Default | Purpose                                                                |
+| -------------- | ----------------------------- | ------- | ---------------------------------------------------------------------- |
+| `threshold`    | `number`                      | `0.5`   | Minimum mean per-token probability for a span to be kept.              |
+| `calibration`  | `Partial<ViterbiCalibration>` | —       | Per-call overrides on top of the checkpoint default (see Calibration). |
+| `returnTokens` | `boolean`                     | `false` | When `true`, the result includes a `tokens` array.                     |
 
 Each entity:
 
 ```typescript
 interface Entity {
   label: PrivacyLabel; // one of the 8 classes above
-  start: number;       // byte offset
-  end: number;         // byte offset (exclusive)
-  score: number;       // mean per-token probability
-  text: string;        // text.slice(start, end)
+  start: number; // byte offset
+  end: number; // byte offset (exclusive)
+  score: number; // mean per-token probability
+  text: string; // text.slice(start, end)
 }
 ```
 
@@ -71,10 +70,10 @@ When `returnTokens: true`, `tokens[i]` carries `{ text, tag, score, start, end }
 
 Inherits every option from `classify`, plus:
 
-| Option        | Type                                                    | Default   | Purpose                                                                                       |
-| ------------- | ------------------------------------------------------- | --------- | --------------------------------------------------------------------------------------------- |
+| Option        | Type                                                  | Default   | Purpose                                                                                                 |
+| ------------- | ----------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------- |
 | `replacement` | `'label'` \| `string` \| `(entity: Entity) => string` | `'label'` | `'label'` produces `[<label>]`; any other string is inserted verbatim; a function is called per entity. |
-| `labels`      | `PrivacyLabel[]`                                        | —         | Allowlist — only entities whose label is in this list are redacted (others stay verbatim).    |
+| `labels`      | `PrivacyLabel[]`                                      | —         | Allowlist — only entities whose label is in this list are redacted (others stay verbatim).              |
 
 `entities` in the return value is the post-filter set actually redacted, sorted by `start`.
 
@@ -97,16 +96,16 @@ const result = m.classify('Hi I am Alice Smith.', { threshold: 0.5 });
 mlx redact --model <path> [options]
 ```
 
-| Flag                  | Default   | Purpose                                                                                       |
-| --------------------- | --------- | --------------------------------------------------------------------------------------------- |
-| `-m`, `--model`       | —         | Path to a privacy-filter model directory (required).                                          |
-| `-i`, `--input`       | stdin     | Input text file.                                                                              |
-| `-o`, `--output`      | stdout    | Output file for redacted text.                                                                |
-| `--replacement`       | `'label'` | Replacement string. `'label'` substitutes `[<label>]`; any other value is inserted verbatim.  |
-| `--labels`            | —         | Comma-separated allowlist of labels (e.g. `private_email,private_person`).                    |
-| `--threshold`         | `0.5`     | Minimum mean per-token probability for an entity to be kept.                                  |
-| `--json`              | off       | Emit the entities sidecar as JSON. With `--output`, writes `<output>.entities.json`. Without `--output`, writes the JSON to stderr. |
-| `-h`, `--help`        | —         | Show help.                                                                                    |
+| Flag             | Default   | Purpose                                                                                                                             |
+| ---------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `-m`, `--model`  | —         | Path to a privacy-filter model directory (required).                                                                                |
+| `-i`, `--input`  | stdin     | Input text file.                                                                                                                    |
+| `-o`, `--output` | stdout    | Output file for redacted text.                                                                                                      |
+| `--replacement`  | `'label'` | Replacement string. `'label'` substitutes `[<label>]`; any other value is inserted verbatim.                                        |
+| `--labels`       | —         | Comma-separated allowlist of labels (e.g. `private_email,private_person`).                                                          |
+| `--threshold`    | `0.5`     | Minimum mean per-token probability for an entity to be kept.                                                                        |
+| `--json`         | off       | Emit the entities sidecar as JSON. With `--output`, writes `<output>.entities.json`. Without `--output`, writes the JSON to stderr. |
+| `-h`, `--help`   | —         | Show help.                                                                                                                          |
 
 ### Examples
 
