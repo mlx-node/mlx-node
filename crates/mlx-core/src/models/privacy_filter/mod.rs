@@ -5,6 +5,7 @@ pub mod config;
 pub mod experts;
 pub mod forward;
 pub mod persistence;
+pub mod quantized_linear;
 pub mod spans;
 pub mod transformer;
 pub mod viterbi;
@@ -15,7 +16,12 @@ pub use config::{PrivacyFilterConfig, RopeParameters};
 pub use experts::GptOssMlp;
 pub use forward::PrivacyFilterModel;
 pub use persistence::{
-    AttnWeights, LayerWeights, LoadedModel, MlpWeights, ModelWeights, load_from_directory,
+    AttnWeights, LayerWeights, LoadedModel, LoadedRouter, MlpWeights, ModelWeights,
+    QuantizationConfig, load_from_directory,
+};
+pub use quantized_linear::{
+    LoadedProj, PrivacyFilterQuantizedSwitchLinear, QuantizedLinear, TensorQuantParams, project_2d,
+    project_moe,
 };
 pub use spans::{Entity, extract_spans};
 pub use transformer::Block;

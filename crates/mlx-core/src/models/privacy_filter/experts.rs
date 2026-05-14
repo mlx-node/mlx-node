@@ -57,11 +57,13 @@
 //!    sum over the `top_k` axis, reshape to `[B, T, H]`.
 
 use crate::array::MxArray;
+use crate::moe::topk_from_logits;
 use crate::nn::Activations;
 use napi::bindgen_prelude::*;
 
 use super::config::PrivacyFilterConfig;
-use super::persistence::MlpWeights;
+use super::persistence::{LoadedRouter, MlpWeights};
+use super::quantized_linear::{project_2d, project_moe};
 
 /// gpt-oss SwiGLU clamp / scale constants. Hard-coded in both mlx-lm's
 /// `gpt_oss.swiglu` and HF transformers' `GptOssExperts._apply_gate`;
@@ -219,7 +221,30 @@ impl<'a> GptOssMlp<'a> {
         let top_k = self.config.num_experts_per_tok as i64;
 
         // ---- 1. Route. (B, T, K) weights + indices. ----
-        let (top_weights, top_indices) = self.weights.router.route(hidden)?;
+        //
+        // Plain checkpoints reuse the cached `TopKRouter` (which fuses
+        // weight + bias via `addmm`). For quantized checkpoints we
+        // compute the router logits ourselves through `project_2d` —
+        // `topk_from_logits` does the rest (top-k + softmax over top-k).
+        let (top_weights, top_indices) = match &self.weights.router {
+            LoadedRouter::Plain(router) => router.route(hidden)?,
+            LoadedRouter::Quantized { proj, config } => {
+                let h_shape = hidden.shape()?;
+                let h_batch = h_shape[0];
+                let h_seq = h_shape[1];
+                let h_dim = h_shape[2];
+                let x_flat = hidden.reshape(&[h_batch * h_seq, h_dim])?;
+                let logits = project_2d(&x_flat, proj)?;
+                let (tw_flat, ti_flat) = topk_from_logits(
+                    &logits,
+                    config.num_experts as i32,
+                    config.top_k as i32,
+                    config.mode,
+                )?;
+                let out_shape = [h_batch, h_seq, config.top_k as i64];
+                (tw_flat.reshape(&out_shape)?, ti_flat.reshape(&out_shape)?)
+            }
+        };
         let idx_shape: Vec<i64> = top_indices.shape()?.as_ref().to_vec();
         debug_assert_eq!(idx_shape, vec![batch, seq_len, top_k]);
 
@@ -247,11 +272,19 @@ impl<'a> GptOssMlp<'a> {
 
         // ---- 3. Fused gate-up projection. ----
         //
-        // Weights are already `[E, in, out]`, which is exactly what
-        // gather_mm wants — no transpose required. (Contrast with
-        // Qwen3.5's `SwitchLinear`, which transposes from `[E, out, in]`
-        // on every call.)
-        let gate_up = x_dispatch.gather_mm(&self.weights.gate_up_proj, &idx_dispatch, do_sort)?;
+        // Plain weights are already `[E, in, out]`, which is exactly
+        // what `gather_mm` wants — no transpose required. Quantized
+        // weights pack the OUT axis to `[E, in, out_packed]` and
+        // dispatch through `mlx_gather_qmm(transpose=false)`. Both
+        // branches produce the same `[N*K, 1, 2I]` (or unsorted
+        // equivalent) output, so the bias add and split below are
+        // unchanged.
+        let gate_up = project_moe(
+            &x_dispatch,
+            &self.weights.gate_up_proj,
+            &idx_dispatch,
+            do_sort,
+        )?;
         let gate_up_bias = gather_bias(&self.weights.gate_up_bias, &idx_dispatch)?;
         let gate_up = gate_up.add(&gate_up_bias)?;
 
@@ -284,7 +317,7 @@ impl<'a> GptOssMlp<'a> {
         let activated = gpt_oss_glu(&gate, &up)?;
 
         // ---- 6. Down projection (+ per-expert bias). ----
-        let down = activated.gather_mm(&self.weights.down_proj, &idx_dispatch, do_sort)?;
+        let down = project_moe(&activated, &self.weights.down_proj, &idx_dispatch, do_sort)?;
         let down_bias = gather_bias(&self.weights.down_bias, &idx_dispatch)?;
         let expert_out = down.add(&down_bias)?;
 
@@ -349,7 +382,14 @@ mod tests {
         // matmuls don't trip the f32-promotes-bf16 footgun. We use the
         // gate_up_proj dtype rather than the LayerNorm one: bf16 vs
         // bf16 here, but the matmul is the one that actually cares.
-        let hidden_dtype = loaded.weights.layers[0].mlp.gate_up_proj.dtype().unwrap();
+        let hidden_dtype = match &loaded.weights.layers[0].mlp.gate_up_proj {
+            crate::models::privacy_filter::LoadedProj::Plain { weight, .. } => {
+                weight.dtype().unwrap()
+            }
+            crate::models::privacy_filter::LoadedProj::Quantized { weight, .. } => {
+                weight.dtype().unwrap()
+            }
+        };
         let hidden = MxArray::random_normal(
             &[1, 8, loaded.config.hidden_size as i64],
             0.0,

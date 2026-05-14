@@ -140,6 +140,53 @@ mod tests {
         );
     }
 
+    /// Run the same `forward_classify_alice_smith_email` body against
+    /// an arbitrary checkpoint directory and return the (tokens, tags)
+    /// pair. Shared by the bf16 reference and quantized variants so
+    /// they all use byte-for-byte identical tokenization + decoding.
+    fn run_classify_alice_smith_email(ckpt: &std::path::Path) -> (Vec<String>, Vec<String>) {
+        let model = PrivacyFilterModel::load_from_dir(ckpt).expect("load model");
+        let text = "Hi I am Alice Smith, email alice@example.com";
+        let ids_u32 = model
+            .loaded
+            .tokenizer
+            .encode_sync(text, Some(false))
+            .expect("encode");
+        let ids: Vec<i32> = ids_u32.iter().map(|&id| id as i32).collect();
+        let t = ids.len() as i64;
+        let input_ids = MxArray::from_int32(&ids, &[1, t]).expect("from_int32");
+        let logits = model.forward_logits(&input_ids).expect("forward");
+        let pred = logits.argmax(-1, Some(false)).expect("argmax");
+        let pred_i32 = pred.to_int32().expect("to_int32");
+        let tok_strs: Vec<String> = ids_u32
+            .iter()
+            .map(|&id| {
+                model
+                    .loaded
+                    .tokenizer
+                    .decode_sync(&[id], false)
+                    .unwrap_or_default()
+            })
+            .collect();
+        let pred_tags: Vec<String> = pred_i32
+            .iter()
+            .map(|&i| model.loaded.label_strs[i as usize].clone())
+            .collect();
+        (tok_strs, pred_tags)
+    }
+
+    /// The named-entity positions in the canonical test sentence.
+    /// Quantized variants are allowed per-token confidence boundary
+    /// noise OUTSIDE this set but must label these positions exactly
+    /// as the bf16 reference does (per the Phase C correctness gate).
+    const ALICE_NER_POSITIONS: &[(usize, &str)] = &[
+        (3, "B-private_person"),
+        (4, "E-private_person"),
+        (7, "B-private_email"),
+        (8, "I-private_email"),
+        (9, "E-private_email"),
+    ];
+
     /// End-to-end correctness: classify a PII-laden sentence and verify
     /// that the predicted tag sequence contains the expected entity
     /// starts (`B-private_person` for the name, `B-private_email` for
@@ -201,5 +248,58 @@ mod tests {
             "expected B-private_email in tag sequence; got {:?}",
             pred_tags
         );
+    }
+
+    /// Run the canonical PII sentence through a quantized variant and
+    /// assert the named-entity positions still match the bf16
+    /// reference. Per-token confidence boundary noise on
+    /// background-token positions is allowed; label flips at the
+    /// NER positions are not.
+    fn assert_quantized_ner_matches(variant: &str) {
+        let ckpt = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(format!(".cache/models/privacy-filter-{variant}"));
+        if !ckpt.exists() {
+            eprintln!(
+                "skipping quantized {variant} test — checkpoint not present at {}",
+                ckpt.display()
+            );
+            return;
+        }
+        let (tokens, tags) = run_classify_alice_smith_email(&ckpt);
+        println!("[{variant}] Tokens: {:?}", tokens);
+        println!("[{variant}] Tags:   {:?}", tags);
+        for &(pos, expected) in ALICE_NER_POSITIONS {
+            assert_eq!(
+                tags.get(pos).map(String::as_str),
+                Some(expected),
+                "[{variant}] tag at NER position {pos} flipped: expected {expected}, got {:?}",
+                tags.get(pos)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter-mxfp8 — run with --include-ignored"]
+    fn forward_classify_alice_smith_email_mxfp8() {
+        assert_quantized_ner_matches("mxfp8");
+    }
+
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter-mxfp4 — run with --include-ignored"]
+    fn forward_classify_alice_smith_email_mxfp4() {
+        assert_quantized_ner_matches("mxfp4");
+    }
+
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter-nvfp4 — run with --include-ignored"]
+    fn forward_classify_alice_smith_email_nvfp4() {
+        assert_quantized_ner_matches("nvfp4");
+    }
+
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter-affine — run with --include-ignored"]
+    fn forward_classify_alice_smith_email_affine() {
+        assert_quantized_ner_matches("affine");
     }
 }
