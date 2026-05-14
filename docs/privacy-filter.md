@@ -160,6 +160,11 @@ await pf.classify(text, {
 - macOS only / Apple Silicon (Metal backend). No CUDA.
 - bf16 weights and forward by default. The Metal banded-attention kernel and the bf16 forward can produce small disagreements vs. Hugging Face's fp32 reference at low-confidence boundary tokens. See the parity test fixtures at [`packages/privacy/__test__/parity-fixtures.json`](../packages/privacy/__test__/parity-fixtures.json) for the tolerated budget.
 - Attention is bidirectional banded with attention sinks; `sliding_window = 128` on alternating layers per the gpt-oss config (band ±128 → 257-token effective window).
+- **Recall degrades sharply past ~2000 tokens of input.** The checkpoint is trained on short documents; long-context inputs (>~5000 chars) miss most entities, and >8000 chars typically returns nothing. When scanning long text, chunk the input — ~1500 chars (~500 tokens) per `classify` call is a reliable upper bound and stays well within the trained context window.
+
+## Memory on Apple Silicon
+
+`process.memoryUsage().rss` undercounts Metal buffer allocations because Apple's unified memory architecture charges GPU buffers to the process's **`phys_footprint`** (what Activity Monitor's "Memory" column displays) rather than the resident set. For accurate measurements use `vmmap -summary <pid> | grep "Physical footprint"` or the `footprint` CLI. Each `classify()` call clears the MLX buffer cache before returning, so steady-state footprint stays bounded; transient peaks between calls scale with input length.
 
 ## Internals
 
