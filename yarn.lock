@@ -749,6 +749,15 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@mlx-node/privacy@workspace:*, @mlx-node/privacy@workspace:packages/privacy":
+  version: 0.0.0-use.local
+  resolution: "@mlx-node/privacy@workspace:packages/privacy"
+  dependencies:
+    "@mlx-node/core": "workspace:*"
+    "@types/node": "npm:^25.6.0"
+  languageName: unknown
+  linkType: soft
+
 "@mlx-node/server@workspace:*, @mlx-node/server@workspace:packages/server":
   version: 0.0.0-use.local
   resolution: "@mlx-node/server@workspace:packages/server"
@@ -4253,6 +4262,7 @@ __metadata:
     "@mlx-node/cli": "workspace:*"
     "@mlx-node/internal-tools": "workspace:*"
     "@mlx-node/lm": "workspace:*"
+    "@mlx-node/privacy": "workspace:*"
     "@mlx-node/server": "workspace:*"
     "@mlx-node/trl": "workspace:*"
     "@mlx-node/vlm": "workspace:*"
