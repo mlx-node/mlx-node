@@ -35,6 +35,14 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+        with:
+          # Don't cache ~/.cargo/bin — restoring it overwrites the
+          # rustup proxy installed by setup-rust-toolchain and leaves
+          # cargo resolving to rustup-init's usage screen.
+          cache-bin: false
+          # Bumped after switching toolchain action; forces fresh
+          # caches and orphans the poisoned v0-rust archives.
+          prefix-key: v1-rust
 
       - name: Configure GitHub token for CMake downloads
         run: |
@@ -98,6 +106,14 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+        with:
+          # Don't cache ~/.cargo/bin — restoring it overwrites the
+          # rustup proxy installed by setup-rust-toolchain and leaves
+          # cargo resolving to rustup-init's usage screen.
+          cache-bin: false
+          # Bumped after switching toolchain action; forces fresh
+          # caches and orphans the poisoned v0-rust archives.
+          prefix-key: v1-rust
 
       - name: Configure GitHub token for CMake downloads
         run: |
@@ -152,6 +168,14 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+        with:
+          # Don't cache ~/.cargo/bin — restoring it overwrites the
+          # rustup proxy installed by setup-rust-toolchain and leaves
+          # cargo resolving to rustup-init's usage screen.
+          cache-bin: false
+          # Bumped after switching toolchain action; forces fresh
+          # caches and orphans the poisoned v0-rust archives.
+          prefix-key: v1-rust
 
       - name: Configure GitHub token for CMake downloads
         run: |
