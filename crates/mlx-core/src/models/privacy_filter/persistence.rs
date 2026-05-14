@@ -241,6 +241,34 @@ fn validate_o_at_index_zero(label_strs: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Validate that every non-`"O"` label parses as a legal BIOES tag (`B-`/`I-`/
+/// `E-`/`S-` prefix followed by a non-empty class). The decoder in
+/// `viterbi.rs::parse_tag` panics on anything else, treating these as
+/// load-time invariants; this surfaces the failure as a clean `Error` before
+/// any classify call rather than at decode time.
+///
+/// Caller is expected to have already run [`validate_o_at_index_zero`] so the
+/// `"O"` background tag's position is verified separately. Here we simply
+/// pass through any label equal to `"O"`.
+fn validate_bioes_labels(label_strs: &[String]) -> Result<()> {
+    for (idx, tag) in label_strs.iter().enumerate() {
+        if tag == "O" {
+            continue;
+        }
+        let mut iter = tag.splitn(2, '-');
+        let head = iter.next().unwrap_or("");
+        let class = iter.next();
+        let prefix_ok = matches!(head, "B" | "I" | "E" | "S");
+        let class_ok = class.is_some_and(|c| !c.is_empty());
+        if !prefix_ok || !class_ok {
+            return Err(Error::from_reason(format!(
+                "label at index {idx} is not a valid BIOES tag: {tag:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Load weights, tokenizer, and default calibration from a privacy-filter checkpoint directory.
 ///
 /// Expected files in `path`:
@@ -410,6 +438,7 @@ pub fn load_from_directory(path: &Path) -> Result<LoadedModel> {
         label_strs[id] = label.clone();
     }
     validate_o_at_index_zero(&label_strs)?;
+    validate_bioes_labels(&label_strs)?;
 
     // ---- 7. Default operating-point calibration ----
     let calibration_default = {
@@ -500,6 +529,53 @@ mod tests {
         let err = validate_o_at_index_zero(&labels).expect_err("expected validation failure");
         assert!(
             err.reason.contains("missing the required \"O\""),
+            "unexpected error message: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn validate_bioes_labels_accepts_canonical() {
+        let labels = s(&["O", "B-PHONE", "I-PHONE", "E-PHONE", "S-EMAIL"]);
+        assert!(validate_bioes_labels(&labels).is_ok());
+    }
+
+    #[test]
+    fn validate_bioes_labels_rejects_unknown_prefix() {
+        // `X-PHONE` has a non-BIOES prefix; the bare `garbage` token has no
+        // `-class` suffix at all. Either form would panic in viterbi.rs.
+        let labels = s(&["O", "B-PHONE", "X-PHONE"]);
+        let err = validate_bioes_labels(&labels).expect_err("expected validation failure");
+        assert!(
+            err.reason.contains("index 2") && err.reason.contains("\"X-PHONE\""),
+            "unexpected error message: {}",
+            err.reason
+        );
+
+        let labels = s(&["O", "garbage"]);
+        let err = validate_bioes_labels(&labels).expect_err("expected validation failure");
+        assert!(
+            err.reason.contains("index 1") && err.reason.contains("\"garbage\""),
+            "unexpected error message: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn validate_bioes_labels_rejects_missing_class() {
+        // `B` has no `-` separator; `B-` has an empty class.
+        let labels = s(&["O", "B"]);
+        let err = validate_bioes_labels(&labels).expect_err("expected validation failure");
+        assert!(
+            err.reason.contains("index 1") && err.reason.contains("\"B\""),
+            "unexpected error message: {}",
+            err.reason
+        );
+
+        let labels = s(&["O", "B-PHONE", "B-"]);
+        let err = validate_bioes_labels(&labels).expect_err("expected validation failure");
+        assert!(
+            err.reason.contains("index 2") && err.reason.contains("\"B-\""),
             "unexpected error message: {}",
             err.reason
         );
