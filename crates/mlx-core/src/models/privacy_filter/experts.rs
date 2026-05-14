@@ -57,7 +57,7 @@
 //!    sum over the `top_k` axis, reshape to `[B, T, H]`.
 
 use crate::array::MxArray;
-use crate::moe::topk_from_logits;
+use crate::moe::{gather_sort, scatter_unsort, topk_from_logits};
 use crate::nn::Activations;
 use napi::bindgen_prelude::*;
 
@@ -83,73 +83,6 @@ const SORT_THRESHOLD: u64 = 64;
 pub struct GptOssMlp<'a> {
     pub weights: &'a MlpWeights,
     pub config: &'a PrivacyFilterConfig,
-}
-
-/// Result of the gather-and-sort pass: tokens permuted so that every
-/// expert's slice of the dispatch is contiguous, plus the inverse
-/// permutation needed to undo the sort. Mirrors
-/// `crate::models::qwen3_5_moe::switch_glu::GatherSortResult`.
-struct SortedDispatch {
-    /// Tokens replicated and reordered to align with `idx_sorted`.
-    /// Shape `[N*K, 1, H]`.
-    x_sorted: MxArray,
-    /// Per-slot expert ids, sorted ascending (so `gather_mm(..., true)`
-    /// can stream over each expert's block in one pass). Shape `[N*K]`.
-    idx_sorted: MxArray,
-    /// Inverse permutation used by [`scatter_unsort`] to restore the
-    /// original `(B, T, K)` ordering. Shape `[N*K]`.
-    inv_order: MxArray,
-}
-
-/// Permute `x` so that tokens routed to the same expert are contiguous.
-///
-/// This is structurally identical to
-/// `crate::models::qwen3_5_moe::switch_glu::gather_sort`. We re-derive
-/// it locally so the two MoE families stay independent — and because
-/// the function is small enough that copying is preferable to leaking
-/// it into a shared module (it has no MLX-internal dependencies beyond
-/// `MxArray`).
-fn gather_sort(x: &MxArray, indices: &MxArray) -> Result<SortedDispatch> {
-    let idx_shape = indices.shape()?;
-    let m = *idx_shape
-        .last()
-        .ok_or_else(|| Error::from_reason("gather_sort: empty indices"))?;
-
-    let flat_indices = indices.reshape(&[-1])?;
-    let order = flat_indices.argsort(Some(-1))?;
-    let inv_order = order.argsort(Some(-1))?;
-    let idx_sorted = flat_indices.take(&order, 0)?;
-
-    let x_shape = x.shape()?;
-    let d = *x_shape
-        .last()
-        .ok_or_else(|| Error::from_reason("gather_sort: empty x"))?;
-    // Collapse all leading dims into a single token axis; insert a unit
-    // axis so the subsequent gather_mm sees the canonical
-    // `[tokens, 1, d]` layout used by `mx.gather_mm`.
-    let x_flat = x.reshape(&[-1, 1, d])?;
-    let m_scalar = MxArray::scalar_int(m as i32)?;
-    let token_indices = order.floor_divide(&m_scalar)?;
-    let x_sorted = x_flat.take(&token_indices, 0)?;
-
-    Ok(SortedDispatch {
-        x_sorted,
-        idx_sorted,
-        inv_order,
-    })
-}
-
-/// Undo `gather_sort`: reorder rows of `x` by `inv_order` and reshape the
-/// leading flat-token axis back into `orig_shape` (the unflattened
-/// `(B, T, K)` shape).
-fn scatter_unsort(x: &MxArray, inv_order: &MxArray, orig_shape: &[i64]) -> Result<MxArray> {
-    let unsorted = x.take(inv_order, 0)?;
-    let x_shape = unsorted.shape()?;
-    let mut new_shape = orig_shape.to_vec();
-    for &dim in &x_shape[1..] {
-        new_shape.push(dim);
-    }
-    unsorted.reshape(&new_shape)
 }
 
 /// Gather a per-expert bias vector for each dispatched token. Wraps a

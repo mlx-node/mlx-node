@@ -1,4 +1,5 @@
 use crate::array::MxArray;
+use crate::moe::{gather_sort, scatter_unsort};
 use crate::nn::Activations;
 use napi::bindgen_prelude::*;
 
@@ -26,47 +27,6 @@ pub struct SwitchGLU {
     pub(crate) gate_proj: SwitchProj,
     pub(crate) up_proj: SwitchProj,
     pub(crate) down_proj: SwitchProj,
-}
-
-struct GatherSortResult {
-    x_sorted: MxArray,
-    idx_sorted: MxArray,
-    inv_order: MxArray,
-}
-
-fn gather_sort(x: &MxArray, indices: &MxArray) -> Result<GatherSortResult> {
-    let idx_shape = indices.shape()?;
-    let m = *idx_shape
-        .last()
-        .ok_or_else(|| Error::from_reason("empty indices"))?;
-
-    let flat_indices = indices.reshape(&[-1])?;
-    let order = flat_indices.argsort(Some(-1))?;
-    let inv_order = order.argsort(Some(-1))?;
-    let idx_sorted = flat_indices.take(&order, 0)?;
-
-    let x_shape = x.shape()?;
-    let d = *x_shape.last().unwrap();
-    let x_flat = x.reshape(&[-1, 1, d])?;
-    let m_scalar = MxArray::scalar_int(m as i32)?;
-    let token_indices = order.floor_divide(&m_scalar)?;
-    let x_sorted = x_flat.take(&token_indices, 0)?;
-
-    Ok(GatherSortResult {
-        x_sorted,
-        idx_sorted,
-        inv_order,
-    })
-}
-
-fn scatter_unsort(x: &MxArray, inv_order: &MxArray, orig_shape: &[i64]) -> Result<MxArray> {
-    let unsorted = x.take(inv_order, 0)?;
-    let x_shape = unsorted.shape()?;
-    let mut new_shape = orig_shape.to_vec();
-    for &dim in &x_shape[1..] {
-        new_shape.push(dim);
-    }
-    unsorted.reshape(&new_shape)
 }
 
 impl SwitchGLU {
