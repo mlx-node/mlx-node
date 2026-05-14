@@ -275,8 +275,8 @@ export declare class Gemma4Model {
     toolCallId: string,
     content: string,
     config: ChatConfig | null | undefined,
-    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -647,8 +647,8 @@ export declare class Lfm2Model {
     toolCallId: string,
     content: string,
     config: ChatConfig | null,
-    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
   /** Get the model configuration. */
   getConfig(): Lfm2Config;
@@ -1170,8 +1170,8 @@ export declare class QianfanOCRModel {
     toolCallId: string,
     content: string,
     config: ChatConfig | null | undefined,
-    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -1334,8 +1334,8 @@ export declare class Qwen35Model {
     toolCallId: string,
     content: string,
     config: ChatConfig | null,
-    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
   /**
    * Get the number of parameters in the model.
@@ -1503,8 +1503,8 @@ export declare class Qwen35MoeModel {
     toolCallId: string,
     content: string,
     config: ChatConfig | null,
-    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
   /**
    * Get the number of parameters in the model.
@@ -1667,8 +1667,8 @@ export declare class Qwen3Model {
     toolCallId: string,
     content: string,
     config: ChatConfig | null,
-    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
   /**
    * Generate multiple completions for multiple prompts in batch

@@ -122,6 +122,7 @@ function makeMockModel() {
     _toolCallId: string,
     _content: string,
     _config?: ChatConfig | null,
+    _signal?: AbortSignal,
     _isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield { text: 'tool', done: false };
@@ -726,11 +727,12 @@ describe('ChatSession', () => {
 
     it('forwards isError=true through to the streaming native binding', async () => {
       // Streaming counterpart to the non-streaming `isError=true`
-      // assertion above. Mirrors the wire-format invariant: the fourth
+      // assertion above. Mirrors the wire-format invariant: the fifth
       // positional arg of `chatStreamSessionContinueTool` must carry
       // the structured flag so the streaming renderer injects the
       // same `[tool error]` marker as the non-streaming path. `config`
-      // precedes it at index [2].
+      // sits at index [2] and `signal` at [3]; `isError` is the
+      // trailing-optional fifth arg.
       const { model, chatSessionStart, chatStreamSessionContinueTool } = makeMockModel();
       chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'call-err'));
       const session = new ChatSession(model);
@@ -745,7 +747,11 @@ describe('ChatSession', () => {
       expect(chatStreamSessionContinueTool).toHaveBeenCalledTimes(1);
       expect(chatStreamSessionContinueTool.mock.calls[0][0]).toBe('call-err');
       expect(chatStreamSessionContinueTool.mock.calls[0][1]).toBe('{"error":"boom"}');
-      expect(chatStreamSessionContinueTool.mock.calls[0][3]).toBe(true);
+      // `signal` (index [3]) precedes `isError` (index [4]) at the
+      // wrapper boundary — mirrors the native NAPI ordering where
+      // the trailing-optional `isError` follows the required callback
+      // so pre-feature 4-arg callers still type-check.
+      expect(chatStreamSessionContinueTool.mock.calls[0][4]).toBe(true);
       // The stream still terminates normally on the mock — confirms the
       // history-append commit branch ran (sawFinal === true).
       expect(events.at(-1)?.done).toBe(true);

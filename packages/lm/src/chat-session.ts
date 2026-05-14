@@ -228,8 +228,8 @@ export interface SessionCapableModel {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
-    isError?: boolean | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent>;
   resetCaches(): void;
   /**
@@ -704,8 +704,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           toolCallId,
           content,
           mergedConfig,
-          isError ?? null,
           signal,
+          isError ?? null,
         )) {
           if (event.done) {
             if (event.finishReason !== 'error') {

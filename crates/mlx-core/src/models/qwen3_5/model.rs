@@ -7066,15 +7066,15 @@ impl Qwen3_5Model {
     /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
     /// `<tool_response>` wrapper.
     #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, isError: boolean | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined"
     )]
     pub async fn chat_stream_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
         config: Option<ChatConfig>,
-        is_error: Option<bool>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+        is_error: Option<bool>,
     ) -> Result<ChatStreamHandle> {
         let config = config.unwrap_or(ChatConfig {
             max_new_tokens: None,

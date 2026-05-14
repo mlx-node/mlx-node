@@ -415,8 +415,8 @@ export class Qwen35Model extends Qwen35ModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
-    isError?: boolean | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
       (callback) =>
@@ -425,8 +425,8 @@ export class Qwen35Model extends Qwen35ModelNative {
           toolCallId,
           content,
           config ?? null,
-          isError ?? null,
           callback,
+          isError ?? null,
         ),
       signal,
     );
@@ -491,8 +491,8 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
-    isError?: boolean | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
       (callback) =>
@@ -501,8 +501,8 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
           toolCallId,
           content,
           config ?? null,
-          isError ?? null,
           callback,
+          isError ?? null,
         ),
       signal,
     );
@@ -569,8 +569,8 @@ export class Lfm2Model extends Lfm2ModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
-    isError?: boolean | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
       (callback) =>
@@ -579,8 +579,8 @@ export class Lfm2Model extends Lfm2ModelNative {
           toolCallId,
           content,
           config ?? null,
-          isError ?? null,
           callback,
+          isError ?? null,
         ),
       signal,
     );
@@ -647,8 +647,8 @@ export class Gemma4Model extends Gemma4ModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
-    isError?: boolean | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
       (callback) =>
@@ -657,8 +657,8 @@ export class Gemma4Model extends Gemma4ModelNative {
           toolCallId,
           content,
           config ?? null,
-          isError ?? null,
           callback,
+          isError ?? null,
         ),
       signal,
     );
@@ -716,8 +716,8 @@ export class Qwen3Model extends Qwen3ModelNative {
     toolCallId: string,
     content: string,
     config?: ChatConfig | null,
-    isError?: boolean | null,
     signal?: AbortSignal,
+    isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
       (callback) =>
@@ -726,8 +726,8 @@ export class Qwen3Model extends Qwen3ModelNative {
           toolCallId,
           content,
           config ?? null,
-          isError ?? null,
           callback,
+          isError ?? null,
         ),
       signal,
     );
