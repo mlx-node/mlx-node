@@ -1037,6 +1037,41 @@ export declare class OutputStore {
 }
 
 /**
+ * NAPI-exported view of [`PrivacyFilterModel`].
+ *
+ * Construct via [`PrivacyFilterModelJs::load`] and run end-to-end
+ * classification via [`PrivacyFilterModelJs::classify`].
+ */
+export declare class PrivacyFilterModel {
+  /**
+   * Load a privacy-filter checkpoint from a directory.
+   *
+   * The directory must contain `config.json`, `model.safetensors`,
+   * `tokenizer.json`, and optionally `viterbi_calibration.json` and
+   * `tokenizer_config.json`. Synchronous to match the loader pattern
+   * used by every other model in this crate (e.g. `TextDetModel`).
+   */
+  static load(modelPath: string): PrivacyFilterModel;
+  /**
+   * Classify `text` and return detected PII entities (and optionally
+   * per-token tags).
+   *
+   * Pipeline:
+   * 1. Tokenize the text with byte offsets, no special tokens.
+   * 2. Run the forward pass to get `[1, T, 33]` logits.
+   * 3. Softmax + argmax per token → tag id and max-prob per token.
+   * 4. Build the transition matrix from the default calibration
+   *    merged with any per-call overrides.
+   * 5. Viterbi-decode using log-softmax emissions to get the BIOES
+   *    tag sequence.
+   * 6. Walk the tags + offsets + per-token probabilities to extract
+   *    coherent spans whose mean probability clears `threshold`.
+   */
+  classify(text: string, opts?: PrivacyClassifyOptions | undefined | null): PrivacyClassifyResult;
+}
+export type PrivacyFilterModelJs = PrivacyFilterModel;
+
+/**
  * Qianfan-OCR Vision-Language Model (InternVL architecture).
  *
  * Combines InternViT vision encoder, MLP bridge with pixel shuffle,
@@ -3571,6 +3606,73 @@ export interface PhaseProfile {
   avgUsPerToken: number;
   /** Number of invocations. */
   count: number;
+}
+
+/**
+ * Per-call Viterbi calibration overrides.
+ *
+ * Any field set to `Some(_)` overrides the corresponding bias from the
+ * model's default calibration (loaded from `viterbi_calibration.json`
+ * at load time). Missing fields fall back to the default.
+ */
+export interface PrivacyCalibration {
+  transitionBiasBackgroundStay?: number;
+  transitionBiasBackgroundToStart?: number;
+  transitionBiasEndToBackground?: number;
+  transitionBiasEndToStart?: number;
+  transitionBiasInsideToContinue?: number;
+  transitionBiasInsideToEnd?: number;
+}
+
+/**
+ * Options for [`PrivacyFilterModelJs::classify`].
+ *
+ * - `threshold` (default `0.5`): minimum mean per-token probability for
+ *   an extracted span to be returned.
+ * - `calibration`: per-call overrides on top of the checkpoint default.
+ * - `return_tokens` (default `false`): when `true`, the result includes
+ *   a `tokens` array with one entry per input token.
+ */
+export interface PrivacyClassifyOptions {
+  threshold?: number;
+  calibration?: PrivacyCalibration;
+  returnTokens?: boolean;
+}
+
+/** Result of [`PrivacyFilterModelJs::classify`]. */
+export interface PrivacyClassifyResult {
+  entities: Array<PrivacyEntity>;
+  tokens?: Array<PrivacyToken>;
+}
+
+/**
+ * A privacy entity detected by [`PrivacyFilterModelJs::classify`].
+ *
+ * `start`/`end` are byte offsets into the input string (Hugging Face
+ * `tokenizers` convention). `label` is the privacy class without the
+ * BIOES prefix (e.g. `"private_email"`). `score` is the mean of the
+ * per-token max-softmax probabilities across the span's tokens.
+ */
+export interface PrivacyEntity {
+  label: string;
+  start: number;
+  end: number;
+  score: number;
+  text: string;
+}
+
+/**
+ * Per-token output emitted when [`PrivacyClassifyOptions::return_tokens`]
+ * is `true`. `tag` is the full BIOES tag (`"O"` or `"B-..."`/`"I-..."`/
+ * `"E-..."`/`"S-..."`). `score` is the softmax probability of the
+ * argmax class at that token.
+ */
+export interface PrivacyToken {
+  text: string;
+  tag: string;
+  score: number;
+  start: number;
+  end: number;
 }
 
 export interface ProfilingSession {

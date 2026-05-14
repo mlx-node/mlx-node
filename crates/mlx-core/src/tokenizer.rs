@@ -1217,6 +1217,23 @@ impl Qwen3Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    /// Encode text synchronously and return both token ids and per-token
+    /// byte offsets `(start, end)` into the original UTF-8 source string.
+    ///
+    /// HF tokenizers expose these offsets via `Encoding::get_offsets`;
+    /// `encode_sync` discards them, so callers that need them (e.g.
+    /// token-classification span extraction) use this helper instead.
+    pub(crate) fn encode_with_offsets_sync(
+        &self,
+        text: &str,
+        add_special_tokens: Option<bool>,
+    ) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
+        let encoding = Self::encode_internal(&self.tokenizer, text, add_special_tokens)?;
+        let ids = encoding.get_ids().to_vec();
+        let offsets = encoding.get_offsets().to_vec();
+        Ok((ids, offsets))
+    }
+
     /// Decode token IDs synchronously (for internal use by generate())
     pub(crate) fn decode_sync(
         &self,

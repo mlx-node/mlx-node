@@ -55,7 +55,11 @@ export default defineConfig({
     watch: false,
     testTimeout: 120000, // 2 minutes
     maxWorkers: 1,
-    include: ['__test__/**/*.{test,spec}.ts', 'examples/**/*.{test,spec}.ts'],
+    include: [
+      '__test__/**/*.{test,spec}.ts',
+      'examples/**/*.{test,spec}.ts',
+      'packages/*/__test__/**/*.{test,spec}.ts',
+    ],
   },
   resolve: {
     alias: {
