@@ -626,6 +626,7 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
         // VLM-specific files
         "preprocessor_config.json",
         "processor_config.json",
+        "viterbi_calibration.json",
     ];
 
     for file_name in config_files.iter() {
