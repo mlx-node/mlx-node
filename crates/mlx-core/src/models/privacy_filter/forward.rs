@@ -140,13 +140,12 @@ mod tests {
         );
     }
 
-    /// Run the same `forward_classify_alice_smith_email` body against
-    /// an arbitrary checkpoint directory and return the (tokens, tags)
-    /// pair. Shared by the bf16 reference and quantized variants so
-    /// they all use byte-for-byte identical tokenization + decoding.
-    fn run_classify_alice_smith_email(ckpt: &std::path::Path) -> (Vec<String>, Vec<String>) {
-        let model = PrivacyFilterModel::load_from_dir(ckpt).expect("load model");
-        let text = "Hi I am Alice Smith, email alice@example.com";
+    /// Tokenize `text`, run the forward pass through `model`, and
+    /// return per-token (string, argmax_tag) pairs. Shared by the
+    /// canonical Alice helper and the multi-fixture cross-mode parity
+    /// test so every checkpoint sees byte-for-byte identical
+    /// tokenization + decoding.
+    fn argmax_tags_for_text(model: &PrivacyFilterModel, text: &str) -> (Vec<String>, Vec<String>) {
         let ids_u32 = model
             .loaded
             .tokenizer
@@ -173,6 +172,15 @@ mod tests {
             .map(|&i| model.loaded.label_strs[i as usize].clone())
             .collect();
         (tok_strs, pred_tags)
+    }
+
+    /// Run the same `forward_classify_alice_smith_email` body against
+    /// an arbitrary checkpoint directory and return the (tokens, tags)
+    /// pair. Shared by the bf16 reference and quantized variants so
+    /// they all use byte-for-byte identical tokenization + decoding.
+    fn run_classify_alice_smith_email(ckpt: &std::path::Path) -> (Vec<String>, Vec<String>) {
+        let model = PrivacyFilterModel::load_from_dir(ckpt).expect("load model");
+        argmax_tags_for_text(&model, "Hi I am Alice Smith, email alice@example.com")
     }
 
     /// The named-entity positions in the canonical test sentence.
@@ -301,5 +309,99 @@ mod tests {
     #[ignore = "requires .cache/models/privacy-filter-affine — run with --include-ignored"]
     fn forward_classify_alice_smith_email_affine() {
         assert_quantized_ner_matches("affine");
+    }
+
+    /// Five-fixture cross-mode parity sweep.
+    ///
+    /// The bf16 checkpoint produces the reference argmax tag sequence
+    /// for each of five PII-laden inputs spanning all eight label
+    /// classes (person, email, phone, address, date, url, account,
+    /// secret). Every quantized variant is then loaded in turn and
+    /// must produce **the same tag** at every position where the bf16
+    /// reference predicted a non-`O` tag. Per-token boundary noise on
+    /// background positions is allowed; label flips at entity
+    /// positions are not.
+    ///
+    /// This is a stronger version of the per-mode single-input
+    /// `forward_classify_alice_smith_email_<mode>` tests above. It
+    /// runs five inputs and compares the argmax decision (not Viterbi
+    /// output) because raw argmax is the simpler invariant to verify
+    /// — the decoder operates downstream on whatever logits the
+    /// quantized forward emits, so quantization-induced tag flips
+    /// will already show up here.
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter-{mxfp4,mxfp8,nvfp4,affine} — run with --include-ignored"]
+    fn parity_across_quantized_modes() {
+        const INPUTS: &[&str] = &[
+            "Hi I am Alice Smith, email alice@example.com",
+            "Call me at +1 555 123 4567 anytime",
+            "Ship the package to 742 Evergreen Terrace, Springfield",
+            "Born 1990-03-14, profile at https://example.org/profile/jdoe",
+            "Account 1234567890; api key sk-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        ];
+
+        let cache_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".cache/models");
+
+        // Reference pass: bf16 argmax tags for each input.
+        let bf16_dir = cache_dir.join("privacy-filter");
+        if !bf16_dir.exists() {
+            eprintln!(
+                "skipping cross-mode parity — bf16 checkpoint missing at {}",
+                bf16_dir.display()
+            );
+            return;
+        }
+        let bf16 = PrivacyFilterModel::load_from_dir(&bf16_dir).expect("load bf16");
+        let mut bf16_tags: Vec<Vec<String>> = Vec::with_capacity(INPUTS.len());
+        for &text in INPUTS {
+            let (_tokens, tags) = argmax_tags_for_text(&bf16, text);
+            bf16_tags.push(tags);
+        }
+        // Drop the bf16 model to free its weights before loading the
+        // next checkpoint — keeps peak footprint bounded on a 36GB box.
+        drop(bf16);
+
+        let variants = ["mxfp8", "mxfp4", "nvfp4", "affine"];
+        // Collect all divergences across every (variant, input) pair so a
+        // single test failure reports the full picture instead of bailing
+        // on the first mode that flips. Each report line stringifies one
+        // (variant, input_idx, position, token, bf16_tag, quant_tag).
+        let mut all_failures: Vec<String> = Vec::new();
+        for variant in variants {
+            let ckpt = cache_dir.join(format!("privacy-filter-{variant}"));
+            if !ckpt.exists() {
+                eprintln!(
+                    "skipping cross-mode parity for {variant} — checkpoint missing at {}",
+                    ckpt.display()
+                );
+                continue;
+            }
+            let model = PrivacyFilterModel::load_from_dir(&ckpt)
+                .unwrap_or_else(|e| panic!("load {variant}: {e:?}"));
+            for (i, &text) in INPUTS.iter().enumerate() {
+                let (tokens, tags) = argmax_tags_for_text(&model, text);
+                let mut mismatches: Vec<(usize, &str, &str, &str)> = Vec::new();
+                for (j, (b, q)) in bf16_tags[i].iter().zip(tags.iter()).enumerate() {
+                    if b != "O" && b != q {
+                        let tok = tokens.get(j).map(String::as_str).unwrap_or("");
+                        mismatches.push((j, tok, b.as_str(), q.as_str()));
+                    }
+                }
+                if !mismatches.is_empty() {
+                    all_failures.push(format!(
+                        "[{variant}] input[{i}]={text:?}: entity-position tag flips vs bf16: \
+                         {mismatches:?}\n  bf16 = {:?}\n  {variant} = {:?}",
+                        bf16_tags[i], tags,
+                    ));
+                }
+            }
+        }
+        assert!(
+            all_failures.is_empty(),
+            "cross-mode parity divergences found:\n{}",
+            all_failures.join("\n\n"),
+        );
     }
 }

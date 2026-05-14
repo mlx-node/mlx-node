@@ -155,6 +155,61 @@ await pf.classify(text, {
 });
 ```
 
+## Quantization
+
+The bf16 checkpoint can be re-quantized into one of four formats via `mlx convert`. The loader auto-detects the format from `config.json::quantization.mode` and instantiates the matching quantized matmul (4-bit affine `quantized_matmul` for affine; `gather_qmm` for the OCP/NVIDIA float-grouped formats).
+
+| Mode     | Bits | Group | Storage layout                                                                              |
+| -------- | ---- | ----- | ------------------------------------------------------------------------------------------- |
+| `affine` | 4    | 64    | 4-bit packed weights + per-group scale + per-group bias. Only mode supporting `--q-recipe`. |
+| `mxfp4`  | 4    | 32    | OCP MX FP4 + shared 8-bit exponent per group of 32. No biases stored.                       |
+| `mxfp8`  | 8    | 32    | OCP MX FP8 (E4M3) + shared exponent per group of 32. No biases stored.                      |
+| `nvfp4`  | 4    | 16    | NVIDIA FP4 + shared exponent per group of 16 (denser than mxfp4). No biases stored.         |
+
+Producing a quantized checkpoint:
+
+```bash
+# 8-bit MX FP — highest quality of the float-grouped modes.
+mlx convert -m privacy-filter -q --q-mode mxfp8 \
+  -i .cache/models/privacy-filter \
+  -o .cache/models/privacy-filter-mxfp8
+
+# 4-bit affine — general-purpose, accepts mixed-bit recipes via --q-recipe.
+mlx convert -m privacy-filter -q --q-mode affine \
+  -i .cache/models/privacy-filter \
+  -o .cache/models/privacy-filter-affine
+```
+
+The loader picks up the format automatically: `PrivacyFilter.load(path)` reads the `quantization.mode` field and selects the appropriate matmul kernel — no API change.
+
+### NER parity
+
+All four quantization modes preserve the named-entity tag positions on the canonical Alice/email single-input test (the same fixture as `forward_classify_alice_smith_email`). Across the broader 5-fixture parity sweep covering all eight PII label classes, every mode produces a small number of boundary-token flips on adjacent entity-position tokens — no NER-class confusions, but the precise span boundary shifts by one token in most cases:
+
+- **mxfp8** and **mxfp4** miss the leading `I-account_number` token (the "123" in "Account 1234567890") on input #4. The remaining account-number tokens are still tagged correctly, so the span is just shorter by one token at the start. These divergences are stable run-to-run.
+- **affine** drops the lone `E-private_address` token ("Springfield") on input #2. Stable run-to-run.
+- **nvfp4** is **non-deterministic** across runs — the same fixture (input #3 with the URL `https://example.org/profile/jdoe`, and input #4 with the secret `sk-ZZZZ…`) produces a different tag sequence on consecutive invocations, including occasional total drop-out of the URL/account-number/secret spans. The nvfp4 path is therefore not recommended for production use until the source of the run-to-run divergence is investigated.
+
+These divergences are surfaced by the Rust test `parity_across_quantized_modes` in [`crates/mlx-core/src/models/privacy_filter/forward.rs`](../crates/mlx-core/src/models/privacy_filter/forward.rs); it intentionally fails to keep the divergences visible. Treat the table above as a guide: **`mxfp8` is the safest quantized mode for production**, and **`nvfp4` is not currently recommended** (non-deterministic outputs).
+
+### Performance
+
+Measured on M3 Max, 36 GB unified memory, 5-mode median over 3 runs. Inputs synthesised by repeating a PII-dense seed sentence (`"Hi I am Alice Smith, email alice@example.com. Call +1 555 123 4567. Born 1990-03-14. "`) until the tokenized length lands inside the target band. `Peak footprint` is the maximum value observed by polling `vmmap -summary <pid>` at 1 Hz across the entire bench (load + warmup + short + long classify); `tok/s` is `tokens / wall_seconds` for the corresponding run.
+
+| Mode     | Load (ms) | 512-tok (ms) | tok/s  | 2K-tok (ms) | tok/s  | Peak footprint |
+| -------- | --------- | ------------ | ------ | ----------- | ------ | -------------- |
+| `bf16`   | 234       | 25           | 21,219 | 112         | 18,768 | 4.30 GB        |
+| `mxfp8`  | 234       | 26           | 20,805 | 117         | 17,888 | 3.10 GB        |
+| `mxfp4`  | 234       | 26           | 20,807 | 114         | 18,358 | 1.40 GB        |
+| `nvfp4`  | 240       | 27           | 19,993 | 114         | 18,382 | 1.40 GB        |
+| `affine` | 236       | 26           | 20,701 | 111         | 18,874 | 1.40 GB        |
+
+Throughput is essentially identical across modes — the privacy-filter forward pass is small enough (eight blocks, 640 hidden) that the matmul kernel choice is not the bottleneck on this hardware. **The win for quantization here is footprint, not speed**: the 4-bit modes (`mxfp4` / `nvfp4` / `affine`) shrink steady-state peak footprint to ~1.4 GB versus 4.30 GB for `bf16`, leaving room for larger batch sizes or co-residency with another model. `mxfp8` is in between at 3.10 GB.
+
+### Quality caveat
+
+Quality on long-form text was validated only on a 5-fixture short-input parity sweep. Production use on long documents (>~500 tokens) should be validated against the `bf16` baseline on a representative sample first. Combined with the existing recall ceiling at ~2000 tokens (see [Limitations](#limitations)), the recommended deployment for long inputs is `bf16` with chunking; the quantized modes are best suited to inference cost / footprint reduction on short PII scans.
+
 ## Limitations
 
 - macOS only / Apple Silicon (Metal backend). No CUDA.
