@@ -219,22 +219,13 @@ impl PrivacyFilterModelJs {
         drop(input_ids);
         crate::array::memory::synchronize_and_clear_cache();
 
-        // Per-token argmax + max-softmax-prob. These are the
-        // "per-token confidence" values that `extract_spans` averages
-        // over each span.
-        let mut argmax_tag: Vec<usize> = Vec::with_capacity(n_tokens);
+        // Per-token max-softmax-prob. These are the "per-token
+        // confidence" values that `extract_spans` averages over each
+        // span.
         let mut per_token_probs: Vec<f32> = Vec::with_capacity(n_tokens);
         for t in 0..n_tokens {
             let row = &probs_flat[t * num_classes..(t + 1) * num_classes];
-            let mut best_idx = 0usize;
-            let mut best_val = row[0];
-            for (j, &v) in row.iter().enumerate().skip(1) {
-                if v > best_val {
-                    best_val = v;
-                    best_idx = j;
-                }
-            }
-            argmax_tag.push(best_idx);
+            let best_val = row.iter().copied().fold(f32::MIN, f32::max);
             per_token_probs.push(best_val);
         }
 
@@ -320,12 +311,6 @@ impl PrivacyFilterModelJs {
         } else {
             None
         };
-
-        // Touch argmax_tag to keep it alive for future debugging hooks
-        // without triggering an unused-variable warning. It carries the
-        // unconstrained argmax sequence (no Viterbi), which is useful
-        // for offline calibration runs but not exposed to JS today.
-        let _ = argmax_tag;
 
         Ok(PrivacyClassifyResult { entities, tokens })
     }
