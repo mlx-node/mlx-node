@@ -53,7 +53,7 @@ pub struct ConversionOptions {
     /// Quantization group size (default: 64 for affine, 32 for mxfp8)
     pub quant_group_size: Option<i32>,
 
-    /// Quantization mode: "affine" (default) or "mxfp8"
+    /// Quantization mode: "affine" (default), "mxfp4", "mxfp8", or "nvfp4"
     pub quant_mode: Option<String>,
 
     /// Quantization recipe for per-layer mixed-bit quantization.
@@ -120,19 +120,29 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     let imatrix_path = options.imatrix_path;
 
     // Validate quant_mode before it reaches FFI
-    if do_quantize && quant_mode != "affine" && quant_mode != "mxfp8" {
+    const VALID_QUANT_MODES: &[&str] = &["affine", "mxfp4", "mxfp8", "nvfp4"];
+    if do_quantize && !VALID_QUANT_MODES.contains(&quant_mode.as_str()) {
         return Err(Error::from_reason(format!(
-            "Invalid quant_mode '{}': must be 'affine' or 'mxfp8'",
-            quant_mode
+            "Invalid quant_mode '{}': must be one of {}",
+            quant_mode,
+            VALID_QUANT_MODES.join(", ")
         )));
     }
 
-    let quant_bits = options
-        .quant_bits
-        .unwrap_or(if quant_mode == "mxfp8" { 8 } else { 4 });
-    let quant_group_size = options
-        .quant_group_size
-        .unwrap_or(if quant_mode == "mxfp8" { 32 } else { 64 });
+    // Per-mode defaults — match MLX C++ kernel instantiations in
+    // mlx/backend/metal/kernels/fp_quantized.metal.
+    let (default_bits, default_group_size) = match quant_mode.as_str() {
+        "affine" => (4, 64),
+        "mxfp4" => (4, 32),
+        "mxfp8" => (8, 32),
+        "nvfp4" => (4, 16),
+        // Unreachable: gated by VALID_QUANT_MODES check above when do_quantize.
+        // When !do_quantize, these defaults are unused.
+        _ => (4, 64),
+    };
+
+    let quant_bits = options.quant_bits.unwrap_or(default_bits);
+    let quant_group_size = options.quant_group_size.unwrap_or(default_group_size);
 
     if do_quantize && quant_group_size <= 0 {
         return Err(Error::from_reason(format!(
@@ -154,10 +164,12 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
                 "--q-recipe requires --quantize to be enabled".to_string(),
             ));
         }
-        if quant_mode == "mxfp8" {
-            return Err(Error::from_reason(
-                "--q-recipe is incompatible with --q-mode mxfp8".to_string(),
-            ));
+        if quant_mode != "affine" {
+            return Err(Error::from_reason(format!(
+                "--q-recipe is incompatible with --q-mode {}: recipes pick per-layer \
+                 bit-widths which are only meaningful for affine quantization",
+                quant_mode
+            )));
         }
         // Validate recipe name early
         let valid = [
@@ -1161,7 +1173,11 @@ fn quantize_weights_inner(
 ) -> Result<HashMap<String, serde_json::Value>> {
     use std::ffi::CString;
 
-    let is_mxfp8 = default_mode == "mxfp8";
+    // FP-style modes (no biases, fixed bit-width) — router gates are normally
+    // promoted to 8-bit affine, but that's incompatible with FP-mode default
+    // (4-bit mxfp4/nvfp4 or 8-bit mxfp8 with group_size=32). Skip them entirely
+    // in the legacy path; the gates remain full-precision.
+    let is_fp_mode = matches!(default_mode, "mxfp4" | "mxfp8" | "nvfp4");
 
     // Gate quantization defaults (used when no predicate)
     let gate_bits: i32 = 8;
@@ -1210,8 +1226,9 @@ fn quantize_weights_inner(
             if !should_quantize(key) {
                 continue;
             }
-            // Skip gates in MXFP8 mode
-            if is_mxfp8 && is_router_gate(key) {
+            // Skip router gates in FP-style modes (mxfp4/mxfp8/nvfp4) — they
+            // don't carry biases and we keep gates full-precision under FP quant.
+            if is_fp_mode && is_router_gate(key) {
                 continue;
             }
             if is_router_gate(key) {

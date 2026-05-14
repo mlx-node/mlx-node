@@ -29,9 +29,9 @@ Vision Arguments:
 
 Quantization Arguments:
   --quantize, -q        Enable quantization of converted weights
-  --q-bits <int>        Quantization bits (default: 4 for affine, 8 for mxfp8)
-  --q-group-size <int>  Group size (default: 64 for affine, 32 for mxfp8)
-  --q-mode <string>     Mode: "affine" (default) or "mxfp8"
+  --q-bits <int>        Quantization bits (default per --q-mode: affine=4, mxfp4=4, mxfp8=8, nvfp4=4)
+  --q-group-size <int>  Group size (default per --q-mode: affine=64, mxfp4=32, mxfp8=32, nvfp4=16)
+  --q-mode <string>     Mode: "affine" (default), "mxfp4", "mxfp8", or "nvfp4"
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,

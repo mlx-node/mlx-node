@@ -1165,7 +1165,8 @@ unsafe extern "C-unwind" {
 
 unsafe extern "C-unwind" {
     /// Quantize a matrix along its last axis.
-    /// Mode: "affine" (returns 3 arrays), "mxfp4"/"mxfp8" (returns 2 arrays, biases=nullptr).
+    /// Mode: "affine" (returns 3 arrays: weight, scales, biases),
+    ///       "mxfp4" / "mxfp8" / "nvfp4" (returns 2 arrays: weight, scales).
     pub fn mlx_quantize(
         w: *mut mlx_array,
         group_size: i32,
