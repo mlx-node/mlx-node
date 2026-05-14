@@ -117,8 +117,9 @@ export async function run(argv: string[]) {
   const quantGroupSize = parsePositiveInt('--q-group-size', args['q-group-size']);
   const quantMode = args['q-mode'];
 
-  if (quantMode !== undefined && quantMode !== 'affine' && quantMode !== 'mxfp8') {
-    console.error('Error: --q-mode must be "affine" or "mxfp8"');
+  const validQuantModes = ['affine', 'mxfp4', 'mxfp8', 'nvfp4'];
+  if (quantMode !== undefined && !validQuantModes.includes(quantMode)) {
+    console.error(`Error: --q-mode must be one of ${validQuantModes.join(', ')}`);
     process.exit(1);
   }
 
@@ -129,8 +130,10 @@ export async function run(argv: string[]) {
       console.error('Error: --q-recipe requires --quantize (-q) to be enabled');
       process.exit(1);
     }
-    if (quantMode === 'mxfp8') {
-      console.error('Error: --q-recipe is incompatible with --q-mode mxfp8');
+    if (quantMode !== undefined && quantMode !== 'affine') {
+      console.error(
+        `Error: --q-recipe is incompatible with --q-mode ${quantMode} (recipes only apply to affine quantization)`,
+      );
       process.exit(1);
     }
     if (!validRecipes.includes(quantRecipe)) {
