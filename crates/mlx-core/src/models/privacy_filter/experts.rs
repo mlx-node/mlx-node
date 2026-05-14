@@ -23,14 +23,9 @@
 //!
 //! ## Activation
 //!
-//! gpt-oss's gated activation interleaves gate / up channels rather than
-//! storing them as contiguous halves. The Python reference splits the
-//! `[2*I]` fused output as `gate_up[..., ::2]` (gate) and
-//! `gate_up[..., 1::2]` (up). We reproduce that **alternating** split by
-//! reshaping the last axis `2*I → (I, 2)` and selecting the two
-//! components along the trailing length-2 axis (this is the standard
-//! reshape-to-pairs trick — `::2 / 1::2` slicing without strided slice
-//! support).
+//! Privacy-filter overrides gpt-oss's interleaved split: HF
+//! `OpenAIPrivacyFilterExperts._apply_gate` uses the concatenated
+//! `[:I] / [I:2I]` layout (`gate_up.chunk(2, dim=-1)`).
 //!
 //! The activation itself is `gpt_oss.swiglu` from
 //! `mlx-lm/mlx_lm/models/gpt_oss.py:49` (cross-referenced against the
@@ -166,12 +161,12 @@ fn gather_bias(bias: &MxArray, idx_sorted: &MxArray) -> Result<MxArray> {
     gathered.expand_dims(-2)
 }
 
-/// gpt-oss's clamped gated linear unit, operating on the alternating
-/// `gate / up` split. See module-level docs for the source references.
+/// gpt-oss's clamped gated linear unit, operating on the privacy-filter
+/// concatenated `[:I] / [I:2I]` split. See module-level docs for refs.
 ///
 /// Inputs:
-/// - `gate`: `[N*K, 1, I]` (the `::2` slice of the fused projection)
-/// - `up`:   `[N*K, 1, I]` (the `1::2` slice)
+/// - `gate`: `[N*K, 1, I]` (the `[:I]` slice of the fused projection)
+/// - `up`:   `[N*K, 1, I]` (the `[I:2I]` slice)
 ///
 /// Output: `[N*K, 1, I]`.
 fn gpt_oss_glu(gate: &MxArray, up: &MxArray) -> Result<MxArray> {
@@ -260,46 +255,30 @@ impl<'a> GptOssMlp<'a> {
         let gate_up_bias = gather_bias(&self.weights.gate_up_bias, &idx_dispatch)?;
         let gate_up = gate_up.add(&gate_up_bias)?;
 
-        // ---- 4. Alternating gate / up split. ----
+        // ---- 4. Concatenated gate / up split. ----
         //
-        // The trailing axis (length `2*I`) interleaves gate and up
-        // channels. Reshape the last axis to `(I, 2)` so position 0 is
-        // gate (the `::2` slice) and position 1 is up (the `1::2`
-        // slice). We then index each half with a length-1 slice along
-        // the new last axis and squeeze it out — `MxArray` doesn't yet
-        // expose strided slicing, but this reshape-and-slice trick is
-        // mathematically equivalent.
+        // Privacy-filter overrides gpt-oss's interleaved layout:
+        // HF `_apply_gate` does `gate_up.chunk(2, dim=-1)`, i.e.
+        // `gate = gate_up[..., :I]`, `up = gate_up[..., I:2I]`.
         let gate_up_shape: Vec<i64> = gate_up.shape()?.as_ref().to_vec();
-        // gate_up_shape = [..., 1, 2*I]; replace the last dim with (I, 2).
-        let mut paired_shape = gate_up_shape.clone();
-        let last = paired_shape
-            .pop()
+        let last = *gate_up_shape
+            .last()
             .ok_or_else(|| Error::from_reason("unexpected scalar gate_up"))?;
         if last != two_intermediate {
             return Err(Error::from_reason(format!(
                 "gate_up trailing dim {last} != 2 * intermediate_size {two_intermediate}"
             )));
         }
-        paired_shape.push(intermediate);
-        paired_shape.push(2);
-        let gate_up_paired = gate_up.reshape(&paired_shape)?;
-
-        // slice along the trailing length-2 axis to extract gate (idx 0)
-        // and up (idx 1), then drop the now-length-1 final axis.
-        let ndim = paired_shape.len();
+        let ndim = gate_up_shape.len();
         let mut starts = vec![0i64; ndim];
-        let mut stops = paired_shape.clone();
-        // gate: last axis [0, 1)
-        stops[ndim - 1] = 1;
-        let gate = gate_up_paired.slice(&starts, &stops)?;
-        // up: last axis [1, 2)
-        starts[ndim - 1] = 1;
-        stops[ndim - 1] = 2;
-        let up = gate_up_paired.slice(&starts, &stops)?;
-        // Drop the trailing length-1 axis so shapes match what
-        // `gpt_oss_glu` and the downstream `gather_mm` expect.
-        let gate = gate.squeeze(Some(&[-1]))?;
-        let up = up.squeeze(Some(&[-1]))?;
+        let mut stops = gate_up_shape.clone();
+        // gate: last axis [0, I)
+        stops[ndim - 1] = intermediate;
+        let gate = gate_up.slice(&starts, &stops)?;
+        // up: last axis [I, 2I)
+        starts[ndim - 1] = intermediate;
+        stops[ndim - 1] = two_intermediate;
+        let up = gate_up.slice(&starts, &stops)?;
 
         // ---- 5. Clamped gpt-oss SwiGLU. ----
         let activated = gpt_oss_glu(&gate, &up)?;

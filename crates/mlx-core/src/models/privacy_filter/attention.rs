@@ -106,9 +106,9 @@ impl<'a> AttentionLayer<'a> {
             sys::mlx_fast_rope_with_freqs(
                 q.handle.0,
                 head_dim as i32,
-                false, // traditional=false (neox-style)
-                0.0,   // base ignored when freqs provided
-                1.0,   // scale=1.0
+                true, // traditional=true: interleaved [::2]/[1::2] (HF _apply_rotary_emb)
+                0.0,  // base ignored when freqs provided
+                1.0,  // scale=1.0
                 offset.handle.0,
                 self.yarn_freqs.handle.0,
             )
@@ -118,7 +118,7 @@ impl<'a> AttentionLayer<'a> {
             sys::mlx_fast_rope_with_freqs(
                 k.handle.0,
                 head_dim as i32,
-                false,
+                true,
                 0.0,
                 1.0,
                 offset.handle.0,
