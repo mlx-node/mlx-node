@@ -201,6 +201,18 @@ impl PrivacyFilterModelJs {
         debug_assert_eq!(probs_flat.len(), n_tokens * num_classes);
         debug_assert_eq!(log_probs_flat.len(), n_tokens * num_classes);
 
+        // Drop GPU-side intermediates and reclaim MLX's buffer cache.
+        // Without this, repeated `classify` calls grow the cache
+        // unboundedly (one classify allocates ~per-layer hidden states,
+        // attention K/V, MLP gate/up/down for 8 layers + the [1, T, 33]
+        // logits + softmax/log-softmax tensors).
+        drop(probs);
+        drop(log_probs);
+        drop(logits_f32);
+        drop(logits);
+        drop(input_ids);
+        crate::array::memory::synchronize_and_clear_cache();
+
         // Per-token argmax + max-softmax-prob. These are the
         // "per-token confidence" values that `extract_spans` averages
         // over each span.
