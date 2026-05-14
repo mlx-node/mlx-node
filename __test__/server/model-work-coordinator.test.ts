@@ -120,6 +120,43 @@ describe('ModelWorkCoordinator', () => {
     expect(b.ownMs).toBeLessThan(20);
   });
 
+  it('flags load_owner=true when a writer arrives during active inference reads', async () => {
+    // Regression: the owner-decision predicate used to AND in
+    // `activeReaders === 0`, so a writer that arrived during a live
+    // inference read was mislabeled as `owner=false` and its
+    // own load latency landed in `load_wait_ms` instead of
+    // `resolve_ms`. The contract per `ModelLoadOutcome` and the
+    // surrounding doc-comment is: a caller owns the load iff no
+    // other writer is active and no writer is queued ahead — active
+    // readers MUST NOT demote the arriving writer because, once
+    // those reads drain, this writer is the one that performs the
+    // load.
+    const coordinator = new ModelWorkCoordinator();
+    const readerRelease = deferred();
+    const READER_HOLD_MS = 40;
+
+    const readerPromise = coordinator.withInference(async () => {
+      // Hold the reader long enough that B observes a measurable
+      // `waitMs` after the reads drain.
+      await new Promise<void>((resolve) => setTimeout(resolve, READER_HOLD_MS));
+      await readerRelease.promise;
+    });
+
+    // Let the reader synchronously increment `activeReaders` before
+    // the writer arrives, so the bug branch (the `activeReaders === 0`
+    // term) would fire if reintroduced.
+    await tick();
+
+    const writerPromise = coordinator.withModelLoadInstrumented(async () => 'W');
+
+    readerRelease.resolve();
+    const [, w] = await Promise.all([readerPromise, writerPromise]);
+
+    expect(w.owner).toBe(true);
+    expect(w.result).toBe('W');
+    expect(w.waitMs).toBeGreaterThanOrEqual(READER_HOLD_MS - 5);
+  });
+
   it('gives pending model loads priority over new inference readers', async () => {
     const coordinator = new ModelWorkCoordinator();
     const releaseRead = deferred();

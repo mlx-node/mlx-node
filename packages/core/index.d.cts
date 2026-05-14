@@ -247,8 +247,8 @@ export declare class Gemma4Model {
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
+    isError?: boolean | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
@@ -274,8 +274,8 @@ export declare class Gemma4Model {
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError: boolean | null | undefined,
     config: ChatConfig | null | undefined,
+    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
 }
@@ -619,8 +619,8 @@ export declare class Lfm2Model {
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
+    isError?: boolean | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
@@ -646,8 +646,8 @@ export declare class Lfm2Model {
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError: boolean | null | undefined,
     config: ChatConfig | null,
+    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
   /** Get the model configuration. */
@@ -1142,8 +1142,8 @@ export declare class QianfanOCRModel {
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
+    isError?: boolean | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
@@ -1169,8 +1169,8 @@ export declare class QianfanOCRModel {
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError: boolean | null | undefined,
     config: ChatConfig | null | undefined,
+    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
 }
@@ -1278,8 +1278,8 @@ export declare class Qwen35Model {
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
+    isError?: boolean | undefined | null,
   ): Promise<ChatResult>;
   /**
    * Streaming variant of `chatSessionStart`.
@@ -1333,8 +1333,8 @@ export declare class Qwen35Model {
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError: boolean | null | undefined,
     config: ChatConfig | null,
+    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
   /**
@@ -1447,8 +1447,8 @@ export declare class Qwen35MoeModel {
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
+    isError?: boolean | undefined | null,
   ): Promise<ChatResult>;
   /**
    * Streaming variant of `chatSessionStart`.
@@ -1502,8 +1502,8 @@ export declare class Qwen35MoeModel {
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError: boolean | null | undefined,
     config: ChatConfig | null,
+    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
   /**
@@ -1639,8 +1639,8 @@ export declare class Qwen3Model {
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | undefined | null,
     config?: ChatConfig | undefined | null,
+    isError?: boolean | undefined | null,
   ): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
@@ -1666,8 +1666,8 @@ export declare class Qwen3Model {
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError: boolean | null | undefined,
     config: ChatConfig | null,
+    isError: boolean | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
   /**

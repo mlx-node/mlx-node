@@ -3186,8 +3186,8 @@ impl Lfm2Model {
         &self,
         tool_call_id: String,
         content: String,
-        is_error: Option<bool>,
         config: Option<ChatConfig>,
+        is_error: Option<bool>,
     ) -> Result<ChatResult> {
         let config = config.unwrap_or_default();
 
@@ -3289,14 +3289,14 @@ impl Lfm2Model {
     /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
     /// `<|im_start|>tool` block.
     #[napi(
-        ts_args_type = "toolCallId: string, content: string, isError: boolean | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, isError: boolean | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
-        is_error: Option<bool>,
         config: Option<ChatConfig>,
+        is_error: Option<bool>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
         let config = config.unwrap_or_default();

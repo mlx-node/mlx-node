@@ -285,10 +285,12 @@ describe.sequential('Qwen3 Chat Session API', () => {
       // Round-trip a tool-result delta. The content does not need to match
       // a real tool schema — we only care that the cache hoist-and-save-back
       // path completes cleanly.
-      const r2 = await model.chatSessionContinueTool('call_test_123', '{"result": 42}', null, {
-        maxNewTokens: 16,
-        temperature: 0,
-      });
+      const r2 = await model.chatSessionContinueTool(
+        'call_test_123',
+        '{"result": 42}',
+        { maxNewTokens: 16, temperature: 0 },
+        null,
+      );
       expect(r2).toBeDefined();
       expect(r2.numTokens).toBeGreaterThan(0);
       expect(typeof r2.rawText).toBe('string');

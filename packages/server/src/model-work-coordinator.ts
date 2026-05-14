@@ -76,7 +76,7 @@ export class ModelWorkCoordinator {
     // actual phase boundaries (lock acquisition, fn completion) so the
     // two intervals partition cleanly instead of both reporting total
     // elapsed time — see `ModelLoadOutcome` for the contract.
-    const owner = !this.writerActive && this.waitingWriters === 0 && this.activeReaders === 0;
+    const owner = !this.writerActive && this.waitingWriters === 0;
     const arrivedAt = Date.now();
     await this.acquireWrite();
     const lockAcquiredAt = Date.now();

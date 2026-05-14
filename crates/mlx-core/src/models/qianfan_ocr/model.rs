@@ -2365,8 +2365,8 @@ impl QianfanOCRModel {
         &self,
         tool_call_id: String,
         content: String,
-        is_error: Option<bool>,
         config: Option<ChatConfig>,
+        is_error: Option<bool>,
     ) -> Result<ChatResult> {
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
@@ -2471,14 +2471,14 @@ impl QianfanOCRModel {
     /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
     /// `<tool_response>` wrapper.
     #[napi(
-        ts_args_type = "toolCallId: string, content: string, isError: boolean | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null | undefined, isError: boolean | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue_tool(
         &self,
         tool_call_id: String,
         content: String,
-        is_error: Option<bool>,
         config: Option<ChatConfig>,
+        is_error: Option<bool>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
         let thread = self.thread.as_ref().ok_or_else(|| {

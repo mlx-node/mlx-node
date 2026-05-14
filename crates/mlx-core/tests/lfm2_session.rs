@@ -531,8 +531,8 @@ async fn lfm2_session_continue_tool_round_trips() {
         .chat_session_continue_tool(
             "dummy_id".to_string(),
             "result content".to_string(),
-            None,
             Some(tool_cfg),
+            None,
         )
         .await
         .expect("chat_session_continue_tool failed");

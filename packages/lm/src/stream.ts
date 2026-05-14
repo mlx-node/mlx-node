@@ -414,8 +414,8 @@ export class Qwen35Model extends Qwen35ModelNative {
   async *chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | null,
     config?: ChatConfig | null,
+    isError?: boolean | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
@@ -424,8 +424,8 @@ export class Qwen35Model extends Qwen35ModelNative {
           this,
           toolCallId,
           content,
-          isError ?? null,
           config ?? null,
+          isError ?? null,
           callback,
         ),
       signal,
@@ -490,8 +490,8 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
   async *chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | null,
     config?: ChatConfig | null,
+    isError?: boolean | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
@@ -500,8 +500,8 @@ export class Qwen35MoeModel extends Qwen35MoeModelNative {
           this,
           toolCallId,
           content,
-          isError ?? null,
           config ?? null,
+          isError ?? null,
           callback,
         ),
       signal,
@@ -568,8 +568,8 @@ export class Lfm2Model extends Lfm2ModelNative {
   async *chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | null,
     config?: ChatConfig | null,
+    isError?: boolean | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
@@ -578,8 +578,8 @@ export class Lfm2Model extends Lfm2ModelNative {
           this,
           toolCallId,
           content,
-          isError ?? null,
           config ?? null,
+          isError ?? null,
           callback,
         ),
       signal,
@@ -646,8 +646,8 @@ export class Gemma4Model extends Gemma4ModelNative {
   async *chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | null,
     config?: ChatConfig | null,
+    isError?: boolean | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
@@ -656,8 +656,8 @@ export class Gemma4Model extends Gemma4ModelNative {
           this,
           toolCallId,
           content,
-          isError ?? null,
           config ?? null,
+          isError ?? null,
           callback,
         ),
       signal,
@@ -715,8 +715,8 @@ export class Qwen3Model extends Qwen3ModelNative {
   async *chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | null,
     config?: ChatConfig | null,
+    isError?: boolean | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
     yield* _runChatStream(
@@ -725,8 +725,8 @@ export class Qwen3Model extends Qwen3ModelNative {
           this,
           toolCallId,
           content,
-          isError ?? null,
           config ?? null,
+          isError ?? null,
           callback,
         ),
       signal,

@@ -201,8 +201,8 @@ export interface SessionCapableModel {
   chatSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | null,
     config?: ChatConfig | null,
+    isError?: boolean | null,
   ): Promise<ChatResult>;
   /**
    * The optional `signal` parameter on every streaming entry point is
@@ -227,8 +227,8 @@ export interface SessionCapableModel {
   chatStreamSessionContinueTool(
     toolCallId: string,
     content: string,
-    isError?: boolean | null,
     config?: ChatConfig | null,
+    isError?: boolean | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
   resetCaches(): void;
@@ -661,7 +661,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const { isError, config } = opts;
       const mergedConfig = this.mergeConfig(config);
-      const result = await this.model.chatSessionContinueTool(toolCallId, content, isError ?? null, mergedConfig);
+      const result = await this.model.chatSessionContinueTool(toolCallId, content, mergedConfig, isError ?? null);
       this.history.push({ role: 'tool', content, toolCallId, isError });
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
@@ -703,8 +703,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         for await (const event of this.model.chatStreamSessionContinueTool(
           toolCallId,
           content,
-          isError ?? null,
           mergedConfig,
+          isError ?? null,
           signal,
         )) {
           if (event.done) {
