@@ -698,6 +698,7 @@ __metadata:
     "@inquirer/prompts": "npm:^8.4.1"
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
+    "@mlx-node/privacy": "workspace:*"
     "@mlx-node/server": "workspace:*"
     "@napi-rs/keyring": "npm:^1.2.0"
     "@types/node": "npm:^25.6.0"

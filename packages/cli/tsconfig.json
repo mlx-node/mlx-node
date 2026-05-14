@@ -9,5 +9,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "references": [{ "path": "../core" }, { "path": "../lm" }, { "path": "../server" }]
+  "references": [{ "path": "../core" }, { "path": "../lm" }, { "path": "../privacy" }, { "path": "../server" }]
 }

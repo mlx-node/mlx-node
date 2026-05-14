@@ -26,6 +26,7 @@
     "@inquirer/prompts": "^8.4.1",
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
+    "@mlx-node/privacy": "workspace:*",
     "@mlx-node/server": "workspace:*",
     "@napi-rs/keyring": "^1.2.0"
   },
