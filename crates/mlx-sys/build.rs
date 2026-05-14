@@ -10,6 +10,111 @@ fn metal_toolchain_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Compile paged-attention Metal kernels into a colocated metallib for native
+/// builds. WASM/WebGPU builds do not use this path.
+fn compile_paged_attn_metallib(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
+    let metal_src_dir = manifest_dir
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has a parent")
+        .join("mlx-paged-attn")
+        .join("metal");
+    if !metal_src_dir.exists() {
+        panic!(
+            "expected paged-attn metal sources at {}",
+            metal_src_dir.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", metal_src_dir.display());
+    for path in walk_metal_dir(&metal_src_dir) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    let metal_files = [
+        "attention/paged_attention.metal",
+        "cache/reshape_and_cache.metal",
+        "cache/copy_blocks.metal",
+    ];
+
+    let mut air_files = Vec::new();
+    for file in metal_files {
+        let src_path = metal_src_dir.join(file);
+        let air_name = file.replace('/', "_").replace(".metal", ".air");
+        let air_path = out_dir.join(&air_name);
+
+        let status = Command::new("xcrun")
+            .args([
+                "-sdk",
+                "macosx",
+                "metal",
+                "-c",
+                src_path.to_str().unwrap(),
+                "-o",
+                air_path.to_str().unwrap(),
+                "-I",
+                metal_src_dir.to_str().unwrap(),
+                "-O3",
+                "-ffast-math",
+            ])
+            .status()
+            .expect("Failed to execute xcrun metal");
+        if !status.success() {
+            panic!(
+                "Metal compilation failed for {}: exit code {:?}",
+                file,
+                status.code()
+            );
+        }
+        air_files.push(air_path);
+    }
+
+    let metallib_path = out_dir.join("paged_attn.metallib");
+    let mut link_cmd = Command::new("xcrun");
+    link_cmd.args(["-sdk", "macosx", "metallib"]);
+    for air in &air_files {
+        link_cmd.arg(air.to_str().unwrap());
+    }
+    link_cmd.args(["-o", metallib_path.to_str().unwrap()]);
+    let status = link_cmd.status().expect("Failed to execute xcrun metallib");
+    if !status.success() {
+        panic!(
+            "Paged-attn metallib linking failed: exit code {:?}",
+            status.code()
+        );
+    }
+
+    metallib_path
+}
+
+fn find_ancestor_with_name(start: &Path, name: &str) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        if ancestor
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .as_deref()
+            == Some(name)
+        {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn walk_metal_dir(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_metal_dir(&path));
+            } else if path.extension().is_some_and(|ext| ext == "metal") {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 fn add_link_search(path: &Path) {
     if path.exists() {
         println!("cargo:rustc-link-search=native={}", path.display());
@@ -202,6 +307,14 @@ fn build_native(mlx_dir: &Path, src_dir: &Path) {
         );
     }
 
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let paged_metallib_path = if !metal_disabled {
+        Some(compile_paged_attn_metallib(&manifest_dir, &out_dir_path))
+    } else {
+        None
+    };
+
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is not set");
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is not set");
 
@@ -259,6 +372,41 @@ fn build_native(mlx_dir: &Path, src_dir: &Path) {
         );
     }
 
+    if let Some(paged_metallib) = paged_metallib_path.as_ref() {
+        for candidate in lib_candidates.iter() {
+            if candidate.exists() {
+                let dst_path = candidate.join("paged_attn.metallib");
+                if let Err(e) = std::fs::copy(paged_metallib, &dst_path) {
+                    panic!(
+                        "Failed to copy paged_attn.metallib to {}: {e}",
+                        dst_path.display()
+                    );
+                }
+            }
+        }
+
+        let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+        if let Some(profile_dir) = find_ancestor_with_name(&out_path, "build")
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
+            let mut sinks = vec![profile_dir.clone(), profile_dir.join("deps")];
+            if let Some(parent) = profile_dir.parent()
+                && parent
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .as_deref()
+                    != Some("target")
+            {
+                sinks.push(parent.join("deps"));
+            }
+            for sink in sinks {
+                if sink.exists() {
+                    let _ = std::fs::copy(paged_metallib, sink.join("paged_attn.metallib"));
+                }
+            }
+        }
+    }
+
     println!("cargo:rustc-link-lib=static=mlx");
 
     if !metal_disabled {
@@ -287,6 +435,10 @@ fn build_native(mlx_dir: &Path, src_dir: &Path) {
 
     if include_generated.exists() {
         bridge.include(&include_generated);
+        let metal_cpp_include = include_generated.join("metal_cpp");
+        if metal_cpp_include.exists() {
+            bridge.include(&metal_cpp_include);
+        }
     }
     // Add src/ as include path for metal/*.metal.inc includes
     bridge.include(src_dir);

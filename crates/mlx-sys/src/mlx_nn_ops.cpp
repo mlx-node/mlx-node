@@ -79,34 +79,55 @@ static void eval_wasm(std::vector<array> arrays) {
 }
 
 void mlx_array_eval(mlx_array* handle) {
-  auto arr = reinterpret_cast<array*>(handle);
-  if (arr) {
-    eval_wasm({*arr});
+  try {
+    auto arr = reinterpret_cast<array*>(handle);
+    if (arr) {
+      eval_wasm({*arr});
+    }
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("array_eval", e.what());
+  } catch (...) {
+    mlx_trace_native_error("array_eval", "unknown exception");
   }
 }
 
 void mlx_async_eval(mlx_array** handles, size_t count) {
-  std::vector<array> arrays;
-  arrays.reserve(count);
-  for (size_t i = 0; i < count; ++i) {
-    if (handles[i]) {
-      arrays.push_back(*reinterpret_cast<array*>(handles[i]));
+  try {
+    std::vector<array> arrays;
+    arrays.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      if (handles[i]) {
+        arrays.push_back(*reinterpret_cast<array*>(handles[i]));
+      }
     }
+    eval_wasm(std::move(arrays));
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("async_eval", e.what());
+  } catch (...) {
+    mlx_trace_native_error("async_eval", "unknown exception");
   }
-  eval_wasm(std::move(arrays));
 }
 
 // Synchronous eval — matches Python's mx.eval(arrays).
 // Unlike async_eval, this blocks until all arrays are materialized.
-void mlx_eval(mlx_array** handles, size_t count) {
-  std::vector<array> arrays;
-  arrays.reserve(count);
-  for (size_t i = 0; i < count; ++i) {
-    if (handles[i]) {
-      arrays.push_back(*reinterpret_cast<array*>(handles[i]));
+bool mlx_eval(mlx_array** handles, size_t count) {
+  try {
+    std::vector<array> arrays;
+    arrays.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      if (handles[i]) {
+        arrays.push_back(*reinterpret_cast<array*>(handles[i]));
+      }
     }
+    eval_wasm(std::move(arrays));
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("eval", e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error("eval", "unknown exception");
+    return false;
   }
-  eval_wasm(std::move(arrays));
 }
 
 size_t mlx_array_size(mlx_array* handle) {

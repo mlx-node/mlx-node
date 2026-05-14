@@ -1,6 +1,7 @@
 use crate::array::MxArray;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
 use super::attention::Qwen3_5Attention;
@@ -9,6 +10,34 @@ use super::debug::log_tensor_stats;
 use super::gated_delta_net::GatedDeltaNet;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::quantized_linear::{MLPVariant, QuantizedLinear};
+
+/// Per-layer routing kind for Qwen3.5's paged dispatch.
+///
+/// Only full-attention layers route through the paged adapter; GDN layers
+/// continue to use their flat `Qwen3_5LayerCache::Linear` state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Qwen3_5LayerKind {
+    Linear,
+    FullAttentionPaged { paged_idx: u32 },
+}
+
+/// Build the per-layer routing list for Qwen3.5 dense/MoE paged dispatch.
+pub(crate) fn compute_layer_kinds(
+    num_layers: usize,
+    is_linear: impl Fn(usize) -> bool,
+) -> Vec<Qwen3_5LayerKind> {
+    let mut kinds = Vec::with_capacity(num_layers);
+    let mut paged_idx = 0u32;
+    for i in 0..num_layers {
+        if is_linear(i) {
+            kinds.push(Qwen3_5LayerKind::Linear);
+        } else {
+            kinds.push(Qwen3_5LayerKind::FullAttentionPaged { paged_idx });
+            paged_idx += 1;
+        }
+    }
+    kinds
+}
 
 /// Attention type for a decoder layer.
 pub enum AttentionType {
@@ -127,6 +156,88 @@ impl DecoderLayer {
         let out = h.add(&mlp_out)?;
         log_tensor_stats(&format!("layer.{:02}.decoder.out", self.layer_idx), &out);
         Ok(out)
+    }
+
+    /// Forward pass with paged-or-flat dispatch for Qwen3.5.
+    ///
+    /// GDN layers keep the existing flat cache path. Full-attention layers
+    /// route through `Qwen3_5Attention::forward_paged`, using the compact
+    /// full-attention ordinal (`paged_idx`) as the adapter pool index.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged_or_flat(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+        mask: Option<&MxArray>,
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+    ) -> Result<MxArray> {
+        match kind {
+            Qwen3_5LayerKind::Linear => {
+                let _ = adapter;
+                let _ = first_logical_position;
+                let _ = cached_prefix_len;
+                let _ = is_prefill;
+                if !matches!(self.attn, AttentionType::Linear(_)) {
+                    return Err(Error::from_reason(
+                        "Qwen3_5DecoderLayer::forward_paged_or_flat: kind=Linear applied to a \
+                         FullAttention operator",
+                    ));
+                }
+                self.forward(x, mask, flat_cache, position_ids, use_kernel)
+            }
+            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                let _ = flat_cache;
+                let _ = position_ids;
+                let _ = use_kernel;
+                let _ = mask;
+                let attn = match &self.attn {
+                    AttentionType::Full(a) => a,
+                    AttentionType::Linear(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5DecoderLayer::forward_paged_or_flat: \
+                             kind=FullAttentionPaged applied to a Linear (GDN) operator",
+                        ));
+                    }
+                };
+
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out = attn.forward_paged(
+                    &normed,
+                    adapter,
+                    paged_idx,
+                    first_logical_position,
+                    cached_prefix_len,
+                    is_prefill,
+                )?;
+                log_tensor_stats(
+                    &format!("layer.{:02}.decoder.attn_out", self.layer_idx),
+                    &attn_out,
+                );
+
+                let h = x.add(&attn_out)?;
+                log_tensor_stats(
+                    &format!("layer.{:02}.decoder.post_attn_residual", self.layer_idx),
+                    &h,
+                );
+
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                let mlp_out = self.mlp.forward(&normed)?;
+                log_tensor_stats(
+                    &format!("layer.{:02}.decoder.mlp_out", self.layer_idx),
+                    &mlp_out,
+                );
+
+                let out = h.add(&mlp_out)?;
+                log_tensor_stats(&format!("layer.{:02}.decoder.out", self.layer_idx), &out);
+                Ok(out)
+            }
+        }
     }
 
     #[cfg(target_family = "wasm")]

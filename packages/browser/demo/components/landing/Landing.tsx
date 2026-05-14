@@ -1,18 +1,8 @@
-import { type RefObject } from "react";
-
 import { DriftingLibrary } from "./DriftingLibrary";
 
 export type LandingProps = {
   onLoad: () => void;
   onLocalModel: () => void;
-  /**
-   * Ref to the hidden file input used for picking a local model directory.
-   * The input itself is rendered at the App root (always-mounted) so that the
-   * `useEffect` that wires `webkitdirectory` + `change` listeners can find the
-   * DOM node after the screen transitions away from `landing` (e.g. into
-   * `loading`). The prop is retained on Landing for API symmetry / future use.
-   */
-  modelDirInputRef: RefObject<HTMLInputElement | null>;
   errorBanner: string | null;
   loadDisabled?: boolean;
 };
@@ -22,7 +12,6 @@ const MODEL_LABEL = "0.8B";
 export function Landing({
   onLoad,
   onLocalModel,
-  modelDirInputRef: _modelDirInputRef,
   errorBanner,
   loadDisabled = false,
 }: LandingProps) {

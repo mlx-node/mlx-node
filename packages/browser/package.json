@@ -13,7 +13,9 @@
     "build": "echo 'TODO: build WASM + bundle'"
   },
   "dependencies": {
+    "@mlx-node/lm": "workspace:*",
     "@napi-rs/wasm-runtime": "^1.1.2",
+    "@streamdown/code": "^1.1.1",
     "buffer": "^6.0.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",

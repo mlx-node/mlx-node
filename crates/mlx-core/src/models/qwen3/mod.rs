@@ -9,12 +9,9 @@
 mod config;
 mod generation;
 mod model;
-#[cfg(not(target_family = "wasm"))]
-mod persistence;
-mod speculative;
+pub mod persistence;
 
 // Public re-exports
 pub use config::*;
 pub use generation::*;
 pub use model::*;
-pub use speculative::*;

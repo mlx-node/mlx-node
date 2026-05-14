@@ -1,43 +1,42 @@
-import type {
-  ChatStreamChunk,
-  ToolCallResult,
-  ToolDefinition,
-} from "@mlx-node/core";
+import type { ChatStreamChunk, ToolCallResult, ToolDefinition } from '@mlx-node/core';
+import { ToolCallTagBuffer } from '@mlx-node/lm/tools';
+import { createCodePlugin } from '@streamdown/code';
+import { type ChangeEvent, useEffect, useReducer, useRef, useState } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { Streamdown } from 'streamdown';
 
-import { useEffect, useReducer, useRef, useState } from "react";
-import { createRoot, type Root } from "react-dom/client";
-import { Streamdown } from "streamdown";
-
-import { createSabRingOverHeap } from "../src/chat-stream-sab.js";
+import { createSabRingOverHeap } from '../src/chat-stream-sab.js';
 import {
-  type ScreenState,
-  type ProfileLikeStats,
-  cycleReasoningEffort,
-  reduceScreen,
-} from "./lib/screen-state";
-import { ChatHeader } from "./components/chat/ChatHeader";
-import { InlinePreviewCard } from "./components/chat/InlinePreviewCard";
-import { PowerComposer } from "./components/chat/PowerComposer";
-import { TelemetryStrip } from "./components/chat/TelemetryStrip";
-import { Landing } from "./components/landing/Landing";
-import { Loading } from "./components/loading/Loading";
-import {
+  couldStillBeReasoningTextPrefix,
+  looksLikeReasoningText,
   sanitizeAssistantText,
   sanitizeThinkingText as sanitizeThinkingMarkup,
   splitAssistantThinking,
-} from "../src/generated-text.js";
-import "streamdown/styles.css";
-import "./styles.css";
+} from '../src/generated-text.js';
+import { ChatHeader } from './components/chat/ChatHeader';
+import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
+import { PowerComposer } from './components/chat/PowerComposer';
+import { TelemetryStrip } from './components/chat/TelemetryStrip';
+import { Landing } from './components/landing/Landing';
+import { Loading } from './components/loading/Loading';
+import { type ScreenState, type ProfileLikeStats, cycleReasoningEffort, reduceScreen } from './lib/screen-state';
+import 'streamdown/styles.css';
+import './styles.css';
 
-type StatusState = "info" | "ready" | "error";
-type ReasoningEffort = "off" | "low" | "medium" | "high";
-const DEFAULT_MODEL_LABEL = "qwen3.5-0.8b-mlx-bf16";
+type StatusState = 'info' | 'ready' | 'error';
+type ReasoningEffort = 'off' | 'low' | 'medium' | 'high';
+const DEFAULT_MODEL_LABEL = 'qwen3.5-0.8b-mlx-bf16';
 const MAX_BROWSER_OUTPUT_TOKENS = 36864;
 const DEFAULT_BROWSER_OUTPUT_TOKENS = 1024;
 const DEFAULT_BROWSER_TEMPERATURE = 0.6;
-const APP_PREVIEW_TOOL_NAME = "create_app_preview";
+const APP_PREVIEW_TOOL_NAME = 'create_app_preview';
 const MAX_TOOL_CONTINUATIONS = 2;
 const AUTO_CONTINUE_AFTER_APP_PREVIEW = false;
+const streamdownPlugins = {
+  code: createCodePlugin({
+    themes: ['github-dark-high-contrast', 'github-dark-high-contrast'],
+  }),
+};
 
 type BrowserToolCall = {
   id?: string;
@@ -53,106 +52,53 @@ type BrowserChatMessage = {
   toolCallId?: string;
 };
 
-class ToolCallDisplayBuffer {
-  private pending = "";
-  private suppressing = false;
-  private seenToolCall = false;
-  private readonly openTag = "<tool_call>";
-  private readonly closeTag = "</tool_call>";
+type ModelSource = {
+  modelFiles?: File[];
+  label?: string;
+};
 
-  reset() {
-    this.pending = "";
-    this.suppressing = false;
-    this.seenToolCall = false;
-  }
+function modelSourceFromLocalFiles(files: File[]): ModelSource | null {
+  if (files.length === 0) return null;
+  const firstPath = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath || files[0]!.name;
+  const label = firstPath.split('/')[0] || 'local model';
+  return { modelFiles: files, label };
+}
 
-  isToolCallActive() {
-    return this.suppressing || this.seenToolCall;
-  }
+function positiveFiniteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
 
-  push(delta: string) {
-    this.pending += delta;
-    let visible = "";
-
-    while (this.pending.length > 0) {
-      if (this.suppressing) {
-        const closeIndex = this.pending.indexOf(this.closeTag);
-        if (closeIndex < 0) {
-          this.pending = this.keepPossiblePrefix(this.pending, this.closeTag);
-          return visible;
-        }
-        this.pending = this.pending.slice(closeIndex + this.closeTag.length);
-        this.suppressing = false;
-        continue;
-      }
-
-      const openIndex = this.pending.indexOf(this.openTag);
-      if (openIndex >= 0) {
-        visible += this.pending.slice(0, openIndex);
-        this.pending = this.pending.slice(openIndex + this.openTag.length);
-        this.suppressing = true;
-        this.seenToolCall = true;
-        continue;
-      }
-
-      const keepLength = this.possiblePrefixLength(this.pending, this.openTag);
-      if (keepLength > 0) {
-        visible += this.pending.slice(0, this.pending.length - keepLength);
-        this.pending = this.pending.slice(-keepLength);
-        return visible;
-      }
-
-      visible += this.pending;
-      this.pending = "";
-    }
-
-    return visible;
-  }
-
-  private keepPossiblePrefix(text: string, marker: string) {
-    const keepLength = this.possiblePrefixLength(text, marker);
-    return keepLength > 0 ? text.slice(-keepLength) : "";
-  }
-
-  private possiblePrefixLength(text: string, marker: string) {
-    const maxLength = Math.min(text.length, marker.length - 1);
-    for (let length = maxLength; length > 0; length--) {
-      if (marker.startsWith(text.slice(-length))) return length;
-    }
-    return 0;
-  }
+function pushVisibleToolText(buffer: ToolCallTagBuffer, delta: string) {
+  const { safeText, tagFound, cleanPrefix } = buffer.push(delta);
+  return tagFound ? cleanPrefix : safeText;
 }
 
 const APP_PREVIEW_TOOL: ToolDefinition = {
-  type: "function",
+  type: 'function',
   function: {
     name: APP_PREVIEW_TOOL_NAME,
-    description:
-      "Render a complete, self-contained HTML/CSS/JavaScript app in the browser preview iframe.",
+    description: 'Render a complete, self-contained HTML/CSS/JavaScript app in the browser preview iframe.',
     parameters: {
-      type: "object",
+      type: 'object',
       properties: JSON.stringify({
         title: {
-          type: "string",
-          description: "Short title for the app preview.",
+          type: 'string',
+          description: 'Short title for the app preview.',
         },
         html: {
-          type: "string",
-          description:
-            "Body HTML for the app. Include meaningful semantic structure.",
+          type: 'string',
+          description: 'Body HTML for the app. Include meaningful semantic structure.',
         },
         css: {
-          type: "string",
-          description:
-            "CSS for the app. Keep it self-contained and responsive.",
+          type: 'string',
+          description: 'CSS for the app. Keep it self-contained and responsive.',
         },
         js: {
-          type: "string",
-          description:
-            "Client-side JavaScript for app interactions. Do not use external dependencies.",
+          type: 'string',
+          description: 'Client-side JavaScript for app interactions. Do not use external dependencies.',
         },
       }),
-      required: ["html", "css", "js"],
+      required: ['html', 'css', 'js'],
     },
   },
 };
@@ -213,29 +159,19 @@ function App() {
   const modelDirInputRef = useRef<HTMLInputElement>(null);
   const temperatureInputRef = useRef<HTMLInputElement>(null);
   const maxOutputTokensInputRef = useRef<HTMLInputElement>(null);
-  const reasoningEffortRef = useRef<ReasoningEffort>("off");
+  const reasoningEffortRef = useRef<ReasoningEffort>('off');
   const initialUrlParams = new URLSearchParams(location.search);
-  const initialAppToolsEnabled =
-    initialUrlParams.get("tools") === "1" ||
-    initialUrlParams.get("app_preview") === "1";
-  const [appToolsEnabled, setAppToolsEnabledState] = useState(
-    initialAppToolsEnabled,
-  );
-  const [reasoningEffort, setReasoningEffortState] =
-    useState<ReasoningEffort>("off");
-  const [screen, dispatchScreen] = useReducer(
-    reduceScreen,
-    "landing" as ScreenState,
-  );
+  const initialAppToolsEnabled = initialUrlParams.get('tools') === '1' || initialUrlParams.get('app_preview') === '1';
+  const [appToolsEnabled, setAppToolsEnabledState] = useState(initialAppToolsEnabled);
+  const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>('off');
+  const [screen, dispatchScreen] = useReducer(reduceScreen, 'landing' as ScreenState);
   const [loadKickoff, setLoadKickoff] = useState(0);
   const [loadingText, setLoadingText] = useState<string | null>(null);
   const [errorBanner, setErrorBannerState] = useState<string | null>(null);
-  const [telemetryStats, setTelemetryStats] = useState<ProfileLikeStats | null>(
-    null,
-  );
-  const [decodeTokensPerSec, setDecodeTokensPerSec] = useState<number | null>(
-    null,
-  );
+  const [telemetryStats, setTelemetryStats] = useState<ProfileLikeStats | null>(null);
+  const [prefillTokensPerSec, setPrefillTokensPerSec] = useState<number | null>(null);
+  const [decodeTokensPerSec, setDecodeTokensPerSec] = useState<number | null>(null);
+  const [pendingModelSource, setPendingModelSource] = useState<ModelSource | null>(null);
   const [modelLine, setModelLine] = useState<string>(DEFAULT_MODEL_LABEL);
   const appToolsEnabledRef = useRef(initialAppToolsEnabled);
   const initialMaxOutputTokens = Math.min(
@@ -243,17 +179,15 @@ function App() {
     Math.max(
       1,
       Number.parseInt(
-        initialUrlParams.get("max_new_tokens") ??
-          initialUrlParams.get("maxOutputTokens") ??
+        initialUrlParams.get('max_new_tokens') ??
+          initialUrlParams.get('maxOutputTokens') ??
           `${DEFAULT_BROWSER_OUTPUT_TOKENS}`,
         10,
       ) || DEFAULT_BROWSER_OUTPUT_TOKENS,
     ),
   );
   const parsedInitialTemperature = Number.parseFloat(
-    initialUrlParams.get("temperature") ??
-      initialUrlParams.get("temp") ??
-      `${DEFAULT_BROWSER_TEMPERATURE}`,
+    initialUrlParams.get('temperature') ?? initialUrlParams.get('temp') ?? `${DEFAULT_BROWSER_TEMPERATURE}`,
   );
   const initialTemperature = Number.isFinite(parsedInitialTemperature)
     ? Math.min(2, Math.max(0, parsedInitialTemperature))
@@ -262,6 +196,23 @@ function App() {
   const [maxTokensValue, setMaxTokensValue] = useState(initialMaxOutputTokens);
   const [generating, setGeneratingState] = useState(false);
   const [sendDisabled, setSendDisabledState] = useState(true);
+
+  useEffect(() => {
+    const modelDirInput = modelDirInputRef.current;
+    if (!modelDirInput) return;
+    modelDirInput.setAttribute('webkitdirectory', '');
+    modelDirInput.setAttribute('directory', '');
+  }, []);
+
+  function handleLocalModelInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const source = modelSourceFromLocalFiles(Array.from(event.currentTarget.files ?? []));
+    event.currentTarget.value = '';
+    if (!source) return;
+    setPendingModelSource(source);
+    setErrorBannerState(null);
+    setLoadKickoff((k) => k + 1);
+    dispatchScreen({ type: 'load_kickoff' });
+  }
 
   useEffect(() => {
     if (loadKickoff === 0) {
@@ -273,24 +224,12 @@ function App() {
     const sendBtn = sendRef.current!;
     const imageBtn = imageButtonRef.current!;
     const imageInput = imageInputRef.current!;
-    const modelDirInput = modelDirInputRef.current!;
     const temperatureInput = temperatureInputRef.current!;
     const maxOutputTokensInput = maxOutputTokensInputRef.current!;
 
-    if (
-      !statusEl ||
-      !chatEl ||
-      !promptEl ||
-      !sendBtn ||
-      !imageBtn ||
-      !imageInput ||
-      !modelDirInput ||
-      !maxOutputTokensInput
-    ) {
+    if (!statusEl || !chatEl || !promptEl || !sendBtn || !imageBtn || !imageInput || !maxOutputTokensInput) {
       return;
     }
-    modelDirInput.setAttribute("webkitdirectory", "");
-    modelDirInput.setAttribute("directory", "");
     let activeModelLabel = DEFAULT_MODEL_LABEL;
 
     if (navigator.storage?.persist) {
@@ -299,8 +238,8 @@ function App() {
         .then((persisted) => {
           log(
             persisted
-              ? "Browser storage persistence granted."
-              : "Browser storage persistence unavailable; cached models may be evicted under storage pressure.",
+              ? 'Browser storage persistence granted.'
+              : 'Browser storage persistence unavailable; cached models may be evicted under storage pressure.',
           );
         })
         .catch((error) => {
@@ -308,15 +247,15 @@ function App() {
         });
     }
 
-    function setStatus(text: string, state: StatusState = "info") {
+    function setStatus(text: string, state: StatusState = 'info') {
       statusEl.textContent = text;
       statusEl.className = `status-pill ${state}`;
       setLoadingText(text);
-      if (state === "ready") {
-        dispatchScreen({ type: "model_ready" });
-      } else if (state === "error") {
+      if (state === 'ready') {
+        dispatchScreen({ type: 'model_ready' });
+      } else if (state === 'error') {
         setErrorBannerState(text);
-        dispatchScreen({ type: "model_error" });
+        dispatchScreen({ type: 'model_error' });
       }
     }
 
@@ -338,10 +277,7 @@ function App() {
       const parsed = Number.parseInt(maxOutputTokensInput.value, 10);
       const clamped = Math.min(
         MAX_BROWSER_OUTPUT_TOKENS,
-        Math.max(
-          1,
-          Number.isFinite(parsed) ? parsed : DEFAULT_BROWSER_OUTPUT_TOKENS,
-        ),
+        Math.max(1, Number.isFinite(parsed) ? parsed : DEFAULT_BROWSER_OUTPUT_TOKENS),
       );
       if (`${clamped}` !== maxOutputTokensInput.value) {
         maxOutputTokensInput.value = `${clamped}`;
@@ -351,16 +287,8 @@ function App() {
 
     function readTemperature() {
       const parsed = Number.parseFloat(temperatureInput.value);
-      const clamped = Math.min(
-        2,
-        Math.max(
-          0,
-          Number.isFinite(parsed) ? parsed : DEFAULT_BROWSER_TEMPERATURE,
-        ),
-      );
-      const formatted = Number.isInteger(clamped)
-        ? `${clamped}`
-        : `${Math.round(clamped * 100) / 100}`;
+      const clamped = Math.min(2, Math.max(0, Number.isFinite(parsed) ? parsed : DEFAULT_BROWSER_TEMPERATURE));
+      const formatted = Number.isInteger(clamped) ? `${clamped}` : `${Math.round(clamped * 100) / 100}`;
       if (formatted !== temperatureInput.value) {
         temperatureInput.value = formatted;
       }
@@ -372,16 +300,16 @@ function App() {
     let pendingImage: Uint8Array | null = null;
 
     function setImageAttached(attached: boolean) {
-      imageBtn.dataset.attached = attached ? "true" : "false";
-      imageBtn.dataset.unsupported = supportsImages ? "false" : "true";
+      imageBtn.dataset.attached = attached ? 'true' : 'false';
+      imageBtn.dataset.unsupported = supportsImages ? 'false' : 'true';
       imageBtn.title = supportsImages
         ? attached
-          ? "Image attached. Click to replace"
-          : "Attach image"
+          ? 'Image attached. Click to replace'
+          : 'Attach image'
         : imageCapabilityKnown
-          ? "Image input unavailable for this model"
-          : "Image input available after model loads";
-      imageBtn.setAttribute("aria-label", imageBtn.title);
+          ? 'Image input unavailable for this model'
+          : 'Image input available after model loads';
+      imageBtn.setAttribute('aria-label', imageBtn.title);
     }
 
     function setImageCapability(enabled: boolean) {
@@ -390,13 +318,13 @@ function App() {
       imageBtn.disabled = !enabled;
       if (!enabled) {
         pendingImage = null;
-        imageInput.value = "";
+        imageInput.value = '';
       }
       setImageAttached(pendingImage !== null);
     }
 
     function autosizePrompt() {
-      promptEl.style.height = "auto";
+      promptEl.style.height = 'auto';
       promptEl.style.height = `${Math.min(promptEl.scrollHeight, 132)}px`;
     }
 
@@ -407,7 +335,7 @@ function App() {
     }
 
     function asRecord(value: unknown): Record<string, unknown> {
-      if (typeof value === "string") {
+      if (typeof value === 'string') {
         try {
           const parsed = JSON.parse(value);
           return asRecord(parsed);
@@ -415,7 +343,7 @@ function App() {
           return {};
         }
       }
-      if (value && typeof value === "object" && !Array.isArray(value)) {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
         return value as Record<string, unknown>;
       }
       return {};
@@ -423,30 +351,30 @@ function App() {
 
     function stringArg(args: Record<string, unknown>, key: string) {
       const value = args[key];
-      return typeof value === "string" ? value : "";
+      return typeof value === 'string' ? value : '';
     }
 
     function stripRawToolMarkupForDisplay(value: string | null | undefined) {
-      let input = value ?? "";
-      let output = "";
+      let input = value ?? '';
+      let output = '';
 
       while (input.length > 0) {
-        const openIndex = input.indexOf("<tool_call>");
+        const openIndex = input.indexOf('<tool_call>');
         if (openIndex < 0) {
           output += input;
           break;
         }
 
         output += input.slice(0, openIndex);
-        const bodyStart = openIndex + "<tool_call>".length;
-        const closeIndex = input.indexOf("</tool_call>", bodyStart);
+        const bodyStart = openIndex + '<tool_call>'.length;
+        const closeIndex = input.indexOf('</tool_call>', bodyStart);
         if (closeIndex < 0) {
           break;
         }
-        input = input.slice(closeIndex + "</tool_call>".length);
+        input = input.slice(closeIndex + '</tool_call>'.length);
       }
 
-      const orphanMarkers = ["<function=", "<parameter="];
+      const orphanMarkers = ['<function=', '<parameter='];
       let orphanIndex = -1;
       for (const marker of orphanMarkers) {
         const index = output.indexOf(marker);
@@ -462,21 +390,17 @@ function App() {
     }
 
     function hasRawToolMarkup(value: string | null | undefined) {
-      const text = value ?? "";
-      return (
-        text.includes("<tool_call>") ||
-        text.includes("<function=") ||
-        text.includes("<parameter=")
-      );
+      const text = value ?? '';
+      return text.includes('<tool_call>') || text.includes('<function=') || text.includes('<parameter=');
     }
 
     function makeUnparsedToolCallCard(finishReason: string): ToolCallResult {
       return {
-        id: "call_unparsed_app_preview",
+        id: 'call_unparsed_app_preview',
         name: APP_PREVIEW_TOOL_NAME,
         arguments: {},
-        status: "parse_error",
-        rawContent: "",
+        status: 'parse_error',
+        rawContent: '',
         error:
           `Incomplete preview tool call: model stopped before emitting a complete ` +
           `<tool_call>...</tool_call> block (finish_reason=${finishReason}).`,
@@ -486,14 +410,14 @@ function App() {
     function escapeHtmlText(text: string) {
       return text.replace(/[<>&"]/g, (char) => {
         switch (char) {
-          case "<":
-            return "&lt;";
-          case ">":
-            return "&gt;";
-          case "&":
-            return "&amp;";
+          case '<':
+            return '&lt;';
+          case '>':
+            return '&gt;';
+          case '&':
+            return '&amp;';
           case '"':
-            return "&quot;";
+            return '&quot;';
           default:
             return char;
         }
@@ -501,11 +425,11 @@ function App() {
     }
 
     function escapeStyleBlock(text: string) {
-      return text.replace(/<\/style/gi, "<\\/style");
+      return text.replace(/<\/style/gi, '<\\/style');
     }
 
     function escapeScriptBlock(text: string) {
-      return text.replace(/<\/script/gi, "<\\/script");
+      return text.replace(/<\/script/gi, '<\\/script');
     }
 
     function wrapPreviewScript(text: string) {
@@ -513,21 +437,16 @@ function App() {
     }
 
     function isClassicScript(script: HTMLScriptElement) {
-      const type = script.getAttribute("type")?.trim().toLowerCase();
-      return (
-        !type || type === "text/javascript" || type === "application/javascript"
-      );
+      const type = script.getAttribute('type')?.trim().toLowerCase();
+      return !type || type === 'text/javascript' || type === 'application/javascript';
     }
 
     function wrapInlinePreviewScripts(root: ParentNode) {
-      root.querySelectorAll("script").forEach((script) => {
-        if (
-          !(script instanceof HTMLScriptElement) ||
-          !isClassicScript(script)
-        ) {
+      root.querySelectorAll('script').forEach((script) => {
+        if (!(script instanceof HTMLScriptElement) || !isClassicScript(script)) {
           return;
         }
-        const source = script.textContent ?? "";
+        const source = script.textContent ?? '';
         if (!source.trim()) return;
         script.textContent = wrapPreviewScript(source);
       });
@@ -535,7 +454,7 @@ function App() {
 
     function sanitizePreviewHtmlFragment(html: string) {
       if (!/<script[\s>]/i.test(html)) return html;
-      const template = document.createElement("template");
+      const template = document.createElement('template');
       template.innerHTML = html;
       wrapInlinePreviewScripts(template.content);
       return template.innerHTML;
@@ -543,38 +462,28 @@ function App() {
 
     function sanitizePreviewDocument(html: string) {
       if (!/<script[\s>]/i.test(html)) return html;
-      const doc = new DOMParser().parseFromString(html, "text/html");
+      const doc = new DOMParser().parseFromString(html, 'text/html');
       wrapInlinePreviewScripts(doc);
-      const doctype = doc.doctype
-        ? `<!doctype ${doc.doctype.name}>`
-        : "<!doctype html>";
+      const doctype = doc.doctype ? `<!doctype ${doc.doctype.name}>` : '<!doctype html>';
       return `${doctype}\n${doc.documentElement.outerHTML}`;
     }
 
     function buildPreviewDocument(args: Record<string, unknown>) {
-      const title = stringArg(args, "title") || "App preview";
-      const rawHtml = stringArg(args, "html");
-      const css = stringArg(args, "css");
-      const js = stringArg(args, "js") || stringArg(args, "javascript");
+      const title = stringArg(args, 'title') || 'App preview';
+      const rawHtml = stringArg(args, 'html');
+      const css = stringArg(args, 'css');
+      const js = stringArg(args, 'js') || stringArg(args, 'javascript');
       const isDocument = /<!doctype|<html[\s>]/i.test(rawHtml);
-      const html = isDocument
-        ? sanitizePreviewDocument(rawHtml)
-        : sanitizePreviewHtmlFragment(rawHtml);
-      const cssTag = css ? `<style>\n${escapeStyleBlock(css)}\n</style>` : "";
-      const jsTag = js
-        ? `<script>\n${escapeScriptBlock(wrapPreviewScript(js))}\n</script>`
-        : "";
+      const html = isDocument ? sanitizePreviewDocument(rawHtml) : sanitizePreviewHtmlFragment(rawHtml);
+      const cssTag = css ? `<style>\n${escapeStyleBlock(css)}\n</style>` : '';
+      const jsTag = js ? `<script>\n${escapeScriptBlock(wrapPreviewScript(js))}\n</script>` : '';
       if (isDocument) {
         let doc = html;
         if (cssTag) {
-          doc = /<\/head>/i.test(doc)
-            ? doc.replace(/<\/head>/i, `${cssTag}\n</head>`)
-            : `${cssTag}\n${doc}`;
+          doc = /<\/head>/i.test(doc) ? doc.replace(/<\/head>/i, `${cssTag}\n</head>`) : `${cssTag}\n${doc}`;
         }
         if (jsTag) {
-          doc = /<\/body>/i.test(doc)
-            ? doc.replace(/<\/body>/i, `${jsTag}\n</body>`)
-            : `${doc}\n${jsTag}`;
+          doc = /<\/body>/i.test(doc) ? doc.replace(/<\/body>/i, `${jsTag}\n</body>`) : `${doc}\n${jsTag}`;
         }
         return doc;
       }
@@ -594,23 +503,16 @@ function App() {
 </html>`;
     }
 
-    function renderInlinePreview(
-      bubbleEl: HTMLElement,
-      title: string,
-      srcdoc: string,
-    ) {
+    function renderInlinePreview(bubbleEl: HTMLElement, title: string, srcdoc: string) {
       // Create a child div in the bubble, mount React InlinePreviewCard into it
-      let host = bubbleEl.querySelector<HTMLDivElement>(
-        ":scope > .inline-preview-host",
-      );
+      let host = bubbleEl.querySelector<HTMLDivElement>(':scope > .inline-preview-host');
       if (!host) {
-        host = document.createElement("div");
-        host.className = "inline-preview-host";
+        host = document.createElement('div');
+        host.className = 'inline-preview-host';
         bubbleEl.appendChild(host);
       }
       // Reuse a previously-mounted root if any (avoid re-creating)
-      const existing = (host as HTMLDivElement & { __reactRoot?: Root })
-        .__reactRoot;
+      const existing = (host as HTMLDivElement & { __reactRoot?: Root }).__reactRoot;
       const root = existing ?? createRoot(host);
       (host as HTMLDivElement & { __reactRoot?: Root }).__reactRoot = root;
       root.render(<InlinePreviewCard title={title} srcdoc={srcdoc} />);
@@ -618,7 +520,7 @@ function App() {
 
     function compactToolArguments(call: ToolCallResult) {
       const args = asRecord(call.arguments);
-      const title = stringArg(args, "title");
+      const title = stringArg(args, 'title');
       const summary = title
         ? { title }
         : Object.fromEntries(
@@ -629,33 +531,30 @@ function App() {
       return JSON.stringify(summary);
     }
 
-    function appendToolCell(
-      call: ToolCallResult,
-      state: "calling" | "result" | "error",
-    ) {
-      const toolDiv = document.createElement("div");
+    function appendToolCell(call: ToolCallResult, state: 'calling' | 'result' | 'error') {
+      const toolDiv = document.createElement('div');
       toolDiv.className = `message tool-card ${state}`;
 
-      const header = document.createElement("div");
-      header.className = "tool-card-header";
+      const header = document.createElement('div');
+      header.className = 'tool-card-header';
 
-      const bullet = document.createElement("span");
-      bullet.className = "tool-card-bullet";
-      bullet.setAttribute("aria-hidden", "true");
+      const bullet = document.createElement('span');
+      bullet.className = 'tool-card-bullet';
+      bullet.setAttribute('aria-hidden', 'true');
       header.appendChild(bullet);
 
-      const title = document.createElement("div");
-      title.className = "tool-card-title";
-      title.textContent = `${state === "calling" ? "Calling" : state === "result" ? "Called" : "Tool error"} ${call.name}`;
+      const title = document.createElement('div');
+      title.className = 'tool-card-title';
+      title.textContent = `${state === 'calling' ? 'Calling' : state === 'result' ? 'Called' : 'Tool error'} ${call.name}`;
       header.appendChild(title);
 
-      const meta = document.createElement("code");
-      meta.className = "tool-card-meta";
+      const meta = document.createElement('code');
+      meta.className = 'tool-card-meta';
       meta.textContent = compactToolArguments(call);
       header.appendChild(meta);
 
-      const body = document.createElement("div");
-      body.className = "tool-card-body";
+      const body = document.createElement('div');
+      body.className = 'tool-card-body';
 
       toolDiv.appendChild(header);
       toolDiv.appendChild(body);
@@ -664,39 +563,32 @@ function App() {
       return toolDiv;
     }
 
-    function updateToolCell(
-      toolDiv: HTMLElement,
-      call: ToolCallResult,
-      state: "result" | "error",
-      text: string,
-    ) {
+    function updateToolCell(toolDiv: HTMLElement, call: ToolCallResult, state: 'result' | 'error', text: string) {
       toolDiv.className = `message tool-card ${state}`;
-      const title = toolDiv.querySelector(".tool-card-title");
+      const title = toolDiv.querySelector('.tool-card-title');
       if (title) {
-        title.textContent = `${state === "result" ? "Called" : "Tool error"} ${call.name}`;
+        title.textContent = `${state === 'result' ? 'Called' : 'Tool error'} ${call.name}`;
       }
-      const body = toolDiv.querySelector(".tool-card-body");
+      const body = toolDiv.querySelector('.tool-card-body');
       if (body) {
         body.textContent = text;
       }
       chatEl.scrollTop = chatEl.scrollHeight;
     }
 
-    function toAssistantToolCalls(
-      toolCalls: readonly ToolCallResult[],
-    ): BrowserToolCall[] {
+    function toAssistantToolCalls(toolCalls: readonly ToolCallResult[]): BrowserToolCall[] {
       return toolCalls
-        .filter((call) => call.status === "ok")
+        .filter((call) => call.status === 'ok')
         .map((call) => {
           const args = asRecord(call.arguments);
-          const title = stringArg(args, "title");
+          const title = stringArg(args, 'title');
           const compactArgs =
             call.name === APP_PREVIEW_TOOL_NAME
               ? JSON.stringify({
-                  title: title || "App preview",
+                  title: title || 'App preview',
                   renderedInBrowserPreview: true,
                 })
-              : typeof call.arguments === "string"
+              : typeof call.arguments === 'string'
                 ? call.arguments
                 : JSON.stringify(call.arguments ?? {});
           return {
@@ -708,9 +600,9 @@ function App() {
     }
 
     function executeToolCall(call: ToolCallResult): BrowserChatMessage {
-      if (call.status !== "ok") {
+      if (call.status !== 'ok') {
         return {
-          role: "tool",
+          role: 'tool',
           toolCallId: call.id,
           content: JSON.stringify({
             ok: false,
@@ -721,7 +613,7 @@ function App() {
 
       if (call.name !== APP_PREVIEW_TOOL_NAME) {
         return {
-          role: "tool",
+          role: 'tool',
           toolCallId: call.id,
           content: JSON.stringify({
             ok: false,
@@ -731,17 +623,17 @@ function App() {
       }
 
       const args = asRecord(call.arguments);
-      const title = stringArg(args, "title") || "App preview";
-      const html = stringArg(args, "html");
-      const css = stringArg(args, "css");
-      const js = stringArg(args, "js") || stringArg(args, "javascript");
+      const title = stringArg(args, 'title') || 'App preview';
+      const html = stringArg(args, 'html');
+      const css = stringArg(args, 'css');
+      const js = stringArg(args, 'js') || stringArg(args, 'javascript');
       if (!html && !css && !js) {
         return {
-          role: "tool",
+          role: 'tool',
           toolCallId: call.id,
           content: JSON.stringify({
             ok: false,
-            error: "create_app_preview requires html, css, or js content.",
+            error: 'create_app_preview requires html, css, or js content.',
           }),
         };
       }
@@ -757,13 +649,13 @@ function App() {
       log(`[TOOL] ${APP_PREVIEW_TOOL_NAME} rendered "${title}"`);
 
       return {
-        role: "tool",
+        role: 'tool',
         toolCallId: call.id,
         content: JSON.stringify({
           ok: true,
           previewId: `preview-${previewSequence}`,
           title,
-          message: "The app is rendered in the browser preview iframe.",
+          message: 'The app is rendered in the browser preview iframe.',
         }),
       };
     }
@@ -772,8 +664,8 @@ function App() {
 
     const messages: BrowserChatMessage[] = [
       {
-        role: "system",
-        content: "You are a helpful assistant. Be concise.",
+        role: 'system',
+        content: 'You are a helpful assistant. Be concise.',
       },
     ];
 
@@ -787,12 +679,13 @@ function App() {
     let toolContinuationCount = 0;
     let previewSequence = 0;
 
-    let reasoningBuffer = "";
-    let contentQueue = "";
-    let responseRenderText = "";
-    let contentPrefixBuffer = "";
+    let reasoningBuffer = '';
+    let contentQueue = '';
+    let responseRenderText = '';
+    let contentPrefixBuffer = '';
     let contentPrefixResolved = false;
-    let currentUserPrompt = "";
+    let contentReasoningPrefixActive = false;
+    let currentUserPrompt = '';
     let rafHandle: number | null = null;
     let scrollDirty = false;
     let reasoningHasContent = false;
@@ -801,15 +694,10 @@ function App() {
     let activeReaderAbort: AbortController | null = null;
     let streamT0 = 0;
     const markdownRoots = new Map<HTMLElement, ReturnType<typeof createRoot>>();
-    const contentToolCallDisplayBuffer = new ToolCallDisplayBuffer();
-    const reasoningToolCallDisplayBuffer = new ToolCallDisplayBuffer();
+    const contentToolCallDisplayBuffer = new ToolCallTagBuffer();
+    const reasoningToolCallDisplayBuffer = new ToolCallTagBuffer();
 
-    function renderStreamdown(
-      container: HTMLElement,
-      text: string,
-      isStreaming: boolean,
-      autoScroll = false,
-    ) {
+    function renderStreamdown(container: HTMLElement, text: string, isStreaming: boolean, autoScroll = false) {
       let root = markdownRoots.get(container);
       if (!root) {
         root = createRoot(container);
@@ -817,11 +705,12 @@ function App() {
       }
       root.render(
         <Streamdown
-          mode={isStreaming ? "streaming" : "static"}
+          mode={isStreaming ? 'streaming' : 'static'}
           className="streamdown-render"
           animated={false}
           isAnimating={isStreaming}
           parseIncompleteMarkdown={isStreaming}
+          plugins={streamdownPlugins}
         >
           {text}
         </Streamdown>,
@@ -843,39 +732,39 @@ function App() {
     }
 
     function createAssistantMessage() {
-      const assistantDiv = document.createElement("div");
-      assistantDiv.className = "message assistant";
+      const assistantDiv = document.createElement('div');
+      assistantDiv.className = 'message assistant';
 
-      const thinkingDiv = document.createElement("details");
-      thinkingDiv.className = "thinking";
-      const thinkingSummary = document.createElement("summary");
-      thinkingSummary.textContent = "Thinking...";
+      const thinkingDiv = document.createElement('details');
+      thinkingDiv.className = 'thinking';
+      const thinkingSummary = document.createElement('summary');
+      thinkingSummary.textContent = 'Thinking...';
       thinkingDiv.appendChild(thinkingSummary);
-      const thinkingContent = document.createElement("div");
-      thinkingContent.className = "thinking-content";
+      const thinkingContent = document.createElement('div');
+      thinkingContent.className = 'thinking-content';
       thinkingDiv.appendChild(thinkingContent);
       assistantDiv.appendChild(thinkingDiv);
 
-      const responseDiv = document.createElement("div");
-      responseDiv.className = "response-content";
+      const responseDiv = document.createElement('div');
+      responseDiv.className = 'response-content';
       assistantDiv.appendChild(responseDiv);
 
-      const toolCallIndicator = document.createElement("div");
-      toolCallIndicator.className = "streaming-tool-call";
+      const toolCallIndicator = document.createElement('div');
+      toolCallIndicator.className = 'streaming-tool-call';
       toolCallIndicator.hidden = true;
-      const indicatorPulse = document.createElement("span");
-      indicatorPulse.className = "streaming-tool-call-pulse";
-      indicatorPulse.setAttribute("aria-hidden", "true");
+      const indicatorPulse = document.createElement('span');
+      indicatorPulse.className = 'streaming-tool-call-pulse';
+      indicatorPulse.setAttribute('aria-hidden', 'true');
       toolCallIndicator.appendChild(indicatorPulse);
-      const indicatorLabel = document.createElement("span");
-      indicatorLabel.className = "streaming-tool-call-label";
-      indicatorLabel.textContent = "Creating app preview";
+      const indicatorLabel = document.createElement('span');
+      indicatorLabel.className = 'streaming-tool-call-label';
+      indicatorLabel.textContent = 'Creating app preview';
       toolCallIndicator.appendChild(indicatorLabel);
-      const indicatorDots = document.createElement("span");
-      indicatorDots.className = "streaming-tool-call-dots";
-      indicatorDots.setAttribute("aria-hidden", "true");
+      const indicatorDots = document.createElement('span');
+      indicatorDots.className = 'streaming-tool-call-dots';
+      indicatorDots.setAttribute('aria-hidden', 'true');
       for (let i = 0; i < 3; i++) {
-        indicatorDots.appendChild(document.createElement("i"));
+        indicatorDots.appendChild(document.createElement('i'));
       }
       toolCallIndicator.appendChild(indicatorDots);
       assistantDiv.appendChild(toolCallIndicator);
@@ -889,12 +778,13 @@ function App() {
       currentToolCallIndicatorDiv = toolCallIndicator;
       isInThinking = false;
 
-      thinkingDiv.style.display = "none";
-      reasoningBuffer = "";
-      contentQueue = "";
-      responseRenderText = "";
-      contentPrefixBuffer = "";
+      thinkingDiv.style.display = 'none';
+      reasoningBuffer = '';
+      contentQueue = '';
+      responseRenderText = '';
+      contentPrefixBuffer = '';
       contentPrefixResolved = false;
+      contentReasoningPrefixActive = false;
       contentToolCallDisplayBuffer.reset();
       reasoningToolCallDisplayBuffer.reset();
       reasoningHasContent = false;
@@ -917,7 +807,7 @@ function App() {
 
       const normalizedBuffer = buffer
         .trimStart()
-        .replace(/^(?:\((?:user)\)|user)\s*:\s*/i, "")
+        .replace(/^(?:\((?:user)\)|user)\s*:\s*/i, '')
         .toLowerCase();
       if (!normalizedBuffer) return true;
       if (normalizedPrompt.startsWith(normalizedBuffer)) return true;
@@ -930,14 +820,9 @@ function App() {
       return false;
     }
 
-    function sanitizeThinkingText(
-      thinking: string | null | undefined,
-      latestUserText?: string,
-    ) {
-      const cleaned = sanitizeThinkingMarkup(
-        splitAssistantThinking(thinking, latestUserText).thinking || thinking,
-      );
-      if (/^[A-Z]$/u.test(cleaned)) return "";
+    function sanitizeThinkingText(thinking: string | null | undefined, latestUserText?: string) {
+      const cleaned = sanitizeThinkingMarkup(splitAssistantThinking(thinking, latestUserText).thinking || thinking);
+      if (/^[A-Z]$/u.test(cleaned)) return '';
       return cleaned;
     }
 
@@ -955,16 +840,11 @@ function App() {
       if (!currentThinkingDiv || !currentReasoningVisible) return;
       const cleaned = sanitizeThinkingText(text);
       if (!cleaned) return;
-      const thinkingContentEl = currentThinkingDiv.querySelector(
-        ".thinking-content",
-      ) as HTMLElement | null;
-      const summary = currentThinkingDiv.querySelector(
-        "summary",
-      ) as HTMLElement | null;
-      if (summary) summary.textContent = "Thought process";
-      if (thinkingContentEl)
-        renderStreamdown(thinkingContentEl, cleaned, true, true);
-      currentThinkingDiv.style.display = "";
+      const thinkingContentEl = currentThinkingDiv.querySelector('.thinking-content') as HTMLElement | null;
+      const summary = currentThinkingDiv.querySelector('summary') as HTMLElement | null;
+      if (summary) summary.textContent = 'Thought process';
+      if (thinkingContentEl) renderStreamdown(thinkingContentEl, cleaned, true, true);
+      currentThinkingDiv.style.display = '';
       currentThinkingDiv.open = open;
       reasoningHasContent = true;
       scrollDirty = true;
@@ -973,133 +853,134 @@ function App() {
 
     function showStreamingToolCallIndicator() {
       if (!currentAssistantDiv || !currentToolCallIndicatorDiv) return;
-      currentAssistantDiv.classList.add("tool-streaming");
+      currentAssistantDiv.classList.add('tool-streaming');
       currentToolCallIndicatorDiv.hidden = false;
       scrollDirty = true;
       scheduleFlush();
     }
 
     function hideStreamingToolCallIndicator() {
-      currentAssistantDiv?.classList.remove("tool-streaming");
+      currentAssistantDiv?.classList.remove('tool-streaming');
       if (currentToolCallIndicatorDiv) {
         currentToolCallIndicatorDiv.hidden = true;
       }
     }
 
     function looksLikeReasoningLeak(text: string) {
-      return /(?:<\/(?:think|longcat_think)>|here'?s a thinking process|(?:^|\n)\s*(?:\d+\.\s*)?\*\*(?:draft response|check against|final output|analy[sz]e|identify))/iu.test(
+      return looksLikeReasoningText(text);
+    }
+
+    function hasExplicitThinkingBoundary(text: string) {
+      return /(?:<\/\s*(?:think|longcat_think)\s*>|^\s*<details\b[\s\S]*<summary\b[\s\S]*(?:thought\s+process|thinking\s+process))/iu.test(
         text,
       );
     }
 
+    function stripAssistantAnswerBoundary(text: string) {
+      return text
+        .replace(/^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:final\s+answer|answer|response)\s*:?\s*(?:\*\*)?\s*/iu, '')
+        .trimStart();
+    }
+
+    function hasAssistantAnswerBoundary(text: string) {
+      return stripAssistantAnswerBoundary(text) !== text.trimStart() && stripAssistantAnswerBoundary(text).length > 0;
+    }
+
+    function couldStillBeAssistantAnswerBoundaryPrefix(text: string) {
+      const probe = text
+        .trimStart()
+        .toLowerCase()
+        .replace(/^(?:#{1,6}\s*)/u, '')
+        .replace(/^\*{1,2}/u, '')
+        .trimStart();
+      if (!probe) return true;
+      return ['final answer', 'answer', 'response'].some(
+        (label) => label.startsWith(probe) && probe.length < label.length,
+      );
+    }
+
     function appendStreamedToken(deltaText: string, isReasoning: boolean) {
-      if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv)
-        return;
+      if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv) return;
       if (!deltaText) return;
 
       streamTokenCount++;
-      setStatus(`Generating... ${streamTokenCount} tokens`, "info");
+      setStatus(`Generating... ${streamTokenCount} tokens`, 'info');
 
       if (isReasoning) {
         const visibleReasoning = appToolsEnabledRef.current
-          ? reasoningToolCallDisplayBuffer.push(deltaText)
+          ? pushVisibleToolText(reasoningToolCallDisplayBuffer, deltaText)
           : deltaText;
         if (!currentReasoningVisible) {
-          if (
-            appToolsEnabledRef.current &&
-            reasoningToolCallDisplayBuffer.isToolCallActive()
-          ) {
+          if (appToolsEnabledRef.current && reasoningToolCallDisplayBuffer.suppressed) {
             showStreamingToolCallIndicator();
           }
           return;
         }
         if (visibleReasoning.length === 0) {
-          if (
-            appToolsEnabledRef.current &&
-            reasoningToolCallDisplayBuffer.isToolCallActive()
-          ) {
+          if (appToolsEnabledRef.current && reasoningToolCallDisplayBuffer.suppressed) {
             showStreamingToolCallIndicator();
           }
           return;
         }
-        if (
-          appToolsEnabledRef.current &&
-          reasoningToolCallDisplayBuffer.isToolCallActive()
-        ) {
+        if (appToolsEnabledRef.current && reasoningToolCallDisplayBuffer.suppressed) {
           showStreamingToolCallIndicator();
         }
         reasoningBuffer += visibleReasoning;
         setStreamingThinkingText(reasoningBuffer, true);
         return;
       } else {
-        let text = contentHasContent
-          ? deltaText
-          : deltaText.replace(/^\s+/, "");
+        let text = contentHasContent ? deltaText : deltaText.replace(/^\s+/, '');
         if (text.length === 0) return;
-        if (!contentPrefixResolved && currentUserPrompt) {
+        if (!contentPrefixResolved && (currentUserPrompt || (currentReasoningVisible && !contentHasContent))) {
           contentPrefixBuffer += text;
-          if (
-            currentReasoningVisible &&
-            reasoningHasContent &&
-            looksLikeReasoningLeak(contentPrefixBuffer)
-          ) {
-            const split = splitAssistantThinking(
-              contentPrefixBuffer,
-              currentUserPrompt,
-            );
-            if (split.thinking) {
-              reasoningBuffer = mergeThinkingText(
-                reasoningBuffer,
-                split.thinking,
-              );
-              setStreamingThinkingText(reasoningBuffer, true);
-              text = split.text;
-              contentPrefixBuffer = "";
+          if (currentReasoningVisible && !contentHasContent) {
+            const split = splitAssistantThinking(contentPrefixBuffer, currentUserPrompt);
+            if (contentReasoningPrefixActive && hasAssistantAnswerBoundary(contentPrefixBuffer)) {
+              text = stripAssistantAnswerBoundary(contentPrefixBuffer);
+              contentPrefixBuffer = '';
+              contentReasoningPrefixActive = false;
               contentPrefixResolved = true;
               if (text.length === 0) return;
-            } else if (contentPrefixBuffer.length < 16_384) {
-              setStreamingThinkingText(
-                mergeThinkingText(reasoningBuffer, contentPrefixBuffer),
-                true,
-              );
+            } else if (contentReasoningPrefixActive && couldStillBeAssistantAnswerBoundaryPrefix(contentPrefixBuffer)) {
+              return;
+            } else if (
+              contentReasoningPrefixActive ||
+              split.thinking ||
+              hasExplicitThinkingBoundary(contentPrefixBuffer) ||
+              looksLikeReasoningLeak(contentPrefixBuffer)
+            ) {
+              reasoningBuffer = mergeThinkingText(reasoningBuffer, split.thinking || contentPrefixBuffer);
+              setStreamingThinkingText(reasoningBuffer, true);
+              text = split.text;
+              contentPrefixBuffer = '';
+              contentReasoningPrefixActive = text.length === 0;
+              contentPrefixResolved = text.length > 0;
+              if (text.length === 0) return;
+            } else if (couldStillBeReasoningTextPrefix(contentPrefixBuffer) && contentPrefixBuffer.length < 512) {
               return;
             }
           }
           if (!contentPrefixResolved) {
-            const cleaned = sanitizeAssistantText(
-              contentPrefixBuffer,
-              currentUserPrompt,
-            );
+            const cleaned = sanitizeAssistantText(contentPrefixBuffer, currentUserPrompt);
             const shouldWait =
               cleaned === contentPrefixBuffer.trimStart() &&
-              couldStillBePromptEchoPrefix(
-                contentPrefixBuffer,
-                currentUserPrompt,
-              ) &&
+              couldStillBePromptEchoPrefix(contentPrefixBuffer, currentUserPrompt) &&
               contentPrefixBuffer.length < currentUserPrompt.length + 24;
             if (shouldWait) return;
             text = cleaned;
-            contentPrefixBuffer = "";
+            contentPrefixBuffer = '';
             contentPrefixResolved = true;
             if (text.length === 0) return;
           }
         }
-        const visibleText = appToolsEnabledRef.current
-          ? contentToolCallDisplayBuffer.push(text)
-          : text;
+        const visibleText = appToolsEnabledRef.current ? pushVisibleToolText(contentToolCallDisplayBuffer, text) : text;
         if (visibleText.length === 0) {
-          if (
-            appToolsEnabledRef.current &&
-            contentToolCallDisplayBuffer.isToolCallActive()
-          ) {
+          if (appToolsEnabledRef.current && contentToolCallDisplayBuffer.suppressed) {
             showStreamingToolCallIndicator();
           }
           return;
         }
-        if (
-          appToolsEnabledRef.current &&
-          contentToolCallDisplayBuffer.isToolCallActive()
-        ) {
+        if (appToolsEnabledRef.current && contentToolCallDisplayBuffer.suppressed) {
           showStreamingToolCallIndicator();
         } else {
           hideStreamingToolCallIndicator();
@@ -1114,7 +995,7 @@ function App() {
       rafHandle = null;
 
       if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv) {
-        contentQueue = "";
+        contentQueue = '';
         return;
       }
 
@@ -1125,10 +1006,8 @@ function App() {
 
         if (isInThinking) {
           isInThinking = false;
-          const summary = currentThinkingDiv.querySelector(
-            "summary",
-          ) as HTMLElement | null;
-          if (summary) summary.textContent = "Thought process";
+          const summary = currentThinkingDiv.querySelector('summary') as HTMLElement | null;
+          if (summary) summary.textContent = 'Thought process';
           currentThinkingDiv.open = false;
         }
         responseRenderText += slice;
@@ -1152,19 +1031,17 @@ function App() {
           hideStreamingToolCallIndicator();
           if (isInThinking) {
             isInThinking = false;
-            const summary = currentThinkingDiv.querySelector(
-              "summary",
-            ) as HTMLElement | null;
-            if (summary) summary.textContent = "Thought process";
+            const summary = currentThinkingDiv.querySelector('summary') as HTMLElement | null;
+            if (summary) summary.textContent = 'Thought process';
             currentThinkingDiv.open = false;
           }
           responseRenderText += contentQueue;
           renderStreamdown(currentResponseDiv, responseRenderText, true);
         }
       }
-      reasoningBuffer = "";
-      contentQueue = "";
-      contentPrefixBuffer = "";
+      reasoningBuffer = '';
+      contentQueue = '';
+      contentPrefixBuffer = '';
       contentPrefixResolved = false;
       contentToolCallDisplayBuffer.reset();
       reasoningToolCallDisplayBuffer.reset();
@@ -1177,28 +1054,21 @@ function App() {
     }
 
     function finalizeAssistantMessage(text: string, thinking: string | null) {
-      if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv)
-        return;
+      if (!currentAssistantDiv || !currentThinkingDiv || !currentResponseDiv) return;
 
       drainQueuesSync();
 
-      const trimmedThinking = thinking?.trim() || "";
-      const shouldShowThinking =
-        currentReasoningVisible && trimmedThinking.length > 3;
+      const trimmedThinking = thinking?.trim() || '';
+      const shouldShowThinking = currentReasoningVisible && trimmedThinking.length > 3;
       if (shouldShowThinking) {
-        const thinkingContentEl = currentThinkingDiv.querySelector(
-          ".thinking-content",
-        ) as HTMLElement | null;
-        if (thinkingContentEl)
-          renderStreamdown(thinkingContentEl, trimmedThinking, false);
-        const summary = currentThinkingDiv.querySelector(
-          "summary",
-        ) as HTMLElement | null;
-        if (summary) summary.textContent = "Thought process";
+        const thinkingContentEl = currentThinkingDiv.querySelector('.thinking-content') as HTMLElement | null;
+        if (thinkingContentEl) renderStreamdown(thinkingContentEl, trimmedThinking, false);
+        const summary = currentThinkingDiv.querySelector('summary') as HTMLElement | null;
+        if (summary) summary.textContent = 'Thought process';
         currentThinkingDiv.open = false;
-        currentThinkingDiv.style.display = "";
+        currentThinkingDiv.style.display = '';
       } else {
-        currentThinkingDiv.style.display = "none";
+        currentThinkingDiv.style.display = 'none';
       }
 
       if (text && text.length > 0) {
@@ -1214,10 +1084,10 @@ function App() {
           chatEl.scrollTop = chatEl.scrollHeight;
           return;
         }
-        responseRenderText = "";
-        renderStreamdown(currentResponseDiv, "", false);
+        responseRenderText = '';
+        renderStreamdown(currentResponseDiv, '', false);
       }
-      currentAssistantDiv.classList.add("done");
+      currentAssistantDiv.classList.add('done');
       chatEl.scrollTop = chatEl.scrollHeight;
 
       currentAssistantDiv = null;
@@ -1226,21 +1096,20 @@ function App() {
       currentToolCallIndicatorDiv = null;
     }
 
-    let worker = new Worker(new URL("../src/mlx-worker.ts", import.meta.url), {
-      type: "module",
+    let worker = new Worker(new URL('../src/mlx-worker.ts', import.meta.url), {
+      type: 'module',
     });
 
     function postChatRequest() {
       const toolsEnabled = appToolsEnabledRef.current;
-      const requestReasoningEffort: ReasoningEffort =
-        reasoningEffortRef.current;
+      const requestReasoningEffort: ReasoningEffort = reasoningEffortRef.current;
       const outboundMessages = messages.map((message, index) =>
-        index === 0 && message.role === "system"
+        index === 0 && message.role === 'system'
           ? {
               ...message,
               content: toolsEnabled
-                ? "You are a helpful assistant. Be concise. When the user asks you to build, write, prototype, or preview a web app, call create_app_preview with complete self-contained HTML, CSS, and JavaScript instead of only describing the app. If reasoning is enabled, you may call create_app_preview during reasoning. After the tool result, briefly summarize what you built."
-                : "You are a helpful assistant. Be concise.",
+                ? 'You are a helpful assistant. Be concise. When the user asks you to build, write, prototype, or preview a web app, call create_app_preview with complete self-contained HTML, CSS, and JavaScript instead of only describing the app. If reasoning is enabled, you may call create_app_preview during reasoning. After the tool result, briefly summarize what you built.'
+                : 'You are a helpful assistant. Be concise.',
             }
           : message,
       );
@@ -1256,7 +1125,7 @@ function App() {
         config.maxNgramRepeats = 8;
       }
       worker.postMessage({
-        type: "chat",
+        type: 'chat',
         messages: outboundMessages,
         config,
         useSab,
@@ -1267,7 +1136,7 @@ function App() {
 
     function finishChatTurn() {
       toolContinuationCount = 0;
-      setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, "ready");
+      setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, 'ready');
       sendBtn.disabled = false;
       setSendDisabledState(false);
       setGeneratingState(false);
@@ -1278,12 +1147,11 @@ function App() {
 
     function finalizeFromResult(result: ChatResult) {
       const latestUserText =
-        [...messages].reverse().find((message) => message.role === "user")
-          ?.content ?? currentUserPrompt;
+        [...messages].reverse().find((message) => message.role === 'user')?.content ?? currentUserPrompt;
       const textParts = splitAssistantThinking(result.text, latestUserText);
       const rawParts = splitAssistantThinking(result.rawText, latestUserText);
       const toolsEnabled = appToolsEnabledRef.current;
-      const finishReason = result.finishReason || "unknown";
+      const finishReason = result.finishReason || 'unknown';
       const rawToolMarkup =
         toolsEnabled &&
         (hasRawToolMarkup(result.text) ||
@@ -1291,13 +1159,8 @@ function App() {
           hasRawToolMarkup(result.thinking) ||
           hasRawToolMarkup(reasoningBuffer));
       let text =
-        textParts.text ||
-        sanitizeAssistantText(result.text, latestUserText) ||
-        (toolsEnabled ? "" : rawParts.text);
-      let thinking = sanitizeThinkingText(
-        result.thinking ?? reasoningBuffer,
-        latestUserText,
-      );
+        textParts.text || sanitizeAssistantText(result.text, latestUserText) || (toolsEnabled ? '' : rawParts.text);
+      let thinking = sanitizeThinkingText(result.thinking ?? reasoningBuffer, latestUserText);
       thinking = mergeThinkingText(thinking, textParts.thinking);
       if (!toolsEnabled) {
         thinking = mergeThinkingText(thinking, rawParts.thinking);
@@ -1306,85 +1169,72 @@ function App() {
         thinking = stripRawToolMarkupForDisplay(thinking);
       }
       const toolCalls = (result.toolCalls ?? []).filter(Boolean);
-      const okToolCalls = toolsEnabled
-        ? toolCalls.filter((call) => call.status === "ok")
-        : [];
-      const suppressedToolCalls = toolsEnabled
-        ? []
-        : toolCalls.filter((call) => call.status === "ok");
-      const failedToolCalls = toolCalls.filter((call) => call.status !== "ok");
+      const okToolCalls = toolsEnabled ? toolCalls.filter((call) => call.status === 'ok') : [];
+      const suppressedToolCalls = toolsEnabled ? [] : toolCalls.filter((call) => call.status === 'ok');
+      const failedToolCalls = toolCalls.filter((call) => call.status !== 'ok');
       const displayText =
         text ||
         (okToolCalls.length > 0
-          ? ""
+          ? ''
           : suppressedToolCalls.length > 0
-            ? "Tool call skipped: app preview is disabled."
-            : "");
+            ? 'Tool call skipped: app preview is disabled.'
+            : '');
       finalizeAssistantMessage(displayText, thinking || null);
       messages.push({
-        role: "assistant",
+        role: 'assistant',
         content: text,
-        toolCalls:
-          okToolCalls.length > 0
-            ? toAssistantToolCalls(okToolCalls)
-            : undefined,
+        toolCalls: okToolCalls.length > 0 ? toAssistantToolCalls(okToolCalls) : undefined,
       });
 
       if (result.performance) {
-        const prefill =
-          Number.isFinite(result.performance.prefillTokensPerSecond) &&
-          result.performance.prefillTokensPerSecond > 0
-            ? ` | Prefill ${result.performance.prefillTokensPerSecond.toFixed(1)} tok/s`
-            : "";
+        const prefillTps = positiveFiniteNumber(result.performance.prefillTokensPerSecond);
+        const decodeTps = positiveFiniteNumber(result.performance.decodeTokensPerSecond);
+        const ttftMs =
+          Number.isFinite(result.performance.ttftMs) && result.performance.ttftMs >= 0
+            ? result.performance.ttftMs.toFixed(0)
+            : 'n/a';
+        const prefill = prefillTps ? ` | Prefill ${prefillTps.toFixed(1)} tok/s` : '';
+        const decode = decodeTps ? decodeTps.toFixed(1) : 'n/a';
         log(
-          `${result.numTokens} tokens | finish ${finishReason} | TTFT ${result.performance.ttftMs.toFixed(0)}ms${prefill} | Decode ${result.performance.decodeTokensPerSecond.toFixed(1)} tok/s`,
+          `${result.numTokens} tokens | finish ${finishReason} | TTFT ${ttftMs}ms${prefill} | Decode ${decode} tok/s`,
         );
-        setDecodeTokensPerSec(
-          result.performance?.decodeTokensPerSecond ?? null,
-        );
+        setPrefillTokensPerSec(prefillTps);
+        setDecodeTokensPerSec(decodeTps);
       } else {
         log(`${result.numTokens ?? 0} tokens | finish ${finishReason}`);
+        setPrefillTokensPerSec(null);
+        setDecodeTokensPerSec(null);
       }
 
       for (const call of failedToolCalls) {
-        const toolCell = appendToolCell(call, "error");
-        updateToolCell(
-          toolCell,
-          call,
-          "error",
-          call.error || `Tool call parse failed: ${call.status}`,
-        );
+        const toolCell = appendToolCell(call, 'error');
+        updateToolCell(toolCell, call, 'error', call.error || `Tool call parse failed: ${call.status}`);
       }
       if (suppressedToolCalls.length > 0) {
         for (const call of suppressedToolCalls) {
-          const toolCell = appendToolCell(call, "error");
-          updateToolCell(
-            toolCell,
-            call,
-            "error",
-            "Tool call ignored: app preview is disabled.",
-          );
+          const toolCell = appendToolCell(call, 'error');
+          updateToolCell(toolCell, call, 'error', 'Tool call ignored: app preview is disabled.');
         }
       }
       if (rawToolMarkup && okToolCalls.length === 0) {
         const call = makeUnparsedToolCallCard(finishReason);
-        const toolCell = appendToolCell(call, "error");
-        updateToolCell(toolCell, call, "error", call.error || "");
+        const toolCell = appendToolCell(call, 'error');
+        updateToolCell(toolCell, call, 'error', call.error || '');
       }
 
       if (okToolCalls.length > 0) {
         for (const call of okToolCalls) {
-          const toolCell = appendToolCell(call, "calling");
+          const toolCell = appendToolCell(call, 'calling');
           const toolMessage = executeToolCall(call);
           const toolResult = asRecord(toolMessage.content);
           const ok = toolResult.ok === true;
           updateToolCell(
             toolCell,
             call,
-            ok ? "result" : "error",
+            ok ? 'result' : 'error',
             ok
-              ? `Preview updated: ${stringArg(toolResult, "title") || call.name}`
-              : stringArg(toolResult, "error") || `Tool failed: ${call.name}`,
+              ? `Preview updated: ${stringArg(toolResult, 'title') || call.name}`
+              : stringArg(toolResult, 'error') || `Tool failed: ${call.name}`,
           );
           messages.push(toolMessage);
         }
@@ -1394,29 +1244,24 @@ function App() {
         }
         if (toolContinuationCount < MAX_TOOL_CONTINUATIONS) {
           toolContinuationCount++;
-          setStatus("Tool complete - generating follow-up...", "info");
-          currentReasoningVisible = reasoningEffortRef.current !== "off";
+          setStatus('Tool complete - generating follow-up...', 'info');
+          currentReasoningVisible = reasoningEffortRef.current !== 'off';
           createAssistantMessage();
           postChatRequest();
           return;
         }
         const call = okToolCalls[okToolCalls.length - 1]!;
-        const toolCell = appendToolCell(call, "error");
-        updateToolCell(
-          toolCell,
-          call,
-          "error",
-          "Tool loop stopped: max continuations reached.",
-        );
+        const toolCell = appendToolCell(call, 'error');
+        updateToolCell(toolCell, call, 'error', 'Tool loop stopped: max continuations reached.');
       }
 
       finishChatTurn();
     }
 
     function resetStreamingUi() {
-      reasoningBuffer = "";
-      contentQueue = "";
-      responseRenderText = "";
+      reasoningBuffer = '';
+      contentQueue = '';
+      responseRenderText = '';
       contentToolCallDisplayBuffer.reset();
       reasoningToolCallDisplayBuffer.reset();
       hideStreamingToolCallIndicator();
@@ -1431,59 +1276,49 @@ function App() {
       const { type, ...data } = e.data;
 
       switch (type) {
-        case "log":
+        case 'log':
           console.log(data.message);
           break;
 
-        case "progress":
+        case 'progress':
           log(data.message);
-          if (data.step === "chat") {
+          if (data.step === 'chat') {
             break;
-          } else if (data.step === "download" && data.pct != null) {
-            setStatus(`Downloading weights... ${data.pct}%`, "info");
+          } else if (data.step === 'download' && data.pct != null) {
+            setStatus(`Downloading weights... ${data.pct}%`, 'info');
           } else {
-            setStatus(data.message, "info");
+            setStatus(data.message, 'info');
           }
           break;
 
-        case "ready":
-          if (typeof data.modelLabel === "string" && data.modelLabel) {
+        case 'ready':
+          if (typeof data.modelLabel === 'string' && data.modelLabel) {
             activeModelLabel = data.modelLabel;
           }
           setModelLine(activeModelLabel);
-          log("Model ready!");
-          setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, "ready");
-          sharedWasmMemory =
-            (data as { sharedMemory?: WebAssembly.Memory }).sharedMemory ??
-            null;
+          log('Model ready!');
+          setStatus(`${compactModelLabel(activeModelLabel)} - Ready`, 'ready');
+          sharedWasmMemory = (data as { sharedMemory?: WebAssembly.Memory }).sharedMemory ?? null;
           promptEl.disabled = false;
           sendBtn.disabled = false;
           setSendDisabledState(false);
           setGeneratingState(false);
-          setImageCapability(
-            (data as { supportsImages?: boolean }).supportsImages === true,
-          );
+          setImageCapability((data as { supportsImages?: boolean }).supportsImages === true);
           break;
 
-        case "stream-sab-open": {
+        case 'stream-sab-open': {
           if (!sharedWasmMemory) {
-            log("Error: received stream-sab-open before shared WASM memory");
+            log('Error: received stream-sab-open before shared WASM memory');
             break;
           }
           streamT0 = performance.now();
           const ringOffset = (data as { ringOffset: number }).ringOffset;
           const size = (data as { size: number }).size;
-          const ring = createSabRingOverHeap(
-            sharedWasmMemory,
-            ringOffset,
-            size,
-          );
+          const ring = createSabRingOverHeap(sharedWasmMemory, ringOffset, size);
           activeReaderAbort = ring.reader(
             (chunk: ChatStreamChunk) => {
               if (chunk.done) {
-                const elapsed = ((performance.now() - streamT0) / 1000).toFixed(
-                  1,
-                );
+                const elapsed = ((performance.now() - streamT0) / 1000).toFixed(1);
                 log(`chatStream completed in ${elapsed}s`);
                 finalizeFromResult({
                   text: chunk.text,
@@ -1497,7 +1332,7 @@ function App() {
                 activeReaderAbort?.abort();
                 activeReaderAbort = null;
                 worker.postMessage({
-                  type: "stream-finalize",
+                  type: 'stream-finalize',
                   numTokens: chunk.numTokens ?? 0,
                 });
               } else {
@@ -1508,13 +1343,9 @@ function App() {
               log(`Stream error: ${err.message}`);
               resetStreamingUi();
               if (currentResponseDiv) {
-                renderStreamdown(
-                  currentResponseDiv,
-                  `Error: ${err.message}`,
-                  false,
-                );
+                renderStreamdown(currentResponseDiv, `Error: ${err.message}`, false);
               }
-              setStatus("Error", "error");
+              setStatus('Error', 'error');
               sendBtn.disabled = false;
               setSendDisabledState(false);
               setGeneratingState(false);
@@ -1525,32 +1356,28 @@ function App() {
               currentToolCallIndicatorDiv = null;
               activeReaderAbort?.abort();
               activeReaderAbort = null;
-              worker.postMessage({ type: "stream-finalize", numTokens: 0 });
+              worker.postMessage({ type: 'stream-finalize', numTokens: 0 });
             },
           );
           break;
         }
 
-        case "result":
+        case 'result':
           finalizeFromResult(data as ChatResult);
           break;
 
-        case "profile":
+        case 'profile':
           logProfile((data as { stats: ProfileStats }).stats);
           break;
 
-        case "error":
+        case 'error':
           log(`Error: ${data.message}`);
           logStack(data.stack);
           resetStreamingUi();
           if (currentResponseDiv) {
-            renderStreamdown(
-              currentResponseDiv,
-              `Error: ${data.message}`,
-              false,
-            );
+            renderStreamdown(currentResponseDiv, `Error: ${data.message}`, false);
           }
-          setStatus("Error", "error");
+          setStatus('Error', 'error');
           sendBtn.disabled = false;
           setSendDisabledState(false);
           setGeneratingState(false);
@@ -1565,12 +1392,10 @@ function App() {
           }
           break;
 
-        case "bridge-poisoned": {
-          const reason = (data as { reason?: string }).reason ?? "unknown";
-          log(
-            `Bridge poisoned (${reason}). The GPU worker is unresponsive - reload the page to recover.`,
-          );
-          setStatus("Bridge poisoned - reload required", "error");
+        case 'bridge-poisoned': {
+          const reason = (data as { reason?: string }).reason ?? 'unknown';
+          log(`Bridge poisoned (${reason}). The GPU worker is unresponsive - reload the page to recover.`);
+          setStatus('Bridge poisoned - reload required', 'error');
           sendBtn.disabled = true;
           setSendDisabledState(true);
           setGeneratingState(false);
@@ -1598,11 +1423,8 @@ function App() {
         .map(([k, v]) => ({ op: Number(k), count: v }))
         .filter(({ count }) => count > 0)
         .sort((a, b) => b.count - a.count)
-        .map(
-          ({ op, count }) =>
-            `${rpcFnName(op)}(${count}, ${(count / n).toFixed(1)}/t)`,
-        )
-        .join(", ");
+        .map(({ op, count }) => `${rpcFnName(op)}(${count}, ${(count / n).toFixed(1)}/t)`)
+        .join(', ');
 
       log(
         `[profile] Decode ${s.numTokens} tok | dispatches=${s.totalDispatches} (${dpt.toFixed(1)}/tok) | ` +
@@ -1615,7 +1437,7 @@ function App() {
       const ph = s.poolHits ?? 0;
       const pm = s.poolMisses ?? 0;
       const pt = ph + pm;
-      const phRate = pt > 0 ? ((ph / pt) * 100).toFixed(1) : "0.0";
+      const phRate = pt > 0 ? ((ph / pt) * 100).toFixed(1) : '0.0';
       log(
         `[profile] pool: hits=${ph} (${(ph / n).toFixed(1)}/tok) misses=${pm} (${(pm / n).toFixed(1)}/tok) hitRate=${phRate}%`,
       );
@@ -1623,7 +1445,7 @@ function App() {
       const gph = s.gpuPoolHits ?? 0;
       const gpm = s.gpuPoolMisses ?? 0;
       const gpt = gph + gpm;
-      const gphRate = gpt > 0 ? ((gph / gpt) * 100).toFixed(1) : "0.0";
+      const gphRate = gpt > 0 ? ((gph / gpt) * 100).toFixed(1) : '0.0';
       log(
         `[profile] gpu-pool: hits=${gph} (${(gph / n).toFixed(1)}/tok) misses=${gpm} (${(gpm / n).toFixed(1)}/tok) hitRate=${gphRate}%`,
       );
@@ -1632,7 +1454,7 @@ function App() {
         const bgh = s.bindGroupCacheHits;
         const bgm = s.bindGroupCacheMisses;
         const bgt = bgh + bgm;
-        const bghRate = bgt > 0 ? ((bgh / bgt) * 100).toFixed(1) : "0.0";
+        const bghRate = bgt > 0 ? ((bgh / bgt) * 100).toFixed(1) : '0.0';
         log(
           `[profile] bg-cache: hits=${bgh} (${(bgh / n).toFixed(1)}/tok) misses=${bgm} (${(bgm / n).toFixed(1)}/tok) hitRate=${bghRate}%`,
         );
@@ -1642,7 +1464,7 @@ function App() {
         const uhh = s.uniformHotHits;
         const uhm = s.uniformHotMisses;
         const uht = uhh + uhm;
-        const uhhRate = uht > 0 ? ((uhh / uht) * 100).toFixed(1) : "0.0";
+        const uhhRate = uht > 0 ? ((uhh / uht) * 100).toFixed(1) : '0.0';
         log(
           `[profile] uniform-hot: hits=${uhh} (${(uhh / n).toFixed(1)}/tok) misses=${uhm} (${(uhm / n).toFixed(1)}/tok) hitRate=${uhhRate}%`,
         );
@@ -1652,11 +1474,9 @@ function App() {
         const sh = s.spinHits;
         const sm = s.spinMisses;
         const st = sh + sm;
-        const shRate = st > 0 ? ((sh / st) * 100).toFixed(1) : "0.0";
+        const shRate = st > 0 ? ((sh / st) * 100).toFixed(1) : '0.0';
         const sb = s.spinBudget ?? 0;
-        log(
-          `[profile] spin: hits=${sh} misses=${sm} hitRate=${shRate}% budget=${sb}`,
-        );
+        log(`[profile] spin: hits=${sh} misses=${sm} hitRate=${shRate}% budget=${sb}`);
       }
 
       log(
@@ -1669,19 +1489,19 @@ function App() {
 
     function logStack(stack: string | undefined) {
       if (!stack) return;
-      for (const line of stack.split("\n").slice(0, 12)) {
+      for (const line of stack.split('\n').slice(0, 12)) {
         if (line.trim()) log(`  ${line}`);
       }
     }
 
     const handleWorkerError = (e: ErrorEvent) => {
       e.preventDefault();
-      const inner = e.error instanceof Error ? e.error.message : "";
+      const inner = e.error instanceof Error ? e.error.message : '';
       log(`Worker error: ${e.message || inner || String(e)}`);
       log(`  file: ${e.filename}`);
       log(`  line: ${e.lineno}, col: ${e.colno}`);
       if (e.error instanceof Error) logStack(e.error.stack);
-      setStatus("Worker error", "error");
+      setStatus('Worker error', 'error');
     };
     worker.onerror = handleWorkerError;
 
@@ -1689,59 +1509,54 @@ function App() {
       log(`Worker messageerror: ${e}`);
     };
 
-    worker.addEventListener("messageerror", onMessageError);
+    worker.addEventListener('messageerror', onMessageError);
 
     const urlParams = new URLSearchParams(location.search);
-    const packBf16 = urlParams.get("pack_bf16") === "1";
-    const sdpaFallback = urlParams.get("sdpa_fallback") === "1";
-    const profile = urlParams.get("profile") === "1";
-    const dispatchBatch = urlParams.get("dispatch_batch") !== "0";
-    const compileMlp = urlParams.get("compile_mlp") !== "0";
-    const compileGdnPre = urlParams.get("compile_gdn_pre") !== "0";
-    const compileGdnPost = urlParams.get("compile_gdn_post") !== "0";
-    const compileGdnG = urlParams.get("compile_gdn_g") !== "0";
-    const enableVlm = urlParams.get("disable_vlm") !== "1";
-    const fuseDispatch = urlParams.get("fuse_dispatch") !== "0";
-    const useSab = urlParams.get("stream_sab") !== "0";
-    const weightUploadBatchMb = Number.parseFloat(
-      urlParams.get("weight_upload_batch_mb") ?? "",
-    );
+    const packBf16 = urlParams.get('pack_bf16') === '1';
+    const sdpaFallback = urlParams.get('sdpa_fallback') === '1';
+    const profile = urlParams.get('profile') === '1';
+    const dispatchBatch = urlParams.get('dispatch_batch') !== '0';
+    const compileMlp = urlParams.get('compile_mlp') !== '0';
+    const compileGdnPre = urlParams.get('compile_gdn_pre') !== '0';
+    const compileGdnPost = urlParams.get('compile_gdn_post') !== '0';
+    const compileGdnG = urlParams.get('compile_gdn_g') !== '0';
+    const enableVlm = urlParams.get('disable_vlm') !== '1';
+    const fuseDispatch = urlParams.get('fuse_dispatch') !== '0';
+    const useSab = urlParams.get('stream_sab') !== '0';
+    const weightUploadBatchMb = Number.parseFloat(urlParams.get('weight_upload_batch_mb') ?? '');
     const weightUploadBatchBytes =
       Number.isFinite(weightUploadBatchMb) && weightUploadBatchMb > 0
         ? Math.round(weightUploadBatchMb * 1024 * 1024)
         : undefined;
-    const modeParam = urlParams.get("mode") as
-      | "sab"
-      | "tsfn"
-      | "baseline"
-      | null;
+    const modeParam = urlParams.get('mode') as 'sab' | 'tsfn' | 'baseline' | null;
     const flagBadges =
-      (packBf16 ? " (pack_bf16=1)" : "") +
-      (sdpaFallback ? " (sdpa_fallback=1)" : "") +
-      (profile ? " (profile=1)" : "") +
-      (dispatchBatch ? " (dispatch_batch=1)" : "") +
-      (compileMlp ? " (compile_mlp=1)" : "") +
-      (compileGdnPre ? " (compile_gdn_pre=1)" : "") +
-      (compileGdnPost ? " (compile_gdn_post=1)" : "") +
-      (compileGdnG ? " (compile_gdn_g=1)" : "") +
-      (fuseDispatch ? "" : " (fuse_dispatch=0)") +
-      (enableVlm ? "" : " (disable_vlm=1)") +
-      (useSab ? "" : " (stream_sab=0)") +
-      (weightUploadBatchBytes
-        ? ` (weight_upload_batch_mb=${Math.round(weightUploadBatchBytes / 1024 / 1024)})`
-        : "") +
-      (modeParam ? ` (mode=${modeParam})` : "");
+      (packBf16 ? ' (pack_bf16=1)' : '') +
+      (sdpaFallback ? ' (sdpa_fallback=1)' : '') +
+      (profile ? ' (profile=1)' : '') +
+      (dispatchBatch ? ' (dispatch_batch=1)' : '') +
+      (compileMlp ? ' (compile_mlp=1)' : '') +
+      (compileGdnPre ? ' (compile_gdn_pre=1)' : '') +
+      (compileGdnPost ? ' (compile_gdn_post=1)' : '') +
+      (compileGdnG ? ' (compile_gdn_g=1)' : '') +
+      (fuseDispatch ? '' : ' (fuse_dispatch=0)') +
+      (enableVlm ? '' : ' (disable_vlm=1)') +
+      (useSab ? '' : ' (stream_sab=0)') +
+      (weightUploadBatchBytes ? ` (weight_upload_batch_mb=${Math.round(weightUploadBatchBytes / 1024 / 1024)})` : '') +
+      (modeParam ? ` (mode=${modeParam})` : '');
 
     function resetForModelLoad(label?: string) {
       activeModelLabel = label ?? DEFAULT_MODEL_LABEL;
       setModelLine(activeModelLabel);
+      setTelemetryStats(null);
+      setPrefillTokensPerSec(null);
+      setDecodeTokensPerSec(null);
       activeReaderAbort?.abort();
       activeReaderAbort = null;
       sharedWasmMemory = null;
       imageCapabilityKnown = false;
       supportsImages = false;
       pendingImage = null;
-      imageInput.value = "";
+      imageInput.value = '';
       setImageAttached(false);
       resetStreamingUi();
       unmountAllStreamdown();
@@ -1756,8 +1571,8 @@ function App() {
       setSendDisabledState(true);
       setGeneratingState(false);
       imageBtn.disabled = true;
-      setStatus("Initializing...", "info");
-      log(`Starting MLX Worker${flagBadges}${label ? ` (${label})` : ""}...`);
+      setStatus('Initializing...', 'info');
+      log(`Starting MLX Worker${flagBadges}${label ? ` (${label})` : ''}...`);
     }
 
     function startWorker(
@@ -1768,10 +1583,9 @@ function App() {
     ) {
       resetForModelLoad(source.label);
       worker.postMessage({
-        type: "init",
-        wasmUrl: new URL(`/mlx-core.opt.wasm?v=${Date.now()}`, location.href)
-          .href,
-        modelUrl: "/model",
+        type: 'init',
+        wasmUrl: new URL(`/mlx-core.opt.wasm?v=${Date.now()}`, location.href).href,
+        modelUrl: '/model',
         modelLabel: source.label ?? DEFAULT_MODEL_LABEL,
         modelFiles: source.modelFiles,
         packBf16,
@@ -1788,74 +1602,65 @@ function App() {
       });
     }
 
-    function restartWorker(source: { modelFiles?: File[]; label?: string }) {
-      worker.removeEventListener("messageerror", onMessageError);
-      worker.terminate();
-      worker = new Worker(new URL("../src/mlx-worker.ts", import.meta.url), {
-        type: "module",
-      });
-      worker.onmessage = handleWorkerMessage;
-      worker.onerror = handleWorkerError;
-      worker.addEventListener("messageerror", onMessageError);
-      startWorker(source);
-    }
-
-    startWorker();
+    startWorker(pendingModelSource ?? undefined);
 
     function handleSend() {
       const text = promptEl.value.trim();
       if (!text) return;
 
-      promptEl.value = "";
+      promptEl.value = '';
       autosizePrompt();
+      setTelemetryStats(null);
+      setPrefillTokensPerSec(null);
+      setDecodeTokensPerSec(null);
       sendBtn.disabled = true;
       setSendDisabledState(true);
       setGeneratingState(true);
       promptEl.disabled = true;
 
       if (pendingImage && !supportsImages) {
-        log("Image removed: the loaded model does not support vision input.");
+        log('Image removed: the loaded model does not support vision input.');
         pendingImage = null;
-        imageInput.value = "";
+        imageInput.value = '';
         setImageAttached(false);
       }
 
-      const userDiv = document.createElement("div");
-      userDiv.className = "message user";
+      const userDiv = document.createElement('div');
+      userDiv.className = 'message user';
       userDiv.textContent = text;
       if (pendingImage) {
-        const img = document.createElement("img");
+        const img = document.createElement('img');
         img.src = URL.createObjectURL(new Blob([toArrayBuffer(pendingImage)]));
-        img.className = "attached-image";
+        img.className = 'attached-image';
         userDiv.appendChild(img);
       }
       chatEl.appendChild(userDiv);
 
       const msg: BrowserChatMessage = {
-        role: "user",
+        role: 'user',
         content: text,
       };
       if (pendingImage) {
         msg.images = [pendingImage];
         pendingImage = null;
-        imageInput.value = "";
+        imageInput.value = '';
         setImageAttached(false);
       }
       messages.push(msg);
 
-      setStatus("Generating...", "info");
+      setStatus('Generating...', 'info');
       streamTokenCount = 0;
       toolContinuationCount = 0;
       isInThinking = false;
       currentUserPrompt = text;
-      currentReasoningVisible = reasoningEffortRef.current !== "off";
+      currentReasoningVisible = reasoningEffortRef.current !== 'off';
       createAssistantMessage();
 
       postChatRequest();
     }
 
     const onPromptKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Enter" && !e.shiftKey) {
+      if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         handleSend();
       }
@@ -1863,8 +1668,8 @@ function App() {
 
     const onImageClick = () => {
       if (!supportsImages) {
-        setStatus("Image input unavailable", "info");
-        log("Image input unavailable for this model.");
+        setStatus('Image input unavailable', 'info');
+        log('Image input unavailable for this model.');
         return;
       }
       imageInput.click();
@@ -1873,40 +1678,25 @@ function App() {
       const file = imageInput.files?.[0];
       if (!file) return;
       if (!supportsImages) {
-        imageInput.value = "";
-        setStatus("Image input unavailable", "info");
-        log("Image ignored: the loaded model does not support vision input.");
+        imageInput.value = '';
+        setStatus('Image input unavailable', 'info');
+        log('Image ignored: the loaded model does not support vision input.');
         return;
       }
       pendingImage = new Uint8Array(await file.arrayBuffer());
-      imageInput.value = "";
-      log(
-        `Image attached: ${file.name} (${(pendingImage.length / 1024).toFixed(0)} KB)`,
-      );
+      imageInput.value = '';
+      log(`Image attached: ${file.name} (${(pendingImage.length / 1024).toFixed(0)} KB)`);
       setImageAttached(true);
-    };
-
-    const onModelDirChange = () => {
-      const files = Array.from(modelDirInput.files ?? []);
-      if (files.length === 0) return;
-      const firstPath =
-        (files[0] as File & { webkitRelativePath?: string })
-          .webkitRelativePath || files[0]!.name;
-      const label = firstPath.split("/")[0] || "local model";
-      modelDirInput.value = "";
-      restartWorker({ modelFiles: files, label });
     };
 
     const onPaste = async (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (!items) return;
       for (const item of items) {
-        if (item.type.startsWith("image/")) {
+        if (item.type.startsWith('image/')) {
           if (!supportsImages) {
-            setStatus("Image input unavailable", "info");
-            log(
-              "Image paste ignored: the loaded model does not support vision input.",
-            );
+            setStatus('Image input unavailable', 'info');
+            log('Image paste ignored: the loaded model does not support vision input.');
             break;
           }
           const file = item.getAsFile();
@@ -1919,22 +1709,19 @@ function App() {
       }
     };
 
-    sendBtn.addEventListener("click", handleSend);
-    promptEl.addEventListener("keydown", onPromptKeyDown);
-    promptEl.addEventListener("input", autosizePrompt);
-    imageBtn.addEventListener("click", onImageClick);
-    imageInput.addEventListener("change", onImageChange);
-    modelDirInput.addEventListener("change", onModelDirChange);
-    document.addEventListener("paste", onPaste);
+    sendBtn.addEventListener('click', handleSend);
+    promptEl.addEventListener('keydown', onPromptKeyDown);
+    promptEl.addEventListener('input', autosizePrompt);
+    imageBtn.addEventListener('click', onImageClick);
+    imageInput.addEventListener('change', onImageChange);
+    document.addEventListener('paste', onPaste);
 
     // Expose a global reset hook for the new ChatHeader's "Reset Chat" button.
     // Clears the chat DOM, resets the local message history (keeping the
     // system prompt), and tears down any in-flight streaming UI state. The
     // underlying worker session will get a fresh start on the next chat
     // message because messages[] now carries only the system prompt.
-    (
-      window as unknown as { __mlxResetChat?: () => void }
-    ).__mlxResetChat = () => {
+    (window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat = () => {
       activeReaderAbort?.abort();
       activeReaderAbort = null;
       resetStreamingUi();
@@ -1948,112 +1735,92 @@ function App() {
     };
 
     return () => {
-      sendBtn.removeEventListener("click", handleSend);
-      promptEl.removeEventListener("keydown", onPromptKeyDown);
-      promptEl.removeEventListener("input", autosizePrompt);
-      imageBtn.removeEventListener("click", onImageClick);
-      imageInput.removeEventListener("change", onImageChange);
-      modelDirInput.removeEventListener("change", onModelDirChange);
-      document.removeEventListener("paste", onPaste);
-      worker.removeEventListener("messageerror", onMessageError);
+      sendBtn.removeEventListener('click', handleSend);
+      promptEl.removeEventListener('keydown', onPromptKeyDown);
+      promptEl.removeEventListener('input', autosizePrompt);
+      imageBtn.removeEventListener('click', onImageClick);
+      imageInput.removeEventListener('change', onImageChange);
+      document.removeEventListener('paste', onPaste);
+      worker.removeEventListener('messageerror', onMessageError);
       activeReaderAbort?.abort();
       if (rafHandle != null) cancelAnimationFrame(rafHandle);
       unmountAllStreamdown();
       worker.terminate();
-      delete (window as unknown as { __mlxResetChat?: () => void })
-        .__mlxResetChat;
+      delete (window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat;
     };
-  }, [loadKickoff]);
+  }, [loadKickoff, pendingModelSource]);
 
   return (
     <div className="app-root">
-      <div
-        className={`chat-layer ${screen === "chat" ? "visible" : ""}`}
-      >
-    <div className="app-shell">
-      <ChatHeader
-        onReset={() => {
-          // The existing useEffect installs a global reset hook on
-          // window.__mlxResetChat when the chat session is established. If
-          // it's set, call it; the chat DOM will clear and the underlying
-          // chat session will be reset.
-          if (
-            (window as unknown as { __mlxResetChat?: () => void })
-              .__mlxResetChat
-          ) {
-            (
-              window as unknown as { __mlxResetChat: () => void }
-            ).__mlxResetChat();
-          }
-          dispatchScreen({ type: "reset_chat" });
-        }}
-      />
-      {/*
+      <div className={`chat-layer ${screen === 'chat' ? 'visible' : ''}`}>
+        <div className="app-shell">
+          <ChatHeader
+            onReset={() => {
+              // The existing useEffect installs a global reset hook on
+              // window.__mlxResetChat when the chat session is established. If
+              // it's set, call it; the chat DOM will clear and the underlying
+              // chat session will be reset.
+              if ((window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat) {
+                (window as unknown as { __mlxResetChat: () => void }).__mlxResetChat();
+              }
+              dispatchScreen({ type: 'reset_chat' });
+            }}
+          />
+          {/*
         Hidden ref-only status element. The legacy app-header rendered the
         Initializing status pill; we kept the ref so the existing useEffect's
         statusEl.textContent / statusEl.className mutations remain safe. The
         new ChatHeader shows its own static "Ready on WebGPU" status.
       */}
-      <span
-        ref={statusRef}
-        id="status"
-        style={{ display: "none" }}
-        aria-hidden="true"
-      />
+          <span ref={statusRef} id="status" style={{ display: 'none' }} aria-hidden="true" />
 
+          <div className="chat-messages" id="chat" ref={chatRef} />
 
-      <div className="chat-messages" id="chat" ref={chatRef} />
+          <TelemetryStrip
+            stats={telemetryStats}
+            prefillTokensPerSecond={prefillTokensPerSec}
+            decodeTokensPerSecond={decodeTokensPerSec}
+            modelLine={modelLine}
+          />
 
-      <TelemetryStrip
-        stats={telemetryStats}
-        decodeTokensPerSecond={decodeTokensPerSec}
-        modelLine={modelLine}
-      />
-
-      <PowerComposer
-        textareaRef={promptRef}
-        sendRef={sendRef}
-        imageButtonRef={imageButtonRef}
-        imageInputRef={imageInputRef}
-        reasoningEffort={reasoningEffort}
-        onCycleReasoning={() => {
-          const next = cycleReasoningEffort(reasoningEffort);
-          reasoningEffortRef.current = next;
-          setReasoningEffortState(next);
-        }}
-        temperature={temperatureValue}
-        onTemperatureChange={(v) => {
-          setTemperatureValue(v);
-          if (temperatureInputRef.current)
-            temperatureInputRef.current.value = `${v}`;
-        }}
-        maxTokens={maxTokensValue}
-        onMaxTokensChange={(v) => {
-          setMaxTokensValue(v);
-          if (maxOutputTokensInputRef.current)
-            maxOutputTokensInputRef.current.value = `${v}`;
-        }}
-        toolsEnabled={appToolsEnabled}
-        onToggleTools={() => {
-          const next = !appToolsEnabled;
-          setAppToolsEnabledState(next);
-          appToolsEnabledRef.current = next;
-        }}
-        generating={generating}
-        sendDisabled={sendDisabled}
-        onSendOrStop={() => {
-          sendRef.current?.click(); // The legacy send button click handler stays
-        }}
-      />
-    </div>
+          <PowerComposer
+            textareaRef={promptRef}
+            sendRef={sendRef}
+            imageButtonRef={imageButtonRef}
+            imageInputRef={imageInputRef}
+            reasoningEffort={reasoningEffort}
+            onCycleReasoning={() => {
+              const next = cycleReasoningEffort(reasoningEffort);
+              reasoningEffortRef.current = next;
+              setReasoningEffortState(next);
+            }}
+            temperature={temperatureValue}
+            onTemperatureChange={(v) => {
+              setTemperatureValue(v);
+              if (temperatureInputRef.current) temperatureInputRef.current.value = `${v}`;
+            }}
+            maxTokens={maxTokensValue}
+            onMaxTokensChange={(v) => {
+              setMaxTokensValue(v);
+              if (maxOutputTokensInputRef.current) maxOutputTokensInputRef.current.value = `${v}`;
+            }}
+            toolsEnabled={appToolsEnabled}
+            onToggleTools={() => {
+              const next = !appToolsEnabled;
+              setAppToolsEnabledState(next);
+              appToolsEnabledRef.current = next;
+            }}
+            generating={generating}
+            sendDisabled={sendDisabled}
+          />
+        </div>
       </div>
 
       {/*
         Always-mounted hidden file input for picking a local model directory.
-        Lives at the App root (outside the screen-conditional Landing/Loading
-        overlays) so that the `useEffect` keyed on `loadKickoff` can attach
-        `webkitdirectory` + `change` listeners regardless of which screen is
-        active when the load is kicked off.
+        Lives at the App root so the landing screen can open it before a model
+        worker exists; React captures the selected files and starts the worker
+        directly from those local File objects.
       */}
       <input
         id="model-dir-input"
@@ -2061,6 +1828,7 @@ function App() {
         type="file"
         multiple
         className="hidden"
+        onChange={handleLocalModelInputChange}
       />
       {/*
         Hidden inputs preserved so the existing useEffect's readTemperature() and
@@ -2068,30 +1836,22 @@ function App() {
         unchanged. The PowerComposer mirrors React state into these via its
         onTemperatureChange / onMaxTokensChange callbacks.
       */}
-      <input
-        ref={temperatureInputRef}
-        type="hidden"
-        defaultValue={initialTemperature}
-      />
-      <input
-        ref={maxOutputTokensInputRef}
-        type="hidden"
-        defaultValue={initialMaxOutputTokens}
-      />
+      <input ref={temperatureInputRef} type="hidden" defaultValue={initialTemperature} />
+      <input ref={maxOutputTokensInputRef} type="hidden" defaultValue={initialMaxOutputTokens} />
 
-      {screen === "landing" && (
+      {screen === 'landing' && (
         <Landing
           onLoad={() => {
+            setPendingModelSource(null);
             setErrorBannerState(null);
             setLoadKickoff((k) => k + 1);
-            dispatchScreen({ type: "load_kickoff" });
+            dispatchScreen({ type: 'load_kickoff' });
           }}
           onLocalModel={() => modelDirInputRef.current?.click()}
-          modelDirInputRef={modelDirInputRef}
           errorBanner={errorBanner}
         />
       )}
-      {screen === "loading" && <Loading status={loadingText} />}
+      {screen === 'loading' && <Loading status={loadingText} />}
     </div>
   );
 }
@@ -2099,118 +1859,118 @@ function App() {
 function rpcFnName(fn: number): string {
   switch (fn) {
     case 1:
-      return "CREATE_INSTANCE";
+      return 'CREATE_INSTANCE';
     case 2:
-      return "INSTANCE_REQUEST_ADAPTER";
+      return 'INSTANCE_REQUEST_ADAPTER';
     case 3:
-      return "INSTANCE_RELEASE";
+      return 'INSTANCE_RELEASE';
     case 4:
-      return "ADAPTER_REQUEST_DEVICE";
+      return 'ADAPTER_REQUEST_DEVICE';
     case 5:
-      return "ADAPTER_RELEASE";
+      return 'ADAPTER_RELEASE';
     case 6:
-      return "ADAPTER_GET_PROPERTIES";
+      return 'ADAPTER_GET_PROPERTIES';
     case 10:
-      return "DEVICE_CREATE_BUFFER";
+      return 'DEVICE_CREATE_BUFFER';
     case 11:
-      return "DEVICE_CREATE_SHADER_MODULE";
+      return 'DEVICE_CREATE_SHADER_MODULE';
     case 12:
-      return "DEVICE_CREATE_COMPUTE_PIPELINE";
+      return 'DEVICE_CREATE_COMPUTE_PIPELINE';
     case 13:
-      return "DEVICE_CREATE_BIND_GROUP";
+      return 'DEVICE_CREATE_BIND_GROUP';
     case 14:
-      return "DEVICE_CREATE_COMMAND_ENCODER";
+      return 'DEVICE_CREATE_COMMAND_ENCODER';
     case 15:
-      return "DEVICE_GET_QUEUE";
+      return 'DEVICE_GET_QUEUE';
     case 16:
-      return "DEVICE_GET_LIMITS";
+      return 'DEVICE_GET_LIMITS';
     case 17:
-      return "DEVICE_SET_ERROR_CALLBACK";
+      return 'DEVICE_SET_ERROR_CALLBACK';
     case 18:
-      return "DEVICE_SET_LOST_CALLBACK";
+      return 'DEVICE_SET_LOST_CALLBACK';
     case 19:
-      return "DEVICE_RELEASE";
+      return 'DEVICE_RELEASE';
     case 20:
-      return "QUEUE_SUBMIT";
+      return 'QUEUE_SUBMIT';
     case 21:
-      return "QUEUE_WRITE_BUFFER";
+      return 'QUEUE_WRITE_BUFFER';
     case 22:
-      return "QUEUE_ON_SUBMITTED_WORK_DONE";
+      return 'QUEUE_ON_SUBMITTED_WORK_DONE';
     case 23:
-      return "QUEUE_RELEASE";
+      return 'QUEUE_RELEASE';
     case 30:
-      return "CMD_ENCODER_BEGIN_COMPUTE_PASS";
+      return 'CMD_ENCODER_BEGIN_COMPUTE_PASS';
     case 31:
-      return "CMD_ENCODER_COPY_BUFFER";
+      return 'CMD_ENCODER_COPY_BUFFER';
     case 32:
-      return "CMD_ENCODER_FINISH";
+      return 'CMD_ENCODER_FINISH';
     case 33:
-      return "CMD_ENCODER_RELEASE";
+      return 'CMD_ENCODER_RELEASE';
     case 34:
-      return "CMD_BUFFER_RELEASE";
+      return 'CMD_BUFFER_RELEASE';
     case 40:
-      return "COMPUTE_PASS_SET_PIPELINE";
+      return 'COMPUTE_PASS_SET_PIPELINE';
     case 41:
-      return "COMPUTE_PASS_SET_BIND_GROUP";
+      return 'COMPUTE_PASS_SET_BIND_GROUP';
     case 42:
-      return "COMPUTE_PASS_DISPATCH";
+      return 'COMPUTE_PASS_DISPATCH';
     case 43:
-      return "COMPUTE_PASS_END";
+      return 'COMPUTE_PASS_END';
     case 44:
-      return "COMPUTE_PASS_RELEASE";
+      return 'COMPUTE_PASS_RELEASE';
     case 50:
-      return "BUFFER_GET_SIZE";
+      return 'BUFFER_GET_SIZE';
     case 51:
-      return "BUFFER_GET_MAPPED_RANGE";
+      return 'BUFFER_GET_MAPPED_RANGE';
     case 52:
-      return "BUFFER_GET_CONST_MAPPED_RANGE";
+      return 'BUFFER_GET_CONST_MAPPED_RANGE';
     case 53:
-      return "BUFFER_UNMAP";
+      return 'BUFFER_UNMAP';
     case 54:
-      return "BUFFER_MAP_ASYNC";
+      return 'BUFFER_MAP_ASYNC';
     case 55:
-      return "BUFFER_DESTROY";
+      return 'BUFFER_DESTROY';
     case 56:
-      return "BUFFER_RELEASE";
+      return 'BUFFER_RELEASE';
     case 60:
-      return "PIPELINE_GET_BIND_GROUP_LAYOUT";
+      return 'PIPELINE_GET_BIND_GROUP_LAYOUT';
     case 61:
-      return "PIPELINE_RELEASE";
+      return 'PIPELINE_RELEASE';
     case 70:
-      return "BIND_GROUP_RELEASE";
+      return 'BIND_GROUP_RELEASE';
     case 71:
-      return "BIND_GROUP_LAYOUT_RELEASE";
+      return 'BIND_GROUP_LAYOUT_RELEASE';
     case 72:
-      return "SHADER_MODULE_RELEASE";
+      return 'SHADER_MODULE_RELEASE';
     case 80:
-      return "POLL";
+      return 'POLL';
     case 90:
-      return "ADD_GPU_BUFFER";
+      return 'ADD_GPU_BUFFER';
     case 91:
-      return "FUSED_DISPATCH";
+      return 'FUSED_DISPATCH';
     case 92:
-      return "FUSED_DISPATCH_2BG";
+      return 'FUSED_DISPATCH_2BG';
     case 93:
-      return "FUSED_SUBMIT";
+      return 'FUSED_SUBMIT';
     case 94:
-      return "FUSED_BG_DISPATCH";
+      return 'FUSED_BG_DISPATCH';
     case 95:
-      return "CREATE_BUFFER_FROM_DATA";
+      return 'CREATE_BUFFER_FROM_DATA';
     case 96:
-      return "FUSED_FULL_DISPATCH";
+      return 'FUSED_FULL_DISPATCH';
     case 97:
-      return "FUSED_DISPATCH_WITH_UNIFORM";
+      return 'FUSED_DISPATCH_WITH_UNIFORM';
     case 98:
-      return "FUSED_COPY_BUFFER";
+      return 'FUSED_COPY_BUFFER';
     case 99:
-      return "GET_STATS";
+      return 'GET_STATS';
     case 102:
-      return "BUFFER_RELEASE_BATCH";
+      return 'BUFFER_RELEASE_BATCH';
     case 103:
-      return "DISPATCH_BATCH";
+      return 'DISPATCH_BATCH';
     default:
       return `fn${fn}`;
   }
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+createRoot(document.getElementById('root')!).render(<App />);

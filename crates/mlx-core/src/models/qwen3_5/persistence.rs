@@ -813,7 +813,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // Materialize mmap-backed weights
                 {
                     let arrays: Vec<&MxArray> = params.values().collect();
-                    crate::array::memory::materialize_weights(&arrays);
+                    crate::array::memory::materialize_weights(&arrays)?;
                 }
 
                 // Set tokenizer
@@ -841,7 +841,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                         config.max_position_embeddings,
                     )?;
 
-                    inner.set_vision_encoder(vision_encoder);
+                    inner.set_vision_encoder(vision_encoder)?;
                     inner.set_image_processor(Qwen35VLImageProcessor::new(None));
                     inner.set_spatial_merge_size(vision_config.spatial_merge_size);
 
@@ -876,6 +876,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let tokenizer_out = inner.tokenizer.clone();
+            let paged_active = inner.paged_adapter.is_some();
 
             Ok((
                 inner,
@@ -885,20 +886,22 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     image_processor,
                     tokenizer_out,
                     cache_limit_guard,
+                    paged_active,
                 ),
             ))
         },
         handle_qwen35_cmd,
     );
 
-    let (config, model_id, _image_processor, _tokenizer, cache_limit_guard) = init_rx
-        .await
-        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+    let (config, _model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) =
+        init_rx
+            .await
+            .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
     Ok(Qwen3_5Model {
         thread,
         config,
-        model_id,
+        paged_active,
         _cache_limit_guard: cache_limit_guard,
     })
 }
@@ -1075,6 +1078,15 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         full_attention_interval: gi(&["full_attention_interval"], 4),
         partial_rotary_factor,
         rope_theta,
+        paged_cache_memory_mb: raw
+            .get("paged_cache_memory_mb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        paged_block_size: raw
+            .get("paged_block_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
     })
 }
 
@@ -1220,7 +1232,7 @@ fn attach_vision_encoder_if_present(
         config.max_position_embeddings,
     )?;
 
-    inner.set_vision_encoder(vision_encoder);
+    inner.set_vision_encoder(vision_encoder)?;
     let processor_config =
         parse_browser_image_processor_config(processor_config_json, &vision_config);
     inner.set_image_processor(Qwen35VLImageProcessor::new(Some(processor_config)));
@@ -1591,22 +1603,22 @@ pub async fn load_from_gpu_buffers(
         tokenizer_config_json,
         processor_config_json,
     )?;
-    let model_id = inner.model_id;
     let config_out = inner.config.clone();
+    let paged_active = inner.paged_adapter.is_some();
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
-        move || Ok((inner, (config_out.clone(), model_id))),
+        move || Ok((inner, (config_out.clone(), paged_active))),
         handle_qwen35_cmd,
     );
 
     // Await the model thread's init (async to avoid blocking the event loop on WASM)
-    let (config_final, model_id_final) = init_rx
+    let (config_final, paged_active_final) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during GPU buffer load"))??;
 
     Ok(Qwen3_5Model {
         thread,
         config: config_final,
-        model_id: model_id_final,
+        paged_active: paged_active_final,
         _cache_limit_guard: crate::cache_limit::coordinator().register(0),
     })
 }

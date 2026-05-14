@@ -62,6 +62,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ChatConfig, ChatMessage, ChatResult, PerformanceMetrics } from '@mlx-node/core';
 import { isContextCapacityError } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
+import { ToolCallTagBuffer } from '@mlx-node/lm/tools';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
 import {
@@ -93,7 +94,6 @@ import { StopSequenceBuffer } from '../stop-sequence-buffer.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
-import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
   createVisibility,
   endJson,

@@ -3016,11 +3016,36 @@ export interface GenerationWithToolCalls {
   toolCalls: Array<ToolCallRecord>;
 }
 
+/** Sample MLX's GPU memory counters. See [`GpuMemorySnapshot`]. */
+export declare function getMemorySnapshot(): GpuMemorySnapshot;
+
 /** Get expected weight keys for PaddleOCR-VL model */
 export declare function getExpectedWeightKeys(): Array<string>;
 
 /** Retrieve all collected profiling data as a `ProfilingSession`. */
 export declare function getProfilingData(): ProfilingSession;
+
+/**
+ * Snapshot of MLX GPU memory counters.
+ *
+ * Useful for live observability during long-running sessions:
+ *
+ * ```js
+ * const { getMemorySnapshot } = require('@mlx-node/core');
+ * setInterval(() => {
+ *   const m = getMemorySnapshot();
+ *   console.log(`active=${(m.activeBytes/1e9).toFixed(2)}GB peak=${(m.peakBytes/1e9).toFixed(2)}GB cache=${(m.cacheBytes/1e9).toFixed(2)}GB`);
+ * }, 1000);
+ * ```
+ */
+export interface GpuMemorySnapshot {
+  /** Current actively-used GPU buffer bytes (excludes cache pool). */
+  activeBytes: number;
+  /** Peak GPU buffer bytes since the last `resetPeakMemory()` call. */
+  peakBytes: number;
+  /** Bytes held in MLX's caching allocator (released by `clearCache`). */
+  cacheBytes: number;
+}
 
 export interface GgufConversionOptions {
   /** Path to the GGUF file */
@@ -3769,6 +3794,14 @@ export interface RecResult {
   /** Confidence score (mean character probability) */
   score: number;
 }
+
+/**
+ * Reset MLX's peak-memory counter to the current active level.
+ * Useful for measuring per-request peak memory in a long-running
+ * process — call before a request, sample
+ * `getMemorySnapshot().peakBytes` after.
+ */
+export declare function resetPeakMemory(): void;
 
 /** Clear all collected profiling data and reset session timer. */
 export declare function resetProfilingData(): void;

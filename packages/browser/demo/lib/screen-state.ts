@@ -1,24 +1,27 @@
-export type ScreenState = 'landing' | 'loading' | 'chat';
+export type ScreenState = "landing" | "loading" | "chat";
 
 export type ScreenEvent =
-  | { type: 'init' }
-  | { type: 'load_kickoff' }
-  | { type: 'model_ready' }
-  | { type: 'model_error' }
-  | { type: 'reset_chat' };
+  | { type: "init" }
+  | { type: "load_kickoff" }
+  | { type: "model_ready" }
+  | { type: "model_error" }
+  | { type: "reset_chat" };
 
-export function reduceScreen(state: ScreenState | undefined, event: ScreenEvent): ScreenState {
-  if (state === undefined || event.type === 'init') return 'landing';
+export function reduceScreen(
+  state: ScreenState | undefined,
+  event: ScreenEvent,
+): ScreenState {
+  if (state === undefined || event.type === "init") return "landing";
   switch (state) {
-    case 'landing':
-      if (event.type === 'load_kickoff') return 'loading';
-      return 'landing';
-    case 'loading':
-      if (event.type === 'model_ready') return 'chat';
-      if (event.type === 'model_error') return 'landing';
-      return 'loading';
-    case 'chat':
-      return 'chat';
+    case "landing":
+      if (event.type === "load_kickoff") return "loading";
+      return "landing";
+    case "loading":
+      if (event.type === "model_ready") return "chat";
+      if (event.type === "model_error") return "landing";
+      return "loading";
+    case "chat":
+      return "chat";
   }
 }
 
@@ -30,33 +33,46 @@ export type ProfileLikeStats = {
 };
 
 export type TelemetryView = {
-  tokPerSec: string;
+  decodeTokPerSec: string;
+  prefillTokPerSec: string;
   gpuRpc: string;
   pool: string;
   modelLine: string;
 };
 
+function formatTokRate(
+  label: string,
+  value: number | null | undefined,
+): string {
+  const rate = value ?? 0;
+  return rate > 0 ? `${label} ${Math.round(rate)} tok/s` : `${label} —`;
+}
+
 /**
  * Formats the telemetry footer strip values.
  *
  * `stats` comes from the demo's ProfileStats reducer (worker counters).
- * `decodeTokensPerSecond` comes from ChatResult.performance (chat-stream API).
+ * `prefillTokensPerSecond` and `decodeTokensPerSecond` come from
+ * ChatResult.performance (chat-stream API).
  * The two sources are merged at the call site (see chat screen wiring).
  */
 export function formatTelemetry(
   stats: ProfileLikeStats | null | undefined,
+  prefillTokensPerSecond: number | null | undefined,
   decodeTokensPerSecond: number | null | undefined,
   modelLine: string,
 ): TelemetryView {
-  const tps = decodeTokensPerSecond ?? 0;
-  const tokPerSec = tps > 0 ? `${Math.round(tps)} tok/s` : '—';
+  const decodeTokPerSec = formatTokRate("decode", decodeTokensPerSecond);
+  const prefillTokPerSec = formatTokRate("prefill", prefillTokensPerSecond);
 
-  let gpuRpc = '—';
-  let pool = '—';
+  let gpuRpc = "—";
+  let pool = "—";
 
   if (stats && stats.numTokens) {
     const rpcPerTok =
-      stats.gpuRpcCount && stats.numTokens ? Math.round(stats.gpuRpcCount / stats.numTokens) : null;
+      stats.gpuRpcCount && stats.numTokens
+        ? Math.round(stats.gpuRpcCount / stats.numTokens)
+        : null;
     if (rpcPerTok != null) {
       gpuRpc = `${rpcPerTok.toLocaleString()} gpu-rpc/tok`;
     }
@@ -69,18 +85,20 @@ export function formatTelemetry(
     }
   }
 
-  return { tokPerSec, gpuRpc, pool, modelLine };
+  return { decodeTokPerSec, prefillTokPerSec, gpuRpc, pool, modelLine };
 }
 
 export function formatLoadingText(status: string | null): string {
-  return status && status.trim().length > 0 ? status : 'Initializing model…';
+  return status && status.trim().length > 0 ? status : "Initializing model…";
 }
 
-export type ReasoningEffort = 'off' | 'low' | 'medium' | 'high';
+export type ReasoningEffort = "off" | "low" | "medium" | "high";
 
-const REASONING_CYCLE: ReasoningEffort[] = ['off', 'low', 'medium', 'high'];
+const REASONING_CYCLE: ReasoningEffort[] = ["off", "low", "medium", "high"];
 
-export function cycleReasoningEffort(current: ReasoningEffort): ReasoningEffort {
+export function cycleReasoningEffort(
+  current: ReasoningEffort,
+): ReasoningEffort {
   const i = REASONING_CYCLE.indexOf(current);
   return REASONING_CYCLE[(i + 1) % REASONING_CYCLE.length];
 }

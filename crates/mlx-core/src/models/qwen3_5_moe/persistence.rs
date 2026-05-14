@@ -1316,7 +1316,7 @@ fn attach_vision_encoder_if_present(
         config.rope_theta,
         config.max_position_embeddings,
     )?;
-    inner.set_vision_encoder(vision_encoder);
+    inner.set_vision_encoder(vision_encoder)?;
     let processor_config =
         parse_browser_image_processor_config(processor_config_json, &vision_config);
     inner.set_image_processor(Qwen35VLImageProcessor::new(Some(processor_config)));

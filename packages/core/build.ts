@@ -1,11 +1,11 @@
-import { readFile, writeFile, copyFile, readdir, stat } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFile, writeFile, copyFile, readdir, stat } from "node:fs/promises";
+import { join, dirname, basename } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { NapiCli, createBuildCommand } from '@napi-rs/cli';
-import { format } from 'vite-plus/fmt';
+import { NapiCli, createBuildCommand } from "@napi-rs/cli";
+import { format } from "vite-plus/fmt";
 
-import viteConfig from '../../vite.config';
+import viteConfig from "../../vite.config";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const buildCommand = createBuildCommand(process.argv.slice(2));
@@ -13,108 +13,210 @@ const cli = new NapiCli();
 const buildOptions = buildCommand.getOptions();
 
 Object.assign(buildOptions, {
-  manifestPath: join(__dirname, '../../crates/mlx-core/Cargo.toml'),
-  packageJsonPath: join(__dirname, 'package.json'),
+  manifestPath: join(__dirname, "../../crates/mlx-core/Cargo.toml"),
+  packageJsonPath: join(__dirname, "package.json"),
   platform: true,
   outputDir: __dirname,
 });
 
-const isWasmBuild = buildOptions.target === 'wasm32-wasip1-threads';
+const isWasmBuild = buildOptions.target === "wasm32-wasip1-threads";
 
 if (isWasmBuild) {
-  // tokio_unstable: enables multi-thread tokio runtime on WASM (requires
-  // asyncWorkPoolSize > 0 in emnapi instantiation so wasi_thread_spawn works).
-  process.env.RUSTFLAGS = '--cfg tokio_unstable';
-  // esaxx-rs (pulled in by tokenizers) uses C++ try/catch — needs -fexceptions
-  // globally. mlx-sys/build.rs sets these for its own cmake/cc::Build, but
-  // esaxx-rs uses its own cc::Build that reads TARGET_CXXFLAGS from env.
-  process.env.TARGET_CXXFLAGS = '-fwasm-exceptions -fexceptions';
+  // tokio_unstable enables the multi-thread runtime required by wasi-threads.
+  process.env.RUSTFLAGS = "--cfg tokio_unstable";
+  // tokenizers/esaxx-rs uses C++ exceptions and has its own cc::Build.
+  process.env.TARGET_CXXFLAGS = "-fwasm-exceptions -fexceptions";
   Object.assign(buildOptions, {
     noJsBinding: true,
     noDefaultFeatures: true,
-    features: ['browser'],
+    features: ["browser"],
   });
 } else {
   Object.assign(buildOptions, {
-    jsBinding: 'index.cjs',
-    dts: 'index.d.cts',
+    jsBinding: "index.cjs",
+    dts: "index.d.cts",
   });
 }
 
-// Snapshot hand-written wasi-worker-browser.mjs BEFORE cli.build() overwrites it.
-// NAPI-RS always regenerates this file, but ours is the source of truth.
-const wasiWorkerBrowserPath = join(__dirname, 'wasi-worker-browser.mjs');
-const wasiWorkerBrowserSrc = isWasmBuild ? await readFile(wasiWorkerBrowserPath, 'utf-8').catch(() => null) : null;
+// NAPI-RS regenerates wasi-worker-browser.mjs; for browser builds our
+// handwritten worker is the source of truth, so keep it across cli.build().
+const wasiWorkerBrowserPath = join(__dirname, "wasi-worker-browser.mjs");
+const wasiWorkerBrowserSrc = isWasmBuild
+  ? await readFile(wasiWorkerBrowserPath, "utf-8").catch(() => null)
+  : null;
 
 const { task } = await cli.build(buildOptions);
 const outputs = await task;
 
 for (const output of outputs) {
-  // Skip formatting wasi-worker-browser.mjs — hand-written, not auto-generated
-  if (output.kind !== 'node' && !output.path.endsWith('wasi-worker-browser.mjs')) {
-    const { code } = await format(output.path, await readFile(output.path, 'utf-8'), viteConfig.fmt);
+  if (
+    output.kind !== "node" &&
+    !output.path.endsWith("wasi-worker-browser.mjs")
+  ) {
+    const { code } = await format(
+      output.path,
+      await readFile(output.path, "utf-8"),
+      viteConfig.fmt,
+    );
     await writeFile(output.path, code);
   }
-  if (output.kind === 'dts' && !isWasmBuild) {
-    const code = await readFile(output.path, 'utf-8');
-    const replaced = code.replace('export declare const enum OutputFormat {', 'export enum OutputFormat {');
+  if (output.kind === "dts" && !isWasmBuild) {
+    const code = await readFile(output.path, "utf-8");
+    const replaced = code.replace(
+      "export declare const enum OutputFormat {",
+      "export enum OutputFormat {",
+    );
     await writeFile(output.path, replaced);
   }
 }
 
-// Restore hand-written wasi-worker-browser.mjs after NAPI-RS overwrote it
 if (wasiWorkerBrowserSrc) {
   await writeFile(wasiWorkerBrowserPath, wasiWorkerBrowserSrc);
 }
 
-// Copy mlx.metallib for colocated Metal shader loading
-// MLX looks for metallib next to the binary, so we copy it here
-// Skip for WASM targets (no Metal shaders)
-const target = process.argv.find((a) => a.includes('wasm32'));
-if (!target) {
-  await copyMetallib();
-} else {
-  // Copy raw WASM binary to the runtime location (symlinked by browser demo)
+if (isWasmBuild) {
   const rawWasm = join(
     __dirname,
-    '../../target/wasm32-wasip1-threads',
-    buildOptions.profile ?? 'release',
-    'mlx_core.wasm',
+    "../../target/wasm32-wasip1-threads",
+    buildOptions.profile ?? "release",
+    "mlx_core.wasm",
   );
-  const runtimeWasm = join(__dirname, 'mlx-core.wasm32-wasi.opt.wasm');
+  const runtimeWasm = join(__dirname, "mlx-core.wasm32-wasi.opt.wasm");
   await copyFile(rawWasm, runtimeWasm);
   console.log(`Copied WASM: ${rawWasm} -> ${runtimeWasm}`);
+} else {
+  await copyNativeAddon(outputs);
+  // Copy mlx.metallib for colocated Metal shader loading
+  // MLX looks for metallib next to the binary, so we copy it here.
+  // Also copy paged_attn.metallib (Phase 2 of the paged-attention
+  // compile integration), which mlx_paged_dispatch.cpp loads via a
+  // `dladdr`-based colocated lookup at runtime.
+  //
+  // Both metallibs are copied to TWO destinations:
+  //   1. `packages/core/`       — sits next to the local
+  //      `mlx-core.darwin-arm64.node` for in-repo `yarn build:native`
+  //      developer flow.
+  //   2. `packages/core/npm/darwin-arm64/` — the platform-specific
+  //      optional package that gets published to npm. The user-facing
+  //      install path resolves the .node addon from this package, so
+  //      the metallibs MUST ship here too — otherwise the
+  //      `dladdr`-based runtime lookup in `mlx_paged_dispatch.cpp`
+  //      lands in the published package directory and finds no
+  //      `paged_attn.metallib`, throwing on first use.
+  //
+  // Both metallibs are required-on-darwin: `mlx.metallib` for stock
+  // MLX kernels, `paged_attn.metallib` for the paged-attention
+  // dispatch path used by `Qwen3Model` (where `use_paged_attention`
+  // is on by default for the legacy `PagedKVCache` route and by
+  // `use_block_paged_cache` on by default for the new vLLM-style path).
+  // We FAIL the build if either is missing so a packaging regression
+  // surfaces immediately rather than as a runtime throw at first use
+  // in a published install.
+  await copyMetallibs();
 }
 
-async function copyMetallib() {
-  const targetDir = join(__dirname, '../../target');
-  try {
-    // Find mlx.metallib in the build directory
-    // Pattern: target/*/release/build/mlx-sys-*/out/lib/mlx.metallib
-    const archDirs = await readdir(targetDir);
-    for (const arch of archDirs) {
-      const releaseDir = join(targetDir, arch, 'release', 'build');
+async function copyNativeAddon(outputs: Awaited<typeof task>) {
+  const nodeOutput = outputs.find((output) => output.kind === "node");
+  if (!nodeOutput) {
+    throw new Error(
+      "[build.ts smoke check] native addon output missing from napi build",
+    );
+  }
+  const expectedName = "mlx-core.darwin-arm64.node";
+  const actualName = basename(nodeOutput.path);
+  if (actualName !== expectedName) {
+    throw new Error(
+      `[build.ts smoke check] expected native addon output ${expectedName}, got ${actualName} at ${nodeOutput.path}`,
+    );
+  }
+
+  const npmDarwinDir = join(__dirname, "npm", "darwin-arm64");
+  const dst = join(npmDarwinDir, expectedName);
+  await copyFile(nodeOutput.path, dst);
+  console.log(`Copied ${expectedName} -> ${dst}`);
+}
+
+async function copyMetallibs() {
+  const npmDarwinDir = join(__dirname, "npm", "darwin-arm64");
+  const destDirs = [__dirname, npmDarwinDir];
+
+  const targetDir = join(__dirname, "../../target");
+  // Find mlx.metallib in the build directory.
+  // Pattern: target/*/release/build/mlx-sys-*/out/lib/mlx.metallib
+  const archDirs = await readdir(targetDir);
+  for (const arch of archDirs) {
+    const releaseDir = join(targetDir, arch, "release", "build");
+    let buildDirs: string[];
+    try {
+      buildDirs = await readdir(releaseDir);
+    } catch {
+      // release/build dir doesn't exist for this arch
+      continue;
+    }
+    for (const dir of buildDirs) {
+      if (!dir.startsWith("mlx-sys-")) continue;
+      const libDir = join(releaseDir, dir, "out", "lib");
+      const mlxPath = join(libDir, "mlx.metallib");
       try {
-        const buildDirs = await readdir(releaseDir);
-        for (const dir of buildDirs) {
-          if (dir.startsWith('mlx-sys-')) {
-            const metallibPath = join(releaseDir, dir, 'out', 'lib', 'mlx.metallib');
-            try {
-              await stat(metallibPath);
-              await copyFile(metallibPath, './mlx.metallib');
-              console.log('Copied mlx.metallib');
-              return;
-            } catch {
-              // metallib not at this path, continue searching
-            }
-          }
-        }
+        await stat(mlxPath);
       } catch {
-        // release/build dir doesn't exist for this arch
+        // metallib not at this path, continue searching
+        continue;
+      }
+      // mlx.metallib is required: copy to all destinations or fail.
+      for (const dest of destDirs) {
+        const dst = join(dest, "mlx.metallib");
+        await copyFile(mlxPath, dst);
+        console.log(`Copied mlx.metallib -> ${dst}`);
+      }
+      // paged_attn.metallib is also required for darwin (Phase 2).
+      // It lives next to mlx.metallib in the same lib dir.
+      const pagedPath = join(libDir, "paged_attn.metallib");
+      try {
+        await stat(pagedPath);
+      } catch {
+        throw new Error(
+          `paged_attn.metallib not found at ${pagedPath}. The paged-attention ` +
+            `compile path (mlx_paged_dispatch.cpp) loads this metallib via dladdr ` +
+            `at runtime; without it, the addon throws on first paged-attention use. ` +
+            `Check that mlx-sys/build.rs ran compile_paged_attn_metallib successfully.`,
+        );
+      }
+      for (const dest of destDirs) {
+        const dst = join(dest, "paged_attn.metallib");
+        await copyFile(pagedPath, dst);
+        console.log(`Copied paged_attn.metallib -> ${dst}`);
+      }
+      // Final sanity-check: every destination must have BOTH files.
+      // This catches a copy that silently overwrote or partially
+      // failed; cheaper to fail the build than to publish a broken
+      // optional package.
+      await assertMetallibPresence(destDirs);
+      return;
+    }
+  }
+  throw new Error(
+    "mlx.metallib not found under any target/<arch>/release/build/mlx-sys-*/out/lib/",
+  );
+}
+
+async function assertMetallibPresence(destDirs: string[]) {
+  const required = ["mlx.metallib", "paged_attn.metallib"];
+  for (const dest of destDirs) {
+    for (const name of required) {
+      const p = join(dest, name);
+      try {
+        await stat(p);
+      } catch {
+        throw new Error(
+          `[build.ts smoke check] expected ${name} at ${p} but it is missing. ` +
+            `If this fires, the published npm package will not contain this metallib ` +
+            `and the runtime dladdr lookup will throw on first use.`,
+        );
       }
     }
-    throw new Error('Note: mlx.metallib not found');
-  } catch {
-    throw new Error('Note: mlx.metallib not found');
+    console.log(
+      `Smoke check: ${dest} has all ${required.length} required metallibs.`,
+    );
   }
 }

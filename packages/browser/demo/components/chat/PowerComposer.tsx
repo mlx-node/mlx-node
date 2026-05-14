@@ -1,5 +1,5 @@
-import { ArrowUp, ImagePlus, Mic, Square } from "lucide-react";
-import { type FormEvent, type KeyboardEvent, type RefObject } from "react";
+import { ArrowUp, ImagePlus, Mic } from "lucide-react";
+import { type FormEvent, type RefObject } from "react";
 
 import { type ReasoningEffort } from "../../lib/screen-state";
 
@@ -19,7 +19,6 @@ export type PowerComposerProps = {
   toolsEnabled: boolean;
   onToggleTools: () => void;
   generating: boolean;
-  onSendOrStop: () => void;
   sendDisabled: boolean;
 };
 
@@ -40,16 +39,8 @@ export function PowerComposer(props: PowerComposerProps) {
     toolsEnabled,
     onToggleTools,
     generating,
-    onSendOrStop,
     sendDisabled,
   } = props;
-
-  function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      if (!sendDisabled) onSendOrStop();
-    }
-  }
 
   function onTextareaInput(e: FormEvent<HTMLTextAreaElement>) {
     const ta = e.currentTarget;
@@ -84,7 +75,6 @@ export function PowerComposer(props: PowerComposerProps) {
             rows={1}
             placeholder="Ask Qwen anything…"
             className="composer-textarea"
-            onKeyDown={onKeyDown}
             onInput={onTextareaInput}
           />
           <button
@@ -98,12 +88,11 @@ export function PowerComposer(props: PowerComposerProps) {
             ref={sendRef}
             type="button"
             id="send"
-            className={`composer-send${generating ? " stopping" : ""}`}
-            aria-label={generating ? "Stop" : "Send"}
-            disabled={sendDisabled}
-            onClick={onSendOrStop}
+            className="composer-send"
+            aria-label={generating ? "Generating" : "Send"}
+            disabled={sendDisabled || generating}
           >
-            {generating ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} />}
+            <ArrowUp size={18} aria-hidden="true" />
           </button>
         </div>
         <div className="composer-pills">

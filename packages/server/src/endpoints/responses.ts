@@ -14,6 +14,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
 import { isContextCapacityError } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
+import { ToolCallTagBuffer } from '@mlx-node/lm/tools';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
 import { sendBadRequest, sendInternalError, sendNotFound, sendRateLimit, sendStorageTimeout } from '../errors.js';
@@ -33,7 +34,6 @@ import { maybeWarnPromptCacheKeyIneligible, QueueFullError, type SessionRegistry
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
-import { ToolCallTagBuffer } from '../tool-call-buffer.js';
 import {
   createVisibility,
   endJson,

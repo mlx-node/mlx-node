@@ -8,6 +8,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   root: __dirname,
+  resolve: {
+    alias: {
+      '@mlx-node/lm/tools': resolve(__dirname, '../lm/src/tools/index.ts'),
+    },
+  },
   test: {
     name: 'browser',
     browser: {

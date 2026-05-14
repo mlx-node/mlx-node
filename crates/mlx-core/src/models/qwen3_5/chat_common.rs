@@ -461,6 +461,25 @@ pub(crate) fn parse_thinking_and_tools(
     think_end_id: Option<u32>,
     think_end_str: Option<&str>,
     include_reasoning: bool,
+) -> (String, Vec<tools::ToolCallResult>, Option<String>) {
+    parse_thinking_and_tools_with_options(
+        text,
+        generated_tokens,
+        thinking_enabled,
+        think_end_id,
+        think_end_str,
+        include_reasoning,
+        false,
+    )
+}
+
+pub(crate) fn parse_thinking_and_tools_with_options(
+    text: &str,
+    generated_tokens: &[u32],
+    thinking_enabled: bool,
+    think_end_id: Option<u32>,
+    think_end_str: Option<&str>,
+    include_reasoning: bool,
     allow_tool_calls_in_reasoning: bool,
 ) -> (String, Vec<tools::ToolCallResult>, Option<String>) {
     let (clean_text, tool_calls, thinking) = if !thinking_enabled {
@@ -523,6 +542,33 @@ pub(crate) fn finalize_chat_result(
     think_end_str: Option<&str>,
     performance: Option<crate::profiling::PerformanceMetrics>,
     include_reasoning: bool,
+    thinking_enabled: bool,
+    prompt_tokens: u32,
+    reasoning_tokens: u32,
+) -> Result<ChatResult> {
+    finalize_chat_result_with_options(
+        tokenizer,
+        generated_tokens,
+        finish_reason,
+        think_end_id,
+        think_end_str,
+        performance,
+        include_reasoning,
+        false,
+        thinking_enabled,
+        prompt_tokens,
+        reasoning_tokens,
+    )
+}
+
+pub(crate) fn finalize_chat_result_with_options(
+    tokenizer: &Qwen3Tokenizer,
+    generated_tokens: &[u32],
+    finish_reason: String,
+    think_end_id: Option<u32>,
+    think_end_str: Option<&str>,
+    performance: Option<crate::profiling::PerformanceMetrics>,
+    include_reasoning: bool,
     allow_tool_calls_in_reasoning: bool,
     thinking_enabled: bool,
     prompt_tokens: u32,
@@ -537,7 +583,7 @@ pub(crate) fn finalize_chat_result(
 
     let num_tokens = generated_tokens.len() as u32;
 
-    let (clean_text, tool_calls, thinking) = parse_thinking_and_tools(
+    let (clean_text, tool_calls, thinking) = parse_thinking_and_tools_with_options(
         &text,
         generated_tokens,
         thinking_enabled,
@@ -1078,7 +1124,7 @@ mod tests {
     #[test]
     fn test_parse_truncated_reasoning_tool_calls_when_opted_in() {
         let text = "<think>Need a preview.\n<tool_call>{\"name\":\"create_app_preview\",\"arguments\":{\"title\":\"Demo\",\"html\":\"<main>Hi</main>\"}}</tool_call>";
-        let (clean, tools, thinking) = parse_thinking_and_tools(
+        let (clean, tools, thinking) = parse_thinking_and_tools_with_options(
             text,
             &[100, 200, 300],
             true,
@@ -1096,7 +1142,7 @@ mod tests {
     #[test]
     fn test_parse_truncated_reasoning_tool_calls_default_isolation() {
         let text = "<think>Need a preview.\n<tool_call>{\"name\":\"create_app_preview\",\"arguments\":{\"title\":\"Demo\"}}</tool_call>";
-        let (clean, tools, thinking) = parse_thinking_and_tools(
+        let (clean, tools, thinking) = parse_thinking_and_tools_with_options(
             text,
             &[100, 200, 300],
             true,

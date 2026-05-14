@@ -1,7 +1,7 @@
+import { ToolCallTagBuffer } from '@mlx-node/lm/tools';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { recoverSuppressedToolCallText } from '../../packages/server/src/mappers/anthropic-response.js';
-import { ToolCallTagBuffer } from '../../packages/server/src/tool-call-buffer.js';
 
 describe('ToolCallTagBuffer', () => {
   it('suppresses Gemma4 structural tool-call tags split across chunks', () => {
@@ -23,6 +23,26 @@ describe('ToolCallTagBuffer', () => {
       cleanPrefix: '',
     });
     expect(buffer.flush()).toBe('');
+  });
+
+  it('resets suppression state for a new stream', () => {
+    const buffer = new ToolCallTagBuffer();
+
+    expect(buffer.push('<tool_call>{"name":"x"}</tool_call>')).toEqual({
+      safeText: '',
+      tagFound: true,
+      cleanPrefix: '',
+    });
+    expect(buffer.suppressed).toBe(true);
+
+    buffer.reset();
+
+    expect(buffer.suppressed).toBe(false);
+    expect(buffer.push('visible')).toEqual({
+      safeText: 'visible',
+      tagFound: false,
+      cleanPrefix: '',
+    });
   });
 
   it('strips parsed tool-call and tool-response blocks when tool use is disallowed', () => {

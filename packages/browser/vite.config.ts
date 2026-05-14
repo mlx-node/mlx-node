@@ -11,6 +11,7 @@ export default defineConfig({
   root: "demo",
   resolve: {
     alias: {
+      "@mlx-node/lm/tools": path.resolve(dirname, "../lm/src/tools/index.ts"),
       "@": path.resolve(dirname, "demo"),
     },
   },

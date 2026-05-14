@@ -691,7 +691,6 @@ impl Lfm2Inner {
             think_end_str.as_deref(),
             performance,
             include_reasoning,
-            p.allow_tool_calls_in_reasoning,
             thinking_enabled,
             prompt_token_count as u32,
             reasoning_tokens,
@@ -2024,7 +2023,6 @@ impl Lfm2Inner {
             think_end_str.as_deref(),
             performance,
             include_reasoning,
-            p.allow_tool_calls_in_reasoning,
             thinking_enabled,
             prompt_token_count as u32,
             reasoning_tokens,
@@ -2304,7 +2302,6 @@ impl Lfm2Inner {
             think_end_str.as_deref(),
             performance,
             include_reasoning,
-            p.allow_tool_calls_in_reasoning,
             thinking_enabled,
             prompt_token_count,
             reasoning_tokens,
@@ -2838,7 +2835,6 @@ impl Lfm2Inner {
             think_end_id,
             think_end_str.as_deref(),
             include_reasoning,
-            p.allow_tool_calls_in_reasoning,
         );
 
         let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {

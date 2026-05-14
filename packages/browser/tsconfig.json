@@ -16,9 +16,9 @@
     "noEmit": true,
     "jsx": "react-jsx",
     "types": ["vite/client"],
-    "baseUrl": ".",
     "paths": {
-      "@/*": ["demo/*"]
+      "@mlx-node/lm/tools": ["../lm/src/tools/index.ts"],
+      "@/*": ["./demo/*"]
     }
   },
   "include": ["demo"]
