@@ -221,6 +221,26 @@ pub struct MlpWeights {
     pub down_bias: MxArray,
 }
 
+/// Validate that the background tag `"O"` lives at index 0 of `label_strs`.
+///
+/// The BIOES Viterbi decoder in `viterbi.rs` hardcodes `O_ID == 0` (used as
+/// the virtual initial state and as the backtrace fallback). Re-trained or
+/// community-fork checkpoints could in principle ship a different label
+/// ordering, which would silently mis-decode tag sequences. Reject those
+/// at load time rather than at decode time.
+fn validate_o_at_index_zero(label_strs: &[String]) -> Result<()> {
+    let o_id = label_strs.iter().position(|s| s == "O").ok_or_else(|| {
+        Error::from_reason("id2label is missing the required \"O\" background tag")
+    })?;
+    if o_id != 0 {
+        return Err(Error::from_reason(format!(
+            "id2label must place \"O\" at index 0 (found at index {o_id}); \
+             the BIOES Viterbi decoder assumes O_ID == 0"
+        )));
+    }
+    Ok(())
+}
+
 /// Load weights, tokenizer, and default calibration from a privacy-filter checkpoint directory.
 ///
 /// Expected files in `path`:
@@ -389,6 +409,7 @@ pub fn load_from_directory(path: &Path) -> Result<LoadedModel> {
         }
         label_strs[id] = label.clone();
     }
+    validate_o_at_index_zero(&label_strs)?;
 
     // ---- 7. Default operating-point calibration ----
     let calibration_default = {
@@ -443,6 +464,45 @@ mod tests {
             LoadedProj::Plain { weight, .. } => weight,
             LoadedProj::Quantized { weight, .. } => weight,
         }
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn validate_o_at_index_zero_accepts_canonical_ordering() {
+        let labels = s(&["O", "B-name", "I-name", "E-name", "S-name"]);
+        assert!(validate_o_at_index_zero(&labels).is_ok());
+    }
+
+    #[test]
+    fn validate_o_at_index_zero_rejects_o_at_nonzero_index() {
+        // Same labels, but the background tag is at index 2 instead of 0 —
+        // exactly the kind of community-fork checkpoint that would silently
+        // mis-decode under the hardcoded `O_ID == 0` assumption in viterbi.rs.
+        let labels = s(&["B-name", "I-name", "O", "E-name", "S-name"]);
+        let err = validate_o_at_index_zero(&labels).expect_err("expected validation failure");
+        let msg = err.reason.clone();
+        assert!(
+            msg.contains("\"O\" at index 0"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("found at index 2"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_o_at_index_zero_rejects_missing_o() {
+        let labels = s(&["B-name", "I-name", "E-name", "S-name"]);
+        let err = validate_o_at_index_zero(&labels).expect_err("expected validation failure");
+        assert!(
+            err.reason.contains("missing the required \"O\""),
+            "unexpected error message: {}",
+            err.reason
+        );
     }
 
     #[test]
