@@ -56,7 +56,12 @@ export function DriftingLibrary() {
     const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    } catch {
+      return;
+    }
     renderer.setPixelRatio(dpr);
     renderer.setClearColor(0x0F0D11, 1);
     container.appendChild(renderer.domElement);

@@ -67,8 +67,10 @@ export function Landing({
           <button
             type="button"
             className="btn-load-arrow"
-            title="Choose model size (coming soon)"
-            disabled
+            title="Choose local model directory"
+            aria-label="Choose local model directory"
+            onClick={onLocalModel}
+            disabled={loadDisabled}
           >
             ▾
           </button>

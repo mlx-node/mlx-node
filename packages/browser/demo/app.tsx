@@ -196,6 +196,11 @@ const APP_PREVIEW_TOOL: ToolDefinition = {
   },
 };
 
+const DIRECTORY_PICKER_INPUT_PROPS = {
+  webkitdirectory: '',
+  directory: '',
+} as const;
+
 type ChatResult = {
   text?: string;
   rawText?: string;
@@ -1948,6 +1953,7 @@ function App() {
         ref={modelDirInputRef}
         type="file"
         multiple
+        {...DIRECTORY_PICKER_INPUT_PROPS}
         className="hidden"
         onChange={handleLocalModelInputChange}
       />
