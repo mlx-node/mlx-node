@@ -7,7 +7,9 @@
 
 import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
+import webgpuWorkerUrl from './webgpu-worker.mjs?worker&url';
 import { createWebGPUBridge } from './webgpu-bridge.js';
+import { workerAssetUrl } from './worker-asset-url.js';
 
 export interface MLXBrowserOptions {
   /** URL of the .wasm file (debug or optimized) */
@@ -73,7 +75,7 @@ export async function initMLX(options: MLXBrowserOptions) {
     wasi,
     onCreateWorker() {
       // Workers get real WebGPU bridge (each creates its own GPUDevice)
-      return new Worker(new URL('./webgpu-worker.mjs', import.meta.url), { type: 'module' });
+      return new Worker(workerAssetUrl(webgpuWorkerUrl), { type: 'module' });
     },
     overwriteImports(importObject: Record<string, Record<string, unknown>>) {
       importObject.env = {

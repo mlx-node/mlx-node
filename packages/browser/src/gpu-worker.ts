@@ -43,7 +43,7 @@ import {
 
 // Revision marker: changes worker asset URLs after enabling COOP/COEP headers
 // on Void, avoiding stale immutable edge-cache entries without those headers.
-(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = "2026-05-14";
+(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = "2026-05-15";
 
 // ---------- Phase 0 RPC Histogram (?profile=1 observability) ----------
 //

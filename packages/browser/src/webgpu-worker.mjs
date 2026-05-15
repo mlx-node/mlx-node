@@ -18,7 +18,7 @@ import { createBridgeStub } from './webgpu-bridge-stub.js';
 
 // Revision marker: changes worker asset URLs after enabling COOP/COEP headers
 // on Void, avoiding stale immutable edge-cache entries without those headers.
-globalThis.__MLX_VOID_COEP_WORKER_ASSET_REV = '2026-05-14';
+globalThis.__MLX_VOID_COEP_WORKER_ASSET_REV = '2026-05-15';
 
 // RPC config received from mlx-worker before emnapi's init message
 let rpcConfig = null;

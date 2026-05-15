@@ -14,7 +14,7 @@ import { Buffer } from "buffer";
 
 // Revision marker: changes worker asset URLs after enabling COOP/COEP headers
 // on Void, avoiding stale immutable edge-cache entries without those headers.
-(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = "2026-05-14";
+(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = "2026-05-15";
 
 // Patch TextDecoder to handle SharedArrayBuffer views.
 // WASM memory is a SharedArrayBuffer (for threads support), but TextDecoder
@@ -51,12 +51,15 @@ import {
   dtypeToCode,
   type TensorInfo,
 } from "./safetensors.js";
+import gpuWorkerUrl from "./gpu-worker.ts?worker&url";
+import webgpuWorkerUrl from "./webgpu-worker.mjs?worker&url";
 import {
   createBridgeStub,
   POOL_STATS_SIZE_BYTES,
   BUFFER_METADATA_SIZE_BYTES,
   type BridgeStub,
 } from "./webgpu-bridge-stub.js";
+import { workerAssetUrl } from "./worker-asset-url.js";
 
 let model: any = null;
 let mlxExports: any = null;
@@ -1327,7 +1330,7 @@ async function handleInit(data: {
     });
     wasmMemory = sharedMemory;
 
-    const gpuWorker = new Worker(new URL("./gpu-worker.ts", import.meta.url), {
+    const gpuWorker = new Worker(workerAssetUrl(gpuWorkerUrl), {
       type: "module",
     });
 
@@ -1458,7 +1461,7 @@ async function handleInit(data: {
         // JS Promise .then() callback, but raw_ptr()'s polling loop calls
         // poll_instance() which is a no-op on WASM — the event loop never
         // runs, the callback never fires, infinite loop.
-        const w = new Worker(new URL("./webgpu-worker.mjs", import.meta.url), {
+        const w = new Worker(workerAssetUrl(webgpuWorkerUrl), {
           type: "module",
         });
         w.addEventListener("message", (event: MessageEvent) => {

@@ -6,6 +6,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { Streamdown } from 'streamdown';
 
 import { createSabRingOverHeap } from '../src/chat-stream-sab.js';
+import mlxWorkerUrl from '../src/mlx-worker.ts?worker&url';
 import {
   couldStillBeReasoningTextPrefix,
   looksLikeReasoningText,
@@ -13,6 +14,7 @@ import {
   sanitizeThinkingText as sanitizeThinkingMarkup,
   splitAssistantThinking,
 } from '../src/generated-text.js';
+import { workerAssetUrl } from '../src/worker-asset-url.js';
 import { ChatHeader } from './components/chat/ChatHeader';
 import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
 import { PowerComposer } from './components/chat/PowerComposer';
@@ -1147,7 +1149,7 @@ function App() {
       currentToolCallIndicatorDiv = null;
     }
 
-    let worker = new Worker(new URL('../src/mlx-worker.ts', import.meta.url), {
+    let worker = new Worker(workerAssetUrl(mlxWorkerUrl), {
       type: 'module',
     });
 
