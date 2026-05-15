@@ -1,16 +1,63 @@
 import { formatLoadingText } from "../../lib/screen-state";
 
-export type LoadingProps = {
-  status: string | null;
+export type LoadingProgress = {
+  pct: number;
+  loadedBytes?: number;
+  totalBytes?: number;
+  file?: string;
+  cacheSource?: string;
 };
 
-export function Loading({ status }: LoadingProps) {
+export type LoadingProps = {
+  status: string | null;
+  progress?: LoadingProgress | null;
+};
+
+function formatBytes(value: number): string {
+  if (value >= 1024 * 1024 * 1024) {
+    return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (value >= 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+  return `${Math.round(value)} B`;
+}
+
+function formatFileName(file: string | undefined): string | null {
+  const trimmed = file?.trim();
+  if (!trimmed) return null;
+  return trimmed.split("/").filter(Boolean).pop() ?? trimmed;
+}
+
+export function Loading({ status, progress }: LoadingProps) {
+  const pct = progress ? Math.round(progress.pct) : null;
+  const fileName = formatFileName(progress?.file);
+  const bytes =
+    progress?.loadedBytes != null && progress.totalBytes != null
+      ? `${formatBytes(progress.loadedBytes)} / ${formatBytes(progress.totalBytes)}`
+      : null;
+  const meta = [fileName, bytes, progress?.cacheSource].filter(Boolean).join(" · ");
+
   return (
     <div className="overlay-screen" style={{ background: "var(--bg)" }}>
       <div className="loading-stack">
         <div className="loader-ring" aria-hidden="true" />
         <div>
           <div className="loader-text">{formatLoadingText(status)}</div>
+          {progress && (
+            <div className="loader-progress" aria-label={`Model loading progress ${pct}%`}>
+              <div className="loader-progress-track">
+                <div className="loader-progress-fill" style={{ width: `${progress.pct}%` }} />
+              </div>
+              <div className="loader-progress-meta">
+                <span>{pct}%</span>
+                {meta && <span>{meta}</span>}
+              </div>
+            </div>
+          )}
           <div className="loader-sub">
             Model weights are cached for future visits.
           </div>

@@ -20,7 +20,7 @@ import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
 import { PowerComposer } from './components/chat/PowerComposer';
 import { TelemetryStrip } from './components/chat/TelemetryStrip';
 import { Landing } from './components/landing/Landing';
-import { Loading } from './components/loading/Loading';
+import { Loading, type LoadingProgress } from './components/loading/Loading';
 import { BrowserChatSessionAdapter, type BrowserChatMessage } from './lib/browser-chat-session';
 import { type ScreenState, type ProfileLikeStats, cycleReasoningEffort, reduceScreen } from './lib/screen-state';
 import 'streamdown/styles.css';
@@ -122,6 +122,41 @@ function modelSourceFromLocalFiles(files: File[]): ModelSource | null {
 
 function positiveFiniteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function nonNegativeFiniteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function clampPct(value: number) {
+  return Math.max(0, Math.min(100, value));
+}
+
+function loadingProgressFromWorker(data: Record<string, unknown>): LoadingProgress | null {
+  const loadedBytes = nonNegativeFiniteNumber(data.loadedBytes);
+  const totalBytes = nonNegativeFiniteNumber(data.totalBytes);
+  const explicitPct = nonNegativeFiniteNumber(data.pct);
+  const pct =
+    explicitPct != null
+      ? clampPct(explicitPct)
+      : loadedBytes != null && totalBytes != null && totalBytes > 0
+        ? clampPct((loadedBytes / totalBytes) * 100)
+        : null;
+
+  if (pct == null) {
+    return null;
+  }
+
+  const file = typeof data.file === 'string' && data.file.trim() ? data.file : undefined;
+  const cacheSource = typeof data.cacheSource === 'string' && data.cacheSource.trim() ? data.cacheSource : undefined;
+
+  return {
+    pct,
+    ...(loadedBytes != null ? { loadedBytes } : {}),
+    ...(totalBytes != null ? { totalBytes } : {}),
+    ...(file ? { file } : {}),
+    ...(cacheSource ? { cacheSource } : {}),
+  };
 }
 
 function pushVisibleToolText(buffer: ToolCallTagBuffer, delta: string) {
@@ -227,6 +262,7 @@ function App() {
   const [screen, dispatchScreen] = useReducer(reduceScreen, 'landing' as ScreenState);
   const [loadKickoff, setLoadKickoff] = useState(0);
   const [loadingText, setLoadingText] = useState<string | null>(null);
+  const [loadingProgress, setLoadingProgress] = useState<LoadingProgress | null>(null);
   const [errorBanner, setErrorBannerState] = useState<string | null>(null);
   const [telemetryStats, setTelemetryStats] = useState<ProfileLikeStats | null>(null);
   const [prefillTokensPerSec, setPrefillTokensPerSec] = useState<number | null>(null);
@@ -281,6 +317,7 @@ function App() {
     if (!source) return;
     setPendingModelSource(source);
     setErrorBannerState(null);
+    setLoadingProgress(null);
     setLoadKickoff((k) => k + 1);
     dispatchScreen({ type: 'load_kickoff' });
   }
@@ -319,10 +356,11 @@ function App() {
         });
     }
 
-    function setStatus(text: string, state: StatusState = 'info') {
+    function setStatus(text: string, state: StatusState = 'info', progress: LoadingProgress | null = null) {
       statusEl.textContent = text;
       statusEl.className = `status-pill ${state}`;
       setLoadingText(text);
+      setLoadingProgress(progress);
       if (state === 'ready') {
         dispatchScreen({ type: 'model_ready' });
       } else if (state === 'error') {
@@ -1334,10 +1372,15 @@ function App() {
           log(data.message);
           if (data.step === 'chat') {
             break;
-          } else if (data.step === 'download' && data.pct != null) {
-            setStatus(`Downloading weights... ${data.pct}%`, 'info');
           } else {
-            setStatus(data.message, 'info');
+            const progress = loadingProgressFromWorker(data);
+            if (data.step === 'download' && progress) {
+              const cacheSource = progress.cacheSource?.toLowerCase();
+              const prefix = cacheSource === 'browser' ? 'Loading cached weights' : 'Downloading weights';
+              setStatus(`${prefix}... ${Math.round(progress.pct)}%`, 'info', progress);
+            } else {
+              setStatus(data.message, 'info', progress);
+            }
           }
           break;
 
@@ -1918,6 +1961,7 @@ function App() {
             }
             setPendingModelSource(null);
             setErrorBannerState(null);
+            setLoadingProgress(null);
             setLoadKickoff((k) => k + 1);
             dispatchScreen({ type: 'load_kickoff' });
           }}
@@ -1926,7 +1970,7 @@ function App() {
           hostedModelAvailable={hostedModelAvailable}
         />
       )}
-      {screen === 'loading' && <Loading status={loadingText} />}
+      {screen === 'loading' && <Loading status={loadingText} progress={loadingProgress} />}
     </div>
   );
 }

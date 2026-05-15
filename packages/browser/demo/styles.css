@@ -345,6 +345,39 @@
     letter-spacing: 0.05em;
     text-align: center;
   }
+  .loader-progress {
+    width: min(320px, calc(100vw - 48px));
+    margin-top: 18px;
+  }
+  .loader-progress-track {
+    height: 5px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgba(236, 228, 218, 0.12);
+  }
+  .loader-progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--book-pink), var(--book-blue));
+    transition: width 0.18s ease;
+  }
+  .loader-progress-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 8px;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    line-height: 1.35;
+    color: var(--text-muted);
+  }
+  .loader-progress-meta span:last-child {
+    min-width: 0;
+    overflow: hidden;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .loader-sub {
     font-size: 0.72rem;
     color: var(--text-muted);

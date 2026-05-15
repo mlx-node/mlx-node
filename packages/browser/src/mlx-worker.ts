@@ -123,6 +123,7 @@ const MAX_WEIGHT_UPLOAD_BATCH_BYTES = MAX_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
 const LARGE_TENSOR_SOLO_BATCH_BYTES = 384 * 1024 * 1024;
 const HF_CACHE_NAME = "mlx-browser-huggingface-models-v1";
 const HF_CACHE_ORIGIN = "https://mlx-node-browser.local";
+const MODEL_FILE_CACHE_NAME = "mlx-browser-model-files-v1";
 
 type ModelSource =
   | {
@@ -130,8 +131,16 @@ type ModelSource =
       baseUrl: string;
       label: string;
       fileCache: Map<string, Uint8Array>;
+      blobCache: Map<string, Blob>;
+      cacheKey: string;
     }
-  | { kind: "local"; files: Map<string, LocalModelFile>; label: string }
+  | {
+      kind: "local";
+      files: Map<string, LocalModelFile>;
+      label: string;
+      blobCache: Map<string, Blob>;
+      cacheKey: string;
+    }
   | {
       kind: "huggingface";
       repoId: string;
@@ -611,6 +620,42 @@ function encodePathParts(value: string): string {
   return value.split("/").map(encodeURIComponent).join("/");
 }
 
+function formatBytes(value: number): string {
+  if (value >= 1024 * 1024 * 1024) {
+    return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${Math.round(value)} B`;
+}
+
+function stableCacheHash(value: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 0x01000193);
+    h2 = Math.imul(h2 ^ code, 0x85ebca6b);
+  }
+  return `${(h1 >>> 0).toString(36)}${(h2 >>> 0).toString(36)}`;
+}
+
+function remoteCacheKey(baseUrl: string): string {
+  const href = new URL(`${baseUrl.replace(/\/+$/, "")}/`, self.location.href)
+    .href;
+  return `remote-${stableCacheHash(href)}`;
+}
+
+function localCacheKey(label: string, entries: Array<[string, LocalModelFile]>): string {
+  const signature = entries
+    .map(([path, file]) => `${path}\0${file.size}\0${file.lastModified}`)
+    .sort()
+    .join("\n");
+  return `local-${stableCacheHash(`${label}\n${signature}`)}`;
+}
+
 function hfResolveUrl(
   source: Extract<ModelSource, { kind: "huggingface" }>,
   path: string,
@@ -904,6 +949,323 @@ async function readHfFileBlob(
   return blob;
 }
 
+type BrowserCachedModelSource =
+  | Extract<ModelSource, { kind: "remote" }>
+  | Extract<ModelSource, { kind: "local" }>;
+
+async function getModelFileCacheDirectory(
+  cacheKey: string,
+  create: boolean,
+): Promise<any | null> {
+  const storage = (navigator as any).storage;
+  if (!storage?.getDirectory) return null;
+
+  try {
+    let dir = await storage.getDirectory();
+    dir = await dir.getDirectoryHandle(MODEL_FILE_CACHE_NAME, { create });
+    dir = await dir.getDirectoryHandle(cacheKey, { create });
+    return dir;
+  } catch (e) {
+    if (!create) return null;
+    post({
+      type: "log",
+      message: `[CACHE] OPFS model cache unavailable: ${String(e)}`,
+    });
+    return null;
+  }
+}
+
+async function getModelFileCacheHandle(
+  cacheKey: string,
+  path: string,
+  create: boolean,
+): Promise<any | null> {
+  let dir = await getModelFileCacheDirectory(cacheKey, create);
+  if (!dir) return null;
+
+  const parts = normalizeModelPath(path).split("/").filter(Boolean);
+  const fileName = parts.pop();
+  if (!fileName || parts.some((part) => part === "." || part === "..")) {
+    return null;
+  }
+
+  try {
+    for (const part of parts) {
+      dir = await dir.getDirectoryHandle(encodeURIComponent(part), { create });
+    }
+    return await dir.getFileHandle(encodeURIComponent(fileName), { create });
+  } catch (e) {
+    if (!create) return null;
+    throw e;
+  }
+}
+
+async function readModelFileCacheBlob(
+  source: BrowserCachedModelSource,
+  path: string,
+): Promise<Blob | undefined> {
+  const normalizedPath = normalizeModelPath(path);
+  const cached = source.blobCache.get(normalizedPath);
+  if (cached) return cached;
+
+  const handle = await getModelFileCacheHandle(
+    source.cacheKey,
+    normalizedPath,
+    false,
+  );
+  if (!handle) return undefined;
+  const file = await handle.getFile();
+  if (file.size <= 0) return undefined;
+  source.blobCache.set(normalizedPath, file);
+  post({
+    type: "progress",
+    step: "download",
+    pct: 100,
+    file: normalizedPath,
+    loadedBytes: file.size,
+    totalBytes: file.size,
+    cacheSource: "browser",
+    message: `Using cached ${normalizedPath} (${formatBytes(file.size)})`,
+  });
+  return file;
+}
+
+function maybePostModelFileProgress(
+  action: "Downloading" | "Caching",
+  path: string,
+  loaded: number,
+  total: number,
+  lastPct: number,
+): number {
+  if (total > 0) {
+    const pct = Math.min(100, Math.floor((loaded / total) * 100));
+    if (pct === 100 || pct >= lastPct + 3) {
+      post({
+        type: "progress",
+        step: "download",
+        pct,
+        file: path,
+        loadedBytes: loaded,
+        totalBytes: total,
+        cacheSource: "network",
+        message: `${action} ${path}... ${pct}% (${formatBytes(loaded)} / ${formatBytes(total)})`,
+      });
+      return pct;
+    }
+    return lastPct;
+  }
+
+  const loadedMb = Math.floor(loaded / 1024 / 1024);
+  if (loadedMb >= lastPct + 128) {
+    post({
+      type: "progress",
+      step: "download",
+      file: path,
+      loadedBytes: loaded,
+      cacheSource: "network",
+      message: `${action} ${path}... ${loadedMb} MB`,
+    });
+    return loadedMb;
+  }
+  return lastPct;
+}
+
+async function writeResponseToModelCache(
+  source: BrowserCachedModelSource,
+  path: string,
+  resp: Response,
+  action: "Downloading" | "Caching",
+): Promise<Blob | undefined> {
+  const normalizedPath = normalizeModelPath(path);
+  const handle = await getModelFileCacheHandle(
+    source.cacheKey,
+    normalizedPath,
+    true,
+  );
+  if (!handle) return undefined;
+
+  const writable = await handle.createWritable();
+  try {
+    const total = Number(resp.headers.get("content-length") ?? "0") || 0;
+    let loaded = 0;
+    let lastProgress = total > 0 ? -3 : -128;
+
+    if (resp.body) {
+      const reader = resp.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        await writable.write(value);
+        loaded += value.byteLength;
+        lastProgress = maybePostModelFileProgress(
+          action,
+          normalizedPath,
+          loaded,
+          total,
+          lastProgress,
+        );
+      }
+    } else {
+      const blob = await resp.blob();
+      await writable.write(blob);
+      loaded = blob.size;
+      maybePostModelFileProgress(action, normalizedPath, loaded, loaded, -3);
+    }
+
+    await writable.close();
+    const file = await handle.getFile();
+    source.blobCache.set(normalizedPath, file);
+    return file;
+  } catch (e) {
+    try {
+      await writable.abort?.();
+    } catch {
+      // Preserve the original cache write error.
+    }
+    throw e;
+  }
+}
+
+async function fetchRemoteFileToModelCache(
+  source: Extract<ModelSource, { kind: "remote" }>,
+  path: string,
+  optional = false,
+): Promise<Blob | undefined> {
+  const normalizedPath = normalizeModelPath(path);
+  if (!(navigator as any).storage?.getDirectory) return undefined;
+
+  post({
+    type: "progress",
+    step: "download",
+    file: normalizedPath,
+    message: `Downloading ${normalizedPath}...`,
+  });
+  const resp = await fetch(`${source.baseUrl}/${normalizedPath}`, {
+    headers: { Accept: "application/octet-stream" },
+  });
+  if (!resp.ok) {
+    if (optional && resp.status === 404) return undefined;
+    throw new Error(
+      `Failed to fetch ${normalizedPath}: HTTP ${resp.status} ${resp.statusText}`,
+    );
+  }
+  const cached = await writeResponseToModelCache(
+    source,
+    normalizedPath,
+    resp,
+    "Downloading",
+  );
+  if (cached) return cached;
+  try {
+    await resp.body?.cancel();
+  } catch {
+    // Nothing useful to recover here; the caller will use range reads.
+  }
+  return undefined;
+}
+
+async function copyLocalFileToModelCache(
+  source: Extract<ModelSource, { kind: "local" }>,
+  path: string,
+  file: LocalModelFile,
+): Promise<Blob | undefined> {
+  const normalizedPath = normalizeModelPath(path);
+  const handle = await getModelFileCacheHandle(
+    source.cacheKey,
+    normalizedPath,
+    true,
+  );
+  if (!handle) return undefined;
+
+  const writable = await handle.createWritable();
+  try {
+    const total = file.size;
+    let loaded = 0;
+    let lastProgress = total > 0 ? -3 : -128;
+
+    if (file.stream) {
+      const reader = file.stream().getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        await writable.write(value);
+        loaded += value.byteLength;
+        lastProgress = maybePostModelFileProgress(
+          "Caching",
+          normalizedPath,
+          loaded,
+          total,
+          lastProgress,
+        );
+      }
+    } else {
+      await writable.write(file);
+      loaded = file.size;
+      maybePostModelFileProgress("Caching", normalizedPath, loaded, loaded, -3);
+    }
+
+    await writable.close();
+    const cached = await handle.getFile();
+    source.blobCache.set(normalizedPath, cached);
+    return cached;
+  } catch (e) {
+    try {
+      await writable.abort?.();
+    } catch {
+      // Preserve the original cache write error.
+    }
+    throw e;
+  }
+}
+
+async function readRemoteFileBlob(
+  source: Extract<ModelSource, { kind: "remote" }>,
+  path: string,
+  optional = false,
+): Promise<Blob | undefined> {
+  const normalizedPath = normalizeModelPath(path);
+  const cached = await readModelFileCacheBlob(source, normalizedPath);
+  if (cached) return cached;
+
+  try {
+    return await fetchRemoteFileToModelCache(source, normalizedPath, optional);
+  } catch (e) {
+    if (optional && e instanceof Error && e.message.includes("HTTP 404")) {
+      return undefined;
+    }
+    post({
+      type: "log",
+      message: `[CACHE] Could not persist ${normalizedPath}; falling back to range fetches: ${String(e)}`,
+    });
+    return undefined;
+  }
+}
+
+async function readLocalFileBlob(
+  source: Extract<ModelSource, { kind: "local" }>,
+  path: string,
+): Promise<Blob> {
+  const normalizedPath = normalizeModelPath(path);
+  const cached = await readModelFileCacheBlob(source, normalizedPath);
+  if (cached) return cached;
+
+  const file = source.files.get(normalizedPath);
+  if (!file) throw new Error(`Local model is missing ${normalizedPath}`);
+  try {
+    const copied = await copyLocalFileToModelCache(source, normalizedPath, file);
+    if (copied) return copied;
+  } catch (e) {
+    post({
+      type: "log",
+      message: `[CACHE] Could not copy ${normalizedPath} into browser storage; using selected file directly: ${String(e)}`,
+    });
+  }
+  source.blobCache.set(normalizedPath, file);
+  return file;
+}
+
 async function listHfRepoFiles(
   source: Extract<ModelSource, { kind: "huggingface" }>,
 ): Promise<string[]> {
@@ -961,10 +1323,13 @@ function createModelSource(
       if (!files.has(file.name)) files.set(file.name, file);
     }
 
+    const label = stripRoot ? firstRoot : "local model";
     return {
       kind: "local",
       files,
-      label: stripRoot ? firstRoot : "local model",
+      label,
+      blobCache: new Map(),
+      cacheKey: localCacheKey(label, [...files.entries()]),
     };
   }
 
@@ -980,11 +1345,14 @@ function createModelSource(
     };
   }
 
+  const baseUrl = modelUrl.replace(/\/+$/, "");
   return {
     kind: "remote",
-    baseUrl: modelUrl.replace(/\/+$/, ""),
+    baseUrl,
     label: modelLabel?.trim() || modelUrl,
     fileCache: new Map(),
+    blobCache: new Map(),
+    cacheKey: remoteCacheKey(baseUrl),
   };
 }
 
@@ -995,12 +1363,14 @@ async function readSourceText(
 ): Promise<string | undefined> {
   const normalizedPath = normalizeModelPath(path);
   if (source.kind === "local") {
-    const file = source.files.get(normalizedPath);
-    if (!file) {
-      if (optional) return undefined;
-      throw new Error(`Local model is missing ${normalizedPath}`);
+    try {
+      return (await readLocalFileBlob(source, normalizedPath)).text();
+    } catch (e) {
+      if (optional && e instanceof Error && e.message.includes("is missing")) {
+        return undefined;
+      }
+      throw e;
     }
-    return file.text();
   }
 
   if (source.kind === "huggingface") {
@@ -1014,6 +1384,22 @@ async function readSourceText(
       text.trimStart().startsWith("<!doctype")
     ) {
       return undefined;
+    }
+    return text;
+  }
+
+  const cachedRemoteBlob = await readRemoteFileBlob(
+    source,
+    normalizedPath,
+    optional,
+  );
+  if (cachedRemoteBlob) {
+    const text = await cachedRemoteBlob.text();
+    if (text.trimStart().toLowerCase().startsWith("<!doctype")) {
+      if (optional) return undefined;
+      throw new Error(
+        `Model source ${source.baseUrl} served the app HTML for ${normalizedPath}; the hosted /model files are not deployed. Choose a local model directory or deploy the model assets separately.`,
+      );
     }
     return text;
   }
@@ -1054,14 +1440,13 @@ async function readSourceSlice(
   if (end === start) return new Uint8Array(0);
 
   if (source.kind === "local") {
-    const file = source.files.get(normalizedPath);
-    if (!file) throw new Error(`Local model is missing ${normalizedPath}`);
-    if (end > file.size) {
+    const blob = await readLocalFileBlob(source, normalizedPath);
+    if (end > blob.size) {
       throw new Error(
-        `Local range for ${normalizedPath} exceeds file size: ${end}/${file.size}`,
+        `Local range for ${normalizedPath} exceeds file size: ${end}/${blob.size}`,
       );
     }
-    return new Uint8Array(await file.slice(start, end).arrayBuffer());
+    return new Uint8Array(await blob.slice(start, end).arrayBuffer());
   }
 
   if (source.kind === "huggingface") {
@@ -1072,6 +1457,16 @@ async function readSourceSlice(
       );
     }
     return new Uint8Array(await blob.slice(start, end).arrayBuffer());
+  }
+
+  const cachedBlob = await readRemoteFileBlob(source, normalizedPath);
+  if (cachedBlob) {
+    if (end > cachedBlob.size) {
+      throw new Error(
+        `Cached range for ${normalizedPath} exceeds file size: ${end}/${cachedBlob.size}`,
+      );
+    }
+    return new Uint8Array(await cachedBlob.slice(start, end).arrayBuffer());
   }
 
   const cached = source.fileCache.get(normalizedPath);
