@@ -1,8 +1,13 @@
 {
   "$schema": "./node_modules/void/schema.json",
   "inference": {
-    "appType": "spa",
-    "outputDir": "dist"
+    "appType": "void",
+    "bindings": {
+      "db": false,
+      "kv": false,
+      "storage": true,
+      "ai": false
+    }
   },
   "routing": {
     "headers": {

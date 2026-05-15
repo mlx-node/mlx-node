@@ -15,11 +15,11 @@
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "types": ["vite/client"],
+    "types": ["vite/client", "@cloudflare/workers-types"],
     "paths": {
       "@mlx-node/lm/tools": ["../lm/src/tools/index.ts"],
       "@/*": ["./demo/*"]
     }
   },
-  "include": ["demo"]
+  "include": ["demo", "routes", "vite.config.ts"]
 }

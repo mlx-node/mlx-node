@@ -4,11 +4,12 @@ import { fileURLToPath } from "node:url";
 
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
+import { voidPlugin } from "void";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 
-function browserDeployAssets() {
+function browserDeployAssets(): Plugin {
   return {
     name: "browser-deploy-assets",
     apply: "build" as const,
@@ -58,7 +59,15 @@ export default defineConfig(({ command }) => ({
     outDir: "../dist",
     emptyOutDir: true,
   },
+  environments: {
+    void_worker: {
+      build: {
+        outDir: "../dist/ssr",
+      },
+    },
+  },
   plugins: [
+    voidPlugin(),
     react(),
     tailwindcss(),
     browserDeployAssets(),

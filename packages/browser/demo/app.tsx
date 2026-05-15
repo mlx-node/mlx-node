@@ -27,6 +27,7 @@ import './styles.css';
 type StatusState = 'info' | 'ready' | 'error';
 type ReasoningEffort = 'off' | 'low' | 'medium' | 'high';
 const DEFAULT_MODEL_LABEL = 'qwen3.5-0.8b-mlx-bf16';
+const DEFAULT_MODEL_URL = '/model';
 const MAX_BROWSER_OUTPUT_TOKENS = 36864;
 const DEFAULT_BROWSER_OUTPUT_TOKENS = 1024;
 const DEFAULT_BROWSER_TEMPERATURE = 0.6;
@@ -51,12 +52,48 @@ function systemPromptForTools(toolsEnabled: boolean) {
 
 type ModelSource = {
   modelFiles?: File[];
+  modelUrl?: string;
   label?: string;
 };
 
-async function hasHostedModel(): Promise<boolean> {
+function normalizeModelBaseUrl(value: string | undefined | null) {
+  const trimmed = value?.trim() || DEFAULT_MODEL_URL;
+  return trimmed.replace(/\/+$/g, '') || DEFAULT_MODEL_URL;
+}
+
+function resolveConfiguredModelUrl(params: URLSearchParams) {
+  return normalizeModelBaseUrl(
+    params.get('model_url') ??
+      params.get('modelUrl') ??
+      params.get('model') ??
+      (import.meta.env.VITE_MLX_MODEL_URL as string | undefined),
+  );
+}
+
+function resolveConfiguredModelLabel(params: URLSearchParams) {
+  return (
+    params.get('model_label') ??
+    params.get('modelLabel') ??
+    (import.meta.env.VITE_MLX_MODEL_LABEL as string | undefined) ??
+    DEFAULT_MODEL_LABEL
+  );
+}
+
+function modelAssetUrl(modelUrl: string, assetPath: string) {
+  const base = `${normalizeModelBaseUrl(modelUrl)}/`;
+  return new URL(
+    assetPath
+      .replace(/^\/+/g, '')
+      .split('/')
+      .map((part) => encodeURIComponent(part))
+      .join('/'),
+    new URL(base, location.href),
+  ).href;
+}
+
+async function hasHostedModel(modelUrl: string): Promise<boolean> {
   try {
-    const resp = await fetch(`/model/config.json?probe=${Date.now()}`, {
+    const resp = await fetch(`${modelAssetUrl(modelUrl, 'config.json')}?probe=${Date.now()}`, {
       cache: 'no-store',
       headers: { Accept: 'application/json' },
     });
@@ -180,6 +217,8 @@ function App() {
   const maxOutputTokensInputRef = useRef<HTMLInputElement>(null);
   const reasoningEffortRef = useRef<ReasoningEffort>('off');
   const initialUrlParams = new URLSearchParams(location.search);
+  const configuredModelUrl = resolveConfiguredModelUrl(initialUrlParams);
+  const configuredModelLabel = resolveConfiguredModelLabel(initialUrlParams);
   const initialAppToolsEnabled = initialUrlParams.get('tools') === '1' || initialUrlParams.get('app_preview') === '1';
   const [appToolsEnabled, setAppToolsEnabledState] = useState(initialAppToolsEnabled);
   const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>('off');
@@ -191,10 +230,8 @@ function App() {
   const [prefillTokensPerSec, setPrefillTokensPerSec] = useState<number | null>(null);
   const [decodeTokensPerSec, setDecodeTokensPerSec] = useState<number | null>(null);
   const [pendingModelSource, setPendingModelSource] = useState<ModelSource | null>(null);
-  const [modelLine, setModelLine] = useState<string>(DEFAULT_MODEL_LABEL);
-  const [hostedModelAvailable, setHostedModelAvailable] = useState<boolean | null>(() =>
-    isLocalDevHost() ? null : false,
-  );
+  const [modelLine, setModelLine] = useState<string>(configuredModelLabel);
+  const [hostedModelAvailable, setHostedModelAvailable] = useState<boolean | null>(null);
   const appToolsEnabledRef = useRef(initialAppToolsEnabled);
   const initialMaxOutputTokens = Math.min(
     MAX_BROWSER_OUTPUT_TOKENS,
@@ -227,15 +264,14 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!isLocalDevHost()) return;
     let cancelled = false;
-    hasHostedModel().then((available) => {
+    hasHostedModel(configuredModelUrl).then((available) => {
       if (!cancelled) setHostedModelAvailable(available);
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [configuredModelUrl]);
 
   function handleLocalModelInputChange(event: ChangeEvent<HTMLInputElement>) {
     const source = modelSourceFromLocalFiles(Array.from(event.currentTarget.files ?? []));
@@ -263,7 +299,7 @@ function App() {
     if (!statusEl || !chatEl || !promptEl || !sendBtn || !imageBtn || !imageInput || !maxOutputTokensInput) {
       return;
     }
-    let activeModelLabel = DEFAULT_MODEL_LABEL;
+    let activeModelLabel = configuredModelLabel;
     let activeChatMaxNewTokens = DEFAULT_BROWSER_OUTPUT_TOKENS;
 
     if (navigator.storage?.persist) {
@@ -1567,7 +1603,7 @@ function App() {
       (modeParam ? ` (mode=${modeParam})` : '');
 
     function resetForModelLoad(label?: string) {
-      activeModelLabel = label ?? DEFAULT_MODEL_LABEL;
+      activeModelLabel = label ?? configuredModelLabel;
       setModelLine(activeModelLabel);
       setTelemetryStats(null);
       setPrefillTokensPerSec(null);
@@ -1600,6 +1636,7 @@ function App() {
     function startWorker(
       source: {
         modelFiles?: File[];
+        modelUrl?: string;
         label?: string;
       } = {},
     ) {
@@ -1607,8 +1644,8 @@ function App() {
       worker.postMessage({
         type: 'init',
         wasmUrl: new URL(`/mlx-core.opt.wasm?v=${Date.now()}`, location.href).href,
-        modelUrl: '/model',
-        modelLabel: source.label ?? DEFAULT_MODEL_LABEL,
+        modelUrl: source.modelUrl ?? configuredModelUrl,
+        modelLabel: source.label ?? configuredModelLabel,
         modelFiles: source.modelFiles,
         packBf16,
         sdpaFallback,
@@ -1779,7 +1816,7 @@ function App() {
       worker.terminate();
       delete (window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat;
     };
-  }, [loadKickoff, pendingModelSource]);
+  }, [configuredModelLabel, configuredModelUrl, loadKickoff, pendingModelSource]);
 
   return (
     <div className="app-root">

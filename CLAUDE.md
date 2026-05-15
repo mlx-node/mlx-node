@@ -211,18 +211,17 @@ For GitHub Actions, consider using [`voidzero-dev/setup-vp`](https://github.com/
 
 ## Browser Playground Void Scope
 
-This repository uses Void only to deploy the browser playground as a prebuilt static SPA. Do not convert the playground into a fullstack Void app, do not add `voidPlugin()` to `packages/browser/vite.config.ts`, and do not add `routes/`, `pages/`, `db/`, or `env.ts` unless the task explicitly asks for a backend feature.
+This repository uses Void to deploy the browser playground. It is mostly a static SPA, with one narrow backend surface for hosted model object storage (`/api/model/*` plus authenticated upload routes). Do not add unrelated `pages/`, `db/`, or `env.ts` features unless the task explicitly asks for another backend feature.
 
 The browser deploy path is:
 
 ```bash
-yarn workspace @mlx-node/browser build
 yarn workspace @mlx-node/browser deploy:void
 ```
 
-`packages/browser/void.json` pins the static SPA output directory and the COOP/COEP/CORP headers required by SharedArrayBuffer and WebGPU workers. Keep it in sync with `packages/browser/demo/public/_headers`, which is emitted into the built `dist` for static hosts that read `_headers`.
+`packages/browser/void.json` pins the Void app type, R2 storage binding, and the COOP/COEP/CORP headers required by SharedArrayBuffer and WebGPU workers. Keep it in sync with `packages/browser/demo/public/_headers`, which is emitted into the built client assets for static hosts that read `_headers`.
 
-The local model symlink under `packages/browser/demo/public/model` is a development-only convenience and must not be included in `packages/browser/dist`. The browser build emits only the Vite bundle, `capybara.png`, `_headers`, and the prebuilt WASM artifact from `packages/core/mlx-core.wasm32-wasi.opt.wasm`.
+The local model symlink under `packages/browser/demo/public/model` is a development-only convenience and must not be included in `packages/browser/dist`. Deployed hosted weights are served from Void storage through `/api/model/*`, which must preserve HTTP Range support for `.safetensors` reads. The browser build emits only the Vite bundle, `capybara.png`, `_headers`, and the prebuilt WASM artifact from `packages/core/mlx-core.wasm32-wasi.opt.wasm`.
 
 <!--injected-by-void-v0.7.5-->
 ## Void
