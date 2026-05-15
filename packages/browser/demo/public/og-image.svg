@@ -1,0 +1,114 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="glow-pink" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(410 332) rotate(13) scale(520 320)">
+      <stop stop-color="#F7CFE0" stop-opacity="0.28"/>
+      <stop offset="0.42" stop-color="#8B5CF6" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#08070D" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow-blue" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(880 170) rotate(128) scale(360 300)">
+      <stop stop-color="#76A9FF" stop-opacity="0.28"/>
+      <stop offset="0.48" stop-color="#3B82F6" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#08070D" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="title" x1="116" y1="260" x2="714" y2="390" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF8EA"/>
+      <stop offset="0.55" stop-color="#F8E1EA"/>
+      <stop offset="1" stop-color="#D8E7FF"/>
+    </linearGradient>
+    <linearGradient id="pill" x1="104" y1="112" x2="526" y2="112" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7CFE0" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#76A9FF" stop-opacity="0.14"/>
+    </linearGradient>
+    <filter id="blur" x="-40%" y="-40%" width="180%" height="180%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+    <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="22" stdDeviation="18" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="630" fill="#08070D"/>
+  <rect width="1200" height="630" fill="url(#glow-pink)"/>
+  <rect width="1200" height="630" fill="url(#glow-blue)"/>
+
+  <g opacity="0.28">
+    <path d="M0 118H1200" stroke="#DAC5D7" stroke-opacity="0.12"/>
+    <path d="M0 512H1200" stroke="#DAC5D7" stroke-opacity="0.1"/>
+    <path d="M114 0V630" stroke="#DAC5D7" stroke-opacity="0.08"/>
+    <path d="M1038 0V630" stroke="#DAC5D7" stroke-opacity="0.08"/>
+  </g>
+
+  <g filter="url(#shadow)" opacity="0.84">
+    <g transform="translate(905 110) rotate(-11)">
+      <path d="M0 34L74 0L162 34L87 77L0 34Z" fill="#B39B73"/>
+      <path d="M0 34L87 77L87 156L0 107V34Z" fill="#4C4439"/>
+      <path d="M87 77L162 34V113L87 156V77Z" fill="#272923"/>
+    </g>
+    <g transform="translate(820 410) rotate(16) scale(.82)">
+      <path d="M0 34L74 0L162 34L87 77L0 34Z" fill="#7D7395"/>
+      <path d="M0 34L87 77L87 156L0 107V34Z" fill="#40394C"/>
+      <path d="M87 77L162 34V113L87 156V77Z" fill="#1D1E29"/>
+    </g>
+    <g transform="translate(995 318) rotate(-25) scale(.55)">
+      <path d="M0 34L74 0L162 34L87 77L0 34Z" fill="#D1B98A"/>
+      <path d="M0 34L87 77L87 156L0 107V34Z" fill="#605540"/>
+      <path d="M87 77L162 34V113L87 156V77Z" fill="#34322B"/>
+    </g>
+    <g transform="translate(72 432) rotate(19) scale(.72)">
+      <path d="M0 34L74 0L162 34L87 77L0 34Z" fill="#AAB3A3"/>
+      <path d="M0 34L87 77L87 156L0 107V34Z" fill="#4A4F4B"/>
+      <path d="M87 77L162 34V113L87 156V77Z" fill="#232828"/>
+    </g>
+    <g transform="translate(168 70) rotate(14) scale(.56)">
+      <path d="M0 34L74 0L162 34L87 77L0 34Z" fill="#CBAE7E"/>
+      <path d="M0 34L87 77L87 156L0 107V34Z" fill="#6C5943"/>
+      <path d="M87 77L162 34V113L87 156V77Z" fill="#393128"/>
+    </g>
+    <g transform="translate(692 78) rotate(-31) scale(.46)">
+      <path d="M0 34L74 0L162 34L87 77L0 34Z" fill="#C8CCD0"/>
+      <path d="M0 34L87 77L87 156L0 107V34Z" fill="#5E6063"/>
+      <path d="M87 77L162 34V113L87 156V77Z" fill="#2B2C31"/>
+    </g>
+  </g>
+
+  <g opacity="0.56" filter="url(#blur)">
+    <circle cx="366" cy="322" r="132" fill="#F7CFE0" fill-opacity="0.2"/>
+    <circle cx="768" cy="253" r="132" fill="#76A9FF" fill-opacity="0.14"/>
+  </g>
+
+  <g transform="translate(104 72)">
+    <rect x="0" y="0" width="66" height="66" rx="17" fill="#0B1020" stroke="#8AA7FF" stroke-opacity="0.38" stroke-width="1.5"/>
+    <text x="33" y="42" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-weight="700" font-size="23" fill="#76A9FF">MLX</text>
+  </g>
+
+  <g transform="translate(104 162)">
+    <rect width="452" height="45" rx="22.5" fill="url(#pill)" stroke="#F7CFE0" stroke-opacity="0.28"/>
+    <circle cx="28" cy="22.5" r="5.5" fill="#F7CFE0"/>
+    <text x="48" y="29" font-family="'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" letter-spacing="4" fill="#F1E7F1" fill-opacity="0.86">MULTIMODAL AI · 100% LOCAL · WEBGPU</text>
+  </g>
+
+  <text x="104" y="316" font-family="'Instrument Serif', Georgia, serif" font-size="92" font-style="italic" fill="url(#title)">Qwen 3.5 Vision</text>
+  <text x="108" y="388" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="31" font-weight="600" fill="#F7F2F5">MLX Browser</text>
+  <text x="108" y="434" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="25" fill="#D8D3DB" fill-opacity="0.88">Run a multimodal language model entirely in your browser.</text>
+  <text x="108" y="471" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="25" fill="#D8D3DB" fill-opacity="0.72">No server, no API keys — powered by WebGPU.</text>
+
+  <g font-family="'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace">
+    <g transform="translate(108 542)">
+      <text font-size="19" font-weight="700" letter-spacing="2" fill="#FFF8EA">VISION + LANGUAGE</text>
+      <text y="32" font-size="15" letter-spacing="2.6" fill="#B9B0B8">UNIFIED MULTIMODAL</text>
+    </g>
+    <g transform="translate(392 542)">
+      <text font-size="19" font-weight="700" letter-spacing="2" fill="#FFF8EA">WEBGPU</text>
+      <text y="32" font-size="15" letter-spacing="2.6" fill="#B9B0B8">BROWSER NATIVE</text>
+    </g>
+    <g transform="translate(612 542)">
+      <text font-size="19" font-weight="700" letter-spacing="2" fill="#FFF8EA">REASONING</text>
+      <text y="32" font-size="15" letter-spacing="2.6" fill="#B9B0B8">CODE · AGENTS · VISUAL</text>
+    </g>
+  </g>
+
+  <g transform="translate(946 480)" opacity="0.86">
+    <rect width="142" height="40" rx="20" fill="#101626" stroke="#76A9FF" stroke-opacity="0.32"/>
+    <text x="71" y="26" text-anchor="middle" font-family="'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" letter-spacing="2.5" fill="#BBD2FF">LOCAL FIRST</text>
+  </g>
+</svg>

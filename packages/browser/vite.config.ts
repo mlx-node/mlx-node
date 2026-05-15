@@ -17,6 +17,8 @@ function browserDeployAssets(): Plugin {
       const assets = [
         ["_headers", path.resolve(dirname, "demo/public/_headers")],
         ["capybara.png", path.resolve(dirname, "demo/public/capybara.png")],
+        ["og-image.png", path.resolve(dirname, "demo/public/og-image.png")],
+        ["og-image.svg", path.resolve(dirname, "demo/public/og-image.svg")],
         [
           "mlx-core.opt.wasm",
           path.resolve(dirname, "../core/mlx-core.wasm32-wasi.opt.wasm"),
