@@ -720,6 +720,14 @@
     border-color: var(--book-pink);
     color: var(--book-pink);
   }
+  .pill:disabled {
+    opacity: 0.48;
+    cursor: not-allowed;
+  }
+  .pill:disabled:hover {
+    border-color: var(--border);
+    color: var(--text-dim);
+  }
   .pill.active {
     background: rgba(244, 200, 215, 0.1);
     color: var(--book-pink);

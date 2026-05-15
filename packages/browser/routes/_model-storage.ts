@@ -1,4 +1,11 @@
 const DEFAULT_MODEL_STORAGE_PREFIX = 'models/qwen3.5-0.8b-mlx-bf16';
+const OPTIONAL_MODEL_METADATA_FILES = new Set([
+  'generation_config.json',
+  'model.safetensors.index.json',
+  'preprocessor_config.json',
+  'processor_config.json',
+  'tokenizer_config.json',
+]);
 
 type EnvLike = Record<string, unknown>;
 
@@ -30,6 +37,10 @@ export function sanitizeModelPath(value: unknown) {
 
 export function keyForModelPath(env: EnvLike, modelPath: string) {
   return `${configuredModelPrefix(env)}/${modelPath}`;
+}
+
+export function isOptionalModelMetadataPath(modelPath: string) {
+  return OPTIONAL_MODEL_METADATA_FILES.has(modelPath);
 }
 
 export function sanitizeStorageKey(env: EnvLike, value: unknown) {

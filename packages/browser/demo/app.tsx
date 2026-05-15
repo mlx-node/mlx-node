@@ -291,6 +291,8 @@ function App() {
     : DEFAULT_BROWSER_TEMPERATURE;
   const [temperatureValue, setTemperatureValue] = useState(initialTemperature);
   const [maxTokensValue, setMaxTokensValue] = useState(initialMaxOutputTokens);
+  const temperatureValueRef = useRef(initialTemperature);
+  const maxTokensValueRef = useRef(initialMaxOutputTokens);
   const [generating, setGeneratingState] = useState(false);
   const [sendDisabled, setSendDisabledState] = useState(true);
 
@@ -384,24 +386,28 @@ function App() {
     }
 
     function readMaxOutputTokens() {
-      const parsed = Number.parseInt(maxOutputTokensInput.value, 10);
+      const parsed = Number.parseInt(`${maxTokensValueRef.current}`, 10);
       const clamped = Math.min(
         MAX_BROWSER_OUTPUT_TOKENS,
         Math.max(1, Number.isFinite(parsed) ? parsed : DEFAULT_BROWSER_OUTPUT_TOKENS),
       );
+      maxTokensValueRef.current = clamped;
       if (`${clamped}` !== maxOutputTokensInput.value) {
         maxOutputTokensInput.value = `${clamped}`;
       }
+      setMaxTokensValue((current) => (current === clamped ? current : clamped));
       return clamped;
     }
 
     function readTemperature() {
-      const parsed = Number.parseFloat(temperatureInput.value);
+      const parsed = Number.parseFloat(`${temperatureValueRef.current}`);
       const clamped = Math.min(2, Math.max(0, Number.isFinite(parsed) ? parsed : DEFAULT_BROWSER_TEMPERATURE));
       const formatted = Number.isInteger(clamped) ? `${clamped}` : `${Math.round(clamped * 100) / 100}`;
+      temperatureValueRef.current = clamped;
       if (formatted !== temperatureInput.value) {
         temperatureInput.value = formatted;
       }
+      setTemperatureValue((current) => (current === clamped ? current : clamped));
       return clamped;
     }
 
@@ -1909,11 +1915,13 @@ function App() {
             }}
             temperature={temperatureValue}
             onTemperatureChange={(v) => {
+              temperatureValueRef.current = v;
               setTemperatureValue(v);
               if (temperatureInputRef.current) temperatureInputRef.current.value = `${v}`;
             }}
             maxTokens={maxTokensValue}
             onMaxTokensChange={(v) => {
+              maxTokensValueRef.current = v;
               setMaxTokensValue(v);
               if (maxOutputTokensInputRef.current) maxOutputTokensInputRef.current.value = `${v}`;
             }}

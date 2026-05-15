@@ -6,6 +6,7 @@ export type PillStepperProps = {
   min: number;
   max: number;
   step: number;
+  disabled?: boolean;
   onChange: (next: number) => void;
 };
 
@@ -15,10 +16,15 @@ export function PillStepper({
   min,
   max,
   step,
+  disabled = false,
   onChange,
 }: PillStepperProps) {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
 
   useEffect(() => {
     if (!open) return;
@@ -43,13 +49,16 @@ export function PillStepper({
       <button
         type="button"
         className="pill"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          if (!disabled) setOpen((o) => !o);
+        }}
         aria-haspopup="dialog"
         aria-expanded={open}
+        disabled={disabled}
       >
         {label} · {fmt(value)}
       </button>
-      {open && (
+      {open && !disabled && (
         <div
           role="dialog"
           style={{
@@ -70,6 +79,7 @@ export function PillStepper({
           <button
             type="button"
             className="composer-icon-btn"
+            disabled={disabled}
             onClick={() => onChange(clamp(value - step))}
           >
             −
@@ -80,6 +90,7 @@ export function PillStepper({
             max={max}
             step={step}
             value={value}
+            disabled={disabled}
             onChange={(e) => {
               const n = Number.parseFloat(e.target.value);
               if (Number.isFinite(n)) onChange(clamp(n));
@@ -99,6 +110,7 @@ export function PillStepper({
           <button
             type="button"
             className="composer-icon-btn"
+            disabled={disabled}
             onClick={() => onChange(clamp(value + step))}
           >
             +

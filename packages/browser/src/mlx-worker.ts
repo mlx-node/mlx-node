@@ -1135,15 +1135,18 @@ async function fetchRemoteFileToModelCache(
   const normalizedPath = normalizeModelPath(path);
   if (!(navigator as any).storage?.getDirectory) return undefined;
 
-  post({
-    type: "progress",
-    step: "download",
-    file: normalizedPath,
-    message: `Downloading ${normalizedPath}...`,
-  });
+  if (!optional) {
+    post({
+      type: "progress",
+      step: "download",
+      file: normalizedPath,
+      message: `Downloading ${normalizedPath}...`,
+    });
+  }
   const resp = await fetch(`${source.baseUrl}/${normalizedPath}`, {
     headers: { Accept: "application/octet-stream" },
   });
+  if (optional && resp.status === 204) return undefined;
   if (!resp.ok) {
     if (optional && resp.status === 404) return undefined;
     throw new Error(
@@ -1405,6 +1408,7 @@ async function readSourceText(
   }
 
   const resp = await fetch(`${source.baseUrl}/${normalizedPath}`);
+  if (optional && resp.status === 204) return undefined;
   if (!resp.ok) {
     if (optional && resp.status === 404) return undefined;
     throw new Error(

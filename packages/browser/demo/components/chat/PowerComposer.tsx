@@ -100,6 +100,7 @@ export function PowerComposer(props: PowerComposerProps) {
             type="button"
             className={`pill${reasoningEffort !== "off" ? " active" : ""}`}
             onClick={onCycleReasoning}
+            disabled={generating}
           >
             think · {reasoningEffort}
           </button>
@@ -109,6 +110,7 @@ export function PowerComposer(props: PowerComposerProps) {
             min={0}
             max={2}
             step={0.1}
+            disabled={generating}
             onChange={onTemperatureChange}
           />
           <PillStepper
@@ -117,12 +119,14 @@ export function PowerComposer(props: PowerComposerProps) {
             min={1}
             max={MAX_TOKEN_LIMIT}
             step={1}
+            disabled={generating}
             onChange={onMaxTokensChange}
           />
           <button
             type="button"
             className={`pill qwen${toolsEnabled ? " active" : ""}`}
             onClick={onToggleTools}
+            disabled={generating}
           >
             tools · {toolsEnabled ? "on" : "off"}
           </button>

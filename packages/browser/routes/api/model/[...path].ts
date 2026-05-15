@@ -4,6 +4,7 @@ import { storage } from 'void/storage';
 import {
   baseModelHeaders,
   inferModelContentType,
+  isOptionalModelMetadataPath,
   keyForModelPath,
   parseRangeHeader,
   sanitizeModelPath,
@@ -19,7 +20,12 @@ export const GET = defineHandler(async (c) => {
 
   const key = keyForModelPath(c.env, modelPath);
   const head = await storage.head(key);
-  if (!head) return new Response('Not found', { status: 404, headers: baseModelHeaders('text/plain') });
+  if (!head) {
+    if (isOptionalModelMetadataPath(modelPath)) {
+      return new Response(null, { status: 204, headers: baseModelHeaders(inferModelContentType(modelPath)) });
+    }
+    return new Response('Not found', { status: 404, headers: baseModelHeaders('text/plain') });
+  }
 
   const contentType = head.httpMetadata?.contentType ?? inferModelContentType(modelPath);
   const range = parseRangeHeader(c.req.header('range') ?? null, head.size);
