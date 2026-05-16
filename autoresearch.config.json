@@ -5,5 +5,5 @@
   "warmup": 2,
   "writeBaseline": false,
   "skipBuild": true,
-  "experimentNotes": "Arc-end state: E37+E38+E39+E40 best-so-far (-13.7% same-binary A/B at 1024 prompt). E41 (QKV stack — slice-reshape copy regression), E42 (attention internal slice — mixed across prompt sizes), E43 (skip clear_cache — within noise) all rejected and cleanly reverted. Diminishing returns; remaining catalog levers (FlashQLA chunked-kernel ideas) target M5+ hardware."
+  "experimentNotes": "Post-arc stable shipping state: E37+E38+E39+E40 + chunk=1024 + async between chunks + GDN chunked-kernel polish (E5+E36 on M5+). Final A/B headline: -13.7% same-binary at 1024-prompt single-chunk; -4-12% multi-chunk; neutral at 8192+. After this, E41/E42/E43/E44/E45 all rejected with reverts. Next attempts: see autoresearch.ideas.md D1 (per-step kernel 2 v-cols/simdgroup), per-step kernel q/k cooperative TG cache (new idea), or C++ text-prefill port."
 }
