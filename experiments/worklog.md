@@ -99,6 +99,57 @@ work that immediately gets re-allocated.
 The clear cost is small relative to chunk compute; skipping it changes
 nothing measurable. Reverted.
 
+### E44 — force chunked GDN kernel on M3 (REJECTED, 2.1–2.3× slower)
+
+Bypass `CHUNK_MIN_GPU_GEN=17` via `MLX_FORCE_CHUNKED_GDN=1` to test whether
+E5+E36 polish (decay_mat + decay_self caches) had closed the gap.
+
+**Result:** chunked is 2.1–2.3× SLOWER than per-step on M3 across 3 pairs
+(per-step 624/764/950 ms vs chunked 1416/1772/1997 ms). M5+ gate is
+correctly placed; the kernel's `simdgroup_matrix` operations need Neural
+Accelerators to be competitive.
+
+### E45 — `DV_PER_TG` sweep for per-step kernel (REJECTED, default optimal)
+
+Parameterized threadgroup-Y via `MLX_GDN_STEP_TG_Y`; swept {1,2,4,8,16} at
+1024 prompt and {4,8,16} at 4096. Result: TG_Y=4 (current default) wins at
+4096 by 4%; at 1024 all variants within 3.8%. Sweep confirms no headroom.
+
+### E46 — cooperative threadgroup q/k cache (REJECTED, 2–6% slower)
+
+New kernel variant where simdgroup-0 cooperatively loads q[Dk] + k[Dk] for
+T_BLOCK=8 consecutive timesteps into threadgroup memory (8 KB total). All
+4 simdgroups in the TG then read from TG memory instead of re-issuing
+global loads. Two `threadgroup_barrier`s per outer iter.
+
+**Why it failed:** barriers cost more than the saved load instructions.
+Apple GPU L1 absorbs the 4-way cross-simdgroup load redundancy near-free,
+so eliminating it via TG memory write + barrier is net negative. Three
+pairs all agreed: +2%, +2%, +6% slower with E46 ON.
+
+### E47 — 2 v-columns per simdgroup (REJECTED, below noise)
+
+Catalog D1: register-blocking change to the per-step kernel. Each
+simdgroup processes dv_A=2y and dv_B=2y+1, sharing q[Dk] + k[Dk] loads
+across both columns. Halves grid-Y; doubles state registers; correctness
+bit-exact.
+
+**Why it failed:** 8 same-binary A/B pairs split 4 ON-faster vs 4 ON-slower.
+Median delta ≈ 0%. The mechanism (halved q/k load issue rate) is real but
+not on the critical path on M3 — the per-step kernel is **compute-bound,
+not load-bound** here. Apple GPU L1 + load-issue throughput together handle
+the cross-simdgroup q/k redundancy near-free, so saving load instructions
+doesn't save wall time.
+
+### Joint lesson from E46+E47
+
+The per-step GDN kernel on M3 (gen 15) is **compute-bound, not
+memory-bound**. Two distinct memory-savings patterns both failed — TG
+cache (barrier cost > saved loads) and register blocking (Apple L1 hides
+the redundancy). Future per-step-kernel work on M3 should target compute
+reduction (e.g. B3 gate-driven early termination, conditional skipping
+when state decays to bf16 epsilon) rather than memory traffic.
+
 ## Methodology lessons
 
 1. **Cross-session bench variance is ~10%** on this M3 Max. The early
