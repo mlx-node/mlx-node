@@ -241,10 +241,14 @@
     color: var(--text-dim);
     backdrop-filter: blur(14px);
     text-shadow: 0 1px 8px rgba(0, 0, 0, 0.72);
+    font-family: var(--font-mono);
+    line-height: 1;
   }
   .landing-void-eyebrow {
-    font-family: var(--font-mono);
+    display: inline-flex;
+    align-items: center;
     font-size: 0.62rem;
+    line-height: 1;
     letter-spacing: 0.16em;
     text-transform: uppercase;
     color: rgba(236, 228, 218, 0.68);
@@ -254,9 +258,9 @@
     align-items: center;
     gap: 8px;
     flex: 0 0 auto;
-    font-family: var(--font-mono);
     font-size: 0.84rem;
     font-weight: 700;
+    line-height: 1;
     letter-spacing: 0.08em;
     text-transform: uppercase;
     color: var(--text);
@@ -270,9 +274,11 @@
     box-shadow: 0 0 14px rgba(244, 200, 215, 0.8);
   }
   .landing-void-copy {
+    display: inline-flex;
+    align-items: center;
     min-width: 0;
     font-size: 0.8rem;
-    line-height: 1.45;
+    line-height: 1;
     color: rgba(236, 228, 218, 0.84);
   }
   .landing-specs {
