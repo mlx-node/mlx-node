@@ -33,6 +33,11 @@ pub struct GatedDeltaNet {
     value_dim: i32,
     conv_dim: i32,
     conv_kernel_dim: i32,
+    /// E51: pre-stacked `[w_qkvz; w_ba]` then transposed to
+    /// `[hidden, qkvz_dim + ba_dim]`. Populated by `finalize_in_proj()` after
+    /// weights are loaded. When present (and non-quantized), `forward()` does
+    /// ONE matmul + two slices instead of two separate matmuls.
+    in_proj_qkvz_ba_t: Option<MxArray>,
 }
 
 impl GatedDeltaNet {
@@ -96,7 +101,30 @@ impl GatedDeltaNet {
             value_dim,
             conv_dim,
             conv_kernel_dim,
+            in_proj_qkvz_ba_t: None,
         })
+    }
+
+    /// E51: precompute the stacked `[qkvz; ba]^T` weight once after both
+    /// in_proj weights have been loaded. Forward will then use one matmul
+    /// (x @ wqb_t) plus two axis-2 slices instead of two matmuls (x @ w_qkvz.T)
+    /// + (x @ w_ba.T). Safe to call repeatedly (idempotent).
+    ///
+    /// Only applies when both in_proj_qkvz and in_proj_ba are non-quantized
+    /// Standard linears. Quantized models continue on the legacy 2-matmul
+    /// path (no-op here).
+    pub fn finalize_in_proj(&mut self) -> Result<()> {
+        match (&self.in_proj_qkvz, &self.in_proj_ba) {
+            (LinearProj::Standard(_), LinearProj::Standard(_)) => {}
+            _ => return Ok(()),
+        }
+        let w_qkvz = self.in_proj_qkvz.get_weight(); // [qkvz_dim, hidden]
+        let w_ba = self.in_proj_ba.get_weight(); // [ba_dim, hidden]
+        let stacked = MxArray::concatenate(&w_qkvz, &w_ba, 0)?; // [qkvz_dim+ba_dim, hidden]
+        let stacked_t = stacked.transpose(Some(&[1, 0]))?; // [hidden, qkvz_dim+ba_dim]
+        stacked_t.eval();
+        self.in_proj_qkvz_ba_t = Some(stacked_t);
+        Ok(())
     }
 
     /// Forward pass for GatedDeltaNet.
@@ -118,11 +146,24 @@ impl GatedDeltaNet {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
 
-        // Project to qkvz: [B, T, key_dim*2 + value_dim*2]
-        let qkvz = self.in_proj_qkvz.forward(x)?;
-
-        // Project to ba: [B, T, num_v_heads*2]
-        let ba = self.in_proj_ba.forward(x)?;
+        // E51: when the stacked weight is available, do one matmul + two
+        // slices. Env-toggle MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1 reverts to
+        // the two-matmul path.
+        let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
+        let ba_dim = (self.num_v_heads * 2) as i64;
+        let (qkvz, ba) = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t
+            && std::env::var("MLX_DISABLE_E51_STACKED_GDN_IN_PROJ").is_err()
+        {
+            let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
+            let qkvz = combined.slice_axis(2, 0, qkvz_dim)?;
+            let ba = combined.slice_axis(2, qkvz_dim, qkvz_dim + ba_dim)?;
+            (qkvz, ba)
+        } else {
+            // Legacy path: two separate matmuls.
+            let qkvz = self.in_proj_qkvz.forward(x)?;
+            let ba = self.in_proj_ba.forward(x)?;
+            (qkvz, ba)
+        };
 
         // Split ba into b and a: each [B, T, num_v_heads]
         let b = ba.slice_axis(2, 0, self.num_v_heads as i64)?;
@@ -274,9 +315,11 @@ impl GatedDeltaNet {
     // ========== Weight accessors (standard mode) ==========
 
     pub fn set_in_proj_qkvz_weight(&mut self, w: &MxArray) -> Result<()> {
+        self.in_proj_qkvz_ba_t = None; // E51: invalidate stacked cache
         self.in_proj_qkvz.set_weight(w, "in_proj_qkvz")
     }
     pub fn set_in_proj_ba_weight(&mut self, w: &MxArray) -> Result<()> {
+        self.in_proj_qkvz_ba_t = None;
         self.in_proj_ba.set_weight(w, "in_proj_ba")
     }
     pub fn set_conv1d_weight(&mut self, w: &MxArray) -> Result<()> {
@@ -310,9 +353,11 @@ impl GatedDeltaNet {
     // ========== Quantized setters ==========
 
     pub fn set_quantized_in_proj_qkvz(&mut self, ql: QuantizedLinear) {
+        self.in_proj_qkvz_ba_t = None;
         self.in_proj_qkvz.set_quantized(ql);
     }
     pub fn set_quantized_in_proj_ba(&mut self, ql: QuantizedLinear) {
+        self.in_proj_qkvz_ba_t = None;
         self.in_proj_ba.set_quantized(ql);
     }
     pub fn set_quantized_out_proj(&mut self, ql: QuantizedLinear) {

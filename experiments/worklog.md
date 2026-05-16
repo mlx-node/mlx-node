@@ -24,6 +24,7 @@ primary data.
 | **E40** | `mlx_fused_ops.cpp` | (same as E39) | In the E39 stacked path, use `qwen35_common::swiglu()` (mlx::core::compile-cached fused `sigmoid·gate·up`) instead of inline ops. |
 | **E5+E36** | `crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc` | (no toggle — kernel-internal) | Threadgroup `decay_mat[BT*BT]` and `decay_self[BT]` precompute. M5+ only (`CHUNK_MIN_GPU_GEN=17`); correctness verified on M3 by temporarily lowering the gate. |
 | **E47** | `crates/mlx-sys/src/metal/gated_delta_step_2vcol.metal.inc` + `mlx_gated_delta.cpp` dispatch | `MLX_DISABLE_E47_GDN_2VCOL=1` | Per-step GDN kernel: each simdgroup handles 2 v-cols (dv_A=2y, dv_B=2y+1), sharing q[Dk]+k[Dk] loads. Grid-Y halves to Dv/2. -2.0% at 1024 single-chunk; neutral at 4096+. |
+| **E51** | `gated_delta_net.rs::finalize_in_proj` + `persistence.rs` | `MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1` | Load-time stack of `in_proj_qkvz` + `in_proj_ba` into `[hidden, qkvz_dim+ba_dim]^T`. Forward does one matmul + two axis-2 slices instead of two matmuls. -0.44% on top of E47. No-op for quantized variants. |
 
 The wins compose: each toggle reverts its piece independently, validated
 by same-binary A/B (see methodology below).

@@ -405,6 +405,10 @@ fn apply_weights_inner(
                 if let Some(w) = params.get(&format!("{}.linear_attn.A_log", prefix)) {
                     gdn.set_a_log(w)?;
                 }
+                // E51: precompute the stacked [in_proj_qkvz; in_proj_ba].T
+                // weight so forward() does one matmul + two slices instead of
+                // two separate matmuls. No-op for quantized variants.
+                gdn.finalize_in_proj()?;
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
