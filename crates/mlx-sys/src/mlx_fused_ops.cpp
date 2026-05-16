@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx_qwen35_common.h"
 
 extern "C" {
 
@@ -40,6 +41,42 @@ mlx_array* mlx_swiglu_mlp_forward(mlx_array* x_handle,
 
   return reinterpret_cast<mlx_array*>(new array(std::move(output)));
 }
+
+// E39: Stacked SwiGLU MLP. Takes pre-stacked + pre-transposed weights computed
+// once at model load (see MLP::finalize_gate_up in transformer/mlp.rs):
+//   w_gate_up_t: [hidden, 2*intermediate]  (concatenate then transpose)
+//   w_down_t:    [intermediate, hidden]    (transpose)
+//
+// Saves one of the two MLP matmuls (gate and up fused into one [hidden,
+// 2*intermediate] matmul). For Qwen3.5-4B: hidden=2560, intermediate=9216, so
+// the fused matmul is x @ W [B,T,2560] @ [2560, 18432]. Lookup of W tile/cache
+// is amortized vs the two separate matmuls.
+mlx_array* mlx_swiglu_mlp_forward_stacked(mlx_array* x_handle,
+                                           mlx_array* w_gate_up_t_handle,
+                                           mlx_array* w_down_t_handle) {
+  auto x = reinterpret_cast<array*>(x_handle);
+  auto w_gate_up_t = reinterpret_cast<array*>(w_gate_up_t_handle);
+  auto w_down_t = reinterpret_cast<array*>(w_down_t_handle);
+
+  // x: [B, T, hidden]; w_gate_up_t: [hidden, 2*intermediate]
+  auto gate_up = matmul(*x, *w_gate_up_t);  // [B, T, 2*intermediate]
+
+  int intermediate = static_cast<int>(gate_up.shape().back()) / 2;
+  int B = static_cast<int>(gate_up.shape()[0]);
+  int T = static_cast<int>(gate_up.shape()[1]);
+
+  auto gate = slice(gate_up, {0, 0, 0}, {B, T, intermediate});
+  auto up   = slice(gate_up, {0, 0, intermediate}, {B, T, 2 * intermediate});
+
+  // E40: fused swiglu via mlx::core::compile (one Metal kernel for
+  // sigmoid(gate)*gate*up). Helper is from mlx_qwen35_common.h.
+  auto gated = qwen35_common::swiglu(gate, up);
+
+  // down: gated @ w_down_t
+  auto output = matmul(gated, *w_down_t);
+  return reinterpret_cast<mlx_array*>(new array(std::move(output)));
+}
+
 // Combines: norm -> attention -> residual -> norm -> mlp -> residual
 // Reduces ~40 FFI calls to 1 per block
 mlx_array* mlx_fused_transformer_block_forward(

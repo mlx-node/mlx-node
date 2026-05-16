@@ -7251,7 +7251,7 @@ impl Qwen3_5Model {
 
 /// Default prefill chunk size (tokens per chunk).
 /// Matches Python mlx-lm's `prefill_step_size` default of 2048.
-const PREFILL_STEP_SIZE: i64 = 2048;
+const PREFILL_STEP_SIZE: i64 = 1024;
 
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
@@ -7264,6 +7264,20 @@ pub(crate) fn eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) -> Resu
         MxArray::eval_arrays(&arrays)?;
     }
     Ok(())
+}
+
+/// Async variant of `eval_layer_caches`: kicks GPU on cache materialization
+/// but does NOT block the CPU. Used between prefill chunks so the CPU can
+/// start building the next chunk's graph while the previous chunk's cache
+/// writes are still in flight.
+pub(crate) fn async_eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
+    if let Some(caches) = caches {
+        let mut arrays: Vec<&MxArray> = Vec::new();
+        for cache in caches.iter() {
+            cache.collect_arrays(&mut arrays);
+        }
+        MxArray::async_eval_arrays(&arrays);
+    }
 }
 
 /// Chunked prefill: process prompt in chunks of `PREFILL_STEP_SIZE`, evaluating
@@ -7284,6 +7298,9 @@ fn chunked_prefill(
     let total_len = prompt.shape_at(1)?;
     let mut offset: i64 = 0;
 
+    // E28: env-var toggle for A/B. Default: async between chunks. When set,
+    // falls back to synchronous eval_layer_caches (the prior behavior).
+    let chunk_async = std::env::var("MLX_PREFILL_SYNC_BETWEEN_CHUNKS").is_err();
     while total_len - offset > PREFILL_STEP_SIZE {
         let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
         {
@@ -7298,7 +7315,11 @@ fn chunked_prefill(
                 embedding_weight_t,
             )?;
         }
-        eval_layer_caches(caches)?;
+        if chunk_async {
+            async_eval_layer_caches(caches);
+        } else {
+            eval_layer_caches(caches)?;
+        }
         crate::array::clear_cache();
         offset += PREFILL_STEP_SIZE;
     }
@@ -7335,10 +7356,48 @@ fn forward_inner(
     let mut h = hidden_states.clone();
 
     let num_layers = layers.len();
+    // Plain layer loop. In-loop async_eval was tested (every 8 layers,
+    // including h + all cache arrays) and found neutral-to-negative at
+    // single-chunk prefill on M3 (back-to-back A/B in the same binary
+    // showed deltas inside the run-to-run noise band). The CPU/GPU
+    // overlap benefit only materializes across the inter-chunk barrier
+    // in chunked_prefill, which now uses async_eval_layer_caches.
+    // E37: slice h to last token before final_norm + lm_head. All callers
+    // of forward_inner only consume the last token's logits (chat decode is
+    // already T=1; prefill samples from last token only — see e.g. line
+    // ~5151's `slice_axis(1, seq_len-1, seq_len)`). For prefill with T=860
+    // this skips ~99.9% of the lm_head matmul.
+    // E38: additionally, in the last layer, slice h to last token BEFORE
+    // the MLP. Skips ~120 GFLOPs of wasted MLP work for the discarded T-1
+    // rows. Cache writes still happen on full T inside attention. For
+    // decode (T=1) both slices are no-ops.
+    // Env-toggle MLX_DISABLE_E37_LAST_TOKEN_SLICE=1 reverts both for A/B.
+    let slice_last_token = std::env::var("MLX_DISABLE_E37_LAST_TOKEN_SLICE").is_err();
     for i in 0..num_layers {
         let cache = caches.as_mut().map(|c| &mut c[i]);
-        h = layers[i].forward(&h, None, cache, None, true)?;
+        let is_last_layer = i + 1 == num_layers;
+        h = layers[i].forward_with_optional_last_slice(
+            &h,
+            None,
+            cache,
+            None,
+            true,
+            slice_last_token && is_last_layer,
+        )?;
     }
+
+    let h = if slice_last_token {
+        // E37 may already have reduced h to [B, 1, hidden] in the last layer;
+        // this is a no-op in that case but kept for decode (T=1) safety.
+        let seq_len = h.shape_at(1)?;
+        if seq_len > 1 {
+            h.slice_axis(1, seq_len - 1, seq_len)?
+        } else {
+            h
+        }
+    } else {
+        h
+    };
 
     let h = final_norm.forward(&h)?;
     match lm_head {

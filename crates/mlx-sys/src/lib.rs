@@ -115,6 +115,15 @@ unsafe extern "C-unwind" {
         w_down: *mut mlx_array,
     ) -> *mut mlx_array;
 
+    // E39: SwiGLU MLP with pre-stacked + pre-transposed weights
+    //   w_gate_up_t: [hidden, 2*intermediate]
+    //   w_down_t:    [intermediate, hidden]
+    pub fn mlx_swiglu_mlp_forward_stacked(
+        x: *mut mlx_array,
+        w_gate_up_t: *mut mlx_array,
+        w_down_t: *mut mlx_array,
+    ) -> *mut mlx_array;
+
     // Fused Transformer Block forward (without KV cache)
     pub fn mlx_fused_transformer_block_forward(
         x: *mut mlx_array,

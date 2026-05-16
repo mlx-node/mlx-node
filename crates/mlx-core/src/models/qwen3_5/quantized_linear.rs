@@ -152,6 +152,14 @@ impl MLPVariant {
         }
     }
 
+    /// E39: finalize stacked gate+up weight. No-op for quantized variant.
+    pub fn finalize_gate_up(&mut self) -> Result<()> {
+        match self {
+            MLPVariant::Standard(mlp) => mlp.finalize_gate_up(),
+            MLPVariant::Quantized { .. } => Ok(()),
+        }
+    }
+
     pub fn set_down_proj_weight(&mut self, w: &MxArray) -> Result<()> {
         match self {
             MLPVariant::Standard(mlp) => mlp.set_down_proj_weight(w),

@@ -1,0 +1,9 @@
+{
+  "modelPath": "/Users/brooklyn/workspace/github/mlx-node/.cache/models/Qwen3.5-4B-mlx",
+  "promptTokens": 1024,
+  "runs": 10,
+  "warmup": 2,
+  "writeBaseline": false,
+  "skipBuild": true,
+  "experimentNotes": "Arc-end state: E37+E38+E39+E40 best-so-far (-13.7% same-binary A/B at 1024 prompt). E41 (QKV stack — slice-reshape copy regression), E42 (attention internal slice — mixed across prompt sizes), E43 (skip clear_cache — within noise) all rejected and cleanly reverted. Diminishing returns; remaining catalog levers (FlashQLA chunked-kernel ideas) target M5+ hardware."
+}

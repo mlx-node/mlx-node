@@ -63,6 +63,10 @@ R"(
     threadgroup float gcum[BT];               // 32 floats
     threadgroup float beta_s[BT];             // 32 floats
     threadgroup float q_buf[BK];              // 128 floats
+    threadgroup float decay_mat[BT * BT];     // 32*32 floats = 4 KB — exp(gcum[i]-gcum[j])
+                                              // precomputed once per chunk, used in Phases 3/4/5
+    threadgroup float decay_self[BT];         // 32 floats = 128 B — exp(gcum[i]) cache
+                                              // replaces redundant exp(gcum[i]) in Phases 3/4
 
     // --- Load state into registers: 4 elements per thread ---
     float s[n_per_t];
@@ -101,6 +105,26 @@ R"(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
+        // ========== Phase 1c: Precompute decay_mat[i,j] = exp(gcum[i] - gcum[j]) ==========
+        // Indexed by BT (not chunk_len) so the read indexing in Phases 3/4/5
+        // (i * BT + j) is consistent across full and partial chunks.
+        // Entries with i >= chunk_len or j >= chunk_len are never read.
+        // 128 threads cooperatively fill chunk_len*chunk_len entries (8 each for BT=32).
+        // Done directly (not via decay[i]/decay[j]) to avoid 0/0=NaN when gcum is
+        // very negative. exp() of a very negative number underflows to 0 cleanly,
+        // which is the mathematically correct "no contribution" answer.
+        for (int idx = linear_tid; idx < chunk_len * chunk_len; idx += num_threads) {
+            int i_ = idx / chunk_len;
+            int j_ = idx % chunk_len;
+            decay_mat[i_ * BT + j_] = exp(gcum[i_] - gcum[j_]);
+        }
+        // decay_self[i] = exp(gcum[i]) — replaces redundant exp() in Phases 3/4.
+        // Net saves ~2*chunk_len exp() per chunk per (v_col, head) tile.
+        if (linear_tid < chunk_len) {
+            decay_self[linear_tid] = exp(gcum[linear_tid]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         // ========== Phase 2: kk_dot lower-triangular (SIMD-accelerated) ==========
         // Each of DV_PER_TG v-columns handles different (i,j) pairs
         for (int i = 0; i < chunk_len; i++) {
@@ -120,7 +144,7 @@ R"(
         // Sequential over i (data dependency), but Dk dot uses simd_sum
         for (int i = 0; i < chunk_len; i++) {
             float v_i     = static_cast<float>(v_base[(chunk_start + i) * v_time_stride + v_idx]);
-            float decay_i = exp(gcum[i]);
+            float decay_i = decay_self[i];  // was exp(gcum[i])
             float beta_i  = beta_s[i];
 
             // kv_mem = sum_d(s[d] * decay_i * k[i,d]) — SIMD reduced
@@ -132,8 +156,9 @@ R"(
             kv_mem = simd_sum(kv_mem);  // broadcast to all 32 lanes
 
             float rhs = beta_i * (v_i - kv_mem);
+            int i_row = i * BT;
             for (int j = 0; j < i; j++) {
-                float a_ij = beta_i * kk_dot[i * BT + j] * exp(gcum[i] - gcum[j]);
+                float a_ij = beta_i * kk_dot[i_row + j] * decay_mat[i_row + j];
                 rhs -= a_ij * delta_arr[j];
             }
             delta_arr[i] = rhs;
@@ -148,7 +173,7 @@ R"(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            float decay_i = exp(gcum[i]);
+            float decay_i = decay_self[i];  // was exp(gcum[i])
 
             // Inter-chunk: q @ (state * decay) — SIMD reduced
             float o_val = 0.0f;
@@ -159,6 +184,7 @@ R"(
             o_val = simd_sum(o_val);  // broadcast to all 32 lanes
 
             // Intra-chunk: sum_j(qk_dot * delta * decay) — SIMD reduced per j
+            int i_row = i * BT;
             for (int j = 0; j <= i; j++) {
                 float qk_dot = 0.0f;
                 for (int p = 0; p < n_per_t; p++) {
@@ -166,7 +192,7 @@ R"(
                     qk_dot = fma(q_buf[d], k_chunk[j * BK + d], qk_dot);
                 }
                 qk_dot = simd_sum(qk_dot);  // broadcast
-                o_val += qk_dot * delta_arr[j] * exp(gcum[i] - gcum[j]);
+                o_val += qk_dot * delta_arr[j] * decay_mat[i_row + j];
             }
 
             // Only lane 0 writes output
@@ -177,12 +203,16 @@ R"(
         }
 
         // ========== Phase 5: State update (direct register update, no reduction) ==========
-        float g_total = gcum[chunk_len - 1];
+        // decay_self[chunk_len - 1] = exp(gcum[chunk_len-1]) precomputed in Phase 1c.
+        // (Was 128 redundant exp() calls per chunk — each thread re-evaluating.)
+        float decay_total = decay_self[chunk_len - 1];
+        int last_row = (chunk_len - 1) * BT;
         for (int p = 0; p < n_per_t; p++) {
             int d = simd_lane * n_per_t + p;
-            float s_new = s[p] * exp(g_total);
+            float s_new = s[p] * decay_total;
             for (int t = 0; t < chunk_len; t++) {
-                s_new += k_chunk[t * BK + d] * delta_arr[t] * exp(g_total - gcum[t]);
+                // exp(g_total - gcum[t]) = decay_mat[(chunk_len-1)*BT + t]
+                s_new += k_chunk[t * BK + d] * delta_arr[t] * decay_mat[last_row + t];
             }
             s[p] = s_new;
         }

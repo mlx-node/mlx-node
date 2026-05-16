@@ -508,6 +508,10 @@ fn apply_weights_inner(
                     if let Some(w) = params.get(&format!("{}.mlp.down_proj.weight", prefix)) {
                         mlp.set_down_proj_weight(w)?;
                     }
+                    // E39: precompute the stacked [gate;up].T + down.T weights
+                    // so the per-forward MLP path uses one matmul instead of two
+                    // and reads pre-transposed weights.
+                    mlp.finalize_gate_up()?;
                 }
             }
             MLPVariant::Quantized { .. } => {}
