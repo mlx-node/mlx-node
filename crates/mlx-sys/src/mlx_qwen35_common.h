@@ -13,10 +13,13 @@
 #include "mlx_common.h"
 #include "mlx_paged_ops.h"
 
-#include <string>
-#include <unordered_map>
-#include <shared_mutex>
 #include <atomic>
+#include <cstdio>
+#include <optional>
+#include <shared_mutex>
+#include <string>
+#include <tuple>
+#include <unordered_map>
 
 namespace qwen35_common {
 
@@ -74,6 +77,36 @@ inline bool has_weight(const std::string& name) {
   return g_weights().count(name) > 0;
 }
 
+// =====================================================================
+// Quantization metadata registry
+//
+// Sidecar map keyed by projection prefix (NO `.weight`/`.scales`/`.biases`
+// suffix), e.g. "layers.3.mlp.switch_mlp.gate_proj". Holds the authoritative
+// per-layer (mode, bits, group_size) supplied by Rust at weight-registration
+// time so the compiled forward path can dispatch correctly without inferring
+// from companion-tensor presence (which conflates MXFP4/MXFP8/NVFP4).
+//
+// Shares g_weights_mutex() — a single lock at registration covers both maps.
+// =====================================================================
+
+struct QuantInfo {
+  std::string mode;  // "affine" | "mxfp8" | "mxfp4" | "nvfp4"
+  int bits;
+  int group_size;
+};
+
+inline std::unordered_map<std::string, QuantInfo>& g_quant_info() {
+  static std::unordered_map<std::string, QuantInfo> instance;
+  return instance;
+}
+
+inline std::optional<QuantInfo> lookup_quant_info(const std::string& prefix) {
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
+  auto it = g_quant_info().find(prefix);
+  if (it == g_quant_info().end()) return std::nullopt;
+  return it->second;  // copy under lock
+}
+
 // Infer affine quantization bits from weight and scales shapes.
 // For affine: weight_cols = original_cols * bits / 32,
 //             scales_cols = original_cols / group_size
@@ -88,13 +121,20 @@ inline int infer_affine_bits(const array& w, const array& scales, int group_size
   return (w_cols * 32) / original_cols;
 }
 
-// Auto-detecting linear projection: uses quantized_matmul if .scales exists,
-// otherwise plain matmul with transposed weight. Safe for both dense (bf16)
-// and quantized (MXFP8/affine) weights.
+// Auto-detecting linear projection.
 //
-// Quant param heuristic: the presence of .biases distinguishes the format:
-//   - No .biases → MXFP8 quantization (group_size=32, bits=8, mode="mxfp8")
-//   - Has .biases → Affine quantization (infer bits from weight/scales shape ratio)
+// Dispatch order:
+//   1. If Rust registered (mode, bits, group_size) for this prefix via
+//      `mlx_store_quant_info`, use those values verbatim. This is the
+//      authoritative path — Rust knows the true quantization tuple from
+//      config.json + per-layer overrides + recipe upgrades.
+//   2. Otherwise fall back to a heuristic that infers MXFP8 vs affine
+//      from companion-tensor presence. Preserves correctness for any
+//      caller that has not (yet) plumbed quant-info registration. A
+//      one-shot log fires the first time the fallback runs per process
+//      so it's visible when the registry path is unexpectedly bypassed.
+//   3. If no `.scales` companion exists at all, the weight is bf16/f16
+//      and we use plain matmul against the pre-transposed weight.
 inline array linear_proj(const array& x, const std::string& prefix) {
   std::string scales_key = prefix + ".scales";
   if (has_weight(scales_key)) {
@@ -105,7 +145,28 @@ inline array linear_proj(const array& x, const std::string& prefix) {
     if (has_weight(biases_key)) {
       biases = get_weight(biases_key);
     }
-    // Detect MXFP8 vs affine: no biases → MXFP8 (gs=32, bits=8, mode="mxfp8")
+
+    // Registry-first dispatch.
+    if (auto info = lookup_quant_info(prefix)) {
+      return mlx::core::quantized_matmul(
+          x, w, scales, biases, /*transpose=*/true,
+          info->group_size, info->bits, info->mode);
+    }
+
+    // Fallback heuristic: only the registered modes affine/mxfp8/mxfp4/nvfp4
+    // are correct callers; MXFP4/NVFP4 paths under the heuristic would silently
+    // mislabel as MXFP8 because none of them carry biases. The fallback exists
+    // for the dense qwen3_5 path (which does not register quant info today) —
+    // dense models in production are MXFP8 or affine, so the heuristic remains
+    // correct there until the dense path is plumbed in a follow-up.
+    static std::atomic<bool> warned_fallback{false};
+    if (!warned_fallback.exchange(true)) {
+      fprintf(stderr,
+              "[mlx_qwen35] linear_proj: registry miss for prefix '%s' "
+              "(first occurrence; suppressing further warnings). Falling "
+              "back to companion-tensor heuristic.\n",
+              prefix.c_str());
+    }
     if (!biases.has_value()) {
       return mlx::core::quantized_matmul(x, w, scales, biases, true, 32, 8, "mxfp8");
     } else {
@@ -114,6 +175,51 @@ inline array linear_proj(const array& x, const std::string& prefix) {
     }
   }
   return matmul(x, get_weight_t(prefix + ".weight"));
+}
+
+// Detect quantization for a layer projection (q_proj, gate_proj, switch_mlp.*,
+// shared_expert.*, dense MLP gate_proj, etc).
+//
+// Returns (is_quantized, group_size, bits, mode). When the prefix has no
+// `.scales` companion, returns (false, 0, 0, "").
+//
+// Dispatch order matches `linear_proj`:
+//   1. Registry hit -> use Rust-authoritative (mode, bits, group_size).
+//   2. Registry miss -> heuristic: no-biases -> MXFP8 (gs=32, bits=8);
+//      has-biases -> affine (gs=64, bits inferred from weight/scales ratio).
+inline std::tuple<bool, int, int, std::string>
+detect_layer_quant(const std::string& prefix) {
+  if (!has_weight(prefix + ".scales")) {
+    return {false, 0, 0, ""};
+  }
+  if (auto info = lookup_quant_info(prefix)) {
+    return {true, info->group_size, info->bits, info->mode};
+  }
+  bool has_biases = has_weight(prefix + ".biases");
+  if (!has_biases) {
+    return {true, 32, 8, "mxfp8"};
+  }
+  auto w = get_weight(prefix + ".weight");
+  auto scales = get_weight(prefix + ".scales");
+  int bits = infer_affine_bits(w, scales, 64);
+  return {true, 64, bits, "affine"};
+}
+
+// Detect quantization for a router/shared-expert gate. Same return shape as
+// `detect_layer_quant`. Pre-PR behavior was to hardcode gates as 8-bit affine
+// gs=64 regardless of the checkpoint; with the registry, Rust drives the
+// actual values (MXFP8 gates under `--q-mxfp --q-bits 8` no-recipe path,
+// 8-bit affine in all other cases). Heuristic fallback retains the legacy
+// hardcoded value for callers that have not been plumbed.
+inline std::tuple<bool, int, int, std::string>
+detect_router_gate_quant(const std::string& prefix) {
+  if (!has_weight(prefix + ".scales")) {
+    return {false, 0, 0, ""};
+  }
+  if (auto info = lookup_quant_info(prefix)) {
+    return {true, info->group_size, info->bits, info->mode};
+  }
+  return {true, 64, 8, "affine"};
 }
 
 // =====================================================================

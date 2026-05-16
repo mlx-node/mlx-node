@@ -1059,13 +1059,17 @@ export declare class PrivacyFilterModel {
    * Pipeline:
    * 1. Tokenize the text with byte offsets, no special tokens.
    * 2. Run the forward pass to get `[1, T, 33]` logits.
-   * 3. Softmax + argmax per token → tag id and max-prob per token.
+   * 3. Compute softmax (for per-tag confidences) and log-softmax (for
+   *    Viterbi emissions) over the class axis.
    * 4. Build the transition matrix from the default calibration
    *    merged with any per-call overrides.
    * 5. Viterbi-decode using log-softmax emissions to get the BIOES
    *    tag sequence.
-   * 6. Walk the tags + offsets + per-token probabilities to extract
-   *    coherent spans whose mean probability clears `threshold`.
+   * 6. For each token, take the softmax probability of the
+   *    Viterbi-emitted tag (so per-token `tag` and `score` share
+   *    decoders), then walk the tags + offsets + those probabilities
+   *    to extract coherent spans whose mean probability clears
+   *    `threshold`.
    */
   classify(text: string, opts?: PrivacyClassifyOptions | undefined | null): PrivacyClassifyResult;
 }
@@ -2605,6 +2609,13 @@ export interface ConversionOptions {
    * Improves quantization quality by amplifying important weight channels.
    */
   imatrixPath?: string;
+  /**
+   * Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
+   * When true, applies after the recipe predicate: any 8-bit affine decision
+   * becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+   * Forces `group_size = 32` for upgraded layers.
+   */
+  quantMxfp?: boolean;
 }
 
 export interface ConversionResult {
@@ -3102,6 +3113,13 @@ export interface GgufConversionOptions {
    * This makes the safetensors compatible with mlx-vlm.
    */
   vlmKeyPrefix?: boolean;
+  /**
+   * Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
+   * When true, applies after the recipe predicate: any 8-bit affine decision
+   * becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+   * Forces `group_size = 32` for upgraded layers.
+   */
+  quantMxfp?: boolean;
 }
 
 export interface GgufConversionResult {
@@ -3650,8 +3668,9 @@ export interface PrivacyClassifyResult {
  *
  * `start`/`end` are byte offsets into the input string (Hugging Face
  * `tokenizers` convention). `label` is the privacy class without the
- * BIOES prefix (e.g. `"private_email"`). `score` is the mean of the
- * per-token max-softmax probabilities across the span's tokens.
+ * BIOES prefix (e.g. `"private_email"`). `score` is the mean — across
+ * the span's tokens — of the softmax probability of the Viterbi-emitted
+ * tag at each token.
  */
 export interface PrivacyEntity {
   label: string;
@@ -3664,8 +3683,10 @@ export interface PrivacyEntity {
 /**
  * Per-token output emitted when [`PrivacyClassifyOptions::return_tokens`]
  * is `true`. `tag` is the full BIOES tag (`"O"` or `"B-..."`/`"I-..."`/
- * `"E-..."`/`"S-..."`). `score` is the softmax probability of the
- * argmax class at that token.
+ * `"E-..."`/`"S-..."`) chosen by the Viterbi decoder. `score` is the
+ * softmax probability of that emitted tag at this token, so `tag` and
+ * `score` always share decoders (at boundary tokens the Viterbi tag can
+ * differ from the local argmax).
  */
 export interface PrivacyToken {
   text: string;

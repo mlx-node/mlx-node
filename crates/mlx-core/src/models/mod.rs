@@ -14,6 +14,7 @@ pub mod pp_text_det;
 pub mod pp_text_rec;
 pub mod privacy_filter;
 pub mod qianfan_ocr;
+pub mod quant_dispatch;
 pub mod qwen3;
 pub mod qwen3_5;
 pub mod qwen3_5_moe;

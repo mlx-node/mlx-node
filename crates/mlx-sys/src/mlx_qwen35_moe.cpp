@@ -168,7 +168,13 @@ array switch_linear_forward(
       sorted);
 }
 
-// Switch linear forward (auto-dispatch quantized vs dense, auto-detect bits)
+// Switch linear forward (auto-dispatch quantized vs dense).
+//
+// Dispatch order:
+//   1. Registry hit → use Rust-authoritative (mode, bits, group_size).
+//   2. Registry miss → infer from companion-tensor presence (legacy
+//      heuristic). The hint args are kept for ABI stability with
+//      existing callers but ignored — the registry is the source of truth.
 array switch_linear_fwd(
     const array& x,
     const std::string& prefix,
@@ -182,15 +188,26 @@ array switch_linear_fwd(
     if (has_weight(prefix + ".biases")) {
       biases = get_weight(prefix + ".biases");
     }
-    // Infer bits from weight/scales shape ratio (supports mixed-bit recipes)
-    // For 3D switch weights: w=[E, out, in_packed], scales=[E, out, in/gs]
-    int w_cols = w.shape(-1);
-    int s_cols = scales.shape(-1);
-    int gs = 64;
-    int original_cols = s_cols * gs;
-    int bits = (w_cols * 32) / original_cols;
-    std::string mode = biases.has_value() ? "affine" : "mxfp8";
-    if (!biases.has_value()) { gs = 32; bits = 8; }
+
+    int gs;
+    int bits;
+    std::string mode;
+    if (auto info = lookup_quant_info(prefix)) {
+      gs = info->group_size;
+      bits = info->bits;
+      mode = info->mode;
+    } else {
+      // Legacy heuristic. Shape-based bit inference handles mixed-bit affine
+      // recipes; no-biases means MXFP8 by convention.
+      int w_cols = w.shape(-1);
+      int s_cols = scales.shape(-1);
+      gs = 64;
+      int original_cols = s_cols * gs;
+      bits = (w_cols * 32) / original_cols;
+      mode = biases.has_value() ? "affine" : "mxfp8";
+      if (!biases.has_value()) { gs = 32; bits = 8; }
+    }
+
     return mlx::core::gather_qmm(
         x, w, scales, biases,
         std::nullopt,  // lhs_indices (not used)
@@ -773,31 +790,10 @@ void mlx_qwen35_moe_init_from_prefill(
     g_dense_quant.clear();
     g_dense_quant.reserve(num_layers);
 
-    auto detect_quant = [](const std::string& prefix) -> std::tuple<bool, int, int, std::string> {
-      if (!has_weight(prefix + ".scales")) {
-        return {false, 0, 0, ""};
-      }
-      // Check for MXFP8: no biases, infer from scales shape
-      bool has_biases = has_weight(prefix + ".biases");
-      if (!has_biases) {
-        // MXFP8: group_size=32, bits=8
-        return {true, 32, 8, "mxfp8"};
-      }
-      // Affine: infer bits from weight/scales shape ratio
-      auto w = get_weight(prefix + ".weight");
-      auto scales = get_weight(prefix + ".scales");
-      int bits = infer_affine_bits(w, scales, 64);
-      return {true, 64, bits, "affine"};
-    };
-
-    auto detect_gate_quant = [](const std::string& prefix) -> std::tuple<bool, int, int, std::string> {
-      if (!has_weight(prefix + ".scales")) {
-        return {false, 0, 0, ""};
-      }
-      // Router gates always use 8-bit affine with group_size=64
-      return {true, 64, 8, "affine"};
-    };
-
+    // Per-layer quant detection dispatches through detect_layer_quant /
+    // detect_router_gate_quant in mlx_qwen35_common.h (registry-first with a
+    // heuristic fallback). Keeping the bodies in the header guarantees the
+    // flat and paged init paths stay in lockstep.
     for (int i = 0; i < num_layers; i++) {
       std::string pfx = "layers." + std::to_string(i) + ".mlp.";
 
@@ -807,10 +803,10 @@ void mlx_qwen35_moe_init_from_prefill(
                   mlp_only_set.count(i) == 0);
 
       if (moe) {
-        auto [sw_q, sw_gs, sw_bits, sw_mode] = detect_quant(pfx + "switch_mlp.gate_proj");
-        auto [sh_q, sh_gs, sh_bits, sh_mode] = detect_quant(pfx + "shared_expert.gate_proj");
-        auto [g_q, g_gs, g_bits, g_mode] = detect_gate_quant(pfx + "gate");
-        auto [sg_q, sg_gs, sg_bits, sg_mode] = detect_gate_quant(pfx + "shared_expert_gate");
+        auto [sw_q, sw_gs, sw_bits, sw_mode] = detect_layer_quant(pfx + "switch_mlp.gate_proj");
+        auto [sh_q, sh_gs, sh_bits, sh_mode] = detect_layer_quant(pfx + "shared_expert.gate_proj");
+        auto [g_q, g_gs, g_bits, g_mode] = detect_router_gate_quant(pfx + "gate");
+        auto [sg_q, sg_gs, sg_bits, sg_mode] = detect_router_gate_quant(pfx + "shared_expert_gate");
 
         g_layer_quant.push_back(LayerQuantInfo{
           sw_q, sw_gs, sw_bits, sw_mode,
@@ -821,7 +817,7 @@ void mlx_qwen35_moe_init_from_prefill(
         g_dense_quant.push_back(DenseMLPQuantInfo{false, 0, 0, ""});
       } else {
         g_layer_quant.push_back(LayerQuantInfo{});
-        auto [dq, dgs, dbits, dmode] = detect_quant(pfx + "gate_proj");
+        auto [dq, dgs, dbits, dmode] = detect_layer_quant(pfx + "gate_proj");
         g_dense_quant.push_back(DenseMLPQuantInfo{dq, dgs, dbits, dmode});
       }
     }
@@ -1184,27 +1180,7 @@ int32_t mlx_qwen35_moe_init_paged(
     g_dense_quant.clear();
     g_dense_quant.reserve(num_layers);
 
-    auto detect_quant = [](const std::string& prefix) -> std::tuple<bool, int, int, std::string> {
-      if (!has_weight(prefix + ".scales")) {
-        return {false, 0, 0, ""};
-      }
-      bool has_biases = has_weight(prefix + ".biases");
-      if (!has_biases) {
-        return {true, 32, 8, "mxfp8"};
-      }
-      auto w = get_weight(prefix + ".weight");
-      auto scales = get_weight(prefix + ".scales");
-      int bits = infer_affine_bits(w, scales, 64);
-      return {true, 64, bits, "affine"};
-    };
-
-    auto detect_gate_quant = [](const std::string& prefix) -> std::tuple<bool, int, int, std::string> {
-      if (!has_weight(prefix + ".scales")) {
-        return {false, 0, 0, ""};
-      }
-      return {true, 64, 8, "affine"};
-    };
-
+    // Same per-layer detect helpers as the flat path (see comment there).
     for (int i = 0; i < num_layers; i++) {
       std::string pfx = "layers." + std::to_string(i) + ".mlp.";
       bool moe = (num_experts > 0 && decoder_sparse_step > 0 &&
@@ -1212,10 +1188,10 @@ int32_t mlx_qwen35_moe_init_paged(
                   mlp_only_set.count(i) == 0);
 
       if (moe) {
-        auto [sw_q, sw_gs, sw_bits, sw_mode] = detect_quant(pfx + "switch_mlp.gate_proj");
-        auto [sh_q, sh_gs, sh_bits, sh_mode] = detect_quant(pfx + "shared_expert.gate_proj");
-        auto [g_q, g_gs, g_bits, g_mode] = detect_gate_quant(pfx + "gate");
-        auto [sg_q, sg_gs, sg_bits, sg_mode] = detect_gate_quant(pfx + "shared_expert_gate");
+        auto [sw_q, sw_gs, sw_bits, sw_mode] = detect_layer_quant(pfx + "switch_mlp.gate_proj");
+        auto [sh_q, sh_gs, sh_bits, sh_mode] = detect_layer_quant(pfx + "shared_expert.gate_proj");
+        auto [g_q, g_gs, g_bits, g_mode] = detect_router_gate_quant(pfx + "gate");
+        auto [sg_q, sg_gs, sg_bits, sg_mode] = detect_router_gate_quant(pfx + "shared_expert_gate");
         g_layer_quant.push_back(LayerQuantInfo{
           sw_q, sw_gs, sw_bits, sw_mode,
           sh_q, sh_gs, sh_bits, sh_mode,
@@ -1225,7 +1201,7 @@ int32_t mlx_qwen35_moe_init_paged(
         g_dense_quant.push_back(DenseMLPQuantInfo{false, 0, 0, ""});
       } else {
         g_layer_quant.push_back(LayerQuantInfo{});
-        auto [dq, dgs, dbits, dmode] = detect_quant(pfx + "gate_proj");
+        auto [dq, dgs, dbits, dmode] = detect_layer_quant(pfx + "gate_proj");
         g_dense_quant.push_back(DenseMLPQuantInfo{dq, dgs, dbits, dmode});
       }
     }

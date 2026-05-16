@@ -8,6 +8,9 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
+use crate::models::quant_dispatch::{
+    default_per_layer_quant, load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
+};
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
 };
@@ -16,36 +19,58 @@ use crate::tokenizer::Qwen3Tokenizer;
 use super::config::Gemma4Config;
 use super::model::{Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
-    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
-    try_build_quantized_linear, try_build_quantized_switch_linear,
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint,
+    is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
+    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
+    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
+    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
+    try_build_quantized_switch_linear,
 };
 
-/// Parse the top-level `quantization` (or legacy `quantization_config`) block
-/// from `config.json` and return `(bits, group_size)`. Falls back to the
-/// 4-bit affine defaults used by Gemma4 when the block is absent.
-fn parse_quant_cfg(model_path: &Path) -> (i32, i32) {
-    let config_path = model_path.join("config.json");
-    let Ok(raw_str) = fs::read_to_string(&config_path) else {
-        return (DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE);
-    };
-    let Ok(raw) = serde_json::from_str::<Value>(&raw_str) else {
-        return (DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE);
-    };
-    let quant_cfg = raw
-        .get("quantization")
-        .or_else(|| raw.get("quantization_config"));
-    let bits = quant_cfg
-        .and_then(|q| q.get("bits"))
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
-        .unwrap_or(DEFAULT_QUANT_BITS);
-    let group_size = quant_cfg
-        .and_then(|q| q.get("group_size"))
-        .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
-        .unwrap_or(DEFAULT_QUANT_GROUP_SIZE);
-    (bits, group_size)
+// Quantization-block parsing now lives in `crate::models::quant_dispatch`,
+// shared with qwen3_5 / qwen3_5_moe. `load_quant_settings_from_disk` returns
+// `(bits, group_size, top_level_mode, per_layer_overrides)` in one read.
+
+/// Merge per-layer quant overrides written under split MoE expert prefixes
+/// (`layers.N.experts.switch_glu.{gate_proj,up_proj,down_proj}`) into the
+/// fused prefixes the load-time tensor fusion produces
+/// (`layers.N.experts.{gate_up_proj,down_proj}`).
+///
+/// Conversion emits overrides under the split names (mlx-lm gemma4_text
+/// sanitize convention), but the load path fuses `switch_glu.gate_proj` +
+/// `switch_glu.up_proj` into `experts.gate_up_proj` and renames
+/// `switch_glu.down_proj` to `experts.down_proj` before `try_build_qsl`
+/// looks up the override. Without this synthesis the load-time lookups
+/// miss for mixed-mode checkpoints and the experts fall back to the
+/// top-level default builder.
+fn merge_split_experts_into_fused(
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    num_layers: usize,
+) {
+    for i in 0..num_layers {
+        let base = format!("layers.{i}.experts");
+        let gate_key = format!("{base}.switch_glu.gate_proj");
+        let up_key = format!("{base}.switch_glu.up_proj");
+        let down_key = format!("{base}.switch_glu.down_proj");
+        let fused_gate_up = format!("{base}.gate_up_proj");
+        let fused_down = format!("{base}.down_proj");
+
+        let gate = per_layer_quant.get(&gate_key).copied();
+        let up = per_layer_quant.get(&up_key).copied();
+        if let Some(merged) = merge_per_layer(
+            gate.as_ref(),
+            up.as_ref(),
+            &fused_gate_up,
+            "gate_proj",
+            "up_proj",
+        ) {
+            per_layer_quant.insert(fused_gate_up, merged);
+        }
+
+        if let Some(down) = per_layer_quant.get(&down_key).copied() {
+            per_layer_quant.insert(fused_down, down);
+        }
+    }
 }
 
 /// Parse config.json into Gemma4Config.
@@ -575,31 +600,54 @@ fn apply_weights(
     config: &Gemma4Config,
     quant_bits: i32,
     quant_group_size: i32,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
+    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
+    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
 
     info!(
-        "Applying weights: {} tensors, quantized={}, mxfp8={}, bits={}, group_size={}",
+        "Applying weights: {} tensors, quantized={}, mxfp8={}, bits={}, group_size={}, default_mode={:?}, per_layer_overrides={}",
         params.len(),
         is_quantized,
         is_mxfp8,
         quant_bits,
         quant_group_size,
+        default_mode,
+        per_layer_quant.len(),
     );
 
-    // Helper closure for building quantized linears
+    // Helper closure for building quantized linears. Dispatches by per-layer
+    // mode (mxfp4 / mxfp8 / affine), falling back to `default_plq` (which
+    // honors top-level `quantization.mode`) when no per-layer override is
+    // present. The `try_build_*` builders all return `None` when the
+    // expected `.scales` key is missing, so no extra `is_quantized` guard
+    // is needed at this layer (and adding one only to the affine arm made
+    // `try_build_ql` and `try_build_qsl` asymmetric).
     let try_build_ql = |prefix: &str| -> Option<super::quantized_linear::QuantizedLinear> {
-        if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
-            return Some(ql);
+        let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
+        match plq.mode {
+            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
+            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
+            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
+            PerLayerMode::Affine => {
+                try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+            }
         }
-        if is_quantized
-            && let Some(ql) =
-                try_build_quantized_linear(params, prefix, quant_group_size, quant_bits)
-        {
-            return Some(ql);
+    };
+    // Helper for expert-batched (switch) quantized linears used by MoE layers.
+    let try_build_qsl = |prefix: &str| -> Option<super::quantized_linear::QuantizedSwitchLinear> {
+        let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
+        match plq.mode {
+            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
+            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
+            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
+            PerLayerMode::Affine => {
+                try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+            }
         }
-        None
     };
 
     // Embedding. Q8 / Q4 affine checkpoints carry `.scales` (+ `.biases`)
@@ -607,15 +655,47 @@ fn apply_weights(
     // dense `load_weight` path trips its shape guard. Route quantized
     // embeddings through `load_quantized`, which pre-dequantizes the full
     // table for the forward lookup and (when tied) for the lm_head matmul.
+    //
+    // Defense-in-depth: `Embedding::load_quantized` calls
+    // `mlx_dequantize(..., "affine")` unconditionally, so MXFP4/MXFP8 metadata
+    // at this key would silently mis-dequantize. The convert path already
+    // forces `embed_tokens` to affine (see `apply_mxfp_upgrade` and the
+    // legacy no-recipe block), but if a future regression or hand-edited
+    // checkpoint claims otherwise we want to fail loud rather than emit
+    // garbage outputs.
     let embed_quantized = params.contains_key("embed_tokens.scales");
+    // Only enforce the affine-only guard when the embedding is actually
+    // quantized (has .scales). Dense bf16 embeddings have no tensor-side
+    // mode, so metadata claiming MXFP at the top level is irrelevant —
+    // there is nothing to mis-dequantize.
+    if embed_quantized {
+        let embed_plq = per_layer_quant
+            .get("embed_tokens")
+            .copied()
+            .unwrap_or(default_plq);
+        if embed_plq.mode != PerLayerMode::Affine {
+            return Err(Error::from_reason(format!(
+                "gemma4 embed_tokens load: Non-affine FP mode {:?} is not supported; affine only",
+                embed_plq.mode
+            )));
+        }
+    }
     if embed_quantized && let Some(w) = params.get("embed_tokens.weight") {
+        let embed_plq = per_layer_quant
+            .get("embed_tokens")
+            .copied()
+            .unwrap_or(default_plq);
         let scales = params.get("embed_tokens.scales").ok_or_else(|| {
             Error::from_reason("Missing embed_tokens.scales for quantized embedding")
         })?;
         let biases = params.get("embed_tokens.biases");
-        inner
-            .embed_tokens
-            .load_quantized(w, scales, biases, quant_group_size, quant_bits)?;
+        inner.embed_tokens.load_quantized(
+            w,
+            scales,
+            biases,
+            embed_plq.group_size,
+            embed_plq.bits,
+        )?;
         if config.tie_word_embeddings {
             let dequant = inner.embed_tokens.get_weight();
             let w_t = dequant.transpose(Some(&[1, 0]))?;
@@ -651,9 +731,28 @@ fn apply_weights(
     // PLE model-level weights
     {
         if let Some(ref mut ple) = inner.ple {
-            if params.contains_key("embed_tokens_per_layer.scales")
-                && let Some(w) = params.get("embed_tokens_per_layer.weight")
-            {
+            // Defense-in-depth: PLE embedding also routes through
+            // `Embedding::load_quantized` (affine-only). MXFP metadata at
+            // this key would silently mis-dequantize. Only enforce when
+            // the embedding is actually quantized (has .scales).
+            let ple_embed_quantized = params.contains_key("embed_tokens_per_layer.scales");
+            if ple_embed_quantized {
+                let ple_embed_plq = per_layer_quant
+                    .get("embed_tokens_per_layer")
+                    .copied()
+                    .unwrap_or(default_plq);
+                if ple_embed_plq.mode != PerLayerMode::Affine {
+                    return Err(Error::from_reason(format!(
+                        "gemma4 embed_tokens_per_layer load: Non-affine FP mode {:?} is not supported; affine only",
+                        ple_embed_plq.mode
+                    )));
+                }
+            }
+            if ple_embed_quantized && let Some(w) = params.get("embed_tokens_per_layer.weight") {
+                let ple_embed_plq = per_layer_quant
+                    .get("embed_tokens_per_layer")
+                    .copied()
+                    .unwrap_or(default_plq);
                 let scales = params.get("embed_tokens_per_layer.scales").ok_or_else(|| {
                     Error::from_reason(
                         "Missing embed_tokens_per_layer.scales for quantized PLE embedding",
@@ -664,8 +763,8 @@ fn apply_weights(
                     w,
                     scales,
                     biases,
-                    quant_group_size,
-                    quant_bits,
+                    ple_embed_plq.group_size,
+                    ple_embed_plq.bits,
                 )?;
                 info!("PLE embed_tokens_per_layer loaded (quantized)");
             } else if let Some(w) = params.get("embed_tokens_per_layer.weight") {
@@ -801,6 +900,22 @@ fn apply_weights(
                 layer.set_router_scale(w)?;
             }
             let router_prefix = format!("{}.router.proj", prefix);
+            // Defense-in-depth: `set_router_proj_quantized` calls
+            // `mlx_dequantize(..., "affine")` unconditionally. MXFP metadata
+            // at this key would silently mis-dequantize. The convert path
+            // already forces `router.proj` to affine.
+            let router_plq = per_layer_quant
+                .get(&router_prefix)
+                .copied()
+                .unwrap_or(default_plq);
+            if router_plq.mode != PerLayerMode::Affine
+                && params.contains_key(&format!("{}.scales", router_prefix))
+            {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {} load: Non-affine FP mode {:?} is not supported; affine only",
+                    router_prefix, router_plq.mode
+                )));
+            }
             if params.contains_key(&format!("{}.scales", router_prefix))
                 && let Some(w) = params.get(&format!("{}.weight", router_prefix))
             {
@@ -813,7 +928,13 @@ fn apply_weights(
                         ))
                     })?;
                 let biases = params.get(&format!("{}.biases", router_prefix));
-                layer.set_router_proj_quantized(w, scales, biases, quant_group_size, quant_bits)?;
+                layer.set_router_proj_quantized(
+                    w,
+                    scales,
+                    biases,
+                    router_plq.group_size,
+                    router_plq.bits,
+                )?;
             } else if let Some(w) = params.get(&format!("{}.weight", router_prefix)) {
                 layer.set_router_proj_weight(w)?;
             }
@@ -829,16 +950,7 @@ fn apply_weights(
             //   experts.gate_up_proj, experts.down_proj
             {
                 let gate_up_prefix = format!("{}.experts.gate_up_proj", prefix);
-                if let Some(qsl) = try_build_quantized_switch_linear(
-                    params,
-                    &gate_up_prefix,
-                    quant_group_size,
-                    quant_bits,
-                ) {
-                    layer.set_moe_gate_up_proj_quantized(qsl)?;
-                } else if let Some(qsl) =
-                    try_build_mxfp8_quantized_switch_linear(params, &gate_up_prefix)
-                {
+                if let Some(qsl) = try_build_qsl(&gate_up_prefix) {
                     layer.set_moe_gate_up_proj_quantized(qsl)?;
                 } else if let Some(w) = params.get(&format!("{}.weight", gate_up_prefix)) {
                     // mlx-lm fused dense format
@@ -850,16 +962,7 @@ fn apply_weights(
             }
             {
                 let down_prefix = format!("{}.experts.down_proj", prefix);
-                if let Some(qsl) = try_build_quantized_switch_linear(
-                    params,
-                    &down_prefix,
-                    quant_group_size,
-                    quant_bits,
-                ) {
-                    layer.set_moe_down_proj_quantized(qsl)?;
-                } else if let Some(qsl) =
-                    try_build_mxfp8_quantized_switch_linear(params, &down_prefix)
-                {
+                if let Some(qsl) = try_build_qsl(&down_prefix) {
                     layer.set_moe_down_proj_quantized(qsl)?;
                 } else if let Some(w) = params.get(&format!("{}.weight", down_prefix)) {
                     // mlx-lm fused dense format
@@ -896,11 +999,17 @@ fn apply_vision_weights(
     config: &Gemma4Config,
     quant_bits: i32,
     quant_group_size: i32,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
     let vc = match &config.vision_config {
         Some(c) => c,
         None => return Ok(()), // No vision — nothing to do
     };
+
+    let is_mxfp8 = is_mxfp8_checkpoint(params);
+    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
+    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
 
     // --- Vision Tower ---
     if let Some(ref mut vision_tower) = inner.vision_tower {
@@ -1047,6 +1156,18 @@ fn apply_vision_weights(
     // present. The dense `set_weight` path otherwise trips the shape guard.
     if let Some(ref mut embedder) = inner.embed_vision {
         let proj_prefix = "embed_vision.embedding_projection";
+        let vision_plq = per_layer_quant
+            .get(proj_prefix)
+            .copied()
+            .unwrap_or(default_plq);
+        if vision_plq.mode != PerLayerMode::Affine
+            && params.contains_key(&format!("{}.scales", proj_prefix))
+        {
+            return Err(Error::from_reason(format!(
+                "gemma4 {} load: Non-affine FP mode {:?} is not supported; affine only",
+                proj_prefix, vision_plq.mode
+            )));
+        }
         if params.contains_key(&format!("{}.scales", proj_prefix))
             && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
         {
@@ -1063,8 +1184,8 @@ fn apply_vision_weights(
                 w,
                 scales,
                 biases,
-                quant_group_size,
-                quant_bits,
+                vision_plq.group_size,
+                vision_plq.bits,
             )?;
         } else if let Some(w) = params.get(&format!("{}.weight", proj_prefix)) {
             embedder.embedding_projection.set_weight(w)?;
@@ -1289,18 +1410,51 @@ impl Gemma4Inner {
         // Create inner model
         let mut inner = Gemma4Inner::new(config.clone())?;
 
-        // Resolve quantization parameters (bits/group_size) from config.json
-        // so the apply path picks the right packing for this checkpoint. This
-        // is required for any non-default (e.g. 8-bit) quantized build — the
-        // default 4-bit constants produce wrong shapes for `embed_tokens` and
-        // wrong kernel parameters for every QuantizedLinear.
-        let (quant_bits, quant_group_size) = parse_quant_cfg(path);
+        // Resolve quantization parameters from config.json so the apply path
+        // picks the right packing for this checkpoint. This is required for
+        // any non-default (e.g. 8-bit) quantized build — the default 4-bit
+        // constants produce wrong shapes for `embed_tokens` and wrong kernel
+        // parameters for every QuantizedLinear. Also reads:
+        //   * `quantization.mode` (top-level) — drives the fallback for
+        //     layers without an explicit per-layer override (load-bearing
+        //     for mixed MXFP4 + affine checkpoints; `is_mxfp8_checkpoint` is
+        //     ambiguous when MXFP4 scales — also uint8 — are present).
+        //   * Per-layer overrides — for mixed-recipe checkpoints
+        //     (e.g. mxfp4 attention + mxfp8 MoE experts).
+        let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
+            load_quant_settings_from_disk(path, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE);
+
+        // Conversion writes per-layer overrides under split MoE expert prefixes
+        // (`layers.N.experts.switch_glu.{gate,up,down}_proj`), but the
+        // load-time tensor fusion produces fused names
+        // (`layers.N.experts.{gate_up_proj,down_proj}`). Synthesize the
+        // fused entries so `try_build_qsl` finds the right per-layer mode for
+        // mixed-recipe checkpoints (e.g. mxfp4 attention + mxfp8 experts).
+        if config.enable_moe_block {
+            merge_split_experts_into_fused(&mut per_layer_quant, config.num_hidden_layers as usize);
+        }
 
         // Apply weights
-        apply_weights(&mut inner, &params, &config, quant_bits, quant_group_size)?;
+        apply_weights(
+            &mut inner,
+            &params,
+            &config,
+            quant_bits,
+            quant_group_size,
+            top_level_mode,
+            &per_layer_quant,
+        )?;
 
         // Apply vision weights (if vision_config present)
-        apply_vision_weights(&mut inner, &params, &config, quant_bits, quant_group_size)?;
+        apply_vision_weights(
+            &mut inner,
+            &params,
+            &config,
+            quant_bits,
+            quant_group_size,
+            top_level_mode,
+            &per_layer_quant,
+        )?;
 
         // Materialize weights in chunked evals to avoid Metal command buffer
         // timeouts on large models. Without this, weights remain as lazy mmap
@@ -1400,5 +1554,36 @@ impl Gemma4Model {
             paged_active,
             _cache_limit_guard: Some(cache_limit_guard),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_split_experts_uses_bare_experts_prefix() {
+        let mut per_layer_quant: HashMap<String, PerLayerQuant> = HashMap::new();
+        let mxfp8 = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Mxfp8,
+        };
+        per_layer_quant.insert("layers.0.experts.switch_glu.gate_proj".to_string(), mxfp8);
+        per_layer_quant.insert("layers.0.experts.switch_glu.up_proj".to_string(), mxfp8);
+        per_layer_quant.insert("layers.0.experts.switch_glu.down_proj".to_string(), mxfp8);
+
+        merge_split_experts_into_fused(&mut per_layer_quant, 1);
+
+        assert_eq!(
+            per_layer_quant.get("layers.0.experts.gate_up_proj"),
+            Some(&mxfp8),
+        );
+        assert_eq!(
+            per_layer_quant.get("layers.0.experts.down_proj"),
+            Some(&mxfp8),
+        );
+        assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.gate_up_proj"));
+        assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.down_proj"));
     }
 }

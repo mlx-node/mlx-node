@@ -10,6 +10,10 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::models::quant_dispatch::{
+    default_per_layer_quant, effective_plq_for, merge_per_layer, parse_quant_block,
+    resolve_default_mode,
+};
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
@@ -24,8 +28,9 @@ use super::decoder_layer::AttentionType;
 use super::model::{Qwen3_5Model, Qwen35Inner, handle_qwen35_cmd};
 use super::processing::Qwen35VLImageProcessor;
 use super::quantized_linear::{
-    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MLPVariant, is_mxfp8_checkpoint,
-    is_quantized_checkpoint, try_build_mxfp8_quantized_linear, try_build_quantized_linear,
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MLPVariant, PerLayerMode, PerLayerQuant,
+    is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
 };
 use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 
@@ -226,16 +231,21 @@ fn apply_weights_inner(
     config: &Qwen3_5Config,
     quant_bits: i32,
     quant_group_size: i32,
-    per_layer_quant: &HashMap<String, (i32, i32)>,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
+    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
+    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
 
     let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
-        if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
-            return Some(ql);
-        }
-        let (bits, gs) = per_layer_quant
+        // Per-layer override lookup. For merged GDN projections (in_proj_qkvz,
+        // in_proj_ba) the source overrides may live under the split keys; if
+        // the two sides disagree we pick the higher-precision combination:
+        //   1. higher `bits` wins,
+        //   2. on equal bits, prefer Affine > Mxfp8 > Mxfp4 (most precise mode).
+        let plq = per_layer_quant
             .get(prefix)
             .copied()
             .or_else(|| {
@@ -243,38 +253,25 @@ fn apply_weights_inner(
                     let base = prefix.strip_suffix(".in_proj_qkvz").unwrap();
                     let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
                     let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
-                    match (qkv, z) {
-                        (Some(&a), Some(&b)) if a != b => {
-                            warn!(
-                                "Merged in_proj_qkvz has conflicting overrides: qkv={:?}, z={:?}. Using higher precision.",
-                                a, b
-                            );
-                            Some(if a.0 > b.0 { a } else { b })
-                        }
-                        (Some(&a), _) | (_, Some(&a)) => Some(a),
-                        _ => None,
-                    }
+                    merge_per_layer(qkv, z, "in_proj_qkvz", "qkv", "z")
                 } else if prefix.ends_with(".in_proj_ba") {
                     let base = prefix.strip_suffix(".in_proj_ba").unwrap();
                     let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
                     let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
-                    match (b_val, a_val) {
-                        (Some(&x), Some(&y)) if x != y => {
-                            warn!(
-                                "Merged in_proj_ba has conflicting overrides: b={:?}, a={:?}. Using higher precision.",
-                                x, y
-                            );
-                            Some(if x.0 > y.0 { x } else { y })
-                        }
-                        (Some(&x), _) | (_, Some(&x)) => Some(x),
-                        _ => None,
-                    }
+                    merge_per_layer(b_val, a_val, "in_proj_ba", "b", "a")
                 } else {
                     None
                 }
             })
-            .unwrap_or((quant_bits, quant_group_size));
-        try_build_quantized_linear(params, prefix, gs, bits)
+            .unwrap_or(default_plq);
+        match plq.mode {
+            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
+            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
+            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
+            PerLayerMode::Affine => {
+                try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+            }
+        }
     };
 
     // Embedding
@@ -283,16 +280,16 @@ fn apply_weights_inner(
             Error::from_reason("Missing embedding.weight for quantized embedding")
         })?;
         let biases = params.get("embedding.biases");
-        let (bits, gs) = per_layer_quant
+        let plq = per_layer_quant
             .get("embed_tokens")
             .copied()
-            .unwrap_or((quant_bits, quant_group_size));
+            .unwrap_or(default_plq);
         inner
             .embedding
-            .load_quantized(weight, scales, biases, gs, bits)?;
+            .load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
         info!(
             "Loaded quantized embedding ({}-bit, quantized_matmul on forward)",
-            bits
+            plq.bits
         );
     } else if let Some(w) = params.get("embedding.weight") {
         inner.embedding.set_weight(w)?;
@@ -310,14 +307,14 @@ fn apply_weights_inner(
                 Error::from_reason("Missing lm_head.weight for quantized lm_head")
             })?;
             let biases = params.get("lm_head.biases");
-            let (bits, gs) = per_layer_quant
+            let plq = per_layer_quant
                 .get("lm_head")
                 .copied()
-                .unwrap_or((quant_bits, quant_group_size));
-            head.load_quantized(weight, scales, biases, gs, bits)?;
+                .unwrap_or(default_plq);
+            head.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
             info!(
                 "Loaded quantized lm_head ({}-bit, quantized_matmul on forward)",
-                bits
+                plq.bits
             );
         } else if let Some(w) = params.get("lm_head.weight") {
             head.set_weight(w)?;
@@ -695,33 +692,15 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     .and_then(|q| q["group_size"].as_i64())
                     .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
                     as i32;
-                let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
-                    .and_then(|q| q.as_object())
-                    .map(|obj| {
-                        obj.iter()
-                            .filter(|(_, v)| v.is_object())
-                            .filter_map(|(k, v)| {
-                                let bits = v["bits"].as_i64()? as i32;
-                                let gs = v["group_size"].as_i64().unwrap_or(quant_group_size as i64)
-                                    as i32;
-                                let normalized = k
-                                    .strip_prefix("model.language_model.")
-                                    .or_else(|| k.strip_prefix("language_model.model."))
-                                    .or_else(|| k.strip_prefix("language_model."))
-                                    .or_else(|| k.strip_prefix("model."))
-                                    .unwrap_or(k)
-                                    .to_string();
-                                Some((normalized, (bits, gs)))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let (top_level_mode, per_layer_quant) =
+                    parse_quant_block(quant_cfg, quant_group_size);
 
                 if quant_cfg.is_some() {
                     info!(
-                        "Using quantization config: bits={}, group_size={}, per_layer_overrides={}",
+                        "Using quantization config: bits={}, group_size={}, top_level_mode={:?}, per_layer_overrides={}",
                         quant_bits,
                         quant_group_size,
+                        top_level_mode,
                         per_layer_quant.len()
                     );
                 }
@@ -749,14 +728,26 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     &config,
                     quant_bits,
                     quant_group_size,
+                    top_level_mode,
                     &per_layer_quant,
                 )?;
 
-                // Register weights with C++. The dense compiled graph uses the
-                // shared quant-aware `linear_proj` helper for projections, so
-                // Q8/MXFP8 checkpoints can take the same compiled decode path
-                // as bf16 checkpoints.
-                register_weights_with_cpp(&params, inner.model_id);
+                // Register weights with C++. The dense compiled graph now
+                // dispatches via the registry-aware `linear_proj` helper,
+                // which keys off the per-projection quant-info entries this
+                // call populates alongside the weights themselves. With
+                // every layer's (mode, bits, group_size) recorded
+                // explicitly, MXFP4 / MXFP8 / NVFP4 / affine checkpoints
+                // all take the compiled decode path — no more Rust
+                // forward-path fallback bypass.
+                register_weights_with_cpp(
+                    &params,
+                    inner.model_id,
+                    top_level_mode,
+                    &per_layer_quant,
+                    quant_bits,
+                    quant_group_size,
+                );
 
                 // Materialize mmap-backed weights
                 {
@@ -857,7 +848,21 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
 /// Register all sanitized weights with the C++ fused forward pass.
 /// Sets model_id AFTER all weights are stored — ensures no inference sees
 /// a partially-populated weight map with the new model's ID.
-fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
+///
+/// The dense compiled graph now reads per-projection quantization
+/// metadata from the C++ side's quant-info registry (populated below),
+/// so the registration call MUST plumb the same `top_level_mode`,
+/// `per_layer_quant`, `quant_bits`, and `quant_group_size` that
+/// `apply_weights_inner` consulted — any divergence here would corrupt
+/// the compiled forward path.
+fn register_weights_with_cpp(
+    params: &HashMap<String, MxArray>,
+    model_id: u64,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    quant_bits: i32,
+    quant_group_size: i32,
+) {
     use mlx_sys as sys;
 
     // Write-lock the weight RwLock for the entire registration.
@@ -865,12 +870,30 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
     // until registration is complete and model_id is set.
     let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
 
+    // `mlx_clear_weights` also clears the per-projection quant-info
+    // registry, so we re-populate both below.
     unsafe { sys::mlx_clear_weights() };
 
-    let store = |name: &str, array: &MxArray| {
+    // Track every quantized prefix we actually stored (i.e. every name that
+    // ends in `.scales`). The defensive merge branches below promote split
+    // GDN projections (`*.in_proj_qkv*` + `*.in_proj_z*`) into the merged
+    // `*.in_proj_qkvz.weight` key the compiled path expects; the
+    // quant-info registration loop must register the merged prefix, not
+    // the splits, so it walks `stored_quant_prefixes` rather than
+    // `params.keys()`. In the normal load path
+    // `sanitize_weights -> merge_split_projections` has already merged
+    // both `.weight` and `.scales` upstream, so these branches are
+    // typically inert and `stored_quant_prefixes` mirrors the
+    // `.scales` keys in `params`.
+    let mut stored_quant_prefixes: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(params.len());
+    let mut store = |name: &str, array: &MxArray| {
         let c_name = CString::new(name).expect("Weight name contains null byte");
         unsafe {
             sys::mlx_store_weight(c_name.as_ptr(), array.as_raw_ptr());
+        }
+        if let Some(prefix) = name.strip_suffix(".scales") {
+            stored_quant_prefixes.insert(prefix.to_string());
         }
     };
 
@@ -918,6 +941,39 @@ fn register_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
 
     let count = unsafe { sys::mlx_weight_count() };
     info!("Registered {} weights with C++ fused forward pass", count);
+
+    // Compute the same default PLQs that `apply_weights_inner` uses, so
+    // the C++ side gets the exact (mode, bits, group_size) tuple the Rust
+    // loader chose for each layer. Dense Qwen3.5 has no MoE router/shared
+    // gates, so `gate_default` is `None`.
+    let is_mxfp8 = is_mxfp8_checkpoint(params);
+    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
+    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+
+    // Walk only the prefixes we actually stored. Any quantized projection
+    // surfaced a `.scales` companion above; for each we resolve the
+    // effective PLQ via the same logic `apply_weights_inner` uses and
+    // hand the (mode, bits, group_size) tuple to the C++ registry.
+    let mut quant_info_count = 0usize;
+    for prefix in &stored_quant_prefixes {
+        let plq = effective_plq_for(prefix, per_layer_quant, default_plq, None);
+        let mode_str = match plq.mode {
+            PerLayerMode::Affine => "affine",
+            PerLayerMode::Mxfp8 => "mxfp8",
+            PerLayerMode::Mxfp4 => "mxfp4",
+            PerLayerMode::Nvfp4 => "nvfp4",
+        };
+        let c_prefix = CString::new(prefix.as_str()).expect("Prefix contains null byte");
+        let c_mode = CString::new(mode_str).expect("Mode string contains null byte");
+        unsafe {
+            sys::mlx_store_quant_info(c_prefix.as_ptr(), c_mode.as_ptr(), plq.bits, plq.group_size);
+        }
+        quant_info_count += 1;
+    }
+    info!(
+        "Registered {} quant-info entries with C++ dense forward pass",
+        quant_info_count
+    );
 
     // Set model ID AFTER all weights are stored. This ordering ensures no
     // inference sees a partially-populated map with the new model's ID.

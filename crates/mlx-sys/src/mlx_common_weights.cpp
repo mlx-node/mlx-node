@@ -29,10 +29,26 @@ void mlx_store_weight(const char* name, mlx_array* weight) {
   }
 }
 
+void mlx_store_quant_info(const char* prefix, const char* mode,
+                          int bits, int group_size) {
+  std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
+  g_quant_info().insert_or_assign(std::string(prefix),
+                                  QuantInfo{std::string(mode), bits, group_size});
+}
+
+void mlx_clear_quant_info() {
+  std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
+  g_quant_info().clear();
+}
+
 void mlx_clear_weights() {
   std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
   g_weights().clear();
   g_weight_transposes().clear();
+  // Prevent cross-model contamination: stale quant overrides referring to
+  // the previous model's tensors would mis-dispatch dequant in the compiled
+  // forward path. Clear the sidecar in the same critical section.
+  g_quant_info().clear();
   g_active_model_id().store(0, std::memory_order_release);
 }
 

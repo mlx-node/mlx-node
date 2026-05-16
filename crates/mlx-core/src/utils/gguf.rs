@@ -1247,6 +1247,12 @@ pub struct GgufConversionOptions {
     /// "model.X" → "language_model.model.X", "lm_head.X" → "language_model.lm_head.X"
     /// This makes the safetensors compatible with mlx-vlm.
     pub vlm_key_prefix: Option<bool>,
+
+    /// Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
+    /// When true, applies after the recipe predicate: any 8-bit affine decision
+    /// becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+    /// Forces `group_size = 32` for upgraded layers.
+    pub quant_mxfp: Option<bool>,
 }
 
 #[napi(object)]
@@ -1365,15 +1371,91 @@ pub async fn convert_gguf_to_safetensors(
         .as_deref()
         .unwrap_or("affine")
         .to_string();
-    let (default_bits, default_group_size) = match quant_mode_str.as_str() {
-        "affine" => (4, 64),
-        "mxfp4" => (4, 32),
-        "mxfp8" => (8, 32),
-        "nvfp4" => (4, 16),
-        _ => (4, 64),
-    };
-    let quant_bits = options.quant_bits.unwrap_or(default_bits);
-    let quant_group_size = options.quant_group_size.unwrap_or(default_group_size);
+    let quant_mxfp = options.quant_mxfp.unwrap_or(false);
+
+    // Validate quant_mode before it reaches FFI
+    if do_quantize
+        && quant_mode_str != "affine"
+        && quant_mode_str != "mxfp8"
+        && quant_mode_str != "mxfp4"
+        && quant_mode_str != "nvfp4"
+    {
+        return Err(Error::from_reason(format!(
+            "Invalid quant_mode '{}': must be 'affine', 'mxfp8', 'mxfp4', or 'nvfp4'",
+            quant_mode_str
+        )));
+    }
+
+    // --q-mxfp orthogonality: requires affine baseline.
+    if quant_mxfp && !do_quantize {
+        return Err(Error::from_reason(
+            "--q-mxfp requires --quantize to be enabled".to_string(),
+        ));
+    }
+    if quant_mxfp && quant_mode_str != "affine" {
+        return Err(Error::from_reason(format!(
+            "--q-mxfp requires --q-mode affine (default), got '{}'. \
+             --q-mxfp orthogonally upgrades affine decisions to mxfp4/mxfp8.",
+            quant_mode_str
+        )));
+    }
+
+    let quant_bits = options.quant_bits.unwrap_or(match quant_mode_str.as_str() {
+        "mxfp4" => 4,
+        "mxfp8" => 8,
+        "nvfp4" => 4,
+        _ => 4,
+    });
+    let quant_group_size = options
+        .quant_group_size
+        .unwrap_or(match quant_mode_str.as_str() {
+            "mxfp4" | "mxfp8" => 32,
+            "nvfp4" => 16,
+            _ => 64,
+        });
+
+    // MXFP modes have strict bits/group_size invariants enforced by the MLX
+    // backend. Surface the failure here (with a clear message) rather than
+    // letting it bubble up as a confusing FFI error mid-conversion.
+    if do_quantize && quant_mode_str == "mxfp4" && (quant_bits != 4 || quant_group_size != 32) {
+        return Err(Error::from_reason(format!(
+            "mxfp4 requires bits=4 and group_size=32 (got bits={quant_bits}, group_size={quant_group_size})"
+        )));
+    }
+    if do_quantize && quant_mode_str == "mxfp8" && (quant_bits != 8 || quant_group_size != 32) {
+        return Err(Error::from_reason(format!(
+            "mxfp8 requires bits=8 and group_size=32 (got bits={quant_bits}, group_size={quant_group_size})"
+        )));
+    }
+    if do_quantize && quant_mode_str == "nvfp4" {
+        crate::convert::validate_nvfp4_invariants(quant_bits, quant_group_size)
+            .map_err(Error::from_reason)?;
+    }
+
+    if do_quantize
+        && options.quant_recipe.is_some()
+        && quant_mode_str != "affine"
+        && quant_mode_str != "nvfp4"
+    {
+        return Err(Error::from_reason(format!(
+            "--q-recipe is compatible with --q-mode affine or nvfp4 only; for mxfp4/mxfp8 use --q-mxfp instead. Got '{}'.",
+            quant_mode_str
+        )));
+    }
+    // Restrict --q-mode nvfp4 + --q-recipe to recipes that have model-aware
+    // tensor-class exclusions for NVFP4-sensitive layers. See
+    // [`crate::convert::validate_nvfp4_recipe`] for the full rationale.
+    if do_quantize
+        && quant_mode_str == "nvfp4"
+        && let Some(ref recipe) = options.quant_recipe
+    {
+        crate::convert::validate_nvfp4_recipe(recipe).map_err(Error::from_reason)?;
+    }
+
+    // Effective mode/group_size recorded in config.json. The no-recipe path
+    // updates these when --q-mxfp upgrades the global mode to mxfp4/mxfp8.
+    let mut quant_mode_effective = quant_mode_str.clone();
+    let mut quant_group_size_effective = quant_group_size;
 
     if do_quantize {
         if let Some(ref recipe) = options.quant_recipe {
@@ -1381,13 +1463,32 @@ pub async fn convert_gguf_to_safetensors(
                 "Quantizing weights: {quant_bits}-bit {quant_mode_str} (group_size={quant_group_size}, recipe={recipe})..."
             );
             let weight_keys: Vec<String> = weights.keys().cloned().collect();
+            // See convert.rs: under --q-mode nvfp4 the global gs=16 is illegal
+            // for the affine decisions recipes emit (lm_head, AWQ-corrected
+            // attn/SSM projections). Pass a recipe-affine-appropriate gs.
+            let recipe_gs = if quant_mode_str == "nvfp4" {
+                64
+            } else {
+                quant_group_size
+            };
             let predicate = crate::convert::build_predicate_for_recipe(
                 recipe,
                 &weight_keys,
                 quant_bits,
-                quant_group_size,
+                recipe_gs,
             )
             .map_err(Error::from_reason)?;
+            let predicate: Box<dyn Fn(&str) -> crate::convert::QuantDecision + Send + Sync> =
+                if quant_mxfp {
+                    crate::convert::apply_mxfp_upgrade(predicate, quant_bits)
+                } else if quant_mode_str == "nvfp4" {
+                    // Recipe + --q-mode nvfp4: promote 4-bit recipe decisions
+                    // to NVFP4 (group_size=16). Mutually exclusive with
+                    // quant_mxfp, since --q-mxfp requires --q-mode affine.
+                    crate::convert::apply_nvfp4_upgrade(predicate)
+                } else {
+                    predicate
+                };
             per_layer_overrides = crate::convert::quantize_weights_with_recipe_pub(
                 &mut weights,
                 quant_bits,
@@ -1396,15 +1497,44 @@ pub async fn convert_gguf_to_safetensors(
                 &*predicate,
             )?;
         } else {
+            // No recipe: --q-mxfp overrides the global mode + group_size so the
+            // legacy quantize path emits mxfp4/mxfp8 weights.
+            let (effective_mode, effective_gs) = if quant_mxfp {
+                match quant_bits {
+                    8 => ("mxfp8".to_string(), 32),
+                    4 => ("mxfp4".to_string(), 32),
+                    _ => {
+                        return Err(Error::from_reason(format!(
+                            "--q-mxfp without a recipe requires --q-bits 4 or 8 (got {})",
+                            quant_bits
+                        )));
+                    }
+                }
+            } else {
+                (quant_mode_str.clone(), quant_group_size)
+            };
             info!(
-                "Quantizing weights: {quant_bits}-bit {quant_mode_str} (group_size={quant_group_size})..."
+                "Quantizing weights: {quant_bits}-bit {effective_mode} (group_size={effective_gs})..."
             );
-            crate::convert::quantize_weights_pub(
+            // Capture per-layer overrides emitted by the legacy path (router-gate
+            // upgrades, lm_head / router.proj / embed_tokens affine downgrades).
+            // These must round-trip into config.json so the loader dispatches
+            // each layer to the correct builder.
+            per_layer_overrides = crate::convert::quantize_weights_pub(
                 &mut weights,
                 quant_bits,
-                quant_group_size,
-                &quant_mode_str,
+                effective_gs,
+                &effective_mode,
             )?;
+            if !per_layer_overrides.is_empty() {
+                info!(
+                    "No-recipe quantization emitted {} per-layer overrides (router-gate / affine-only keys): {:?}",
+                    per_layer_overrides.len(),
+                    per_layer_overrides.keys().collect::<Vec<_>>()
+                );
+            }
+            quant_mode_effective = effective_mode;
+            quant_group_size_effective = effective_gs;
         }
     }
 
@@ -1467,9 +1597,9 @@ pub async fn convert_gguf_to_safetensors(
 
         if do_quantize {
             let mut quant_obj = serde_json::json!({
-                "group_size": quant_group_size,
+                "group_size": quant_group_size_effective,
                 "bits": quant_bits,
-                "mode": quant_mode_str,
+                "mode": quant_mode_effective,
             });
             if let Some(obj) = quant_obj.as_object_mut() {
                 for (path, override_val) in &per_layer_overrides {

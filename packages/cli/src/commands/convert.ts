@@ -41,6 +41,24 @@ Quantization Arguments:
   --q-bits <int>        Quantization bits (default per --q-mode: affine=4, mxfp4=4, mxfp8=8, nvfp4=4)
   --q-group-size <int>  Group size (default per --q-mode: affine=64, mxfp4=32, mxfp8=32, nvfp4=16)
   --q-mode <string>     Mode: "affine" (default), "mxfp4", "mxfp8", or "nvfp4"
+  --q-mxfp              Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
+                        Applies after the recipe predicate: any 8-bit affine
+                        decision becomes mxfp8, any 4-bit becomes mxfp4. Requires
+                        --quantize and --q-mode affine (default). Forces
+                        group_size=32 for upgraded layers. Skipped keys (kept at
+                        8-bit affine for accuracy or loader compatibility):
+                        lm_head, router projections, embed_tokens (incl. Gemma4
+                        embed_tokens_per_layer), embedding_projection, and MoE
+                        router gates (mlp.gate / shared_expert_gate). MXFP8's
+                        coarse E8M0 scales destroy top-K expert routing on the
+                        gates, matching the Python mlx-lm quant_predicate.
+
+                        Recommended combo: --q-recipe unsloth --q-bits 4 --q-mxfp
+                        promotes mlp.gate_proj/up_proj to mxfp4 (q/k/v at 6-bit
+                        affine, down_proj at 5-bit affine, router gates at 8-bit
+                        affine, lm_head at 8-bit affine, out_proj stays bf16).
+                        At default --q-bits 3 only down_proj (4b -> mxfp4) gets
+                        the upgrade.
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
@@ -91,6 +109,7 @@ export async function run(argv: string[]) {
       'q-bits': { type: 'string' },
       'q-group-size': { type: 'string' },
       'q-mode': { type: 'string' },
+      'q-mxfp': { type: 'boolean', default: false },
       'q-recipe': { type: 'string' },
       'imatrix-path': { type: 'string' },
       mmproj: { type: 'string' },
@@ -132,6 +151,18 @@ export async function run(argv: string[]) {
     process.exit(1);
   }
 
+  if (args['q-mxfp'] && !args.quantize) {
+    console.error('Error: --q-mxfp requires --quantize');
+    process.exit(1);
+  }
+
+  if (args['q-mxfp'] && quantMode !== undefined && quantMode !== 'affine') {
+    console.error(
+      `Error: --q-mxfp requires --q-mode affine (got '${quantMode}'). --q-mxfp orthogonally upgrades affine decisions to mxfp4/mxfp8.`,
+    );
+    process.exit(1);
+  }
+
   const quantRecipe = args['q-recipe'];
   const validRecipes = ['mixed_2_6', 'mixed_3_4', 'mixed_3_6', 'mixed_4_6', 'qwen3_5', 'unsloth'];
   if (quantRecipe !== undefined) {
@@ -139,9 +170,9 @@ export async function run(argv: string[]) {
       console.error('Error: --q-recipe requires --quantize (-q) to be enabled');
       process.exit(1);
     }
-    if (quantMode !== undefined && quantMode !== 'affine') {
+    if (quantMode !== undefined && quantMode !== 'affine' && quantMode !== 'nvfp4') {
       console.error(
-        `Error: --q-recipe is incompatible with --q-mode ${quantMode} (recipes only apply to affine quantization)`,
+        `Error: --q-recipe is compatible with --q-mode affine or nvfp4 only; for mxfp4/mxfp8 use --q-mxfp instead. Got '${quantMode}'.`,
       );
       process.exit(1);
     }
@@ -149,12 +180,23 @@ export async function run(argv: string[]) {
       console.error(`Error: Unknown recipe "${quantRecipe}". Available: ${validRecipes.join(', ')}`);
       process.exit(1);
     }
+    // Restrict --q-mode nvfp4 + --q-recipe to recipes that have model-aware
+    // tensor-class exclusions for NVFP4-sensitive layers (e.g.
+    // linear_attn.out_proj — KLD ~6.0 in hybrid Qwen3.5/3.6 models). The
+    // generic `mixed_*` recipes lack these skip lists, so they would silently
+    // promote highly-sensitive layers to NVFP4 and corrupt the model.
+    if (quantMode === 'nvfp4' && quantRecipe !== 'unsloth' && quantRecipe !== 'qwen3_5') {
+      console.error(
+        `Error: --q-mode nvfp4 + --q-recipe is currently supported only for 'unsloth' and 'qwen3_5' recipes (got '${quantRecipe}'). Other recipes lack tensor-class exclusions for NVFP4-sensitive layers (e.g. linear_attn.out_proj).`,
+      );
+      process.exit(1);
+    }
     // Unsloth recipe defaults to 3-bit base (MLP gate/up at 3-bit, down at 4-bit,
     // embed_tokens at 5-bit, lm_head at 6-bit, attn q/k/v + SSM in_proj at 5-bit
     // with AWQ pre-scaling via input_layernorm, out_proj/o_proj kept at bf16).
     // Based on Unsloth's per-tensor KLD analysis. Requires imatrix for AWQ correction
     // on the attention/SSM projections.
-    if (quantRecipe === 'unsloth' && !args['q-bits']) {
+    if (quantRecipe === 'unsloth' && !args['q-bits'] && quantMode !== 'nvfp4') {
       console.log('Note: unsloth recipe defaults to 3-bit base (override with --q-bits)');
     }
     if (quantRecipe === 'unsloth' && !args['imatrix-path']) {
@@ -167,7 +209,40 @@ export async function run(argv: string[]) {
 
   // Apply recipe-specific defaults for bits when not explicitly set.
   // Unsloth recipe: 3-bit base → MLP gate/up=3b, down=4b, embed=5b, lm_head=6b, attn q/k/v=5b+AWQ, out_proj=bf16
-  const effectiveQuantBits = quantBits ?? (quantRecipe === 'unsloth' ? 3 : undefined);
+  // Exception: --q-mode nvfp4 forces bits=4 regardless of recipe, because
+  // NVFP4 invariant requires bits=4 (the unsloth 3-bit default would otherwise
+  // produce an inconsistent checkpoint: top-level bits=3 but per-layer
+  // overrides at bits=4 from apply_nvfp4_upgrade, with no failure surface).
+  const effectiveQuantBits = quantBits ?? (quantMode === 'nvfp4' ? 4 : quantRecipe === 'unsloth' ? 3 : undefined);
+
+  // MXFP modes have strict bits/group_size invariants enforced by the MLX
+  // backend. Surface the failure here rather than letting it bubble up as a
+  // confusing FFI error mid-conversion. Use the effective bits (post-recipe)
+  // and the effective group_size that would be sent to the native side.
+  if (args.quantize && quantMode === 'mxfp4') {
+    const effBits = effectiveQuantBits ?? 4;
+    const effGs = quantGroupSize ?? 32;
+    if (effBits !== 4 || effGs !== 32) {
+      console.error(`Error: mxfp4 requires bits=4 and group_size=32 (got bits=${effBits}, group_size=${effGs})`);
+      process.exit(1);
+    }
+  }
+  if (args.quantize && quantMode === 'mxfp8') {
+    const effBits = effectiveQuantBits ?? 8;
+    const effGs = quantGroupSize ?? 32;
+    if (effBits !== 8 || effGs !== 32) {
+      console.error(`Error: mxfp8 requires bits=8 and group_size=32 (got bits=${effBits}, group_size=${effGs})`);
+      process.exit(1);
+    }
+  }
+  if (args.quantize && quantMode === 'nvfp4') {
+    const effBits = effectiveQuantBits ?? 4;
+    const effGs = quantGroupSize ?? 16;
+    if (effBits !== 4 || effGs !== 16) {
+      console.error(`Error: nvfp4 requires bits=4 and group_size=16 (got bits=${effBits}, group_size=${effGs})`);
+      process.exit(1);
+    }
+  }
 
   const mmprojPath = args.mmproj ? resolve(args.mmproj) : undefined;
   if (mmprojPath !== undefined) {
@@ -214,8 +289,9 @@ export async function run(argv: string[]) {
       const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
       const qBits = effectiveQuantBits || defaultBits;
       const qGs = quantGroupSize || defaultGs;
+      const qMxfpSuffix = args['q-mxfp'] ? ', --q-mxfp: 8b->mxfp8, 4b->mxfp4' : '';
       console.log(
-        `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}`,
+        `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}`,
       );
     }
     if (imatrixPath) {
@@ -236,6 +312,7 @@ export async function run(argv: string[]) {
         quantBits: effectiveQuantBits,
         quantGroupSize,
         quantMode,
+        quantMxfp: args['q-mxfp'],
         quantRecipe,
         imatrixPath,
         vlmKeyPrefix: !!mmprojPath,
@@ -345,7 +422,10 @@ export async function run(argv: string[]) {
     const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
     const qBits = effectiveQuantBits || defaultBits;
     const qGs = quantGroupSize || defaultGs;
-    console.log(`Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}`);
+    const qMxfpSuffix = args['q-mxfp'] ? ', --q-mxfp: 8b->mxfp8, 4b->mxfp4' : '';
+    console.log(
+      `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}`,
+    );
   }
   if (imatrixPath) {
     console.log(`imatrix:    ${imatrixPath}`);
@@ -363,6 +443,7 @@ export async function run(argv: string[]) {
       quantBits: effectiveQuantBits,
       quantGroupSize,
       quantMode,
+      quantMxfp: args['q-mxfp'],
       quantRecipe,
       imatrixPath,
     });

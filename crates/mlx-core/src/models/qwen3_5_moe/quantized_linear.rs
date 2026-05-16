@@ -10,9 +10,11 @@ use napi::bindgen_prelude::*;
 pub use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
 pub use crate::models::qwen3_5::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DEFAULT_QUANT_MODE, GATE_QUANT_BITS,
-    GATE_QUANT_GROUP_SIZE, LinearProj, MLPVariant, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
-    is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_mxfp8_quantized_linear,
-    try_build_quantized_linear,
+    GATE_QUANT_GROUP_SIZE, LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP4_MODE,
+    MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, NVFP4_BITS, NVFP4_GROUP_SIZE, NVFP4_MODE,
+    PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
+    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
+    try_build_nvfp4_quantized_linear, try_build_quantized_linear,
 };
 
 /// QuantizedSwitchLinear: Expert-indexed quantized linear layer using gather_qmm.
@@ -127,5 +129,41 @@ pub fn try_build_mxfp8_quantized_switch_linear(
         MXFP8_GROUP_SIZE,
         MXFP8_BITS,
         MXFP8_MODE.to_string(),
+    ))
+}
+
+/// Try to build an MXFP4 QuantizedSwitchLinear from weight/scales keys.
+/// MXFP4 has no biases (only weight + uint8 E2M1 scales), fixed at 4 bits / group_size 32.
+pub fn try_build_mxfp4_quantized_switch_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedSwitchLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    Some(QuantizedSwitchLinear::new(
+        weight.clone(),
+        scales.clone(),
+        None,
+        MXFP4_GROUP_SIZE,
+        MXFP4_BITS,
+        MXFP4_MODE.to_string(),
+    ))
+}
+
+/// Try to build an NVFP4 QuantizedSwitchLinear from weight/scales keys.
+/// NVFP4 has no biases (only weight + uint8 E4M3 scales), fixed at 4 bits / group_size 16.
+pub fn try_build_nvfp4_quantized_switch_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedSwitchLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    Some(QuantizedSwitchLinear::new(
+        weight.clone(),
+        scales.clone(),
+        None,
+        NVFP4_GROUP_SIZE,
+        NVFP4_BITS,
+        NVFP4_MODE.to_string(),
     ))
 }

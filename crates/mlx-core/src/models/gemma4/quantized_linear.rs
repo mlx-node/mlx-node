@@ -115,6 +115,42 @@ pub fn try_build_mxfp8_quantized_switch_linear(
     ))
 }
 
+/// Try to build an MXFP4 QuantizedSwitchLinear from weight/scales keys.
+/// MXFP4 has no biases (only weight + uint8 E2M1 scales), fixed at 4 bits / group_size 32.
+pub fn try_build_mxfp4_quantized_switch_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedSwitchLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    Some(QuantizedSwitchLinear::new(
+        weight.clone(),
+        scales.clone(),
+        None,
+        MXFP4_GROUP_SIZE,
+        MXFP4_BITS,
+        MXFP4_MODE.to_string(),
+    ))
+}
+
+/// Try to build an NVFP4 QuantizedSwitchLinear from weight/scales keys.
+/// NVFP4 has no biases (only weight + uint8 E4M3 scales), fixed at 4 bits / group_size 16.
+pub fn try_build_nvfp4_quantized_switch_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedSwitchLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    Some(QuantizedSwitchLinear::new(
+        weight.clone(),
+        scales.clone(),
+        None,
+        NVFP4_GROUP_SIZE,
+        NVFP4_BITS,
+        NVFP4_MODE.to_string(),
+    ))
+}
+
 /// Default quantization parameters for 4-bit models.
 pub const DEFAULT_QUANT_BITS: i32 = 4;
 pub const DEFAULT_QUANT_GROUP_SIZE: i32 = 64;
@@ -124,6 +160,22 @@ pub const DEFAULT_QUANT_MODE: &str = "affine";
 pub const MXFP8_BITS: i32 = 8;
 pub const MXFP8_GROUP_SIZE: i32 = 32;
 pub const MXFP8_MODE: &str = "mxfp8";
+
+/// MXFP4 quantization parameters (E2M1 format, fixed bits/group_size).
+pub const MXFP4_BITS: i32 = 4;
+pub const MXFP4_GROUP_SIZE: i32 = 32;
+pub const MXFP4_MODE: &str = "mxfp4";
+
+/// NVFP4 quantization parameters (E2M1 4-bit weights with E4M3 uint8 scales,
+/// group_size 16).
+pub const NVFP4_BITS: i32 = 4;
+pub const NVFP4_GROUP_SIZE: i32 = 16;
+pub const NVFP4_MODE: &str = "nvfp4";
+
+// Re-export PerLayerMode/PerLayerQuant from the family-neutral
+// `quant_dispatch` module so gemma4 doesn't reach into the qwen3_5 internals
+// for these shared types.
+pub use crate::models::quant_dispatch::{PerLayerMode, PerLayerQuant};
 
 /// A linear projection that can be either standard or quantized.
 pub enum LinearProj {
@@ -254,6 +306,44 @@ pub fn try_build_mxfp8_quantized_linear(
         MXFP8_GROUP_SIZE,
         MXFP8_BITS,
         MXFP8_MODE.to_string(),
+    ))
+}
+
+/// Try to build an MXFP4 QuantizedLinear from weight/scales keys in a params map.
+/// MXFP4 has no biases (only weight + uint8 E2M1 scales), fixed at 4 bits / group_size 32.
+pub fn try_build_mxfp4_quantized_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    Some(QuantizedLinear::new(
+        weight.clone(),
+        scales.clone(),
+        None,
+        None,
+        MXFP4_GROUP_SIZE,
+        MXFP4_BITS,
+        MXFP4_MODE.to_string(),
+    ))
+}
+
+/// Try to build an NVFP4 QuantizedLinear from weight/scales keys in a params map.
+/// NVFP4 has no biases (only weight + uint8 E4M3 scales), fixed at 4 bits / group_size 16.
+pub fn try_build_nvfp4_quantized_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedLinear> {
+    let weight = params.get(&format!("{}.weight", key_prefix))?;
+    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    Some(QuantizedLinear::new(
+        weight.clone(),
+        scales.clone(),
+        None,
+        None,
+        NVFP4_GROUP_SIZE,
+        NVFP4_BITS,
+        NVFP4_MODE.to_string(),
     ))
 }
 

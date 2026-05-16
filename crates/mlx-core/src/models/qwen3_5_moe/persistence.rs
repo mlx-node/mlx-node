@@ -9,6 +9,9 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::models::quant_dispatch::{
+    default_per_layer_quant, effective_plq_for, parse_quant_block, resolve_default_mode,
+};
 use crate::models::qwen3_5::persistence::{load_vision_weights, parse_vision_config};
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
@@ -22,9 +25,11 @@ use super::decoder_layer::{AttentionType, MLPType};
 use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, handle_qwen35_moe_cmd};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
-    MLPVariant, QuantizedSwitchLinear, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
-    try_build_quantized_linear,
+    MLPVariant, PerLayerMode, PerLayerQuant, QuantizedSwitchLinear, is_mxfp8_checkpoint,
+    is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
+    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
+    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
+    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
 };
 use super::switch_glu::SwitchGLU;
 
@@ -273,6 +278,50 @@ fn try_build_quantized_switch_linear(
     ))
 }
 
+/// Compute the fallback PLQs that `effective_plq_for` consults when no per-layer
+/// override exists. Both `apply_weights_moe_inner` and
+/// `register_moe_weights_with_cpp` MUST agree on these defaults — the loader
+/// applies them when constructing quantized layers, and the C++ side receives
+/// them via `mlx_store_quant_info`. Any divergence would corrupt the compiled
+/// forward path.
+///
+/// Returns `(default_plq, default_gate_plq)`.
+///
+/// Router gate fallback. Historically router gates were always affine 8-bit,
+/// but `--q-mxfp --q-bits 8` (no recipe) upgrades router gates to MXFP8 via
+/// `quantize_weights_inner`'s `is_router_gate` branch. When the global
+/// default also becomes MXFP8 the gate entry matches the global default
+/// exactly, so no per-layer override is emitted to config.json; on load
+/// `per_layer_quant.get(gate_prefix)` then returns None and we fall back
+/// to `default_gate_plq`. It MUST track the top-level mode for those cases.
+///
+/// Mode mapping: only MXFP8 is meaningful for router gates (gates are
+/// always 8-bit; MXFP4 gates don't exist), so MXFP4 / Affine top-level
+/// modes both keep the historical affine fallback. MXFP8 → mxfp8/gs=32.
+fn compute_moe_defaults(
+    params: &HashMap<String, MxArray>,
+    top_level_mode: Option<PerLayerMode>,
+    quant_bits: i32,
+    quant_group_size: i32,
+) -> (PerLayerQuant, PerLayerQuant) {
+    let is_mxfp8 = is_mxfp8_checkpoint(params);
+    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
+    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+    let default_gate_mode = if matches!(default_mode, PerLayerMode::Mxfp8) {
+        PerLayerMode::Mxfp8
+    } else {
+        PerLayerMode::Affine
+    };
+    let default_gate_group_size = if matches!(default_gate_mode, PerLayerMode::Mxfp8) {
+        32
+    } else {
+        GATE_QUANT_GROUP_SIZE
+    };
+    let default_gate_plq =
+        default_per_layer_quant(GATE_QUANT_BITS, default_gate_group_size, default_gate_mode);
+    (default_plq, default_gate_plq)
+}
+
 /// Apply weights directly to a Qwen35MoeInner (no locks needed).
 ///
 /// Accesses inner fields directly (no `Arc<RwLock<>>`). Used by
@@ -283,78 +332,43 @@ fn apply_weights_moe_inner(
     config: &Qwen3_5MoeConfig,
     quant_bits: i32,
     quant_group_size: i32,
-    per_layer_quant: &HashMap<String, (i32, i32)>,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
-    let is_mxfp8 = is_mxfp8_checkpoint(params);
+    let (default_plq, default_gate_plq) =
+        compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
 
-    // Helper: try MXFP8 builder first (if applicable), then affine builder.
+    // Helper: dispatch by per-layer mode (mxfp4 / mxfp8 / nvfp4 / affine).
+    //
+    // Per-projection PLQ resolution (override lookup, merged GDN fallback,
+    // and gate-prefix routing) is delegated to `effective_plq_for`. That
+    // helper also handles gate prefixes (`*.mlp.gate`,
+    // `*.mlp.shared_expert_gate`) by routing them to `default_gate_plq`
+    // when no per-layer override is recorded — the historical
+    // `try_build_ql_gate` closure is therefore subsumed and removed.
     let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
-        if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_linear(params, prefix) {
-            return Some(ql);
+        let plq = effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq));
+        match plq.mode {
+            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
+            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
+            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
+            PerLayerMode::Affine => {
+                try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+            }
         }
-        let (bits, gs) = per_layer_quant
-            .get(prefix)
-            .copied()
-            .or_else(|| {
-                if prefix.ends_with(".in_proj_qkvz") {
-                    let base = prefix.strip_suffix(".in_proj_qkvz").unwrap();
-                    let qkv = per_layer_quant.get(&format!("{}.in_proj_qkv", base));
-                    let z = per_layer_quant.get(&format!("{}.in_proj_z", base));
-                    match (qkv, z) {
-                        (Some(&a), Some(&b)) if a != b => {
-                            warn!(
-                                "Merged in_proj_qkvz has conflicting overrides: \
-                                 qkv={:?}, z={:?}. Using higher precision.",
-                                a, b
-                            );
-                            Some(if a.0 > b.0 { a } else { b })
-                        }
-                        (Some(&a), _) | (_, Some(&a)) => Some(a),
-                        _ => None,
-                    }
-                } else if prefix.ends_with(".in_proj_ba") {
-                    let base = prefix.strip_suffix(".in_proj_ba").unwrap();
-                    let b_val = per_layer_quant.get(&format!("{}.in_proj_b", base));
-                    let a_val = per_layer_quant.get(&format!("{}.in_proj_a", base));
-                    match (b_val, a_val) {
-                        (Some(&x), Some(&y)) if x != y => {
-                            warn!(
-                                "Merged in_proj_ba has conflicting overrides: \
-                                 b={:?}, a={:?}. Using higher precision.",
-                                x, y
-                            );
-                            Some(if x.0 > y.0 { x } else { y })
-                        }
-                        (Some(&x), _) | (_, Some(&x)) => Some(x),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or((quant_bits, quant_group_size));
-        try_build_quantized_linear(params, prefix, gs, bits)
-    };
-
-    // Router gates: check per-layer overrides first, fallback to 8-bit affine
-    let try_build_ql_gate = |params: &HashMap<String, MxArray>, prefix: &str| {
-        let (bits, gs) = per_layer_quant
-            .get(prefix)
-            .copied()
-            .unwrap_or((GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE));
-        try_build_quantized_linear(params, prefix, gs, bits)
     };
 
     let try_build_qsl = |params: &HashMap<String, MxArray>, prefix: &str| {
-        if is_mxfp8 && let Some(ql) = try_build_mxfp8_quantized_switch_linear(params, prefix) {
-            return Some(ql);
+        let plq = effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq));
+        match plq.mode {
+            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
+            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
+            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
+            PerLayerMode::Affine => {
+                try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+            }
         }
-        let (bits, gs) = per_layer_quant
-            .get(prefix)
-            .copied()
-            .unwrap_or((quant_bits, quant_group_size));
-        try_build_quantized_switch_linear(params, prefix, gs, bits)
     };
 
     // Embedding — supports both dense and quantized weights
@@ -363,14 +377,14 @@ fn apply_weights_moe_inner(
             Error::from_reason("Missing embedding.weight for quantized embedding")
         })?;
         let biases = params.get("embedding.biases");
-        let (bits, gs) = per_layer_quant
+        let plq = per_layer_quant
             .get("embed_tokens")
             .copied()
-            .unwrap_or((quant_bits, quant_group_size));
+            .unwrap_or(default_plq);
         inner
             .embedding
-            .load_quantized(weight, scales, biases, gs, bits)?;
-        info!("Loaded quantized embedding ({}-bit)", bits);
+            .load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
+        info!("Loaded quantized embedding ({}-bit)", plq.bits);
     } else if let Some(w) = params.get("embedding.weight") {
         inner.embedding.set_weight(w)?;
     }
@@ -592,7 +606,7 @@ fn apply_weights_moe_inner(
             MLPType::Dense(MLPVariant::Quantized { .. }) => {}
             MLPType::MoE(moe) => {
                 if is_quantized {
-                    if let Some(ql) = try_build_ql_gate(params, &format!("{}.mlp.gate", prefix)) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.mlp.gate", prefix)) {
                         moe.set_quantized_gate(ql);
                     } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
                         moe.set_gate_weight(w)?;
@@ -644,7 +658,7 @@ fn apply_weights_moe_inner(
                     }
 
                     if let Some(ql) =
-                        try_build_ql_gate(params, &format!("{}.mlp.shared_expert_gate", prefix))
+                        try_build_ql(params, &format!("{}.mlp.shared_expert_gate", prefix))
                     {
                         moe.set_quantized_shared_expert_gate(ql);
                     } else if let Some(w) =
@@ -887,34 +901,15 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         .and_then(|q| q["group_size"].as_i64())
                         .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
                         as i32;
-                    let per_layer_quant: HashMap<String, (i32, i32)> = quant_cfg
-                        .and_then(|q| q.as_object())
-                        .map(|obj| {
-                            obj.iter()
-                                .filter(|(_, v)| v.is_object())
-                                .filter_map(|(k, v)| {
-                                    let bits = v["bits"].as_i64()? as i32;
-                                    let gs =
-                                        v["group_size"].as_i64().unwrap_or(quant_group_size as i64)
-                                            as i32;
-                                    let normalized = k
-                                        .strip_prefix("model.language_model.")
-                                        .or_else(|| k.strip_prefix("language_model.model."))
-                                        .or_else(|| k.strip_prefix("language_model."))
-                                        .or_else(|| k.strip_prefix("model."))
-                                        .unwrap_or(k)
-                                        .to_string();
-                                    Some((normalized, (bits, gs)))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let (top_level_mode, per_layer_quant) =
+                        parse_quant_block(quant_cfg, quant_group_size);
 
                     if quant_cfg.is_some() {
                         info!(
-                            "Using quantization config: bits={}, group_size={}, per_layer_overrides={}",
+                            "Using quantization config: bits={}, group_size={}, top_level_mode={:?}, per_layer_overrides={}",
                             quant_bits,
                             quant_group_size,
+                            top_level_mode,
                             per_layer_quant.len()
                         );
                     }
@@ -942,11 +937,25 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         &config,
                         quant_bits,
                         quant_group_size,
+                        top_level_mode,
                         &per_layer_quant,
                     )?;
 
-                    // Register weights with C++ MoE forward pass
-                    register_moe_weights_with_cpp(&params, inner.model_id);
+                    // Register weights with the C++ MoE forward pass. The
+                    // compiled backend dispatches per-projection by (mode,
+                    // bits, group_size) via the quant-info registry
+                    // populated below — see `register_moe_weights_with_cpp`
+                    // and `lookup_quant_info` on the C++ side. Affine and
+                    // MXFP8 / MXFP4 / NVFP4 modes all flow through the same
+                    // compiled path.
+                    register_moe_weights_with_cpp(
+                        &params,
+                        inner.model_id,
+                        top_level_mode,
+                        &per_layer_quant,
+                        quant_bits,
+                        quant_group_size,
+                    );
 
                     // Materialize mmap-backed weights
                     {
@@ -1169,7 +1178,20 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
 /// Register all sanitized weights with the C++ MoE forward pass.
 /// Uses the same shared g_weights map as the dense path (mlx_store_weight).
 /// Sets model_id AFTER all weights are stored.
-fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u64) {
+///
+/// Also populates the per-projection quant-info registry
+/// (`mlx_store_quant_info`) so the compiled forward path can dispatch
+/// directly on the loader-chosen `(mode, bits, group_size)` tuple instead
+/// of inferring a mode from companion-tensor presence. The registry is
+/// populated but not yet read by C++ — Tasks 3/4 wire the consumers.
+fn register_moe_weights_with_cpp(
+    params: &HashMap<String, MxArray>,
+    model_id: u64,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    quant_bits: i32,
+    quant_group_size: i32,
+) {
     use mlx_sys as sys;
     use std::ffi::CString;
 
@@ -1178,7 +1200,8 @@ fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u6
         .write()
         .unwrap();
 
-    // Clear weights (shared map)
+    // Clear weights (shared map). `mlx_clear_weights` also clears the
+    // per-projection quant-info registry, so we re-populate both below.
     unsafe { sys::mlx_clear_weights() };
 
     let store = |name: &str, array: &MxArray| {
@@ -1197,6 +1220,46 @@ fn register_moe_weights_with_cpp(params: &HashMap<String, MxArray>, model_id: u6
 
     let count = unsafe { sys::mlx_weight_count() };
     info!("Registered {} weights with C++ MoE forward pass", count);
+
+    // Compute the same default PLQs that `apply_weights_moe_inner` uses,
+    // so the C++ side gets the exact (mode, bits, group_size) tuple the
+    // Rust loaders chose for each layer.
+    let (default_plq, default_gate_plq) =
+        compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
+
+    // Walk params for `.scales` companions — those mark quantized
+    // projection prefixes that the compiled C++ path will dispatch on.
+    // For each, derive the effective PLQ via the same logic
+    // `apply_weights_moe_inner` uses, and pass the
+    // (mode, bits, group_size) tuple to the C++ registry.
+    let mut quant_info_count = 0usize;
+    for name in params.keys() {
+        if let Some(prefix) = name.strip_suffix(".scales") {
+            let plq =
+                effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq));
+            let mode_str = match plq.mode {
+                PerLayerMode::Affine => "affine",
+                PerLayerMode::Mxfp8 => "mxfp8",
+                PerLayerMode::Mxfp4 => "mxfp4",
+                PerLayerMode::Nvfp4 => "nvfp4",
+            };
+            let c_prefix = CString::new(prefix).expect("Prefix contains null byte");
+            let c_mode = CString::new(mode_str).expect("Mode string contains null byte");
+            unsafe {
+                sys::mlx_store_quant_info(
+                    c_prefix.as_ptr(),
+                    c_mode.as_ptr(),
+                    plq.bits,
+                    plq.group_size,
+                );
+            }
+            quant_info_count += 1;
+        }
+    }
+    info!(
+        "Registered {} quant-info entries with C++ MoE forward pass",
+        quant_info_count
+    );
 
     // Set model ID AFTER all weights are stored.
     unsafe { sys::mlx_set_model_id(model_id) };

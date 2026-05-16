@@ -1375,6 +1375,22 @@ unsafe extern "C-unwind" {
     /// Store a model weight by name (called once per weight during model load)
     pub fn mlx_store_weight(name: *const std::os::raw::c_char, weight: *mut mlx_array);
 
+    /// Store per-projection quantization metadata (mode/bits/group_size) so the
+    /// compiled C++ forward path can dispatch correctly without inferring from
+    /// companion-tensor presence. `prefix` is the projection key WITHOUT
+    /// `.weight`/`.scales`/`.biases` suffix (e.g. `layers.3.self_attn.q_proj`).
+    pub fn mlx_store_quant_info(
+        prefix: *const std::os::raw::c_char,
+        mode: *const std::os::raw::c_char,
+        bits: i32,
+        group_size: i32,
+    );
+
+    /// Clear all stored quant info. Provided for symmetric API surface and
+    /// explicit-clear callers (e.g. test setup that wants to wipe the quant
+    /// registry without touching weights); also invoked from `mlx_clear_weights`.
+    pub fn mlx_clear_quant_info();
+
     /// Clear all stored weights (called on model destruction)
     pub fn mlx_clear_weights();
 
