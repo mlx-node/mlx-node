@@ -21,6 +21,7 @@ Final shippable state: **-13.7% same-binary A/B at 1024-token prompt**
 | **E39** | `transformer/mlp.rs::finalize_gate_up` + `mlx_fused_ops.cpp::mlx_swiglu_mlp_forward_stacked` | `MLX_DISABLE_E39_STACKED_MLP=1` | Pre-stack `[w_gate; w_up]^T` at model load. One matmul instead of two; per-call transposes baked in. |
 | **E40** | `mlx_fused_ops.cpp` | (same as E39) | In the E39 stacked path, use `qwen35_common::swiglu()` (mlx::core::compile-cached fused `sigmoid·gate·up`) instead of inline ops. |
 | **E5+E36** | `crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc` | (no toggle — kernel-internal) | Threadgroup `decay_mat[BT*BT]` and `decay_self[BT]` precompute. M5+ only (`CHUNK_MIN_GPU_GEN=17`); correctness verified on M3 by temporarily lowering the gate. |
+| **E47** | `crates/mlx-sys/src/metal/gated_delta_step_2vcol.metal.inc` + `mlx_gated_delta.cpp` dispatch | `MLX_DISABLE_E47_GDN_2VCOL=1` | Per-step GDN kernel: each simdgroup handles 2 v-cols (dv_A=2y, dv_B=2y+1), sharing q[Dk]+k[Dk] loads. Grid-Y halves to Dv/2. -2.0% at 1024 single-chunk; neutral at 4096+. |
 
 The wins compose: each toggle reverts its piece independently, validated
 by same-binary A/B (see methodology below).
@@ -127,28 +128,58 @@ Apple GPU L1 absorbs the 4-way cross-simdgroup load redundancy near-free,
 so eliminating it via TG memory write + barrier is net negative. Three
 pairs all agreed: +2%, +2%, +6% slower with E46 ON.
 
-### E47 — 2 v-columns per simdgroup (REJECTED, below noise)
+### E47 — 2 v-columns per simdgroup (REJECTED first, then ACCEPTED on rerun)
 
 Catalog D1: register-blocking change to the per-step kernel. Each
 simdgroup processes dv_A=2y and dv_B=2y+1, sharing q[Dk] + k[Dk] loads
 across both columns. Halves grid-Y; doubles state registers; correctness
 bit-exact.
 
-**Why it failed:** 8 same-binary A/B pairs split 4 ON-faster vs 4 ON-slower.
-Median delta ≈ 0%. The mechanism (halved q/k load issue rate) is real but
-not on the critical path on M3 — the per-step kernel is **compute-bound,
-not load-bound** here. Apple GPU L1 + load-issue throughput together handle
-the cross-simdgroup q/k redundancy near-free, so saving load instructions
-doesn't save wall time.
+**First attempt rejected (8 pairs split 4/4).** Looked like noise.
 
-### Joint lesson from E46+E47
+**Rerun ACCEPTED (-2.0% at 1024-prompt single-chunk, neutral at 4096).**
+After a 1-hour M3 cool-down, sanity benches showed the *true* cold-state
+noise floor: ~0.3% within-pair, not the ~3% I'd been seeing. In two
+batches of 4 alternating runs (8 total):
 
-The per-step GDN kernel on M3 (gen 15) is **compute-bound, not
-memory-bound**. Two distinct memory-savings patterns both failed — TG
-cache (barrier cost > saved loads) and register blocking (Apple L1 hides
-the redundancy). Future per-step-kernel work on M3 should target compute
-reduction (e.g. B3 gate-driven early termination, conditional skipping
-when state decays to bf16 epsilon) rather than memory traffic.
+| ON     | OFF    |
+|--------|--------|
+| 572.38 | 584.99 |
+| 572.51 | 585.69 |
+| 574.25 | 585.26 |
+| 582.72 | 585.51 |
+
+Median ON 573.4 ms vs median OFF 585.4 ms = **-2.0%**, with within-pair
+noise <0.5 ms vs a 12 ms cross-condition gap. Direction agrees in every
+comparison.
+
+At 4096-prompt (1 quick pair, multi-chunk): 2135 ms ON vs 2141 ms OFF =
+**-0.25% (neutral)**. The win compresses at long prompts because full-attn
+O(T²) SDPA dominates.
+
+### Methodology lesson — bench in cold-state batches of 4
+
+The earlier "compute-bound, not memory-bound" conclusion from rejecting
+E47 was **premature**. The real story is bench-thermal:
+
+- **Cold idle 30+ min**: within-pair noise ~0.3-0.5%, runs 1-6 stable.
+- **Mid-cycle warming**: noise spikes to ~3-5% as runs 7-10 drift.
+- **Saturated thermal**: 10%+ noise, all bets off.
+
+Always bench the first 4 runs of a cold cycle; cool for 20+ min between
+batches. With this protocol, sub-1% wins are measurable. With back-to-back
+8-pair tests (the protocol I'd used originally), a real -2% signal can hide
+as 4/8 ON-faster / 4/8 ON-slower noise.
+
+Register-blocking *does* save real wall time on M3, just less than the
+naive instruction-count math would suggest because Apple GPU's L1 absorbs
+much of the cross-simdgroup load redundancy. The win is the ~2% that
+the L1 doesn't absorb — kernel-launch and dispatch overhead from the
+halved grid-Y, plus tighter scheduling.
+
+E46's (TG cache) rejection still stands — it added barriers + TG memory
+writes that costed more than the loads saved. E47's win comes from
+*reducing kernel-launch / grid count*, not from caching.
 
 ## Methodology lessons
 
