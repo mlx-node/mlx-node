@@ -9,7 +9,7 @@ const defaultModelDir = path.resolve(
   dirname,
   '../../../../mlx-node/.cache/models/qwen3.5-0.8b-mlx-bf16',
 );
-const defaultBaseUrl = 'https://mlx-node-browser.void.app';
+const defaultBaseUrl = 'https://mlx.void.app';
 const defaultPrefix = 'models/qwen3.5-0.8b-mlx-bf16';
 const defaultPartSize = 32 * 1024 * 1024;
 const maxSinglePutSize = 32 * 1024 * 1024;

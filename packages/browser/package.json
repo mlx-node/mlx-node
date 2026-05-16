@@ -12,7 +12,7 @@
     "test": "vp test --config vitest.config.ts",
     "build": "vp exec vite build",
     "preview": "vp exec vite preview --host 127.0.0.1",
-    "deploy:void": "VITE_MLX_MODEL_URL=/api/model yarn build && vp exec void deploy --skip-build",
+    "deploy:void": "VITE_MLX_MODEL_URL=/api/model yarn build && vp exec void deploy --project mlx --skip-build",
     "upload:void-model": "node scripts/upload-void-model.mjs"
   },
   "dependencies": {
