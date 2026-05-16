@@ -5,11 +5,13 @@ latency on Apple Silicon M3 Max. Bench: median time-to-first-delta of
 `session.sendStream(prompt, …)` against `.cache/models/Qwen3.5-4B-mlx`,
 correctness-gated by an 8-token greedy fingerprint at temperature=0.
 
-Final shippable state: **-13.7% same-binary A/B at 1024-token prompt**
-(median 725 ms vs 819 ms legacy), **-4.2% at 4096-token multi-chunk**
-(2593 ms vs 2707 ms), max_abs_diff=0 throughout. Diff: 8 files modified,
-~262 net LOC in `crates/mlx-core` and `crates/mlx-sys`. See
-`autoresearch.jsonl` for the run-by-run primary data.
+Final shippable state (after the second push on 2026-05-17):
+**-16.0% same-binary A/B at 1024-token prompt** (median 572.7 ms vs
+682.2 ms legacy), max_abs_diff=0 throughout. The original arc shipped
+-13.7%; the post-arc E47 (2-v-col GDN register-blocking) added another
+-2.3%. E48 (4-v-col) remains opt-in at +0.5% on top, available via
+`MLX_ENABLE_E48_GDN_4VCOL=1`. See `autoresearch.jsonl` for the run-by-run
+primary data.
 
 ## TL;DR — what shipped
 
