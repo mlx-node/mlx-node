@@ -1749,8 +1749,12 @@ fn quantize_with_optional_tiling(
 
         packed_chunks.push(q_weight);
         scale_chunks.push(q_scales);
+        // After the unconditional push above, `packed_chunks.len() > 1` means
+        // at least one prior chunk was already processed. If this chunk
+        // returned biases but earlier chunks didn't (`!has_biases`), the
+        // backend disagreed with itself across slices of the same tensor.
         if let Some(b) = q_biases {
-            if !has_biases && !bias_chunks.is_empty() {
+            if !has_biases && packed_chunks.len() > 1 {
                 return Err(Error::from_reason(format!(
                     "mlx_quantize returned inconsistent biases across chunks for '{}'",
                     key_for_error
