@@ -40,6 +40,14 @@ export function Landing({
           WebGPU.
         </p>
 
+        <div className="landing-void-ad" aria-label="Hosted on Void Platform">
+          <span className="landing-void-eyebrow">Hosted on</span>
+          <span className="landing-void-mark">Void Platform</span>
+          <span className="landing-void-copy">
+            Edge assets · WebGPU isolation
+          </span>
+        </div>
+
         <div className="landing-specs">
           <div className="spec">
             <div className="spec-value">Vision + Language</div>
@@ -53,13 +61,6 @@ export function Landing({
             <div className="spec-value">Reasoning</div>
             <div className="spec-label">Code · Agents · Visual</div>
           </div>
-        </div>
-
-        <div className="landing-void-ad" aria-label="Powered by Void Platform">
-          <span className="landing-void-mark">Void Platform</span>
-          <span className="landing-void-copy">
-            Edge assets · WebGPU isolation
-          </span>
         </div>
 
         <div className="btn-load-group">
@@ -98,6 +99,7 @@ export function Landing({
 
       <div className="landing-footer">
         Built with <code>@mlx-node/browser</code>
+        <span className="landing-footer-void">Hosted on Void</span>
         <span className="local-link" onClick={onLocalModel}>
           Local model…
         </span>
