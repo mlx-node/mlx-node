@@ -2106,4 +2106,10 @@ function rpcFnName(fn: number): string {
   }
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+const rootHost = document.getElementById('root')!;
+const rootGlobal = globalThis as typeof globalThis & {
+  __mlxBrowserDemoRoot?: Root;
+};
+const appRoot = rootGlobal.__mlxBrowserDemoRoot ?? createRoot(rootHost);
+rootGlobal.__mlxBrowserDemoRoot = appRoot;
+appRoot.render(<App />);

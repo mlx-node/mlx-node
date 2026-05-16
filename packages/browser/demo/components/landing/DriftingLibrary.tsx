@@ -11,6 +11,17 @@ const BOOK_COLORS = [PINK, BLUE, CREAM, LILAC, PEACH, SAGE];
 
 const BOOK_COUNT = 120;
 
+function hasWebGlSupport(): boolean {
+  try {
+    const canvas = document.createElement("canvas");
+    return Boolean(
+      canvas.getContext("webgl2") || canvas.getContext("webgl"),
+    );
+  } catch {
+    return false;
+  }
+}
+
 function makeBook(color: number): THREE.Group {
   const grp = new THREE.Group();
   const w = 0.42, h = 0.62, t = 0.13;
@@ -54,6 +65,7 @@ export function DriftingLibrary() {
     if (!container) return;
 
     const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!hasWebGlSupport()) return;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     let renderer: THREE.WebGLRenderer;

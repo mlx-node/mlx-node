@@ -55,6 +55,13 @@ export function Landing({
           </div>
         </div>
 
+        <div className="landing-void-ad" aria-label="Powered by Void Platform">
+          <span className="landing-void-mark">Void Platform</span>
+          <span className="landing-void-copy">
+            Edge assets · WebGPU isolation
+          </span>
+        </div>
+
         <div className="btn-load-group">
           <button
             type="button"
