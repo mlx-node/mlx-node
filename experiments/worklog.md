@@ -5,13 +5,19 @@ latency on Apple Silicon M3 Max. Bench: median time-to-first-delta of
 `session.sendStream(prompt, …)` against `.cache/models/Qwen3.5-4B-mlx`,
 correctness-gated by an 8-token greedy fingerprint at temperature=0.
 
-Final shippable state (after the second push on 2026-05-17):
-**-16.0% same-binary A/B at 1024-token prompt** (median 572.7 ms vs
-682.2 ms legacy), max_abs_diff=0 throughout. The original arc shipped
--13.7%; the post-arc E47 (2-v-col GDN register-blocking) added another
--2.3%. E48 (4-v-col) remains opt-in at +0.5% on top, available via
-`MLX_ENABLE_E48_GDN_4VCOL=1`. See `autoresearch.jsonl` for the run-by-run
-primary data.
+Final shippable state (after the third push on 2026-05-17):
+**-16.4% same-binary A/B at 1024-token prompt** (composed E47+E51 on
+top of the original arc). The original arc shipped -13.7%; E47 (2-vcol
+GDN register-blocking) added -2.3%; E51 (GDN in_proj stack) added
+-0.44%. max_abs_diff=0 throughout. E48 (4-vcol) remains opt-in at +0.5%
+on top, available via `MLX_ENABLE_E48_GDN_4VCOL=1`. See
+`autoresearch.jsonl` for the run-by-run primary data.
+
+Per-experiment headroom at this prompt size has now saturated below the
+cold-state noise floor (~0.3%). The next big lever is the C++ text
+prefill compile-cache port (E53, scope doc:
+`experiments/E53-text-prefill-compile-scope.md`), expected 1-3% but
+multi-hour scope.
 
 ## TL;DR — what shipped
 
