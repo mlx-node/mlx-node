@@ -48,6 +48,7 @@ Two pushes are bundled:
 | **E47** | `crates/mlx-sys/src/metal/gated_delta_step_2vcol.metal.inc` + `mlx_gated_delta.cpp` dispatch | `MLX_DISABLE_E47_GDN_2VCOL=1` | Per-step GDN kernel: each simdgroup handles 2 v-cols (dv_A=2y, dv_B=2y+1), sharing q[Dk]+k[Dk] loads. Grid-Y halves to Dv/2. -2.0% at 1024 single-chunk; neutral at 4096+. |
 | **E48** *(opt-in)* | `gated_delta_step_4vcol.metal.inc` + dispatch | `MLX_ENABLE_E48_GDN_4VCOL=1` | 4-vcol variant of E47. +0.5% on top of E47 for large-Dv models. Default-off because the grid-Y reduction could regress on smaller-Dv shapes. |
 | **E51** | `gated_delta_net.rs::finalize_in_proj` + `persistence.rs` | `MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1` | Load-time stack of `in_proj_qkvz` + `in_proj_ba` into `[hidden, qkvz_dim+ba_dim]^T`. Forward does one matmul + two axis-2 slices instead of two matmuls. -0.44% across 24 GDN layers. No-op for quantized variants. |
+| **E55** | `qwen3_5/model.rs::PREFILL_STEP_SIZE` | (no toggle — const) | `PREFILL_STEP_SIZE` 1024 → 2048 to match mlx-lm's default and close the long-context gap. Halves chunk count at multi-chunk prompts. At T ≤ 2048 the const is irrelevant (single `remaining` branch). −5-7% at 20k. |
 
 To verify the composed delta, run two same-binary passes with all
 toggles flipped to legacy vs all on. The exact env-var combo for
@@ -61,6 +62,9 @@ MLX_DISABLE_E47_GDN_2VCOL=1 \
 MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1 \
 <bench command>
 ```
+
+E55 (chunk=2048) is not env-toggle revertable since it's a const; flip
+to 1024 in `model.rs` for an A/B if needed.
 
 `E5+E36` chunked-kernel polish is M5+ gated so it doesn't affect the
 M3 bench (no toggle).
