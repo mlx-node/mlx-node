@@ -1465,6 +1465,15 @@ unsafe extern "C-unwind" {
     /// Get current compiled cache offset (tokens processed).
     pub fn mlx_qwen35_get_cache_offset() -> i32;
 
+    /// W6 (MTP): export a heap-allocated deep copy of the
+    /// post-final-norm hidden state of the last decoded token,
+    /// captured by the most recent `mlx_qwen35_forward_compiled`.
+    /// Sets `*out` to a heap-allocated `mlx_array*` of shape
+    /// `[1, hidden_size]` bf16 on success, or `nullptr` if no
+    /// forward has run since the last reset. Caller owns the
+    /// returned handle (use `mlx_array_delete`).
+    pub fn mlx_qwen35_export_last_hidden(out: *mut *mut mlx_array);
+
     /// Returns 1 if the main dense compiled path has been initialised
     /// via `mlx_qwen35_compiled_init_from_prefill`, 0 otherwise. Used
     /// by the W5 MTP init helper to fail loudly when called out of

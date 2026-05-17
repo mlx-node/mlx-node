@@ -2431,6 +2431,18 @@ export interface ChatConfig {
    * avoiding redundant computation for multi-turn conversations.
    */
   reuseCache?: boolean | undefined;
+  /**
+   * W6 (MTP): opt-in flag enabling the Multi-Token Prediction
+   * speculative decode loop on the dense compiled path. Requires
+   * the model checkpoint to carry an MTP head (otherwise
+   * silently ignored). Default: `false`.
+   */
+  enableMtp?: boolean | undefined;
+  /**
+   * W6 (MTP): number of draft tokens per speculative cycle. Clamped
+   * to `[1, 5]` by the W5 verify FFI contract. Default: 3.
+   */
+  mtpDepth?: number | undefined;
 }
 
 /** Chat message with tool calling support */

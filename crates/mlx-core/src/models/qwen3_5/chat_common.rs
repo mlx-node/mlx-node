@@ -254,6 +254,19 @@ pub(crate) struct ChatParams {
     pub reuse_cache: bool,
     pub thinking_token_budget: Option<i32>,
     pub include_reasoning: bool,
+    /// W6 (MTP): opt-in flag enabling the Multi-Token Prediction
+    /// speculative decode loop. Effective only on the dense compiled
+    /// path AND when the model checkpoint carries an MTP head
+    /// (`Qwen35Inner::has_mtp_weights`). The eager Rust forward, the
+    /// paged path, MoE, and VLM decode loops all continue to use the
+    /// single-token `decode_loop!` macro regardless. Default: `false`.
+    pub enable_mtp: bool,
+    /// W6 (MTP): number of draft tokens per speculative cycle, fed to
+    /// the W5 `forward_mtp_draft_compiled` / `forward_mtp_verify_compiled`
+    /// FFI. Must be in `[1, 5]` to satisfy the verify-FFI contract.
+    /// Default: 3 (MTPLX paper's reported sweet spot). Adaptive depth
+    /// is intentionally out of scope — see plan W6 task list.
+    pub mtp_depth: usize,
 }
 
 /// Resolve the effective `enable_thinking` value from `reasoning_effort`.
@@ -309,6 +322,14 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         reuse_cache: config.reuse_cache.unwrap_or(true),
         thinking_token_budget: config.thinking_token_budget,
         include_reasoning: resolve_include_reasoning(config),
+        // W6 (MTP) — defaults keep MTP OFF until the per-request opt-in
+        // lands in the TS surface (W7). `mtp_depth = 3` matches MTPLX's
+        // reported sweet spot; clamped to `[1, 5]` by the W5 verify FFI.
+        enable_mtp: config.enable_mtp.unwrap_or(false),
+        mtp_depth: config
+            .mtp_depth
+            .map(|d| (d as usize).clamp(1, 5))
+            .unwrap_or(3),
     }
 }
 
@@ -1019,6 +1040,558 @@ macro_rules! decode_loop {
 
 pub(crate) use decode_loop;
 
+// =============================================================================
+// W6 — MTP speculative decode loop (dense compiled path only).
+//
+// Sister to `decode_loop!` above; preserves every behavior of the
+// single-token loop (penalties, ReasoningTracker / budget, EOS,
+// repetition cutoff, every-256-step cache clear, streaming +
+// cancellation) while emitting up to `mtp_depth + 1` tokens per
+// outer iteration via the W5 draft + verify FFI plus the W4
+// `accept_with_residual` sampler.
+//
+// Cache-rollback strategy (compiled path):
+//   - The verify FFI advances the MAIN compiled K/V offset by
+//     `depth + 1`. On any rejection we rewind the main offset by
+//     `accepted_count - (depth + 1)` (a negative delta) via
+//     `mlx_qwen35_compiled_adjust_offset`. We do NOT zero the K/V
+//     buffer entries at positions `[accepted .. depth+1]` — the
+//     next forward simply overwrites them.
+//   - The MTP draft FFI advances its OWN offset by 1 per draft
+//     step. On any rejection we rewind by `accepted_count - depth`
+//     via `mlx_qwen35_mtp_compiled_adjust_offset`. The MTP path is
+//     by design 1-token behind the main path's accepted prefix.
+//   - W3's `Qwen3_5LayerCache::snapshot_all` / `restore_all` is the
+//     EAGER-PATH rollback primitive. On the compiled path the live
+//     K/V lives in `g_compiled_caches` (C++), not `self.caches`, so
+//     the snapshot/restore is intentionally NOT used here.
+//
+// Tracker / budget invariant:
+//   - `should_force_think_end()` is checked BEFORE starting each
+//     draft cycle. If forced, the macro emits ONE forced token via
+//     the normal main-path forward + sampler and skips the cycle.
+//   - It is also checked BEFORE accepting each individual verified
+//     token. If forced mid-cycle, the macro aborts the remaining
+//     accepted tokens, rewinds the offsets to (already-emitted + 1)
+//     committed positions on top of the forced token, and emits the
+//     forced token through the normal path.
+// =============================================================================
+
+/// Closure bundle for the MTP cycle. Mirrors `DecodeOps` but adds
+/// draft / verify / rollback hooks that are only meaningful on the
+/// dense compiled path.
+///
+/// `F`  : single main-path forward step returning `(logits, hidden,
+///        needs_squeeze)`. `hidden` is `[1, hidden_size]` bf16.
+/// `D`  : MTP draft step returning `(h_next, draft_logits)` where
+///        `h_next` is `[1, 1, hidden]` and `draft_logits` is
+///        `[1, vocab]`.
+/// `V`  : MTP verify step returning verify logits of shape
+///        `[1, depth + 1, vocab]`.
+/// `R`  : rollback hook receiving `(accepted, depth)`. Implementor
+///        calls `mlx_qwen35_compiled_adjust_offset(accepted as i32 -
+///        (depth as i32 + 1))` AND
+///        `mlx_qwen35_mtp_compiled_adjust_offset(accepted as i32 -
+///        depth as i32)`. Split into one hook so the macro stays
+///        path-agnostic.
+/// `E`  : eval-step hook (same contract as `DecodeOps::eval_step`)
+///        called after every emitted token to flush the lazy graph.
+pub(crate) struct MtpOps<F, D, V, R, E>
+where
+    F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
+    D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
+    V: FnMut(&MxArray, &MxArray, usize) -> Result<MxArray>,
+    R: FnMut(usize, usize),
+    E: Fn(&MxArray, &MxArray, bool),
+{
+    pub forward_with_hidden: F,
+    pub draft_step: D,
+    pub verify_step: V,
+    pub rollback: R,
+    pub eval_step: E,
+}
+
+/// Outcome of `run_mtp_cycle_inner` — the list of accepted tokens for
+/// this cycle plus whether a rejection forced a rollback (used by the
+/// macro to log / observe).
+pub(crate) struct MtpCycleOutcome {
+    /// Accepted token IDs in emission order. Always at least one
+    /// element on success (residual sample on full reject, or
+    /// bonus token on full accept).
+    pub tokens: Vec<u32>,
+}
+
+/// One MTP draft+verify cycle. Pure helper — the caller drives the
+/// per-token streaming, EOS, cancellation, and tracker bookkeeping
+/// inside `decode_loop_mtp!`.
+///
+/// Contract:
+/// * `prev_hidden_in` / `prev_emb_in` are `[1, 1, hidden]` bf16.
+/// * `last_committed_id` is the token at the end of `token_history`
+///   — used as the first column of the verify input.
+/// * `depth` MUST be `>= 1` and `<= 5` (verify FFI clamps).
+/// * `embedding_weight` is the model's embedding table (already
+///   resolved to the LM head when `tie_word_embeddings=false` on the
+///   caller side — same arg as `forward_with_hidden`).
+///
+/// On error any partial offset / K/V drift from the partial cycle
+/// is the caller's problem; production callers fold the cycle inside
+/// `DENSE_COMPILED_MUTEX` so a `?` early-return drops the
+/// `CompiledResetGuard` and wipes the C++ state cleanly.
+pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E>(
+    ops: &mut MtpOps<F, D, V, R, E>,
+    prev_hidden_in: MxArray,
+    prev_emb_in: MxArray,
+    last_committed_id: u32,
+    embedding_weight: &MxArray,
+    token_history: &[u32],
+    params: &ChatParams,
+    rng: &mut impl rand::Rng,
+    depth: usize,
+) -> Result<(MtpCycleOutcome, MxArray, MxArray)>
+where
+    F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
+    D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
+    V: FnMut(&MxArray, &MxArray, usize) -> Result<MxArray>,
+    R: FnMut(usize, usize),
+    E: Fn(&MxArray, &MxArray, bool),
+{
+    use crate::array::{DType, MxArray as A};
+    use crate::nn::Activations;
+    use crate::sampling;
+
+    debug_assert!(depth >= 1, "run_mtp_cycle_inner: depth must be >= 1");
+
+    // Step 1: D draft steps. Each yields (h_next, draft_logits).
+    // We accumulate the drafted token IDs and per-token p_draft over
+    // the full vocab (cast to fp32 once) for the acceptance check.
+    let mut prev_hidden = prev_hidden_in;
+    let mut prev_emb = prev_emb_in;
+    let mut draft_ids: Vec<i32> = Vec::with_capacity(depth);
+    let mut draft_probs: Vec<MxArray> = Vec::with_capacity(depth);
+
+    for _ in 0..depth {
+        let (h_next, draft_logits) = (ops.draft_step)(&prev_hidden, &prev_emb)?;
+        // draft_logits is [1, vocab]; squeeze to [vocab] for softmax.
+        let logits_1d = draft_logits.squeeze(Some(&[0]))?;
+        let probs = Activations::softmax(&logits_1d, Some(-1))?.astype(DType::Float32)?;
+        // Sample the drafted token using the same sampling pipeline
+        // the main path uses — drafter and verifier must agree on
+        // their proposal distribution for Leviathan-Chen.
+        let tok = sampling::sample(&draft_logits, params.sampling_config)?;
+        tok.eval();
+        let tok_id = tok.item_at_int32(0)?;
+        draft_ids.push(tok_id);
+        draft_probs.push(probs);
+        // Update prev_hidden for next draft step.
+        prev_hidden = h_next;
+        // prev_emb for the next draft is the embedding of the token
+        // we just drafted.
+        let id_arr = A::from_int32(&[tok_id], &[1])?;
+        let emb_2d = embedding_weight.take(&id_arr, 0)?; // [1, hidden]
+        let hidden = emb_2d.shape_at(1)?;
+        prev_emb = emb_2d.reshape(&[1, 1, hidden])?;
+    }
+
+    // Step 2: build verify input [last_committed_id, d_0, ..., d_{D-1}].
+    let mut verify_ids: Vec<i32> = Vec::with_capacity(depth + 1);
+    verify_ids.push(last_committed_id as i32);
+    verify_ids.extend(draft_ids.iter().copied());
+    let verify_in = A::from_int32(&verify_ids, &[1, (depth + 1) as i64])?;
+    let verify_logits = (ops.verify_step)(&verify_in, embedding_weight, depth)?;
+    // verify_logits: [1, depth+1, vocab]. We materialize it now so
+    // per-position slicing reads from a CPU-resident buffer for
+    // penalty application.
+    verify_logits.eval();
+    let vocab = verify_logits.shape_at(2)?;
+
+    // Step 3: per-position accept/reject. Build extended history as
+    // we accept; rejecting at position i halts the loop.
+    let mut accepted_tokens: Vec<u32> = Vec::with_capacity(depth + 1);
+    let mut hist_extended: Vec<u32> = token_history.to_vec();
+    let mut all_accepted = true;
+    let mut rejection_residual: Option<i32> = None;
+
+    for i in 0..depth {
+        // verify_logits[0, i, :] → [vocab]
+        let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+        let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
+        let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
+        let p_target = Activations::softmax(&penalized, Some(-1))?.astype(DType::Float32)?;
+        p_target.eval();
+
+        let (accept, out_tok) =
+            sampling::accept_with_residual(&p_target, &draft_probs[i], draft_ids[i], rng)?;
+        if accept {
+            let id_u = out_tok as u32;
+            accepted_tokens.push(id_u);
+            hist_extended.push(id_u);
+        } else {
+            all_accepted = false;
+            rejection_residual = Some(out_tok);
+            accepted_tokens.push(out_tok as u32);
+            break;
+        }
+    }
+
+    if all_accepted {
+        // Step 4 (bonus): sample from verify position D (after all
+        // drafts accepted). Apply penalties consistent with the
+        // extended history.
+        let i = depth;
+        let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+        let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
+        let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
+        let bonus = sampling::sample(&penalized, params.sampling_config)?;
+        bonus.eval();
+        let bonus_id = bonus.item_at_int32(0)? as u32;
+        accepted_tokens.push(bonus_id);
+    }
+
+    // Step 5: rollback. `accepted_drafts` is the number of draft
+    // tokens (out of `depth`) whose K/V we are KEEPING in BOTH the
+    // main and the MTP draft caches. The rest must be discarded.
+    //
+    // Layout BEFORE this cycle (right after the macro's Step A):
+    //   - Main offset advanced by 1 (Step A wrote K/V for `y`, the
+    //     prior cycle's last accepted token, at the next free slot).
+    //   - MTP draft offset unchanged since the prior cycle's
+    //     rollback (the MTP path mirrors a snapshot of the main
+    //     offset and only moves on draft / rollback).
+    //
+    // Verify wrote K/V for ALL `depth + 1` inputs of
+    // `[last_committed_id, d_0, .., d_{depth-1}]` into the MAIN cache
+    // (advancing main offset by `depth + 1`). Draft steps wrote K/V
+    // for the `depth` drafted tokens into the MTP cache (advancing
+    // MTP offset by `depth`).
+    //
+    //   - On full accept: ALL `depth + 1` verify positions are kept
+    //     in main (last_committed + `depth` drafts) and ALL `depth`
+    //     draft positions are kept in MTP. The bonus token has no
+    //     K/V written this cycle — its K/V will be laid down by the
+    //     NEXT cycle's Step A.
+    //   - On rejection after `K` accepted drafts: we keep the
+    //     last_committed slot + the first `K` draft slots in main
+    //     (= `K + 1` main verify slots) and the first `K` slots in
+    //     MTP. The REJECTED draft's K/V is discarded by offset
+    //     rewind in BOTH caches. The verifier's residual sample is
+    //     emitted as a token but has no K/V written this cycle —
+    //     its K/V will be laid down by the NEXT cycle's Step A.
+    //
+    // Both deltas reduce to `accepted_drafts - depth`:
+    //   - main_delta = (K + 1) - (depth + 1) = K - depth
+    //   - mtp_delta  = K       - depth
+    let accepted_drafts = if all_accepted {
+        depth
+    } else {
+        // accepted_tokens contains `K` accepted drafts + 1 residual.
+        accepted_tokens.len() - 1
+    };
+    (ops.rollback)(accepted_drafts, depth);
+
+    let _ = rejection_residual; // documented above; only used for clarity
+
+    // Return the post-cycle (prev_hidden, prev_emb) seed slots. They
+    // are NOT used by `decode_loop_mtp!` (the macro always re-seeds
+    // via Step A on the next outer iteration — see the macro comment
+    // on why chaining cycles back-to-back is not currently possible
+    // without a verify-graph hidden accessor). Kept in the signature
+    // so a future enhancement can wire chained cycles without
+    // changing the helper API.
+    let next_emb = {
+        let last_id = *accepted_tokens.last().expect("at least one accepted token") as i32;
+        let id_arr = A::from_int32(&[last_id], &[1])?;
+        let emb_2d = embedding_weight.take(&id_arr, 0)?;
+        let hidden = emb_2d.shape_at(1)?;
+        emb_2d.reshape(&[1, 1, hidden])?
+    };
+    Ok((
+        MtpCycleOutcome {
+            tokens: accepted_tokens,
+        },
+        prev_hidden,
+        next_emb,
+    ))
+}
+
+/// MTP speculative decode loop. See `decode_loop!` for the
+/// single-token sister macro this mirrors.
+///
+/// Required arguments mirror `decode_loop!`. Adds:
+///   - `mtp_ops`: an [`MtpOps`] struct.
+///   - `mtp_depth`: number of draft tokens per cycle (`>= 1`, `<= 5`).
+///   - `mtp_rng`: an `&mut impl rand::Rng` driving the acceptance
+///     coin flip. The caller picks the seed strategy
+///     (`rand::rng()` — thread-local CSPRNG — is the typical
+///     production choice; `StdRng::seed_from_u64(seed)` is preferred
+///     in tests for determinism).
+///
+/// The `streaming` block is OPTIONAL — same shape as `decode_loop!`.
+macro_rules! decode_loop_mtp {
+    (
+        mtp_ops: $mtp:expr,
+        mtp_depth: $depth:expr,
+        mtp_rng: $rng:expr,
+        y: $y:expr,
+        embedding_weight: $emb:expr,
+        params: $p:expr,
+        reasoning_tracker: $tracker:expr,
+        profiler: $profiler:expr,
+        max_new_tokens: $max:expr,
+        eos_id: $eos:expr,
+        generated_tokens: $gen:expr,
+        token_history: $hist:expr,
+        finish_reason: $reason:expr,
+        first_token_instant: $first_tok:expr,
+        report_perf: $report:expr,
+        generation_stream: $stream:expr
+        $(, streaming: {
+            callback: $cb:expr,
+            cancelled: $cancelled:expr,
+            decode_stream: $ds:expr,
+            tokenizer: $tok:expr,
+            streamed_text_len: $slen:expr,
+            last_is_reasoning: $last_r:expr
+        })?
+    ) => {{
+        // Emit the FIRST token via a normal main-path forward+hidden.
+        // The MTP loop needs an established last-committed token AND
+        // its post-final-norm hidden state to seed the first draft.
+        // After this initial forward, `prev_hidden` / `prev_emb`
+        // carry the seed for the next cycle.
+        let mut prev_hidden_opt: Option<$crate::array::MxArray>;
+        let mut prev_emb_opt: Option<$crate::array::MxArray>;
+        let mut last_committed_id_opt: Option<u32>;
+
+        // Track cycles for the every-256-emitted-token cache clear.
+        // We use the running `gen.len()` rather than a separate step
+        // counter so MTP and non-MTP loops stay byte-equivalent on
+        // the cache-clear cadence.
+        let mut last_clear_at: usize = $gen.len();
+
+        loop {
+            // ---- Step A: emit one main-path-derived token. -----------
+            // This is either the very first token of the generation,
+            // OR a forced think-end token (budget), OR the recovery
+            // step after an MTP cycle returned fewer than depth+1
+            // tokens (rejection mid-cycle — we need a fresh hidden
+            // from the main path to re-seed MTP).
+            let _stream_ctx = $crate::stream::StreamContext::new($stream);
+
+            $profiler.begin("forward");
+            let next_ids = $y.reshape(&[1, 1])?;
+            let (mut logits, hidden, needs_squeeze) =
+                ($mtp.forward_with_hidden)(&next_ids, &$emb)?;
+            if needs_squeeze {
+                logits = logits.squeeze(Some(&[1]))?;
+            }
+            $profiler.end();
+
+            let (next_token, budget_forced) =
+                if $tracker.should_force_think_end() {
+                    let forced_id = $tracker.forced_token_id() as i32;
+                    ($crate::array::MxArray::from_int32(&[forced_id], &[1])?, true)
+                } else {
+                    $profiler.begin("rep_penalty");
+                    logits = $crate::models::qwen3_5::chat_common::apply_all_penalties(
+                        logits, &$hist, &$p,
+                    )?;
+                    $profiler.end();
+
+                    $profiler.begin("sample");
+                    let t = $crate::sampling::sample(&logits, $p.sampling_config)?;
+                    $profiler.end();
+                    (t, false)
+                };
+
+            $profiler.begin("eval_caches");
+            ($mtp.eval_step)(&next_token, &logits, budget_forced);
+            $profiler.end();
+
+            $profiler.begin("eval_token");
+            next_token.eval();
+            $profiler.end();
+
+            $profiler.begin("extract");
+            let token_id = next_token.item_at_int32(0)? as u32;
+            $profiler.end();
+            $profiler.mark_first_token();
+            if $report && $first_tok.is_none() {
+                $first_tok = Some(std::time::Instant::now());
+            }
+
+            $gen.push(token_id);
+            $hist.push(token_id);
+            let _is_reasoning = $tracker.observe_token(token_id);
+
+            $(
+                $last_r = _is_reasoning;
+                if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    $reason = String::from("cancelled");
+                    break;
+                }
+                let token_text = $crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                    &mut $ds, $tok.inner(), token_id, &$gen, $slen,
+                );
+                $slen += token_text.len();
+                $cb.call(
+                    Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                        text: token_text, done: false, finish_reason: None,
+                        tool_calls: None, thinking: None, num_tokens: None,
+                        prompt_tokens: None, reasoning_tokens: None,
+                        raw_text: None, cached_tokens: None, performance: None,
+                        is_reasoning: Some(_is_reasoning),
+                    }),
+                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            )?
+
+            if token_id == $eos {
+                $reason = String::from("stop");
+                break;
+            }
+            if let Some(reason) = $crate::sampling::check_repetition_cutoff(
+                &$gen, $p.max_consecutive_tokens, $p.max_ngram_repeats, $p.ngram_size,
+            ) {
+                $reason = reason.to_string();
+                break;
+            }
+            if $gen.len() >= ($max as usize) {
+                if $reason.is_empty() { $reason = String::from("length"); }
+                break;
+            }
+
+            // Seed for MTP cycles using the hidden returned from this
+            // forward. `hidden` is `[1, hidden_size]`; reshape to
+            // `[1, 1, hidden]` for the draft FFI's `[B, T, hidden]`
+            // contract.
+            let hidden_dim = hidden.shape_at(1)?;
+            prev_hidden_opt = Some(hidden.reshape(&[1, 1, hidden_dim])?);
+            // prev_emb is the embedding of the JUST-emitted token.
+            let id_arr = $crate::array::MxArray::from_int32(&[token_id as i32], &[1])?;
+            let emb_2d = $emb.take(&id_arr, 0)?;
+            let h = emb_2d.shape_at(1)?;
+            prev_emb_opt = Some(emb_2d.reshape(&[1, 1, h])?);
+            last_committed_id_opt = Some(token_id);
+            $y = next_token;
+            $profiler.step();
+
+            // ---- Step B: ONE MTP draft+verify cycle. -------------------
+            // We run exactly one cycle per outer iteration, then loop
+            // back through Step A. Why: chaining cycles back-to-back
+            // requires the post-final-norm hidden of the LAST
+            // committed token from the previous cycle, but the W5
+            // verify FFI only exports logits — there's no hidden
+            // accessor for verify-graph positions. Doing one
+            // main-path step between cycles is correct (re-seeds
+            // `prev_hidden` from the ground-truth forward) and still
+            // a net win: per outer round we emit 1 (Step A) +
+            // (D + 1) (cycle on full accept) = D + 2 tokens for D
+            // draft steps + 1 verify + 1 main forward.
+            if $gen.len() >= ($max as usize) {
+                if $reason.is_empty() { $reason = String::from("length"); }
+                break;
+            }
+            if $tracker.should_force_think_end() {
+                // Budget tripped during Step A's observe — defer the
+                // forced token to the next Step A.
+                continue;
+            }
+
+            let prev_h = prev_hidden_opt.take().expect("prev_hidden seeded after Step A");
+            let prev_e = prev_emb_opt.take().expect("prev_emb seeded after Step A");
+            let last_id = last_committed_id_opt.expect("last_committed seeded after Step A");
+            // `_` discards the next-cycle seed; we always re-seed via
+            // Step A on the next outer iteration.
+            $profiler.begin("mtp_cycle");
+            let cycle_res =
+                $crate::models::qwen3_5::chat_common::run_mtp_cycle_inner(
+                    &mut $mtp,
+                    prev_h,
+                    prev_e,
+                    last_id,
+                    &$emb,
+                    &$hist,
+                    &$p,
+                    &mut $rng,
+                    $depth,
+                );
+            $profiler.end();
+            let (outcome, _new_hidden, _new_emb) = cycle_res?;
+
+            // Emit each accepted token through the same stop /
+            // streaming pipeline as the single-token loop.
+            let mut hit_stop = false;
+            for tok_id in outcome.tokens.iter().copied() {
+                if $gen.len() >= ($max as usize) {
+                    if $reason.is_empty() { $reason = String::from("length"); }
+                    hit_stop = true;
+                    break;
+                }
+                $gen.push(tok_id);
+                $hist.push(tok_id);
+                let _is_reasoning = $tracker.observe_token(tok_id);
+                $(
+                    $last_r = _is_reasoning;
+                    if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        $reason = String::from("cancelled");
+                        hit_stop = true;
+                        break;
+                    }
+                    let token_text = $crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                        &mut $ds, $tok.inner(), tok_id, &$gen, $slen,
+                    );
+                    $slen += token_text.len();
+                    $cb.call(
+                        Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                            text: token_text, done: false, finish_reason: None,
+                            tool_calls: None, thinking: None, num_tokens: None,
+                            prompt_tokens: None, reasoning_tokens: None,
+                            raw_text: None, cached_tokens: None, performance: None,
+                            is_reasoning: Some(_is_reasoning),
+                        }),
+                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                )?
+                if tok_id == $eos {
+                    $reason = String::from("stop");
+                    hit_stop = true;
+                    break;
+                }
+                if let Some(reason) = $crate::sampling::check_repetition_cutoff(
+                    &$gen, $p.max_consecutive_tokens, $p.max_ngram_repeats, $p.ngram_size,
+                ) {
+                    $reason = reason.to_string();
+                    hit_stop = true;
+                    break;
+                }
+            }
+
+            // Every-256-emitted-token cache clear (matches the
+            // single-token loop's cadence in token-count units).
+            if $gen.len() >= last_clear_at + 256 {
+                $crate::array::synchronize_and_clear_cache();
+                last_clear_at = $gen.len();
+            }
+
+            if hit_stop { break; }
+            // Set `$y` to the last accepted token so the next Step A
+            // feeds the right token through main-path forward.
+            // (Step A unconditionally re-seeds `prev_hidden_opt` /
+            // `prev_emb_opt` / `last_committed_id_opt`, so no explicit
+            // drain here.)
+            let last = *outcome.tokens.last().expect("at least one accepted") as i32;
+            $y = $crate::array::MxArray::from_int32(&[last], &[1])?;
+            $profiler.step();
+        }
+
+        $profiler.snapshot_memory_after();
+        $profiler.report();
+    }};
+}
+
+pub(crate) use decode_loop_mtp;
+
 /// Policy decision for the C++ compiled paged forward fallback.
 ///
 /// Inputs:
@@ -1045,6 +1618,486 @@ pub(crate) use decode_loop;
 #[inline]
 pub(crate) fn should_propagate_compiled_paged_error(compiled_step_completed: bool) -> bool {
     compiled_step_completed
+}
+
+#[cfg(test)]
+mod mtp_params_tests {
+    //! W6 (MTP) — defaults + override plumbing for `ChatParams`.
+    //! No Metal required; purely tests the `ChatConfig → ChatParams`
+    //! extraction.
+
+    use super::extract_chat_params;
+    use crate::models::qwen3_5::model::ChatConfig;
+
+    fn base_config() -> ChatConfig {
+        ChatConfig {
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            reasoning_effort: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            report_performance: None,
+            reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
+        }
+    }
+
+    /// Defaults: MTP off, depth 3.
+    #[test]
+    fn defaults_disable_mtp() {
+        let cfg = base_config();
+        let p = extract_chat_params(&cfg);
+        assert!(!p.enable_mtp, "enable_mtp must default to false");
+        assert_eq!(p.mtp_depth, 3, "mtp_depth must default to 3");
+    }
+
+    /// User override: `enable_mtp=true`, `mtp_depth=2` flows through.
+    #[test]
+    fn user_overrides_pass_through() {
+        let mut cfg = base_config();
+        cfg.enable_mtp = Some(true);
+        cfg.mtp_depth = Some(2);
+        let p = extract_chat_params(&cfg);
+        assert!(p.enable_mtp);
+        assert_eq!(p.mtp_depth, 2);
+    }
+
+    /// Depth clamping: <1 clamps to 1, >5 clamps to 5.
+    #[test]
+    fn depth_clamps_to_verify_ffi_range() {
+        let mut cfg = base_config();
+        cfg.mtp_depth = Some(0);
+        let p = extract_chat_params(&cfg);
+        assert_eq!(p.mtp_depth, 1, "mtp_depth=0 must clamp to 1");
+
+        cfg.mtp_depth = Some(99);
+        let p = extract_chat_params(&cfg);
+        assert_eq!(
+            p.mtp_depth, 5,
+            "mtp_depth=99 must clamp to verify-FFI max 5"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mtp_cycle_tests {
+    //! W6 (MTP) — `run_mtp_cycle_inner` smoke tests with mock
+    //! draft / verify closures. Each test invokes the helper with a
+    //! tiny synthetic vocab and validates: emitted token count,
+    //! rollback callback receives the expected
+    //! `(accepted_drafts, depth)` pair. Drafter and verifier closures
+    //! track call counts so the tests double as wiring assertions.
+    //!
+    //! The rollback contract: `accepted_drafts` is the number of
+    //! draft positions whose K/V we keep (range `0..=depth`). The
+    //! dispatch-site callback in `model.rs` translates this into the
+    //! single shared offset delta `accepted_drafts - depth` and
+    //! applies it to BOTH the main and MTP compiled offsets.
+    //!
+    //! These are Metal-light: they DO use MLX softmax / sample /
+    //! take inside the helper, so the tests skip cleanly when Metal
+    //! is unavailable (mirrors the `compiled_ffi_tests` pattern in
+    //! `mtp.rs`).
+    //!
+    //! Full token-for-token parity vs the eager Rust MTP forward is
+    //! intentionally out of scope here — see task #8 of the W6 plan
+    //! for the integration smoke that exercises real weights.
+
+    use std::cell::RefCell;
+
+    use crate::array::MxArray;
+    use crate::models::qwen3_5::chat_common::{MtpOps, extract_chat_params, run_mtp_cycle_inner};
+    use crate::models::qwen3_5::model::ChatConfig;
+
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    const VOCAB: i64 = 8;
+    const HIDDEN: i64 = 4;
+
+    fn default_params() -> super::ChatParams {
+        extract_chat_params(&ChatConfig {
+            max_new_tokens: None,
+            temperature: Some(1.0),
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            reasoning_effort: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            report_performance: None,
+            reuse_cache: None,
+            enable_mtp: Some(true),
+            mtp_depth: Some(3),
+        })
+    }
+
+    /// Build a fake embedding table — vocab x hidden, deterministic
+    /// distinct values per row so `take` returns recognizable embs.
+    fn fake_embedding() -> Option<MxArray> {
+        let mut data = Vec::with_capacity((VOCAB * HIDDEN) as usize);
+        for v in 0..VOCAB {
+            for h in 0..HIDDEN {
+                data.push((v * 10 + h) as f32);
+            }
+        }
+        MxArray::from_float32(&data, &[VOCAB, HIDDEN]).ok()
+    }
+
+    fn fake_hidden() -> Option<MxArray> {
+        let data = vec![0.5f32; HIDDEN as usize];
+        MxArray::from_float32(&data, &[1, 1, HIDDEN]).ok()
+    }
+
+    /// Construct a draft-step closure that always returns peaked
+    /// logits at `draft_id_per_step[step]` and a constant h_next.
+    /// Tracks call count in `counter`.
+    fn make_draft<'a>(
+        draft_id_per_step: &'a [i32],
+        counter: &'a RefCell<usize>,
+    ) -> impl FnMut(&MxArray, &MxArray) -> napi::Result<(MxArray, MxArray)> + 'a {
+        move |_prev_h: &MxArray, _prev_e: &MxArray| {
+            let step = *counter.borrow();
+            *counter.borrow_mut() += 1;
+            let id = draft_id_per_step[step % draft_id_per_step.len()];
+            let mut logits = vec![-10.0f32; VOCAB as usize];
+            logits[id as usize] = 10.0;
+            let draft_logits = MxArray::from_float32(&logits, &[1, VOCAB]).expect("draft logits");
+            let h_next = MxArray::from_float32(&vec![0.0f32; HIDDEN as usize], &[1, 1, HIDDEN])
+                .expect("h_next");
+            Ok((h_next, draft_logits))
+        }
+    }
+
+    /// Construct a verify-step closure that returns logits peaked at
+    /// `verify_id_per_position[i]` for each verify position.
+    fn make_verify<'a>(
+        verify_id_per_position: &'a [i32],
+        counter: &'a RefCell<usize>,
+    ) -> impl FnMut(&MxArray, &MxArray, usize) -> napi::Result<MxArray> + 'a {
+        move |_ids: &MxArray, _emb: &MxArray, depth: usize| {
+            *counter.borrow_mut() += 1;
+            let positions = depth + 1;
+            assert_eq!(verify_id_per_position.len(), positions);
+            let mut data = vec![-10.0f32; positions * VOCAB as usize];
+            for (i, &id) in verify_id_per_position.iter().enumerate() {
+                data[i * VOCAB as usize + id as usize] = 10.0;
+            }
+            let arr =
+                MxArray::from_float32(&data, &[1, positions as i64, VOCAB]).expect("verify logits");
+            Ok(arr)
+        }
+    }
+
+    fn skip_if_metal_unavailable<T, E: std::fmt::Display>(
+        label: &str,
+        r: Result<T, E>,
+    ) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                let msg = format!("{}", e);
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (Metal unavailable): {msg}");
+                    None
+                } else {
+                    panic!("unexpected failure in {label}: {msg}");
+                }
+            }
+        }
+    }
+
+    /// All-accept path: drafter and verifier agree on every drafted
+    /// token; cycle emits `depth + 1` tokens and the rollback
+    /// callback fires with `(accepted_drafts=depth, depth=depth)` so
+    /// the resulting `accepted_drafts - depth = 0` delta leaves both
+    /// the main and the MTP offsets where the verify pass left them.
+    #[test]
+    fn all_accept_emits_depth_plus_one_tokens() {
+        let depth = 3usize;
+        let Some(emb) = fake_embedding() else { return };
+        let Some(prev_h) = fake_hidden() else { return };
+        let Some(prev_e) = fake_hidden() else { return };
+
+        let draft_ids = vec![1i32, 2, 3];
+        let verify_ids = vec![1i32, 2, 3, 4];
+        let draft_ctr = RefCell::new(0usize);
+        let verify_ctr = RefCell::new(0usize);
+        let rollback_seen = RefCell::new(None::<(usize, usize)>);
+
+        let mut ops = MtpOps {
+            forward_with_hidden: |_ids: &MxArray,
+                                  _emb: &MxArray|
+             -> napi::Result<(MxArray, MxArray, bool)> {
+                unreachable!("forward_with_hidden is not called inside run_mtp_cycle_inner")
+            },
+            draft_step: make_draft(&draft_ids, &draft_ctr),
+            verify_step: make_verify(&verify_ids, &verify_ctr),
+            rollback: |a: usize, d: usize| {
+                *rollback_seen.borrow_mut() = Some((a, d));
+            },
+            eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+        };
+        let params = default_params();
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+
+        let res = run_mtp_cycle_inner(
+            &mut ops,
+            prev_h,
+            prev_e,
+            0u32,
+            &emb,
+            &[],
+            &params,
+            &mut rng,
+            depth,
+        );
+        let Some((outcome, _h, _e)) = skip_if_metal_unavailable("all_accept", res) else {
+            return;
+        };
+        assert_eq!(*draft_ctr.borrow(), depth, "must run depth draft steps");
+        assert_eq!(*verify_ctr.borrow(), 1, "must run exactly one verify step");
+        assert_eq!(
+            outcome.tokens.len(),
+            depth + 1,
+            "all-accept must emit depth+1 tokens (depth drafts + 1 bonus)"
+        );
+        assert_eq!(outcome.tokens, vec![1u32, 2, 3, 4]);
+        assert_eq!(
+            *rollback_seen.borrow(),
+            Some((depth, depth)),
+            "rollback callback must receive (accepted_drafts=depth, depth=depth) on full \
+             accept — produces zero offset delta in the dispatch-site formula \
+             `accepted_drafts - depth`"
+        );
+    }
+
+    /// Depth-1 degeneracy: 1 draft + 1 verify position still works.
+    #[test]
+    fn depth_one_degenerates_correctly() {
+        let depth = 1usize;
+        let Some(emb) = fake_embedding() else { return };
+        let Some(prev_h) = fake_hidden() else { return };
+        let Some(prev_e) = fake_hidden() else { return };
+
+        let draft_ids = vec![5i32];
+        let verify_ids = vec![5i32, 7];
+        let draft_ctr = RefCell::new(0usize);
+        let verify_ctr = RefCell::new(0usize);
+        let rollback_seen = RefCell::new(None::<(usize, usize)>);
+
+        let mut ops = MtpOps {
+            forward_with_hidden: |_ids: &MxArray,
+                                  _emb: &MxArray|
+             -> napi::Result<(MxArray, MxArray, bool)> {
+                unreachable!()
+            },
+            draft_step: make_draft(&draft_ids, &draft_ctr),
+            verify_step: make_verify(&verify_ids, &verify_ctr),
+            rollback: |a: usize, d: usize| {
+                *rollback_seen.borrow_mut() = Some((a, d));
+            },
+            eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+        };
+        let params = default_params();
+        let mut rng = StdRng::seed_from_u64(0xBADC0DE);
+
+        let res = run_mtp_cycle_inner(
+            &mut ops,
+            prev_h,
+            prev_e,
+            0u32,
+            &emb,
+            &[],
+            &params,
+            &mut rng,
+            depth,
+        );
+        let Some((outcome, _h, _e)) = skip_if_metal_unavailable("depth_one", res) else {
+            return;
+        };
+        assert_eq!(*draft_ctr.borrow(), 1);
+        assert_eq!(outcome.tokens.len(), 2, "depth=1 + full accept = 2 tokens");
+        assert_eq!(outcome.tokens, vec![5u32, 7u32]);
+        assert_eq!(*rollback_seen.borrow(), Some((1, 1)));
+    }
+
+    /// All-reject path: drafter and verifier argmaxes disagree on
+    /// position 0 — cycle emits exactly 1 residual token and the
+    /// rollback callback reports `accepted_drafts=0` so the
+    /// dispatch-site delta `0 - depth = -depth` rewinds the full
+    /// draft window on BOTH the main and MTP offsets.
+    #[test]
+    fn all_reject_emits_one_residual() {
+        let depth = 3usize;
+        let Some(emb) = fake_embedding() else { return };
+        let Some(prev_h) = fake_hidden() else { return };
+        let Some(prev_e) = fake_hidden() else { return };
+
+        let draft_ids = vec![1i32, 2, 3];
+        let verify_ids = vec![6i32, 7, 0, 0];
+        let draft_ctr = RefCell::new(0usize);
+        let verify_ctr = RefCell::new(0usize);
+        let rollback_seen = RefCell::new(None::<(usize, usize)>);
+
+        let mut ops = MtpOps {
+            forward_with_hidden: |_ids: &MxArray,
+                                  _emb: &MxArray|
+             -> napi::Result<(MxArray, MxArray, bool)> {
+                unreachable!()
+            },
+            draft_step: make_draft(&draft_ids, &draft_ctr),
+            verify_step: make_verify(&verify_ids, &verify_ctr),
+            rollback: |a: usize, d: usize| {
+                *rollback_seen.borrow_mut() = Some((a, d));
+            },
+            eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+        };
+        let params = default_params();
+        let mut rng = StdRng::seed_from_u64(0xDEAD);
+
+        let res = run_mtp_cycle_inner(
+            &mut ops,
+            prev_h,
+            prev_e,
+            0u32,
+            &emb,
+            &[],
+            &params,
+            &mut rng,
+            depth,
+        );
+        let Some((outcome, _h, _e)) = skip_if_metal_unavailable("all_reject", res) else {
+            return;
+        };
+        assert_eq!(*draft_ctr.borrow(), depth);
+        assert_eq!(
+            outcome.tokens.len(),
+            1,
+            "all-reject at position 0 emits 1 residual token"
+        );
+        assert_eq!(
+            *rollback_seen.borrow(),
+            Some((0, depth)),
+            "rollback must report accepted_drafts=0 on first-position reject so the \
+             dispatch-site delta `0 - depth = -depth` rewinds the full draft window \
+             on both caches"
+        );
+    }
+
+    /// Partial-reject regression: drafter and verifier agree on the
+    /// first two positions, then diverge at position 2 (out of
+    /// `depth=3`). Cycle emits 3 tokens — 2 accepted drafts plus 1
+    /// verifier residual — and the rollback callback reports
+    /// `accepted_drafts=2`, NOT `accepted_drafts=3` (the pre-fix
+    /// bug). This regression locks in the invariant that the
+    /// residual sample does NOT count toward `accepted_drafts`,
+    /// because the residual has no draft K/V slot; its K/V will be
+    /// laid down by the NEXT cycle's Step A.
+    #[test]
+    fn partial_reject_reports_accepted_draft_count() {
+        let depth = 3usize;
+        let Some(emb) = fake_embedding() else { return };
+        let Some(prev_h) = fake_hidden() else { return };
+        let Some(prev_e) = fake_hidden() else { return };
+
+        // Drafter argmaxes at 1, 2, 3; verifier agrees on the first
+        // two positions (1, 2) and diverges (argmax 6) at position 2.
+        // Position 3 is the bonus slot — never sampled on
+        // partial-reject. The accept loop walks verify positions
+        // 0..depth and compares each against `draft_ids[i]`.
+        let draft_ids = vec![1i32, 2, 3];
+        let verify_ids = vec![1i32, 2, 6, 0];
+        let draft_ctr = RefCell::new(0usize);
+        let verify_ctr = RefCell::new(0usize);
+        let rollback_seen = RefCell::new(None::<(usize, usize)>);
+
+        let mut ops = MtpOps {
+            forward_with_hidden: |_ids: &MxArray,
+                                  _emb: &MxArray|
+             -> napi::Result<(MxArray, MxArray, bool)> {
+                unreachable!()
+            },
+            draft_step: make_draft(&draft_ids, &draft_ctr),
+            verify_step: make_verify(&verify_ids, &verify_ctr),
+            rollback: |a: usize, d: usize| {
+                *rollback_seen.borrow_mut() = Some((a, d));
+            },
+            eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+        };
+        let params = default_params();
+        let mut rng = StdRng::seed_from_u64(0xFEED);
+
+        let res = run_mtp_cycle_inner(
+            &mut ops,
+            prev_h,
+            prev_e,
+            0u32,
+            &emb,
+            &[],
+            &params,
+            &mut rng,
+            depth,
+        );
+        let Some((outcome, _h, _e)) = skip_if_metal_unavailable("partial_reject", res) else {
+            return;
+        };
+        assert_eq!(*draft_ctr.borrow(), depth);
+        // 2 accepted drafts (positions 0,1) + 1 residual at position 2.
+        assert_eq!(
+            outcome.tokens.len(),
+            3,
+            "partial-reject K=2 must emit 2 accepted drafts + 1 residual = 3 tokens"
+        );
+        // On accept, `accept_with_residual` returns the original
+        // drafted id (not the verifier's argmax).
+        assert_eq!(
+            outcome.tokens[0], 1u32,
+            "first accepted draft is draft_ids[0]"
+        );
+        assert_eq!(
+            outcome.tokens[1], 2u32,
+            "second accepted draft is draft_ids[1]"
+        );
+        // Residual is sampled from `(p_target - p_draft)+`; with
+        // sharply-peaked argmax disagreement at position 2 it MUST
+        // equal the verifier argmax (6).
+        assert_eq!(
+            outcome.tokens[2], 6u32,
+            "residual must be the verifier argmax under peaked disagreement"
+        );
+        assert_eq!(
+            *rollback_seen.borrow(),
+            Some((2, depth)),
+            "rollback must report accepted_drafts=K=2 on partial reject (NOT K + 1 = 3); \
+             the dispatch-site delta `2 - 3 = -1` rewinds exactly the rejected draft slot \
+             on both caches. Locks in the pre-fix off-by-one regression."
+        );
+    }
 }
 
 #[cfg(test)]

@@ -879,4 +879,27 @@ mod compiled_ffi_tests {
 
         teardown();
     }
+
+    /// W6 smoke: `mlx_qwen35_export_last_hidden` returns nullptr
+    /// when no main-path forward has run since the last reset (the
+    /// MTP draft FFI advances only the MTP offset, not the main
+    /// path; it must NOT populate `g_last_hidden`).
+    #[test]
+    fn export_last_hidden_null_without_main_forward() {
+        let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Fresh reset → no main forward has run → exporter must
+        // return nullptr.
+        unsafe {
+            sys::mlx_qwen35_compiled_reset();
+            sys::mlx_clear_weights();
+            sys::mlx_qwen35_compiled_test_force_inited(0);
+            let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+            sys::mlx_qwen35_export_last_hidden(&mut out);
+            assert!(
+                out.is_null(),
+                "export_last_hidden must return null before any main forward"
+            );
+        }
+        teardown();
+    }
 }

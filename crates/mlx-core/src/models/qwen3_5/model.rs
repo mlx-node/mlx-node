@@ -2369,33 +2369,125 @@ impl Qwen35Inner {
 
             profiler.set_label("chat_compiled");
 
-            let mut ops = chat_common::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                    Ok((forward_compiled(ids, emb)?, false))
-                },
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    eval_token_and_compiled_caches(token);
-                    if budget_forced {
-                        logits.eval();
+            // W6 (MTP) — opt-in speculative decode. Effective only when
+            // both the per-request flag and the model checkpoint carry
+            // an MTP head. The init mirrors the main path's
+            // `mlx_qwen35_compiled_init_from_prefill` and shares the
+            // C++ `g_weights` store. Init failure (no MTP weights,
+            // mismatched config) silently disables MTP for this turn —
+            // the regular single-token loop continues to work.
+            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+                let prefill_len = seq_len as i32;
+                let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+                match init_mtp_compiled_from_main(&self.config, max_kv_len) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "W6 MTP init failed; falling back to single-token decode: {}",
+                            e.reason
+                        );
+                        false
                     }
-                },
+                }
             };
-            chat_common::decode_loop!(
-                ops: ops,
-                y: y,
-                embedding_weight: embedding_weight,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                first_token_instant: first_token_instant,
-                report_perf: p.report_performance,
-                generation_stream: generation_stream
-            );
+            if mtp_active {
+                // Thread-local CSPRNG; one `random::<f64>()` draw per
+                // emitted token via `accept_with_residual`.
+                let mut rng = rand::rng();
+                let mut mtp_ops = chat_common::MtpOps {
+                    forward_with_hidden: |ids: &MxArray,
+                                          emb: &MxArray|
+                     -> Result<(MxArray, MxArray, bool)> {
+                        let (l, h) = forward_compiled_with_hidden(ids, emb)?;
+                        Ok((l, h, false))
+                    },
+                    draft_step: |prev_hidden: &MxArray,
+                                 prev_emb: &MxArray|
+                     -> Result<(MxArray, MxArray)> {
+                        forward_mtp_draft_compiled(prev_hidden, prev_emb)
+                    },
+                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
+                        forward_mtp_verify_compiled(ids, emb, depth as i32)
+                    },
+                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // Both deltas are `accepted_drafts - depth`:
+                        //   - Main: verify wrote `depth + 1` K/V
+                        //     slots (last_committed + `depth`
+                        //     drafts); we keep `accepted_drafts + 1`
+                        //     of them → delta = K - depth.
+                        //   - MTP: drafts wrote `depth` K/V slots;
+                        //     we keep `accepted_drafts` of them →
+                        //     delta = K - depth.
+                        // On any rejection, the MTP K/V at offsets
+                        // [accepted_drafts..depth] is rewound via
+                        // `mlx_qwen35_mtp_compiled_adjust_offset`.
+                        // The MTP path is NOT re-initialised; the
+                        // next cycle re-uses the existing
+                        // `g_mtp_compiled_caches` with the rewound
+                        // offset.
+                        let delta = accepted_drafts as i32 - depth as i32;
+                        if delta != 0 {
+                            mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                            mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
+                        }
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_compiled_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop_mtp!(
+                    mtp_ops: mtp_ops,
+                    mtp_depth: p.mtp_depth,
+                    mtp_rng: rng,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
+                unsafe {
+                    mlx_sys::mlx_qwen35_mtp_compiled_reset();
+                }
+            } else {
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                        Ok((forward_compiled(ids, emb)?, false))
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_compiled_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream
+                );
+            }
 
             // Export caches from C++ before CompiledResetGuard drops
             if p.reuse_cache {
@@ -4386,41 +4478,134 @@ impl Qwen35Inner {
 
             profiler.set_label("chat_stream_delta_compiled");
 
-            let mut ops = chat_common::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                    Ok((forward_compiled(ids, emb)?, false))
-                },
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    eval_token_and_compiled_caches(token);
-                    if budget_forced {
-                        logits.eval();
+            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+                let prefill_len = seq_len as i32;
+                let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+                match init_mtp_compiled_from_main(&self.config, max_kv_len) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "W6 MTP init failed; falling back to single-token decode: {}",
+                            e.reason
+                        );
+                        false
                     }
-                },
-            };
-            chat_common::decode_loop!(
-                ops: ops,
-                y: y,
-                embedding_weight: embedding_weight,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: p.max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                first_token_instant: first_token_instant,
-                report_perf: p.report_performance,
-                generation_stream: generation_stream,
-                streaming: {
-                    callback: cb,
-                    cancelled: cancelled,
-                    decode_stream: decode_stream,
-                    tokenizer: tokenizer_for_decode,
-                    streamed_text_len: streamed_text_len,
-                    last_is_reasoning: last_is_reasoning
                 }
-            );
+            };
+            if mtp_active {
+                // Thread-local CSPRNG; one `random::<f64>()` draw per
+                // emitted token via `accept_with_residual`.
+                let mut rng = rand::rng();
+                let mut mtp_ops = chat_common::MtpOps {
+                    forward_with_hidden: |ids: &MxArray,
+                                          emb: &MxArray|
+                     -> Result<(MxArray, MxArray, bool)> {
+                        let (l, h) = forward_compiled_with_hidden(ids, emb)?;
+                        Ok((l, h, false))
+                    },
+                    draft_step: |prev_hidden: &MxArray,
+                                 prev_emb: &MxArray|
+                     -> Result<(MxArray, MxArray)> {
+                        forward_mtp_draft_compiled(prev_hidden, prev_emb)
+                    },
+                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
+                        forward_mtp_verify_compiled(ids, emb, depth as i32)
+                    },
+                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // Both deltas are `accepted_drafts - depth`:
+                        //   - Main: verify wrote `depth + 1` K/V
+                        //     slots (last_committed + `depth`
+                        //     drafts); we keep `accepted_drafts + 1`
+                        //     of them → delta = K - depth.
+                        //   - MTP: drafts wrote `depth` K/V slots;
+                        //     we keep `accepted_drafts` of them →
+                        //     delta = K - depth.
+                        // On any rejection, the MTP K/V at offsets
+                        // [accepted_drafts..depth] is rewound via
+                        // `mlx_qwen35_mtp_compiled_adjust_offset`.
+                        // The MTP path is NOT re-initialised; the
+                        // next cycle re-uses the existing
+                        // `g_mtp_compiled_caches` with the rewound
+                        // offset.
+                        let delta = accepted_drafts as i32 - depth as i32;
+                        if delta != 0 {
+                            mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                            mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
+                        }
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_compiled_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop_mtp!(
+                    mtp_ops: mtp_ops,
+                    mtp_depth: p.mtp_depth,
+                    mtp_rng: rng,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream,
+                    streaming: {
+                        callback: cb,
+                        cancelled: cancelled,
+                        decode_stream: decode_stream,
+                        tokenizer: tokenizer_for_decode,
+                        streamed_text_len: streamed_text_len,
+                        last_is_reasoning: last_is_reasoning
+                    }
+                );
+                unsafe {
+                    mlx_sys::mlx_qwen35_mtp_compiled_reset();
+                }
+            } else {
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                        Ok((forward_compiled(ids, emb)?, false))
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_compiled_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream,
+                    streaming: {
+                        callback: cb,
+                        cancelled: cancelled,
+                        decode_stream: decode_stream,
+                        tokenizer: tokenizer_for_decode,
+                        streamed_text_len: streamed_text_len,
+                        last_is_reasoning: last_is_reasoning
+                    }
+                );
+            }
 
             // Export caches from C++ so the next turn's Rust-side cache
             // state is consistent with the compiled forward's view.
@@ -4958,41 +5143,134 @@ impl Qwen35Inner {
 
             profiler.set_label("chat_stream_compiled");
 
-            let mut ops = chat_common::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
-                    Ok((forward_compiled(ids, emb)?, false))
-                },
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    eval_token_and_compiled_caches(token);
-                    if budget_forced {
-                        logits.eval();
+            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+                let prefill_len = seq_len as i32;
+                let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+                match init_mtp_compiled_from_main(&self.config, max_kv_len) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "W6 MTP init failed; falling back to single-token decode: {}",
+                            e.reason
+                        );
+                        false
                     }
-                },
-            };
-            chat_common::decode_loop!(
-                ops: ops,
-                y: y,
-                embedding_weight: embedding_weight,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: p.max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                first_token_instant: first_token_instant,
-                report_perf: p.report_performance,
-                generation_stream: generation_stream,
-                streaming: {
-                    callback: cb,
-                    cancelled: cancelled,
-                    decode_stream: decode_stream,
-                    tokenizer: tokenizer_for_decode,
-                    streamed_text_len: streamed_text_len,
-                    last_is_reasoning: last_is_reasoning
                 }
-            );
+            };
+            if mtp_active {
+                // Thread-local CSPRNG; one `random::<f64>()` draw per
+                // emitted token via `accept_with_residual`.
+                let mut rng = rand::rng();
+                let mut mtp_ops = chat_common::MtpOps {
+                    forward_with_hidden: |ids: &MxArray,
+                                          emb: &MxArray|
+                     -> Result<(MxArray, MxArray, bool)> {
+                        let (l, h) = forward_compiled_with_hidden(ids, emb)?;
+                        Ok((l, h, false))
+                    },
+                    draft_step: |prev_hidden: &MxArray,
+                                 prev_emb: &MxArray|
+                     -> Result<(MxArray, MxArray)> {
+                        forward_mtp_draft_compiled(prev_hidden, prev_emb)
+                    },
+                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
+                        forward_mtp_verify_compiled(ids, emb, depth as i32)
+                    },
+                    rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // Both deltas are `accepted_drafts - depth`:
+                        //   - Main: verify wrote `depth + 1` K/V
+                        //     slots (last_committed + `depth`
+                        //     drafts); we keep `accepted_drafts + 1`
+                        //     of them → delta = K - depth.
+                        //   - MTP: drafts wrote `depth` K/V slots;
+                        //     we keep `accepted_drafts` of them →
+                        //     delta = K - depth.
+                        // On any rejection, the MTP K/V at offsets
+                        // [accepted_drafts..depth] is rewound via
+                        // `mlx_qwen35_mtp_compiled_adjust_offset`.
+                        // The MTP path is NOT re-initialised; the
+                        // next cycle re-uses the existing
+                        // `g_mtp_compiled_caches` with the rewound
+                        // offset.
+                        let delta = accepted_drafts as i32 - depth as i32;
+                        if delta != 0 {
+                            mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
+                            mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
+                        }
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_compiled_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop_mtp!(
+                    mtp_ops: mtp_ops,
+                    mtp_depth: p.mtp_depth,
+                    mtp_rng: rng,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream,
+                    streaming: {
+                        callback: cb,
+                        cancelled: cancelled,
+                        decode_stream: decode_stream,
+                        tokenizer: tokenizer_for_decode,
+                        streamed_text_len: streamed_text_len,
+                        last_is_reasoning: last_is_reasoning
+                    }
+                );
+                unsafe {
+                    mlx_sys::mlx_qwen35_mtp_compiled_reset();
+                }
+            } else {
+                let mut ops = chat_common::DecodeOps {
+                    forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                        Ok((forward_compiled(ids, emb)?, false))
+                    },
+                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
+                        eval_token_and_compiled_caches(token);
+                        if budget_forced {
+                            logits.eval();
+                        }
+                    },
+                };
+                chat_common::decode_loop!(
+                    ops: ops,
+                    y: y,
+                    embedding_weight: embedding_weight,
+                    params: p,
+                    reasoning_tracker: reasoning_tracker,
+                    profiler: profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id: eos_id,
+                    generated_tokens: generated_tokens,
+                    token_history: token_history,
+                    finish_reason: finish_reason,
+                    first_token_instant: first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream: generation_stream,
+                    streaming: {
+                        callback: cb,
+                        cancelled: cancelled,
+                        decode_stream: decode_stream,
+                        tokenizer: tokenizer_for_decode,
+                        streamed_text_len: streamed_text_len,
+                        last_is_reasoning: last_is_reasoning
+                    }
+                );
+            }
 
             // Export caches
             if reuse_cache {
@@ -6519,6 +6797,15 @@ impl Qwen35Inner {
 
         Ok(params)
     }
+
+    /// W6 (MTP): true when this model checkpoint includes an MTP head
+    /// (W2 module loaded by `persistence::apply_weights_inner`). The
+    /// W6 speculative decode loop gates on this together with the
+    /// per-request `enable_mtp` flag — both must be true for the
+    /// MTP-accelerated path to take over.
+    pub(crate) fn has_mtp_weights(&self) -> bool {
+        self.mtp.is_some()
+    }
 }
 
 /// Wrapper around `StreamTx` that provides a `.call()` method matching the
@@ -6647,6 +6934,16 @@ pub struct ChatConfig {
     /// avoiding redundant computation for multi-turn conversations.
     #[napi(ts_type = "boolean | undefined")]
     pub reuse_cache: Option<bool>,
+    /// W6 (MTP): opt-in flag enabling the Multi-Token Prediction
+    /// speculative decode loop on the dense compiled path. Requires
+    /// the model checkpoint to carry an MTP head (otherwise
+    /// silently ignored). Default: `false`.
+    #[napi(ts_type = "boolean | undefined")]
+    pub enable_mtp: Option<bool>,
+    /// W6 (MTP): number of draft tokens per speculative cycle. Clamped
+    /// to `[1, 5]` by the W5 verify FFI contract. Default: 3.
+    #[napi(ts_type = "number | undefined")]
+    pub mtp_depth: Option<i32>,
 }
 
 /// Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE).
@@ -6858,6 +7155,8 @@ impl Qwen3_5Model {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionStart {
@@ -6913,6 +7212,8 @@ impl Qwen3_5Model {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionContinue {
@@ -6973,6 +7274,8 @@ impl Qwen3_5Model {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| {
@@ -7026,6 +7329,8 @@ impl Qwen3_5Model {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7095,6 +7400,8 @@ impl Qwen3_5Model {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7161,6 +7468,8 @@ impl Qwen3_5Model {
             reasoning_effort: None,
             report_performance: None,
             reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7524,6 +7833,43 @@ fn eval_token_and_compiled_caches(next_token: &MxArray) {
     }
 }
 
+/// W6 (MTP): one compiled forward step that ALSO exports the
+/// post-final-norm hidden of the decoded token. Calls
+/// `forward_compiled` first, then asks the C++ side for the stashed
+/// hidden from that step.
+///
+/// Returns `(logits, hidden)` where `logits` is `[1, vocab]` and
+/// `hidden` is `[1, hidden_size]` bf16. The hidden state is the
+/// pre-LM-head input — the exact tensor MTP draft's `prev_hidden`
+/// expects, after a `reshape(&[1, 1, hidden])` to match the
+/// `[B, T, hidden]` MTP-draft contract.
+///
+/// Caller MUST hold `DENSE_COMPILED_MUTEX` and the
+/// `COMPILED_WEIGHTS_RWLOCK` read guard for the whole call — the
+/// hidden is stashed in a process-wide `g_last_hidden` global on
+/// the C++ side and is only valid until the next main-path forward
+/// or reset.
+// W6 chat-session integration is the only intended caller. below
+pub(super) fn forward_compiled_with_hidden(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    use mlx_sys as sys;
+
+    let logits = forward_compiled(input_ids, embedding_weight)?;
+
+    let mut hidden_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe { sys::mlx_qwen35_export_last_hidden(&mut hidden_ptr) };
+    if hidden_ptr.is_null() {
+        return Err(Error::from_reason(
+            "forward_compiled_with_hidden: C++ returned null hidden — \
+             check that forward_compiled succeeded and g_compile_inited is true",
+        ));
+    }
+    let hidden = MxArray::from_handle(hidden_ptr, "compiled_forward_last_hidden")?;
+    Ok((logits, hidden))
+}
+
 // ============================================================================
 // W5 — Compiled C++ MTP (Multi-Token Prediction) wrappers (dense).
 //
@@ -7572,9 +7918,7 @@ fn eval_token_and_compiled_caches(next_token: &MxArray) {
 /// is left uninitialised and subsequent draft/verify calls become
 /// null-pointer no-ops so the caller can fall back to the eager Rust
 /// MTP forward.
-// W6 (chat-session integration) is the only intended caller; allow
-// the dead-code lint to stay quiet until that wires in.
-#[allow(dead_code)]
+// W6 (chat-session integration) is the only intended caller.
 pub(super) fn init_mtp_compiled_from_main(config: &Qwen3_5Config, max_kv_len: i32) -> Result<()> {
     use mlx_sys as sys;
 
@@ -7625,7 +7969,7 @@ pub(super) fn init_mtp_compiled_from_main(config: &Qwen3_5Config, max_kv_len: i3
 /// Returns `Err` if the C++ side returns null pointers (init not
 /// done, exception). On `Err` the MTP state is left as-is — the
 /// caller should fall back to the eager Rust MTP forward.
-#[allow(dead_code)] // wired in by W6 chat-session integration
+// W6 chat-session integration is the only intended caller.
 pub(super) fn forward_mtp_draft_compiled(
     prev_hidden: &MxArray,
     prev_emb: &MxArray,
@@ -7678,7 +8022,7 @@ pub(super) fn forward_mtp_draft_compiled(
 /// offset / cache state during the verify. Tests serialise via
 /// `FFI_LOCK` in the absence of concurrent main-path forward calls —
 /// see `compiled_ffi_tests` in `mtp.rs`.
-#[allow(dead_code)] // wired in by W6 chat-session integration
+// W6 chat-session integration is the only intended caller.
 pub(super) fn forward_mtp_verify_compiled(
     input_ids: &MxArray,
     embedding_weight: &MxArray,

@@ -129,6 +129,8 @@ fn parity_chat_config(max_new_tokens: i32) -> ChatConfig {
         include_reasoning: Some(true),
         report_performance: Some(false),
         reuse_cache: Some(true),
+        enable_mtp: None,
+        mtp_depth: None,
     }
 }
 

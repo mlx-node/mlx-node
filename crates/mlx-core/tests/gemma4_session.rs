@@ -42,6 +42,8 @@ fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
         include_reasoning: Some(false),
         report_performance: Some(true),
         reuse_cache: Some(true),
+        enable_mtp: None,
+        mtp_depth: None,
     }
 }
 

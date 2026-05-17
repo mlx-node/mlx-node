@@ -428,10 +428,8 @@ pub(crate) fn sample_and_logprobs(
 /// argmax fallback stays within `p_target`'s support; an exact correction
 /// is impossible in the degenerate regime where the residual carries no
 /// mass, so we pick the highest-probability target token instead.
-// `pub(crate)`: only W6's `chat_common.rs` speculative-decode loop will
-// call this. W6 hasn't landed yet, so `#[allow(dead_code)]` silences the
-// dead-code lint until the consumer exists.
-#[allow(dead_code)]
+// `pub(crate)`: the W6 `chat_common::run_mtp_cycle_inner` speculative
+// decode helper is the production caller.
 pub(crate) fn accept_with_residual<R: Rng + ?Sized>(
     p_target: &MxArray,
     p_draft: &MxArray,

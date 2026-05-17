@@ -31,6 +31,20 @@ static std::optional<array> g_compiled_offset;       // scalar int32 (current de
 static int g_offset_int = 0;                         // C++ int mirror of g_compiled_offset
 static bool g_compile_inited = false;
 
+// W6 (MTP) — last post-final-norm hidden of the LAST committed token,
+// stashed at the LM-head boundary inside `qwen35_decode_fn` BEFORE the
+// `lm_head` linear runs. Shape is `[B, hidden_size]` after the
+// implicit reshape that `take` + the per-row final_norm produce
+// (decode batch is `[1, 1]` → reshape({-1}) → `[1]` → `take` →
+// `[1, hidden]`). The W6 MTP seeding path consumes this via
+// `mlx_qwen35_export_last_hidden` to get the first draft step's
+// `prev_hidden` without re-running the main forward.
+//
+// Cleared on `mlx_qwen35_compiled_reset` so cross-turn stale handles
+// never leak. The C++ side keeps a `std::optional<array>` so we can
+// distinguish "never populated" from "populated with zeros".
+static std::optional<array> g_last_hidden;
+
 // =====================================================================
 // Phase 5 piece 1: paged-decode globals.
 //
@@ -127,6 +141,12 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
 
   // Final norm + LM head
   h = fast::rms_norm(h, get_weight("final_norm.weight"), cfg.rms_norm_eps);
+  // W6 (MTP) — stash the post-final-norm hidden of the last decoded
+  // token BEFORE lm_head. The shape is `[1, hidden_size]` for the
+  // flat-path decode (batch=1, single token). The optional is
+  // overwritten on every call so it always reflects the last
+  // committed token's hidden state.
+  g_last_hidden = h;
   if (cfg.tie_word_embeddings) {
     h = linear_proj(h, "embedding");
   } else {
@@ -465,6 +485,11 @@ void mlx_qwen35_compiled_reset() {
   g_offset_int = 0;
   g_compile_inited = false;
 
+  // W6 (MTP) — clear the stashed last-hidden so a subsequent reset →
+  // re-init turn doesn't see a stale handle whose underlying buffer
+  // is no longer valid.
+  g_last_hidden = std::nullopt;
+
   // Phase 5 piece 1 paged-path globals.
   g_dense_paged_config = CompileConfig{};
   g_dense_k_pools.clear();
@@ -474,6 +499,36 @@ void mlx_qwen35_compiled_reset() {
   g_dense_paged_linear_caches.clear();
   g_dense_paged_offset_int = 0;
   g_dense_paged_inited = false;
+}
+
+// W6 (MTP) — export a heap-allocated deep copy of the post-final-norm
+// hidden state of the last decoded token, captured by the most recent
+// `mlx_qwen35_forward_compiled` invocation. Returns nullptr if no
+// forward has run since the last reset / the stash is unpopulated.
+// Caller owns the returned `mlx_array*` (use `mlx_array_delete`).
+//
+// The returned handle is a lazy MLX array whose graph references the
+// final_norm output; the caller MUST `eval()` it before reading any
+// element, and MUST NOT call `mlx_qwen35_compiled_reset()` between
+// export and eval (the reset would clear `g_compiled_caches` whose
+// inputs the hidden may still depend on via the cached graph).
+void mlx_qwen35_export_last_hidden(mlx_array** out) {
+  if (!out) return;
+  *out = nullptr;
+  if (!g_compile_inited || !g_last_hidden.has_value()) {
+    return;
+  }
+  try {
+    *out = reinterpret_cast<mlx_array*>(new array(*g_last_hidden));
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_export_last_hidden: %s\n", e.what());
+    fflush(stderr);
+    *out = nullptr;
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in mlx_qwen35_export_last_hidden\n");
+    fflush(stderr);
+    *out = nullptr;
+  }
 }
 
 // Export compiled caches for PromptCache reuse.
