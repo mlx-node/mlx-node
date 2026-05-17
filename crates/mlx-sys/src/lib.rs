@@ -1814,6 +1814,16 @@ unsafe extern "C-unwind" {
     /// `mlx_qwen35_moe_mtp_compiled_init_from_main` as a precondition.
     pub fn mlx_qwen35_moe_is_compile_inited() -> i32;
 
+    /// W6 MoE (MTP): export a heap-allocated deep copy of the
+    /// post-final-norm hidden state of the last decoded token,
+    /// captured by the most recent `mlx_qwen35_moe_forward`. Sets
+    /// `*out` to a heap-allocated `mlx_array*` of shape
+    /// `[1, hidden_size]` bf16 on success, or `nullptr` if no
+    /// forward has run since the last reset. Caller owns the
+    /// returned handle (use `mlx_array_delete`). Mirrors the dense
+    /// `mlx_qwen35_export_last_hidden` contract.
+    pub fn mlx_qwen35_moe_export_last_hidden(out: *mut *mut mlx_array);
+
     /// Test-only: forcibly mark the main MoE compiled path as initialised
     /// (or not) without going through `init_from_prefill`. Production code
     /// MUST NOT call this — the W5 MoE MTP smoke tests use it to satisfy

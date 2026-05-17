@@ -72,6 +72,19 @@ static bool g_moe_inited = false;
 static std::vector<LayerQuantInfo> g_layer_quant;     // per-layer MoE quant info
 static std::vector<DenseMLPQuantInfo> g_dense_quant;  // per-layer dense MLP quant info
 
+// W6 MoE (MTP) — last post-final-norm hidden of the LAST committed token,
+// stashed at the LM-head boundary inside `moe_compiled_decode_fn` BEFORE
+// the `lm_head` linear runs. Shape is `[B, hidden_size]` after the
+// per-row final_norm produces (decode batch is `[1, 1]` → `[1, hidden]`).
+// The W6 MoE MTP seeding path consumes this via
+// `mlx_qwen35_moe_export_last_hidden` to get the first draft step's
+// `prev_hidden` without re-running the main MoE forward.
+//
+// Cleared on `mlx_qwen35_moe_reset` so cross-turn stale handles never
+// leak. The C++ side keeps a `std::optional<array>` so we can
+// distinguish "never populated" from "populated with zeros".
+static std::optional<array> g_moe_last_hidden;
+
 // =====================================================================
 // Phase 4 piece 1: paged-decode globals.
 //
@@ -529,6 +542,16 @@ static std::vector<array> moe_compiled_decode_fn(const std::vector<array>& input
 
   // Final norm + LM head
   h = fast::rms_norm(h, get_weight("final_norm.weight"), cfg.rms_norm_eps);
+  // W6 MoE (MTP) — emit the post-final-norm hidden of the last decoded
+  // token alongside logits so `mlx_qwen35_moe_forward` can stash it
+  // into `g_moe_last_hidden`. Unlike the dense flat path (which calls
+  // `qwen35_decode_fn` directly and can assign a global from the body),
+  // MoE wraps this function in `mlx::core::compile`, so any global
+  // assignment inside the body would only fire at trace time. Returning
+  // the hidden as an extra output threads it through the compiled
+  // graph on every call. Shape after the per-row final_norm is
+  // `[1, hidden_size]` for the flat-path decode (batch=1, single token).
+  array last_hidden = h;
   if (cfg.tie_word_embeddings) {
     h = linear_proj(h, "embedding");
   } else {
@@ -538,9 +561,10 @@ static std::vector<array> moe_compiled_decode_fn(const std::vector<array>& input
   auto new_offset = offset_arr + array(1, mlx::core::int32);
 
   std::vector<array> result;
-  result.reserve(2 + cfg.num_layers * 2);
+  result.reserve(3 + cfg.num_layers * 2);
   result.push_back(std::move(h));
   result.push_back(std::move(new_offset));
+  result.push_back(std::move(last_hidden));
   for (auto& c : new_caches) result.push_back(std::move(c));
   return result;
 }
@@ -882,11 +906,26 @@ void mlx_qwen35_moe_forward(
         ? moe_compiled_decode_fn(fn_inputs)
         : compiled_moe_decode()(fn_inputs);
 
-    // Extract outputs: [logits, new_offset, new_caches...]
+    // Extract outputs: [logits, new_offset, last_hidden, new_caches...].
+    // W6 MoE (MTP) introduced `last_hidden` at index 2 so caches now
+    // start at index 3. The hidden is stashed for
+    // `mlx_qwen35_moe_export_last_hidden`; non-MTP callers pay nothing
+    // beyond one extra array copy in the result vector.
+    const size_t expected_outputs = 3 + static_cast<size_t>(cfg.num_layers) * 2;
+    if (outputs.size() != expected_outputs) {
+      fprintf(stderr,
+              "[MLX] moe_compiled_decode_fn returned %zu outputs, expected %zu "
+              "(layout: [logits, offset, hidden, caches...]). Stride drift.\n",
+              outputs.size(), expected_outputs);
+      fflush(stderr);
+      *output_logits = nullptr;
+      return;
+    }
     *output_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
     g_moe_offset_int++;
+    g_moe_last_hidden = outputs[2];
     for (int i = 0; i < cfg.num_layers * 2; i++) {
-      g_moe_caches[i] = outputs[2 + i];
+      g_moe_caches[i] = outputs[3 + i];
     }
 
     if (cache_offset_out) {
@@ -951,6 +990,11 @@ void mlx_qwen35_moe_reset() {
   g_dense_quant.clear();
   g_weight_transposes_3d.clear();
 
+  // W6 MoE (MTP) — clear the stashed last-hidden so a subsequent reset →
+  // re-init turn doesn't see a stale handle whose underlying buffer is
+  // no longer valid.
+  g_moe_last_hidden = std::nullopt;
+
   // Phase 4 piece 1 paged-path globals.
   g_paged_config = MoeConfig{};
   g_k_pools.clear();
@@ -960,6 +1004,38 @@ void mlx_qwen35_moe_reset() {
   g_paged_linear_caches.clear();
   g_paged_offset_int = 0;
   g_paged_inited = false;
+}
+
+// W6 MoE (MTP) — export a heap-allocated deep copy of the
+// post-final-norm hidden state of the last decoded token, captured by
+// the most recent `mlx_qwen35_moe_forward` invocation. Returns nullptr
+// if no forward has run since the last reset / the stash is
+// unpopulated. Caller owns the returned `mlx_array*`
+// (use `mlx_array_delete`).
+//
+// The returned handle is a lazy MLX array whose graph references the
+// final_norm output; the caller MUST `eval()` it before reading any
+// element, and MUST NOT call `mlx_qwen35_moe_reset()` between export
+// and eval (the reset would clear `g_moe_caches` whose inputs the
+// hidden may still depend on via the cached graph). Mirrors the dense
+// `mlx_qwen35_export_last_hidden` contract.
+void mlx_qwen35_moe_export_last_hidden(mlx_array** out) {
+  if (!out) return;
+  *out = nullptr;
+  if (!g_moe_inited || !g_moe_last_hidden.has_value()) {
+    return;
+  }
+  try {
+    *out = reinterpret_cast<mlx_array*>(new array(*g_moe_last_hidden));
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_export_last_hidden: %s\n", e.what());
+    fflush(stderr);
+    *out = nullptr;
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in mlx_qwen35_moe_export_last_hidden\n");
+    fflush(stderr);
+    *out = nullptr;
+  }
 }
 
 // Export MoE caches for PromptCache reuse.
