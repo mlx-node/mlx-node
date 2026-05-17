@@ -743,6 +743,17 @@ fn apply_weights_moe_inner(
         }
     }
 
+    // MTP head — present only when the checkpoint shipped `mtp.*`
+    // weights and the inner was constructed with `n_mtp_layers > 0`.
+    // The module's `apply_weights` consumes the same per-layer
+    // quantization plumbing as the main MoE loader, including the
+    // gate-prefix routing through `default_gate_plq` (router gates
+    // are 8-bit affine for canonical recipes even when the global
+    // default is 4-bit affine).
+    if let Some(mtp) = inner.mtp.as_mut() {
+        mtp.apply_weights(params, default_plq, default_gate_plq, per_layer_quant)?;
+    }
+
     // Verify mandatory weights
     let mut missing_mandatory = Vec::new();
     if !params.contains_key("embedding.weight") {

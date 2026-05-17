@@ -23,6 +23,7 @@ use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
+use super::mtp::Qwen3_5MoeMTPModule;
 use super::persistence;
 use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
@@ -308,6 +309,12 @@ pub(crate) struct Qwen35MoeInner {
     /// full-attention layers — same semantics as the dense model.
     /// **Opt-in via `Qwen3_5MoeConfig::use_block_paged_cache`.**
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Multi-Token Prediction head — `Some` when `config.n_mtp_layers > 0`
+    /// (the checkpoint shipped MTP weights), `None` otherwise. Owned by
+    /// the model thread; the speculative-decode loop (W6) reads it
+    /// directly. Weight loading happens after construction in
+    /// `apply_weights_moe_inner`.
+    pub(crate) mtp: Option<Qwen3_5MoeMTPModule>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -769,12 +776,25 @@ impl Qwen35MoeInner {
             None
         };
 
+        // Multi-Token Prediction (MTP) head. Built when the config
+        // reports `n_mtp_layers > 0` (i.e. the checkpoint shipped MTP
+        // weights). The constructor rejects all-linear configs and zero
+        // layer counts; weights are loaded later by
+        // `apply_weights_moe_inner`. None when MTP is absent — keeps
+        // the decode path cost-free on non-MTP checkpoints.
+        let mtp = if config.n_mtp_layers > 0 {
+            Some(Qwen3_5MoeMTPModule::new(&config)?)
+        } else {
+            None
+        };
+
         info!(
-            "Qwen3.5 MoE inner created: {} layers, fa_idx={}, experts={}, paged={}",
+            "Qwen3.5 MoE inner created: {} layers, fa_idx={}, experts={}, paged={}, mtp_layers={}",
             config.num_layers,
             fa_idx,
             config.num_experts,
-            paged_adapter.is_some()
+            paged_adapter.is_some(),
+            config.n_mtp_layers
         );
 
         Ok(Self {
@@ -800,6 +820,7 @@ impl Qwen35MoeInner {
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
             paged_adapter,
+            mtp,
             training_state: None,
         })
     }
