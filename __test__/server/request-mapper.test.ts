@@ -384,6 +384,60 @@ describe('mapRequest', () => {
     expect(messages).toEqual([{ role: 'user', content: 'No explicit type' }]);
   });
 
+  // -------------------------------------------------------------------
+  // W7 (MTP): `extra_body.generation_mode` + `extra_body.mtp_depth`
+  // -------------------------------------------------------------------
+  describe('extra_body MTP overrides', () => {
+    it('maps generation_mode "mtp" to enableMtp=true', () => {
+      const { config } = mapRequest({
+        model: 'test-model',
+        input: 'Hello',
+        extra_body: { generation_mode: 'mtp' },
+      });
+      expect(config.enableMtp).toBe(true);
+    });
+
+    it('maps generation_mode "ar" to enableMtp=false', () => {
+      const { config } = mapRequest({
+        model: 'test-model',
+        input: 'Hello',
+        extra_body: { generation_mode: 'ar' },
+      });
+      expect(config.enableMtp).toBe(false);
+    });
+
+    it('leaves enableMtp untouched on absent / null / unknown generation_mode', () => {
+      for (const mode of [undefined, null, 'unknown']) {
+        const { config } = mapRequest({
+          model: 'test-model',
+          input: 'Hello',
+          extra_body: { generation_mode: mode as never },
+        });
+        expect(config.enableMtp).toBeUndefined();
+      }
+    });
+
+    it('forwards a valid mtp_depth onto config.mtpDepth', () => {
+      const { config } = mapRequest({
+        model: 'test-model',
+        input: 'Hello',
+        extra_body: { mtp_depth: 4 },
+      });
+      expect(config.mtpDepth).toBe(4);
+    });
+
+    it('rejects mtp_depth values outside the [1, 5] integer range', () => {
+      for (const depth of [0, -1, 6, 2.5, Number.NaN, null]) {
+        const { config } = mapRequest({
+          model: 'test-model',
+          input: 'Hello',
+          extra_body: { mtp_depth: depth as never },
+        });
+        expect(config.mtpDepth).toBeUndefined();
+      }
+    });
+  });
+
   describe('assistant message + function_call coalescing (Finding 3)', () => {
     it('coalesces assistant message followed by function_call into a single assistant turn', () => {
       // A single assistant turn that produced both text and tool calls is serialised by

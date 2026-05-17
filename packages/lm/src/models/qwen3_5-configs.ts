@@ -42,6 +42,11 @@ export const QWEN35_CONFIGS: { [key: string]: Qwen35Config } = {
     fullAttentionInterval: 4,
     partialRotaryFactor: 0.25,
     ropeTheta: 100000.0,
+    // W1 (MTP): no MTP head in the stock 0.6B dense checkpoint.
+    // Real values are populated from `config.json` at load time; this
+    // preset is only used by tests that build a `Qwen35Config` from
+    // scratch.
+    nMtpLayers: 0,
   },
 };
 

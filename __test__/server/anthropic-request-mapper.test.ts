@@ -1286,4 +1286,48 @@ describe('mapAnthropicRequest', () => {
       expect(messages[0].images).toHaveLength(2);
     });
   });
+
+  // -------------------------------------------------------------------
+  // W7 (MTP): `extra_body.generation_mode` + `extra_body.mtp_depth`
+  // -------------------------------------------------------------------
+  describe('extra_body MTP overrides', () => {
+    it('maps generation_mode "mtp" to enableMtp=true', () => {
+      const { config } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        extra_body: { generation_mode: 'mtp' },
+      });
+      expect(config.enableMtp).toBe(true);
+    });
+
+    it('maps generation_mode "ar" to enableMtp=false', () => {
+      const { config } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        extra_body: { generation_mode: 'ar' },
+      });
+      expect(config.enableMtp).toBe(false);
+    });
+
+    it('leaves enableMtp untouched when extra_body is absent', () => {
+      const { config } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+      });
+      expect(config.enableMtp).toBeUndefined();
+    });
+
+    it('forwards a valid mtp_depth onto config.mtpDepth', () => {
+      const { config } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        extra_body: { mtp_depth: 2 },
+      });
+      expect(config.mtpDepth).toBe(2);
+    });
+  });
 });

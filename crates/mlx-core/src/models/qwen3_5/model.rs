@@ -7041,6 +7041,12 @@ pub struct Qwen3_5Model {
     /// the chat-entry sites. Surfaced through the
     /// `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
+    /// W7 (MTP): snapshot of `Qwen35Inner::has_mtp_weights()` captured
+    /// at construction time, mirroring `paged_active`. Surfaced through
+    /// the `hasMtpWeights()` NAPI method so the TS ChatSession can
+    /// auto-default `enableMtp = true` for checkpoints that ship an MTP
+    /// head without round-tripping through the model thread.
+    pub(crate) mtp_active: bool,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop, so the global cap can shrink once JS GCs
     /// the wrapper.
@@ -7070,6 +7076,21 @@ impl Qwen3_5Model {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    /// W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
+    /// loaded by `persistence::apply_weights_inner`). Snapshotted at
+    /// load time from `Qwen35Inner::has_mtp_weights()` so the TS
+    /// `ChatSession` can auto-default `enableMtp = true` for
+    /// MTP-capable checkpoints without dispatching a command into the
+    /// model thread.
+    ///
+    /// Note: this only reports weight availability. Whether the W6
+    /// speculative-decode path actually runs on a given call also
+    /// requires the per-request `enableMtp` flag.
+    #[napi]
+    pub fn has_mtp_weights(&self) -> bool {
+        self.mtp_active
     }
 
     /// Load a pretrained model from a directory.

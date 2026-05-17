@@ -242,6 +242,61 @@ describe('ChatSession', () => {
       // restart which rebuilds chatSessionStart from history.
       expect(session.turns).toBe(2);
     });
+
+    // -----------------------------------------------------------------
+    // W7 (MTP): `enableMtp` auto-default
+    // -----------------------------------------------------------------
+
+    it('auto-defaults enableMtp=true when the model exposes hasMtpWeights()==true', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      (model as SessionCapableModel).hasMtpWeights = () => true;
+      const session = new ChatSession(model);
+
+      await session.send('Hello');
+
+      const [, config] = chatSessionStart.mock.calls[0];
+      expect(config?.enableMtp).toBe(true);
+    });
+
+    it('does not set enableMtp when the model exposes hasMtpWeights()==false', async () => {
+      const { model, chatSessionStart } = makeMockModel();
+      (model as SessionCapableModel).hasMtpWeights = () => false;
+      const session = new ChatSession(model);
+
+      await session.send('Hello');
+
+      const [, config] = chatSessionStart.mock.calls[0];
+      // Auto-default never fires → property stays undefined (not `false`),
+      // mirroring the contract from the JSDoc on `mergeConfig`.
+      expect(config?.enableMtp).toBeUndefined();
+    });
+
+    it('does not set enableMtp when the model omits hasMtpWeights() entirely', async () => {
+      // Models predating W7 (Qwen3, Gemma4, LFM2, etc.) do NOT define
+      // `hasMtpWeights` on their native wrapper. The duck check inside
+      // `mergeConfig` must skip the auto-default cleanly.
+      const { model, chatSessionStart } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('Hello');
+
+      const [, config] = chatSessionStart.mock.calls[0];
+      expect(config?.enableMtp).toBeUndefined();
+    });
+
+    it('respects an explicit enableMtp=false even when the model has MTP weights', async () => {
+      // An explicit opt-out from the caller must win over the auto-
+      // default — operators benchmarking MTP-vs-AR need to be able to
+      // force the AR path on a checkpoint that ships an MTP head.
+      const { model, chatSessionStart } = makeMockModel();
+      (model as SessionCapableModel).hasMtpWeights = () => true;
+      const session = new ChatSession(model);
+
+      await session.send('Hello', { config: { enableMtp: false } });
+
+      const [, config] = chatSessionStart.mock.calls[0];
+      expect(config?.enableMtp).toBe(false);
+    });
   });
 
   // -------------------------------------------------------------------

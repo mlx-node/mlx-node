@@ -848,6 +848,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
+            let mtp_active = inner.has_mtp_weights();
 
             Ok((
                 inner,
@@ -858,21 +859,30 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     tokenizer_out,
                     cache_limit_guard,
                     paged_active,
+                    mtp_active,
                 ),
             ))
         },
         handle_qwen35_cmd,
     );
 
-    let (config, _model_id, _image_processor, _tokenizer, cache_limit_guard, paged_active) =
-        init_rx
-            .await
-            .map_err(|_| Error::from_reason("Model thread exited during load"))??;
+    let (
+        config,
+        _model_id,
+        _image_processor,
+        _tokenizer,
+        cache_limit_guard,
+        paged_active,
+        mtp_active,
+    ) = init_rx
+        .await
+        .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
     Ok(Qwen3_5Model {
         thread,
         config,
         paged_active,
+        mtp_active,
         _cache_limit_guard: cache_limit_guard,
     })
 }

@@ -1240,6 +1240,19 @@ export declare class Qwen35Model {
    */
   hasBlockPagedCache(): boolean;
   /**
+   * W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
+   * loaded by `persistence::apply_weights_inner`). Snapshotted at
+   * load time from `Qwen35Inner::has_mtp_weights()` so the TS
+   * `ChatSession` can auto-default `enableMtp = true` for
+   * MTP-capable checkpoints without dispatching a command into the
+   * model thread.
+   *
+   * Note: this only reports weight availability. Whether the W6
+   * speculative-decode path actually runs on a given call also
+   * requires the per-request `enableMtp` flag.
+   */
+  hasMtpWeights(): boolean;
+  /**
    * Load a pretrained model from a directory.
    *
    * Expects the directory to contain:
@@ -1416,6 +1429,19 @@ export declare class Qwen35MoeModel {
    * the model thread.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
+   * loaded by `persistence::apply_weights_moe_inner`). Snapshotted
+   * at load time from `Qwen35MoeInner::has_mtp_weights()` so the TS
+   * `ChatSession` can auto-default `enableMtp = true` for
+   * MTP-capable checkpoints without dispatching a command into the
+   * model thread. Mirrors `Qwen3_5Model::has_mtp_weights`.
+   *
+   * Note: this only reports weight availability. Whether the W6
+   * speculative-decode path actually runs on a given call also
+   * requires the per-request `enableMtp` flag.
+   */
+  hasMtpWeights(): boolean;
   /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */

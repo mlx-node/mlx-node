@@ -114,6 +114,46 @@ export interface MappedRequest {
   config: ChatConfig;
 }
 
+/**
+ * Shared MTP-extension parser for the `extra_body` carrier on both
+ * `/v1/responses` (OpenAI) and `/v1/messages` (Anthropic) request
+ * shapes. Mutates the passed `config` in place:
+ *
+ *   * `generation_mode: "mtp"` → `enableMtp = true`
+ *   * `generation_mode: "ar"`  → `enableMtp = false`
+ *   * any other / absent value → `enableMtp` untouched, so the
+ *     downstream `ChatSession.mergeConfig` auto-default (true when
+ *     the model ships an MTP head) applies.
+ *
+ *   * `mtp_depth: <positive int ≤ 5>` → `mtpDepth = value`
+ *   * non-integer, out-of-range, or absent → `mtpDepth` untouched;
+ *     downstream Rust validation (W5 FFI) catches any pathological
+ *     value the server didn't reject. Cheap server-side rejection
+ *     for the obvious cases (zero, negative, NaN, > 5) saves a
+ *     round-trip into the model thread.
+ *
+ * Kept as a pure helper rather than inlined into each mapper so the
+ * two endpoints can't drift in semantics.
+ */
+export function applyExtraBodyMtpOverrides(
+  config: ChatConfig,
+  extraBody: { generation_mode?: string | null; mtp_depth?: number | null } | undefined,
+): void {
+  if (!extraBody) return;
+  const mode = extraBody.generation_mode;
+  if (mode === 'mtp') {
+    config.enableMtp = true;
+  } else if (mode === 'ar') {
+    config.enableMtp = false;
+  }
+  // Any other value (null, undefined, unknown string) → leave alone.
+
+  const depth = extraBody.mtp_depth;
+  if (depth != null && Number.isInteger(depth) && depth > 0 && depth <= 5) {
+    config.mtpDepth = depth;
+  }
+}
+
 export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage[]): MappedRequest {
   const messages: ChatMessage[] = [];
 
@@ -241,6 +281,8 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
   if (priorMessages && priorMessages.length > 0) {
     config.reuseCache = true;
   }
+
+  applyExtraBodyMtpOverrides(config, req.extra_body);
 
   return { messages, config };
 }

@@ -263,6 +263,25 @@ export interface SessionCapableModel {
    * time and never changes for a given model instance.
    */
   hasBlockPagedCache?(): boolean;
+  /**
+   * W7 (MTP): whether the underlying native model checkpoint shipped
+   * an MTP (Multi-Token-Prediction) head — the W2 module loaded by
+   * persistence. Currently surfaced by `Qwen3_5Model` and
+   * `Qwen3_5MoeModel`; all other native wrappers omit the method, in
+   * which case callers treat a missing getter as `false` (no MTP).
+   *
+   * When `true`, {@link ChatSession#mergeConfig} auto-defaults the
+   * per-request `enableMtp` flag to `true` — the W6 speculative-decode
+   * path takes over unless the caller explicitly opts out by passing
+   * `enableMtp: false` in their `ChatConfig` overlay. When `false`
+   * (or the method is missing), `enableMtp` is left untouched.
+   *
+   * Synchronous on every supporting wrapper so the auto-default check
+   * doesn't need a model-thread roundtrip per call — the value is
+   * captured at load time and never changes for a given model
+   * instance.
+   */
+  hasMtpWeights?(): boolean;
 }
 
 /** Per-call options for {@link ChatSession#send} / `sendStream`. */
@@ -1016,13 +1035,28 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * The session path is a session-reuse operation by construction —
    * `reuseCache: false` on the continue path would wipe the very
    * cache the delta depends on.
+   *
+   * W7 (MTP) auto-default: if neither `defaultConfig` nor `overlay`
+   * sets `enableMtp` AND the underlying model exposes
+   * `hasMtpWeights()` returning `true`, set `enableMtp = true` so the
+   * W6 speculative-decode path runs out of the box on MTP-capable
+   * checkpoints. An explicit `false` from either source wins (the
+   * undefined-check below preserves it).
    */
   private mergeConfig(overlay: ChatConfig | undefined): ChatConfig {
-    return {
+    const merged: ChatConfig = {
       ...this.defaultConfig,
       ...overlay,
       reuseCache: true,
     };
+    if (
+      merged.enableMtp === undefined &&
+      typeof this.model.hasMtpWeights === 'function' &&
+      this.model.hasMtpWeights()
+    ) {
+      merged.enableMtp = true;
+    }
+    return merged;
   }
 
   /**

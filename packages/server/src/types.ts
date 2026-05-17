@@ -184,6 +184,31 @@ export interface ResponsesAPIRequest {
      */
     retention_seconds?: number;
   };
+  /**
+   * MLX-Node extension carrier for non-OpenAI fields, namespaced under
+   * `extra_body` to mirror the OpenAI SDK convention for vendor
+   * passthrough. Unknown keys are ignored (additive, forward-compat).
+   *
+   * Currently exposes:
+   *   * `generation_mode`: `"mtp"` forces W6 speculative-decode (sets
+   *     `enableMtp = true`), `"ar"` forces plain autoregressive
+   *     (`enableMtp = false`). Absent / null / unrecognized leaves
+   *     `enableMtp` untouched so the downstream `ChatSession` auto-
+   *     default (true when the model ships an MTP head) applies.
+   *   * `mtp_depth`: positive integer override for the per-call draft
+   *     depth. Forwarded to `ChatConfig.mtpDepth` as-is; the native
+   *     side validates it (W5 FFI rejects out-of-range values with a
+   *     normal NAPI error, which the server surfaces as 4xx/5xx).
+   */
+  extra_body?: {
+    // Typed as `string | null` (not the literal union `'mtp' | 'ar'`)
+    // because the value arrives off-wire and may carry any client-
+    // supplied payload. The mapper validates by exact-string match;
+    // anything that doesn't match is silently ignored so the auto-
+    // default still applies.
+    generation_mode?: string | null;
+    mtp_depth?: number | null;
+  };
 }
 
 // ---------------------------------------------------------------------------

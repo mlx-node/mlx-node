@@ -12,6 +12,7 @@ import type {
   SystemBlock,
 } from '../types-anthropic.js';
 import { anthropicToolUseIdToInternal } from './anthropic-response.js';
+import { applyExtraBodyMtpOverrides } from './request.js';
 
 export interface MappedAnthropicRequest {
   messages: ChatMessage[];
@@ -404,6 +405,8 @@ export function mapAnthropicRequest(
       config.tools = req.tools.map(mapTool);
     }
   }
+
+  applyExtraBodyMtpOverrides(config, req.extra_body);
 
   return { messages, config };
 }

@@ -79,6 +79,8 @@ export const TINY_QWEN35_CONFIG: Qwen35Config = {
   fullAttentionInterval: 4,
   partialRotaryFactor: 0.25,
   ropeTheta: 10000.0,
+  // W1 (MTP): tiny test checkpoint ships no MTP head.
+  nMtpLayers: 0,
 };
 
 /**
