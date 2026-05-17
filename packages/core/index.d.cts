@@ -3844,6 +3844,14 @@ export interface Qwen35Config {
    * weights parity verification.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * Number of MTP (Multi-Token Prediction) head layers shipped with the
+   * checkpoint. Populated from `mtp_num_hidden_layers` /
+   * `num_nextn_predict_layers` in `config.json`. `0` means the
+   * checkpoint has no MTP heads and the speculative-decode path is
+   * unavailable.
+   */
+  nMtpLayers: number;
 }
 
 /** Generation configuration for Qwen3.5 */
@@ -3927,6 +3935,14 @@ export interface Qwen35MoeConfig {
    * Default: `None` / `false`.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * Number of MTP (Multi-Token Prediction) head layers shipped with
+   * the checkpoint. Populated from `mtp_num_hidden_layers` /
+   * `num_nextn_predict_layers` in `config.json`. `0` means the
+   * checkpoint has no MTP heads and the speculative-decode path is
+   * unavailable.
+   */
+  nMtpLayers: number;
 }
 
 /** Generation configuration for Qwen3.5 MoE */

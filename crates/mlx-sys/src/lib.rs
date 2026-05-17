@@ -1465,6 +1465,20 @@ unsafe extern "C-unwind" {
     /// Get current compiled cache offset (tokens processed).
     pub fn mlx_qwen35_get_cache_offset() -> i32;
 
+    /// Returns 1 if the main dense compiled path has been initialised
+    /// via `mlx_qwen35_compiled_init_from_prefill`, 0 otherwise. Used
+    /// by the W5 MTP init helper to fail loudly when called out of
+    /// order rather than mirroring a phantom offset of 0.
+    pub fn mlx_qwen35_is_compile_inited() -> i32;
+
+    /// Test-only: forcibly mark the main dense compiled path as
+    /// initialised (or not) without standing up a full per-layer KV
+    /// cache. Used by the W5 MTP FFI smoke tests in
+    /// `crates/mlx-core/src/models/qwen3_5/mtp.rs` so they can satisfy
+    /// the `is_compile_inited` precondition. PRODUCTION CODE MUST NOT
+    /// CALL THIS — use `mlx_qwen35_compiled_init_from_prefill`.
+    pub fn mlx_qwen35_compiled_test_force_inited(inited: i32);
+
     /// Export paged dense linear-attention caches for live-session continuation.
     /// Full-attention K/V stays in the Rust paged adapter pools; this returns
     /// the paged graph's per-layer `(conv_state, recurrent_state)` slots so
@@ -1553,6 +1567,94 @@ unsafe extern "C-unwind" {
         output_logits: *mut *mut mlx_array,
         cache_offset_out: *mut i32,
     );
+
+    // ============================================
+    // W5 — Qwen3.5 Dense MTP (Multi-Token Prediction) compiled
+    // draft + verify graphs. See
+    // `crates/mlx-sys/src/mlx_qwen35_mtp_compiled.cpp` for
+    // implementation. ALL three FFIs MUST be called inside the
+    // same `DENSE_COMPILED_MUTEX` critical section as the main
+    // flat-path compiled forward — the verify FFI mutates the
+    // main compiled state in place.
+    // ============================================
+
+    /// Initialize the MTP compiled state. MUST be called once per
+    /// turn AFTER `mlx_qwen35_compiled_init_from_prefill`. The
+    /// MTP path allocates its OWN per-layer KV caches sized to
+    /// `max_kv_len`; the main path's caches are left untouched.
+    ///
+    /// Returns `0` on success, `-1` on failure (n_mtp_layers <= 0,
+    /// MTP weights not registered, exception). On `-1` the Rust
+    /// caller MUST skip the compiled draft/verify path and fall
+    /// back to the eager Rust MTP forward.
+    pub fn mlx_qwen35_mtp_compiled_init_from_main(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        n_mtp_layers: i32,
+    ) -> i32;
+
+    /// One MTP draft step. `prev_hidden` and `prev_emb` are both
+    /// `[1, 1, hidden]` bf16. On success sets `*out_h_next` and
+    /// `*out_logits` to heap-allocated `mlx_array*` (caller owns
+    /// — use `mlx_array_delete`). On failure (init not done,
+    /// exception) both outputs are set to null.
+    ///
+    /// Advances the MTP offset by 1 and mutates MTP KV caches in
+    /// place. Independent of the main path's offset.
+    pub fn mlx_qwen35_mtp_draft_compiled(
+        prev_hidden: *mut mlx_array,
+        prev_emb: *mut mlx_array,
+        out_h_next: *mut *mut mlx_array,
+        out_logits: *mut *mut mlx_array,
+    );
+
+    /// One MTP verify step on `depth + 1` tokens. `input_ids` is
+    /// `[1, depth+1]` int32, `embedding_weight` is the model's
+    /// embedding (or LM head if untied). `depth` MUST be in
+    /// `[1, 5]` — values outside that range are rejected with a
+    /// null-pointer return and stderr diagnostic.
+    ///
+    /// Sets `*out_logits` to a heap-allocated `[1, depth+1, vocab]`
+    /// array (caller owns) on success, null on failure.
+    ///
+    /// SIDE EFFECTS: advances the MAIN compiled path's offset by
+    /// `depth + 1` and writes K/V into `g_compiled_caches[]` at the
+    /// corresponding positions. The caller MUST hold
+    /// `DENSE_COMPILED_MUTEX` for the entire draft+verify cycle to
+    /// prevent another turn from racing the offset / cache state.
+    pub fn mlx_qwen35_mtp_verify_compiled(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+    );
+
+    /// Tear down MTP compiled state. Idempotent. Does NOT reset
+    /// the main path — call `mlx_qwen35_compiled_reset` separately.
+    pub fn mlx_qwen35_mtp_compiled_reset();
+
+    /// Adjust the MTP offset by `delta` (e.g. to rewind after a
+    /// verify-reject rolled back the main path). Mirrors
+    /// `mlx_qwen35_compiled_adjust_offset`.
+    pub fn mlx_qwen35_mtp_compiled_adjust_offset(delta: i32);
+
+    /// Read the current MTP offset (for debugging / tests).
+    pub fn mlx_qwen35_mtp_get_offset() -> i32;
 
     // ============================================
     // Qwen3.5 VLM Prefill

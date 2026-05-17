@@ -654,6 +654,85 @@ inline AttnPureResult attn_pure_fn(
 }
 
 // =====================================================================
+// W5 (MTP) helper: attention forward with array-valued RoPE offset and
+// parameterised weight prefix.
+//
+// Mirrors `attn_pure_fn` but:
+//   - Reads weights from `<prefix>.self_attn.*` (NOT hard-coded
+//     `layers.{i}.self_attn.*`), so the MTP compiled draft graph
+//     (`mtp.layers.{j}.self_attn.*`) and the per-depth verify graph
+//     (`layers.{i}.self_attn.*`) can both share this helper without
+//     duplicating the attention body.
+//   - Takes the cache write offset as a `[1] int32` array so the closure
+//     can be cached by `mlx::core::compile(...)`. The flat-path
+//     `attn_pure_fn` captures a C++ `int` which invalidates the compile
+//     cache every step; this variant threads the offset through the
+//     graph instead.
+//
+// Behavior, shapes and weight-key conventions otherwise match
+// `attn_pure_fn(dynamic_kv=false)` exactly. The function intentionally
+// does NOT support `dynamic_kv` — the verify / MTP draft graphs always
+// rely on the additive `attn_mask` (compile requires fixed shapes).
+// =====================================================================
+inline AttnPureResult attn_pure_fn_arr_offset(
+    const array& x,             // [B, hidden] — 2D
+    const std::string& layer_prefix,  // e.g. "layers.3" or "mtp.layers.0"
+    const array& kv_keys,       // [B, Hkv, max_kv_len, D]
+    const array& kv_values,     // [B, Hkv, max_kv_len, D]
+    const array& attn_mask,     // [1, 1, 1, max_kv_len] additive bf16 mask
+    const array& offset_arr,    // [1] int32 — RoPE + slice_update start
+    const BaseConfig& cfg) {
+  int B = x.shape(0);
+  std::string pfx = layer_prefix + ".self_attn.";
+
+  auto q_proj = linear_proj(x, pfx + "q_proj");
+  if (has_weight(pfx + "q_proj.bias")) q_proj = q_proj + get_weight(pfx + "q_proj.bias");
+
+  auto qph    = reshape(q_proj, {B, 1, cfg.num_heads, cfg.head_dim * 2});
+  auto queries = slice(qph, {0, 0, 0, 0},            {B, 1, cfg.num_heads, cfg.head_dim});
+  auto gate    = slice(qph, {0, 0, 0, cfg.head_dim}, {B, 1, cfg.num_heads, cfg.head_dim * 2});
+  gate = reshape(gate, {B, cfg.num_heads * cfg.head_dim});
+
+  auto keys   = linear_proj(x, pfx + "k_proj");
+  auto values = linear_proj(x, pfx + "v_proj");
+  if (has_weight(pfx + "k_proj.bias")) keys   = keys   + get_weight(pfx + "k_proj.bias");
+  if (has_weight(pfx + "v_proj.bias")) values = values + get_weight(pfx + "v_proj.bias");
+
+  keys   = reshape(keys,   {B, 1, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, 1, cfg.num_kv_heads, cfg.head_dim});
+
+  queries = fast::rms_norm(queries, get_weight(pfx + "q_norm.weight"), cfg.rms_norm_eps);
+  keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
+
+  // Array-valued RoPE offset — graph-stable across decode steps.
+  queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+  keys    = fast::rope(keys,    cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+
+  queries = transpose(queries, {0, 2, 1, 3});
+  keys    = transpose(keys,    {0, 2, 1, 3});
+  values  = transpose(values,  {0, 2, 1, 3});
+
+  // slice_update with array start so the verify graph can advance the
+  // KV-cache write offset by 0,1,...,depth without re-tracing.
+  auto new_kv_keys   = mlx::core::slice_update(kv_keys,   keys,   offset_arr, {2});
+  auto new_kv_values = mlx::core::slice_update(kv_values, values, offset_arr, {2});
+
+  float scale = std::pow((float)cfg.head_dim, -0.5f);
+  auto attn_out = fast::scaled_dot_product_attention(
+      queries, new_kv_keys, new_kv_values, scale, "", attn_mask, {});
+
+  attn_out = transpose(attn_out, {0, 2, 1, 3});
+  attn_out = reshape(attn_out, {B, cfg.num_heads * cfg.head_dim});
+
+  attn_out = compiled_attn_gate()({attn_out, gate})[0];
+
+  auto output = linear_proj(attn_out, pfx + "o_proj");
+  if (has_weight(pfx + "o_proj.bias")) output = output + get_weight(pfx + "o_proj.bias");
+
+  return {output, new_kv_keys, new_kv_values};
+}
+
+// =====================================================================
 // Attention prefill (3D input, M-RoPE, causal mask)
 // =====================================================================
 

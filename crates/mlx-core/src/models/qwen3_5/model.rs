@@ -7525,6 +7525,192 @@ fn eval_token_and_compiled_caches(next_token: &MxArray) {
 }
 
 // ============================================================================
+// W5 — Compiled C++ MTP (Multi-Token Prediction) wrappers (dense).
+//
+// Companions to `forward_compiled` / `eval_token_and_compiled_caches`.
+// The C++ side lives in `crates/mlx-sys/src/mlx_qwen35_mtp_compiled.cpp`
+// and shares `g_weights()` / `g_compiled_caches` with the main path.
+//
+// Locking contract:
+//   - Production callers (W6 chat-session loop) MUST hold
+//     `DENSE_COMPILED_MUTEX` and `COMPILED_WEIGHTS_RWLOCK` (read) across
+//     the entire draft+verify cycle — the verify FFI mutates the main
+//     compiled state in place, so any concurrent main-path forward would
+//     race.
+//   - Tests in `compiled_ffi_tests` (in `mtp.rs`) cannot lock
+//     `DENSE_COMPILED_MUTEX` directly because it is `static` (private)
+//     to this module. They instead serialise on `FFI_LOCK`, which is
+//     sufficient in the absence of concurrent main-path forward calls.
+// The plan W5 says to "reuse `DENSE_COMPILED_MUTEX`" rather than adding
+// a new lock; the W6 chat-session integration will arrange that.
+//
+// W6 integration contract:
+//   1. After `mlx_qwen35_compiled_init_from_prefill(...)` succeeds for
+//      the current turn, call `init_mtp_compiled_from_main(...)` ONCE
+//      with the same config / max_kv_len.
+//   2. For each draft+verify cycle:
+//      a. Snapshot caches (W3) and main offset.
+//      b. Call `forward_mtp_draft_compiled(...)` D times.
+//      c. Call `forward_mtp_verify_compiled(...)` ONCE.
+//      d. Accept / reject per W4 sampler. On reject, rewind the main
+//         offset via `mlx_qwen35_compiled_adjust_offset` AND the MTP
+//         offset via `mlx_qwen35_mtp_compiled_adjust_offset` to keep
+//         the two paths in lock-step.
+//   3. On turn end, call `mlx_qwen35_mtp_compiled_reset()` (FFI).
+// ============================================================================
+
+/// Initialize the MTP compiled path from the main path's current state.
+///
+/// Must be called AFTER `mlx_qwen35_compiled_init_from_prefill`. The
+/// MTP path allocates fresh per-layer KV caches sized to `max_kv_len`
+/// (zeros) — it does NOT seed from the main path's prefill caches
+/// because MTP draft layers attend to their own draft KV history, not
+/// the committed-prefix history.
+///
+/// Returns `Ok(())` on success. Returns `Err` on `n_mtp_layers <= 0`,
+/// missing MTP weights, or any C++ exception. On error the MTP state
+/// is left uninitialised and subsequent draft/verify calls become
+/// null-pointer no-ops so the caller can fall back to the eager Rust
+/// MTP forward.
+// W6 (chat-session integration) is the only intended caller; allow
+// the dead-code lint to stay quiet until that wires in.
+#[allow(dead_code)]
+pub(super) fn init_mtp_compiled_from_main(config: &Qwen3_5Config, max_kv_len: i32) -> Result<()> {
+    use mlx_sys as sys;
+
+    let status = unsafe {
+        sys::mlx_qwen35_mtp_compiled_init_from_main(
+            config.num_layers,
+            config.hidden_size,
+            config.num_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.rope_theta as f32,
+            config.rope_dims(),
+            config.rms_norm_eps as f32,
+            config.full_attention_interval,
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+            config.linear_conv_kernel_dim,
+            if config.tie_word_embeddings { 1 } else { 0 },
+            max_kv_len,
+            1,
+            config.n_mtp_layers,
+        )
+    };
+
+    if status != 0 {
+        return Err(Error::from_reason(format!(
+            "init_mtp_compiled_from_main: C++ returned status {status} — \
+             check stderr for diagnostic"
+        )));
+    }
+    Ok(())
+}
+
+/// One MTP draft step on the compiled path.
+///
+/// Inputs are `[1, 1, hidden]` bf16: `prev_hidden` is the post-norm
+/// hidden state from the previous step (or the committed-prefix
+/// hidden on the first step), and `prev_emb` is the embedding of
+/// the previously-committed-or-drafted token (caller picks).
+///
+/// Returns `(h_next, draft_logits)` where `h_next` is `[1, 1, hidden]`
+/// (feed to next draft step's `prev_hidden`) and `draft_logits` is
+/// `[1, vocab]` (sampler input). Mutates the MTP KV caches in place
+/// and advances the MTP offset by 1.
+///
+/// Returns `Err` if the C++ side returns null pointers (init not
+/// done, exception). On `Err` the MTP state is left as-is — the
+/// caller should fall back to the eager Rust MTP forward.
+#[allow(dead_code)] // wired in by W6 chat-session integration
+pub(super) fn forward_mtp_draft_compiled(
+    prev_hidden: &MxArray,
+    prev_emb: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    use mlx_sys as sys;
+
+    let mut h_next_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut logits_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_mtp_draft_compiled(
+            prev_hidden.as_raw_ptr(),
+            prev_emb.as_raw_ptr(),
+            &mut h_next_ptr,
+            &mut logits_ptr,
+        );
+    }
+
+    if h_next_ptr.is_null() || logits_ptr.is_null() {
+        // Clean up the half-allocated output if only one side succeeded.
+        if !h_next_ptr.is_null() {
+            unsafe { sys::mlx_array_delete(h_next_ptr) };
+        }
+        if !logits_ptr.is_null() {
+            unsafe { sys::mlx_array_delete(logits_ptr) };
+        }
+        return Err(Error::from_reason(
+            "forward_mtp_draft_compiled: C++ returned null — check stderr",
+        ));
+    }
+
+    let h_next = MxArray::from_handle(h_next_ptr, "mtp_draft_h_next")?;
+    let logits = MxArray::from_handle(logits_ptr, "mtp_draft_logits")?;
+    Ok((h_next, logits))
+}
+
+/// One MTP verify step on the compiled path.
+///
+/// `input_ids` is `[1, depth+1]` int32 — typically
+/// `[last_committed_id, drafted_tok_0, ..., drafted_tok_{depth-1}]`.
+/// `embedding_weight` is the model's embedding table (or LM head if
+/// `tie_word_embeddings=false`). `depth` must be in `[1, 5]`.
+///
+/// Returns logits of shape `[1, depth+1, vocab]`.
+///
+/// SIDE EFFECTS: advances the MAIN compiled path's offset by
+/// `depth + 1` and writes K/V into the main `g_compiled_caches[]` at
+/// the corresponding positions. Production callers (W6 chat-session
+/// loop) MUST already hold `DENSE_COMPILED_MUTEX` and the
+/// `COMPILED_WEIGHTS_RWLOCK` read guard so no other turn can race the
+/// offset / cache state during the verify. Tests serialise via
+/// `FFI_LOCK` in the absence of concurrent main-path forward calls —
+/// see `compiled_ffi_tests` in `mtp.rs`.
+#[allow(dead_code)] // wired in by W6 chat-session integration
+pub(super) fn forward_mtp_verify_compiled(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    depth: i32,
+) -> Result<MxArray> {
+    use mlx_sys as sys;
+
+    if !(1..=5).contains(&depth) {
+        return Err(Error::from_reason(format!(
+            "forward_mtp_verify_compiled: depth {depth} outside [1, 5]"
+        )));
+    }
+
+    let mut out_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_mtp_verify_compiled(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            depth,
+            &mut out_ptr,
+        );
+    }
+
+    if out_ptr.is_null() {
+        return Err(Error::from_reason(
+            "forward_mtp_verify_compiled: C++ returned null — check stderr",
+        ));
+    }
+    MxArray::from_handle(out_ptr, "mtp_verify_logits")
+}
+
+// ============================================================================
 // Phase 5 piece 1: C++ compiled paged-decode dispatcher (Dense).
 //
 // Mirrors `init_paged_moe_compiled_session` / `forward_moe_cpp_paged`

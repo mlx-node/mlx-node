@@ -490,6 +490,26 @@ int mlx_qwen35_get_cache_offset() {
   return g_offset_int;
 }
 
+// Exposed for `mlx_qwen35_mtp_compiled_init_from_main` so the MTP init
+// can fail loudly if the main path hasn't been initialised yet. Without
+// this guard, `mlx_qwen35_get_cache_offset()` silently returns 0 from a
+// fresh `g_offset_int`, and the MTP path would build attention masks
+// against a phantom prefix.
+int mlx_qwen35_is_compile_inited() {
+  return g_compile_inited ? 1 : 0;
+}
+
+// Test-only helper: forcibly mark the main compiled path as initialised
+// (or not) without going through the full `init_from_prefill` flow that
+// requires real per-layer KV cache arrays. Used by W5 MTP FFI smoke
+// tests so they can satisfy the new `is_compile_inited` precondition in
+// `mlx_qwen35_mtp_compiled_init_from_main` without standing up a full
+// dense decoder cache. Production code MUST NOT call this — use
+// `mlx_qwen35_compiled_init_from_prefill` instead.
+void mlx_qwen35_compiled_test_force_inited(int inited) {
+  g_compile_inited = (inited != 0);
+}
+
 int mlx_qwen35_export_paged_linear_caches(mlx_array** out_ptrs, int max_count) {
   if (!g_dense_paged_inited || g_dense_paged_linear_caches.empty()) return 0;
   int expected = static_cast<int>(g_dense_paged_linear_caches.size());
