@@ -7251,7 +7251,14 @@ impl Qwen3_5Model {
 
 /// Default prefill chunk size (tokens per chunk).
 /// Matches Python mlx-lm's `prefill_step_size` default of 2048.
-const PREFILL_STEP_SIZE: i64 = 1024;
+///
+/// E55: bumped 1024 → 2048 after benching against mlx-lm at 20k prompt:
+/// chunk=1024 incurred 20 chunk boundaries vs mlx-lm's 10 (mlx-lm uses
+/// 2048 by default); the doubled per-chunk overhead cost ~14% at 20k.
+/// At 1024-prompt single-chunk the value is irrelevant — the loop is
+/// guarded by `total_len - offset > PREFILL_STEP_SIZE` so any T < step
+/// goes through the single `remaining` branch unchanged.
+const PREFILL_STEP_SIZE: i64 = 2048;
 
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
