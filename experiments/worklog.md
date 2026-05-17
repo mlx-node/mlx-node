@@ -19,6 +19,18 @@ prefill compile-cache port (E53, scope doc:
 `experiments/E53-text-prefill-compile-scope.md`), expected 1-3% but
 multi-hour scope.
 
+**Methodology lesson (E54, 2026-05-17):** running `./autoresearch.sh`
+twice with different env vars to A/B a small kernel toggle gives noise
+that is ~30-50× the in-process cold-state noise floor (~15-16%
+cross-process spread between two E47-default runs, vs ~0.3% within one
+process). The autoresearch.md ≥3% Adopt threshold is calibrated for
+this cross-process regime; cold-state in-process pairs (model loaded
+once, env vars toggled between timed passes) are what previous
+sub-3% wins (E47, E48, E51) actually relied on. A reusable
+in-process A/B script (new file, not modifying the off-limits harness)
+is a useful next infrastructure investment for validating future
+small-delta candidates.
+
 ## TL;DR — what shipped
 
 | Tag | Where | Toggle | Mechanism |
