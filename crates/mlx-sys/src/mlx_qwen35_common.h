@@ -732,6 +732,79 @@ inline AttnPureResult attn_prefill_fn(
 }
 
 // =====================================================================
+// Attention prefill (3D input, scalar RoPE offset, causal mask).
+// E53: text-only variant. Differs from attn_prefill_fn only in the RoPE
+// step — scalar-offset fast::rope instead of M-RoPE. The first-cut
+// caller (mlx_qwen35_text_prefill) uses single-chunk prefill so offset=0
+// and SDPA can run in "causal" string mode (no explicit mask array).
+// Returns keys/values in [B, Hkv, T, D] for cache initialization.
+// =====================================================================
+
+inline AttnPureResult attn_prefill_fn_scalar(
+    const array& x,    // [B, T, hidden] — 3D
+    int layer_idx,
+    int offset,        // RoPE start position (0 for first chunk)
+    const BaseConfig& cfg) {
+  int B = x.shape(0);
+  int T = x.shape(1);
+  int hidden = x.shape(2);
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
+
+  auto x_flat = reshape(x, {B * T, hidden});
+
+  // Q projection (2x width for per-head gating)
+  auto q_proj = linear_proj(x_flat, pfx + "q_proj");
+  if (has_weight(pfx + "q_proj.bias")) q_proj = q_proj + get_weight(pfx + "q_proj.bias");
+
+  auto qph    = reshape(q_proj, {B, T, cfg.num_heads, cfg.head_dim * 2});
+  auto queries = slice(qph, {0, 0, 0, 0},            {B, T, cfg.num_heads, cfg.head_dim});
+  auto gate    = slice(qph, {0, 0, 0, cfg.head_dim}, {B, T, cfg.num_heads, cfg.head_dim * 2});
+  gate = reshape(gate, {B, T, cfg.num_heads * cfg.head_dim});
+
+  // K, V projections
+  auto keys   = linear_proj(x_flat, pfx + "k_proj");
+  auto values = linear_proj(x_flat, pfx + "v_proj");
+  if (has_weight(pfx + "k_proj.bias")) keys   = keys   + get_weight(pfx + "k_proj.bias");
+  if (has_weight(pfx + "v_proj.bias")) values = values + get_weight(pfx + "v_proj.bias");
+
+  keys   = reshape(keys,   {B, T, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, T, cfg.num_kv_heads, cfg.head_dim});
+
+  // QK norm
+  queries = fast::rms_norm(queries, get_weight(pfx + "q_norm.weight"), cfg.rms_norm_eps);
+  keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
+
+  // Scalar-offset partial RoPE (text path; matches Qwen3_5Attention::forward()).
+  queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset);
+  keys    = fast::rope(keys,    cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset);
+
+  // [B, T, H, D] → [B, H, T, D]
+  auto q_t = transpose(queries, {0, 2, 1, 3});
+  auto k_t = transpose(keys,    {0, 2, 1, 3});
+  auto v_t = transpose(values,  {0, 2, 1, 3});
+
+  // SDPA in "causal" string mode — uses MLX's fused causal kernel, no
+  // explicit O(T^2) mask materialization. Matches the Rust prefill path's
+  // scaled_dot_product_attention_causal() (see attention.rs:228).
+  float scale = std::pow((float)cfg.head_dim, -0.5f);
+  auto attn_out = fast::scaled_dot_product_attention(
+      q_t, k_t, v_t, scale, "causal", std::nullopt, std::nullopt);
+
+  attn_out = transpose(attn_out, {0, 2, 1, 3});
+  attn_out = reshape(attn_out, {B, T, cfg.num_heads * cfg.head_dim});
+
+  // Gate
+  attn_out = compiled_attn_gate()({attn_out, gate})[0];
+
+  // Output projection
+  auto out_flat = linear_proj(reshape(attn_out, {B * T, cfg.num_heads * cfg.head_dim}), pfx + "o_proj");
+  if (has_weight(pfx + "o_proj.bias")) out_flat = out_flat + get_weight(pfx + "o_proj.bias");
+  auto output = reshape(out_flat, {B, T, hidden});
+
+  return {output, k_t, v_t};
+}
+
+// =====================================================================
 // GDN prefill (3D input, full sequence conv1d, initial recurrent state)
 // =====================================================================
 
