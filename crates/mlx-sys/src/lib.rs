@@ -1662,6 +1662,15 @@ unsafe extern "C-unwind" {
     /// `mlx_qwen35_compiled_adjust_offset`.
     pub fn mlx_qwen35_mtp_compiled_adjust_offset(delta: i32);
 
+    /// W6 Bug #2 fix (Option Reset): begin a fresh MTP draft cycle
+    /// aligned to the main path's current offset. Zeroes the MTP K/V
+    /// caches and sets the MTP offset to `main_offset`. Must be called
+    /// at the start of every MTP cycle inside `decode_loop_mtp!` —
+    /// without it the MTP offset drifts behind the main offset by 2
+    /// per cycle (1 Step-A forward + 1 verify[0] forward that the MTP
+    /// path doesn't see), producing wrong RoPE positions and gibberish.
+    pub fn mlx_qwen35_mtp_compiled_begin_cycle(main_offset: i32);
+
     /// Read the current MTP offset (for debugging / tests).
     pub fn mlx_qwen35_mtp_get_offset() -> i32;
 
@@ -1919,6 +1928,12 @@ unsafe extern "C-unwind" {
     /// verify-reject rolled back the main MoE path). Mirrors
     /// `mlx_qwen35_mtp_compiled_adjust_offset` on the dense side.
     pub fn mlx_qwen35_moe_mtp_compiled_adjust_offset(delta: i32);
+
+    /// W6 Bug #2 fix (Option Reset): begin a fresh MoE MTP draft cycle
+    /// aligned to the main MoE path's current offset. See dense
+    /// `mlx_qwen35_mtp_compiled_begin_cycle` for the full rationale —
+    /// the divergence and fix are identical.
+    pub fn mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset: i32);
 
     /// Read the current MoE MTP offset (for debugging / tests).
     pub fn mlx_qwen35_moe_mtp_get_offset() -> i32;

@@ -641,6 +641,49 @@ void mlx_qwen35_mtp_compiled_adjust_offset(int delta) {
 }
 
 // -----------------------------------------------------------------------------
+// W6 Bug #2 fix (Option Reset): begin a fresh MTP draft cycle aligned to
+// the main path's current offset. Zeroes the MTP K/V caches and sets
+// `g_mtp_offset_int = main_offset`.
+//
+// Why this exists:
+//   Per outer iteration of `decode_loop_mtp!` the main offset advances
+//   by D+2 (1 Step-A forward + (D+1) verify forwards) while the MTP
+//   draft offset only advances by D. After K cycles the MTP offset
+//   lags the main offset by 2K, so MTP RoPE positions diverge from
+//   the actual sequence positions — drafts produce gibberish, every
+//   token rejects, and the residual sample comes from a corrupted
+//   distribution.
+//
+//   Naively syncing the offset (Option Sync) leaves a 2-position gap
+//   in the MTP K/V buffer per cycle (the slots Step A + verify[0] wrote
+//   on the main path are never written on the MTP path); those slots
+//   read back as zero K/V and pollute the draft attention. Resetting
+//   to all-zeros and re-anchoring to `main_offset` matches the W5 init
+//   behavior (zeroed buffer + offset = prefill_len), so every cycle is
+//   self-contained and behaves like the very first draft cycle.
+//
+// Trade-off: abandons the W6.5 chained-cycle perf win (where prior
+// cycles' MTP K/V would seed the next cycle's drafts). That's out of
+// scope here — the immediate goal is parity, not throughput.
+//
+// No-op if MTP isn't initialised — the dispatcher Rust-side already
+// gates the call on `mtp_active`, but defensive-checked here too.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_mtp_compiled_begin_cycle(int main_offset) {
+  if (!g_mtp_compile_inited) return;
+  const auto& cfg = g_mtp_config;
+  for (int j = 0; j < cfg.n_mtp_layers; j++) {
+    g_mtp_compiled_caches[j * 2]     = zeros(
+        {cfg.batch_size, cfg.num_kv_heads, cfg.max_kv_len, cfg.head_dim},
+        mlx::core::bfloat16);
+    g_mtp_compiled_caches[j * 2 + 1] = zeros(
+        {cfg.batch_size, cfg.num_kv_heads, cfg.max_kv_len, cfg.head_dim},
+        mlx::core::bfloat16);
+  }
+  g_mtp_offset_int = main_offset;
+}
+
+// -----------------------------------------------------------------------------
 // Read accessor for the current MTP offset (debugging / introspection
 // from Rust unit tests).
 // -----------------------------------------------------------------------------

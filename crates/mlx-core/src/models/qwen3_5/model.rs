@@ -2437,6 +2437,17 @@ impl Qwen35Inner {
                             logits.eval();
                         }
                     },
+                    // W6 Bug #2 fix (Option Reset): reset MTP K/V and
+                    // re-anchor MTP offset to the main path's current
+                    // offset before each draft cycle. Without this the
+                    // MTP offset drifts 2 behind per cycle (Step A's
+                    // forward + verify[0]'s forward both write to the
+                    // main path but not to the MTP path), so MTP RoPE
+                    // positions become wrong and drafts diverge.
+                    begin_cycle: || unsafe {
+                        let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
+                        mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
+                    },
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -4539,6 +4550,17 @@ impl Qwen35Inner {
                             logits.eval();
                         }
                     },
+                    // W6 Bug #2 fix (Option Reset): reset MTP K/V and
+                    // re-anchor MTP offset to the main path's current
+                    // offset before each draft cycle. Without this the
+                    // MTP offset drifts 2 behind per cycle (Step A's
+                    // forward + verify[0]'s forward both write to the
+                    // main path but not to the MTP path), so MTP RoPE
+                    // positions become wrong and drafts diverge.
+                    begin_cycle: || unsafe {
+                        let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
+                        mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
+                    },
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -5203,6 +5225,17 @@ impl Qwen35Inner {
                         if budget_forced {
                             logits.eval();
                         }
+                    },
+                    // W6 Bug #2 fix (Option Reset): reset MTP K/V and
+                    // re-anchor MTP offset to the main path's current
+                    // offset before each draft cycle. Without this the
+                    // MTP offset drifts 2 behind per cycle (Step A's
+                    // forward + verify[0]'s forward both write to the
+                    // main path but not to the MTP path), so MTP RoPE
+                    // positions become wrong and drafts diverge.
+                    begin_cycle: || unsafe {
+                        let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
+                        mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
                     },
                 };
                 chat_common::decode_loop_mtp!(

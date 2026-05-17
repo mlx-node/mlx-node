@@ -414,9 +414,23 @@ pub(crate) fn sample_and_logprobs(
 ///     the verifier's correction is emitted instead.
 ///
 /// Ratio is computed in fp32; BF16 underflows on small `q` and breaks
-/// exactness (see MTPLX `sampling.py:143-148`). At T=0 the math
-/// degenerates to `accepted = (argmax(p_target) == draft_id)` — no
-/// separate T=0 branch needed.
+/// exactness (see MTPLX `sampling.py:143-148`).
+///
+/// **T=0 (greedy) degeneracy.** When `sampling_config.temperature <= 1e-6`
+/// the entire decoding path collapses to argmax — both the drafter (via
+/// `sample()` ⇒ `compiled_sample_full`) and any non-speculative reference
+/// run pick `argmax(logits)` deterministically. To preserve byte-exact
+/// parity between AR and MTP at T=0 we MUST take the same argmax-only
+/// branch here instead of running the stochastic ratio + categorical
+/// pipeline, which uses MLX's global RNG and would emit different tokens
+/// even when both distributions agree on the argmax. Concretely:
+///   - accept iff `argmax(p_target) == draft_id`
+///   - on reject, emit `argmax(p_target)` (the residual `(p_target -
+///     p_draft)+` has its maximum at the target argmax whenever the draft
+///     mass concentrates on a non-argmax token, which is the only way to
+///     enter this branch)
+///
+/// For T > 0 the existing stochastic Leviathan-Chen logic runs unchanged.
 ///
 /// The caller-supplied `rng` is consumed for the single `u ~ Uniform(0, 1)`
 /// acceptance coin flip. The residual sample uses MLX's global random state
@@ -434,6 +448,7 @@ pub(crate) fn accept_with_residual<R: Rng + ?Sized>(
     p_target: &MxArray,
     p_draft: &MxArray,
     draft_id: i32,
+    sampling_config: &SamplingConfig,
     rng: &mut R,
 ) -> Result<(bool, i32)> {
     if draft_id < 0 {
@@ -481,6 +496,23 @@ pub(crate) fn accept_with_residual<R: Rng + ?Sized>(
                 draft_id, vocab
             ),
         ));
+    }
+
+    // T=0 (greedy) shortcut. See doc-comment above: must mirror the
+    // argmax-only behavior of `sample()` at T=0 to maintain AR/MTP
+    // parity. `sampling_config.temperature` is `Option<f64>` with the
+    // default = 1.0; `None` also routes here as 1.0 (no shortcut).
+    let temperature = sampling_config.temperature.unwrap_or(1.0);
+    if temperature <= 1e-6 {
+        // fp32 for the argmax so we read from a deterministic dtype.
+        let p_target_f32 = p_target.astype(DType::Float32)?;
+        let argmax_arr = p_target_f32.argmax(0, None)?;
+        argmax_arr.eval();
+        let target_argmax = argmax_arr.item_at_int32(0)?;
+        if target_argmax == draft_id {
+            return Ok((true, draft_id));
+        }
+        return Ok((false, target_argmax));
     }
 
     // fp32 is mandatory — BF16 underflows on small q and breaks exactness.
@@ -1400,6 +1432,29 @@ mod accept_with_residual_tests {
         MxArray::from_float32(&data, &[vocab as i64]).expect("from_float32")
     }
 
+    /// SamplingConfig with `temperature = 1.0` — keeps the stochastic
+    /// Leviathan-Chen path active so the original tests exercise it.
+    fn stochastic_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(1.0),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        }
+    }
+
+    /// SamplingConfig with `temperature = 0.0` — forces the T=0 argmax
+    /// shortcut. Mirrors how `extract_chat_params` propagates the user-
+    /// facing `temperature` field (W4 parity requirement).
+    fn greedy_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(0.0),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        }
+    }
+
     #[test]
     fn t0_collapse_argmax_match_accepts() {
         // p_target = p_draft = one-hot at token 7, draft picked 7.
@@ -1411,8 +1466,9 @@ mod accept_with_residual_tests {
         // u_64 = u64::MAX still yields u < 1, so accept must fire even at
         // the upper edge.
         let mut rng = ScriptedRng::new(&[u64::MAX]);
-        let (accepted, out) =
-            accept_with_residual(&p_target, &p_draft, 7, &mut rng).expect("accept_with_residual");
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 7, &cfg, &mut rng)
+            .expect("accept_with_residual");
         assert!(accepted, "T=0 argmax match must accept");
         assert_eq!(out, 7);
     }
@@ -1430,8 +1486,9 @@ mod accept_with_residual_tests {
         let p_draft = one_hot(5, vocab);
 
         let mut rng = ScriptedRng::new(&[u64::MAX]);
-        let (accepted, out) =
-            accept_with_residual(&p_target, &p_draft, 5, &mut rng).expect("accept_with_residual");
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 5, &cfg, &mut rng)
+            .expect("accept_with_residual");
         assert!(!accepted, "argmax mismatch must reject");
         assert_eq!(out, 2, "residual collapses to argmax(p_target)");
     }
@@ -1450,8 +1507,9 @@ mod accept_with_residual_tests {
 
         // u ≈ 0 (next_u64 = 0) forces acceptance for any positive p_accept.
         let mut rng = ScriptedRng::new(&[0]);
-        let (accepted, out) =
-            accept_with_residual(&p_target, &p_draft, 3, &mut rng).expect("accept_with_residual");
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 3, &cfg, &mut rng)
+            .expect("accept_with_residual");
         assert!(accepted, "ratio >= 1 with u → 0 must accept");
         assert_eq!(out, 3);
     }
@@ -1471,9 +1529,10 @@ mod accept_with_residual_tests {
         // verify the sample always lands in the residual support, since
         // MLX's categorical uses its own RNG and we can't pin it.
         let mut rejections = 0;
+        let cfg = stochastic_cfg();
         for _ in 0..16 {
             let mut rng = ScriptedRng::new(&[u64::MAX]);
-            let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &mut rng)
+            let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
                 .expect("accept_with_residual");
             assert!(!accepted, "ratio = 0.1 with u → 1 must reject");
             assert_ne!(
@@ -1524,7 +1583,8 @@ mod accept_with_residual_tests {
         let draft_id = 3i32;
 
         let mut rng = ScriptedRng::new(&[u64::MAX]);
-        let (accepted, out) = accept_with_residual(&p_target, &p_draft, draft_id, &mut rng)
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, draft_id, &cfg, &mut rng)
             .expect("accept_with_residual");
         assert!(!accepted, "ratio = 0.5 with u → 1 must reject");
         assert_eq!(
@@ -1547,8 +1607,9 @@ mod accept_with_residual_tests {
             MxArray::from_float32(&[0.4f32, 0.2, 0.2, 0.2], &[vocab as i64]).expect("p_draft");
 
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-        let (accepted, out) =
-            accept_with_residual(&p_target, &p_draft, 0, &mut rng).expect("accept_with_residual");
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
+            .expect("accept_with_residual");
         assert!(!accepted, "p_t = 0 must reject");
         assert_ne!(out, 0, "residual excludes draft_id where p_t = 0");
         assert!(
@@ -1573,8 +1634,9 @@ mod accept_with_residual_tests {
         let p_draft = MxArray::from_float32(&[1.0f32, 0.0, 0.0], &[vocab as i64]).expect("p_draft");
 
         let mut rng = ScriptedRng::new(&[0]);
-        let (accepted, out) =
-            accept_with_residual(&p_target, &p_draft, 0, &mut rng).expect("accept_with_residual");
+        let cfg = stochastic_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
+            .expect("accept_with_residual");
         assert!(
             !accepted,
             "p_accept = 0 with u = 0 must reject (strict `<` semantics)"
@@ -1588,5 +1650,44 @@ mod accept_with_residual_tests {
             "out must lie in residual support {{1, 2}}, got {}",
             out
         );
+    }
+
+    /// W4 Bug #3 regression: T=0 must collapse to argmax-compare. The
+    /// stochastic Leviathan-Chen path would consume MLX's global RNG
+    /// (and the supplied `rng`) and emit non-argmax tokens, breaking
+    /// AR/MTP parity. Compare with the AR T=0 contract in
+    /// `sample_compiled` (temperature → argmax via compiled C++).
+    #[test]
+    fn accepts_argmax_at_t_zero() {
+        // p_target argmax = 1, draft_id = 1 ⇒ accept.
+        let vocab = 3;
+        let p_target =
+            MxArray::from_float32(&[0.1f32, 0.7, 0.2], &[vocab as i64]).expect("p_target");
+        let p_draft = MxArray::from_float32(&[0.4f32, 0.3, 0.3], &[vocab as i64]).expect("p_draft");
+        // Scripted RNG with no entries — proves T=0 path consumes ZERO
+        // RNG draws (would panic on exhausted queue if it tried).
+        let mut rng = ScriptedRng::new(&[]);
+        let cfg = greedy_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 1, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(accepted, "T=0: argmax(p_target) == draft_id must accept");
+        assert_eq!(out, 1);
+    }
+
+    #[test]
+    fn rejects_non_argmax_at_t_zero_emits_argmax() {
+        // p_target argmax = 1, draft_id = 0 ⇒ reject, emit 1.
+        let vocab = 3;
+        let p_target =
+            MxArray::from_float32(&[0.1f32, 0.7, 0.2], &[vocab as i64]).expect("p_target");
+        let p_draft = MxArray::from_float32(&[0.4f32, 0.3, 0.3], &[vocab as i64]).expect("p_draft");
+        // Empty queue verifies the T=0 path bypasses the stochastic
+        // coin flip entirely.
+        let mut rng = ScriptedRng::new(&[]);
+        let cfg = greedy_cfg();
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
+            .expect("accept_with_residual");
+        assert!(!accepted, "T=0: argmax(p_target) != draft_id must reject");
+        assert_eq!(out, 1, "T=0 reject must emit argmax(p_target)");
     }
 }

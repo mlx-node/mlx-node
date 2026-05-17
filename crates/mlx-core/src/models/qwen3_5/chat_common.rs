@@ -1096,19 +1096,29 @@ pub(crate) use decode_loop;
 ///        path-agnostic.
 /// `E`  : eval-step hook (same contract as `DecodeOps::eval_step`)
 ///        called after every emitted token to flush the lazy graph.
-pub(crate) struct MtpOps<F, D, V, R, E>
+/// `B`  : begin-cycle hook called once per outer iteration, BEFORE
+///        the draft steps, AFTER Step A's main-path forward. The
+///        implementor reads the main path's current offset (via
+///        `mlx_qwen35_get_cache_offset` / `mlx_qwen35_moe_get_cache_offset`)
+///        and calls the corresponding `*_begin_cycle(main_offset)` FFI
+///        to zero the MTP K/V caches and re-anchor the MTP offset.
+///        This fixes W6 Bug #2 (mid-stream divergence): without the
+///        reset the MTP offset lags the main offset by 2 per cycle.
+pub(crate) struct MtpOps<F, D, V, R, E, B>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
     V: FnMut(&MxArray, &MxArray, usize) -> Result<MxArray>,
     R: FnMut(usize, usize),
     E: Fn(&MxArray, &MxArray, bool),
+    B: FnMut(),
 {
     pub forward_with_hidden: F,
     pub draft_step: D,
     pub verify_step: V,
     pub rollback: R,
     pub eval_step: E,
+    pub begin_cycle: B,
 }
 
 /// Outcome of `run_mtp_cycle_inner` — the list of accepted tokens for
@@ -1138,8 +1148,8 @@ pub(crate) struct MtpCycleOutcome {
 /// is the caller's problem; production callers fold the cycle inside
 /// `DENSE_COMPILED_MUTEX` so a `?` early-return drops the
 /// `CompiledResetGuard` and wipes the C++ state cleanly.
-pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E>(
-    ops: &mut MtpOps<F, D, V, R, E>,
+pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, B>(
+    ops: &mut MtpOps<F, D, V, R, E, B>,
     prev_hidden_in: MxArray,
     prev_emb_in: MxArray,
     last_committed_id: u32,
@@ -1155,6 +1165,7 @@ where
     V: FnMut(&MxArray, &MxArray, usize) -> Result<MxArray>,
     R: FnMut(usize, usize),
     E: Fn(&MxArray, &MxArray, bool),
+    B: FnMut(),
 {
     use crate::array::{DType, MxArray as A};
     use crate::nn::Activations;
@@ -1220,8 +1231,14 @@ where
         let p_target = Activations::softmax(&penalized, Some(-1))?.astype(DType::Float32)?;
         p_target.eval();
 
-        let (accept, out_tok) =
-            sampling::accept_with_residual(&p_target, &draft_probs[i], draft_ids[i], rng)?;
+        let sampling_cfg = params.sampling_config.unwrap_or_default();
+        let (accept, out_tok) = sampling::accept_with_residual(
+            &p_target,
+            &draft_probs[i],
+            draft_ids[i],
+            &sampling_cfg,
+            rng,
+        )?;
         if accept {
             let id_u = out_tok as u32;
             accepted_tokens.push(id_u);
@@ -1577,6 +1594,14 @@ macro_rules! decode_loop_mtp {
             let prev_h = prev_hidden_opt.take().expect("prev_hidden seeded after Step A");
             let prev_e = prev_emb_opt.take().expect("prev_emb seeded after Step A");
             let last_id = last_committed_id_opt.expect("last_committed seeded after Step A");
+            // W6 Bug #2 fix (Option Reset): re-anchor the MTP cache to
+            // the main path's CURRENT offset before launching this
+            // cycle's drafts. Step A just advanced the main offset by
+            // 1 (and the previous cycle's verify advanced it by D+1),
+            // so the main offset is now (post-Step-A position). Without
+            // this reset, the MTP draft offset lags by 2 per cycle —
+            // RoPE positions diverge and drafts produce gibberish.
+            ($mtp.begin_cycle)();
             // `_` discards the next-cycle seed; we always re-seed via
             // Step A on the next outer iteration.
             $profiler.begin("mtp_cycle");
@@ -1937,6 +1962,7 @@ mod mtp_cycle_tests {
                 *rollback_seen.borrow_mut() = Some((a, d));
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+            begin_cycle: || {},
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
@@ -1998,6 +2024,7 @@ mod mtp_cycle_tests {
                 *rollback_seen.borrow_mut() = Some((a, d));
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+            begin_cycle: || {},
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xBADC0DE);
@@ -2052,6 +2079,7 @@ mod mtp_cycle_tests {
                 *rollback_seen.borrow_mut() = Some((a, d));
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+            begin_cycle: || {},
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xDEAD);
@@ -2124,6 +2152,7 @@ mod mtp_cycle_tests {
                 *rollback_seen.borrow_mut() = Some((a, d));
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+            begin_cycle: || {},
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xFEED);

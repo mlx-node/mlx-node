@@ -1697,6 +1697,14 @@ impl Qwen35MoeInner {
                             logits.eval();
                         }
                     },
+                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
+                    // and re-anchor MTP offset to the main MoE path's
+                    // current offset before each draft cycle. See the
+                    // dense site for the full rationale.
+                    begin_cycle: || unsafe {
+                        let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
+                        mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                    },
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -3776,6 +3784,14 @@ impl Qwen35MoeInner {
                             logits.eval();
                         }
                     },
+                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
+                    // and re-anchor MTP offset to the main MoE path's
+                    // current offset before each draft cycle. See the
+                    // dense site for the full rationale.
+                    begin_cycle: || unsafe {
+                        let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
+                        mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                    },
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -4391,6 +4407,14 @@ impl Qwen35MoeInner {
                         if budget_forced {
                             logits.eval();
                         }
+                    },
+                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
+                    // and re-anchor MTP offset to the main MoE path's
+                    // current offset before each draft cycle. See the
+                    // dense site for the full rationale.
+                    begin_cycle: || unsafe {
+                        let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
+                        mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
                     },
                 };
                 chat_common::decode_loop_mtp!(
@@ -5129,6 +5153,14 @@ impl Qwen35MoeInner {
                         if budget_forced {
                             logits.eval();
                         }
+                    },
+                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
+                    // and re-anchor MTP offset to the main MoE path's
+                    // current offset before each draft cycle. See the
+                    // dense site for the full rationale.
+                    begin_cycle: || unsafe {
+                        let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
+                        mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
                     },
                 };
                 chat_common::decode_loop_mtp!(

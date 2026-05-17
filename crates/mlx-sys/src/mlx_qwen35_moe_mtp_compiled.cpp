@@ -877,6 +877,26 @@ void mlx_qwen35_moe_mtp_compiled_adjust_offset(int delta) {
 }
 
 // -----------------------------------------------------------------------------
+// W6 Bug #2 fix (Option Reset): begin a fresh MoE MTP draft cycle aligned
+// to the main MoE path's current offset. Zeroes the MTP K/V caches and
+// sets `g_mtp_offset_int = main_offset`. See the dense MTP file for the
+// full rationale — the divergence and fix are identical here.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_moe_mtp_compiled_begin_cycle(int main_offset) {
+  if (!g_mtp_compile_inited) return;
+  const auto& cfg = g_mtp_config;
+  for (int j = 0; j < cfg.n_mtp_layers; j++) {
+    g_mtp_compiled_caches[j * 2]     = zeros(
+        {cfg.batch_size, cfg.num_kv_heads, cfg.max_kv_len, cfg.head_dim},
+        mlx::core::bfloat16);
+    g_mtp_compiled_caches[j * 2 + 1] = zeros(
+        {cfg.batch_size, cfg.num_kv_heads, cfg.max_kv_len, cfg.head_dim},
+        mlx::core::bfloat16);
+  }
+  g_mtp_offset_int = main_offset;
+}
+
+// -----------------------------------------------------------------------------
 // Read accessor for the current MoE MTP offset (debugging / introspection
 // from Rust unit tests).
 // -----------------------------------------------------------------------------
