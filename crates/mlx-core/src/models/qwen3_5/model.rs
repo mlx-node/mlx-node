@@ -28,6 +28,7 @@ use super::chat_common::{
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
+use super::mtp::Qwen3_5MTPModule;
 use super::persistence;
 use super::processing::Qwen35VLImageProcessor;
 use super::vision::Qwen3_5VisionEncoder;
@@ -324,6 +325,15 @@ pub(crate) struct Qwen35Inner {
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
+    /// Optional Multi-Token Prediction head (W2 of the MTP plan).
+    ///
+    /// Constructed when `config.n_mtp_layers > 0`. The W6 speculative
+    /// decode loop is the only intended caller; the existing
+    /// single-token decode path ignores this field, so MTP is invisible
+    /// to the current chat session until W6 wires it in. Weight loading
+    /// is performed by `persistence::apply_weights_inner` after the
+    /// main per-layer weights are loaded.
+    pub(crate) mtp: Option<Qwen3_5MTPModule>,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -847,6 +857,16 @@ impl Qwen35Inner {
             None
         };
 
+        // MTP head — constructed only when the checkpoint config
+        // declares MTP layers. Weight load happens later, inside
+        // `persistence::apply_weights_inner`, so the module starts
+        // with random init here.
+        let mtp = if config.n_mtp_layers > 0 {
+            Some(Qwen3_5MTPModule::new(&config)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             embedding,
@@ -870,6 +890,7 @@ impl Qwen35Inner {
             gdn_last_history_checkpoint: None,
             paged_adapter,
             training_state: None,
+            mtp,
         })
     }
 

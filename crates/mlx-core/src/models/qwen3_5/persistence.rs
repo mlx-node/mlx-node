@@ -541,6 +541,18 @@ fn apply_weights_inner(
         }
     }
 
+    // MTP head — load `mtp.*` weights once the main per-layer weights
+    // are in place. The module is constructed in `Qwen35Inner::new()`
+    // when `config.n_mtp_layers > 0`; if construction returned `None`
+    // (no MTP layers) we silently skip even if the params happen to
+    // contain `mtp.*` entries (the sanitize pass already preserved
+    // them — see W1). The W6 decode loop is the only intended caller
+    // of `mtp.forward`; for now the module just sits next to the main
+    // model and reads from the same params HashMap.
+    if let Some(mtp) = inner.mtp.as_mut() {
+        mtp.apply_weights(params, default_plq, per_layer_quant)?;
+    }
+
     // Validate mandatory weights
     validate_mandatory_weights(params, config, inner.layers.len())?;
 
