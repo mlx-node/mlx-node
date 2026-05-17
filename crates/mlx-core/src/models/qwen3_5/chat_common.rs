@@ -1369,7 +1369,83 @@ macro_rules! decode_loop_mtp {
         // the cache-clear cadence.
         let mut last_clear_at: usize = $gen.len();
 
+        // PARITY-FIX: emit the initial `$y` (sampled from the prefill's
+        // last logits BEFORE this macro was entered) before Step A's
+        // first iteration. AR's `decode_loop!` macro emits its input
+        // `$y` at the top of each iteration; MTP's Step A only emits
+        // the SAMPLED next token, which means the very first token of
+        // the generation (the prefill's seed sample) never reached
+        // `$gen`. Without this push MTP's output is the AR output
+        // shifted left by one token — the source of the W6 parity
+        // mismatch reported in `examples/qwen35-mtp-smoke.ts`. We
+        // mirror the per-token bookkeeping Step A does (eval, stream
+        // callback, tracker.observe_token, profiler) so the initial
+        // token participates identically. The stop checks (EOS,
+        // length, cancel, repetition) run at the top of the loop body
+        // below — they read `$gen` so the initial push is visible.
+        {
+            let _stream_ctx = $crate::stream::StreamContext::new($stream);
+            $profiler.begin("extract");
+            $y.eval();
+            let initial_token_id = $y.item_at_int32(0)? as u32;
+            $profiler.end();
+            $profiler.mark_first_token();
+            if $report && $first_tok.is_none() {
+                $first_tok = Some(std::time::Instant::now());
+            }
+            $gen.push(initial_token_id);
+            $hist.push(initial_token_id);
+            let _is_reasoning = $tracker.observe_token(initial_token_id);
+            $(
+                $last_r = _is_reasoning;
+                if !$cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    let token_text = $crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                        &mut $ds, $tok.inner(), initial_token_id, &$gen, $slen,
+                    );
+                    $slen += token_text.len();
+                    $cb.call(
+                        Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                            text: token_text, done: false, finish_reason: None,
+                            tool_calls: None, thinking: None, num_tokens: None,
+                            prompt_tokens: None, reasoning_tokens: None,
+                            raw_text: None, cached_tokens: None, performance: None,
+                            is_reasoning: Some(_is_reasoning),
+                        }),
+                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
+            )?
+            $profiler.step();
+        }
+
         loop {
+            // PARITY-FIX: re-check the same stop conditions Step A
+            // uses, BEFORE the forward, so the initial push (above)
+            // and any prior-iteration push that landed us on a stop
+            // condition exit cleanly without one more forward.
+            if let Some(&last) = $gen.last() {
+                if last == $eos {
+                    $reason = String::from("stop");
+                    break;
+                }
+            }
+            $(
+                if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    $reason = String::from("cancelled");
+                    break;
+                }
+            )?
+            if let Some(reason) = $crate::sampling::check_repetition_cutoff(
+                &$gen, $p.max_consecutive_tokens, $p.max_ngram_repeats, $p.ngram_size,
+            ) {
+                $reason = reason.to_string();
+                break;
+            }
+            if $gen.len() >= ($max as usize) {
+                if $reason.is_empty() { $reason = String::from("length"); }
+                break;
+            }
+
             // ---- Step A: emit one main-path-derived token. -----------
             // This is either the very first token of the generation,
             // OR a forced think-end token (budget), OR the recovery
