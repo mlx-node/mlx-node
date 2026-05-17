@@ -1015,6 +1015,27 @@ void mlx_qwen35_moe_adjust_offset(int delta) {
   g_moe_offset_int += delta;
 }
 
+// Exposed for `mlx_qwen35_moe_mtp_compiled_init_from_main` so the MTP init
+// can fail loudly if the main MoE compiled path hasn't been initialised yet.
+// Mirrors `mlx_qwen35_is_compile_inited` on the dense side — without this
+// guard the MTP path would mirror a phantom prefix offset into its own
+// `g_mtp_offset_int` from a fresh-zero `g_moe_offset_int`.
+int mlx_qwen35_moe_is_compile_inited() {
+  return g_moe_inited ? 1 : 0;
+}
+
+// Test-only helper: forcibly mark the main MoE compiled path as initialised
+// (or not) without going through the full `init_from_prefill` flow that
+// requires real per-layer KV cache arrays. Used by the W5 MoE MTP FFI smoke
+// tests in `crates/mlx-core/src/models/qwen3_5_moe/mtp.rs` so they can
+// satisfy the new `is_compile_inited` precondition in
+// `mlx_qwen35_moe_mtp_compiled_init_from_main` without standing up a full
+// MoE decoder cache. Production code MUST NOT call this — use
+// `mlx_qwen35_moe_init_from_prefill` instead.
+void mlx_qwen35_moe_compiled_test_force_inited(int inited) {
+  g_moe_inited = (inited != 0);
+}
+
 // =============================================================================
 // Phase 4 piece 1: paged forward FFI.
 //

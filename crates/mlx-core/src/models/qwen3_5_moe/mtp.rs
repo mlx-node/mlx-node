@@ -828,3 +828,349 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod compiled_ffi_tests {
+    //! Compiled-path smoke tests for the W5 MoE MTP FFI.
+    //!
+    //! Mirror of `crates/mlx-core/src/models/qwen3_5/mtp.rs::compiled_ffi_tests`
+    //! adapted for the MoE entrypoints. Exercises the C++ FFI declared in
+    //! `crates/mlx-sys/src/mlx_qwen35_moe_mtp_compiled.cpp`
+    //! (`mlx_qwen35_moe_mtp_compiled_init_from_main`,
+    //!  `mlx_qwen35_moe_mtp_draft_compiled`,
+    //!  `mlx_qwen35_moe_mtp_compiled_reset`).
+    //!
+    //! The C++ side uses process-wide globals (`g_weights()`,
+    //! `g_mtp_compiled_caches`, `g_mtp_layer_quant`, `g_mtp_dense_quant`,
+    //! `g_mtp_3d_transposes`) so the tests acquire `FFI_LOCK` to serialize
+    //! with each other. Other tests in this crate don't touch those
+    //! globals, so the lock is only contended within this module.
+    //!
+    //! Each test registers the MTP weight tensors it needs directly via
+    //! `mlx_store_weight` (bypassing the per-module `apply_weights` path
+    //! so the test is fully self-contained), runs the compiled FFI, and
+    //! cleans up with `mlx_clear_weights` +
+    //! `mlx_qwen35_moe_mtp_compiled_reset`.
+
+    use std::ffi::CString;
+    use std::sync::Mutex;
+
+    use mlx_sys as sys;
+
+    use crate::array::{DType, MxArray};
+    use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
+    use crate::models::qwen3_5_moe::model::{
+        forward_moe_mtp_draft_compiled, init_moe_mtp_compiled_from_main,
+    };
+
+    static FFI_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tiny_cfg() -> Qwen3_5MoeConfig {
+        // hidden_size=64, head_dim=16, num_heads=4 → q_proj out = 128.
+        // num_kv_heads=2 → k_proj out = 32. intermediate=128 for dense MLP.
+        // num_experts=4, num_experts_per_tok=2, decoder_sparse_step=1 →
+        // every layer is MoE (mirrors the canonical Qwen3.5-MoE checkpoint
+        // recipe). full_attention_interval=4 makes layer 3 a
+        // full-attention layer; n_mtp_layers=1.
+        Qwen3_5MoeConfig {
+            vocab_size: 256,
+            hidden_size: 64,
+            num_layers: 4,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 256,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            shared_expert_intermediate_size: Some(64),
+            moe_intermediate_size: Some(64),
+            norm_topk_prob: true,
+            mlp_only_layers: None,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            n_mtp_layers: 1,
+        }
+    }
+
+    fn store_weight(name: &str, shape: &[i64]) -> std::result::Result<MxArray, String> {
+        let arr = MxArray::random_normal(shape, 0.0, 0.02, Some(DType::BFloat16))
+            .map_err(|e| e.reason.to_string())?;
+        let c_name = CString::new(name).expect("weight name has no NUL");
+        unsafe {
+            sys::mlx_store_weight(c_name.as_ptr(), arr.as_raw_ptr());
+        }
+        Ok(arr)
+    }
+
+    /// Register every MoE MTP weight the compiled draft graph reads from
+    /// `g_weights()` for the tiny MoE config. Returns the live MxArrays
+    /// so they outlive the C++ call (defensive — the store already
+    /// refcounts, but the Rust handles also keep Metal allocations from
+    /// being released by `mlx_clear_weights` mid-test).
+    ///
+    /// For an MoE-typed MTP layer (decoder_sparse_step=1 → every layer
+    /// is MoE), we register: top-level mtp.* norms + fc, per-layer
+    /// attention projections + layer norms, router gate, switch_mlp 3D
+    /// expert projections, shared_expert dense MLP, and shared_expert_gate.
+    fn register_moe_mtp_weights(
+        cfg: &Qwen3_5MoeConfig,
+    ) -> std::result::Result<Vec<MxArray>, String> {
+        let hidden = cfg.hidden_size as i64;
+        let q_out = (cfg.num_heads * cfg.head_dim * 2) as i64;
+        let k_out = (cfg.num_kv_heads * cfg.head_dim) as i64;
+        let v_out = k_out;
+        let o_in = (cfg.num_heads * cfg.head_dim) as i64;
+        let vocab = cfg.vocab_size as i64;
+        let num_experts = cfg.num_experts as i64;
+        let moe_inter = cfg.moe_intermediate_size.unwrap_or(cfg.intermediate_size) as i64;
+        let se_inter = cfg
+            .shared_expert_intermediate_size
+            .unwrap_or(cfg.intermediate_size) as i64;
+
+        let mut kept = vec![
+            store_weight("mtp.pre_fc_norm_hidden.weight", &[hidden])?,
+            store_weight("mtp.pre_fc_norm_embedding.weight", &[hidden])?,
+            store_weight("mtp.norm.weight", &[hidden])?,
+            store_weight("mtp.fc.weight", &[hidden, 2 * hidden])?,
+        ];
+
+        for j in 0..cfg.n_mtp_layers as usize {
+            let pfx = format!("mtp.layers.{j}");
+            // Attention.
+            kept.push(store_weight(
+                &format!("{pfx}.input_layernorm.weight"),
+                &[hidden],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.post_attention_layernorm.weight"),
+                &[hidden],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.self_attn.q_proj.weight"),
+                &[q_out, hidden],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.self_attn.k_proj.weight"),
+                &[k_out, hidden],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.self_attn.v_proj.weight"),
+                &[v_out, hidden],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.self_attn.o_proj.weight"),
+                &[hidden, o_in],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.self_attn.q_norm.weight"),
+                &[cfg.head_dim as i64],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.self_attn.k_norm.weight"),
+                &[cfg.head_dim as i64],
+            )?);
+
+            // Router gate. Shape [num_experts, hidden] (Linear: out=num_experts, in=hidden).
+            kept.push(store_weight(
+                &format!("{pfx}.mlp.gate.weight"),
+                &[num_experts, hidden],
+            )?);
+
+            // switch_mlp 3D expert projections. Convention: [E, out, in].
+            // gather_mm transposes internally to [E, in, out] — the
+            // MoE MTP init pre-computes these via `prepopulate_mtp_3d_transposes`.
+            kept.push(store_weight(
+                &format!("{pfx}.mlp.switch_mlp.gate_proj.weight"),
+                &[num_experts, moe_inter, hidden],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.mlp.switch_mlp.up_proj.weight"),
+                &[num_experts, moe_inter, hidden],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.mlp.switch_mlp.down_proj.weight"),
+                &[num_experts, hidden, moe_inter],
+            )?);
+
+            // Shared expert dense MLP.
+            kept.push(store_weight(
+                &format!("{pfx}.mlp.shared_expert.gate_proj.weight"),
+                &[se_inter, hidden],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.mlp.shared_expert.up_proj.weight"),
+                &[se_inter, hidden],
+            )?);
+            kept.push(store_weight(
+                &format!("{pfx}.mlp.shared_expert.down_proj.weight"),
+                &[hidden, se_inter],
+            )?);
+
+            // Shared expert gate (Linear, scalar gate per token).
+            kept.push(store_weight(
+                &format!("{pfx}.mlp.shared_expert_gate.weight"),
+                &[1, hidden],
+            )?);
+        }
+
+        // tie_word_embeddings=true so the draft graph looks up "embedding".
+        kept.push(store_weight("embedding.weight", &[vocab, hidden])?);
+
+        Ok(kept)
+    }
+
+    fn skip_on_metal_failure<T>(label: &str, r: std::result::Result<T, String>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(msg) => {
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    None
+                } else {
+                    panic!("unexpected failure in {label}: {msg}");
+                }
+            }
+        }
+    }
+
+    /// Tear down the MoE MTP compiled state, every weight stored by the
+    /// test, and the test-only main-MoE inited flag. Mirrors the dense
+    /// `teardown()` in `qwen3_5/mtp.rs`.
+    fn teardown() {
+        unsafe {
+            sys::mlx_qwen35_moe_mtp_compiled_reset();
+            sys::mlx_clear_weights();
+            sys::mlx_qwen35_moe_compiled_test_force_inited(0);
+        }
+    }
+
+    #[test]
+    fn init_rejects_zero_mtp_layers() {
+        let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = tiny_cfg();
+        cfg.n_mtp_layers = 0;
+        let r = init_moe_mtp_compiled_from_main(&cfg, 32);
+        assert!(r.is_err(), "n_mtp_layers=0 must return Err");
+        teardown();
+    }
+
+    #[test]
+    fn init_rejects_missing_weights() {
+        let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No weights registered → C++ side sees no `mtp.norm.weight`. We
+        // also force the main-MoE inited flag so the test reaches the
+        // `has_weight` check rather than failing earlier on the
+        // is_compile_inited precondition.
+        unsafe {
+            sys::mlx_clear_weights();
+            sys::mlx_qwen35_moe_compiled_test_force_inited(1);
+        }
+        let cfg = tiny_cfg();
+        let r = init_moe_mtp_compiled_from_main(&cfg, 32);
+        assert!(
+            r.is_err(),
+            "init without registered MTP weights must return Err"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn draft_step_produces_expected_shapes() {
+        let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = tiny_cfg();
+
+        let Some(_kept) = skip_on_metal_failure(
+            "draft_step_produces_expected_shapes",
+            register_moe_mtp_weights(&cfg),
+        ) else {
+            return;
+        };
+
+        // Force the main-MoE inited flag so MTP init passes the
+        // is_compile_inited precondition without standing up a real
+        // per-layer KV cache (this test never calls the main MoE
+        // forward, only MTP draft).
+        unsafe { sys::mlx_qwen35_moe_compiled_test_force_inited(1) };
+        let max_kv_len = 32i32;
+        if let Err(e) = init_moe_mtp_compiled_from_main(&cfg, max_kv_len) {
+            let msg = e.reason.to_string();
+            if msg.contains("Metal") || msg.contains("device") {
+                eprintln!("skipping draft_step (Metal unavailable): {msg}");
+                teardown();
+                return;
+            }
+            teardown();
+            panic!("init_moe_mtp_compiled_from_main failed: {msg}");
+        }
+
+        let hidden = cfg.hidden_size as i64;
+        let shape = [1i64, 1, hidden];
+        let prev_hidden = match MxArray::random_normal(&shape, 0.0, 1.0, Some(DType::BFloat16)) {
+            Ok(a) => a,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping draft_step (Metal unavailable): {msg}");
+                    teardown();
+                    return;
+                }
+                teardown();
+                panic!("random_normal failed: {msg}");
+            }
+        };
+        let prev_emb = MxArray::random_normal(&shape, 0.0, 1.0, Some(DType::BFloat16))
+            .expect("prev_emb random_normal");
+
+        let result = forward_moe_mtp_draft_compiled(&prev_hidden, &prev_emb);
+        match result {
+            Ok((h_next, logits)) => {
+                let h_shape = h_next.shape().expect("h_next shape");
+                let l_shape = logits.shape().expect("logits shape");
+                assert_eq!(
+                    h_shape.as_ref(),
+                    &[1i64, 1, hidden],
+                    "h_next must be [1, 1, hidden]"
+                );
+                let l = l_shape.as_ref();
+                assert_eq!(
+                    l.len(),
+                    2,
+                    "logits must be 2D [B, vocab]; got rank {}",
+                    l.len()
+                );
+                assert_eq!(l[1], cfg.vocab_size as i64, "logits vocab dim mismatch");
+
+                let off = unsafe { sys::mlx_qwen35_moe_mtp_get_offset() };
+                assert_eq!(off, 1, "MoE MTP offset must advance by 1 per draft step");
+            }
+            Err(e) => {
+                let msg = e.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping draft_step (Metal unavailable): {msg}");
+                } else {
+                    teardown();
+                    panic!("forward_moe_mtp_draft_compiled failed: {msg}");
+                }
+            }
+        }
+
+        teardown();
+    }
+}

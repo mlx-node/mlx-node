@@ -7549,6 +7549,199 @@ fn eval_token_and_moe_caches(next_token: &MxArray) {
     }
 }
 
+// ============================================================================
+// W5 — Compiled C++ MTP (Multi-Token Prediction) wrappers (MoE).
+//
+// MoE twin of the dense `init_mtp_compiled_from_main` /
+// `forward_mtp_draft_compiled` / `forward_mtp_verify_compiled` trio
+// (`crates/mlx-core/src/models/qwen3_5/model.rs:7418`). The C++ side
+// lives in `crates/mlx-sys/src/mlx_qwen35_moe_mtp_compiled.cpp` and
+// shares `g_weights()` with the main MoE path.
+//
+// Locking contract:
+//   - Production callers (W6 chat-session loop) MUST hold
+//     `MOE_COMPILED_MUTEX` (NOT `DENSE_COMPILED_MUTEX`!) AND the
+//     `COMPILED_WEIGHTS_RWLOCK` read guard across the entire
+//     draft+verify cycle — the verify FFI loops the main MoE forward
+//     in a single critical section and mutates `g_moe_caches` /
+//     `g_moe_offset_int` in place.
+//   - Tests in `compiled_ffi_tests` (in `mtp.rs`) cannot lock
+//     `MOE_COMPILED_MUTEX` directly because it is `static` (private)
+//     to this module. They instead serialise on `FFI_LOCK`, which is
+//     sufficient in the absence of concurrent main-path forward calls.
+//
+// W6 integration contract:
+//   1. After `mlx_qwen35_moe_init_from_prefill(...)` succeeds for the
+//      current turn, call `init_moe_mtp_compiled_from_main(...)` ONCE
+//      with the same config / max_kv_len.
+//   2. For each draft+verify cycle:
+//      a. Snapshot caches (W3) and main offset.
+//      b. Call `forward_moe_mtp_draft_compiled(...)` D times.
+//      c. Call `forward_moe_mtp_verify_compiled(...)` ONCE.
+//      d. Accept / reject per W4 sampler. On reject, rewind the main
+//         MoE offset via `mlx_qwen35_moe_adjust_offset` AND the MoE MTP
+//         offset via `mlx_qwen35_moe_mtp_compiled_adjust_offset` to
+//         keep the two paths in lock-step.
+//   3. On turn end, call `mlx_qwen35_moe_mtp_compiled_reset()` (FFI).
+// ============================================================================
+
+/// Initialize the MoE MTP compiled path from the main MoE path's
+/// current state.
+///
+/// Must be called AFTER `mlx_qwen35_moe_init_from_prefill`. The MTP
+/// path allocates fresh per-layer KV caches sized to `max_kv_len`
+/// (zeros) — it does NOT seed from the main MoE caches because MTP
+/// draft layers attend to their own draft KV history.
+///
+/// Returns `Ok(())` on success. Returns `Err` on `n_mtp_layers <= 0`,
+/// missing MTP weights, or any C++ exception. On error the MTP state
+/// is left uninitialised and subsequent draft/verify calls become
+/// null-pointer no-ops so the caller can fall back to the eager Rust
+/// MoE MTP forward.
+// W6 (chat-session integration) is the only intended caller; allow
+// the dead-code lint to stay quiet until that wires in.
+#[allow(dead_code)]
+pub(super) fn init_moe_mtp_compiled_from_main(
+    config: &Qwen3_5MoeConfig,
+    max_kv_len: i32,
+) -> Result<()> {
+    use mlx_sys as sys;
+
+    let status = unsafe {
+        sys::mlx_qwen35_moe_mtp_compiled_init_from_main(
+            config.num_layers,
+            config.hidden_size,
+            config.num_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.rope_theta as f32,
+            config.rope_dims(),
+            config.rms_norm_eps as f32,
+            config.full_attention_interval,
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+            config.linear_conv_kernel_dim,
+            if config.tie_word_embeddings { 1 } else { 0 },
+            max_kv_len,
+            1,
+            config.n_mtp_layers,
+            config.num_experts,
+            config.num_experts_per_tok,
+            if config.norm_topk_prob { 1 } else { 0 },
+            config.decoder_sparse_step,
+        )
+    };
+
+    if status != 0 {
+        return Err(Error::from_reason(format!(
+            "init_moe_mtp_compiled_from_main: C++ returned status {status} — \
+             check stderr for diagnostic"
+        )));
+    }
+    Ok(())
+}
+
+/// One MoE MTP draft step on the compiled path.
+///
+/// Inputs are `[1, 1, hidden]` bf16: `prev_hidden` is the post-norm
+/// hidden state from the previous step (or the committed-prefix
+/// hidden on the first step), and `prev_emb` is the embedding of
+/// the previously-committed-or-drafted token (caller picks).
+///
+/// Returns `(h_next, draft_logits)` where `h_next` is `[1, 1, hidden]`
+/// (feed to next draft step's `prev_hidden`) and `draft_logits` is
+/// `[1, vocab]` (sampler input). Mutates the MoE MTP KV caches in
+/// place and advances the MoE MTP offset by 1.
+///
+/// Returns `Err` if the C++ side returns null pointers (init not
+/// done, exception). On `Err` the MTP state is left as-is — the
+/// caller should fall back to the eager Rust MoE MTP forward.
+#[allow(dead_code)] // wired in by W6 chat-session integration
+pub(super) fn forward_moe_mtp_draft_compiled(
+    prev_hidden: &MxArray,
+    prev_emb: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    use mlx_sys as sys;
+
+    let mut h_next_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut logits_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_moe_mtp_draft_compiled(
+            prev_hidden.as_raw_ptr(),
+            prev_emb.as_raw_ptr(),
+            &mut h_next_ptr,
+            &mut logits_ptr,
+        );
+    }
+
+    if h_next_ptr.is_null() || logits_ptr.is_null() {
+        if !h_next_ptr.is_null() {
+            unsafe { sys::mlx_array_delete(h_next_ptr) };
+        }
+        if !logits_ptr.is_null() {
+            unsafe { sys::mlx_array_delete(logits_ptr) };
+        }
+        return Err(Error::from_reason(
+            "forward_moe_mtp_draft_compiled: C++ returned null — check stderr",
+        ));
+    }
+
+    let h_next = MxArray::from_handle(h_next_ptr, "moe_mtp_draft_h_next")?;
+    let logits = MxArray::from_handle(logits_ptr, "moe_mtp_draft_logits")?;
+    Ok((h_next, logits))
+}
+
+/// One MoE MTP verify step on the compiled path.
+///
+/// `input_ids` is `[1, depth+1]` int32 — typically
+/// `[last_committed_id, drafted_tok_0, ..., drafted_tok_{depth-1}]`.
+/// `embedding_weight` is the model's embedding table (or LM head if
+/// `tie_word_embeddings=false`). `depth` must be in `[1, 5]`.
+///
+/// Returns logits of shape `[1, depth+1, vocab]`.
+///
+/// SIDE EFFECTS: advances the MAIN MoE compiled path's offset by
+/// `depth + 1` and writes K/V into the main MoE `g_moe_caches[]` at
+/// the corresponding positions. Production callers (W6 chat-session
+/// loop) MUST already hold `MOE_COMPILED_MUTEX` and the
+/// `COMPILED_WEIGHTS_RWLOCK` read guard so no other turn can race the
+/// offset / cache state during the verify. Tests serialise via
+/// `FFI_LOCK` in the absence of concurrent main-path forward calls —
+/// see `compiled_ffi_tests` in `mtp.rs`.
+#[allow(dead_code)] // wired in by W6 chat-session integration
+pub(super) fn forward_moe_mtp_verify_compiled(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    depth: i32,
+) -> Result<MxArray> {
+    use mlx_sys as sys;
+
+    if !(1..=5).contains(&depth) {
+        return Err(Error::from_reason(format!(
+            "forward_moe_mtp_verify_compiled: depth {depth} outside [1, 5]"
+        )));
+    }
+
+    let mut out_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_moe_mtp_verify_compiled(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            depth,
+            &mut out_ptr,
+        );
+    }
+
+    if out_ptr.is_null() {
+        return Err(Error::from_reason(
+            "forward_moe_mtp_verify_compiled: C++ returned null — check stderr",
+        ));
+    }
+    MxArray::from_handle(out_ptr, "moe_mtp_verify_logits")
+}
+
 /// Block size hard-coded into the compiled C++ paged graph
 /// (`mlx_qwen35_moe.cpp` — see `attn_for_compile_paged` and the
 /// `mlx_qwen35_moe_init_paged` docstring). The Rust adapter supports

@@ -1799,6 +1799,111 @@ unsafe extern "C-unwind" {
     /// Adjust MoE cache offset by delta (for VLM M-RoPE position correction).
     pub fn mlx_qwen35_moe_adjust_offset(delta: i32);
 
+    /// Whether the main MoE compiled path is initialised. Returns 1 if
+    /// `mlx_qwen35_moe_init_from_prefill` has successfully run since the
+    /// last `mlx_qwen35_moe_reset`, 0 otherwise. Used by
+    /// `mlx_qwen35_moe_mtp_compiled_init_from_main` as a precondition.
+    pub fn mlx_qwen35_moe_is_compile_inited() -> i32;
+
+    /// Test-only: forcibly mark the main MoE compiled path as initialised
+    /// (or not) without going through `init_from_prefill`. Production code
+    /// MUST NOT call this — the W5 MoE MTP smoke tests use it to satisfy
+    /// the `is_compile_inited` precondition without standing up a full
+    /// MoE decoder cache.
+    pub fn mlx_qwen35_moe_compiled_test_force_inited(inited: i32);
+
+    // ============================================
+    // W5 — Qwen3.5 MoE MTP (Multi-Token Prediction) compiled
+    // draft + verify graphs. See
+    // `crates/mlx-sys/src/mlx_qwen35_moe_mtp_compiled.cpp` for
+    // implementation. ALL three FFIs MUST be called inside the
+    // same `MOE_COMPILED_MUTEX` critical section as the main MoE
+    // compiled forward — the verify FFI loops the main MoE forward
+    // and mutates `g_moe_caches` / `g_moe_offset_int` in place.
+    // ============================================
+
+    /// Initialize the MoE MTP compiled state. MUST be called once per
+    /// turn AFTER `mlx_qwen35_moe_init_from_prefill`. The MTP path
+    /// allocates its OWN per-layer KV caches sized to `max_kv_len`;
+    /// the main MoE caches are left untouched.
+    ///
+    /// Returns `0` on success, `-1` on failure (n_mtp_layers <= 0,
+    /// main MoE path not inited, MTP weights not registered, exception).
+    /// On `-1` the Rust caller MUST skip the compiled draft/verify path
+    /// and fall back to the eager Rust MoE MTP forward.
+    pub fn mlx_qwen35_moe_mtp_compiled_init_from_main(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_dims: i32,
+        rms_norm_eps: f32,
+        full_attention_interval: i32,
+        linear_num_k_heads: i32,
+        linear_num_v_heads: i32,
+        linear_key_head_dim: i32,
+        linear_value_head_dim: i32,
+        linear_conv_kernel_dim: i32,
+        tie_word_embeddings: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        n_mtp_layers: i32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        norm_topk_prob: i32,
+        decoder_sparse_step: i32,
+    ) -> i32;
+
+    /// One MoE MTP draft step. `prev_hidden` and `prev_emb` are both
+    /// `[1, 1, hidden]` bf16. On success sets `*out_h_next` and
+    /// `*out_logits` to heap-allocated `mlx_array*` (caller owns
+    /// — use `mlx_array_delete`). On failure (init not done, exception)
+    /// both outputs are set to null.
+    ///
+    /// Advances the MoE MTP offset by 1 and mutates the MoE MTP KV
+    /// caches in place. Independent of the main MoE path's offset.
+    pub fn mlx_qwen35_moe_mtp_draft_compiled(
+        prev_hidden: *mut mlx_array,
+        prev_emb: *mut mlx_array,
+        out_h_next: *mut *mut mlx_array,
+        out_logits: *mut *mut mlx_array,
+    );
+
+    /// One MoE MTP verify step on `depth + 1` tokens. `input_ids` is
+    /// `[1, depth+1]` int32, `embedding_weight` is the model's
+    /// embedding (or LM head if untied). `depth` MUST be in `[1, 5]`
+    /// — values outside that range are rejected with a null-pointer
+    /// return and stderr diagnostic.
+    ///
+    /// Sets `*out_logits` to a heap-allocated `[1, depth+1, vocab]`
+    /// array (caller owns) on success, null on failure.
+    ///
+    /// SIDE EFFECTS: advances the MAIN MoE compiled path's offset by
+    /// `depth + 1` and writes K/V into `g_moe_caches[]` at the
+    /// corresponding positions. The caller MUST hold `MOE_COMPILED_MUTEX`
+    /// (NOT `DENSE_COMPILED_MUTEX`) for the entire draft+verify cycle
+    /// to prevent another turn from racing the offset / cache state.
+    pub fn mlx_qwen35_moe_mtp_verify_compiled(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+    );
+
+    /// Tear down MoE MTP compiled state. Idempotent. Does NOT reset
+    /// the main MoE path — call `mlx_qwen35_moe_reset` separately.
+    pub fn mlx_qwen35_moe_mtp_compiled_reset();
+
+    /// Adjust the MoE MTP offset by `delta` (e.g. to rewind after a
+    /// verify-reject rolled back the main MoE path). Mirrors
+    /// `mlx_qwen35_mtp_compiled_adjust_offset` on the dense side.
+    pub fn mlx_qwen35_moe_mtp_compiled_adjust_offset(delta: i32);
+
+    /// Read the current MoE MTP offset (for debugging / tests).
+    pub fn mlx_qwen35_moe_mtp_get_offset() -> i32;
+
     // ============================================
     // Phase 4 piece 1: paged MoE forward (coexists with the flat path).
     //
