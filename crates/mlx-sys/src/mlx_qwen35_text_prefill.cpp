@@ -74,6 +74,17 @@ void mlx_qwen35_text_prefill(
     return;
   }
 
+  // Last-token extraction below assumes B=1. h_flat is laid out batch-major,
+  // and slicing rows [(B*T)-1, B*T) only grabs the last token of the FINAL
+  // batch element, silently dropping batches 0..B-2. Reject B != 1 loudly
+  // until a per-batch gather is wired in.
+  if (batch_size != 1) {
+    fprintf(stderr, "[MLX] mlx_qwen35_text_prefill: batch_size=%d not supported (only B=1)\n", batch_size);
+    fflush(stderr);
+    *output_logits = nullptr;
+    return;
+  }
+
   try {
     auto& inputs_embeds = *reinterpret_cast<array*>(inputs_embeds_ptr);
 
