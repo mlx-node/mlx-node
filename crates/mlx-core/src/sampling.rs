@@ -7,11 +7,12 @@
 // - Top-p (nucleus) sampling
 // - Min-p sampling
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::nn::Activations;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use rand::{Rng, RngExt};
 
 /// Configuration for sampling strategies
 /// ⚡ PERFORMANCE: Made Copy to avoid cloning on every token
@@ -400,6 +401,149 @@ pub(crate) fn sample_and_logprobs(
     let logprobs = MxArray::from_handle(logprobs_handle, "sample_logprobs")?;
 
     Ok((token, logprobs))
+}
+
+/// Speculative-sampling acceptance step (Leviathan-Chen theorem).
+///
+/// `p_target` and `p_draft` are probability distributions of shape `[vocab]`
+/// (softmax already applied; not logits). `draft_id` is the token the
+/// drafter sampled. Returns `(accepted, out_token)`:
+///   - `accepted = true`  ⇒ `out_token == draft_id`. The drafter wins.
+///   - `accepted = false` ⇒ `out_token` is a fresh sample from the residual
+///     distribution `(p_target - p_draft)+ / sum`. The drafter loses and
+///     the verifier's correction is emitted instead.
+///
+/// Ratio is computed in fp32; BF16 underflows on small `q` and breaks
+/// exactness (see MTPLX `sampling.py:143-148`). At T=0 the math
+/// degenerates to `accepted = (argmax(p_target) == draft_id)` — no
+/// separate T=0 branch needed.
+///
+/// The caller-supplied `rng` is consumed for the single `u ~ Uniform(0, 1)`
+/// acceptance coin flip. The residual sample uses MLX's global random state
+/// via the same `categorical` path that `sample()` uses; this matches the
+/// existing sampling contract (one MLX RNG draw per emitted token).
+///
+/// `residual.sum() == 0` (would only happen if `p_target == p_draft`
+/// element-wise after the clip) falls back to `argmax(p_target)`. The
+/// argmax fallback is also exact in that degenerate regime — when both
+/// distributions agree, every rejected draft must have been the argmax
+/// anyway in a T=0 collapse, and emitting argmax remains within the
+/// support of `p_target`.
+pub fn accept_with_residual<R: Rng + ?Sized>(
+    p_target: &MxArray,
+    p_draft: &MxArray,
+    draft_id: i32,
+    rng: &mut R,
+) -> Result<(bool, i32)> {
+    if draft_id < 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual: draft_id must be non-negative, got {}",
+                draft_id
+            ),
+        ));
+    }
+
+    let ndim = p_target.ndim()? as usize;
+    if ndim != 1 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual: p_target must be 1D [vocab], got ndim={}",
+                ndim
+            ),
+        ));
+    }
+    if p_draft.ndim()? as usize != 1 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "accept_with_residual: p_draft must be 1D [vocab]".to_string(),
+        ));
+    }
+    let vocab = p_target.shape_at(0)?;
+    if p_draft.shape_at(0)? != vocab {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual: p_target/p_draft vocab mismatch {} vs {}",
+                vocab,
+                p_draft.shape_at(0)?
+            ),
+        ));
+    }
+    if (draft_id as i64) >= vocab {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual: draft_id {} out of bounds for vocab {}",
+                draft_id, vocab
+            ),
+        ));
+    }
+
+    // fp32 is mandatory — BF16 underflows on small q and breaks exactness.
+    let p_target_f32 = p_target.astype(DType::Float32)?;
+    let p_draft_f32 = p_draft.astype(DType::Float32)?;
+    // `item_at_*` reads `arr.data<T>()[index]` directly, which requires the
+    // underlying buffer to be materialized. Force evaluation before any
+    // scalar extraction.
+    p_target_f32.eval();
+    p_draft_f32.eval();
+
+    let idx = draft_id as usize;
+    let p_t = p_target_f32.item_at_float32(idx)?;
+    let p_d = p_draft_f32.item_at_float32(idx)?;
+
+    // Clamp to 1.0 to handle the (legal) case where the draft underestimates
+    // the target's probability for the drawn token.
+    let p_accept = if p_d <= 0.0 {
+        // Drafter assigned ~zero probability but still sampled `draft_id`.
+        // Accept iff the target also gives it positive mass; otherwise the
+        // draft is impossible under the target and must be rejected.
+        if p_t > 0.0 { 1.0 } else { 0.0 }
+    } else {
+        (p_t / p_d).min(1.0)
+    };
+
+    let u: f64 = rng.random();
+    if u <= f64::from(p_accept) {
+        return Ok((true, draft_id));
+    }
+
+    // Rejected — sample from the residual distribution `(p_target - p_draft)+`.
+    let diff = p_target_f32.sub(&p_draft_f32)?;
+    let residual = diff.clip(Some(0.0), None)?;
+
+    // Compute sum on CPU to detect the zero-mass degenerate case.
+    let total_arr = residual.sum(None, None)?;
+    total_arr.eval();
+    let total = total_arr.item_at_float32(0)?;
+    // NaN-safe: written so a NaN `total` takes the argmax fallback rather
+    // than dividing by NaN and emitting a garbage token.
+    if !total.is_finite() || total <= 0.0 {
+        // residual.sum() == 0 or NaN — both distributions agree element-wise
+        // after the clip, or one of them is non-finite. Fall back to argmax,
+        // which stays within the target's support.
+        let argmax_arr = p_target_f32.argmax(0, None)?;
+        argmax_arr.eval();
+        let argmax = argmax_arr.item_at_int32(0)?;
+        return Ok((false, argmax));
+    }
+
+    let normalized = residual.div_scalar(f64::from(total))?;
+
+    // MLX's `categorical` consumes logits and uses the MLX global RNG.
+    // Convert the normalized residual to log-space; entries where
+    // `residual == 0` map to `-inf` and are excluded from the support.
+    // `categorical` and `argmax` both return uint32 indices in MLX;
+    // `item_at_int32` performs the safe static_cast to the public i32
+    // contract (vocab sizes are far below i32::MAX).
+    let log_probs = normalized.log()?;
+    let sampled = log_probs.categorical(Some(-1))?;
+    sampled.eval();
+    let token = sampled.item_at_int32(0)?;
+    Ok((false, token))
 }
 
 /// Shared context for penalty functions: validates inputs, slices to recent tokens,
@@ -1192,5 +1336,217 @@ mod frequency_penalty_tests {
         assert_close(data[3], 4.0, 1e-5);
         assert_close(data[4], 16.0, 1e-5); // 20.0 - 4.0 = 16.0
         assert_close(data[5], 6.0, 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod accept_with_residual_tests {
+    use super::*;
+    use crate::array::MxArray;
+    use rand::rngs::StdRng;
+    use rand::{SeedableRng, TryRng};
+    use std::convert::Infallible;
+
+    /// Scripted RNG that hands out predetermined `u64` values from a queue
+    /// (smallest-first) and then panics if exhausted. Used to pin the
+    /// `u ~ Uniform(0, 1)` draw inside `accept_with_residual`:
+    ///   - `0` ⇒ `u ≈ 0` (force accept whenever p_accept > 0).
+    ///   - `u64::MAX` ⇒ `u ≈ 1 - ε` (force reject whenever p_accept < 1).
+    struct ScriptedRng {
+        queue: std::collections::VecDeque<u64>,
+    }
+
+    impl ScriptedRng {
+        fn new(values: &[u64]) -> Self {
+            Self {
+                queue: values.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl TryRng for ScriptedRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+            // f64 sampling routes through next_u64, so this branch is only
+            // exercised if a future caller asks for u32. Panic loudly to
+            // catch unintended additional draws during the test.
+            panic!("ScriptedRng::try_next_u32 called — accept_with_residual must only draw u64");
+        }
+
+        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+            Ok(self
+                .queue
+                .pop_front()
+                .expect("ScriptedRng exhausted — accept_with_residual drew more u64 than scripted"))
+        }
+
+        fn try_fill_bytes(&mut self, _dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
+            panic!("ScriptedRng::try_fill_bytes called — unexpected RNG path");
+        }
+    }
+
+    fn one_hot(token: usize, vocab: usize) -> MxArray {
+        let mut data = vec![0.0f32; vocab];
+        data[token] = 1.0;
+        MxArray::from_float32(&data, &[vocab as i64]).expect("from_float32")
+    }
+
+    #[test]
+    fn t0_collapse_argmax_match_accepts() {
+        // p_target = p_draft = one-hot at token 7, draft picked 7.
+        // p_t / p_d = 1.0 ⇒ always accept regardless of u.
+        let vocab = 16;
+        let p_target = one_hot(7, vocab);
+        let p_draft = one_hot(7, vocab);
+
+        // u_64 = u64::MAX still yields u < 1, so accept must fire even at
+        // the upper edge.
+        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let (accepted, out) =
+            accept_with_residual(&p_target, &p_draft, 7, &mut rng).expect("accept_with_residual");
+        assert!(accepted, "T=0 argmax match must accept");
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn t0_collapse_argmax_mismatch_rejects() {
+        // p_target = one-hot at A (=2), p_draft = one-hot at B (=5), drawn B.
+        //   p_t[B] = 0, p_d[B] = 1 ⇒ p_accept = 0.
+        //   residual = max(p_target - p_draft, 0) = one-hot at A.
+        // For rejection we need u > 0. f64 from StandardUniform takes the
+        // top 53 bits of next_u64 (so `next_u64 >> 11`); we need that shift
+        // result to be > 0. Use u64::MAX which yields u ≈ 1 - 2^-53.
+        let vocab = 8;
+        let p_target = one_hot(2, vocab);
+        let p_draft = one_hot(5, vocab);
+
+        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let (accepted, out) =
+            accept_with_residual(&p_target, &p_draft, 5, &mut rng).expect("accept_with_residual");
+        assert!(!accepted, "argmax mismatch must reject");
+        assert_eq!(out, 2, "residual collapses to argmax(p_target)");
+    }
+
+    #[test]
+    fn accept_when_target_dominates() {
+        // Contrived: target gives draft_id (=3) prob 0.6, draft gives 0.2.
+        // Ratio = 3.0, clamped to 1.0 ⇒ always accept.
+        let vocab = 4;
+        // p_target: [0.1, 0.1, 0.2, 0.6]
+        let p_target =
+            MxArray::from_float32(&[0.1f32, 0.1, 0.2, 0.6], &[vocab as i64]).expect("p_target");
+        // p_draft:  [0.3, 0.3, 0.2, 0.2]
+        let p_draft =
+            MxArray::from_float32(&[0.3f32, 0.3, 0.2, 0.2], &[vocab as i64]).expect("p_draft");
+
+        // u ≈ 0 (next_u64 = 0) forces acceptance for any positive p_accept.
+        let mut rng = ScriptedRng::new(&[0]);
+        let (accepted, out) =
+            accept_with_residual(&p_target, &p_draft, 3, &mut rng).expect("accept_with_residual");
+        assert!(accepted, "ratio >= 1 with u → 0 must accept");
+        assert_eq!(out, 3);
+    }
+
+    #[test]
+    fn reject_then_residual_sample() {
+        // Contrived: draft_id = 0 has p_t=0.05, p_d=0.5 ⇒ ratio = 0.1.
+        // u ≈ 1 forces rejection. Residual support = positions where
+        // p_target > p_draft: indices {1, 2, 3}.
+        let vocab = 4;
+        let p_target =
+            MxArray::from_float32(&[0.05f32, 0.40, 0.30, 0.25], &[vocab as i64]).expect("p_target");
+        let p_draft =
+            MxArray::from_float32(&[0.50f32, 0.20, 0.15, 0.15], &[vocab as i64]).expect("p_draft");
+
+        // u ≈ 1 - ε ⇒ reject whenever p_accept < 1. Run multiple trials to
+        // verify the sample always lands in the residual support, since
+        // MLX's categorical uses its own RNG and we can't pin it.
+        let mut rejections = 0;
+        for _ in 0..16 {
+            let mut rng = ScriptedRng::new(&[u64::MAX]);
+            let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &mut rng)
+                .expect("accept_with_residual");
+            assert!(!accepted, "ratio = 0.1 with u → 1 must reject");
+            assert_ne!(
+                out, 0,
+                "rejected sample must NOT be the draft token (residual is 0 there)"
+            );
+            // For each i, residual support requires p_target[i] > p_draft[i].
+            // Positions where p_target <= p_draft: index 0.
+            // So out ∈ {1, 2, 3}.
+            assert!(
+                (1..=3).contains(&out),
+                "sample must land in residual support {{1,2,3}}, got {}",
+                out
+            );
+            rejections += 1;
+        }
+        assert_eq!(rejections, 16);
+    }
+
+    #[test]
+    fn residual_zero_sum_falls_back_to_argmax() {
+        // p_target == p_draft element-wise ⇒ residual is all zeros.
+        // Force rejection (u → 1, p_accept < 1) by picking a draft_id where
+        // p_t = p_d > 0 but ratio is exactly 1.0 — at u = 1 - ε and
+        // p_accept = 1.0, `u <= p_accept` is true ⇒ accepts. So we need a
+        // draft_id where the ratio is strictly less than 1.0.
+        //
+        // Trick: make p_target == p_draft but choose draft_id with p_d > 0.
+        // ratio = 1.0 ⇒ always accept. That's the wrong path for this
+        // test. Instead bake the rejection by giving p_target slightly less
+        // mass at draft_id (so ratio < 1) while keeping the residual
+        // exactly zero everywhere. The only way both holds is if the
+        // difference is *negative* at draft_id and zero everywhere else —
+        // i.e. p_target[draft_id] < p_draft[draft_id] and p_target == p_draft
+        // elsewhere. Then residual = clip(p_t - p_d, min=0) is all zero
+        // (the only nonzero diff is negative at draft_id, clipped away).
+        //
+        // argmax(p_target) ≠ draft_id is the contract requirement.
+        let vocab = 4;
+        // p_target: [0.40, 0.30, 0.20, 0.10] — argmax at 0.
+        // p_draft:  [0.40, 0.30, 0.20, 0.20] — only differs at index 3.
+        // ratio at draft_id=3: 0.10 / 0.20 = 0.5 ⇒ u → 1 rejects.
+        // diff = [0, 0, 0, -0.10]; clip(min=0) = [0, 0, 0, 0]; sum = 0.
+        let p_target =
+            MxArray::from_float32(&[0.40f32, 0.30, 0.20, 0.10], &[vocab as i64]).expect("p_target");
+        let p_draft =
+            MxArray::from_float32(&[0.40f32, 0.30, 0.20, 0.20], &[vocab as i64]).expect("p_draft");
+        let draft_id = 3i32;
+
+        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let (accepted, out) = accept_with_residual(&p_target, &p_draft, draft_id, &mut rng)
+            .expect("accept_with_residual");
+        assert!(!accepted, "ratio = 0.5 with u → 1 must reject");
+        assert_eq!(
+            out, 0,
+            "residual sum = 0 must fall back to argmax(p_target) = 0"
+        );
+    }
+
+    #[test]
+    fn rejects_when_target_zero_at_draft_id() {
+        // Defense in depth: p_d > 0, p_t = 0 ⇒ p_accept = 0 ⇒ reject and
+        // sample from residual which excludes draft_id (p_t=0 there).
+        // Distinct from t0_collapse_argmax_mismatch_rejects because the
+        // distributions are not one-hot — this exercises the dense path
+        // and confirms StdRng (not just the scripted one) works end-to-end.
+        let vocab = 4;
+        let p_target =
+            MxArray::from_float32(&[0.0f32, 0.5, 0.3, 0.2], &[vocab as i64]).expect("p_target");
+        let p_draft =
+            MxArray::from_float32(&[0.4f32, 0.2, 0.2, 0.2], &[vocab as i64]).expect("p_draft");
+
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let (accepted, out) =
+            accept_with_residual(&p_target, &p_draft, 0, &mut rng).expect("accept_with_residual");
+        assert!(!accepted, "p_t = 0 must reject");
+        assert_ne!(out, 0, "residual excludes draft_id where p_t = 0");
+        assert!(
+            (1..=3).contains(&out),
+            "out must be in residual support, got {}",
+            out
+        );
     }
 }
