@@ -8921,6 +8921,7 @@ mod paged_construction_tests {
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
             use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+            n_mtp_layers: 0,
         }
     }
 

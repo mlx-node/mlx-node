@@ -90,6 +90,14 @@ pub struct Qwen3_5MoeConfig {
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,
+
+    /// Number of MTP (Multi-Token Prediction) head layers shipped with
+    /// the checkpoint. Populated from `mtp_num_hidden_layers` /
+    /// `num_nextn_predict_layers` in `config.json`. `0` means the
+    /// checkpoint has no MTP heads and the speculative-decode path is
+    /// unavailable.
+    #[serde(default)]
+    pub n_mtp_layers: i32,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -153,6 +161,7 @@ impl Qwen3_5MoeConfig {
             paged_cache_memory_mb: self.paged_cache_memory_mb,
             paged_block_size: self.paged_block_size,
             use_block_paged_cache: self.use_block_paged_cache,
+            n_mtp_layers: self.n_mtp_layers,
         }
     }
 

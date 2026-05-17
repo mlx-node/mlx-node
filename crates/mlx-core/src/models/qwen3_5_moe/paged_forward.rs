@@ -623,6 +623,7 @@ mod tests {
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
             use_block_paged_cache: Some(true),
+            n_mtp_layers: 0,
         }
     }
 

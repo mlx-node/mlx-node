@@ -133,6 +133,14 @@ fn sanitize_weights(
     });
     let needs_norm_fix = has_mtp_weights || has_unsanitized_conv1d;
 
+    if has_mtp_weights {
+        info!(
+            "Qwen3.5: MTP weights detected in checkpoint (config.n_mtp_layers={}). \
+             Retaining mtp.* keys for the speculative-decode MTP head.",
+            config.n_mtp_layers
+        );
+    }
+
     // FP8 dequantization pass — convert FP8 weights to bf16 before further processing.
     // After all sanitization, FP8 weights are re-quantized to 4-bit affine for memory savings.
     let had_fp8 = params.keys().any(|k| k.ends_with("weight_scale_inv"));
@@ -153,17 +161,13 @@ fn sanitize_weights(
     ];
 
     for (name, array) in params.drain() {
-        // Skip MTP weights
-        if name.contains("mtp.") {
-            continue;
-        }
-
         // Skip visual encoder weights (for VL models)
         if name.contains("model.visual") || name.contains("visual_encoder") {
             continue;
         }
 
-        // Strip prefixes (VL models use model.language_model.*, text-only use model.*)
+        // Strip prefixes (VL models use model.language_model.*, text-only use model.*).
+        // After this, MTP keys land under `mtp.*`, e.g. `mtp.layers.0.input_layernorm.weight`.
         let name = name
             .strip_prefix("model.language_model.")
             .or_else(|| name.strip_prefix("language_model.model."))
@@ -171,6 +175,10 @@ fn sanitize_weights(
             .or_else(|| name.strip_prefix("model."))
             .unwrap_or(&name)
             .to_string();
+
+        // MTP weights are stored in final form (MTPLX convention) — bypass the
+        // +1.0 norm shift and the lm_head/embed_tokens renames below.
+        let is_mtp_weight = name.starts_with("mtp.");
 
         // Rename special keys (including quantization metadata .scales/.biases)
         let name = if let Some(suffix) = name.strip_prefix("embed_tokens.") {
@@ -199,8 +207,12 @@ fn sanitize_weights(
             array
         };
 
-        // Apply norm +1.0 fix for unsanitized weights
-        let array = if needs_norm_fix && norm_suffixes.iter().any(|sfx| name.ends_with(sfx)) {
+        // Apply norm +1.0 fix for unsanitized weights — but NOT to MTP weights,
+        // which are stored in final form (MTPLX convention).
+        let array = if needs_norm_fix
+            && !is_mtp_weight
+            && norm_suffixes.iter().any(|sfx| name.ends_with(sfx))
+        {
             let ndim = array.ndim()?;
             if ndim == 1 {
                 let one = MxArray::scalar_float(1.0)?.astype(array.dtype()?)?;
@@ -1099,6 +1111,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
+        n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
     })
 }
 

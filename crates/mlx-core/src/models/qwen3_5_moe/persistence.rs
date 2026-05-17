@@ -55,6 +55,14 @@ fn sanitize_weights(
     });
     let needs_norm_fix = has_mtp_weights || has_unsanitized_conv1d;
 
+    if has_mtp_weights {
+        info!(
+            "Qwen3.5-MoE: MTP weights detected in checkpoint (config.n_mtp_layers={}). \
+             Retaining mtp.* keys for the speculative-decode MTP head.",
+            config.n_mtp_layers
+        );
+    }
+
     // Detect FP8 source checkpoint before dequantization removes scale_inv keys
     let had_fp8 = params.keys().any(|k| k.ends_with("weight_scale_inv"));
 
@@ -84,9 +92,6 @@ fn sanitize_weights(
     ];
 
     for (name, array) in params.drain() {
-        if name.contains("mtp.") {
-            continue;
-        }
         if name.contains("model.visual") || name.contains("visual_encoder") {
             continue;
         }
@@ -109,6 +114,26 @@ fn sanitize_weights(
         };
 
         if config.tie_word_embeddings && name.starts_with("lm_head.") {
+            continue;
+        }
+
+        // MTP weights bypass expert stacking, gate_up split, down_proj rename,
+        // and the +1.0 norm shift. They are stored in final form (MTPLX
+        // convention) and consumed by the W2 MTP module as-is. Only the
+        // conv1d transpose still applies — defensive, MTP layers reuse the
+        // main DecoderLayer architecture which includes conv1d.
+        if name.starts_with("mtp.") {
+            let array = if name.contains("conv1d.weight") {
+                let shape = array.shape()?;
+                if shape.len() == 3 && shape[2] != 1 {
+                    array.transpose(Some(&[0, 2, 1]))?
+                } else {
+                    array
+                }
+            } else {
+                array
+            };
+            result.insert(name, array);
             continue;
         }
 
@@ -1172,6 +1197,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
+        n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
     })
 }
 
