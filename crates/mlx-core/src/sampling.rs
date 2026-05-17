@@ -425,11 +425,14 @@ pub(crate) fn sample_and_logprobs(
 ///
 /// `residual.sum() == 0` (would only happen if `p_target == p_draft`
 /// element-wise after the clip) falls back to `argmax(p_target)`. The
-/// argmax fallback is also exact in that degenerate regime — when both
-/// distributions agree, every rejected draft must have been the argmax
-/// anyway in a T=0 collapse, and emitting argmax remains within the
-/// support of `p_target`.
-pub fn accept_with_residual<R: Rng + ?Sized>(
+/// argmax fallback stays within `p_target`'s support; an exact correction
+/// is impossible in the degenerate regime where the residual carries no
+/// mass, so we pick the highest-probability target token instead.
+// `pub(crate)`: only W6's `chat_common.rs` speculative-decode loop will
+// call this. W6 hasn't landed yet, so `#[allow(dead_code)]` silences the
+// dead-code lint until the consumer exists.
+#[allow(dead_code)]
+pub(crate) fn accept_with_residual<R: Rng + ?Sized>(
     p_target: &MxArray,
     p_draft: &MxArray,
     draft_id: i32,
@@ -507,7 +510,14 @@ pub fn accept_with_residual<R: Rng + ?Sized>(
     };
 
     let u: f64 = rng.random();
-    if u <= f64::from(p_accept) {
+    // Strict `<` (not `<=`): `rng.random::<f64>()` is in `[0, 1)`, so the
+    // `next_u64() == 0` path yields `u = 0.0` exactly. With `<=`, a
+    // degenerate `p_accept = 0.0` (e.g. `p_target[draft_id] = 0` and
+    // `p_draft[draft_id] > 0`) would accept a token of zero target mass and
+    // break Leviathan-Chen exactness. With `<`, `p_accept = 0` always
+    // rejects because `u >= 0`, and `p_accept = 1` always accepts because
+    // `u < 1`.
+    if u < f64::from(p_accept) {
         return Ok((true, draft_id));
     }
 
@@ -1546,6 +1556,38 @@ mod accept_with_residual_tests {
         assert!(
             (1..=3).contains(&out),
             "out must be in residual support, got {}",
+            out
+        );
+    }
+
+    #[test]
+    fn rejects_when_target_zero_at_draft_id_with_u_zero() {
+        // Regression for the `u <= p_accept` → `u <` fix. `ScriptedRng::new(&[0])`
+        // pins `u = 0.0` exactly (rand's StandardUniform for f64 takes the top
+        // 53 bits of next_u64, so `next_u64 = 0` ⇒ `u = 0.0`). With
+        // `p_target[draft_id] = 0` and `p_draft[draft_id] > 0`, p_accept = 0.0.
+        // Pre-fix, `0.0 <= 0.0` accepted a token of zero target mass, breaking
+        // exactness. Post-fix, `0.0 < 0.0` is false, so we must reject and
+        // resample from the residual (which excludes draft_id).
+        let vocab = 3;
+        let p_target =
+            MxArray::from_float32(&[0.0f32, 0.5, 0.5], &[vocab as i64]).expect("p_target");
+        let p_draft = MxArray::from_float32(&[1.0f32, 0.0, 0.0], &[vocab as i64]).expect("p_draft");
+
+        let mut rng = ScriptedRng::new(&[0]);
+        let (accepted, out) =
+            accept_with_residual(&p_target, &p_draft, 0, &mut rng).expect("accept_with_residual");
+        assert!(
+            !accepted,
+            "p_accept = 0 with u = 0 must reject (strict `<` semantics)"
+        );
+        assert_ne!(
+            out, 0,
+            "rejected sample must NOT land on the zero-mass draft token"
+        );
+        assert!(
+            out == 1 || out == 2,
+            "out must lie in residual support {{1, 2}}, got {}",
             out
         );
     }
