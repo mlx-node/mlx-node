@@ -1500,7 +1500,14 @@ inline AttnPureResult attn_batched_verify_fn(
 //                        new qkv rows were appended.
 //   - recurrent_state:   state after T recurrent advances.
 // =====================================================================
-inline GDNPureResult gdn_batched_verify_fn(
+// Unified `gdn_batched_verify_fn` templated on `WithTape`. When
+// `WithTape=false` returns `GDNPureResult`; when `WithTape=true` returns
+// `GDNPureResultWithTape` carrying the per-step `(tape, k, g, qkv)` of
+// shape `[B, T, ...]`. Mirrors `gdn_pure_fn_impl` but operates on T>=1
+// tokens in a single kernel dispatch.
+template <bool WithTape>
+inline std::conditional_t<WithTape, GDNPureResultWithTape, GDNPureResult>
+gdn_batched_verify_fn_impl(
     const array& x,                  // [B, T, hidden] — 3D
     int layer_idx,
     const array& conv_state,         // [B, kernel-1, conv_dim]
@@ -1538,7 +1545,8 @@ inline GDNPureResult gdn_batched_verify_fn(
             linear_proj(x_flat, pfx + "in_proj_a")};
   }();
 
-  // Re-3D the qkv for conv1d: `[B, T, conv_dim]`.
+  // Re-3D the qkv for conv1d: `[B, T, conv_dim]`. When WithTape, this is
+  // also the tensor recorded for conv-state replay (qkv_tape).
   auto qkv_3d = reshape(qkv, {B, T, conv_dim});
 
   // Conv1d: prepend the pre-verify conv_state, slide the kernel across
@@ -1579,8 +1587,19 @@ inline GDNPureResult gdn_batched_verify_fn(
   auto g_3d = reshape(g_flat, {B, T, cfg.linear_num_v_heads});
 
   // Metal kernel — T advances starting from the CURRENT recurrent state.
-  auto [y, new_recurrent_state] =
-      gated_delta_kernel_call(q, k, v, g_3d, beta_3d, recurrent_state);
+  // Non-tape variant returns (y, recurrent_state); tape variant also
+  // returns `[B, T, Hv, Dv]` fp32 per-step delta tape. `array` has no
+  // default ctor — emit the call inside a constexpr lambda so the
+  // downstream rmsnorm+out_proj graph can be shared.
+  auto kernel_out = [&] {
+    if constexpr (WithTape) {
+      return gated_delta_kernel_with_tape_call(q, k, v, g_3d, beta_3d, recurrent_state);
+    } else {
+      return gated_delta_kernel_call(q, k, v, g_3d, beta_3d, recurrent_state);
+    }
+  }();
+  auto& y                   = std::get<0>(kernel_out);
+  auto& new_recurrent_state = std::get<1>(kernel_out);
 
   // RMSNorm gating — z is [B*T, value_dim], reshape to [B, T, Hv, Dv]
   auto z_h = reshape(z, {B, T, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
@@ -1593,10 +1612,30 @@ inline GDNPureResult gdn_batched_verify_fn(
   auto out_flat = linear_proj(y_flat, pfx + "out_proj");
   auto output = reshape(out_flat, {B, T, hidden});
 
-  return {output, new_conv_state, new_recurrent_state};
+  if constexpr (WithTape) {
+    // k after rmsnorm+scale, g fp32 — captured before the kernel call.
+    return GDNPureResultWithTape{
+        std::move(output), std::move(new_conv_state), std::move(new_recurrent_state),
+        std::move(std::get<2>(kernel_out)), std::move(k), std::move(g_3d), std::move(qkv_3d)};
+  } else {
+    return GDNPureResult{std::move(output), std::move(new_conv_state),
+                         std::move(new_recurrent_state)};
+  }
 }
 
-// =====================================================================
+// Backwards-compatible thin wrappers. Callers continue to use
+// `gdn_batched_verify_fn(...)` / `gdn_batched_verify_fn_with_tape(...)`
+// exactly as before; the actual body lives in
+// `gdn_batched_verify_fn_impl`.
+inline GDNPureResult gdn_batched_verify_fn(
+    const array& x,
+    int layer_idx,
+    const array& conv_state,
+    const array& recurrent_state,
+    const BaseConfig& cfg) {
+  return gdn_batched_verify_fn_impl<false>(x, layer_idx, conv_state, recurrent_state, cfg);
+}
+
 // W6.7 — Tape-recording variant of `gdn_batched_verify_fn`. Identical
 // math; emits per-step `(tape, k, g, qkv)` tensors of shape `[B, T, ...]`
 // directly (no concatenation needed — the Metal tape kernel naturally
@@ -1605,96 +1644,13 @@ inline GDNPureResult gdn_batched_verify_fn(
 // (replacing the prior D+1 `concatenate` appends), and the tape-replay
 // rollback path consumes a `slice([:, 0..accepted_steps, ...])` exactly
 // like before.
-// =====================================================================
 inline GDNPureResultWithTape gdn_batched_verify_fn_with_tape(
-    const array& x,                  // [B, T, hidden]
+    const array& x,
     int layer_idx,
     const array& conv_state,
     const array& recurrent_state,
     const BaseConfig& cfg) {
-  int B = x.shape(0);
-  int T = x.shape(1);
-  int hidden = x.shape(2);
-  int key_dim = cfg.linear_num_k_heads * cfg.linear_key_head_dim;
-  int value_dim = cfg.linear_num_v_heads * cfg.linear_value_head_dim;
-  int conv_dim = key_dim * 2 + value_dim;
-
-  std::string pfx = "layers." + std::to_string(layer_idx) + ".linear_attn.";
-
-  auto x_flat = reshape(x, {B * T, hidden});
-  struct QkvzResult { array qkv, z; };
-  auto [qkv, z] = [&]() -> QkvzResult {
-    if (has_weight(pfx + "in_proj_qkvz.weight")) {
-      auto qkvz = linear_proj(x_flat, pfx + "in_proj_qkvz");
-      return {slice(qkvz, {0, 0}, {B * T, conv_dim}),
-              slice(qkvz, {0, conv_dim}, {B * T, key_dim * 2 + value_dim * 2})};
-    }
-    return {linear_proj(x_flat, pfx + "in_proj_qkv"),
-            linear_proj(x_flat, pfx + "in_proj_z")};
-  }();
-  struct BaResult { array b, a; };
-  auto [b, a] = [&]() -> BaResult {
-    if (has_weight(pfx + "in_proj_ba.weight")) {
-      auto ba = linear_proj(x_flat, pfx + "in_proj_ba");
-      return {slice(ba, {0, 0}, {B * T, cfg.linear_num_v_heads}),
-              slice(ba, {0, cfg.linear_num_v_heads}, {B * T, cfg.linear_num_v_heads * 2})};
-    }
-    return {linear_proj(x_flat, pfx + "in_proj_b"),
-            linear_proj(x_flat, pfx + "in_proj_a")};
-  }();
-
-  auto qkv_3d = reshape(qkv, {B, T, conv_dim});
-  auto qkv_tape = qkv_3d;  // [B, T, conv_dim] — recorded for conv-state replay
-
-  auto conv_input = concatenate({conv_state, qkv_3d}, 1);
-  int keep = cfg.linear_conv_kernel_dim - 1;
-  int total = keep + T;
-  auto new_conv_state = slice(conv_input, {0, total - keep, 0}, {B, total, conv_dim});
-
-  auto conv_w = get_weight(pfx + "conv1d.weight");
-  auto conv_out = mlx::core::conv1d(conv_input, conv_w, 1, 0, 1, conv_dim);
-
-  conv_out = compiled_silu()({conv_out})[0];
-
-  auto q = slice(conv_out, {0, 0, 0},              {B, T, key_dim});
-  auto k = slice(conv_out, {0, 0, key_dim},        {B, T, key_dim * 2});
-  auto v = slice(conv_out, {0, 0, key_dim * 2},    {B, T, conv_dim});
-
-  q = reshape(q, {B, T, cfg.linear_num_k_heads, cfg.linear_key_head_dim});
-  k = reshape(k, {B, T, cfg.linear_num_k_heads, cfg.linear_key_head_dim});
-  v = reshape(v, {B, T, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
-
-  float inv_s = std::pow((float)cfg.linear_key_head_dim, -0.5f);
-  auto q_dt = q.dtype();
-  q = rms_norm_no_weight(q, 1e-6f) * array(inv_s * inv_s, q_dt);
-  k = rms_norm_no_weight(k, 1e-6f) * array(inv_s, q_dt);
-
-  auto beta_3d = reshape(sigmoid(b), {B, T, cfg.linear_num_v_heads});
-  auto a_log = get_weight(pfx + "A_log");
-  auto dt_b  = get_weight(pfx + "dt_bias");
-  auto g_flat = fused_compute_g(a_log, a, dt_b);
-  auto g_3d = reshape(g_flat, {B, T, cfg.linear_num_v_heads});
-
-  // Capture k and g BEFORE the kernel call. Shapes are already `[B, T, ...]`.
-  auto k_tape = k;
-  auto g_tape = g_3d;  // fp32 per `fused_compute_g`
-
-  // Tape-emitting kernel: same dispatch shape as the non-tape kernel; emits
-  // `[B, T, Hv, Dv]` fp32 tape covering all T per-step innovations.
-  auto [y, new_recurrent_state, tape] =
-      gated_delta_kernel_with_tape_call(q, k, v, g_3d, beta_3d, recurrent_state);
-
-  auto z_h = reshape(z, {B, T, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
-  auto nw = get_weight(pfx + "norm.weight");
-  auto y_normed = fast::rms_norm(y, nw, cfg.rms_norm_eps);
-  y_normed = compiled_silu_mul()({z_h, y_normed})[0];
-
-  auto y_flat = reshape(y_normed, {B * T, value_dim});
-  auto out_flat = linear_proj(y_flat, pfx + "out_proj");
-  auto output = reshape(out_flat, {B, T, hidden});
-
-  return {output, new_conv_state, new_recurrent_state,
-          tape, k_tape, g_tape, qkv_tape};
+  return gdn_batched_verify_fn_impl<true>(x, layer_idx, conv_state, recurrent_state, cfg);
 }
 
 }  // namespace qwen35_common
