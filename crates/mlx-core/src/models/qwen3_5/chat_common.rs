@@ -1498,14 +1498,18 @@ macro_rules! decode_loop_mtp {
         // `MTP(prev_hidden=verify_hiddens[K], prev_emb=embed($y)) ->
         // next-next logits`, matching the head's training contract.
         //
-        // Default policy (W6.5 fix): chaining ENABLED. Set
-        // `MLX_MTP_NO_CHAINED_CYCLES=1` to opt out — useful when
-        // bisecting regressions or comparing perf against pre-W6.5
-        // baselines. The earlier scaffolding (commit 7230b8b) shipped
-        // with chaining DISABLED because it exported only verify
-        // position D and partial-accept cycles drafted from the wrong
-        // context; the position-K slice (this commit) restores the
-        // design's ≥0.6× ratio target.
+        // Default policy (W6.5 follow-up): chaining DISABLED until W6.7
+        // lands. The position-K slice (commit 2322841) makes chaining
+        // SEMANTICALLY correct — byte-exact parity at T=0 holds in both
+        // modes — but the per-position hidden capture inside a loop of
+        // D+1 sequential forwards adds graph-evaluation overhead that
+        // scales with D, regressing 0.30× → 0.20× at depth=3 (depth=1 is
+        // a wash). W6.7 collapses the loop into ONE compiled graph
+        // emitting `[1, D+1, hidden]` natively; at that point chaining
+        // becomes profitable and we will flip this default back to ON.
+        //
+        // Set `MLX_MTP_CHAINED_CYCLES=1` to opt INTO chaining for
+        // testing / measurement against the pre-chained baseline.
         //
         // Invariants:
         //   - `None` on the FIRST iteration (no prior verify) — Step A
@@ -1522,7 +1526,7 @@ macro_rules! decode_loop_mtp {
         // `g_compiled_caches` (its upstream) is alive for the rest of
         // the decode loop. See `mlx_qwen35_mtp_verify_compiled_with_hidden`
         // for the C++ lifetime contract.
-        let chained_cycles_enabled: bool = !std::env::var("MLX_MTP_NO_CHAINED_CYCLES")
+        let chained_cycles_enabled: bool = std::env::var("MLX_MTP_CHAINED_CYCLES")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let mut chained_hidden_opt: Option<$crate::array::MxArray> = None;
@@ -1618,10 +1622,12 @@ macro_rules! decode_loop_mtp {
             // needs Step A to forward `$y` so its K/V is committed
             // before we inject the forced token).
             //
-            // Opt-out (`MLX_MTP_NO_CHAINED_CYCLES=1`): always Step A,
-            // matching pre-W6.5 behaviour byte-exact. Useful when
-            // bisecting regressions or comparing perf against the
-            // pre-W6.5 baseline.
+            // Default (`MLX_MTP_CHAINED_CYCLES` unset): always Step A,
+            // matching pre-W6.5 behaviour byte-exact. The chained path
+            // is opt-in via `MLX_MTP_CHAINED_CYCLES=1` until W6.7's
+            // batched-verify graph eliminates the per-cycle per-position
+            // hidden-capture overhead that currently regresses perf at
+            // depth ≥ 2.
             //
             // On the chained path the prior cycle's verify already
             // committed all accepted tokens' K/V, and the next cycle's
