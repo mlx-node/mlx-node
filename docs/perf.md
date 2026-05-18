@@ -60,9 +60,9 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 
 ## MTP speculative decoding
 
-Qwen3.5 / Qwen3.6 MTP (Multi-Token Prediction) speculative decoding adds five
-runtime knobs gating individual optimizations across the W6.5–W6.18 perf
-chain (plus one unconditional warmup hook for verify prewarm). All four
+Qwen3.5 / Qwen3.6 MTP (Multi-Token Prediction) speculative decoding adds six
+runtime knobs gating individual optimizations across the W6.5–W6.19 perf
+chain (plus one unconditional warmup hook for verify prewarm). All five
 env vars are read at most once per process and cached; the truthy
 vocabulary is uniform (`1` / `true` / `on`, case-insensitive, with
 `trim()`). The adaptive-depth knob is a TypeScript `ChatConfig` field
@@ -77,6 +77,7 @@ needs per-session resolution.
 | `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        | Slower than the default Step-A path at depth ≥ 2 even after the W6.5-resume fix batched the `verify_hidden[K]` slice into the next-cycle `async_eval`. The residual ~18% gap on bf16/M3 Max traces to cross-cycle CPU bookkeeping, not the slice DMA. |
 | `MLX_MTP_VERIFY_ASYNC_EVAL`   | OFF     | W6.9       | opt-IN        | Overlaps verify dispatch with the accept loop's CPU-side graph construction. Composes cleanly with all other flags.                                                                        |
 | `MLX_MTP_FUSED_DRAFT`         | OFF     | W6.18      | opt-IN        | Fuses D draft steps into one compile()d graph. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending Step-A bypass follow-up where the infrastructure will pay off. Dense only — MoE always uses the per-step draft loop. |
+| `MLX_MTP_SPARSE_ACCEPT`       | OFF     | W6.19      | opt-IN        | Batched argmax over D+1 verify positions at T=0 with no penalties; collapses D × full-vocab softmax materializations into one .eval(). Falls back to legacy per-position path at T>0 or when sampling penalties are active. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending hardware/model targets where MLX scheduler exposes the sync cost. |
 
 Interactions:
 
@@ -106,7 +107,7 @@ Cross-references:
 - Source of truth (env-var readers + inventory table):
   `crates/mlx-core/src/models/qwen3_5/chat_common.rs` (`mtp_use_tape_replay`,
   `mtp_chained_cycles_enabled`, `mtp_verify_async_eval`,
-  `mtp_fused_draft_enabled`).
+  `mtp_fused_draft_enabled`, `mtp_sparse_accept_enabled`).
 - W6.8 adaptive-depth policy:
   `crates/mlx-core/src/models/qwen3_5/adaptive_depth.rs`.
 - Parity gate harness: `examples/qwen35-mtp-smoke.ts`.

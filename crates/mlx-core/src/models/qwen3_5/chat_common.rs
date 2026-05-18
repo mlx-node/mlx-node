@@ -45,9 +45,9 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 // MTP runtime flag inventory
 // ---------------------------------------------------------------------------
 //
-// The W6.5–W6.9 perf chain added four runtime knobs gating individual
+// The W6.5–W6.19 perf chain added six runtime knobs gating individual
 // optimizations. All are read at most once per process and cached. The
-// truthy vocabulary is uniform across the three env-var flags: trim()
+// truthy vocabulary is uniform across the five env-var flags: trim()
 // + `1` / `true` / `on` (case-insensitive). The adaptive depth knob is
 // surfaced through the TypeScript `ChatConfig.mtpAdaptiveDepth` field
 // rather than an env var because it interacts with the user-set
@@ -61,6 +61,7 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 // | `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        |
 // | `MLX_MTP_VERIFY_ASYNC_EVAL`   | OFF     | W6.9       | opt-IN        |
 // | `MLX_MTP_FUSED_DRAFT`         | OFF     | W6.18      | opt-IN        |
+// | `MLX_MTP_SPARSE_ACCEPT`       | OFF     | W6.19      | opt-IN        |
 //
 // * adaptive defaults ON when `enableMtp=true` and `mtpDepth` is unset;
 //   defaults OFF (pinned) when `mtpDepth` is set explicitly.
@@ -246,19 +247,24 @@ pub(crate) fn mtp_fused_draft_enabled() -> bool {
 //     argmax in one shot without re-applying the penalty per
 //     position.
 //
-// Opt-out: `MLX_MTP_SPARSE_ACCEPT=0` (or `false` / `off`). Default
-// ON because the legacy path's D × full-vocab softmax materializations
-// are pure waste at T=0 (argmax doesn't need probabilities) and the
-// optimization composes cleanly with all other MTP knobs. The env
-// var is read once per process and cached.
+// Opt-IN: `MLX_MTP_SPARSE_ACCEPT=1` (or `true` / `on`). Default OFF
+// because the current smoke target (qwen3.6-27b-nvfp4-mtp, depth=3,
+// M3 Max) shows no measured perf win — the W6.19 bench was 0.547×
+// vs 0.56× baseline AR ratio, well within run-to-run noise. The
+// optimization composes cleanly with all other MTP knobs and is
+// kept opt-in pending hardware/model targets where the MLX
+// scheduler exposes the D × full-vocab softmax materialization
+// cost. Matches the W6.18 polish precedent: perf-neutral knobs are
+// opt-IN so they don't bit-rot the default code path. The env var
+// is read once per process and cached.
 pub(crate) fn mtp_sparse_accept_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("MLX_MTP_SPARSE_ACCEPT") {
         Ok(v) => {
             let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
         }
-        Err(_) => true, // default ON — opt-out gate for diagnostics
+        Err(_) => false, // default OFF — opt-in until a target shows perf win
     })
 }
 
