@@ -66,6 +66,43 @@ pub(crate) fn mtp_use_tape_replay() -> bool {
     })
 }
 
+// W6.9 — Async-prefetch pipeline.
+//
+// Replaces the synchronous `verify_logits.eval()` at the end of
+// `run_mtp_cycle_inner`'s verify step with a single batched
+// `mlx::core::async_eval` over `(verify_logits, verify_hiddens)`. The
+// dispatch is non-blocking, so CPU control flow continues into the
+// accept loop's penalty / softmax / slice graph construction while the
+// GPU is still running the verify command buffer. The first downstream
+// `eval()` (the accept loop's `p_target.eval()`) then implicitly
+// synchronizes — the same overlap pattern DFlash uses with
+// `mx.async_eval(posterior)` at `spec_epoch.py:2069`.
+//
+// This is the scheduler-level realisation of the W6.9 plan's "stash
+// next-cycle draft handle, drain at cycle start" idea. The literal
+// stash-and-drain refactor would require plumbing a pre-built draft
+// graph handle through `run_mtp_cycle_inner` AND mutating
+// `g_mtp_compiled_caches` BEFORE the accept loop knows K — both
+// architecturally invasive AND only safe in the opt-in
+// `MLX_MTP_CHAINED_CYCLES` path (default off). The async_eval pipeline
+// captures the same overlap-with-CPU-graph-construction win without
+// touching the FFI surface, the `MtpOps` closures, or the cycle
+// state machine.
+//
+// Opt-in: `MLX_MTP_PREFETCH=1` (or `true`). Default OFF until the
+// parity gates have shipped a couple of releases. The env var is read
+// once per process and cached.
+pub(crate) fn mtp_async_prefetch() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_PREFETCH") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false, // default OFF — flip in a follow-up after parity proven
+    })
+}
+
 /// Hash raw image bytes to a u64 key for cache lookup.
 fn hash_image_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -1314,10 +1351,40 @@ where
     // `verify_hiddens[:, K, :]` — the correct prediction context for
     // the next cycle's first MTP draft.
     let (verify_logits, verify_hiddens) = (ops.verify_step)(&verify_in, embedding_weight, depth)?;
-    // We materialize logits now so per-position slicing reads from a
-    // CPU-resident buffer for penalty application. The hiddens ride
-    // on the same compiled graph; we only eval the K-th slice below.
-    verify_logits.eval();
+    // W6.9 — Async-prefetch pipeline. When `MLX_MTP_PREFETCH=1`, we
+    // dispatch verify (logits + hiddens) via `async_eval` instead of
+    // the synchronous `eval()` below. The kernel launch returns
+    // immediately, letting the CPU construct the accept loop's
+    // penalty / softmax / slice graph while the verify command buffer
+    // is still executing on the GPU. The first downstream `eval()`
+    // (the accept loop's `p_target.eval()` at the per-position softmax)
+    // syncs on completion — the same overlap pattern DFlash applies in
+    // `spec_epoch.py:2069`'s `mx.async_eval(posterior)`.
+    //
+    // We batch `verify_hiddens` into the same async_eval call so MLX's
+    // scheduler can fuse it with the verify logits graph (they share
+    // the per-position `final_norm` outputs). Only the post-accept
+    // `verify_hiddens[:, K, :]` slice is actually realised on-device
+    // by the chained-cycle path; for the default Step-A path the
+    // batch eval is still cheap (one extra command-buffer entry).
+    //
+    // When the env var is OFF (default), behaviour is byte-identical
+    // to pre-W6.9 — `verify_logits.eval()` blocks until verify is
+    // done before the accept loop's softmax graph is built.
+    if mtp_async_prefetch() {
+        tracing::debug!(
+            target: "mlx_core::mtp::prefetch",
+            depth = depth,
+            "W6.9 async_eval(verify_logits, verify_hiddens)"
+        );
+        MxArray::async_eval_arrays(&[&verify_logits, &verify_hiddens]);
+    } else {
+        // We materialize logits now so per-position slicing reads
+        // from a CPU-resident buffer for penalty application. The
+        // hiddens ride on the same compiled graph; we only eval the
+        // K-th slice below.
+        verify_logits.eval();
+    }
     let vocab = verify_logits.shape_at(2)?;
 
     // Step 3: per-position accept/reject. Build extended history as
