@@ -1702,6 +1702,13 @@ impl Qwen35MoeInner {
                             logits.eval();
                         }
                     },
+                    // W6.5-resume — MoE twin: fold the chained
+                    // `verify_hidden[K]` slice into the same async_eval
+                    // dispatch as the post-cycle token + (optional) MoE
+                    // caches. See the dense site for the full rationale.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
+                    },
                     // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
                     // and re-anchor MTP offset to the main MoE path's
                     // current offset before each draft cycle. See the
@@ -3826,6 +3833,13 @@ impl Qwen35MoeInner {
                             logits.eval();
                         }
                     },
+                    // W6.5-resume — MoE twin: fold the chained
+                    // `verify_hidden[K]` slice into the same async_eval
+                    // dispatch as the post-cycle token + (optional) MoE
+                    // caches. See the dense site for the full rationale.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
+                    },
                     // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
                     // and re-anchor MTP offset to the main MoE path's
                     // current offset before each draft cycle. See the
@@ -4486,6 +4500,13 @@ impl Qwen35MoeInner {
                         if budget_forced {
                             logits.eval();
                         }
+                    },
+                    // W6.5-resume — MoE twin: fold the chained
+                    // `verify_hidden[K]` slice into the same async_eval
+                    // dispatch as the post-cycle token + (optional) MoE
+                    // caches. See the dense site for the full rationale.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
                     },
                     // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
                     // and re-anchor MTP offset to the main MoE path's
@@ -5269,6 +5290,13 @@ impl Qwen35MoeInner {
                         if budget_forced {
                             logits.eval();
                         }
+                    },
+                    // W6.5-resume — MoE twin: fold the chained
+                    // `verify_hidden[K]` slice into the same async_eval
+                    // dispatch as the post-cycle token + (optional) MoE
+                    // caches. See the dense site for the full rationale.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
                     },
                     // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
                     // and re-anchor MTP offset to the main MoE path's
@@ -8078,6 +8106,20 @@ fn forward_moe_cpp(input_ids: &MxArray, embedding_weight: &MxArray) -> Result<Mx
 fn eval_token_and_moe_caches(next_token: &MxArray) {
     unsafe {
         mlx_sys::mlx_qwen35_moe_eval_token_and_caches(next_token.as_raw_ptr());
+    }
+}
+
+/// W6.5-resume (MoE twin) — evaluate `next_token`, the chained
+/// `verify_hidden[K]` slice, and (when `MLX_EVAL_ALL_CACHES` is set)
+/// the MoE compiled caches in a SINGLE `async_eval` batch. Mirrors
+/// `eval_token_caches_and_chained_hidden` on the dense side; see the
+/// dense doc comment for the full rationale.
+fn eval_token_moe_caches_and_chained_hidden(next_token: &MxArray, chained_hidden: &MxArray) {
+    unsafe {
+        mlx_sys::mlx_qwen35_moe_eval_token_caches_and_extra(
+            next_token.as_raw_ptr(),
+            chained_hidden.as_raw_ptr(),
+        );
     }
 }
 

@@ -2453,6 +2453,18 @@ impl Qwen35Inner {
                             logits.eval();
                         }
                     },
+                    // W6.5-resume — fold the chained `verify_hidden[K]`
+                    // slice into the same async_eval batch as the
+                    // post-cycle token + compiled caches. See the comment
+                    // block at the chained-end-of-iteration call in
+                    // `decode_loop_mtp!` (chat_common.rs) for why this
+                    // matters: without it the slice stays lazy across
+                    // the iteration boundary and the next cycle's draft
+                    // graph build forces a Metal roundtrip the Step-A
+                    // bypass doesn't pay.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_caches_and_chained_hidden(token, chained_hidden);
+                    },
                     // W6 Bug #2 fix (Option Reset): reset MTP K/V and
                     // re-anchor MTP offset to the main path's current
                     // offset before each draft cycle. Without this the
@@ -4642,6 +4654,18 @@ impl Qwen35Inner {
                             logits.eval();
                         }
                     },
+                    // W6.5-resume — fold the chained `verify_hidden[K]`
+                    // slice into the same async_eval batch as the
+                    // post-cycle token + compiled caches. See the comment
+                    // block at the chained-end-of-iteration call in
+                    // `decode_loop_mtp!` (chat_common.rs) for why this
+                    // matters: without it the slice stays lazy across
+                    // the iteration boundary and the next cycle's draft
+                    // graph build forces a Metal roundtrip the Step-A
+                    // bypass doesn't pay.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_caches_and_chained_hidden(token, chained_hidden);
+                    },
                     // W6 Bug #2 fix (Option Reset): reset MTP K/V and
                     // re-anchor MTP offset to the main path's current
                     // offset before each draft cycle. Without this the
@@ -5393,6 +5417,18 @@ impl Qwen35Inner {
                         if budget_forced {
                             logits.eval();
                         }
+                    },
+                    // W6.5-resume — fold the chained `verify_hidden[K]`
+                    // slice into the same async_eval batch as the
+                    // post-cycle token + compiled caches. See the comment
+                    // block at the chained-end-of-iteration call in
+                    // `decode_loop_mtp!` (chat_common.rs) for why this
+                    // matters: without it the slice stays lazy across
+                    // the iteration boundary and the next cycle's draft
+                    // graph build forces a Metal roundtrip the Step-A
+                    // bypass doesn't pay.
+                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
+                        eval_token_caches_and_chained_hidden(token, chained_hidden);
                     },
                     // W6 Bug #2 fix (Option Reset): reset MTP K/V and
                     // re-anchor MTP offset to the main path's current
@@ -8134,6 +8170,26 @@ fn forward_compiled(input_ids: &MxArray, embedding_weight: &MxArray) -> Result<M
 fn eval_token_and_compiled_caches(next_token: &MxArray) {
     unsafe {
         mlx_sys::mlx_qwen35_eval_token_and_compiled_caches(next_token.as_raw_ptr());
+    }
+}
+
+/// W6.5-resume — evaluate `next_token`, the `chained_hidden` slice, and
+/// all compiled cache arrays in a SINGLE `async_eval` batch. Used by the
+/// chained-cycles MTP path at end-of-iteration so the chained
+/// `verify_hidden[K]` slice becomes a sibling of the next-cycle draft's
+/// first inputs — mirroring the Step-A bypass's fused
+/// `(logits, hidden)` dispatch and eliminating the mid-cycle Metal
+/// command-buffer roundtrip the lazy slice would otherwise force when
+/// the next cycle's draft graph reads `prev_hidden`.
+///
+/// `chained_hidden` is `[1, 1, hidden]` bf16 — the `verify_hiddens[:, K, :]`
+/// slice produced by `run_mtp_cycle_inner`.
+fn eval_token_caches_and_chained_hidden(next_token: &MxArray, chained_hidden: &MxArray) {
+    unsafe {
+        mlx_sys::mlx_qwen35_eval_token_caches_and_extra(
+            next_token.as_raw_ptr(),
+            chained_hidden.as_raw_ptr(),
+        );
     }
 }
 

@@ -1453,6 +1453,20 @@ unsafe extern "C-unwind" {
     /// Eval next_token and all compiled cache arrays to prevent graph accumulation.
     pub fn mlx_qwen35_eval_token_and_compiled_caches(next_token: *mut mlx_array);
 
+    /// W6.5-resume — eval `next_token`, an extra array, and all compiled
+    /// cache arrays in ONE `async_eval` batch. Used by the chained-cycles
+    /// MTP path to fuse the `verify_hidden[K]` slice eval with the
+    /// next-cycle first-draft inputs, eliminating the mid-cycle Metal
+    /// command-buffer roundtrip that the Step-A bypass avoids by
+    /// producing `hidden` and `token` as siblings of a single fused eval.
+    ///
+    /// `extra` MAY be null, in which case behaviour is identical to
+    /// `mlx_qwen35_eval_token_and_compiled_caches`.
+    pub fn mlx_qwen35_eval_token_caches_and_extra(
+        next_token: *mut mlx_array,
+        extra: *mut mlx_array,
+    );
+
     /// Adjust the compiled offset by delta (for VLM rope_deltas).
     pub fn mlx_qwen35_compiled_adjust_offset(delta: i32);
 
@@ -1900,6 +1914,18 @@ unsafe extern "C-unwind" {
 
     /// Eval next_token and all MoE cache arrays to prevent graph accumulation.
     pub fn mlx_qwen35_moe_eval_token_and_caches(next_token: *mut mlx_array);
+
+    /// W6.5-resume — MoE twin of `mlx_qwen35_eval_token_caches_and_extra`.
+    /// Folds an extra array into the same `async_eval` dispatch as the
+    /// next token (and, when `MLX_EVAL_ALL_CACHES` is set, the full MoE
+    /// cache vector). Used by the chained-cycles MTP path to fuse the
+    /// `verify_hidden[K]` slice with the next-cycle draft eval.
+    ///
+    /// `extra` MAY be null.
+    pub fn mlx_qwen35_moe_eval_token_caches_and_extra(
+        next_token: *mut mlx_array,
+        extra: *mut mlx_array,
+    );
 
     /// Reset MoE state.
     pub fn mlx_qwen35_moe_reset();

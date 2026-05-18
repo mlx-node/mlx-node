@@ -1071,6 +1071,43 @@ void mlx_qwen35_eval_token_and_compiled_caches(mlx_array* next_token_ptr) {
   }
 }
 
+// W6.5-resume — same async_eval batch as
+// `mlx_qwen35_eval_token_and_compiled_caches` but also folds an
+// arbitrary `extra` array into the dispatch. Used by the chained-cycles
+// MTP path (`MLX_MTP_CHAINED_CYCLES=1`) at end-of-iteration to fuse the
+// `verify_hidden[K]` slice eval with the next cycle's first draft
+// inputs. Without this, the slice stays lazy until the next-cycle
+// draft graph is built — at which point materializing it forces a
+// mid-cycle Metal command-buffer roundtrip on the chained path that
+// the Step-A bypass doesn't pay (because Step A produces `hidden` and
+// `token` as siblings of a single fused eval).
+//
+// `extra_ptr` MAY be null, in which case behaviour is identical to
+// `mlx_qwen35_eval_token_and_compiled_caches`. Logging guards against
+// silent misuse on the no-extra path.
+void mlx_qwen35_eval_token_caches_and_extra(
+    mlx_array* next_token_ptr, mlx_array* extra_ptr) {
+  try {
+    std::vector<array> to_eval;
+    to_eval.reserve(2 + g_compiled_caches.size());
+    to_eval.push_back(*reinterpret_cast<array*>(next_token_ptr));
+    if (extra_ptr) {
+      to_eval.push_back(*reinterpret_cast<array*>(extra_ptr));
+    }
+    for (const auto& c : g_compiled_caches) {
+      to_eval.push_back(c);
+    }
+    mlx::core::async_eval(std::move(to_eval));
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in eval_token_caches_and_extra: %s\n", e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in eval_token_caches_and_extra\n");
+    fflush(stderr);
+  }
+}
+
 void mlx_qwen35_compiled_adjust_offset(int delta) {
   g_offset_int += delta;
   g_compiled_offset = array(g_offset_int, mlx::core::int32);

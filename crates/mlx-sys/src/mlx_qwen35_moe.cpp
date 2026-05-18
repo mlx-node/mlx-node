@@ -1352,6 +1352,53 @@ void mlx_qwen35_moe_eval_token_and_caches(mlx_array* next_token_ptr) {
   }
 }
 
+// W6.5-resume — same as `mlx_qwen35_moe_eval_token_and_caches` but
+// also folds an arbitrary `extra` array into the async_eval dispatch.
+// Used by the chained-cycles MTP path on the MoE twin to fuse the
+// `verify_hidden[K]` slice with the next-cycle draft eval. Mirrors
+// `mlx_qwen35_eval_token_caches_and_extra` on the dense side; see
+// that comment block for the full rationale.
+//
+// Honours `MLX_EVAL_ALL_CACHES` for parity with the non-chained
+// helper: when set, the dispatch batches token + extra + all MoE
+// caches; when unset, only token + extra (matching the default
+// behaviour that token-only eval implicitly drains the compiled
+// graph). `extra_ptr` MAY be null.
+void mlx_qwen35_moe_eval_token_caches_and_extra(
+    mlx_array* next_token_ptr, mlx_array* extra_ptr) {
+  try {
+    static bool eval_all = std::getenv("MLX_EVAL_ALL_CACHES") != nullptr;
+    if (eval_all) {
+      std::vector<array> to_eval;
+      to_eval.reserve(2 + g_moe_caches.size());
+      to_eval.push_back(*reinterpret_cast<array*>(next_token_ptr));
+      if (extra_ptr) {
+        to_eval.push_back(*reinterpret_cast<array*>(extra_ptr));
+      }
+      for (const auto& c : g_moe_caches) {
+        to_eval.push_back(c);
+      }
+      mlx::core::async_eval(std::move(to_eval));
+    } else {
+      if (extra_ptr) {
+        mlx::core::async_eval({*reinterpret_cast<array*>(next_token_ptr),
+                               *reinterpret_cast<array*>(extra_ptr)});
+      } else {
+        mlx::core::async_eval({*reinterpret_cast<array*>(next_token_ptr)});
+      }
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in mlx_qwen35_moe_eval_token_caches_and_extra: %s\n",
+            e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_moe_eval_token_caches_and_extra\n");
+    fflush(stderr);
+  }
+}
+
 // Reset MoE state — clears BOTH the legacy flat globals AND the
 // Phase 4 piece 1 paged globals. Keeping these symmetric is required
 // because `mlx_qwen35_moe_init_paged` flips `g_paged_inited` to true

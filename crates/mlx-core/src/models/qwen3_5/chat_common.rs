@@ -147,13 +147,17 @@ pub(crate) fn mtp_verify_async_eval() -> bool {
 
 // W6.5 — Chained cycles via verify-hidden export.
 //
-// Opt-in: `MLX_MTP_CHAINED_CYCLES=1` (or `true` / `on`). Default OFF
-// because the chained verify_hidden[K] slice currently forces an extra
-// command-buffer roundtrip per cycle on the default Step-A bypass,
-// regressing 0.30× → 0.20× at depth=3 (the W6.5-resume follow-up will
-// fold the slice eval into the next cycle's draft graph and let this
-// default flip back to ON). The env var is read once per process and
-// cached.
+// Opt-in: `MLX_MTP_CHAINED_CYCLES=1` (or `true` / `on`). The W6.5-resume
+// follow-up fused the chained `verify_hidden[K]` slice into the same
+// `async_eval` batch as `(token, g_compiled_caches)` at end-of-iteration
+// (see `eval_step_with_chained_hidden` in `MtpOps`) so the slice becomes
+// a sibling of the next-cycle draft's first inputs rather than a late
+// dependency materialized inside the draft graph build. Whether the
+// default flips back to ON depends on the smoke benchmark — see the
+// commit log for the per-run measurement and the `mtp_speculative_decoding`
+// memory page for the running absolute-ratio history.
+//
+// The env var is read once per process and cached.
 pub(crate) fn mtp_chained_cycles_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("MLX_MTP_CHAINED_CYCLES") {
@@ -161,7 +165,7 @@ pub(crate) fn mtp_chained_cycles_enabled() -> bool {
             let v = v.trim();
             v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
         }
-        Err(_) => false, // default OFF
+        Err(_) => false, // default OFF — will flip post-resume benchmark
     })
 }
 
@@ -1278,7 +1282,7 @@ pub(crate) use decode_loop;
 ///             reaches `snapshot_offset + K`.
 ///        On full-accept the macro skips this hook (verify already
 ///        left the linear state advanced through all D drafts).
-pub(crate) struct MtpOps<F, D, V, R, E, B, S, RR>
+pub(crate) struct MtpOps<F, D, V, R, E, EX, B, S, RR>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
@@ -1294,6 +1298,21 @@ where
     V: FnMut(&MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>,
     R: FnMut(usize, usize),
     E: Fn(&MxArray, &MxArray, bool),
+    // W6.5-resume — same shape as `eval_step` but folds the chained
+    // `verify_hidden[K]` slice into the SAME `async_eval` batch as
+    // `(token, g_compiled_caches)`. Used by the chained-cycles macro
+    // path at end-of-iteration so the slice is co-materialized with
+    // the next cycle's first-draft input sources, eliminating the
+    // mid-cycle Metal command-buffer roundtrip the lazy path forces.
+    //
+    // Contract: `token` is the just-set `$y` (CPU-only integer array
+    // of the last accepted token); `chained_hidden` is the lazy
+    // `verify_hiddens[:, K, :]` slice the prior cycle produced. The
+    // closure MUST schedule `async_eval` (or equivalent) over the
+    // dense / MoE compiled caches PLUS both arrays so the slice
+    // becomes a sibling of the next-cycle draft graph rather than a
+    // late dependency.
+    EX: Fn(&MxArray, &MxArray),
     B: FnMut(),
     S: FnMut(),
     RR: FnMut(&[u32], &MxArray) -> Result<()>,
@@ -1303,6 +1322,7 @@ where
     pub verify_step: V,
     pub rollback: R,
     pub eval_step: E,
+    pub eval_step_with_chained_hidden: EX,
     pub begin_cycle: B,
     pub snapshot_main_linear: S,
     pub restore_and_replay_main: RR,
@@ -1335,8 +1355,8 @@ pub(crate) struct MtpCycleOutcome {
 /// is the caller's problem; production callers fold the cycle inside
 /// `DENSE_COMPILED_MUTEX` so a `?` early-return drops the
 /// `CompiledResetGuard` and wipes the C++ state cleanly.
-pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, B, S, RR>(
-    ops: &mut MtpOps<F, D, V, R, E, B, S, RR>,
+pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, EX, B, S, RR>(
+    ops: &mut MtpOps<F, D, V, R, E, EX, B, S, RR>,
     prev_hidden_in: MxArray,
     prev_emb_in: MxArray,
     last_committed_id: u32,
@@ -1352,6 +1372,7 @@ where
     V: FnMut(&MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>,
     R: FnMut(usize, usize),
     E: Fn(&MxArray, &MxArray, bool),
+    EX: Fn(&MxArray, &MxArray),
     B: FnMut(),
     S: FnMut(),
     RR: FnMut(&[u32], &MxArray) -> Result<()>,
@@ -2145,22 +2166,41 @@ macro_rules! decode_loop_mtp {
             let last = *outcome.tokens.last().expect("at least one accepted") as i32;
             $y = $crate::array::MxArray::from_int32(&[last], &[1])?;
 
-            // W6.5 — when chaining IS enabled, flush the main path's
-            // KV-cache lazy graph BEFORE the next cycle starts. On the
-            // Step-A path this is redundant: Step A's `eval_step` call
-            // at the top of the NEXT iteration handles it. On the
-            // chained path we'd otherwise extend the cache lazy chain
-            // by D+1 ops per layer per cycle, with no flush at all,
-            // and decode tok/s drifts down over the run.
+            // W6.5-resume — when chaining IS enabled, flush the main
+            // path's KV-cache lazy graph BEFORE the next cycle starts
+            // AND fuse the chained `verify_hidden[K]` slice into the
+            // SAME `async_eval` batch as `(token, g_compiled_caches)`.
             //
-            // We pass `$y` (the integer-token array of the just-set
-            // last accepted token) as the `token` arg — the C++ helper
-            // does `async_eval({token} ++ g_compiled_caches)`, so the
-            // token arg only piggybacks the cache-flush batch. The
-            // `logits` arg is NOT evaluated when `budget_forced=false`.
+            // PRIOR (post-W6.5, pre-resume): we called the plain
+            // `eval_step($y, h, false)` here. That helper does
+            // `async_eval({$y} ++ g_compiled_caches)` and IGNORES `h`
+            // (it only evals the logits arg when `budget_forced=true`).
+            // So the chained hidden stayed LAZY across the iteration
+            // boundary — when the next cycle's `(ops.draft_step)(...)`
+            // built its graph against `prev_hidden = chained_hidden`,
+            // materializing the slice forced a mid-cycle Metal
+            // command-buffer roundtrip that the Step-A bypass doesn't
+            // pay (because Step A's `forward_with_hidden` returns
+            // `(logits, hidden)` as siblings of the same compiled
+            // forward and the macro's `eval_step` co-schedules them
+            // via `next_token → logits → hidden` dependency).
+            //
+            // The new helper `eval_step_with_chained_hidden` extends
+            // the same dispatch to include the slice — so it becomes a
+            // sibling of `(token, caches)`, the kernel scheduler can
+            // overlap its materialization with the next cycle's draft
+            // graph construction, and the chained path stops paying
+            // the per-cycle roundtrip.
+            //
+            // On the Step-A path this whole branch is dead anyway:
+            // Step A's `eval_step` call at the top of the NEXT
+            // iteration handles the cache flush, and there is no
+            // chained hidden to fold. The branch is only entered when
+            // `chained_cycles_enabled=true` AND `chained_hidden_opt`
+            // is `Some(...)`.
             if chained_cycles_enabled {
                 if let Some(ref h) = chained_hidden_opt {
-                    ($mtp.eval_step)(&$y, h, /*budget_forced=*/ false);
+                    ($mtp.eval_step_with_chained_hidden)(&$y, h);
                 }
             }
             $profiler.step();
@@ -2502,6 +2542,7 @@ mod mtp_cycle_tests {
                 *rollback_seen.borrow_mut() = Some((a, d));
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+            eval_step_with_chained_hidden: |_t: &MxArray, _h: &MxArray| {},
             begin_cycle: || {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
@@ -2566,6 +2607,7 @@ mod mtp_cycle_tests {
                 *rollback_seen.borrow_mut() = Some((a, d));
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+            eval_step_with_chained_hidden: |_t: &MxArray, _h: &MxArray| {},
             begin_cycle: || {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
@@ -2623,6 +2665,7 @@ mod mtp_cycle_tests {
                 *rollback_seen.borrow_mut() = Some((a, d));
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+            eval_step_with_chained_hidden: |_t: &MxArray, _h: &MxArray| {},
             begin_cycle: || {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
@@ -2698,6 +2741,7 @@ mod mtp_cycle_tests {
                 *rollback_seen.borrow_mut() = Some((a, d));
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+            eval_step_with_chained_hidden: |_t: &MxArray, _h: &MxArray| {},
             begin_cycle: || {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
