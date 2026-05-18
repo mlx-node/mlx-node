@@ -40,6 +40,7 @@
 
 #include "mlx_qwen35_common.h"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -313,6 +314,19 @@ constexpr int MAX_VERIFY_DEPTH = 5;
 using VerifyFn = std::function<std::vector<array>(
     const array&, const array&)>;
 static std::array<VerifyFn, MAX_VERIFY_DEPTH> g_verify_compiled_by_depth{};
+
+// W6.7 follow-up #3 — Reset-aware once-flag for the prewarm path.
+//
+// `mlx_qwen35_mtp_compiled_prewarm_verify` must run AT MOST ONCE per
+// process (the heavy `mlx::core::compile` work is ~1.5s and reusing the
+// cached compile is just a few cycles per call), BUT it must run again
+// after `mlx_qwen35_mtp_compiled_reset` clears `g_verify_compiled_by_depth`.
+//
+// A plain `std::once_flag` would prevent the re-run (and we'd silently
+// fall back to lazy-per-depth construction on the first verify of each
+// depth — a perf regression on reset+re-init paths). Use an atomic bool
+// so the reset hook can flip it back to `false`.
+static std::atomic<bool> g_prewarm_done{false};
 
 // W6.7 — Build a verify closure for a fixed depth. Captures NO per-call
 // state. The closure expects `input_ids` of shape `[1, depth+1]` and the
@@ -813,10 +827,16 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden(
 // W6.7 follow-up #2 — `init_mtp_compiled_from_main` runs once PER TURN,
 // not once per process, so wiring the prewarm there would re-run the
 // 10 dummy verifies on every turn and burn ~1.5s of TTFT per turn. Gate
-// the body behind `std::call_once` so the heavy work fires exactly once
-// per process — on the FIRST turn (after MTP init has set up
+// the body behind a once-flag so the heavy work fires exactly once per
+// process — on the FIRST turn (after MTP init has set up
 // `g_compile_inited` and `g_compiled_caches`). Subsequent turns hit the
 // already-flipped flag and return immediately.
+//
+// W6.7 follow-up #3 — The flag is `std::atomic<bool>` rather than
+// `std::once_flag`: `mlx_qwen35_mtp_compiled_reset` resets the per-depth
+// closure table, so the prewarm flag MUST be resettable too — otherwise
+// a reset+re-init cycle would leave `g_verify_compiled_by_depth` null and
+// silently fall back to lazy-per-depth construction.
 //
 // No-op if MTP is uninitialised. Best-effort: any failure inside the
 // underlying prewarm is logged + swallowed and the verify path simply
@@ -826,34 +846,40 @@ void mlx_qwen35_mtp_compiled_prewarm_verify() {
   if (!g_mtp_compile_inited) {
     return;
   }
-  static std::once_flag prewarm_once;
-  std::call_once(prewarm_once, []() {
-    // Step 1: populate the per-depth closures so first-use of each depth
-    // doesn't allocate inside the verify call.
-    try {
-      for (int d = 1; d <= MAX_VERIFY_DEPTH; d++) {
-        auto& slot = g_verify_compiled_by_depth[d - 1];
-        if (!slot) {
-          slot = make_verify_fn(d);
-        }
+  // W6.7 follow-up #3 — Atomic-bool gate (reset-aware) replaces
+  // `std::once_flag`. CAS-flipping `false -> true` is the entry permit;
+  // `mlx_qwen35_mtp_compiled_reset` flips it back to `false`. Caller is
+  // serialised on `DENSE_COMPILED_MUTEX` (Rust-side), but using an atomic
+  // keeps the check correct under any future relaxation of that contract.
+  bool expected = false;
+  if (!g_prewarm_done.compare_exchange_strong(expected, true)) {
+    return;
+  }
+  // Step 1: populate the per-depth closures so first-use of each depth
+  // doesn't allocate inside the verify call.
+  try {
+    for (int d = 1; d <= MAX_VERIFY_DEPTH; d++) {
+      auto& slot = g_verify_compiled_by_depth[d - 1];
+      if (!slot) {
+        slot = make_verify_fn(d);
       }
-    } catch (const std::exception& e) {
-      fprintf(stderr,
-              "[MLX] mlx_qwen35_mtp_compiled_prewarm_verify: closure "
-              "population failed: %s\n", e.what());
-      fflush(stderr);
-      // Continue — the MLX-level prewarm below is still worth attempting.
-    } catch (...) {
-      fprintf(stderr,
-              "[MLX] mlx_qwen35_mtp_compiled_prewarm_verify: unknown "
-              "exception during closure population\n");
-      fflush(stderr);
     }
-    // Step 2: force the heavy `mlx::core::compile` to run NOW (10 traces:
-    // depths {1..5} × {WithTape=false, WithTape=true}). Snapshot/restore
-    // of main-path state is handled inside that function.
-    mlx_qwen35_prewarm_verify_compiled();
-  });
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_mtp_compiled_prewarm_verify: closure "
+            "population failed: %s\n", e.what());
+    fflush(stderr);
+    // Continue — the MLX-level prewarm below is still worth attempting.
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_mtp_compiled_prewarm_verify: unknown "
+            "exception during closure population\n");
+    fflush(stderr);
+  }
+  // Step 2: force the heavy `mlx::core::compile` to run NOW (10 traces:
+  // depths {1..5} × {WithTape=false, WithTape=true}). Snapshot/restore
+  // of main-path state is handled inside that function.
+  mlx_qwen35_prewarm_verify_compiled();
 }
 
 // -----------------------------------------------------------------------------
@@ -869,6 +895,11 @@ void mlx_qwen35_mtp_compiled_reset() {
   for (auto& slot : g_verify_compiled_by_depth) {
     slot = nullptr;
   }
+  // W6.7 follow-up #3 — Re-arm the prewarm gate so a subsequent re-init
+  // can repopulate `g_verify_compiled_by_depth` via the prewarm path
+  // (otherwise the closures stay null and every first-of-depth verify
+  // pays the per-depth closure construction cost).
+  g_prewarm_done.store(false);
 }
 
 // -----------------------------------------------------------------------------

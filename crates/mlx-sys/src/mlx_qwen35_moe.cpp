@@ -1179,8 +1179,20 @@ void mlx_qwen35_moe_forward_batched_verify(
       fflush(stderr);
       return;
     }
-    *out_logits  = reinterpret_cast<mlx_array*>(new array(outputs[0]));
-    *out_hiddens = reinterpret_cast<mlx_array*>(new array(outputs[2]));
+    // Stage allocations into locals first: if `new array(...)` throws on
+    // the SECOND call (`std::bad_alloc` under OOM) we'd otherwise leak the
+    // first heap `array` already written to `*out_logits`. Only commit to
+    // the out-pointers after both allocations succeed.
+    array* logits_alloc  = new array(outputs[0]);
+    array* hiddens_alloc = nullptr;
+    try {
+      hiddens_alloc = new array(outputs[2]);
+    } catch (...) {
+      delete logits_alloc;
+      throw;
+    }
+    *out_logits  = reinterpret_cast<mlx_array*>(logits_alloc);
+    *out_hiddens = reinterpret_cast<mlx_array*>(hiddens_alloc);
 
     for (int i = 0; i < cfg.num_layers * 2; i++) {
       g_moe_caches[i] = outputs[3 + i];

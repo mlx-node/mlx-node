@@ -51,6 +51,7 @@
 
 #include "mlx_qwen35_common.h"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -602,6 +603,15 @@ using VerifyFn = std::function<std::vector<array>(
     const array&, const array&)>;
 static std::array<VerifyFn, MAX_VERIFY_DEPTH> g_verify_compiled_by_depth{};
 
+// W6.7 follow-up #3 — Reset-aware once-flag for the MoE prewarm path.
+// Mirrors the dense MTP file (`mlx_qwen35_mtp_compiled.cpp`); see the
+// comment there for the full rationale. TL;DR: `std::once_flag` cannot be
+// reset, so a `mlx_qwen35_moe_mtp_compiled_reset` + re-init would leave
+// `g_verify_compiled_by_depth` null and force lazy-per-depth construction
+// on every first verify. An atomic-bool gate lets the reset hook re-arm
+// the prewarm.
+static std::atomic<bool> g_prewarm_done{false};
+
 // W6.7 — Dispatch to the new batched MoE verify FFI (one compiled
 // forward over T = depth+1 tokens) and surface
 // `{logits[1, T, vocab], hiddens[1, T, hidden]}`. See the dense MTP
@@ -987,10 +997,14 @@ void mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
 // for MoE) so this prewarms 5 shapes total instead of 10.
 //
 // W6.7 follow-up #2 — `init_moe_mtp_compiled_from_main` runs once PER
-// TURN, not once per process. Gate the body behind `std::call_once` so
-// the heavy work fires exactly once per process — on the FIRST turn
-// (after MoE MTP init has set up the global state). Subsequent turns
+// TURN, not once per process. Gate the body behind a once-flag so the
+// heavy work fires exactly once per process — on the FIRST turn (after
+// MoE MTP init has set up the global state). Subsequent turns
 // short-circuit immediately.
+//
+// W6.7 follow-up #3 — The flag is `std::atomic<bool>` rather than
+// `std::once_flag` so `mlx_qwen35_moe_mtp_compiled_reset` can re-arm it.
+// See the dense MTP file for the full rationale.
 //
 // Best-effort: any failure is logged + swallowed, leaving the verify
 // path to fall back to lazy-at-first-use.
@@ -999,28 +1013,31 @@ void mlx_qwen35_moe_mtp_compiled_prewarm_verify() {
   if (!g_mtp_compile_inited) {
     return;
   }
-  static std::once_flag prewarm_once;
-  std::call_once(prewarm_once, []() {
-    try {
-      for (int d = 1; d <= MAX_VERIFY_DEPTH; d++) {
-        auto& slot = g_verify_compiled_by_depth[d - 1];
-        if (!slot) {
-          slot = make_verify_fn(d);
-        }
+  // W6.7 follow-up #3 — Atomic-bool gate (reset-aware) replaces
+  // `std::once_flag`. See the dense MTP file for the rationale.
+  bool expected = false;
+  if (!g_prewarm_done.compare_exchange_strong(expected, true)) {
+    return;
+  }
+  try {
+    for (int d = 1; d <= MAX_VERIFY_DEPTH; d++) {
+      auto& slot = g_verify_compiled_by_depth[d - 1];
+      if (!slot) {
+        slot = make_verify_fn(d);
       }
-    } catch (const std::exception& e) {
-      fprintf(stderr,
-              "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: closure "
-              "population failed: %s\n", e.what());
-      fflush(stderr);
-    } catch (...) {
-      fprintf(stderr,
-              "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: unknown "
-              "exception during closure population\n");
-      fflush(stderr);
     }
-    mlx_qwen35_moe_prewarm_verify_compiled();
-  });
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: closure "
+            "population failed: %s\n", e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: unknown "
+            "exception during closure population\n");
+    fflush(stderr);
+  }
+  mlx_qwen35_moe_prewarm_verify_compiled();
 }
 
 // -----------------------------------------------------------------------------
@@ -1038,6 +1055,9 @@ void mlx_qwen35_moe_mtp_compiled_reset() {
   for (auto& slot : g_verify_compiled_by_depth) {
     slot = nullptr;
   }
+  // W6.7 follow-up #3 — Re-arm the prewarm gate so a subsequent re-init
+  // can repopulate `g_verify_compiled_by_depth` via the prewarm path.
+  g_prewarm_done.store(false);
 }
 
 // -----------------------------------------------------------------------------
