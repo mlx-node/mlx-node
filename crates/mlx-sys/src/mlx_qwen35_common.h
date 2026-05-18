@@ -473,10 +473,151 @@ inline std::pair<array, array> gated_delta_kernel_call(
 }
 
 // =====================================================================
+// W6.6 — Tape-emitting GDN kernel for MTP rollback. Mirrors the standard
+// gated-delta kernel but emits the per-step innovation `delta` as a
+// third output (`tape`, fp32, shape `[B, T, Hv, Dv]`). The MTP verify
+// path records `(tape, k, g, qkv)` per layer during the D+1 verify
+// forward; on rollback the tape-replay kernel applies the first
+// `accepted_steps` innovations to the pre-verify snapshot state without
+// re-running the main model forward.
+//
+// See `metal/gated_delta_step_tape.metal.inc` for the kernel source
+// (ported verbatim from DFlash `_gated_delta_tape_kernel`).
+// =====================================================================
+
+inline std::unique_ptr<mlx::core::fast::CustomKernelFunction>& qwen35_gd_tape_kernel() {
+  static std::unique_ptr<mlx::core::fast::CustomKernelFunction> instance;
+  return instance;
+}
+
+inline void ensure_gated_delta_tape_kernel() {
+  std::lock_guard<std::mutex> lock(qwen35_kernel_mutex());
+  if (qwen35_gd_tape_kernel()) return;
+
+  static const char* source =
+    #include "metal/gated_delta_step_tape.metal.inc"
+  ;
+
+  auto kernel = fast::metal_kernel(
+      "gated_delta_step_tape",
+      {"q", "k", "v", "g", "beta", "state_in", "T"},
+      {"y", "state_out", "innovation_tape"},
+      source
+  );
+  qwen35_gd_tape_kernel() = std::make_unique<mlx::core::fast::CustomKernelFunction>(std::move(kernel));
+}
+
+// Returns (y, state_out, tape). `tape` is fp32, shape `[B, T, Hv, Dv]`.
+inline std::tuple<array, array, array> gated_delta_kernel_with_tape_call(
+    const array& q, const array& k, const array& v,
+    const array& g, const array& beta_arr,
+    const array& state) {
+  ensure_gated_delta_tape_kernel();
+
+  int B = q.shape(0);
+  int T = q.shape(1);
+  int Hk = q.shape(2);
+  int Dk = q.shape(3);
+  int Hv = v.shape(2);
+  int Dv = v.shape(3);
+  auto input_type = q.dtype();
+  auto T_arr = array(T, mlx::core::int32);
+
+  auto results = (*qwen35_gd_tape_kernel())(
+      {q, k, v, g, beta_arr, state, T_arr},
+      {Shape{B, T, Hv, Dv}, state.shape(), Shape{B, T, Hv, Dv}},
+      {input_type, input_type, mlx::core::float32},
+      std::make_tuple(32, Dv, B * Hv),
+      std::make_tuple(32, 4, 1),
+      {{"InT", input_type}, {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
+      std::nullopt, false,
+      mlx::core::default_stream(mlx::core::Device::gpu)
+  );
+
+  return std::tuple<array, array, array>(
+      std::move(results[0]), std::move(results[1]), std::move(results[2]));
+}
+
+// =====================================================================
+// W6.6 — Tape-replay kernel. Takes a snapshot `state`, plus per-step
+// `(tape, k, g)` recorded by the tape-emitting forward kernel, and
+// returns a new state advanced by `T` steps. The recurrent_state output
+// matches what `T` calls to `gated_delta_kernel_call` with the same
+// per-step inputs would have produced (modulo the per-step InT
+// round-trip the forward path takes between FFI calls in our verify
+// loop — see `metal/tape_replay.metal.inc` header for details).
+//
+// `tape.shape == [B, T, Hv, Dv]` (fp32)
+// `k.shape    == [B, T, Hk, Dk]` (model dtype)
+// `g.shape    == [B, T, Hv]` (fp32)
+// `state.shape == [B, Hv, Dv, Dk]` (model dtype)
+// =====================================================================
+
+inline std::unique_ptr<mlx::core::fast::CustomKernelFunction>& qwen35_tape_replay_kernel() {
+  static std::unique_ptr<mlx::core::fast::CustomKernelFunction> instance;
+  return instance;
+}
+
+inline void ensure_tape_replay_kernel() {
+  std::lock_guard<std::mutex> lock(qwen35_kernel_mutex());
+  if (qwen35_tape_replay_kernel()) return;
+
+  static const char* source =
+    #include "metal/tape_replay.metal.inc"
+  ;
+
+  auto kernel = fast::metal_kernel(
+      "tape_replay",
+      {"tape", "k", "g", "state_in", "T"},
+      {"state_out"},
+      source
+  );
+  qwen35_tape_replay_kernel() = std::make_unique<mlx::core::fast::CustomKernelFunction>(std::move(kernel));
+}
+
+inline array tape_replay_kernel_call(
+    const array& tape, const array& k, const array& g,
+    const array& state) {
+  ensure_tape_replay_kernel();
+
+  int B = k.shape(0);
+  int T = k.shape(1);
+  int Hk = k.shape(2);
+  int Dk = k.shape(3);
+  int Hv = tape.shape(2);
+  int Dv = tape.shape(3);
+  auto input_type = state.dtype();
+  auto T_arr = array(T, mlx::core::int32);
+
+  auto results = (*qwen35_tape_replay_kernel())(
+      {tape, k, g, state, T_arr},
+      {state.shape()},
+      {input_type},
+      std::make_tuple(32, Dv, B * Hv),
+      std::make_tuple(32, 4, 1),
+      {{"InT", input_type}, {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
+      std::nullopt, false,
+      mlx::core::default_stream(mlx::core::Device::gpu)
+  );
+
+  return std::move(results[0]);
+}
+
+// =====================================================================
 // Pure GDN forward (shared between dense compiled and MoE non-compiled)
 // =====================================================================
 
 struct GDNPureResult { array output, conv_state, recurrent_state; };
+
+// W6.6 — extended GDN result that also returns the per-step `(tape, k, g,
+// qkv)` tensors needed by the rollback tape-replay path. `tape` is fp32
+// `[B, 1, Hv, Dv]`, `k` is `[B, 1, Hk, Dk]` (model dtype), `g` is
+// `[B, 1, Hv]` (fp32), `qkv` is `[B, 1, conv_dim]` (model dtype — the
+// pre-conv qkv projection before the depthwise-conv state advance).
+struct GDNPureResultWithTape {
+  array output, conv_state, recurrent_state;
+  array tape, k_tape, g_tape, qkv_tape;
+};
 
 inline GDNPureResult gdn_pure_fn(
     const array& x,              // [B, hidden] — 2D
@@ -566,6 +707,106 @@ inline GDNPureResult gdn_pure_fn(
   auto output = linear_proj(y_flat, pfx + "out_proj");
 
   return {output, new_conv_state, new_recurrent_state};
+}
+
+// =====================================================================
+// W6.6 — Tape-recording variant of `gdn_pure_fn`. Identical math; the
+// only difference is the underlying Metal kernel call returns the
+// per-step `tape` innovation, and we also surface `(k, g, qkv)` for the
+// tape-replay rollback to consume. Used by the dense and MoE main
+// forwards during MTP verify cycles when tape-replay is enabled.
+//
+// Returns `GDNPureResultWithTape` so the caller threads the extra
+// outputs through its compiled-graph output vector (MoE) or stashes
+// them into per-layer accumulator globals (dense flat path).
+// =====================================================================
+inline GDNPureResultWithTape gdn_pure_fn_with_tape(
+    const array& x,
+    int layer_idx,
+    const array& conv_state,
+    const array& recurrent_state,
+    const BaseConfig& cfg) {
+  int B = x.shape(0);
+  int key_dim = cfg.linear_num_k_heads * cfg.linear_key_head_dim;
+  int value_dim = cfg.linear_num_v_heads * cfg.linear_value_head_dim;
+  int conv_dim = key_dim * 2 + value_dim;
+
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".linear_attn.";
+
+  struct QkvzResult { array qkv, z; };
+  auto [qkv, z] = [&]() -> QkvzResult {
+    if (has_weight(pfx + "in_proj_qkvz.weight")) {
+      auto qkvz = linear_proj(x, pfx + "in_proj_qkvz");
+      return {slice(qkvz, {0, 0}, {B, conv_dim}),
+              slice(qkvz, {0, conv_dim}, {B, key_dim * 2 + value_dim * 2})};
+    }
+    return {linear_proj(x, pfx + "in_proj_qkv"),
+            linear_proj(x, pfx + "in_proj_z")};
+  }();
+  struct BaResult { array b, a; };
+  auto [b, a] = [&]() -> BaResult {
+    if (has_weight(pfx + "in_proj_ba.weight")) {
+      auto ba = linear_proj(x, pfx + "in_proj_ba");
+      return {slice(ba, {0, 0}, {B, cfg.linear_num_v_heads}),
+              slice(ba, {0, cfg.linear_num_v_heads}, {B, cfg.linear_num_v_heads * 2})};
+    }
+    return {linear_proj(x, pfx + "in_proj_b"),
+            linear_proj(x, pfx + "in_proj_a")};
+  }();
+
+  // Reshape qkv to 3D for conv1d — also the tensor we record for conv-state replay.
+  auto qkv_3d = reshape(qkv, {B, 1, conv_dim});
+  auto qkv_tape = qkv_3d;  // recorded per-step for conv-state replay
+
+  auto conv_input = concatenate({conv_state, qkv_3d}, 1);
+
+  int total_len = cfg.linear_conv_kernel_dim;
+  int keep = cfg.linear_conv_kernel_dim - 1;
+  auto new_conv_state = slice(conv_input, {0, total_len - keep, 0}, {B, total_len, conv_dim});
+
+  auto conv_w = get_weight(pfx + "conv1d.weight");
+  auto conv_out = mlx::core::conv1d(conv_input, conv_w, 1, 0, 1, conv_dim);
+
+  conv_out = compiled_silu()({conv_out})[0];
+
+  auto q = slice(conv_out, {0, 0, 0},              {B, 1, key_dim});
+  auto k = slice(conv_out, {0, 0, key_dim},        {B, 1, key_dim * 2});
+  auto v = slice(conv_out, {0, 0, key_dim * 2},    {B, 1, conv_dim});
+
+  q = reshape(q, {B, 1, cfg.linear_num_k_heads, cfg.linear_key_head_dim});
+  k = reshape(k, {B, 1, cfg.linear_num_k_heads, cfg.linear_key_head_dim});
+  v = reshape(v, {B, 1, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
+
+  float inv_s = std::pow((float)cfg.linear_key_head_dim, -0.5f);
+  auto q_dt = q.dtype();
+  q = rms_norm_no_weight(q, 1e-6f) * array(inv_s * inv_s, q_dt);
+  k = rms_norm_no_weight(k, 1e-6f) * array(inv_s, q_dt);
+
+  auto beta_3d = reshape(sigmoid(b), {B, 1, cfg.linear_num_v_heads});
+  auto a_log  = get_weight(pfx + "A_log");
+  auto dt_b   = get_weight(pfx + "dt_bias");
+  auto g_3d = reshape(fused_compute_g(a_log, a, dt_b), {B, 1, cfg.linear_num_v_heads});
+
+  // Capture k and g BEFORE the kernel call — these are the per-step
+  // tensors the replay kernel consumes (k after rmsnorm+scale, g in fp32).
+  auto k_tape = k;
+  auto g_tape = g_3d;  // fp32 per `fused_compute_g`
+
+  // Tape-emitting kernel: returns y, new_recurrent_state, AND the
+  // per-step delta `tape` (shape [B, 1, Hv, Dv] fp32).
+  auto [y, new_recurrent_state, tape] =
+      gated_delta_kernel_with_tape_call(q, k, v, g_3d, beta_3d, recurrent_state);
+
+  auto z_h = reshape(z, {B, 1, cfg.linear_num_v_heads, cfg.linear_value_head_dim});
+  auto nw = get_weight(pfx + "norm.weight");
+  auto y_normed = fast::rms_norm(y, nw, cfg.rms_norm_eps);
+  y_normed = compiled_silu_mul()({z_h, y_normed})[0];
+
+  auto y_flat = reshape(y_normed, {B, value_dim});
+  auto output = linear_proj(y_flat, pfx + "out_proj");
+
+  return {output, new_conv_state, new_recurrent_state,
+          tape, k_tape, g_tape, qkv_tape};
 }
 
 // =====================================================================

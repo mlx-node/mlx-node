@@ -71,6 +71,46 @@ static std::vector<array> g_compiled_linear_snapshot;
 static int g_linear_snapshot_offset = 0;
 static bool g_linear_snapshot_taken = false;
 
+// W6.6 — Tape-replay rollback infrastructure.
+//
+// When `g_tape_recording_armed == true`, `qwen35_decode_fn` routes
+// linear-attention layers through `gdn_pure_fn_with_tape` (which calls
+// the tape-emitting Metal kernel) and appends the per-step
+// `(tape, k, g, qkv)` tensors into the per-layer accumulators below.
+// After the MTP verify loop's D+1 forwards, each accumulator holds a
+// `[B, D+1, ...]` tensor recording every per-step innovation. On
+// rollback the replay kernel applies the first `accepted_steps` of
+// those innovations to the pre-verify snapshot state — replacing the
+// K+1 main-model forwards the old Bug #4 rollback ran.
+//
+// Layout (each vector has `num_layers` slots; full-attention slots hold
+// placeholders so per-layer indexing stays uniform):
+//   - g_gdn_tape_acc[i]:        [B, accumulated_steps, Hv, Dv]  fp32
+//   - g_gdn_k_tape_acc[i]:      [B, accumulated_steps, Hk, Dk]  model dtype
+//   - g_gdn_g_tape_acc[i]:      [B, accumulated_steps, Hv]      fp32
+//   - g_gdn_qkv_tape_acc[i]:    [B, accumulated_steps, conv_dim] model dtype
+//
+// Lifecycle:
+//   - `mlx_qwen35_compiled_tape_arm()` clears the accumulators and sets
+//     the recording flag. Called by `decode_loop_mtp!` right BEFORE the
+//     verify FFI runs its D+1 sequential forwards (when tape-replay is
+//     ENABLED — env var `MLX_MTP_USE_TAPE_REPLAY != "0"`).
+//   - Each `qwen35_decode_fn` step appends one slice to each layer's
+//     accumulator via `concatenate` along axis 1.
+//   - `mlx_qwen35_compiled_tape_replay(accepted_steps)` consumes the
+//     first `accepted_steps` slices to restore the snapshot state, then
+//     clears the accumulators.
+//   - `mlx_qwen35_compiled_tape_disarm()` is idempotent (called on the
+//     happy path AFTER full-accept since no replay is needed; matches
+//     the K+1 path's "discard snapshot" semantics).
+//
+// Cleared by `mlx_qwen35_compiled_reset`.
+static bool g_tape_recording_armed = false;
+static std::vector<std::optional<array>> g_gdn_tape_acc;    // [num_layers]
+static std::vector<std::optional<array>> g_gdn_k_tape_acc;  // [num_layers]
+static std::vector<std::optional<array>> g_gdn_g_tape_acc;  // [num_layers]
+static std::vector<std::optional<array>> g_gdn_qkv_tape_acc;// [num_layers]
+
 // =====================================================================
 // Phase 5 piece 1: paged-decode globals.
 //
@@ -142,10 +182,35 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
     if (is_linear) {
       const auto& cs = inputs[2 + i * 2];
       const auto& rs = inputs[2 + i * 2 + 1];
-      auto res = gdn_pure_fn(normed, i, cs, rs, cfg);
-      layer_out = std::move(res.output);
-      new_caches[i * 2]     = std::move(res.conv_state);
-      new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+      if (g_tape_recording_armed) {
+        // W6.6 — emit tape during MTP verify forwards so the rollback
+        // path can replay only the accepted prefix instead of re-running
+        // the main model. The math is identical to `gdn_pure_fn`; the
+        // extra outputs are appended into per-layer accumulators along
+        // the time axis so after the D+1 verify-loop iterations each
+        // accumulator holds the full per-step record.
+        auto res = gdn_pure_fn_with_tape(normed, i, cs, rs, cfg);
+        layer_out = std::move(res.output);
+        new_caches[i * 2]     = std::move(res.conv_state);
+        new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+
+        auto append = [](std::optional<array>& slot, const array& step) {
+          if (!slot.has_value()) {
+            slot = step;
+          } else {
+            slot = concatenate({*slot, step}, 1);
+          }
+        };
+        append(g_gdn_tape_acc[i],     res.tape);
+        append(g_gdn_k_tape_acc[i],   res.k_tape);
+        append(g_gdn_g_tape_acc[i],   res.g_tape);
+        append(g_gdn_qkv_tape_acc[i], res.qkv_tape);
+      } else {
+        auto res = gdn_pure_fn(normed, i, cs, rs, cfg);
+        layer_out = std::move(res.output);
+        new_caches[i * 2]     = std::move(res.conv_state);
+        new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+      }
     } else {
       const auto& kk = inputs[2 + i * 2];
       const auto& kv = inputs[2 + i * 2 + 1];
@@ -411,6 +476,15 @@ void mlx_qwen35_compiled_init_from_prefill(
     g_offset_int = prefill_offset;
     g_compile_inited = true;
 
+    // W6.6 — size the per-layer tape accumulator vectors. They remain
+    // empty (each slot is `std::nullopt`) until `mlx_qwen35_compiled_tape_arm`
+    // is called and `qwen35_decode_fn` records the first step.
+    g_gdn_tape_acc.assign(num_layers, std::nullopt);
+    g_gdn_k_tape_acc.assign(num_layers, std::nullopt);
+    g_gdn_g_tape_acc.assign(num_layers, std::nullopt);
+    g_gdn_qkv_tape_acc.assign(num_layers, std::nullopt);
+    g_tape_recording_armed = false;
+
     // Break the lazy RNG split chain from model initialization.
     auto rng_key = mlx::core::random::KeySequence::default_().next();
     mlx::core::eval({rng_key});
@@ -571,6 +645,178 @@ void mlx_qwen35_compiled_restore_linear_caches() {
   }
 }
 
+// W6.6 — Arm tape recording. After this call, `qwen35_decode_fn` routes
+// linear-attention layers through `gdn_pure_fn_with_tape` and appends
+// the per-step `(tape, k, g, qkv)` tensors into the per-layer
+// accumulator vectors. Must be called BEFORE the MTP verify FFI's D+1
+// sequential forwards. Idempotent — clearing accumulators is safe to
+// repeat. No-op if `g_compile_inited` is false.
+//
+// The companion `_snapshot_linear_caches` is still required (the
+// rollback path uses the snapshot as the starting state for the replay
+// kernel). This call only turns on tape recording; the snapshot lives
+// in `g_compiled_linear_snapshot`.
+void mlx_qwen35_compiled_tape_arm() {
+  if (!g_compile_inited) {
+    g_tape_recording_armed = false;
+    return;
+  }
+  const auto& cfg = g_compile_config;
+  g_gdn_tape_acc.assign(cfg.num_layers, std::nullopt);
+  g_gdn_k_tape_acc.assign(cfg.num_layers, std::nullopt);
+  g_gdn_g_tape_acc.assign(cfg.num_layers, std::nullopt);
+  g_gdn_qkv_tape_acc.assign(cfg.num_layers, std::nullopt);
+  g_tape_recording_armed = true;
+}
+
+// W6.6 — Disarm tape recording and drop accumulators. Called on the
+// happy path (full-accept needs no replay) and after a successful
+// replay. Idempotent.
+void mlx_qwen35_compiled_tape_disarm() {
+  g_tape_recording_armed = false;
+  // Drop refcounts so the lazy MLX graphs can be released. The vectors
+  // stay sized so a subsequent arm doesn't have to re-allocate.
+  for (auto& slot : g_gdn_tape_acc)     slot.reset();
+  for (auto& slot : g_gdn_k_tape_acc)   slot.reset();
+  for (auto& slot : g_gdn_g_tape_acc)   slot.reset();
+  for (auto& slot : g_gdn_qkv_tape_acc) slot.reset();
+}
+
+// W6.6 — Restore the GDN linear-attention recurrent + conv states by
+// applying the first `accepted_steps` recorded innovations to the
+// pre-verify snapshot, then advance the decode offset to
+// `snapshot_offset + accepted_steps`.
+//
+// This REPLACES the K+1 main-model forwards the old Bug #4 rollback
+// path ran (`restore_linear_caches` + K `mlx_qwen35_forward_compiled`
+// calls). After this call:
+//   - g_compiled_caches[i*2]   == conv_state at "snapshot + accepted_steps innovations"
+//   - g_compiled_caches[i*2+1] == recurrent_state at "snapshot + accepted_steps innovations"
+//   - g_offset_int             == g_linear_snapshot_offset + accepted_steps
+//
+// Note: `accepted_steps` here is `K + 1` in the MTP cycle terminology
+// (the verify processes `last_committed_id + K accepted drafts` =
+// `K + 1` tokens that survive). The caller computes this from
+// `accepted_drafts + 1` and passes it as `accepted_steps`.
+//
+// Preconditions:
+//   - `_snapshot_linear_caches` has been called for this cycle.
+//   - `_tape_arm` has been called and the D+1 verify forwards have all
+//     recorded into the accumulators.
+//   - `1 <= accepted_steps <= recorded_steps`.
+//
+// On any precondition violation logs to stderr and leaves state
+// untouched (the caller can fall back to the K+1 path on the next
+// rollback). Always disarms recording afterward (success or failure)
+// so a stale armed flag can't leak across cycles.
+void mlx_qwen35_compiled_tape_replay(int accepted_steps) {
+  if (!g_compile_inited) {
+    g_tape_recording_armed = false;
+    return;
+  }
+  if (!g_linear_snapshot_taken) {
+    fprintf(stderr,
+            "[MLX] tape_replay: snapshot not taken — falling back\n");
+    fflush(stderr);
+    mlx_qwen35_compiled_tape_disarm();
+    return;
+  }
+  if (accepted_steps <= 0) {
+    fprintf(stderr,
+            "[MLX] tape_replay: accepted_steps=%d must be > 0\n",
+            accepted_steps);
+    fflush(stderr);
+    mlx_qwen35_compiled_tape_disarm();
+    return;
+  }
+  const auto& cfg = g_compile_config;
+  try {
+    int keep = cfg.linear_conv_kernel_dim - 1;
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (!is_linear) continue;
+      if (!g_gdn_tape_acc[i].has_value() || !g_gdn_k_tape_acc[i].has_value() ||
+          !g_gdn_g_tape_acc[i].has_value() || !g_gdn_qkv_tape_acc[i].has_value()) {
+        fprintf(stderr,
+                "[MLX] tape_replay: layer %d has empty accumulator — "
+                "did the verify forwards record? Falling back.\n", i);
+        fflush(stderr);
+        mlx_qwen35_compiled_tape_disarm();
+        return;
+      }
+      auto& tape_full = *g_gdn_tape_acc[i];
+      auto& k_full    = *g_gdn_k_tape_acc[i];
+      auto& g_full    = *g_gdn_g_tape_acc[i];
+      auto& qkv_full  = *g_gdn_qkv_tape_acc[i];
+
+      int recorded = tape_full.shape(1);
+      if (accepted_steps > recorded) {
+        fprintf(stderr,
+                "[MLX] tape_replay: accepted_steps=%d > recorded=%d "
+                "(layer %d). Falling back.\n", accepted_steps, recorded, i);
+        fflush(stderr);
+        mlx_qwen35_compiled_tape_disarm();
+        return;
+      }
+
+      // Slice the first `accepted_steps` per-step entries.
+      auto tape_pre = slice(tape_full, {0, 0, 0, 0},
+                            {tape_full.shape(0), accepted_steps,
+                             tape_full.shape(2), tape_full.shape(3)});
+      auto k_pre    = slice(k_full,    {0, 0, 0, 0},
+                            {k_full.shape(0), accepted_steps,
+                             k_full.shape(2), k_full.shape(3)});
+      auto g_pre    = slice(g_full,    {0, 0, 0},
+                            {g_full.shape(0), accepted_steps, g_full.shape(2)});
+      auto qkv_pre  = slice(qkv_full,  {0, 0, 0},
+                            {qkv_full.shape(0), accepted_steps, qkv_full.shape(2)});
+
+      // Recurrent state: replay innovations from the snapshot state.
+      const array& snapshot_rs = g_compiled_linear_snapshot[i * 2 + 1];
+      auto new_rs = tape_replay_kernel_call(tape_pre, k_pre, g_pre, snapshot_rs);
+
+      // Conv state: window of (kernel_dim - 1) entries starting at
+      // position `accepted_steps` in the augmented stream
+      // `concat(snapshot_conv_state, qkv_recorded)`. Mirrors DFlash's
+      // `_rebuild_conv_state` (recurrent_rollback_cache.py:123-140).
+      const array& snapshot_cs = g_compiled_linear_snapshot[i * 2];
+      auto new_cs = [&]() -> array {
+        if (keep > 0) {
+          auto conv_input = concatenate({snapshot_cs, qkv_pre}, 1);
+          int total = conv_input.shape(1);
+          int start = accepted_steps;
+          int end   = std::min(start + keep, total);
+          // `start + keep == accepted_steps + (kernel_dim - 1)` and
+          // `total == keep + accepted_steps`, so `end == total` exactly.
+          return slice(conv_input,
+                       {0, start, 0},
+                       {conv_input.shape(0), end, conv_input.shape(2)});
+        }
+        return snapshot_cs;
+      }();
+
+      g_compiled_caches[i * 2]     = std::move(new_cs);
+      g_compiled_caches[i * 2 + 1] = std::move(new_rs);
+    }
+
+    // Advance the offset to "snapshot + accepted_steps". Mirrors what
+    // the K+1 path produced via `restore_linear_caches` (which set
+    // offset = snapshot_offset) + K `forward_compiled` calls (each
+    // advancing offset by 1).
+    g_offset_int = g_linear_snapshot_offset + accepted_steps;
+    g_compiled_offset = array(g_offset_int, mlx::core::int32);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_compiled_tape_replay: %s\n",
+            e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_compiled_tape_replay\n");
+    fflush(stderr);
+  }
+  mlx_qwen35_compiled_tape_disarm();
+}
+
 // Reset BOTH the legacy flat compiled state AND the Phase 5 piece 1
 // paged-path globals. Keeping these symmetric is required because
 // `mlx_qwen35_init_paged` flips `g_dense_paged_inited` to true
@@ -596,6 +842,14 @@ void mlx_qwen35_compiled_reset() {
   g_compiled_linear_snapshot.clear();
   g_linear_snapshot_offset = 0;
   g_linear_snapshot_taken = false;
+
+  // W6.6 — drop any pending tape recording so a stale armed flag /
+  // half-recorded accumulator can't leak across model reloads.
+  g_tape_recording_armed = false;
+  g_gdn_tape_acc.clear();
+  g_gdn_k_tape_acc.clear();
+  g_gdn_g_tape_acc.clear();
+  g_gdn_qkv_tape_acc.clear();
 
   // Phase 5 piece 1 paged-path globals.
   g_dense_paged_config = CompileConfig{};

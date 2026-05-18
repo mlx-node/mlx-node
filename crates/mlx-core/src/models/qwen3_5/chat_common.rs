@@ -8,6 +8,7 @@
 //! management.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::OnceLock;
 
 use napi::bindgen_prelude::*;
 
@@ -39,6 +40,31 @@ use super::model::{ChatConfig, ChatResult, ChatStreamChunk};
 ///
 /// Introduced as part of the chat_common helper promotion.
 pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESSION_RESTART:";
+
+// W6.6 — Tape-replay rollback for GDN linear-attention.
+//
+// Replaces the K+1 main-model forwards the W6 Bug #4 fix ran on every
+// partial-accept verify cycle. When ON (default), the cycle arms tape
+// recording on the dense compiled path BEFORE verify; the per-step
+// `(tape, k, g, qkv)` tensors are accumulated during the D+1 verify
+// forwards; on rejection a single Metal kernel replays only the
+// accepted prefix into the pre-verify snapshot state and the conv state
+// is rebuilt by slicing the recorded qkv. Saves ~30% of cycle wall-time
+// (the W6 plan's rollback budget).
+//
+// Opt-out: `MLX_MTP_USE_TAPE_REPLAY=0` (or `false`) falls back to the
+// K+1 replay path for a release while we shake out kernel bugs. The
+// env var is read once per process and cached.
+pub(crate) fn mtp_use_tape_replay() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_USE_TAPE_REPLAY") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true, // default ON
+    })
+}
 
 /// Hash raw image bytes to a u64 key for cache lookup.
 fn hash_image_bytes(bytes: &[u8]) -> u64 {

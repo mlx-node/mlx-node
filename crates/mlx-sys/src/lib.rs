@@ -1480,6 +1480,40 @@ unsafe extern "C-unwind" {
     /// been taken since the last reset.
     pub fn mlx_qwen35_compiled_restore_linear_caches();
 
+    /// W6.6 — Arm tape recording for the dense compiled path. After
+    /// this call, every `mlx_qwen35_forward_compiled` routes linear-
+    /// attention layers through a tape-emitting Metal kernel and
+    /// appends the per-step `(tape, k, g, qkv)` tensors into per-layer
+    /// accumulator vectors. The MTP cycle macro calls this BEFORE the
+    /// verify FFI's D+1 sequential forwards so the rollback path can
+    /// replay only the accepted prefix instead of running K+1 main-
+    /// model forwards. Idempotent; no-op if `g_compile_inited` is
+    /// false.
+    pub fn mlx_qwen35_compiled_tape_arm();
+
+    /// W6.6 — Disarm tape recording and drop accumulators. Called on
+    /// full-accept (no replay needed) and after a successful replay.
+    /// Idempotent.
+    pub fn mlx_qwen35_compiled_tape_disarm();
+
+    /// W6.6 — Restore the GDN linear-attention recurrent + conv states
+    /// by applying the first `accepted_steps` recorded innovations to
+    /// the pre-verify snapshot, then advance the decode offset to
+    /// `snapshot_offset + accepted_steps`. Replaces the K+1 main-model
+    /// forwards the old Bug #4 rollback ran. Always disarms recording
+    /// afterward.
+    ///
+    /// Preconditions (else logs to stderr and disarms without applying):
+    ///   - `mlx_qwen35_compiled_snapshot_linear_caches` has been
+    ///     called for this cycle;
+    ///   - `mlx_qwen35_compiled_tape_arm` has been called and the
+    ///     D+1 verify forwards have all recorded into the
+    ///     accumulators;
+    ///   - `1 <= accepted_steps <= recorded_steps` (in MTP cycle
+    ///     terms `accepted_steps = K + 1` where K = number of accepted
+    ///     drafts).
+    pub fn mlx_qwen35_compiled_tape_replay(accepted_steps: i32);
+
     /// Reset compiled state (call on model reset / new conversation).
     pub fn mlx_qwen35_compiled_reset();
 

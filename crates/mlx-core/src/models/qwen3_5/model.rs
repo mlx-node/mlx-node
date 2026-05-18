@@ -2436,6 +2436,16 @@ impl Qwen35Inner {
                         if delta != 0 {
                             mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
                         }
+                        // W6.6 — on full-accept the `restore_and_replay_main`
+                        // hook is NOT invoked; tape recording stays armed
+                        // with stale accumulators. Disarm so the next
+                        // cycle's `_tape_arm` starts from clean slots.
+                        // On rejection `restore_and_replay_main` calls
+                        // `_tape_replay` which internally disarms;
+                        // calling `_tape_disarm` here too is harmless.
+                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
+                            mlx_sys::mlx_qwen35_compiled_tape_disarm();
+                        }
                     },
                     eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
                         eval_token_and_compiled_caches(token);
@@ -2461,8 +2471,19 @@ impl Qwen35Inner {
                     // rejection the GDN recurrent state stays polluted
                     // with rejected-draft positions and the next Step A
                     // produces wrong logits.
+                    //
+                    // W6.6 — when tape-replay is ENABLED (default; opt
+                    // out via `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the
+                    // GDN tape recorder so the rollback path can replay
+                    // accepted innovations into the snapshot state via
+                    // a single Metal kernel instead of K+1 main-model
+                    // forwards. Snapshot is still required — the tape
+                    // replay starts from the snapshot state.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
+                        if chat_common::mtp_use_tape_replay() {
+                            mlx_sys::mlx_qwen35_compiled_tape_arm();
+                        }
                     },
                     // W6 Bug #4 fix — on rejection: restore linear caches
                     // + offset, then replay the K accepted drafts via
@@ -2472,9 +2493,24 @@ impl Qwen35Inner {
                     // offset to `snapshot_offset + K`, matching what the
                     // previous direct `adjust_offset(K - depth)` rollback
                     // would have produced.
+                    //
+                    // W6.6 — when tape-replay is ENABLED, replace the
+                    // K+1 forwards with a single `_tape_replay` FFI that
+                    // applies the recorded innovations to the snapshot
+                    // state. `accepted_drafts.len()` is `K + 1` here
+                    // (the slice contains `[last_committed_id, d_0,
+                    // .., d_{K-1}]` — see `run_mtp_cycle_inner`'s
+                    // `replay_ids` construction).
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
+                        if chat_common::mtp_use_tape_replay() {
+                            let steps = accepted_drafts.len() as i32;
+                            unsafe {
+                                mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
+                            }
+                            return Ok(());
+                        }
                         unsafe {
                             mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
                         }
@@ -4589,6 +4625,16 @@ impl Qwen35Inner {
                         if delta != 0 {
                             mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
                         }
+                        // W6.6 — on full-accept the `restore_and_replay_main`
+                        // hook is NOT invoked; tape recording stays armed
+                        // with stale accumulators. Disarm so the next
+                        // cycle's `_tape_arm` starts from clean slots.
+                        // On rejection `restore_and_replay_main` calls
+                        // `_tape_replay` which internally disarms;
+                        // calling `_tape_disarm` here too is harmless.
+                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
+                            mlx_sys::mlx_qwen35_compiled_tape_disarm();
+                        }
                     },
                     eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
                         eval_token_and_compiled_caches(token);
@@ -4614,8 +4660,19 @@ impl Qwen35Inner {
                     // rejection the GDN recurrent state stays polluted
                     // with rejected-draft positions and the next Step A
                     // produces wrong logits.
+                    //
+                    // W6.6 — when tape-replay is ENABLED (default; opt
+                    // out via `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the
+                    // GDN tape recorder so the rollback path can replay
+                    // accepted innovations into the snapshot state via
+                    // a single Metal kernel instead of K+1 main-model
+                    // forwards. Snapshot is still required — the tape
+                    // replay starts from the snapshot state.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
+                        if chat_common::mtp_use_tape_replay() {
+                            mlx_sys::mlx_qwen35_compiled_tape_arm();
+                        }
                     },
                     // W6 Bug #4 fix — on rejection: restore linear caches
                     // + offset, then replay the K accepted drafts via
@@ -4625,9 +4682,24 @@ impl Qwen35Inner {
                     // offset to `snapshot_offset + K`, matching what the
                     // previous direct `adjust_offset(K - depth)` rollback
                     // would have produced.
+                    //
+                    // W6.6 — when tape-replay is ENABLED, replace the
+                    // K+1 forwards with a single `_tape_replay` FFI that
+                    // applies the recorded innovations to the snapshot
+                    // state. `accepted_drafts.len()` is `K + 1` here
+                    // (the slice contains `[last_committed_id, d_0,
+                    // .., d_{K-1}]` — see `run_mtp_cycle_inner`'s
+                    // `replay_ids` construction).
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
+                        if chat_common::mtp_use_tape_replay() {
+                            let steps = accepted_drafts.len() as i32;
+                            unsafe {
+                                mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
+                            }
+                            return Ok(());
+                        }
                         unsafe {
                             mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
                         }
@@ -5305,6 +5377,16 @@ impl Qwen35Inner {
                         if delta != 0 {
                             mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
                         }
+                        // W6.6 — on full-accept the `restore_and_replay_main`
+                        // hook is NOT invoked; tape recording stays armed
+                        // with stale accumulators. Disarm so the next
+                        // cycle's `_tape_arm` starts from clean slots.
+                        // On rejection `restore_and_replay_main` calls
+                        // `_tape_replay` which internally disarms;
+                        // calling `_tape_disarm` here too is harmless.
+                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
+                            mlx_sys::mlx_qwen35_compiled_tape_disarm();
+                        }
                     },
                     eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
                         eval_token_and_compiled_caches(token);
@@ -5330,8 +5412,19 @@ impl Qwen35Inner {
                     // rejection the GDN recurrent state stays polluted
                     // with rejected-draft positions and the next Step A
                     // produces wrong logits.
+                    //
+                    // W6.6 — when tape-replay is ENABLED (default; opt
+                    // out via `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the
+                    // GDN tape recorder so the rollback path can replay
+                    // accepted innovations into the snapshot state via
+                    // a single Metal kernel instead of K+1 main-model
+                    // forwards. Snapshot is still required — the tape
+                    // replay starts from the snapshot state.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
+                        if chat_common::mtp_use_tape_replay() {
+                            mlx_sys::mlx_qwen35_compiled_tape_arm();
+                        }
                     },
                     // W6 Bug #4 fix — on rejection: restore linear caches
                     // + offset, then replay the K accepted drafts via
@@ -5341,9 +5434,24 @@ impl Qwen35Inner {
                     // offset to `snapshot_offset + K`, matching what the
                     // previous direct `adjust_offset(K - depth)` rollback
                     // would have produced.
+                    //
+                    // W6.6 — when tape-replay is ENABLED, replace the
+                    // K+1 forwards with a single `_tape_replay` FFI that
+                    // applies the recorded innovations to the snapshot
+                    // state. `accepted_drafts.len()` is `K + 1` here
+                    // (the slice contains `[last_committed_id, d_0,
+                    // .., d_{K-1}]` — see `run_mtp_cycle_inner`'s
+                    // `replay_ids` construction).
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
+                        if chat_common::mtp_use_tape_replay() {
+                            let steps = accepted_drafts.len() as i32;
+                            unsafe {
+                                mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
+                            }
+                            return Ok(());
+                        }
                         unsafe {
                             mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
                         }
