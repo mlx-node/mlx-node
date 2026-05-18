@@ -225,6 +225,43 @@ pub(crate) fn mtp_fused_draft_enabled() -> bool {
     })
 }
 
+// W6.19 — Accept-loop sync collapse via on-device sparse top-K /
+// batched argmax (MTPLX-style).
+//
+// Replaces the legacy per-position accept loop's D forced GPU syncs
+// (each materializing a full-vocab softmax of ~151k floats) with ONE
+// batched on-device op over all `D+1` verify positions. On the T=0
+// (greedy) path this is `argmax(verify_logits, axis=-1)` → `[1, D+1]`
+// int32, evaluated once. On T>0 we keep the legacy per-position
+// path (residual sampling still needs the full target distribution
+// to draw from `(p_target - p_draft)+`).
+//
+// Eligibility (T=0 fast path):
+//   - `temperature <= 1e-6` (matches `accept_with_residual`'s argmax
+//     shortcut — Bug #3 invariant).
+//   - All penalties at defaults (repetition=1.0, presence=0.0,
+//     frequency=0.0). When any penalty is active, the per-position
+//     `apply_all_penalties` call depends on `hist_extended` which
+//     mutates inside the accept loop — we cannot precompute the
+//     argmax in one shot without re-applying the penalty per
+//     position.
+//
+// Opt-out: `MLX_MTP_SPARSE_ACCEPT=0` (or `false` / `off`). Default
+// ON because the legacy path's D × full-vocab softmax materializations
+// are pure waste at T=0 (argmax doesn't need probabilities) and the
+// optimization composes cleanly with all other MTP knobs. The env
+// var is read once per process and cached.
+pub(crate) fn mtp_sparse_accept_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_SPARSE_ACCEPT") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true, // default ON — opt-out gate for diagnostics
+    })
+}
+
 /// Hash raw image bytes to a u64 key for cache lookup.
 fn hash_image_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -1603,6 +1640,35 @@ where
     // When the env var is OFF (default), behaviour is byte-identical
     // to pre-W6.9 — `verify_logits.eval()` blocks until verify is
     // done before the accept loop's softmax graph is built.
+    // W6.19 — Fast-path eligibility: at T=0 with all penalties at
+    // defaults, the per-position accept decision collapses to
+    // `argmax(verify_logits[i]) == draft_id[i]` (Bug #3 invariant
+    // in `accept_with_residual`). When eligible, collapse the D+1
+    // per-position softmax materializations into ONE batched
+    // `argmax(verify_logits, axis=-1)` op + one `.eval()` reading
+    // D+1 int32 values.
+    //
+    // Why this is safe:
+    //   * T=0 → `accept_with_residual` only reads `argmax(p_target)`
+    //     vs `draft_id`. `softmax` is monotone so `argmax(softmax(x))
+    //     == argmax(x)`. No probabilities are ever consumed.
+    //   * Penalties default → `apply_all_penalties` is the identity,
+    //     so `hist_extended` does NOT affect the per-position logits.
+    //     We can compute all D+1 argmaxes BEFORE the accept loop.
+    //   * Bonus token on full-accept = argmax at position D, also a
+    //     trivial readout from the same batched array.
+    //
+    // When ineligible (T>0, or any penalty non-default), fall
+    // through to the legacy per-position path below.
+    let temp = params
+        .sampling_config
+        .and_then(|c| c.temperature)
+        .unwrap_or(1.0);
+    let penalties_no_op = params.repetition_penalty == 1.0
+        && params.presence_penalty == 0.0
+        && params.frequency_penalty == 0.0;
+    let use_sparse_accept = mtp_sparse_accept_enabled() && temp <= 1e-6 && penalties_no_op;
+
     if mtp_verify_async_eval() {
         tracing::debug!(
             target: "mlx_core::mtp::verify_async_eval",
@@ -1615,6 +1681,15 @@ where
         // from a CPU-resident buffer for penalty application. The
         // hiddens ride on the same compiled graph; we only eval the
         // K-th slice below.
+        //
+        // W6.19 note: the sparse-accept path also benefits from this
+        // eager eval — folding verify materialization into the
+        // accept-loop argmax op (one combined sync) measured ~10%
+        // slower than two separate syncs on the qwen3.6-27b smoke.
+        // The eager eval here lets MLX's scheduler pipeline the
+        // verify command buffer with the subsequent argmax dispatch
+        // build, which the combined-eval variant defeats. Kept
+        // unconditional.
         verify_logits.eval();
     }
     let vocab = verify_logits.shape_at(2)?;
@@ -1626,46 +1701,98 @@ where
     let mut all_accepted = true;
     let mut rejection_residual: Option<i32> = None;
 
-    for i in 0..depth {
-        // verify_logits[0, i, :] → [vocab]
-        let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-        let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
-        let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
-        let p_target = Activations::softmax(&penalized, Some(-1))?.astype(DType::Float32)?;
-        p_target.eval();
+    if use_sparse_accept {
+        // ONE batched argmax over all D+1 verify positions. Shape
+        // `[1, D+1, vocab]` → `[1, D+1]` int32. Bug #3: at T=0 we
+        // care only about per-position argmax — no full-vocab
+        // softmax materialization needed.
+        //
+        // `verify_logits` may still be lazy from the verify dispatch
+        // (especially under `MLX_MTP_VERIFY_ASYNC_EVAL=1`). The
+        // `.eval()` below is the SINGLE sync point for the accept
+        // loop — vs the legacy D × per-position `p_target.eval()`
+        // path that forced D full-vocab softmaxes through Metal.
+        let argmax_arr = verify_logits.argmax(-1, None)?;
+        argmax_arr.eval();
 
-        let sampling_cfg = params.sampling_config.unwrap_or_default();
-        let (accept, out_tok) = sampling::accept_with_residual(
-            &p_target,
-            &draft_probs[i],
-            draft_ids[i],
-            &sampling_cfg,
-            rng,
-        )?;
-        if accept {
-            let id_u = out_tok as u32;
-            accepted_tokens.push(id_u);
-            hist_extended.push(id_u);
-        } else {
-            all_accepted = false;
-            rejection_residual = Some(out_tok);
-            accepted_tokens.push(out_tok as u32);
-            break;
+        // Extract D+1 int32s into a CPU buffer. `verify_logits` was
+        // `[1, D+1, vocab]`; the argmax over the last axis yields
+        // `[1, D+1]`. We read flat positions 0..=depth.
+        let mut target_argmax: Vec<i32> = Vec::with_capacity(depth + 1);
+        for i in 0..=depth {
+            target_argmax.push(argmax_arr.item_at_int32(i)?);
         }
-    }
 
-    if all_accepted {
-        // Step 4 (bonus): sample from verify position D (after all
-        // drafts accepted). Apply penalties consistent with the
-        // extended history.
-        let i = depth;
-        let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-        let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
-        let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
-        let bonus = sampling::sample(&penalized, params.sampling_config)?;
-        bonus.eval();
-        let bonus_id = bonus.item_at_int32(0)? as u32;
-        accepted_tokens.push(bonus_id);
+        // Accept loop runs entirely on CPU buffers — no further GPU
+        // syncs. The Leviathan-Chen accept-reject coin is unused at
+        // T=0 (deterministic argmax decision); `rng` is intentionally
+        // not advanced, matching `accept_with_residual`'s T=0
+        // shortcut (zero RNG consumed).
+        for i in 0..depth {
+            let target_id = target_argmax[i];
+            if target_id == draft_ids[i] {
+                let id_u = target_id as u32;
+                accepted_tokens.push(id_u);
+                hist_extended.push(id_u);
+            } else {
+                all_accepted = false;
+                rejection_residual = Some(target_id);
+                accepted_tokens.push(target_id as u32);
+                break;
+            }
+        }
+        if all_accepted {
+            // Bonus token = argmax at position D. Same batched
+            // array, no extra ops, no extra eval.
+            let bonus_id = target_argmax[depth] as u32;
+            accepted_tokens.push(bonus_id);
+        }
+    } else {
+        // Legacy per-position path. Kept for T>0 (where residual
+        // sampling needs the full target distribution) and for
+        // penalty-active configurations (where `hist_extended`
+        // mutates the per-position logits inside the loop).
+        for i in 0..depth {
+            // verify_logits[0, i, :] → [vocab]
+            let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+            let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
+            let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
+            let p_target = Activations::softmax(&penalized, Some(-1))?.astype(DType::Float32)?;
+            p_target.eval();
+
+            let sampling_cfg = params.sampling_config.unwrap_or_default();
+            let (accept, out_tok) = sampling::accept_with_residual(
+                &p_target,
+                &draft_probs[i],
+                draft_ids[i],
+                &sampling_cfg,
+                rng,
+            )?;
+            if accept {
+                let id_u = out_tok as u32;
+                accepted_tokens.push(id_u);
+                hist_extended.push(id_u);
+            } else {
+                all_accepted = false;
+                rejection_residual = Some(out_tok);
+                accepted_tokens.push(out_tok as u32);
+                break;
+            }
+        }
+
+        if all_accepted {
+            // Step 4 (bonus): sample from verify position D (after all
+            // drafts accepted). Apply penalties consistent with the
+            // extended history.
+            let i = depth;
+            let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+            let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
+            let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
+            let bonus = sampling::sample(&penalized, params.sampling_config)?;
+            bonus.eval();
+            let bonus_id = bonus.item_at_int32(0)? as u32;
+            accepted_tokens.push(bonus_id);
+        }
     }
 
     // Step 5: rollback. `accepted_drafts` is the number of draft
