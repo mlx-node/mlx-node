@@ -41,6 +41,40 @@ use super::model::{ChatConfig, ChatResult, ChatStreamChunk};
 /// Introduced as part of the chat_common helper promotion.
 pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESSION_RESTART:";
 
+// ---------------------------------------------------------------------------
+// MTP runtime flag inventory
+// ---------------------------------------------------------------------------
+//
+// The W6.5–W6.9 perf chain added four runtime knobs gating individual
+// optimizations. All are read at most once per process and cached. The
+// truthy vocabulary is uniform across the three env-var flags: trim()
+// + `1` / `true` / `on` (case-insensitive). The adaptive depth knob is
+// surfaced through the TypeScript `ChatConfig.mtpAdaptiveDepth` field
+// rather than an env var because it interacts with the user-set
+// `mtpDepth` and needs per-session resolution.
+//
+// | Knob                          | Default | Workstream | Opt direction |
+// |-------------------------------|---------|------------|---------------|
+// | `MLX_MTP_USE_TAPE_REPLAY`     | ON      | W6.6       | opt-OUT       |
+// | (eager verify prewarm)        | ON      | W6.7       | n/a (always)  |
+// | `mtpAdaptiveDepth` (TS field) | ON*     | W6.8       | per-session   |
+// | `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        |
+// | `MLX_MTP_VERIFY_ASYNC_EVAL`   | OFF     | W6.9       | opt-IN        |
+//
+// * adaptive defaults ON when `enableMtp=true` and `mtpDepth` is unset;
+//   defaults OFF (pinned) when `mtpDepth` is set explicitly.
+//
+// Interaction notes:
+//   - `MLX_MTP_USE_TAPE_REPLAY=0` falls back to the W6 Bug #4 K+1 replay
+//     path; safe to combine with all other flags.
+//   - `MLX_MTP_CHAINED_CYCLES=1` is currently slower than the default
+//     Step-A path at depth ≥ 2 because the chained verify_hidden[K]
+//     slice forces an extra command-buffer roundtrip per cycle.
+//     Re-evaluate after the W6.5-resume follow-up lands.
+//   - `MLX_MTP_VERIFY_ASYNC_EVAL=1` overlaps verify dispatch with the
+//     accept loop's CPU-side graph construction; composes cleanly with
+//     all other flags.
+
 // W6.6 — Tape-replay rollback for GDN linear-attention.
 //
 // Replaces the K+1 main-model forwards the W6 Bug #4 fix ran on every
@@ -108,6 +142,26 @@ pub(crate) fn mtp_verify_async_eval() -> bool {
             v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
         }
         Err(_) => false, // default OFF — flip in a follow-up after parity proven
+    })
+}
+
+// W6.5 — Chained cycles via verify-hidden export.
+//
+// Opt-in: `MLX_MTP_CHAINED_CYCLES=1` (or `true` / `on`). Default OFF
+// because the chained verify_hidden[K] slice currently forces an extra
+// command-buffer roundtrip per cycle on the default Step-A bypass,
+// regressing 0.30× → 0.20× at depth=3 (the W6.5-resume follow-up will
+// fold the slice eval into the next cycle's draft graph and let this
+// default flip back to ON). The env var is read once per process and
+// cached.
+pub(crate) fn mtp_chained_cycles_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_CHAINED_CYCLES") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false, // default OFF
     })
 }
 
@@ -1656,9 +1710,7 @@ macro_rules! decode_loop_mtp {
         // `g_compiled_caches` (its upstream) is alive for the rest of
         // the decode loop. See `mlx_qwen35_mtp_verify_compiled_with_hidden`
         // for the C++ lifetime contract.
-        let chained_cycles_enabled: bool = std::env::var("MLX_MTP_CHAINED_CYCLES")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let chained_cycles_enabled: bool = $crate::models::qwen3_5::chat_common::mtp_chained_cycles_enabled();
         let mut chained_hidden_opt: Option<$crate::array::MxArray> = None;
 
         // W6.8 — Adaptive MTP depth policy. When `mtp_adaptive_depth`
