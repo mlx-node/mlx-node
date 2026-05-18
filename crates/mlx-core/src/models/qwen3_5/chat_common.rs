@@ -89,12 +89,20 @@ pub(crate) fn mtp_use_tape_replay() -> bool {
 // touching the FFI surface, the `MtpOps` closures, or the cycle
 // state machine.
 //
-// Opt-in: `MLX_MTP_PREFETCH=1` (or `true`). Default OFF until the
-// parity gates have shipped a couple of releases. The env var is read
-// once per process and cached.
-pub(crate) fn mtp_async_prefetch() -> bool {
+// Opt-in: `MLX_MTP_VERIFY_ASYNC_EVAL=1` (or `true`). Default OFF until
+// the parity gates have shipped a couple of releases. The env var is
+// read once per process and cached.
+//
+// Naming note: an earlier draft of this flag was called
+// `MLX_MTP_PREFETCH`, but the change is overlap-with-CPU-graph-
+// construction (intra-cycle) — NOT cross-cycle draft staging. The
+// literal "stash next-cycle draft handle, drain at cycle start"
+// prefetch from the W6.9 plan lives in a follow-up task scoped to
+// `MLX_MTP_CHAINED_CYCLES=1`. The current flag's name reflects the
+// actual mechanism so users don't expect cross-cycle behaviour.
+pub(crate) fn mtp_verify_async_eval() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_PREFETCH") {
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_VERIFY_ASYNC_EVAL") {
         Ok(v) => {
             let v = v.trim();
             v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
@@ -1351,14 +1359,15 @@ where
     // `verify_hiddens[:, K, :]` — the correct prediction context for
     // the next cycle's first MTP draft.
     let (verify_logits, verify_hiddens) = (ops.verify_step)(&verify_in, embedding_weight, depth)?;
-    // W6.9 — Async-prefetch pipeline. When `MLX_MTP_PREFETCH=1`, we
-    // dispatch verify (logits + hiddens) via `async_eval` instead of
-    // the synchronous `eval()` below. The kernel launch returns
-    // immediately, letting the CPU construct the accept loop's
-    // penalty / softmax / slice graph while the verify command buffer
-    // is still executing on the GPU. The first downstream `eval()`
-    // (the accept loop's `p_target.eval()` at the per-position softmax)
-    // syncs on completion — the same overlap pattern DFlash applies in
+    // W6.9 — Async-eval over verify outputs. When
+    // `MLX_MTP_VERIFY_ASYNC_EVAL=1`, we dispatch verify (logits +
+    // hiddens) via `async_eval` instead of the synchronous `eval()`
+    // below. The kernel launch returns immediately, letting the CPU
+    // construct the accept loop's penalty / softmax / slice graph
+    // while the verify command buffer is still executing on the GPU.
+    // The first downstream `eval()` (the accept loop's
+    // `p_target.eval()` at the per-position softmax) syncs on
+    // completion — the same overlap pattern DFlash applies in
     // `spec_epoch.py:2069`'s `mx.async_eval(posterior)`.
     //
     // We batch `verify_hiddens` into the same async_eval call so MLX's
@@ -1371,9 +1380,9 @@ where
     // When the env var is OFF (default), behaviour is byte-identical
     // to pre-W6.9 — `verify_logits.eval()` blocks until verify is
     // done before the accept loop's softmax graph is built.
-    if mtp_async_prefetch() {
+    if mtp_verify_async_eval() {
         tracing::debug!(
-            target: "mlx_core::mtp::prefetch",
+            target: "mlx_core::mtp::verify_async_eval",
             depth = depth,
             "W6.9 async_eval(verify_logits, verify_hiddens)"
         );
