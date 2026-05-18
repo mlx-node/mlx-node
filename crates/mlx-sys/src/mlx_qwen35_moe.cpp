@@ -85,6 +85,23 @@ static std::vector<DenseMLPQuantInfo> g_dense_quant;  // per-layer dense MLP qua
 // distinguish "never populated" from "populated with zeros".
 static std::optional<array> g_moe_last_hidden;
 
+// W6 MoE (MTP) Bug #4 fix — snapshot of the GDN linear-attention
+// caches (conv_state + recurrent_state) plus the decode offset taken
+// BEFORE the verify FFI runs its D+1 sequential MoE forwards. The
+// verify loop mutates `g_moe_caches` in place; for linear-attention
+// layers the recurrent / conv state advances through D+1 tokens that
+// may or may not all be accepted. On rejection we restore this
+// snapshot so the linear state matches the pre-verify "after Step A"
+// state; the caller then replays exactly K accepted drafts via the
+// main MoE forward FFI to bring the linear state forward through the
+// committed drafts only. Mirrors the dense-path snapshot
+// (`g_compiled_linear_snapshot` in mlx_qwen35.cpp).
+//
+// Cleared on `mlx_qwen35_moe_reset`.
+static std::vector<array> g_moe_linear_snapshot;
+static int g_moe_linear_snapshot_offset = 0;
+static bool g_moe_linear_snapshot_taken = false;
+
 // =====================================================================
 // Phase 4 piece 1: paged-decode globals.
 //
@@ -995,6 +1012,12 @@ void mlx_qwen35_moe_reset() {
   // no longer valid.
   g_moe_last_hidden = std::nullopt;
 
+  // W6 MoE (MTP) Bug #4 — drop any pending linear-cache snapshot so it
+  // can't leak across turns / model loads.
+  g_moe_linear_snapshot.clear();
+  g_moe_linear_snapshot_offset = 0;
+  g_moe_linear_snapshot_taken = false;
+
   // Phase 4 piece 1 paged-path globals.
   g_paged_config = MoeConfig{};
   g_k_pools.clear();
@@ -1089,6 +1112,70 @@ int mlx_qwen35_moe_get_cache_offset() {
 // Adjust MoE cache offset by delta (for VLM M-RoPE position correction).
 void mlx_qwen35_moe_adjust_offset(int delta) {
   g_moe_offset_int += delta;
+}
+
+// W6 MoE (MTP) Bug #4 — snapshot the GDN linear-attention caches
+// plus the decode offset. Mirrors the dense-path
+// `mlx_qwen35_compiled_snapshot_linear_caches`. Called by the MTP
+// cycle macro AFTER Step A and BEFORE verify.
+//
+// Only linear-attention layer slots are populated; full-attention
+// slots are stored as bf16 zero placeholders so per-layer indexing
+// stays uniform.
+void mlx_qwen35_moe_compiled_snapshot_linear_caches() {
+  if (!g_moe_inited) {
+    g_moe_linear_snapshot_taken = false;
+    return;
+  }
+  const auto& cfg = g_moe_config;
+  try {
+    g_moe_linear_snapshot.clear();
+    g_moe_linear_snapshot.reserve(cfg.num_layers * 2);
+    auto placeholder = []() { return zeros({}, mlx::core::bfloat16); };
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (is_linear) {
+        // `array(other)` = refcount bump; underlying recurrent/conv
+        // buffer stays alive while the global slot mutates inside the
+        // verify loop.
+        g_moe_linear_snapshot.push_back(array(g_moe_caches[i * 2]));
+        g_moe_linear_snapshot.push_back(array(g_moe_caches[i * 2 + 1]));
+      } else {
+        g_moe_linear_snapshot.push_back(placeholder());
+        g_moe_linear_snapshot.push_back(placeholder());
+      }
+    }
+    g_moe_linear_snapshot_offset = g_moe_offset_int;
+    g_moe_linear_snapshot_taken = true;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_compiled_snapshot_linear_caches: %s\n", e.what());
+    fflush(stderr);
+    g_moe_linear_snapshot.clear();
+    g_moe_linear_snapshot_taken = false;
+  }
+}
+
+// W6 MoE (MTP) Bug #4 — restore the GDN linear caches AND the
+// decode offset from the most recent snapshot. Mirrors the dense-path
+// `mlx_qwen35_compiled_restore_linear_caches`. Called on rejection
+// before replaying K accepted drafts via the main MoE forward FFI.
+//
+// No-op if no snapshot has been taken since the last reset.
+void mlx_qwen35_moe_compiled_restore_linear_caches() {
+  if (!g_moe_inited || !g_moe_linear_snapshot_taken) return;
+  const auto& cfg = g_moe_config;
+  try {
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (!is_linear) continue;
+      g_moe_caches[i * 2]     = array(g_moe_linear_snapshot[i * 2]);
+      g_moe_caches[i * 2 + 1] = array(g_moe_linear_snapshot[i * 2 + 1]);
+    }
+    g_moe_offset_int = g_moe_linear_snapshot_offset;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_compiled_restore_linear_caches: %s\n", e.what());
+    fflush(stderr);
+  }
 }
 
 // Exposed for `mlx_qwen35_moe_mtp_compiled_init_from_main` so the MTP init

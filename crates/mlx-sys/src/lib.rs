@@ -1456,6 +1456,30 @@ unsafe extern "C-unwind" {
     /// Adjust the compiled offset by delta (for VLM rope_deltas).
     pub fn mlx_qwen35_compiled_adjust_offset(delta: i32);
 
+    /// W6 (MTP) Bug #4 — snapshot the dense compiled path's GDN
+    /// linear-attention caches (conv_state + recurrent_state) plus
+    /// the decode offset. Called by `decode_loop_mtp!` AFTER Step A
+    /// and BEFORE the verify FFI runs its D+1 sequential forwards.
+    /// The verify loop mutates `g_compiled_caches` in place; on
+    /// rejection we restore the snapshot via
+    /// `mlx_qwen35_compiled_restore_linear_caches` and replay the K
+    /// accepted drafts so the linear state matches the committed
+    /// token stream. Only linear-attention layer slots are snapshotted
+    /// — full-attention K/V slots are handled by the existing
+    /// offset-rewind path.
+    ///
+    /// No-op if `g_compile_inited` is false. Idempotent — overwrites
+    /// any previous snapshot.
+    pub fn mlx_qwen35_compiled_snapshot_linear_caches();
+
+    /// W6 (MTP) Bug #4 — restore the dense compiled path's GDN
+    /// linear-attention caches AND the decode offset from the most
+    /// recent snapshot. Called on verify rejection
+    /// (`accepted_drafts < depth`) BEFORE replaying K accepted drafts
+    /// via `mlx_qwen35_forward_compiled`. No-op if no snapshot has
+    /// been taken since the last reset.
+    pub fn mlx_qwen35_compiled_restore_linear_caches();
+
     /// Reset compiled state (call on model reset / new conversation).
     pub fn mlx_qwen35_compiled_reset();
 
@@ -1816,6 +1840,17 @@ unsafe extern "C-unwind" {
 
     /// Adjust MoE cache offset by delta (for VLM M-RoPE position correction).
     pub fn mlx_qwen35_moe_adjust_offset(delta: i32);
+
+    /// W6 MoE (MTP) Bug #4 — snapshot the MoE compiled path's GDN
+    /// linear-attention caches plus the decode offset. Mirrors the
+    /// dense-path `mlx_qwen35_compiled_snapshot_linear_caches`.
+    pub fn mlx_qwen35_moe_compiled_snapshot_linear_caches();
+
+    /// W6 MoE (MTP) Bug #4 — restore the MoE compiled path's GDN
+    /// linear-attention caches AND the decode offset from the most
+    /// recent snapshot. Mirrors the dense-path
+    /// `mlx_qwen35_compiled_restore_linear_caches`.
+    pub fn mlx_qwen35_moe_compiled_restore_linear_caches();
 
     /// Whether the main MoE compiled path is initialised. Returns 1 if
     /// `mlx_qwen35_moe_init_from_prefill` has successfully run since the

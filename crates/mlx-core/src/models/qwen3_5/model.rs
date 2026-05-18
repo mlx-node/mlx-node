@@ -2410,24 +2410,23 @@ impl Qwen35Inner {
                         forward_mtp_verify_compiled(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Both deltas are `accepted_drafts - depth`:
-                        //   - Main: verify wrote `depth + 1` K/V
-                        //     slots (last_committed + `depth`
-                        //     drafts); we keep `accepted_drafts + 1`
-                        //     of them → delta = K - depth.
-                        //   - MTP: drafts wrote `depth` K/V slots;
-                        //     we keep `accepted_drafts` of them →
-                        //     delta = K - depth.
-                        // On any rejection, the MTP K/V at offsets
-                        // [accepted_drafts..depth] is rewound via
-                        // `mlx_qwen35_mtp_compiled_adjust_offset`.
-                        // The MTP path is NOT re-initialised; the
-                        // next cycle re-uses the existing
-                        // `g_mtp_compiled_caches` with the rewound
-                        // offset.
+                        // MTP path only. The MAIN path's offset and GDN
+                        // linear caches are restored via the
+                        // `snapshot_main_linear` / `restore_and_replay_main`
+                        // pair below (W6 Bug #4 fix). Calling
+                        // `mlx_qwen35_compiled_adjust_offset(delta)` here
+                        // would double-rewind the main offset.
+                        //
+                        //   - MTP delta: drafts wrote `depth` K/V slots;
+                        //     we keep `accepted_drafts` → delta = K - depth.
+                        //   - On rejection, the MTP K/V at offsets
+                        //     [accepted_drafts..depth] is rewound; the
+                        //     MTP path is NOT re-initialised — the next
+                        //     cycle re-uses the existing
+                        //     `g_mtp_compiled_caches` with the rewound
+                        //     offset.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
-                            mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
                             mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
                         }
                     },
@@ -2447,6 +2446,40 @@ impl Qwen35Inner {
                     begin_cycle: || unsafe {
                         let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
                         mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
+                    },
+                    // W6 Bug #4 fix — snapshot the main path's GDN
+                    // linear caches + offset BEFORE the verify FFI runs
+                    // its D+1 sequential forwards. Verify mutates
+                    // `g_compiled_caches` in place; without restoring on
+                    // rejection the GDN recurrent state stays polluted
+                    // with rejected-draft positions and the next Step A
+                    // produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
+                    },
+                    // W6 Bug #4 fix — on rejection: restore linear caches
+                    // + offset, then replay the K accepted drafts via
+                    // forward_compiled so the main linear state matches
+                    // the committed token stream. Each replay call
+                    // advances the offset by 1; K calls bring the main
+                    // offset to `snapshot_offset + K`, matching what the
+                    // previous direct `adjust_offset(K - depth)` rollback
+                    // would have produced.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_compiled_with_hidden(&id_arr, emb)?;
+                            // Force eval so the lazy graph chain is
+                            // bounded — mirrors the eval_step closure's
+                            // behaviour on the main decode path.
+                            logits.eval();
+                        }
+                        Ok(())
                     },
                 };
                 chat_common::decode_loop_mtp!(
@@ -4523,24 +4556,23 @@ impl Qwen35Inner {
                         forward_mtp_verify_compiled(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Both deltas are `accepted_drafts - depth`:
-                        //   - Main: verify wrote `depth + 1` K/V
-                        //     slots (last_committed + `depth`
-                        //     drafts); we keep `accepted_drafts + 1`
-                        //     of them → delta = K - depth.
-                        //   - MTP: drafts wrote `depth` K/V slots;
-                        //     we keep `accepted_drafts` of them →
-                        //     delta = K - depth.
-                        // On any rejection, the MTP K/V at offsets
-                        // [accepted_drafts..depth] is rewound via
-                        // `mlx_qwen35_mtp_compiled_adjust_offset`.
-                        // The MTP path is NOT re-initialised; the
-                        // next cycle re-uses the existing
-                        // `g_mtp_compiled_caches` with the rewound
-                        // offset.
+                        // MTP path only. The MAIN path's offset and GDN
+                        // linear caches are restored via the
+                        // `snapshot_main_linear` / `restore_and_replay_main`
+                        // pair below (W6 Bug #4 fix). Calling
+                        // `mlx_qwen35_compiled_adjust_offset(delta)` here
+                        // would double-rewind the main offset.
+                        //
+                        //   - MTP delta: drafts wrote `depth` K/V slots;
+                        //     we keep `accepted_drafts` → delta = K - depth.
+                        //   - On rejection, the MTP K/V at offsets
+                        //     [accepted_drafts..depth] is rewound; the
+                        //     MTP path is NOT re-initialised — the next
+                        //     cycle re-uses the existing
+                        //     `g_mtp_compiled_caches` with the rewound
+                        //     offset.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
-                            mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
                             mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
                         }
                     },
@@ -4560,6 +4592,40 @@ impl Qwen35Inner {
                     begin_cycle: || unsafe {
                         let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
                         mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
+                    },
+                    // W6 Bug #4 fix — snapshot the main path's GDN
+                    // linear caches + offset BEFORE the verify FFI runs
+                    // its D+1 sequential forwards. Verify mutates
+                    // `g_compiled_caches` in place; without restoring on
+                    // rejection the GDN recurrent state stays polluted
+                    // with rejected-draft positions and the next Step A
+                    // produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
+                    },
+                    // W6 Bug #4 fix — on rejection: restore linear caches
+                    // + offset, then replay the K accepted drafts via
+                    // forward_compiled so the main linear state matches
+                    // the committed token stream. Each replay call
+                    // advances the offset by 1; K calls bring the main
+                    // offset to `snapshot_offset + K`, matching what the
+                    // previous direct `adjust_offset(K - depth)` rollback
+                    // would have produced.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_compiled_with_hidden(&id_arr, emb)?;
+                            // Force eval so the lazy graph chain is
+                            // bounded — mirrors the eval_step closure's
+                            // behaviour on the main decode path.
+                            logits.eval();
+                        }
+                        Ok(())
                     },
                 };
                 chat_common::decode_loop_mtp!(
@@ -5199,24 +5265,23 @@ impl Qwen35Inner {
                         forward_mtp_verify_compiled(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Both deltas are `accepted_drafts - depth`:
-                        //   - Main: verify wrote `depth + 1` K/V
-                        //     slots (last_committed + `depth`
-                        //     drafts); we keep `accepted_drafts + 1`
-                        //     of them → delta = K - depth.
-                        //   - MTP: drafts wrote `depth` K/V slots;
-                        //     we keep `accepted_drafts` of them →
-                        //     delta = K - depth.
-                        // On any rejection, the MTP K/V at offsets
-                        // [accepted_drafts..depth] is rewound via
-                        // `mlx_qwen35_mtp_compiled_adjust_offset`.
-                        // The MTP path is NOT re-initialised; the
-                        // next cycle re-uses the existing
-                        // `g_mtp_compiled_caches` with the rewound
-                        // offset.
+                        // MTP path only. The MAIN path's offset and GDN
+                        // linear caches are restored via the
+                        // `snapshot_main_linear` / `restore_and_replay_main`
+                        // pair below (W6 Bug #4 fix). Calling
+                        // `mlx_qwen35_compiled_adjust_offset(delta)` here
+                        // would double-rewind the main offset.
+                        //
+                        //   - MTP delta: drafts wrote `depth` K/V slots;
+                        //     we keep `accepted_drafts` → delta = K - depth.
+                        //   - On rejection, the MTP K/V at offsets
+                        //     [accepted_drafts..depth] is rewound; the
+                        //     MTP path is NOT re-initialised — the next
+                        //     cycle re-uses the existing
+                        //     `g_mtp_compiled_caches` with the rewound
+                        //     offset.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
-                            mlx_sys::mlx_qwen35_compiled_adjust_offset(delta);
                             mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
                         }
                     },
@@ -5236,6 +5301,40 @@ impl Qwen35Inner {
                     begin_cycle: || unsafe {
                         let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
                         mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
+                    },
+                    // W6 Bug #4 fix — snapshot the main path's GDN
+                    // linear caches + offset BEFORE the verify FFI runs
+                    // its D+1 sequential forwards. Verify mutates
+                    // `g_compiled_caches` in place; without restoring on
+                    // rejection the GDN recurrent state stays polluted
+                    // with rejected-draft positions and the next Step A
+                    // produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
+                    },
+                    // W6 Bug #4 fix — on rejection: restore linear caches
+                    // + offset, then replay the K accepted drafts via
+                    // forward_compiled so the main linear state matches
+                    // the committed token stream. Each replay call
+                    // advances the offset by 1; K calls bring the main
+                    // offset to `snapshot_offset + K`, matching what the
+                    // previous direct `adjust_offset(K - depth)` rollback
+                    // would have produced.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_compiled_with_hidden(&id_arr, emb)?;
+                            // Force eval so the lazy graph chain is
+                            // bounded — mirrors the eval_step closure's
+                            // behaviour on the main decode path.
+                            logits.eval();
+                        }
+                        Ok(())
                     },
                 };
                 chat_common::decode_loop_mtp!(

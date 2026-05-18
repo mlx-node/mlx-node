@@ -45,6 +45,32 @@ static bool g_compile_inited = false;
 // distinguish "never populated" from "populated with zeros".
 static std::optional<array> g_last_hidden;
 
+// W6 (MTP) Bug #4 fix — snapshot of the GDN linear-attention caches
+// (conv_state + recurrent_state) plus the decode offset taken BEFORE
+// the verify FFI runs its D+1 sequential forward passes. The verify
+// loop mutates `g_compiled_caches` in place for every layer; for
+// linear-attention layers the recurrent / conv state advances through
+// D+1 tokens that may or may not be accepted. On rejection (any
+// `accepted_drafts < depth`) we restore this snapshot so the linear
+// state matches the pre-verify "after Step A" state; the caller then
+// replays exactly K accepted drafts via `forward_compiled` to bring
+// the linear state forward through the committed drafts only.
+//
+// Only LINEAR-attention layers are snapshotted — full-attention K/V
+// slots are correctly handled by the existing offset-rewind path
+// (later writes overwrite the stale slots, and attention masking
+// hides them via `offset`).
+//
+// `g_linear_snapshot_offset` records the offset at snapshot time so
+// restore can rewind the offset in lockstep. `g_linear_snapshot_taken`
+// guards against an out-of-order restore that would silently install
+// garbage state.
+//
+// Cleared by `mlx_qwen35_compiled_reset`.
+static std::vector<array> g_compiled_linear_snapshot;
+static int g_linear_snapshot_offset = 0;
+static bool g_linear_snapshot_taken = false;
+
 // =====================================================================
 // Phase 5 piece 1: paged-decode globals.
 //
@@ -470,6 +496,81 @@ void mlx_qwen35_compiled_adjust_offset(int delta) {
   g_compiled_offset = array(g_offset_int, mlx::core::int32);
 }
 
+// W6 (MTP) Bug #4 — snapshot the GDN linear-attention caches plus
+// the decode offset. Called by the MTP cycle macro AFTER Step A and
+// BEFORE verify. The snapshot keeps the pre-verify recurrent /
+// conv state alive (MLX arrays are ref-counted; we just bump the
+// refcount via copy construction) while the global continues to
+// mutate inside the verify loop. Restore via
+// `mlx_qwen35_compiled_restore_linear_caches`.
+//
+// Only linear-attention layer slots are populated; full-attention
+// slots are stored as bf16 zero placeholders so per-layer indexing
+// stays uniform. Idempotent — calling twice overwrites the previous
+// snapshot.
+void mlx_qwen35_compiled_snapshot_linear_caches() {
+  if (!g_compile_inited) {
+    g_linear_snapshot_taken = false;
+    return;
+  }
+  const auto& cfg = g_compile_config;
+  try {
+    g_compiled_linear_snapshot.clear();
+    g_compiled_linear_snapshot.reserve(cfg.num_layers * 2);
+    auto placeholder = []() { return zeros({}, mlx::core::bfloat16); };
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (is_linear) {
+        // `array(other)` = refcount bump on the MLX array; the
+        // underlying recurrent/conv buffer stays alive while the
+        // global slot mutates inside the verify loop.
+        g_compiled_linear_snapshot.push_back(array(g_compiled_caches[i * 2]));
+        g_compiled_linear_snapshot.push_back(array(g_compiled_caches[i * 2 + 1]));
+      } else {
+        g_compiled_linear_snapshot.push_back(placeholder());
+        g_compiled_linear_snapshot.push_back(placeholder());
+      }
+    }
+    g_linear_snapshot_offset = g_offset_int;
+    g_linear_snapshot_taken = true;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_compiled_snapshot_linear_caches: %s\n", e.what());
+    fflush(stderr);
+    g_compiled_linear_snapshot.clear();
+    g_linear_snapshot_taken = false;
+  }
+}
+
+// W6 (MTP) Bug #4 — restore the GDN linear caches AND the decode
+// offset from the most recent snapshot. Called on verify rejection
+// (any `accepted_drafts < depth`) BEFORE replaying the K accepted
+// drafts via `mlx_qwen35_forward_compiled`. Full-attention K/V slots
+// are intentionally left as-is — their offsets are rewound via the
+// offset restore here, and later writes will overwrite the stale
+// post-verify slots.
+//
+// No-op if no snapshot has been taken since the last reset.
+void mlx_qwen35_compiled_restore_linear_caches() {
+  if (!g_compile_inited || !g_linear_snapshot_taken) return;
+  const auto& cfg = g_compile_config;
+  try {
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (!is_linear) continue;
+      // Restore via copy constructor — keeps the snapshot vector's
+      // entries alive for potential repeated restores within the same
+      // cycle (defensive; current callers restore at most once).
+      g_compiled_caches[i * 2]     = array(g_compiled_linear_snapshot[i * 2]);
+      g_compiled_caches[i * 2 + 1] = array(g_compiled_linear_snapshot[i * 2 + 1]);
+    }
+    g_offset_int = g_linear_snapshot_offset;
+    g_compiled_offset = array(g_offset_int, mlx::core::int32);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_compiled_restore_linear_caches: %s\n", e.what());
+    fflush(stderr);
+  }
+}
+
 // Reset BOTH the legacy flat compiled state AND the Phase 5 piece 1
 // paged-path globals. Keeping these symmetric is required because
 // `mlx_qwen35_init_paged` flips `g_dense_paged_inited` to true
@@ -489,6 +590,12 @@ void mlx_qwen35_compiled_reset() {
   // re-init turn doesn't see a stale handle whose underlying buffer
   // is no longer valid.
   g_last_hidden = std::nullopt;
+
+  // W6 (MTP) Bug #4 — drop any pending linear-cache snapshot so it
+  // can't leak across turns / model loads.
+  g_compiled_linear_snapshot.clear();
+  g_linear_snapshot_offset = 0;
+  g_linear_snapshot_taken = false;
 
   // Phase 5 piece 1 paged-path globals.
   g_dense_paged_config = CompileConfig{};

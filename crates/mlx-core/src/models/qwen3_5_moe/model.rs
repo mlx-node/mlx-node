@@ -1675,19 +1675,17 @@ impl Qwen35MoeInner {
                         forward_moe_mtp_verify_compiled(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Mirrors the dense rollback contract — both
-                        // deltas are `accepted_drafts - depth`. Main
-                        // MoE verify wrote `depth + 1` K/V slots; we
-                        // keep `accepted_drafts + 1` of them →
-                        // delta = K - depth. MoE MTP drafts wrote
-                        // `depth` slots; we keep `accepted_drafts`
-                        // of them → delta = K - depth. The MoE MTP
-                        // path is NOT re-initialised; the next cycle
-                        // re-uses the existing MoE MTP caches with the
-                        // rewound offset.
+                        // MoE MTP path only. The main MoE path's offset
+                        // and GDN linear caches are restored via the
+                        // `snapshot_main_linear` / `restore_and_replay_main`
+                        // pair below (W6 Bug #4 fix). Calling
+                        // `mlx_qwen35_moe_adjust_offset(delta)` here
+                        // would double-rewind the main offset.
+                        //
+                        //   - MTP delta: drafts wrote `depth` K/V slots;
+                        //     we keep `accepted_drafts` → delta = K - depth.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
-                            mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
                             mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
                         }
                     },
@@ -1704,6 +1702,33 @@ impl Qwen35MoeInner {
                     begin_cycle: || unsafe {
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                    },
+                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
+                    // GDN linear caches + offset BEFORE the verify FFI
+                    // runs its D+1 sequential MoE forwards. Verify
+                    // mutates `g_moe_caches` in place; without restoring
+                    // on rejection the GDN recurrent state stays polluted
+                    // and the next Step A produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
+                    },
+                    // W6 MoE Bug #4 fix — on rejection: restore linear
+                    // caches + offset, then replay the K accepted drafts
+                    // via `forward_moe_compiled_with_hidden` so the main
+                    // MoE linear state matches the committed token
+                    // stream. Mirrors the dense-path closure.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_moe_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_moe_compiled_with_hidden(&id_arr, emb)?;
+                            logits.eval();
+                        }
+                        Ok(())
                     },
                 };
                 chat_common::decode_loop_mtp!(
@@ -3772,9 +3797,12 @@ impl Qwen35MoeInner {
                         forward_moe_mtp_verify_compiled(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // MoE MTP path only — main offset/linear restored
+                        // via `restore_and_replay_main`. See the first
+                        // MoE dispatch site (chat_sync_core_compiled_inner)
+                        // for the full W6 Bug #4 rationale.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
-                            mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
                             mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
                         }
                     },
@@ -3791,6 +3819,33 @@ impl Qwen35MoeInner {
                     begin_cycle: || unsafe {
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                    },
+                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
+                    // GDN linear caches + offset BEFORE the verify FFI
+                    // runs its D+1 sequential MoE forwards. Verify
+                    // mutates `g_moe_caches` in place; without restoring
+                    // on rejection the GDN recurrent state stays polluted
+                    // and the next Step A produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
+                    },
+                    // W6 MoE Bug #4 fix — on rejection: restore linear
+                    // caches + offset, then replay the K accepted drafts
+                    // via `forward_moe_compiled_with_hidden` so the main
+                    // MoE linear state matches the committed token
+                    // stream. Mirrors the dense-path closure.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_moe_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_moe_compiled_with_hidden(&id_arr, emb)?;
+                            logits.eval();
+                        }
+                        Ok(())
                     },
                 };
                 chat_common::decode_loop_mtp!(
@@ -4396,9 +4451,12 @@ impl Qwen35MoeInner {
                         forward_moe_mtp_verify_compiled(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // MoE MTP path only — main offset/linear restored
+                        // via `restore_and_replay_main`. See the first
+                        // MoE dispatch site (chat_sync_core_compiled_inner)
+                        // for the full W6 Bug #4 rationale.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
-                            mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
                             mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
                         }
                     },
@@ -4415,6 +4473,33 @@ impl Qwen35MoeInner {
                     begin_cycle: || unsafe {
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                    },
+                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
+                    // GDN linear caches + offset BEFORE the verify FFI
+                    // runs its D+1 sequential MoE forwards. Verify
+                    // mutates `g_moe_caches` in place; without restoring
+                    // on rejection the GDN recurrent state stays polluted
+                    // and the next Step A produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
+                    },
+                    // W6 MoE Bug #4 fix — on rejection: restore linear
+                    // caches + offset, then replay the K accepted drafts
+                    // via `forward_moe_compiled_with_hidden` so the main
+                    // MoE linear state matches the committed token
+                    // stream. Mirrors the dense-path closure.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_moe_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_moe_compiled_with_hidden(&id_arr, emb)?;
+                            logits.eval();
+                        }
+                        Ok(())
                     },
                 };
                 chat_common::decode_loop_mtp!(
@@ -5142,9 +5227,12 @@ impl Qwen35MoeInner {
                         forward_moe_mtp_verify_compiled(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
+                        // MoE MTP path only — main offset/linear restored
+                        // via `restore_and_replay_main`. See the first
+                        // MoE dispatch site (chat_sync_core_compiled_inner)
+                        // for the full W6 Bug #4 rationale.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
-                            mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
                             mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
                         }
                     },
@@ -5161,6 +5249,33 @@ impl Qwen35MoeInner {
                     begin_cycle: || unsafe {
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                    },
+                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
+                    // GDN linear caches + offset BEFORE the verify FFI
+                    // runs its D+1 sequential MoE forwards. Verify
+                    // mutates `g_moe_caches` in place; without restoring
+                    // on rejection the GDN recurrent state stays polluted
+                    // and the next Step A produces wrong logits.
+                    snapshot_main_linear: || unsafe {
+                        mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
+                    },
+                    // W6 MoE Bug #4 fix — on rejection: restore linear
+                    // caches + offset, then replay the K accepted drafts
+                    // via `forward_moe_compiled_with_hidden` so the main
+                    // MoE linear state matches the committed token
+                    // stream. Mirrors the dense-path closure.
+                    restore_and_replay_main: |accepted_drafts: &[u32],
+                                              emb: &MxArray|
+                     -> Result<()> {
+                        unsafe {
+                            mlx_sys::mlx_qwen35_moe_compiled_restore_linear_caches();
+                        }
+                        for &tok in accepted_drafts {
+                            let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
+                            let (logits, _hidden) = forward_moe_compiled_with_hidden(&id_arr, emb)?;
+                            logits.eval();
+                        }
+                        Ok(())
                     },
                 };
                 chat_common::decode_loop_mtp!(

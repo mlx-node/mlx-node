@@ -1088,12 +1088,14 @@ pub(crate) use decode_loop;
 ///        `[1, vocab]`.
 /// `V`  : MTP verify step returning verify logits of shape
 ///        `[1, depth + 1, vocab]`.
-/// `R`  : rollback hook receiving `(accepted, depth)`. Implementor
-///        calls `mlx_qwen35_compiled_adjust_offset(accepted as i32 -
-///        (depth as i32 + 1))` AND
+/// `R`  : rollback hook receiving `(accepted, depth)`. On rejection
+///        the implementor calls
 ///        `mlx_qwen35_mtp_compiled_adjust_offset(accepted as i32 -
-///        depth as i32)`. Split into one hook so the macro stays
-///        path-agnostic.
+///        depth as i32)` (MTP path only). The MAIN path's offset is
+///        rewound by `restore_and_replay_main` via the snapshot taken
+///        in `snapshot_main_linear` — DO NOT also call
+///        `mlx_qwen35_compiled_adjust_offset` here, or the main
+///        offset will double-rewind.
 /// `E`  : eval-step hook (same contract as `DecodeOps::eval_step`)
 ///        called after every emitted token to flush the lazy graph.
 /// `B`  : begin-cycle hook called once per outer iteration, BEFORE
@@ -1104,7 +1106,32 @@ pub(crate) use decode_loop;
 ///        to zero the MTP K/V caches and re-anchor the MTP offset.
 ///        This fixes W6 Bug #2 (mid-stream divergence): without the
 ///        reset the MTP offset lags the main offset by 2 per cycle.
-pub(crate) struct MtpOps<F, D, V, R, E, B>
+/// `S`  : snapshot hook for the main path's GDN linear-attention caches
+///        plus the main decode offset. Called once per cycle AFTER
+///        Step A and BEFORE verify. Implementor calls
+///        `mlx_qwen35_compiled_snapshot_linear_caches` (or the MoE
+///        equivalent). The snapshot is consumed by
+///        `restore_and_replay_main` on rejection — without it the
+///        GDN recurrent state stays polluted with rejected draft
+///        positions and the next Step A produces wrong logits (W6 Bug
+///        #4).
+/// `RR` : restore + replay hook called on rejection (any
+///        `accepted_drafts < depth`) AFTER `rollback`. Receives the
+///        list of accepted draft token IDs (NOT including the residual
+///        sample, NOT including `last_committed`) and the embedding
+///        weight. Implementor:
+///          1. Calls `mlx_qwen35_compiled_restore_linear_caches`
+///             (rewinds linear caches AND main offset to the
+///             snapshot point);
+///          2. For each accepted draft, runs ONE
+///             `mlx_qwen35_forward_compiled` (via
+///             `forward_with_hidden` to keep the implementation
+///             path-agnostic) so the main linear state catches up to
+///             "after Step A + K accepted drafts" and the main offset
+///             reaches `snapshot_offset + K`.
+///        On full-accept the macro skips this hook (verify already
+///        left the linear state advanced through all D drafts).
+pub(crate) struct MtpOps<F, D, V, R, E, B, S, RR>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
@@ -1112,6 +1139,8 @@ where
     R: FnMut(usize, usize),
     E: Fn(&MxArray, &MxArray, bool),
     B: FnMut(),
+    S: FnMut(),
+    RR: FnMut(&[u32], &MxArray) -> Result<()>,
 {
     pub forward_with_hidden: F,
     pub draft_step: D,
@@ -1119,6 +1148,8 @@ where
     pub rollback: R,
     pub eval_step: E,
     pub begin_cycle: B,
+    pub snapshot_main_linear: S,
+    pub restore_and_replay_main: RR,
 }
 
 /// Outcome of `run_mtp_cycle_inner` — the list of accepted tokens for
@@ -1148,8 +1179,8 @@ pub(crate) struct MtpCycleOutcome {
 /// is the caller's problem; production callers fold the cycle inside
 /// `DENSE_COMPILED_MUTEX` so a `?` early-return drops the
 /// `CompiledResetGuard` and wipes the C++ state cleanly.
-pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, B>(
-    ops: &mut MtpOps<F, D, V, R, E, B>,
+pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, B, S, RR>(
+    ops: &mut MtpOps<F, D, V, R, E, B, S, RR>,
     prev_hidden_in: MxArray,
     prev_emb_in: MxArray,
     last_committed_id: u32,
@@ -1166,6 +1197,8 @@ where
     R: FnMut(usize, usize),
     E: Fn(&MxArray, &MxArray, bool),
     B: FnMut(),
+    S: FnMut(),
+    RR: FnMut(&[u32], &MxArray) -> Result<()>,
 {
     use crate::array::{DType, MxArray as A};
     use crate::nn::Activations;
@@ -1209,6 +1242,14 @@ where
     verify_ids.push(last_committed_id as i32);
     verify_ids.extend(draft_ids.iter().copied());
     let verify_in = A::from_int32(&verify_ids, &[1, (depth + 1) as i64])?;
+    // W6 Bug #4 — snapshot the main path's GDN linear caches + offset
+    // BEFORE verify runs its D+1 sequential forwards. Verify mutates
+    // `g_compiled_caches` in place; on rejection we restore from this
+    // snapshot and replay only the K accepted drafts so the linear
+    // recurrent state matches the committed token stream. On full
+    // accept the snapshot is discarded — verify already left the
+    // linear state correctly advanced.
+    (ops.snapshot_main_linear)();
     let verify_logits = (ops.verify_step)(&verify_in, embedding_weight, depth)?;
     // verify_logits: [1, depth+1, vocab]. We materialize it now so
     // per-position slicing reads from a CPU-resident buffer for
@@ -1305,6 +1346,36 @@ where
         accepted_tokens.len() - 1
     };
     (ops.rollback)(accepted_drafts, depth);
+
+    // W6 Bug #4 fix — on rejection, restore the main path's GDN
+    // linear caches (back to "after Step A": Step A processed `y_N`
+    // and the snapshot was taken right after) and replay the
+    // K + 1 committed tokens that verify processed but the restore
+    // discarded:
+    //   * `last_committed_id` (= y_{N+1}, the token Step A sampled
+    //     and the cycle treated as the verify-position-0 anchor),
+    //   * `d_0..d_{K-1}` (the K accepted drafts).
+    // The residual sample R is NOT replayed — its K/V will be laid
+    // down by the NEXT outer iteration's Step A (it becomes `y` at
+    // the loop boundary).
+    //
+    // Post-replay main offset = snapshot_offset + K + 1, matching
+    // what the previous direct `adjust_offset(K - depth)` rollback
+    // produced. Post-replay linear state = AR equivalent for the
+    // `[y_N, y_{N+1}, d_0..d_{K-1}]` token prefix.
+    //
+    // On full accept verify already left the linear state advanced
+    // through `[y_N, y_{N+1}, d_0..d_{depth-1}]` (note y_{N+1} is
+    // re-processed, mirroring AR), so the snapshot is simply
+    // discarded on the next snapshot or reset.
+    if !all_accepted {
+        let mut replay_ids: Vec<u32> = Vec::with_capacity(accepted_drafts + 1);
+        replay_ids.push(last_committed_id);
+        // accepted_tokens = [d_0, .., d_{K-1}, residual]; we replay
+        // only the K accepted drafts (NOT the residual).
+        replay_ids.extend_from_slice(&accepted_tokens[..accepted_drafts]);
+        (ops.restore_and_replay_main)(&replay_ids, embedding_weight)?;
+    }
 
     let _ = rejection_residual; // documented above; only used for clarity
 
@@ -1963,6 +2034,8 @@ mod mtp_cycle_tests {
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
             begin_cycle: || {},
+            snapshot_main_linear: || {},
+            restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
@@ -2025,6 +2098,8 @@ mod mtp_cycle_tests {
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
             begin_cycle: || {},
+            snapshot_main_linear: || {},
+            restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xBADC0DE);
@@ -2080,6 +2155,8 @@ mod mtp_cycle_tests {
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
             begin_cycle: || {},
+            snapshot_main_linear: || {},
+            restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xDEAD);
@@ -2153,6 +2230,8 @@ mod mtp_cycle_tests {
             },
             eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
             begin_cycle: || {},
+            snapshot_main_linear: || {},
+            restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xFEED);
