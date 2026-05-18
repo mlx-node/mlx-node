@@ -60,9 +60,19 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 // | `mtpAdaptiveDepth` (TS field) | ON*     | W6.8       | per-session   |
 // | `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        |
 // | `MLX_MTP_VERIFY_ASYNC_EVAL`   | OFF     | W6.9       | opt-IN        |
+// | `MLX_MTP_FUSED_DRAFT`         | OFF     | W6.18      | opt-IN        |
 //
 // * adaptive defaults ON when `enableMtp=true` and `mtpDepth` is unset;
 //   defaults OFF (pinned) when `mtpDepth` is set explicitly.
+//
+// Naming disambiguation:
+//   - `MLX_MTP_CHAINED_CYCLES` (W6.5) — CROSS-CYCLE hidden-state export.
+//     Each cycle's `verify_hidden[K]` slice seeds the next cycle's first
+//     MTP draft; see `eval_step_with_chained_hidden` below.
+//   - `MLX_MTP_FUSED_DRAFT` (W6.18) — WITHIN-CYCLE draft-step fusion.
+//     All D draft steps within a single cycle compile into one
+//     `mlx::core::compile`d graph; see `MtpOps::fused_draft` and
+//     `mlx_qwen35_mtp_draft_fused_compiled` in the C++ FFI.
 //
 // Interaction notes:
 //   - `MLX_MTP_USE_TAPE_REPLAY=0` falls back to the W6 Bug #4 K+1 replay
@@ -77,6 +87,13 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 //   - `MLX_MTP_VERIFY_ASYNC_EVAL=1` overlaps verify dispatch with the
 //     accept loop's CPU-side graph construction; composes cleanly with
 //     all other flags.
+//   - `MLX_MTP_FUSED_DRAFT=1` routes all D draft steps through one
+//     compiled graph. Default OFF because the current smoke target
+//     (qwen3.6-27b-nvfp4-mtp, depth=3, M3 Max) shows no measured win
+//     — the per-step `tok.eval()` barriers do not serialize into 3 ×
+//     30–50 ms stalls on this hardware. Infrastructure is kept opt-in
+//     pending the Step-A-bypass follow-up where draft syncs are
+//     expected to dominate the cycle wall.
 
 // W6.6 — Tape-replay rollback for GDN linear-attention.
 //
@@ -169,6 +186,42 @@ pub(crate) fn mtp_chained_cycles_enabled() -> bool {
             v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
         }
         Err(_) => false, // default OFF — will flip post-resume benchmark
+    })
+}
+
+// W6.18 — Fused within-cycle draft graph.
+//
+// Opt-in: `MLX_MTP_FUSED_DRAFT=1` (or `true` / `on`). When ON AND the
+// caller installed an `MtpOps::fused_draft` closure AND temperature is
+// effectively zero, `run_mtp_cycle_inner` routes all D draft steps
+// through ONE `mlx::core::compile`d graph (the
+// `mlx_qwen35_mtp_draft_fused_compiled` FFI) instead of looping the
+// per-step `draft_step` closure D times.
+//
+// Default OFF: the current smoke target (qwen3.6-27b-nvfp4-mtp,
+// depth=3, M3 Max) measured 0.61× → 0.60× AR ratio — no observable
+// win. Per-cycle wall-time instrumentation shows the fused FFI runs
+// all D=3 draft steps in ~33 ms total, vs the per-step path's
+// ~30–42 ms total — equivalent. The per-step `tok.eval()` barriers do
+// not serialize into 3 × 30–50 ms stalls (which the task brief
+// assumed, extrapolating from a 4B-bf16 measurement); MLX already
+// overlaps CPU work between sync points. The remaining MTP overhead
+// vs AR lives in Step A + batched verify + accept loop, not in
+// drafting. The infrastructure is preserved opt-in for a future
+// Step-A-bypass follow-up where draft syncs are expected to pay off.
+//
+// Naming: independent of the W6.5 `MLX_MTP_CHAINED_CYCLES` knob; see
+// the "Naming disambiguation" block in the inventory above.
+//
+// The env var is read once per process and cached.
+pub(crate) fn mtp_fused_draft_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_FUSED_DRAFT") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false, // default OFF — opt-in until a target shows perf win
     })
 }
 
@@ -1329,10 +1382,16 @@ where
     pub begin_cycle: B,
     pub snapshot_main_linear: S,
     pub restore_and_replay_main: RR,
-    /// W6.18 — Optional chained-draft callback. When `Some(...)` AND
-    /// `run_mtp_cycle_inner` decides to use the chained path (currently
-    /// gated on `temperature <= 1e-6`), all D draft steps run inside
-    /// ONE compiled graph via this closure. Contract:
+    /// W6.18 — Optional fused-draft callback. When `Some(...)` AND
+    /// `MLX_MTP_FUSED_DRAFT=1` AND `run_mtp_cycle_inner` decides to use
+    /// the fused path (currently gated on `temperature <= 1e-6`), all D
+    /// draft steps run inside ONE compiled graph via this closure.
+    ///
+    /// "Fused" refers to the WITHIN-CYCLE fusion of D draft steps —
+    /// independent of the W6.5 CROSS-CYCLE `MLX_MTP_CHAINED_CYCLES`
+    /// concept (verify-hidden export across cycles).
+    ///
+    /// Contract:
     ///
     /// * Inputs: `prev_hidden` / `prev_emb` (`[1, 1, hidden]` bf16),
     ///   embedding_weight (`[vocab, hidden]`), depth ∈ {1..5}.
@@ -1342,9 +1401,9 @@ where
     ///   per-step probs are unused numerically — `accept_with_residual`
     ///   only reads the draft IDs in the greedy path.
     ///
-    /// `None` disables chaining and forces the per-step `draft_step`
+    /// `None` disables fusion and forces the per-step `draft_step`
     /// loop (legacy path; required for tests and MoE).
-    pub chained_draft:
+    pub fused_draft:
         Option<Box<dyn FnMut(&MxArray, &MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>>>,
 }
 
@@ -1404,40 +1463,42 @@ where
     debug_assert!(depth >= 1, "run_mtp_cycle_inner: depth must be >= 1");
 
     // Step 1: D draft steps. Either fused into one compiled graph
-    // (W6.18 chained path) or the legacy per-step loop.
+    // (W6.18 fused path) or the legacy per-step loop.
     //
-    // Chained path gating:
-    //   1. `ops.chained_draft` is `Some(...)` — the caller installed
+    // Fused path gating:
+    //   1. `MLX_MTP_FUSED_DRAFT=1` — opt-in env var (default OFF; see
+    //      `mtp_fused_draft_enabled` for rationale).
+    //   2. `ops.fused_draft` is `Some(...)` — the caller installed
     //      the FFI dispatch (production dense path does; MoE / tests
     //      pass None).
-    //   2. `temperature <= 1e-6` — at T=0 (greedy) the per-step Rust
+    //   3. `temperature <= 1e-6` — at T=0 (greedy) the per-step Rust
     //      path collapses to argmax via `sampling::sample` (see
-    //      `compiled_sample_full`); the chained graph also argmaxes
+    //      `compiled_sample_full`); the fused graph also argmaxes
     //      on-device, so the drafted IDs are byte-equivalent.
     //      At T>0 the per-step path stochastically samples (consuming
-    //      MLX's global RNG between steps); the chained graph uses
+    //      MLX's global RNG between steps); the fused graph uses
     //      argmax, which is a SEMANTIC change for the drafter only —
     //      verify is still the ground truth, so emitted tokens still
     //      come from the target distribution per Leviathan-Chen, but
     //      acceptance rate may differ. We keep T>0 on the per-step
     //      path to preserve the existing contract.
     //
-    // On any chained-path error we fall back to the per-step loop in
+    // On any fused-path error we fall back to the per-step loop in
     // the same cycle (the eager Rust path is the safety net).
     let temperature = params
         .sampling_config
         .and_then(|c| c.temperature)
         .unwrap_or(1.0);
-    let try_chained = ops.chained_draft.is_some() && temperature <= 1e-6;
+    let try_fused = mtp_fused_draft_enabled() && ops.fused_draft.is_some() && temperature <= 1e-6;
 
     let mut prev_hidden = prev_hidden_in;
     let mut prev_emb = prev_emb_in;
     let mut draft_ids: Vec<i32> = Vec::with_capacity(depth);
     let mut draft_probs: Vec<MxArray> = Vec::with_capacity(depth);
 
-    let mut used_chained = false;
-    if try_chained && let Some(ref mut chained) = ops.chained_draft {
-        match chained(&prev_hidden, &prev_emb, embedding_weight, depth) {
+    let mut used_fused = false;
+    if try_fused && let Some(ref mut fused) = ops.fused_draft {
+        match fused(&prev_hidden, &prev_emb, embedding_weight, depth) {
             Ok((ids_arr, probs_arr)) => {
                 // ids_arr is `[depth]` int32; eval and read once.
                 ids_arr.eval();
@@ -1450,8 +1511,8 @@ where
                 // (only reads draft_id), so the lazy slice never gets
                 // materialised by Metal. This avoids a per-position
                 // eval barrier that would defeat the very sync collapse
-                // this task is about. At T>0 the chained path is gated
-                // off (try_chained=false), so this code is unreachable.
+                // this task is about. At T>0 the fused path is gated
+                // off (try_fused=false), so this code is unreachable.
                 let vocab = probs_arr.shape_at(1)?;
                 for i in 0..depth {
                     let row = probs_arr.slice(&[i as i64, 0], &[(i + 1) as i64, vocab])?;
@@ -1459,16 +1520,16 @@ where
                     // `accept_with_residual` contract.
                     draft_probs.push(row.squeeze(Some(&[0]))?);
                 }
-                used_chained = true;
+                used_fused = true;
             }
             Err(e) => {
-                // W6.18 — chained path failed (init not done, C++
+                // W6.18 — fused path failed (init not done, C++
                 // exception, shape mismatch). Log + fall back to
                 // the per-step loop so the cycle still completes.
                 tracing::warn!(
-                    target: "mlx_core::mtp::chained",
+                    target: "mlx_core::mtp::fused",
                     error = %e.reason,
-                    "W6.18 chained draft FFI failed; falling back to per-step path"
+                    "W6.18 fused draft FFI failed; falling back to per-step path"
                 );
                 draft_ids.clear();
                 draft_probs.clear();
@@ -1476,7 +1537,7 @@ where
         }
     }
 
-    if !used_chained {
+    if !used_fused {
         for _ in 0..depth {
             let (h_next, draft_logits) = (ops.draft_step)(&prev_hidden, &prev_emb)?;
             // draft_logits is [1, vocab]; squeeze to [vocab] for softmax.
@@ -2634,10 +2695,10 @@ mod mtp_cycle_tests {
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
             // W6.18 — tests exercise the per-step `draft_step` path.
-            // The chained-draft FFI is dense-only and the tests don't
+            // The fused-draft FFI is dense-only and the tests don't
             // need to validate it (cycle-level acceptance semantics
             // are path-agnostic).
-            chained_draft: None,
+            fused_draft: None,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
@@ -2704,10 +2765,10 @@ mod mtp_cycle_tests {
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
             // W6.18 — tests exercise the per-step `draft_step` path.
-            // The chained-draft FFI is dense-only and the tests don't
+            // The fused-draft FFI is dense-only and the tests don't
             // need to validate it (cycle-level acceptance semantics
             // are path-agnostic).
-            chained_draft: None,
+            fused_draft: None,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xBADC0DE);
@@ -2767,10 +2828,10 @@ mod mtp_cycle_tests {
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
             // W6.18 — tests exercise the per-step `draft_step` path.
-            // The chained-draft FFI is dense-only and the tests don't
+            // The fused-draft FFI is dense-only and the tests don't
             // need to validate it (cycle-level acceptance semantics
             // are path-agnostic).
-            chained_draft: None,
+            fused_draft: None,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xDEAD);
@@ -2848,10 +2909,10 @@ mod mtp_cycle_tests {
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
             // W6.18 — tests exercise the per-step `draft_step` path.
-            // The chained-draft FFI is dense-only and the tests don't
+            // The fused-draft FFI is dense-only and the tests don't
             // need to validate it (cycle-level acceptance semantics
             // are path-agnostic).
-            chained_draft: None,
+            fused_draft: None,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xFEED);

@@ -1704,8 +1704,12 @@ unsafe extern "C-unwind" {
         out_logits: *mut *mut mlx_array,
     );
 
-    /// W6.18 — Chained MTP draft: ALL `depth` draft steps in ONE
+    /// W6.18 — Fused MTP draft: ALL `depth` draft steps in ONE
     /// `mlx::core::compile`d graph. MTPLX-style.
+    ///
+    /// "Fused" refers to the WITHIN-CYCLE fusion of D draft steps and is
+    /// independent of the W6.5 CROSS-CYCLE `MLX_MTP_CHAINED_CYCLES`
+    /// concept (verify-hidden export across cycles).
     ///
     /// Inputs:
     ///   - `prev_hidden` / `prev_emb` — `[1, 1, hidden]` bf16, same
@@ -1735,7 +1739,7 @@ unsafe extern "C-unwind" {
     /// On any failure all three output slots are null; the Rust caller
     /// should fall back to the per-step path (preserves the eager-Rust
     /// safety net).
-    pub fn mlx_qwen35_mtp_draft_chained_compiled(
+    pub fn mlx_qwen35_mtp_draft_fused_compiled(
         prev_hidden: *mut mlx_array,
         prev_emb: *mut mlx_array,
         embedding_weight: *mut mlx_array,

@@ -352,10 +352,10 @@ static auto& compiled_mtp_draft_decode() {
 // =====================================================================
 
 template <int D>
-static std::vector<array> mtp_draft_chained_decode_fn(
+static std::vector<array> mtp_draft_fused_decode_fn(
     const std::vector<array>& inputs) {
   static_assert(D >= 1 && D <= 5,
-                "mtp_draft_chained_decode_fn: D must be in [1, 5]");
+                "mtp_draft_fused_decode_fn: D must be in [1, 5]");
   const auto& cfg = g_mtp_config;
   auto prev_hidden  = inputs[0];          // [1, 1, hidden]
   auto prev_emb     = inputs[1];          // [1, 1, hidden]
@@ -492,19 +492,23 @@ static std::vector<array> mtp_draft_chained_decode_fn(
   return result;
 }
 
-// Per-depth compile cache for the chained draft graph. One
+// Per-depth compile cache for the fused draft graph. One
 // `mlx::core::compile` entry per depth ∈ {1..5} — five total, mirroring
 // MTPLX's `_make_device_d2_draft_core` which compiles a per-depth
 // closure. The closure body is parameterised by the template `D`, so
 // each depth gets its own statically-unrolled graph.
+//
+// "Fused" here refers to the WITHIN-CYCLE fusion of D draft steps into
+// one compile()d graph (W6.18). Do NOT confuse with the W6.5 CROSS-CYCLE
+// `MLX_MTP_CHAINED_CYCLES` concept (verify-hidden export across cycles).
 //
 // `mlx::core::compile`'s INTERNAL trace cache keys on input shapes /
 // dtypes; the per-depth dispatch we add here is on the closure
 // IDENTITY (one `std::function` per depth), not just shapes — because
 // the unrolled body is different code per depth.
 template <int D>
-static auto& compiled_mtp_draft_chained_decode() {
-  static auto fn = mlx::core::compile(mtp_draft_chained_decode_fn<D>);
+static auto& compiled_mtp_draft_fused_decode() {
+  static auto fn = mlx::core::compile(mtp_draft_fused_decode_fn<D>);
   return fn;
 }
 
@@ -512,40 +516,40 @@ static auto& compiled_mtp_draft_chained_decode() {
 // templated compiled closure. Returns `nullptr`-equivalent (an empty
 // `std::function`) for out-of-range; the FFI rejects those before
 // dispatch.
-using ChainedDraftFn = std::function<std::vector<array>(const std::vector<array>&)>;
+using FusedDraftFn = std::function<std::vector<array>(const std::vector<array>&)>;
 
-static ChainedDraftFn make_chained_draft_dispatcher(int depth) {
+static FusedDraftFn make_fused_draft_dispatcher(int depth) {
   switch (depth) {
     case 1: return [](const std::vector<array>& in) {
-      return compiled_mtp_draft_chained_decode<1>()(in);
+      return compiled_mtp_draft_fused_decode<1>()(in);
     };
     case 2: return [](const std::vector<array>& in) {
-      return compiled_mtp_draft_chained_decode<2>()(in);
+      return compiled_mtp_draft_fused_decode<2>()(in);
     };
     case 3: return [](const std::vector<array>& in) {
-      return compiled_mtp_draft_chained_decode<3>()(in);
+      return compiled_mtp_draft_fused_decode<3>()(in);
     };
     case 4: return [](const std::vector<array>& in) {
-      return compiled_mtp_draft_chained_decode<4>()(in);
+      return compiled_mtp_draft_fused_decode<4>()(in);
     };
     case 5: return [](const std::vector<array>& in) {
-      return compiled_mtp_draft_chained_decode<5>()(in);
+      return compiled_mtp_draft_fused_decode<5>()(in);
     };
-    default: return ChainedDraftFn{};
+    default: return FusedDraftFn{};
   }
 }
 
 // Per-depth dispatcher table. Mirrors `g_verify_compiled_by_depth` —
 // populated lazily on first use of each depth, or eagerly via the
 // prewarm path below.
-constexpr int MAX_CHAINED_DRAFT_DEPTH = 5;
-static std::array<ChainedDraftFn, MAX_CHAINED_DRAFT_DEPTH>
-    g_chained_draft_compiled_by_depth{};
+constexpr int MAX_FUSED_DRAFT_DEPTH = 5;
+static std::array<FusedDraftFn, MAX_FUSED_DRAFT_DEPTH>
+    g_fused_draft_compiled_by_depth{};
 
-static const ChainedDraftFn& get_or_make_chained_draft_fn(int depth) {
-  auto& slot = g_chained_draft_compiled_by_depth[depth - 1];
+static const FusedDraftFn& get_or_make_fused_draft_fn(int depth) {
+  auto& slot = g_fused_draft_compiled_by_depth[depth - 1];
   if (!slot) {
-    slot = make_chained_draft_dispatcher(depth);
+    slot = make_fused_draft_dispatcher(depth);
   }
   return slot;
 }
@@ -879,7 +883,13 @@ void mlx_qwen35_mtp_draft_compiled(
 }
 
 // -----------------------------------------------------------------------------
-// W6.18 — Chained MTP draft: ALL D draft steps in one compiled graph.
+// W6.18 — Fused MTP draft: ALL D draft steps in one compiled graph.
+//
+// "Fused" refers to the WITHIN-CYCLE fusion of D draft steps. This is
+// independent of the W6.5 CROSS-CYCLE `MLX_MTP_CHAINED_CYCLES` concept
+// (verify-hidden export across cycles); see comments at the top of this
+// file and `chat_common.rs::mtp_chained_cycles_enabled` for the
+// cross-cycle concept.
 //
 // Inputs:
 //   - prev_hidden_ptr:       `[1, 1, hidden]` bf16 — post-final-norm
@@ -922,7 +932,7 @@ void mlx_qwen35_mtp_draft_compiled(
 // caller falls back to the per-step `mlx_qwen35_mtp_draft_compiled`
 // path (Rust-side dispatch).
 // -----------------------------------------------------------------------------
-void mlx_qwen35_mtp_draft_chained_compiled(
+void mlx_qwen35_mtp_draft_fused_compiled(
     mlx_array* prev_hidden_ptr,
     mlx_array* prev_emb_ptr,
     mlx_array* embedding_weight_ptr,
@@ -939,11 +949,11 @@ void mlx_qwen35_mtp_draft_chained_compiled(
       !out_h_final || !out_draft_ids || !out_draft_probs) {
     return;
   }
-  if (depth < 1 || depth > MAX_CHAINED_DRAFT_DEPTH) {
+  if (depth < 1 || depth > MAX_FUSED_DRAFT_DEPTH) {
     fprintf(stderr,
-            "[MLX] mlx_qwen35_mtp_draft_chained_compiled: depth %d "
+            "[MLX] mlx_qwen35_mtp_draft_fused_compiled: depth %d "
             "outside [1, %d]\n",
-            depth, MAX_CHAINED_DRAFT_DEPTH);
+            depth, MAX_FUSED_DRAFT_DEPTH);
     fflush(stderr);
     return;
   }
@@ -963,11 +973,11 @@ void mlx_qwen35_mtp_draft_chained_compiled(
       inputs.push_back(c);
     }
 
-    const auto& chained_fn = get_or_make_chained_draft_fn(depth);
-    auto outputs = chained_fn(inputs);
+    const auto& fused_fn = get_or_make_fused_draft_fn(depth);
+    auto outputs = fused_fn(inputs);
     if (outputs.size() < static_cast<size_t>(3 + g_mtp_config.n_mtp_layers * 2)) {
       throw std::runtime_error(
-          "mlx_qwen35_mtp_draft_chained_compiled: chained graph returned "
+          "mlx_qwen35_mtp_draft_fused_compiled: fused graph returned "
           "fewer outputs than expected");
     }
 
@@ -980,7 +990,7 @@ void mlx_qwen35_mtp_draft_chained_compiled(
     }
   } catch (const std::exception& e) {
     fprintf(stderr,
-            "[MLX] Exception in mlx_qwen35_mtp_draft_chained_compiled: %s\n",
+            "[MLX] Exception in mlx_qwen35_mtp_draft_fused_compiled: %s\n",
             e.what());
     fflush(stderr);
     if (out_h_final)    *out_h_final    = nullptr;
@@ -988,7 +998,7 @@ void mlx_qwen35_mtp_draft_chained_compiled(
     if (out_draft_probs)*out_draft_probs= nullptr;
   } catch (...) {
     fprintf(stderr,
-            "[MLX] Unknown exception in mlx_qwen35_mtp_draft_chained_compiled\n");
+            "[MLX] Unknown exception in mlx_qwen35_mtp_draft_fused_compiled\n");
     fflush(stderr);
     if (out_h_final)    *out_h_final    = nullptr;
     if (out_draft_ids)  *out_draft_ids  = nullptr;
@@ -1247,17 +1257,17 @@ void mlx_qwen35_mtp_compiled_prewarm_verify() {
         slot = make_verify_fn(d);
       }
     }
-    // W6.18 — also populate the chained-draft per-depth dispatcher slots
+    // W6.18 — also populate the fused-draft per-depth dispatcher slots
     // so first-use of each depth doesn't allocate the `std::function`
     // inside the draft call. The compiled graph itself is still traced
     // lazily on first use of each depth (the static-function-local
-    // `compiled_mtp_draft_chained_decode<D>` cache is shape-keyed by
+    // `compiled_mtp_draft_fused_decode<D>` cache is shape-keyed by
     // `mlx::core::compile` and only fires the heavy trace on first
     // invocation with real shapes).
-    for (int d = 1; d <= MAX_CHAINED_DRAFT_DEPTH; d++) {
-      auto& slot = g_chained_draft_compiled_by_depth[d - 1];
+    for (int d = 1; d <= MAX_FUSED_DRAFT_DEPTH; d++) {
+      auto& slot = g_fused_draft_compiled_by_depth[d - 1];
       if (!slot) {
-        slot = make_chained_draft_dispatcher(d);
+        slot = make_fused_draft_dispatcher(d);
       }
     }
   } catch (const std::exception& e) {
@@ -1291,12 +1301,12 @@ void mlx_qwen35_mtp_compiled_reset() {
   for (auto& slot : g_verify_compiled_by_depth) {
     slot = nullptr;
   }
-  // W6.18 — also clear the chained draft dispatcher table so a
+  // W6.18 — also clear the fused draft dispatcher table so a
   // subsequent re-init repopulates the per-depth closures from scratch.
-  // The underlying compiled-graph cache inside `compiled_mtp_draft_chained_decode<D>`
+  // The underlying compiled-graph cache inside `compiled_mtp_draft_fused_decode<D>`
   // is static-function-local so it survives the reset (a deliberate
   // perf choice: re-init reuses the cached compile traces).
-  for (auto& slot : g_chained_draft_compiled_by_depth) {
+  for (auto& slot : g_fused_draft_compiled_by_depth) {
     slot = nullptr;
   }
   // W6.7 follow-up #3 — Re-arm the prewarm gate so a subsequent re-init
