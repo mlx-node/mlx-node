@@ -521,6 +521,39 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // generic quantize block below must skip these to avoid double-quantizing.
     let is_privacy_filter = matches!(model_type.as_deref(), Some("privacy-filter"));
 
+    // Refuse `--quantize` against pre-quantized MTP sources for Qwen3.5/3.6.
+    // The W6.15 convert path retains `mtp.*` tensors untouched (MTPLX
+    // "final form" convention), which means existing `mtp.*.scales` /
+    // `.biases` flow through to the output. Re-quantizing the
+    // language-model body simultaneously rewrites the global `quantization`
+    // block in `config.json` to whatever bits/group_size/mode the user
+    // asked for, and the load path (`mtp.rs::apply_weights`) resolves
+    // missing per-tensor overrides through that block — so an affine-8 MTP
+    // head silently gets loaded as e.g. NVFP4-4 group_size=16. Fail loudly
+    // here rather than emit a checkpoint that diverges at load time.
+    if do_quantize && has_custom_sanitizer {
+        let has_pre_quantized_mtp = tensors.keys().any(|k| {
+            let bare = k
+                .strip_prefix("model.language_model.")
+                .or_else(|| k.strip_prefix("language_model.model."))
+                .or_else(|| k.strip_prefix("language_model."))
+                .or_else(|| k.strip_prefix("model."))
+                .unwrap_or(k);
+            (bare.starts_with("mtp.") || bare.starts_with("mtp_"))
+                && (k.ends_with(".scales") || k.ends_with(".biases"))
+        });
+        if has_pre_quantized_mtp {
+            return Err(Error::from_reason(
+                "Source checkpoint ships pre-quantized MTP weights (mtp.*.scales / .biases). \
+                 Re-quantizing the language-model body while keeping MTP scales would mis-interpret \
+                 the original MTP quantization metadata at load time. Re-run without --quantize, \
+                 dequantize the MTP head before conversion, or open an issue for an explicit \
+                 per-tensor MTP override path."
+                    .to_string(),
+            ));
+        }
+    }
+
     // Convert tensors to target dtype
     info!("Converting tensors to {}...", target_dtype);
 
@@ -1014,6 +1047,17 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
 
     // Exclude in_proj_a, in_proj_b, and in_proj_ba (low-rank projections in GatedDeltaNet)
     if key.contains("in_proj_a.") || key.contains("in_proj_b.") || key.contains("in_proj_ba.") {
+        return false;
+    }
+
+    // Exclude MTP (multi-token prediction) head weights. MTPLX convention is
+    // that MTP weights are stored in their "final form" and must NOT be
+    // re-quantized by us — doing so produces a quantization-of-quantization
+    // chain that degrades the head's verify-time accuracy. MTP heads are
+    // small (~150-500MB total even on 27B dense) so the disk-size cost of
+    // keeping them at the source dtype is negligible. Matches the W1
+    // load-path bypass in `qwen3_5/persistence.rs::sanitize_weights`.
+    if key.starts_with("mtp.") || key.starts_with("mtp_") || key.contains(".mtp.") {
         return false;
     }
 
@@ -2377,7 +2421,12 @@ fn dequant_fp8(weight: &MxArray, scale_inv: &MxArray, target_dtype: DType) -> Re
 ///
 /// Handles:
 /// 1. VL key prefix remapping to mlx-vlm convention (language_model.model.*, vision_tower.*)
-/// 2. Skipping MTP weights
+/// 2. Retaining MTP (multi-token prediction) head weights under the bare `mtp.*`
+///    prefix so the speculative-decode head loads at runtime. MTPLX convention
+///    stores MTP weights in their "final form"; we therefore skip both the
+///    norm +1.0 shift (Step 4) and quantization (`should_quantize` excludes
+///    `mtp.*`) for these tensors. Mirrors the W1 load-path bypass in
+///    `qwen3_5/persistence.rs::sanitize_weights`.
 /// 3. FP8 E4M3 dequantization (weight + weight_scale_inv → target dtype)
 /// 4. Individual expert stacking (experts.{i}.{proj} → switch_mlp.{proj})
 /// 5. mlx-vlm sanitization: norm weight +1.0 shift, conv1d weight transpose
@@ -2427,11 +2476,56 @@ fn sanitize_qwen35_moe(
         info!("  Detected FP8 weights — will dequantize");
     }
 
-    // Step 1: Remap key prefixes, skip MTP
+    // Step 1: Remap key prefixes; retain MTP weights at the bare `mtp.*` prefix.
+    //
+    // MTP (multi-token prediction) head weights flow through this pass
+    // unchanged. The load path (`qwen3_5/persistence.rs::sanitize_weights`,
+    // W1) reads them under exactly the `mtp.*` prefix; emitting them with
+    // any of the `language_model.model.` / `model.` re-prefixes that the
+    // language-model body uses would force the load-time prefix-strip to do
+    // the same work twice. Source HF checkpoints already ship MTP keys as
+    // bare `mtp.*` (see e.g. `qwen3.5-0.8b/model.safetensors.index.json`),
+    // and to defend against prefixed variants we explicitly strip the same
+    // prefix set the language-model branch handles below. Normalising MTP
+    // to the bare form here is also what makes the Step 4 `starts_with("mtp.")`
+    // bypass for the +1.0 norm shift load-bearing.
+    let is_mtp_key = |k: &str| -> bool {
+        let bare = k
+            .strip_prefix("model.language_model.")
+            .or_else(|| k.strip_prefix("language_model.model."))
+            .or_else(|| k.strip_prefix("language_model."))
+            .or_else(|| k.strip_prefix("model."))
+            .unwrap_or(k);
+        bare.starts_with("mtp.") || bare.starts_with("mtp_")
+    };
+
+    let has_mtp = weights.keys().any(|k| is_mtp_key(k));
+    if has_mtp {
+        let mtp_count = weights.keys().filter(|k| is_mtp_key(k)).count();
+        info!(
+            "  Detected {} MTP weight keys — retaining at bare `mtp.*` prefix \
+             (un-quantized; MTPLX final-form convention)",
+            mtp_count
+        );
+    }
+
     let mut new_weights: HashMap<String, MxArray> = HashMap::new();
     for (key, value) in weights.into_iter() {
-        // Skip MTP (multi-token prediction)
-        if key.starts_with("mtp.") || key.starts_with("mtp_") {
+        // MTP head: normalise to bare `mtp.*` prefix and pass through.
+        // MTPLX convention stores these in final form, so we deliberately
+        // bypass the language-model re-prefixing below. Step 4's norm +1.0
+        // shift is gated to skip keys starting with `mtp.` and
+        // `should_quantize` excludes MTP so the quantize pass leaves them
+        // at the source / target dtype.
+        if is_mtp_key(&key) {
+            let bare = key
+                .strip_prefix("model.language_model.")
+                .or_else(|| key.strip_prefix("language_model.model."))
+                .or_else(|| key.strip_prefix("language_model."))
+                .or_else(|| key.strip_prefix("model."))
+                .unwrap_or(&key)
+                .to_string();
+            new_weights.insert(bare, value);
             continue;
         }
 
@@ -2674,6 +2768,52 @@ fn sanitize_qwen35_moe(
             }
         }
 
+        // MTP MoE layers may also ship individual experts under
+        // `mtp.layers.{l}.mlp.experts.{i}.{proj}.weight`. Stack them into
+        // the `mtp.layers.{l}.mlp.switch_mlp.{proj}.weight` form the MoE
+        // MTP loader (`qwen3_5_moe/mtp.rs::apply_weights`) expects.
+        // Without this, the cleanup pass below would silently delete every
+        // individual MTP expert and leave the MTP MoE head with missing
+        // weights. Detection is per-prefix because `n_mtp_layers` is not
+        // available in this scope; we walk every distinct `mtp.layers.{l}`
+        // we observe and stack on demand. No-cache sources ship MoE MTP as
+        // pre-stacked (Format B), so this branch is currently defensive.
+        let mtp_expert_prefixes: std::collections::BTreeSet<String> = new_weights
+            .keys()
+            .filter_map(|k| {
+                if k.starts_with("mtp.layers.") && k.contains(".mlp.experts.0.gate_proj.weight") {
+                    k.find(".mlp.experts.0.gate_proj.weight")
+                        .map(|idx| k[..idx + 4].to_string()) // include `.mlp`
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for prefix in &mtp_expert_prefixes {
+            info!(
+                "  MTP: stacking {} individual experts under '{}'...",
+                num_experts, prefix
+            );
+            for proj in &["gate_proj", "up_proj", "down_proj"] {
+                let mut to_stack: Vec<MxArray> = Vec::with_capacity(num_experts);
+                for e in 0..num_experts {
+                    let k = format!("{}.experts.{}.{}.weight", prefix, e, proj);
+                    match new_weights.remove(&k) {
+                        Some(w) => to_stack.push(w),
+                        None => {
+                            return Err(Error::from_reason(format!(
+                                "Missing MTP expert weight: {}",
+                                k
+                            )));
+                        }
+                    }
+                }
+                let refs: Vec<&MxArray> = to_stack.iter().collect();
+                let stacked = MxArray::stack(refs, Some(0))?;
+                new_weights.insert(format!("{}.switch_mlp.{}.weight", prefix, proj), stacked);
+            }
+        }
+
         // Clean up any remaining individual expert keys
         let expert_keys: Vec<String> = new_weights
             .keys()
@@ -2730,10 +2870,15 @@ fn sanitize_qwen35_moe(
     //
     // Detect if model is already in MLX format by checking norm weight values.
     // HF raw norm weights are ~0.0 (unshifted), MLX format is ~1.0 (shifted).
+    // We deliberately exclude MTP norms from the probe: MTPLX stores MTP
+    // norms in final form (already ~1.0) even when the language-model body
+    // is unshifted, so picking an MTP key would mis-classify a raw HF
+    // checkpoint as "already sanitized" and skip the +1.0 shift on the
+    // language-model norms (catastrophic for inference quality).
     let already_sanitized = {
         let test_key = new_weights
             .keys()
-            .find(|k| k.ends_with(".input_layernorm.weight"))
+            .find(|k| k.ends_with(".input_layernorm.weight") && !k.starts_with("mtp."))
             .cloned();
         if let Some(ref k) = test_key {
             let v = new_weights.get(k).unwrap();
@@ -2800,6 +2945,12 @@ fn sanitize_qwen35_moe(
                 }
             }
         } else if norm_suffixes.iter().any(|sfx| k.ends_with(sfx)) {
+            // MTP norms are stored in final form (MTPLX convention) — bypass
+            // the +1.0 shift here. Mirrors the W1 load-path bypass in
+            // `qwen3_5/persistence.rs::sanitize_weights` (`is_mtp_weight`).
+            if k.starts_with("mtp.") {
+                continue;
+            }
             let v = new_weights.get(&k).unwrap();
             if v.ndim()? == 1 {
                 let shifted = v.add_scalar(1.0)?;
