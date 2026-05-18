@@ -68,9 +68,12 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 //   - `MLX_MTP_USE_TAPE_REPLAY=0` falls back to the W6 Bug #4 K+1 replay
 //     path; safe to combine with all other flags.
 //   - `MLX_MTP_CHAINED_CYCLES=1` is currently slower than the default
-//     Step-A path at depth ≥ 2 because the chained verify_hidden[K]
-//     slice forces an extra command-buffer roundtrip per cycle.
-//     Re-evaluate after the W6.5-resume follow-up lands.
+//     Step-A path at depth ≥ 2 even after the W6.5-resume fix (the
+//     `verify_hidden[K]` slice is now batched into the next-cycle
+//     `async_eval` — see `eval_step_with_chained_hidden` below). The
+//     residual ~18% gap on bf16/M3 Max smoke traces to cross-cycle CPU
+//     bookkeeping, not the slice DMA the original W6.5 plan blamed.
+//     Further work tracked in the literal-prefetch follow-up.
 //   - `MLX_MTP_VERIFY_ASYNC_EVAL=1` overlaps verify dispatch with the
 //     accept loop's CPU-side graph construction; composes cleanly with
 //     all other flags.

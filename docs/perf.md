@@ -73,7 +73,7 @@ resolution.
 | `MLX_MTP_USE_TAPE_REPLAY`     | ON      | W6.6       | opt-OUT       | Set to `0` / `false` / `off` to fall back to the W6 Bug #4 K+1 main-model replay path. Dense only — MoE always uses K+1.                                                                   |
 | (eager verify prewarm)        | always  | W6.7       | unconditional | No env var. Once-per-process `atomic<bool>` CAS at model load runs 10 dummy shapes (5 depths × 2 tape variants) to warm caches.                                                            |
 | `mtpAdaptiveDepth` (TS field) | ON\*    | W6.8       | per-session   | TS `ChatConfig` field. \* defaults ON when `enableMtp=true` and `mtpDepth` is unset; defaults OFF (pinned) when `mtpDepth` is set explicitly.                                              |
-| `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        | Slower than the default Step-A path at depth ≥ 2 today (the chained `verify_hidden[K]` slice forces an extra command-buffer roundtrip). Re-evaluate after the W6.5-resume follow-up lands. |
+| `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        | Slower than the default Step-A path at depth ≥ 2 even after the W6.5-resume fix batched the `verify_hidden[K]` slice into the next-cycle `async_eval`. The residual ~18% gap on bf16/M3 Max traces to cross-cycle CPU bookkeeping, not the slice DMA. |
 | `MLX_MTP_VERIFY_ASYNC_EVAL`   | OFF     | W6.9       | opt-IN        | Overlaps verify dispatch with the accept loop's CPU-side graph construction. Composes cleanly with all other flags.                                                                        |
 
 Interactions:
