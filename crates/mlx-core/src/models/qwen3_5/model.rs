@@ -8237,22 +8237,29 @@ pub(super) fn forward_mtp_verify_compiled(
     MxArray::from_handle(out_ptr, "mtp_verify_logits")
 }
 
-/// W6.5 — verify pass that ALSO exports the post-final-norm hidden of
-/// the LAST verify iteration (verify position `depth`). The caller
-/// uses this to chain MTP cycles without running a fresh main-model
-/// forward at "Step A" — the chained hidden is fed as `prev_hidden`
-/// to the next cycle's first draft step.
+/// W6.5 — verify pass that ALSO exports the post-final-norm hidden
+/// state at EVERY verify position. The caller uses this to chain MTP
+/// cycles without running a fresh main-model forward at "Step A" —
+/// after the accept loop computes K (= number of accepted drafts), it
+/// slices `verify_hiddens[:, K, :]` and feeds the result as
+/// `prev_hidden` to the next cycle's first draft step. K's value
+/// corresponds to the prediction context for the committed token at
+/// position K+1 (bonus on full-accept, residual on rejection), matching
+/// the MTP head's training contract.
 ///
 /// Same locking contract as [`forward_mtp_verify_compiled`]: callers
 /// MUST hold `DENSE_COMPILED_MUTEX` and a `COMPILED_WEIGHTS_RWLOCK`
-/// read guard for the entire cycle. Returns `(logits, last_hidden)`
-/// on success; on C++ failure the function returns `Err` and the
-/// caller MUST fall back to Step A on the next cycle.
+/// read guard for the entire cycle. Returns `(logits, hiddens)` on
+/// success — `logits` shape `[1, depth+1, vocab]`, `hiddens` shape
+/// `[1, depth+1, hidden_size]`. On C++ failure the function returns
+/// `Err` and the caller MUST fall back to Step A on the next cycle.
 ///
-/// The exported hidden is a lazy MLX array; it stays valid as long as
-/// `g_compiled_caches` (which the verify-final `final_norm` graph
-/// references) is alive — i.e. until the surrounding
-/// `CompiledResetGuard` drops at end of decode.
+/// The exported hiddens are a lazy MLX array; it stays valid as long
+/// as `g_compiled_caches` (which the verify's per-position `final_norm`
+/// graph references) is alive — i.e. until the surrounding
+/// `CompiledResetGuard` drops at end of decode. In practice the caller
+/// slices position K and evals only the resulting `[1, 1, hidden]` so
+/// only one per-position final_norm output is realised on-device.
 pub(super) fn forward_mtp_verify_compiled_with_hidden(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
@@ -8267,14 +8274,14 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden(
     }
 
     let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_hidden: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_hiddens: *mut sys::mlx_array = std::ptr::null_mut();
     unsafe {
         sys::mlx_qwen35_mtp_verify_compiled_with_hidden(
             input_ids.as_raw_ptr(),
             embedding_weight.as_raw_ptr(),
             depth,
             &mut out_logits,
-            &mut out_hidden,
+            &mut out_hiddens,
         );
     }
 
@@ -8283,18 +8290,18 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden(
             "forward_mtp_verify_compiled_with_hidden: C++ returned null logits — check stderr",
         ));
     }
-    if out_hidden.is_null() {
+    if out_hiddens.is_null() {
         // Logits succeeded but hidden export failed — drop the logits
         // handle via the standard wrapper, then surface the error so
         // the caller falls back to Step A.
         let _ = MxArray::from_handle(out_logits, "mtp_verify_logits_drop_on_hidden_fail")?;
         return Err(Error::from_reason(
-            "forward_mtp_verify_compiled_with_hidden: C++ returned null last_hidden — check stderr",
+            "forward_mtp_verify_compiled_with_hidden: C++ returned null hiddens — check stderr",
         ));
     }
     let logits = MxArray::from_handle(out_logits, "mtp_verify_logits")?;
-    let hidden = MxArray::from_handle(out_hidden, "mtp_verify_last_hidden")?;
-    Ok((logits, hidden))
+    let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_hiddens")?;
+    Ok((logits, hiddens))
 }
 
 // ============================================================================

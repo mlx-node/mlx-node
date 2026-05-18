@@ -1135,11 +1135,15 @@ pub(crate) struct MtpOps<F, D, V, R, E, B, S, RR>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
-    // W6.5 — verify returns (logits, verify_last_hidden). The hidden
-    // is the post-final-norm output at verify position `depth` (the
-    // bonus / residual position) — the macro stashes it across cycles
-    // so the next cycle can skip Step A's full main-model forward and
-    // seed its first draft from this hidden instead.
+    // W6.5 — verify returns (logits, verify_hiddens). Logits shape is
+    // `[1, depth+1, vocab]`; hiddens shape is `[1, depth+1, hidden]`.
+    // The hiddens carry the post-final-norm output at EVERY verify
+    // position. After `run_mtp_cycle_inner` computes the number of
+    // accepted drafts K, it slices `verify_hiddens[:, K, :]` to seed
+    // the next cycle's first MTP draft — that hidden is the prediction
+    // context for the committed token at position K+1 (bonus on
+    // full-accept, residual on rejection), matching the MTP head's
+    // training contract.
     V: FnMut(&MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>,
     R: FnMut(usize, usize),
     E: Fn(&MxArray, &MxArray, bool),
@@ -1255,17 +1259,16 @@ where
     // accept the snapshot is discarded — verify already left the
     // linear state correctly advanced.
     (ops.snapshot_main_linear)();
-    // W6.5 — verify returns BOTH logits and the post-final-norm hidden
-    // of the LAST verify iteration (position `depth`). The hidden is
-    // surfaced back to the macro so the next cycle can skip Step A's
-    // main-model forward; logits are processed as before.
-    let (verify_logits, verify_last_hidden) =
-        (ops.verify_step)(&verify_in, embedding_weight, depth)?;
-    // verify_logits: [1, depth+1, vocab]. We materialize it now so
-    // per-position slicing reads from a CPU-resident buffer for
-    // penalty application. The verify hidden ride along on the same
-    // compiled graph and is implicitly evaluated by `verify_logits.eval()`
-    // — its `final_norm` is upstream of every per-position logit.
+    // W6.5 — verify returns BOTH logits and per-position hiddens.
+    // Logits: `[1, depth+1, vocab]`; hiddens: `[1, depth+1, hidden]`.
+    // We hold off on slicing the hidden until after the accept loop
+    // computes K (= number of accepted drafts) so we can pick
+    // `verify_hiddens[:, K, :]` — the correct prediction context for
+    // the next cycle's first MTP draft.
+    let (verify_logits, verify_hiddens) = (ops.verify_step)(&verify_in, embedding_weight, depth)?;
+    // We materialize logits now so per-position slicing reads from a
+    // CPU-resident buffer for penalty application. The hiddens ride
+    // on the same compiled graph; we only eval the K-th slice below.
     verify_logits.eval();
     let vocab = verify_logits.shape_at(2)?;
 
@@ -1396,26 +1399,39 @@ where
     // the rest of the locals; the underlying lazy MLX arrays stay
     // alive as long as any other handle still holds them.
 
-    // W6.5 — return the verify-final hidden so the caller (the
-    // `decode_loop_mtp!` macro) can chain cycles: the NEXT cycle's
-    // first MTP draft uses this hidden as `prev_hidden`, eliminating
-    // the per-cycle main-model "Step A" forward.
+    // W6.5 — pick the position-K slice of `verify_hiddens` and return
+    // it so the caller (the `decode_loop_mtp!` macro) can chain cycles:
+    // the NEXT cycle's first MTP draft uses this hidden as
+    // `prev_hidden`, eliminating the per-cycle main-model "Step A"
+    // forward.
     //
-    // Semantics: this hidden is at verify position `depth`, i.e. the
-    // prediction context for the bonus token (full-accept) or for the
-    // residual sample (rejection). It is NOT strictly the hidden of
-    // the LAST accepted token (that would be bonus / residual itself,
-    // whose own hidden was never computed by verify). Using verify
-    // position `depth` as a context surrogate is the design choice
-    // documented in the W6.5 plan section: the MTP draft head is a
-    // heuristic predictor, and any drafts that diverge from
-    // ground-truth still get caught by the next cycle's verify pass
-    // (which uses the actual main model), so T=0 parity is preserved.
+    // Semantics: `verify_hiddens[K]` is the post-final-norm hidden at
+    // verify position K — the prediction context for the committed
+    // token at position K+1 of `[last_committed, d_0, ..., d_{D-1}]`,
+    // i.e. the BONUS token on full-accept (K=D, position K+1 = bonus's
+    // would-be slot) or the RESIDUAL token on rejection (K<D, position
+    // K+1 = rejected draft's slot, replaced by residual). Either way,
+    // the next cycle's MTP draft gets `(prev_hidden=verify_hiddens[K],
+    // prev_emb=embed(committed_K+1))` which matches the training
+    // contract of the MTP head: `MTP(h_t, embed(t+1)) -> logits at
+    // t+2`.
+    //
+    // Why K (not D, not D+1): the prior W6.5 scaffolding shipped
+    // position D unconditionally, which only matches when ALL drafts
+    // are accepted (K==D). Partial-accept cycles chained from
+    // position D's hidden — the prediction context for the rejected
+    // draft — and the MTP head's drafts diverged from main, dropping
+    // mean acceptance from ~1.5 to ~0.8 tokens/cycle.
+    let hidden_dim = verify_hiddens.shape_at(2)?;
+    let verify_hidden_k = verify_hiddens.slice(
+        &[0, accepted_drafts as i64, 0],
+        &[1, (accepted_drafts + 1) as i64, hidden_dim],
+    )?;
     Ok((
         MtpCycleOutcome {
             tokens: accepted_tokens,
         },
-        verify_last_hidden,
+        verify_hidden_k,
     ))
 }
 
@@ -1468,51 +1484,30 @@ macro_rules! decode_loop_mtp {
         let mut prev_emb_opt: Option<$crate::array::MxArray>;
         let mut last_committed_id_opt: Option<u32>;
 
-        // W6.5 — chained-cycle state. `run_mtp_cycle_inner` returns the
-        // post-final-norm hidden of the LAST verify iteration; we stash
-        // it here so the NEXT outer iteration can skip Step A's
-        // ~150 ms main-model forward and feed the chained hidden
-        // directly into the cycle's first MTP draft.
+        // W6.5 — chained-cycle state. `run_mtp_cycle_inner` slices
+        // `verify_hiddens[:, K, :]` and returns it; we stash that
+        // `[1, 1, hidden]` here so the NEXT outer iteration can skip
+        // Step A's ~150 ms main-model forward and feed the chained
+        // hidden directly into the cycle's first MTP draft.
         //
-        // **STATUS (2026-05-18, default off):** The verify-final
-        // hidden corresponds to verify position D — the prediction
-        // context for the bonus / residual token — NOT the hidden of
-        // the LAST ACCEPTED token (which is bonus / residual itself,
-        // whose own hidden was never computed by the verify pass).
-        // Feeding position D's hidden as `prev_hidden` to the next
-        // cycle's first MTP draft is a semantic mismatch: the MTP
-        // head is trained against `(prev_hidden, prev_emb)` pairs
-        // where `prev_hidden` IS the hidden of `prev_emb`'s token, so
-        // the chained-cycle drafts mispredict at a much higher rate
-        // than the Step-A-seeded baseline.
+        // K = number of accepted drafts this cycle. Semantics:
+        // `verify_hiddens[K]` is the prediction context for the
+        // committed token at position K+1 (bonus on full-accept,
+        // residual on rejection) — i.e. for the LAST emitted token of
+        // this cycle. The next cycle's MTP draft is therefore
+        // `MTP(prev_hidden=verify_hiddens[K], prev_emb=embed($y)) ->
+        // next-next logits`, matching the head's training contract.
         //
-        // Empirically on qwen3.5-4b bf16 / M3 Max at 200 tokens,
-        // depth=3: chained drafts collapse mean acceptance from ~1.5
-        // tokens/cycle (Step-A baseline) to ~0.8 tokens/cycle, so the
-        // chained loop runs ~1.7× more cycles per generation. Decode
-        // tok/s falls from 2.21 (pre-W6.5, 0.30× ratio) to 1.47
-        // (W6.5 chained, 0.18× ratio) — a *regression* against the
-        // W6.5 plan's ≥0.6× gate. Parity still passes byte-exact at
-        // T=0 because verify (= main model) is the ground truth.
+        // Default policy (W6.5 fix): chaining ENABLED. Set
+        // `MLX_MTP_NO_CHAINED_CYCLES=1` to opt out — useful when
+        // bisecting regressions or comparing perf against pre-W6.5
+        // baselines. The earlier scaffolding (commit 7230b8b) shipped
+        // with chaining DISABLED because it exported only verify
+        // position D and partial-accept cycles drafted from the wrong
+        // context; the position-K slice (this commit) restores the
+        // design's ≥0.6× ratio target.
         //
-        // Default policy: chaining DISABLED. The C++ FFI
-        // `mlx_qwen35_mtp_verify_compiled_with_hidden` and the Rust
-        // wrapper `forward_mtp_verify_compiled_with_hidden` ship as
-        // the additive surface they were specced as; this macro
-        // simply leaves `chained_hidden_opt` permanently `None` so
-        // every iteration takes the Step-A path (no regression vs.
-        // pre-W6.5). To opt-in for experimentation, set the env var
-        // `MLX_MTP_CHAINED_CYCLES=1` — useful when probing whether
-        // the W6.7 batched-verify rework + a position-K hidden export
-        // restores the design's intended ~15 % wall-time win.
-        //
-        // A correct chained design needs either (a) the verify FFI to
-        // return ALL D+1 per-position hiddens so Rust can pick
-        // verify_hidden[K] after acceptance, OR (b) a one-token main
-        // forward of the residual / bonus to compute the right
-        // `prev_hidden`. Both belong to a follow-up workstream.
-        //
-        // Invariants when chaining IS enabled (via env var):
+        // Invariants:
         //   - `None` on the FIRST iteration (no prior verify) — Step A
         //     runs unconditionally and re-seeds the hidden from a real
         //     main forward.
@@ -1522,12 +1517,12 @@ macro_rules! decode_loop_mtp {
         //   - `Some(hidden)` after every successful cycle, to be drained
         //     by the NEXT iteration before its cycle runs.
         //
-        // The hidden is a lazy MLX array referencing the verify-final
-        // `final_norm` graph node; it stays alive because
+        // The hidden is a lazy MLX array referencing the verify's
+        // position-K `final_norm` graph node; it stays alive because
         // `g_compiled_caches` (its upstream) is alive for the rest of
         // the decode loop. See `mlx_qwen35_mtp_verify_compiled_with_hidden`
         // for the C++ lifetime contract.
-        let chained_cycles_enabled: bool = std::env::var("MLX_MTP_CHAINED_CYCLES")
+        let chained_cycles_enabled: bool = !std::env::var("MLX_MTP_NO_CHAINED_CYCLES")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let mut chained_hidden_opt: Option<$crate::array::MxArray> = None;
@@ -1616,26 +1611,27 @@ macro_rules! decode_loop_mtp {
             }
 
             // ---- Step A vs. chained-hidden decision (W6.5). -----------
-            // Default (`MLX_MTP_CHAINED_CYCLES` unset): always Step A,
-            // matching pre-W6.5 behaviour byte-exact. Chaining off is
-            // currently the production policy — see the long doc at
-            // `chained_hidden_opt` for the perf-regression rationale.
-            //
-            // Opt-in (`MLX_MTP_CHAINED_CYCLES=1`): skip Step A's full
+            // Default (chained_cycles_enabled=true): skip Step A's full
             // main-model forward when a chained verify hidden is
             // available from the prior cycle, unless the tracker is
             // about to force a think-end token (the forced-token path
             // needs Step A to forward `$y` so its K/V is committed
             // before we inject the forced token).
             //
+            // Opt-out (`MLX_MTP_NO_CHAINED_CYCLES=1`): always Step A,
+            // matching pre-W6.5 behaviour byte-exact. Useful when
+            // bisecting regressions or comparing perf against the
+            // pre-W6.5 baseline.
+            //
             // On the chained path the prior cycle's verify already
             // committed all accepted tokens' K/V, and the next cycle's
             // verify will write `$y`'s K/V at its position-0 input.
             // The MTP draft seeds from `chained_hidden_opt`
-            // (verify-position-D's hidden — a context surrogate).
-            // T=0 parity is preserved because verify (= main model) is
-            // the ground truth and at T=0 the residual-sampler picks
-            // the same token regardless of draft accuracy.
+            // (`verify_hiddens[K]` — the prediction context for the
+            // committed token at position K+1, i.e. $y itself). T=0
+            // parity is preserved because verify (= main model) is the
+            // ground truth and at T=0 the residual-sampler picks the
+            // same token regardless of draft accuracy.
             let do_step_a = !chained_cycles_enabled
                 || chained_hidden_opt.is_none()
                 || $tracker.should_force_think_end();
@@ -1752,11 +1748,12 @@ macro_rules! decode_loop_mtp {
                 let chained_h = chained_hidden_opt
                     .take()
                     .expect("chained_hidden_opt is Some on the chained path (guarded by do_step_a)");
-                // Chained hidden ships as `[1, hidden]`; reshape to
-                // `[1, 1, hidden]` for the draft FFI's `[B, T, hidden]`
-                // contract — same shape Step A produces.
-                let hidden_dim = chained_h.shape_at(1)?;
-                prev_hidden_opt = Some(chained_h.reshape(&[1, 1, hidden_dim])?);
+                // `run_mtp_cycle_inner` already sliced the K-th
+                // position out of the verify hiddens, so `chained_h`
+                // arrives shaped `[1, 1, hidden]` — the same shape the
+                // draft FFI's `[B, T, hidden]` contract expects, no
+                // reshape needed.
+                prev_hidden_opt = Some(chained_h);
 
                 // Read `$y`'s id without re-evaluating it; the prior
                 // cycle tail already ran `MxArray::from_int32(...)` to
@@ -2133,11 +2130,13 @@ mod mtp_cycle_tests {
 
     /// Construct a verify-step closure that returns logits peaked at
     /// `verify_id_per_position[i]` for each verify position, plus a
-    /// zero `[1, hidden]` stand-in for the verify-final hidden (W6.5
-    /// — the production closure exports the post-final-norm hidden at
-    /// position `depth`; for the mock tests below we don't care about
-    /// its contents, only the shape, so a fresh zeros tensor matches
-    /// the `[1, hidden_size]` contract from `g_last_hidden`).
+    /// zero `[1, depth+1, hidden]` stand-in for the per-position
+    /// verify hiddens (W6.5 fix — the production closure exports the
+    /// post-final-norm hidden at EVERY verify position so the caller
+    /// can slice `verify_hiddens[:, K, :]` for chaining). For the
+    /// mock tests below we don't care about contents, only shape, so
+    /// a fresh zeros tensor matches the `[1, depth+1, hidden_size]`
+    /// contract `run_mtp_cycle_inner` slices from.
     fn make_verify<'a>(
         verify_id_per_position: &'a [i32],
         counter: &'a RefCell<usize>,
@@ -2152,12 +2151,14 @@ mod mtp_cycle_tests {
             }
             let arr =
                 MxArray::from_float32(&data, &[1, positions as i64, VOCAB]).expect("verify logits");
-            // Verify-final hidden: [1, hidden]. Mirrors the production
-            // `g_last_hidden` shape (batch=1, single-token flat decode).
-            let zero_hidden = vec![0.0f32; HIDDEN as usize];
-            let hidden =
-                MxArray::from_float32(&zero_hidden, &[1, HIDDEN]).expect("verify hidden stub");
-            Ok((arr, hidden))
+            // Per-position verify hiddens: [1, depth+1, hidden].
+            // Mirrors the production stacked `[1, D+1, hidden_size]`
+            // contract `mlx_qwen35_mtp_verify_compiled_with_hidden`
+            // ships.
+            let zero_hiddens = vec![0.0f32; positions * HIDDEN as usize];
+            let hiddens = MxArray::from_float32(&zero_hiddens, &[1, positions as i64, HIDDEN])
+                .expect("verify hiddens stub");
+            Ok((arr, hiddens))
         }
     }
 

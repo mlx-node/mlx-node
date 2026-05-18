@@ -98,14 +98,20 @@ extern "C" int mlx_qwen35_is_compile_inited();
 // main flat-path compiled state. The verify graph in this file loops
 // `mlx_qwen35_forward_compiled` D+1 times; each call reassigns
 // `g_last_hidden` to the post-final-norm hidden of THAT step's token.
-// After the verify loop completes, `g_last_hidden` therefore holds the
-// hidden at verify position D (i.e. the prediction context for the bonus
-// token on full-accept, or for the residual sample on rejection).
+//
+// To support chained MTP cycles correctly we MUST capture the hidden after
+// EACH of the D+1 iterations (not just the last) and surface them as a
+// stacked `[1, D+1, hidden]` tensor. The Rust caller then slices position
+// `K` (= number of accepted drafts) to seed the next cycle's first MTP
+// draft — `verify_hidden[K]` is the prediction context for the
+// committed-token-at-position-K+1 (bonus on full-accept, residual on
+// rejection), matching the MTP head's training contract `(prev_hidden,
+// embed(next_token)) -> next-next logits`.
 //
 // Returns null when the main path is uninitialised OR no forward has run
 // since the last reset. Mirrors the public FFI used by the W6 Step-A
-// seeding path; declared here too so the new `*_with_hidden` verify can
-// thread it without going through the FFI boundary twice.
+// seeding path; declared here too so the verify closure can thread it
+// once per iteration without going through the FFI boundary twice.
 extern "C" void mlx_qwen35_export_last_hidden(mlx_array** out);
 
 namespace {
@@ -282,8 +288,15 @@ static std::array<VerifyFn, MAX_VERIFY_DEPTH> g_verify_compiled_by_depth{};
 // Build a verify closure for a fixed depth. Captures NO per-call
 // state — depth is baked in. The closure expects `input_ids` of shape
 // `[1, depth+1]` and the `embedding_weight` from the model. The
-// closure returns `{logits[1, depth+1, vocab]}` as a single-element
-// vector.
+// closure returns a 2-element vector:
+//   `{ logits[1, depth+1, vocab], hiddens[1, depth+1, hidden_size] }`
+//
+// The hiddens are captured AFTER every per-step forward (each call
+// overwrites the main-path `g_last_hidden` global) so the Rust caller
+// can slice `verify_hidden[K]` to seed chained-cycle drafts at the
+// correct prediction context (W6.5). Non-hidden callers
+// (`mlx_qwen35_mtp_verify_compiled`) simply ignore `outputs[1]`; the
+// lazy MLX graph for the hiddens drops with the local vector.
 static VerifyFn make_verify_fn(int depth) {
   return [depth](const array& input_ids, const array& embedding_weight)
              -> std::vector<array> {
@@ -300,7 +313,9 @@ static VerifyFn make_verify_fn(int depth) {
     }
 
     std::vector<array> per_step_logits;
+    std::vector<array> per_step_hiddens;
     per_step_logits.reserve(seq_len);
+    per_step_hiddens.reserve(seq_len);
 
     for (int t = 0; t < seq_len; t++) {
       // Slice the t-th token out of input_ids → [1, 1]
@@ -329,11 +344,33 @@ static VerifyFn make_verify_fn(int depth) {
       // step_logits shape: [1, vocab]. Insert a time dim for stacking.
       per_step_logits.push_back(reshape(step_logits,
                                        {1, 1, step_logits.shape(-1)}));
+
+      // W6.5 — capture the post-final-norm hidden for THIS step BEFORE
+      // the next iteration's forward overwrites `g_last_hidden`.
+      // `mlx_qwen35_export_last_hidden` heap-allocates a refcounted
+      // clone of the lazy graph node; we take ownership and reshape
+      // from `[1, hidden]` (the global's shape per the flat-decode
+      // stash) into `[1, 1, hidden]` so the concatenate-along-time
+      // pattern below mirrors the logits stacking.
+      mlx_array* hid_ptr = nullptr;
+      mlx_qwen35_export_last_hidden(&hid_ptr);
+      if (!hid_ptr) {
+        throw std::runtime_error(
+            "mlx_qwen35_mtp_verify: g_last_hidden unpopulated after "
+            "forward at t=" + std::to_string(t));
+      }
+      array step_hidden = *reinterpret_cast<array*>(hid_ptr);
+      delete reinterpret_cast<array*>(hid_ptr);
+      per_step_hiddens.push_back(reshape(step_hidden,
+                                        {1, 1, step_hidden.shape(-1)}));
     }
 
-    // Stack along time axis → [1, depth+1, vocab].
-    auto stacked = concatenate(per_step_logits, 1);
-    return {stacked};
+    // Stack along time axis →
+    //   logits:  [1, depth+1, vocab]
+    //   hiddens: [1, depth+1, hidden_size]
+    auto stacked_logits  = concatenate(per_step_logits, 1);
+    auto stacked_hiddens = concatenate(per_step_hiddens, 1);
+    return {stacked_logits, stacked_hiddens};
   };
 }
 
@@ -632,19 +669,27 @@ void mlx_qwen35_mtp_verify_compiled(
 }
 
 // -----------------------------------------------------------------------------
-// W6.5 — verify pass that ALSO exports the verify-final hidden so the
-// caller can chain MTP cycles without running a fresh main-model
-// forward at each cycle's "Step A".
+// W6.5 — verify pass that ALSO exports the post-final-norm hidden state
+// at EVERY verify position so the caller can chain MTP cycles without
+// running a fresh main-model forward at each cycle's "Step A".
 //
 // Behaviourally identical to `mlx_qwen35_mtp_verify_compiled` for the
 // logits output (and the same `g_compiled_caches[]` / `g_offset_int`
-// mutation contract) plus one extra owned `mlx_array*` for the
-// post-final-norm hidden of the LAST verify iteration. The verify graph
-// here loops `mlx_qwen35_forward_compiled` D+1 times — each call
-// overwrites the main path's `g_last_hidden` (see `mlx_qwen35.cpp`
-// `qwen35_decode_fn` line 175). After the loop completes, that global
-// holds the hidden of verify position D, which we export via the
-// existing `mlx_qwen35_export_last_hidden` clone helper.
+// mutation contract) plus one extra owned `mlx_array*` for ALL D+1
+// per-position hiddens stacked along the time axis →
+// `[1, depth+1, hidden_size]`. The verify graph here loops
+// `mlx_qwen35_forward_compiled` D+1 times; the verify closure captures
+// `g_last_hidden` after EACH iteration before the next forward
+// overwrites it.
+//
+// Why D+1 instead of just the last hidden: the Rust caller selects
+// position `K` (= number of accepted drafts) — `verify_hidden[K]` is the
+// prediction context for the committed token at position K+1 (bonus on
+// full-accept, residual on rejection), matching the MTP head's training
+// contract. The prior `*_with_hidden` shipped position D only, which
+// only matches when ALL drafts are accepted; partial-accept cycles
+// chained from the wrong context and collapsed acceptance from ~1.5 to
+// ~0.8 tokens/cycle.
 //
 // Why an extra entrypoint instead of extending the existing one:
 //   (a) backward compat — callers that don't need the hidden keep the
@@ -657,13 +702,16 @@ void mlx_qwen35_mtp_verify_compiled(
 // The hidden's lifetime contract mirrors
 // `mlx_qwen35_export_last_hidden`:
 //   - The returned handle is a lazy MLX array whose graph references
-//     the verify's final_norm output. The caller MUST `eval()` it (or
-//     consume it via a graph that does) before reading any element.
+//     the verify's per-step final_norm outputs. The caller MUST `eval()`
+//     it (or consume it via a graph that does) before reading any
+//     element. In practice the Rust caller slices position K first and
+//     evals only the resulting `[1, 1, hidden]` slice, so only one
+//     per-position final_norm path is realised on-device.
 //   - The caller MUST NOT call `mlx_qwen35_compiled_reset()` between
 //     export and eval — that reset would clear `g_compiled_caches`
 //     whose inputs the hidden depends on via the cached graph.
 //
-// `*out_last_hidden` is nullptr on failure (matches the logits-only
+// `*out_hiddens` is nullptr on failure (matches the logits-only
 // FFI's failure semantics so the Rust caller can fall back to Step A
 // when chaining is unavailable). The caller MUST null-check both
 // outputs before consuming.
@@ -673,12 +721,12 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden(
     mlx_array* embedding_weight_ptr,
     int depth,
     mlx_array** out_logits,
-    mlx_array** out_last_hidden
+    mlx_array** out_hiddens
 ) {
   if (out_logits) *out_logits = nullptr;
-  if (out_last_hidden) *out_last_hidden = nullptr;
+  if (out_hiddens) *out_hiddens = nullptr;
   if (!input_ids_ptr || !embedding_weight_ptr || !out_logits ||
-      !out_last_hidden) {
+      !out_hiddens) {
     return;
   }
   if (depth < 1 || depth > MAX_VERIFY_DEPTH) {
@@ -707,43 +755,36 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden(
     }
 
     // Run the existing per-depth verify loop. After this returns,
-    // `g_compiled_caches[]` / `g_offset_int` have been advanced by D+1
-    // AND `g_last_hidden` holds the post-final-norm hidden of the LAST
-    // verify iteration (verify position D).
+    // `g_compiled_caches[]` / `g_offset_int` have been advanced by D+1.
+    // The closure returns `{logits[1, D+1, vocab], hiddens[1, D+1,
+    // hidden]}` — the hiddens were captured per-iteration before the
+    // next forward overwrote `g_last_hidden`.
     const auto& verify_fn = get_or_make_verify_fn(depth);
     auto outputs = verify_fn(input_ids, embedding_weight);
-    *out_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
-
-    // Export the final-iteration hidden via the same ref-counted clone
-    // path the public W6 Step-A seeding FFI uses. Returns nullptr if
-    // `g_last_hidden` is unpopulated — in practice the verify loop just
-    // ran D+1 forwards so the stash is fresh, but defensive-checked.
-    mlx_qwen35_export_last_hidden(out_last_hidden);
-    if (*out_last_hidden == nullptr) {
-      // Shouldn't happen after a successful verify, but if it does the
-      // caller can still consume the logits and fall back to a fresh
-      // Step A on the next cycle. Emit a diagnostic so the
-      // unexpected-state case is observable.
+    if (outputs.size() < 2) {
       fprintf(stderr,
-              "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden: "
-              "verify succeeded but g_last_hidden was unpopulated; the "
-              "Rust caller should fall back to Step A on the next cycle\n");
+              "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden: verify "
+              "closure returned %zu outputs; expected 2 (logits, hiddens)\n",
+              outputs.size());
       fflush(stderr);
+      return;
     }
+    *out_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
+    *out_hiddens = reinterpret_cast<mlx_array*>(new array(outputs[1]));
   } catch (const std::exception& e) {
     fprintf(stderr,
             "[MLX] Exception in mlx_qwen35_mtp_verify_compiled_with_hidden: %s\n",
             e.what());
     fflush(stderr);
     if (out_logits) *out_logits = nullptr;
-    if (out_last_hidden) *out_last_hidden = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
   } catch (...) {
     fprintf(stderr,
             "[MLX] Unknown exception in "
             "mlx_qwen35_mtp_verify_compiled_with_hidden\n");
     fflush(stderr);
     if (out_logits) *out_logits = nullptr;
-    if (out_last_hidden) *out_last_hidden = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
   }
 }
 

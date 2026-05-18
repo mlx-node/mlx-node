@@ -8312,13 +8312,16 @@ pub(super) fn forward_moe_mtp_verify_compiled(
 }
 
 /// W6.5 — MoE verify pass that ALSO exports the post-final-norm hidden
-/// of the LAST verify iteration. MoE twin of
+/// state at EVERY verify position. MoE twin of
 /// [`super::super::qwen3_5::model::forward_mtp_verify_compiled_with_hidden`]
-/// — see that function's docstring for the chaining rationale.
+/// — see that function's docstring for the chaining rationale and
+/// slice-K semantics.
 ///
 /// Same locking contract as [`forward_moe_mtp_verify_compiled`]:
 /// callers MUST hold `MOE_COMPILED_MUTEX` (NOT the dense one) and a
-/// `COMPILED_WEIGHTS_RWLOCK` read guard for the entire cycle.
+/// `COMPILED_WEIGHTS_RWLOCK` read guard for the entire cycle. Returns
+/// `(logits[1, depth+1, vocab], hiddens[1, depth+1, hidden_size])` on
+/// success.
 pub(super) fn forward_moe_mtp_verify_compiled_with_hidden(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
@@ -8333,14 +8336,14 @@ pub(super) fn forward_moe_mtp_verify_compiled_with_hidden(
     }
 
     let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_hidden: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_hiddens: *mut sys::mlx_array = std::ptr::null_mut();
     unsafe {
         sys::mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
             input_ids.as_raw_ptr(),
             embedding_weight.as_raw_ptr(),
             depth,
             &mut out_logits,
-            &mut out_hidden,
+            &mut out_hiddens,
         );
     }
 
@@ -8349,15 +8352,15 @@ pub(super) fn forward_moe_mtp_verify_compiled_with_hidden(
             "forward_moe_mtp_verify_compiled_with_hidden: C++ returned null logits — check stderr",
         ));
     }
-    if out_hidden.is_null() {
+    if out_hiddens.is_null() {
         let _ = MxArray::from_handle(out_logits, "moe_mtp_verify_logits_drop_on_hidden_fail")?;
         return Err(Error::from_reason(
-            "forward_moe_mtp_verify_compiled_with_hidden: C++ returned null last_hidden — check stderr",
+            "forward_moe_mtp_verify_compiled_with_hidden: C++ returned null hiddens — check stderr",
         ));
     }
     let logits = MxArray::from_handle(out_logits, "moe_mtp_verify_logits")?;
-    let hidden = MxArray::from_handle(out_hidden, "moe_mtp_verify_last_hidden")?;
-    Ok((logits, hidden))
+    let hiddens = MxArray::from_handle(out_hiddens, "moe_mtp_verify_hiddens")?;
+    Ok((logits, hiddens))
 }
 
 /// Block size hard-coded into the compiled C++ paged graph

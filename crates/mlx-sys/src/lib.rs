@@ -1678,30 +1678,40 @@ unsafe extern "C-unwind" {
     );
 
     /// W6.5 — verify pass that ALSO exports the post-final-norm hidden
-    /// of the LAST verify iteration (verify position `depth`), so the
-    /// MTP cycle macro can chain into the next cycle's draft without
-    /// running a fresh main-model forward at "Step A".
+    /// state at EVERY verify position, so the MTP cycle macro can chain
+    /// into the next cycle's draft from the correct prediction context
+    /// without running a fresh main-model forward at "Step A".
     ///
     /// Behaviour is identical to `mlx_qwen35_mtp_verify_compiled` for
     /// `out_logits` and the main-cache mutation contract. The extra
-    /// `out_last_hidden` is a heap-allocated `[1, hidden_size]` bf16
-    /// array (caller owns) on success or null on failure. Failure
-    /// semantics match the logits-only variant — caller falls back to
-    /// a fresh Step A on the next cycle when either output is null.
+    /// `out_hiddens` is a heap-allocated `[1, depth+1, hidden_size]`
+    /// bf16 array (caller owns) on success or null on failure — the
+    /// post-final-norm hidden at EACH of the D+1 verify positions
+    /// stacked along the time axis. The Rust caller slices position
+    /// `K` (= number of accepted drafts) AFTER the accept loop to seed
+    /// the next cycle's first MTP draft — `verify_hidden[K]` is the
+    /// prediction context for the committed token at position K+1
+    /// (bonus on full-accept, residual on rejection), matching the
+    /// MTP head's training contract `MTP(prev_hidden, embed(t)) ->
+    /// next-next logits`.
+    ///
+    /// Failure semantics match the logits-only variant — caller falls
+    /// back to a fresh Step A on the next cycle when either output is
+    /// null.
     ///
     /// Same locking contract as the logits-only variant: production
     /// callers MUST hold `DENSE_COMPILED_MUTEX` for the entire
     /// draft+verify cycle. The exported hidden is a lazy MLX array
-    /// whose graph references the verify-final `final_norm` output;
-    /// the caller MUST eval it (or consume it via a graph that does)
-    /// BEFORE the surrounding `CompiledResetGuard` drops, otherwise
-    /// the underlying buffer is released.
+    /// whose graph references the verify's per-position `final_norm`
+    /// outputs; the caller MUST eval (or slice + eval) it BEFORE the
+    /// surrounding `CompiledResetGuard` drops, otherwise the underlying
+    /// buffer is released.
     pub fn mlx_qwen35_mtp_verify_compiled_with_hidden(
         input_ids: *mut mlx_array,
         embedding_weight: *mut mlx_array,
         depth: i32,
         out_logits: *mut *mut mlx_array,
-        out_last_hidden: *mut *mut mlx_array,
+        out_hiddens: *mut *mut mlx_array,
     );
 
     /// Tear down MTP compiled state. Idempotent. Does NOT reset
@@ -1983,21 +1993,22 @@ unsafe extern "C-unwind" {
     );
 
     /// W6.5 — MoE verify pass that ALSO exports the post-final-norm
-    /// hidden of the LAST verify iteration (verify position `depth`).
-    /// MoE twin of `mlx_qwen35_mtp_verify_compiled_with_hidden` — see
-    /// that FFI's docstring for the chaining rationale and the
+    /// hidden state at EVERY verify position. MoE twin of
+    /// `mlx_qwen35_mtp_verify_compiled_with_hidden` — see that FFI's
+    /// docstring for the chaining rationale, slice-K semantics, and
     /// lifetime contract.
     ///
     /// Same locking contract: production callers MUST hold
     /// `MOE_COMPILED_MUTEX` (NOT the dense one) for the entire
-    /// draft+verify cycle. Lifetime of `out_last_hidden` mirrors the
-    /// dense variant.
+    /// draft+verify cycle. `out_hiddens` is a heap-allocated
+    /// `[1, depth+1, hidden_size]` bf16 array on success, null on
+    /// failure; lifetime mirrors the dense variant.
     pub fn mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
         input_ids: *mut mlx_array,
         embedding_weight: *mut mlx_array,
         depth: i32,
         out_logits: *mut *mut mlx_array,
-        out_last_hidden: *mut *mut mlx_array,
+        out_hiddens: *mut *mut mlx_array,
     );
 
     /// Tear down MoE MTP compiled state. Idempotent. Does NOT reset
