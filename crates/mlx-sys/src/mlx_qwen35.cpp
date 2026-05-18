@@ -156,15 +156,21 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
   auto h = inputs[0];
   int offset = g_offset_int;
 
-  // Attention mask: [1, 1, 1, max_kv_len]
-  int first_fa = cfg.full_attention_interval - 1;
-  int max_kv_len = inputs[2 + first_fa * 2].shape(2);
-  auto positions = arange(0, max_kv_len, mlx::core::int32);
-  auto valid_mask = less_equal(positions, array(offset, mlx::core::int32));
-  auto attn_mask = where(valid_mask,
-      array(0.0f, mlx::core::bfloat16),
-      array(-std::numeric_limits<float>::infinity(), mlx::core::bfloat16));
-  attn_mask = reshape(attn_mask, {1, 1, 1, max_kv_len});
+  // W6.21 — T=1 decode: skip the per-step `[1,1,1,max_kv_len]` attention
+  // mask. `attn_pure_fn(dynamic_kv=true)` slices the KV cache down to the
+  // valid range `[0..offset+1]` and passes NO mask to SDPA. This mirrors
+  // upstream mlx-lm's `create_attention_mask(N=1) → None` + `cache.state`
+  // (keys[..., :offset, :]) pattern. Faster SDPA kernel; byte-exact at
+  // T=0 because the masked-out columns can never affect the per-row
+  // softmax (the mask is `-inf` exactly where the sliced version has no
+  // entry at all).
+  //
+  // Note: `qwen35_decode_fn` is NOT wrapped in `mlx::core::compile`, so
+  // using a C++-int slice bound (`valid_len = offset+1`) here is safe;
+  // the graph topology evolves with offset but is re-traced every call
+  // anyway. Compiled paths (MoE flat / paged / batched verify / MTP
+  // draft) keep the static-mask path because they need fixed shapes
+  // for the `mlx::core::compile` cache.
 
   std::vector<array> new_caches;
   new_caches.reserve(cfg.num_layers * 2);
@@ -214,7 +220,12 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
     } else {
       const auto& kk = inputs[2 + i * 2];
       const auto& kv = inputs[2 + i * 2 + 1];
-      auto res = attn_pure_fn(normed, i, kk, kv, attn_mask, offset, cfg);
+      // W6.21 — `dynamic_kv=true`: helper slices KV down to `[0..offset+1]`
+      // and skips the mask entirely. The `attn_mask` slot is unused under
+      // this branch; pass a zero-element placeholder.
+      auto dummy_mask = zeros({}, mlx::core::bfloat16);
+      auto res = attn_pure_fn(normed, i, kk, kv, dummy_mask, offset, cfg,
+                              /*dynamic_kv=*/true);
       layer_out = std::move(res.output);
       new_caches[i * 2]     = std::move(res.keys);
       new_caches[i * 2 + 1] = std::move(res.values);

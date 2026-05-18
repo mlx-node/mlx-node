@@ -782,7 +782,7 @@ inline AttnPureResult attn_pure_fn(
     const array& attn_mask,  // [1, 1, 1, max_kv_len] additive mask (ignored when dynamic_kv=true)
     int offset,
     const BaseConfig& cfg,
-    bool dynamic_kv = false) {  // true = slice KV to valid range, skip mask (MoE path)
+    bool dynamic_kv = false) {  // true = slice KV to valid range, skip mask (W6.21 T=1 decode)
   int B = x.shape(0);
   std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
 
@@ -826,14 +826,22 @@ inline AttnPureResult attn_pure_fn(
   float scale = std::pow((float)cfg.head_dim, -0.5f);
   auto attn_out = [&]() -> array {
     if (dynamic_kv) {
-      // MoE path: slice KV cache to valid range [0..offset+1], pass no mask → faster SDPA kernel
+      // W6.21 — slice KV cache to valid range [0..offset+1], pass no mask
+      // → faster SDPA kernel. Mirrors upstream mlx-lm's
+      // `create_attention_mask(N=1) → None` + `cache.state` slicing
+      // pattern (see ./mlx-lm/mlx_lm/models/base.py:51-52 and
+      // ./mlx-lm/mlx_lm/models/cache.py:362-368). Only safe when the
+      // caller is NOT inside `mlx::core::compile` — the slice length
+      // depends on the C++ `offset` int which changes per decode step,
+      // so a compiled graph would mis-cache. Currently used by the
+      // dense flat decode path (`qwen35_decode_fn` in mlx_qwen35.cpp).
       int valid_len = offset + 1;
       auto valid_keys   = slice(new_kv_keys,   {0, 0, 0, 0}, {B, cfg.num_kv_heads, valid_len, cfg.head_dim});
       auto valid_values = slice(new_kv_values, {0, 0, 0, 0}, {B, cfg.num_kv_heads, valid_len, cfg.head_dim});
       return fast::scaled_dot_product_attention(
           queries, valid_keys, valid_values, scale, "", std::nullopt, {});
     } else {
-      // Dense compiled path: fixed shapes + additive mask (required for mlx::core::compile)
+      // Compiled / verify paths: fixed shapes + additive mask (required for mlx::core::compile)
       return fast::scaled_dot_product_attention(
           queries, new_kv_keys, new_kv_values, scale, "", attn_mask, {});
     }
