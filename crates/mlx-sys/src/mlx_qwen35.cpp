@@ -1083,8 +1083,7 @@ void mlx_qwen35_eval_token_and_compiled_caches(mlx_array* next_token_ptr) {
 // `token` as siblings of a single fused eval).
 //
 // `extra_ptr` MAY be null, in which case behaviour is identical to
-// `mlx_qwen35_eval_token_and_compiled_caches`. Logging guards against
-// silent misuse on the no-extra path.
+// `mlx_qwen35_eval_token_and_compiled_caches`.
 void mlx_qwen35_eval_token_caches_and_extra(
     mlx_array* next_token_ptr, mlx_array* extra_ptr) {
   try {
