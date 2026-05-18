@@ -52,21 +52,30 @@ pub fn synchronize_and_clear_cache() {
 /// Default paged-decode-step cache cleanup cadence.
 ///
 /// Per-step transients (~30+ MB across many layers from GDN/MoE/attention
-/// intermediates) accumulate in MLX's caching allocator until cleared. On
-/// the paged path the per-layer `synchronize_mlx()` inside
-/// `LayerKVPool::gather_attention` already pays the GPU-stall cost, so calling
-/// `clear_cache()` more often is essentially free. At 64 steps the peak is
-/// capped to ~64 × 30 MB ≈ 2 GB instead of ~30 GB at the prior 256-step
-/// cadence — small enough to keep RSS well below the M3 Max's 128 GB
-/// physical-memory ceiling under multi-conversation Claude Code workloads,
-/// without the GPU-stall churn of an aggressive 16-step cadence. The flat
-/// path keeps its 256-step cadence because its compiled C++ forward has
-/// its own memory management.
+/// intermediates) accumulate in MLX's caching allocator until cleared.
+/// Each clear pairs a full `synchronize()` GPU stall with a cache wipe;
+/// while the paged path's per-layer `synchronize_mlx()` inside
+/// `LayerKVPool::gather_attention` already pays a per-step stall cost,
+/// the additional pool-wide flush is not free.
+///
+/// We mirror DFlash's `_DECODE_CLEAR_CACHE_INTERVAL_TOKENS = 1024`
+/// (see `dflash_mlx/engine/spec_epoch.py:71`): MLX's caching allocator
+/// handles its own internal eviction and 1024 steps' worth of transients
+/// fit comfortably within the M3 Max's 128 GB physical ceiling. Bumping
+/// from 64 → 1024 cuts the number of forced stalls by 16× over a 1024-
+/// token decode (16 stalls → 1).
+///
+/// Validated on `qwen3.5-4b` paged path at `max_new_tokens=1200` (which
+/// crosses the new 1024-step boundary): peak memory is byte-identical
+/// at 12.51 GB between `cadence=64` and `cadence=1024`, and decode
+/// throughput improves ~2% (7.08 → 7.24 tok/s, wall 170.0s → 166.0s).
+/// The flat path keeps its 256-step cadence because its compiled C++
+/// forward has its own memory management.
 ///
 /// Override at runtime by exporting `MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL`
 /// (positive integer). The env var is read once on first use and cached;
 /// invalid / non-positive values fall back to this default.
-pub const PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT: i32 = 64;
+pub const PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT: i32 = 1024;
 
 /// Effective cadence — `MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL` env override
 /// or [`PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT`]. Read once on first call

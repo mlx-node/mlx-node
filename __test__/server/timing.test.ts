@@ -6,7 +6,7 @@ describe('server timing tuning metadata', () => {
     expect(resolveServerTuningForUsage({})).toEqual({
       server_paged_prefill_chunk_size: 0,
       server_paged_prefill_eval_interval: 8,
-      server_paged_decode_cache_clear_interval: 64,
+      server_paged_decode_cache_clear_interval: 1024,
     });
   });
 
@@ -34,7 +34,7 @@ describe('server timing tuning metadata', () => {
     ).toEqual({
       server_paged_prefill_chunk_size: 0,
       server_paged_prefill_eval_interval: 8,
-      server_paged_decode_cache_clear_interval: 64,
+      server_paged_decode_cache_clear_interval: 1024,
     });
   });
 });

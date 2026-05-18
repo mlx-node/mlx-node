@@ -56,7 +56,8 @@ Options:
                                   prefill. Defaults to 8.
     MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL
                                   Token cadence for paged decode cache clear.
-                                  Defaults to 64.
+                                  Defaults to 1024 (mirrors DFlash's
+                                  _DECODE_CLEAR_CACHE_INTERVAL_TOKENS).
     MLX_PAGED_CACHE_MEMORY_MB      Paged KV cache memory budget override for
                                   paged-aware Qwen3.5 launch.
     MLX_GEMMA4_NATIVE_KV_WRITE    Set to 0/false/off to disable graph-native

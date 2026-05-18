@@ -119,7 +119,7 @@ export function resolveServerTuningForUsage(
   return {
     server_paged_prefill_chunk_size: parseNonNegativeI32(env.MLX_PAGED_PREFILL_CHUNK_SIZE, 0),
     server_paged_prefill_eval_interval: parsePositiveI32(env.MLX_PAGED_PREFILL_EVAL_INTERVAL, 8),
-    server_paged_decode_cache_clear_interval: parsePositiveI32(env.MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL, 64),
+    server_paged_decode_cache_clear_interval: parsePositiveI32(env.MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL, 1024),
   };
 }
 
