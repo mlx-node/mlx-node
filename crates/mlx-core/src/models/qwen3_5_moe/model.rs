@@ -1744,6 +1744,10 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
+                    // W6.18 — chained MTP draft is dense-only at this
+                    // task scope. MoE follow-up is a separate task; for
+                    // now MoE always uses the per-step draft loop.
+                    chained_draft: None,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -3875,6 +3879,10 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
+                    // W6.18 — chained MTP draft is dense-only at this
+                    // task scope. MoE follow-up is a separate task; for
+                    // now MoE always uses the per-step draft loop.
+                    chained_draft: None,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -4543,6 +4551,10 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
+                    // W6.18 — chained MTP draft is dense-only at this
+                    // task scope. MoE follow-up is a separate task; for
+                    // now MoE always uses the per-step draft loop.
+                    chained_draft: None,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -5333,6 +5345,10 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
+                    // W6.18 — chained MTP draft is dense-only at this
+                    // task scope. MoE follow-up is a separate task; for
+                    // now MoE always uses the per-step draft loop.
+                    chained_draft: None,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,

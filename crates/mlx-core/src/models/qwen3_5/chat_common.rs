@@ -1329,6 +1329,23 @@ where
     pub begin_cycle: B,
     pub snapshot_main_linear: S,
     pub restore_and_replay_main: RR,
+    /// W6.18 — Optional chained-draft callback. When `Some(...)` AND
+    /// `run_mtp_cycle_inner` decides to use the chained path (currently
+    /// gated on `temperature <= 1e-6`), all D draft steps run inside
+    /// ONE compiled graph via this closure. Contract:
+    ///
+    /// * Inputs: `prev_hidden` / `prev_emb` (`[1, 1, hidden]` bf16),
+    ///   embedding_weight (`[vocab, hidden]`), depth ∈ {1..5}.
+    /// * Outputs: `(draft_ids, draft_probs)` where `draft_ids` is `[D]`
+    ///   int32 (drafted token IDs in step order) and `draft_probs` is
+    ///   `[D, vocab]` fp32 (per-step softmax probs). At T<=1e-6 the
+    ///   per-step probs are unused numerically — `accept_with_residual`
+    ///   only reads the draft IDs in the greedy path.
+    ///
+    /// `None` disables chaining and forces the per-step `draft_step`
+    /// loop (legacy path; required for tests and MoE).
+    pub chained_draft:
+        Option<Box<dyn FnMut(&MxArray, &MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>>>,
 }
 
 /// Outcome of `run_mtp_cycle_inner` — the list of accepted tokens for
@@ -1386,35 +1403,102 @@ where
 
     debug_assert!(depth >= 1, "run_mtp_cycle_inner: depth must be >= 1");
 
-    // Step 1: D draft steps. Each yields (h_next, draft_logits).
-    // We accumulate the drafted token IDs and per-token p_draft over
-    // the full vocab (cast to fp32 once) for the acceptance check.
+    // Step 1: D draft steps. Either fused into one compiled graph
+    // (W6.18 chained path) or the legacy per-step loop.
+    //
+    // Chained path gating:
+    //   1. `ops.chained_draft` is `Some(...)` — the caller installed
+    //      the FFI dispatch (production dense path does; MoE / tests
+    //      pass None).
+    //   2. `temperature <= 1e-6` — at T=0 (greedy) the per-step Rust
+    //      path collapses to argmax via `sampling::sample` (see
+    //      `compiled_sample_full`); the chained graph also argmaxes
+    //      on-device, so the drafted IDs are byte-equivalent.
+    //      At T>0 the per-step path stochastically samples (consuming
+    //      MLX's global RNG between steps); the chained graph uses
+    //      argmax, which is a SEMANTIC change for the drafter only —
+    //      verify is still the ground truth, so emitted tokens still
+    //      come from the target distribution per Leviathan-Chen, but
+    //      acceptance rate may differ. We keep T>0 on the per-step
+    //      path to preserve the existing contract.
+    //
+    // On any chained-path error we fall back to the per-step loop in
+    // the same cycle (the eager Rust path is the safety net).
+    let temperature = params
+        .sampling_config
+        .and_then(|c| c.temperature)
+        .unwrap_or(1.0);
+    let try_chained = ops.chained_draft.is_some() && temperature <= 1e-6;
+
     let mut prev_hidden = prev_hidden_in;
     let mut prev_emb = prev_emb_in;
     let mut draft_ids: Vec<i32> = Vec::with_capacity(depth);
     let mut draft_probs: Vec<MxArray> = Vec::with_capacity(depth);
 
-    for _ in 0..depth {
-        let (h_next, draft_logits) = (ops.draft_step)(&prev_hidden, &prev_emb)?;
-        // draft_logits is [1, vocab]; squeeze to [vocab] for softmax.
-        let logits_1d = draft_logits.squeeze(Some(&[0]))?;
-        let probs = Activations::softmax(&logits_1d, Some(-1))?.astype(DType::Float32)?;
-        // Sample the drafted token using the same sampling pipeline
-        // the main path uses — drafter and verifier must agree on
-        // their proposal distribution for Leviathan-Chen.
-        let tok = sampling::sample(&draft_logits, params.sampling_config)?;
-        tok.eval();
-        let tok_id = tok.item_at_int32(0)?;
-        draft_ids.push(tok_id);
-        draft_probs.push(probs);
-        // Update prev_hidden for next draft step.
-        prev_hidden = h_next;
-        // prev_emb for the next draft is the embedding of the token
-        // we just drafted.
-        let id_arr = A::from_int32(&[tok_id], &[1])?;
-        let emb_2d = embedding_weight.take(&id_arr, 0)?; // [1, hidden]
-        let hidden = emb_2d.shape_at(1)?;
-        prev_emb = emb_2d.reshape(&[1, 1, hidden])?;
+    let mut used_chained = false;
+    if try_chained && let Some(ref mut chained) = ops.chained_draft {
+        match chained(&prev_hidden, &prev_emb, embedding_weight, depth) {
+            Ok((ids_arr, probs_arr)) => {
+                // ids_arr is `[depth]` int32; eval and read once.
+                ids_arr.eval();
+                for i in 0..depth {
+                    draft_ids.push(ids_arr.item_at_int32(i)?);
+                }
+                // probs_arr is `[depth, vocab]` fp32. Slice into per-step
+                // `[vocab]` rows; we do NOT eval the slices here — at
+                // T=0 `accept_with_residual` ignores p_draft numerically
+                // (only reads draft_id), so the lazy slice never gets
+                // materialised by Metal. This avoids a per-position
+                // eval barrier that would defeat the very sync collapse
+                // this task is about. At T>0 the chained path is gated
+                // off (try_chained=false), so this code is unreachable.
+                let vocab = probs_arr.shape_at(1)?;
+                for i in 0..depth {
+                    let row = probs_arr.slice(&[i as i64, 0], &[(i + 1) as i64, vocab])?;
+                    // Squeeze to `[vocab]` for the per-position
+                    // `accept_with_residual` contract.
+                    draft_probs.push(row.squeeze(Some(&[0]))?);
+                }
+                used_chained = true;
+            }
+            Err(e) => {
+                // W6.18 — chained path failed (init not done, C++
+                // exception, shape mismatch). Log + fall back to
+                // the per-step loop so the cycle still completes.
+                tracing::warn!(
+                    target: "mlx_core::mtp::chained",
+                    error = %e.reason,
+                    "W6.18 chained draft FFI failed; falling back to per-step path"
+                );
+                draft_ids.clear();
+                draft_probs.clear();
+            }
+        }
+    }
+
+    if !used_chained {
+        for _ in 0..depth {
+            let (h_next, draft_logits) = (ops.draft_step)(&prev_hidden, &prev_emb)?;
+            // draft_logits is [1, vocab]; squeeze to [vocab] for softmax.
+            let logits_1d = draft_logits.squeeze(Some(&[0]))?;
+            let probs = Activations::softmax(&logits_1d, Some(-1))?.astype(DType::Float32)?;
+            // Sample the drafted token using the same sampling pipeline
+            // the main path uses — drafter and verifier must agree on
+            // their proposal distribution for Leviathan-Chen.
+            let tok = sampling::sample(&draft_logits, params.sampling_config)?;
+            tok.eval();
+            let tok_id = tok.item_at_int32(0)?;
+            draft_ids.push(tok_id);
+            draft_probs.push(probs);
+            // Update prev_hidden for next draft step.
+            prev_hidden = h_next;
+            // prev_emb for the next draft is the embedding of the token
+            // we just drafted.
+            let id_arr = A::from_int32(&[tok_id], &[1])?;
+            let emb_2d = embedding_weight.take(&id_arr, 0)?; // [1, hidden]
+            let hidden = emb_2d.shape_at(1)?;
+            prev_emb = emb_2d.reshape(&[1, 1, hidden])?;
+        }
     }
 
     // Step 2: build verify input [last_committed_id, d_0, ..., d_{D-1}].
@@ -2549,6 +2633,11 @@ mod mtp_cycle_tests {
             begin_cycle: || {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
+            // W6.18 — tests exercise the per-step `draft_step` path.
+            // The chained-draft FFI is dense-only and the tests don't
+            // need to validate it (cycle-level acceptance semantics
+            // are path-agnostic).
+            chained_draft: None,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
@@ -2614,6 +2703,11 @@ mod mtp_cycle_tests {
             begin_cycle: || {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
+            // W6.18 — tests exercise the per-step `draft_step` path.
+            // The chained-draft FFI is dense-only and the tests don't
+            // need to validate it (cycle-level acceptance semantics
+            // are path-agnostic).
+            chained_draft: None,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xBADC0DE);
@@ -2672,6 +2766,11 @@ mod mtp_cycle_tests {
             begin_cycle: || {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
+            // W6.18 — tests exercise the per-step `draft_step` path.
+            // The chained-draft FFI is dense-only and the tests don't
+            // need to validate it (cycle-level acceptance semantics
+            // are path-agnostic).
+            chained_draft: None,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xDEAD);
@@ -2748,6 +2847,11 @@ mod mtp_cycle_tests {
             begin_cycle: || {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
+            // W6.18 — tests exercise the per-step `draft_step` path.
+            // The chained-draft FFI is dense-only and the tests don't
+            // need to validate it (cycle-level acceptance semantics
+            // are path-agnostic).
+            chained_draft: None,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xFEED);
