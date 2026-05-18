@@ -1524,18 +1524,19 @@ macro_rules! decode_loop_mtp {
         // `MTP(prev_hidden=verify_hiddens[K], prev_emb=embed($y)) ->
         // next-next logits`, matching the head's training contract.
         //
-        // Default policy (W6.5 follow-up): chaining DISABLED until W6.7
-        // lands. The position-K slice (commit 2322841) makes chaining
+        // Default policy (W6.5 follow-up; preserved post-W6.7): chaining
+        // DISABLED. The position-K slice (commit 2322841) makes chaining
         // SEMANTICALLY correct — byte-exact parity at T=0 holds in both
-        // modes — but the per-position hidden capture inside a loop of
-        // D+1 sequential forwards adds graph-evaluation overhead that
-        // scales with D, regressing 0.30× → 0.20× at depth=3 (depth=1 is
-        // a wash). W6.7 collapses the loop into ONE compiled graph
-        // emitting `[1, D+1, hidden]` natively; at that point chaining
-        // becomes profitable and we will flip this default back to ON.
+        // modes — but at depth=3 it still measures slower than the
+        // Step-A path even with W6.7's batched verify (0.60× vs 0.74×
+        // on M3 Max bf16, 200-token smoke). The likely cause is the
+        // per-cycle `verify_hiddens[K]` slice + eval pulling an extra
+        // dependency through the compiled-graph cache that the Step-A
+        // path doesn't pay. Re-measure when the chained-hidden eval is
+        // folded into the next cycle's draft trace (W6.8 candidate).
         //
         // Set `MLX_MTP_CHAINED_CYCLES=1` to opt INTO chaining for
-        // testing / measurement against the pre-chained baseline.
+        // testing / measurement against the Step-A baseline.
         //
         // Invariants:
         //   - `None` on the FIRST iteration (no prior verify) — Step A
@@ -1650,10 +1651,11 @@ macro_rules! decode_loop_mtp {
             //
             // Default (`MLX_MTP_CHAINED_CYCLES` unset): always Step A,
             // matching pre-W6.5 behaviour byte-exact. The chained path
-            // is opt-in via `MLX_MTP_CHAINED_CYCLES=1` until W6.7's
-            // batched-verify graph eliminates the per-cycle per-position
-            // hidden-capture overhead that currently regresses perf at
-            // depth ≥ 2.
+            // stays opt-in via `MLX_MTP_CHAINED_CYCLES=1`; even after
+            // W6.7's batched verify (which eliminates the per-position
+            // hidden-capture loop the W6.5 follow-up flagged) the
+            // chained path still regresses perf, see the comment block
+            // at the top of `decode_loop_mtp!` for details.
             //
             // On the chained path the prior cycle's verify already
             // committed all accepted tokens' K/V, and the next cycle's

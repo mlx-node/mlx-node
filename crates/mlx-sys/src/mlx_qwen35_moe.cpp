@@ -726,6 +726,132 @@ static std::vector<array> moe_compiled_decode_fn_paged(const std::vector<array>&
   return result;
 }
 
+// =====================================================================
+// W6.7 — MoE batched verify decode graph.
+//
+// Direct MoE mirror of `qwen35_verify_batched_decode_fn<false>` in
+// `mlx_qwen35.cpp` (the MoE path doesn't ship W6.6 tape-replay yet — it
+// stays out of scope, matching the W6.6 commit body). One forward over
+// `T = depth + 1` tokens replacing the prior D+1 sequential
+// `mlx_qwen35_moe_forward` calls.
+//
+// Input vector layout (matches the per-step MoE graph plus the 3D h):
+//   [0]                  h_3d         [B, T, hidden]  bf16
+//   [1]                  offset_arr   [1]             int32
+//   For each layer i in [0, num_layers):
+//     [2 + i*2 + 0]      cache_a      (k for full-attn, conv_state for linear)
+//     [2 + i*2 + 1]      cache_b      (v for full-attn, recurrent_state for linear)
+//
+// Output vector layout:
+//   [0]                  logits       [B, T, vocab]
+//   [1]                  new_offset_arr — `offset_arr + T`
+//   [2]                  hiddens      [B, T, hidden]  pre-lm_head hidden
+//   For each layer i:
+//     [3 + i*2 + 0]      new_cache_a
+//     [3 + i*2 + 1]      new_cache_b
+//
+// `last_hidden` is kept at slot 2 to mirror the per-step graph layout —
+// the FFI consumes it independently of the cache stride.
+// =====================================================================
+static std::vector<array> moe_verify_batched_decode_fn(
+    const std::vector<array>& inputs) {
+  const auto& cfg = g_moe_config;
+  auto h          = inputs[0];        // [B, T, hidden]
+  auto offset_arr = inputs[1];        // [1] int32
+
+  int B = h.shape(0);
+  int T = h.shape(1);
+  int hidden = h.shape(2);
+
+  // Tail-causal mask `[1, 1, T, max_kv_len]`: at query row `t`, valid
+  // keys are `[0..offset + t]`. Built once for all full-attention layers.
+  int first_fa = cfg.full_attention_interval - 1;
+  int max_kv_len = inputs[2 + first_fa * 2].shape(2);
+  auto col_positions = arange(0, max_kv_len, mlx::core::int32);   // [K]
+  auto row_idx       = arange(0, T, mlx::core::int32);            // [T]
+  auto col_row = reshape(col_positions, {1, max_kv_len});         // [1, K]
+  auto row_col = reshape(row_idx, {T, 1}) + offset_arr;           // [T, 1]
+  auto valid_2d = less_equal(col_row, row_col);                   // [T, K]
+  auto attn_mask = where(valid_2d,
+      array(0.0f, mlx::core::bfloat16),
+      array(-std::numeric_limits<float>::infinity(), mlx::core::bfloat16));
+  attn_mask = reshape(attn_mask, {1, 1, T, max_kv_len});
+
+  std::vector<array> new_caches;
+  new_caches.reserve(cfg.num_layers * 2);
+  for (int i = 0; i < cfg.num_layers * 2; i++) {
+    new_caches.push_back(zeros({}, mlx::core::bfloat16));
+  }
+
+  for (int i = 0; i < cfg.num_layers; i++) {
+    bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+    std::string lp = "layers." + std::to_string(i);
+
+    auto normed = fast::rms_norm(h, get_weight(lp + ".input_layernorm.weight"),
+                                 cfg.rms_norm_eps);
+
+    array layer_out = zeros({}, mlx::core::bfloat16);
+    if (is_linear) {
+      const auto& cs = inputs[2 + i * 2];
+      const auto& rs = inputs[2 + i * 2 + 1];
+      auto res = gdn_batched_verify_fn(normed, i, cs, rs, cfg);
+      layer_out = std::move(res.output);
+      new_caches[i * 2]     = std::move(res.conv_state);
+      new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+    } else {
+      const auto& kk = inputs[2 + i * 2];
+      const auto& kv = inputs[2 + i * 2 + 1];
+      auto res = attn_batched_verify_fn(normed, i, kk, kv, attn_mask, offset_arr, cfg);
+      layer_out = std::move(res.output);
+      new_caches[i * 2]     = std::move(res.keys);
+      new_caches[i * 2 + 1] = std::move(res.values);
+    }
+    h = h + layer_out;
+
+    // Post-attn norm + MoE/Dense MLP. The MLP helpers expect 2D input
+    // `[B*T, hidden]` (they internally treat `B` as the token count
+    // for routing / expert dispatch). Flatten time into batch.
+    auto h_flat = reshape(h, {B * T, hidden});
+    auto mlp_in = fast::rms_norm(h_flat, get_weight(lp + ".post_attention_layernorm.weight"),
+                                 cfg.rms_norm_eps);
+
+    array mlp_out = zeros({}, mlx::core::bfloat16);
+    bool moe = is_moe_layer(i, cfg);
+    if (moe) {
+      mlp_out = sparse_moe_fn(mlp_in, i, cfg, g_layer_quant[i]);
+    } else {
+      mlp_out = dense_mlp_fn(mlp_in, i, cfg, g_dense_quant[i]);
+    }
+    h = h + reshape(mlp_out, {B, T, hidden});
+  }
+
+  // Final norm + LM head on flat 2D, then reshape outputs.
+  auto h_flat = reshape(h, {B * T, hidden});
+  h_flat = fast::rms_norm(h_flat, get_weight("final_norm.weight"), cfg.rms_norm_eps);
+  array last_hidden = reshape(h_flat, {B, T, hidden});
+
+  auto logits_flat = cfg.tie_word_embeddings
+      ? linear_proj(h_flat, "embedding")
+      : linear_proj(h_flat, "lm_head");
+  int vocab = logits_flat.shape(-1);
+  auto logits = reshape(logits_flat, {B, T, vocab});
+
+  auto new_offset = offset_arr + array(T, mlx::core::int32);
+
+  std::vector<array> result;
+  result.reserve(3 + cfg.num_layers * 2);
+  result.push_back(std::move(logits));
+  result.push_back(std::move(new_offset));
+  result.push_back(std::move(last_hidden));
+  for (auto& c : new_caches) result.push_back(std::move(c));
+  return result;
+}
+
+static auto& compiled_moe_verify_batched() {
+  static auto fn = mlx::core::compile(moe_verify_batched_decode_fn);
+  return fn;
+}
+
 static auto& compiled_moe_decode_paged() {
   static auto fn = mlx::core::compile(moe_compiled_decode_fn_paged);
   return fn;
@@ -956,6 +1082,122 @@ void mlx_qwen35_moe_forward(
     fprintf(stderr, "[MLX] Unknown exception in mlx_qwen35_moe_forward\n");
     fflush(stderr);
     *output_logits = nullptr;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// W6.7 — MoE batched verify forward (MoE twin of
+// `mlx_qwen35_forward_batched_verify`).
+//
+// Runs ONE compiled forward over `T = depth + 1` tokens, replacing the prior
+// D+1 sequential `mlx_qwen35_moe_forward` calls performed inside the per-
+// depth MoE verify closure. Emits `[1, T, vocab]` logits + `[1, T, hidden]`
+// post-final-norm hiddens in one dispatch. Does NOT support W6.6 tape-replay
+// (MoE tape-replay is deferred).
+//
+// Inputs:
+//   - input_ids:        `[1, T]` int32 tokens (T = depth + 1).
+//   - embedding_weight: model's embedding table (or LM-head if untied).
+//   - depth:            T = depth + 1; depth ∈ [1, 5] enforced by caller.
+// Outputs (heap-allocated, caller owns):
+//   - out_logits:       `[1, T, vocab]` bf16 logits.
+//   - out_hiddens:      `[1, T, hidden_size]` bf16 post-final-norm.
+// Side effects:
+//   - `g_moe_offset_int` += T
+//   - `g_moe_caches[]` updated in place with the post-verify state.
+//   - `g_moe_last_hidden` is NOT touched here; the batched FFI returns the
+//     full `[1, T, hidden]` directly so the legacy per-step stash isn't used.
+//
+// Caller MUST hold `MOE_COMPILED_MUTEX` and the weights read lock.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_moe_forward_batched_verify(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array** out_logits,
+    mlx_array** out_hiddens
+) {
+  if (out_logits) *out_logits = nullptr;
+  if (out_hiddens) *out_hiddens = nullptr;
+  if (!input_ids_ptr || !embedding_weight_ptr || !out_logits || !out_hiddens) {
+    return;
+  }
+  if (!g_moe_inited) return;
+  if (depth < 1 || depth > 5) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_moe_forward_batched_verify: depth %d outside [1, 5]\n",
+            depth);
+    fflush(stderr);
+    return;
+  }
+  const auto& cfg = g_moe_config;
+  int T = depth + 1;
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+
+    if (input_ids.ndim() != 2 || input_ids.shape(0) != 1 ||
+        input_ids.shape(1) != T) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_moe_forward_batched_verify: input_ids shape must be "
+              "[1, %d], got ndim=%d shape=[%lld,%lld]\n",
+              T, input_ids.ndim(),
+              input_ids.ndim() >= 1 ? (long long)input_ids.shape(0) : -1LL,
+              input_ids.ndim() >= 2 ? (long long)input_ids.shape(1) : -1LL);
+      fflush(stderr);
+      return;
+    }
+
+    // Embed: `[1, T]` int32 → `[1, T, hidden]` bf16.
+    auto flat_ids = reshape(input_ids, {-1});
+    auto emb_flat = take(embedding_weight, flat_ids, 0);
+    auto h_3d = reshape(emb_flat, {1, T, cfg.hidden_size});
+
+    std::vector<array> fn_inputs;
+    fn_inputs.reserve(2 + cfg.num_layers * 2);
+    fn_inputs.push_back(std::move(h_3d));
+    fn_inputs.push_back(reshape(array(g_moe_offset_int, mlx::core::int32), {1}));
+    for (const auto& c : g_moe_caches) {
+      fn_inputs.push_back(c);
+    }
+
+    static bool no_compile = std::getenv("MLX_NO_COMPILE") != nullptr;
+    auto outputs = no_compile
+        ? moe_verify_batched_decode_fn(fn_inputs)
+        : compiled_moe_verify_batched()(fn_inputs);
+
+    // outputs[0]: logits  [1, T, vocab]
+    // outputs[1]: new_offset_arr (unused — we maintain `g_moe_offset_int` here)
+    // outputs[2]: hiddens [1, T, hidden]
+    // outputs[3..]: updated caches
+    const size_t expected = 3 + static_cast<size_t>(cfg.num_layers) * 2;
+    if (outputs.size() != expected) {
+      fprintf(stderr,
+              "[MLX] moe_verify_batched_decode_fn returned %zu outputs, expected %zu\n",
+              outputs.size(), expected);
+      fflush(stderr);
+      return;
+    }
+    *out_logits  = reinterpret_cast<mlx_array*>(new array(outputs[0]));
+    *out_hiddens = reinterpret_cast<mlx_array*>(new array(outputs[2]));
+
+    for (int i = 0; i < cfg.num_layers * 2; i++) {
+      g_moe_caches[i] = outputs[3 + i];
+    }
+    g_moe_offset_int += T;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_forward_batched_verify: %s\n",
+            e.what());
+    fflush(stderr);
+    if (out_logits) *out_logits = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_moe_forward_batched_verify\n");
+    fflush(stderr);
+    if (out_logits) *out_logits = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
   }
 }
 

@@ -72,16 +72,14 @@ using namespace qwen35_common;
 // semantics identical to the main path and avoids the risk of
 // double-incrementing the offset.
 //
-// The verify graph still gets a per-depth compile-cache key: each
-// length-D verify is wrapped as a single closure that performs D+1
-// sequential `mlx_qwen35_forward_compiled` calls; the closure body
-// itself isn't traced (the per-step body is not currently compiled),
-// but the per-step kernel fusions in `compiled_swiglu` /
-// `compiled_compute_g` / `compiled_attn_gate` ARE cached. This is the
-// same trade-off the main path makes; the W5 plan accepts it because
-// graph-cached per-depth verify is a Phase-2 perf win (next workstream)
-// and the immediate ≥1.6× target is reachable with the current kernel
-// fusions alone.
+// W6.7 — the verify graph is now ONE compiled forward over T = D+1
+// tokens (see `mlx_qwen35_forward_batched_verify` in `mlx_qwen35.cpp`).
+// This file's per-depth `g_verify_compiled_by_depth` table dispatches
+// into that batched FFI instead of the prior D+1 sequential single-token
+// forwards. The closure body is still NOT wrapped in
+// `mlx::core::compile` here — the heavy compile lives inside the
+// batched-verify FFI; this file's closure does shape validation +
+// FFI marshalling only.
 // =============================================================================
 
 extern "C" void mlx_qwen35_forward_compiled(
@@ -113,6 +111,20 @@ extern "C" int mlx_qwen35_is_compile_inited();
 // seeding path; declared here too so the verify closure can thread it
 // once per iteration without going through the FFI boundary twice.
 extern "C" void mlx_qwen35_export_last_hidden(mlx_array** out);
+
+// W6.7 — One-shot batched verify forward. Runs the entire D+1-token
+// verify on a single compiled graph (vs the prior D+1 sequential
+// `mlx_qwen35_forward_compiled` calls) and emits `[1, D+1, vocab]`
+// logits + `[1, D+1, hidden]` hiddens. Lives in `mlx_qwen35.cpp` because
+// the graph references the main-path's `g_compiled_caches` /
+// `g_offset_int` directly. Tape-replay arming is consumed via the
+// existing `g_tape_recording_armed` global.
+extern "C" void mlx_qwen35_forward_batched_verify(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array** out_logits,
+    mlx_array** out_hiddens);
 
 namespace {
 
@@ -267,17 +279,26 @@ static auto& compiled_mtp_draft_decode() {
 // =====================================================================
 // Verify graphs: per-depth dispatcher.
 //
-// One entry per depth ∈ {1..5}. The closure for depth D performs D+1
-// successive single-token decode steps via the existing flat-path FFI
-// `mlx_qwen35_forward_compiled`. Each call advances the main
-// `g_offset_int` by 1 and updates `g_compiled_caches[]` in place,
-// matching the per-step semantics the chat loop already relies on. The
-// closure stacks the D+1 logits along axis 1 to produce the verify
-// output `[1, depth+1, vocab]`.
+// One entry per depth ∈ {1..5}. The closure for depth D dispatches to
+// `mlx_qwen35_forward_batched_verify` (W6.7) which runs a SINGLE
+// compiled graph over T = D+1 tokens, emitting `[1, D+1, vocab]` logits
+// and `[1, D+1, hidden]` post-final-norm hiddens in one launch. The
+// FFI also advances the main `g_offset_int` by D+1 and writes the
+// D+1 KV slots in place via `slice_update`, matching the prior per-step
+// semantics the chat loop relies on.
 //
 // Per the W5 plan we MUST reject depth > 5. Per-depth lookup is O(log
 // k) under `std::map`-style search but k ≤ 5 so we use a fixed-size
 // array indexed by depth - 1.
+//
+// The per-depth `g_verify_compiled_by_depth` table is retained for two
+// reasons: (a) depth validation lives one place (the slot's existence
+// implies `depth ∈ [1, 5]`), (b) the per-depth closure still owns the
+// `seq_len == depth + 1` runtime check that catches shape drift from
+// the Rust caller. The actual compiled graph cache lives inside
+// `mlx_qwen35.cpp` (see `compiled_verify_batched_notape` /
+// `compiled_verify_batched_tape`) where it's keyed on input shape by
+// `mlx::core::compile` itself.
 // =====================================================================
 
 constexpr int MAX_VERIFY_DEPTH = 5;
@@ -285,25 +306,30 @@ using VerifyFn = std::function<std::vector<array>(
     const array&, const array&)>;
 static std::array<VerifyFn, MAX_VERIFY_DEPTH> g_verify_compiled_by_depth{};
 
-// Build a verify closure for a fixed depth. Captures NO per-call
-// state — depth is baked in. The closure expects `input_ids` of shape
-// `[1, depth+1]` and the `embedding_weight` from the model. The
-// closure returns a 2-element vector:
-//   `{ logits[1, depth+1, vocab], hiddens[1, depth+1, hidden_size] }`
+// W6.7 — Build a verify closure for a fixed depth. Captures NO per-call
+// state. The closure expects `input_ids` of shape `[1, depth+1]` and the
+// `embedding_weight` from the model. Returns
+// `{logits[1, depth+1, vocab], hiddens[1, depth+1, hidden_size]}`.
 //
-// The hiddens are captured AFTER every per-step forward (each call
-// overwrites the main-path `g_last_hidden` global) so the Rust caller
-// can slice `verify_hidden[K]` to seed chained-cycle drafts at the
-// correct prediction context (W6.5). Non-hidden callers
-// (`mlx_qwen35_mtp_verify_compiled`) simply ignore `outputs[1]`; the
-// lazy MLX graph for the hiddens drops with the local vector.
+// PRIOR (W6.5): the closure looped `mlx_qwen35_forward_compiled` D+1 times,
+// stashing the per-step `g_last_hidden` after each call and concatenating
+// the per-step `[1, 1, ...]` slices on axis 1. That cost D+1 kernel-launch
+// sequences and an extra concatenate-per-position lazy graph node.
+//
+// NOW (W6.7): one call to `mlx_qwen35_forward_batched_verify` runs a
+// single compiled graph over T = depth+1 tokens, emitting the full
+// `[1, T, vocab]` and `[1, T, hidden]` tensors natively. The tape-replay
+// side-channels (W6.6) are populated by the same dispatch when armed via
+// `mlx_qwen35_compiled_tape_arm`; the batched graph assigns one tape per
+// linear-attention layer in ONE shot (no per-step `concatenate`).
+//
+// The two distinct entrypoints `mlx_qwen35_mtp_verify_compiled` (logits
+// only) and `mlx_qwen35_mtp_verify_compiled_with_hidden` both consume the
+// same `{logits, hiddens}` tuple — the logits-only entrypoint just drops
+// the second element. Backwards compatibility preserved.
 static VerifyFn make_verify_fn(int depth) {
   return [depth](const array& input_ids, const array& embedding_weight)
              -> std::vector<array> {
-    // Split input_ids along the time axis and feed each token through
-    // the existing flat-path single-step FFI. The main path's
-    // `g_offset_int` increments by 1 per call, so after the loop the
-    // committed-prefix offset will have advanced by `depth + 1`.
     int seq_len = input_ids.shape(1);
     if (seq_len != depth + 1) {
       throw std::runtime_error(
@@ -312,65 +338,34 @@ static VerifyFn make_verify_fn(int depth) {
           std::to_string(depth + 1) + ")");
     }
 
-    std::vector<array> per_step_logits;
-    std::vector<array> per_step_hiddens;
-    per_step_logits.reserve(seq_len);
-    per_step_hiddens.reserve(seq_len);
-
-    for (int t = 0; t < seq_len; t++) {
-      // Slice the t-th token out of input_ids → [1, 1]
-      auto tok = slice(input_ids, {0, t}, {1, t + 1});
-
-      mlx_array* out_ptr = nullptr;
-      // Wrap the embedding-weight in a stack array view because the
-      // FFI expects `mlx_array*` and we have a const-array reference.
-      // The embedding weight is a global g_weights() entry on the
-      // main path side, so we materialize a temporary handle.
-      array emb_copy = embedding_weight;
-      array tok_copy = tok;
-      mlx_qwen35_forward_compiled(
-          reinterpret_cast<mlx_array*>(&tok_copy),
-          reinterpret_cast<mlx_array*>(&emb_copy),
-          &out_ptr,
-          /*cache_offset_out=*/nullptr);
-      if (!out_ptr) {
-        throw std::runtime_error(
-            "mlx_qwen35_mtp_verify: main forward returned null at t=" +
-            std::to_string(t));
+    // Heap-allocate temporaries because the cross-translation-unit FFI
+    // accepts `mlx_array*` pointers, not const-array references.
+    array tok_copy = input_ids;
+    array emb_copy = embedding_weight;
+    mlx_array* logits_ptr = nullptr;
+    mlx_array* hidden_ptr = nullptr;
+    mlx_qwen35_forward_batched_verify(
+        reinterpret_cast<mlx_array*>(&tok_copy),
+        reinterpret_cast<mlx_array*>(&emb_copy),
+        depth,
+        &logits_ptr,
+        &hidden_ptr);
+    if (!logits_ptr || !hidden_ptr) {
+      // Drop any half-allocated handle before erroring.
+      if (logits_ptr) {
+        delete reinterpret_cast<array*>(logits_ptr);
       }
-      // Take ownership of the heap-allocated array the FFI returned.
-      array step_logits = *reinterpret_cast<array*>(out_ptr);
-      delete reinterpret_cast<array*>(out_ptr);
-      // step_logits shape: [1, vocab]. Insert a time dim for stacking.
-      per_step_logits.push_back(reshape(step_logits,
-                                       {1, 1, step_logits.shape(-1)}));
-
-      // W6.5 — capture the post-final-norm hidden for THIS step BEFORE
-      // the next iteration's forward overwrites `g_last_hidden`.
-      // `mlx_qwen35_export_last_hidden` heap-allocates a refcounted
-      // clone of the lazy graph node; we take ownership and reshape
-      // from `[1, hidden]` (the global's shape per the flat-decode
-      // stash) into `[1, 1, hidden]` so the concatenate-along-time
-      // pattern below mirrors the logits stacking.
-      mlx_array* hid_ptr = nullptr;
-      mlx_qwen35_export_last_hidden(&hid_ptr);
-      if (!hid_ptr) {
-        throw std::runtime_error(
-            "mlx_qwen35_mtp_verify: g_last_hidden unpopulated after "
-            "forward at t=" + std::to_string(t));
+      if (hidden_ptr) {
+        delete reinterpret_cast<array*>(hidden_ptr);
       }
-      array step_hidden = *reinterpret_cast<array*>(hid_ptr);
-      delete reinterpret_cast<array*>(hid_ptr);
-      per_step_hiddens.push_back(reshape(step_hidden,
-                                        {1, 1, step_hidden.shape(-1)}));
+      throw std::runtime_error(
+          "mlx_qwen35_mtp_verify: batched verify forward returned null");
     }
-
-    // Stack along time axis →
-    //   logits:  [1, depth+1, vocab]
-    //   hiddens: [1, depth+1, hidden_size]
-    auto stacked_logits  = concatenate(per_step_logits, 1);
-    auto stacked_hiddens = concatenate(per_step_hiddens, 1);
-    return {stacked_logits, stacked_hiddens};
+    array logits = *reinterpret_cast<array*>(logits_ptr);
+    delete reinterpret_cast<array*>(logits_ptr);
+    array hiddens = *reinterpret_cast<array*>(hidden_ptr);
+    delete reinterpret_cast<array*>(hidden_ptr);
+    return {logits, hiddens};
   };
 }
 
@@ -677,10 +672,10 @@ void mlx_qwen35_mtp_verify_compiled(
 // logits output (and the same `g_compiled_caches[]` / `g_offset_int`
 // mutation contract) plus one extra owned `mlx_array*` for ALL D+1
 // per-position hiddens stacked along the time axis →
-// `[1, depth+1, hidden_size]`. The verify graph here loops
-// `mlx_qwen35_forward_compiled` D+1 times; the verify closure captures
-// `g_last_hidden` after EACH iteration before the next forward
-// overwrites it.
+// `[1, depth+1, hidden_size]`. W6.7: the verify graph is a single
+// compiled forward over T = D+1 tokens; the hidden output is the
+// graph's `[1, T, hidden]` post-final-norm slot returned directly (no
+// `g_last_hidden` intermediate).
 //
 // Why D+1 instead of just the last hidden: the Rust caller selects
 // position `K` (= number of accepted drafts) — `verify_hidden[K]` is the

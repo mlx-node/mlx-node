@@ -261,6 +261,200 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
 // etc.) for kernel fusion.
 
 // =====================================================================
+// W6.7 — Batched verify decode graph.
+//
+// One forward over `T = depth + 1` tokens (vs the prior D+1 sequential
+// `qwen35_decode_fn` calls). Replaces the per-step `g_verify_*` closure
+// loop in `mlx_qwen35_mtp_compiled.cpp`. Eliminates the per-position
+// `g_last_hidden` capture + `concatenate` accumulator append that the
+// W6.5 chained-cycles path needed (the batched graph emits
+// `[1, D+1, hidden]` natively in one dispatch).
+//
+// Input vector layout:
+//   [0]                      h_3d        [B, T, hidden]  bf16
+//   [1]                      offset_arr  [1]             int32
+//   For each layer i in [0, num_layers):
+//     [2 + i*2 + 0]          cache_a     (k for full-attn, conv_state for linear)
+//     [2 + i*2 + 1]          cache_b     (v for full-attn, recurrent_state for linear)
+//
+// Output vector layout:
+//   [0]                      logits      [B, T, vocab]
+//   [1]                      hiddens     [B, T, hidden]  pre-lm_head hidden
+//   For each layer i:
+//     [2 + i*2 + 0]          new_cache_a
+//     [2 + i*2 + 1]          new_cache_b
+//   For each layer i (TAPE variant only):
+//     [extra_base + i*4 + 0] tape        [B, T, Hv, Dv]  fp32  — placeholder for full-attn
+//     [extra_base + i*4 + 1] k_tape      [B, T, Hk, Dk]
+//     [extra_base + i*4 + 2] g_tape      [B, T, Hv]      fp32
+//     [extra_base + i*4 + 3] qkv_tape    [B, T, conv_dim]
+//
+// The graph is parameterised by `T` only (depth at trace time); the offset
+// arrives as an array so the same compiled graph reuses across all
+// decode positions for a given D. One graph per (depth, with_tape) is
+// cached in `g_compiled_verify_batched` / `g_compiled_verify_batched_tape`.
+// =====================================================================
+
+namespace {
+
+template <bool WithTape>
+static std::vector<array> qwen35_verify_batched_decode_fn(
+    const std::vector<array>& inputs) {
+  const auto& cfg = g_compile_config;
+
+  auto h_3d       = inputs[0];          // [B, T, hidden]
+  auto offset_arr = inputs[1];          // [1] int32
+
+  int B = h_3d.shape(0);
+  int T = h_3d.shape(1);
+
+  // Tail-causal mask: shape `[1, 1, T, max_kv_len]`. At query row `t`,
+  // valid keys are `[0..offset + t]`. Built ONCE per layer-set; reused
+  // across every full-attention layer to keep the compile graph cheap.
+  int first_fa = cfg.full_attention_interval - 1;
+  int max_kv_len = inputs[2 + first_fa * 2].shape(2);
+  auto col_positions = arange(0, max_kv_len, mlx::core::int32);            // [K]
+  auto row_idx       = arange(0, T, mlx::core::int32);                     // [T]
+  // valid = col <= offset + row  →  reshape to [T, K] then broadcast.
+  auto col_row = reshape(col_positions, {1, max_kv_len});                  // [1, K]
+  auto row_col = reshape(row_idx, {T, 1}) + offset_arr;                    // [T, 1]
+  auto valid_2d = less_equal(col_row, row_col);                            // [T, K]
+  auto attn_mask = where(valid_2d,
+      array(0.0f, mlx::core::bfloat16),
+      array(-std::numeric_limits<float>::infinity(), mlx::core::bfloat16));
+  attn_mask = reshape(attn_mask, {1, 1, T, max_kv_len});                   // [1, 1, T, K]
+
+  std::vector<array> new_caches;
+  new_caches.reserve(cfg.num_layers * 2);
+  for (int i = 0; i < cfg.num_layers * 2; i++) {
+    new_caches.push_back(zeros({}, mlx::core::bfloat16));
+  }
+
+  // Tape buffers — only filled when WithTape. Per-layer slots; full-attn
+  // layers stay as scalar zero placeholders so the output stride stays
+  // uniform.
+  std::vector<array> tape_buf, k_tape_buf, g_tape_buf, qkv_tape_buf;
+  if constexpr (WithTape) {
+    tape_buf.reserve(cfg.num_layers);
+    k_tape_buf.reserve(cfg.num_layers);
+    g_tape_buf.reserve(cfg.num_layers);
+    qkv_tape_buf.reserve(cfg.num_layers);
+    for (int i = 0; i < cfg.num_layers; i++) {
+      tape_buf.push_back(zeros({}, mlx::core::float32));
+      k_tape_buf.push_back(zeros({}, mlx::core::bfloat16));
+      g_tape_buf.push_back(zeros({}, mlx::core::float32));
+      qkv_tape_buf.push_back(zeros({}, mlx::core::bfloat16));
+    }
+  }
+
+  array h = h_3d;
+  for (int i = 0; i < cfg.num_layers; i++) {
+    bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+    std::string lp = "layers." + std::to_string(i);
+
+    auto normed = fast::rms_norm(h, get_weight(lp + ".input_layernorm.weight"),
+                                 cfg.rms_norm_eps);
+
+    array layer_out = zeros({}, mlx::core::bfloat16);
+    if (is_linear) {
+      const auto& cs = inputs[2 + i * 2];
+      const auto& rs = inputs[2 + i * 2 + 1];
+      if constexpr (WithTape) {
+        auto res = gdn_batched_verify_fn_with_tape(normed, i, cs, rs, cfg);
+        layer_out = std::move(res.output);
+        new_caches[i * 2]     = std::move(res.conv_state);
+        new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+        tape_buf[i]     = std::move(res.tape);
+        k_tape_buf[i]   = std::move(res.k_tape);
+        g_tape_buf[i]   = std::move(res.g_tape);
+        qkv_tape_buf[i] = std::move(res.qkv_tape);
+      } else {
+        auto res = gdn_batched_verify_fn(normed, i, cs, rs, cfg);
+        layer_out = std::move(res.output);
+        new_caches[i * 2]     = std::move(res.conv_state);
+        new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+      }
+    } else {
+      const auto& kk = inputs[2 + i * 2];
+      const auto& kv = inputs[2 + i * 2 + 1];
+      auto res = attn_batched_verify_fn(normed, i, kk, kv, attn_mask, offset_arr, cfg);
+      layer_out = std::move(res.output);
+      new_caches[i * 2]     = std::move(res.keys);
+      new_caches[i * 2 + 1] = std::move(res.values);
+    }
+    h = h + layer_out;
+
+    // MLP (SwiGLU) — same math as `qwen35_decode_fn`, but flatten batch +
+    // time for the linear projections.
+    std::string mp = lp + ".mlp.";
+    int hidden = h.shape(2);
+    auto h_flat = reshape(h, {B * T, hidden});
+    auto mlp_in_flat = fast::rms_norm(h_flat, get_weight(lp + ".post_attention_layernorm.weight"),
+                                      cfg.rms_norm_eps);
+    auto gate    = linear_proj(mlp_in_flat, mp + "gate_proj");
+    auto up      = linear_proj(mlp_in_flat, mp + "up_proj");
+    auto mlp_out = linear_proj(swiglu(gate, up), mp + "down_proj");
+    h = h + reshape(mlp_out, {B, T, hidden});
+  }
+
+  // Final norm + LM head — operate on flat 2D, return logits 3D.
+  int hidden = h.shape(2);
+  auto h_flat = reshape(h, {B * T, hidden});
+  h_flat = fast::rms_norm(h_flat, get_weight("final_norm.weight"), cfg.rms_norm_eps);
+  // Capture pre-lm_head hidden (post-final-norm). Same point as
+  // `g_last_hidden` in `qwen35_decode_fn`. Shape is `[B*T, hidden]`;
+  // reshape to `[B, T, hidden]` so the FFI hands it to the Rust caller
+  // in the contract documented at `mlx_qwen35_mtp_verify_compiled_with_hidden`.
+  auto hidden_out = reshape(h_flat, {B, T, hidden});
+
+  auto logits_flat = cfg.tie_word_embeddings
+      ? linear_proj(h_flat, "embedding")
+      : linear_proj(h_flat, "lm_head");
+  int vocab = logits_flat.shape(-1);
+  auto logits = reshape(logits_flat, {B, T, vocab});
+
+  std::vector<array> result;
+  size_t reserve = 2 + cfg.num_layers * 2;
+  if constexpr (WithTape) reserve += cfg.num_layers * 4;
+  result.reserve(reserve);
+  result.push_back(std::move(logits));
+  result.push_back(std::move(hidden_out));
+  for (auto& c : new_caches) result.push_back(std::move(c));
+  if constexpr (WithTape) {
+    for (int i = 0; i < cfg.num_layers; i++) {
+      result.push_back(std::move(tape_buf[i]));
+      result.push_back(std::move(k_tape_buf[i]));
+      result.push_back(std::move(g_tape_buf[i]));
+      result.push_back(std::move(qkv_tape_buf[i]));
+    }
+  }
+  return result;
+}
+
+// Compiled-graph cache for the batched verify forward. `mlx::core::compile`
+// already keys its internal trace cache on input shapes/dtypes — one
+// `compile()` per (with_tape) variant covers all 5 depths because the
+// closure body is parameterized purely by `T = input.shape(1)`. Two
+// compile entries total (with-tape vs without-tape) rather than 10.
+//
+// Populated lazily on first use; thread-safety mirrors the other
+// `compiled_*()` helpers in this file (single-mutex per turn from
+// `DENSE_COMPILED_MUTEX` on the Rust side).
+using BatchedVerifyFn = std::function<std::vector<array>(const std::vector<array>&)>;
+
+static BatchedVerifyFn& compiled_verify_batched_notape() {
+  static BatchedVerifyFn fn = mlx::core::compile(qwen35_verify_batched_decode_fn<false>);
+  return fn;
+}
+
+static BatchedVerifyFn& compiled_verify_batched_tape() {
+  static BatchedVerifyFn fn = mlx::core::compile(qwen35_verify_batched_decode_fn<true>);
+  return fn;
+}
+
+}  // namespace
+
+// =====================================================================
 // Phase 5 piece 1: full-graph paged-decode compile function.
 //
 // Mirrors `moe_compiled_decode_fn_paged` from `mlx_qwen35_moe.cpp` but
@@ -544,6 +738,145 @@ void mlx_qwen35_forward_compiled(
     fprintf(stderr, "[MLX] Unknown exception in mlx_qwen35_forward_compiled\n");
     fflush(stderr);
     *output_logits = nullptr;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// W6.7 — Batched verify forward.
+//
+// Runs ONE compiled forward over `T = depth + 1` tokens, replacing the prior
+// `D+1` sequential `mlx_qwen35_forward_compiled` calls performed inside the
+// per-depth verify closure of `mlx_qwen35_mtp_compiled.cpp`. The compiled
+// graph emits `[1, T, vocab]` logits + `[1, T, hidden]` post-final-norm
+// hiddens in one dispatch.
+//
+// Tape integration: if `g_tape_recording_armed` is true at entry, the
+// with-tape variant is invoked and the per-layer tape buffers
+// `(tape, k_tape, g_tape, qkv_tape)` of shape `[1, T, ...]` are stashed
+// DIRECTLY into the `g_gdn_*_tape_acc` slots (replacing the prior D+1
+// `concatenate` appends). The rollback path consumes a `slice([:, 0..K, ...])`
+// of these exactly as before — the cumulative shape is identical.
+//
+// Inputs:
+//   - input_ids:        `[1, T]` int32 tokens (T = depth + 1).
+//   - embedding_weight: model's embedding table (or LM-head if untied).
+//   - depth:            T = depth + 1; depth ∈ [1, 5] enforced by caller.
+// Outputs (heap-allocated, caller owns):
+//   - out_logits:       `[1, T, vocab]` bf16 logits.
+//   - out_hiddens:      `[1, T, hidden_size]` bf16 post-final-norm.
+// Side effects:
+//   - `g_offset_int` += T
+//   - `g_compiled_caches[]` updated in place with the post-verify state
+//     (T new K/V slots written for full-attn layers; recurrent + conv
+//     state advanced T steps for linear-attention layers).
+//   - When `g_tape_recording_armed`: per-layer accumulators populated.
+//
+// Returns nullptrs on failure. The caller MUST hold `DENSE_COMPILED_MUTEX`
+// and the `COMPILED_WEIGHTS_RWLOCK` read guard.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_forward_batched_verify(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array** out_logits,
+    mlx_array** out_hiddens
+) {
+  if (out_logits) *out_logits = nullptr;
+  if (out_hiddens) *out_hiddens = nullptr;
+  if (!input_ids_ptr || !embedding_weight_ptr || !out_logits || !out_hiddens) {
+    return;
+  }
+  if (!g_compile_inited) return;
+  if (depth < 1 || depth > 5) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_forward_batched_verify: depth %d outside [1, 5]\n",
+            depth);
+    fflush(stderr);
+    return;
+  }
+  const auto& cfg = g_compile_config;
+  int T = depth + 1;
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+
+    // Validate input_ids shape `[1, T]`.
+    if (input_ids.ndim() != 2 || input_ids.shape(0) != 1 ||
+        input_ids.shape(1) != T) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_forward_batched_verify: input_ids shape must be "
+              "[1, %d], got ndim=%d shape=[%lld,%lld]\n",
+              T, input_ids.ndim(),
+              input_ids.ndim() >= 1 ? (long long)input_ids.shape(0) : -1LL,
+              input_ids.ndim() >= 2 ? (long long)input_ids.shape(1) : -1LL);
+      fflush(stderr);
+      return;
+    }
+
+    // Embed: `[1, T]` int32 → `[1, T, hidden]` bf16.
+    auto flat_ids = reshape(input_ids, {-1});               // [T]
+    auto emb_flat = take(embedding_weight, flat_ids, 0);    // [T, hidden]
+    auto h_3d = reshape(emb_flat, {1, T, cfg.hidden_size}); // [1, T, hidden]
+
+    std::vector<array> inputs;
+    inputs.reserve(2 + cfg.num_layers * 2);
+    inputs.push_back(std::move(h_3d));
+    inputs.push_back(reshape(array(g_offset_int, mlx::core::int32), {1}));
+    for (const auto& c : g_compiled_caches) {
+      inputs.push_back(c);
+    }
+
+    bool with_tape = g_tape_recording_armed;
+    auto& fn = with_tape ? compiled_verify_batched_tape()
+                         : compiled_verify_batched_notape();
+    auto outputs = fn(inputs);
+
+    // outputs[0]: logits  [1, T, vocab]
+    // outputs[1]: hiddens [1, T, hidden]
+    // outputs[2 .. 2+2N): updated caches (N = num_layers)
+    // If with_tape: outputs[2+2N ..] hold per-layer (tape, k_tape, g_tape, qkv_tape)
+    *out_logits  = reinterpret_cast<mlx_array*>(new array(outputs[0]));
+    *out_hiddens = reinterpret_cast<mlx_array*>(new array(outputs[1]));
+
+    // Update KV / linear caches in place.
+    for (int i = 0; i < cfg.num_layers * 2; i++) {
+      g_compiled_caches[i] = outputs[2 + i];
+    }
+
+    // Advance offset by T (one per token in the batch).
+    g_offset_int += T;
+
+    // Stash tape outputs into the per-layer accumulators. The batched
+    // graph emits `[1, T, ...]` natively, so each slot gets a SINGLE
+    // assignment — no `concatenate` loop. The slot lifetime / shape
+    // contract matches the legacy per-step append (which produced
+    // `[1, recorded_steps, ...]` via repeated `concatenate(slot, step)`
+    // on axis 1).
+    if (with_tape) {
+      int extra_base = 2 + cfg.num_layers * 2;
+      for (int i = 0; i < cfg.num_layers; i++) {
+        bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+        if (!is_linear) continue;
+        int base = extra_base + i * 4;
+        g_gdn_tape_acc[i]     = outputs[base + 0];
+        g_gdn_k_tape_acc[i]   = outputs[base + 1];
+        g_gdn_g_tape_acc[i]   = outputs[base + 2];
+        g_gdn_qkv_tape_acc[i] = outputs[base + 3];
+      }
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_forward_batched_verify: %s\n",
+            e.what());
+    fflush(stderr);
+    if (out_logits) *out_logits = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_forward_batched_verify\n");
+    fflush(stderr);
+    if (out_logits) *out_logits = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
   }
 }
 

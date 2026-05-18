@@ -98,6 +98,17 @@ extern "C" int mlx_qwen35_moe_is_compile_inited();
 // iteration without going through the FFI boundary twice.
 extern "C" void mlx_qwen35_moe_export_last_hidden(mlx_array** out);
 
+// W6.7 — One-shot batched MoE verify forward. Runs the entire D+1-token
+// verify on a single compiled graph (vs the prior D+1 sequential
+// `mlx_qwen35_moe_forward` calls) and emits `[1, D+1, vocab]` logits +
+// `[1, D+1, hidden]` hiddens.
+extern "C" void mlx_qwen35_moe_forward_batched_verify(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array** out_logits,
+    mlx_array** out_hiddens);
+
 namespace {
 
 // =====================================================================
@@ -584,6 +595,10 @@ using VerifyFn = std::function<std::vector<array>(
     const array&, const array&)>;
 static std::array<VerifyFn, MAX_VERIFY_DEPTH> g_verify_compiled_by_depth{};
 
+// W6.7 — Dispatch to the new batched MoE verify FFI (one compiled
+// forward over T = depth+1 tokens) and surface
+// `{logits[1, T, vocab], hiddens[1, T, hidden]}`. See the dense MTP
+// `make_verify_fn` for the design rationale.
 static VerifyFn make_verify_fn(int depth) {
   return [depth](const array& input_ids, const array& embedding_weight)
              -> std::vector<array> {
@@ -595,58 +610,31 @@ static VerifyFn make_verify_fn(int depth) {
           std::to_string(depth + 1) + ")");
     }
 
-    std::vector<array> per_step_logits;
-    std::vector<array> per_step_hiddens;
-    per_step_logits.reserve(seq_len);
-    per_step_hiddens.reserve(seq_len);
-
-    for (int t = 0; t < seq_len; t++) {
-      auto tok = slice(input_ids, {0, t}, {1, t + 1});
-
-      mlx_array* out_ptr = nullptr;
-      array emb_copy = embedding_weight;
-      array tok_copy = tok;
-      mlx_qwen35_moe_forward(
-          reinterpret_cast<mlx_array*>(&tok_copy),
-          reinterpret_cast<mlx_array*>(&emb_copy),
-          &out_ptr,
-          /*cache_offset_out=*/nullptr);
-      if (!out_ptr) {
-        throw std::runtime_error(
-            "mlx_qwen35_moe_mtp_verify: main MoE forward returned null at t=" +
-            std::to_string(t));
+    array tok_copy = input_ids;
+    array emb_copy = embedding_weight;
+    mlx_array* logits_ptr = nullptr;
+    mlx_array* hidden_ptr = nullptr;
+    mlx_qwen35_moe_forward_batched_verify(
+        reinterpret_cast<mlx_array*>(&tok_copy),
+        reinterpret_cast<mlx_array*>(&emb_copy),
+        depth,
+        &logits_ptr,
+        &hidden_ptr);
+    if (!logits_ptr || !hidden_ptr) {
+      if (logits_ptr) {
+        delete reinterpret_cast<array*>(logits_ptr);
       }
-      array step_logits = *reinterpret_cast<array*>(out_ptr);
-      delete reinterpret_cast<array*>(out_ptr);
-      per_step_logits.push_back(reshape(step_logits,
-                                       {1, 1, step_logits.shape(-1)}));
-
-      // W6.5 — capture the post-final-norm hidden for THIS step BEFORE
-      // the next iteration's MoE forward overwrites `g_moe_last_hidden`.
-      // `mlx_qwen35_moe_export_last_hidden` heap-allocates a refcounted
-      // clone of the lazy graph node; we take ownership and reshape
-      // from `[1, hidden]` (the global's shape per the flat-decode
-      // stash) into `[1, 1, hidden]` so the concatenate-along-time
-      // pattern below mirrors the logits stacking.
-      mlx_array* hid_ptr = nullptr;
-      mlx_qwen35_moe_export_last_hidden(&hid_ptr);
-      if (!hid_ptr) {
-        throw std::runtime_error(
-            "mlx_qwen35_moe_mtp_verify: g_moe_last_hidden unpopulated "
-            "after MoE forward at t=" + std::to_string(t));
+      if (hidden_ptr) {
+        delete reinterpret_cast<array*>(hidden_ptr);
       }
-      array step_hidden = *reinterpret_cast<array*>(hid_ptr);
-      delete reinterpret_cast<array*>(hid_ptr);
-      per_step_hiddens.push_back(reshape(step_hidden,
-                                        {1, 1, step_hidden.shape(-1)}));
+      throw std::runtime_error(
+          "mlx_qwen35_moe_mtp_verify: batched MoE verify forward returned null");
     }
-
-    // Stack along time axis →
-    //   logits:  [1, depth+1, vocab]
-    //   hiddens: [1, depth+1, hidden_size]
-    auto stacked_logits  = concatenate(per_step_logits, 1);
-    auto stacked_hiddens = concatenate(per_step_hiddens, 1);
-    return {stacked_logits, stacked_hiddens};
+    array logits = *reinterpret_cast<array*>(logits_ptr);
+    delete reinterpret_cast<array*>(logits_ptr);
+    array hiddens = *reinterpret_cast<array*>(hidden_ptr);
+    delete reinterpret_cast<array*>(hidden_ptr);
+    return {logits, hiddens};
   };
 }
 
