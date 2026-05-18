@@ -2406,8 +2406,15 @@ impl Qwen35Inner {
                      -> Result<(MxArray, MxArray)> {
                         forward_mtp_draft_compiled(prev_hidden, prev_emb)
                     },
-                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
-                        forward_mtp_verify_compiled(ids, emb, depth as i32)
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<(MxArray, MxArray)> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-model forward.
+                        forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MTP path only. The MAIN path's offset and GDN
@@ -4552,8 +4559,15 @@ impl Qwen35Inner {
                      -> Result<(MxArray, MxArray)> {
                         forward_mtp_draft_compiled(prev_hidden, prev_emb)
                     },
-                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
-                        forward_mtp_verify_compiled(ids, emb, depth as i32)
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<(MxArray, MxArray)> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-model forward.
+                        forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MTP path only. The MAIN path's offset and GDN
@@ -5261,8 +5275,15 @@ impl Qwen35Inner {
                      -> Result<(MxArray, MxArray)> {
                         forward_mtp_draft_compiled(prev_hidden, prev_emb)
                     },
-                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
-                        forward_mtp_verify_compiled(ids, emb, depth as i32)
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<(MxArray, MxArray)> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-model forward.
+                        forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MTP path only. The MAIN path's offset and GDN
@@ -8175,7 +8196,16 @@ pub(super) fn forward_mtp_draft_compiled(
 /// offset / cache state during the verify. Tests serialise via
 /// `FFI_LOCK` in the absence of concurrent main-path forward calls —
 /// see `compiled_ffi_tests` in `mtp.rs`.
+///
+/// **W6.5 status:** All production callers now use
+/// [`forward_mtp_verify_compiled_with_hidden`] (chained-cycle path).
+/// This thin logits-only wrapper is kept as the backward-compatible
+/// surface for the underlying C++ FFI and as the natural fallback
+/// when a future opt-out (env-flag) is needed; flagged with
+/// `#[allow(dead_code)]` so the dead-code lint doesn't fire while
+/// the chained path is the only active caller.
 // W6 chat-session integration is the only intended caller.
+#[allow(dead_code)]
 pub(super) fn forward_mtp_verify_compiled(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
@@ -8205,6 +8235,66 @@ pub(super) fn forward_mtp_verify_compiled(
         ));
     }
     MxArray::from_handle(out_ptr, "mtp_verify_logits")
+}
+
+/// W6.5 — verify pass that ALSO exports the post-final-norm hidden of
+/// the LAST verify iteration (verify position `depth`). The caller
+/// uses this to chain MTP cycles without running a fresh main-model
+/// forward at "Step A" — the chained hidden is fed as `prev_hidden`
+/// to the next cycle's first draft step.
+///
+/// Same locking contract as [`forward_mtp_verify_compiled`]: callers
+/// MUST hold `DENSE_COMPILED_MUTEX` and a `COMPILED_WEIGHTS_RWLOCK`
+/// read guard for the entire cycle. Returns `(logits, last_hidden)`
+/// on success; on C++ failure the function returns `Err` and the
+/// caller MUST fall back to Step A on the next cycle.
+///
+/// The exported hidden is a lazy MLX array; it stays valid as long as
+/// `g_compiled_caches` (which the verify-final `final_norm` graph
+/// references) is alive — i.e. until the surrounding
+/// `CompiledResetGuard` drops at end of decode.
+pub(super) fn forward_mtp_verify_compiled_with_hidden(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    depth: i32,
+) -> Result<(MxArray, MxArray)> {
+    use mlx_sys as sys;
+
+    if !(1..=5).contains(&depth) {
+        return Err(Error::from_reason(format!(
+            "forward_mtp_verify_compiled_with_hidden: depth {depth} outside [1, 5]"
+        )));
+    }
+
+    let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_hidden: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_mtp_verify_compiled_with_hidden(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            depth,
+            &mut out_logits,
+            &mut out_hidden,
+        );
+    }
+
+    if out_logits.is_null() {
+        return Err(Error::from_reason(
+            "forward_mtp_verify_compiled_with_hidden: C++ returned null logits — check stderr",
+        ));
+    }
+    if out_hidden.is_null() {
+        // Logits succeeded but hidden export failed — drop the logits
+        // handle via the standard wrapper, then surface the error so
+        // the caller falls back to Step A.
+        let _ = MxArray::from_handle(out_logits, "mtp_verify_logits_drop_on_hidden_fail")?;
+        return Err(Error::from_reason(
+            "forward_mtp_verify_compiled_with_hidden: C++ returned null last_hidden — check stderr",
+        ));
+    }
+    let logits = MxArray::from_handle(out_logits, "mtp_verify_logits")?;
+    let hidden = MxArray::from_handle(out_hidden, "mtp_verify_last_hidden")?;
+    Ok((logits, hidden))
 }
 
 // ============================================================================

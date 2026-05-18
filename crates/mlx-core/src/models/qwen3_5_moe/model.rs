@@ -1671,8 +1671,15 @@ impl Qwen35MoeInner {
                      -> Result<(MxArray, MxArray)> {
                         forward_moe_mtp_draft_compiled(prev_hidden, prev_emb)
                     },
-                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
-                        forward_moe_mtp_verify_compiled(ids, emb, depth as i32)
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<(MxArray, MxArray)> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-MoE forward.
+                        forward_moe_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MoE MTP path only. The main MoE path's offset
@@ -3793,8 +3800,15 @@ impl Qwen35MoeInner {
                      -> Result<(MxArray, MxArray)> {
                         forward_moe_mtp_draft_compiled(prev_hidden, prev_emb)
                     },
-                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
-                        forward_moe_mtp_verify_compiled(ids, emb, depth as i32)
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<(MxArray, MxArray)> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-MoE forward.
+                        forward_moe_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MoE MTP path only — main offset/linear restored
@@ -4447,8 +4461,15 @@ impl Qwen35MoeInner {
                      -> Result<(MxArray, MxArray)> {
                         forward_moe_mtp_draft_compiled(prev_hidden, prev_emb)
                     },
-                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
-                        forward_moe_mtp_verify_compiled(ids, emb, depth as i32)
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<(MxArray, MxArray)> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-MoE forward.
+                        forward_moe_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MoE MTP path only — main offset/linear restored
@@ -5223,8 +5244,15 @@ impl Qwen35MoeInner {
                      -> Result<(MxArray, MxArray)> {
                         forward_moe_mtp_draft_compiled(prev_hidden, prev_emb)
                     },
-                    verify_step: |ids: &MxArray, emb: &MxArray, depth: usize| -> Result<MxArray> {
-                        forward_moe_mtp_verify_compiled(ids, emb, depth as i32)
+                    verify_step: |ids: &MxArray,
+                                  emb: &MxArray,
+                                  depth: usize|
+                     -> Result<(MxArray, MxArray)> {
+                        // W6.5 — return (logits, verify-final hidden)
+                        // so the cycle macro can chain into the next
+                        // cycle's first MTP draft and skip Step A's
+                        // ~150 ms main-MoE forward.
+                        forward_moe_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MoE MTP path only — main offset/linear restored
@@ -8243,7 +8271,15 @@ pub(super) fn forward_moe_mtp_draft_compiled(
 /// offset / cache state during the verify. Tests serialise via
 /// `FFI_LOCK` in the absence of concurrent main-path forward calls —
 /// see `compiled_ffi_tests` in `mtp.rs`.
+///
+/// **W6.5 status:** All production MoE callers now use
+/// [`forward_moe_mtp_verify_compiled_with_hidden`] (chained-cycle
+/// path). This logits-only wrapper is kept as the backward-compatible
+/// surface and as the natural fallback when a future env-flag opt-out
+/// is needed; flagged with `#[allow(dead_code)]` so the dead-code
+/// lint doesn't fire while the chained path is the only active caller.
 // W6 MoE chat-session integration is the only intended caller.
+#[allow(dead_code)]
 pub(super) fn forward_moe_mtp_verify_compiled(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
@@ -8273,6 +8309,55 @@ pub(super) fn forward_moe_mtp_verify_compiled(
         ));
     }
     MxArray::from_handle(out_ptr, "moe_mtp_verify_logits")
+}
+
+/// W6.5 — MoE verify pass that ALSO exports the post-final-norm hidden
+/// of the LAST verify iteration. MoE twin of
+/// [`super::super::qwen3_5::model::forward_mtp_verify_compiled_with_hidden`]
+/// — see that function's docstring for the chaining rationale.
+///
+/// Same locking contract as [`forward_moe_mtp_verify_compiled`]:
+/// callers MUST hold `MOE_COMPILED_MUTEX` (NOT the dense one) and a
+/// `COMPILED_WEIGHTS_RWLOCK` read guard for the entire cycle.
+pub(super) fn forward_moe_mtp_verify_compiled_with_hidden(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    depth: i32,
+) -> Result<(MxArray, MxArray)> {
+    use mlx_sys as sys;
+
+    if !(1..=5).contains(&depth) {
+        return Err(Error::from_reason(format!(
+            "forward_moe_mtp_verify_compiled_with_hidden: depth {depth} outside [1, 5]"
+        )));
+    }
+
+    let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_hidden: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            depth,
+            &mut out_logits,
+            &mut out_hidden,
+        );
+    }
+
+    if out_logits.is_null() {
+        return Err(Error::from_reason(
+            "forward_moe_mtp_verify_compiled_with_hidden: C++ returned null logits — check stderr",
+        ));
+    }
+    if out_hidden.is_null() {
+        let _ = MxArray::from_handle(out_logits, "moe_mtp_verify_logits_drop_on_hidden_fail")?;
+        return Err(Error::from_reason(
+            "forward_moe_mtp_verify_compiled_with_hidden: C++ returned null last_hidden — check stderr",
+        ));
+    }
+    let logits = MxArray::from_handle(out_logits, "moe_mtp_verify_logits")?;
+    let hidden = MxArray::from_handle(out_hidden, "moe_mtp_verify_last_hidden")?;
+    Ok((logits, hidden))
 }
 
 /// Block size hard-coded into the compiled C++ paged graph

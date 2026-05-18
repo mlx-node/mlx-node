@@ -1677,6 +1677,33 @@ unsafe extern "C-unwind" {
         out_logits: *mut *mut mlx_array,
     );
 
+    /// W6.5 — verify pass that ALSO exports the post-final-norm hidden
+    /// of the LAST verify iteration (verify position `depth`), so the
+    /// MTP cycle macro can chain into the next cycle's draft without
+    /// running a fresh main-model forward at "Step A".
+    ///
+    /// Behaviour is identical to `mlx_qwen35_mtp_verify_compiled` for
+    /// `out_logits` and the main-cache mutation contract. The extra
+    /// `out_last_hidden` is a heap-allocated `[1, hidden_size]` bf16
+    /// array (caller owns) on success or null on failure. Failure
+    /// semantics match the logits-only variant — caller falls back to
+    /// a fresh Step A on the next cycle when either output is null.
+    ///
+    /// Same locking contract as the logits-only variant: production
+    /// callers MUST hold `DENSE_COMPILED_MUTEX` for the entire
+    /// draft+verify cycle. The exported hidden is a lazy MLX array
+    /// whose graph references the verify-final `final_norm` output;
+    /// the caller MUST eval it (or consume it via a graph that does)
+    /// BEFORE the surrounding `CompiledResetGuard` drops, otherwise
+    /// the underlying buffer is released.
+    pub fn mlx_qwen35_mtp_verify_compiled_with_hidden(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+        out_last_hidden: *mut *mut mlx_array,
+    );
+
     /// Tear down MTP compiled state. Idempotent. Does NOT reset
     /// the main path — call `mlx_qwen35_compiled_reset` separately.
     pub fn mlx_qwen35_mtp_compiled_reset();
@@ -1953,6 +1980,24 @@ unsafe extern "C-unwind" {
         embedding_weight: *mut mlx_array,
         depth: i32,
         out_logits: *mut *mut mlx_array,
+    );
+
+    /// W6.5 — MoE verify pass that ALSO exports the post-final-norm
+    /// hidden of the LAST verify iteration (verify position `depth`).
+    /// MoE twin of `mlx_qwen35_mtp_verify_compiled_with_hidden` — see
+    /// that FFI's docstring for the chaining rationale and the
+    /// lifetime contract.
+    ///
+    /// Same locking contract: production callers MUST hold
+    /// `MOE_COMPILED_MUTEX` (NOT the dense one) for the entire
+    /// draft+verify cycle. Lifetime of `out_last_hidden` mirrors the
+    /// dense variant.
+    pub fn mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+        out_last_hidden: *mut *mut mlx_array,
     );
 
     /// Tear down MoE MTP compiled state. Idempotent. Does NOT reset

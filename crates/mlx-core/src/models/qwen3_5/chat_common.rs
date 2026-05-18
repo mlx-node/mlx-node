@@ -1135,7 +1135,12 @@ pub(crate) struct MtpOps<F, D, V, R, E, B, S, RR>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
-    V: FnMut(&MxArray, &MxArray, usize) -> Result<MxArray>,
+    // W6.5 — verify returns (logits, verify_last_hidden). The hidden
+    // is the post-final-norm output at verify position `depth` (the
+    // bonus / residual position) — the macro stashes it across cycles
+    // so the next cycle can skip Step A's full main-model forward and
+    // seed its first draft from this hidden instead.
+    V: FnMut(&MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>,
     R: FnMut(usize, usize),
     E: Fn(&MxArray, &MxArray, bool),
     B: FnMut(),
@@ -1189,11 +1194,11 @@ pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, B, S, RR>(
     params: &ChatParams,
     rng: &mut impl rand::Rng,
     depth: usize,
-) -> Result<(MtpCycleOutcome, MxArray, MxArray)>
+) -> Result<(MtpCycleOutcome, MxArray)>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
-    V: FnMut(&MxArray, &MxArray, usize) -> Result<MxArray>,
+    V: FnMut(&MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>,
     R: FnMut(usize, usize),
     E: Fn(&MxArray, &MxArray, bool),
     B: FnMut(),
@@ -1250,10 +1255,17 @@ where
     // accept the snapshot is discarded — verify already left the
     // linear state correctly advanced.
     (ops.snapshot_main_linear)();
-    let verify_logits = (ops.verify_step)(&verify_in, embedding_weight, depth)?;
+    // W6.5 — verify returns BOTH logits and the post-final-norm hidden
+    // of the LAST verify iteration (position `depth`). The hidden is
+    // surfaced back to the macro so the next cycle can skip Step A's
+    // main-model forward; logits are processed as before.
+    let (verify_logits, verify_last_hidden) =
+        (ops.verify_step)(&verify_in, embedding_weight, depth)?;
     // verify_logits: [1, depth+1, vocab]. We materialize it now so
     // per-position slicing reads from a CPU-resident buffer for
-    // penalty application.
+    // penalty application. The verify hidden ride along on the same
+    // compiled graph and is implicitly evaluated by `verify_logits.eval()`
+    // — its `final_norm` is upstream of every per-position logit.
     verify_logits.eval();
     let vocab = verify_logits.shape_at(2)?;
 
@@ -1378,27 +1390,32 @@ where
     }
 
     let _ = rejection_residual; // documented above; only used for clarity
+    // `prev_hidden` / `prev_emb` are no longer needed (they were the
+    // INPUTS to the cycle's drafts; the verify pass downstream of
+    // them is already evaluated). They drop at end-of-function with
+    // the rest of the locals; the underlying lazy MLX arrays stay
+    // alive as long as any other handle still holds them.
 
-    // Return the post-cycle (prev_hidden, prev_emb) seed slots. They
-    // are NOT used by `decode_loop_mtp!` (the macro always re-seeds
-    // via Step A on the next outer iteration — see the macro comment
-    // on why chaining cycles back-to-back is not currently possible
-    // without a verify-graph hidden accessor). Kept in the signature
-    // so a future enhancement can wire chained cycles without
-    // changing the helper API.
-    let next_emb = {
-        let last_id = *accepted_tokens.last().expect("at least one accepted token") as i32;
-        let id_arr = A::from_int32(&[last_id], &[1])?;
-        let emb_2d = embedding_weight.take(&id_arr, 0)?;
-        let hidden = emb_2d.shape_at(1)?;
-        emb_2d.reshape(&[1, 1, hidden])?
-    };
+    // W6.5 — return the verify-final hidden so the caller (the
+    // `decode_loop_mtp!` macro) can chain cycles: the NEXT cycle's
+    // first MTP draft uses this hidden as `prev_hidden`, eliminating
+    // the per-cycle main-model "Step A" forward.
+    //
+    // Semantics: this hidden is at verify position `depth`, i.e. the
+    // prediction context for the bonus token (full-accept) or for the
+    // residual sample (rejection). It is NOT strictly the hidden of
+    // the LAST accepted token (that would be bonus / residual itself,
+    // whose own hidden was never computed by verify). Using verify
+    // position `depth` as a context surrogate is the design choice
+    // documented in the W6.5 plan section: the MTP draft head is a
+    // heuristic predictor, and any drafts that diverge from
+    // ground-truth still get caught by the next cycle's verify pass
+    // (which uses the actual main model), so T=0 parity is preserved.
     Ok((
         MtpCycleOutcome {
             tokens: accepted_tokens,
         },
-        prev_hidden,
-        next_emb,
+        verify_last_hidden,
     ))
 }
 
@@ -1450,6 +1467,70 @@ macro_rules! decode_loop_mtp {
         let mut prev_hidden_opt: Option<$crate::array::MxArray>;
         let mut prev_emb_opt: Option<$crate::array::MxArray>;
         let mut last_committed_id_opt: Option<u32>;
+
+        // W6.5 — chained-cycle state. `run_mtp_cycle_inner` returns the
+        // post-final-norm hidden of the LAST verify iteration; we stash
+        // it here so the NEXT outer iteration can skip Step A's
+        // ~150 ms main-model forward and feed the chained hidden
+        // directly into the cycle's first MTP draft.
+        //
+        // **STATUS (2026-05-18, default off):** The verify-final
+        // hidden corresponds to verify position D — the prediction
+        // context for the bonus / residual token — NOT the hidden of
+        // the LAST ACCEPTED token (which is bonus / residual itself,
+        // whose own hidden was never computed by the verify pass).
+        // Feeding position D's hidden as `prev_hidden` to the next
+        // cycle's first MTP draft is a semantic mismatch: the MTP
+        // head is trained against `(prev_hidden, prev_emb)` pairs
+        // where `prev_hidden` IS the hidden of `prev_emb`'s token, so
+        // the chained-cycle drafts mispredict at a much higher rate
+        // than the Step-A-seeded baseline.
+        //
+        // Empirically on qwen3.5-4b bf16 / M3 Max at 200 tokens,
+        // depth=3: chained drafts collapse mean acceptance from ~1.5
+        // tokens/cycle (Step-A baseline) to ~0.8 tokens/cycle, so the
+        // chained loop runs ~1.7× more cycles per generation. Decode
+        // tok/s falls from 2.21 (pre-W6.5, 0.30× ratio) to 1.47
+        // (W6.5 chained, 0.18× ratio) — a *regression* against the
+        // W6.5 plan's ≥0.6× gate. Parity still passes byte-exact at
+        // T=0 because verify (= main model) is the ground truth.
+        //
+        // Default policy: chaining DISABLED. The C++ FFI
+        // `mlx_qwen35_mtp_verify_compiled_with_hidden` and the Rust
+        // wrapper `forward_mtp_verify_compiled_with_hidden` ship as
+        // the additive surface they were specced as; this macro
+        // simply leaves `chained_hidden_opt` permanently `None` so
+        // every iteration takes the Step-A path (no regression vs.
+        // pre-W6.5). To opt-in for experimentation, set the env var
+        // `MLX_MTP_CHAINED_CYCLES=1` — useful when probing whether
+        // the W6.7 batched-verify rework + a position-K hidden export
+        // restores the design's intended ~15 % wall-time win.
+        //
+        // A correct chained design needs either (a) the verify FFI to
+        // return ALL D+1 per-position hiddens so Rust can pick
+        // verify_hidden[K] after acceptance, OR (b) a one-token main
+        // forward of the residual / bonus to compute the right
+        // `prev_hidden`. Both belong to a follow-up workstream.
+        //
+        // Invariants when chaining IS enabled (via env var):
+        //   - `None` on the FIRST iteration (no prior verify) — Step A
+        //     runs unconditionally and re-seeds the hidden from a real
+        //     main forward.
+        //   - `None` when forced-think-end fires — that path needs Step
+        //     A's forward to write `$y`'s K/V before injecting the
+        //     forced token. (See the force-end branch below.)
+        //   - `Some(hidden)` after every successful cycle, to be drained
+        //     by the NEXT iteration before its cycle runs.
+        //
+        // The hidden is a lazy MLX array referencing the verify-final
+        // `final_norm` graph node; it stays alive because
+        // `g_compiled_caches` (its upstream) is alive for the rest of
+        // the decode loop. See `mlx_qwen35_mtp_verify_compiled_with_hidden`
+        // for the C++ lifetime contract.
+        let chained_cycles_enabled: bool = std::env::var("MLX_MTP_CHAINED_CYCLES")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mut chained_hidden_opt: Option<$crate::array::MxArray> = None;
 
         // Track cycles for the every-256-emitted-token cache clear.
         // We use the running `gen.len()` rather than a separate step
@@ -1534,147 +1615,207 @@ macro_rules! decode_loop_mtp {
                 break;
             }
 
-            // ---- Step A: emit one main-path-derived token. -----------
-            // This is either the very first token of the generation,
-            // OR a forced think-end token (budget), OR the recovery
-            // step after an MTP cycle returned fewer than depth+1
-            // tokens (rejection mid-cycle — we need a fresh hidden
-            // from the main path to re-seed MTP).
+            // ---- Step A vs. chained-hidden decision (W6.5). -----------
+            // Default (`MLX_MTP_CHAINED_CYCLES` unset): always Step A,
+            // matching pre-W6.5 behaviour byte-exact. Chaining off is
+            // currently the production policy — see the long doc at
+            // `chained_hidden_opt` for the perf-regression rationale.
+            //
+            // Opt-in (`MLX_MTP_CHAINED_CYCLES=1`): skip Step A's full
+            // main-model forward when a chained verify hidden is
+            // available from the prior cycle, unless the tracker is
+            // about to force a think-end token (the forced-token path
+            // needs Step A to forward `$y` so its K/V is committed
+            // before we inject the forced token).
+            //
+            // On the chained path the prior cycle's verify already
+            // committed all accepted tokens' K/V, and the next cycle's
+            // verify will write `$y`'s K/V at its position-0 input.
+            // The MTP draft seeds from `chained_hidden_opt`
+            // (verify-position-D's hidden — a context surrogate).
+            // T=0 parity is preserved because verify (= main model) is
+            // the ground truth and at T=0 the residual-sampler picks
+            // the same token regardless of draft accuracy.
+            let do_step_a = !chained_cycles_enabled
+                || chained_hidden_opt.is_none()
+                || $tracker.should_force_think_end();
+
             let _stream_ctx = $crate::stream::StreamContext::new($stream);
 
-            $profiler.begin("forward");
-            let next_ids = $y.reshape(&[1, 1])?;
-            let (mut logits, hidden, needs_squeeze) =
-                ($mtp.forward_with_hidden)(&next_ids, &$emb)?;
-            if needs_squeeze {
-                logits = logits.squeeze(Some(&[1]))?;
-            }
-            $profiler.end();
+            if do_step_a {
+                $profiler.begin("forward");
+                let next_ids = $y.reshape(&[1, 1])?;
+                let (mut logits, hidden, needs_squeeze) =
+                    ($mtp.forward_with_hidden)(&next_ids, &$emb)?;
+                if needs_squeeze {
+                    logits = logits.squeeze(Some(&[1]))?;
+                }
+                $profiler.end();
 
-            let (next_token, budget_forced) =
-                if $tracker.should_force_think_end() {
-                    let forced_id = $tracker.forced_token_id() as i32;
-                    ($crate::array::MxArray::from_int32(&[forced_id], &[1])?, true)
-                } else {
-                    $profiler.begin("rep_penalty");
-                    logits = $crate::models::qwen3_5::chat_common::apply_all_penalties(
-                        logits, &$hist, &$p,
-                    )?;
-                    $profiler.end();
+                let (next_token, budget_forced) =
+                    if $tracker.should_force_think_end() {
+                        let forced_id = $tracker.forced_token_id() as i32;
+                        ($crate::array::MxArray::from_int32(&[forced_id], &[1])?, true)
+                    } else {
+                        $profiler.begin("rep_penalty");
+                        logits = $crate::models::qwen3_5::chat_common::apply_all_penalties(
+                            logits, &$hist, &$p,
+                        )?;
+                        $profiler.end();
 
-                    $profiler.begin("sample");
-                    let t = $crate::sampling::sample(&logits, $p.sampling_config)?;
-                    $profiler.end();
-                    (t, false)
-                };
+                        $profiler.begin("sample");
+                        let t = $crate::sampling::sample(&logits, $p.sampling_config)?;
+                        $profiler.end();
+                        (t, false)
+                    };
 
-            $profiler.begin("eval_caches");
-            ($mtp.eval_step)(&next_token, &logits, budget_forced);
-            $profiler.end();
+                $profiler.begin("eval_caches");
+                ($mtp.eval_step)(&next_token, &logits, budget_forced);
+                $profiler.end();
 
-            $profiler.begin("eval_token");
-            next_token.eval();
-            $profiler.end();
+                $profiler.begin("eval_token");
+                next_token.eval();
+                $profiler.end();
 
-            $profiler.begin("extract");
-            let token_id = next_token.item_at_int32(0)? as u32;
-            $profiler.end();
-            $profiler.mark_first_token();
-            if $report && $first_tok.is_none() {
-                $first_tok = Some(std::time::Instant::now());
-            }
+                $profiler.begin("extract");
+                let token_id = next_token.item_at_int32(0)? as u32;
+                $profiler.end();
+                $profiler.mark_first_token();
+                if $report && $first_tok.is_none() {
+                    $first_tok = Some(std::time::Instant::now());
+                }
 
-            $gen.push(token_id);
-            $hist.push(token_id);
-            let _is_reasoning = $tracker.observe_token(token_id);
+                $gen.push(token_id);
+                $hist.push(token_id);
+                let _is_reasoning = $tracker.observe_token(token_id);
 
-            $(
-                $last_r = _is_reasoning;
-                if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                    $reason = String::from("cancelled");
+                $(
+                    $last_r = _is_reasoning;
+                    if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        $reason = String::from("cancelled");
+                        break;
+                    }
+                    let token_text = $crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                        &mut $ds, $tok.inner(), token_id, &$gen, $slen,
+                    );
+                    $slen += token_text.len();
+                    $cb.call(
+                        Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                            text: token_text, done: false, finish_reason: None,
+                            tool_calls: None, thinking: None, num_tokens: None,
+                            prompt_tokens: None, reasoning_tokens: None,
+                            raw_text: None, cached_tokens: None, performance: None,
+                            is_reasoning: Some(_is_reasoning),
+                        }),
+                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                )?
+
+                if token_id == $eos {
+                    $reason = String::from("stop");
                     break;
                 }
-                let token_text = $crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
-                    &mut $ds, $tok.inner(), token_id, &$gen, $slen,
-                );
-                $slen += token_text.len();
-                $cb.call(
-                    Ok($crate::models::qwen3_5::model::ChatStreamChunk {
-                        text: token_text, done: false, finish_reason: None,
-                        tool_calls: None, thinking: None, num_tokens: None,
-                        prompt_tokens: None, reasoning_tokens: None,
-                        raw_text: None, cached_tokens: None, performance: None,
-                        is_reasoning: Some(_is_reasoning),
-                    }),
-                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            )?
+                if let Some(reason) = $crate::sampling::check_repetition_cutoff(
+                    &$gen, $p.max_consecutive_tokens, $p.max_ngram_repeats, $p.ngram_size,
+                ) {
+                    $reason = reason.to_string();
+                    break;
+                }
+                if $gen.len() >= ($max as usize) {
+                    if $reason.is_empty() { $reason = String::from("length"); }
+                    break;
+                }
 
-            if token_id == $eos {
-                $reason = String::from("stop");
-                break;
-            }
-            if let Some(reason) = $crate::sampling::check_repetition_cutoff(
-                &$gen, $p.max_consecutive_tokens, $p.max_ngram_repeats, $p.ngram_size,
-            ) {
-                $reason = reason.to_string();
-                break;
-            }
-            if $gen.len() >= ($max as usize) {
-                if $reason.is_empty() { $reason = String::from("length"); }
-                break;
-            }
+                // Seed for MTP cycles using the hidden returned from this
+                // forward. `hidden` is `[1, hidden_size]`; reshape to
+                // `[1, 1, hidden]` for the draft FFI's `[B, T, hidden]`
+                // contract.
+                let hidden_dim = hidden.shape_at(1)?;
+                prev_hidden_opt = Some(hidden.reshape(&[1, 1, hidden_dim])?);
+                // prev_emb is the embedding of the JUST-emitted token.
+                let id_arr = $crate::array::MxArray::from_int32(&[token_id as i32], &[1])?;
+                let emb_2d = $emb.take(&id_arr, 0)?;
+                let h = emb_2d.shape_at(1)?;
+                prev_emb_opt = Some(emb_2d.reshape(&[1, 1, h])?);
+                last_committed_id_opt = Some(token_id);
+                $y = next_token;
+            } else {
+                // ---- Chained path: skip Step A entirely (W6.5). -------
+                // `$y` already holds the prior cycle's last accepted
+                // token (set by that cycle's tail update). That token
+                // has already been pushed to `$gen` / `$hist` /
+                // `tracker` AND streamed to the callback. Its K/V will
+                // be written by THIS cycle's verify at position 0.
+                //
+                // We just need to seed the cycle's MTP draft inputs
+                // from the chained hidden and the embedding of `$y`.
+                let chained_h = chained_hidden_opt
+                    .take()
+                    .expect("chained_hidden_opt is Some on the chained path (guarded by do_step_a)");
+                // Chained hidden ships as `[1, hidden]`; reshape to
+                // `[1, 1, hidden]` for the draft FFI's `[B, T, hidden]`
+                // contract — same shape Step A produces.
+                let hidden_dim = chained_h.shape_at(1)?;
+                prev_hidden_opt = Some(chained_h.reshape(&[1, 1, hidden_dim])?);
 
-            // Seed for MTP cycles using the hidden returned from this
-            // forward. `hidden` is `[1, hidden_size]`; reshape to
-            // `[1, 1, hidden]` for the draft FFI's `[B, T, hidden]`
-            // contract.
-            let hidden_dim = hidden.shape_at(1)?;
-            prev_hidden_opt = Some(hidden.reshape(&[1, 1, hidden_dim])?);
-            // prev_emb is the embedding of the JUST-emitted token.
-            let id_arr = $crate::array::MxArray::from_int32(&[token_id as i32], &[1])?;
-            let emb_2d = $emb.take(&id_arr, 0)?;
-            let h = emb_2d.shape_at(1)?;
-            prev_emb_opt = Some(emb_2d.reshape(&[1, 1, h])?);
-            last_committed_id_opt = Some(token_id);
-            $y = next_token;
+                // Read `$y`'s id without re-evaluating it; the prior
+                // cycle tail already ran `MxArray::from_int32(...)` to
+                // produce a fully materialised `[1]` int32 array, so
+                // `item_at_int32(0)` here is a CPU-only read.
+                $y.eval();
+                let token_id = $y.item_at_int32(0)? as u32;
+
+                let id_arr = $crate::array::MxArray::from_int32(&[token_id as i32], &[1])?;
+                let emb_2d = $emb.take(&id_arr, 0)?;
+                let h = emb_2d.shape_at(1)?;
+                prev_emb_opt = Some(emb_2d.reshape(&[1, 1, h])?);
+                last_committed_id_opt = Some(token_id);
+                // Note: no `$y =` assignment — `$y` is already correct.
+                // No tracker.observe_token / no $gen.push / no callback —
+                // the prior cycle's emit loop already handled all of
+                // that for the same `token_id`.
+            }
             $profiler.step();
 
             // ---- Step B: ONE MTP draft+verify cycle. -------------------
-            // We run exactly one cycle per outer iteration, then loop
-            // back through Step A. Why: chaining cycles back-to-back
-            // requires the post-final-norm hidden of the LAST
-            // committed token from the previous cycle, but the W5
-            // verify FFI only exports logits — there's no hidden
-            // accessor for verify-graph positions. Doing one
-            // main-path step between cycles is correct (re-seeds
-            // `prev_hidden` from the ground-truth forward) and still
-            // a net win: per outer round we emit 1 (Step A) +
-            // (D + 1) (cycle on full accept) = D + 2 tokens for D
-            // draft steps + 1 verify + 1 main forward.
+            // On the chained path the prior verify already committed
+            // bonus/residual; this cycle's verify writes the chained
+            // `$y`'s K/V at position 0 and extends the prefix by D more
+            // drafts. On full accept per cycle we emit D+1 tokens for
+            // D draft steps + 1 verify (one fewer main forward than
+            // pre-W6.5).
             if $gen.len() >= ($max as usize) {
                 if $reason.is_empty() { $reason = String::from("length"); }
                 break;
             }
             if $tracker.should_force_think_end() {
                 // Budget tripped during Step A's observe — defer the
-                // forced token to the next Step A.
+                // forced token to the next Step A. On the chained path
+                // this can't fire (do_step_a above forces Step A when
+                // think-end is queued) but keep the guard for clarity.
                 continue;
             }
 
-            let prev_h = prev_hidden_opt.take().expect("prev_hidden seeded after Step A");
-            let prev_e = prev_emb_opt.take().expect("prev_emb seeded after Step A");
-            let last_id = last_committed_id_opt.expect("last_committed seeded after Step A");
+            let prev_h = prev_hidden_opt
+                .take()
+                .expect("prev_hidden seeded by Step A or chained path");
+            let prev_e = prev_emb_opt
+                .take()
+                .expect("prev_emb seeded by Step A or chained path");
+            let last_id = last_committed_id_opt
+                .expect("last_committed seeded by Step A or chained path");
             // W6 Bug #2 fix (Option Reset): re-anchor the MTP cache to
             // the main path's CURRENT offset before launching this
-            // cycle's drafts. Step A just advanced the main offset by
-            // 1 (and the previous cycle's verify advanced it by D+1),
-            // so the main offset is now (post-Step-A position). Without
-            // this reset, the MTP draft offset lags by 2 per cycle —
-            // RoPE positions diverge and drafts produce gibberish.
+            // cycle's drafts. On the Step-A path the main offset has
+            // advanced by 1 (Step A's forward) + the prior cycle's
+            // verify advancement. On the chained path the main offset
+            // has only advanced by the prior cycle's verify (Step A
+            // was skipped). EITHER way, this resets the MTP K/V and
+            // sets the MTP offset = current main offset, which is
+            // exactly the contract `begin_cycle` is documented to
+            // honour. Without it the MTP draft RoPE positions diverge
+            // and drafts produce gibberish.
             ($mtp.begin_cycle)();
-            // `_` discards the next-cycle seed; we always re-seed via
-            // Step A on the next outer iteration.
             $profiler.begin("mtp_cycle");
             let cycle_res =
                 $crate::models::qwen3_5::chat_common::run_mtp_cycle_inner(
@@ -1689,7 +1830,13 @@ macro_rules! decode_loop_mtp {
                     $depth,
                 );
             $profiler.end();
-            let (outcome, _new_hidden, _new_emb) = cycle_res?;
+            // W6.5 — `run_mtp_cycle_inner` returns the verify-final
+            // hidden so the NEXT outer iteration can skip Step A's
+            // ~150 ms main-model forward. We stash it into
+            // `chained_hidden_opt`; the iteration boundary's `do_step_a`
+            // check will drain it.
+            let (outcome, verify_last_hidden) = cycle_res?;
+            chained_hidden_opt = Some(verify_last_hidden);
 
             // Emit each accepted token through the same stop /
             // streaming pipeline as the single-token loop.
@@ -1754,6 +1901,25 @@ macro_rules! decode_loop_mtp {
             // drain here.)
             let last = *outcome.tokens.last().expect("at least one accepted") as i32;
             $y = $crate::array::MxArray::from_int32(&[last], &[1])?;
+
+            // W6.5 — when chaining IS enabled, flush the main path's
+            // KV-cache lazy graph BEFORE the next cycle starts. On the
+            // Step-A path this is redundant: Step A's `eval_step` call
+            // at the top of the NEXT iteration handles it. On the
+            // chained path we'd otherwise extend the cache lazy chain
+            // by D+1 ops per layer per cycle, with no flush at all,
+            // and decode tok/s drifts down over the run.
+            //
+            // We pass `$y` (the integer-token array of the just-set
+            // last accepted token) as the `token` arg — the C++ helper
+            // does `async_eval({token} ++ g_compiled_caches)`, so the
+            // token arg only piggybacks the cache-flush batch. The
+            // `logits` arg is NOT evaluated when `budget_forced=false`.
+            if chained_cycles_enabled {
+                if let Some(ref h) = chained_hidden_opt {
+                    ($mtp.eval_step)(&$y, h, /*budget_forced=*/ false);
+                }
+            }
             $profiler.step();
         }
 
@@ -1966,11 +2132,16 @@ mod mtp_cycle_tests {
     }
 
     /// Construct a verify-step closure that returns logits peaked at
-    /// `verify_id_per_position[i]` for each verify position.
+    /// `verify_id_per_position[i]` for each verify position, plus a
+    /// zero `[1, hidden]` stand-in for the verify-final hidden (W6.5
+    /// — the production closure exports the post-final-norm hidden at
+    /// position `depth`; for the mock tests below we don't care about
+    /// its contents, only the shape, so a fresh zeros tensor matches
+    /// the `[1, hidden_size]` contract from `g_last_hidden`).
     fn make_verify<'a>(
         verify_id_per_position: &'a [i32],
         counter: &'a RefCell<usize>,
-    ) -> impl FnMut(&MxArray, &MxArray, usize) -> napi::Result<MxArray> + 'a {
+    ) -> impl FnMut(&MxArray, &MxArray, usize) -> napi::Result<(MxArray, MxArray)> + 'a {
         move |_ids: &MxArray, _emb: &MxArray, depth: usize| {
             *counter.borrow_mut() += 1;
             let positions = depth + 1;
@@ -1981,7 +2152,12 @@ mod mtp_cycle_tests {
             }
             let arr =
                 MxArray::from_float32(&data, &[1, positions as i64, VOCAB]).expect("verify logits");
-            Ok(arr)
+            // Verify-final hidden: [1, hidden]. Mirrors the production
+            // `g_last_hidden` shape (batch=1, single-token flat decode).
+            let zero_hidden = vec![0.0f32; HIDDEN as usize];
+            let hidden =
+                MxArray::from_float32(&zero_hidden, &[1, HIDDEN]).expect("verify hidden stub");
+            Ok((arr, hidden))
         }
     }
 
@@ -2051,7 +2227,7 @@ mod mtp_cycle_tests {
             &mut rng,
             depth,
         );
-        let Some((outcome, _h, _e)) = skip_if_metal_unavailable("all_accept", res) else {
+        let Some((outcome, _verify_hidden)) = skip_if_metal_unavailable("all_accept", res) else {
             return;
         };
         assert_eq!(*draft_ctr.borrow(), depth, "must run depth draft steps");
@@ -2115,7 +2291,7 @@ mod mtp_cycle_tests {
             &mut rng,
             depth,
         );
-        let Some((outcome, _h, _e)) = skip_if_metal_unavailable("depth_one", res) else {
+        let Some((outcome, _verify_hidden)) = skip_if_metal_unavailable("depth_one", res) else {
             return;
         };
         assert_eq!(*draft_ctr.borrow(), 1);
@@ -2172,7 +2348,7 @@ mod mtp_cycle_tests {
             &mut rng,
             depth,
         );
-        let Some((outcome, _h, _e)) = skip_if_metal_unavailable("all_reject", res) else {
+        let Some((outcome, _verify_hidden)) = skip_if_metal_unavailable("all_reject", res) else {
             return;
         };
         assert_eq!(*draft_ctr.borrow(), depth);
@@ -2247,7 +2423,8 @@ mod mtp_cycle_tests {
             &mut rng,
             depth,
         );
-        let Some((outcome, _h, _e)) = skip_if_metal_unavailable("partial_reject", res) else {
+        let Some((outcome, _verify_hidden)) = skip_if_metal_unavailable("partial_reject", res)
+        else {
             return;
         };
         assert_eq!(*draft_ctr.borrow(), depth);
