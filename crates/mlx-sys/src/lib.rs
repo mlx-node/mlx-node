@@ -1748,6 +1748,24 @@ unsafe extern "C-unwind" {
         out_hiddens: *mut *mut mlx_array,
     );
 
+    /// W6.7 follow-up — Eagerly compile the batched verify graphs for
+    /// both `WithTape=false` and `WithTape=true` over depths {1..5}.
+    ///
+    /// Wire this immediately after a successful
+    /// `mlx_qwen35_mtp_compiled_init_from_main` so the first verify
+    /// cycle of each prompt no longer pays the MLX trace+compile cost.
+    /// Best-effort: failures are logged to stderr and swallowed —
+    /// callers MUST NOT check a return code, and the verify path will
+    /// fall back to its prior lazy-at-first-use behavior.
+    ///
+    /// Internally: populates the per-depth dispatch closures AND runs
+    /// one dummy `mlx_qwen35_forward_batched_verify` per (depth ∈ {1..5},
+    /// with_tape ∈ {false, true}) pair to force `mlx::core::eval` of
+    /// the compiled-graph outputs. Snapshots/restores the main path's
+    /// `g_compiled_caches` and `g_offset_int` so the prewarm leaves the
+    /// real decode state untouched.
+    pub fn mlx_qwen35_mtp_compiled_prewarm_verify();
+
     /// Tear down MTP compiled state. Idempotent. Does NOT reset
     /// the main path — call `mlx_qwen35_compiled_reset` separately.
     pub fn mlx_qwen35_mtp_compiled_reset();
@@ -2044,6 +2062,17 @@ unsafe extern "C-unwind" {
         out_logits: *mut *mut mlx_array,
         out_hiddens: *mut *mut mlx_array,
     );
+
+    /// W6.7 follow-up — Eagerly compile the MoE batched verify graph for
+    /// depths {1..5}. MoE has only the no-tape variant (W6.6 tape-replay
+    /// is deferred for MoE), so this prewarms 5 shapes total.
+    ///
+    /// Wire this immediately after a successful
+    /// `mlx_qwen35_moe_mtp_compiled_init_from_main`. Best-effort:
+    /// failures are logged to stderr and swallowed — callers MUST NOT
+    /// check a return code, and the verify path will fall back to its
+    /// prior lazy-at-first-use behavior.
+    pub fn mlx_qwen35_moe_mtp_compiled_prewarm_verify();
 
     /// Tear down MoE MTP compiled state. Idempotent. Does NOT reset
     /// the main MoE path — call `mlx_qwen35_moe_reset` separately.

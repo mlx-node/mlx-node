@@ -1201,6 +1201,113 @@ void mlx_qwen35_moe_forward_batched_verify(
   }
 }
 
+// -----------------------------------------------------------------------------
+// W6.7 follow-up — Eagerly compile the MoE batched verify graph for ALL depths
+// in {1..5}. MoE has only ONE variant (no tape-replay — W6.6 deferred for MoE)
+// so this prewarms 5 graph shapes total.
+//
+// PRIOR (W6.7): `compiled_moe_verify_batched()`'s static initializer fires on
+// first call, so the first verify cycle of each MoE prompt pays the trace+
+// compile cost for its depth-D shape.
+//
+// NOW: this entry point runs ONE dummy verify forward per depth to force
+// `mlx::core::eval` of the compiled-graph outputs, populating MLX's
+// internal shape-keyed compile cache. Subsequent verifies at the same
+// shape hit the cache.
+//
+// State preservation:
+//   - Snapshots `g_moe_caches[]` and `g_moe_offset_int` before any dummy
+//     call and restores them afterward, so the main MoE path's state is
+//     unchanged.
+//
+// Preconditions:
+//   - `g_moe_inited` is true.
+//   - Embedding weight (`"embedding"` or `"lm_head"`) is registered.
+//
+// Failure handling: best-effort; exceptions are logged and swallowed.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_moe_prewarm_verify_compiled() {
+  if (!g_moe_inited) {
+    return;
+  }
+  const auto& cfg = g_moe_config;
+  if (g_moe_caches.empty()) {
+    return;
+  }
+
+  // Weights are registered under e.g. `"embedding.weight"` /
+  // `"lm_head.weight"` — match the production fetch via the `.weight`
+  // suffix.
+  array embedding_weight = zeros({}, mlx::core::bfloat16);
+  try {
+    if (cfg.tie_word_embeddings && has_weight("embedding.weight")) {
+      embedding_weight = get_weight("embedding.weight");
+    } else if (has_weight("lm_head.weight")) {
+      embedding_weight = get_weight("lm_head.weight");
+    } else if (has_weight("embedding.weight")) {
+      embedding_weight = get_weight("embedding.weight");
+    } else {
+      fprintf(stderr,
+              "[MLX] moe_prewarm_verify_compiled: no embedding.weight/lm_head.weight "
+              "registered; skipping prewarm.\n");
+      fflush(stderr);
+      return;
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] moe_prewarm_verify_compiled: failed to fetch embedding "
+            "weight: %s\n", e.what());
+    fflush(stderr);
+    return;
+  }
+
+  std::vector<array> saved_caches = g_moe_caches;
+  int saved_offset_int = g_moe_offset_int;
+
+  auto run_one = [&](int depth) {
+    int T = depth + 1;
+    g_moe_caches = saved_caches;
+    g_moe_offset_int = saved_offset_int;
+
+    array dummy_ids = zeros({1, T}, mlx::core::int32);
+    array emb_copy = embedding_weight;
+    mlx_array* logits_ptr = nullptr;
+    mlx_array* hidden_ptr = nullptr;
+    mlx_qwen35_moe_forward_batched_verify(
+        reinterpret_cast<mlx_array*>(&dummy_ids),
+        reinterpret_cast<mlx_array*>(&emb_copy),
+        depth,
+        &logits_ptr,
+        &hidden_ptr);
+    if (!logits_ptr || !hidden_ptr) {
+      if (logits_ptr) delete reinterpret_cast<array*>(logits_ptr);
+      if (hidden_ptr) delete reinterpret_cast<array*>(hidden_ptr);
+      throw std::runtime_error(
+          "mlx_qwen35_moe_prewarm_verify_compiled: batched verify returned null");
+    }
+    array logits = *reinterpret_cast<array*>(logits_ptr);
+    delete reinterpret_cast<array*>(logits_ptr);
+    array hiddens = *reinterpret_cast<array*>(hidden_ptr);
+    delete reinterpret_cast<array*>(hidden_ptr);
+    mlx::core::eval({logits, hiddens});
+  };
+
+  try {
+    for (int d = 1; d <= 5; d++) run_one(d);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_moe_prewarm_verify_compiled: %s\n",
+            e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_moe_prewarm_verify_compiled\n");
+    fflush(stderr);
+  }
+
+  g_moe_caches = std::move(saved_caches);
+  g_moe_offset_int = saved_offset_int;
+}
+
 // Eval token (+ caches implicitly via dependency graph).
 //
 // The compiled forward returns [logits, offset, caches...] as outputs of a

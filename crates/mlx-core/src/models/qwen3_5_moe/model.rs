@@ -8201,6 +8201,15 @@ pub(super) fn init_moe_mtp_compiled_from_main(
              check stderr for diagnostic"
         )));
     }
+
+    // W6.7 follow-up — eagerly compile the MoE batched verify graph for
+    // depths {1..5} (no-tape variant only; MoE tape-replay is deferred
+    // per W6.6). Best-effort: failure inside the FFI is logged + swallowed
+    // and the verify path falls back to lazy-at-first-use.
+    unsafe {
+        sys::mlx_qwen35_moe_mtp_compiled_prewarm_verify();
+    }
+
     Ok(())
 }
 

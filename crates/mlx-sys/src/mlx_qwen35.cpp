@@ -880,6 +880,166 @@ void mlx_qwen35_forward_batched_verify(
   }
 }
 
+// -----------------------------------------------------------------------------
+// W6.7 follow-up — Eagerly compile the batched verify graph for ALL depths
+// in {1..5} for both `WithTape=false` and `WithTape=true` variants.
+//
+// PRIOR (W6.7): the `static auto fn = mlx::core::compile(...)` initializer
+// in `compiled_verify_batched_{notape,tape}()` fires on first call, so the
+// FIRST verify cycle of each turn pays the MLX trace+compile cost for the
+// depth-D shape it happens to hit. Subsequent prompts within the same
+// process reuse the cached trace, but the first prompt eats the latency
+// on its critical path.
+//
+// NOW: this entry point runs ONE dummy verify forward per (depth, with_tape)
+// pair to force `mlx::core::eval` of the compiled-graph outputs. MLX's
+// internal compile cache keys on input shape — one (depth, with_tape)
+// trace covers every subsequent verify at that same shape. Cost: ~10
+// dummy graph evals at model load; saves first-token latency on the
+// first verify cycle of each prompt.
+//
+// State preservation:
+//   - Snapshots `g_compiled_caches[]`, `g_offset_int`, `g_compiled_offset`,
+//     `g_tape_recording_armed`, and the four `g_gdn_*_tape_acc[]`
+//     accumulators before any dummy call.
+//   - Restores them AFTER the prewarm even if a dummy raises. This keeps
+//     the main path's KV / offset state unchanged so the very next real
+//     decode step sees identical inputs.
+//
+// Preconditions:
+//   - `g_compile_inited` is true (main path was set up via
+//     `mlx_qwen35_compiled_init_from_prefill`).
+//   - Embedding weight (`"embedding"` or `"lm_head"`) is registered.
+//
+// Failure handling: any exception is logged to stderr and swallowed —
+// prewarm is a best-effort optimization, not a correctness gate. On
+// failure the verify graph falls back to its prior lazy-at-first-use
+// path.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_prewarm_verify_compiled() {
+  if (!g_compile_inited) {
+    return;
+  }
+  const auto& cfg = g_compile_config;
+  if (g_compiled_caches.empty()) {
+    return;
+  }
+
+  // Look up the embedding table (or LM head when untied). The batched
+  // verify FFI uses this via `take(embedding_weight, flat_ids, 0)` so
+  // the dtype/shape only needs to be a valid embedding table. Weights
+  // are registered under e.g. `"embedding.weight"` / `"lm_head.weight"`
+  // — match the production fetch via the `.weight` suffix.
+  array embedding_weight = zeros({}, mlx::core::bfloat16);
+  try {
+    if (cfg.tie_word_embeddings && has_weight("embedding.weight")) {
+      embedding_weight = get_weight("embedding.weight");
+    } else if (has_weight("lm_head.weight")) {
+      embedding_weight = get_weight("lm_head.weight");
+    } else if (has_weight("embedding.weight")) {
+      embedding_weight = get_weight("embedding.weight");
+    } else {
+      fprintf(stderr,
+              "[MLX] prewarm_verify_compiled: no embedding.weight/lm_head.weight "
+              "registered; skipping prewarm.\n");
+      fflush(stderr);
+      return;
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] prewarm_verify_compiled: failed to fetch embedding weight: "
+            "%s\n", e.what());
+    fflush(stderr);
+    return;
+  }
+
+  // Snapshot mutable state so post-prewarm the main path looks untouched.
+  std::vector<array> saved_caches = g_compiled_caches;  // refcount bump per entry
+  int saved_offset_int = g_offset_int;
+  std::optional<array> saved_offset = g_compiled_offset;
+  bool saved_tape_armed = g_tape_recording_armed;
+  auto saved_tape_acc = g_gdn_tape_acc;
+  auto saved_k_tape_acc = g_gdn_k_tape_acc;
+  auto saved_g_tape_acc = g_gdn_g_tape_acc;
+  auto saved_qkv_tape_acc = g_gdn_qkv_tape_acc;
+
+  auto run_one = [&](int depth, bool with_tape) {
+    int T = depth + 1;
+    // Reset the main-path snapshot back to its starting state before each
+    // dummy so all 10 prewarm calls use the SAME cache shape / offset.
+    g_compiled_caches = saved_caches;
+    g_offset_int = saved_offset_int;
+    g_compiled_offset = saved_offset;
+    if (with_tape) {
+      // Arm tape recording so the FFI dispatches to `compiled_verify_batched_tape()`.
+      g_gdn_tape_acc.assign(cfg.num_layers, std::nullopt);
+      g_gdn_k_tape_acc.assign(cfg.num_layers, std::nullopt);
+      g_gdn_g_tape_acc.assign(cfg.num_layers, std::nullopt);
+      g_gdn_qkv_tape_acc.assign(cfg.num_layers, std::nullopt);
+      g_tape_recording_armed = true;
+    } else {
+      g_tape_recording_armed = false;
+    }
+
+    array dummy_ids = zeros({1, T}, mlx::core::int32);
+    array emb_copy = embedding_weight;
+    mlx_array* logits_ptr = nullptr;
+    mlx_array* hidden_ptr = nullptr;
+    mlx_qwen35_forward_batched_verify(
+        reinterpret_cast<mlx_array*>(&dummy_ids),
+        reinterpret_cast<mlx_array*>(&emb_copy),
+        depth,
+        &logits_ptr,
+        &hidden_ptr);
+    if (!logits_ptr || !hidden_ptr) {
+      if (logits_ptr) delete reinterpret_cast<array*>(logits_ptr);
+      if (hidden_ptr) delete reinterpret_cast<array*>(hidden_ptr);
+      throw std::runtime_error(
+          "mlx_qwen35_prewarm_verify_compiled: batched verify returned null");
+    }
+    // Force trace+compile by evaluating the outputs. The compile cache
+    // only populates after the first eval — building the lazy graph
+    // alone is not enough.
+    array logits = *reinterpret_cast<array*>(logits_ptr);
+    delete reinterpret_cast<array*>(logits_ptr);
+    array hiddens = *reinterpret_cast<array*>(hidden_ptr);
+    delete reinterpret_cast<array*>(hidden_ptr);
+    std::vector<array> to_eval = {logits, hiddens};
+    if (with_tape) {
+      for (auto& slot : g_gdn_tape_acc) if (slot) to_eval.push_back(*slot);
+      for (auto& slot : g_gdn_k_tape_acc) if (slot) to_eval.push_back(*slot);
+      for (auto& slot : g_gdn_g_tape_acc) if (slot) to_eval.push_back(*slot);
+      for (auto& slot : g_gdn_qkv_tape_acc) if (slot) to_eval.push_back(*slot);
+    }
+    mlx::core::eval(std::move(to_eval));
+  };
+
+  try {
+    for (int d = 1; d <= 5; d++) run_one(d, /*with_tape=*/false);
+    for (int d = 1; d <= 5; d++) run_one(d, /*with_tape=*/true);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_prewarm_verify_compiled: %s\n",
+            e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_prewarm_verify_compiled\n");
+    fflush(stderr);
+  }
+
+  // Restore the snapshot — even if a prewarm call mutated g_compiled_caches
+  // or g_offset_int via the FFI, this puts the main path back exactly where
+  // it was at function entry.
+  g_compiled_caches = std::move(saved_caches);
+  g_offset_int = saved_offset_int;
+  g_compiled_offset = std::move(saved_offset);
+  g_tape_recording_armed = saved_tape_armed;
+  g_gdn_tape_acc = std::move(saved_tape_acc);
+  g_gdn_k_tape_acc = std::move(saved_k_tape_acc);
+  g_gdn_g_tape_acc = std::move(saved_g_tape_acc);
+  g_gdn_qkv_tape_acc = std::move(saved_qkv_tape_acc);
+}
+
 void mlx_qwen35_eval_token_and_compiled_caches(mlx_array* next_token_ptr) {
   try {
     std::vector<array> to_eval;

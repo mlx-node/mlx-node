@@ -109,6 +109,12 @@ extern "C" void mlx_qwen35_moe_forward_batched_verify(
     mlx_array** out_logits,
     mlx_array** out_hiddens);
 
+// W6.7 follow-up — eagerly compile the MoE batched verify graph for
+// depths {1..5}. Defined in `mlx_qwen35_moe.cpp` where it has direct
+// access to `g_moe_caches` / `g_moe_offset_int` for snapshot/restore.
+// Best-effort: failures are logged + swallowed.
+extern "C" void mlx_qwen35_moe_prewarm_verify_compiled();
+
 namespace {
 
 // =====================================================================
@@ -968,6 +974,43 @@ void mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
     if (out_logits) *out_logits = nullptr;
     if (out_hiddens) *out_hiddens = nullptr;
   }
+}
+
+// -----------------------------------------------------------------------------
+// W6.7 follow-up — Pre-warm the per-depth verify dispatch closures AND the
+// underlying MLX-compiled batched verify graph for the MoE main path.
+//
+// Wire this to fire IMMEDIATELY after
+// `mlx_qwen35_moe_mtp_compiled_init_from_main` returns 0 from the Rust
+// caller. MoE has only ONE compiled variant (W6.6 tape-replay is deferred
+// for MoE) so this prewarms 5 shapes total instead of 10.
+//
+// Best-effort: any failure is logged + swallowed, leaving the verify
+// path to fall back to lazy-at-first-use.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_moe_mtp_compiled_prewarm_verify() {
+  if (!g_mtp_compile_inited) {
+    return;
+  }
+  try {
+    for (int d = 1; d <= MAX_VERIFY_DEPTH; d++) {
+      auto& slot = g_verify_compiled_by_depth[d - 1];
+      if (!slot) {
+        slot = make_verify_fn(d);
+      }
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: closure "
+            "population failed: %s\n", e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: unknown "
+            "exception during closure population\n");
+    fflush(stderr);
+  }
+  mlx_qwen35_moe_prewarm_verify_compiled();
 }
 
 // -----------------------------------------------------------------------------

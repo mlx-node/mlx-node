@@ -8233,6 +8233,17 @@ pub(super) fn init_mtp_compiled_from_main(config: &Qwen3_5Config, max_kv_len: i3
              check stderr for diagnostic"
         )));
     }
+
+    // W6.7 follow-up — eagerly compile the batched verify graphs for all
+    // depths in {1..5} for both `WithTape=false` and `WithTape=true`. The
+    // FFI is best-effort: any failure inside is logged to stderr and
+    // swallowed, leaving the verify path to fall back to lazy compile on
+    // first use. We DON'T propagate errors here — prewarm is purely a
+    // latency optimization, not a correctness gate.
+    unsafe {
+        sys::mlx_qwen35_mtp_compiled_prewarm_verify();
+    }
+
     Ok(())
 }
 
