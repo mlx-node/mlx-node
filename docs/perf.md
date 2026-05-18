@@ -58,6 +58,50 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_CACHE_LIMIT_GB`  | Hard Metal pool ceiling                  |
 | `MLX_GPU_HEADROOM_GB` | Headroom term in the auto-sizing formula |
 
+## MTP speculative decoding
+
+Qwen3.5 / Qwen3.6 MTP (Multi-Token Prediction) speculative decoding adds four
+runtime knobs gating individual optimizations in the W6.5–W6.9 perf chain.
+All three env vars are read at most once per process and cached; the truthy
+vocabulary is uniform (`1` / `true` / `on`, case-insensitive, with `trim()`).
+The adaptive-depth knob is a TypeScript `ChatConfig` field (not an env var)
+because it interacts with the user-set `mtpDepth` and needs per-session
+resolution.
+
+| Knob                          | Default | Workstream | Direction     | Notes                                                                                                                                                                                      |
+| ----------------------------- | ------- | ---------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `MLX_MTP_USE_TAPE_REPLAY`     | ON      | W6.6       | opt-OUT       | Set to `0` / `false` / `off` to fall back to the W6 Bug #4 K+1 main-model replay path. Dense only — MoE always uses K+1.                                                                   |
+| (eager verify prewarm)        | always  | W6.7       | unconditional | No env var. Once-per-process `atomic<bool>` CAS at model load runs 10 dummy shapes (5 depths × 2 tape variants) to warm caches.                                                            |
+| `mtpAdaptiveDepth` (TS field) | ON\*    | W6.8       | per-session   | TS `ChatConfig` field. \* defaults ON when `enableMtp=true` and `mtpDepth` is unset; defaults OFF (pinned) when `mtpDepth` is set explicitly.                                              |
+| `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        | Slower than the default Step-A path at depth ≥ 2 today (the chained `verify_hidden[K]` slice forces an extra command-buffer roundtrip). Re-evaluate after the W6.5-resume follow-up lands. |
+| `MLX_MTP_VERIFY_ASYNC_EVAL`   | OFF     | W6.9       | opt-IN        | Overlaps verify dispatch with the accept loop's CPU-side graph construction. Composes cleanly with all other flags.                                                                        |
+
+Interactions:
+
+- `MLX_MTP_USE_TAPE_REPLAY=0` is safe to combine with all other flags.
+- `MLX_MTP_VERIFY_ASYNC_EVAL=1` composes cleanly with every other knob;
+  parity holds byte-exact at `T=0` across all combinations on qwen3.5-4b.
+- Setting `mtpDepth` explicitly disables adaptive depth by default;
+  pass `mtpAdaptiveDepth: true` alongside to keep adaptation enabled with
+  `mtpDepth` as the initial seed.
+
+Naming note: the W6.9 flag was briefly drafted as `MLX_MTP_PREFETCH`. The
+current name reflects the actual mechanism (intra-cycle overlap with
+CPU-side graph construction, not cross-cycle draft staging). The literal
+"stash next-cycle draft handle, drain at cycle start" prefetch lives in a
+follow-up scoped to `MLX_MTP_CHAINED_CYCLES=1`.
+
+Cross-references:
+
+- TS field JSDoc: `enableMtp` / `mtpDepth` / `mtpAdaptiveDepth` on
+  `ChatSession.send` in `packages/lm/src/chat-session.ts`.
+- Source of truth (env-var readers + inventory table):
+  `crates/mlx-core/src/models/qwen3_5/chat_common.rs` (`mtp_use_tape_replay`,
+  `mtp_chained_cycles_enabled`, `mtp_verify_async_eval`).
+- W6.8 adaptive-depth policy:
+  `crates/mlx-core/src/models/qwen3_5/adaptive_depth.rs`.
+- Parity gate harness: `examples/qwen35-mtp-smoke.ts`.
+
 ## Key performance patterns
 
 - `token.eval()` immediately after sampling — without it MLX builds an unbounded lazy graph.
