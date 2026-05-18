@@ -55,6 +55,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -985,6 +986,12 @@ void mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
 // caller. MoE has only ONE compiled variant (W6.6 tape-replay is deferred
 // for MoE) so this prewarms 5 shapes total instead of 10.
 //
+// W6.7 follow-up #2 — `init_moe_mtp_compiled_from_main` runs once PER
+// TURN, not once per process. Gate the body behind `std::call_once` so
+// the heavy work fires exactly once per process — on the FIRST turn
+// (after MoE MTP init has set up the global state). Subsequent turns
+// short-circuit immediately.
+//
 // Best-effort: any failure is logged + swallowed, leaving the verify
 // path to fall back to lazy-at-first-use.
 // -----------------------------------------------------------------------------
@@ -992,25 +999,28 @@ void mlx_qwen35_moe_mtp_compiled_prewarm_verify() {
   if (!g_mtp_compile_inited) {
     return;
   }
-  try {
-    for (int d = 1; d <= MAX_VERIFY_DEPTH; d++) {
-      auto& slot = g_verify_compiled_by_depth[d - 1];
-      if (!slot) {
-        slot = make_verify_fn(d);
+  static std::once_flag prewarm_once;
+  std::call_once(prewarm_once, []() {
+    try {
+      for (int d = 1; d <= MAX_VERIFY_DEPTH; d++) {
+        auto& slot = g_verify_compiled_by_depth[d - 1];
+        if (!slot) {
+          slot = make_verify_fn(d);
+        }
       }
+    } catch (const std::exception& e) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: closure "
+              "population failed: %s\n", e.what());
+      fflush(stderr);
+    } catch (...) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: unknown "
+              "exception during closure population\n");
+      fflush(stderr);
     }
-  } catch (const std::exception& e) {
-    fprintf(stderr,
-            "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: closure "
-            "population failed: %s\n", e.what());
-    fflush(stderr);
-  } catch (...) {
-    fprintf(stderr,
-            "[MLX] mlx_qwen35_moe_mtp_compiled_prewarm_verify: unknown "
-            "exception during closure population\n");
-    fflush(stderr);
-  }
-  mlx_qwen35_moe_prewarm_verify_compiled();
+    mlx_qwen35_moe_prewarm_verify_compiled();
+  });
 }
 
 // -----------------------------------------------------------------------------
