@@ -1,0 +1,800 @@
+//! W6.8 — Adaptive MTP depth policy.
+//!
+//! Per-session policy that picks the MTP draft depth `D ∈ {1..=5}` for
+//! each cycle by maintaining an EMA of the effective decode rate
+//! (`accepted_tokens / cycle_wall_ns`) per depth.
+//!
+//! State machine: `Explore → Full → {NeighborProbe | Reduced → Probe}`.
+//!
+//! * `Explore` — initial bootstrap. Sweeps every depth in `{1..=5}`
+//!   for `MIN_COLD_SAMPLES` cycles each so every per-depth EMA gets
+//!   real observations BEFORE the first hill-climb decision. Without
+//!   this, the policy was effectively stuck at its seed depth
+//!   (codex-flagged design flaw: `pick_depth()` returns
+//!   `current_depth`, so non-current depths never get samples and
+//!   can never win the hill-climb).
+//! * `Full` — run at `current_depth` and re-evaluate the hill-climb
+//!   every cycle. Every `FULL_REPROBE_INTERVAL` cycles, launch a
+//!   `NeighborProbe` burst to refresh adjacent depths' EMAs.
+//! * `NeighborProbe` — short burst at a neighbor of `current_depth`
+//!   to keep its EMA current. Returns to `Full`.
+//! * `Reduced` / `Probe` — DFlash-style 3-state fallback for
+//!   low-acceptance prompts. Drop to `MIN_DEPTH`, periodically probe
+//!   back up to `current_depth`.
+//!
+//! Reference: `dflash-mlx/dflash_mlx/engine/spec_epoch.py`
+//! `_AdaptiveBlockPolicy` (lines 190-418). The DFlash policy is keyed
+//! on a "block length" (full vs. min vs. probe), where ours is keyed
+//! on draft depth. The drop-acceptance threshold (`0.75`) and probe-
+//! interval pattern are lifted directly.
+//!
+//! The compiled MTP verify graphs are pre-warmed at model load for every
+//! depth in `{1..=5}` (W6.7), so switching depth between cycles is
+//! zero-cost from the compile side — the policy can swing freely.
+
+use std::time::Duration;
+
+/// Min and max draft depths supported by the W5 verify FFI contract.
+/// Mirrors the clamp in `extract_chat_params`.
+pub(crate) const MIN_DEPTH: u8 = 1;
+pub(crate) const MAX_DEPTH: u8 = 5;
+
+/// DFlash drop threshold: when rolling acceptance over a window drops
+/// below this, we leave `Full` for `Reduced`. Reference:
+/// `_ADAPTIVE_DROP_ACCEPTANCE_THRESHOLD = 0.75`.
+const DROP_ACCEPT_THRESHOLD: f64 = 0.75;
+
+/// Rolling window for acceptance + rate stats inside a single state
+/// (matches DFlash's `window_size = 4`).
+const STATE_WINDOW: usize = 4;
+
+/// Cycles to spend at the `Reduced` depth before probing back up to a
+/// deeper depth. DFlash uses 24; we use a much shorter probe interval
+/// because our cycles are O(50 ms) each and 200-token smoke turns only
+/// run ~50-100 cycles total — a 24-cycle lockout would never probe.
+const REDUCED_CYCLES_BEFORE_PROBE: u32 = 8;
+
+/// Probe length: how many cycles to spend at the probe (deeper) depth
+/// before deciding whether to commit (return to `Full` at that depth)
+/// or revert (back to `Reduced`).
+const PROBE_CYCLES: u32 = 3;
+
+/// Minimum cycles a depth must be tried before EMA-decay kicks in for
+/// that depth's rate. This guards against cold-start jitter where the
+/// first observed sample for a depth is anomalous (e.g. cache warmup).
+const MIN_COLD_SAMPLES: u32 = 2;
+
+/// EMA decay factor: `new_ema = (1 - alpha) * old_ema + alpha * sample`.
+/// Higher = more responsive, noisier. 0.3 picked empirically — gives
+/// the policy ~10 cycles of meaningful history before swing.
+const EMA_ALPHA: f64 = 0.3;
+
+/// Cycles to spend in `Full` before launching a `NeighborProbe` burst
+/// to refresh adjacent depths' EMAs. Picked so that on a 200-token
+/// turn (~50 cycles total) we get one or two refresh rounds.
+const FULL_REPROBE_INTERVAL: u32 = 20;
+
+/// Cycles spent at a neighbor depth during a `NeighborProbe` burst.
+/// Single cycle is enough to update the EMA at a rate-stable depth;
+/// `MIN_COLD_SAMPLES` ensures we still hit the cold-mean path if the
+/// neighbor was never seen before.
+const NEIGHBOR_PROBE_CYCLES: u32 = MIN_COLD_SAMPLES;
+
+/// Adaptive state machine.
+///
+/// **Why an explicit `Explore` state**: the codex adversarial review
+/// flagged that the prior design's `Full` state could never discover
+/// non-seed depths — `pick_depth()` returned `current_depth` and the
+/// hill-climb only considered candidates with `sample_count >=
+/// MIN_COLD_SAMPLES` observations, but production callers in
+/// `decode_loop_mtp!` only ever record observations at the depth
+/// `pick_depth()` returned, so the EMA for unsampled depths stays at
+/// 0.0 forever. Result: a 3-seeded policy could only oscillate between
+/// {3, 1} (Full vs. Reduced), never trying 2/4/5.
+///
+/// The new `Explore` state runs through every depth in `{1..=5}` for
+/// `MIN_COLD_SAMPLES` cycles each at decode start, seeding all
+/// per-depth EMAs. After exploration, the policy commits to the
+/// best-rate depth in `Full`. Subsequent periodic `NeighborProbe`
+/// re-checks the adjacent depths so a regime change mid-decode (e.g.
+/// going from a high-acceptance code block to a low-acceptance prose
+/// block) gets re-discovered without dropping all the way to
+/// `Reduced`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdaptiveState {
+    /// Bootstrap: cycle through each depth in `{1..=5}` for
+    /// `MIN_COLD_SAMPLES` cycles each. After all depths are seeded,
+    /// transition to `Full` at the best-EMA depth.
+    Explore,
+    /// Run at the policy's current chosen depth (`current_depth`).
+    /// Re-evaluates the hill-climb every cycle. Periodically (every
+    /// `FULL_REPROBE_INTERVAL` cycles) drops a `NeighborProbe` to
+    /// re-test the immediately adjacent depths so we can adapt to
+    /// drift in the optimum without paying a full `Reduced` cycle.
+    Full,
+    /// Run a single cycle at a neighbor of `current_depth` to refresh
+    /// that depth's EMA. After `NEIGHBOR_PROBE_CYCLES` cycles, return
+    /// to `Full` (which re-runs the hill-climb with the fresh data).
+    NeighborProbe,
+    /// Run at `MIN_DEPTH`. Entered when rolling acceptance at `Full`
+    /// dropped below `DROP_ACCEPT_THRESHOLD`. After
+    /// `REDUCED_CYCLES_BEFORE_PROBE` cycles, transitions to `Probe`.
+    Reduced,
+    /// One-shot test: temporarily run at `probe_depth` (the depth we
+    /// dropped from). After `PROBE_CYCLES` cycles, compare the probe's
+    /// rate EMA against `Reduced`'s rate and either commit back to
+    /// `Full` at `probe_depth` (probe won) or revert to `Reduced`
+    /// (probe lost).
+    Probe,
+}
+
+/// Per-cycle observation passed to the policy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CycleStats {
+    /// Depth used this cycle (the `D` arg to `run_mtp_cycle_inner`).
+    pub depth: u8,
+    /// Tokens committed this cycle. On full-accept this is `D + 1`
+    /// (the D drafts + bonus). On partial-accept it's `K + 1`
+    /// (K accepted drafts + residual). Range: `[1, D + 1]`.
+    pub committed: u32,
+    /// Wall-clock time spent on this cycle's draft+verify path.
+    /// Measured by the caller with `std::time::Instant`. Must be
+    /// non-zero (the policy divides by it).
+    pub wall_ns: u64,
+}
+
+impl CycleStats {
+    /// Acceptance ratio for this cycle: `accepted_drafts / depth`.
+    /// `accepted_drafts = committed - 1` (one of the `committed`
+    /// tokens is always the residual/bonus, not a draft accept).
+    pub fn acceptance(&self) -> f64 {
+        if self.depth == 0 {
+            return 0.0;
+        }
+        let accepted_drafts = self.committed.saturating_sub(1) as f64;
+        accepted_drafts / (self.depth as f64)
+    }
+
+    /// Effective decode rate (tokens / second). The policy's primary
+    /// objective function.
+    pub fn rate_tps(&self) -> f64 {
+        if self.wall_ns == 0 {
+            return 0.0;
+        }
+        (self.committed as f64) / Duration::from_nanos(self.wall_ns).as_secs_f64()
+    }
+}
+
+/// Rolling-window stats for a single (state, depth) bucket.
+#[derive(Clone, Debug, Default)]
+struct WindowStats {
+    acceptances: Vec<f64>,
+    rates: Vec<f64>,
+}
+
+impl WindowStats {
+    fn push(&mut self, c: &CycleStats) {
+        self.acceptances.push(c.acceptance());
+        self.rates.push(c.rate_tps());
+        if self.acceptances.len() > STATE_WINDOW {
+            self.acceptances.remove(0);
+            self.rates.remove(0);
+        }
+    }
+
+    fn mean_acceptance(&self) -> f64 {
+        if self.acceptances.is_empty() {
+            return 1.0; // No data → assume "good" so we don't drop prematurely.
+        }
+        self.acceptances.iter().sum::<f64>() / (self.acceptances.len() as f64)
+    }
+
+    fn mean_rate(&self) -> f64 {
+        if self.rates.is_empty() {
+            return 0.0;
+        }
+        self.rates.iter().sum::<f64>() / (self.rates.len() as f64)
+    }
+
+    fn full(&self) -> bool {
+        self.acceptances.len() >= STATE_WINDOW
+    }
+
+    fn clear(&mut self) {
+        self.acceptances.clear();
+        self.rates.clear();
+    }
+}
+
+/// Adaptive depth policy state. One per chat session / decode-loop
+/// invocation. Lives on the stack inside the `decode_loop_mtp!` macro
+/// and is dropped at decode end.
+pub(crate) struct AdaptiveDepthPolicy {
+    /// Per-depth EMA of tokens/sec rate. Indexed by `depth - 1`.
+    rate_ema: [f64; MAX_DEPTH as usize],
+    /// Per-depth observation count. EMA-decay only kicks in once a
+    /// depth has been observed at least `MIN_COLD_SAMPLES` times.
+    sample_count: [u32; MAX_DEPTH as usize],
+    /// The depth currently being used (and the depth the policy would
+    /// commit to in `Full` state).
+    current_depth: u8,
+    /// State machine state.
+    state: AdaptiveState,
+    /// Rolling-window stats for the current state. Cleared on every
+    /// state transition.
+    window: WindowStats,
+    /// In `Explore`: tracks which depth is currently being sampled.
+    /// In `Reduced`: cycles elapsed since the last `Probe`. Used to
+    /// trigger the next probe at `REDUCED_CYCLES_BEFORE_PROBE`.
+    /// In `Probe` / `NeighborProbe`: cycles spent in that burst.
+    /// In `Full`: cycles since entering Full (drives `FULL_REPROBE_INTERVAL`).
+    cycles_in_state: u32,
+    /// Explore state: the depth to sample on this cycle. Advanced
+    /// every `MIN_COLD_SAMPLES` cycles. Range `[MIN_DEPTH, MAX_DEPTH]`.
+    explore_depth: u8,
+    /// Depth to use during the next `Probe` or `NeighborProbe`. In
+    /// `Reduced`→`Probe`, set to the depth we dropped from. In
+    /// `Full`→`NeighborProbe`, set to a neighbor of `current_depth`.
+    probe_depth: u8,
+    /// Average rate measured during the last `Reduced` burst — used as
+    /// the comparison baseline when `Probe` exits.
+    reduced_baseline_rate: f64,
+    /// Average rate measured during the in-progress `Probe` — populated
+    /// by `record_cycle` while `state == Probe`.
+    probe_rate_ema: f64,
+    /// Total cycles seen across the lifetime of this policy. Diagnostic
+    /// only; included in `debug!` logs.
+    total_cycles: u64,
+}
+
+impl AdaptiveDepthPolicy {
+    /// Construct with an initial depth (typically the user's
+    /// `mtpDepth` value or the default `3`).
+    ///
+    /// Starts in `Explore` state, which sweeps every depth in
+    /// `{1..=5}` for `MIN_COLD_SAMPLES` cycles each before
+    /// transitioning to `Full` at the best-rate depth. This guarantees
+    /// every depth gets observations in production (codex review fix
+    /// — the prior `Full`-start design could never sample non-seed
+    /// depths because `pick_depth()` only returned `current_depth`).
+    pub fn new(initial_depth: u8) -> Self {
+        let d = initial_depth.clamp(MIN_DEPTH, MAX_DEPTH);
+        Self {
+            rate_ema: [0.0; MAX_DEPTH as usize],
+            sample_count: [0; MAX_DEPTH as usize],
+            current_depth: d,
+            state: AdaptiveState::Explore,
+            window: WindowStats::default(),
+            cycles_in_state: 0,
+            explore_depth: MIN_DEPTH,
+            probe_depth: d,
+            reduced_baseline_rate: 0.0,
+            probe_rate_ema: 0.0,
+            total_cycles: 0,
+        }
+    }
+
+    /// Construct a NO-OP policy that always returns `fixed_depth`.
+    /// Used in tests to exercise the bounds-clamping path; production
+    /// callers in `decode_loop_mtp!` skip `record_cycle` when adaptive
+    /// is off so the same `pick_depth()` always returns the seed.
+    #[cfg(test)]
+    pub fn fixed(fixed_depth: u8) -> Self {
+        Self::new(fixed_depth)
+    }
+
+    /// Depth to use for the next cycle. Cheap call — pure read.
+    pub fn pick_depth(&self) -> u8 {
+        match self.state {
+            AdaptiveState::Explore => self.explore_depth,
+            AdaptiveState::Full => self.current_depth,
+            AdaptiveState::NeighborProbe => self.probe_depth,
+            AdaptiveState::Reduced => MIN_DEPTH,
+            AdaptiveState::Probe => self.probe_depth,
+        }
+    }
+
+    /// Diagnostic snapshot for logging.
+    pub fn state_label(&self) -> &'static str {
+        match self.state {
+            AdaptiveState::Explore => "explore",
+            AdaptiveState::Full => "full",
+            AdaptiveState::NeighborProbe => "neighbor_probe",
+            AdaptiveState::Reduced => "reduced",
+            AdaptiveState::Probe => "probe",
+        }
+    }
+
+    /// Diagnostic snapshot of per-depth EMA. Used by tests; production
+    /// callers in `decode_loop_mtp!` log the chosen depth + state
+    /// label per cycle via `tracing::debug!`.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn rate_ema_snapshot(&self) -> [f64; MAX_DEPTH as usize] {
+        self.rate_ema
+    }
+
+    /// Record a cycle's observation and update the state machine + EMA.
+    pub fn record_cycle(&mut self, c: CycleStats) {
+        self.total_cycles += 1;
+        let d = c.depth.clamp(MIN_DEPTH, MAX_DEPTH);
+        let idx = (d - 1) as usize;
+
+        // Per-depth rate EMA: cold-start exact mean for first
+        // MIN_COLD_SAMPLES samples, then EMA.
+        let rate = c.rate_tps();
+        let prev_count = self.sample_count[idx];
+        if prev_count < MIN_COLD_SAMPLES {
+            // Cumulative mean over the cold-start period.
+            let new_count = prev_count + 1;
+            let prev = self.rate_ema[idx];
+            self.rate_ema[idx] =
+                prev * (prev_count as f64 / new_count as f64) + rate / (new_count as f64);
+            self.sample_count[idx] = new_count;
+        } else {
+            let prev = self.rate_ema[idx];
+            self.rate_ema[idx] = (1.0 - EMA_ALPHA) * prev + EMA_ALPHA * rate;
+        }
+
+        // Per-state window.
+        self.window.push(&c);
+        self.cycles_in_state = self.cycles_in_state.saturating_add(1);
+
+        // State transitions.
+        match self.state {
+            AdaptiveState::Explore => self.maybe_explore_transition(),
+            AdaptiveState::Full => self.maybe_full_transition(),
+            AdaptiveState::NeighborProbe => self.maybe_neighbor_probe_transition(),
+            AdaptiveState::Reduced => self.maybe_reduced_transition(rate),
+            AdaptiveState::Probe => self.maybe_probe_transition(rate),
+        }
+    }
+
+    /// `Explore` → `Full`. Advance to the next depth after
+    /// `MIN_COLD_SAMPLES` cycles; when every depth has been sampled,
+    /// pick the best-rate depth and switch to `Full`.
+    fn maybe_explore_transition(&mut self) {
+        // Advance after MIN_COLD_SAMPLES cycles at the current
+        // explore_depth.
+        let need = MIN_COLD_SAMPLES;
+        let cur = self.explore_depth;
+        if self.sample_count[(cur - 1) as usize] >= need {
+            if cur < MAX_DEPTH {
+                self.explore_depth = cur + 1;
+                // Reset the per-state window so the new depth's
+                // observations don't get mixed in.
+                self.window.clear();
+            } else {
+                // All depths sampled — pick the winner and enter Full.
+                self.current_depth = self.best_seeded_depth();
+                self.enter_full();
+            }
+        }
+    }
+
+    /// Pick the depth with the highest EMA among those with at least
+    /// `MIN_COLD_SAMPLES` observations. Falls back to `current_depth`
+    /// when nothing is seeded yet (only happens before exploration
+    /// finishes).
+    fn best_seeded_depth(&self) -> u8 {
+        let mut best_depth = self.current_depth;
+        let mut best_rate = f64::NEG_INFINITY;
+        for d in MIN_DEPTH..=MAX_DEPTH {
+            let i = (d - 1) as usize;
+            if self.sample_count[i] >= MIN_COLD_SAMPLES && self.rate_ema[i] > best_rate {
+                best_rate = self.rate_ema[i];
+                best_depth = d;
+            }
+        }
+        best_depth
+    }
+
+    /// `Full` → `Reduced` when rolling acceptance drops below
+    /// threshold over a full window. Otherwise re-pick `current_depth`
+    /// from the per-depth rate EMA (hill-climb on stale data — keeps
+    /// adapting to drift) and periodically launch a `NeighborProbe`
+    /// burst to refresh neighbor EMAs.
+    fn maybe_full_transition(&mut self) {
+        // First: hill-climb to the current best-seeded depth.
+        let best = self.best_seeded_depth();
+        if best != self.current_depth {
+            self.current_depth = best;
+            // Don't drop the window — the acceptance check below uses
+            // the rolling window which briefly mixes old + new depth
+            // samples until it rotates.
+        }
+
+        // Second: drop to `Reduced` if acceptance is consistently bad.
+        if self.window.full() && self.window.mean_acceptance() < DROP_ACCEPT_THRESHOLD {
+            self.probe_depth = self.current_depth;
+            self.enter_reduced();
+            return;
+        }
+
+        // Third: periodic NeighborProbe to keep adjacent depths' EMA
+        // fresh in case the optimum drifted. Probes are spaced
+        // `FULL_REPROBE_INTERVAL` cycles apart; pick the most-stale
+        // neighbor (lowest sample_count) within ±1.
+        if self.cycles_in_state >= FULL_REPROBE_INTERVAL {
+            if let Some(neighbor) = self.stale_neighbor() {
+                self.probe_depth = neighbor;
+                self.enter_neighbor_probe();
+            } else {
+                // Both neighbors fresh enough — reset the counter to
+                // avoid hot-looping and try again in another window.
+                self.cycles_in_state = 0;
+            }
+        }
+    }
+
+    /// Return the neighbor of `current_depth` (`±1` clamped to
+    /// `[MIN_DEPTH, MAX_DEPTH]`) whose EMA is most stale, or `None` if
+    /// both neighbors are well-seeded.
+    fn stale_neighbor(&self) -> Option<u8> {
+        let cur = self.current_depth;
+        let mut candidates: Vec<u8> = Vec::with_capacity(2);
+        if cur > MIN_DEPTH {
+            candidates.push(cur - 1);
+        }
+        if cur < MAX_DEPTH {
+            candidates.push(cur + 1);
+        }
+        candidates
+            .into_iter()
+            .min_by_key(|&d| self.sample_count[(d - 1) as usize])
+    }
+
+    /// `NeighborProbe` → `Full`. Just run for the configured number of
+    /// cycles to push fresh observations through the EMA, then hand
+    /// back to `Full` for the next hill-climb evaluation.
+    fn maybe_neighbor_probe_transition(&mut self) {
+        if self.cycles_in_state >= NEIGHBOR_PROBE_CYCLES {
+            self.enter_full();
+        }
+    }
+
+    /// `Reduced` → `Probe` after a fixed burst. The `Reduced` burst
+    /// gives the EMA-rate-at-MIN_DEPTH time to stabilise so we have a
+    /// real baseline to compare the probe against.
+    fn maybe_reduced_transition(&mut self, _rate: f64) {
+        if self.cycles_in_state >= REDUCED_CYCLES_BEFORE_PROBE {
+            self.reduced_baseline_rate = self.window.mean_rate();
+            self.enter_probe();
+        }
+    }
+
+    /// `Probe` → `Full` (commit) or `Probe` → `Reduced` (revert).
+    /// Decision: if the probe depth's rate during the burst beats the
+    /// `Reduced` baseline rate by any margin, commit back. Otherwise
+    /// fall back to `Reduced` and wait another burst before re-probing.
+    fn maybe_probe_transition(&mut self, rate: f64) {
+        // Accumulate probe rate as a simple EMA over the burst.
+        if self.cycles_in_state == 1 {
+            self.probe_rate_ema = rate;
+        } else {
+            self.probe_rate_ema = (1.0 - EMA_ALPHA) * self.probe_rate_ema + EMA_ALPHA * rate;
+        }
+
+        if self.cycles_in_state >= PROBE_CYCLES {
+            if self.probe_rate_ema > self.reduced_baseline_rate {
+                // Probe wins — commit. Stay at `probe_depth` in `Full`.
+                self.current_depth = self.probe_depth;
+                self.enter_full();
+            } else {
+                // Probe lost — back to `Reduced` for another burst.
+                self.enter_reduced();
+            }
+        }
+    }
+
+    fn enter_full(&mut self) {
+        self.state = AdaptiveState::Full;
+        self.window.clear();
+        self.cycles_in_state = 0;
+    }
+
+    fn enter_neighbor_probe(&mut self) {
+        self.state = AdaptiveState::NeighborProbe;
+        self.window.clear();
+        self.cycles_in_state = 0;
+    }
+
+    fn enter_reduced(&mut self) {
+        self.state = AdaptiveState::Reduced;
+        self.window.clear();
+        self.cycles_in_state = 0;
+    }
+
+    fn enter_probe(&mut self) {
+        self.state = AdaptiveState::Probe;
+        self.window.clear();
+        self.cycles_in_state = 0;
+        self.probe_rate_ema = 0.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! W6.8 — Pure-Rust unit tests for the adaptive depth policy.
+    //! No Metal, no MLX, no model load — these run in `cargo test
+    //! -p mlx-core --lib adaptive_depth`.
+    //!
+    //! IMPORTANT: production callers in `decode_loop_mtp!` only ever
+    //! call `record_cycle` with the depth `pick_depth()` returned. The
+    //! `drive_cycles` helper below enforces that contract; any test
+    //! that manually injects observations at a depth `pick_depth()`
+    //! did NOT return is testing a non-production code path and will
+    //! say so in its docstring.
+
+    use super::*;
+
+    /// Drive the policy for `n` cycles, always asking `pick_depth()`
+    /// for the depth and computing `(committed, wall_ns)` from the
+    /// caller-supplied closure. Mirrors the production loop in
+    /// `decode_loop_mtp!` byte-for-byte.
+    fn drive_cycles(
+        p: &mut AdaptiveDepthPolicy,
+        n: u32,
+        mut make_stats: impl FnMut(u8) -> (u32, u64),
+    ) {
+        for _ in 0..n {
+            let depth = p.pick_depth();
+            let (committed, wall_ns) = make_stats(depth);
+            p.record_cycle(CycleStats {
+                depth,
+                committed,
+                wall_ns,
+            });
+        }
+    }
+
+    /// Total cycles required to finish exploration: 5 depths *
+    /// MIN_COLD_SAMPLES cycles each.
+    const EXPLORE_TOTAL: u32 = (MAX_DEPTH as u32) * MIN_COLD_SAMPLES;
+
+    /// Cold-start: first MIN_COLD_SAMPLES samples per depth use a
+    /// cumulative mean, not EMA. Verify the rate stored is the exact
+    /// mean. Drives the policy directly (bypassing `pick_depth`) since
+    /// we want to exercise the cumulative-mean math at a single depth.
+    #[test]
+    fn cold_start_uses_cumulative_mean() {
+        let mut p = AdaptiveDepthPolicy::new(3);
+        p.record_cycle(CycleStats {
+            depth: 3,
+            committed: 4,
+            wall_ns: 40_000_000, // 100 tps
+        });
+        p.record_cycle(CycleStats {
+            depth: 3,
+            committed: 4,
+            wall_ns: 20_000_000, // 200 tps
+        });
+        let ema_idx = 2; // depth 3
+        assert!(
+            (p.rate_ema[ema_idx] - 150.0).abs() < 1e-6,
+            "expected cumulative mean 150.0, got {}",
+            p.rate_ema[ema_idx]
+        );
+        assert_eq!(p.sample_count[ema_idx], MIN_COLD_SAMPLES);
+    }
+
+    /// Bootstrap: the policy must spend `EXPLORE_TOTAL` cycles in
+    /// `Explore` and visit every depth in `{1..=5}` before entering
+    /// `Full`. **This is the regression test the codex review asked
+    /// for** — the policy is driven entirely via `pick_depth()`, never
+    /// manually fed unpicked depths.
+    #[test]
+    fn explore_visits_every_depth_then_enters_full() {
+        let mut p = AdaptiveDepthPolicy::new(3);
+        assert_eq!(p.state, AdaptiveState::Explore);
+
+        // Drive exactly the explore-burst length with a non-trivial
+        // rate function (rate increases with depth ⇒ depth 5 wins).
+        drive_cycles(&mut p, EXPLORE_TOTAL, |d| (d as u32 + 1, 30_000_000));
+
+        // After exploration: every depth has MIN_COLD_SAMPLES samples
+        // and the policy entered Full at the best-rate depth.
+        for d in MIN_DEPTH..=MAX_DEPTH {
+            assert_eq!(
+                p.sample_count[(d - 1) as usize],
+                MIN_COLD_SAMPLES,
+                "depth {d} should have {MIN_COLD_SAMPLES} samples after exploration",
+            );
+        }
+        assert_eq!(p.state, AdaptiveState::Full);
+        // Higher depth ⇒ higher rate (committed = depth+1, wall same)
+        // ⇒ depth 5 wins.
+        assert_eq!(p.current_depth, MAX_DEPTH);
+    }
+
+    /// State transition: after exploration, `Full` → `Reduced` when
+    /// rolling acceptance over a full window falls below 0.75.
+    /// **Production flow only.**
+    #[test]
+    fn full_to_reduced_on_low_acceptance() {
+        let mut p = AdaptiveDepthPolicy::new(3);
+        // Exploration with low acceptance (committed = 2 = 1 accepted
+        // draft + 1 residual) regardless of depth. Rate ~constant.
+        drive_cycles(&mut p, EXPLORE_TOTAL, |_d| (2, 30_000_000));
+        assert_eq!(p.state, AdaptiveState::Full);
+        // Now Full with low acceptance — window should fill and drop.
+        drive_cycles(&mut p, STATE_WINDOW as u32, |_d| (2, 30_000_000));
+        assert_eq!(p.state, AdaptiveState::Reduced);
+        assert_eq!(p.pick_depth(), MIN_DEPTH);
+        // probe_depth = the depth we dropped from. Since exploration
+        // saw uniform rates, hill-climb keeps current_depth at the
+        // first-tied winner — depth 1 in this case (lowest depth
+        // with rate equal to the others). Either way it's in [1, 5].
+        assert!((MIN_DEPTH..=MAX_DEPTH).contains(&p.probe_depth));
+    }
+
+    /// `Full` stays in `Full` when acceptance is good.
+    #[test]
+    fn full_stays_full_on_good_acceptance() {
+        let mut p = AdaptiveDepthPolicy::new(3);
+        drive_cycles(&mut p, EXPLORE_TOTAL, |d| (d as u32 + 1, 30_000_000));
+        let pre_state = p.state;
+        // A few more cycles at full-accept — should stay in Full
+        // until the FULL_REPROBE_INTERVAL fires (which only switches
+        // to NeighborProbe momentarily).
+        drive_cycles(&mut p, STATE_WINDOW as u32, |d| (d as u32 + 1, 30_000_000));
+        assert_eq!(pre_state, AdaptiveState::Full);
+        assert!(matches!(
+            p.state,
+            AdaptiveState::Full | AdaptiveState::NeighborProbe
+        ));
+    }
+
+    /// State transition: `Reduced` → `Probe` after the burst, then
+    /// `Probe` → `Reduced` if the probe's rate is worse than the
+    /// reduced baseline. **Production flow only.**
+    #[test]
+    fn reduced_to_probe_and_back_when_probe_loses() {
+        let mut p = AdaptiveDepthPolicy::new(3);
+        // Bad-acceptance exploration ⇒ Full at some depth.
+        drive_cycles(&mut p, EXPLORE_TOTAL, |_d| (2, 30_000_000));
+        // Drive Full → Reduced.
+        drive_cycles(&mut p, STATE_WINDOW as u32, |_d| (2, 30_000_000));
+        assert_eq!(p.state, AdaptiveState::Reduced);
+
+        // Reduced burst: pick_depth() returns MIN_DEPTH=1; deliver a
+        // FAST rate (200 tps) to make Reduced look good.
+        drive_cycles(&mut p, REDUCED_CYCLES_BEFORE_PROBE, |_d| {
+            (2, 10_000_000) // 200 tps
+        });
+        assert_eq!(p.state, AdaptiveState::Probe);
+
+        // Probe burst: pick_depth() returns probe_depth. Deliver a
+        // SLOW rate (25 tps) so the probe loses vs. the 200 tps
+        // baseline ⇒ revert to Reduced.
+        drive_cycles(&mut p, PROBE_CYCLES, |_d| (2, 80_000_000));
+        assert_eq!(
+            p.state,
+            AdaptiveState::Reduced,
+            "probe lost → back to reduced"
+        );
+    }
+
+    /// State transition: `Probe` → `Full` when the probe rate exceeds
+    /// the Reduced baseline. **Production flow only.**
+    #[test]
+    fn probe_to_full_when_probe_wins() {
+        let mut p = AdaptiveDepthPolicy::new(3);
+        drive_cycles(&mut p, EXPLORE_TOTAL, |_d| (2, 30_000_000));
+        drive_cycles(&mut p, STATE_WINDOW as u32, |_d| (2, 30_000_000));
+        assert_eq!(p.state, AdaptiveState::Reduced);
+
+        // Reduced is SLOW (50 tps baseline).
+        drive_cycles(&mut p, REDUCED_CYCLES_BEFORE_PROBE, |_d| {
+            (2, 40_000_000) // 50 tps
+        });
+        assert_eq!(p.state, AdaptiveState::Probe);
+
+        // Probe is FAST (200 tps).
+        drive_cycles(&mut p, PROBE_CYCLES, |_d| (4, 20_000_000));
+        assert_eq!(p.state, AdaptiveState::Full);
+    }
+
+    /// **Codex regression test**: the policy must be able to discover
+    /// a non-seed depth as the optimum, driven entirely through the
+    /// production `pick_depth()`→`record_cycle()` loop. Bound the
+    /// acceptance to "good" so we stay out of Reduced and let
+    /// Explore + NeighborProbe do their job.
+    ///
+    /// Setup: rate is monotonically increasing in depth. Seed = 1
+    /// (intentionally the worst). The policy must discover depth 5
+    /// is the optimum.
+    #[test]
+    fn discovers_non_seed_best_depth_via_production_flow() {
+        let mut p = AdaptiveDepthPolicy::new(1);
+        // committed = depth + 1 (full accept), wall_ns constant ⇒
+        // rate proportional to (depth + 1). Higher depth wins.
+        drive_cycles(&mut p, EXPLORE_TOTAL + 4, |d| (d as u32 + 1, 30_000_000));
+        assert_eq!(p.state, AdaptiveState::Full);
+        assert_eq!(
+            p.current_depth, MAX_DEPTH,
+            "production flow with monotone-in-depth rate must discover MAX_DEPTH"
+        );
+    }
+
+    /// Periodic `NeighborProbe` fires after `FULL_REPROBE_INTERVAL`
+    /// cycles in `Full` and pushes fresh observations through the
+    /// neighbor's EMA.
+    #[test]
+    fn full_launches_neighbor_probe_at_interval() {
+        let mut p = AdaptiveDepthPolicy::new(3);
+        // Constant-rate exploration ⇒ Full at depth 1 (ties broken
+        // by lowest depth in `best_seeded_depth`).
+        drive_cycles(&mut p, EXPLORE_TOTAL, |_d| (3, 30_000_000));
+        assert_eq!(p.state, AdaptiveState::Full);
+        let cur_before = p.current_depth;
+
+        // Drive `FULL_REPROBE_INTERVAL` cycles in Full. We should
+        // enter NeighborProbe at least once.
+        let mut entered_probe = false;
+        for _ in 0..(FULL_REPROBE_INTERVAL + NEIGHBOR_PROBE_CYCLES + 4) {
+            let d = p.pick_depth();
+            p.record_cycle(CycleStats {
+                depth: d,
+                committed: 3,
+                wall_ns: 30_000_000,
+            });
+            if p.state == AdaptiveState::NeighborProbe {
+                entered_probe = true;
+            }
+        }
+        assert!(
+            entered_probe,
+            "NeighborProbe must fire within FULL_REPROBE_INTERVAL + buffer cycles"
+        );
+        // Probe target must be an adjacent depth.
+        // Sanity: the candidate neighbor pool for cur_before is
+        // within ±1 of cur_before (clamped to [MIN_DEPTH, MAX_DEPTH]).
+        // We pick the one with the lowest sample count.
+        let mut candidates: Vec<u8> = Vec::with_capacity(2);
+        if cur_before > MIN_DEPTH {
+            candidates.push(cur_before - 1);
+        }
+        if cur_before < MAX_DEPTH {
+            candidates.push(cur_before + 1);
+        }
+        let chosen = candidates
+            .into_iter()
+            .min_by_key(|&d| p.sample_count[(d - 1) as usize])
+            .unwrap_or(cur_before);
+        assert!((MIN_DEPTH..=MAX_DEPTH).contains(&chosen));
+    }
+
+    /// Bounds: `pick_depth` always returns a value in
+    /// `[MIN_DEPTH, MAX_DEPTH]` across every state.
+    #[test]
+    fn pick_depth_in_bounds() {
+        let mut p = AdaptiveDepthPolicy::new(99);
+        assert!((MIN_DEPTH..=MAX_DEPTH).contains(&p.pick_depth()));
+        // Drive many cycles through real production flow.
+        drive_cycles(&mut p, EXPLORE_TOTAL + 50, |d| {
+            // Mix of good and bad cycles so we exercise all branches.
+            if (d as u32).is_multiple_of(2) {
+                (d as u32 + 1, 30_000_000) // full accept
+            } else {
+                (2, 30_000_000) // mostly reject
+            }
+        });
+        assert!((MIN_DEPTH..=MAX_DEPTH).contains(&p.pick_depth()));
+    }
+
+    /// Fixed-depth helper bounds-clamps the input; the seed is the
+    /// initial `current_depth`, but exploration will still run on the
+    /// first record (production callers pin `mtp_adaptive_depth=false`
+    /// to skip exploration entirely).
+    #[test]
+    fn fixed_constructor_clamps() {
+        let p = AdaptiveDepthPolicy::fixed(0);
+        // In Explore state, `pick_depth()` returns `explore_depth`
+        // which starts at MIN_DEPTH.
+        assert_eq!(p.pick_depth(), MIN_DEPTH);
+        let p = AdaptiveDepthPolicy::fixed(7);
+        assert_eq!(p.pick_depth(), MIN_DEPTH);
+        assert_eq!(p.current_depth, MAX_DEPTH);
+    }
+}

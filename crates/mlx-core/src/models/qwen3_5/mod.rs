@@ -1,3 +1,4 @@
+pub(crate) mod adaptive_depth;
 pub mod arrays_cache;
 pub mod attention;
 pub(crate) mod chat_common;

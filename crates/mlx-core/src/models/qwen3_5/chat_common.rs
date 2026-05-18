@@ -290,9 +290,24 @@ pub(crate) struct ChatParams {
     /// W6 (MTP): number of draft tokens per speculative cycle, fed to
     /// the W5 `forward_mtp_draft_compiled` / `forward_mtp_verify_compiled`
     /// FFI. Must be in `[1, 5]` to satisfy the verify-FFI contract.
-    /// Default: 3 (MTPLX paper's reported sweet spot). Adaptive depth
-    /// is intentionally out of scope — see plan W6 task list.
+    /// Default: 3 (MTPLX paper's reported sweet spot). When
+    /// `mtp_adaptive_depth = true`, this value is only used as the
+    /// initial depth — the W6.8 `AdaptiveDepthPolicy` picks per-cycle.
     pub mtp_depth: usize,
+    /// W6.8 (MTP): when true, the decode loop runs an
+    /// `AdaptiveDepthPolicy` (`adaptive_depth.rs`) that picks the draft
+    /// depth per cycle by maximising per-depth EMA of
+    /// `accepted_tokens / cycle_wall_ns`. When false, the loop pins
+    /// `mtp_depth` for every cycle (legacy pre-W6.8 behaviour).
+    ///
+    /// Default resolution (`extract_chat_params`):
+    ///   * User set `mtpAdaptiveDepth` explicitly → use that.
+    ///   * User set `mtpDepth` (a fixed numeric depth) but NOT
+    ///     `mtpAdaptiveDepth` → `false` (pin to user's depth).
+    ///   * Neither field set → `true` (adaptive ON by default; the
+    ///     compiled verify graphs for all depths in `{1..=5}` are
+    ///     pre-warmed at model load so switching is zero-cost).
+    pub mtp_adaptive_depth: bool,
 }
 
 /// Resolve the effective `enable_thinking` value from `reasoning_effort`.
@@ -356,6 +371,13 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
             .mtp_depth
             .map(|d| (d as usize).clamp(1, 5))
             .unwrap_or(3),
+        // W6.8 — adaptive depth policy ON by default when neither
+        // `mtpAdaptiveDepth` nor `mtpDepth` was set; OFF when the user
+        // pinned a specific `mtpDepth`. An explicit `mtpAdaptiveDepth`
+        // always wins. See `ChatParams::mtp_adaptive_depth` docs.
+        mtp_adaptive_depth: config
+            .mtp_adaptive_depth
+            .unwrap_or(config.mtp_depth.is_none()),
     }
 }
 
@@ -1466,7 +1488,12 @@ where
 ///
 /// Required arguments mirror `decode_loop!`. Adds:
 ///   - `mtp_ops`: an [`MtpOps`] struct.
-///   - `mtp_depth`: number of draft tokens per cycle (`>= 1`, `<= 5`).
+///   - `mtp_depth`: initial / fixed number of draft tokens per cycle
+///     (`>= 1`, `<= 5`). When the W6.8 adaptive policy is ON (see
+///     `params.mtp_adaptive_depth`), this value seeds
+///     `AdaptiveDepthPolicy::new(...)` and the per-cycle depth is then
+///     chosen by `pick_depth()`. When adaptive is OFF, this value is
+///     used unchanged for every cycle.
 ///   - `mtp_rng`: an `&mut impl rand::Rng` driving the acceptance
 ///     coin flip. The caller picks the seed strategy
 ///     (`rand::rng()` — thread-local CSPRNG — is the typical
@@ -1557,6 +1584,23 @@ macro_rules! decode_loop_mtp {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let mut chained_hidden_opt: Option<$crate::array::MxArray> = None;
+
+        // W6.8 — Adaptive MTP depth policy. When `mtp_adaptive_depth`
+        // is true (default unless the caller pinned `mtpDepth`), the
+        // policy picks the per-cycle draft depth from a per-depth EMA
+        // of `accepted_tokens / cycle_wall_ns` plus a DFlash-style
+        // 3-state machine (`full | reduced | probe`). When false, the
+        // policy is constructed but `pick_depth()` returns
+        // `$p.mtp_depth` on every call (no transitions ever fire
+        // because `record_cycle` is gated below).
+        //
+        // The compiled MTP verify graphs are pre-warmed at model load
+        // for every depth `D ∈ {1..=5}` (W6.7), so swinging the depth
+        // freely between cycles is zero-cost from the compile side.
+        let mut mtp_depth_policy =
+            $crate::models::qwen3_5::adaptive_depth::AdaptiveDepthPolicy::new(
+                $depth.min(u8::MAX as usize) as u8,
+            );
 
         // Track cycles for the every-256-emitted-token cache clear.
         // We use the running `gen.len()` rather than a separate step
@@ -1847,7 +1891,18 @@ macro_rules! decode_loop_mtp {
             // honour. Without it the MTP draft RoPE positions diverge
             // and drafts produce gibberish.
             ($mtp.begin_cycle)();
+            // W6.8 — per-cycle depth selection. When adaptive is OFF,
+            // `pick_depth()` returns the seed depth unchanged
+            // (`record_cycle` is gated below). When adaptive is ON, the
+            // policy hill-climbs across depth-EMA + manages the
+            // `full | reduced | probe` state machine.
+            let cycle_depth: usize = if $p.mtp_adaptive_depth {
+                mtp_depth_policy.pick_depth() as usize
+            } else {
+                $depth
+            };
             $profiler.begin("mtp_cycle");
+            let cycle_started_at = std::time::Instant::now();
             let cycle_res =
                 $crate::models::qwen3_5::chat_common::run_mtp_cycle_inner(
                     &mut $mtp,
@@ -1858,7 +1913,7 @@ macro_rules! decode_loop_mtp {
                     &$hist,
                     &$p,
                     &mut $rng,
-                    $depth,
+                    cycle_depth,
                 );
             $profiler.end();
             // W6.5 — `run_mtp_cycle_inner` returns the verify-final
@@ -1868,6 +1923,35 @@ macro_rules! decode_loop_mtp {
             // check will drain it.
             let (outcome, verify_last_hidden) = cycle_res?;
             chained_hidden_opt = Some(verify_last_hidden);
+            // W6.8 — feed observation to the policy AFTER the cycle's
+            // tokens have been counted but BEFORE the emit loop's stop
+            // checks (so the record always runs even on partial-emit
+            // due to EOS / length / cancel). `committed` is the number
+            // of tokens the cycle actually produced (drafts accepted +
+            // residual/bonus); range `[1, depth+1]`.
+            let cycle_wall_ns: u64 = cycle_started_at
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64;
+            let cycle_committed: u32 = outcome.tokens.len() as u32;
+            if $p.mtp_adaptive_depth {
+                mtp_depth_policy.record_cycle(
+                    $crate::models::qwen3_5::adaptive_depth::CycleStats {
+                        depth: cycle_depth as u8,
+                        committed: cycle_committed,
+                        wall_ns: cycle_wall_ns,
+                    },
+                );
+                tracing::debug!(
+                    target: "mlx_core::mtp::adaptive",
+                    state = mtp_depth_policy.state_label(),
+                    depth = cycle_depth,
+                    committed = cycle_committed,
+                    wall_ms = (cycle_wall_ns as f64) / 1_000_000.0,
+                    next_depth = mtp_depth_policy.pick_depth(),
+                    "W6.8 cycle"
+                );
+            }
 
             // Emit each accepted token through the same stop /
             // streaming pipeline as the single-token loop.
@@ -2022,6 +2106,7 @@ mod mtp_params_tests {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         }
     }
 
@@ -2059,6 +2144,50 @@ mod mtp_params_tests {
             p.mtp_depth, 5,
             "mtp_depth=99 must clamp to verify-FFI max 5"
         );
+    }
+
+    /// W6.8 — `mtp_adaptive_depth` default resolution.
+    ///
+    ///   * Neither `mtpAdaptiveDepth` nor `mtpDepth` set → adaptive ON.
+    ///   * `mtpDepth` set, `mtpAdaptiveDepth` unset → adaptive OFF
+    ///     (caller pinned a depth).
+    ///   * `mtpAdaptiveDepth = Some(true)`, `mtpDepth` set → adaptive
+    ///     ON (explicit field wins; depth becomes initial seed).
+    ///   * `mtpAdaptiveDepth = Some(false)`, `mtpDepth` unset → OFF.
+    #[test]
+    fn adaptive_depth_default_resolution() {
+        // Default: no fields set → adaptive ON.
+        let cfg = base_config();
+        let p = extract_chat_params(&cfg);
+        assert!(
+            p.mtp_adaptive_depth,
+            "mtp_adaptive_depth must default to true when neither field is set"
+        );
+
+        // User pinned depth → adaptive OFF.
+        let mut cfg = base_config();
+        cfg.mtp_depth = Some(4);
+        let p = extract_chat_params(&cfg);
+        assert!(
+            !p.mtp_adaptive_depth,
+            "setting mtpDepth alone must pin (adaptive OFF)"
+        );
+        assert_eq!(p.mtp_depth, 4);
+
+        // Explicit adaptive=true with pinned depth → adaptive ON.
+        let mut cfg = base_config();
+        cfg.mtp_depth = Some(2);
+        cfg.mtp_adaptive_depth = Some(true);
+        let p = extract_chat_params(&cfg);
+        assert!(p.mtp_adaptive_depth);
+        assert_eq!(p.mtp_depth, 2, "depth becomes the initial seed");
+
+        // Explicit adaptive=false with no depth → OFF (uses default 3).
+        let mut cfg = base_config();
+        cfg.mtp_adaptive_depth = Some(false);
+        let p = extract_chat_params(&cfg);
+        assert!(!p.mtp_adaptive_depth);
+        assert_eq!(p.mtp_depth, 3);
     }
 }
 
@@ -2122,6 +2251,7 @@ mod mtp_cycle_tests {
             reuse_cache: None,
             enable_mtp: Some(true),
             mtp_depth: Some(3),
+            mtp_adaptive_depth: None,
         })
     }
 

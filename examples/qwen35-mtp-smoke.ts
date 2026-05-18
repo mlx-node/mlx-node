@@ -10,6 +10,13 @@
  * Plan W6 perf target: >= 1.6x at depth=3 on M3 Max bf16.
  *
  *   oxnode examples/qwen35-mtp-smoke.ts [model-name] [--depth N] [--max-tokens N] [--prompt "..."]
+ *   oxnode examples/qwen35-mtp-smoke.ts [model-name] --adaptive [--max-tokens N]
+ *
+ * `--adaptive` opts INTO the W6.8 adaptive-depth policy: it omits
+ * `mtpDepth` from the config so the native side runs
+ * `AdaptiveDepthPolicy` (per-depth EMA + DFlash 3-state machine).
+ * With `--adaptive` unset (default), `mtpDepth` is pinned to `--depth`
+ * (default 3) — matches pre-W6.8 behaviour for parity testing.
  *
  * Defaults: qwen3.5-4b, depth=3, max-tokens=200.
  */
@@ -27,6 +34,7 @@ const { values, positionals } = parseArgs({
     'max-tokens': { type: 'string' },
     prompt: { type: 'string' },
     'no-warmup': { type: 'boolean' },
+    adaptive: { type: 'boolean' },
   },
   allowPositionals: true,
 });
@@ -38,6 +46,7 @@ const prompt =
   values.prompt ??
   'Write a concise three-paragraph essay on why deterministic sampling at temperature 0 is useful for testing speculative decoding implementations.';
 const skipWarmup = values['no-warmup'] === true;
+const adaptive = values.adaptive === true;
 
 const MODEL_PATH = resolve(process.cwd(), '.cache', 'models', modelName);
 
@@ -54,8 +63,15 @@ if (!hasMtp) {
   console.error(`Model ${modelName} does not carry MTP heads. Smoke aborted.`);
   process.exit(2);
 }
-console.log(`MTP heads detected. Running depth=${depth}, max_new_tokens=${maxTokens}`);
+console.log(
+  `MTP heads detected. Running ${
+    adaptive ? 'adaptive depth (W6.8 policy)' : `depth=${depth} pinned`
+  }, max_new_tokens=${maxTokens}`,
+);
 
+// W6.8: when `--adaptive`, omit `mtpDepth` so `extract_chat_params`
+// defaults `mtp_adaptive_depth = true`. Otherwise pin `mtpDepth = depth`
+// which implicitly opts OUT of adaptive (matches pre-W6.8 behaviour).
 const baseConfig: ChatConfig = {
   temperature: 0,
   topK: 1,
@@ -63,7 +79,7 @@ const baseConfig: ChatConfig = {
   maxNewTokens: maxTokens,
   reasoningEffort: 'none',
   includeReasoning: false,
-  mtpDepth: depth,
+  ...(adaptive ? {} : { mtpDepth: depth }),
   reportPerformance: true,
 };
 

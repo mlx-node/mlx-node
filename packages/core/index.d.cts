@@ -2467,8 +2467,25 @@ export interface ChatConfig {
   /**
    * W6 (MTP): number of draft tokens per speculative cycle. Clamped
    * to `[1, 5]` by the W5 verify FFI contract. Default: 3.
+   *
+   * W6.8: when `mtpAdaptiveDepth` is `true` (the default whenever
+   * the caller did NOT set this field), this value is only used as
+   * the *initial* depth — the adaptive policy picks per-cycle from
+   * the EMA hill-climb. Setting this field implicitly opts OUT of
+   * adaptive depth unless `mtpAdaptiveDepth` is also set to `true`.
    */
   mtpDepth?: number | undefined;
+  /**
+   * W6.8 (MTP): when true, the decode loop runs the W6.8 adaptive
+   * depth policy (per-depth EMA of `accepted_tokens / cycle_wall_ns`
+   * plus DFlash-style 3-state machine `full | reduced | probe`).
+   * When false, the loop pins `mtpDepth` for every cycle.
+   *
+   * Default: true when `mtpDepth` is also undefined; false when
+   * `mtpDepth` is set (caller pinned a specific depth). An explicit
+   * value always wins over the default.
+   */
+  mtpAdaptiveDepth?: boolean | undefined;
 }
 
 /** Chat message with tool calling support */

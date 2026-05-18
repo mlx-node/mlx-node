@@ -7366,6 +7366,7 @@ impl Qwen3_5MoeModel {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35MoeCmd::ChatSessionStart {
@@ -7423,6 +7424,7 @@ impl Qwen3_5MoeModel {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| {
@@ -7487,6 +7489,7 @@ impl Qwen3_5MoeModel {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| {
@@ -7542,6 +7545,7 @@ impl Qwen3_5MoeModel {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7613,6 +7617,7 @@ impl Qwen3_5MoeModel {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7681,6 +7686,7 @@ impl Qwen3_5MoeModel {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));

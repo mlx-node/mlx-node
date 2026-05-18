@@ -74,6 +74,7 @@ fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
         reuse_cache: Some(false),
         enable_mtp: None,
         mtp_depth: None,
+        mtp_adaptive_depth: None,
     }
 }
 

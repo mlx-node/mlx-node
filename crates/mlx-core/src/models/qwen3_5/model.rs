@@ -7203,8 +7203,24 @@ pub struct ChatConfig {
     pub enable_mtp: Option<bool>,
     /// W6 (MTP): number of draft tokens per speculative cycle. Clamped
     /// to `[1, 5]` by the W5 verify FFI contract. Default: 3.
+    ///
+    /// W6.8: when `mtpAdaptiveDepth` is `true` (the default whenever
+    /// the caller did NOT set this field), this value is only used as
+    /// the *initial* depth — the adaptive policy picks per-cycle from
+    /// the EMA hill-climb. Setting this field implicitly opts OUT of
+    /// adaptive depth unless `mtpAdaptiveDepth` is also set to `true`.
     #[napi(ts_type = "number | undefined")]
     pub mtp_depth: Option<i32>,
+    /// W6.8 (MTP): when true, the decode loop runs the W6.8 adaptive
+    /// depth policy (per-depth EMA of `accepted_tokens / cycle_wall_ns`
+    /// plus DFlash-style 3-state machine `full | reduced | probe`).
+    /// When false, the loop pins `mtpDepth` for every cycle.
+    ///
+    /// Default: true when `mtpDepth` is also undefined; false when
+    /// `mtpDepth` is set (caller pinned a specific depth). An explicit
+    /// value always wins over the default.
+    #[napi(ts_type = "boolean | undefined")]
+    pub mtp_adaptive_depth: Option<bool>,
 }
 
 /// Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE).
@@ -7439,6 +7455,7 @@ impl Qwen3_5Model {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionStart {
@@ -7496,6 +7513,7 @@ impl Qwen3_5Model {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ChatSessionContinue {
@@ -7558,6 +7576,7 @@ impl Qwen3_5Model {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         crate::model_thread::send_and_await(&self.thread, |reply| {
@@ -7613,6 +7632,7 @@ impl Qwen3_5Model {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7684,6 +7704,7 @@ impl Qwen3_5Model {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -7752,6 +7773,7 @@ impl Qwen3_5Model {
             reuse_cache: None,
             enable_mtp: None,
             mtp_depth: None,
+            mtp_adaptive_depth: None,
         });
 
         let cancelled = Arc::new(AtomicBool::new(false));
