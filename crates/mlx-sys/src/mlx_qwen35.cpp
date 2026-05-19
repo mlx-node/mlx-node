@@ -753,6 +753,12 @@ void mlx_qwen35_compiled_init_from_prefill(
     mlx_array** cache_arrays,
     int prefill_offset
 ) {
+  fprintf(stderr,
+          "[MLX] mlx_qwen35_compiled_init_from_prefill: ENTER "
+          "weight_count=%zu layer_count=%d max_kv_len=%d batch_size=%d "
+          "prefill_offset=%d hidden_size=%d num_heads=%d num_kv_heads=%d\n",
+          qwen35_common::g_weights().size(), num_layers, max_kv_len,
+          batch_size, prefill_offset, hidden_size, num_heads, num_kv_heads);
   try {
     g_compile_config = CompileConfig{{
       num_layers, hidden_size, num_heads, num_kv_heads, head_dim,
@@ -805,6 +811,10 @@ void mlx_qwen35_compiled_init_from_prefill(
     // Break the lazy RNG split chain from model initialization.
     auto rng_key = mlx::core::random::KeySequence::default_().next();
     mlx::core::eval({rng_key});
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_compiled_init_from_prefill: EXIT OK "
+            "compiled_caches=%zu offset=%d\n",
+            g_compiled_caches.size(), g_offset_int);
   } catch (const std::exception& e) {
     std::cerr << "[MLX] mlx_qwen35_compiled_init_from_prefill: " << e.what() << std::endl;
     g_compile_inited = false;

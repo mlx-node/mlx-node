@@ -131,7 +131,57 @@ fn sanitize_weights(
             }
         }
     });
-    let needs_norm_fix = has_mtp_weights || has_unsanitized_conv1d;
+    // The +1.0 norm shift converts raw-HF Qwen3.5 layernorm weights (mean ~0,
+    // gamma stored in (γ-1) form for numerical stability) into the final form
+    // (mean ~1) the inference kernels expect. We only need it for RAW HF
+    // sources — our own convert pipeline (`mlx convert`) writes norms already
+    // in shifted form, so re-applying the +1 at load time DOUBLE-SHIFTS them
+    // and produces incoherent generation.
+    //
+    // The correct discriminator is `has_unsanitized_conv1d`: HF stores
+    // `linear_attn.conv1d.weight` as `[C, 1, K]` (kernel last == K), while our
+    // convert pipeline transposes it to `[C, K, 1]` (kernel last == 1). So
+    // shape[-1] != 1 ⇒ this is a raw HF source ⇒ norms also need shifting.
+    //
+    // We previously also OR'd in `has_mtp_weights` here, on the assumption
+    // that "ships MTP heads ⇒ raw HF source". That broke any model our convert
+    // pipeline produces with `mtp.*` retained (e.g. `qwen3.6-27b-nvfp4-mtp`):
+    // the convert already shifted the norms, then load shifted them again,
+    // and AR generation produced garbage tokens. Verified empirically via the
+    // SHIFTING +1 to norm trace below: pre_mean ≈ 0.98, post_mean ≈ 1.98.
+    let needs_norm_fix = has_unsanitized_conv1d;
+
+    info!(
+        "Qwen3.5 sanitize_weights: param_count={} has_mtp_weights={} has_unsanitized_conv1d={} \
+         needs_norm_fix={} (heuristic: has_unsanitized_conv1d only — mtp presence is no longer a signal)",
+        params.len(),
+        has_mtp_weights,
+        has_unsanitized_conv1d,
+        needs_norm_fix,
+    );
+
+    // Sample a norm value pre-shift to verify whether the shift is appropriate.
+    // If `needs_norm_fix` is true but the source's norms are already
+    // sanitized (mean ~1.0 instead of ~0.0), the +1.0 add at line 217 will
+    // DOUBLE-SHIFT them and produce gibberish output. This affects models
+    // converted by us that also preserve `mtp.*` keys.
+    if needs_norm_fix {
+        for (name, array) in &params {
+            if name.ends_with(".input_layernorm.weight") && name.contains("layers.0") {
+                if let (Ok(_shape), Ok(ndim)) = (array.shape(), array.ndim())
+                    && ndim == 1
+                {
+                    let dtype = array.dtype().ok();
+                    info!(
+                        "Qwen3.5 sanitize_weights: SAMPLE norm '{}' dtype={:?} \
+                         pre-shift (will add +1.0 if needs_norm_fix && norm_suffix && !is_mtp)",
+                        name, dtype
+                    );
+                }
+                break;
+            }
+        }
+    }
 
     if has_mtp_weights {
         info!(
@@ -209,10 +259,29 @@ fn sanitize_weights(
 
         // Apply norm +1.0 fix for unsanitized weights — but NOT to MTP weights,
         // which are stored in final form (MTPLX convention).
-        let array = if needs_norm_fix
-            && !is_mtp_weight
-            && norm_suffixes.iter().any(|sfx| name.ends_with(sfx))
-        {
+        let is_norm_suffix = norm_suffixes.iter().any(|sfx| name.ends_with(sfx));
+        let will_shift = needs_norm_fix && !is_mtp_weight && is_norm_suffix;
+        // Capture pre-shift mean for the first layer's norms so the
+        // log shows whether the source was already sanitized (mean
+        // ≈ 1.0 → DOUBLE-shift hazard) vs unsanitized (mean ≈ 0.0,
+        // expected). Only sampled for the first occurrence per norm
+        // suffix to bound the cost — sample if the norm is on layer 0.
+        let sample_log = will_shift && name.contains("layers.0");
+        let pre_mean_opt: Option<f32> = if sample_log {
+            // Cast to f32 before reading the scalar mean — bf16/f16
+            // backends would otherwise need a dtype-specific reader.
+            array
+                .astype(DType::Float32)
+                .and_then(|a| a.mean(None, None))
+                .and_then(|m| {
+                    m.eval();
+                    m.item_at_float32(0)
+                })
+                .ok()
+        } else {
+            None
+        };
+        let array = if will_shift {
             let ndim = array.ndim()?;
             if ndim == 1 {
                 let one = MxArray::scalar_float(1.0)?.astype(array.dtype()?)?;
@@ -223,6 +292,21 @@ fn sanitize_weights(
         } else {
             array
         };
+        if sample_log {
+            let post_mean_opt: Option<f32> = array
+                .astype(DType::Float32)
+                .and_then(|a| a.mean(None, None))
+                .and_then(|m| {
+                    m.eval();
+                    m.item_at_float32(0)
+                })
+                .ok();
+            info!(
+                "Qwen3.5 sanitize_weights: SHIFTING +1 to norm '{}' \
+                 (is_mtp_weight={} is_norm={}) pre_mean={:?} post_mean={:?}",
+                name, is_mtp_weight, is_norm_suffix, pre_mean_opt, post_mean_opt,
+            );
+        }
 
         result.insert(name, array);
     }

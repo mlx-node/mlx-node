@@ -53,7 +53,13 @@ fn sanitize_weights(
             }
         }
     });
-    let needs_norm_fix = has_mtp_weights || has_unsanitized_conv1d;
+    // MoE twin of the dense fix: use only `has_unsanitized_conv1d` as the
+    // discriminator. `has_mtp_weights` is NOT a reliable signal for "needs
+    // norm shift" — our convert pipeline ships MTP heads alongside
+    // already-shifted norms, so re-shifting at load doubles the value and
+    // produces garbage. See dense `persistence.rs::sanitize_weights` for
+    // the full rationale and empirical evidence.
+    let needs_norm_fix = has_unsanitized_conv1d;
 
     if has_mtp_weights {
         info!(

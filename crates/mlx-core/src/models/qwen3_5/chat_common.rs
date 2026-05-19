@@ -1215,6 +1215,22 @@ macro_rules! decode_loop {
             $hist.push(token_id);
             let _is_reasoning = $tracker.observe_token(token_id);
 
+            // Throttled per-step decode trace (AR / single-token loop).
+            // Logs every 32 steps so long decode runs leave a sparse
+            // breadcrumb trail (step idx, sampled token, cache offset
+            // from the dense compiled global — MoE callers can ignore
+            // the offset field).
+            if step % 32 == 0 {
+                let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                tracing::info!(
+                    "Qwen3.5 decode AR step={} sampled_token_id={} cache_offset={} gen_len={}",
+                    step,
+                    token_id,
+                    cache_offset,
+                    $gen.len(),
+                );
+            }
+
             // Streaming-only block (conditionally compiled via macro repetition)
             $(
                 $last_r = _is_reasoning;
@@ -2382,6 +2398,26 @@ macro_rules! decode_loop_mtp {
             // check will drain it.
             let (outcome, verify_last_hidden) = cycle_res?;
             chained_hidden_opt = Some(verify_last_hidden);
+
+            // Throttled per-cycle MTP trace. Mirrors the AR loop's
+            // every-32-steps cadence in token-count units so MTP and
+            // AR runs leave comparable breadcrumb density. Reports the
+            // dense compiled main-path cache offset; on the MoE path
+            // this is the dense global and will read 0 — verify MoE
+            // offsets via `mtp_chained_hidden_opt`-flavoured tooling.
+            if ($gen.len() / 32) != (($gen.len() + outcome.tokens.len()) / 32) {
+                let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                let first_tok = outcome.tokens.first().copied().unwrap_or(0);
+                tracing::info!(
+                    "Qwen3.5 decode MTP cycle gen_len={} depth={} committed={} \
+                     first_tok={} cache_offset={}",
+                    $gen.len(),
+                    cycle_depth,
+                    outcome.tokens.len(),
+                    first_tok,
+                    cache_offset,
+                );
+            }
             // W6.8 — feed observation to the policy AFTER the cycle's
             // tokens have been counted but BEFORE the emit loop's stop
             // checks (so the record always runs even on partial-emit

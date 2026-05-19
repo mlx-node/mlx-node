@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::array::MxArray;
 use crate::inference_trace::{
@@ -2280,6 +2280,40 @@ impl Qwen35Inner {
         let mut finish_reason = String::from("length");
         let max_new_tokens = p.max_new_tokens;
 
+        // Decode-entry trace. Snapshot all the inputs that decide the
+        // AR-vs-MTP branch so MLX_NODE_LOG=info captures everything
+        // needed to reconstruct a turn's control flow.
+        {
+            let prefill_len = seq_len as i32;
+            let max_kv_len_estimate = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let has_mtp = self.has_mtp_weights();
+            let branch = if p.enable_mtp && has_mtp && use_compiled {
+                "MTP (will attempt init)"
+            } else if !p.enable_mtp {
+                "AR (enable_mtp=false)"
+            } else if !has_mtp {
+                "AR (no MTP weights on model)"
+            } else {
+                "AR (compiled path disabled)"
+            };
+            info!(
+                "Qwen3.5 chat_decode entry: prompt_len={} max_new_tokens={} enable_mtp={} \
+                 mtp_depth={} prefill_seq_len={} max_kv_len={} use_compiled={} has_mtp_weights={} \
+                 is_delta={} has_images={} branch=\"{}\"",
+                token_history_init.len(),
+                max_new_tokens,
+                p.enable_mtp,
+                p.mtp_depth,
+                prefill_len,
+                max_kv_len_estimate,
+                use_compiled,
+                has_mtp,
+                is_delta,
+                has_images,
+                branch,
+            );
+        }
+
         let last_logits = apply_all_penalties(last_logits, &token_history_init, &p)?;
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
@@ -2376,12 +2410,19 @@ impl Qwen35Inner {
             // C++ `g_weights` store. Init failure (no MTP weights,
             // mismatched config) silently disables MTP for this turn —
             // the regular single-token loop continues to work.
-            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+            let cond_enable_mtp = p.enable_mtp;
+            let cond_has_mtp_weights = self.has_mtp_weights();
+            let mut cond_init_ok: Option<bool> = None;
+            let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
                 let prefill_len = seq_len as i32;
                 let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
                 match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        cond_init_ok = Some(true);
+                        true
+                    }
                     Err(e) => {
+                        cond_init_ok = Some(false);
                         warn!(
                             "W6 MTP init failed; falling back to single-token decode: {}",
                             e.reason
@@ -2390,6 +2431,11 @@ impl Qwen35Inner {
                     }
                 }
             };
+            info!(
+                "Qwen3.5 MTP gate (dense): enable_mtp={} has_mtp_weights={} init_ok={:?} \
+                 -> mtp_active={}",
+                cond_enable_mtp, cond_has_mtp_weights, cond_init_ok, mtp_active
+            );
             if mtp_active {
                 // Thread-local CSPRNG; one `random::<f64>()` draw per
                 // emitted token via `accept_with_residual`.
@@ -4586,12 +4632,19 @@ impl Qwen35Inner {
 
             profiler.set_label("chat_stream_delta_compiled");
 
-            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+            let cond_enable_mtp = p.enable_mtp;
+            let cond_has_mtp_weights = self.has_mtp_weights();
+            let mut cond_init_ok: Option<bool> = None;
+            let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
                 let prefill_len = seq_len as i32;
                 let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
                 match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        cond_init_ok = Some(true);
+                        true
+                    }
                     Err(e) => {
+                        cond_init_ok = Some(false);
                         warn!(
                             "W6 MTP init failed; falling back to single-token decode: {}",
                             e.reason
@@ -4600,6 +4653,11 @@ impl Qwen35Inner {
                     }
                 }
             };
+            info!(
+                "Qwen3.5 MTP gate (stream_delta): enable_mtp={} has_mtp_weights={} init_ok={:?} \
+                 -> mtp_active={}",
+                cond_enable_mtp, cond_has_mtp_weights, cond_init_ok, mtp_active
+            );
             if mtp_active {
                 // Thread-local CSPRNG; one `random::<f64>()` draw per
                 // emitted token via `accept_with_residual`.
@@ -5359,12 +5417,19 @@ impl Qwen35Inner {
 
             profiler.set_label("chat_stream_compiled");
 
-            let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
+            let cond_enable_mtp = p.enable_mtp;
+            let cond_has_mtp_weights = self.has_mtp_weights();
+            let mut cond_init_ok: Option<bool> = None;
+            let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
                 let prefill_len = seq_len as i32;
                 let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
                 match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        cond_init_ok = Some(true);
+                        true
+                    }
                     Err(e) => {
+                        cond_init_ok = Some(false);
                         warn!(
                             "W6 MTP init failed; falling back to single-token decode: {}",
                             e.reason
@@ -5373,6 +5438,11 @@ impl Qwen35Inner {
                     }
                 }
             };
+            info!(
+                "Qwen3.5 MTP gate (stream): enable_mtp={} has_mtp_weights={} init_ok={:?} \
+                 -> mtp_active={}",
+                cond_enable_mtp, cond_has_mtp_weights, cond_init_ok, mtp_active
+            );
             if mtp_active {
                 // Thread-local CSPRNG; one `random::<f64>()` draw per
                 // emitted token via `accept_with_residual`.
@@ -8089,6 +8159,23 @@ fn chunked_prefill(
 
 /// Lock-free forward pass through all layers.
 /// Attention layer handles causal masking internally via "causal" SDPA mode.
+/// Format an `MxArray`'s shape for logging. Returns `[d0, d1, ...]`
+/// or `"<unavailable>"` if `ndim()` fails.
+fn shape_dbg(arr: &MxArray) -> String {
+    let ndim = match arr.ndim() {
+        Ok(n) => n,
+        Err(_) => return "<unavailable>".to_string(),
+    };
+    let mut dims: Vec<i64> = Vec::with_capacity(ndim as usize);
+    for axis in 0..ndim {
+        match arr.shape_at(axis) {
+            Ok(d) => dims.push(d),
+            Err(_) => return "<unavailable>".to_string(),
+        }
+    }
+    format!("{:?}", dims)
+}
+
 fn forward_inner(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
@@ -8101,6 +8188,12 @@ fn forward_inner(
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
+
+    debug!(
+        "Qwen3.5 forward_inner: input_ids_shape={} post_embed_shape={}",
+        shape_dbg(input_ids),
+        shape_dbg(&h),
+    );
 
     let num_layers = layers.len();
     // Plain layer loop. In-loop async_eval was tested (every 8 layers,
@@ -8131,6 +8224,14 @@ fn forward_inner(
             true,
             slice_last_token && is_last_layer,
         )?;
+        if i == 0 || is_last_layer {
+            debug!(
+                "Qwen3.5 forward_inner: post_layer[{}/{}] shape={}",
+                i,
+                num_layers,
+                shape_dbg(&h),
+            );
+        }
     }
 
     let h = if slice_last_token {
@@ -8147,16 +8248,25 @@ fn forward_inner(
     };
 
     let h = final_norm.forward(&h)?;
-    match lm_head {
-        Some(head) => head.forward(&h),
+    debug!(
+        "Qwen3.5 forward_inner: post_final_norm shape={}",
+        shape_dbg(&h)
+    );
+    let logits = match lm_head {
+        Some(head) => head.forward(&h)?,
         None => match embedding_weight_t {
-            Some(wt) => h.matmul(wt),
+            Some(wt) => h.matmul(wt)?,
             None => {
                 let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-                h.matmul(&wt)
+                h.matmul(&wt)?
             }
         },
-    }
+    };
+    debug!(
+        "Qwen3.5 forward_inner: post_lm_head shape={}",
+        shape_dbg(&logits)
+    );
+    Ok(logits)
 }
 
 /// Compiled single-token decode step using mlx::core::compile().

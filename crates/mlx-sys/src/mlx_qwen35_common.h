@@ -15,11 +15,13 @@
 
 #include <atomic>
 #include <cstdio>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace qwen35_common {
 
@@ -135,9 +137,24 @@ inline int infer_affine_bits(const array& w, const array& scales, int group_size
 //      so it's visible when the registry path is unexpectedly bypassed.
 //   3. If no `.scales` companion exists at all, the weight is bf16/f16
 //      and we use plain matmul against the pre-transposed weight.
+// Set + mutex tracking which `linear_proj` prefixes have already
+// emitted a one-shot dispatch trace. Lazily initialised so the linker
+// instantiates a single shared copy across all TUs that include this
+// header.
+inline std::unordered_set<std::string>& g_linear_proj_logged_prefixes() {
+  static std::unordered_set<std::string> instance;
+  return instance;
+}
+
+inline std::mutex& g_linear_proj_logged_mutex() {
+  static std::mutex instance;
+  return instance;
+}
+
 inline array linear_proj(const array& x, const std::string& prefix) {
   std::string scales_key = prefix + ".scales";
-  if (has_weight(scales_key)) {
+  bool scales_present = has_weight(scales_key);
+  if (scales_present) {
     auto w = get_weight(prefix + ".weight");
     auto scales = get_weight(scales_key);
     std::string biases_key = prefix + ".biases";
@@ -148,6 +165,18 @@ inline array linear_proj(const array& x, const std::string& prefix) {
 
     // Registry-first dispatch.
     if (auto info = lookup_quant_info(prefix)) {
+      // One-shot dispatch trace per NEW prefix.
+      {
+        std::lock_guard<std::mutex> lk(g_linear_proj_logged_mutex());
+        if (g_linear_proj_logged_prefixes().insert(prefix).second) {
+          fprintf(stderr,
+                  "[MLX] linear_proj dispatch: prefix='%s' scales_present=1 "
+                  "registered_quant_mode='%s' bits=%d group_size=%d "
+                  "fallback_used=0\n",
+                  prefix.c_str(), info->mode.c_str(), info->bits,
+                  info->group_size);
+        }
+      }
       return mlx::core::quantized_matmul(
           x, w, scales, biases, /*transpose=*/true,
           info->group_size, info->bits, info->mode);
@@ -167,11 +196,33 @@ inline array linear_proj(const array& x, const std::string& prefix) {
               "back to companion-tensor heuristic.\n",
               prefix.c_str());
     }
+    // One-shot dispatch trace per NEW prefix (fallback branch).
+    {
+      std::lock_guard<std::mutex> lk(g_linear_proj_logged_mutex());
+      if (g_linear_proj_logged_prefixes().insert(prefix).second) {
+        const char* mode = biases.has_value() ? "affine(infer)" : "mxfp8(heuristic)";
+        fprintf(stderr,
+                "[MLX] linear_proj dispatch: prefix='%s' scales_present=1 "
+                "registered_quant_mode=NONE fallback_used=1 fallback_mode='%s'\n",
+                prefix.c_str(), mode);
+      }
+    }
     if (!biases.has_value()) {
       return mlx::core::quantized_matmul(x, w, scales, biases, true, 32, 8, "mxfp8");
     } else {
       int bits = infer_affine_bits(w, scales, 64);
       return mlx::core::quantized_matmul(x, w, scales, biases, true, 64, bits, "affine");
+    }
+  }
+  // One-shot dispatch trace per NEW prefix (plain matmul branch).
+  {
+    std::lock_guard<std::mutex> lk(g_linear_proj_logged_mutex());
+    if (g_linear_proj_logged_prefixes().insert(prefix).second) {
+      fprintf(stderr,
+              "[MLX] linear_proj dispatch: prefix='%s' scales_present=0 "
+              "registered_quant_mode=NONE fallback_used=0 "
+              "fallback_mode='bf16_matmul'\n",
+              prefix.c_str());
     }
   }
   return matmul(x, get_weight_t(prefix + ".weight"));
