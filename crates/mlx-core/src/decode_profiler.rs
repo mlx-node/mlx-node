@@ -72,8 +72,10 @@ pub struct DecodeProfiler {
     model_type: &'static str,
     phases: HashMap<&'static str, PhaseStats>,
     phase_order: Vec<&'static str>,
-    current_phase: Option<&'static str>,
-    phase_start: Instant,
+    /// Stack of in-flight phases. Each frame stores its own `(name, start)`,
+    /// so nested begin/end pairs compose correctly (e.g. outer `mtp_cycle`
+    /// can wrap inner `draft`, `verify`, etc. without losing the cycle total).
+    phase_stack: Vec<(&'static str, Instant)>,
     loop_start: Instant,
     num_tokens: u64,
     prompt_tokens: u32,
@@ -107,8 +109,7 @@ impl DecodeProfiler {
             model_type,
             phases: HashMap::new(),
             phase_order: Vec::new(),
-            current_phase: None,
-            phase_start: Instant::now(),
+            phase_stack: Vec::new(),
             loop_start: Instant::now(),
             num_tokens: 0,
             prompt_tokens: 0,
@@ -188,30 +189,69 @@ impl DecodeProfiler {
     }
 
     /// Start timing a named phase. Pairs with `end()`.
+    ///
+    /// Nestable: each `begin` pushes a new frame onto an internal stack so an
+    /// outer phase (e.g. `mtp_cycle`) can wrap inner sub-phases. Each frame
+    /// carries its own start `Instant`; `end()` pops the top frame.
+    ///
+    /// First-seen ordering is established here on `begin()` so that an outer
+    /// phase (begun first, ended last) still appears before inner phases in
+    /// `phase_order`.
     #[inline]
     pub fn begin(&mut self, phase: &'static str) {
         if !self.enabled {
             return;
         }
-        self.current_phase = Some(phase);
-        self.phase_start = Instant::now();
+        self.register_phase(phase);
+        self.phase_stack.push((phase, Instant::now()));
     }
 
-    /// End the current phase and accumulate its time.
+    /// End the most-recently-begun phase and accumulate its time. No-op if
+    /// the stack is empty (matches prior behavior on stray `end()`).
     #[inline]
     pub fn end(&mut self) {
         if !self.enabled {
             return;
         }
-        if let Some(phase) = self.current_phase.take() {
-            let elapsed_us = self.phase_start.elapsed().as_micros() as u64;
-            let stats = self.phases.entry(phase).or_insert_with(|| {
-                self.phase_order.push(phase);
-                PhaseStats {
-                    total_us: 0,
-                    count: 0,
-                }
-            });
+        if let Some((phase, start)) = self.phase_stack.pop() {
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            self.accumulate(phase, elapsed_us);
+        }
+    }
+
+    /// Record a precomputed duration under `name` without touching the
+    /// begin/end stack. Useful for paths that already have an
+    /// `Instant::elapsed()` (e.g. FFI calls that return their own timings).
+    /// Same enabled/disabled gating and accumulation semantics as `end()`.
+    #[inline]
+    pub fn record_duration(&mut self, name: &'static str, dur: std::time::Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.register_phase(name);
+        let elapsed_us = dur.as_micros() as u64;
+        self.accumulate(name, elapsed_us);
+    }
+
+    /// Register `name` in `phase_order` on first sight, and ensure a
+    /// `PhaseStats` entry exists. Idempotent on repeated calls.
+    #[inline]
+    fn register_phase(&mut self, name: &'static str) {
+        let phase_order = &mut self.phase_order;
+        self.phases.entry(name).or_insert_with(|| {
+            phase_order.push(name);
+            PhaseStats {
+                total_us: 0,
+                count: 0,
+            }
+        });
+    }
+
+    /// Accumulate `elapsed_us` into `phases[name]`. Callers MUST have run
+    /// `register_phase(name)` first; an unregistered name is silently dropped.
+    #[inline]
+    fn accumulate(&mut self, name: &'static str, elapsed_us: u64) {
+        if let Some(stats) = self.phases.get_mut(name) {
             stats.total_us += elapsed_us;
             stats.count += 1;
         }
@@ -590,6 +630,107 @@ mod tests {
             assert_eq!(
                 phase_names,
                 vec!["eval_token", "extract", "forward", "sample"]
+            );
+        });
+    }
+
+    #[test]
+    fn test_nested_phases() {
+        with_profiling(|| {
+            let mut profiler = DecodeProfiler::new("test_nested", "qwen3_5");
+
+            // Open outer phase A, then nested phase B.
+            profiler.begin("outer_a");
+            profiler.begin("inner_b");
+            thread::sleep(Duration::from_millis(5));
+            profiler.end(); // closes inner_b (records >= 5ms)
+            thread::sleep(Duration::from_millis(5));
+            profiler.end(); // closes outer_a (records >= 10ms total)
+
+            profiler.step();
+            profiler.report();
+
+            let store = profiling::PROFILING_STORE.lock().unwrap();
+            let last = store.last().unwrap();
+
+            // Both phases must be present.
+            let outer = last
+                .phases
+                .iter()
+                .find(|p| p.name == "outer_a")
+                .expect("outer_a phase should be recorded");
+            let inner = last
+                .phases
+                .iter()
+                .find(|p| p.name == "inner_b")
+                .expect("inner_b phase should be recorded");
+
+            // Outer's total time encompasses inner's, so outer >= inner.
+            assert!(
+                outer.total_ms >= inner.total_ms,
+                "outer_a total_ms {} should be >= inner_b total_ms {}",
+                outer.total_ms,
+                inner.total_ms,
+            );
+            // Inner slept ~5ms; allow generous slack for CI timer jitter.
+            assert!(
+                inner.total_ms >= 2.0,
+                "inner_b total_ms {} should be >= 2ms",
+                inner.total_ms,
+            );
+            // Outer slept ~10ms total (5ms before inner closed + 5ms after).
+            assert!(
+                outer.total_ms >= 5.0,
+                "outer_a total_ms {} should be >= 5ms",
+                outer.total_ms,
+            );
+
+            // phase_order is first-seen: outer_a was begun first, so it must
+            // appear before inner_b in the recorded order.
+            let names: Vec<&str> = last.phases.iter().map(|p| p.name.as_str()).collect();
+            let pos_outer = names
+                .iter()
+                .position(|&n| n == "outer_a")
+                .expect("outer_a in order");
+            let pos_inner = names
+                .iter()
+                .position(|&n| n == "inner_b")
+                .expect("inner_b in order");
+            assert!(
+                pos_outer < pos_inner,
+                "outer_a (pos {}) should appear before inner_b (pos {}) in first-seen order",
+                pos_outer,
+                pos_inner,
+            );
+        });
+    }
+
+    #[test]
+    fn test_record_duration() {
+        with_profiling(|| {
+            let mut profiler = DecodeProfiler::new("test_record_duration", "qwen3_5");
+
+            profiler.record_duration("foo", Duration::from_micros(1234));
+            // Must not touch the begin/end stack.
+            assert!(profiler.phase_stack.is_empty());
+
+            profiler.step();
+            profiler.report();
+
+            let store = profiling::PROFILING_STORE.lock().unwrap();
+            let last = store.last().unwrap();
+
+            let foo = last
+                .phases
+                .iter()
+                .find(|p| p.name == "foo")
+                .expect("foo phase should be recorded");
+            assert_eq!(foo.count, 1);
+            // 1234us = 1.234ms; allow tiny float slack.
+            assert!(
+                (foo.total_ms - 1.234).abs() < 0.001,
+                "foo total_ms {} should be 1.234",
+                foo.total_ms,
             );
         });
     }
