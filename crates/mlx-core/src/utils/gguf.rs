@@ -1509,7 +1509,18 @@ pub async fn convert_gguf_to_safetensors(
                 false,
             )?;
         } else {
-            // No recipe: --q-mxfp overrides the global mode + group_size so the
+            // No recipe. NVFP4 cannot land here — the legacy `quantize_weights`
+            // path uniformly applies the global mode/bits/group_size to every
+            // quantizable tensor, which for NVFP4 silently corrupts the
+            // sensitivity-critical tensors (linear_attn.out_proj, down_proj,
+            // etc.). See `convert::NVFP4_NO_RECIPE_ERROR` for the full
+            // rationale.
+            if quant_mode_str == "nvfp4" {
+                return Err(Error::from_reason(
+                    crate::convert::NVFP4_NO_RECIPE_ERROR.to_string(),
+                ));
+            }
+            // --q-mxfp overrides the global mode + group_size so the
             // legacy quantize path emits mxfp4/mxfp8 weights.
             let (effective_mode, effective_gs) = if quant_mxfp {
                 match quant_bits {

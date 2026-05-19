@@ -810,7 +810,17 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 embed_quantizable,
             )?;
         } else {
-            // No recipe: --q-mxfp overrides the global mode + group_size so the
+            // No recipe, non-privacy-filter. NVFP4 cannot land here — the
+            // legacy `quantize_weights` path uniformly applies the global
+            // mode/bits/group_size to every quantizable tensor, which for
+            // NVFP4 silently corrupts the sensitivity-critical tensors
+            // (linear_attn.out_proj, down_proj, etc.) that need affine
+            // 5/6/8-bit fallbacks. See `NVFP4_NO_RECIPE_ERROR` for the full
+            // rationale.
+            if quant_mode == "nvfp4" {
+                return Err(Error::from_reason(NVFP4_NO_RECIPE_ERROR.to_string()));
+            }
+            // --q-mxfp overrides the global mode + group_size so the
             // legacy quantize path emits mxfp4/mxfp8 weights. The legacy path
             // STILL emits per-layer overrides for special keys (router-gate
             // upgrades, lm_head/router.proj affine downgrades, embed_tokens
@@ -1783,6 +1793,27 @@ pub(crate) fn validate_nvfp4_recipe(recipe: &str) -> std::result::Result<(), Str
     }
     Ok(())
 }
+
+/// Error message returned when `--q-mode nvfp4` is invoked without a recipe.
+///
+/// Background: the no-recipe quantization path runs every quantizable tensor
+/// through the global default (`bits=4, group_size=16, mode=nvfp4`). For NVFP4
+/// that uniformly promotes the high-KLD sensitivity-critical tensors —
+/// `linear_attn.out_proj` (KLD ~6.0), `self_attn.o_proj` (KLD ~1.5),
+/// `mlp.down_proj`, `linear_attn.in_proj_qkv`, `linear_attn.in_proj_z`,
+/// `self_attn.{q,k,v}_proj` — without the affine 5/6/8-bit fallbacks the
+/// Unsloth KLD analysis prescribes for them. The resulting checkpoint loads
+/// cleanly but produces incoherent generations.
+///
+/// The recipe path (`build_predicate_for_recipe` + `apply_nvfp4_upgrade`)
+/// emits those per-tensor overrides; the no-recipe path does not. The
+/// privacy-filter convert branch is exempt because it has its own predicate
+/// (`build_privacy_filter_predicate`) that already encodes the right skips.
+pub(crate) const NVFP4_NO_RECIPE_ERROR: &str = "--q-mode nvfp4 requires --q-recipe (currently 'qwen3_5' or 'unsloth'). \
+     Pure NVFP4 corrupts sensitivity-critical tensors (linear_attn.out_proj, \
+     self_attn.o_proj, mlp.down_proj, in_proj_qkv/z, q/k/v_proj) without a \
+     recipe's per-tensor affine fallbacks. 'qwen3_5' works without an \
+     imatrix; 'unsloth' is the gold-standard but requires --imatrix-path.";
 
 pub(crate) fn apply_nvfp4_upgrade(
     inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync>,
@@ -4246,6 +4277,38 @@ mod tests {
             assert!(
                 validate_nvfp4_recipe(recipe).is_err(),
                 "{recipe} must be rejected under --q-mode nvfp4"
+            );
+        }
+    }
+
+    #[test]
+    fn nvfp4_no_recipe_error_names_supported_recipes() {
+        // Error must point users at the two valid recipes so the recovery
+        // path is obvious. If a future recipe joins the allowlist, update
+        // both the error and this assertion.
+        assert!(
+            NVFP4_NO_RECIPE_ERROR.contains("qwen3_5"),
+            "error must mention 'qwen3_5' as the no-imatrix recipe, got: {NVFP4_NO_RECIPE_ERROR}"
+        );
+        assert!(
+            NVFP4_NO_RECIPE_ERROR.contains("unsloth"),
+            "error must mention 'unsloth' as the imatrix-required recipe, got: {NVFP4_NO_RECIPE_ERROR}"
+        );
+    }
+
+    #[test]
+    fn nvfp4_no_recipe_error_names_sensitive_tensors() {
+        // The error names the high-KLD tensors the legacy path would
+        // corrupt so the user can correlate output garbage with the bug.
+        for needle in [
+            "linear_attn.out_proj",
+            "self_attn.o_proj",
+            "down_proj",
+            "in_proj_qkv",
+        ] {
+            assert!(
+                NVFP4_NO_RECIPE_ERROR.contains(needle),
+                "error must name the sensitive tensor '{needle}', got: {NVFP4_NO_RECIPE_ERROR}"
             );
         }
     }
