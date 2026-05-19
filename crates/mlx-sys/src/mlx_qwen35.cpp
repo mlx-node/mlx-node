@@ -1,5 +1,7 @@
 #include "mlx_qwen35_common.h"
+#include <cctype>
 #include <cstdlib>
+#include <string>
 
 using namespace qwen35_common;
 
@@ -509,15 +511,28 @@ static std::array<std::array<BatchedVerifyFn, 2>, kTotalBucketSlots>
     g_verify_compiled_by_bucket{};
 
 // W6.29 — bucket dispatcher opt-out. Default ON; set
-// `MLX_MTP_BUCKETED_VERIFY=0` to force the legacy single-trace path
+// `MLX_MTP_BUCKETED_VERIFY` to `0` / `false` / `off` (case-insensitive,
+// surrounding whitespace ignored) to force the legacy single-trace path
 // (kLegacyBucketIdx). Used as a safety hatch only; the bucket path is
 // strictly parity-safe (the tail mask is identical math).
+//
+// Truthy/falsy parsing mirrors the Rust `MLX_MTP_*` readers in
+// `crates/mlx-core/src/models/qwen3_5/chat_common.rs` so the convention
+// is uniform across the MTP knob surface.
 static bool bucketed_verify_disabled() {
   static const bool disabled = []() {
-    if (const char* v = std::getenv("MLX_MTP_BUCKETED_VERIFY")) {
-      return v[0] == '0';
+    const char* raw = std::getenv("MLX_MTP_BUCKETED_VERIFY");
+    if (!raw) return false;
+    std::string v(raw);
+    size_t s = 0;
+    while (s < v.size() && std::isspace(static_cast<unsigned char>(v[s]))) s++;
+    size_t e = v.size();
+    while (e > s && std::isspace(static_cast<unsigned char>(v[e - 1]))) e--;
+    std::string trimmed = v.substr(s, e - s);
+    for (char& c : trimmed) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
-    return false;
+    return trimmed == "0" || trimmed == "false" || trimmed == "off";
   }();
   return disabled;
 }

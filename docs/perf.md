@@ -60,14 +60,14 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 
 ## MTP speculative decoding
 
-Qwen3.5 / Qwen3.6 MTP (Multi-Token Prediction) speculative decoding adds six
-runtime knobs gating individual optimizations across the W6.5–W6.19 perf
-chain (plus one unconditional warmup hook for verify prewarm). All five
-env vars are read at most once per process and cached; the truthy
-vocabulary is uniform (`1` / `true` / `on`, case-insensitive, with
-`trim()`). The adaptive-depth knob is a TypeScript `ChatConfig` field
-(not an env var) because it interacts with the user-set `mtpDepth` and
-needs per-session resolution.
+Qwen3.5 / Qwen3.6 MTP (Multi-Token Prediction) speculative decoding adds seven
+runtime knobs gating individual optimizations across the W6.5–W6.29 perf
+chain (plus one unconditional warmup hook for verify prewarm). All six
+env vars are read at most once per process and cached; the truthy/falsy
+vocabulary is uniform (`1` / `true` / `on` and `0` / `false` / `off`,
+case-insensitive, with `trim()`). The adaptive-depth knob is a
+TypeScript `ChatConfig` field (not an env var) because it interacts with
+the user-set `mtpDepth` and needs per-session resolution.
 
 | Knob                          | Default | Workstream | Direction     | Notes                                                                                                                                                                                      |
 | ----------------------------- | ------- | ---------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -78,6 +78,7 @@ needs per-session resolution.
 | `MLX_MTP_VERIFY_ASYNC_EVAL`   | OFF     | W6.9       | opt-IN        | Overlaps verify dispatch with the accept loop's CPU-side graph construction. Composes cleanly with all other flags.                                                                        |
 | `MLX_MTP_FUSED_DRAFT`         | OFF     | W6.18      | opt-IN        | Fuses D draft steps into one compile()d graph. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending Step-A bypass follow-up where the infrastructure will pay off. Dense only — MoE always uses the per-step draft loop. |
 | `MLX_MTP_SPARSE_ACCEPT`       | OFF     | W6.19      | opt-IN        | Batched argmax over D+1 verify positions at T=0 with no penalties; collapses D × full-vocab softmax materializations into one .eval(). Falls back to legacy per-position path at T>0 or when sampling penalties are active. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending hardware/model targets where MLX scheduler exposes the sync cost. |
+| `MLX_MTP_BUCKETED_VERIFY`     | ON      | W6.29      | opt-OUT       | Per-bucket compiled verify graphs (`max_kv_len ∈ {256, 512, 1024, 2048, 4096, 8192}` + LEGACY fallback) so SDPA reads a static `[B, Hkv, bucket_kv_len, head_dim]` slice of the writeback cache. Eager prewarm at the prefill-offset bucket; lazy-trace others (~0.5 s per bucket-transition step). Measured at long decode (max_tokens=32768) on qwen3.5-4b / M3 Max: AR +12.0%, MTP +26.1%. No-op at default short prompts where the first bucket already covers the full cache. Set to `0` / `false` / `off` to force the legacy single-trace path. |
 
 Interactions:
 
@@ -107,7 +108,10 @@ Cross-references:
 - Source of truth (env-var readers + inventory table):
   `crates/mlx-core/src/models/qwen3_5/chat_common.rs` (`mtp_use_tape_replay`,
   `mtp_chained_cycles_enabled`, `mtp_verify_async_eval`,
-  `mtp_fused_draft_enabled`, `mtp_sparse_accept_enabled`).
+  `mtp_fused_draft_enabled`, `mtp_sparse_accept_enabled`). The W6.29
+  bucket dispatcher opt-out lives in C++ (`bucketed_verify_disabled` in
+  `crates/mlx-sys/src/mlx_qwen35.cpp`) because the bucket table and
+  compile cache are C++-side state.
 - W6.8 adaptive-depth policy:
   `crates/mlx-core/src/models/qwen3_5/adaptive_depth.rs`.
 - Parity gate harness: `examples/qwen35-mtp-smoke.ts`.
