@@ -1401,9 +1401,23 @@ inline AttnPureResult attn_for_compile_paged(
 //   2. `slice_update(kv, keys, offset_arr, {2})` writes T contiguous
 //      slots at axis 2 starting at `offset_arr[0]` — the slice-update
 //      kernel infers the slot count from `keys.shape(2)`.
-//   3. The additive `tail_mask` is per-position (shape `[1, 1, T, K]`)
-//      instead of per-step `[1, 1, 1, K]`, so attention at query
-//      position `t` correctly sees keys `[0..offset+t]`.
+//   3. The additive `tail_mask` is per-position (shape `[1, 1, T, B])
+//      where B ≤ max_kv_len is the SDPA "bucket" — see `bucket_kv_len`.
+//
+// W6.29 — `bucket_kv_len` is the static SDPA key-column count baked into
+// the compile trace. If `bucket_kv_len < max_kv_len`, the writeback
+// still operates on the full `[B, Hkv, max_kv_len, D]` cache (so the
+// returned `new_kv_keys/values` are full-size and the caller's
+// `g_compiled_caches[]` mutation contract is unchanged), but the K/V
+// view fed to SDPA is a static prefix `slice` of length `bucket_kv_len`.
+// The bucket dispatcher (in `mlx_qwen35.cpp`) picks the smallest bucket
+// ≥ `offset + T`, so all VALID key columns are inside the slice — the
+// columns past offset+T-1 inside the slice are still zero-init and
+// masked off by the tail mask.
+//
+// Passing `bucket_kv_len == 0` (default) preserves legacy behavior:
+// SDPA sees the full max_kv_len cache. This keeps the legacy/fallback
+// graph entry compilable without a separate code path.
 //
 // Weight keys read: `layers.{layer_idx}.self_attn.{q,k,v,o}_proj{.weight,
 // .bias?}`, `.q_norm.weight`, `.k_norm.weight`. Same set as the per-step
@@ -1414,9 +1428,10 @@ inline AttnPureResult attn_batched_verify_fn(
     int layer_idx,
     const array& kv_keys,      // [B, Hkv, max_kv_len, D]
     const array& kv_values,    // [B, Hkv, max_kv_len, D]
-    const array& tail_mask,    // [1, 1, T, max_kv_len] additive bf16 mask
+    const array& tail_mask,    // [1, 1, T, bucket_kv_len] additive bf16 mask
     const array& offset_arr,   // [1] int32
-    const BaseConfig& cfg) {
+    const BaseConfig& cfg,
+    int bucket_kv_len = 0) {
   int B = x.shape(0);
   int T = x.shape(1);
   int hidden = x.shape(2);
@@ -1465,12 +1480,27 @@ inline AttnPureResult attn_batched_verify_fn(
   auto new_kv_keys   = mlx::core::slice_update(kv_keys,   keys_for_write,   offset_arr, {2});
   auto new_kv_values = mlx::core::slice_update(kv_values, values_for_write, offset_arr, {2});
 
-  // SDPA over the FULL kv pool with the [1, 1, T, max_kv_len] tail-causal
-  // mask. Position-`t` queries see keys `[0..offset+t]`; the mask
-  // construction in the caller graph zeros that range and `-inf`s the rest.
+  // W6.29 — Bucketed SDPA view. The caller supplies a bucket size that's
+  // (a) ≥ `offset + T` (so every valid key column is inside the slice)
+  // and (b) a static integer baked into the compile trace (so SDPA sees
+  // a smaller, fixed `[B, Hkv, bucket, D]` key tensor). `bucket_kv_len==0`
+  // means "no bucketing" — SDPA reads the full max_kv_len cache (legacy).
+  int Hkv = cfg.num_kv_heads;
+  int max_kv_len = kv_keys.shape(2);
+  array sdpa_keys   = new_kv_keys;
+  array sdpa_values = new_kv_values;
+  if (bucket_kv_len > 0 && bucket_kv_len < max_kv_len) {
+    sdpa_keys   = slice(new_kv_keys,   {0, 0, 0, 0}, {B, Hkv, bucket_kv_len, cfg.head_dim});
+    sdpa_values = slice(new_kv_values, {0, 0, 0, 0}, {B, Hkv, bucket_kv_len, cfg.head_dim});
+  }
+
+  // SDPA over the bucketed kv view with a `[1, 1, T, bucket]` (or
+  // `[1, 1, T, max_kv_len]` in the legacy path) tail mask. Position-`t`
+  // queries see keys `[0..offset+t]`; the mask construction in the caller
+  // graph zeros that range and `-inf`s the rest.
   float scale = std::pow((float)cfg.head_dim, -0.5f);
   auto attn_out = fast::scaled_dot_product_attention(
-      queries, new_kv_keys, new_kv_values, scale, "", tail_mask, {});
+      queries, sdpa_keys, sdpa_values, scale, "", tail_mask, {});
 
   // Transpose back to [B, T, H, D] -> [B*T, H*D].
   attn_out = transpose(attn_out, {0, 2, 1, 3});

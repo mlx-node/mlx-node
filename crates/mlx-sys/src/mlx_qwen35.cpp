@@ -308,9 +308,29 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
 
 namespace {
 
+// W6.29 — Bucketed verify graph.
+//
+// `bucket_kv_len` is the static SDPA key-column count baked into the
+// compile trace for THIS entry of the per-bucket cache. The graph
+// processes the same `[B, T, hidden]` input and emits the same outputs
+// as the prior single-trace version, but SDPA now reads only the first
+// `bucket_kv_len` columns of each full-attn layer's KV cache.
+//
+// Invariant the caller MUST uphold: `bucket_kv_len >= g_offset_int + T`,
+// so every valid key column at every row is inside the bucket prefix.
+// The mask's `valid_2d` predicate is computed against `arange(0, bucket)`,
+// which is exactly the K range SDPA sees. Tokens past
+// `g_offset_int + T - 1` inside the bucket prefix are zero-initialised
+// in the KV pool and `-inf`-masked, identical to the prior unbucketed
+// trace's tail behavior.
+//
+// `bucket_kv_len == 0` selects the legacy full-length path (SDPA sees
+// the full `max_kv_len` cache). Used for prompts that exceed the largest
+// bucket and as a safety fallback when bucketing is disabled.
 template <bool WithTape>
-static std::vector<array> qwen35_verify_batched_decode_fn(
-    const std::vector<array>& inputs) {
+static std::vector<array> qwen35_verify_batched_decode_fn_bucketed(
+    const std::vector<array>& inputs,
+    int bucket_kv_len) {
   const auto& cfg = g_compile_config;
 
   auto h_3d       = inputs[0];          // [B, T, hidden]
@@ -319,21 +339,25 @@ static std::vector<array> qwen35_verify_batched_decode_fn(
   int B = h_3d.shape(0);
   int T = h_3d.shape(1);
 
-  // Tail-causal mask: shape `[1, 1, T, max_kv_len]`. At query row `t`,
+  // Tail-causal mask: shape `[1, 1, T, sdpa_kv_len]`. At query row `t`,
   // valid keys are `[0..offset + t]`. Built ONCE per layer-set; reused
   // across every full-attention layer to keep the compile graph cheap.
+  //
+  // `sdpa_kv_len` is `bucket_kv_len` for bucketed traces, else the full
+  // cache size from the input shape (legacy path).
   int first_fa = cfg.full_attention_interval - 1;
   int max_kv_len = inputs[2 + first_fa * 2].shape(2);
-  auto col_positions = arange(0, max_kv_len, mlx::core::int32);            // [K]
-  auto row_idx       = arange(0, T, mlx::core::int32);                     // [T]
+  int sdpa_kv_len = bucket_kv_len > 0 ? bucket_kv_len : max_kv_len;
+  auto col_positions = arange(0, sdpa_kv_len, mlx::core::int32);          // [K]
+  auto row_idx       = arange(0, T, mlx::core::int32);                    // [T]
   // valid = col <= offset + row  →  reshape to [T, K] then broadcast.
-  auto col_row = reshape(col_positions, {1, max_kv_len});                  // [1, K]
-  auto row_col = reshape(row_idx, {T, 1}) + offset_arr;                    // [T, 1]
-  auto valid_2d = less_equal(col_row, row_col);                            // [T, K]
+  auto col_row = reshape(col_positions, {1, sdpa_kv_len});                // [1, K]
+  auto row_col = reshape(row_idx, {T, 1}) + offset_arr;                   // [T, 1]
+  auto valid_2d = less_equal(col_row, row_col);                           // [T, K]
   auto attn_mask = where(valid_2d,
       array(0.0f, mlx::core::bfloat16),
       array(-std::numeric_limits<float>::infinity(), mlx::core::bfloat16));
-  attn_mask = reshape(attn_mask, {1, 1, T, max_kv_len});                   // [1, 1, T, K]
+  attn_mask = reshape(attn_mask, {1, 1, T, sdpa_kv_len});                 // [1, 1, T, K]
 
   std::vector<array> new_caches;
   new_caches.reserve(cfg.num_layers * 2);
@@ -388,7 +412,8 @@ static std::vector<array> qwen35_verify_batched_decode_fn(
     } else {
       const auto& kk = inputs[2 + i * 2];
       const auto& kv = inputs[2 + i * 2 + 1];
-      auto res = attn_batched_verify_fn(normed, i, kk, kv, attn_mask, offset_arr, cfg);
+      auto res = attn_batched_verify_fn(normed, i, kk, kv, attn_mask, offset_arr, cfg,
+                                        bucket_kv_len);
       layer_out = std::move(res.output);
       new_caches[i * 2]     = std::move(res.keys);
       new_caches[i * 2 + 1] = std::move(res.values);
@@ -442,25 +467,97 @@ static std::vector<array> qwen35_verify_batched_decode_fn(
   return result;
 }
 
-// Compiled-graph cache for the batched verify forward. `mlx::core::compile`
-// already keys its internal trace cache on input shapes/dtypes — one
-// `compile()` per (with_tape) variant covers all 5 depths because the
-// closure body is parameterized purely by `T = input.shape(1)`. Two
-// compile entries total (with-tape vs without-tape) rather than 10.
+// W6.29 — Per-bucket compiled-graph cache for the batched verify forward.
+//
+// PRIOR (W6.7): `mlx::core::compile` keyed its internal trace cache on
+// input shapes/dtypes. Because `max_kv_len` is baked into the KV cache
+// shape, ONE compile per (with_tape) variant covered all 5 depths — but
+// every depth's verify SDPA processed the FULL padded `max_kv_len`
+// key tensor with a tail `-inf` mask, even when `offset + T << max_kv_len`.
+//
+// NOW: one compile per (bucket, with_tape) pair, where `bucket` is the
+// static SDPA key-column count baked into the trace. The dispatcher
+// (`bucket_index_for`) picks the smallest bucket >= `g_offset_int + T`,
+// so SDPA reads only that prefix and the mask matches its column count.
+// Speedup is proportional to `bucket / max_kv_len` per SDPA call —
+// dominant at early decode positions on long-context models.
+//
+// Buckets: powers of two from 256 to 8192. The largest bucket is chosen
+// to cover ~all realistic decode contexts on the qwen3.5 / qwen3.6
+// family (32k models rarely decode past 8k in practice; longer contexts
+// fall back to the legacy "full max_kv_len" path which is index
+// `LEGACY_BUCKET_IDX`).
 //
 // Populated lazily on first use; thread-safety mirrors the other
 // `compiled_*()` helpers in this file (single-mutex per turn from
 // `DENSE_COMPILED_MUTEX` on the Rust side).
 using BatchedVerifyFn = std::function<std::vector<array>(const std::vector<array>&)>;
 
-static BatchedVerifyFn& compiled_verify_batched_notape() {
-  static BatchedVerifyFn fn = mlx::core::compile(qwen35_verify_batched_decode_fn<false>);
-  return fn;
+static constexpr std::array<int, 6> kVerifyBuckets = {256, 512, 1024, 2048, 4096, 8192};
+static constexpr int kNumVerifyBuckets = kVerifyBuckets.size();
+// Slot kNumVerifyBuckets is reserved for the LEGACY full-length graph —
+// used when `offset + T > 8192` or as the safety fallback when the
+// bucket dispatcher is disabled via `MLX_MTP_BUCKETED_VERIFY=0`.
+static constexpr int kLegacyBucketIdx = kNumVerifyBuckets;
+static constexpr int kTotalBucketSlots = kNumVerifyBuckets + 1;
+
+// 2D dispatcher table: [bucket_slot][with_tape]. Lazily populated.
+// Each entry wraps `mlx::core::compile(...)` over a lambda that captures
+// its `bucket_kv_len` so each lambda has unique closure identity, forcing
+// MLX's compile cache to allocate a per-bucket trace.
+static std::array<std::array<BatchedVerifyFn, 2>, kTotalBucketSlots>
+    g_verify_compiled_by_bucket{};
+
+// W6.29 — bucket dispatcher opt-out. Default ON; set
+// `MLX_MTP_BUCKETED_VERIFY=0` to force the legacy single-trace path
+// (kLegacyBucketIdx). Used as a safety hatch only; the bucket path is
+// strictly parity-safe (the tail mask is identical math).
+static bool bucketed_verify_disabled() {
+  static const bool disabled = []() {
+    if (const char* v = std::getenv("MLX_MTP_BUCKETED_VERIFY")) {
+      return v[0] == '0';
+    }
+    return false;
+  }();
+  return disabled;
 }
 
-static BatchedVerifyFn& compiled_verify_batched_tape() {
-  static BatchedVerifyFn fn = mlx::core::compile(qwen35_verify_batched_decode_fn<true>);
-  return fn;
+// Bucket selection: smallest bucket >= `needed`. Returns kLegacyBucketIdx
+// when `needed` exceeds the largest bucket (or when bucketing is disabled).
+//
+// `needed` is `g_offset_int + T` — the maximum key column SDPA must read.
+// Asserting `bucket_size_for(needed) >= needed` is a hard correctness
+// invariant.
+static int bucket_index_for(int needed) {
+  if (bucketed_verify_disabled()) return kLegacyBucketIdx;
+  for (int i = 0; i < kNumVerifyBuckets; i++) {
+    if (kVerifyBuckets[i] >= needed) return i;
+  }
+  return kLegacyBucketIdx;
+}
+
+static int bucket_size_for_idx(int idx) {
+  return idx == kLegacyBucketIdx ? 0 : kVerifyBuckets[idx];
+}
+
+// Build (and cache) the compiled function for a given (bucket, with_tape).
+// The lambda capture of `bucket_size` (an `int`) gives each closure
+// unique identity — MLX's compile cache then allocates a per-bucket trace.
+static BatchedVerifyFn& get_or_compile_verify_bucket(int bucket_idx, bool with_tape) {
+  auto& slot = g_verify_compiled_by_bucket[bucket_idx][with_tape ? 1 : 0];
+  if (!slot) {
+    int bucket_size = bucket_size_for_idx(bucket_idx);
+    if (with_tape) {
+      slot = mlx::core::compile([bucket_size](const std::vector<array>& inputs) {
+        return qwen35_verify_batched_decode_fn_bucketed<true>(inputs, bucket_size);
+      });
+    } else {
+      slot = mlx::core::compile([bucket_size](const std::vector<array>& inputs) {
+        return qwen35_verify_batched_decode_fn_bucketed<false>(inputs, bucket_size);
+      });
+    }
+  }
+  return slot;
 }
 
 }  // namespace
@@ -839,8 +936,11 @@ void mlx_qwen35_forward_batched_verify(
     }
 
     bool with_tape = g_tape_recording_armed;
-    auto& fn = with_tape ? compiled_verify_batched_tape()
-                         : compiled_verify_batched_notape();
+    // W6.29 — pick the smallest bucket >= offset + T. The legacy
+    // full-length graph is returned when offset + T exceeds the largest
+    // bucket (or when the dispatcher is disabled via env var).
+    int bucket_idx = bucket_index_for(g_offset_int + T);
+    auto& fn = get_or_compile_verify_bucket(bucket_idx, with_tape);
     auto outputs = fn(inputs);
 
     // outputs[0]: logits  [1, T, vocab]
@@ -1039,6 +1139,24 @@ void mlx_qwen35_prewarm_verify_compiled() {
   };
 
   try {
+    // W6.29 — Prewarm strategy: trace ONLY the bucket the first verify
+    // cycle will hit. With 6 buckets + legacy slot × 5 depths × 2 tape
+    // variants = 70 possible traces, eagerly prewarming all of them at
+    // model load would cost ~75s (~1s per dense forward at depth 5).
+    // Lazy-tracing other buckets shifts that cost to first-use of each
+    // (bucket, depth, tape) combo — typically <0.5s per shape because
+    // the underlying weight load + kernel dispatch is already warm by
+    // the time the larger buckets are hit.
+    //
+    // The "first verify cycle bucket" is the one that fits
+    // `g_offset_int + max_depth + 1` — i.e. the post-prefill offset plus
+    // the maximum verify window. Calling `mlx_qwen35_forward_batched_verify`
+    // with `g_offset_int = saved_offset_int` (real prefill offset)
+    // routes through `bucket_index_for(...)` exactly like a real cycle
+    // would, so the trace MLX caches IS the trace the first real cycle
+    // hits. Subsequent prompts at different offsets that don't fit this
+    // bucket re-trace on first use (one-time cost amortised over the
+    // turn).
     for (int d = 1; d <= 5; d++) run_one(d, /*with_tape=*/false);
     for (int d = 1; d <= 5; d++) run_one(d, /*with_tape=*/true);
   } catch (const std::exception& e) {
