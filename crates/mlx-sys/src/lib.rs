@@ -1367,6 +1367,26 @@ unsafe extern "C-unwind" {
     // GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17)
     pub fn mlx_gpu_architecture_gen() -> i32;
 
+    // W6.30 — MTPLX multi3 qmv4 kernel port (small-M=3 quantized GEMV).
+    // See `mlx_qmv_multi3.h`. Returns nullptr on error.
+    pub fn mlx_multi3_qmv4_matmul(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+    ) -> *mut mlx_array;
+
+    // W6.30 — stock `mlx::core::quantized_matmul` baseline (affine, 4-bit).
+    // Used by the microbench harness. Returns nullptr on error.
+    pub fn mlx_stock_qmv4_matmul(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+    ) -> *mut mlx_array;
+
     // Fused GDN gating: beta = sigmoid(b), g = -exp(a_log) * softplus(a + dt_bias)
     pub fn mlx_fused_gdn_gating(
         b: *mut mlx_array,

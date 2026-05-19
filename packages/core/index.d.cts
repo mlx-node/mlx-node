@@ -3587,6 +3587,33 @@ export interface ModelConfig {
   eosTokenId: number;
 }
 
+/**
+ * Run the multi3 qmv4 microbench on the given shape.
+ *
+ * Arguments:
+ *   - `k`, `n`: matmul dimensions. Must satisfy `K % 512 == 0`, `N % 8 == 0`
+ *     (per the kernel's eligibility envelope).
+ *   - `group_size`: one of {32, 64, 128}.
+ *   - `dtype`: bf16 or fp16; scales/biases are quantized to match.
+ *   - `warmup`: number of untimed dispatches before measurement starts.
+ *     Recommended ≥ 5 so command-buffer setup latency does not contaminate
+ *     the timed window. Defaults to 5.
+ *   - `iters`: number of timed dispatches. Median is reported. Defaults to 20.
+ *
+ * The harness synchronously evaluates each result via `MxArray::eval()` so
+ * the wall-clock interval covers the full GPU dispatch (including
+ * command-buffer flush) rather than just the lazy graph build. This matches
+ * what production verify code observes.
+ */
+export declare function multi3Qmv4Microbench(
+  k: number,
+  n: number,
+  groupSize: number,
+  dtype: DType,
+  warmup?: number | undefined | null,
+  iters?: number | undefined | null,
+): QmvMulti3MicrobenchResult;
+
 /** Result from document orientation classification. */
 export interface OrientationResult {
   /** Detected rotation angle (0, 90, 180, or 270 degrees) */
@@ -3826,6 +3853,24 @@ export interface QianfanOcrConfig {
   useThumbnail: boolean;
   maxDynamicPatch: number;
   minDynamicPatch: number;
+}
+
+/** Microbench result for a single (K, N, group_size, dtype) shape. */
+export interface QmvMulti3MicrobenchResult {
+  /** Median stock `quantized_matmul` wall-clock per call, in nanoseconds. */
+  stockNs: number;
+  /** Median multi3 qmv4 kernel wall-clock per call, in nanoseconds. */
+  kernelNs: number;
+  /** `stock_ns / kernel_ns`. Values > 1 mean the kernel is faster than stock. */
+  ratio: number;
+  /**
+   * Max absolute difference (element-wise, after f32 up-cast) between stock
+   * and kernel outputs on the same inputs. Sampled once per call. The
+   * kernel reorders per-group accumulation and bf16/fp16 round to limited
+   * mantissa, so non-zero values are expected; the gate is `<= 5e-2`
+   * (matches `parity_tests::PARITY_TOL_BF16`).
+   */
+  maxAbsDiff: number;
 }
 
 /**
