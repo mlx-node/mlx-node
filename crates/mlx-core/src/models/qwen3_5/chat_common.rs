@@ -1486,6 +1486,7 @@ pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, EX, B, S, RR>(
     token_history: &[u32],
     params: &ChatParams,
     rng: &mut impl rand::Rng,
+    profiler: &mut crate::decode_profiler::DecodeProfiler,
     depth: usize,
 ) -> Result<(MtpCycleOutcome, MxArray)>
 where
@@ -1528,6 +1529,7 @@ where
     //
     // On any fused-path error we fall back to the per-step loop in
     // the same cycle (the eager Rust path is the safety net).
+    profiler.begin("mtp_draft_total");
     let temperature = params
         .sampling_config
         .and_then(|c| c.temperature)
@@ -1604,6 +1606,7 @@ where
             prev_emb = emb_2d.reshape(&[1, 1, hidden])?;
         }
     }
+    profiler.end();
 
     // Step 2: build verify input [last_committed_id, d_0, ..., d_{D-1}].
     let mut verify_ids: Vec<i32> = Vec::with_capacity(depth + 1);
@@ -1617,14 +1620,22 @@ where
     // recurrent state matches the committed token stream. On full
     // accept the snapshot is discarded — verify already left the
     // linear state correctly advanced.
+    profiler.begin("mtp_tape_snapshot");
     (ops.snapshot_main_linear)();
+    profiler.end();
     // W6.5 — verify returns BOTH logits and per-position hiddens.
     // Logits: `[1, depth+1, vocab]`; hiddens: `[1, depth+1, hidden]`.
     // We hold off on slicing the hidden until after the accept loop
     // computes K (= number of accepted drafts) so we can pick
     // `verify_hiddens[:, K, :]` — the correct prediction context for
     // the next cycle's first MTP draft.
-    let (verify_logits, verify_hiddens) = (ops.verify_step)(&verify_in, embedding_weight, depth)?;
+    // Phase 1 instrumentation: the gap between `mtp_cycle` and this
+    // floor is the headroom available to algorithmic work.
+    let verify_only_t0 = std::time::Instant::now();
+    profiler.begin("mtp_verify_dispatch");
+    let verify_step_res = (ops.verify_step)(&verify_in, embedding_weight, depth);
+    profiler.end();
+    let (verify_logits, verify_hiddens) = verify_step_res?;
     // W6.9 — Async-eval over verify outputs. When
     // `MLX_MTP_VERIFY_ASYNC_EVAL=1`, we dispatch verify (logits +
     // hiddens) via `async_eval` instead of the synchronous `eval()`
@@ -1675,6 +1686,7 @@ where
         && params.frequency_penalty == 0.0;
     let use_sparse_accept = mtp_sparse_accept_enabled() && temp <= 1e-6 && penalties_no_op;
 
+    profiler.begin("mtp_verify_eval");
     if mtp_verify_async_eval() {
         tracing::debug!(
             target: "mlx_core::mtp::verify_async_eval",
@@ -1698,6 +1710,8 @@ where
         // unconditional.
         verify_logits.eval();
     }
+    profiler.end();
+    profiler.record_duration("mtp_verify_floor", verify_only_t0.elapsed());
     let vocab = verify_logits.shape_at(2)?;
 
     // Step 3: per-position accept/reject. Build extended history as
@@ -1718,6 +1732,7 @@ where
         // `.eval()` below is the SINGLE sync point for the accept
         // loop — vs the legacy D × per-position `p_target.eval()`
         // path that forced D full-vocab softmaxes through Metal.
+        profiler.begin("mtp_accept_argmax");
         let argmax_arr = verify_logits.argmax(-1, None)?;
         argmax_arr.eval();
 
@@ -1728,12 +1743,14 @@ where
         for i in 0..=depth {
             target_argmax.push(argmax_arr.item_at_int32(i)?);
         }
+        profiler.end();
 
         // Accept loop runs entirely on CPU buffers — no further GPU
         // syncs. The Leviathan-Chen accept-reject coin is unused at
         // T=0 (deterministic argmax decision); `rng` is intentionally
         // not advanced, matching `accept_with_residual`'s T=0
         // shortcut (zero RNG consumed).
+        profiler.begin("mtp_accept_loop");
         for i in 0..depth {
             let target_id = target_argmax[i];
             if target_id == draft_ids[i] {
@@ -1753,11 +1770,16 @@ where
             let bonus_id = target_argmax[depth] as u32;
             accepted_tokens.push(bonus_id);
         }
+        profiler.end();
     } else {
         // Legacy per-position path. Kept for T>0 (where residual
         // sampling needs the full target distribution) and for
         // penalty-active configurations (where `hist_extended`
         // mutates the per-position logits inside the loop).
+        // Note: this wrap includes the full-accept bonus-token sample
+        // (sample + eval), whereas the sparse-accept branch's bonus is
+        // a CPU buffer read inside the same phase name.
+        profiler.begin("mtp_accept_loop");
         for i in 0..depth {
             // verify_logits[0, i, :] → [vocab]
             let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
@@ -1799,6 +1821,7 @@ where
             let bonus_id = bonus.item_at_int32(0)? as u32;
             accepted_tokens.push(bonus_id);
         }
+        profiler.end();
     }
 
     // Step 5: rollback. `accepted_drafts` is the number of draft
@@ -1840,7 +1863,9 @@ where
         // accepted_tokens contains `K` accepted drafts + 1 residual.
         accepted_tokens.len() - 1
     };
+    profiler.begin("mtp_rollback");
     (ops.rollback)(accepted_drafts, depth);
+    profiler.end();
 
     // W6 Bug #4 fix — on rejection, restore the main path's GDN
     // linear caches (back to "after Step A": Step A processed `y_N`
@@ -1869,7 +1894,10 @@ where
         // accepted_tokens = [d_0, .., d_{K-1}, residual]; we replay
         // only the K accepted drafts (NOT the residual).
         replay_ids.extend_from_slice(&accepted_tokens[..accepted_drafts]);
-        (ops.restore_and_replay_main)(&replay_ids, embedding_weight)?;
+        profiler.begin("mtp_tape_replay");
+        let replay_res = (ops.restore_and_replay_main)(&replay_ids, embedding_weight);
+        profiler.end();
+        replay_res?;
     }
 
     let _ = rejection_residual; // documented above; only used for clarity
@@ -2343,6 +2371,7 @@ macro_rules! decode_loop_mtp {
                     &$hist,
                     &$p,
                     &mut $rng,
+                    &mut $profiler,
                     cycle_depth,
                 );
             $profiler.end();
@@ -2386,6 +2415,7 @@ macro_rules! decode_loop_mtp {
             // Emit each accepted token through the same stop /
             // streaming pipeline as the single-token loop.
             let mut hit_stop = false;
+            $profiler.begin("mtp_emit_loop");
             for tok_id in outcome.tokens.iter().copied() {
                 if $gen.len() >= ($max as usize) {
                     if $reason.is_empty() { $reason = String::from("length"); }
@@ -2430,6 +2460,7 @@ macro_rules! decode_loop_mtp {
                     break;
                 }
             }
+            $profiler.end();
 
             // Every-256-emitted-token cache clear (matches the
             // single-token loop's cadence in token-count units).
@@ -2667,6 +2698,7 @@ mod mtp_cycle_tests {
     use std::cell::RefCell;
 
     use crate::array::MxArray;
+    use crate::decode_profiler::DecodeProfiler;
     use crate::models::qwen3_5::chat_common::{MtpOps, extract_chat_params, run_mtp_cycle_inner};
     use crate::models::qwen3_5::model::ChatConfig;
 
@@ -2835,6 +2867,7 @@ mod mtp_cycle_tests {
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let mut profiler = DecodeProfiler::new("test", "test");
 
         let res = run_mtp_cycle_inner(
             &mut ops,
@@ -2845,6 +2878,7 @@ mod mtp_cycle_tests {
             &[],
             &params,
             &mut rng,
+            &mut profiler,
             depth,
         );
         let Some((outcome, _verify_hidden)) = skip_if_metal_unavailable("all_accept", res) else {
@@ -2905,6 +2939,7 @@ mod mtp_cycle_tests {
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xBADC0DE);
+        let mut profiler = DecodeProfiler::new("test", "test");
 
         let res = run_mtp_cycle_inner(
             &mut ops,
@@ -2915,6 +2950,7 @@ mod mtp_cycle_tests {
             &[],
             &params,
             &mut rng,
+            &mut profiler,
             depth,
         );
         let Some((outcome, _verify_hidden)) = skip_if_metal_unavailable("depth_one", res) else {
@@ -2968,6 +3004,7 @@ mod mtp_cycle_tests {
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xDEAD);
+        let mut profiler = DecodeProfiler::new("test", "test");
 
         let res = run_mtp_cycle_inner(
             &mut ops,
@@ -2978,6 +3015,7 @@ mod mtp_cycle_tests {
             &[],
             &params,
             &mut rng,
+            &mut profiler,
             depth,
         );
         let Some((outcome, _verify_hidden)) = skip_if_metal_unavailable("all_reject", res) else {
@@ -3049,6 +3087,7 @@ mod mtp_cycle_tests {
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xFEED);
+        let mut profiler = DecodeProfiler::new("test", "test");
 
         let res = run_mtp_cycle_inner(
             &mut ops,
@@ -3059,6 +3098,7 @@ mod mtp_cycle_tests {
             &[],
             &params,
             &mut rng,
+            &mut profiler,
             depth,
         );
         let Some((outcome, _verify_hidden)) = skip_if_metal_unavailable("partial_reject", res)
