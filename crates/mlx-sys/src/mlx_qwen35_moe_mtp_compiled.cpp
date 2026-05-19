@@ -155,6 +155,10 @@ struct DenseMLPQuantInfoMtp {
 static MoeConfigMtp g_mtp_config{};
 static std::vector<array> g_mtp_compiled_caches;  // 2 * n_mtp_layers (K,V)
 static int g_mtp_offset_int = 0;
+// W6.32 — start-of-cycle offset (= main offset captured by `begin_cycle`).
+// MoE twin of `g_mtp_chain_start_int` in the dense MTP file; see that file
+// for the rationale (mask out zero-K/V slots in `[0..chain_start)`).
+static int g_mtp_chain_start_int = 0;
 static bool g_mtp_compile_inited = false;
 
 // Per-MTP-layer quant info, populated at init.
@@ -497,12 +501,17 @@ void prepopulate_mtp_3d_transposes() {
 // Draft graph (traced once, reused across all D draft steps).
 //
 // Inputs:
-//   [0]                prev_hidden  [1, 1, hidden]  bf16
-//   [1]                prev_emb     [1, 1, hidden]  bf16
-//   [2]                offset_arr   [1]             int32
+//   [0]                prev_hidden     [1, 1, hidden]  bf16
+//   [1]                prev_emb        [1, 1, hidden]  bf16
+//   [2]                offset_arr      [1]             int32 (RoPE +
+//                                                     slice_update start)
+//   [3]                chain_start_arr [1]             int32 (lower
+//                                                     attn-mask bound;
+//                                                     see dense MTP file
+//                                                     for rationale)
 //   For each MTP layer j in [0, n_mtp_layers):
-//     [3 + j*2 + 0]    K cache      [1, Hkv, max_kv_len, head_dim]
-//     [3 + j*2 + 1]    V cache      [1, Hkv, max_kv_len, head_dim]
+//     [4 + j*2 + 0]    K cache         [1, Hkv, max_kv_len, head_dim]
+//     [4 + j*2 + 1]    V cache         [1, Hkv, max_kv_len, head_dim]
 //
 // Outputs:
 //   [0]                h_next       [1, 1, hidden]
@@ -513,9 +522,10 @@ void prepopulate_mtp_3d_transposes() {
 // =====================================================================
 static std::vector<array> moe_mtp_draft_decode_fn(const std::vector<array>& inputs) {
   const auto& cfg = g_mtp_config;
-  auto prev_hidden = inputs[0];
-  auto prev_emb    = inputs[1];
-  auto offset_arr  = inputs[2];
+  auto prev_hidden     = inputs[0];
+  auto prev_emb        = inputs[1];
+  auto offset_arr      = inputs[2];
+  auto chain_start_arr = inputs[3];
 
   auto h_norm = fast::rms_norm(prev_hidden,
                                get_weight("mtp.pre_fc_norm_hidden.weight"),
@@ -528,9 +538,12 @@ static std::vector<array> moe_mtp_draft_decode_fn(const std::vector<array>& inpu
   auto concat2d = reshape(concat3d, {1, cfg.hidden_size * 2});
   auto h2d = linear_proj(concat2d, "mtp.fc");
 
-  int max_kv_len = inputs[3].shape(2);
+  int max_kv_len = inputs[4].shape(2);
   auto positions = arange(0, max_kv_len, mlx::core::int32);
-  auto valid_mask = less_equal(positions, offset_arr);
+  // Mask: 0 (allow) iff `chain_start <= pos <= offset_arr`. See dense
+  // MTP file for the full rationale on the lower bound.
+  auto valid_mask = logical_and(greater_equal(positions, chain_start_arr),
+                                less_equal(positions, offset_arr));
   auto attn_mask = where(valid_mask,
                          array(0.0f, mlx::core::bfloat16),
                          array(-std::numeric_limits<float>::infinity(),
@@ -552,8 +565,8 @@ static std::vector<array> moe_mtp_draft_decode_fn(const std::vector<array>& inpu
     auto normed = fast::rms_norm(h2d, get_weight(lp + ".input_layernorm.weight"),
                                  cfg.rms_norm_eps);
 
-    const auto& kk = inputs[3 + j * 2];
-    const auto& kv = inputs[3 + j * 2 + 1];
+    const auto& kk = inputs[4 + j * 2];
+    const auto& kv = inputs[4 + j * 2 + 1];
     auto res = attn_pure_fn_arr_offset(normed, lp,
                                        kk, kv, attn_mask, offset_arr, cfg);
     h2d = h2d + res.output;
@@ -766,9 +779,11 @@ int32_t mlx_qwen35_moe_mtp_compiled_init_from_main(
       g_mtp_compiled_caches.push_back(std::move(vv));
     }
 
-    // Mirror the main MoE path's current offset (see dense MTP file for
-    // the full rationale on why this mirror is correct).
+    // Mirror the main MoE path's current offset. `g_mtp_chain_start_int`
+    // gets re-snapshotted by every `begin_cycle`; this seed is only for
+    // any debug introspection between init and the first cycle.
     g_mtp_offset_int = mlx_qwen35_moe_get_cache_offset();
+    g_mtp_chain_start_int = g_mtp_offset_int;
 
     detect_mtp_layer_quants(g_mtp_config);
     prepopulate_mtp_3d_transposes();
@@ -813,10 +828,11 @@ void mlx_qwen35_moe_mtp_draft_compiled(
     auto& prev_emb    = *reinterpret_cast<array*>(prev_emb_ptr);
 
     std::vector<array> inputs;
-    inputs.reserve(3 + g_mtp_config.n_mtp_layers * 2);
+    inputs.reserve(4 + g_mtp_config.n_mtp_layers * 2);
     inputs.push_back(prev_hidden);
     inputs.push_back(prev_emb);
     inputs.push_back(reshape(array(g_mtp_offset_int, mlx::core::int32), {1}));
+    inputs.push_back(reshape(array(g_mtp_chain_start_int, mlx::core::int32), {1}));
     for (const auto& c : g_mtp_compiled_caches) {
       inputs.push_back(c);
     }
@@ -1047,6 +1063,7 @@ void mlx_qwen35_moe_mtp_compiled_prewarm_verify() {
 void mlx_qwen35_moe_mtp_compiled_reset() {
   g_mtp_compiled_caches.clear();
   g_mtp_offset_int = 0;
+  g_mtp_chain_start_int = 0;
   g_mtp_compile_inited = false;
   g_mtp_config = MoeConfigMtp{};
   g_mtp_layer_quant.clear();
@@ -1087,6 +1104,9 @@ void mlx_qwen35_moe_mtp_compiled_begin_cycle(int main_offset) {
         mlx::core::bfloat16);
   }
   g_mtp_offset_int = main_offset;
+  // W6.32 — see dense MTP file for full rationale on the chain-start
+  // lower-bound in the attn_mask.
+  g_mtp_chain_start_int = main_offset;
 }
 
 // -----------------------------------------------------------------------------

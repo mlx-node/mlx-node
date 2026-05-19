@@ -155,6 +155,16 @@ static MTPCompileConfig g_mtp_config{};
 static std::vector<array> g_mtp_compiled_caches;  // 2 * n_mtp_layers (K,V interleaved)
 static int g_mtp_offset_int = 0;                  // mirror of main `g_offset_int`
                                                    // at the time of init.
+// W6.32 — start-of-cycle offset (= main offset captured by `begin_cycle`).
+// The MTP attn_mask must mask out positions `[0..g_mtp_chain_start_int)`
+// because the K/V at those slots is zero (the MTP cache is zero-initialised
+// per cycle). Without that floor the softmax weight on the real chain K/V
+// is diluted by `1 / chain_start` because every zero-K position contributes
+// `exp(0) = 1` while the real-K position contributes `exp(q·k)` — a
+// long-prefix decode (chain_start ~ 1024) reduces the chain's attention
+// contribution to ~13%. Matches MTPLX's empty-`KVCache()` semantics where
+// the chain is the only thing attended.
+static int g_mtp_chain_start_int = 0;
 static bool g_mtp_compile_inited = false;
 
 // =====================================================================
@@ -162,13 +172,26 @@ static bool g_mtp_compile_inited = false;
 //
 // Inputs (vector order matters — compile keys on shapes only, but the
 // closure captures positional indexes):
-//   [0]                prev_hidden  [1, 1, hidden]  bf16
-//   [1]                prev_emb     [1, 1, hidden]  bf16
-//   [2]                offset_arr   [1]             int32 (RoPE +
-//                                                  slice_update start)
+//   [0]                prev_hidden     [1, 1, hidden]  bf16
+//   [1]                prev_emb        [1, 1, hidden]  bf16
+//   [2]                offset_arr      [1]   int32 (RoPE + slice_update
+//                                                 start; advances by 1
+//                                                 per draft step).
+//   [3]                chain_start_arr [1]   int32 (start of this MTP
+//                                                 draft chain; constant
+//                                                 across all D steps of
+//                                                 one cycle, snapshotted
+//                                                 by `begin_cycle`). Used
+//                                                 to mask out the zero
+//                                                 K/V slots in
+//                                                 [0..chain_start) which
+//                                                 would otherwise dilute
+//                                                 the softmax weight on
+//                                                 the real chain K/V by
+//                                                 ~1/chain_start.
 //   For each MTP layer j in [0, n_mtp_layers):
-//     [3 + j*2 + 0]    K cache      [1, Hkv, max_kv_len, head_dim]
-//     [3 + j*2 + 1]    V cache      [1, Hkv, max_kv_len, head_dim]
+//     [4 + j*2 + 0]    K cache         [1, Hkv, max_kv_len, head_dim]
+//     [4 + j*2 + 1]    V cache         [1, Hkv, max_kv_len, head_dim]
 //
 // Outputs:
 //   [0]                h_next       [1, 1, hidden]  — for next draft
@@ -180,9 +203,10 @@ static bool g_mtp_compile_inited = false;
 // =====================================================================
 static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) {
   const auto& cfg = g_mtp_config;
-  auto prev_hidden = inputs[0];          // [1, 1, hidden]
-  auto prev_emb    = inputs[1];          // [1, 1, hidden]
-  auto offset_arr  = inputs[2];          // [1] int32
+  auto prev_hidden     = inputs[0];      // [1, 1, hidden]
+  auto prev_emb        = inputs[1];      // [1, 1, hidden]
+  auto offset_arr      = inputs[2];      // [1] int32
+  auto chain_start_arr = inputs[3];      // [1] int32
 
   // Mirror Qwen3_5MTPModule::forward (W2 dense Rust path):
   //   h_norm = pre_fc_norm_hidden(prev_hidden)
@@ -206,14 +230,22 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
 
   // Build the attention mask for the MTP layers. MTP draft steps run
   // ONE token per call, and the cache offset advances by 1 per draft
-  // step. The mask is the same shape as the main flat path:
-  //   [1, 1, 1, max_kv_len], additive bf16, -inf for positions > offset.
-  // Because `offset_arr` is an array input, the mask must be built
-  // from arange + compare (NOT from an int constant).
-  int max_kv_len = inputs[3].shape(2);  // first K-cache's max_kv_len
+  // step. The mask is `[1, 1, 1, max_kv_len]` additive bf16:
+  //   0 (allow)  iff `chain_start <= pos <= offset_arr`
+  //   -inf       elsewhere
+  // Why both bounds: the MTP K/V cache is zero-initialised by
+  // `begin_cycle`; only positions `[chain_start..offset_arr]` hold real
+  // K/V (written by THIS cycle's draft steps so far). The earlier
+  // implementation used only `pos <= offset_arr`, which admitted ALL
+  // zero K/V at `[0..chain_start)` and diluted the real chain's softmax
+  // weight (one real K vs `chain_start` zero K → ~1/chain_start weight
+  // on the real K for long-prefix decode). MTPLX gets this for free by
+  // using mlx-lm's `KVCache()` which starts empty (`self.keys = None`)
+  // — see `MTPLX/mtplx/mtp_patch.py:638` `make_mtp_cache`.
+  int max_kv_len = inputs[4].shape(2);  // first K-cache's max_kv_len
   auto positions = arange(0, max_kv_len, mlx::core::int32);
-  // offset_arr is [1] int32; broadcasting handles the comparison.
-  auto valid_mask = less_equal(positions, offset_arr);
+  auto valid_mask = logical_and(greater_equal(positions, chain_start_arr),
+                                less_equal(positions, offset_arr));
   auto attn_mask = where(valid_mask,
                          array(0.0f, mlx::core::bfloat16),
                          array(-std::numeric_limits<float>::infinity(),
@@ -235,8 +267,8 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
     auto normed = fast::rms_norm(h2d, get_weight(lp + ".input_layernorm.weight"),
                                  cfg.rms_norm_eps);
 
-    const auto& kk = inputs[3 + j * 2];
-    const auto& kv = inputs[3 + j * 2 + 1];
+    const auto& kk = inputs[4 + j * 2];
+    const auto& kv = inputs[4 + j * 2 + 1];
     auto res = attn_pure_fn_arr_offset(normed, lp,
                                        kk, kv, attn_mask, offset_arr, cfg);
     h2d = h2d + res.output;
@@ -409,8 +441,18 @@ static std::vector<array> mtp_draft_fused_decode_fn(
     auto concat2d = reshape(concat3d, {1, cfg.hidden_size * 2});
     auto h2d = linear_proj(concat2d, "mtp.fc");          // [1, hidden]
 
-    // Attention mask depends on step_offset; rebuild per step.
-    auto valid_mask = less_equal(positions_col, step_offset);
+    // Attention mask: 0 (allow) iff `offset_arr <= pos <= step_offset`
+    // (i.e. position is inside THIS cycle's chain), -inf elsewhere.
+    // `offset_arr` (the input parameter) is the chain start because the
+    // fused FFI is called exactly once per cycle with the current
+    // `g_mtp_offset_int`; each unrolled step then uses
+    // `step_offset = offset_arr + step`. Masking the [0..offset_arr)
+    // prefix is critical — the K/V at those slots is zero
+    // (begin_cycle zeroes the buffer), so admitting them would dilute
+    // the softmax weight on the real chain by ~1/offset_arr. See the
+    // per-step `mtp_draft_decode_fn` for the full rationale.
+    auto valid_mask = logical_and(greater_equal(positions_col, offset_arr),
+                                  less_equal(positions_col, step_offset));
     auto attn_mask = where(valid_mask,
                            array(0.0f, mlx::core::bfloat16),
                            array(-std::numeric_limits<float>::infinity(),
@@ -779,15 +821,14 @@ int32_t mlx_qwen35_mtp_compiled_init_from_main(
 
     // Mirror the main path's current offset. Draft steps will advance
     // `g_mtp_offset_int` independently — the main offset is untouched
-    // by drafting.
-    //
-    // Why this mirror is correct: MTP attention masks consistently treat
-    // draft-step positions as following the committed prefix. The MTP
-    // K/V caches are zero-initialised just above, so the attn_mask
-    // validates only positions [0..g_mtp_offset_int]; the zero-filled
-    // tail past g_mtp_offset_int is masked out and never read until a
-    // draft step writes into it.
+    // by drafting. `g_mtp_chain_start_int` snapshots this same offset
+    // at every `begin_cycle` and is the LOWER bound the draft attn_mask
+    // uses to exclude the zero K/V slots in `[0..chain_start)`. The
+    // seed here is only relevant if a caller ever drafted before
+    // calling begin_cycle — the Rust side does not, but the seed keeps
+    // the two counters consistent for any debug introspection.
     g_mtp_offset_int = mlx_qwen35_get_cache_offset();
+    g_mtp_chain_start_int = g_mtp_offset_int;
 
     // Drop any stale verify closures from a prior model load — the
     // per-depth closures capture nothing model-specific, but a fresh
@@ -851,10 +892,11 @@ void mlx_qwen35_mtp_draft_compiled(
     auto& prev_emb    = *reinterpret_cast<array*>(prev_emb_ptr);
 
     std::vector<array> inputs;
-    inputs.reserve(3 + g_mtp_config.n_mtp_layers * 2);
+    inputs.reserve(4 + g_mtp_config.n_mtp_layers * 2);
     inputs.push_back(prev_hidden);
     inputs.push_back(prev_emb);
     inputs.push_back(reshape(array(g_mtp_offset_int, mlx::core::int32), {1}));
+    inputs.push_back(reshape(array(g_mtp_chain_start_int, mlx::core::int32), {1}));
     for (const auto& c : g_mtp_compiled_caches) {
       inputs.push_back(c);
     }
@@ -1296,6 +1338,7 @@ void mlx_qwen35_mtp_compiled_prewarm_verify() {
 void mlx_qwen35_mtp_compiled_reset() {
   g_mtp_compiled_caches.clear();
   g_mtp_offset_int = 0;
+  g_mtp_chain_start_int = 0;
   g_mtp_compile_inited = false;
   g_mtp_config = MTPCompileConfig{};
   for (auto& slot : g_verify_compiled_by_depth) {
@@ -1365,6 +1408,11 @@ void mlx_qwen35_mtp_compiled_begin_cycle(int main_offset) {
         mlx::core::bfloat16);
   }
   g_mtp_offset_int = main_offset;
+  // W6.32 — snapshot the chain start so the draft attn_mask can exclude
+  // the zero-K/V slots `[0..main_offset)`. Stays constant for the entire
+  // cycle (every draft step within this cycle uses the same lower bound)
+  // and gets refreshed by the next `begin_cycle`.
+  g_mtp_chain_start_int = main_offset;
 }
 
 // -----------------------------------------------------------------------------
