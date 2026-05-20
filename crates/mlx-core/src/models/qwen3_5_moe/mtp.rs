@@ -37,7 +37,7 @@
 //! ```text
 //! h_norm = pre_fc_norm_hidden(prev_hidden)
 //! e_norm = pre_fc_norm_embedding(prev_emb)
-//! h = fc(concat([h_norm, e_norm], axis=-1))
+//! h = fc(concat([e_norm, h_norm], axis=-1))
 //! for layer in layers: h = layer(h, mask=None, cache=...)
 //! return norm(h)
 //! ```
@@ -205,9 +205,10 @@ impl Qwen3_5MoeMTPModule {
         let h_norm = self.pre_fc_norm_hidden.forward(prev_hidden)?;
         let e_norm = self.pre_fc_norm_embedding.forward(prev_emb)?;
         // Concat along the hidden axis (last dim) and project back to
-        // hidden via the bias-free fc. Matches MTPLX `fc(concat([h_norm,
-        // e_norm], axis=-1))`.
-        let concat = MxArray::concatenate(&h_norm, &e_norm, -1)?;
+        // hidden via the bias-free fc. Order is `[embedding, hidden]` —
+        // MTPLX `concat_order` default `"embedding_hidden"`; the bias-free
+        // `fc` columns are trained for that block layout.
+        let concat = MxArray::concatenate(&e_norm, &h_norm, -1)?;
         let mut h = self.fc.forward(&concat)?;
 
         match caches {

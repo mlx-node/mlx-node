@@ -534,7 +534,10 @@ static std::vector<array> moe_mtp_draft_decode_fn(const std::vector<array>& inpu
                                get_weight("mtp.pre_fc_norm_embedding.weight"),
                                cfg.rms_norm_eps);
 
-  auto concat3d = concatenate({h_norm, e_norm}, 2);
+  // Concat order `[embedding, hidden]` — MTPLX `concat_order` default
+  // `"embedding_hidden"`; the bias-free `mtp.fc` columns expect that
+  // block layout.
+  auto concat3d = concatenate({e_norm, h_norm}, 2);
   auto concat2d = reshape(concat3d, {1, cfg.hidden_size * 2});
   auto h2d = linear_proj(concat2d, "mtp.fc");
 
@@ -827,7 +830,7 @@ void mlx_qwen35_moe_mtp_draft_compiled(
     fprintf(stderr,
             "[MTP-TRACE] mlx_qwen35_moe_mtp_draft_compiled: ENTER (per-step) "
             "mtp_offset=%d (RoPE base) chain_start=%d "
-            "fc_concat_order=[hidden,embedding]\n",
+            "fc_concat_order=[embedding,hidden]\n",
             g_mtp_offset_int, g_mtp_chain_start_int);
   }
 

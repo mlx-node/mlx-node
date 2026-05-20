@@ -20,7 +20,7 @@
 //! ```text
 //! h_norm = pre_fc_norm_hidden(prev_hidden)
 //! e_norm = pre_fc_norm_embedding(prev_emb)
-//! h = fc(concat([h_norm, e_norm], axis=-1))
+//! h = fc(concat([e_norm, h_norm], axis=-1))
 //! for layer in layers: h = layer(h, mask=None, cache=...)
 //! return norm(h)
 //! ```
@@ -153,25 +153,25 @@ impl Qwen3_5MTPModule {
         let h_norm = self.pre_fc_norm_hidden.forward(prev_hidden)?;
         let e_norm = self.pre_fc_norm_embedding.forward(prev_emb)?;
         // Concat along the hidden axis (last dim) and project back to
-        // hidden via the bias-free fc. Matches MTPLX `fc(concat([h_norm,
-        // e_norm], axis=-1))`.
-        //
-        // The concat column order is the prime drafter-quality suspect
-        // (the bias-free `fc` silently mixes halves on a wrong order):
-        // log it once so a single `MLX_NODE_LOG=debug` run records the
-        // contract this build actually shipped.
+        // hidden via the bias-free fc. The order is `[embedding, hidden]`
+        // — MTPLX's `MTPContract.concat_order` default `"embedding_hidden"`
+        // (`MTPLX/mtplx/mtp_patch.py`). The bias-free `fc` weight columns
+        // `[0:hidden]` consume the embedding half and `[hidden:2*hidden]`
+        // the hidden half; a swapped order silently corrupts the
+        // projection. Logged once so a `MLX_NODE_LOG=debug` run records
+        // the contract this build shipped.
         {
             static CONCAT_ORDER_LOGGED: std::sync::Once = std::sync::Once::new();
             CONCAT_ORDER_LOGGED.call_once(|| {
                 tracing::debug!(
                     target: "mlx_core::mtp",
-                    concat_order = "[hidden, embedding]",
+                    concat_order = "[embedding, hidden]",
                     n_layers = self.layers.len(),
                     "MTP fc concat order (Rust eager forward)"
                 );
             });
         }
-        let concat = MxArray::concatenate(&h_norm, &e_norm, -1)?;
+        let concat = MxArray::concatenate(&e_norm, &h_norm, -1)?;
         let mut h = self.fc.forward(&concat)?;
 
         match caches {

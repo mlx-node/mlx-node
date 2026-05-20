@@ -211,7 +211,7 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
   // Mirror Qwen3_5MTPModule::forward (W2 dense Rust path):
   //   h_norm = pre_fc_norm_hidden(prev_hidden)
   //   e_norm = pre_fc_norm_embedding(prev_emb)
-  //   h      = fc(concat([h_norm, e_norm], axis=-1))
+  //   h      = fc(concat([e_norm, h_norm], axis=-1))
   //   for layer in mtp.layers: h = layer(h, mask=None, cache=...)
   //   return norm(h)
   auto h_norm = fast::rms_norm(prev_hidden,
@@ -221,8 +221,11 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
                                get_weight("mtp.pre_fc_norm_embedding.weight"),
                                cfg.rms_norm_eps);
 
-  // Concat along the hidden axis → [1, 1, 2*hidden]
-  auto concat3d = concatenate({h_norm, e_norm}, 2);
+  // Concat along the hidden axis → [1, 1, 2*hidden]. Order is
+  // `[embedding, hidden]` — MTPLX `concat_order` default
+  // `"embedding_hidden"`; the bias-free `mtp.fc` weight columns are
+  // trained for that block layout.
+  auto concat3d = concatenate({e_norm, h_norm}, 2);
   // mtp.fc projects 2*hidden → hidden. linear_proj operates on 2D
   // [B*T, in_features], so we squeeze the time dim to match.
   auto concat2d = reshape(concat3d, {1, cfg.hidden_size * 2});
@@ -437,7 +440,8 @@ static std::vector<array> mtp_draft_fused_decode_fn(
                                  get_weight("mtp.pre_fc_norm_embedding.weight"),
                                  cfg.rms_norm_eps);
 
-    auto concat3d = concatenate({h_norm, e_norm}, 2);
+    // Concat order `[embedding, hidden]` — see the per-step path above.
+    auto concat3d = concatenate({e_norm, h_norm}, 2);
     auto concat2d = reshape(concat3d, {1, cfg.hidden_size * 2});
     auto h2d = linear_proj(concat2d, "mtp.fc");          // [1, hidden]
 
@@ -891,7 +895,7 @@ void mlx_qwen35_mtp_draft_compiled(
     fprintf(stderr,
             "[MTP-TRACE] mlx_qwen35_mtp_draft_compiled: ENTER (per-step) "
             "mtp_offset=%d (RoPE base) chain_start=%d "
-            "fc_concat_order=[hidden,embedding]\n",
+            "fc_concat_order=[embedding,hidden]\n",
             g_mtp_offset_int, g_mtp_chain_start_int);
   }
 
@@ -1017,7 +1021,7 @@ void mlx_qwen35_mtp_draft_fused_compiled(
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
             "[MTP-TRACE] mlx_qwen35_mtp_draft_fused_compiled: ENTER depth=%d "
-            "mtp_offset=%d (RoPE base) fc_concat_order=[hidden,embedding]\n",
+            "mtp_offset=%d (RoPE base) fc_concat_order=[embedding,hidden]\n",
             depth, g_mtp_offset_int);
   }
 
