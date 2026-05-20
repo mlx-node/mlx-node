@@ -138,6 +138,23 @@ if (arTps > 0 && mtpTps > 0) {
   console.log('Could not compute speedup (missing performance metrics).');
 }
 
+console.log('\n--- MTP acceptance ---');
+const mtpPerf = mtp.performance;
+if (mtpPerf?.mtpCycles != null) {
+  const perPos = mtpPerf.mtpAcceptanceByPosition ?? [];
+  const perPosStr = perPos.map((p) => p.toFixed(3)).join(', ');
+  console.log(
+    `cycles=${mtpPerf.mtpCycles} ` +
+      `mean_accepted=${(mtpPerf.mtpMeanAcceptedTokens ?? 0).toFixed(2)}/cycle ` +
+      `per_position=[${perPosStr}]`,
+  );
+  console.log('Reference (MTPLX, stock Qwen3.6-27B native MTP heads, depth=3): per_position≈[1.00, 0.98, 0.94].');
+} else {
+  console.log(
+    'No MTP acceptance recorded — mtpCycles is missing. The MTP run may not have executed any speculative cycle.',
+  );
+}
+
 if (!parity) {
   process.exit(3);
 }

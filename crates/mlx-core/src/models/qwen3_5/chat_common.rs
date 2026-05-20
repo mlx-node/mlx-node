@@ -732,6 +732,12 @@ pub(crate) fn compute_performance_metrics(
         } else {
             0.0
         },
+        // MTP acceptance is filled in post-hoc by the MTP decode paths
+        // via `DecodeProfiler::fill_mtp_acceptance` — the profiler is in
+        // scope there but not here. Stays `None` on autoregressive runs.
+        mtp_mean_accepted_tokens: None,
+        mtp_acceptance_by_position: None,
+        mtp_cycles: None,
     })
 }
 
@@ -1879,6 +1885,17 @@ where
         // accepted_tokens contains `K` accepted drafts + 1 residual.
         accepted_tokens.len() - 1
     };
+    // W6.33 — per-cycle acceptance: feeds the profiler's acceptance
+    // summary (surfaced on `PerformanceMetrics` + the stderr report).
+    profiler.record_mtp_cycle(depth, accepted_drafts);
+    tracing::debug!(
+        target: "mlx_core::mtp",
+        depth,
+        accepted_drafts,
+        all_accepted,
+        committed = accepted_tokens.len(),
+        "MTP cycle accept result"
+    );
     profiler.begin("mtp_rollback");
     (ops.rollback)(accepted_drafts, depth);
     profiler.end();

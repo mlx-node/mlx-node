@@ -39,6 +39,16 @@ pub struct PerformanceMetrics {
     /// Decode throughput: (generated_tokens - 1) / decode_time.
     /// Excludes the first token (counted as prefill).
     pub decode_tokens_per_second: f64,
+    /// MTP speculative decode: mean accepted draft tokens per cycle
+    /// (range `[0, depth]`). `None` on plain autoregressive runs where
+    /// no MTP cycle executed.
+    pub mtp_mean_accepted_tokens: Option<f64>,
+    /// MTP speculative decode: per-draft-position acceptance rate
+    /// (index = draft position). `None` on plain autoregressive runs.
+    pub mtp_acceptance_by_position: Option<Vec<f64>>,
+    /// MTP speculative decode: number of draft+verify cycles executed.
+    /// `None` on plain autoregressive runs.
+    pub mtp_cycles: Option<u32>,
 }
 
 #[napi(object)]

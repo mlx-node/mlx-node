@@ -1898,7 +1898,11 @@ impl Qwen35MoeInner {
             first_token_instant,
             prefill_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         let mut result = finalize_chat_result(
             &tokenizer,
@@ -4106,7 +4110,11 @@ impl Qwen35MoeInner {
             first_token_instant,
             prefill_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         // Send final done chunk
         cb.call(
@@ -4702,7 +4710,11 @@ impl Qwen35MoeInner {
             first_token_instant,
             delta_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         let _final_sampled_token = y;
 
@@ -5568,7 +5580,11 @@ impl Qwen35MoeInner {
             first_token_instant,
             delta_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         cb.call(
             Ok(ChatStreamChunk {

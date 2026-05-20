@@ -3725,6 +3725,22 @@ export interface PerformanceMetrics {
    * Excludes the first token (counted as prefill).
    */
   decodeTokensPerSecond: number;
+  /**
+   * MTP speculative decode: mean accepted draft tokens per cycle
+   * (range `[0, depth]`). `None` on plain autoregressive runs where
+   * no MTP cycle executed.
+   */
+  mtpMeanAcceptedTokens?: number;
+  /**
+   * MTP speculative decode: per-draft-position acceptance rate
+   * (index = draft position). `None` on plain autoregressive runs.
+   */
+  mtpAcceptanceByPosition?: Array<number>;
+  /**
+   * MTP speculative decode: number of draft+verify cycles executed.
+   * `None` on plain autoregressive runs.
+   */
+  mtpCycles?: number;
 }
 
 export interface PhaseProfile {

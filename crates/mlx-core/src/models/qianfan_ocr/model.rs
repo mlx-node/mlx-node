@@ -709,6 +709,10 @@ impl QianfanOCRInner {
                     } else {
                         0.0
                     },
+                    // Qianfan-OCR has no MTP heads — acceptance stays None.
+                    mtp_mean_accepted_tokens: None,
+                    mtp_acceptance_by_position: None,
+                    mtp_cycles: None,
                 })
             } else {
                 None
@@ -1101,6 +1105,10 @@ impl QianfanOCRInner {
                     } else {
                         0.0
                     },
+                    // Qianfan-OCR has no MTP heads — acceptance stays None.
+                    mtp_mean_accepted_tokens: None,
+                    mtp_acceptance_by_position: None,
+                    mtp_cycles: None,
                 })
             } else {
                 None
@@ -1558,6 +1566,10 @@ impl QianfanOCRInner {
                     } else {
                         0.0
                     },
+                    // Qianfan-OCR has no MTP heads — acceptance stays None.
+                    mtp_mean_accepted_tokens: None,
+                    mtp_acceptance_by_position: None,
+                    mtp_cycles: None,
                 })
             } else {
                 None
@@ -2045,6 +2057,10 @@ impl QianfanOCRInner {
                     } else {
                         0.0
                     },
+                    // Qianfan-OCR has no MTP heads — acceptance stays None.
+                    mtp_mean_accepted_tokens: None,
+                    mtp_acceptance_by_position: None,
+                    mtp_cycles: None,
                 })
             } else {
                 None

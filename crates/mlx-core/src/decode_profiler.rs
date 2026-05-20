@@ -85,6 +85,18 @@ pub struct DecodeProfiler {
     first_token_marked: bool,
     memory_before: Option<MemorySnapshot>,
     memory_after: Option<MemorySnapshot>,
+    /// MTP speculative-decode acceptance counters (W6.33). Updated by
+    /// `record_mtp_cycle` once per draft+verify cycle. `mtp_cycles == 0`
+    /// means no MTP cycle ran (a plain autoregressive decode).
+    mtp_cycles: u64,
+    /// Sum of accepted draft tokens (K) across all cycles.
+    mtp_accepted_drafts_total: u64,
+    /// Sum of attempted draft depth (D) across all cycles.
+    mtp_depth_total: u64,
+    /// Per draft-position: how many cycles attempted that position.
+    mtp_attempt_by_position: Vec<u64>,
+    /// Per draft-position: how many cycles accepted that position.
+    mtp_accept_by_position: Vec<u64>,
 }
 
 struct PhaseStats {
@@ -119,6 +131,11 @@ impl DecodeProfiler {
             first_token_marked: false,
             memory_before: None,
             memory_after: None,
+            mtp_cycles: 0,
+            mtp_accepted_drafts_total: 0,
+            mtp_depth_total: 0,
+            mtp_attempt_by_position: Vec::new(),
+            mtp_accept_by_position: Vec::new(),
         }
     }
 
@@ -263,6 +280,66 @@ impl DecodeProfiler {
         self.num_tokens += 1;
     }
 
+    /// Record one MTP speculative draft+verify cycle: `depth` draft
+    /// tokens were attempted and `accepted_drafts` (K) of them were
+    /// accepted by verify. Acceptance is prefix-monotone — positions
+    /// `0..K` accepted, positions `K..depth` attempted-but-rejected.
+    ///
+    /// Unlike the timing methods, this is **not** gated on `enabled`:
+    /// it is pure CPU integer arithmetic (negligible cost) and the
+    /// resulting acceptance summary must reach `PerformanceMetrics`
+    /// whenever `reportPerformance` is set, independent of whether
+    /// `MLX_PROFILE_DECODE` enabled the timing profiler.
+    #[inline]
+    pub fn record_mtp_cycle(&mut self, depth: usize, accepted_drafts: usize) {
+        let k = accepted_drafts.min(depth);
+        self.mtp_cycles += 1;
+        self.mtp_accepted_drafts_total += k as u64;
+        self.mtp_depth_total += depth as u64;
+        if self.mtp_attempt_by_position.len() < depth {
+            self.mtp_attempt_by_position.resize(depth, 0);
+        }
+        if self.mtp_accept_by_position.len() < depth {
+            self.mtp_accept_by_position.resize(depth, 0);
+        }
+        for slot in self.mtp_attempt_by_position.iter_mut().take(depth) {
+            *slot += 1;
+        }
+        for slot in self.mtp_accept_by_position.iter_mut().take(k) {
+            *slot += 1;
+        }
+    }
+
+    /// MTP acceptance summary: `(mean_accepted_per_cycle,
+    /// per_position_rate, cycles)`. `None` when no MTP cycle ran.
+    pub fn mtp_acceptance_summary(&self) -> Option<(f64, Vec<f64>, u32)> {
+        if self.mtp_cycles == 0 {
+            return None;
+        }
+        let mean = self.mtp_accepted_drafts_total as f64 / self.mtp_cycles as f64;
+        let per_pos: Vec<f64> = self
+            .mtp_accept_by_position
+            .iter()
+            .zip(self.mtp_attempt_by_position.iter())
+            .map(|(&a, &t)| if t > 0 { a as f64 / t as f64 } else { 0.0 })
+            .collect();
+        Some((
+            mean,
+            per_pos,
+            self.mtp_cycles.min(u64::from(u32::MAX)) as u32,
+        ))
+    }
+
+    /// Copy the MTP acceptance summary into a `PerformanceMetrics`.
+    /// No-op when no MTP cycle ran (leaves the fields `None`).
+    pub fn fill_mtp_acceptance(&self, m: &mut crate::profiling::PerformanceMetrics) {
+        if let Some((mean, per_pos, cycles)) = self.mtp_acceptance_summary() {
+            m.mtp_mean_accepted_tokens = Some(mean);
+            m.mtp_acceptance_by_position = Some(per_pos);
+            m.mtp_cycles = Some(cycles);
+        }
+    }
+
     /// Print a summary and/or push to the global profiling store.
     ///
     /// - If env var is set → print to stderr (backward compat)
@@ -367,6 +444,19 @@ impl DecodeProfiler {
             cpu_total_us as f64 / n,
             cpu_tok_s
         ));
+
+        if let Some((mean, per_pos, cycles)) = self.mtp_acceptance_summary() {
+            let mean_depth = self.mtp_depth_total as f64 / self.mtp_cycles as f64;
+            let per_pos_str: Vec<String> = per_pos.iter().map(|p| format!("{:.3}", p)).collect();
+            lines.push(format!(
+                "  [PROFILE] MTP accept: cycles={} mean_accepted={:.2}/cycle \
+                 mean_depth={:.2} per_position=[{}]",
+                cycles,
+                mean,
+                mean_depth,
+                per_pos_str.join(", "),
+            ));
+        }
 
         let report = lines.join("\n");
         eprintln!("{}", report);
@@ -733,6 +823,63 @@ mod tests {
                 foo.total_ms,
             );
         });
+    }
+
+    #[test]
+    fn test_record_mtp_cycle() {
+        // record_mtp_cycle is ungated — works on a disabled profiler.
+        let mut profiler = DecodeProfiler::new("test_mtp", "qwen3_5");
+
+        // No cycles yet → no summary.
+        assert!(profiler.mtp_acceptance_summary().is_none());
+
+        // depth=3 cycles with K = 3, 1, 2 → mean accepted = 6/3 = 2.0.
+        profiler.record_mtp_cycle(3, 3);
+        profiler.record_mtp_cycle(3, 1);
+        profiler.record_mtp_cycle(3, 2);
+
+        let (mean, per_pos, cycles) = profiler
+            .mtp_acceptance_summary()
+            .expect("summary after 3 cycles");
+        assert_eq!(cycles, 3);
+        assert!((mean - 2.0).abs() < 1e-9, "mean accepted {mean} != 2.0");
+        // Pos 0 accepted in all 3 cycles (K>=1): 3/3. Pos 1 when K>=2
+        // (K=3,2): 2/3. Pos 2 when K>=3 (K=3 only): 1/3.
+        assert_eq!(per_pos.len(), 3);
+        assert!((per_pos[0] - 1.0).abs() < 1e-9);
+        assert!((per_pos[1] - 2.0 / 3.0).abs() < 1e-9);
+        assert!((per_pos[2] - 1.0 / 3.0).abs() < 1e-9);
+
+        // fill_mtp_acceptance copies the summary onto PerformanceMetrics.
+        let mut m = crate::profiling::PerformanceMetrics {
+            ttft_ms: 0.0,
+            prefill_tokens_per_second: 0.0,
+            decode_tokens_per_second: 0.0,
+            mtp_mean_accepted_tokens: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+        };
+        profiler.fill_mtp_acceptance(&mut m);
+        assert_eq!(m.mtp_cycles, Some(3));
+        assert!((m.mtp_mean_accepted_tokens.expect("mean") - 2.0).abs() < 1e-9);
+        assert_eq!(
+            m.mtp_acceptance_by_position
+                .as_ref()
+                .expect("per_pos")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_record_mtp_cycle_clamps_overaccept() {
+        let mut profiler = DecodeProfiler::new("test_mtp_clamp", "qwen3_5");
+        // accepted_drafts > depth is clamped to depth.
+        profiler.record_mtp_cycle(2, 5);
+        let (mean, per_pos, cycles) = profiler.mtp_acceptance_summary().expect("summary");
+        assert_eq!(cycles, 1);
+        assert!((mean - 2.0).abs() < 1e-9);
+        assert_eq!(per_pos, vec![1.0, 1.0]);
     }
 
     #[test]

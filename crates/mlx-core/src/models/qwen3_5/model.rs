@@ -2759,7 +2759,11 @@ impl Qwen35Inner {
             first_token_instant,
             prefill_tokens_len,
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         // `y` is the last sampled token from the decode loop. The
         // `decode_loop!` macro assigns to `y` each iteration and the final
@@ -5032,7 +5036,11 @@ impl Qwen35Inner {
             first_token_instant,
             delta_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         cb.call(
             Ok(ChatStreamChunk {
@@ -5819,7 +5827,11 @@ impl Qwen35Inner {
             first_token_instant,
             prefill_tokens.len(),
             generated_tokens.len(),
-        );
+        )
+        .map(|mut m| {
+            profiler.fill_mtp_acceptance(&mut m);
+            m
+        });
 
         // Send final done chunk
         cb.call(
