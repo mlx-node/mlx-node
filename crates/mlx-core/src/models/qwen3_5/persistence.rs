@@ -210,6 +210,45 @@ fn sanitize_weights(
         // Matches mlx-lm, mlx-vlm, and MoE persistence behavior.
     ];
 
+    // Probe whether MTP norm weights are in raw-HF form and need a +1.0
+    // shift. This is INDEPENDENT of `needs_norm_fix` above: `mlx convert`
+    // historically skipped the +1.0 shift for every `mtp.*` key, so a
+    // checkpoint converted before that fix carries already-shifted LM-body
+    // norms but raw (~0) MTP norms. `fast::rms_norm` is direct-convention,
+    // so a raw MTP norm evaluates (w-1)·x → garbage drafts → zero MTP
+    // acceptance. Probe a representative MTP norm's mean: raw ≈ 0.04,
+    // correct ≈ 1.04, so the 0.5 threshold has ~0.46 margin on each side.
+    // A probe failure conservatively defaults to "no shift" (no panic,
+    // no double-shift hazard).
+    let mtp_norms_need_shift = if has_mtp_weights {
+        // Probe by suffix, not exact key: this runs BEFORE the drain loop
+        // strips `model.` / `language_model.` prefixes, so a checkpoint
+        // with prefixed MTP keys (e.g. `model.mtp.layers.0...`) must still
+        // be matched. No non-MTP tensor ends with this suffix.
+        params
+            .iter()
+            .find(|(k, _)| k.ends_with("mtp.layers.0.input_layernorm.weight"))
+            .map(|(_, a)| a)
+            .and_then(|a| {
+                let f32a = a.astype(DType::Float32).ok()?;
+                let m = f32a.mean(None, None).ok()?;
+                m.eval();
+                m.item_at_float32(0).ok()
+            })
+            .map(|mean| {
+                let need = mean < 0.5;
+                info!(
+                    "Qwen3.5 sanitize_weights: MTP-norm probe mean={:.4} \
+                     (raw≈0.04 correct≈1.04) → mtp_norms_need_shift={}",
+                    mean, need,
+                );
+                need
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     for (name, array) in params.drain() {
         // Skip visual encoder weights (for VL models)
         if name.contains("model.visual") || name.contains("visual_encoder") {
@@ -226,8 +265,9 @@ fn sanitize_weights(
             .unwrap_or(&name)
             .to_string();
 
-        // MTP weights are stored in final form (MTPLX convention) — bypass the
-        // +1.0 norm shift and the lm_head/embed_tokens renames below.
+        // `mtp.*` keys bypass the lm_head/embed_tokens renames below and the
+        // LM-body `will_shift` path. MTP norms instead get a separate,
+        // independently probed +1.0 correction — see `mtp_norms_need_shift`.
         let is_mtp_weight = name.starts_with("mtp.");
 
         // Rename special keys (including quantization metadata .scales/.biases)
@@ -257,10 +297,19 @@ fn sanitize_weights(
             array
         };
 
-        // Apply norm +1.0 fix for unsanitized weights — but NOT to MTP weights,
-        // which are stored in final form (MTPLX convention).
+        // Apply norm +1.0 fix for unsanitized LM-body weights. MTP norms are
+        // excluded here (`!is_mtp_weight`) and corrected separately below.
         let is_norm_suffix = norm_suffixes.iter().any(|sfx| name.ends_with(sfx));
         let will_shift = needs_norm_fix && !is_mtp_weight && is_norm_suffix;
+        // MTP norm keys: the four shared norm suffixes plus the MTP-only
+        // `mtp.norm.weight` and the two pre-fc norms, none of which are
+        // covered by `norm_suffixes` / the `norm.weight`→`final_norm.weight`
+        // rename.
+        let is_mtp_norm = is_mtp_weight
+            && (name == "mtp.norm.weight"
+                || name.ends_with(".pre_fc_norm_hidden.weight")
+                || name.ends_with(".pre_fc_norm_embedding.weight")
+                || is_norm_suffix);
         // Capture pre-shift mean for the first layer's norms so the
         // log shows whether the source was already sanitized (mean
         // ≈ 1.0 → DOUBLE-shift hazard) vs unsanitized (mean ≈ 0.0,
@@ -289,6 +338,19 @@ fn sanitize_weights(
             } else {
                 array
             }
+        } else {
+            array
+        };
+        // Independent MTP-norm correction (see `mtp_norms_need_shift`).
+        // Mutually exclusive with `will_shift`, which requires `!is_mtp_weight`.
+        let array = if mtp_norms_need_shift && is_mtp_norm && array.ndim()? == 1 {
+            let one = MxArray::scalar_float(1.0)?.astype(array.dtype()?)?;
+            let shifted = array.add(&one)?;
+            info!(
+                "Qwen3.5 sanitize_weights: SHIFTING +1 to MTP norm '{}'",
+                name,
+            );
+            shifted
         } else {
             array
         };

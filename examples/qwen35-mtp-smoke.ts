@@ -3,8 +3,13 @@
  * MTP speculative-decode smoke benchmark.
  *
  * Runs the same prompt twice on a Qwen3.5 / Qwen3.5-MoE checkpoint that
- * carries MTP heads — once with the speculative loop ON, once OFF —
- * at T=0 so the outputs must match token-for-token (parity gate).
+ * carries MTP heads — once with the speculative loop ON, once OFF — at
+ * T=0. Speculative decoding is distributionally lossless, NOT bitwise
+ * identical to a separate single-token AR run: the batched verify
+ * forward and sequential AR decode reduce matmuls in a different order
+ * (~1e-2 per-logit difference), which flips rare argmax near-ties. vLLM,
+ * MTPLX and dflash-mlx all document this. So a late isolated divergence
+ * is expected; an EARLY one signals a real verify-path bug.
  * Reports per-run decode tok/s and the MTP speedup ratio.
  *
  * Plan W6 perf target: >= 1.6x at depth=3 on M3 Max bf16.
@@ -114,17 +119,38 @@ const mtpText = mtp.text;
 const parity = arText === mtpText;
 
 console.log('\n--- Parity (T=0) ---');
+// Speculative decoding is distributionally lossless but NOT bitwise
+// identical to a separate sequential AR run (batched verify matmul and
+// per-row GEMV reduce in a different order). A late isolated divergence
+// is a numeric near-tie; an EARLY one signals a real verify-path bug.
+// This text check is only a SECONDARY signal — the blocking correctness
+// gate is acceptance health below (a broken verifier collapses it).
+let divergenceOk = true;
 if (parity) {
   console.log(`OK: AR and MTP produced identical output (${arText.length} chars).`);
 } else {
-  console.log(`MISMATCH: AR and MTP outputs differ.`);
-  console.log(`AR  first 200 chars: ${JSON.stringify(arText.slice(0, 200))}`);
-  console.log(`MTP first 200 chars: ${JSON.stringify(mtpText.slice(0, 200))}`);
-
-  // Show first divergence offset
   let i = 0;
   while (i < Math.min(arText.length, mtpText.length) && arText[i] === mtpText[i]) i++;
-  console.log(`Diverged at character offset: ${i}`);
+  const minLen = Math.min(arText.length, mtpText.length);
+  const earlyBugThreshold = Math.max(64, Math.floor(minLen * 0.1));
+  const wStart = Math.max(0, i - 80);
+  const wEnd = i + 80;
+  console.log(`Outputs diverge at character offset ${i}/${minLen}.`);
+  console.log(`AR  window [${wStart}..${wEnd}]: ${JSON.stringify(arText.slice(wStart, wEnd))}`);
+  console.log(`MTP window [${wStart}..${wEnd}]: ${JSON.stringify(mtpText.slice(wStart, wEnd))}`);
+
+  if (i < earlyBugThreshold) {
+    divergenceOk = false;
+    console.log(
+      `FAIL: divergence at offset ${i} is within the first ${earlyBugThreshold} chars — ` +
+        `too early for a near-tie flip; indicates a real verify-path bug.`,
+    );
+  } else {
+    console.log(
+      `EXPECTED: a late isolated near-tie flip — consistent with lossless speculative ` +
+        `decoding (vLLM / MTPLX / dflash-mlx all document spec-vs-AR divergence).`,
+    );
+  }
 }
 
 console.log('\n--- Speedup ---');
@@ -139,22 +165,35 @@ if (arTps > 0 && mtpTps > 0) {
 }
 
 console.log('\n--- MTP acceptance ---');
+let acceptanceOk = true;
 const mtpPerf = mtp.performance;
 if (mtpPerf?.mtpCycles != null) {
   const perPos = mtpPerf.mtpAcceptanceByPosition ?? [];
   const perPosStr = perPos.map((p) => p.toFixed(3)).join(', ');
+  const meanAcc = mtpPerf.mtpMeanAcceptedTokens ?? 0;
+  console.log(`cycles=${mtpPerf.mtpCycles} mean_accepted=${meanAcc.toFixed(2)}/cycle ` + `per_position=[${perPosStr}]`);
   console.log(
-    `cycles=${mtpPerf.mtpCycles} ` +
-      `mean_accepted=${(mtpPerf.mtpMeanAcceptedTokens ?? 0).toFixed(2)}/cycle ` +
-      `per_position=[${perPosStr}]`,
+    'Reference (MTPLX, stock Qwen3.6-27B native MTP heads, T=0, depth=3): ' +
+      'per_position≈[0.73, 0.43, 0.17] cycle-history / [0.90, 0.78, 0.62] committed-history.',
   );
-  console.log('Reference (MTPLX, stock Qwen3.6-27B native MTP heads, depth=3): per_position≈[1.00, 0.98, 0.94].');
+  // BLOCKING correctness gate. A real verify-path bug (wrong logits,
+  // cache, or rollback state) corrupts the target argmax and collapses
+  // acceptance far below the native-head floor. Healthy native heads
+  // clear these bounds with wide margin; a broken verifier lands near
+  // zero. This is what the relaxed text-parity check delegates to.
+  const pos0 = perPos[0] ?? 0;
+  if (meanAcc < 0.5 || pos0 < 0.4) {
+    acceptanceOk = false;
+    console.log(
+      `FAIL: acceptance (mean=${meanAcc.toFixed(2)}, pos0=${pos0.toFixed(3)}) is below the ` +
+        `native-head floor — indicates a broken verify/draft path.`,
+    );
+  }
 } else {
-  console.log(
-    'No MTP acceptance recorded — mtpCycles is missing. The MTP run may not have executed any speculative cycle.',
-  );
+  acceptanceOk = false;
+  console.log('FAIL: no MTP acceptance recorded — mtpCycles missing; the MTP run executed no speculative cycle.');
 }
 
-if (!parity) {
+if (!divergenceOk || !acceptanceOk) {
   process.exit(3);
 }

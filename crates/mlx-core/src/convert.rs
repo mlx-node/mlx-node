@@ -2933,6 +2933,42 @@ fn sanitize_qwen35_moe(
         ".q_norm.weight",
         ".k_norm.weight",
     ];
+
+    // MTP-head norms are classified INDEPENDENTLY of the LM body. The
+    // `already_sanitized` probe above samples a non-MTP norm, but a
+    // checkpoint can mix conventions — e.g. an older convert revision
+    // shifted the body but skipped every `mtp.*` key, leaving raw MTP
+    // norms behind a shifted body. Probe an MTP norm directly and shift
+    // only the seven MTP norm tensors (`mtp.norm` + the two pre-fc norms
+    // match none of the suffixes above). Mean is the discriminator: a
+    // raw MTP norm sits near 0, a shifted one near 1.
+    let mtp_norm_suffixes = [
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+        ".pre_fc_norm_hidden.weight",
+        ".pre_fc_norm_embedding.weight",
+    ];
+    let is_mtp_norm = |k: &str| {
+        k.starts_with("mtp.")
+            && (k == "mtp.norm.weight" || mtp_norm_suffixes.iter().any(|s| k.ends_with(s)))
+    };
+    let mtp_norms_need_shift = match new_weights
+        .iter()
+        .find(|(k, _)| k.ends_with("mtp.layers.0.input_layernorm.weight"))
+    {
+        Some((_, v)) => {
+            let f32_v = v.astype(DType::Float32)?;
+            let m = f32_v.mean(None, None)?;
+            m.eval();
+            let mean = m.item_at_float32(0).unwrap_or(1.0);
+            let need = mean < 0.5;
+            info!("  MTP-norm probe: mean={mean:.4} (raw≈0 shifted≈1) → shift={need}");
+            need
+        }
+        None => false,
+    };
     let keys: Vec<String> = if already_sanitized {
         Vec::new() // skip all sanitization transforms
     } else {
@@ -2975,13 +3011,32 @@ fn sanitize_qwen35_moe(
                     new_weights.insert(k, transposed);
                 }
             }
-        } else if norm_suffixes.iter().any(|sfx| k.ends_with(sfx)) {
-            // MTP norms are stored in final form (MTPLX convention) — bypass
-            // the +1.0 shift here. Mirrors the W1 load-path bypass in
-            // `qwen3_5/persistence.rs::sanitize_weights` (`is_mtp_weight`).
-            if k.starts_with("mtp.") {
-                continue;
+        } else if !k.starts_with("mtp.") && norm_suffixes.iter().any(|sfx| k.ends_with(sfx)) {
+            // Raw-HF LM-body norm weights are stored unshifted (~0); MLX
+            // `fast::rms_norm` is direct-convention and expects weight+1.
+            // MTP-head norms are excluded here (the body suffixes also
+            // match `mtp.*` keys) and shifted separately below under the
+            // independent `mtp_norms_need_shift` probe.
+            let v = new_weights.get(&k).unwrap();
+            if v.ndim()? == 1 {
+                let shifted = v.add_scalar(1.0)?;
+                new_weights.insert(k, shifted);
             }
+        }
+    }
+
+    // MTP-head norm shift — independent of `already_sanitized` and the
+    // main loop's `keys` gate, so MTP norms are corrected even when the
+    // LM body is already sanitized. A previous revision skipped `mtp.*`
+    // entirely on the false assumption that MTP norms ship in final form;
+    // that left raw MTP norms behind and produced zero MTP acceptance.
+    if mtp_norms_need_shift {
+        let mtp_keys: Vec<String> = new_weights
+            .keys()
+            .filter(|k| is_mtp_norm(k.as_str()))
+            .cloned()
+            .collect();
+        for k in mtp_keys {
             let v = new_weights.get(&k).unwrap();
             if v.ndim()? == 1 {
                 let shifted = v.add_scalar(1.0)?;
