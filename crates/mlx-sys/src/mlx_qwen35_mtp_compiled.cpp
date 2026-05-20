@@ -1275,6 +1275,12 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden(
     }
     *out_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
     *out_hiddens = reinterpret_cast<mlx_array*>(new array(outputs[1]));
+    if (qwen35_common::mtp_trace_enabled()) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled_with_hidden: "
+              "EXIT OK depth=%d\n",
+              depth);
+    }
   } catch (const std::exception& e) {
     fprintf(stderr,
             "[MLX] Exception in mlx_qwen35_mtp_verify_compiled_with_hidden: %s\n",

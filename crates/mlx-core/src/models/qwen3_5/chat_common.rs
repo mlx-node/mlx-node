@@ -1642,7 +1642,9 @@ where
         }
     }
     profiler.end();
-    tracing::debug!(
+    // `trace!` not `debug!` — the full `draft_ids` vector is per-token
+    // detail; one record per cycle would flood a long decode at debug.
+    tracing::trace!(
         target: "mlx_core::mtp",
         depth,
         used_fused,
@@ -1655,7 +1657,9 @@ where
     verify_ids.push(last_committed_id as i32);
     verify_ids.extend(draft_ids.iter().copied());
     let verify_in = A::from_int32(&verify_ids, &[1, (depth + 1) as i64])?;
-    tracing::debug!(
+    // `trace!` not `debug!` — the full `verify_ids` vector is per-token
+    // detail; keep debug to compact once-per-cycle summaries.
+    tracing::trace!(
         target: "mlx_core::mtp",
         depth,
         last_committed_id,
