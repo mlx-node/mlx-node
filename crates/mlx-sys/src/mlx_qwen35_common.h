@@ -14,7 +14,9 @@
 #include "mlx_paged_ops.h"
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -24,6 +26,34 @@
 #include <unordered_set>
 
 namespace qwen35_common {
+
+// =====================================================================
+// MTP control-flow tracing (W6.34)
+// =====================================================================
+//
+// Gated by `MLX_MTP_TRACE`: set to `1` / `true` / `on` (case-insensitive,
+// surrounding whitespace ignored) to emit C++-side ENTER/EXIT traces for
+// the MTP draft / verify entrypoints. Default OFF so production decode is
+// not flooded. Truthy parsing mirrors the Rust `MLX_MTP_*` readers in
+// `crates/mlx-core/src/models/qwen3_5/chat_common.rs` and the C++
+// `bucketed_verify_disabled()` reader so the convention is uniform.
+inline bool mtp_trace_enabled() {
+  static const bool enabled = []() {
+    const char* raw = std::getenv("MLX_MTP_TRACE");
+    if (!raw) return false;
+    std::string v(raw);
+    size_t s = 0;
+    while (s < v.size() && std::isspace(static_cast<unsigned char>(v[s]))) s++;
+    size_t e = v.size();
+    while (e > s && std::isspace(static_cast<unsigned char>(v[e - 1]))) e--;
+    std::string trimmed = v.substr(s, e - s);
+    for (char& c : trimmed) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return trimmed == "1" || trimmed == "true" || trimmed == "on";
+  }();
+  return enabled;
+}
 
 // =====================================================================
 // Global weight storage (shared between dense and MoE)

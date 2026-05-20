@@ -155,6 +155,22 @@ impl Qwen3_5MTPModule {
         // Concat along the hidden axis (last dim) and project back to
         // hidden via the bias-free fc. Matches MTPLX `fc(concat([h_norm,
         // e_norm], axis=-1))`.
+        //
+        // The concat column order is the prime drafter-quality suspect
+        // (the bias-free `fc` silently mixes halves on a wrong order):
+        // log it once so a single `MLX_NODE_LOG=debug` run records the
+        // contract this build actually shipped.
+        {
+            static CONCAT_ORDER_LOGGED: std::sync::Once = std::sync::Once::new();
+            CONCAT_ORDER_LOGGED.call_once(|| {
+                tracing::debug!(
+                    target: "mlx_core::mtp",
+                    concat_order = "[hidden, embedding]",
+                    n_layers = self.layers.len(),
+                    "MTP fc concat order (Rust eager forward)"
+                );
+            });
+        }
         let concat = MxArray::concatenate(&h_norm, &e_norm, -1)?;
         let mut h = self.fc.forward(&concat)?;
 

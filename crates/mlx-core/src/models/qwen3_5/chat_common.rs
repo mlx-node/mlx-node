@@ -1629,12 +1629,26 @@ where
         }
     }
     profiler.end();
+    tracing::debug!(
+        target: "mlx_core::mtp",
+        depth,
+        used_fused,
+        draft_ids = ?draft_ids,
+        "MTP draft phase complete"
+    );
 
     // Step 2: build verify input [last_committed_id, d_0, ..., d_{D-1}].
     let mut verify_ids: Vec<i32> = Vec::with_capacity(depth + 1);
     verify_ids.push(last_committed_id as i32);
     verify_ids.extend(draft_ids.iter().copied());
     let verify_in = A::from_int32(&verify_ids, &[1, (depth + 1) as i64])?;
+    tracing::debug!(
+        target: "mlx_core::mtp",
+        depth,
+        last_committed_id,
+        verify_ids = ?verify_ids,
+        "MTP verify input built"
+    );
     // W6 Bug #4 — snapshot the main path's GDN linear caches + offset
     // BEFORE verify runs its D+1 sequential forwards. Verify mutates
     // `g_compiled_caches` in place; on rejection we restore from this
@@ -1775,6 +1789,14 @@ where
         profiler.begin("mtp_accept_loop");
         for i in 0..depth {
             let target_id = target_argmax[i];
+            tracing::trace!(
+                target: "mlx_core::mtp::accept",
+                pos = i,
+                draft_id = draft_ids[i],
+                target_id,
+                accepted = target_id == draft_ids[i],
+                "MTP sparse accept position"
+            );
             if target_id == draft_ids[i] {
                 let id_u = target_id as u32;
                 accepted_tokens.push(id_u);
@@ -1818,6 +1840,14 @@ where
                 &sampling_cfg,
                 rng,
             )?;
+            tracing::trace!(
+                target: "mlx_core::mtp::accept",
+                pos = i,
+                draft_id = draft_ids[i],
+                out_tok,
+                accepted = accept,
+                "MTP legacy accept position"
+            );
             if accept {
                 let id_u = out_tok as u32;
                 accepted_tokens.push(id_u);
@@ -2382,6 +2412,11 @@ macro_rules! decode_loop_mtp {
             // honour. Without it the MTP draft RoPE positions diverge
             // and drafts produce gibberish.
             ($mtp.begin_cycle)();
+            tracing::debug!(
+                target: "mlx_core::mtp",
+                mtp_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() },
+                "MTP begin_cycle done; cache re-anchored"
+            );
             // W6.8 — per-cycle depth selection. When adaptive is OFF,
             // `pick_depth()` returns the seed depth unchanged
             // (`record_cycle` is gated below). When adaptive is ON, the

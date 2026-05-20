@@ -887,6 +887,13 @@ void mlx_qwen35_mtp_draft_compiled(
   if (!g_mtp_compile_inited) return;
   if (!prev_hidden_ptr || !prev_emb_ptr || !out_h_next || !out_logits) return;
 
+  if (qwen35_common::mtp_trace_enabled()) {
+    fprintf(stderr,
+            "[MTP-TRACE] mlx_qwen35_mtp_draft_compiled: ENTER (per-step) "
+            "mtp_offset=%d chain_start=%d\n",
+            g_mtp_offset_int, g_mtp_chain_start_int);
+  }
+
   try {
     auto& prev_hidden = *reinterpret_cast<array*>(prev_hidden_ptr);
     auto& prev_emb    = *reinterpret_cast<array*>(prev_emb_ptr);
@@ -908,6 +915,12 @@ void mlx_qwen35_mtp_draft_compiled(
     g_mtp_offset_int++;
     for (int j = 0; j < g_mtp_config.n_mtp_layers * 2; j++) {
       g_mtp_compiled_caches[j] = outputs[2 + j];
+    }
+    if (qwen35_common::mtp_trace_enabled()) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_mtp_draft_compiled: EXIT OK "
+              "new_mtp_offset=%d\n",
+              g_mtp_offset_int);
     }
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] Exception in mlx_qwen35_mtp_draft_compiled: %s\n",
@@ -1000,6 +1013,13 @@ void mlx_qwen35_mtp_draft_fused_compiled(
     return;
   }
 
+  if (qwen35_common::mtp_trace_enabled()) {
+    fprintf(stderr,
+            "[MTP-TRACE] mlx_qwen35_mtp_draft_fused_compiled: ENTER depth=%d "
+            "mtp_offset=%d\n",
+            depth, g_mtp_offset_int);
+  }
+
   try {
     auto& prev_hidden = *reinterpret_cast<array*>(prev_hidden_ptr);
     auto& prev_emb    = *reinterpret_cast<array*>(prev_emb_ptr);
@@ -1029,6 +1049,12 @@ void mlx_qwen35_mtp_draft_fused_compiled(
     g_mtp_offset_int += depth;
     for (int j = 0; j < g_mtp_config.n_mtp_layers * 2; j++) {
       g_mtp_compiled_caches[j] = outputs[3 + j];
+    }
+    if (qwen35_common::mtp_trace_enabled()) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_mtp_draft_fused_compiled: EXIT OK "
+              "depth=%d new_mtp_offset=%d\n",
+              depth, g_mtp_offset_int);
     }
   } catch (const std::exception& e) {
     fprintf(stderr,
@@ -1088,6 +1114,12 @@ void mlx_qwen35_mtp_verify_compiled(
     return;
   }
 
+  if (qwen35_common::mtp_trace_enabled()) {
+    fprintf(stderr,
+            "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled: ENTER depth=%d\n",
+            depth);
+  }
+
   try {
     auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
     auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
@@ -1107,6 +1139,11 @@ void mlx_qwen35_mtp_verify_compiled(
     const auto& verify_fn = get_or_make_verify_fn(depth);
     auto outputs = verify_fn(input_ids, embedding_weight);
     *out_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
+    if (qwen35_common::mtp_trace_enabled()) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled: EXIT OK depth=%d\n",
+              depth);
+    }
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] Exception in mlx_qwen35_mtp_verify_compiled: %s\n",
             e.what());
@@ -1188,6 +1225,13 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden(
             depth, MAX_VERIFY_DEPTH);
     fflush(stderr);
     return;
+  }
+
+  if (qwen35_common::mtp_trace_enabled()) {
+    fprintf(stderr,
+            "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled_with_hidden: ENTER "
+            "depth=%d\n",
+            depth);
   }
 
   try {
