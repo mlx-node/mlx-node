@@ -1929,6 +1929,13 @@ where
     profiler.begin("mtp_rollback");
     (ops.rollback)(accepted_drafts, depth);
     profiler.end();
+    tracing::debug!(
+        target: "mlx_core::mtp",
+        accepted_drafts,
+        depth,
+        offset_delta = accepted_drafts as i64 - depth as i64,
+        "MTP rollback applied"
+    );
 
     // W6 Bug #4 fix — on rejection, restore the main path's GDN
     // linear caches (back to "after Step A": Step A processed `y_N`
@@ -1957,6 +1964,12 @@ where
         // accepted_tokens = [d_0, .., d_{K-1}, residual]; we replay
         // only the K accepted drafts (NOT the residual).
         replay_ids.extend_from_slice(&accepted_tokens[..accepted_drafts]);
+        tracing::debug!(
+            target: "mlx_core::mtp",
+            replay_token_count = replay_ids.len(),
+            last_committed_id,
+            "MTP tape replay (restore main caches + replay accepted prefix)"
+        );
         profiler.begin("mtp_tape_replay");
         let replay_res = (ops.restore_and_replay_main)(&replay_ids, embedding_weight);
         profiler.end();

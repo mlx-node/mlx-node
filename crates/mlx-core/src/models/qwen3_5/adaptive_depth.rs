@@ -341,12 +341,24 @@ impl AdaptiveDepthPolicy {
         self.cycles_in_state = self.cycles_in_state.saturating_add(1);
 
         // State transitions.
+        let prev_state = self.state_label();
         match self.state {
             AdaptiveState::Explore => self.maybe_explore_transition(),
             AdaptiveState::Full => self.maybe_full_transition(),
             AdaptiveState::NeighborProbe => self.maybe_neighbor_probe_transition(),
             AdaptiveState::Reduced => self.maybe_reduced_transition(rate),
             AdaptiveState::Probe => self.maybe_probe_transition(rate),
+        }
+        let new_state = self.state_label();
+        if prev_state != new_state {
+            tracing::debug!(
+                target: "mlx_core::mtp::adaptive",
+                from = prev_state,
+                to = new_state,
+                total_cycles = self.total_cycles,
+                next_depth = self.pick_depth(),
+                "MTP adaptive-depth state transition"
+            );
         }
     }
 

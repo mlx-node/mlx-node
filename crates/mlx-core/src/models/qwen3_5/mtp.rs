@@ -407,6 +407,22 @@ impl Qwen3_5MTPModule {
             }
         }
 
+        let fc_quant = if params.contains_key("mtp.fc.scales") {
+            "affine-quantized"
+        } else if params.contains_key("mtp.fc.weight") {
+            "dense"
+        } else {
+            "MISSING"
+        };
+        tracing::debug!(
+            target: "mlx_core::mtp",
+            is_quantized,
+            default_quant_mode = ?default_plq.mode,
+            fc_load = fc_quant,
+            n_layers = self.layers.len(),
+            "MTP apply_weights complete"
+        );
+
         Ok(())
     }
 }
