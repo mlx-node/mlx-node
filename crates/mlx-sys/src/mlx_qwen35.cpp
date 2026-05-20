@@ -543,10 +543,21 @@ static bool bucketed_verify_disabled() {
 // `needed` is `g_offset_int + T` — the maximum key column SDPA must read.
 // Asserting `bucket_size_for(needed) >= needed` is a hard correctness
 // invariant.
-static int bucket_index_for(int needed) {
+//
+// `max_kv_len` is the allocated KV-cache width. A bucket WIDER than the
+// cache must never be selected: the bucketed graph would build an SDPA
+// mask of `[1, 1, T, bucket]` while the cache key tensor is only
+// `max_kv_len` columns, and the two cannot broadcast (crash). When the
+// smallest fitting bucket exceeds `max_kv_len`, fall back to the legacy
+// full-length graph, whose mask is sized to the real `max_kv_len`
+// (see `qwen35_verify_batched_decode_fn_bucketed`, `bucket_kv_len == 0`).
+static int bucket_index_for(int needed, int max_kv_len) {
   if (bucketed_verify_disabled()) return kLegacyBucketIdx;
   for (int i = 0; i < kNumVerifyBuckets; i++) {
-    if (kVerifyBuckets[i] >= needed) return i;
+    if (kVerifyBuckets[i] >= needed) {
+      if (kVerifyBuckets[i] > max_kv_len) return kLegacyBucketIdx;
+      return i;
+    }
   }
   return kLegacyBucketIdx;
 }
@@ -975,8 +986,9 @@ void mlx_qwen35_forward_batched_verify(
     bool with_tape = g_tape_recording_armed;
     // W6.29 — pick the smallest bucket >= offset + T. The legacy
     // full-length graph is returned when offset + T exceeds the largest
-    // bucket (or when the dispatcher is disabled via env var).
-    int bucket_idx = bucket_index_for(g_offset_int + T);
+    // bucket, when the chosen bucket would exceed the allocated KV cache
+    // width, or when the dispatcher is disabled via env var.
+    int bucket_idx = bucket_index_for(g_offset_int + T, cfg.max_kv_len);
     auto& fn = get_or_compile_verify_bucket(bucket_idx, with_tape);
     auto outputs = fn(inputs);
 
@@ -1092,33 +1104,22 @@ void mlx_qwen35_prewarm_verify_compiled() {
     return;
   }
 
-  // Look up the embedding table (or LM head when untied). The batched
-  // verify FFI uses this via `take(embedding_weight, flat_ids, 0)` so
-  // the dtype/shape only needs to be a valid embedding table. Weights
-  // are registered under e.g. `"embedding.weight"` / `"lm_head.weight"`
-  // — match the production fetch via the `.weight` suffix.
-  array embedding_weight = zeros({}, mlx::core::bfloat16);
-  try {
-    if (cfg.tie_word_embeddings && has_weight("embedding.weight")) {
-      embedding_weight = get_weight("embedding.weight");
-    } else if (has_weight("lm_head.weight")) {
-      embedding_weight = get_weight("lm_head.weight");
-    } else if (has_weight("embedding.weight")) {
-      embedding_weight = get_weight("embedding.weight");
-    } else {
-      fprintf(stderr,
-              "[MLX] prewarm_verify_compiled: no embedding.weight/lm_head.weight "
-              "registered; skipping prewarm.\n");
-      fflush(stderr);
-      return;
-    }
-  } catch (const std::exception& e) {
-    fprintf(stderr,
-            "[MLX] prewarm_verify_compiled: failed to fetch embedding weight: "
-            "%s\n", e.what());
-    fflush(stderr);
-    return;
-  }
+  // Dummy embedding table for graph tracing. `mlx_qwen35_forward_batched_verify`
+  // does `take(embedding_weight, flat_ids, 0)` then `reshape(.., {1, T,
+  // hidden})`; the resulting `h_3d` — NOT `embedding_weight` itself — is
+  // the compiled graph's input, so the trace is keyed only on
+  // `[1, T, hidden]`, never on the embedding's shape. The prewarm feeds
+  // all-zero `dummy_ids`, so a single dense bf16 row suffices: `take` of
+  // index 0 yields `[T, hidden]` regardless of vocabulary size.
+  //
+  // We deliberately do NOT fetch the real `embedding.weight` from
+  // `g_weights`: on quantized-embedding checkpoints that entry is a
+  // PACKED `[vocab, hidden * bits / 32]` table, and `take` + `reshape`
+  // to dense `[1, T, hidden]` would fail (the reason this prewarm
+  // previously crashed on `qwen3.6-27b-nvfp4-mtp`). A dense dummy is
+  // correct for every checkpoint — the real verify path passes its own
+  // dense embedding via the FFI pointer argument.
+  array embedding_weight = zeros({1, cfg.hidden_size}, mlx::core::bfloat16);
 
   // Snapshot mutable state so post-prewarm the main path looks untouched.
   std::vector<array> saved_caches = g_compiled_caches;  // refcount bump per entry
