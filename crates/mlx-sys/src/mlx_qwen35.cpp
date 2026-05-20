@@ -937,8 +937,9 @@ void mlx_qwen35_forward_batched_verify(
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
             "[MTP-TRACE] mlx_qwen35_forward_batched_verify: ENTER depth=%d "
-            "T=%d offset=%d tape_armed=%d\n",
-            depth, T, g_offset_int, g_tape_recording_armed ? 1 : 0);
+            "T=%d (input_ids=[1,%d]) offset=%d (RoPE base; causal mask) "
+            "tape_armed=%d\n",
+            depth, T, T, g_offset_int, g_tape_recording_armed ? 1 : 0);
   }
 
   try {

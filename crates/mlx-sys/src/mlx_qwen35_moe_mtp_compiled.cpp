@@ -826,7 +826,8 @@ void mlx_qwen35_moe_mtp_draft_compiled(
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
             "[MTP-TRACE] mlx_qwen35_moe_mtp_draft_compiled: ENTER (per-step) "
-            "mtp_offset=%d chain_start=%d\n",
+            "mtp_offset=%d (RoPE base) chain_start=%d "
+            "fc_concat_order=[hidden,embedding]\n",
             g_mtp_offset_int, g_mtp_chain_start_int);
   }
 

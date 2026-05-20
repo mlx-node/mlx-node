@@ -1605,7 +1605,12 @@ where
     }
 
     if !used_fused {
-        for _ in 0..depth {
+        // `step_input_id` is the token whose hidden/embedding seed this
+        // draft step: `last_committed_id` for step 0, then each prior
+        // drafted id. Logged per step so a debug run can reconstruct
+        // the full draft chain.
+        let mut step_input_id = last_committed_id as i32;
+        for step in 0..depth {
             let (h_next, draft_logits) = (ops.draft_step)(&prev_hidden, &prev_emb)?;
             // draft_logits is [1, vocab]; squeeze to [vocab] for softmax.
             let logits_1d = draft_logits.squeeze(Some(&[0]))?;
@@ -1616,6 +1621,13 @@ where
             let tok = sampling::sample(&draft_logits, params.sampling_config)?;
             tok.eval();
             let tok_id = tok.item_at_int32(0)?;
+            tracing::trace!(
+                target: "mlx_core::mtp::draft",
+                step,
+                input_id = step_input_id,
+                drafted_id = tok_id,
+                "MTP per-step draft"
+            );
             draft_ids.push(tok_id);
             draft_probs.push(probs);
             // Update prev_hidden for next draft step.
@@ -1626,6 +1638,7 @@ where
             let emb_2d = embedding_weight.take(&id_arr, 0)?; // [1, hidden]
             let hidden = emb_2d.shape_at(1)?;
             prev_emb = emb_2d.reshape(&[1, 1, hidden])?;
+            step_input_id = tok_id;
         }
     }
     profiler.end();
@@ -1659,6 +1672,11 @@ where
     profiler.begin("mtp_tape_snapshot");
     (ops.snapshot_main_linear)();
     profiler.end();
+    tracing::trace!(
+        target: "mlx_core::mtp",
+        depth,
+        "MTP main-linear caches + offset snapshot taken (pre-verify)"
+    );
     // W6.5 — verify returns BOTH logits and per-position hiddens.
     // Logits: `[1, depth+1, vocab]`; hiddens: `[1, depth+1, hidden]`.
     // We hold off on slicing the hidden until after the accept loop
@@ -1672,6 +1690,12 @@ where
     let verify_step_res = (ops.verify_step)(&verify_in, embedding_weight, depth);
     profiler.end();
     let (verify_logits, verify_hiddens) = verify_step_res?;
+    tracing::debug!(
+        target: "mlx_core::mtp",
+        depth,
+        verify_tokens = depth + 1,
+        "MTP verify dispatched (batched target forward over depth+1 tokens)"
+    );
     // W6.9 — Async-eval over verify outputs. When
     // `MLX_MTP_VERIFY_ASYNC_EVAL=1`, we dispatch verify (logits +
     // hiddens) via `async_eval` instead of the synchronous `eval()`
@@ -1745,6 +1769,11 @@ where
         // build, which the combined-eval variant defeats. Kept
         // unconditional.
         verify_logits.eval();
+        tracing::debug!(
+            target: "mlx_core::mtp::verify_async_eval",
+            depth,
+            "verify_logits.eval() (synchronous; async-eval disabled)"
+        );
     }
     profiler.end();
     profiler.record_duration("mtp_verify_floor", verify_only_t0.elapsed());
@@ -1812,6 +1841,11 @@ where
             // Bonus token = argmax at position D. Same batched
             // array, no extra ops, no extra eval.
             let bonus_id = target_argmax[depth] as u32;
+            tracing::trace!(
+                target: "mlx_core::mtp::accept",
+                bonus_id,
+                "MTP bonus token (full accept, sparse path)"
+            );
             accepted_tokens.push(bonus_id);
         }
         profiler.end();
@@ -1871,6 +1905,11 @@ where
             let bonus = sampling::sample(&penalized, params.sampling_config)?;
             bonus.eval();
             let bonus_id = bonus.item_at_int32(0)? as u32;
+            tracing::trace!(
+                target: "mlx_core::mtp::accept",
+                bonus_id,
+                "MTP bonus token (full accept, legacy path)"
+            );
             accepted_tokens.push(bonus_id);
         }
         profiler.end();
@@ -2263,6 +2302,11 @@ macro_rules! decode_loop_mtp {
                 let (next_token, budget_forced) =
                     if $tracker.should_force_think_end() {
                         let forced_id = $tracker.forced_token_id() as i32;
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            forced_id,
+                            "MTP Step A: forcing think-end token (reasoning budget tripped)"
+                        );
                         ($crate::array::MxArray::from_int32(&[forced_id], &[1])?, true)
                     } else {
                         $profiler.begin("rep_penalty");
@@ -2402,6 +2446,10 @@ macro_rules! decode_loop_mtp {
                 // forced token to the next Step A. On the chained path
                 // this can't fire (do_step_a above forces Step A when
                 // think-end is queued) but keep the guard for clarity.
+                tracing::debug!(
+                    target: "mlx_core::mtp",
+                    "MTP cycle skipped: think-end queued, deferring to next Step A"
+                );
                 continue;
             }
 
@@ -2424,12 +2472,10 @@ macro_rules! decode_loop_mtp {
             // exactly the contract `begin_cycle` is documented to
             // honour. Without it the MTP draft RoPE positions diverge
             // and drafts produce gibberish.
+            // The `begin_cycle` closure emits its own
+            // `mlx_core::mtp` trace (old/new MTP offset) — it is the
+            // only site that knows the dense-vs-MoE offset getters.
             ($mtp.begin_cycle)();
-            tracing::debug!(
-                target: "mlx_core::mtp",
-                mtp_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() },
-                "MTP begin_cycle done; cache re-anchored"
-            );
             // W6.8 — per-cycle depth selection. When adaptive is OFF,
             // `pick_depth()` returns the seed depth unchanged
             // (`record_cycle` is gated below). When adaptive is ON, the
@@ -2562,6 +2608,13 @@ macro_rules! decode_loop_mtp {
                 }
             }
             $profiler.end();
+            tracing::debug!(
+                target: "mlx_core::mtp",
+                cycle_committed,
+                gen_len = $gen.len(),
+                hit_stop,
+                "MTP cycle emit loop done"
+            );
 
             // Every-256-emitted-token cache clear (matches the
             // single-token loop's cadence in token-count units).

@@ -1714,8 +1714,16 @@ impl Qwen35MoeInner {
                     // current offset before each draft cycle. See the
                     // dense site for the full rationale.
                     begin_cycle: || unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
                     },
                     // W6 MoE Bug #4 fix — snapshot the main MoE path's
                     // GDN linear caches + offset BEFORE the verify FFI
@@ -3853,8 +3861,16 @@ impl Qwen35MoeInner {
                     // current offset before each draft cycle. See the
                     // dense site for the full rationale.
                     begin_cycle: || unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
                     },
                     // W6 MoE Bug #4 fix — snapshot the main MoE path's
                     // GDN linear caches + offset BEFORE the verify FFI
@@ -4529,8 +4545,16 @@ impl Qwen35MoeInner {
                     // current offset before each draft cycle. See the
                     // dense site for the full rationale.
                     begin_cycle: || unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
                     },
                     // W6 MoE Bug #4 fix — snapshot the main MoE path's
                     // GDN linear caches + offset BEFORE the verify FFI
@@ -5327,8 +5351,16 @@ impl Qwen35MoeInner {
                     // current offset before each draft cycle. See the
                     // dense site for the full rationale.
                     begin_cycle: || unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
                     },
                     // W6 MoE Bug #4 fix — snapshot the main MoE path's
                     // GDN linear caches + offset BEFORE the verify FFI

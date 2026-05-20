@@ -890,7 +890,8 @@ void mlx_qwen35_mtp_draft_compiled(
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
             "[MTP-TRACE] mlx_qwen35_mtp_draft_compiled: ENTER (per-step) "
-            "mtp_offset=%d chain_start=%d\n",
+            "mtp_offset=%d (RoPE base) chain_start=%d "
+            "fc_concat_order=[hidden,embedding]\n",
             g_mtp_offset_int, g_mtp_chain_start_int);
   }
 
@@ -1016,7 +1017,7 @@ void mlx_qwen35_mtp_draft_fused_compiled(
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
             "[MTP-TRACE] mlx_qwen35_mtp_draft_fused_compiled: ENTER depth=%d "
-            "mtp_offset=%d\n",
+            "mtp_offset=%d (RoPE base) fc_concat_order=[hidden,embedding]\n",
             depth, g_mtp_offset_int);
   }
 
@@ -1024,6 +1025,13 @@ void mlx_qwen35_mtp_draft_fused_compiled(
     auto& prev_hidden = *reinterpret_cast<array*>(prev_hidden_ptr);
     auto& prev_emb    = *reinterpret_cast<array*>(prev_emb_ptr);
     auto& embedding_w = *reinterpret_cast<array*>(embedding_weight_ptr);
+
+    if (qwen35_common::mtp_trace_enabled()) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_mtp_draft_fused_compiled: prev_hidden "
+              "ndim=%d prev_emb ndim=%d\n",
+              prev_hidden.ndim(), prev_emb.ndim());
+    }
 
     std::vector<array> inputs;
     inputs.reserve(4 + g_mtp_config.n_mtp_layers * 2);

@@ -2519,8 +2519,16 @@ impl Qwen35Inner {
                     // main path but not to the MTP path), so MTP RoPE
                     // positions become wrong and drafts diverge.
                     begin_cycle: || unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
                         mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
                     },
                     // W6 Bug #4 fix — snapshot the main path's GDN
                     // linear caches + offset BEFORE the verify FFI runs
@@ -4745,8 +4753,16 @@ impl Qwen35Inner {
                     // main path but not to the MTP path), so MTP RoPE
                     // positions become wrong and drafts diverge.
                     begin_cycle: || unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
                         mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
                     },
                     // W6 Bug #4 fix — snapshot the main path's GDN
                     // linear caches + offset BEFORE the verify FFI runs
@@ -5534,8 +5550,16 @@ impl Qwen35Inner {
                     // main path but not to the MTP path), so MTP RoPE
                     // positions become wrong and drafts diverge.
                     begin_cycle: || unsafe {
+                        let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
                         mlx_sys::mlx_qwen35_mtp_compiled_begin_cycle(main_offset);
+                        tracing::debug!(
+                            target: "mlx_core::mtp",
+                            old_mtp_offset,
+                            main_offset,
+                            new_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset(),
+                            "MTP begin_cycle: cache re-anchored to main offset"
+                        );
                     },
                     // W6 Bug #4 fix — snapshot the main path's GDN
                     // linear caches + offset BEFORE the verify FFI runs
