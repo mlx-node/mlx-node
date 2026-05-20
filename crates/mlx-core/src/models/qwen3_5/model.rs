@@ -751,6 +751,21 @@ pub(crate) struct ChatDecodeInputs {
     pub embedding_weight_t: MxArray,
     pub generation_stream: Stream,
     pub params: super::chat_common::ChatParams,
+
+    // --- Phase C: prompt-prefix MTP prefill -----------------------------
+    /// Post-final-norm hidden state for every prefilled prompt token,
+    /// `[1, prefill_len, hidden]`. `Some` only when MTP is active for this
+    /// turn (`params.enable_mtp && has_mtp_weights`) and the prefill ran
+    /// the hidden-emitting `chunked_prefill_with_hidden`. Consumed once,
+    /// after `init_mtp_compiled_from_main`, to commit the prompt prefix
+    /// into the MTP committed-history cache via `prefill_mtp_commit`.
+    /// `None` for non-MTP turns and for the streaming/delta paths.
+    pub prompt_hidden: Option<MxArray>,
+    /// The exact prompt token ids whose hiddens `prompt_hidden` holds —
+    /// i.e. the `prefill_tokens` slice the hidden-emitting prefill
+    /// forwarded. `prompt_hidden.shape(1) == prompt_hidden_ids.len()`.
+    /// `Some` iff `prompt_hidden` is `Some`.
+    pub prompt_hidden_ids: Option<Vec<u32>>,
 }
 
 // ========== Qwen35Inner implementation ==========
@@ -1807,8 +1822,33 @@ impl Qwen35Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
+        // Phase C — prompt-prefix MTP prefill. When MTP is active for
+        // this turn the prefill runs the hidden-emitting
+        // `chunked_prefill_with_hidden` so the per-prompt-token hiddens
+        // can be committed into the MTP committed-history cache; this
+        // raises draft acceptance (especially for long prompts). The VLM
+        // / cached-prefix branches keep the cheaper logits-only prefill —
+        // they do not feed the dense MTP committed-history path.
+        //
+        // `MLX_MTP_NO_PROMPT_PREFILL=1` opts OUT — the prefill stays
+        // logits-only and the MTP committed-history starts empty (the
+        // pre-Phase-C-prompt-prefill behaviour). Kept as an A/B /
+        // escape-hatch toggle.
+        //
+        // Cache-reuse turns: when `cached_prefix_len > 0` the prefill
+        // only processes the uncached SUFFIX, so the captured hidden
+        // tensor would cover the suffix — not the full prompt. The
+        // prompt-prefill seed REQUIRES the full prompt's hiddens, so it
+        // is skipped on cache-reuse turns; committed-history still runs
+        // (it starts empty and builds from decode tokens — correct).
+        let want_prompt_hidden = p.enable_mtp
+            && self.has_mtp_weights()
+            && !chat_common::mtp_no_prompt_prefill()
+            && cached_prefix_len == 0;
+
         // === VLM or text prefill branching ===
         profiler.begin_prefill();
+        let mut prompt_hidden: Option<MxArray> = None;
         let (last_logits, seq_len, vlm_compiled_init_done) = if has_images && cached_prefix_len == 0
         {
             if let Some(vision_enc) = self.vision_encoder.clone() {
@@ -1849,16 +1889,31 @@ impl Qwen35Inner {
             }
         } else {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let logits = chunked_prefill(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                Some(&embedding_weight_t),
-                generation_stream,
-            )?;
+            let logits = if want_prompt_hidden {
+                let (logits, ph) = chunked_prefill_with_hidden(
+                    &prompt,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    Some(&embedding_weight_t),
+                    generation_stream,
+                )?;
+                prompt_hidden = Some(ph);
+                logits
+            } else {
+                chunked_prefill(
+                    &prompt,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    Some(&embedding_weight_t),
+                    generation_stream,
+                )?
+            };
 
             let seq_len = logits.shape_at(1)?;
             let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
@@ -1912,6 +1967,11 @@ impl Qwen35Inner {
             embedding_weight_t,
             generation_stream,
             params: p,
+            // Phase C — `prompt_hidden` is `Some` iff the hidden-emitting
+            // prefill ran; pair it with the exact `prefill_tokens` whose
+            // hiddens it holds.
+            prompt_hidden_ids: prompt_hidden.as_ref().map(|_| prefill_tokens.clone()),
+            prompt_hidden,
         })
     }
 
@@ -2120,6 +2180,11 @@ impl Qwen35Inner {
             embedding_weight_t,
             generation_stream,
             params: p,
+            // Delta path: the prefill runs on top of the live KV caches,
+            // so there is no fresh full-prompt hidden to commit into the
+            // MTP committed-history cache.
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
         })
     }
 
@@ -2274,6 +2339,8 @@ impl Qwen35Inner {
             embedding_weight_t,
             generation_stream,
             params: p,
+            prompt_hidden,
+            prompt_hidden_ids,
         } = inputs;
 
         let mut generated_tokens: Vec<u32> = Vec::new();
@@ -2437,6 +2504,47 @@ impl Qwen35Inner {
                 cond_enable_mtp, cond_has_mtp_weights, cond_init_ok, mtp_active
             );
             if mtp_active {
+                // Reset MTP compiled state on EVERY exit from this
+                // decode path — including the `?`-propagated abort out
+                // of `decode_loop_mtp!` (e.g. a failed
+                // `mlx_qwen35_mtp_compiled_commit`). The explicit
+                // post-macro `mlx_qwen35_mtp_compiled_reset()` only runs
+                // on the normal return; the guard's `Drop` covers the
+                // error path so the next turn always re-inits cleanly.
+                let _mtp_compiled_guard = MtpCompiledResetGuard;
+
+                // Phase C — prompt-prefix MTP prefill. With MTP just
+                // inited and `g_mtp_committed_len == 0`, commit the
+                // prompt prefix (+ the first sampled token `y`) into the
+                // MTP committed-history cache BEFORE the decode loop so
+                // the MTP heads attend over the prompt from cycle 1.
+                // Gated on `prompt_hidden` being captured by the
+                // hidden-emitting prefill; the commit run is
+                // `[prefill_tokens[1..], y]` so cycle 1's slot-0 seam is
+                // contiguous (see `prefill_mtp_commit`).
+                if let (Some(ph), Some(ph_ids)) =
+                    (prompt_hidden.as_ref(), prompt_hidden_ids.as_ref())
+                {
+                    if ph_ids.len() >= 2 {
+                        // Read `y`'s scalar id (already async_eval'd at
+                        // the top of this function).
+                        y.eval();
+                        let y_id = y.item_at_int32(0)? as u32;
+                        prefill_mtp_commit(ph, ph_ids, y_id, &embedding_weight)?;
+                        info!(
+                            "Qwen3.5 MTP prompt-prefill: committed prefix \
+                             ({} prompt tokens + y) into MTP cache",
+                            ph_ids.len(),
+                        );
+                    } else {
+                        debug!(
+                            "Qwen3.5 MTP prompt-prefill: prompt too short \
+                             ({} tokens) — skipped",
+                            ph_ids.len(),
+                        );
+                    }
+                }
+
                 // Thread-local CSPRNG; one `random::<f64>()` draw per
                 // emitted token via `accept_with_residual`.
                 let mut rng = rand::rng();
@@ -2463,25 +2571,20 @@ impl Qwen35Inner {
                         forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // MTP path only. The MAIN path's offset and GDN
-                        // linear caches are restored via the
-                        // `snapshot_main_linear` / `restore_and_replay_main`
-                        // pair below (W6 Bug #4 fix). Calling
-                        // `mlx_qwen35_compiled_adjust_offset(delta)` here
-                        // would double-rewind the main offset.
+                        // Phase C — committed-history policy. The MTP
+                        // offset is driven ABSOLUTELY by the commit FFI
+                        // (`mlx_qwen35_mtp_compiled_commit` sets
+                        // `g_mtp_offset_int = g_mtp_committed_len`),
+                        // which already ran BEFORE this rollback. The
+                        // previous cycle-policy `adjust_offset(K-depth)`
+                        // call is REMOVED — double-adjusting would
+                        // corrupt the absolute offset.
                         //
-                        //   - MTP delta: drafts wrote `depth` K/V slots;
-                        //     we keep `accepted_drafts` → delta = K - depth.
-                        //   - On rejection, the MTP K/V at offsets
-                        //     [accepted_drafts..depth] is rewound; the
-                        //     MTP path is NOT re-initialised — the next
-                        //     cycle re-uses the existing
-                        //     `g_mtp_compiled_caches` with the rewound
-                        //     offset.
-                        let delta = accepted_drafts as i32 - depth as i32;
-                        if delta != 0 {
-                            mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
-                        }
+                        // The MAIN path's offset and GDN linear caches
+                        // are still restored via the
+                        // `snapshot_main_linear` / `restore_and_replay_main`
+                        // pair below (W6 Bug #4 fix) — unchanged.
+                        let _ = (accepted_drafts, depth);
                         // W6.6 — on full-accept the `restore_and_replay_main`
                         // hook is NOT invoked; tape recording stays armed
                         // with stale accumulators. Disarm so the next
@@ -2599,6 +2702,30 @@ impl Qwen35Inner {
                     // `draft_step` loop above. See
                     // `make_fused_draft_closure` for the body.
                     fused_draft: Some(make_fused_draft_closure()),
+                    // Phase C — committed-history commit hook (dense
+                    // path). Appends exact MTP K/V for this cycle's
+                    // K+1 committed tokens to the persistent MTP cache
+                    // so the next cycle's drafts attend the full
+                    // committed prefix. Runs unconditionally (full
+                    // accept + reject) — see `run_mtp_cycle_inner`.
+                    commit_mtp: |seed_hidden: &MxArray,
+                                 verify_hiddens: &MxArray,
+                                 committed_ids: &[u32],
+                                 k_accepted: usize,
+                                 emb: &MxArray|
+                     -> Result<()> {
+                        commit_mtp_compiled(
+                            seed_hidden,
+                            verify_hiddens,
+                            committed_ids,
+                            k_accepted,
+                            emb,
+                        )
+                    },
+                    // Phase C — dense committed-history path. Forces the
+                    // fused-draft path OFF (its mask excludes the
+                    // committed prefix) — see `run_mtp_cycle_inner`.
+                    committed_history_active: true,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -4671,6 +4798,14 @@ impl Qwen35Inner {
                 cond_enable_mtp, cond_has_mtp_weights, cond_init_ok, mtp_active
             );
             if mtp_active {
+                // Reset MTP compiled state on EVERY exit from this
+                // decode path — including the `?`-propagated abort out
+                // of `decode_loop_mtp!` (e.g. a failed
+                // `mlx_qwen35_mtp_compiled_commit`). The explicit
+                // post-macro `mlx_qwen35_mtp_compiled_reset()` only runs
+                // on the normal return; the guard's `Drop` covers the
+                // error path so the next turn always re-inits cleanly.
+                let _mtp_compiled_guard = MtpCompiledResetGuard;
                 // Thread-local CSPRNG; one `random::<f64>()` draw per
                 // emitted token via `accept_with_residual`.
                 let mut rng = rand::rng();
@@ -4697,25 +4832,20 @@ impl Qwen35Inner {
                         forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // MTP path only. The MAIN path's offset and GDN
-                        // linear caches are restored via the
-                        // `snapshot_main_linear` / `restore_and_replay_main`
-                        // pair below (W6 Bug #4 fix). Calling
-                        // `mlx_qwen35_compiled_adjust_offset(delta)` here
-                        // would double-rewind the main offset.
+                        // Phase C — committed-history policy. The MTP
+                        // offset is driven ABSOLUTELY by the commit FFI
+                        // (`mlx_qwen35_mtp_compiled_commit` sets
+                        // `g_mtp_offset_int = g_mtp_committed_len`),
+                        // which already ran BEFORE this rollback. The
+                        // previous cycle-policy `adjust_offset(K-depth)`
+                        // call is REMOVED — double-adjusting would
+                        // corrupt the absolute offset.
                         //
-                        //   - MTP delta: drafts wrote `depth` K/V slots;
-                        //     we keep `accepted_drafts` → delta = K - depth.
-                        //   - On rejection, the MTP K/V at offsets
-                        //     [accepted_drafts..depth] is rewound; the
-                        //     MTP path is NOT re-initialised — the next
-                        //     cycle re-uses the existing
-                        //     `g_mtp_compiled_caches` with the rewound
-                        //     offset.
-                        let delta = accepted_drafts as i32 - depth as i32;
-                        if delta != 0 {
-                            mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
-                        }
+                        // The MAIN path's offset and GDN linear caches
+                        // are still restored via the
+                        // `snapshot_main_linear` / `restore_and_replay_main`
+                        // pair below (W6 Bug #4 fix) — unchanged.
+                        let _ = (accepted_drafts, depth);
                         // W6.6 — on full-accept the `restore_and_replay_main`
                         // hook is NOT invoked; tape recording stays armed
                         // with stale accumulators. Disarm so the next
@@ -4833,6 +4963,30 @@ impl Qwen35Inner {
                     // `draft_step` loop above. See
                     // `make_fused_draft_closure` for the body.
                     fused_draft: Some(make_fused_draft_closure()),
+                    // Phase C — committed-history commit hook (dense
+                    // path). Appends exact MTP K/V for this cycle's
+                    // K+1 committed tokens to the persistent MTP cache
+                    // so the next cycle's drafts attend the full
+                    // committed prefix. Runs unconditionally (full
+                    // accept + reject) — see `run_mtp_cycle_inner`.
+                    commit_mtp: |seed_hidden: &MxArray,
+                                 verify_hiddens: &MxArray,
+                                 committed_ids: &[u32],
+                                 k_accepted: usize,
+                                 emb: &MxArray|
+                     -> Result<()> {
+                        commit_mtp_compiled(
+                            seed_hidden,
+                            verify_hiddens,
+                            committed_ids,
+                            k_accepted,
+                            emb,
+                        )
+                    },
+                    // Phase C — dense committed-history path. Forces the
+                    // fused-draft path OFF (its mask excludes the
+                    // committed prefix) — see `run_mtp_cycle_inner`.
+                    committed_history_active: true,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -5296,6 +5450,21 @@ impl Qwen35Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
+        // Phase C — prompt-prefix MTP prefill (streaming path). Mirrors
+        // the non-streaming `chat_with_caches_inner` logic: when MTP is
+        // active for this turn the prefill runs the hidden-emitting
+        // `chunked_prefill_with_hidden` so the per-prompt-token hiddens
+        // can be committed into the MTP committed-history cache before
+        // decode. Gated OFF on cache-reuse turns (`cached_prefix_len >
+        // 0`) — the prompt-prefill seed requires the FULL prompt's
+        // hiddens and the prefill only processes the uncached suffix
+        // there. `MLX_MTP_NO_PROMPT_PREFILL=1` opts out.
+        let want_prompt_hidden = p.enable_mtp
+            && self.has_mtp_weights()
+            && !chat_common::mtp_no_prompt_prefill()
+            && cached_prefix_len == 0;
+        let mut prompt_hidden: Option<MxArray> = None;
+
         // VLM or text prefill
         profiler.begin_prefill();
         let (mut last_logits, seq_len, vlm_compiled_init_done) = if has_images
@@ -5338,16 +5507,31 @@ impl Qwen35Inner {
             }
         } else {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let logits = chunked_prefill(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                Some(&embedding_weight_t),
-                generation_stream,
-            )?;
+            let logits = if want_prompt_hidden {
+                let (logits, ph) = chunked_prefill_with_hidden(
+                    &prompt,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    Some(&embedding_weight_t),
+                    generation_stream,
+                )?;
+                prompt_hidden = Some(ph);
+                logits
+            } else {
+                chunked_prefill(
+                    &prompt,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    Some(&embedding_weight_t),
+                    generation_stream,
+                )?
+            };
 
             let seq_len = logits.shape_at(1)?;
             let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
@@ -5360,6 +5544,12 @@ impl Qwen35Inner {
             (last_logits, total_seq_len, false)
         };
         profiler.end_prefill();
+
+        // Phase C — pair the captured prompt hiddens with the exact
+        // `prefill_tokens` whose hiddens they hold. `Some` iff the
+        // hidden-emitting prefill ran above.
+        let prompt_hidden_ids: Option<Vec<u32>> =
+            prompt_hidden.as_ref().map(|_| prefill_tokens.clone());
 
         let mut token_history: Vec<u32> = tokens.clone();
         last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
@@ -5468,6 +5658,45 @@ impl Qwen35Inner {
                 cond_enable_mtp, cond_has_mtp_weights, cond_init_ok, mtp_active
             );
             if mtp_active {
+                // Reset MTP compiled state on EVERY exit from this
+                // decode path — including the `?`-propagated abort out
+                // of `decode_loop_mtp!` (e.g. a failed
+                // `mlx_qwen35_mtp_compiled_commit`). The explicit
+                // post-macro `mlx_qwen35_mtp_compiled_reset()` only runs
+                // on the normal return; the guard's `Drop` covers the
+                // error path so the next turn always re-inits cleanly.
+                let _mtp_compiled_guard = MtpCompiledResetGuard;
+
+                // Phase C — prompt-prefix MTP prefill (streaming path).
+                // Mirrors the non-streaming `chat_with_caches_inner`
+                // region: with MTP just inited and `g_mtp_committed_len
+                // == 0`, commit the prompt prefix (+ first sampled
+                // token `y`) into the MTP committed-history cache BEFORE
+                // the decode loop so the MTP heads attend over the
+                // prompt from cycle 1. Gated on `prompt_hidden` being
+                // captured by the hidden-emitting prefill (skipped on
+                // cache-reuse turns and when opted out).
+                if let (Some(ph), Some(ph_ids)) =
+                    (prompt_hidden.as_ref(), prompt_hidden_ids.as_ref())
+                {
+                    if ph_ids.len() >= 2 {
+                        y.eval();
+                        let y_id = y.item_at_int32(0)? as u32;
+                        prefill_mtp_commit(ph, ph_ids, y_id, &embedding_weight)?;
+                        info!(
+                            "Qwen3.5 MTP prompt-prefill (stream): committed prefix \
+                             ({} prompt tokens + y) into MTP cache",
+                            ph_ids.len(),
+                        );
+                    } else {
+                        debug!(
+                            "Qwen3.5 MTP prompt-prefill (stream): prompt too short \
+                             ({} tokens) — skipped",
+                            ph_ids.len(),
+                        );
+                    }
+                }
+
                 // Thread-local CSPRNG; one `random::<f64>()` draw per
                 // emitted token via `accept_with_residual`.
                 let mut rng = rand::rng();
@@ -5494,25 +5723,20 @@ impl Qwen35Inner {
                         forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // MTP path only. The MAIN path's offset and GDN
-                        // linear caches are restored via the
-                        // `snapshot_main_linear` / `restore_and_replay_main`
-                        // pair below (W6 Bug #4 fix). Calling
-                        // `mlx_qwen35_compiled_adjust_offset(delta)` here
-                        // would double-rewind the main offset.
+                        // Phase C — committed-history policy. The MTP
+                        // offset is driven ABSOLUTELY by the commit FFI
+                        // (`mlx_qwen35_mtp_compiled_commit` sets
+                        // `g_mtp_offset_int = g_mtp_committed_len`),
+                        // which already ran BEFORE this rollback. The
+                        // previous cycle-policy `adjust_offset(K-depth)`
+                        // call is REMOVED — double-adjusting would
+                        // corrupt the absolute offset.
                         //
-                        //   - MTP delta: drafts wrote `depth` K/V slots;
-                        //     we keep `accepted_drafts` → delta = K - depth.
-                        //   - On rejection, the MTP K/V at offsets
-                        //     [accepted_drafts..depth] is rewound; the
-                        //     MTP path is NOT re-initialised — the next
-                        //     cycle re-uses the existing
-                        //     `g_mtp_compiled_caches` with the rewound
-                        //     offset.
-                        let delta = accepted_drafts as i32 - depth as i32;
-                        if delta != 0 {
-                            mlx_sys::mlx_qwen35_mtp_compiled_adjust_offset(delta);
-                        }
+                        // The MAIN path's offset and GDN linear caches
+                        // are still restored via the
+                        // `snapshot_main_linear` / `restore_and_replay_main`
+                        // pair below (W6 Bug #4 fix) — unchanged.
+                        let _ = (accepted_drafts, depth);
                         // W6.6 — on full-accept the `restore_and_replay_main`
                         // hook is NOT invoked; tape recording stays armed
                         // with stale accumulators. Disarm so the next
@@ -5630,6 +5854,30 @@ impl Qwen35Inner {
                     // `draft_step` loop above. See
                     // `make_fused_draft_closure` for the body.
                     fused_draft: Some(make_fused_draft_closure()),
+                    // Phase C — committed-history commit hook (dense
+                    // path). Appends exact MTP K/V for this cycle's
+                    // K+1 committed tokens to the persistent MTP cache
+                    // so the next cycle's drafts attend the full
+                    // committed prefix. Runs unconditionally (full
+                    // accept + reject) — see `run_mtp_cycle_inner`.
+                    commit_mtp: |seed_hidden: &MxArray,
+                                 verify_hiddens: &MxArray,
+                                 committed_ids: &[u32],
+                                 k_accepted: usize,
+                                 emb: &MxArray|
+                     -> Result<()> {
+                        commit_mtp_compiled(
+                            seed_hidden,
+                            verify_hiddens,
+                            committed_ids,
+                            k_accepted,
+                            emb,
+                        )
+                    },
+                    // Phase C — dense committed-history path. Forces the
+                    // fused-draft path OFF (its mask excludes the
+                    // committed prefix) — see `run_mtp_cycle_inner`.
+                    committed_history_active: true,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -7267,6 +7515,34 @@ impl Drop for CompiledResetGuard {
     }
 }
 
+/// RAII guard that tears down the MTP compiled state on EVERY exit from
+/// a dense MTP decode path — the normal return AND the error/abort path.
+///
+/// The dense MTP decode (`decode_loop_mtp!`) propagates `Err` via `?`
+/// (e.g. a non-zero `mlx_qwen35_mtp_compiled_commit` status surfaced by
+/// `commit_mtp_compiled`). On that abort the explicit
+/// `mlx_qwen35_mtp_compiled_reset()` call placed AFTER the macro is
+/// skipped, leaving `g_mtp_compile_inited`, the MTP K/V caches, offsets,
+/// and `g_mtp_committed_len` resident from the partial cycle — the next
+/// chat turn would then re-init on top of stale MTP globals.
+/// `CompiledResetGuard` only resets the MAIN compiled state, so a
+/// dedicated guard is required for the MTP globals.
+///
+/// Created right after `init_mtp_compiled_from_main` succeeds; its
+/// `Drop` runs `mlx_qwen35_mtp_compiled_reset()` whether the decode
+/// returns `Ok` or `Err`. The explicit post-macro reset is retained as
+/// a harmless no-op (reset is idempotent) so the success path's reset
+/// timing is unchanged relative to the surrounding cache export logic.
+struct MtpCompiledResetGuard;
+
+impl Drop for MtpCompiledResetGuard {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::mlx_qwen35_mtp_compiled_reset();
+        }
+    }
+}
+
 /// Generation configuration for Qwen3.5
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -8193,6 +8469,88 @@ fn chunked_prefill(
     Ok(logits)
 }
 
+/// Phase C — `chunked_prefill` variant that ALSO returns the
+/// post-final-norm hidden state for EVERY prompt token, concatenated
+/// along the time axis → `[1, prompt_len, hidden]`.
+///
+/// Used only when MTP is active for the turn: the prompt hiddens are
+/// needed to commit the prompt prefix into the MTP committed-history
+/// cache (`prefill_mtp_commit`). Logits-only callers keep the cheaper
+/// `chunked_prefill`. The per-chunk forward op sequence is identical;
+/// this just keeps every chunk's `[1, chunk, hidden]` hidden and
+/// concatenates them instead of discarding all but the last chunk's
+/// logits.
+fn chunked_prefill_with_hidden(
+    prompt: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight_t: Option<&MxArray>,
+    generation_stream: crate::stream::Stream,
+) -> Result<(MxArray, MxArray)> {
+    let total_len = prompt.shape_at(1)?;
+    let mut offset: i64 = 0;
+    let mut hidden_chunks: Vec<MxArray> = Vec::new();
+
+    while total_len - offset > PREFILL_STEP_SIZE {
+        let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
+        let chunk_hidden = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            let (_logits, hidden) = forward_inner_with_hidden(
+                &chunk,
+                embedding_weight,
+                layers,
+                caches,
+                final_norm,
+                lm_head,
+                embedding_weight_t,
+            )?;
+            hidden
+        };
+        eval_layer_caches(caches)?;
+        // Materialize the chunk hidden before clearing the MLX cache —
+        // it is a lazy handle referencing graph nodes that `clear_cache`
+        // would otherwise free.
+        chunk_hidden.eval();
+        hidden_chunks.push(chunk_hidden);
+        crate::array::clear_cache();
+        offset += PREFILL_STEP_SIZE;
+    }
+
+    let remaining = prompt.slice_axis(1, offset, total_len)?;
+    let (logits, last_hidden) = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        forward_inner_with_hidden(
+            &remaining,
+            embedding_weight,
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            embedding_weight_t,
+        )?
+    };
+    hidden_chunks.push(last_hidden);
+
+    // Concatenate every chunk's `[1, chunk, hidden]` along axis 1 →
+    // `[1, prompt_len, hidden]`.
+    let prompt_hidden = if hidden_chunks.len() == 1 {
+        hidden_chunks
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::from_reason("chunked_prefill_with_hidden: empty hidden chunks"))?
+    } else {
+        let mut acc = hidden_chunks[0].clone();
+        for chunk in &hidden_chunks[1..] {
+            acc = MxArray::concatenate(&acc, chunk, 1)?;
+        }
+        acc
+    };
+    Ok((logits, prompt_hidden))
+}
+
 /// Lock-free forward pass through all layers.
 /// Attention layer handles causal masking internally via "causal" SDPA mode.
 /// Format an `MxArray`'s shape for logging. Returns `[d0, d1, ...]`
@@ -8221,6 +8579,36 @@ fn forward_inner(
     lm_head: &Option<Linear>,
     embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
+    let (logits, _hidden) = forward_inner_with_hidden(
+        input_ids,
+        embedding_weight,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embedding_weight_t,
+    )?;
+    Ok(logits)
+}
+
+/// `forward_inner` variant that ALSO returns the post-final-norm hidden
+/// state — `[1, T, hidden]` for an input of `T` tokens.
+///
+/// Phase C (prompt-prefix prefill) needs the per-prompt-token hiddens to
+/// commit the prompt prefix into the MTP committed-history cache; the
+/// plain `forward_inner` consumes the hidden into `lm_head` and drops it.
+/// The op sequence is byte-identical to `forward_inner` — the only
+/// difference is the extra returned handle (an `MxArray` is a cheap
+/// refcounted clone).
+fn forward_inner_with_hidden(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight_t: Option<&MxArray>,
+) -> Result<(MxArray, MxArray)> {
     let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
@@ -8302,7 +8690,7 @@ fn forward_inner(
         "Qwen3.5 forward_inner: post_lm_head shape={}",
         shape_dbg(&logits)
     );
-    Ok(logits)
+    Ok((logits, h))
 }
 
 /// Compiled single-token decode step using mlx::core::compile().
@@ -8547,6 +8935,251 @@ pub(super) fn forward_mtp_draft_compiled(
     let h_next = MxArray::from_handle(h_next_ptr, "mtp_draft_h_next")?;
     let logits = MxArray::from_handle(logits_ptr, "mtp_draft_logits")?;
     Ok((h_next, logits))
+}
+
+/// Phase C — committed-history commit. Append exact MTP K/V for the
+/// FULL `K+2` committed token sequence of this cycle to the persistent
+/// MTP cache so the next cycle's drafts attend over the full committed
+/// prefix.
+///
+/// The committed sequence emitted by one outer iteration is
+/// `[last_committed_id, d_0..d_{K-1}, boundary]` — exactly `M = K+2`
+/// tokens (`committed_ids`). The MTP head contract is
+/// `MTP(h(t), emb(t+1))` predicting `t+2`: the slot for committed token
+/// `x` must hold attention K/V computed from
+/// `fc([e_norm(emb(x)), h_norm(h(prev(x)))])` — embedding of `x`,
+/// hidden of the token BEFORE `x`. So the M hidden rows fed to the
+/// commit are:
+///   slot 0 (`last_committed_id`) ← `seed_hidden` (the cycle's Step-A
+///       hidden = h(token before `last_committed_id`)).
+///   slot i, 1≤i≤K (`d_{i-1}`)   ← `verify_hiddens[:, i-1, :]`.
+///   slot K+1 (`boundary`)       ← `verify_hiddens[:, K, :]`.
+/// i.e. `[seed_hidden] ++ verify_hiddens[:, 0:K+1, :]` (length K+2),
+/// paired against `emb(committed_ids)` (length K+2).
+///
+/// `verify_hiddens` is `[1, depth+1, hidden]` bf16 (the verify
+/// forward's post-final-norm hidden at every verify position).
+/// `seed_hidden` is `[1, 1, hidden]` bf16. `committed_ids` has length
+/// `K+2`. `embedding_weight` is the model's embedding table.
+///
+/// Assembles the two `[1, K+2, hidden]` arrays Rust-side (concatenate
+/// `seed_hidden` with `verify_hiddens[:, 0:K+1, :]`; gather the K+2
+/// embedding rows) and invokes `mlx_qwen35_mtp_compiled_commit`, which
+/// writes the K/V and advances the persistent committed-prefix counter
+/// by `M = K+2`.
+///
+/// Errors propagate via `Result` — no `unwrap` on the decode hot path.
+pub(super) fn commit_mtp_compiled(
+    seed_hidden: &MxArray,
+    verify_hiddens: &MxArray,
+    committed_ids: &[u32],
+    k_accepted: usize,
+    embedding_weight: &MxArray,
+) -> Result<()> {
+    use mlx_sys as sys;
+
+    // M = K+2 committed tokens. `committed_ids` =
+    // `[last_committed_id, d_0..d_{K-1}, boundary]`.
+    let m = committed_ids.len();
+    if m < 2 {
+        return Err(Error::from_reason(
+            "commit_mtp_compiled: committed_ids must have at least 2 elements",
+        ));
+    }
+    if m != k_accepted + 2 {
+        return Err(Error::from_reason(
+            "commit_mtp_compiled: committed_ids length must equal k_accepted + 2",
+        ));
+    }
+    let hidden_dim = verify_hiddens.shape_at(2)?;
+
+    // Hidden sequence: [seed_hidden] ++ verify_hiddens[:, 0:K+1, :].
+    // `verify_hiddens` is [1, depth+1, hidden]; we take the first K+1
+    // time rows (slots for d_0..d_{K-1} + boundary) and prepend the
+    // Step-A seed hidden along the time axis → [1, K+2, hidden].
+    let vh_prefix = verify_hiddens.slice(&[0, 0, 0], &[1, (m - 1) as i64, hidden_dim])?;
+    let hidden_seq = MxArray::concatenate(seed_hidden, &vh_prefix, 1)?;
+
+    // Embedding sequence: gather the K+2 committed-token rows from the
+    // embedding table → [K+2, hidden] → [1, K+2, hidden]. Passing
+    // pre-gathered rows avoids a quantized-embedding edge case inside
+    // the commit graph.
+    let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
+    let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
+    let gathered = embedding_weight.take(&ids_arr, 0)?;
+    let gathered_embs = gathered.reshape(&[1, m as i64, hidden_dim])?;
+
+    // The FFI returns 0 on success and a non-zero code on any failure
+    // (capacity overflow, exception, not-inited). On a non-zero status
+    // `g_mtp_committed_len` is NOT advanced — the persistent MTP cache
+    // and the committed-prefix counter are now desynced. Propagate as
+    // an `Err` so the `?` at the call site aborts decode cleanly with a
+    // diagnostic; a silent fallback would anchor the next cycle's
+    // drafts to a stale committed length and corrupt all later output.
+    let status = unsafe {
+        sys::mlx_qwen35_mtp_compiled_commit(
+            hidden_seq.as_raw_ptr(),
+            gathered_embs.as_raw_ptr(),
+            m as i32,
+        )
+    };
+    if status != 0 {
+        return Err(Error::from_reason(format!(
+            "MTP committed-history commit failed (status {status}) — cache desync"
+        )));
+    }
+    Ok(())
+}
+
+/// Phase C — prompt-prefix MTP prefill.
+///
+/// Commits the prompt prefix (plus the first sampled token `y`) into the
+/// MTP committed-history cache so the MTP heads attend over the prompt
+/// from the very first decode cycle, instead of building history only
+/// from decode-produced tokens. After this runs,
+/// `g_mtp_committed_len == prompt_len`.
+///
+/// MTP head contract: the MTP slot for committed token `x` holds K/V
+/// from `fc([e_norm(emb(x)), h_norm(h(prev(x)))])` — the embedding of
+/// `x` paired with the post-final-norm hidden of the token BEFORE `x`.
+/// Token 0 of the prompt has no `h(-1)` and is skipped.
+///
+/// SEAM with the first decode cycle: `decode_loop_mtp!`'s Step A samples
+/// `y` from the prefill's last logits, forwards `y`, and samples the
+/// cycle's `last_committed_id`. Cycle 1's commit then writes a slot for
+/// `last_committed_id` (= the SECOND generated token) paired with
+/// `h(y)`. For the persistent MTP cache to remain a CONTIGUOUS
+/// real-sequence run (so RoPE positions = slot indices with a uniform
+/// −1 shift), the prompt-prefill must commit a contiguous run ENDING at
+/// `y` — i.e. it must include `y` itself. So:
+///   - committed token ids = `[prompt_ids[1..prompt_len], y]`  (length P)
+///     real positions `1 .. P` inclusive.
+///   - paired hiddens = `prompt_hidden[:, 0..prompt_len, :]` (length P)
+///     slot for `prompt_ids[p]` (1≤p<P) ↔ `prompt_hidden[:, p-1, :]`;
+///     slot for `y` ↔ `prompt_hidden[:, P-1, :]` = `h(prompt_ids[P-1])`.
+///
+/// Cycle 1's slot-0 then lands at MTP slot `prompt_len` paired with
+/// `h(y)` (= `run_mtp_cycle_inner`'s `commit_seed_hidden`) — contiguous,
+/// no gap, no double-count.
+///
+/// Mechanism: the existing compiled commit graph
+/// (`mlx_qwen35_mtp_compiled_commit`) is templated over `M ∈ [2, 7]` and
+/// reads the RoPE base from `g_mtp_committed_len`, advancing it by `M`.
+/// We CHUNK the `P` committed tokens into pieces all sized in `[2, 7]`
+/// and call the commit FFI per chunk — repeated calls over consecutive
+/// chunks Just Work (each advances `g_mtp_committed_len`). Chunk size 6
+/// is used; the final remainder is handled so no chunk has size < 2. The
+/// caller MUST gate this on `prompt_len >= 2` (committed run length ≥ 2).
+///
+/// This does NOT route through `commit_mtp_compiled` — that helper
+/// asserts `m == k_accepted + 2`, false for prompt chunks. This helper
+/// just calls the FFI with `m = chunk_size`.
+///
+/// `prompt_hidden` is `[1, prompt_len, hidden]` bf16. `prompt_ids` is the
+/// full prompt token sequence (length `prompt_len`). `y` is the first
+/// sampled token. `embedding_weight` is the model's embedding table.
+/// Errors propagate via `Result`.
+pub(super) fn prefill_mtp_commit(
+    prompt_hidden: &MxArray,
+    prompt_ids: &[u32],
+    y: u32,
+    embedding_weight: &MxArray,
+) -> Result<()> {
+    use mlx_sys as sys;
+
+    let prompt_len = prompt_ids.len();
+    // Committed run = [prompt_ids[1..prompt_len], y] → length `prompt_len`
+    // (token 0 skipped, `y` appended). Caller gates on `prompt_len >= 2`,
+    // re-check defensively: a run shorter than 2 cannot use the M∈[2,7]
+    // commit graph.
+    if prompt_len < 2 {
+        return Ok(());
+    }
+    let committed_total = prompt_len;
+    let hidden_dim = prompt_hidden.shape_at(2)?;
+
+    // Committed token ids: prompt_ids[1..prompt_len] then `y`.
+    let mut committed_ids: Vec<i32> = Vec::with_capacity(committed_total);
+    committed_ids.extend(prompt_ids[1..prompt_len].iter().map(|&v| v as i32));
+    committed_ids.push(y as i32);
+    debug_assert_eq!(committed_ids.len(), committed_total);
+
+    // Partition `committed_total` into chunk sizes all in [2, 7].
+    // Default chunk size 6; fix up the final remainder so no chunk < 2.
+    let chunk_sizes = partition_prefill_chunks(committed_total);
+
+    // `cursor` walks the committed-token index space [0, committed_total).
+    // Committed token index `i` ↔ `committed_ids[i]` and the paired
+    // hidden `prompt_hidden[:, i, :]` (= h of the token before
+    // committed token `i`).
+    let mut cursor: usize = 0;
+    for &chunk in &chunk_sizes {
+        let chunk_i64 = chunk as i64;
+        let start = cursor as i64;
+
+        // hidden_seq: prompt_hidden[:, cursor .. cursor+chunk, :].
+        let hidden_seq =
+            prompt_hidden.slice(&[0, start, 0], &[1, start + chunk_i64, hidden_dim])?;
+
+        // gathered_embs: embedding rows for committed_ids[cursor .. cursor+chunk].
+        let ids_arr = MxArray::from_int32(&committed_ids[cursor..cursor + chunk], &[chunk_i64])?;
+        let gathered = embedding_weight.take(&ids_arr, 0)?;
+        let gathered_embs = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
+
+        // The FFI reads the RoPE base from `g_mtp_committed_len` and
+        // advances it by `chunk` on success. A non-zero status leaves
+        // the committed counter unchanged — propagate as `Err`.
+        let status = unsafe {
+            sys::mlx_qwen35_mtp_compiled_commit(
+                hidden_seq.as_raw_ptr(),
+                gathered_embs.as_raw_ptr(),
+                chunk as i32,
+            )
+        };
+        if status != 0 {
+            return Err(Error::from_reason(format!(
+                "prefill_mtp_commit: commit FFI failed (status {status}) at \
+                 chunk cursor {cursor} size {chunk}"
+            )));
+        }
+        cursor += chunk;
+    }
+    Ok(())
+}
+
+/// Partition `total` committed tokens into chunk sizes all within the
+/// compiled commit graph's `M ∈ [2, 7]` window.
+///
+/// Strategy: greedily take size-6 chunks. The final remainder `r` is
+/// `total % 6`:
+///   - `r == 0`           → all chunks are size 6.
+///   - `r >= 2`           → append one chunk of size `r`.
+///   - `r == 1` (total≥7) → split the last `6 + 1` into `4 + 3` so no
+///     chunk is size 1.
+///
+/// Precondition: `total >= 2` (caller-gated). For `total ∈ {2..6}` the
+/// single chunk is `total` itself (which is in [2, 7]).
+fn partition_prefill_chunks(total: usize) -> Vec<usize> {
+    debug_assert!(total >= 2, "partition_prefill_chunks: total must be >= 2");
+    const CHUNK: usize = 6;
+    if total <= 7 {
+        // A single chunk in [2, 7] covers it directly.
+        return vec![total];
+    }
+    let mut chunks: Vec<usize> = Vec::new();
+    let mut remaining = total;
+    while remaining > 7 {
+        chunks.push(CHUNK);
+        remaining -= CHUNK;
+    }
+    // `remaining` is now in [2, 7] (we stopped before it could drop to
+    // 1: from 8 we'd subtract 6 → 2; from 13 → 7). Push it directly.
+    debug_assert!(
+        (2..=7).contains(&remaining),
+        "partition_prefill_chunks: remainder {remaining} out of [2, 7]"
+    );
+    chunks.push(remaining);
+    chunks
 }
 
 /// W6.18 — Fused MTP draft: ALL `depth` draft steps in ONE compiled

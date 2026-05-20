@@ -1866,6 +1866,42 @@ unsafe extern "C-unwind" {
     /// Read the current MTP offset (for debugging / tests).
     pub fn mlx_qwen35_mtp_get_offset() -> i32;
 
+    /// Phase C — committed-history MTP cache policy: append exact
+    /// committed K/V to the persistent MTP cache.
+    ///
+    /// Called once per draft cycle, AFTER the accept loop computes the
+    /// accepted-draft count K and BEFORE rollback. Computes the MTP
+    /// layer-0 attention K/V for the `M = K+2` committed tokens
+    /// `[last_committed_id, d_0..d_{K-1}, boundary]` from their
+    /// hidden / embedding rows (assembled Rust-side), writes them into
+    /// the persistent MTP KV cache at absolute positions
+    /// `[g_mtp_committed_len .. g_mtp_committed_len+M)`, and advances
+    /// the committed-prefix counter by exactly `M` — so the MTP prefix
+    /// length stays equal to the real decode sequence length and RoPE
+    /// positions never drift.
+    ///
+    /// `hidden_seq` and `gathered_embs` are both `[1, M, hidden]` bf16,
+    /// pre-assembled Rust-side: `hidden_seq[i]` = hidden of the token
+    /// BEFORE committed token `i` (the MTP `MTP(h(t), emb(t+1))`
+    /// contract), `gathered_embs[i]` = input embedding of committed
+    /// token `i`. `m` = M = K+2.
+    ///
+    /// SIDE EFFECTS: mutates `g_mtp_compiled_caches[]` and advances
+    /// `g_mtp_committed_len` / `g_mtp_offset_int` by `m`. Same locking
+    /// contract as the other MTP FFIs — the caller MUST hold
+    /// `DENSE_COMPILED_MUTEX` for the cycle.
+    ///
+    /// Returns `0` on success (committed exactly `m` slots). Returns a
+    /// distinct non-zero code on any failure (1 = not-inited/null arg,
+    /// 2 = bad `m`, 3 = capacity overflow, 4 = std exception,
+    /// 5 = unknown exception). On every non-zero return
+    /// `g_mtp_committed_len` is left UNCHANGED.
+    pub fn mlx_qwen35_mtp_compiled_commit(
+        hidden_seq: *mut mlx_array,
+        gathered_embs: *mut mlx_array,
+        m: i32,
+    ) -> i32;
+
     // ============================================
     // Qwen3.5 VLM Prefill
     // ============================================

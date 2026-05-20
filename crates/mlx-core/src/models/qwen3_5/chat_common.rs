@@ -190,6 +190,24 @@ pub(crate) fn mtp_chained_cycles_enabled() -> bool {
     })
 }
 
+// Phase C — prompt-prefix MTP prefill opt-OUT.
+//
+// `MLX_MTP_NO_PROMPT_PREFILL=1` (or `true` / `on`) disables committing
+// the prompt prefix into the MTP committed-history cache: the prefill
+// stays logits-only and the MTP heads build history only from
+// decode-produced tokens (the pre-prompt-prefill behaviour). Default
+// OFF (prompt-prefill enabled). Read once per process and cached.
+pub(crate) fn mtp_no_prompt_prefill() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_NO_PROMPT_PREFILL") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false, // default OFF — prompt-prefill enabled
+    })
+}
+
 // W6.18 — Fused within-cycle draft graph.
 //
 // Opt-in: `MLX_MTP_FUSED_DRAFT=1` (or `true` / `on`). When ON AND the
@@ -1403,7 +1421,7 @@ pub(crate) use decode_loop;
 ///             reaches `snapshot_offset + K`.
 ///        On full-accept the macro skips this hook (verify already
 ///        left the linear state advanced through all D drafts).
-pub(crate) struct MtpOps<F, D, V, R, E, EX, B, S, RR>
+pub(crate) struct MtpOps<F, D, V, R, E, EX, B, S, RR, CM>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
@@ -1437,6 +1455,21 @@ where
     B: FnMut(),
     S: FnMut(),
     RR: FnMut(&[u32], &MxArray) -> Result<()>,
+    // Phase C — committed-history commit hook. Called once per cycle
+    // AFTER the accept loop computes `accepted_drafts` (K) and BEFORE
+    // `rollback`, on BOTH the full-accept and reject paths. Receives
+    // `(prev_hidden_in [1,1,hidden], verify_hiddens [1,D+1,hidden],
+    // committed_ids [K+2], k_accepted, embedding_weight)`.
+    //
+    // `committed_ids` is the FULL committed sequence emitted by this
+    // outer iteration — `[last_committed_id, d_0..d_{K-1}, boundary]`
+    // (length K+2). `prev_hidden_in` is the cycle's seed hidden (Step
+    // A's hidden output = h(token before last_committed_id)). The
+    // implementor assembles the K+2 hidden / embedding rows and invokes
+    // the commit FFI, which appends K+2 exact committed K/V slots to the
+    // persistent MTP cache. A no-op closure disables committed-history
+    // (MoE path + tests stay cycle-policy).
+    CM: FnMut(&MxArray, &MxArray, &[u32], usize, &MxArray) -> Result<()>,
 {
     pub forward_with_hidden: F,
     pub draft_step: D,
@@ -1447,6 +1480,10 @@ where
     pub begin_cycle: B,
     pub snapshot_main_linear: S,
     pub restore_and_replay_main: RR,
+    /// Phase C — committed-history commit hook. See the `CM` bound
+    /// above for the contract. Pass a no-op closure to keep the
+    /// cycle-history policy (MoE path, tests).
+    pub commit_mtp: CM,
     /// W6.18 — Optional fused-draft callback. When `Some(...)` AND
     /// `MLX_MTP_FUSED_DRAFT=1` AND `run_mtp_cycle_inner` decides to use
     /// the fused path (currently gated on `temperature <= 1e-6`), all D
@@ -1470,6 +1507,16 @@ where
     /// loop (legacy path; required for tests and MoE).
     pub fused_draft:
         Option<Box<dyn FnMut(&MxArray, &MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>>>,
+    /// Phase C — set `true` on the dense path where `commit_mtp` runs
+    /// the real committed-history commit. When `true`,
+    /// `run_mtp_cycle_inner` force-disables the fused-draft path: the
+    /// fused draft graph masks out the committed prefix `[0,
+    /// committed_len)` (its mask is `offset_arr <= pos <= step_offset`),
+    /// which is incompatible with committed-history. The per-step draft
+    /// path uses the correct `chain_start <= pos <= offset` mask with
+    /// `chain_start = 0`. MoE / tests leave this `false` (legacy
+    /// cycle-history policy — fused draft stays opt-in there).
+    pub committed_history_active: bool,
 }
 
 /// Outcome of `run_mtp_cycle_inner` — the list of accepted tokens for
@@ -1499,8 +1546,8 @@ pub(crate) struct MtpCycleOutcome {
 /// is the caller's problem; production callers fold the cycle inside
 /// `DENSE_COMPILED_MUTEX` so a `?` early-return drops the
 /// `CompiledResetGuard` and wipes the C++ state cleanly.
-pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, EX, B, S, RR>(
-    ops: &mut MtpOps<F, D, V, R, E, EX, B, S, RR>,
+pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, EX, B, S, RR, CM>(
+    ops: &mut MtpOps<F, D, V, R, E, EX, B, S, RR, CM>,
     prev_hidden_in: MxArray,
     prev_emb_in: MxArray,
     last_committed_id: u32,
@@ -1521,12 +1568,22 @@ where
     B: FnMut(),
     S: FnMut(),
     RR: FnMut(&[u32], &MxArray) -> Result<()>,
+    CM: FnMut(&MxArray, &MxArray, &[u32], usize, &MxArray) -> Result<()>,
 {
     use crate::array::{DType, MxArray as A};
     use crate::nn::Activations;
     use crate::sampling;
 
     debug_assert!(depth >= 1, "run_mtp_cycle_inner: depth must be >= 1");
+
+    // Phase C — keep the ORIGINAL cycle-seed hidden alive for the
+    // committed-history commit. `prev_hidden_in` is h(token before
+    // `last_committed_id`) — the correct hidden to pair with the
+    // embedding of `last_committed_id` for that token's MTP slot. The
+    // draft loop below moves `prev_hidden_in` into the mutable
+    // `prev_hidden` local and overwrites it step by step, so clone the
+    // (cheap, refcounted) handle now before that happens.
+    let commit_seed_hidden = prev_hidden_in.clone();
 
     // Step 1: D draft steps. Either fused into one compiled graph
     // (W6.18 fused path) or the legacy per-step loop.
@@ -1556,7 +1613,20 @@ where
         .sampling_config
         .and_then(|c| c.temperature)
         .unwrap_or(1.0);
-    let try_fused = mtp_fused_draft_enabled() && ops.fused_draft.is_some() && temperature <= 1e-6;
+    // Phase C — force-disable the fused-draft path when committed-history
+    // is active. The fused draft graph builds its attention mask as
+    // `offset_arr <= pos <= step_offset`, which EXCLUDES the persistent
+    // committed prefix `[0, committed_len)` — drafts would attend only
+    // their own in-cycle chain and ignore the committed history the
+    // whole policy exists to exploit. The per-step `draft_step` path
+    // uses the correct `chain_start <= pos <= offset` mask (with
+    // `chain_start = 0` under committed-history), so route through it.
+    // Fused draft is opt-in, OFF by default, and known to regress on
+    // this target anyway — disabling it here costs nothing.
+    let try_fused = mtp_fused_draft_enabled()
+        && ops.fused_draft.is_some()
+        && temperature <= 1e-6
+        && !ops.committed_history_active;
 
     let mut prev_hidden = prev_hidden_in;
     let mut prev_emb = prev_emb_in;
@@ -1969,6 +2039,39 @@ where
         committed = accepted_tokens.len(),
         "MTP cycle accept result"
     );
+
+    // Phase C — committed-history commit. Append exact MTP K/V for the
+    // FULL K+2 committed sequence `[last_committed, d_0..d_{K-1},
+    // boundary]` to the persistent MTP cache so the NEXT cycle's drafts
+    // attend over the full committed prefix. Runs on BOTH the
+    // full-accept and reject paths (commit is unconditional). The
+    // boundary token (bonus on full accept, residual on reject) IS
+    // committed here — its hidden is `verify_hiddens[:, K, :]`, already
+    // available — so the persistent MTP prefix advances by exactly K+2
+    // per cycle, matching the real decode sequence length and keeping
+    // RoPE positions aligned.
+    //
+    // `committed_ids` = `[last_committed_id] ++ accepted_tokens`;
+    // `accepted_tokens` already equals `[d_0..d_{K-1}, boundary]`
+    // (length K+1), so `committed_ids` has length K+2. The commit
+    // closure pairs each token with the hidden of the token BEFORE it
+    // (MTP contract) — slot 0 ↔ `commit_seed_hidden`, slot i (1..=K) ↔
+    // `verify_hiddens[:, i-1, :]`. A no-op closure keeps the legacy
+    // cycle-history policy (MoE path, tests).
+    let mut committed_ids: Vec<u32> = Vec::with_capacity(accepted_tokens.len() + 1);
+    committed_ids.push(last_committed_id);
+    committed_ids.extend(accepted_tokens.iter().copied());
+    profiler.begin("mtp_commit");
+    let commit_res = (ops.commit_mtp)(
+        &commit_seed_hidden,
+        &verify_hiddens,
+        &committed_ids,
+        accepted_drafts,
+        embedding_weight,
+    );
+    profiler.end();
+    commit_res?;
+
     profiler.begin("mtp_rollback");
     (ops.rollback)(accepted_drafts, depth);
     profiler.end();
@@ -2159,7 +2262,26 @@ macro_rules! decode_loop_mtp {
         // `g_compiled_caches` (its upstream) is alive for the rest of
         // the decode loop. See `mlx_qwen35_mtp_verify_compiled_with_hidden`
         // for the C++ lifetime contract.
-        let chained_cycles_enabled: bool = $crate::models::qwen3_5::chat_common::mtp_chained_cycles_enabled();
+        // Phase C — committed-history and chained cycles are mutually
+        // exclusive until the chained commit contract is implemented.
+        // Chained cycles skip Step A and re-seed `last_committed_id`
+        // from the prior boundary token; the committed-history commit
+        // payload (`[last_committed_id] ++ accepted_tokens`) would then
+        // double-commit that boundary token and advance
+        // `g_mtp_committed_len` one slot too far per cycle → RoPE/cache
+        // position drift. Hard-disable chaining whenever committed
+        // history is active.
+        let chained_cycles_enabled: bool =
+            $crate::models::qwen3_5::chat_common::mtp_chained_cycles_enabled()
+                && !$mtp.committed_history_active;
+        if $crate::models::qwen3_5::chat_common::mtp_chained_cycles_enabled()
+            && $mtp.committed_history_active
+        {
+            tracing::info!(
+                "MTP chained cycles suppressed: committed-history active \
+                 (MLX_MTP_CHAINED_CYCLES ignored — mutually exclusive)"
+            );
+        }
         let mut chained_hidden_opt: Option<$crate::array::MxArray> = None;
 
         // W6.8 — Adaptive MTP depth policy. When `mtp_adaptive_depth`
@@ -2490,6 +2612,34 @@ macro_rules! decode_loop_mtp {
             } else {
                 $depth
             };
+            // Near-tail budget cap. The compiled verify writes `depth+1`
+            // target-cache slots BEFORE the post-verify truncation to
+            // `max_new_tokens`; when fewer than `depth+1` main-cache
+            // slots remain near the tail the write can overrun the
+            // rounded `max_kv_len` allocation. Cap the effective cycle
+            // depth so the verify never needs more main-cache slots than
+            // the remaining generation budget can absorb. `remaining` is
+            // `>= 1` here (the `$gen.len() >= $max` check above already
+            // broke the loop otherwise). With `effective_depth =
+            // remaining - 1` the verify writes exactly `remaining`
+            // slots and the cycle emits at most `remaining` tokens.
+            let remaining: usize = ($max as usize).saturating_sub($gen.len());
+            let cycle_depth: usize = cycle_depth.min(remaining.saturating_sub(1));
+            if cycle_depth < 1 {
+                // Only 1 token of budget left — an MTP cycle would
+                // draft+verify more tokens than can be emitted. Fall
+                // back to single-token AR decode: skip this cycle and
+                // let the next iteration's Step A emit the final token
+                // (its post-emit `$gen.len() >= $max` check then breaks
+                // the loop with reason "length"). `chained_hidden_opt`
+                // is still `None` here, so Step A runs unconditionally.
+                tracing::debug!(
+                    target: "mlx_core::mtp",
+                    remaining,
+                    "MTP cycle skipped near tail: AR-decoding the final token(s)"
+                );
+                continue;
+            }
             $profiler.begin("mtp_cycle");
             let cycle_started_at = std::time::Instant::now();
             let cycle_res =
@@ -3022,6 +3172,13 @@ mod mtp_cycle_tests {
             // need to validate it (cycle-level acceptance semantics
             // are path-agnostic).
             fused_draft: None,
+            // Phase C — committed-history commit is dense-only and
+            // exercised by the smoke harness; the cycle-level
+            // acceptance tests use a no-op commit hook.
+            commit_mtp: |_: &MxArray, _: &MxArray, _: &[u32], _: usize, _: &MxArray| Ok(()),
+            // Phase C — cycle-level acceptance tests use the legacy
+            // cycle-history policy, so committed-history is inactive.
+            committed_history_active: false,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
@@ -3094,6 +3251,13 @@ mod mtp_cycle_tests {
             // need to validate it (cycle-level acceptance semantics
             // are path-agnostic).
             fused_draft: None,
+            // Phase C — committed-history commit is dense-only and
+            // exercised by the smoke harness; the cycle-level
+            // acceptance tests use a no-op commit hook.
+            commit_mtp: |_: &MxArray, _: &MxArray, _: &[u32], _: usize, _: &MxArray| Ok(()),
+            // Phase C — cycle-level acceptance tests use the legacy
+            // cycle-history policy, so committed-history is inactive.
+            committed_history_active: false,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xBADC0DE);
@@ -3159,6 +3323,13 @@ mod mtp_cycle_tests {
             // need to validate it (cycle-level acceptance semantics
             // are path-agnostic).
             fused_draft: None,
+            // Phase C — committed-history commit is dense-only and
+            // exercised by the smoke harness; the cycle-level
+            // acceptance tests use a no-op commit hook.
+            commit_mtp: |_: &MxArray, _: &MxArray, _: &[u32], _: usize, _: &MxArray| Ok(()),
+            // Phase C — cycle-level acceptance tests use the legacy
+            // cycle-history policy, so committed-history is inactive.
+            committed_history_active: false,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xDEAD);
@@ -3242,6 +3413,13 @@ mod mtp_cycle_tests {
             // need to validate it (cycle-level acceptance semantics
             // are path-agnostic).
             fused_draft: None,
+            // Phase C — committed-history commit is dense-only and
+            // exercised by the smoke harness; the cycle-level
+            // acceptance tests use a no-op commit hook.
+            commit_mtp: |_: &MxArray, _: &MxArray, _: &[u32], _: usize, _: &MxArray| Ok(()),
+            // Phase C — cycle-level acceptance tests use the legacy
+            // cycle-history policy, so committed-history is inactive.
+            committed_history_active: false,
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xFEED);

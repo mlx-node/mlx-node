@@ -167,6 +167,46 @@ static int g_mtp_offset_int = 0;                  // mirror of main `g_offset_in
 static int g_mtp_chain_start_int = 0;
 static bool g_mtp_compile_inited = false;
 
+// Phase C — MTP K/V cache headroom.
+//
+// The MTP K/V cache is allocated `max_kv_len + MTP_CACHE_HEADROOM` slots.
+// `begin_cycle` re-anchors the draft offset to `g_mtp_committed_len`
+// (≤ sequence length ≤ max_kv_len) and the draft steps `slice_update`
+// K/V at `[g_mtp_committed_len .. g_mtp_committed_len + depth)` BEFORE
+// the commit's capacity check runs; a commit then writes
+// `[g_mtp_committed_len .. g_mtp_committed_len + (depth + 2))`. Near the
+// tail of a long generation `g_mtp_committed_len` approaches max_kv_len,
+// so without headroom either write can run off the end of an exactly
+// `max_kv_len`-sized buffer. `MTP_CACHE_HEADROOM` must cover the largest
+// single draft/commit write: max draft depth 5 + the 2 boundary tokens
+// of a commit = 7. We round up to 16 for alignment and slack. The
+// draft / fused-draft / commit graphs all read the buffer's actual
+// `max_kv_len` dimension via `inputs[...].shape(2)`, so a larger buffer
+// just makes those graphs compile against the larger shape — the
+// attention mask `arange(0, buffer_len)` and `slice_update` operate over
+// the bigger buffer correctly. The commit FFI's capacity check is kept
+// as defense-in-depth; with this headroom it should never trip.
+constexpr int MTP_CACHE_HEADROOM = 16;
+
+// Phase C — committed-history MTP cache policy.
+//
+// `g_mtp_committed_len` is the number of MTP cache slots that hold EXACT
+// committed K/V — i.e. K/V keyed at absolute sequence positions
+// `[0 .. g_mtp_committed_len)`, computed from the target model's
+// post-final-norm hidden + input embedding of each committed token.
+//
+// Under the `committed` history policy the MTP cache PERSISTS across
+// cycles (`begin_cycle` no longer zeroes it). Each cycle's
+// `mlx_qwen35_mtp_compiled_commit` appends K+1 exact slots
+// (`[last_committed, d_0..d_{K-1}]`) and advances this counter; the
+// `boundary`/residual token's slot is DEFERRED to the next cycle's
+// commit (its hidden is not produced until it is consumed by a forward).
+//
+// `begin_cycle` then re-anchors the draft offset to this counter so the
+// next cycle's draft steps write at `[g_mtp_committed_len ..]` and the
+// draft attention mask spans the full committed prefix `[0 .. offset]`.
+static int g_mtp_committed_len = 0;
+
 // =====================================================================
 // Draft graph: traced once, reused across all D draft steps.
 //
@@ -318,6 +358,197 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
 static auto& compiled_mtp_draft_decode() {
   static auto fn = mlx::core::compile(mtp_draft_decode_fn);
   return fn;
+}
+
+// =====================================================================
+// Phase C — committed-history commit graph.
+//
+// Computes the MTP layer-0 attention K/V for M committed tokens and
+// writes them into the persistent MTP KV cache. One graph per cycle,
+// compiled once per M (statically unrolled by template `M`).
+//
+// `M = K+2` on the default Step-A path — the FULL committed sequence
+// `[last_committed_id, d_0..d_{K-1}, boundary]` emitted by one outer
+// iteration. The boundary token (bonus on full accept, residual on
+// reject) IS committed here so the MTP prefix advances by exactly M
+// per cycle, matching the real decode sequence length — no prefix
+// compression, no RoPE drift.
+//
+// The committed K/V for a token `x` MUST be bit-compatible with what a
+// draft step at that absolute position would have produced — drafts in
+// the next cycle attend over these slots, and a mis-keyed slot
+// corrupts the draft attention. We therefore reuse the EXACT op
+// sequence of `mtp_draft_decode_fn`'s per-token body (norm / fc /
+// k_proj / k_norm / RoPE) up to but NOT including attention output:
+// only K and V are needed to fill the cache.
+//
+// Bug 2 fix — token/hidden pairing: row `i` of `hidden_seq` already
+// holds the hidden of the token BEFORE committed token `i` (the MTP
+// `MTP(h(t), emb(t+1))` contract), and row `i` of `gathered_embs` holds
+// the embedding of committed token `i`. The pairing is done Rust-side
+// in `commit_mtp_compiled`, so this graph just consumes row `i` of each
+// array at slot `i` — `fc([e_norm(emb_i), h_norm(hidden_i)])`.
+//
+// Inputs (vector order):
+//   [0]              hidden_seq      [1, M, hidden] bf16
+//                                    (hidden of the token BEFORE each
+//                                     committed token, pre-paired
+//                                     Rust-side).
+//   [1]              gathered_embs   [1, M, hidden] bf16
+//                                    (input embedding of each committed
+//                                     token, pre-gathered Rust-side).
+//   [2]              base_offset_arr [1] int32 — the absolute position
+//                                    of slot 0 (= g_mtp_committed_len).
+//                                    Threaded as an array input to keep
+//                                    the compile cache shape-stable,
+//                                    exactly like the draft graph's
+//                                    offset_arr.
+//   For each MTP layer j in [0, n_mtp_layers):
+//     [3 + j*2 + 0]  K cache         [1, Hkv, max_kv_len, head_dim]
+//     [3 + j*2 + 1]  V cache         [1, Hkv, max_kv_len, head_dim]
+//
+// Outputs (vector order):
+//   For each MTP layer j:
+//     [j*2 + 0]      new K cache (M slots written)
+//     [j*2 + 1]      new V cache (M slots written)
+//
+// ALL M slots are written and the C++ caller advances
+// `g_mtp_committed_len` by exactly M.
+//
+// `n_mtp_layers == 1` for the dense MTP target, but the loop is general.
+// =====================================================================
+template <int M>
+static std::vector<array> mtp_commit_fn(const std::vector<array>& inputs) {
+  static_assert(M >= 2 && M <= 7,
+                "mtp_commit_fn: M must be in [2, 7] (= K+2, depth <= 5)");
+  const auto& cfg = g_mtp_config;
+  auto hidden_seq    = inputs[0];   // [1, M, hidden]
+  auto gathered_embs = inputs[1];   // [1, M, hidden]
+  auto base_offset   = inputs[2];   // [1] int32
+
+  // Cache vector that gets rewritten across the M positions.
+  std::vector<array> caches;
+  caches.reserve(cfg.n_mtp_layers * 2);
+  for (int j = 0; j < cfg.n_mtp_layers * 2; j++) {
+    caches.push_back(inputs[3 + j]);
+  }
+
+  // Statically unrolled over the M committed positions.
+  for (int i = 0; i < M; i++) {
+    // Slice position `i` → [1, 1, hidden] (matches the draft path's
+    // [1, 1, hidden] prev_hidden / prev_emb contract). Row `i` of
+    // `hidden_seq` is already h(prev(committed_token_i)) and row `i` of
+    // `gathered_embs` is emb(committed_token_i) — paired Rust-side.
+    auto h_i = slice(hidden_seq, {0, i, 0},
+                     {1, i + 1, cfg.hidden_size});      // [1, 1, hidden]
+    auto e_i = slice(gathered_embs, {0, i, 0},
+                     {1, i + 1, cfg.hidden_size});      // [1, 1, hidden]
+
+    // Absolute position of slot `i` = base_offset + i. Threaded as a
+    // [1] int32 array so RoPE matches the draft graph's `offset_arr`
+    // semantics exactly.
+    auto pos_i = base_offset + array(i, mlx::core::int32);
+
+    // ---- MTP head pre-attention body (mirrors mtp_draft_decode_fn) ----
+    // h_norm = pre_fc_norm_hidden(h_i); e_norm = pre_fc_norm_embedding(e_i)
+    // h2d    = fc(concat([e_norm, h_norm], axis=-1))   ([embedding,hidden])
+    auto h_norm = fast::rms_norm(h_i,
+                                 get_weight("mtp.pre_fc_norm_hidden.weight"),
+                                 cfg.rms_norm_eps);
+    auto e_norm = fast::rms_norm(e_i,
+                                 get_weight("mtp.pre_fc_norm_embedding.weight"),
+                                 cfg.rms_norm_eps);
+    auto concat3d = concatenate({e_norm, h_norm}, 2);   // [1, 1, 2*hidden]
+    auto concat2d = reshape(concat3d, {1, cfg.hidden_size * 2});
+    auto h2d = linear_proj(concat2d, "mtp.fc");          // [1, hidden]
+
+    // Layer-0 (only layer) input_layernorm → K/V projection.
+    std::string lp = "mtp.layers.0";
+    auto normed = fast::rms_norm(h2d, get_weight(lp + ".input_layernorm.weight"),
+                                 cfg.rms_norm_eps);
+
+    std::string pfx = lp + ".self_attn.";
+    int B = normed.shape(0);
+    auto keys   = linear_proj(normed, pfx + "k_proj");
+    auto values = linear_proj(normed, pfx + "v_proj");
+    if (has_weight(pfx + "k_proj.bias")) keys   = keys   + get_weight(pfx + "k_proj.bias");
+    if (has_weight(pfx + "v_proj.bias")) values = values + get_weight(pfx + "v_proj.bias");
+
+    keys   = reshape(keys,   {B, 1, cfg.num_kv_heads, cfg.head_dim});
+    values = reshape(values, {B, 1, cfg.num_kv_heads, cfg.head_dim});
+
+    // k_norm then RoPE at absolute position `pos_i` — identical to
+    // `attn_pure_fn_arr_offset` so the committed K matches a draft-time
+    // query at the same position.
+    keys = fast::rms_norm(keys, get_weight(pfx + "k_norm.weight"),
+                          cfg.rms_norm_eps);
+    keys = fast::rope(keys, cfg.rope_dims, false, cfg.rope_theta, 1.0f, pos_i);
+
+    keys   = transpose(keys,   {0, 2, 1, 3});   // [B, Hkv, 1, D]
+    values = transpose(values, {0, 2, 1, 3});
+
+    // slice_update writes the single K/V slot at absolute position
+    // `pos_i` into layer 0's cache.
+    caches[0] = mlx::core::slice_update(caches[0], keys,   pos_i, {2});
+    caches[1] = mlx::core::slice_update(caches[1], values, pos_i, {2});
+  }
+
+  std::vector<array> result;
+  result.reserve(cfg.n_mtp_layers * 2);
+  for (auto& c : caches) result.push_back(std::move(c));
+  return result;
+}
+
+// Per-M compiled commit graph. One `mlx::core::compile` entry per
+// M ∈ {2..7} (= K+2, depth ≤ 5) — the unrolled body differs per M, so
+// each gets its own static-function-local compile cache (survives
+// reset, like the fused draft graph).
+template <int M>
+static auto& compiled_mtp_commit() {
+  static auto fn = mlx::core::compile(mtp_commit_fn<M>);
+  return fn;
+}
+
+using CommitFn = std::function<std::vector<array>(const std::vector<array>&)>;
+
+// Valid committed-token counts: M = K+2, K ∈ [0, depth], depth ∈ [1, 5]
+// → M ∈ [2, 7].
+constexpr int MIN_COMMIT_M = 2;
+constexpr int MAX_COMMIT_M = 7;
+
+static CommitFn make_commit_dispatcher(int m) {
+  switch (m) {
+    case 2: return [](const std::vector<array>& in) {
+      return compiled_mtp_commit<2>()(in);
+    };
+    case 3: return [](const std::vector<array>& in) {
+      return compiled_mtp_commit<3>()(in);
+    };
+    case 4: return [](const std::vector<array>& in) {
+      return compiled_mtp_commit<4>()(in);
+    };
+    case 5: return [](const std::vector<array>& in) {
+      return compiled_mtp_commit<5>()(in);
+    };
+    case 6: return [](const std::vector<array>& in) {
+      return compiled_mtp_commit<6>()(in);
+    };
+    case 7: return [](const std::vector<array>& in) {
+      return compiled_mtp_commit<7>()(in);
+    };
+    default: return CommitFn{};
+  }
+}
+
+static std::array<CommitFn, MAX_COMMIT_M - MIN_COMMIT_M + 1>
+    g_commit_compiled_by_m{};
+
+static const CommitFn& get_or_make_commit_fn(int m) {
+  auto& slot = g_commit_compiled_by_m[m - MIN_COMMIT_M];
+  if (!slot) {
+    slot = make_commit_dispatcher(m);
+  }
+  return slot;
 }
 
 // =====================================================================
@@ -801,13 +1032,20 @@ int32_t mlx_qwen35_mtp_compiled_init_from_main(
     g_mtp_config.linear_value_head_dim   = linear_value_head_dim;
     g_mtp_config.linear_conv_kernel_dim  = linear_conv_kernel_dim;
     g_mtp_config.tie_word_embeddings     = (tie_word_embeddings != 0);
-    g_mtp_config.max_kv_len              = max_kv_len;
+    // Phase C headroom: the MTP K/V buffer is allocated
+    // `max_kv_len + MTP_CACHE_HEADROOM` slots so a near-tail draft /
+    // commit `slice_update` (up to depth + 2 = 7 slots past
+    // g_mtp_committed_len) can never run off the end. `g_mtp_config.max_kv_len`
+    // stores the ACTUAL buffer length so the commit FFI's capacity check
+    // matches the buffer the draft/commit graphs `slice_update` into.
+    const int mtp_buffer_len = max_kv_len + MTP_CACHE_HEADROOM;
+    g_mtp_config.max_kv_len              = mtp_buffer_len;
     g_mtp_config.batch_size              = batch_size;
     g_mtp_config.n_mtp_layers            = n_mtp_layers;
     g_mtp_config.mtp_fa_layer_idx        = std::max(full_attention_interval - 1, 0);
 
     // Fresh per-MTP-layer KV caches. All MTP layers are full-attention,
-    // so each entry is a [B, Hkv, max_kv_len, D] zero buffer at bf16.
+    // so each entry is a [B, Hkv, mtp_buffer_len, D] zero buffer at bf16.
     // We DO NOT seed from the main path's caches: MTP draft steps
     // build their OWN KV context from the drafted tokens and discard
     // it on acceptance failure, so seeding from the main path's
@@ -815,9 +1053,9 @@ int32_t mlx_qwen35_mtp_compiled_init_from_main(
     g_mtp_compiled_caches.clear();
     g_mtp_compiled_caches.reserve(n_mtp_layers * 2);
     for (int j = 0; j < n_mtp_layers; j++) {
-      auto kk = zeros({batch_size, num_kv_heads, max_kv_len, head_dim},
+      auto kk = zeros({batch_size, num_kv_heads, mtp_buffer_len, head_dim},
                       mlx::core::bfloat16);
-      auto vv = zeros({batch_size, num_kv_heads, max_kv_len, head_dim},
+      auto vv = zeros({batch_size, num_kv_heads, mtp_buffer_len, head_dim},
                       mlx::core::bfloat16);
       g_mtp_compiled_caches.push_back(std::move(kk));
       g_mtp_compiled_caches.push_back(std::move(vv));
@@ -833,6 +1071,19 @@ int32_t mlx_qwen35_mtp_compiled_init_from_main(
     // the two counters consistent for any debug introspection.
     g_mtp_offset_int = mlx_qwen35_get_cache_offset();
     g_mtp_chain_start_int = g_mtp_offset_int;
+    // Phase C — committed-history policy. The MTP KV cache is its OWN
+    // sequence, independent of the main model's absolute positions: the
+    // prompt-prefix tokens are NEVER given MTP K/V (only tokens
+    // produced during decode are committed). The committed-prefix
+    // counter therefore starts at 0 — the first
+    // `mlx_qwen35_mtp_compiled_commit` after the first verify writes
+    // slots `[0 .. K+1)`, and subsequent cycles append.
+    //
+    // Starting the counter at `main_offset` would leave the slots
+    // `[0 .. main_offset)` permanently zero yet inside the draft
+    // attention window (`begin_cycle` sets `chain_start = 0`), diluting
+    // the softmax weight on the real committed K/V by ~1/main_offset.
+    g_mtp_committed_len = 0;
 
     // Drop any stale verify closures from a prior model load — the
     // per-depth closures capture nothing model-specific, but a fresh
@@ -1401,9 +1652,18 @@ void mlx_qwen35_mtp_compiled_reset() {
   g_mtp_compiled_caches.clear();
   g_mtp_offset_int = 0;
   g_mtp_chain_start_int = 0;
+  // Phase C — committed-history counter resets with the rest of the
+  // MTP state so a fresh turn starts with an empty committed prefix.
+  g_mtp_committed_len = 0;
   g_mtp_compile_inited = false;
   g_mtp_config = MTPCompileConfig{};
   for (auto& slot : g_verify_compiled_by_depth) {
+    slot = nullptr;
+  }
+  // Phase C — drop the per-M commit dispatchers (the underlying
+  // compiled-graph cache is static-function-local and survives reset,
+  // mirroring the fused draft graph).
+  for (auto& slot : g_commit_compiled_by_m) {
     slot = nullptr;
   }
   // W6.18 — also clear the fused draft dispatcher table so a
@@ -1430,51 +1690,176 @@ void mlx_qwen35_mtp_compiled_adjust_offset(int delta) {
 }
 
 // -----------------------------------------------------------------------------
-// W6 Bug #2 fix (Option Reset): begin a fresh MTP draft cycle aligned to
-// the main path's current offset. Zeroes the MTP K/V caches and sets
-// `g_mtp_offset_int = main_offset`.
+// Phase C — committed-history MTP cache policy: begin a fresh MTP draft
+// cycle WITHOUT zeroing the persistent MTP K/V cache.
 //
-// Why this exists:
-//   Per outer iteration of `decode_loop_mtp!` the main offset advances
-//   by D+2 (1 Step-A forward + (D+1) verify forwards) while the MTP
-//   draft offset only advances by D. After K cycles the MTP offset
-//   lags the main offset by 2K, so MTP RoPE positions diverge from
-//   the actual sequence positions — drafts produce gibberish, every
-//   token rejects, and the residual sample comes from a corrupted
-//   distribution.
+// Prior behavior (W6 Bug #2 "Option Reset", cycle history policy): this
+// zeroed the entire MTP KV cache every cycle and re-anchored the offset
+// to `main_offset`, so the MTP heads attended ONLY over the current
+// cycle's draft chain. A ground-truth A/B against the MTPLX reference
+// proved a PERSISTENT committed-history cache (heads attend over the
+// full committed prefix) nearly doubles draft acceptance.
 //
-//   Naively syncing the offset (Option Sync) leaves a 2-position gap
-//   in the MTP K/V buffer per cycle (the slots Step A + verify[0] wrote
-//   on the main path are never written on the MTP path); those slots
-//   read back as zero K/V and pollute the draft attention. Resetting
-//   to all-zeros and re-anchoring to `main_offset` matches the W5 init
-//   behavior (zeroed buffer + offset = prefill_len), so every cycle is
-//   self-contained and behaves like the very first draft cycle.
+// New behavior (committed policy):
+//   - Do NOT zero / reallocate the caches. They persist across cycles;
+//     `mlx_qwen35_mtp_compiled_commit` (called after each verify) keeps
+//     `[0 .. g_mtp_committed_len)` filled with exact committed K/V.
+//   - Re-anchor the draft offset to `g_mtp_committed_len` — the next
+//     cycle's draft steps write at `[g_mtp_committed_len ..]`.
+//   - Set `g_mtp_chain_start_int = 0`. The existing draft attn_mask
+//     (`chain_start <= pos <= offset`) then collapses to plain causal
+//     (`0 <= pos <= offset`), correct because the whole prefix
+//     `[0 .. g_mtp_committed_len)` now holds real committed K/V.
 //
-// Trade-off: abandons the W6.5 chained-cycle perf win (where prior
-// cycles' MTP K/V would seed the next cycle's drafts). That's out of
-// scope here — the immediate goal is parity, not throughput.
+// The `main_offset` argument is retained for FFI ABI stability; under
+// the committed policy it is no longer used to re-anchor the offset
+// (the commit fn drives `g_mtp_offset_int` / `g_mtp_committed_len`).
 //
 // No-op if MTP isn't initialised — the dispatcher Rust-side already
 // gates the call on `mtp_active`, but defensive-checked here too.
 // -----------------------------------------------------------------------------
 void mlx_qwen35_mtp_compiled_begin_cycle(int main_offset) {
   if (!g_mtp_compile_inited) return;
-  const auto& cfg = g_mtp_config;
-  for (int j = 0; j < cfg.n_mtp_layers; j++) {
-    g_mtp_compiled_caches[j * 2]     = zeros(
-        {cfg.batch_size, cfg.num_kv_heads, cfg.max_kv_len, cfg.head_dim},
-        mlx::core::bfloat16);
-    g_mtp_compiled_caches[j * 2 + 1] = zeros(
-        {cfg.batch_size, cfg.num_kv_heads, cfg.max_kv_len, cfg.head_dim},
-        mlx::core::bfloat16);
+  (void)main_offset;  // committed-history policy: offset driven by commit
+  g_mtp_offset_int = g_mtp_committed_len;
+  g_mtp_chain_start_int = 0;
+}
+
+// -----------------------------------------------------------------------------
+// Phase C — append exact committed K/V to the persistent MTP cache.
+//
+// Called once per cycle, AFTER the accept loop has determined the
+// accepted-draft count K and BEFORE the rollback. Writes M = K+2 exact
+// MTP layer-0 K/V slots for the FULL committed sequence
+// `[last_committed_id, d_0..d_{K-1}, boundary]` using the pre-assembled
+// hidden / embedding rows, then advances `g_mtp_committed_len` by M.
+//
+// Bug 1 fix — the boundary token (bonus on full accept, residual on
+// reject) IS committed here. Its hidden (`verify_hiddens[:, K, :]`) is
+// already available at commit time, so there is no deferral: the MTP
+// prefix grows by exactly M = K+2 per cycle, matching the real decode
+// sequence length. The prior "K+1, defer boundary" policy compressed
+// the prefix by 1/cycle and drifted every RoPE position.
+//
+// Inputs:
+//   - hidden_seq_ptr:    `[1, M, hidden]` bf16 — `hidden_seq[i]` is the
+//                        hidden of the token BEFORE committed token `i`
+//                        (the MTP `MTP(h(t), emb(t+1))` contract).
+//                        Pre-assembled Rust-side: row 0 is the cycle's
+//                        Step-A seed hidden, rows 1..K+1 are
+//                        `verify_hiddens[:, 0:K+1, :]`.
+//   - gathered_embs_ptr: `[1, M, hidden]` bf16 — input embedding of each
+//                        committed token, pre-gathered Rust-side
+//                        (avoids a quantized-embedding edge case in
+//                        the graph).
+//   - m:                 M = K+2 ∈ {2..7}. Both input arrays MUST have
+//                        time dim M.
+//
+// SIDE EFFECTS: writes M K/V slots into `g_mtp_compiled_caches[]` at
+// absolute positions `[g_mtp_committed_len .. g_mtp_committed_len+M)`,
+// then sets `g_mtp_committed_len += M` and
+// `g_mtp_offset_int = g_mtp_committed_len`.
+//
+// Returns 0 on success (committed exactly M slots, `g_mtp_committed_len`
+// advanced by M). Returns a distinct non-zero code on any failure
+// (not-inited, bad args, capacity overflow, exception). On EVERY failure
+// path `g_mtp_committed_len` is left UNCHANGED so the Rust caller can
+// detect the desync and abort decode cleanly rather than anchoring the
+// next cycle's drafts to a stale committed length.
+//
+// Failure codes:
+//   1  MTP not initialised / null arg pointer
+//   2  m outside [MIN_COMMIT_M, MAX_COMMIT_M]
+//   3  capacity overflow (committed_len + m > max_kv_len)
+//   4  std::exception thrown inside the commit graph
+//   5  unknown (non-std) exception
+// -----------------------------------------------------------------------------
+int mlx_qwen35_mtp_compiled_commit(
+    mlx_array* hidden_seq_ptr,
+    mlx_array* gathered_embs_ptr,
+    int m
+) {
+  if (!g_mtp_compile_inited) return 1;
+  if (!hidden_seq_ptr || !gathered_embs_ptr) return 1;
+  if (m < MIN_COMMIT_M || m > MAX_COMMIT_M) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_mtp_compiled_commit: m %d outside [%d, %d]\n",
+            m, MIN_COMMIT_M, MAX_COMMIT_M);
+    fflush(stderr);
+    return 2;
   }
-  g_mtp_offset_int = main_offset;
-  // W6.32 — snapshot the chain start so the draft attn_mask can exclude
-  // the zero-K/V slots `[0..main_offset)`. Stays constant for the entire
-  // cycle (every draft step within this cycle uses the same lower bound)
-  // and gets refreshed by the next `begin_cycle`.
-  g_mtp_chain_start_int = main_offset;
+  // Guard the cache: writing M slots starting at g_mtp_committed_len
+  // must stay inside the buffer. Compute the sum in 64-bit signed so the
+  // capacity check itself cannot overflow.
+  const int64_t projected_len =
+      static_cast<int64_t>(g_mtp_committed_len) + static_cast<int64_t>(m);
+  if (projected_len > static_cast<int64_t>(g_mtp_config.max_kv_len)) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_mtp_compiled_commit: committed_len %d + m %d "
+            "exceeds max_kv_len %d — skipping commit\n",
+            g_mtp_committed_len, m, g_mtp_config.max_kv_len);
+    fflush(stderr);
+    return 3;
+  }
+
+  if (qwen35_common::mtp_trace_enabled()) {
+    fprintf(stderr,
+            "[MTP-TRACE] mlx_qwen35_mtp_compiled_commit: ENTER m=%d "
+            "committed_len=%d (base RoPE pos)\n",
+            m, g_mtp_committed_len);
+  }
+
+  try {
+    auto& hidden_seq    = *reinterpret_cast<array*>(hidden_seq_ptr);
+    auto& gathered_embs = *reinterpret_cast<array*>(gathered_embs_ptr);
+
+    std::vector<array> inputs;
+    inputs.reserve(3 + g_mtp_config.n_mtp_layers * 2);
+    inputs.push_back(hidden_seq);
+    inputs.push_back(gathered_embs);
+    inputs.push_back(reshape(array(g_mtp_committed_len, mlx::core::int32), {1}));
+    for (const auto& c : g_mtp_compiled_caches) {
+      inputs.push_back(c);
+    }
+
+    const auto& commit_fn = get_or_make_commit_fn(m);
+    if (!commit_fn) {
+      throw std::runtime_error(
+          "mlx_qwen35_mtp_compiled_commit: no commit dispatcher for m");
+    }
+    auto outputs = commit_fn(inputs);
+    if (outputs.size() < static_cast<size_t>(g_mtp_config.n_mtp_layers * 2)) {
+      throw std::runtime_error(
+          "mlx_qwen35_mtp_compiled_commit: commit graph returned fewer "
+          "outputs than expected");
+    }
+    for (int j = 0; j < g_mtp_config.n_mtp_layers * 2; j++) {
+      g_mtp_compiled_caches[j] = outputs[j];
+    }
+
+    g_mtp_committed_len += m;
+    g_mtp_offset_int = g_mtp_committed_len;
+
+    if (qwen35_common::mtp_trace_enabled()) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_mtp_compiled_commit: EXIT OK "
+              "new_committed_len=%d new_mtp_offset=%d\n",
+              g_mtp_committed_len, g_mtp_offset_int);
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    // g_mtp_committed_len is advanced only after the graph fully
+    // succeeds above, so a throw here leaves committed state unchanged.
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_mtp_compiled_commit: %s\n",
+            e.what());
+    fflush(stderr);
+    return 4;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_mtp_compiled_commit\n");
+    fflush(stderr);
+    return 5;
+  }
 }
 
 // -----------------------------------------------------------------------------

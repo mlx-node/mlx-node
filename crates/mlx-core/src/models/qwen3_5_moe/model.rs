@@ -1756,6 +1756,20 @@ impl Qwen35MoeInner {
                     // task scope. MoE follow-up is a separate task; for
                     // now MoE always uses the per-step draft loop.
                     fused_draft: None,
+                    // Phase C — committed-history is dense-only at this
+                    // task scope. The MoE path keeps the legacy
+                    // cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a
+                    // no-op.
+                    commit_mtp: |_seed_hidden: &MxArray,
+                                 _verify_hiddens: &MxArray,
+                                 _committed_ids: &[u32],
+                                 _k_accepted: usize,
+                                 _emb: &MxArray|
+                     -> Result<()> { Ok(()) },
+                    // Phase C — committed-history is dense-only; the
+                    // MoE path keeps the legacy cycle-history policy.
+                    committed_history_active: false,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -3903,6 +3917,20 @@ impl Qwen35MoeInner {
                     // task scope. MoE follow-up is a separate task; for
                     // now MoE always uses the per-step draft loop.
                     fused_draft: None,
+                    // Phase C — committed-history is dense-only at this
+                    // task scope. The MoE path keeps the legacy
+                    // cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a
+                    // no-op.
+                    commit_mtp: |_seed_hidden: &MxArray,
+                                 _verify_hiddens: &MxArray,
+                                 _committed_ids: &[u32],
+                                 _k_accepted: usize,
+                                 _emb: &MxArray|
+                     -> Result<()> { Ok(()) },
+                    // Phase C — committed-history is dense-only; the
+                    // MoE path keeps the legacy cycle-history policy.
+                    committed_history_active: false,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -4587,6 +4615,20 @@ impl Qwen35MoeInner {
                     // task scope. MoE follow-up is a separate task; for
                     // now MoE always uses the per-step draft loop.
                     fused_draft: None,
+                    // Phase C — committed-history is dense-only at this
+                    // task scope. The MoE path keeps the legacy
+                    // cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a
+                    // no-op.
+                    commit_mtp: |_seed_hidden: &MxArray,
+                                 _verify_hiddens: &MxArray,
+                                 _committed_ids: &[u32],
+                                 _k_accepted: usize,
+                                 _emb: &MxArray|
+                     -> Result<()> { Ok(()) },
+                    // Phase C — committed-history is dense-only; the
+                    // MoE path keeps the legacy cycle-history policy.
+                    committed_history_active: false,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -5393,6 +5435,20 @@ impl Qwen35MoeInner {
                     // task scope. MoE follow-up is a separate task; for
                     // now MoE always uses the per-step draft loop.
                     fused_draft: None,
+                    // Phase C — committed-history is dense-only at this
+                    // task scope. The MoE path keeps the legacy
+                    // cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a
+                    // no-op.
+                    commit_mtp: |_seed_hidden: &MxArray,
+                                 _verify_hiddens: &MxArray,
+                                 _committed_ids: &[u32],
+                                 _k_accepted: usize,
+                                 _emb: &MxArray|
+                     -> Result<()> { Ok(()) },
+                    // Phase C — committed-history is dense-only; the
+                    // MoE path keeps the legacy cycle-history policy.
+                    committed_history_active: false,
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
