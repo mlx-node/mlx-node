@@ -28,6 +28,7 @@ import { LessonLayout } from './learn/LessonLayout';
 import { findChapter } from './learn/chapters';
 import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
 import { TokenizationChapterBody, TokenizerDemo } from './learn/chapters/01-tokenization';
+import { RmsNormChapterBody, RmsNormDemo } from './learn/chapters/06-rms-norm';
 import { SamplingChapterBody, SamplingDemo } from './learn/chapters/09-sampling';
 
 const INITIAL_SCREEN: ScreenState = { kind: 'landing' };
@@ -2080,6 +2081,8 @@ function App() {
                 <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'tokenization' ? (
                 <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : chapter.id === 'rmsnorm' ? (
+                <RmsNormDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'sampling' ? (
                 <SamplingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : null
@@ -2089,6 +2092,8 @@ function App() {
               <AttentionChapterBody />
             ) : chapter.id === 'tokenization' ? (
               <TokenizationChapterBody />
+            ) : chapter.id === 'rmsnorm' ? (
+              <RmsNormChapterBody />
             ) : chapter.id === 'sampling' ? (
               <SamplingChapterBody />
             ) : (

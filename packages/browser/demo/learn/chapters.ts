@@ -60,7 +60,7 @@ export const CHAPTERS: ChapterMeta[] = [
     title: "RMSNorm",
     blurb:
       "Why normalize? Pre- and post-norm activation distributions for a real layer.",
-    available: false,
+    available: true,
   },
   {
     id: "mlp",
