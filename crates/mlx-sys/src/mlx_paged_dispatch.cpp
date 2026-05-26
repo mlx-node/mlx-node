@@ -11,6 +11,18 @@
 
 #include "mlx_paged_dispatch.h"
 
+// The entire kernel-dispatch implementation here is Metal-only: it loads
+// the paged-attention .metallib via MLX's Metal device API and encodes
+// onto `mlx::core::metal::CommandEncoder`. On the WASM/WebGPU build there
+// is no Metal toolchain and no MLX Metal symbols, so the whole TU
+// compiles to an empty object. WASM paged paths are routed through the
+// WebGPU backend in MLX itself rather than this dispatcher.
+//
+// `__wasi__` is auto-defined by the WASI clang driver and is the marker
+// we use to detect "no Metal SDK" — see the matching comment in
+// `mlx_paged_dispatch.h`.
+#if !defined(__wasi__)
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -1760,3 +1772,5 @@ void dispatch_paged_attention_varlen_auto(
 }
 
 } // namespace mlx::core::fast::paged
+
+#endif // !__wasi__

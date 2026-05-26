@@ -1,31 +1,30 @@
-// Pure-C++ kernel dispatch wrappers that the `PagedKVWrite` /
-// `PagedAttention` `Custom` primitives call from inside `eval_gpu`. They
-// encode kernels onto MLX's own `metal::CommandEncoder`, so dependency
-// tracking is correct without manual synchronization.
+// Phase 2 of the paged-attention compile integration.
+//
+// This header declares pure-C++ kernel dispatch wrappers that the
+// `PagedKVWrite` / `PagedAttention` `Custom` primitives call from inside
+// `eval_gpu`. Unlike Phase 1's extern-C shim into the mlx-paged-attn
+// Rust crate, these wrappers encode kernels onto MLX's own
+// `metal::CommandEncoder`, so dependency tracking is correct and no
+// `wait_until_completed` synchronization band-aid is needed.
 //
 // Kernel names + threadgroup-memory math + V1/V2 selection mirror the
 // Rust dispatcher in `crates/mlx-paged-attn/src/metal/{state,
 // reshape_and_cache, paged_attention}.rs`. The Rust dispatcher remains
-// in place as the synchronous fallback path: the adapter's raw-Metal
-// `PagedKVCacheAdapter::update_keys_values` goes through `LayerKVPool` →
-// Rust `dispatch_*`, outside MLX's graph scheduler. The `Custom`
-// primitives dispatched here are the graph-native default: every paged
-// family's pure-Rust forward (qwen3, qwen3.5 dense/MoE, lfm2, gemma4)
-// emits them via `PagedKVCacheAdapter::update_keys_values_native` /
-// `gather_kv_for_decode_graph` (`gather_kv_for_prefill_chunk` is
-// family-dependent: opt-in default-OFF on lfm2, absent on qwen3), so the
-// K/V write and attention read ride MLX's lazy graph with no per-layer
-// host sync. They also stay compile-traceable (usable inside
-// `mlx::core::compile`), covered by the compile-trace smoke tests in
-// `mlx_paged_ops.cpp`.
+// in place: it is the active production paged path for Qwen3, LFM2,
+// and Gemma4 (whose paged forward goes through `PagedKVCacheAdapter`
+// → `LayerKVPool` → Rust `dispatch_*` calls, NOT through the C++
+// `PagedKVWrite` / `PagedAttention` Custom primitives). The C++ port
+// in this header is exclusively for the compile-traceable primitives
+// used inside the Qwen3.5 dense / Qwen3.5 MoE C++ compile graphs
+// (`mlx_qwen35_init_paged` / `mlx_qwen35_moe_init_paged`).
 //
 // Notes:
 //   - The .metallib for these kernels is compiled by `mlx-sys/build.rs`
 //     from `crates/mlx-paged-attn/metal/*.metal`. It ships colocated
 //     with `mlx.metallib` (e.g. in `packages/core/`) and is loaded via
 //     MLX's `Device::get_library(name, path)` path overload.
-//   - `Device::get_library` and `::get_kernel` cache by name, so we get
-//     pipeline reuse for free.
+//   - `mlx::core::metal::Device::get_library` and `::get_kernel` cache
+//     by name, so we get pipeline reuse for free.
 //   - The Custom primitive's `eval_gpu` is responsible for argument
 //     validation, output allocation (`array::set_data`), and any
 //     pre-dispatch host-side checks. These functions only do the kernel
@@ -33,17 +32,25 @@
 
 #pragma once
 
+// The kernel-dispatch wrappers declared in this header take
+// `mlx::core::metal::CommandEncoder&` / `mlx::core::metal::Device&` and
+// transitively pull in `<Metal/Metal.hpp>` via
+// `mlx/backend/metal/device.h`. They are only callable when the Metal
+// backend is built; on the WASM/WebGPU build the entire header is empty
+// so translation units that include it (e.g. `mlx_paged_ops.cpp`) still
+// compile while their `eval_gpu` paths are themselves Metal-gated.
+//
+// Build detection: we key off `__wasi__` (auto-defined by the WASI
+// clang driver) rather than `MLX_USE_METAL`, because mlx-sys/build.rs
+// does not currently `.define()` `MLX_USE_METAL` on the native cc::Build
+// path. The negation `!defined(__wasi__)` is therefore TRUE on the
+// macOS/Metal build (preserving the pre-change byte-identical behavior)
+// and FALSE on the WASI/WebGPU build (where Metal/Metal.hpp is absent).
+#if !defined(__wasi__)
+
 #include <cstdint>
 
 #include "mlx/array.h"
-
-// These dispatch wrappers take MLX's Metal `CommandEncoder` / `Device` by
-// reference, so the whole declaration block is Metal-only. The two TUs that
-// include this header (`mlx_paged_dispatch.cpp`, `mlx_paged_ops.cpp`) are
-// excluded from the non-Apple build, but guard the include + decls anyway so
-// the header is safe to parse on any host.
-#if defined(__APPLE__)
-
 #include "mlx/backend/metal/device.h"
 
 namespace mlx::core::fast::paged {
@@ -111,8 +118,7 @@ void dispatch_reshape_and_cache(
 /// underlying kernel uses `1.0` as its disabled sentinel; this function
 /// translates.
 ///
-/// `sliding_window`: 0 = disabled, nonzero masks older K positions;
-/// negative is rejected.
+/// Sliding window must be 0 in Phase 2 (Phase 7 adds Gemma4 support).
 void dispatch_paged_attention_auto(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -137,39 +143,6 @@ void dispatch_paged_attention_auto(
     int sliding_window,
     KvDtype kv_dtype);
 
-/// Ragged-Q dispatcher. Writes `[total_queries, num_q_heads,
-/// head_size]` attention output to `out`. `cu_seqlens_q` carries the
-/// per-sequence query slice boundaries. V1/V2 selection mirrors the
-/// single-row dispatcher (`max_context_len <= PARTITION_SIZE` → V1).
-///
-/// `block_table` and `seq_lens` keep the same layouts as the
-/// single-row entrypoint.
-void dispatch_paged_attention_varlen_auto(
-    mlx::core::metal::CommandEncoder& encoder,
-    mlx::core::metal::Device& device,
-    mlx::core::Stream stream,
-    mlx::core::array& out,
-    const mlx::core::array& q,
-    const mlx::core::array& k_pool,
-    const mlx::core::array& v_pool,
-    const mlx::core::array& block_table,
-    const mlx::core::array& seq_lens,
-    const mlx::core::array& cu_seqlens_q,
-    const mlx::core::array& k_scale,
-    const mlx::core::array& v_scale,
-    int num_seqs,
-    int total_queries,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_size,
-    int block_size,
-    int max_context_len,
-    int max_blocks_per_seq,
-    float scale,
-    float softcap,
-    int sliding_window,
-    KvDtype kv_dtype);
-
 } // namespace mlx::core::fast::paged
 
-#endif // defined(__APPLE__)
+#endif // !__wasi__
