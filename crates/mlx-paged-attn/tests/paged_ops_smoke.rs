@@ -1940,3 +1940,71 @@ fn paged_attention_eval_gpu_rejects_zero_block_size() {
     let rc = unsafe { mlx_sys::mlx_paged_attention_eval_gpu_rejects_zero_block_size() };
     assert_eval_gpu_rejects_bad_state(rc, "PagedAttention block_size=0");
 }
+
+#[test]
+fn paged_attention_varlen_is_equivalent_same_state() {
+    let rc = unsafe {
+        mlx_sys::mlx_paged_attention_varlen_is_equivalent(
+            0.125, 0.0, 16, 8, 4, 64, 0, 1, 0.125, 0.0, 16, 8, 4, 64, 0, 1,
+        )
+    };
+    assert_eq!(
+        rc, 1,
+        "varlen is_equivalent: same scalar state should be equivalent"
+    );
+}
+
+#[test]
+fn paged_attention_varlen_is_equivalent_differing_state() {
+    let rc = unsafe {
+        mlx_sys::mlx_paged_attention_varlen_is_equivalent(
+            0.125, 0.0, 16, 8, 4, 64, 0, 1, 0.25, 0.0, 16, 8, 4, 64, 0, 1,
+        )
+    };
+    assert_eq!(
+        rc, 0,
+        "varlen is_equivalent: different scale should NOT be equivalent"
+    );
+}
+
+#[test]
+fn paged_attention_varlen_vjp_throws() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_varlen_vjp_throws() };
+    assert_eq!(
+        rc, 1,
+        "PagedAttentionVarlen::vjp must throw std::runtime_error"
+    );
+}
+
+#[test]
+fn paged_attention_varlen_factory_accepts_wellformed() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_varlen_factory_accepts_wellformed() };
+    assert_eq!(
+        rc, 1,
+        "factory should accept well-formed varlen tracer inputs (rc={rc})"
+    );
+}
+
+#[test]
+fn paged_attention_varlen_factory_rejects_cu_seqlens_len() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_varlen_factory_rejects_cu_seqlens_len() };
+    assert_eq!(rc, 1, "factory must reject cu_seqlens_q with wrong length");
+}
+
+#[test]
+fn paged_attention_varlen_factory_rejects_cu_seqlens_dtype() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_varlen_factory_rejects_cu_seqlens_dtype() };
+    assert_eq!(
+        rc, 1,
+        "factory must reject cu_seqlens_q with non-int32 dtype"
+    );
+}
+
+#[test]
+fn paged_attention_varlen_compile_trace_smoke() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_varlen_compile_trace_smoke() };
+    assert_eq!(
+        rc, 1,
+        "paged_attention_varlen must compose with mlx::core::compile (rc={rc})"
+    );
+}

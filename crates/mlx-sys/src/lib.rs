@@ -1168,6 +1168,50 @@ unsafe extern "C-unwind" {
     /// `mlx_paged_phase2_stress_mixed_graph_v` with `seq_len=8`. Same
     /// return-code contract.
     pub fn mlx_paged_phase2_stress_mixed_graph(iterations: i32) -> i32;
+
+    /// Compare two `PagedAttentionVarlen` primitives via `is_equivalent`.
+    /// Returns 1 iff equivalent, 0 otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_attention_varlen_is_equivalent(
+        scale_lhs: f32,
+        softcap_lhs: f32,
+        block_size_lhs: i32,
+        num_q_heads_lhs: i32,
+        num_kv_heads_lhs: i32,
+        head_size_lhs: i32,
+        sliding_window_lhs: i32,
+        kv_dtype_lhs: u8,
+        scale_rhs: f32,
+        softcap_rhs: f32,
+        block_size_rhs: i32,
+        num_q_heads_rhs: i32,
+        num_kv_heads_rhs: i32,
+        head_size_rhs: i32,
+        sliding_window_rhs: i32,
+        kv_dtype_rhs: u8,
+    ) -> i32;
+
+    /// Returns 1 iff `PagedAttentionVarlen::vjp` throws
+    /// `std::runtime_error`.
+    pub fn mlx_paged_attention_varlen_vjp_throws() -> i32;
+
+    /// Returns 1 iff the public `paged_attention_varlen(...)` factory
+    /// accepts well-formed tracer inputs and produces an output array of
+    /// the expected shape. -1 on shape mismatch, 0 on factory exception.
+    pub fn mlx_paged_attention_varlen_factory_accepts_wellformed() -> i32;
+
+    /// Returns 1 iff the factory rejects a `cu_seqlens_q` array whose
+    /// length is not `num_seqs + 1`.
+    pub fn mlx_paged_attention_varlen_factory_rejects_cu_seqlens_len() -> i32;
+
+    /// Returns 1 iff the factory rejects a `cu_seqlens_q` array whose
+    /// dtype is not int32.
+    pub fn mlx_paged_attention_varlen_factory_rejects_cu_seqlens_dtype() -> i32;
+
+    /// Returns 1 iff `paged_attention_varlen(...)` composes inside
+    /// `mlx::core::compile(...)` and returns an output of the expected
+    /// shape. -1 on any thrown exception or shape mismatch.
+    pub fn mlx_paged_attention_varlen_compile_trace_smoke() -> i32;
 }
 
 // ================================================================================

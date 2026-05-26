@@ -1293,6 +1293,488 @@ array paged_attention(
   return array(std::move(out_shape), out_dtype, primitive, std::move(inputs));
 }
 
+namespace {
+
+void validate_paged_attention_varlen_inputs(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& block_table,
+    const array& seq_lens,
+    const array& cu_seqlens_q,
+    const array& k_scale,
+    const array& v_scale,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int sliding_window,
+    KvDtype kv_dtype,
+    const char* op_name) {
+  require_row_contiguous_zero_offset(q, op_name, "q");
+  require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
+  require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
+  require_row_contiguous_zero_offset(block_table, op_name, "block_table");
+  require_row_contiguous_zero_offset(seq_lens, op_name, "seq_lens");
+  require_row_contiguous_zero_offset(cu_seqlens_q, op_name, "cu_seqlens_q");
+  require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");
+  require_row_contiguous_zero_offset(v_scale, op_name, "v_scale");
+
+  if (sliding_window < 0) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] sliding_window ("
+        << sliding_window << ") must be >= 0";
+    throw std::invalid_argument(msg.str());
+  }
+  if (num_kv_heads <= 0) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] num_kv_heads (" << num_kv_heads
+        << ") must be > 0";
+    throw std::invalid_argument(msg.str());
+  }
+  if (num_q_heads <= 0) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] num_q_heads (" << num_q_heads
+        << ") must be > 0";
+    throw std::invalid_argument(msg.str());
+  }
+  if (num_q_heads % num_kv_heads != 0) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] GQA grouping invalid: num_q_heads="
+        << num_q_heads << " must be divisible by num_kv_heads="
+        << num_kv_heads;
+    throw std::invalid_argument(msg.str());
+  }
+  if (block_size <= 0) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] block_size (" << block_size
+        << ") must be > 0";
+    throw std::invalid_argument(msg.str());
+  }
+  if (head_size <= 0) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] head_size (" << head_size
+        << ") must be > 0";
+    throw std::invalid_argument(msg.str());
+  }
+
+  int x_pack_expected = x_pack_for(kv_dtype);
+  if (head_size % x_pack_expected != 0) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] head_size (" << head_size
+        << ") must be divisible by dtype-derived x_pack ("
+        << x_pack_expected << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
+  if (k_scale.dtype() != mlx::core::float32 ||
+      v_scale.dtype() != mlx::core::float32) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] k_scale / v_scale must be float32";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_scale.size() != 1 || v_scale.size() != 1) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] k_scale / v_scale must be 1-element arrays";
+    throw std::invalid_argument(msg.str());
+  }
+
+  if (q.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] q must be rank 3 "
+        << "[total_queries, num_q_heads, head_size]; got rank " << q.ndim();
+    throw std::invalid_argument(msg.str());
+  }
+  {
+    auto expected_io_dtype = io_dtype_for_kv_dtype(kv_dtype);
+    if (q.dtype() != expected_io_dtype) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] q dtype " << q.dtype()
+          << " disagrees with the expected io dtype "
+          << expected_io_dtype;
+      throw std::invalid_argument(msg.str());
+    }
+    auto expected_cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
+    if (k_pool.dtype() != expected_cache_dtype) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] k_pool dtype "
+          << k_pool.dtype() << " disagrees with the expected cache dtype "
+          << expected_cache_dtype;
+      throw std::invalid_argument(msg.str());
+    }
+    if (v_pool.dtype() != expected_cache_dtype) {
+      std::ostringstream msg;
+      msg << "[validator] [" << op_name << "] v_pool dtype "
+          << v_pool.dtype() << " disagrees with the expected cache dtype "
+          << expected_cache_dtype;
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  if (q.shape(1) != num_q_heads) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] q.shape(1) (" << q.shape(1)
+        << ") disagrees with num_q_heads (" << num_q_heads << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (q.shape(2) != head_size) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] q.shape(2) (" << q.shape(2)
+        << ") disagrees with head_size (" << head_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
+  if (k_pool.ndim() != 5) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] k_pool must be rank 5";
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_pool.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] v_pool must be rank 4";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(0) != v_pool.shape(0)) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] k_pool / v_pool num_blocks mismatch";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(1) != num_kv_heads || v_pool.shape(1) != num_kv_heads) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] pool num_kv_heads mismatch";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(3) != block_size || v_pool.shape(3) != block_size) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] pool block_size mismatch";
+    throw std::invalid_argument(msg.str());
+  }
+  if (v_pool.shape(2) != head_size) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] v_pool.shape(2) ("
+        << v_pool.shape(2) << ") != head_size (" << head_size << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(2) != head_size / x_pack_expected) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] k_pool.shape(2) ("
+        << k_pool.shape(2) << ") != head_size/x_pack ("
+        << head_size / x_pack_expected << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_pool.shape(4) != x_pack_expected) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] k_pool.shape(4) ("
+        << k_pool.shape(4) << ") != x_pack (" << x_pack_expected << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
+  if (block_table.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] block_table must be rank 2";
+    throw std::invalid_argument(msg.str());
+  }
+  if (block_table.dtype() != mlx::core::int32) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] block_table dtype must be int32";
+    throw std::invalid_argument(msg.str());
+  }
+  if (seq_lens.ndim() != 1) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] seq_lens must be rank 1";
+    throw std::invalid_argument(msg.str());
+  }
+  if (seq_lens.dtype() != mlx::core::int32) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] seq_lens dtype must be int32";
+    throw std::invalid_argument(msg.str());
+  }
+  if (block_table.shape(0) != seq_lens.shape(0)) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] block_table.shape(0) != seq_lens.shape(0)";
+    throw std::invalid_argument(msg.str());
+  }
+
+  if (cu_seqlens_q.ndim() != 1) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] cu_seqlens_q must be rank 1";
+    throw std::invalid_argument(msg.str());
+  }
+  if (cu_seqlens_q.dtype() != mlx::core::int32) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] cu_seqlens_q dtype must be int32";
+    throw std::invalid_argument(msg.str());
+  }
+  if (cu_seqlens_q.shape(0) != seq_lens.shape(0) + 1) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name
+        << "] cu_seqlens_q.shape(0) (" << cu_seqlens_q.shape(0)
+        << ") must equal num_seqs + 1 (" << seq_lens.shape(0) + 1 << ")";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+} // namespace
+
+void PagedAttentionVarlen::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  if (inputs.size() != 8) {
+    throw std::runtime_error(
+        "PagedAttentionVarlen: expected 8 inputs (q, k_pool, v_pool, "
+        "block_table, seq_lens, cu_seqlens_q, k_scale, v_scale)");
+  }
+  if (outputs.size() != 1) {
+    throw std::runtime_error("PagedAttentionVarlen: expected 1 output");
+  }
+
+  const array& q = inputs[0];
+  const array& k_pool = inputs[1];
+  const array& v_pool = inputs[2];
+  const array& block_table = inputs[3];
+  const array& seq_lens = inputs[4];
+  const array& cu_seqlens_q = inputs[5];
+  const array& k_scale = inputs[6];
+  const array& v_scale = inputs[7];
+
+  array& out = outputs[0];
+
+  validate_paged_attention_varlen_inputs(
+      q,
+      k_pool,
+      v_pool,
+      block_table,
+      seq_lens,
+      cu_seqlens_q,
+      k_scale,
+      v_scale,
+      block_size_,
+      num_q_heads_,
+      num_kv_heads_,
+      head_size_,
+      sliding_window_,
+      kv_dtype_,
+      "PagedAttentionVarlen::eval_gpu");
+
+  uint32_t num_seqs = static_cast<uint32_t>(seq_lens.shape(0));
+  uint32_t total_queries = static_cast<uint32_t>(q.shape(0));
+  uint32_t max_blocks_per_seq = static_cast<uint32_t>(block_table.shape(1));
+
+  // Runtime data-dependent guards on seq_lens / block_table / cu_seqlens_q.
+  // The metal kernel reads `context_lens[seq_idx]` as `uint32_t`, walks
+  // `block_table[seq_idx * max_blocks_per_seq + j]` for each block, and
+  // does `cu_seqlens_q[seq_idx + 1] - cu_seqlens_q[seq_idx]` to discover
+  // each token's source sequence. None of those reads are bounds-checked
+  // GPU-side.
+  const int32_t* seq_lens_data = seq_lens.data<int32_t>();
+  const int32_t* block_table_data = block_table.data<int32_t>();
+  const int32_t* cu_seqlens_q_data = cu_seqlens_q.data<int32_t>();
+
+  if (num_seqs > 0) {
+    const int32_t num_blocks = static_cast<int32_t>(k_pool.shape(0));
+    const int64_t max_seq_len_bound =
+        static_cast<int64_t>(max_blocks_per_seq) *
+        static_cast<int64_t>(block_size_);
+    for (uint32_t i = 0; i < num_seqs; ++i) {
+      const int32_t s = seq_lens_data[i];
+      if (s < 0 || static_cast<int64_t>(s) > max_seq_len_bound) {
+        std::ostringstream msg;
+        msg << "[runtime] PagedAttentionVarlen::eval_gpu: seq_lens[" << i
+            << "] (" << s << ") out of range [0, " << max_seq_len_bound
+            << "]";
+        throw std::invalid_argument(msg.str());
+      }
+      const int32_t num_used_blocks =
+          (s + block_size_ - 1) / block_size_;
+      const size_t row_offset =
+          static_cast<size_t>(i) * static_cast<size_t>(max_blocks_per_seq);
+      for (int32_t j = 0; j < num_used_blocks; ++j) {
+        const int32_t blk = block_table_data[row_offset + static_cast<size_t>(j)];
+        if (blk < 0 || blk >= num_blocks) {
+          std::ostringstream msg;
+          msg << "[runtime] PagedAttentionVarlen::eval_gpu: block_table[" << i
+              << ", " << j << "] (" << blk << ") out of range [0, "
+              << num_blocks << ")";
+          throw std::invalid_argument(msg.str());
+        }
+      }
+    }
+  }
+
+  if (cu_seqlens_q_data[0] != 0) {
+    std::ostringstream msg;
+    msg << "[runtime] PagedAttentionVarlen::eval_gpu: cu_seqlens_q[0] ("
+        << cu_seqlens_q_data[0] << ") must be 0";
+    throw std::invalid_argument(msg.str());
+  }
+  if (static_cast<uint32_t>(cu_seqlens_q_data[num_seqs]) != total_queries) {
+    std::ostringstream msg;
+    msg << "[runtime] PagedAttentionVarlen::eval_gpu: cu_seqlens_q["
+        << num_seqs << "] (" << cu_seqlens_q_data[num_seqs]
+        << ") must equal total_queries (" << total_queries << ")";
+    throw std::invalid_argument(msg.str());
+  }
+  for (uint32_t i = 0; i < num_seqs; ++i) {
+    if (cu_seqlens_q_data[i + 1] < cu_seqlens_q_data[i]) {
+      std::ostringstream msg;
+      msg << "[runtime] PagedAttentionVarlen::eval_gpu: cu_seqlens_q not "
+          << "monotone non-decreasing at index " << i;
+      throw std::invalid_argument(msg.str());
+    }
+  }
+
+  int32_t max_context_len = 0;
+  for (uint32_t i = 0; i < num_seqs; ++i) {
+    if (seq_lens_data[i] > max_context_len) {
+      max_context_len = seq_lens_data[i];
+    }
+  }
+  if (max_context_len <= 0) {
+    throw std::runtime_error(
+        "PagedAttentionVarlen: max_context_len from seq_lens must be > 0");
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  auto& s = stream();
+  auto& d = mlx::core::metal::device(s.device);
+  auto& compute_encoder = mlx::core::metal::get_command_encoder(s);
+
+  mlx::core::fast::paged::dispatch_paged_attention_varlen_auto(
+      compute_encoder,
+      d,
+      s,
+      out,
+      q,
+      k_pool,
+      v_pool,
+      block_table,
+      seq_lens,
+      cu_seqlens_q,
+      k_scale,
+      v_scale,
+      static_cast<int>(num_seqs),
+      static_cast<int>(total_queries),
+      num_q_heads_,
+      num_kv_heads_,
+      head_size_,
+      block_size_,
+      max_context_len,
+      static_cast<int>(max_blocks_per_seq),
+      scale_,
+      softcap_,
+      sliding_window_,
+      to_paged_dtype(kv_dtype_));
+}
+
+std::vector<array> PagedAttentionVarlen::vjp(
+    const std::vector<array>& /*primals*/,
+    const std::vector<array>& /*cotangents*/,
+    const std::vector<int>& /*argnums*/,
+    const std::vector<array>& /*outputs*/) {
+  throw std::runtime_error("PagedAttentionVarlen is inference-only");
+}
+
+std::vector<Shape> PagedAttentionVarlen::output_shapes(
+    const std::vector<array>& inputs) {
+  if (inputs.empty()) {
+    throw std::runtime_error(
+        "PagedAttentionVarlen::output_shapes: empty inputs");
+  }
+  const auto& q = inputs[0];
+  if (q.ndim() != 3) {
+    throw std::runtime_error(
+        "PagedAttentionVarlen::output_shapes: q must be rank 3");
+  }
+  return {Shape{q.shape(0), num_q_heads_, head_size_}};
+}
+
+bool PagedAttentionVarlen::is_equivalent(const Primitive& other) const {
+  const PagedAttentionVarlen& o =
+      static_cast<const PagedAttentionVarlen&>(other);
+  return scale_ == o.scale_ && softcap_ == o.softcap_ &&
+      block_size_ == o.block_size_ && num_q_heads_ == o.num_q_heads_ &&
+      num_kv_heads_ == o.num_kv_heads_ && head_size_ == o.head_size_ &&
+      sliding_window_ == o.sliding_window_ && kv_dtype_ == o.kv_dtype_;
+}
+
+array paged_attention_varlen(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& block_table,
+    const array& seq_lens,
+    const array& cu_seqlens_q,
+    const array& k_scale,
+    const array& v_scale,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+
+  auto fallback = [](std::vector<array> /*inputs*/) -> std::vector<array> {
+    throw std::runtime_error(
+        "paged_attention_varlen has no fallback implementation (inference-only)");
+  };
+
+  validate_paged_attention_varlen_inputs(
+      q,
+      k_pool,
+      v_pool,
+      block_table,
+      seq_lens,
+      cu_seqlens_q,
+      k_scale,
+      v_scale,
+      block_size,
+      num_q_heads,
+      num_kv_heads,
+      head_size,
+      sliding_window,
+      kv_dtype,
+      "paged_attention_varlen");
+
+  auto out_dtype = io_dtype_for_kv_dtype(kv_dtype);
+  Shape out_shape = {q.shape(0), num_q_heads, head_size};
+
+  std::vector<array> inputs = {
+      q,
+      k_pool,
+      v_pool,
+      block_table,
+      seq_lens,
+      cu_seqlens_q,
+      k_scale,
+      v_scale};
+
+  auto primitive = std::make_shared<PagedAttentionVarlen>(
+      s,
+      std::move(fallback),
+      scale,
+      softcap,
+      block_size,
+      num_q_heads,
+      num_kv_heads,
+      head_size,
+      sliding_window,
+      kv_dtype);
+
+  return array(std::move(out_shape), out_dtype, primitive, std::move(inputs));
+}
+
 } // namespace mlx::core::fast
 
 extern "C" {
@@ -5620,6 +6102,302 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph_v(
 /// variant directly so it can drive both V1 and V2.
 extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
   return mlx_paged_phase2_stress_mixed_graph_v(iterations, /*seq_len=*/8);
+}
+
+} // extern "C"
+
+// =============================================================================
+// PagedAttentionVarlen FFI test helpers.
+//
+// Smoke-test the new sibling primitive at the C++ boundary without
+// requiring a full Metal/MLX environment. The Rust integration tests in
+// `crates/mlx-paged-attn/tests/paged_ops_smoke.rs` bind these.
+// =============================================================================
+
+extern "C" {
+
+/// `PagedAttentionVarlen::is_equivalent` smoke check.
+int mlx_paged_attention_varlen_is_equivalent(
+    float scale_lhs,
+    float softcap_lhs,
+    int block_size_lhs,
+    int num_q_heads_lhs,
+    int num_kv_heads_lhs,
+    int head_size_lhs,
+    int sliding_window_lhs,
+    uint8_t kv_dtype_lhs,
+    float scale_rhs,
+    float softcap_rhs,
+    int block_size_rhs,
+    int num_q_heads_rhs,
+    int num_kv_heads_rhs,
+    int head_size_rhs,
+    int sliding_window_rhs,
+    uint8_t kv_dtype_rhs) {
+  using namespace mlx::core::fast;
+
+  auto stub_fallback = [](std::vector<mlx::core::array> /*ignored*/)
+      -> std::vector<mlx::core::array> {
+    throw std::runtime_error("is_equivalent test should not invoke fallback");
+  };
+  auto s = mlx::core::default_stream(mlx::core::default_device());
+
+  PagedAttentionVarlen lhs(
+      s,
+      stub_fallback,
+      scale_lhs,
+      softcap_lhs,
+      block_size_lhs,
+      num_q_heads_lhs,
+      num_kv_heads_lhs,
+      head_size_lhs,
+      sliding_window_lhs,
+      static_cast<KvDtype>(kv_dtype_lhs));
+  PagedAttentionVarlen rhs(
+      s,
+      stub_fallback,
+      scale_rhs,
+      softcap_rhs,
+      block_size_rhs,
+      num_q_heads_rhs,
+      num_kv_heads_rhs,
+      head_size_rhs,
+      sliding_window_rhs,
+      static_cast<KvDtype>(kv_dtype_rhs));
+
+  return lhs.is_equivalent(rhs) ? 1 : 0;
+}
+
+/// `PagedAttentionVarlen::vjp` must throw `std::runtime_error`.
+int mlx_paged_attention_varlen_vjp_throws() {
+  using namespace mlx::core::fast;
+
+  auto stub_fallback = [](std::vector<mlx::core::array> /*ignored*/)
+      -> std::vector<mlx::core::array> { return {}; };
+  auto s = mlx::core::default_stream(mlx::core::default_device());
+
+  PagedAttentionVarlen p(
+      s,
+      stub_fallback,
+      0.125f,
+      0.0f,
+      16,
+      8,
+      4,
+      64,
+      0,
+      KvDtype::Bf16);
+  std::vector<mlx::core::array> empty_arrays;
+  std::vector<int> empty_argnums;
+  try {
+    p.vjp(empty_arrays, empty_arrays, empty_argnums, empty_arrays);
+  } catch (const std::runtime_error&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// Public factory accepts well-formed tracer arrays and returns a real
+/// `array` carrying the primitive (we don't `eval()` it — tracer inputs
+/// have no backing data). Returns 1 on success, 0 on any factory
+/// exception, -1 if the returned array shape disagrees with spec.
+int mlx_paged_attention_varlen_factory_accepts_wellformed() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  array q(Shape{4, 8, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{2, 4}, int32, nullptr, {});
+  array seq_lens(Shape{2}, int32, nullptr, {});
+  array cu_seqlens_q(Shape{3}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    auto out = paged_attention_varlen(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        cu_seqlens_q,
+        k_scale,
+        v_scale,
+        /*scale=*/0.125f,
+        /*softcap=*/0.0f,
+        /*sliding_window=*/0,
+        /*block_size=*/16,
+        /*num_q_heads=*/8,
+        /*num_kv_heads=*/4,
+        /*head_size=*/64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+    if (out.ndim() != 3 || out.shape(0) != 4 || out.shape(1) != 8 ||
+        out.shape(2) != 64) {
+      return -1;
+    }
+  } catch (const std::exception&) {
+    return 0;
+  }
+  return 1;
+}
+
+/// cu_seqlens_q with the wrong length must be rejected.
+int mlx_paged_attention_varlen_factory_rejects_cu_seqlens_len() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  array q(Shape{4, 8, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{2, 4}, int32, nullptr, {});
+  array seq_lens(Shape{2}, int32, nullptr, {});
+  // length should be 3 (num_seqs + 1); we pass 4 to trigger rejection.
+  array cu_seqlens_q(Shape{4}, int32, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    paged_attention_varlen(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        cu_seqlens_q,
+        k_scale,
+        v_scale,
+        0.125f,
+        0.0f,
+        0,
+        16,
+        8,
+        4,
+        64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// cu_seqlens_q with non-int32 dtype must be rejected.
+int mlx_paged_attention_varlen_factory_rejects_cu_seqlens_dtype() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  array q(Shape{4, 8, 64}, bfloat16, nullptr, {});
+  array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+  array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+  array block_table(Shape{2, 4}, int32, nullptr, {});
+  array seq_lens(Shape{2}, int32, nullptr, {});
+  // dtype should be int32; we pass int64 to trigger rejection.
+  array cu_seqlens_q(Shape{3}, int64, nullptr, {});
+  array k_scale(1.0f, float32);
+  array v_scale(1.0f, float32);
+
+  try {
+    paged_attention_varlen(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        cu_seqlens_q,
+        k_scale,
+        v_scale,
+        0.125f,
+        0.0f,
+        0,
+        16,
+        8,
+        4,
+        64,
+        KvDtype::Bf16,
+        StreamOrDevice{});
+  } catch (const std::invalid_argument&) {
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+  return 0;
+}
+
+/// Run the varlen factory inside `mlx::core::compile` to confirm the
+/// primitive composes with the MLX compile pipeline. Tracer inputs
+/// flow through the factory and the returned compile lambda; we do
+/// NOT evaluate the output (no Metal dispatch in this smoke check).
+/// Returns 1 on success, -1 on any thrown exception.
+int mlx_paged_attention_varlen_compile_trace_smoke() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  try {
+    auto trace_fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+      if (inputs.size() != 8) {
+        throw std::runtime_error("trace_fn: expected 8 inputs");
+      }
+      auto out = paged_attention_varlen(
+          inputs[0],
+          inputs[1],
+          inputs[2],
+          inputs[3],
+          inputs[4],
+          inputs[5],
+          inputs[6],
+          inputs[7],
+          /*scale=*/0.125f,
+          /*softcap=*/0.0f,
+          /*sliding_window=*/0,
+          /*block_size=*/16,
+          /*num_q_heads=*/8,
+          /*num_kv_heads=*/4,
+          /*head_size=*/64,
+          KvDtype::Bf16,
+          StreamOrDevice{});
+      return {out};
+    };
+
+    auto compiled = mlx::core::compile(trace_fn);
+
+    // Tracer inputs (no backing data).
+    array q(Shape{4, 8, 64}, bfloat16, nullptr, {});
+    array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
+    array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
+    array block_table(Shape{2, 4}, int32, nullptr, {});
+    array seq_lens(Shape{2}, int32, nullptr, {});
+    array cu_seqlens_q(Shape{3}, int32, nullptr, {});
+    array k_scale(1.0f, float32);
+    array v_scale(1.0f, float32);
+
+    std::vector<array> inputs{
+        q, k_pool, v_pool, block_table, seq_lens, cu_seqlens_q, k_scale,
+        v_scale};
+
+    auto outputs = compiled(inputs);
+    if (outputs.size() != 1) {
+      return -1;
+    }
+    if (outputs[0].ndim() != 3 || outputs[0].shape(0) != 4 ||
+        outputs[0].shape(1) != 8 || outputs[0].shape(2) != 64) {
+      return -1;
+    }
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_attention_varlen_compile_trace_smoke] threw: %s\n",
+        e.what());
+    return -1;
+  } catch (...) {
+    return -1;
+  }
+  return 1;
 }
 
 } // extern "C"

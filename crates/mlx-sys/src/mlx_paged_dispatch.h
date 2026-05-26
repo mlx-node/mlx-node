@@ -127,4 +127,37 @@ void dispatch_paged_attention_auto(
     int sliding_window,
     KvDtype kv_dtype);
 
+/// Ragged-Q dispatcher. Writes `[total_queries, num_q_heads,
+/// head_size]` attention output to `out`. `cu_seqlens_q` carries the
+/// per-sequence query slice boundaries. V1/V2 selection mirrors the
+/// single-row dispatcher (`max_context_len <= PARTITION_SIZE` → V1).
+///
+/// `block_table` and `seq_lens` keep the same layouts as the
+/// single-row entrypoint.
+void dispatch_paged_attention_varlen_auto(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    mlx::core::Stream stream,
+    mlx::core::array& out,
+    const mlx::core::array& q,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& block_table,
+    const mlx::core::array& seq_lens,
+    const mlx::core::array& cu_seqlens_q,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    int num_seqs,
+    int total_queries,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int max_context_len,
+    int max_blocks_per_seq,
+    float scale,
+    float softcap,
+    int sliding_window,
+    KvDtype kv_dtype);
+
 } // namespace mlx::core::fast::paged

@@ -284,4 +284,113 @@ array paged_attention(
     KvDtype kv_dtype,
     StreamOrDevice s = {});
 
+/// Ragged-Q sibling of `PagedAttention`. Accepts a flat
+/// `[total_queries, num_q_heads, head_size]` Q tensor and a
+/// `[num_seqs + 1]` int32 `cu_seqlens_q` array (FlashAttention-style
+/// cumulative query lengths). Each query token's effective causal
+/// context is `context_lens[seq] - q_len[seq] + q_pos_in_seq + 1`,
+/// which is what the MTP verify path needs: draft token `t` sees the
+/// committed prefix plus `t` ancestors but NOT the speculative tail.
+///
+/// Used by the compile-traceable MTP verify forward in Phase 4b. The
+/// kernel name selection mirrors the single-row `PagedAttention`
+/// primitive but routes to the `paged_attention_varlen[_v2_reduce]`
+/// kernels in `paged_attn.metallib`.
+class PagedAttentionVarlen : public Custom {
+ public:
+  PagedAttentionVarlen(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      float softcap,
+      int block_size,
+      int num_q_heads,
+      int num_kv_heads,
+      int head_size,
+      int sliding_window,
+      KvDtype kv_dtype)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        softcap_(softcap),
+        block_size_(block_size),
+        num_q_heads_(num_q_heads),
+        num_kv_heads_(num_kv_heads),
+        head_size_(head_size),
+        sliding_window_(sliding_window),
+        kv_dtype_(kv_dtype) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("PagedAttentionVarlen CPU NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(PagedAttentionVarlen);
+
+  auto state() const {
+    return std::make_tuple(
+        nullptr,
+        scale_,
+        softcap_,
+        block_size_,
+        num_q_heads_,
+        num_kv_heads_,
+        head_size_,
+        sliding_window_,
+        static_cast<uint8_t>(kv_dtype_));
+  }
+
+ private:
+  float scale_;
+  float softcap_;
+  int block_size_;
+  int num_q_heads_;
+  int num_kv_heads_;
+  int head_size_;
+  int sliding_window_;
+  KvDtype kv_dtype_;
+};
+
+/// Emit a `PagedAttentionVarlen` primitive. Returns the attention
+/// output of shape `[total_queries, num_q_heads, head_size]`.
+///
+/// Strict input contract:
+///   - `q` rank 3 `[total_queries, num_q_heads, head_size]`.
+///   - `k_pool` / `v_pool` follow the same layout as `paged_attention`.
+///   - `block_table` rank 2 `[num_seqs, max_blocks_per_seq]` int32.
+///   - `seq_lens` rank 1 `[num_seqs]` int32.
+///   - `cu_seqlens_q` rank 1 `[num_seqs + 1]` int32 with
+///     `cu_seqlens_q[0] == 0` and `cu_seqlens_q[num_seqs] == total_queries`.
+///   - `k_scale` / `v_scale` size 1 float32.
+array paged_attention_varlen(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& block_table,
+    const array& seq_lens,
+    const array& cu_seqlens_q,
+    const array& k_scale,
+    const array& v_scale,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast
