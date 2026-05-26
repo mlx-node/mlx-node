@@ -32,6 +32,7 @@ import { TokenizationChapterBody, TokenizerDemo } from './learn/chapters/01-toke
 import { RopeChapterBody, RopeDemo } from './learn/chapters/05-rope';
 import { RmsNormChapterBody, RmsNormDemo } from './learn/chapters/06-rms-norm';
 import { MlpChapterBody, MlpDemo } from './learn/chapters/07-mlp';
+import { FullBlockChapterBody, FullBlockDemo } from './learn/chapters/08-full-block';
 import { SamplingChapterBody, SamplingDemo } from './learn/chapters/09-sampling';
 
 const INITIAL_SCREEN: ScreenState = { kind: 'landing' };
@@ -2092,6 +2093,8 @@ function App() {
                 <RmsNormDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'mlp' ? (
                 <MlpDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : chapter.id === 'full-block' ? (
+                <FullBlockDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'sampling' ? (
                 <SamplingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : null
@@ -2109,6 +2112,8 @@ function App() {
               <RmsNormChapterBody />
             ) : chapter.id === 'mlp' ? (
               <MlpChapterBody />
+            ) : chapter.id === 'full-block' ? (
+              <FullBlockChapterBody />
             ) : chapter.id === 'sampling' ? (
               <SamplingChapterBody />
             ) : (

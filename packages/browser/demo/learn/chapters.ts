@@ -76,7 +76,7 @@ export const CHAPTERS: ChapterMeta[] = [
     title: "Full transformer block",
     blurb:
       "Attention + Norm + MLP + Residual. The 3D rotatable stack overview.",
-    available: false,
+    available: true,
   },
   {
     id: "sampling",

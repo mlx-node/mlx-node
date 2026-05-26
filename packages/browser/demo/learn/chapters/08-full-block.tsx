@@ -1,0 +1,1084 @@
+import * as React from "react";
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+
+import { Button } from "../../components/ui/button";
+import { Textarea } from "../../components/ui/textarea";
+import type {
+  AttentionRun,
+  HiddenStatePointStats,
+  HiddenStateStep,
+} from "../../../src/inspector-types";
+import { runForInspector } from "../../lib/inspector-client";
+import { Prose } from "../Prose";
+
+const DEFAULT_PROMPT = "A transformer stacks the same block many times.";
+const DEFAULT_NUM_LAYERS = 24;
+// Qwen3.5-0.8B; matches the model's hidden_size.
+const HIDDEN_DIM = 1024;
+// Qwen3.5-0.8B uses full attention every 4th layer.
+const FULL_ATTN_INTERVAL = 4;
+
+const CAPTURE_POINTS = [
+  "pre_attn_input",
+  "post_attn_norm",
+  "attn_output",
+  "post_attn_residual",
+  "post_mlp_norm",
+  "mlp_output",
+  "post_mlp_residual",
+] as const;
+
+type CapturePoint = (typeof CAPTURE_POINTS)[number];
+
+const POINT_LABELS: Record<CapturePoint, string> = {
+  pre_attn_input: "Layer input",
+  post_attn_norm: "After pre-attn RMSNorm",
+  attn_output: "Attention output",
+  post_attn_residual: "After attn residual",
+  post_mlp_norm: "After pre-MLP RMSNorm",
+  mlp_output: "MLP output",
+  post_mlp_residual: "Layer output",
+};
+
+export function FullBlockChapterBody() {
+  return (
+    <Prose>
+      <h1>The full transformer block</h1>
+      <p>
+        The last five chapters introduced individual ingredients — attention,
+        multi-head &amp; GQA, RoPE, RMSNorm, the gated MLP — as if each lived
+        in isolation. They do not. Every one of Qwen3.5-0.8B's 24 decoder
+        layers stitches them together in the <em>same</em> fixed pattern, then
+        the model stacks that pattern 24 times. This chapter zooms out: one
+        layer as a whole, and a stack of them as a tower.
+      </p>
+
+      <h2>Pre-norm: norm, sub-block, residual</h2>
+      <p>
+        Qwen3.5 follows the modern <strong>pre-norm</strong> recipe. Inside
+        each layer there are two sub-blocks (attention and MLP), and each is
+        wrapped the same way: normalize the input, run the sub-block on the
+        normalized copy, add the result back into the residual stream.
+      </p>
+      <pre>
+        <code>{`x_attn = x + Attention(RMSNorm(x))
+x_out  = x_attn + MLP(RMSNorm(x_attn))`}</code>
+      </pre>
+      <p>
+        Two RMSNorms, two residual adds, one attention, one MLP — that is the
+        full layer. The 3D widget below shows it as a tall, narrow tower:
+        the residual stream runs from bottom to top, and each "ring" you can
+        see in the tower is one of those 24 layers.
+      </p>
+
+      <h2>What each piece contributes</h2>
+      <ul>
+        <li>
+          <strong>Attention</strong> (chapter 3) — the only place in the layer
+          where information moves <em>across tokens</em>. Without it, every
+          position would evolve independently.
+        </li>
+        <li>
+          <strong>Multi-head &amp; GQA</strong> (chapter 4) — attention is run
+          in parallel by many heads sharing a smaller pool of K/V projections,
+          so the model can look at several patterns at once without inflating
+          the KV cache.
+        </li>
+        <li>
+          <strong>RoPE</strong> (chapter 5) — the rotation applied to Q and K
+          inside attention. It's how the model knows token 5 is later than
+          token 3 without a separate position embedding.
+        </li>
+        <li>
+          <strong>RMSNorm</strong> (chapter 6) — applied <em>before</em> each
+          sub-block. It collapses the magnitude of the input to roughly{" "}
+          <code>sqrt(hidden_dim)</code> ≈ {Math.sqrt(HIDDEN_DIM).toFixed(0)} so
+          the attention scores and MLP activations don't explode.
+        </li>
+        <li>
+          <strong>MLP</strong> (chapter 7) — a per-token feed-forward with the
+          SwiGLU gated nonlinearity. It is where most of the parameters live,
+          and where per-token feature computation happens.
+        </li>
+      </ul>
+
+      <h2>The residual highway</h2>
+      <p>
+        Notice that nothing inside the layer <em>replaces</em> the hidden
+        state — both the attention and the MLP results are <em>added</em> to
+        whatever was already there. The residual stream is a highway that
+        runs the full depth of the model. Each block reads from it, computes
+        a small correction, and writes the correction back. The model's final
+        prediction is the accumulation of every block's contribution, not the
+        output of the last block alone.
+      </p>
+      <p>
+        Two consequences fall out. First, gradients: backprop can flow
+        straight through the identity path even in a 24-layer stack, which is
+        why deep transformers train at all. Second, magnitudes: the residual
+        stream grows in L2 with depth (each layer adds a non-zero
+        contribution), while every <em>individual</em> sub-block's output
+        stays small. The 3D widget colors each ring by the per-token L2 of
+        the layer output — you can see the magnitude climb as you scan up
+        the tower.
+      </p>
+
+      <h2>Hybrid attention: not every layer is "full"</h2>
+      <p>
+        Qwen3.5 is a <strong>hybrid</strong> stack. Most layers use a fast
+        linear-attention variant called <em>GatedDeltaNet</em>; only every
+        fourth layer (indices 3, 7, 11, 15, 19, 23 on the 0.8B model) uses
+        the classic <code>softmax(QKᵀ/√d)</code> formulation from chapter 3.
+        Linear-attention layers do almost all the across-token mixing under
+        the tight memory budget of long contexts; full-attention layers
+        appear at fixed intervals to do the heavy modelling that linear
+        attention can't. The 3D widget highlights full-attention layers in a
+        warmer color so you can see the interleave at a glance. Chapter 10
+        will dig into how this hybrid recipe works and why it's the new
+        default for high-throughput open LLMs.
+      </p>
+
+      <h2>What the widget shows</h2>
+      <p>
+        Press <em>Run</em> to capture all seven hidden-state stats per layer
+        for a single forward pass. The 3D tower renders 24 stacked tiles —
+        one per layer — colored by per-token L2 of the layer output. Drag to
+        rotate, scroll to zoom, click a layer to inspect its stats in the
+        side panel. The mini bar chart inside the panel walks the seven
+        capture points within the selected layer so you can trace the signal
+        from the layer's input through the two sub-blocks and out the top.
+      </p>
+    </Prose>
+  );
+}
+
+export type FullBlockDemoProps = {
+  workerRef: React.RefObject<Worker | null>;
+  abortRef: React.RefObject<AbortController | null>;
+};
+
+type RunStatus =
+  | { kind: "ok" }
+  | { kind: "mock-no-worker" }
+  | { kind: "mock-error"; error: string }
+  | { kind: "aborted" }
+  | { kind: "empty-prompt" };
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
+}
+
+function makeMockStats(
+  point: CapturePoint,
+  layerIdx: number,
+): HiddenStatePointStats {
+  // Mock `count` is set to HIDDEN_DIM (i.e. seqLen=1) so that the raw `l2Norm`
+  // here equals the per-token L2 the UI displays. Keeps mock values
+  // numerically aligned with the prose without extra arithmetic.
+  const wave = Math.sin((layerIdx + 1) * 0.55);
+  const depth = layerIdx / DEFAULT_NUM_LAYERS;
+  // Residual stream grows roughly linearly with depth.
+  const residualBase = 48 + depth * 90;
+  switch (point) {
+    case "pre_attn_input":
+      return {
+        point,
+        mean: 0.012,
+        std: 1.6 + depth * 0.6,
+        absMax: 8 + depth * 6,
+        l2Norm: residualBase,
+        count: HIDDEN_DIM,
+      };
+    case "post_attn_norm":
+      return {
+        point,
+        mean: 0.001,
+        std: 1.02,
+        absMax: 4.8,
+        l2Norm: Math.sqrt(HIDDEN_DIM),
+        count: HIDDEN_DIM,
+      };
+    case "attn_output":
+      return {
+        point,
+        mean: 0.0005,
+        std: 0.4,
+        absMax: 2.5,
+        l2Norm: 10 + wave * 4,
+        count: HIDDEN_DIM,
+      };
+    case "post_attn_residual":
+      return {
+        point,
+        mean: 0.013,
+        std: 1.7 + depth * 0.6,
+        absMax: 9 + depth * 6,
+        l2Norm: residualBase + 5,
+        count: HIDDEN_DIM,
+      };
+    case "post_mlp_norm":
+      return {
+        point,
+        mean: 0.002,
+        std: 1.01,
+        absMax: 4.9,
+        l2Norm: Math.sqrt(HIDDEN_DIM) * 1.02,
+        count: HIDDEN_DIM,
+      };
+    case "mlp_output":
+      return {
+        point,
+        mean: 0.0007,
+        std: 0.35,
+        absMax: 2.3,
+        l2Norm: 12 + wave * 5,
+        count: HIDDEN_DIM,
+      };
+    case "post_mlp_residual":
+      return {
+        point,
+        mean: 0.015,
+        std: 1.8 + depth * 0.6,
+        absMax: 9.4 + depth * 6,
+        l2Norm: residualBase + 10,
+        count: HIDDEN_DIM,
+      };
+  }
+}
+
+function fullAttentionLayerIndices(numLayers: number): number[] {
+  const out: number[] = [];
+  for (
+    let idx = FULL_ATTN_INTERVAL - 1;
+    idx < numLayers;
+    idx += FULL_ATTN_INTERVAL
+  ) {
+    out.push(idx);
+  }
+  return out;
+}
+
+function makeMockFullBlockRun(): AttentionRun {
+  const tokens = [
+    { id: 1, text: "A" },
+    { id: 2, text: " transformer" },
+    { id: 3, text: " stacks" },
+    { id: 4, text: " the" },
+    { id: 5, text: " same" },
+    { id: 6, text: " block" },
+    { id: 7, text: " many" },
+    { id: 8, text: " times" },
+    { id: 9, text: "." },
+  ];
+  const hiddenStates: HiddenStateStep[] = [
+    {
+      step: 0,
+      layers: Array.from({ length: DEFAULT_NUM_LAYERS }, (_, idx) => ({
+        layerIdx: idx,
+        stats: CAPTURE_POINTS.map((p) => makeMockStats(p, idx)),
+      })),
+    },
+  ];
+  return {
+    prompt: DEFAULT_PROMPT,
+    tokens,
+    generatedToken: { id: 10, text: " (mock)" },
+    attention: [],
+    modelMeta: {
+      name: "Qwen3.5-0.8B (mock)",
+      numLayers: DEFAULT_NUM_LAYERS,
+      fullAttentionLayerIndices: fullAttentionLayerIndices(DEFAULT_NUM_LAYERS),
+    },
+    hiddenStates,
+  };
+}
+
+function getLayerStats(
+  steps: HiddenStateStep[] | undefined,
+  layerIdx: number,
+): Partial<Record<CapturePoint, HiddenStatePointStats>> {
+  const out: Partial<Record<CapturePoint, HiddenStatePointStats>> = {};
+  if (!steps || steps.length === 0) return out;
+  const step = steps[0];
+  if (!step) return out;
+  const layer = step.layers.find((l) => l.layerIdx === layerIdx);
+  if (!layer) return out;
+  for (const stat of layer.stats) {
+    if ((CAPTURE_POINTS as readonly string[]).includes(stat.point)) {
+      out[stat.point as CapturePoint] = stat;
+    }
+  }
+  return out;
+}
+
+function perTokenL2(stats: HiddenStatePointStats | undefined): number | null {
+  if (!stats) return null;
+  const seqLen = stats.count / HIDDEN_DIM;
+  if (seqLen <= 0) return null;
+  return stats.l2Norm / Math.sqrt(seqLen);
+}
+
+function formatNumber(value: number, digits = 3): string {
+  if (!Number.isFinite(value)) return "—";
+  if (Math.abs(value) >= 1000) return value.toFixed(0);
+  if (Math.abs(value) >= 10) return value.toFixed(1);
+  return value.toFixed(digits);
+}
+
+export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
+  const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT);
+  const [run, setRun] = React.useState<AttentionRun | null>(null);
+  const [status, setStatus] = React.useState<RunStatus | null>(null);
+  const [running, setRunning] = React.useState(false);
+  const [selectedLayer, setSelectedLayer] = React.useState(0);
+
+  // Render a mock stack on initial mount so the 3D tower is never empty.
+  React.useEffect(() => {
+    if (run === null) {
+      setRun(makeMockFullBlockRun());
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const runAbortRef = React.useRef<AbortController | null>(null);
+  const runGenRef = React.useRef(0);
+
+  React.useEffect(
+    () => () => {
+      runAbortRef.current?.abort();
+    },
+    [],
+  );
+
+  function applyMockFallback(reason: RunStatus, logMessage: string) {
+    const mock = makeMockFullBlockRun();
+    console.log(logMessage, {
+      promptLength: prompt.length,
+      layers: mock.hiddenStates?.[0]?.layers.length ?? 0,
+    });
+    setRun(mock);
+    setStatus(reason);
+  }
+
+  async function handleRun() {
+    if (prompt.trim().length === 0) {
+      setStatus({ kind: "empty-prompt" });
+      return;
+    }
+
+    const myGen = ++runGenRef.current;
+    setRunning(true);
+    const worker = workerRef.current;
+    if (!worker) {
+      applyMockFallback(
+        { kind: "mock-no-worker" },
+        "[full-block-demo] using mock HiddenStateStep[] (model not loaded)",
+      );
+      setRunning(false);
+      return;
+    }
+
+    runAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    runAbortRef.current = ctrl;
+
+    const appSignal = abortRef.current?.signal;
+    if (appSignal?.aborted) {
+      ctrl.abort();
+    }
+    const onAppAbort = () => ctrl.abort();
+    if (appSignal && !appSignal.aborted) {
+      appSignal.addEventListener("abort", onAppAbort, { once: true });
+    }
+
+    try {
+      const result = await runForInspector(
+        worker,
+        {
+          prompt,
+          hiddenStates: {
+            points: [...CAPTURE_POINTS],
+          },
+          maxNewTokens: 1,
+        },
+        { signal: ctrl.signal },
+      );
+      if (runGenRef.current !== myGen) return;
+      console.log("[full-block-demo] runForInspector ok", {
+        promptLength: prompt.length,
+        layers: result.hiddenStates?.[0]?.layers.length ?? 0,
+      });
+      setRun(result);
+      setStatus({ kind: "ok" });
+      const maxLayer = (result.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS) - 1;
+      if (selectedLayer > maxLayer) {
+        setSelectedLayer(0);
+      }
+    } catch (err) {
+      if (runGenRef.current !== myGen) return;
+      if (isAbortError(err)) {
+        console.info(
+          "[full-block-demo] runForInspector aborted (worker terminated or superseded)",
+        );
+        if (appSignal?.aborted) {
+          setStatus({ kind: "aborted" });
+        }
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(
+          "[full-block-demo] runForInspector failed; falling back to mock",
+          err,
+        );
+        applyMockFallback(
+          { kind: "mock-error", error: message },
+          "[full-block-demo] using mock HiddenStateStep[] (backend error)",
+        );
+      }
+    } finally {
+      if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
+      if (runAbortRef.current === ctrl) runAbortRef.current = null;
+      if (runGenRef.current === myGen) setRunning(false);
+    }
+  }
+
+  const hiddenSteps = run?.hiddenStates;
+  const numLayers = run?.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS;
+  const fullAttnIndices = React.useMemo(
+    () =>
+      new Set(
+        run?.modelMeta?.fullAttentionLayerIndices ??
+          fullAttentionLayerIndices(numLayers),
+      ),
+    [run?.modelMeta?.fullAttentionLayerIndices, numLayers],
+  );
+
+  const layerOutL2 = React.useMemo(() => {
+    const out: Array<{ layerIdx: number; value: number | null }> = [];
+    if (!hiddenSteps || hiddenSteps.length === 0) return out;
+    const step = hiddenSteps[0];
+    if (!step) return out;
+    for (const layer of step.layers) {
+      const stat = layer.stats.find((s) => s.point === "post_mlp_residual");
+      out.push({ layerIdx: layer.layerIdx, value: perTokenL2(stat) });
+    }
+    out.sort((a, b) => a.layerIdx - b.layerIdx);
+    return out;
+  }, [hiddenSteps]);
+
+  const layerStats = React.useMemo(
+    () => getLayerStats(hiddenSteps, selectedLayer),
+    [hiddenSteps, selectedLayer],
+  );
+
+  const hasData = Boolean(hiddenSteps && hiddenSteps.length > 0);
+
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <label
+          htmlFor="full-block-demo-input"
+          className="text-xs uppercase tracking-wider text-muted-foreground"
+        >
+          Prompt
+        </label>
+        <Textarea
+          id="full-block-demo-input"
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          rows={3}
+          className="font-mono text-sm"
+          placeholder={DEFAULT_PROMPT}
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={handleRun} disabled={running}>
+            {running ? "Running..." : "Run"}
+          </Button>
+          <span className="text-xs text-muted-foreground">
+            Captures all seven hidden-state stats per layer for a single
+            forward pass.
+          </span>
+        </div>
+      </div>
+
+      {status?.kind === "mock-no-worker" ? (
+        <div
+          role="status"
+          className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          Showing demo data — load the model from the chat tab first to see
+          real activation stats.
+        </div>
+      ) : null}
+      {status?.kind === "mock-error" ? (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+        >
+          <strong>Inspector run failed.</strong> Showing demo data instead.{" "}
+          {status.error}
+        </div>
+      ) : null}
+      {status?.kind === "aborted" ? (
+        <div
+          role="status"
+          className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+        >
+          Request cancelled — model was reloaded. Click <strong>Run</strong>{" "}
+          again to retry.
+        </div>
+      ) : null}
+      {status?.kind === "empty-prompt" ? (
+        <div
+          role="alert"
+          className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          Enter a prompt to see the full transformer block in action.
+        </div>
+      ) : null}
+
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+        <StackViewer3D
+          layerOutL2={layerOutL2}
+          fullAttnIndices={fullAttnIndices}
+          selectedLayer={selectedLayer}
+          onSelect={(idx) => setSelectedLayer(idx)}
+        />
+        <LayerSidePanel
+          layerIdx={selectedLayer}
+          isFullAttention={fullAttnIndices.has(selectedLayer)}
+          layerStats={layerStats}
+          hasData={hasData}
+          modelName={run?.modelMeta?.name ?? "—"}
+          numLayers={numLayers}
+        />
+      </div>
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// 3D stack viewer.
+// -----------------------------------------------------------------------------
+
+type StackViewer3DProps = {
+  layerOutL2: Array<{ layerIdx: number; value: number | null }>;
+  fullAttnIndices: Set<number>;
+  selectedLayer: number;
+  onSelect: (layerIdx: number) => void;
+};
+
+const STACK_TOTAL_HEIGHT = 18;
+const STACK_RADIUS = 1.6;
+const STACK_LAYER_GAP = 0.12;
+
+function colorForL2(
+  value: number | null,
+  vmin: number,
+  vmax: number,
+  isFullAttn: boolean,
+): THREE.Color {
+  // Two-ramp scheme:
+  //   linear-attn layers ramp cool→warm purple/blue.
+  //   full-attn  layers ramp warm orange→red to mark the interleave.
+  if (value === null || !Number.isFinite(value)) {
+    return new THREE.Color(0x444444);
+  }
+  const t = vmax > vmin ? (value - vmin) / (vmax - vmin) : 0.5;
+  const clamped = Math.max(0, Math.min(1, t));
+  if (isFullAttn) {
+    const cold = new THREE.Color(0xf9c97a);
+    const hot = new THREE.Color(0xef4444);
+    return cold.lerp(hot, clamped);
+  }
+  const cold = new THREE.Color(0x4f46e5);
+  const hot = new THREE.Color(0x9333ea);
+  return cold.lerp(hot, clamped);
+}
+
+function StackViewer3D({
+  layerOutL2,
+  fullAttnIndices,
+  selectedLayer,
+  onSelect,
+}: StackViewer3DProps) {
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const onSelectRef = React.useRef(onSelect);
+  const selectedLayerRef = React.useRef(selectedLayer);
+
+  React.useEffect(() => {
+    onSelectRef.current = onSelect;
+  }, [onSelect]);
+  React.useEffect(() => {
+    selectedLayerRef.current = selectedLayer;
+  }, [selectedLayer]);
+
+  type SceneState = {
+    renderer: THREE.WebGLRenderer;
+    scene: THREE.Scene;
+    camera: THREE.PerspectiveCamera;
+    controls: OrbitControls;
+    layerMeshes: THREE.Mesh[];
+    layerMaterials: THREE.MeshStandardMaterial[];
+    selectionEdges: THREE.LineSegments;
+    raycaster: THREE.Raycaster;
+    requestRender: () => void;
+    fit: () => void;
+    cleanup: () => void;
+  };
+
+  const sceneRef = React.useRef<SceneState | null>(null);
+
+  // Set up scene once on mount.
+  React.useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0x000000, 0);
+    container.appendChild(renderer.domElement);
+    renderer.domElement.style.display = "block";
+    renderer.domElement.style.width = "100%";
+    renderer.domElement.style.height = "100%";
+    renderer.domElement.style.touchAction = "none";
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 200);
+    camera.position.set(7, 8, 10);
+    camera.lookAt(0, STACK_TOTAL_HEIGHT / 2, 0);
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 0.7));
+    const key = new THREE.DirectionalLight(0xffffff, 0.85);
+    key.position.set(4, 8, 6);
+    scene.add(key);
+    const fill = new THREE.DirectionalLight(0x88aaff, 0.35);
+    fill.position.set(-5, 4, -3);
+    scene.add(fill);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.target.set(0, STACK_TOTAL_HEIGHT / 2, 0);
+    controls.minDistance = 6;
+    controls.maxDistance = 40;
+    controls.update();
+
+    const layerMeshes: THREE.Mesh[] = [];
+    const layerMaterials: THREE.MeshStandardMaterial[] = [];
+
+    // Selection outline (placeholder geometry; updated when selection changes).
+    const selectionEdges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+      new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 }),
+    );
+    selectionEdges.visible = false;
+    scene.add(selectionEdges);
+
+    const raycaster = new THREE.Raycaster();
+
+    // Render-on-demand: we don't run a rAF loop continuously. Anything that
+    // changes scene state calls `requestRender()`, which either renders once
+    // (with damping disabled) or arms a short rAF loop until controls settle.
+    let damperFrameId: number | null = null;
+    function renderOnce() {
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    function runDamper() {
+      damperFrameId = requestAnimationFrame(() => {
+        const moved = controls.update();
+        renderer.render(scene, camera);
+        if (moved) {
+          runDamper();
+        } else {
+          damperFrameId = null;
+        }
+      });
+    }
+    function requestRender() {
+      if (damperFrameId === null) {
+        runDamper();
+      }
+    }
+
+    controls.addEventListener("change", () => requestRender());
+    controls.addEventListener("start", () => requestRender());
+
+    function fit() {
+      const w = container!.clientWidth;
+      const h = container!.clientHeight;
+      if (w === 0 || h === 0) return;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderOnce();
+    }
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(container);
+
+    function pickLayerAt(clientX: number, clientY: number) {
+      const rect = renderer.domElement.getBoundingClientRect();
+      const x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      const y = -((clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(new THREE.Vector2(x, y), camera);
+      const hits = raycaster.intersectObjects(layerMeshes, false);
+      if (hits.length === 0) return null;
+      const hit = hits[0]!.object as THREE.Mesh;
+      return typeof hit.userData.layerIdx === "number"
+        ? (hit.userData.layerIdx as number)
+        : null;
+    }
+
+    let pointerDown: { x: number; y: number } | null = null;
+    const handlePointerDown = (ev: PointerEvent) => {
+      pointerDown = { x: ev.clientX, y: ev.clientY };
+    };
+    const handlePointerUp = (ev: PointerEvent) => {
+      if (!pointerDown) return;
+      const dx = ev.clientX - pointerDown.x;
+      const dy = ev.clientY - pointerDown.y;
+      pointerDown = null;
+      if (Math.hypot(dx, dy) > 4) return; // treat as drag, not click
+      const idx = pickLayerAt(ev.clientX, ev.clientY);
+      if (idx !== null) onSelectRef.current(idx);
+    };
+    renderer.domElement.addEventListener("pointerdown", handlePointerDown);
+    renderer.domElement.addEventListener("pointerup", handlePointerUp);
+
+    sceneRef.current = {
+      renderer,
+      scene,
+      camera,
+      controls,
+      layerMeshes,
+      layerMaterials,
+      selectionEdges,
+      raycaster,
+      requestRender,
+      fit,
+      cleanup: () => {
+        if (damperFrameId !== null) cancelAnimationFrame(damperFrameId);
+        ro.disconnect();
+        controls.dispose();
+        renderer.domElement.removeEventListener("pointerdown", handlePointerDown);
+        renderer.domElement.removeEventListener("pointerup", handlePointerUp);
+        for (const mesh of layerMeshes) {
+          mesh.geometry.dispose();
+          const mat = mesh.material as THREE.Material | THREE.Material[];
+          if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+          else mat.dispose();
+          scene.remove(mesh);
+        }
+        selectionEdges.geometry.dispose();
+        (selectionEdges.material as THREE.Material).dispose();
+        scene.remove(selectionEdges);
+        renderer.forceContextLoss();
+        renderer.dispose();
+        if (renderer.domElement.parentNode === container) {
+          container.removeChild(renderer.domElement);
+        }
+      },
+    };
+
+    return () => {
+      sceneRef.current?.cleanup();
+      sceneRef.current = null;
+    };
+  }, []);
+
+  // Rebuild the layer meshes whenever the data shape changes. We dispose old
+  // geometries and materials before adding new ones to keep GPU resources
+  // bounded.
+  React.useEffect(() => {
+    const state = sceneRef.current;
+    if (!state) return;
+
+    for (const mesh of state.layerMeshes) {
+      mesh.geometry.dispose();
+      const mat = mesh.material as THREE.Material | THREE.Material[];
+      if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+      else mat.dispose();
+      state.scene.remove(mesh);
+    }
+    state.layerMeshes.length = 0;
+    state.layerMaterials.length = 0;
+
+    const numLayers = layerOutL2.length || DEFAULT_NUM_LAYERS;
+    const tileHeight = Math.max(
+      0.15,
+      STACK_TOTAL_HEIGHT / numLayers - STACK_LAYER_GAP,
+    );
+    const finite = layerOutL2
+      .map((d) => d.value)
+      .filter((v): v is number => v !== null && Number.isFinite(v));
+    const vmin = finite.length > 0 ? Math.min(...finite) : 0;
+    const vmax = finite.length > 0 ? Math.max(...finite) : 1;
+
+    for (let i = 0; i < numLayers; i++) {
+      const entry = layerOutL2[i];
+      const layerIdx = entry?.layerIdx ?? i;
+      const value = entry?.value ?? null;
+      const isFull = false; // updated by selection/styling effect below
+      const color = colorForL2(value, vmin, vmax, isFull);
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.55,
+        metalness: 0.1,
+      });
+      // Use a slightly chamfered cylinder to read as "ring of a tower". Open
+      // top + bottom would look like a tube; closed cylinders read as tiles.
+      const geom = new THREE.CylinderGeometry(
+        STACK_RADIUS,
+        STACK_RADIUS,
+        tileHeight,
+        24,
+      );
+      const mesh = new THREE.Mesh(geom, material);
+      const yBase = i * (tileHeight + STACK_LAYER_GAP);
+      mesh.position.set(0, yBase + tileHeight / 2, 0);
+      mesh.userData.layerIdx = layerIdx;
+      state.scene.add(mesh);
+      state.layerMeshes.push(mesh);
+      state.layerMaterials.push(material);
+    }
+
+    // Recenter camera target on the new stack height.
+    const stackHeight = numLayers * tileHeight + (numLayers - 1) * STACK_LAYER_GAP;
+    state.controls.target.set(0, stackHeight / 2, 0);
+    state.controls.update();
+    state.requestRender();
+  }, [layerOutL2]);
+
+  // Update tile colors when L2 data changes or full-attn set changes.
+  React.useEffect(() => {
+    const state = sceneRef.current;
+    if (!state) return;
+    const finite = layerOutL2
+      .map((d) => d.value)
+      .filter((v): v is number => v !== null && Number.isFinite(v));
+    const vmin = finite.length > 0 ? Math.min(...finite) : 0;
+    const vmax = finite.length > 0 ? Math.max(...finite) : 1;
+    for (let i = 0; i < state.layerMeshes.length; i++) {
+      const mesh = state.layerMeshes[i]!;
+      const material = state.layerMaterials[i]!;
+      const layerIdx = mesh.userData.layerIdx as number;
+      const value = layerOutL2[i]?.value ?? null;
+      const isFull = fullAttnIndices.has(layerIdx);
+      material.color.copy(colorForL2(value, vmin, vmax, isFull));
+      material.emissive.copy(material.color).multiplyScalar(isFull ? 0.18 : 0.04);
+      material.needsUpdate = true;
+    }
+    state.requestRender();
+  }, [layerOutL2, fullAttnIndices]);
+
+  // Update selection outline when selectedLayer changes.
+  React.useEffect(() => {
+    const state = sceneRef.current;
+    if (!state) return;
+    const targetMesh = state.layerMeshes.find(
+      (m) => m.userData.layerIdx === selectedLayer,
+    );
+    if (!targetMesh) {
+      state.selectionEdges.visible = false;
+      state.requestRender();
+      return;
+    }
+    // Rebuild edges for the selected mesh's geometry — cylinder geometries
+    // can vary in tile height when num-layers changes.
+    state.selectionEdges.geometry.dispose();
+    state.selectionEdges.geometry = new THREE.EdgesGeometry(targetMesh.geometry);
+    state.selectionEdges.position.copy(targetMesh.position);
+    state.selectionEdges.scale.set(1.04, 1.02, 1.04);
+    state.selectionEdges.visible = true;
+    state.requestRender();
+  }, [selectedLayer, layerOutL2]);
+
+  return (
+    <div className="space-y-2 rounded-md border border-border bg-background p-3">
+      <div className="flex items-center justify-between">
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">
+          Transformer stack — 24 layers
+        </div>
+        <div className="text-[11px] text-muted-foreground">
+          drag to rotate · scroll to zoom · click a layer
+        </div>
+      </div>
+      <div
+        ref={containerRef}
+        className="relative h-[420px] w-full overflow-hidden rounded bg-gradient-to-b from-slate-900/60 to-slate-950/80"
+        aria-label="Rotatable 3D view of the transformer stack"
+      />
+      <Legend />
+    </div>
+  );
+}
+
+function Legend() {
+  return (
+    <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
+      <span className="inline-flex items-center gap-1">
+        <span
+          aria-hidden
+          className="inline-block h-3 w-3 rounded-sm"
+          style={{
+            background:
+              "linear-gradient(to right, rgb(79,70,229), rgb(147,51,234))",
+          }}
+        />
+        Linear attention (GatedDeltaNet)
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span
+          aria-hidden
+          className="inline-block h-3 w-3 rounded-sm"
+          style={{
+            background:
+              "linear-gradient(to right, rgb(249,201,122), rgb(239,68,68))",
+          }}
+        />
+        Full attention (softmax QKᵀ)
+      </span>
+      <span className="ml-auto">
+        color = per-token L2 of layer output (post-residual)
+      </span>
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// Side panel: layer stats grid + mini bar chart across the seven capture points.
+// -----------------------------------------------------------------------------
+
+function LayerSidePanel({
+  layerIdx,
+  isFullAttention,
+  layerStats,
+  hasData,
+  modelName,
+  numLayers,
+}: {
+  layerIdx: number;
+  isFullAttention: boolean;
+  layerStats: Partial<Record<CapturePoint, HiddenStatePointStats>>;
+  hasData: boolean;
+  modelName: string;
+  numLayers: number;
+}) {
+  return (
+    <div className="space-y-3 rounded-md border border-border bg-background p-3">
+      <div className="flex items-baseline justify-between">
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">
+          Layer {layerIdx} · {isFullAttention ? "Full attention" : "Linear attention"}
+        </div>
+        <div className="text-[11px] text-muted-foreground">
+          {modelName}
+          {hasData ? ` · ${numLayers} layers` : ""}
+        </div>
+      </div>
+
+      <PerPointBarChart layerStats={layerStats} />
+
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        {CAPTURE_POINTS.map((point) => (
+          <StatBox
+            key={point}
+            title={POINT_LABELS[point]}
+            stats={layerStats[point]}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StatBox({
+  title,
+  stats,
+}: {
+  title: string;
+  stats: HiddenStatePointStats | undefined;
+}) {
+  const l2 = perTokenL2(stats);
+  return (
+    <div className="rounded-md border border-border bg-background p-2 text-xs">
+      <div className="mb-1 uppercase tracking-wider text-[10px] text-muted-foreground">
+        {title}
+      </div>
+      <dl className="grid grid-cols-2 gap-x-2 gap-y-0.5 font-mono">
+        <dt className="text-muted-foreground">L2/tok</dt>
+        <dd className="text-right text-foreground/90">
+          {l2 !== null ? formatNumber(l2, 2) : "—"}
+        </dd>
+        <dt className="text-muted-foreground">|max|</dt>
+        <dd className="text-right text-foreground/90">
+          {stats ? formatNumber(stats.absMax, 2) : "—"}
+        </dd>
+        <dt className="text-muted-foreground">std</dt>
+        <dd className="text-right text-foreground/90">
+          {stats ? formatNumber(stats.std) : "—"}
+        </dd>
+        <dt className="text-muted-foreground">mean</dt>
+        <dd className="text-right text-foreground/90">
+          {stats ? formatNumber(stats.mean) : "—"}
+        </dd>
+      </dl>
+    </div>
+  );
+}
+
+function PerPointBarChart({
+  layerStats,
+}: {
+  layerStats: Partial<Record<CapturePoint, HiddenStatePointStats>>;
+}) {
+  const values = CAPTURE_POINTS.map((point) => ({
+    point,
+    value: perTokenL2(layerStats[point]),
+  }));
+  const finite = values
+    .map((v) => v.value)
+    .filter((v): v is number => v !== null && Number.isFinite(v));
+  const maxValue = finite.length > 0 ? Math.max(...finite) : 1;
+  return (
+    <div
+      role="list"
+      aria-label="Per-token L2 across the seven capture points in this layer"
+      className="rounded-md border border-border bg-muted/30 p-3"
+    >
+      <div className="mb-2 text-[11px] uppercase tracking-wider text-muted-foreground">
+        Signal flow through the layer (per-token L2)
+      </div>
+      <div className="space-y-1">
+        {values.map(({ point, value }) => {
+          const safeMax = maxValue > 0 ? maxValue : 1;
+          const pct =
+            value === null || !Number.isFinite(value)
+              ? 0
+              : Math.max(0, Math.min(100, (value / safeMax) * 100));
+          return (
+            <div
+              key={point}
+              role="listitem"
+              className="grid grid-cols-[10rem_minmax(0,1fr)_3.5rem] items-center gap-2 text-[11px]"
+            >
+              <span className="truncate font-mono uppercase tracking-wider text-muted-foreground">
+                {POINT_LABELS[point]}
+              </span>
+              <div className="relative h-3 w-full overflow-hidden rounded bg-muted">
+                <div
+                  className="h-full bg-primary/80"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <span className="text-right font-mono text-foreground/80">
+                {value === null ? "—" : formatNumber(value, 2)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
