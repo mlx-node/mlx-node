@@ -29,8 +29,10 @@ pub use copy_blocks::CopyBlocksParams;
 pub use kv_scale::{KvScaleManager, KvScaleStats};
 pub use mlx_integration::{MlxMetalBuffer, is_metal_extraction_supported, synchronize_mlx};
 pub use paged_attention::{
-    PagedAttentionOutput, PagedAttentionParams, dispatch_paged_attention_auto,
-    dispatch_paged_attention_v1_raw, dispatch_paged_attention_v2_raw,
+    PagedAttentionOutput, PagedAttentionParams, PagedAttentionVarlenOutput,
+    PagedAttentionVarlenParams, dispatch_paged_attention_auto, dispatch_paged_attention_v1_raw,
+    dispatch_paged_attention_v2_raw, dispatch_paged_attention_varlen_auto,
+    dispatch_paged_attention_varlen_v1_raw, dispatch_paged_attention_varlen_v2_raw,
 };
 pub use reshape_and_cache::{RawBufferInfo, ReshapeAndCacheParams, dispatch_reshape_and_cache_raw};
 pub use state::{MetalDtype, MetalState};

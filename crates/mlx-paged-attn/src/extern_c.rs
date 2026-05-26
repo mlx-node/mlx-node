@@ -45,8 +45,9 @@ use metal::Buffer;
 use metal::foreign_types::ForeignType;
 
 use crate::metal::{
-    MetalDtype, PagedAttentionParams, RawBufferInfo, ReshapeAndCacheParams,
-    dispatch_paged_attention_auto, dispatch_reshape_and_cache_raw,
+    MetalDtype, PagedAttentionParams, PagedAttentionVarlenParams, RawBufferInfo,
+    ReshapeAndCacheParams, dispatch_paged_attention_auto, dispatch_paged_attention_varlen_auto,
+    dispatch_reshape_and_cache_raw,
 };
 
 /// `KvDtype` mirror for the C ABI. Must agree, value-by-value, with
@@ -456,6 +457,178 @@ fn blit_attention_output(
     command_buffer.wait_until_completed();
 
     Ok(())
+}
+
+/// `extern "C"` wrapper around `dispatch_paged_attention_varlen_auto`
+/// (Phase 4a — multi-row paged attention for MTP speculative decoding).
+///
+/// This is a SIBLING of `mlx_paged_attn_paged_attention_dispatch`, not a
+/// replacement: the single-row entrypoint stays the proven AR path; Phase
+/// 4b will opt the MTP verify path into this varlen entrypoint via env
+/// var, after which it can flip default.
+///
+/// # Buffer layout
+/// - `queries`: `[total_queries, num_q_heads, head_size]` — ragged Q.
+/// - `cu_seqlens_q`: `[num_seqs + 1]` int32 cumulative query counts.
+///   `cu_seqlens_q[0]` must equal 0 and `cu_seqlens_q[num_seqs]` must
+///   equal `total_queries`. Caller validates this.
+/// - `key_pool`, `value_pool`, `block_table`, `seq_lens`, `output`: same
+///   layouts as the single-row entrypoint.
+///
+/// # Safety
+/// - All pointer parameters MUST be valid `MTLBuffer*` pointers.
+/// - The MLX arrays they point at MUST be evaluated before the call.
+/// - `output_buffer` MUST be at least
+///   `total_queries * num_q_heads * head_size * sizeof(io_dtype)` bytes
+///   starting at `output_offset`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn mlx_paged_attn_paged_attention_varlen_dispatch(
+    queries_buffer: *mut c_void,
+    queries_offset: usize,
+    key_pool_buffer: *mut c_void,
+    value_pool_buffer: *mut c_void,
+    block_table_buffer: *mut c_void,
+    seq_lens_buffer: *mut c_void,
+    cu_seqlens_q_buffer: *mut c_void,
+    output_buffer: *mut c_void,
+    output_offset: usize,
+    num_seqs: u32,
+    total_queries: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_size: u32,
+    block_size: u32,
+    max_context_len: u32,
+    max_blocks_per_seq: u32,
+    scale: f32,
+    softcap: f32,
+    sliding_window: i32,
+    kv_dtype_raw: u8,
+    k_scale: f32,
+    v_scale: f32,
+) -> i32 {
+    if queries_buffer.is_null()
+        || key_pool_buffer.is_null()
+        || value_pool_buffer.is_null()
+        || block_table_buffer.is_null()
+        || seq_lens_buffer.is_null()
+        || cu_seqlens_q_buffer.is_null()
+        || output_buffer.is_null()
+    {
+        eprintln!("mlx_paged_attn_paged_attention_varlen_dispatch: null buffer pointer");
+        return -1;
+    }
+    if sliding_window < 0 {
+        eprintln!(
+            "mlx_paged_attn_paged_attention_varlen_dispatch: sliding_window={sliding_window} \
+             must be >= 0 (use 0 to disable the sliding mask)"
+        );
+        return -1;
+    }
+    let Some(kv_dtype) = parse_kv_dtype(kv_dtype_raw) else {
+        eprintln!(
+            "mlx_paged_attn_paged_attention_varlen_dispatch: invalid kv_dtype_raw {}",
+            kv_dtype_raw
+        );
+        return -1;
+    };
+    if num_seqs == 0 || total_queries == 0 || num_q_heads == 0 || head_size == 0 {
+        eprintln!("mlx_paged_attn_paged_attention_varlen_dispatch: zero-sized dispatch");
+        return -1;
+    }
+    if max_context_len == 0 || max_blocks_per_seq == 0 {
+        eprintln!("mlx_paged_attn_paged_attention_varlen_dispatch: zero context/blocks");
+        return -1;
+    }
+
+    let cache_dtype = kv_dtype.to_metal();
+    let io_dtype = if kv_dtype.is_fp8() {
+        MetalDtype::BFloat16
+    } else {
+        cache_dtype
+    };
+
+    // softcap = 0.0 is the C++ "disabled" sentinel; kernel expects 1.0.
+    let softcapping = if softcap == 0.0 { 1.0 } else { softcap };
+
+    let q_stride = (num_q_heads * head_size) as i32;
+    let kv_block_stride = (num_kv_heads * head_size * block_size) as i32;
+    let kv_head_stride = (head_size * block_size) as i32;
+
+    let params = PagedAttentionVarlenParams {
+        num_seqs,
+        total_queries,
+        num_heads: num_q_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        max_seq_len: max_context_len,
+        max_num_blocks_per_seq: max_blocks_per_seq,
+        scale,
+        softcapping,
+        q_stride,
+        kv_block_stride,
+        kv_head_stride,
+        k_scale,
+        v_scale,
+        sliding_window,
+    };
+
+    let queries_raw = RawBufferInfo {
+        ptr: queries_buffer,
+        offset: queries_offset,
+    };
+
+    // SAFETY: caller guarantees the buffers are live MTLBuffer* pointers
+    // retained by MLX. Forget the owned wrappers after the dispatch so
+    // the underlying refcounts aren't double-decremented.
+    let key_pool = unsafe { borrow_buffer(key_pool_buffer) };
+    let value_pool = unsafe { borrow_buffer(value_pool_buffer) };
+    let block_table = unsafe { borrow_buffer(block_table_buffer) };
+    let seq_lens = unsafe { borrow_buffer(seq_lens_buffer) };
+    let cu_seqlens_q = unsafe { borrow_buffer(cu_seqlens_q_buffer) };
+
+    let dispatch_result = unsafe {
+        dispatch_paged_attention_varlen_auto(
+            &queries_raw,
+            &key_pool,
+            &value_pool,
+            &block_table,
+            &seq_lens,
+            &cu_seqlens_q,
+            max_context_len,
+            &params,
+            io_dtype,
+            cache_dtype,
+        )
+    };
+
+    let blit_result = match dispatch_result {
+        Ok(out) => {
+            // SAFETY: caller guarantees output_buffer is live and large
+            // enough. Reuses the same blit helper as the single-row path.
+            let output_owned = unsafe { borrow_buffer(output_buffer) };
+            let r = blit_attention_output(&out, &output_owned, output_offset, io_dtype);
+            std::mem::forget(output_owned);
+            r
+        }
+        Err(e) => Err(e),
+    };
+
+    std::mem::forget(key_pool);
+    std::mem::forget(value_pool);
+    std::mem::forget(block_table);
+    std::mem::forget(seq_lens);
+    std::mem::forget(cu_seqlens_q);
+
+    match blit_result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("mlx_paged_attn_paged_attention_varlen_dispatch: error: {e}");
+            -1
+        }
+    }
 }
 
 #[cfg(test)]

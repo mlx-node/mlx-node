@@ -232,6 +232,55 @@ impl MetalState {
             io_type, head_size
         )
     }
+
+    /// Varlen counterparts to the V1/V2/reduce kernel name helpers above
+    /// (Phase 4a). The naming convention mirrors the single-row helpers
+    /// 1:1 except for the `varlen` infix so the metallib lookup is
+    /// unambiguous; this also means a missing-kernel typo here fails
+    /// loudly at pipeline-build time rather than silently selecting the
+    /// single-row kernel.
+    pub fn paged_attention_varlen_v1_kernel_name(
+        io_dtype: MetalDtype,
+        cache_dtype: MetalDtype,
+        head_size: u32,
+        block_size: u32,
+        use_alibi: bool,
+    ) -> String {
+        let io_type = io_dtype.type_string();
+        let cache_type = cache_dtype.type_string();
+        let suffix = if use_alibi { "_alibi" } else { "" };
+        format!(
+            "paged_attention_varlen_{}_cache_{}_hs{}_bs{}_nt256_nsl32_ps0{}",
+            io_type, cache_type, head_size, block_size, suffix
+        )
+    }
+
+    pub fn paged_attention_varlen_v2_kernel_name(
+        io_dtype: MetalDtype,
+        cache_dtype: MetalDtype,
+        head_size: u32,
+        block_size: u32,
+        use_alibi: bool,
+    ) -> String {
+        let io_type = io_dtype.type_string();
+        let cache_type = cache_dtype.type_string();
+        let suffix = if use_alibi { "_alibi" } else { "" };
+        format!(
+            "paged_attention_varlen_{}_cache_{}_hs{}_bs{}_nt256_nsl32_ps512{}",
+            io_type, cache_type, head_size, block_size, suffix
+        )
+    }
+
+    pub fn paged_attention_varlen_v2_reduce_kernel_name(
+        io_dtype: MetalDtype,
+        head_size: u32,
+    ) -> String {
+        let io_type = io_dtype.type_string();
+        format!(
+            "paged_attention_varlen_v2_reduce_{}_hs{}_nt256_nsl32_ps512",
+            io_type, head_size
+        )
+    }
 }
 
 /// Data types supported by Metal kernels

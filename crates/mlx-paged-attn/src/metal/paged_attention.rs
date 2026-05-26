@@ -760,6 +760,519 @@ pub unsafe fn dispatch_paged_attention_auto(
     }
 }
 
+/// Parameters for the varlen (multi-row) paged_attention dispatch.
+///
+/// Phase 4a (Multi-Token Prediction): the verify pass needs D+1 query
+/// tokens per sequence, so the kernel grid is `(num_q_heads, total_queries,
+/// num_partitions)` and the query tensor is a flat ragged
+/// `[total_queries, num_q_heads, head_size]` layout.
+///
+/// `cu_seqlens_q` is the standard FlashAttention-style cumulative query
+/// length array: `cu_seqlens_q[0] = 0`, `cu_seqlens_q[i+1] -
+/// cu_seqlens_q[i] = q_len_i`, and `cu_seqlens_q[num_seqs] =
+/// total_queries`. Every query token discovers its source sequence by
+/// binary-searching this array on the GPU.
+pub struct PagedAttentionVarlenParams {
+    /// Number of sequences in the batch (length of context_lens).
+    pub num_seqs: u32,
+    /// Total number of query tokens across all sequences (equals
+    /// `cu_seqlens_q[num_seqs]`). Determines the y-dimension of the
+    /// dispatch grid.
+    pub total_queries: u32,
+    /// Number of query heads.
+    pub num_heads: u32,
+    /// Number of KV heads.
+    pub num_kv_heads: u32,
+    /// Size of each head.
+    pub head_size: u32,
+    /// Block size for paged attention.
+    pub block_size: u32,
+    /// Max effective_context_len across all queries. Used to size V2's
+    /// `max_num_partitions` and to choose V1 vs V2.
+    pub max_seq_len: u32,
+    /// Maximum number of blocks per sequence.
+    pub max_num_blocks_per_seq: u32,
+    /// Attention scale factor (1/sqrt(head_size)).
+    pub scale: f32,
+    /// Softcapping value (1.0 = disabled).
+    pub softcapping: f32,
+    /// Query stride (num_heads * head_size — same as the single-row
+    /// kernel, since Q is still row-major in [num_heads, head_size]).
+    pub q_stride: i32,
+    /// KV block stride.
+    pub kv_block_stride: i32,
+    /// KV head stride.
+    pub kv_head_stride: i32,
+    /// K scale for FP8 quantization (1.0 for non-FP8).
+    pub k_scale: f32,
+    /// V scale for FP8 quantization (1.0 for non-FP8).
+    pub v_scale: f32,
+    /// Sliding-window mask. Same semantics as the single-row kernel,
+    /// referenced to `effective_context_len` per query token (Phase 7).
+    pub sliding_window: i32,
+}
+
+impl Default for PagedAttentionVarlenParams {
+    fn default() -> Self {
+        Self {
+            num_seqs: 0,
+            total_queries: 0,
+            num_heads: 0,
+            num_kv_heads: 0,
+            head_size: 128,
+            block_size: 16,
+            max_seq_len: 0,
+            max_num_blocks_per_seq: 0,
+            scale: 1.0,
+            softcapping: 1.0,
+            q_stride: 0,
+            kv_block_stride: 0,
+            kv_head_stride: 0,
+            k_scale: 1.0,
+            v_scale: 1.0,
+            sliding_window: 0,
+        }
+    }
+}
+
+/// Output of the varlen dispatch — shape `[total_queries, num_heads,
+/// head_size]`. Reuses `PagedAttentionOutput` because the only semantic
+/// change is that `num_seqs` actually carries `total_queries`; downstream
+/// consumers only ever multiply the three fields back together to size
+/// blits.
+pub type PagedAttentionVarlenOutput = PagedAttentionOutput;
+
+/// Dispatch the varlen V1 paged_attention kernel (no partitioning, used
+/// when `max_seq_len <= PARTITION_SIZE`).
+///
+/// # Safety
+/// - `queries` must be a valid MTLBuffer* with shape
+///   `[total_queries, num_heads, head_size]` (ragged Q layout).
+/// - `cu_seqlens_q` must hold `num_seqs + 1` int32 cumulative counts.
+/// - Same K/V/block_tables/context_lens layout as the single-row
+///   dispatchers.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
+    queries: &RawBufferInfo,
+    key_cache: &Buffer,
+    value_cache: &Buffer,
+    block_tables: &Buffer,
+    context_lens: &Buffer,
+    cu_seqlens_q: &Buffer,
+    params: &PagedAttentionVarlenParams,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
+) -> Result<PagedAttentionVarlenOutput, String> {
+    let state = MetalState::get()?;
+
+    // Output sized by total_queries — every query token gets its own
+    // [num_heads, head_size] slab. Allocated in io_dtype regardless of
+    // cache_dtype (FP8 dequantizes internally).
+    let output_element_size = io_dtype.size() as u64;
+    let output_size = (params.total_queries as u64)
+        * (params.num_heads as u64)
+        * (params.head_size as u64)
+        * output_element_size;
+    let output = state
+        .device
+        .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
+
+    let kernel_name = MetalState::paged_attention_varlen_v1_kernel_name(
+        io_dtype,
+        cache_dtype,
+        params.head_size,
+        params.block_size,
+        false, // use_alibi — not exercised in Phase 4a
+    );
+    let pipeline = state.get_pipeline(&kernel_name)?;
+
+    let command_buffer = state.command_queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    let dummy_float: f32 = 0.0;
+    let dummy_buffer = state.device.new_buffer_with_data(
+        &dummy_float as *const f32 as *const _,
+        std::mem::size_of::<f32>() as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    // SAFETY: caller guarantees queries.ptr is a valid MTLBuffer*.
+    let queries_ref: &BufferRef = unsafe { ForeignTypeRef::from_ptr(queries.ptr as *mut _) };
+
+    encoder.set_buffer(0, Some(&dummy_buffer), 0); // exp_sums (unused in V1)
+    encoder.set_buffer(1, Some(&dummy_buffer), 0); // max_logits (unused in V1)
+    encoder.set_buffer(2, Some(&output), 0);
+    encoder.set_buffer(3, Some(queries_ref), queries.offset as u64);
+    encoder.set_buffer(4, Some(key_cache), 0);
+    encoder.set_buffer(5, Some(value_cache), 0);
+
+    let k_scale_buffer = state.device.new_buffer_with_data(
+        &params.k_scale as *const f32 as *const _,
+        std::mem::size_of::<f32>() as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let v_scale_buffer = state.device.new_buffer_with_data(
+        &params.v_scale as *const f32 as *const _,
+        std::mem::size_of::<f32>() as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    encoder.set_buffer(6, Some(&k_scale_buffer), 0);
+    encoder.set_buffer(7, Some(&v_scale_buffer), 0);
+
+    let create_int_buffer = |value: i32| {
+        state.device.new_buffer_with_data(
+            &value as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let create_float_buffer = |value: f32| {
+        state.device.new_buffer_with_data(
+            &value as *const f32 as *const _,
+            std::mem::size_of::<f32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        )
+    };
+
+    let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
+    let scale_buf = create_float_buffer(params.scale);
+    let softcapping_buf = create_float_buffer(params.softcapping);
+    let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32);
+    let q_stride_buf = create_int_buffer(params.q_stride);
+    let kv_block_stride_buf = create_int_buffer(params.kv_block_stride);
+    let kv_head_stride_buf = create_int_buffer(params.kv_head_stride);
+
+    encoder.set_buffer(8, Some(&num_kv_heads_buf), 0);
+    encoder.set_buffer(9, Some(&scale_buf), 0);
+    encoder.set_buffer(10, Some(&softcapping_buf), 0);
+    encoder.set_buffer(11, Some(block_tables), 0);
+    encoder.set_buffer(12, Some(context_lens), 0);
+    encoder.set_buffer(13, Some(&max_num_blocks_buf), 0);
+    encoder.set_buffer(14, Some(&dummy_buffer), 0); // alibi_slopes
+    encoder.set_buffer(15, Some(&q_stride_buf), 0);
+    encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
+    encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
+
+    let sliding_window_buf = create_int_buffer(params.sliding_window);
+    encoder.set_buffer(18, Some(&sliding_window_buf), 0);
+
+    // New buffers for varlen: cu_seqlens_q + num_seqs.
+    encoder.set_buffer(19, Some(cu_seqlens_q), 0);
+    let num_seqs_buf = create_int_buffer(params.num_seqs as i32);
+    encoder.set_buffer(20, Some(&num_seqs_buf), 0);
+
+    // Threadgroup memory layout matches the single-row V1 dispatcher.
+    // The `logits` buffer is still sized by `max_seq_len` (the cross-batch
+    // worst case) — individual query tokens may use fewer slots when
+    // their effective_context_len is smaller, but the allocation must
+    // cover the longest.
+    const NUM_WARPS_FOR_REDUCE: usize = 8;
+    let logits_bytes = params.max_seq_len as usize * std::mem::size_of::<f32>();
+    let v_reduce_bytes =
+        (NUM_WARPS_FOR_REDUCE / 2) * params.head_size as usize * std::mem::size_of::<f32>();
+    let red_smem_bytes = 2 * NUM_WARPS_FOR_REDUCE * std::mem::size_of::<f32>();
+    let threadgroup_mem_size = logits_bytes.max(v_reduce_bytes) + red_smem_bytes;
+    encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+
+    // Grid: (num_heads, total_queries, 1) — one threadgroup per
+    // (head, query_token). The y-dim is the only structural change vs.
+    // the single-row dispatcher.
+    let threads_per_threadgroup = MTLSize::new(256, 1, 1);
+    let threadgroups = MTLSize::new(params.num_heads as u64, params.total_queries as u64, 1);
+
+    encoder.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
+    encoder.end_encoding();
+
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    Ok(PagedAttentionVarlenOutput {
+        buffer: output,
+        // `num_seqs` in PagedAttentionOutput is overloaded to mean "the
+        // leading dim of the output". For varlen that's total_queries.
+        num_seqs: params.total_queries,
+        num_heads: params.num_heads,
+        head_size: params.head_size,
+        dtype: io_dtype,
+    })
+}
+
+/// Dispatch the varlen V2 paged_attention kernel (with partitioning, used
+/// when `max_seq_len > PARTITION_SIZE`).
+///
+/// # Safety
+/// Same as `dispatch_paged_attention_varlen_v1_raw`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
+    queries: &RawBufferInfo,
+    key_cache: &Buffer,
+    value_cache: &Buffer,
+    block_tables: &Buffer,
+    context_lens: &Buffer,
+    cu_seqlens_q: &Buffer,
+    params: &PagedAttentionVarlenParams,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
+) -> Result<PagedAttentionVarlenOutput, String> {
+    let state = MetalState::get()?;
+
+    let output_element_size = io_dtype.size() as u64;
+    let output_size = (params.total_queries as u64)
+        * (params.num_heads as u64)
+        * (params.head_size as u64)
+        * output_element_size;
+    let output = state
+        .device
+        .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
+
+    // Sized off the worst-case effective_context_len (the caller's
+    // `max_seq_len`), so every query token fits in the allocated grid.
+    // Per-token short-context queries simply leave some partition slots
+    // empty — the reduce kernel skips them via the
+    // `effective_context_len`-derived `num_partitions` it computes
+    // independently.
+    let max_num_partitions = params.max_seq_len.div_ceil(PARTITION_SIZE);
+
+    // Note: the V2 main kernel writes exp_sums / max_logits / tmp_out
+    // indexed by q_token_idx (NOT seq_idx), so size by total_queries.
+    let exp_sums_size = (params.total_queries * params.num_heads * max_num_partitions) as usize
+        * std::mem::size_of::<f32>();
+    let max_logits_size = exp_sums_size;
+    let tmp_out_size =
+        (params.total_queries * params.num_heads * max_num_partitions * params.head_size) as usize
+            * io_dtype.size();
+
+    let exp_sums = state.device.new_buffer(
+        exp_sums_size as u64,
+        metal::MTLResourceOptions::StorageModePrivate,
+    );
+    let max_logits = state.device.new_buffer(
+        max_logits_size as u64,
+        metal::MTLResourceOptions::StorageModePrivate,
+    );
+    let tmp_out = state.device.new_buffer(
+        tmp_out_size as u64,
+        metal::MTLResourceOptions::StorageModePrivate,
+    );
+
+    // SAFETY: caller guarantees queries.ptr is a valid MTLBuffer*.
+    let queries_ref: &BufferRef = unsafe { ForeignTypeRef::from_ptr(queries.ptr as *mut _) };
+
+    // Phase 1: partitioned varlen attention.
+    {
+        let kernel_name = MetalState::paged_attention_varlen_v2_kernel_name(
+            io_dtype,
+            cache_dtype,
+            params.head_size,
+            params.block_size,
+            false,
+        );
+        let pipeline = state.get_pipeline(&kernel_name)?;
+
+        let command_buffer = state.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(0, Some(&exp_sums), 0);
+        encoder.set_buffer(1, Some(&max_logits), 0);
+        encoder.set_buffer(2, Some(&tmp_out), 0);
+        encoder.set_buffer(3, Some(queries_ref), queries.offset as u64);
+        encoder.set_buffer(4, Some(key_cache), 0);
+        encoder.set_buffer(5, Some(value_cache), 0);
+
+        let k_scale_buffer = state.device.new_buffer_with_data(
+            &params.k_scale as *const f32 as *const _,
+            std::mem::size_of::<f32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let v_scale_buffer = state.device.new_buffer_with_data(
+            &params.v_scale as *const f32 as *const _,
+            std::mem::size_of::<f32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        encoder.set_buffer(6, Some(&k_scale_buffer), 0);
+        encoder.set_buffer(7, Some(&v_scale_buffer), 0);
+
+        let create_int_buffer = |value: i32| {
+            state.device.new_buffer_with_data(
+                &value as *const i32 as *const _,
+                std::mem::size_of::<i32>() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let create_float_buffer = |value: f32| {
+            state.device.new_buffer_with_data(
+                &value as *const f32 as *const _,
+                std::mem::size_of::<f32>() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+
+        let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
+        let scale_buf = create_float_buffer(params.scale);
+        let softcapping_buf = create_float_buffer(params.softcapping);
+        let max_num_blocks_buf = create_int_buffer(params.max_num_blocks_per_seq as i32);
+        let q_stride_buf = create_int_buffer(params.q_stride);
+        let kv_block_stride_buf = create_int_buffer(params.kv_block_stride);
+        let kv_head_stride_buf = create_int_buffer(params.kv_head_stride);
+
+        let dummy_float: f32 = 0.0;
+        let dummy_buffer = state.device.new_buffer_with_data(
+            &dummy_float as *const f32 as *const _,
+            std::mem::size_of::<f32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        encoder.set_buffer(8, Some(&num_kv_heads_buf), 0);
+        encoder.set_buffer(9, Some(&scale_buf), 0);
+        encoder.set_buffer(10, Some(&softcapping_buf), 0);
+        encoder.set_buffer(11, Some(block_tables), 0);
+        encoder.set_buffer(12, Some(context_lens), 0);
+        encoder.set_buffer(13, Some(&max_num_blocks_buf), 0);
+        encoder.set_buffer(14, Some(&dummy_buffer), 0); // alibi_slopes
+        encoder.set_buffer(15, Some(&q_stride_buf), 0);
+        encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
+        encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
+
+        let sliding_window_buf = create_int_buffer(params.sliding_window);
+        encoder.set_buffer(18, Some(&sliding_window_buf), 0);
+
+        encoder.set_buffer(19, Some(cu_seqlens_q), 0);
+        let num_seqs_buf = create_int_buffer(params.num_seqs as i32);
+        encoder.set_buffer(20, Some(&num_seqs_buf), 0);
+
+        const NUM_WARPS_V2: usize = 8;
+        let logits_bytes_v2 = PARTITION_SIZE as usize * std::mem::size_of::<f32>();
+        let v_reduce_bytes_v2 =
+            (NUM_WARPS_V2 / 2) * params.head_size as usize * std::mem::size_of::<f32>();
+        let red_smem_bytes_v2 = 2 * NUM_WARPS_V2 * std::mem::size_of::<f32>();
+        let threadgroup_mem_size = logits_bytes_v2.max(v_reduce_bytes_v2) + red_smem_bytes_v2;
+        encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+
+        // Grid: (num_heads, total_queries, max_num_partitions).
+        let threads_per_threadgroup = MTLSize::new(256, 1, 1);
+        let threadgroups = MTLSize::new(
+            params.num_heads as u64,
+            params.total_queries as u64,
+            max_num_partitions as u64,
+        );
+
+        encoder.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
+        encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+
+    // Phase 2: reduce partitions. The varlen reduce kernel walks the
+    // ragged query layout the same way as the main kernel (y =
+    // q_token_idx, binary-search to seq_idx).
+    {
+        let kernel_name =
+            MetalState::paged_attention_varlen_v2_reduce_kernel_name(io_dtype, params.head_size);
+        let pipeline = state.get_pipeline(&kernel_name)?;
+
+        let command_buffer = state.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        encoder.set_buffer(0, Some(&output), 0);
+        encoder.set_buffer(1, Some(&exp_sums), 0);
+        encoder.set_buffer(2, Some(&max_logits), 0);
+        encoder.set_buffer(3, Some(&tmp_out), 0);
+        encoder.set_buffer(4, Some(context_lens), 0);
+
+        let max_num_partitions_buf = state.device.new_buffer_with_data(
+            &(max_num_partitions as i32) as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        encoder.set_buffer(5, Some(&max_num_partitions_buf), 0);
+
+        encoder.set_buffer(6, Some(cu_seqlens_q), 0);
+        let num_seqs_buf = state.device.new_buffer_with_data(
+            &(params.num_seqs as i32) as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        encoder.set_buffer(7, Some(&num_seqs_buf), 0);
+
+        let threadgroup_mem_size = 2 * (max_num_partitions as usize) * std::mem::size_of::<f32>();
+        encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+
+        let threads_per_threadgroup = MTLSize::new(256, 1, 1);
+        let threadgroups = MTLSize::new(params.num_heads as u64, params.total_queries as u64, 1);
+
+        encoder.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
+        encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+
+    Ok(PagedAttentionVarlenOutput {
+        buffer: output,
+        num_seqs: params.total_queries,
+        num_heads: params.num_heads,
+        head_size: params.head_size,
+        dtype: io_dtype,
+    })
+}
+
+/// Automatically pick V1 or V2 for varlen dispatch based on `max_seq_len`.
+///
+/// Threshold matches the single-row auto-dispatcher (PARTITION_SIZE=512)
+/// so the V1/V2 cutover stays consistent across the codebase.
+///
+/// # Safety
+/// Same as the underlying `dispatch_paged_attention_varlen_*_raw` calls.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dispatch_paged_attention_varlen_auto(
+    queries: &RawBufferInfo,
+    key_cache: &Buffer,
+    value_cache: &Buffer,
+    block_tables: &Buffer,
+    context_lens: &Buffer,
+    cu_seqlens_q: &Buffer,
+    max_context_len: u32,
+    params: &PagedAttentionVarlenParams,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
+) -> Result<PagedAttentionVarlenOutput, String> {
+    if max_context_len <= PARTITION_SIZE {
+        // SAFETY: caller guarantees all buffer pointers are valid.
+        unsafe {
+            dispatch_paged_attention_varlen_v1_raw(
+                queries,
+                key_cache,
+                value_cache,
+                block_tables,
+                context_lens,
+                cu_seqlens_q,
+                params,
+                io_dtype,
+                cache_dtype,
+            )
+        }
+    } else {
+        // SAFETY: caller guarantees all buffer pointers are valid.
+        unsafe {
+            dispatch_paged_attention_varlen_v2_raw(
+                queries,
+                key_cache,
+                value_cache,
+                block_tables,
+                context_lens,
+                cu_seqlens_q,
+                params,
+                io_dtype,
+                cache_dtype,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

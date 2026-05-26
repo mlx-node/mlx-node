@@ -33,7 +33,8 @@ pub mod metal;
 // in `crates/mlx-sys/src/mlx_paged_ops.cpp` can link against them.
 #[cfg(target_os = "macos")]
 pub use extern_c::{
-    mlx_paged_attn_paged_attention_dispatch, mlx_paged_attn_reshape_and_cache_dispatch,
+    mlx_paged_attn_paged_attention_dispatch, mlx_paged_attn_paged_attention_varlen_dispatch,
+    mlx_paged_attn_reshape_and_cache_dispatch,
 };
 
 pub use block_allocator::*;

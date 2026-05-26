@@ -1300,6 +1300,575 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
 }
 
+// ========================================== Varlen Paged Attention kernel
+//
+// Phase 4a: multi-row paged attention for speculative decoding (MTP).
+//
+// The single-row kernel above launches one threadgroup per (head, seq_idx)
+// — every sequence contributes exactly one query token, so the global Q
+// layout is `[num_seqs, num_heads, head_size]`. With multi-token-prediction
+// the verify pass needs D+1 query tokens per sequence (one bonus token + D
+// draft tokens), so the existing kernel either has to be called D+1 times
+// (sequential round-trips, defeating the speedup) or be generalised to
+// accept ragged batches.
+//
+// This kernel keeps the proven single-row path untouched and provides a
+// SIBLING entrypoint that consumes a flat `[total_num_queries, num_heads,
+// head_size]` Q tensor plus a `cu_seqlens_q[num_seqs+1]` cumulative count.
+// One threadgroup per (head, q_token_idx); each threadgroup binary-searches
+// cu_seqlens_q to discover its source sequence so it can fetch the right
+// block_table row, context_len, and causal upper bound.
+//
+// Causal mask formula (matches MTPLX pagedattention.metal:867 exactly):
+//     q_len            = cu_seqlens_q[seq_idx+1] - cu_seqlens_q[seq_idx]
+//     q_pos_in_seq     = q_token_idx - cu_seqlens_q[seq_idx]
+//     effective_ctx    = context_len - q_len + q_pos_in_seq + 1
+//
+// Hand-traced example: 3 sequences with q_lens=[2,1,4] and
+// context_lens=[5,3,6] gives cu_seqlens_q=[0,2,3,7]. q_token_idx=1 (the
+// second token of seq 0) sees q_len=2, q_pos_in_seq=1, effective_ctx=5 — it
+// attends to all 5 KV positions. q_token_idx=3 (first draft of seq 2) sees
+// q_len=4, q_pos_in_seq=0, effective_ctx=3 — it attends only to the
+// 3-token prefix that existed before the draft window. This matches the
+// causal contract: a query token at logical position P can attend to KV
+// positions [0, P+1) and we model P as
+// (context_len - q_len + q_pos_in_seq).
+//
+// Special case: q_lens=[1,1,...,1] with cu_seqlens_q=[0,1,2,...,N] yields
+// q_len=1, q_pos_in_seq=0, effective_ctx=context_len for every threadgroup
+// — byte-identical to the single-row kernel. The single-seq T=1 parity
+// test relies on this property.
+
+// Binary search to find which sequence a global query token belongs to.
+//
+// In varlen attention, queries from multiple sequences are packed
+// contiguously into a flat array:
+//   q[0..q_len_0-1] -> seq 0, q[q_len_0..q_len_0+q_len_1-1] -> seq 1, ...
+// The kernel launches one threadgroup per (head, query_token) in a flat
+// grid. Each threadgroup needs to discover which sequence it belongs to so
+// it can look up the correct block_table row, context_len, and causal mask
+// boundary.
+//
+// cu_seqlens_q is sorted ascending: [0, q_len_0, q_len_0+q_len_1, ...].
+// Returns seq_idx such that
+//     cu_seqlens_q[seq_idx] <= q_token_idx < cu_seqlens_q[seq_idx+1].
+//
+// O(log num_seqs) — for our typical batch sizes (≤ 64) this is a couple of
+// iterations and dwarfs nothing in the kernel's QK/V loops.
+inline int find_seq_idx_varlen(const device int32_t *cu_seqlens_q,
+                                int q_token_idx, int num_seqs) {
+  int lo = 0, hi = num_seqs;
+  while (lo < hi) {
+    int mid = (lo + hi + 1) / 2;
+    if (cu_seqlens_q[mid] <= q_token_idx) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
+          int NUM_SIMD_LANES, int PARTITION_SIZE = 0, bool USE_ALIBI = false>
+[[kernel]] void paged_attention_varlen(
+    device float *exp_sums [[buffer(0)]],
+    device float *max_logits [[buffer(1)]],
+    device T *out [[buffer(2)]],
+    // Q is now ragged: [total_num_queries, num_heads, head_size].
+    device const T *q [[buffer(3)]],
+    device const CACHE_T *k_cache [[buffer(4)]],
+    device const CACHE_T *v_cache [[buffer(5)]],
+    const device float *__restrict__ k_scale [[buffer(6)]],
+    const device float *__restrict__ v_scale [[buffer(7)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    const constant float &softcapping [[buffer(10)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    device const float *alibi_slopes [[buffer(14)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    const constant int &sliding_window [[buffer(18)]],
+    device const int32_t *cu_seqlens_q [[buffer(19)]],  // [num_seqs + 1]
+    const constant int &num_seqs [[buffer(20)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint simd_tid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  // Varlen mapping: y-axis enumerates query tokens (not sequences).
+  // Binary-search to translate q_token_idx -> seq_idx so we can look up
+  // the right block_table row + context_len + causal bound.
+  const int q_token_idx = threadgroup_position_in_grid.y;
+  const int seq_idx = find_seq_idx_varlen(cu_seqlens_q, q_token_idx, num_seqs);
+  const int q_seq_start = cu_seqlens_q[seq_idx];
+  const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+  const int q_pos_in_seq = q_token_idx - q_seq_start;
+  const int partition_idx = threadgroup_position_in_grid.z;
+  const int max_num_partitions = threadgroups_per_grid.z;
+  const int thread_idx = thread_position_in_threadgroup.x;
+  constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
+  const uint32_t context_len = context_lens[seq_idx];
+
+  // Causal upper bound for this query token. See the header comment above
+  // for the derivation. Effective context can shrink below `context_len`
+  // (the bonus + draft tokens at the front of the verify window must NOT
+  // attend to the most recent KV slots — those slots correspond to
+  // future-in-time tokens for them).
+  const int effective_context_len =
+      (int)context_len - q_len + q_pos_in_seq + 1;
+  if (effective_context_len <= 0) {
+    // No KV tokens to attend to. The output buffer is zero-initialised by
+    // the caller, so leaving accs at zero produces 0 / softmax(0) = 0.
+    return;
+  }
+
+  if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= effective_context_len) {
+    // This partition lies entirely past the causal cutoff for this query
+    // token. The reduce kernel ignores partitions past
+    // ceil(effective_context_len / PARTITION_SIZE), so we can safely bail
+    // without writing exp_sums / max_logits / tmp_out.
+    return;
+  }
+
+  const int num_context_blocks = DIVIDE_ROUND_UP(effective_context_len, BLOCK_SIZE);
+  const int num_blocks_per_partition =
+      USE_PARTITIONING ? PARTITION_SIZE / BLOCK_SIZE : num_context_blocks;
+
+  // [start_block_idx, end_block_idx) is the range of blocks to process.
+  const int start_block_idx =
+      USE_PARTITIONING ? partition_idx * num_blocks_per_partition : 0;
+  const int end_block_idx =
+      MIN(start_block_idx + num_blocks_per_partition, num_context_blocks);
+  const int num_blocks = end_block_idx - start_block_idx;
+
+  // [start_token_idx, end_token_idx) is the range of tokens to process.
+  // Clamp end_token_idx to effective_context_len (not context_len) so the
+  // tail block honours the causal cutoff.
+  const int start_token_idx = start_block_idx * BLOCK_SIZE;
+  const int end_token_idx =
+      MIN(start_token_idx + num_blocks * BLOCK_SIZE, effective_context_len);
+  const int num_tokens = end_token_idx - start_token_idx;
+
+  constexpr int THREAD_GROUP_SIZE = MAX(NUM_SIMD_LANES / BLOCK_SIZE, 1);
+  constexpr int NUM_THREAD_GROUPS =
+      NUM_THREADS / THREAD_GROUP_SIZE;
+  assert(NUM_THREADS % THREAD_GROUP_SIZE == 0);
+  constexpr int NUM_TOKENS_PER_THREAD_GROUP =
+      DIVIDE_ROUND_UP(BLOCK_SIZE, NUM_SIMD_LANES);
+  constexpr int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
+  const int warp_idx = simd_tid;
+  const int lane = simd_lid;
+
+  const int head_idx = threadgroup_position_in_grid.x;
+  const int num_heads = threadgroups_per_grid.x;
+  const int num_queries_per_kv = num_heads / num_kv_heads;
+  const int kv_head_idx = head_idx / num_queries_per_kv;
+  const float alibi_slope = !USE_ALIBI ? 0.f : alibi_slopes[head_idx];
+
+  constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(T)), 1);
+  using K_vec = typename Vec<T, VEC_SIZE>::Type;
+  using Q_vec = typename Vec<T, VEC_SIZE>::Type;
+  using Quant_vec = typename Vec<CACHE_T, VEC_SIZE>::Type;
+
+  constexpr int NUM_ELEMS_PER_THREAD = HEAD_SIZE / THREAD_GROUP_SIZE;
+  constexpr int NUM_VECS_PER_THREAD = NUM_ELEMS_PER_THREAD / VEC_SIZE;
+
+  const int thread_group_idx = thread_idx / THREAD_GROUP_SIZE;
+  const int thread_group_offset = thread_idx % THREAD_GROUP_SIZE;
+
+  // Q indexing: ragged layout uses q_token_idx (not seq_idx) as the row.
+  const device T *q_ptr = q + q_token_idx * q_stride + head_idx * HEAD_SIZE;
+  threadgroup Q_vec q_vecs[THREAD_GROUP_SIZE][NUM_VECS_PER_THREAD];
+#pragma unroll
+  for (int i = thread_group_idx; i < NUM_VECS_PER_THREAD;
+       i += NUM_THREAD_GROUPS) {
+    const int vec_idx = thread_group_offset + i * THREAD_GROUP_SIZE;
+    q_vecs[thread_group_offset][i] =
+        *reinterpret_cast<const device Q_vec *>(q_ptr + vec_idx * VEC_SIZE);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  threadgroup float *logits = reinterpret_cast<threadgroup float *>(shared_mem);
+  threadgroup float red_smem[2 * NUM_WARPS];
+
+  constexpr int x = 16 / sizeof(CACHE_T);
+  float qk_max = -FLT_MAX;
+
+  const device uint32_t *block_table =
+      block_tables + seq_idx * max_num_blocks_per_seq;
+  for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
+       block_idx += NUM_WARPS) {
+    const int64_t physical_block_number =
+        static_cast<int64_t>(block_table[block_idx]);
+
+    for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
+      const int physical_block_offset =
+          (thread_group_idx + i * NUM_SIMD_LANES) % BLOCK_SIZE;
+      const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+      K_vec k_vecs[NUM_VECS_PER_THREAD];
+
+#pragma unroll
+      for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
+        const device CACHE_T *k_ptr =
+            k_cache + physical_block_number * kv_block_stride +
+            kv_head_idx * kv_head_stride + physical_block_offset * x;
+        const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
+        const int offset1 = (vec_idx * VEC_SIZE) / x;
+        const int offset2 = (vec_idx * VEC_SIZE) % x;
+
+        if constexpr (is_uchar<CACHE_T>()) {
+          Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
+              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+          k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
+        } else {
+          k_vecs[j] = *reinterpret_cast<const device K_vec *>(
+              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+        }
+      }
+
+      float qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
+                             q_vecs[thread_group_offset], k_vecs);
+
+      if (softcapping != 1.0) {
+        qk = precise::tanh(qk / softcapping) * softcapping;
+      }
+
+      if constexpr (USE_ALIBI) {
+        if (alibi_slope != 0) {
+          // ALiBi bias is referenced to the query's own logical position
+          // within the full context (context_len - q_len + q_pos_in_seq),
+          // which equals effective_context_len - 1. This matches the
+          // single-row kernel for the T=1 case where
+          // effective_context_len == context_len.
+          int position_offset = token_idx - (effective_context_len - 1);
+          float alibi_bias = alibi_slope * float(position_offset);
+          qk += alibi_bias;
+        }
+      }
+
+      if (thread_group_offset == 0) {
+        // Two masks, same semantics as the single-row kernel:
+        //   1. Causal upper bound: token_idx >= effective_context_len ->
+        //      logit=0, V-zero. The single-row kernel masks against
+        //      context_len; varlen uses effective_context_len so draft
+        //      tokens that haven't been committed yet are excluded.
+        //   2. Sliding window (Phase 7): when sliding_window > 0 and
+        //      token_idx is older than effective_context_len - sw, mask
+        //      with -INFINITY so it drops out of softmax exactly.
+        const int sw = sliding_window;
+        const int sliding_lower =
+            (sw > 0 && effective_context_len > sw)
+                ? (effective_context_len - sw)
+                : 0;
+        const bool sliding_evicted =
+            sw > 0 && token_idx < sliding_lower;
+        const bool out_of_context = token_idx >= effective_context_len;
+        float stored_logit;
+        if (out_of_context) {
+          stored_logit = 0.f;
+        } else if (sliding_evicted) {
+          stored_logit = -INFINITY;
+        } else {
+          stored_logit = qk;
+        }
+        logits[token_idx - start_token_idx] = stored_logit;
+        const bool any_mask = out_of_context || sliding_evicted;
+        qk_max = any_mask ? qk_max : max(qk_max, qk);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int mask = NUM_SIMD_LANES / 2; mask >= THREAD_GROUP_SIZE; mask /= 2) {
+    qk_max = max(qk_max, simd_shuffle_xor(qk_max, mask));
+  }
+  if (lane == 0) {
+    red_smem[warp_idx] = qk_max;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  qk_max = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
+#pragma unroll
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+    qk_max = max(qk_max, simd_shuffle_xor(qk_max, mask));
+  }
+  qk_max = simd_shuffle(qk_max, 0);
+
+  float exp_sum = 0.f;
+  for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
+    float val = exp(logits[i] - qk_max);
+    logits[i] = val;
+    exp_sum += val;
+  }
+  exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(&red_smem[NUM_WARPS], exp_sum,
+                                                 simd_tid, simd_lid);
+
+  const float inv_sum = divide(1.f, exp_sum + 1e-6f);
+  for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
+    logits[i] *= inv_sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Partition output layout matches the single-row kernel: indexed by
+  // (q_token_idx, head_idx, partition_idx) rather than
+  // (seq_idx, head_idx, partition_idx). The reduce kernel below mirrors
+  // this — it iterates per query token, not per sequence.
+  if (USE_PARTITIONING && thread_idx == 0) {
+    device float *max_logits_ptr =
+        max_logits + q_token_idx * num_heads * max_num_partitions +
+        head_idx * max_num_partitions + partition_idx;
+    *max_logits_ptr = qk_max;
+    device float *exp_sums_ptr = exp_sums +
+                                 q_token_idx * num_heads * max_num_partitions +
+                                 head_idx * max_num_partitions + partition_idx;
+    *exp_sums_ptr = exp_sum;
+  }
+
+  constexpr int V_VEC_SIZE = MIN(16 / sizeof(T), BLOCK_SIZE);
+  using V_vec = typename Vec<T, V_VEC_SIZE>::Type;
+  using L_vec = typename Vec<T, V_VEC_SIZE>::Type;
+  using Float_L_vec = typename FloatVec<L_vec>::Type;
+  using V_quant_vec = typename Vec<CACHE_T, V_VEC_SIZE>::Type;
+
+  constexpr int NUM_V_VECS_PER_ROW = BLOCK_SIZE / V_VEC_SIZE;
+  constexpr int NUM_ROWS_PER_ITER = NUM_SIMD_LANES / NUM_V_VECS_PER_ROW;
+  constexpr int NUM_ROWS_PER_THREAD =
+      DIVIDE_ROUND_UP(HEAD_SIZE, NUM_ROWS_PER_ITER);
+
+  float accs[NUM_ROWS_PER_THREAD];
+#pragma unroll
+  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+    accs[i] = 0.f;
+  }
+
+  T zero_value = 0;
+  for (int block_idx = start_block_idx + warp_idx; block_idx < end_block_idx;
+       block_idx += NUM_WARPS) {
+    const int64_t physical_block_number =
+        static_cast<int64_t>(block_table[block_idx]);
+    const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
+    const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+    L_vec logits_vec;
+    Float_L_vec logits_float_vec = *reinterpret_cast<threadgroup Float_L_vec *>(
+        logits + token_idx - start_token_idx);
+    from_float(logits_vec, logits_float_vec);
+
+    const device CACHE_T *v_ptr = v_cache + physical_block_number * kv_block_stride +
+                                  kv_head_idx * kv_head_stride;
+#pragma unroll
+    for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+      const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+      if (row_idx < HEAD_SIZE) {
+        const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
+        V_vec v_vec;
+
+        if constexpr (is_uchar<CACHE_T>()) {
+          V_quant_vec v_quant_vec =
+              *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
+          v_vec = fp8_convert<V_vec, V_quant_vec>(v_quant_vec, *v_scale);
+        } else {
+          v_vec = *reinterpret_cast<const device V_vec *>(v_ptr + offset);
+        }
+
+        // Zero V lanes past the causal cutoff in the tail block.
+        if (block_idx == num_context_blocks - 1) {
+          thread T *v_vec_ptr = reinterpret_cast<thread T *>(&v_vec);
+#pragma unroll
+          for (int j = 0; j < V_VEC_SIZE; j++) {
+            v_vec_ptr[j] =
+                token_idx + j < effective_context_len ? v_vec_ptr[j] : zero_value;
+          }
+        }
+        accs[i] += dot(logits_vec, v_vec);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+    float acc = accs[i];
+#pragma unroll
+    for (int mask = NUM_V_VECS_PER_ROW / 2; mask >= 1; mask /= 2) {
+      acc += simd_shuffle_xor(acc, mask);
+    }
+    accs[i] = acc;
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  threadgroup float *out_smem =
+      reinterpret_cast<threadgroup float *>(shared_mem);
+#pragma unroll
+  for (int i = NUM_WARPS; i > 1; i /= 2) {
+    int mid = i / 2;
+    if (warp_idx >= mid && warp_idx < i) {
+      threadgroup float *dst = &out_smem[(warp_idx - mid) * HEAD_SIZE];
+#pragma unroll
+      for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+        const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+        if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
+          dst[row_idx] = accs[i];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (warp_idx < mid) {
+      const threadgroup float *src = &out_smem[warp_idx * HEAD_SIZE];
+#pragma unroll
+      for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+        const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+        if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
+          accs[i] += src[row_idx];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Output indexed by q_token_idx (not seq_idx).
+  if (warp_idx == 0) {
+    device T *out_ptr =
+        out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
+        head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
+#pragma unroll
+    for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
+      const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
+      if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
+        *(out_ptr + row_idx) = T(accs[i]);
+      }
+    }
+  }
+}
+
+// V2 reduce kernel for varlen. The single-row reduce kernel keys partition
+// count off `context_lens[seq_idx]`, but in varlen mode each query token has
+// its own effective_context_len bound (a draft token sees less context than
+// the bonus token), so we must recompute it here using the same formula as
+// the main kernel.
+template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
+          int PARTITION_SIZE = 0>
+[[kernel]] void paged_attention_varlen_v2_reduce(
+    device T *out [[buffer(0)]],
+    const device float *exp_sums [[buffer(1)]],
+    const device float *max_logits [[buffer(2)]],
+    const device T *tmp_out [[buffer(3)]],
+    device uint32_t *context_lens [[buffer(4)]],
+    const constant int &max_num_partitions [[buffer(5)]],
+    device const int32_t *cu_seqlens_q [[buffer(6)]],
+    const constant int &num_seqs [[buffer(7)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]],
+    uint simd_tid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  const int num_heads = threadgroups_per_grid.x;
+  const int head_idx = threadgroup_position_in_grid.x;
+  // Varlen: y-axis enumerates query tokens, not sequences.
+  const int q_token_idx = threadgroup_position_in_grid.y;
+  const int seq_idx = find_seq_idx_varlen(cu_seqlens_q, q_token_idx, num_seqs);
+  const int q_seq_start = cu_seqlens_q[seq_idx];
+  const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+  const int q_pos_in_seq = q_token_idx - q_seq_start;
+  const uint32_t context_len = context_lens[seq_idx];
+  const int effective_context_len =
+      (int)context_len - q_len + q_pos_in_seq + 1;
+  if (effective_context_len <= 0) {
+    // Output is zero-initialised by the caller. No reduction to do.
+    return;
+  }
+  const int num_partitions =
+      DIVIDE_ROUND_UP(effective_context_len, PARTITION_SIZE);
+  if (num_partitions == 1) {
+    device T *out_ptr =
+        out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+    const device T *tmp_out_ptr =
+        tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
+        head_idx * max_num_partitions * HEAD_SIZE;
+    for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
+         i += threads_per_threadgroup.x) {
+      out_ptr[i] = tmp_out_ptr[i];
+    }
+    return;
+  }
+
+  constexpr int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
+  const int warp_idx = simd_tid;
+  const int lane = simd_lid;
+
+  threadgroup float red_smem[2 * NUM_WARPS];
+
+  threadgroup float *shared_max_logits =
+      reinterpret_cast<threadgroup float *>(shared_mem);
+  const device float *max_logits_ptr =
+      max_logits + q_token_idx * num_heads * max_num_partitions +
+      head_idx * max_num_partitions;
+  float max_logit = -FLT_MAX;
+  for (int i = thread_position_in_threadgroup.x; i < num_partitions;
+       i += threads_per_threadgroup.x) {
+    const float l = max_logits_ptr[i];
+    shared_max_logits[i] = l;
+    max_logit = max(max_logit, l);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma unroll
+  for (int mask = NUM_SIMD_LANES / 2; mask >= 1; mask /= 2) {
+    max_logit = max(max_logit, simd_shuffle_xor(max_logit, mask));
+  }
+  if (lane == 0) {
+    red_smem[warp_idx] = max_logit;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  max_logit = lane < NUM_WARPS ? red_smem[lane] : -FLT_MAX;
+#pragma unroll
+  for (int mask = NUM_WARPS / 2; mask >= 1; mask /= 2) {
+    max_logit = max(max_logit, simd_shuffle_xor(max_logit, mask));
+  }
+  max_logit = simd_shuffle(max_logit, 0);
+
+  threadgroup float *shared_exp_sums = reinterpret_cast<threadgroup float *>(
+      shared_mem + sizeof(float) * num_partitions);
+  const device float *exp_sums_ptr = exp_sums +
+                                     q_token_idx * num_heads * max_num_partitions +
+                                     head_idx * max_num_partitions;
+  float global_exp_sum = 0.0f;
+  for (int i = thread_position_in_threadgroup.x; i < num_partitions;
+       i += threads_per_threadgroup.x) {
+    float l = shared_max_logits[i];
+    float rescaled_exp_sum = exp_sums_ptr[i] * exp(l - max_logit);
+    global_exp_sum += rescaled_exp_sum;
+    shared_exp_sums[i] = rescaled_exp_sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  global_exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(
+      &red_smem[NUM_WARPS], global_exp_sum, simd_tid, simd_lid);
+  const float inv_global_exp_sum = divide(1.0f, global_exp_sum + 1e-6f);
+
+  const device T *tmp_out_ptr =
+      tmp_out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
+      head_idx * max_num_partitions * HEAD_SIZE;
+  device T *out_ptr =
+      out + q_token_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
+#pragma unroll
+  for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
+       i += NUM_THREADS) {
+    float acc = 0.0f;
+    for (int j = 0; j < num_partitions; ++j) {
+      acc += float(tmp_out_ptr[j * HEAD_SIZE + i]) * shared_exp_sums[j] *
+             inv_global_exp_sum;
+    }
+    out_ptr[i] = T(acc);
+  }
+}
+
 // FORKED: Updated macro to include USE_ALIBI template parameter
 #define instantiate_paged_attention_impl(type, cache_type, head_size,          \
                                          block_size, num_threads,              \
@@ -1469,3 +2038,182 @@ instantiate_paged_attention_v2(half, half, 32);
 instantiate_paged_attention_v2(float, uchar, 32);
 instantiate_paged_attention_v2(bfloat16_t, uchar, 32);
 instantiate_paged_attention_v2(half, uchar, 32);
+
+// ============================================================================
+// Varlen kernel instantiations (Phase 4a).
+//
+// Same (io_type, cache_type) matrix as the single-row kernels above so the
+// Rust dispatcher's MetalDtype routing maps to a varlen kernel for every
+// non-varlen kernel it can already pick. Head sizes / block sizes mirror
+// the single-row instantiations exactly — see instantiate_paged_attention_*
+// macros above for the rationale.
+// ============================================================================
+
+#define instantiate_paged_attention_varlen_impl(                               \
+    type, cache_type, head_size, block_size, num_threads, num_simd_lanes,      \
+    partition_size, use_alibi, alibi_suffix)                                   \
+  template [[host_name("paged_attention_varlen_" #type "_cache_" #cache_type   \
+                       "_hs" #head_size "_bs" #block_size "_nt" #num_threads   \
+                       "_nsl" #num_simd_lanes                                  \
+                       "_ps" #partition_size alibi_suffix)]] [[kernel]] void   \
+  paged_attention_varlen<type, cache_type, head_size, block_size, num_threads, \
+                          num_simd_lanes, partition_size, use_alibi>(          \
+      device float *exp_sums [[buffer(0)]],                                    \
+      device float *max_logits [[buffer(1)]],                                  \
+      device type *out [[buffer(2)]],                                          \
+      device const type *q [[buffer(3)]],                                      \
+      device const cache_type *k_cache [[buffer(4)]],                          \
+      device const cache_type *v_cache [[buffer(5)]],                          \
+      const device float *__restrict__ k_scale [[buffer(6)]],                  \
+      const device float *__restrict__ v_scale [[buffer(7)]],                  \
+      const constant int &num_kv_heads [[buffer(8)]],                          \
+      const constant float &scale [[buffer(9)]],                               \
+      const constant float &softcapping [[buffer(10)]],                        \
+      device const uint32_t *block_tables [[buffer(11)]],                      \
+      device const uint32_t *context_lens [[buffer(12)]],                      \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],               \
+      device const float *alibi_slopes [[buffer(14)]],                         \
+      const constant int &q_stride [[buffer(15)]],                             \
+      const constant int &kv_block_stride [[buffer(16)]],                      \
+      const constant int &kv_head_stride [[buffer(17)]],                       \
+      const constant int &sliding_window [[buffer(18)]],                       \
+      device const int32_t *cu_seqlens_q [[buffer(19)]],                       \
+      const constant int &num_seqs [[buffer(20)]],                             \
+      threadgroup char *shared_mem [[threadgroup(0)]],                         \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
+      uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], \
+      uint simd_tid [[simdgroup_index_in_threadgroup]],                        \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_paged_attention_varlen_inner(                              \
+    type, cache_type, head_size, block_size, num_threads, num_simd_lanes,      \
+    partition_size)                                                            \
+  instantiate_paged_attention_varlen_impl(type, cache_type, head_size,         \
+                                          block_size, num_threads,             \
+                                          num_simd_lanes, partition_size,      \
+                                          false, "");                          \
+  instantiate_paged_attention_varlen_impl(type, cache_type, head_size,         \
+                                          block_size, num_threads,             \
+                                          num_simd_lanes, partition_size,      \
+                                          true, "_alibi");
+
+#define instantiate_paged_attention_varlen_v2_reduce_inner(                    \
+    type, head_size, num_threads, num_simd_lanes, partition_size)              \
+  template [[host_name(                                                        \
+      "paged_attention_varlen_v2_reduce_" #type "_hs" #head_size               \
+      "_nt" #num_threads "_nsl" #num_simd_lanes "_ps" #partition_size)]]       \
+  [[kernel]] void paged_attention_varlen_v2_reduce<                            \
+      type, head_size, num_threads, num_simd_lanes, partition_size>(           \
+      device type * out [[buffer(0)]],                                         \
+      const device float *exp_sums [[buffer(1)]],                              \
+      const device float *max_logits [[buffer(2)]],                            \
+      const device type *tmp_out [[buffer(3)]],                                \
+      device uint32_t *context_lens [[buffer(4)]],                             \
+      const constant int &max_num_partitions [[buffer(5)]],                    \
+      device const int32_t *cu_seqlens_q [[buffer(6)]],                        \
+      const constant int &num_seqs [[buffer(7)]],                              \
+      threadgroup char *shared_mem [[threadgroup(0)]],                         \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
+      uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], \
+      uint3 threads_per_threadgroup [[threads_per_threadgroup]],               \
+      uint simd_tid [[simdgroup_index_in_threadgroup]],                        \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_paged_attention_varlen_heads(                              \
+    type, cache_type, block_size, num_threads, num_simd_lanes, partition_size) \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 32, block_size,   \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);                   \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 64, block_size,   \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);                   \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 80, block_size,   \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);                   \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 96, block_size,   \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);                   \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 112, block_size,  \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);                   \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 120, block_size,  \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);                   \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 128, block_size,  \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);                   \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 192, block_size,  \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);                   \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 256, block_size,  \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);                   \
+  instantiate_paged_attention_varlen_inner(type, cache_type, 512, block_size,  \
+                                            num_threads, num_simd_lanes,       \
+                                            partition_size);
+
+#define instantiate_paged_attention_varlen_v2_reduce_heads(                    \
+    type, num_threads, num_simd_lanes, partition_size)                         \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 32, num_threads, num_simd_lanes, partition_size);                  \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 64, num_threads, num_simd_lanes, partition_size);                  \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 80, num_threads, num_simd_lanes, partition_size);                  \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 96, num_threads, num_simd_lanes, partition_size);                  \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 112, num_threads, num_simd_lanes, partition_size);                 \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 120, num_threads, num_simd_lanes, partition_size);                 \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 128, num_threads, num_simd_lanes, partition_size);                 \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 192, num_threads, num_simd_lanes, partition_size);                 \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 256, num_threads, num_simd_lanes, partition_size);                 \
+  instantiate_paged_attention_varlen_v2_reduce_inner(                          \
+      type, 512, num_threads, num_simd_lanes, partition_size);
+
+#define instantiate_paged_attention_varlen_block_size(                         \
+    type, cache_type, num_threads, num_simd_lanes, partition_size)             \
+  instantiate_paged_attention_varlen_heads(type, cache_type, 8, num_threads,   \
+                                            num_simd_lanes, partition_size);   \
+  instantiate_paged_attention_varlen_heads(type, cache_type, 16, num_threads,  \
+                                            num_simd_lanes, partition_size);   \
+  instantiate_paged_attention_varlen_heads(type, cache_type, 32, num_threads,  \
+                                            num_simd_lanes, partition_size);
+
+#define instantiate_paged_attention_varlen_v1(type, cache_type, num_simd_lanes)\
+  instantiate_paged_attention_varlen_block_size(type, cache_type, 256,         \
+                                                 num_simd_lanes, 0);
+
+#define instantiate_paged_attention_varlen_v2(type, cache_type, num_simd_lanes)\
+  instantiate_paged_attention_varlen_block_size(type, cache_type, 256,         \
+                                                 num_simd_lanes, 512);
+
+#define instantiate_paged_attention_varlen_v2_reduce(type, num_simd_lanes)     \
+  instantiate_paged_attention_varlen_v2_reduce_heads(type, 256, num_simd_lanes,\
+                                                      512);
+
+instantiate_paged_attention_varlen_v1(float, float, 32);
+instantiate_paged_attention_varlen_v1(bfloat16_t, bfloat16_t, 32);
+instantiate_paged_attention_varlen_v1(half, half, 32);
+
+instantiate_paged_attention_varlen_v1(float, uchar, 32);
+instantiate_paged_attention_varlen_v1(bfloat16_t, uchar, 32);
+instantiate_paged_attention_varlen_v1(half, uchar, 32);
+
+instantiate_paged_attention_varlen_v2_reduce(float, 32);
+instantiate_paged_attention_varlen_v2_reduce(bfloat16_t, 32);
+instantiate_paged_attention_varlen_v2_reduce(half, 32);
+
+instantiate_paged_attention_varlen_v2(float, float, 32);
+instantiate_paged_attention_varlen_v2(bfloat16_t, bfloat16_t, 32);
+instantiate_paged_attention_varlen_v2(half, half, 32);
+
+instantiate_paged_attention_varlen_v2(float, uchar, 32);
+instantiate_paged_attention_varlen_v2(bfloat16_t, uchar, 32);
+instantiate_paged_attention_varlen_v2(half, uchar, 32);
