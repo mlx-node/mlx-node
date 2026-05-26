@@ -484,18 +484,35 @@ static std::vector<array> qwen35_verify_batched_decode_fn_bucketed(
 // Speedup is proportional to `bucket / max_kv_len` per SDPA call —
 // dominant at early decode positions on long-context models.
 //
-// Buckets: powers of two from 256 to 8192. The largest bucket is chosen
-// to cover ~all realistic decode contexts on the qwen3.5 / qwen3.6
-// family (32k models rarely decode past 8k in practice; longer contexts
-// fall back to the legacy "full max_kv_len" path which is index
-// `LEGACY_BUCKET_IDX`).
-//
 // Populated lazily on first use; thread-safety mirrors the other
 // `compiled_*()` helpers in this file (single-mutex per turn from
 // `DENSE_COMPILED_MUTEX` on the Rust side).
 using BatchedVerifyFn = std::function<std::vector<array>(const std::vector<array>&)>;
 
-static constexpr std::array<int, 6> kVerifyBuckets = {256, 512, 1024, 2048, 4096, 8192};
+// W6.35 — Bucket sizes. The SDPA kernel-selection boundary, NOT a power
+// of two, drives this set. MLX's Metal SDPA `eval_gpu` routes the
+// `q.shape(2)<=8` verify/decode attention to the single-pass
+// `sdpa_vector` kernel while `k.shape(2)` is small, and to the
+// hierarchical `sdpa_vector_2pass` kernel once `k.shape(2)` crosses a
+// threshold. The two kernels reduce the per-row softmax in a DIFFERENT
+// floating-point order, so for the verify SDPA to stay bitwise identical
+// to the AR T=1 decode the verify's `k.shape(2)` (= the bucket) must land
+// in the SAME kernel the AR decode hits at that context length.
+//
+// The AR decode (`attn_pure_fn` `dynamic_kv=true`) slices KV to the
+// exact valid length `offset+1`, so its `k.shape(2)` is the real context
+// length. On this target — Apple M3 Max, `get_architecture()` is
+// `applegpu_g15s` so `get_architecture().back() == 's'` — the threshold
+// is `k.shape(2) >= 1024`: see `scaled_dot_product_attention.cpp`
+// `eval_gpu` (`(devc=='d'||devc=='s') && k.shape(2) >= 1024`). Hence the
+// `1023` bucket (NOT `1024`): every verify with `offset+T <= 1023` keeps
+// `k.shape(2) == 1023 < 1024` and stays on `sdpa_vector`, matching the AR
+// decode (which is also `< 1024` there). The `4095` bucket is retained
+// for the >1024 contexts where AR is ALSO on `sdpa_vector_2pass`: there
+// both paths use the 2-pass kernel and — for the `devc=='s'` GQA shapes
+// here — the same `blocks` count (128 for `1024 < N <= 8192`), so the
+// 2-pass reduction is N-independent and stays bit-exact row-for-row.
+static constexpr std::array<int, 6> kVerifyBuckets = {256, 512, 1023, 2048, 4095, 8192};
 static constexpr int kNumVerifyBuckets = kVerifyBuckets.size();
 // Slot kNumVerifyBuckets is reserved for the LEGACY full-length graph —
 // used when `offset + T > 8192` or as the safety fallback when the
