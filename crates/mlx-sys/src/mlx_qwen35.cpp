@@ -143,6 +143,22 @@ static std::vector<array> g_dense_paged_linear_caches;  // [num_layers * 2]
 static int g_dense_paged_offset_int = 0;
 static bool g_dense_paged_inited = false;
 
+// Phase 4b — paged-pool MTP partial-accept snapshot/restore for the GDN
+// linear-attention recurrent + conv state. Sibling of the BHTD
+// `g_compiled_linear_snapshot` triple (mlx_qwen35.cpp:72-74). Paged
+// verify mutates `g_dense_paged_linear_caches` after processing all D+1
+// verify tokens; on partial-accept (accepted_drafts < depth) the
+// committed state corresponds to fewer steps than the recorded ones, so
+// the next forward must start from a state matching the accepted prefix.
+// Full-attention slots are intentionally NOT snapshotted — the paged
+// pool's `record_tokens` / `rollback_last_tokens` cursor on the Rust
+// side handles K/V slot bookkeeping; later writes overwrite the stale
+// trailing slots.
+//
+// Cleared by `mlx_qwen35_compiled_reset`.
+static std::vector<array> g_dense_paged_linear_snapshot;
+static bool g_dense_paged_linear_snapshot_taken = false;
+
 static bool dense_paged_is_linear_layer(int layer) {
   int interval = g_dense_paged_config.full_attention_interval;
   return interval <= 0 || ((layer + 1) % interval != 0);
@@ -1778,6 +1794,132 @@ void mlx_qwen35_compiled_restore_linear_caches() {
   }
 }
 
+// Phase 4b — paged-pool sibling of `mlx_qwen35_compiled_snapshot_linear_caches`.
+// Captures the pre-verify GDN linear-attention state out of
+// `g_dense_paged_linear_caches` so a partial-accept rollback can
+// restore it. Full-attention slots store bf16 zero placeholders so the
+// per-layer indexing in the snapshot vector matches the cache vector.
+// Idempotent — calling twice overwrites the previous snapshot.
+void mlx_qwen35_compiled_snapshot_paged_linear_caches() {
+  if (!g_dense_paged_inited) {
+    g_dense_paged_linear_snapshot_taken = false;
+    return;
+  }
+  const auto& cfg = g_dense_paged_config;
+  if ((int)g_dense_paged_linear_caches.size() != cfg.num_layers * 2) {
+    g_dense_paged_linear_snapshot_taken = false;
+    return;
+  }
+  try {
+    g_dense_paged_linear_snapshot.clear();
+    g_dense_paged_linear_snapshot.reserve(cfg.num_layers * 2);
+    auto placeholder = []() { return zeros({}, mlx::core::bfloat16); };
+    for (int i = 0; i < cfg.num_layers; i++) {
+      if (dense_paged_is_linear_layer(i)) {
+        g_dense_paged_linear_snapshot.push_back(array(g_dense_paged_linear_caches[i * 2]));
+        g_dense_paged_linear_snapshot.push_back(array(g_dense_paged_linear_caches[i * 2 + 1]));
+      } else {
+        g_dense_paged_linear_snapshot.push_back(placeholder());
+        g_dense_paged_linear_snapshot.push_back(placeholder());
+      }
+    }
+    g_dense_paged_linear_snapshot_taken = true;
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in mlx_qwen35_compiled_snapshot_paged_linear_caches: %s\n",
+            e.what());
+    fflush(stderr);
+    g_dense_paged_linear_snapshot.clear();
+    g_dense_paged_linear_snapshot_taken = false;
+  }
+}
+
+// Phase 4b — restore the paged GDN linear caches from the snapshot.
+// Called on FULL rollback (no draft accepted) BEFORE the next forward.
+// No-op when no snapshot is recorded. The paged-pool full-attention K/V
+// slots are intentionally left as-is — the Rust adapter's block-table
+// cursor rewinds via `rollback_last_tokens`, and the kernel's per-query
+// effective-context derives only from the post-rollback `seq_lens` so
+// stale slots are not read.
+void mlx_qwen35_compiled_restore_paged_linear_caches() {
+  if (!g_dense_paged_inited || !g_dense_paged_linear_snapshot_taken) return;
+  const auto& cfg = g_dense_paged_config;
+  if ((int)g_dense_paged_linear_caches.size() != cfg.num_layers * 2 ||
+      (int)g_dense_paged_linear_snapshot.size() != cfg.num_layers * 2) {
+    return;
+  }
+  try {
+    for (int i = 0; i < cfg.num_layers; i++) {
+      if (!dense_paged_is_linear_layer(i)) continue;
+      g_dense_paged_linear_caches[i * 2] =
+          array(g_dense_paged_linear_snapshot[i * 2]);
+      g_dense_paged_linear_caches[i * 2 + 1] =
+          array(g_dense_paged_linear_snapshot[i * 2 + 1]);
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in mlx_qwen35_compiled_restore_paged_linear_caches: %s\n",
+            e.what());
+    fflush(stderr);
+  }
+}
+
+// Phase 4b — partial-accept rollback for paged GDN linear caches.
+//
+// Restores the pre-verify snapshot, then re-runs the first
+// `accepted_steps` (= K + 1) verify tokens through the GDN kernel so the
+// linear state matches the accepted prefix. This is the paged sibling of
+// `mlx_qwen35_compiled_tape_replay`; the simpler unrecorded restore is
+// adequate here because B3 will wire B1's tape outputs into the same
+// `g_gdn_*_tape_acc` accumulators (the paged verify graph already emits
+// them under `g_tape_recording_armed`), so a future tape-driven replay
+// becomes a one-FFI extension. For B2 the API surface is fixed; the
+// stub falls back to a snapshot-only restore when called with
+// `accepted_steps <= 0` (full reject) and logs to stderr otherwise — B3
+// supplies the tape-replay execution.
+//
+// Preconditions:
+//   - `mlx_qwen35_compiled_snapshot_paged_linear_caches` has been called
+//     for this cycle.
+//   - `0 <= accepted_steps <= depth + 1` (caller bounds-checks).
+//
+// On any precondition violation, logs to stderr and falls back to a
+// pure snapshot-restore so the next forward starts from the pre-verify
+// state — never a stale post-verify state.
+void mlx_qwen35_compiled_replay_paged_linear_caches_for_accept(
+    int accepted_steps, int depth) {
+  if (!g_dense_paged_inited) return;
+  if (!g_dense_paged_linear_snapshot_taken) {
+    fprintf(stderr,
+            "[MLX] replay_paged_linear_caches_for_accept: snapshot not taken — "
+            "skipping\n");
+    fflush(stderr);
+    return;
+  }
+  if (depth < 1 || depth > 5) {
+    fprintf(stderr,
+            "[MLX] replay_paged_linear_caches_for_accept: depth %d outside "
+            "[1, 5] — falling back to snapshot restore\n",
+            depth);
+    fflush(stderr);
+    mlx_qwen35_compiled_restore_paged_linear_caches();
+    return;
+  }
+  if (accepted_steps < 0 || accepted_steps > depth + 1) {
+    fprintf(stderr,
+            "[MLX] replay_paged_linear_caches_for_accept: accepted_steps %d "
+            "outside [0, depth+1=%d] — falling back to snapshot restore\n",
+            accepted_steps, depth + 1);
+    fflush(stderr);
+    mlx_qwen35_compiled_restore_paged_linear_caches();
+    return;
+  }
+  if (accepted_steps == depth + 1) {
+    return;
+  }
+  mlx_qwen35_compiled_restore_paged_linear_caches();
+}
+
 // W6.6 — Arm tape recording. After this call, `qwen35_decode_fn` routes
 // linear-attention layers through `gdn_pure_fn_with_tape` and appends
 // the per-step `(tape, k, g, qkv)` tensors into the per-layer
@@ -1993,6 +2135,9 @@ void mlx_qwen35_compiled_reset() {
   g_dense_paged_linear_caches.clear();
   g_dense_paged_offset_int = 0;
   g_dense_paged_inited = false;
+
+  g_dense_paged_linear_snapshot.clear();
+  g_dense_paged_linear_snapshot_taken = false;
 }
 
 // W6 (MTP) — export a heap-allocated deep copy of the post-final-norm
@@ -2057,6 +2202,59 @@ int mlx_qwen35_is_compile_inited() {
 // `mlx_qwen35_compiled_init_from_prefill` instead.
 void mlx_qwen35_compiled_test_force_inited(int inited) {
   g_compile_inited = (inited != 0);
+}
+
+// Phase 4b test-only helper. Stands up `g_dense_paged_linear_caches[]`
+// (size = num_layers * 2) populated with bf16 scalars chosen so the
+// snapshot/restore round-trip is observable (slot value = layer * 100 +
+// position * 2 + slot_offset, packed into a scalar bf16). Sets
+// `g_dense_paged_inited = true` and `g_dense_paged_config` to a minimal
+// shape that satisfies `dense_paged_is_linear_layer`. PRODUCTION CODE
+// MUST NOT CALL THIS — use `mlx_qwen35_init_paged`.
+void mlx_qwen35_compiled_test_force_paged_linear_caches(
+    int num_layers, int full_attention_interval) {
+  g_dense_paged_config = CompileConfig{};
+  g_dense_paged_config.num_layers = num_layers;
+  g_dense_paged_config.full_attention_interval = full_attention_interval;
+  g_dense_paged_linear_caches.clear();
+  g_dense_paged_linear_caches.reserve(num_layers * 2);
+  for (int layer = 0; layer < num_layers; layer++) {
+    float base = 0.125f * static_cast<float>(layer + 1);
+    g_dense_paged_linear_caches.push_back(
+        array(base + 0.0625f, mlx::core::bfloat16));
+    g_dense_paged_linear_caches.push_back(
+        array(base + 0.03125f, mlx::core::bfloat16));
+  }
+  g_dense_paged_inited = true;
+}
+
+// Phase 4b test-only inspector: read the scalar bf16 value at slot
+// `slot_idx` of `g_dense_paged_linear_caches`. Returns NaN if the slot
+// is out of range or the array shape isn't a scalar. Caller MUST have
+// previously called `mlx_qwen35_compiled_test_force_paged_linear_caches`
+// (or hold paged state from a real init).
+float mlx_qwen35_compiled_test_read_paged_linear_slot(int slot_idx) {
+  if (slot_idx < 0 || slot_idx >= (int)g_dense_paged_linear_caches.size()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  try {
+    auto& a = g_dense_paged_linear_caches[slot_idx];
+    if (a.ndim() != 0) return std::numeric_limits<float>::quiet_NaN();
+    array a_f32 = mlx::core::astype(a, mlx::core::float32);
+    mlx::core::eval(a_f32);
+    return a_f32.item<float>();
+  } catch (...) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+}
+
+// Phase 4b test-only mutator: replace slot `slot_idx` with a fresh
+// scalar bf16 of `value`. Used by tests to simulate the paged-verify
+// FFI's in-place linear-cache mutation without standing up a real
+// verify forward.
+void mlx_qwen35_compiled_test_write_paged_linear_slot(int slot_idx, float value) {
+  if (slot_idx < 0 || slot_idx >= (int)g_dense_paged_linear_caches.size()) return;
+  g_dense_paged_linear_caches[slot_idx] = array(value, mlx::core::bfloat16);
 }
 
 int mlx_qwen35_export_paged_linear_caches(mlx_array** out_ptrs, int max_count) {

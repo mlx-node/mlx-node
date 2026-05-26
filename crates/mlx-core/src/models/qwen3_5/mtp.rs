@@ -934,4 +934,204 @@ mod compiled_ffi_tests {
         }
         teardown();
     }
+
+    /// Phase 4b — smoke-test the Rust wrapper around
+    /// `mlx_qwen35_forward_batched_verify_paged`. Confirms:
+    /// 1. `forward_mtp_verify_paged` validates `depth` and rejects out
+    ///    of `[1, 5]` before any FFI call;
+    /// 2. The wrapper takes both locks without deadlock and slices the
+    ///    padded `slot_mapping` produced by
+    ///    `build_paged_attention_inputs` down to the exact `[D+1]`
+    ///    length required by `paged_kv_write`;
+    /// 3. With `g_dense_paged_inited == false` the underlying FFI
+    ///    refuses to run and surfaces a structured `Err` (no panic, no
+    ///    null-deref) so the caller can fall back gracefully;
+    /// 4. The BHTD globals (`g_compiled_caches`, `g_offset_int`) are
+    ///    not touched — the paged path is isolated from the
+    ///    main-compiled state.
+    #[test]
+    fn paged_verify_shape_smoke() {
+        use crate::models::qwen3_5::model::forward_mtp_verify_paged;
+        use crate::transformer::paged_attention_inputs::PagedAttentionInputs;
+
+        let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe {
+            sys::mlx_qwen35_compiled_reset();
+            sys::mlx_clear_weights();
+            sys::mlx_qwen35_compiled_test_force_inited(0);
+        }
+
+        let cfg = tiny_cfg();
+        let depth: i32 = 3;
+        let t = (depth + 1) as i64;
+        let chunk_size_max: i64 = 6;
+        let max_blocks_per_seq: i64 = 4;
+
+        let Some(input_ids) = skip_on_metal_failure(
+            "paged_verify_shape_smoke input_ids",
+            MxArray::from_int32(&[0i32; 4], &[1, t]).map_err(|e| e.reason.to_string()),
+        ) else {
+            return;
+        };
+        let Some(embedding) = skip_on_metal_failure(
+            "paged_verify_shape_smoke embedding",
+            MxArray::random_normal(
+                &[cfg.vocab_size as i64, cfg.hidden_size as i64],
+                0.0,
+                0.02,
+                Some(DType::BFloat16),
+            )
+            .map_err(|e| e.reason.to_string()),
+        ) else {
+            return;
+        };
+
+        let offset_arr =
+            MxArray::from_int32(&[0i32], &[1]).expect("paged_verify_shape_smoke offset_arr");
+        let block_table_data: Vec<i32> = vec![-1; max_blocks_per_seq as usize];
+        let block_table = MxArray::from_int32(&block_table_data, &[1, max_blocks_per_seq])
+            .expect("paged_verify_shape_smoke block_table");
+        let slot_mapping_data: Vec<i64> = vec![-1; chunk_size_max as usize];
+        let slot_mapping = MxArray::from_int64(&slot_mapping_data, &[chunk_size_max])
+            .expect("paged_verify_shape_smoke slot_mapping");
+        let num_valid_tokens =
+            MxArray::from_int32(&[t as i32], &[1]).expect("paged_verify_shape_smoke nvt");
+        let num_valid_blocks =
+            MxArray::from_int32(&[1i32], &[1]).expect("paged_verify_shape_smoke nvb");
+        let seq_lens =
+            MxArray::from_int32(&[t as i32], &[1]).expect("paged_verify_shape_smoke seq_lens");
+        let cu_seqlens_q = MxArray::from_int32(&[0, t as i32], &[2])
+            .expect("paged_verify_shape_smoke cu_seqlens_q");
+
+        let inputs = PagedAttentionInputs {
+            offset_arr,
+            block_table,
+            slot_mapping,
+            num_valid_tokens,
+            num_valid_blocks,
+            seq_lens,
+        };
+
+        for bad in [0_i32, 6_i32, -1_i32] {
+            let r = forward_mtp_verify_paged(&input_ids, &embedding, bad, &inputs, &cu_seqlens_q);
+            assert!(
+                r.is_err(),
+                "depth={bad} must be rejected before the FFI is reached"
+            );
+        }
+
+        let pre_offset = unsafe { sys::mlx_qwen35_get_cache_offset() };
+        let r = forward_mtp_verify_paged(&input_ids, &embedding, depth, &inputs, &cu_seqlens_q);
+        assert!(
+            r.is_err(),
+            "with g_dense_paged_inited=false the FFI must return null and the wrapper must Err"
+        );
+        let post_offset = unsafe { sys::mlx_qwen35_get_cache_offset() };
+        assert_eq!(
+            pre_offset, post_offset,
+            "paged verify wrapper must NOT touch BHTD g_offset_int"
+        );
+
+        teardown();
+    }
+
+    /// Phase 4b regression — partial-accept rollback of
+    /// `g_dense_paged_linear_caches`. The paged verify FFI mutates the
+    /// linear slots in-place after processing the entire D+1 window;
+    /// the snapshot/restore pair is what lets the MTP rollback path
+    /// recover the pre-verify state when fewer drafts accept. This
+    /// test simulates the mutation directly via the test-only writer
+    /// FFI and asserts the restore brings every slot back to its
+    /// snapshot value.
+    #[test]
+    fn paged_verify_partial_reject_restores_linear_cache() {
+        let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe {
+            sys::mlx_qwen35_compiled_reset();
+            sys::mlx_clear_weights();
+        }
+
+        let num_layers: i32 = 4;
+        let full_attention_interval: i32 = 4;
+        unsafe {
+            sys::mlx_qwen35_compiled_test_force_paged_linear_caches(
+                num_layers,
+                full_attention_interval,
+            );
+        }
+
+        let linear_slot_indices: Vec<i32> = (0..num_layers)
+            .filter(|i| ((*i + 1) % full_attention_interval) != 0)
+            .flat_map(|i| [i * 2, i * 2 + 1])
+            .collect();
+        assert!(
+            !linear_slot_indices.is_empty(),
+            "tiny_cfg's interval=4 must leave at least one linear layer"
+        );
+
+        let pre: Vec<f32> = linear_slot_indices
+            .iter()
+            .map(|&idx| unsafe { sys::mlx_qwen35_compiled_test_read_paged_linear_slot(idx) })
+            .collect();
+        for (idx, val) in linear_slot_indices.iter().zip(pre.iter()) {
+            assert!(
+                !val.is_nan(),
+                "pre-snapshot slot {idx} must be a populated bf16 scalar"
+            );
+        }
+
+        unsafe { sys::mlx_qwen35_compiled_snapshot_paged_linear_caches() };
+
+        for &idx in &linear_slot_indices {
+            unsafe { sys::mlx_qwen35_compiled_test_write_paged_linear_slot(idx, -64.0) };
+        }
+        for &idx in &linear_slot_indices {
+            let v = unsafe { sys::mlx_qwen35_compiled_test_read_paged_linear_slot(idx) };
+            assert!(
+                (v - -64.0).abs() < 1e-3,
+                "post-mutation slot {idx} must reflect the simulated verify write (got {v})"
+            );
+        }
+
+        unsafe { sys::mlx_qwen35_compiled_restore_paged_linear_caches() };
+
+        for (&idx, expected) in linear_slot_indices.iter().zip(pre.iter()) {
+            let restored = unsafe { sys::mlx_qwen35_compiled_test_read_paged_linear_slot(idx) };
+            assert!(
+                (restored - expected).abs() < 1e-3,
+                "slot {idx}: restore must return the pre-verify value (expected {expected}, got {restored})"
+            );
+        }
+
+        unsafe { sys::mlx_qwen35_compiled_snapshot_paged_linear_caches() };
+        for &idx in &linear_slot_indices {
+            unsafe { sys::mlx_qwen35_compiled_test_write_paged_linear_slot(idx, -42.0) };
+        }
+        unsafe { sys::mlx_qwen35_compiled_replay_paged_linear_caches_for_accept(2, 3) };
+        for (&idx, expected) in linear_slot_indices.iter().zip(pre.iter()) {
+            let restored = unsafe { sys::mlx_qwen35_compiled_test_read_paged_linear_slot(idx) };
+            assert!(
+                (restored - expected).abs() < 1e-3,
+                "replay(accept=2, depth=3): slot {idx} should match snapshot (expected {expected}, got {restored})"
+            );
+        }
+
+        unsafe { sys::mlx_qwen35_compiled_snapshot_paged_linear_caches() };
+        for &idx in &linear_slot_indices {
+            unsafe { sys::mlx_qwen35_compiled_test_write_paged_linear_slot(idx, 7.0) };
+        }
+        unsafe { sys::mlx_qwen35_compiled_replay_paged_linear_caches_for_accept(4, 3) };
+        for &idx in &linear_slot_indices {
+            let after_full_accept =
+                unsafe { sys::mlx_qwen35_compiled_test_read_paged_linear_slot(idx) };
+            assert!(
+                (after_full_accept - 7.0).abs() < 1e-3,
+                "replay(accept=depth+1=4, depth=3): slot {idx} must stay at the post-verify value (got {after_full_accept})"
+            );
+        }
+
+        teardown();
+    }
 }

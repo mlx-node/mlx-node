@@ -9528,6 +9528,109 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden(
     Ok((logits, hiddens))
 }
 
+/// Phase 4b — paged-pool sibling of
+/// [`forward_mtp_verify_compiled_with_hidden`]. Drives the new
+/// `mlx_qwen35_forward_batched_verify_paged` FFI which reads K/V from
+/// the paged adapter's pool tensors (via the C++ `g_dense_k_pools[]` /
+/// `g_dense_v_pools[]` globals seeded by `mlx_qwen35_init_paged`) and
+/// emits per-position logits + hiddens for the D+1 verify window in a
+/// single compiled forward.
+///
+/// `inputs` MUST come from
+/// [`PagedKVCacheAdapter::build_paged_attention_inputs`] called for the
+/// D+1 verify window (the caller `record_tokens` before building).
+/// `cu_seqlens_q` is `[0, depth+1]` int32 — the verify window has a
+/// single sequence with `depth+1` query rows.
+///
+/// LOCKING: the underlying FFI mutates process-global compile-cache,
+/// paged-pool, and paged-linear-cache state. This wrapper acquires both
+/// `DENSE_COMPILED_MUTEX` and a `COMPILED_WEIGHTS_RWLOCK` read guard
+/// for the entire call so concurrent main-path forwards on a different
+/// turn cannot race the mutation. Mirrors the locking contract of
+/// [`forward_mtp_verify_compiled_with_hidden`].
+///
+/// `slot_mapping` is sliced to exact `[depth + 1]` length before being
+/// handed to the FFI to satisfy `paged_kv_write`'s
+/// `slot_mapping.shape(0) == new_k.shape(0)` contract — the adapter
+/// returns a `chunk_size_max`-padded array. The dtype/rank of the
+/// sliced array stays stable (int64, rank-1), so MLX's compile cache
+/// allocates one trace per depth value (5 traces max) — same scaling
+/// factor as the BHTD bucket dispatch.
+///
+/// Phase 4b B2 status: defined and unit-tested (via the
+/// `compiled_ffi_tests::paged_verify_shape_smoke` regression in
+/// `mtp.rs`) but not yet wired into production decode — the routing
+/// gate inside `chat_sync_core_paged_inner` is reserved for B3. The
+/// `dead_code` allow keeps the lint quiet until B3 lands.
+#[allow(dead_code)]
+pub(super) fn forward_mtp_verify_paged(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    depth: i32,
+    inputs: &crate::transformer::paged_attention_inputs::PagedAttentionInputs,
+    cu_seqlens_q: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    use mlx_sys as sys;
+
+    if !(1..=5).contains(&depth) {
+        return Err(Error::from_reason(format!(
+            "forward_mtp_verify_paged: depth {depth} outside [1, 5]"
+        )));
+    }
+
+    let slot_mapping_len = i64::from(depth) + 1;
+    let slot_mapping = inputs
+        .slot_mapping
+        .slice(&[0], &[slot_mapping_len])
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "forward_mtp_verify_paged: failed to slice slot_mapping to [{slot_mapping_len}]: {}",
+                e.reason
+            ))
+        })?;
+
+    let _dense_lock = DENSE_COMPILED_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _weight_guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+
+    let mut out_logits: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_hiddens: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_forward_batched_verify_paged(
+            input_ids.as_raw_ptr(),
+            embedding_weight.as_raw_ptr(),
+            depth,
+            inputs.offset_arr.as_raw_ptr(),
+            inputs.block_table.as_raw_ptr(),
+            slot_mapping.as_raw_ptr(),
+            inputs.seq_lens.as_raw_ptr(),
+            cu_seqlens_q.as_raw_ptr(),
+            &mut out_logits,
+            &mut out_hiddens,
+        );
+    }
+
+    if out_logits.is_null() {
+        if !out_hiddens.is_null() {
+            let _ =
+                MxArray::from_handle(out_hiddens, "mtp_verify_paged_hiddens_drop_on_logits_fail")?;
+        }
+        return Err(Error::from_reason(
+            "forward_mtp_verify_paged: C++ returned null logits — check stderr",
+        ));
+    }
+    if out_hiddens.is_null() {
+        let _ = MxArray::from_handle(out_logits, "mtp_verify_paged_logits_drop_on_hidden_fail")?;
+        return Err(Error::from_reason(
+            "forward_mtp_verify_paged: C++ returned null hiddens — check stderr",
+        ));
+    }
+    let logits = MxArray::from_handle(out_logits, "mtp_verify_paged_logits")?;
+    let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_paged_hiddens")?;
+    Ok((logits, hiddens))
+}
+
 // ============================================================================
 // Phase 5 piece 1: C++ compiled paged-decode dispatcher (Dense).
 //

@@ -145,6 +145,18 @@ extern "C" void mlx_qwen35_forward_batched_verify_paged(
     mlx_array** out_logits,
     mlx_array** out_hiddens);
 
+// Phase 4b — paged-pool partial-accept rollback machinery (paged
+// siblings of `mlx_qwen35_compiled_snapshot_linear_caches` /
+// `mlx_qwen35_compiled_restore_linear_caches`). Defined in
+// `mlx_qwen35.cpp` where they have direct access to
+// `g_dense_paged_linear_caches`. Used by B3's MTP-on-paged gate to
+// rollback the GDN recurrent + conv state when the verify accepts
+// fewer than `depth + 1` tokens.
+extern "C" void mlx_qwen35_compiled_snapshot_paged_linear_caches();
+extern "C" void mlx_qwen35_compiled_restore_paged_linear_caches();
+extern "C" void mlx_qwen35_compiled_replay_paged_linear_caches_for_accept(
+    int accepted_steps, int depth);
+
 // W6.7 follow-up — eagerly compile the batched verify graphs for both
 // `WithTape=false` and `WithTape=true` over depths {1..5}. Defined in
 // `mlx_qwen35.cpp` where it has direct access to the main path's

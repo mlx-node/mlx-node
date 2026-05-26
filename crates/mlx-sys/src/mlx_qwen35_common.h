@@ -1617,7 +1617,12 @@ inline AttnPureResult attn_batched_verify_fn_paged(
     const array& v_scale,            // [1] f32
     const array& offset_arr,         // [1] int32 — RoPE start position
     const array& block_table,        // [1, max_blocks_per_seq] int32
-    const array& slot_mapping,       // [chunk_size_max] int64
+    const array& slot_mapping,       // [T = depth+1] int64 — exact length
+                                     // required by paged_kv_write (its
+                                     // shape(0) MUST equal new_k.shape(0)
+                                     // = B*T). Caller slices any
+                                     // chunk_size_max-padded array down
+                                     // before passing it in.
     const array& seq_lens,           // [1] int32 — post-write context
     const array& cu_seqlens_q,       // [2] int32 — [0, T]
     int block_size,

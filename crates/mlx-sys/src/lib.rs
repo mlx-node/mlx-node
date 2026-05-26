@@ -1558,6 +1558,51 @@ unsafe extern "C-unwind" {
     /// been taken since the last reset.
     pub fn mlx_qwen35_compiled_restore_linear_caches();
 
+    /// Phase 4b — paged-pool sibling of
+    /// `mlx_qwen35_compiled_snapshot_linear_caches`. Snapshots the GDN
+    /// linear-attention recurrent + conv state out of
+    /// `g_dense_paged_linear_caches[]` so a partial-accept rollback in
+    /// the paged MTP verify cycle can restore it before the next
+    /// forward. Full-attention pool slots are NOT snapshotted — the
+    /// Rust paged adapter's `rollback_last_tokens` handles K/V cursor
+    /// bookkeeping.
+    ///
+    /// No-op if `g_dense_paged_inited == false`. Idempotent — overwrites
+    /// any previous snapshot.
+    pub fn mlx_qwen35_compiled_snapshot_paged_linear_caches();
+
+    /// Phase 4b — restore the paged GDN linear caches from the most
+    /// recent snapshot. Called on FULL rollback (zero drafts accepted)
+    /// BEFORE the next forward. For partial-accept (1 <= K < depth) use
+    /// `mlx_qwen35_compiled_replay_paged_linear_caches_for_accept`
+    /// instead. No-op if no snapshot has been taken since the last
+    /// reset.
+    pub fn mlx_qwen35_compiled_restore_paged_linear_caches();
+
+    /// Phase 4b — partial-accept rollback for the paged GDN linear
+    /// caches. Called after the MTP verify loop when
+    /// `accepted_steps == accepted_drafts + 1` (the K accepted drafts
+    /// plus the bonus / residual token) is strictly less than
+    /// `depth + 1`. Currently restores the pre-verify snapshot — the
+    /// tape-replay fast path (mirroring
+    /// `mlx_qwen35_compiled_tape_replay`) becomes a follow-up wiring
+    /// once B3 routes the paged verify's tape outputs into the existing
+    /// `g_gdn_*_tape_acc[]` accumulators.
+    ///
+    /// `accepted_steps == depth + 1` is a no-op (full accept — the
+    /// post-verify state already matches the committed prefix).
+    ///
+    /// Preconditions (else logs to stderr and falls back to a pure
+    /// snapshot restore):
+    ///   - `mlx_qwen35_compiled_snapshot_paged_linear_caches` has been
+    ///     called for this cycle;
+    ///   - `1 <= depth <= 5`;
+    ///   - `0 <= accepted_steps <= depth + 1`.
+    pub fn mlx_qwen35_compiled_replay_paged_linear_caches_for_accept(
+        accepted_steps: i32,
+        depth: i32,
+    );
+
     /// W6.6 — Arm tape recording for the dense compiled path. After
     /// this call, every `mlx_qwen35_forward_compiled` routes linear-
     /// attention layers through a tape-emitting Metal kernel and
@@ -1623,6 +1668,27 @@ unsafe extern "C-unwind" {
     /// the `is_compile_inited` precondition. PRODUCTION CODE MUST NOT
     /// CALL THIS — use `mlx_qwen35_compiled_init_from_prefill`.
     pub fn mlx_qwen35_compiled_test_force_inited(inited: i32);
+
+    /// Phase 4b test-only: populate
+    /// `g_dense_paged_linear_caches[]` with scalar bf16 markers and set
+    /// `g_dense_paged_inited = true` so the paged snapshot/restore FFIs
+    /// can be exercised without standing up a real paged adapter.
+    /// PRODUCTION CODE MUST NOT CALL THIS — use `mlx_qwen35_init_paged`.
+    pub fn mlx_qwen35_compiled_test_force_paged_linear_caches(
+        num_layers: i32,
+        full_attention_interval: i32,
+    );
+
+    /// Phase 4b test-only: read back the scalar bf16 value at slot
+    /// `slot_idx` of `g_dense_paged_linear_caches`. Returns NaN if out
+    /// of range or the slot isn't a scalar.
+    pub fn mlx_qwen35_compiled_test_read_paged_linear_slot(slot_idx: i32) -> f32;
+
+    /// Phase 4b test-only: replace slot `slot_idx` of
+    /// `g_dense_paged_linear_caches` with a fresh scalar bf16 of
+    /// `value`. Used to simulate the paged-verify FFI's in-place
+    /// linear-cache mutation without a real verify forward.
+    pub fn mlx_qwen35_compiled_test_write_paged_linear_slot(slot_idx: i32, value: f32);
 
     /// Export paged dense linear-attention caches for live-session continuation.
     /// Full-attention K/V stays in the Rust paged adapter pools; this returns
@@ -1880,10 +1946,13 @@ unsafe extern "C-unwind" {
     /// Caller MUST construct:
     ///   - `offset_arr`:   `[1]` int32 — RoPE start position.
     ///   - `block_table`:  `[1, max_blocks_per_seq]` int32.
-    ///   - `slot_mapping`: `[chunk_size_max]` int64 — pool slot indices
-    ///     for the D+1 new tokens; the trailing slots past index
-    ///     `depth+1` are ignored by the kernel but must be present so
-    ///     the static compile trace stays cache-keyed.
+    ///   - `slot_mapping`: `[depth + 1]` int64 — EXACT length required.
+    ///     The kernel reshapes new K/V to `B*T = depth+1` rows and calls
+    ///     `paged_kv_write`, which asserts
+    ///     `slot_mapping.shape(0) == new_k.shape(0)`. Callers using
+    ///     `PagedKVCacheAdapter::build_paged_attention_inputs` (which
+    ///     returns a `chunk_size_max`-padded array) MUST slice down to
+    ///     `[depth + 1]` before passing it in.
     ///   - `seq_lens`:     `[1]` int32 — post-write context length.
     ///   - `cu_seqlens_q`: `[2]` int32 = `[0, depth+1]`.
     ///
@@ -1896,6 +1965,16 @@ unsafe extern "C-unwind" {
     /// `g_dense_paged_inited == true`. The Rust dispatcher must keep
     /// the BHTD verify path live as the fallback when either gate is
     /// false.
+    ///
+    /// LOCKING: this FFI lazily writes to the process-global
+    /// `g_verify_compiled_paged[]` compile-cache table AND mutates
+    /// `g_dense_k_pools[]` / `g_dense_v_pools[]` /
+    /// `g_dense_paged_linear_caches[]` per call. Production callers MUST
+    /// hold `DENSE_COMPILED_MUTEX` AND a `COMPILED_WEIGHTS_RWLOCK` read
+    /// guard for the entire draft+verify cycle so no other turn can
+    /// race the pool / linear-cache mutation. Tests in
+    /// `compiled_ffi_tests` (see `mtp.rs`) serialise via `FFI_LOCK` in
+    /// the absence of concurrent main-path forward calls.
     pub fn mlx_qwen35_forward_batched_verify_paged(
         input_ids: *mut mlx_array,
         embedding_weight: *mut mlx_array,
