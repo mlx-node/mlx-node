@@ -5299,6 +5299,10 @@ impl Qwen35Inner {
         let attention_layers = opts.attention_layers.clone();
         let logits_request = opts.logits.clone();
         let logits_enabled = logits_request.is_some();
+        let hidden_states_request = opts.hidden_states.clone();
+        let hidden_states_enabled = hidden_states_request.is_some();
+        let hidden_states_layers = hidden_states_request.as_ref().and_then(|r| r.layers.clone());
+        let hidden_states_points = hidden_states_request.as_ref().and_then(|r| r.points.clone());
         let logits_top_k = logits_request
             .as_ref()
             .map(|r| {
@@ -5352,12 +5356,18 @@ impl Qwen35Inner {
             attention_layers,
             logits_enabled,
             logits_top_k,
+            hidden_states_enabled,
+            hidden_states_layers,
+            hidden_states_points,
         );
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let generation_stream = Stream::new(DeviceType::Gpu);
 
+        // Step 0 = prefill. Each subsequent decode step bumps `current_step`
+        // before the forward so the recorder tags captures correctly.
+        recorder.current_step = 0;
         let last_logits = {
             let _stream_ctx = StreamContext::new(generation_stream);
             forward_inner_with_inspector(
@@ -5408,8 +5418,25 @@ impl Qwen35Inner {
             // Decode steps do NOT re-capture attention — we already have
             // the prefill capture, and decode-step capture would just be
             // a [num_heads, 1, kv_len] strip per layer per step, which the
-            // current frontend slice doesn't need.
-            let logits = {
+            // current frontend slice doesn't need. Hidden-state stats, on
+            // the other hand, are cheap (small fixed payload per step) and
+            // the lesson UI wants the per-step trajectory, so we route
+            // decode through the inspector-aware forward when only hidden
+            // states are requested.
+            let logits = if hidden_states_enabled {
+                recorder.current_step = (step as u32) + 1;
+                let _stream_ctx = StreamContext::new(generation_stream);
+                forward_inner_with_inspector(
+                    &next_ids,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    Some(&embedding_weight_t),
+                    &mut recorder,
+                )?
+            } else {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 forward_inner(
                     &next_ids,
@@ -5554,6 +5581,42 @@ impl Qwen35Inner {
             None
         };
 
+        let hidden_states_out: Option<Vec<crate::inspector::HiddenStateStepNapi>> =
+            if hidden_states_enabled {
+                let steps = std::mem::take(&mut recorder.hidden_states_steps);
+                let mut out_steps: Vec<crate::inspector::HiddenStateStepNapi> =
+                    Vec::with_capacity(steps.len());
+                for step in steps {
+                    let mut out_layers: Vec<crate::inspector::HiddenStateLayerNapi> =
+                        Vec::with_capacity(step.layers.len());
+                    for layer in step.layers {
+                        let mut out_stats: Vec<crate::inspector::HiddenStatePointStatsNapi> =
+                            Vec::with_capacity(layer.stats.len());
+                        for s in layer.stats {
+                            out_stats.push(crate::inspector::HiddenStatePointStatsNapi {
+                                point: s.point.to_string(),
+                                mean: s.mean as f64,
+                                std: s.std as f64,
+                                abs_max: s.abs_max as f64,
+                                l2_norm: s.l2_norm as f64,
+                                count: s.count,
+                            });
+                        }
+                        out_layers.push(crate::inspector::HiddenStateLayerNapi {
+                            layer_idx: layer.layer_index,
+                            stats: out_stats,
+                        });
+                    }
+                    out_steps.push(crate::inspector::HiddenStateStepNapi {
+                        step: step.step,
+                        layers: out_layers,
+                    });
+                }
+                Some(out_steps)
+            } else {
+                None
+            };
+
         Ok(AttentionRunNapi {
             prompt,
             tokens: token_infos,
@@ -5561,6 +5624,7 @@ impl Qwen35Inner {
             attention: attention_layers_out,
             model_meta,
             logits: logits_out,
+            hidden_states: hidden_states_out,
         })
     }
 

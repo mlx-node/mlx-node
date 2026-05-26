@@ -23,7 +23,7 @@
 //! Frontends typically restrict captures to one or two layers; the
 //! `attention_layers` request field is the throttle.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -31,6 +31,19 @@ use napi_derive::napi;
 use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::nn::Activations;
+
+/// Canonical names of the seven hidden-state capture points per decoder layer.
+/// Order matches the forward-pass order and is the default capture set when
+/// no `points` filter is supplied.
+pub const HIDDEN_STATE_POINTS: [&str; 7] = [
+    "pre_attn_input",
+    "post_attn_norm",
+    "attn_output",
+    "post_attn_residual",
+    "post_mlp_norm",
+    "mlp_output",
+    "post_mlp_residual",
+];
 
 /// Soft cap on cumulative attention bytes captured by a single inspector run.
 ///
@@ -83,6 +96,36 @@ pub struct CapturedLogits {
     pub top_k_logits: Vec<f32>,
 }
 
+/// Per-point hidden-state summary statistics. Stats are computed in f32 over
+/// every element of the layer activation tensor (flattened across `seq` and
+/// `hidden_dim`). `std` is the population standard deviation — divides by
+/// `count`, not `count - 1`. The capture is unbiased for visualization use
+/// and avoids a degenerate NaN when `count == 1`.
+#[derive(Debug, Clone)]
+pub struct CapturedHiddenStatePointStats {
+    pub point: &'static str,
+    pub mean: f32,
+    pub std: f32,
+    pub abs_max: f32,
+    pub l2_norm: f32,
+    pub count: u32,
+}
+
+/// One layer's worth of hidden-state captures for a single generation step.
+#[derive(Debug, Clone)]
+pub struct CapturedHiddenStateLayer {
+    pub layer_index: u32,
+    pub stats: Vec<CapturedHiddenStatePointStats>,
+}
+
+/// One generation step's worth of hidden-state captures, accumulating layers
+/// as the forward pass progresses through them.
+#[derive(Debug, Clone)]
+pub struct CapturedHiddenStateStep {
+    pub step: u32,
+    pub layers: Vec<CapturedHiddenStateLayer>,
+}
+
 /// State carried through a single inspector-enabled forward run.
 ///
 /// The recorder lives on the stack of `run_for_inspector_sync` and is threaded
@@ -108,6 +151,24 @@ pub struct InspectorRecorder {
     pub logits_top_k: u32,
     /// Captured per-step logits payloads, in generation order.
     pub logits: Vec<CapturedLogits>,
+    /// Whether to capture per-layer hidden-state summary statistics.
+    pub hidden_states_enabled: bool,
+    /// If `Some`, only capture hidden states for layer indices in this set.
+    /// When `None`, capture every decoder layer.
+    pub hidden_states_layers: Option<HashSet<u32>>,
+    /// Which named points to capture per layer. Always populated — defaults
+    /// to all seven names from [`HIDDEN_STATE_POINTS`] when the request omits
+    /// a filter.
+    pub hidden_states_points: HashSet<&'static str>,
+    /// One entry per generation step that produced any captures. Layers are
+    /// appended in forward-pass order; new steps are appended whenever
+    /// [`Self::current_step`] advances past the last recorded step.
+    pub hidden_states_steps: Vec<CapturedHiddenStateStep>,
+    /// The generation step currently in flight. `run_for_inspector_sync`
+    /// updates this before each forward pass (prefill = 0, then 1, 2, ...).
+    /// The decoder layer reads it through `capture_hidden_state` so callers
+    /// don't have to thread the value through every forward signature.
+    pub current_step: u32,
     /// Cumulative bytes captured into [`Self::attention`]. Used to enforce
     /// [`INSPECTOR_TOTAL_BYTES_SOFT_CAP`] across all captured layers in a
     /// single inspector run.
@@ -120,8 +181,27 @@ impl InspectorRecorder {
         attention_layers: Option<Vec<i32>>,
         logits_enabled: bool,
         logits_top_k: u32,
+        hidden_states_enabled: bool,
+        hidden_states_layers: Option<Vec<i32>>,
+        hidden_states_points: Option<Vec<String>>,
     ) -> Self {
         let attention_layers = attention_layers.map(|ids| ids.into_iter().collect());
+        let hidden_states_layers = hidden_states_layers.map(|ids| {
+            ids.into_iter()
+                .filter_map(|v| if v < 0 { None } else { Some(v as u32) })
+                .collect()
+        });
+        let hidden_states_points = match hidden_states_points {
+            None => HIDDEN_STATE_POINTS.iter().copied().collect(),
+            Some(requested) => {
+                let requested_set: HashSet<String> = requested.into_iter().collect();
+                HIDDEN_STATE_POINTS
+                    .iter()
+                    .copied()
+                    .filter(|p| requested_set.contains(*p))
+                    .collect()
+            }
+        };
         Self {
             attention_enabled,
             attention_layers,
@@ -129,6 +209,11 @@ impl InspectorRecorder {
             logits_enabled,
             logits_top_k,
             logits: Vec::new(),
+            hidden_states_enabled,
+            hidden_states_layers,
+            hidden_states_points,
+            hidden_states_steps: Vec::new(),
+            current_step: 0,
             captured_bytes: 0,
         }
     }
@@ -403,6 +488,144 @@ impl InspectorRecorder {
         self.captured_bytes = captured_bytes_after;
         Ok(())
     }
+
+    /// Whether the recorder is configured to capture this layer/point combo.
+    /// Cheap check used by the decoder forward to skip the f32 promotion + CPU
+    /// copy when filtered out.
+    pub fn should_capture_hidden_state(&self, layer_idx: u32, point: &str) -> bool {
+        if !self.hidden_states_enabled {
+            return false;
+        }
+        if let Some(set) = &self.hidden_states_layers {
+            if !set.contains(&layer_idx) {
+                return false;
+            }
+        }
+        self.hidden_states_points.contains(point)
+    }
+
+    /// Capture summary statistics for one named point in one layer at the
+    /// recorder's `current_step`. `point` must be one of [`HIDDEN_STATE_POINTS`]
+    /// — unknown names are rejected with an error so the wire contract stays
+    /// in sync with the frontend's union type.
+    ///
+    /// Stats are computed in one f32 pass over the host buffer; the mean is
+    /// promoted to f64 mid-loop to keep the variance numerically stable for
+    /// large `count` (Qwen3.5-0.8B prefill at 1k tokens is ~1.5M floats).
+    pub fn capture_hidden_state(
+        &mut self,
+        layer_idx: u32,
+        point: &str,
+        x: &MxArray,
+    ) -> Result<()> {
+        if !self.should_capture_hidden_state(layer_idx, point) {
+            return Ok(());
+        }
+        // Resolve to the static string slice so the captured record can hold a
+        // 'static reference rather than allocating a String per capture.
+        let point_static: &'static str = match HIDDEN_STATE_POINTS.iter().find(|p| **p == point) {
+            Some(p) => *p,
+            None => {
+                return Err(Error::from_reason(format!(
+                    "inspector capture_hidden_state: unknown point {:?}",
+                    point
+                )));
+            }
+        };
+
+        // Each captured record is ~32 bytes — vanishingly small next to
+        // attention scores — but we still account for it to keep the soft-cap
+        // invariant honest.
+        let expected_bytes: usize = std::mem::size_of::<CapturedHiddenStatePointStats>();
+        let captured_bytes_after = self.captured_bytes.saturating_add(expected_bytes);
+        if captured_bytes_after > INSPECTOR_TOTAL_BYTES_SOFT_CAP {
+            return Err(Error::from_reason(format!(
+                "Inspector capture would exceed soft cap: requested {} B, total {} MiB, cap {} MiB.",
+                expected_bytes,
+                captured_bytes_after / 1024 / 1024,
+                INSPECTOR_TOTAL_BYTES_SOFT_CAP / 1024 / 1024,
+            )));
+        }
+
+        use crate::array::DType;
+        let x_f32 = x.astype(DType::Float32)?;
+        x_f32.eval();
+        let buffer = x_f32.to_float32_vec()?;
+        let count = buffer.len();
+        if count == 0 {
+            return Err(Error::from_reason(format!(
+                "inspector capture_hidden_state: empty tensor at point {:?} layer {}",
+                point_static, layer_idx
+            )));
+        }
+        if count > u32::MAX as usize {
+            return Err(Error::from_reason(format!(
+                "inspector capture_hidden_state: element count {} exceeds u32 cap",
+                count
+            )));
+        }
+
+        // Single pass: sum, sum of squares, max(|x|). Variance is computed via
+        // E[x^2] - E[x]^2 in f64 to avoid catastrophic cancellation on large
+        // tensors where the elementwise mean dwarfs individual deviations.
+        let mut sum: f64 = 0.0;
+        let mut sumsq: f64 = 0.0;
+        let mut abs_max: f32 = 0.0;
+        for &v in &buffer {
+            let vd = v as f64;
+            sum += vd;
+            sumsq += vd * vd;
+            let a = v.abs();
+            if v.is_nan() {
+                abs_max = f32::NAN;
+            } else if a > abs_max {
+                abs_max = a;
+            }
+        }
+        let n = count as f64;
+        let mean = sum / n;
+        let variance = (sumsq / n) - (mean * mean);
+        let std = if variance > 0.0 { variance.sqrt() } else { 0.0 };
+        let l2_norm = sumsq.sqrt() as f32;
+
+        let stats = CapturedHiddenStatePointStats {
+            point: point_static,
+            mean: mean as f32,
+            std: std as f32,
+            abs_max,
+            l2_norm,
+            count: count as u32,
+        };
+
+        // Append to the step record, creating one if `current_step` advanced
+        // past whatever we last saw.
+        let step = self.current_step;
+        let step_entry = match self.hidden_states_steps.last_mut() {
+            Some(last) if last.step == step => last,
+            _ => {
+                self.hidden_states_steps.push(CapturedHiddenStateStep {
+                    step,
+                    layers: Vec::new(),
+                });
+                self.hidden_states_steps.last_mut().unwrap()
+            }
+        };
+        // Within a step the forward pass walks layers in order; keep the last
+        // entry hot to coalesce repeated points on the same layer.
+        let layer_entry = match step_entry.layers.last_mut() {
+            Some(last) if last.layer_index == layer_idx => last,
+            _ => {
+                step_entry.layers.push(CapturedHiddenStateLayer {
+                    layer_index: layer_idx,
+                    stats: Vec::new(),
+                });
+                step_entry.layers.last_mut().unwrap()
+            }
+        };
+        layer_entry.stats.push(stats);
+        self.captured_bytes = captured_bytes_after;
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -416,6 +639,21 @@ impl InspectorRecorder {
 pub struct LogitsInspectorRequest {
     /// Number of top-ranked token ids to retain per generation step.
     pub top_k: i32,
+}
+
+/// Per-layer hidden-state summary capture request. Mirrors
+/// `HiddenStatesInspectorRequest` in `packages/browser/src/inspector-types.ts`.
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct HiddenStatesInspectorRequest {
+    /// Restrict capture to specific decoder-layer indices.
+    /// Default (`None`): every layer.
+    #[napi(ts_type = "number[] | undefined")]
+    pub layers: Option<Vec<i32>>,
+    /// Restrict capture to a subset of the seven canonical capture points
+    /// (see `HIDDEN_STATE_POINTS` in inspector.rs). Default: all seven.
+    #[napi(ts_type = "string[] | undefined")]
+    pub points: Option<Vec<String>>,
 }
 
 /// Inspector-run options. Mirrors the TS `InspectorRequest` (minus the wire
@@ -434,6 +672,10 @@ pub struct InspectorRunOptions {
     /// Capture per-step top-K logits. Default: not captured.
     #[napi(ts_type = "LogitsInspectorRequest | undefined")]
     pub logits: Option<LogitsInspectorRequest>,
+    /// Capture per-layer hidden-state summary stats at the seven canonical
+    /// capture points around attention / MLP / residuals. Default: not captured.
+    #[napi(ts_type = "HiddenStatesInspectorRequest | undefined")]
+    pub hidden_states: Option<HiddenStatesInspectorRequest>,
     /// How many new tokens to generate before returning. Default: 1.
     /// Hard-capped at 8 inside the native code — this is a visualization
     /// hook, not a chat path.
@@ -480,6 +722,44 @@ pub struct LogitsStepNapi {
     pub top_k_texts: Vec<String>,
 }
 
+/// Summary stats for a single capture point. Matches `HiddenStatePointStats`
+/// in inspector-types.ts.
+///
+/// NAPI does not surface `f32`, so the floats are serialized as `f64` — the
+/// underlying capture is f32 (see `CapturedHiddenStatePointStats`), so the
+/// extra precision is purely cosmetic and the wire size cost is trivial at
+/// the volumes this hook produces.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct HiddenStatePointStatsNapi {
+    /// One of the seven names from `HIDDEN_STATE_POINTS` in inspector.rs.
+    pub point: String,
+    pub mean: f64,
+    pub std: f64,
+    pub abs_max: f64,
+    pub l2_norm: f64,
+    pub count: u32,
+}
+
+/// One layer's hidden-state captures for a single generation step. Matches
+/// `HiddenStateLayer` in inspector-types.ts.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct HiddenStateLayerNapi {
+    pub layer_idx: u32,
+    pub stats: Vec<HiddenStatePointStatsNapi>,
+}
+
+/// One generation step's hidden-state captures. Matches `HiddenStateStep` in
+/// inspector-types.ts.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct HiddenStateStepNapi {
+    /// 0-based generation step (0 == prefill, 1+ == decode steps).
+    pub step: u32,
+    pub layers: Vec<HiddenStateLayerNapi>,
+}
+
 /// Top-level inspector-run result. Matches `AttentionRun` in
 /// inspector-types.ts.
 #[napi(object)]
@@ -493,6 +773,10 @@ pub struct AttentionRunNapi {
     /// `opts.logits` was set on the inspector request.
     #[napi(ts_type = "LogitsStepNapi[] | undefined")]
     pub logits: Option<Vec<LogitsStepNapi>>,
+    /// Per-step hidden-state summary stats, in generation order. Present iff
+    /// `opts.hiddenStates` was set on the inspector request.
+    #[napi(ts_type = "HiddenStateStepNapi[] | undefined")]
+    pub hidden_states: Option<Vec<HiddenStateStepNapi>>,
 }
 
 /// Hard cap on `max_new_tokens` for an inspector run. The inspector hook is

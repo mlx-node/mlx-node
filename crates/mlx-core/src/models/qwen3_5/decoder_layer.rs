@@ -181,26 +181,86 @@ impl DecoderLayer {
         cache: Option<&mut Qwen3_5LayerCache>,
         position_ids: Option<&MxArray>,
         use_kernel: bool,
-        recorder: Option<&mut InspectorRecorder>,
+        mut recorder: Option<&mut InspectorRecorder>,
     ) -> Result<MxArray> {
         let layer_idx = self.layer_idx as i32;
+        let layer_idx_u32 = self.layer_idx as u32;
+
+        if let Some(rec) = recorder.as_deref_mut() {
+            if rec.should_capture_hidden_state(layer_idx_u32, "pre_attn_input") {
+                rec.capture_hidden_state(layer_idx_u32, "pre_attn_input", x)?;
+            }
+        }
+
         let normed = self.input_layernorm.forward(x)?;
+
+        if let Some(rec) = recorder.as_deref_mut() {
+            if rec.should_capture_hidden_state(layer_idx_u32, "post_attn_norm") {
+                rec.capture_hidden_state(layer_idx_u32, "post_attn_norm", &normed)?;
+            }
+        }
+
         let attn_out = match &mut self.attn {
             AttentionType::Linear(gdn) => {
-                let _ = recorder; // linear layers contribute an empty `scores` payload
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
                 gdn.forward(&normed, mask, ac, use_kernel)?
             }
             AttentionType::Full(attn) => {
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                attn.forward_with_inspector(&normed, mask, kvc, position_ids, 0, recorder, layer_idx)?
+                // Reborrow `recorder` for the attention call so the post-attn
+                // capture sites below still own a `&mut` to the recorder.
+                let attn_recorder = recorder.as_deref_mut();
+                attn.forward_with_inspector(
+                    &normed,
+                    mask,
+                    kvc,
+                    position_ids,
+                    0,
+                    attn_recorder,
+                    layer_idx,
+                )?
             }
         };
 
+        if let Some(rec) = recorder.as_deref_mut() {
+            if rec.should_capture_hidden_state(layer_idx_u32, "attn_output") {
+                rec.capture_hidden_state(layer_idx_u32, "attn_output", &attn_out)?;
+            }
+        }
+
         let h = x.add(&attn_out)?;
+
+        if let Some(rec) = recorder.as_deref_mut() {
+            if rec.should_capture_hidden_state(layer_idx_u32, "post_attn_residual") {
+                rec.capture_hidden_state(layer_idx_u32, "post_attn_residual", &h)?;
+            }
+        }
+
         let normed = self.post_attention_layernorm.forward(&h)?;
+
+        if let Some(rec) = recorder.as_deref_mut() {
+            if rec.should_capture_hidden_state(layer_idx_u32, "post_mlp_norm") {
+                rec.capture_hidden_state(layer_idx_u32, "post_mlp_norm", &normed)?;
+            }
+        }
+
         let mlp_out = self.mlp.forward(&normed)?;
-        h.add(&mlp_out)
+
+        if let Some(rec) = recorder.as_deref_mut() {
+            if rec.should_capture_hidden_state(layer_idx_u32, "mlp_output") {
+                rec.capture_hidden_state(layer_idx_u32, "mlp_output", &mlp_out)?;
+            }
+        }
+
+        let out = h.add(&mlp_out)?;
+
+        if let Some(rec) = recorder.as_deref_mut() {
+            if rec.should_capture_hidden_state(layer_idx_u32, "post_mlp_residual") {
+                rec.capture_hidden_state(layer_idx_u32, "post_mlp_residual", &out)?;
+            }
+        }
+
+        Ok(out)
     }
 
     /// Forward pass with paged-or-flat dispatch for Qwen3.5.

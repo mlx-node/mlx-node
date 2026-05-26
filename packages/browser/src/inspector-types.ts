@@ -64,6 +64,56 @@ export type AttentionRun = {
    *  sampler it usually equals `topKIds[0]`, but exact-tie logits can break
    *  the equality due to unstable top-K partitioning. */
   logits?: LogitsStep[];
+  /** Per-layer hidden-state summary statistics, in generation order.
+   *  Populated iff the inspector request set `hiddenStates`. */
+  hiddenStates?: HiddenStateStep[];
+};
+
+/** Canonical capture-point names in forward-pass order. Mirrors the Rust
+ *  `HIDDEN_STATE_POINTS` constant in `crates/mlx-core/src/inspector.rs`. */
+export const HIDDEN_STATE_POINTS = [
+  'pre_attn_input',
+  'post_attn_norm',
+  'attn_output',
+  'post_attn_residual',
+  'post_mlp_norm',
+  'mlp_output',
+  'post_mlp_residual',
+] as const;
+
+export type HiddenStatePointName = (typeof HIDDEN_STATE_POINTS)[number];
+
+/** Summary statistics for a single decoder-layer capture point.
+ *  `std` is the population standard deviation (divides by `count`, not
+ *  `count - 1`). All floats are computed in f32 on the Rust side and widened
+ *  to f64 for NAPI transport. */
+export type HiddenStatePointStats = {
+  /** Capture-point name. Typically narrowed to `HiddenStatePointName`, but
+   *  kept as a plain string so unknown points coming from the backend don't
+   *  break the type. */
+  point: string;
+  mean: number;
+  std: number;
+  absMax: number;
+  l2Norm: number;
+  /** Total number of float elements considered for this capture (flattened
+   *  across seq and hidden_dim). */
+  count: number;
+};
+
+export type HiddenStateLayer = {
+  /** 0-based index into the model's full layer stack. */
+  layerIdx: number;
+  /** Stats per capture point, in forward-pass order. May be a subset of the
+   *  seven canonical names if the request filtered points. */
+  stats: HiddenStatePointStats[];
+};
+
+export type HiddenStateStep = {
+  /** 0-based generation step (0 == prefill, 1+ == decode). */
+  step: number;
+  /** Per-layer captures for this step, in forward-pass order. */
+  layers: HiddenStateLayer[];
 };
 
 /** Per-step top-K logits capture. Lengths of `topKIds`, `topKLogits`, and
@@ -97,6 +147,15 @@ export type InspectorRequest = {
   attentionLayers?: number[];
   /** Capture per-step top-K logits. Default: not captured. */
   logits?: { topK: number };
+  /** Capture per-layer hidden-state summary stats at the seven canonical
+   *  points around attention / MLP / residuals. Default: not captured.
+   *  Stats only — no full activation arrays. */
+  hiddenStates?: {
+    /** Restrict to specific layer indices. Default: every layer. */
+    layers?: number[];
+    /** Restrict to a subset of the seven capture-point names. Default: all. */
+    points?: string[];
+  };
   /** How many new tokens to generate before returning. Default: 1. */
   maxNewTokens?: number;
 };

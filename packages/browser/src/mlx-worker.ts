@@ -2657,6 +2657,7 @@ async function handleRunForInspector(data: {
   attention?: boolean;
   attentionLayers?: number[];
   logits?: { topK: number };
+  hiddenStates?: { layers?: number[]; points?: string[] };
   maxNewTokens?: number;
 }) {
   const id = data.id;
@@ -2673,12 +2674,14 @@ async function handleRunForInspector(data: {
       attention?: boolean;
       attentionLayers?: number[];
       logits?: { topK: number };
+      hiddenStates?: { layers?: number[]; points?: string[] };
       maxNewTokens?: number;
     } = {};
     if (data.attention !== undefined) opts.attention = data.attention;
     if (data.attentionLayers !== undefined)
       opts.attentionLayers = data.attentionLayers;
     if (data.logits !== undefined) opts.logits = data.logits;
+    if (data.hiddenStates !== undefined) opts.hiddenStates = data.hiddenStates;
     if (data.maxNewTokens !== undefined) opts.maxNewTokens = data.maxNewTokens;
 
     const result = await model.runForInspector(data.prompt, opts);

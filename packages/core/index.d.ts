@@ -2001,6 +2001,11 @@ export interface AttentionRunNapi {
    * `opts.logits` was set on the inspector request.
    */
   logits?: LogitsStepNapi[] | undefined;
+  /**
+   * Per-step hidden-state summary stats, in generation order. Present iff
+   * `opts.hiddenStates` was set on the inspector request.
+   */
+  hiddenStates?: HiddenStateStepNapi[] | undefined;
 }
 
 /**
@@ -2674,6 +2679,61 @@ export interface HarrierConfig {
 }
 
 /**
+ * One layer's hidden-state captures for a single generation step. Matches
+ * `HiddenStateLayer` in inspector-types.ts.
+ */
+export interface HiddenStateLayerNapi {
+  layerIdx: number;
+  stats: Array<HiddenStatePointStatsNapi>;
+}
+
+/**
+ * Summary stats for a single capture point. Matches `HiddenStatePointStats`
+ * in inspector-types.ts.
+ *
+ * NAPI does not surface `f32`, so the floats are serialized as `f64` — the
+ * underlying capture is f32 (see `CapturedHiddenStatePointStats`), so the
+ * extra precision is purely cosmetic and the wire size cost is trivial at
+ * the volumes this hook produces.
+ */
+export interface HiddenStatePointStatsNapi {
+  /** One of the seven names from `HIDDEN_STATE_POINTS` in inspector.rs. */
+  point: string;
+  mean: number;
+  std: number;
+  absMax: number;
+  l2Norm: number;
+  count: number;
+}
+
+/**
+ * Per-layer hidden-state summary capture request. Mirrors
+ * `HiddenStatesInspectorRequest` in `packages/browser/src/inspector-types.ts`.
+ */
+export interface HiddenStatesInspectorRequest {
+  /**
+   * Restrict capture to specific decoder-layer indices.
+   * Default (`None`): every layer.
+   */
+  layers?: number[] | undefined;
+  /**
+   * Restrict capture to a subset of the seven canonical capture points
+   * (see `HIDDEN_STATE_POINTS` in inspector.rs). Default: all seven.
+   */
+  points?: string[] | undefined;
+}
+
+/**
+ * One generation step's hidden-state captures. Matches `HiddenStateStep` in
+ * inspector-types.ts.
+ */
+export interface HiddenStateStepNapi {
+  /** 0-based generation step (0 == prefill, 1+ == decode steps). */
+  step: number;
+  layers: Array<HiddenStateLayerNapi>;
+}
+
+/**
  * Inspector-run options. Mirrors the TS `InspectorRequest` (minus the wire
  * fields `type` / `id` / `prompt`, which are part of the worker protocol
  * rather than the NAPI signature).
@@ -2688,6 +2748,11 @@ export interface InspectorRunOptions {
   attentionLayers?: number[] | undefined;
   /** Capture per-step top-K logits. Default: not captured. */
   logits?: LogitsInspectorRequest | undefined;
+  /**
+   * Capture per-layer hidden-state summary stats at the seven canonical
+   * capture points around attention / MLP / residuals. Default: not captured.
+   */
+  hiddenStates?: HiddenStatesInspectorRequest | undefined;
   /**
    * How many new tokens to generate before returning. Default: 1.
    * Hard-capped at 8 inside the native code — this is a visualization
