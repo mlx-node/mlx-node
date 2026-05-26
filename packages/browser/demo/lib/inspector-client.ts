@@ -136,6 +136,7 @@ export function runForInspector(
       ...(req.attentionLayers !== undefined
         ? { attentionLayers: req.attentionLayers }
         : {}),
+      ...(req.logits !== undefined ? { logits: req.logits } : {}),
       ...(req.maxNewTokens !== undefined
         ? { maxNewTokens: req.maxNewTokens }
         : {}),

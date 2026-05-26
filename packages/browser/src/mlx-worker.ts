@@ -2656,6 +2656,7 @@ async function handleRunForInspector(data: {
   prompt: string;
   attention?: boolean;
   attentionLayers?: number[];
+  logits?: { topK: number };
   maxNewTokens?: number;
 }) {
   const id = data.id;
@@ -2671,11 +2672,13 @@ async function handleRunForInspector(data: {
     const opts: {
       attention?: boolean;
       attentionLayers?: number[];
+      logits?: { topK: number };
       maxNewTokens?: number;
     } = {};
     if (data.attention !== undefined) opts.attention = data.attention;
     if (data.attentionLayers !== undefined)
       opts.attentionLayers = data.attentionLayers;
+    if (data.logits !== undefined) opts.logits = data.logits;
     if (data.maxNewTokens !== undefined) opts.maxNewTokens = data.maxNewTokens;
 
     const result = await model.runForInspector(data.prompt, opts);
@@ -2695,6 +2698,19 @@ async function handleRunForInspector(data: {
       ) {
         seen.add(scores.buffer);
         transfer.push(scores.buffer);
+      }
+    }
+    const logitsSteps = Array.isArray(result?.logits) ? result.logits : [];
+    for (const step of logitsSteps) {
+      const buf = step?.topKLogits;
+      if (
+        buf &&
+        typeof buf === "object" &&
+        buf.buffer instanceof ArrayBuffer &&
+        !seen.has(buf.buffer)
+      ) {
+        seen.add(buf.buffer);
+        transfer.push(buf.buffer);
       }
     }
     (self as any).postMessage(

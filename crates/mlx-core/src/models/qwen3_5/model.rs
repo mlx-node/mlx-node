@@ -12,7 +12,7 @@ use crate::array::MxArray;
 use crate::chat_stream::{ChatStreamSink, MIN_SAB_LEN, SabSink};
 use crate::inspector::{
     AttentionLayerNapi, AttentionRunNapi, INSPECTOR_MAX_NEW_TOKENS_CAP, InspectorRecorder,
-    InspectorRunOptions, ModelMetaNapi, TokenInfoNapi,
+    InspectorRunOptions, LogitsStepNapi, ModelMetaNapi, TokenInfoNapi,
 };
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -5297,6 +5297,23 @@ impl Qwen35Inner {
     ) -> Result<AttentionRunNapi> {
         let attention_enabled = opts.attention.unwrap_or(false);
         let attention_layers = opts.attention_layers.clone();
+        let logits_request = opts.logits.clone();
+        let logits_enabled = logits_request.is_some();
+        let logits_top_k = logits_request
+            .as_ref()
+            .map(|r| {
+                if r.top_k <= 0 {
+                    0u32
+                } else {
+                    r.top_k as u32
+                }
+            })
+            .unwrap_or(0);
+        if logits_enabled && logits_top_k == 0 {
+            return Err(Error::from_reason(
+                "run_for_inspector: logits.topK must be >= 1",
+            ));
+        }
         let max_new_tokens_raw = opts.max_new_tokens.unwrap_or(1);
         if max_new_tokens_raw < 1 {
             return Err(Error::from_reason(format!(
@@ -5330,7 +5347,12 @@ impl Qwen35Inner {
 
         // Build the recorder and run prefill with capture.
         self.init_caches_sync()?;
-        let mut recorder = InspectorRecorder::new(attention_enabled, attention_layers);
+        let mut recorder = InspectorRecorder::new(
+            attention_enabled,
+            attention_layers,
+            logits_enabled,
+            logits_top_k,
+        );
 
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
@@ -5365,13 +5387,18 @@ impl Qwen35Inner {
             min_p: None,
         });
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
-        let mut y = sample(&last_logits, sampling_config)?;
+        let mut current_logits = last_logits;
+        let mut y = sample(&current_logits, sampling_config)?;
         let eos_id = self.config.eos_token_id as u32;
 
         for step in 0..max_new_tokens {
             y.eval();
             let token_id = y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
+
+            if logits_enabled {
+                recorder.capture_logits(step as u32, token_id, &current_logits)?;
+            }
 
             if step + 1 == max_new_tokens || token_id == eos_id {
                 break;
@@ -5396,6 +5423,7 @@ impl Qwen35Inner {
             };
             let logits = logits.squeeze(Some(&[1]))?;
             y = sample(&logits, sampling_config)?;
+            current_logits = logits;
         }
 
         // Always reset caches — the inspector run is one-shot, not a
@@ -5501,12 +5529,38 @@ impl Qwen35Inner {
             }
         }
 
+        let logits_out: Option<Vec<LogitsStepNapi>> = if logits_enabled {
+            let captures = std::mem::take(&mut recorder.logits);
+            let mut steps: Vec<LogitsStepNapi> = Vec::with_capacity(captures.len());
+            for cap in captures {
+                let mut top_k_texts: Vec<String> = Vec::with_capacity(cap.top_k_ids.len());
+                for &id in &cap.top_k_ids {
+                    let text = tokenizer
+                        .decode_sync(&[id], false)
+                        .unwrap_or_else(|_| String::new());
+                    top_k_texts.push(text);
+                }
+                let top_k_ids_i32: Vec<i32> = cap.top_k_ids.into_iter().map(|v| v as i32).collect();
+                steps.push(LogitsStepNapi {
+                    step: cap.step as i32,
+                    token_id: cap.token_id as i32,
+                    top_k_ids: top_k_ids_i32,
+                    top_k_logits: Float32Array::new(cap.top_k_logits),
+                    top_k_texts,
+                });
+            }
+            Some(steps)
+        } else {
+            None
+        };
+
         Ok(AttentionRunNapi {
             prompt,
             tokens: token_infos,
             generated_token,
             attention: attention_layers_out,
             model_meta,
+            logits: logits_out,
         })
     }
 

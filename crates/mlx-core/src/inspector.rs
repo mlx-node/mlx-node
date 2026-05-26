@@ -68,6 +68,21 @@ pub struct CapturedAttention {
     pub scores: Vec<f32>,
 }
 
+/// Per-generation-step top-K logits capture.
+///
+/// `top_k_ids` are token ids in descending logit order; `top_k_logits` are the
+/// matching raw (pre-softmax) logits in the same order. `token_id` is the
+/// token actually sampled at this step. Under greedy sampling — which the
+/// inspector run uses — `token_id == top_k_ids[0]`. Text decoding happens
+/// later in `run_for_inspector_sync` where the tokenizer is available.
+#[derive(Debug, Clone)]
+pub struct CapturedLogits {
+    pub step: u32,
+    pub token_id: u32,
+    pub top_k_ids: Vec<u32>,
+    pub top_k_logits: Vec<f32>,
+}
+
 /// State carried through a single inspector-enabled forward run.
 ///
 /// The recorder lives on the stack of `run_for_inspector_sync` and is threaded
@@ -86,6 +101,13 @@ pub struct InspectorRecorder {
     /// recorder's encounter sequence (matches the forward-pass layer iteration
     /// order).
     pub attention: Vec<CapturedAttention>,
+    /// Whether to capture per-step top-K logits. When `false`, all logits
+    /// capture calls are no-ops.
+    pub logits_enabled: bool,
+    /// How many top-K entries to retain per captured step.
+    pub logits_top_k: u32,
+    /// Captured per-step logits payloads, in generation order.
+    pub logits: Vec<CapturedLogits>,
     /// Cumulative bytes captured into [`Self::attention`]. Used to enforce
     /// [`INSPECTOR_TOTAL_BYTES_SOFT_CAP`] across all captured layers in a
     /// single inspector run.
@@ -93,12 +115,20 @@ pub struct InspectorRecorder {
 }
 
 impl InspectorRecorder {
-    pub fn new(attention_enabled: bool, attention_layers: Option<Vec<i32>>) -> Self {
+    pub fn new(
+        attention_enabled: bool,
+        attention_layers: Option<Vec<i32>>,
+        logits_enabled: bool,
+        logits_top_k: u32,
+    ) -> Self {
         let attention_layers = attention_layers.map(|ids| ids.into_iter().collect());
         Self {
             attention_enabled,
             attention_layers,
             attention: Vec::new(),
+            logits_enabled,
+            logits_top_k,
+            logits: Vec::new(),
             captured_bytes: 0,
         }
     }
@@ -280,11 +310,113 @@ impl InspectorRecorder {
         self.captured_bytes = captured_bytes_after;
         Ok(())
     }
+
+    /// Capture top-K logits for one generation step.
+    ///
+    /// `logits` is the 1-D logits vector for the token position being sampled
+    /// (shape `[vocab]`). For Qwen3.5 the vocab is ~151k, so we pull the full
+    /// vector to host once per step and run an O(vocab) partial sort — vocab
+    /// is too large for an on-device gather to be worth the kernel-launch
+    /// overhead for `top_k` ≤ 64. `token_id` is the id actually sampled at
+    /// this step (typically `top_k_ids[0]` under greedy sampling).
+    pub fn capture_logits(
+        &mut self,
+        step: u32,
+        token_id: u32,
+        logits: &MxArray,
+    ) -> Result<()> {
+        if !self.logits_enabled || self.logits_top_k == 0 {
+            return Ok(());
+        }
+        let ndim = logits.ndim()?;
+        let vocab = match ndim {
+            1 => logits.shape_at(0)? as usize,
+            2 => {
+                let batch = logits.shape_at(0)?;
+                if batch != 1 {
+                    return Err(Error::from_reason(format!(
+                        "inspector capture_logits 2-D requires batch=1, got {}",
+                        batch
+                    )));
+                }
+                logits.shape_at(1)? as usize
+            }
+            _ => {
+                return Err(Error::from_reason(format!(
+                    "inspector capture_logits expects 1-D or [1, vocab] logits, got ndim={}",
+                    ndim
+                )));
+            }
+        };
+        if vocab == 0 {
+            return Err(Error::from_reason("inspector capture_logits: empty vocab"));
+        }
+        let top_k = (self.logits_top_k as usize).min(vocab);
+
+        let expected_bytes = top_k.saturating_mul(4 + 4);
+        let captured_bytes_after = self.captured_bytes.saturating_add(expected_bytes);
+        if captured_bytes_after > INSPECTOR_TOTAL_BYTES_SOFT_CAP {
+            return Err(Error::from_reason(format!(
+                "Inspector capture would exceed soft cap: requested {} B, total {} MiB, cap {} MiB.",
+                expected_bytes,
+                captured_bytes_after / 1024 / 1024,
+                INSPECTOR_TOTAL_BYTES_SOFT_CAP / 1024 / 1024,
+            )));
+        }
+
+        use crate::array::DType;
+        let logits_f32 = logits.astype(DType::Float32)?;
+        logits_f32.eval();
+        let buffer = logits_f32.to_float32_vec()?;
+        if buffer.len() != vocab {
+            return Err(Error::from_reason(format!(
+                "inspector capture_logits got {} floats, expected vocab={}",
+                buffer.len(),
+                vocab
+            )));
+        }
+
+        let mut indexed: Vec<(u32, f32)> = buffer
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (i as u32, v))
+            .collect();
+        indexed.select_nth_unstable_by(top_k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        indexed.truncate(top_k);
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut top_k_ids = Vec::with_capacity(top_k);
+        let mut top_k_logits = Vec::with_capacity(top_k);
+        for (id, logit) in indexed {
+            top_k_ids.push(id);
+            top_k_logits.push(logit);
+        }
+
+        self.logits.push(CapturedLogits {
+            step,
+            token_id,
+            top_k_ids,
+            top_k_logits,
+        });
+        self.captured_bytes = captured_bytes_after;
+        Ok(())
+    }
 }
 
 // ============================================================================
 // NAPI surface
 // ============================================================================
+
+/// Per-step top-K logits inspector request. Mirrors `LogitsInspectorRequest`
+/// in `packages/browser/src/inspector-types.ts`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct LogitsInspectorRequest {
+    /// Number of top-ranked token ids to retain per generation step.
+    pub top_k: i32,
+}
 
 /// Inspector-run options. Mirrors the TS `InspectorRequest` (minus the wire
 /// fields `type` / `id` / `prompt`, which are part of the worker protocol
@@ -299,6 +431,9 @@ pub struct InspectorRunOptions {
     /// Default: all full-attention layers.
     #[napi(ts_type = "number[] | undefined")]
     pub attention_layers: Option<Vec<i32>>,
+    /// Capture per-step top-K logits. Default: not captured.
+    #[napi(ts_type = "LogitsInspectorRequest | undefined")]
+    pub logits: Option<LogitsInspectorRequest>,
     /// How many new tokens to generate before returning. Default: 1.
     /// Hard-capped at 8 inside the native code — this is a visualization
     /// hook, not a chat path.
@@ -335,6 +470,16 @@ pub struct ModelMetaNapi {
     pub full_attention_layer_indices: Vec<i32>,
 }
 
+/// Per-step top-K logits payload. Matches `LogitsStep` in inspector-types.ts.
+#[napi(object)]
+pub struct LogitsStepNapi {
+    pub step: i32,
+    pub token_id: i32,
+    pub top_k_ids: Vec<i32>,
+    pub top_k_logits: Float32Array,
+    pub top_k_texts: Vec<String>,
+}
+
 /// Top-level inspector-run result. Matches `AttentionRun` in
 /// inspector-types.ts.
 #[napi(object)]
@@ -344,6 +489,10 @@ pub struct AttentionRunNapi {
     pub generated_token: TokenInfoNapi,
     pub attention: Vec<AttentionLayerNapi>,
     pub model_meta: ModelMetaNapi,
+    /// Per-step top-K logits, in generation order. Present iff
+    /// `opts.logits` was set on the inspector request.
+    #[napi(ts_type = "LogitsStepNapi[] | undefined")]
+    pub logits: Option<Vec<LogitsStepNapi>>,
 }
 
 /// Hard cap on `max_new_tokens` for an inspector run. The inspector hook is

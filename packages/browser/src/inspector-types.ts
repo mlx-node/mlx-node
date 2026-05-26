@@ -58,6 +58,28 @@ export type AttentionRun = {
   attention: AttentionLayer[];
   /** Model identification + which layers carry attention scores. */
   modelMeta: ModelMeta;
+  /** Per-step top-K logits, in generation order. Populated iff the
+   *  inspector request set `logits: { topK }`. Each entry's `tokenId` is the
+   *  token actually sampled at that step; under the inspector's greedy
+   *  sampler it usually equals `topKIds[0]`, but exact-tie logits can break
+   *  the equality due to unstable top-K partitioning. */
+  logits?: LogitsStep[];
+};
+
+/** Per-step top-K logits capture. Lengths of `topKIds`, `topKLogits`, and
+ *  `topKTexts` are all equal to `min(requested topK, vocab)`. Logits are
+ *  raw pre-softmax values — the consumer applies temperature / softmax. */
+export type LogitsStep = {
+  /** 0-based generation step index. */
+  step: number;
+  /** Token id sampled at this step. */
+  tokenId: number;
+  /** Top-K token ids in descending logit order. */
+  topKIds: number[];
+  /** Raw logits matching `topKIds`, same order. NOT softmax probabilities. */
+  topKLogits: Float32Array;
+  /** Decoded text for each id in `topKIds`. */
+  topKTexts: string[];
 };
 
 // -----------------------------------------------------------------------------
@@ -73,6 +95,8 @@ export type InspectorRequest = {
   attention?: boolean;
   /** Restrict to specific full-attention layer indices. Default: all. */
   attentionLayers?: number[];
+  /** Capture per-step top-K logits. Default: not captured. */
+  logits?: { topK: number };
   /** How many new tokens to generate before returning. Default: 1. */
   maxNewTokens?: number;
 };
