@@ -4479,7 +4479,7 @@ impl Qwen3Inner {
             }
         }
 
-        let params_clone: HashMap<String, MxArray> =
+        let mut params_clone: HashMap<String, MxArray> =
             params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         // Build weights.mlx metadata (shape + dtype only; full data is in safetensors).
@@ -4528,7 +4528,11 @@ impl Qwen3Inner {
             "format": "mlx-node",
             "version": "1.0"
         }));
-        crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
+        crate::utils::safetensors::save_safetensors(
+            &safetensors_path,
+            &mut params_clone,
+            metadata,
+        )?;
         info!("Saved weights.safetensors");
 
         let weights_str = serde_json::to_string_pretty(&weights_json)?;

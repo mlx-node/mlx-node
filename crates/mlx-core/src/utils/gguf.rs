@@ -1264,6 +1264,35 @@ pub struct GgufConversionResult {
     pub source_format: String,
 }
 
+/// RAII guard that pins the MLX default device + stream to CPU for one
+/// GGUF conversion call, then restores the previous values on drop.
+/// See `convert::ConvertDefaultStreamGuard` for the rationale.
+struct ConvertGgufDefaultStreamGuard {
+    saved_device: i32,
+    saved_stream: mlx_sys::mlx_stream,
+}
+
+impl ConvertGgufDefaultStreamGuard {
+    fn enter_cpu() -> Self {
+        let saved_device = unsafe { mlx_sys::mlx_default_device() };
+        let saved_stream = unsafe { mlx_sys::mlx_default_stream(saved_device) };
+        unsafe { mlx_sys::mlx_set_default_device(0) };
+        let cpu_stream = unsafe { mlx_sys::mlx_default_stream(0) };
+        unsafe { mlx_sys::mlx_set_default_stream(cpu_stream) };
+        Self {
+            saved_device,
+            saved_stream,
+        }
+    }
+}
+
+impl Drop for ConvertGgufDefaultStreamGuard {
+    fn drop(&mut self) {
+        unsafe { mlx_sys::mlx_set_default_stream(self.saved_stream) };
+        unsafe { mlx_sys::mlx_set_default_device(self.saved_device) };
+    }
+}
+
 #[napi]
 pub async fn convert_gguf_to_safetensors(
     options: GgufConversionOptions,
@@ -1278,6 +1307,11 @@ pub async fn convert_gguf_to_safetensors(
             input_path.display()
         )));
     }
+
+    // Route every MLX op in this conversion through the CPU device + stream.
+    // See `convert_model` for the full rationale — same reasoning applies
+    // here for GGUF→SafeTensors conversion of huge MoE checkpoints.
+    let _stream_guard = ConvertGgufDefaultStreamGuard::enter_cpu();
 
     // Parse GGUF header and metadata
     info!("Parsing GGUF file: {}", input_path.display());
@@ -1572,7 +1606,7 @@ pub async fn convert_gguf_to_safetensors(
     // Add "format: mlx" metadata so loaders (e.g., mlx-vlm) know weights are
     // already in MLX layout and skip sanitize (which would double-apply +1.0 to norms).
     let st_metadata = serde_json::json!({ "format": "mlx" });
-    save_safetensors(&safetensors_path, &weights, Some(st_metadata))?;
+    save_safetensors(&safetensors_path, &mut weights, Some(st_metadata))?;
 
     // Only write config.json and tokenizer files for the primary model file.
     // Secondary files (e.g., vision.safetensors for mmproj) should not overwrite

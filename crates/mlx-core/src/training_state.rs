@@ -124,7 +124,7 @@ impl ModelThreadTrainingState {
             "step": step.to_string(),
             "format": "adamw_optimizer_state",
         });
-        crate::utils::safetensors::save_safetensors(path, &tensors, Some(metadata))
+        crate::utils::safetensors::save_safetensors(path, &mut tensors, Some(metadata))
     }
 
     /// Restore AdamW moment tensors + step from a SafeTensors file.
@@ -389,7 +389,7 @@ mod tests {
             let arr = MxArray::from_float32(&[*val], &[1]).unwrap();
             tensor_map.insert(key.to_string(), arr);
         }
-        crate::utils::safetensors::save_safetensors(path, &tensor_map, metadata).unwrap();
+        crate::utils::safetensors::save_safetensors(path, &mut tensor_map, metadata).unwrap();
     }
 
     // =========================================================================

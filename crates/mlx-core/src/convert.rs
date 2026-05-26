@@ -20,6 +20,43 @@ use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
 use crate::utils::safetensors::load_safetensors_lazy;
 
+/// RAII guard that pins the MLX default device + stream to CPU for one
+/// conversion call, then restores the previous values on drop.
+///
+/// Used by the conversion path to temporarily route every MLX op through
+/// CPU for the duration of one `convert_model` /
+/// `convert_gguf_to_safetensors` call. Both the default *device* and the
+/// default *stream* must be switched: MLX dispatches stream-less ops via
+/// `default_stream(default_device())`, so flipping the stream alone is
+/// not enough — the device must be CPU too. On drop, the previous
+/// device and stream are restored so subsequent inference / training
+/// calls keep using the GPU. See the call sites for the rationale.
+struct ConvertDefaultStreamGuard {
+    saved_device: i32,
+    saved_stream: mlx_sys::mlx_stream,
+}
+
+impl ConvertDefaultStreamGuard {
+    fn enter_cpu() -> Self {
+        let saved_device = unsafe { mlx_sys::mlx_default_device() };
+        let saved_stream = unsafe { mlx_sys::mlx_default_stream(saved_device) };
+        unsafe { mlx_sys::mlx_set_default_device(0) };
+        let cpu_stream = unsafe { mlx_sys::mlx_default_stream(0) };
+        unsafe { mlx_sys::mlx_set_default_stream(cpu_stream) };
+        Self {
+            saved_device,
+            saved_stream,
+        }
+    }
+}
+
+impl Drop for ConvertDefaultStreamGuard {
+    fn drop(&mut self) {
+        unsafe { mlx_sys::mlx_set_default_stream(self.saved_stream) };
+        unsafe { mlx_sys::mlx_set_default_device(self.saved_device) };
+    }
+}
+
 /// Structure for parsing model.safetensors.index.json
 #[derive(Debug, Deserialize)]
 struct ShardedModelIndex {
@@ -115,6 +152,39 @@ pub struct ConversionResult {
 /// ```
 #[napi]
 pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResult> {
+    let _convert_start = std::time::Instant::now();
+    info!(
+        target = "mlx_core::convert",
+        input_dir = %options.input_dir,
+        output_dir = %options.output_dir,
+        dtype = ?options.dtype,
+        model_type = ?options.model_type,
+        quantize = options.quantize.unwrap_or(false),
+        quant_mode = ?options.quant_mode,
+        quant_recipe = ?options.quant_recipe,
+        "convert_model start"
+    );
+    let result = convert_model_inner(options).await;
+    match &result {
+        Ok(r) => info!(
+            target = "mlx_core::convert",
+            total_seconds = _convert_start.elapsed().as_secs_f64(),
+            num_tensors = r.num_tensors,
+            num_parameters = r.num_parameters,
+            output_path = %r.output_path,
+            "convert_model finished"
+        ),
+        Err(e) => tracing::error!(
+            target = "mlx_core::convert",
+            total_seconds = _convert_start.elapsed().as_secs_f64(),
+            error = %e,
+            "convert_model failed"
+        ),
+    }
+    result
+}
+
+async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionResult> {
     let input_dir = PathBuf::from(&options.input_dir);
     let output_dir = PathBuf::from(&options.output_dir);
     let target_dtype = options.dtype.unwrap_or_else(|| "float32".to_string());
@@ -248,6 +318,18 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
             input_dir.display()
         )));
     }
+
+    // Route every MLX op in this conversion through the CPU device + stream.
+    //
+    // The conversion path is slice / reshape / dtype-cast only — no real math.
+    // On GPU, materializing a 1.6 GB sliced view of a fused expert tensor backed
+    // by a 250 GB mmap'd source can stall a Metal command buffer past the macOS
+    // GPU watchdog (~5 s), surfacing as
+    // `kIOGPUCommandBufferCallbackErrorTimeout` mid-shard for large MoE models
+    // (e.g. Qwen3.5 122B-A10B with 256 experts × 48 layers). CPU has direct
+    // access to the mmap'd pages and is immune to the watchdog. `_stream_guard`
+    // restores the prior default device + stream when convert_model returns.
+    let _stream_guard = ConvertDefaultStreamGuard::enter_cpu();
 
     // Check for required files
     let config_path = input_dir.join("config.json");
@@ -660,9 +742,20 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     tensor_names.sort();
 
     // Save converted model — sharded output with index file (mlx-lm/mlx-vlm compatible)
-    info!("Saving converted model to: {}", output_dir.display());
+    info!(
+        target = "mlx_core::convert",
+        output_dir = %output_dir.display(),
+        num_tensors = converted_tensors.len(),
+        "starting sharded save"
+    );
 
-    crate::utils::safetensors::save_safetensors_sharded(&output_dir, &converted_tensors)?;
+    let save_start = std::time::Instant::now();
+    crate::utils::safetensors::save_safetensors_sharded(&output_dir, &mut converted_tensors)?;
+    info!(
+        target = "mlx_core::convert",
+        save_seconds = save_start.elapsed().as_secs_f64(),
+        "sharded save complete"
+    );
 
     // Write config.json — clean and sort keys to match mlx-lm/mlx-vlm save_config
     let output_config_path = output_dir.join("config.json");

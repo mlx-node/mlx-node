@@ -69,7 +69,7 @@ pub fn convert_foreign_weights(
         ))
     })?;
 
-    let (tensors, config_json) = match options.model_type.as_str() {
+    let (mut tensors, config_json) = match options.model_type.as_str() {
         "pp-lcnet-ori" => convert_pp_lcnet_ori(&input_path, verbose)?,
         "uvdoc" => convert_uvdoc(&input_path, verbose)?,
         other => {
@@ -81,9 +81,9 @@ pub fn convert_foreign_weights(
 
     // Save SafeTensors
     let weights_path = output_dir.join("model.safetensors");
-    save_safetensors(&weights_path, &tensors, None)?;
-
+    // Capture names BEFORE save (save drains the map for memory reasons).
     let mut tensor_names: Vec<String> = tensors.keys().cloned().collect();
+    save_safetensors(&weights_path, &mut tensors, None)?;
     tensor_names.sort();
     let num_tensors = tensor_names.len() as i32;
 

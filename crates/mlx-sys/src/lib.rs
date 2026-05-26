@@ -542,6 +542,8 @@ unsafe extern "C-unwind" {
     pub fn mlx_new_stream(device_type: i32) -> mlx_stream;
     pub fn mlx_set_default_stream(stream: mlx_stream);
     pub fn mlx_stream_synchronize(stream: mlx_stream);
+    pub fn mlx_default_device() -> i32;
+    pub fn mlx_set_default_device(device_type: i32);
 
     // Metal operations (for memory management).
     //

@@ -318,6 +318,24 @@ fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
 /// Maximum shard size in bytes (5 GB), matching mlx-lm and mlx-vlm.
 const MAX_SHARD_SIZE: usize = 5 << 30;
 
+/// Snapshot MLX's allocator counters in MB. Returns `(active, peak, cache)`.
+/// Each accessor is fallible (returns -1 if the Metal allocator is
+/// uninitialised, e.g. CPU-only host or convert path that never touched the
+/// GPU), in which case we report `0` so the log line still emits cleanly.
+fn current_mlx_memory_stats_mb() -> (u64, u64, u64) {
+    use mlx_sys as sys;
+    let to_mb = |bytes: u64| bytes / (1u64 << 20);
+    let mut active: u64 = 0;
+    let mut peak: u64 = 0;
+    let mut cache: u64 = 0;
+    unsafe {
+        let _ = sys::mlx_get_active_memory(&mut active);
+        let _ = sys::mlx_get_peak_memory(&mut peak);
+        let _ = sys::mlx_get_cache_memory(&mut cache);
+    }
+    (to_mb(active), to_mb(peak), to_mb(cache))
+}
+
 /// Save tensors to SafeTensors format.
 ///
 /// Uses a two-pass streaming approach to avoid materializing all tensor bytes
@@ -325,9 +343,17 @@ const MAX_SHARD_SIZE: usize = 5 << 30;
 ///
 /// Pass 1: Compute byte sizes from array metadata (no evaluation), build header.
 /// Pass 2: Write header, then stream each tensor's bytes to disk one at a time.
+///
+/// `tensors` is borrowed `&mut` so each entry can be `.remove(name)`d after
+/// its bytes hit disk. Dropping the `MxArray` releases the MLX-allocated
+/// backing buffer immediately, which is critical for very large MoE
+/// checkpoints — otherwise materialized contiguous buffers for 144+ expert
+/// tensors stay live across the whole sharded save and exhaust RAM
+/// (observed: 162 GB MLX active memory at shard 34 of 49 on a 128 GB host,
+/// triggering silent OOM-kill).
 fn save_safetensors_single<P: AsRef<Path>>(
     path: P,
-    tensors: &HashMap<String, MxArray>,
+    tensors: &mut HashMap<String, MxArray>,
     names: &[String],
     metadata: Option<serde_json::Value>,
 ) -> Result<()> {
@@ -379,9 +405,27 @@ fn save_safetensors_single<P: AsRef<Path>>(
         .write_all(header_bytes)
         .map_err(|e| Error::from_reason(format!("Failed to write header: {}", e)))?;
 
-    // Stream each tensor: materialize → write → drop
+    // Stream each tensor: materialize → write → drop.
+    // - DEBUG: per-tensor timing (off in production)
+    // - INFO:  any single tensor that took >2 s to materialize, since on a
+    //          GPU stream that means we're approaching the macOS Metal
+    //          command-buffer watchdog (~5 s) and on a CPU stream it means
+    //          we're likely paging in a cold mmap region — both are signal
+    //          you want in production logs.
+    let trace_enabled = tracing::enabled!(tracing::Level::DEBUG);
     for name in names {
         let array = tensors.get(name).unwrap();
+        let t0 = std::time::Instant::now();
+        if trace_enabled {
+            let dtype = array.dtype().ok();
+            let shape = array.shape().ok();
+            tracing::debug!(
+                tensor = %name,
+                ?dtype,
+                shape = ?shape.as_ref().map(|s| s.as_ref().to_vec()),
+                "materializing tensor"
+            );
+        }
         let bytes = array_to_bytes(array).map_err(|e| {
             let dtype = array.dtype().ok();
             let shape = array.shape().ok();
@@ -393,10 +437,31 @@ fn save_safetensors_single<P: AsRef<Path>>(
                 e
             ))
         })?;
+        let elapsed = t0.elapsed();
+        if trace_enabled {
+            tracing::debug!(
+                tensor = %name,
+                bytes = bytes.len(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "tensor written"
+            );
+        } else if elapsed.as_millis() >= 2000 {
+            tracing::info!(
+                tensor = %name,
+                bytes = bytes.len(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow tensor materialization"
+            );
+        }
         writer
             .write_all(&bytes)
             .map_err(|e| Error::from_reason(format!("Failed to write tensor {}: {}", name, e)))?;
-        // `bytes` is dropped here, freeing memory before the next tensor
+        drop(bytes);
+
+        // Release the MLX backing buffer for this tensor now that its bytes
+        // are on disk. See the function-level doc on `tensors: &mut` for the
+        // reason this is load-bearing on huge MoE checkpoints.
+        tensors.remove(name);
     }
 
     writer
@@ -407,9 +472,11 @@ fn save_safetensors_single<P: AsRef<Path>>(
 }
 
 /// Save tensors to a single SafeTensors file (legacy API for non-sharded use cases).
+///
+/// Note: drains `tensors` as it writes — see `save_safetensors_single`'s docs.
 pub fn save_safetensors<P: AsRef<Path>>(
     path: P,
-    tensors: &HashMap<String, MxArray>,
+    tensors: &mut HashMap<String, MxArray>,
     metadata: Option<serde_json::Value>,
 ) -> Result<()> {
     let mut names: Vec<String> = tensors.keys().cloned().collect();
@@ -423,9 +490,13 @@ pub fn save_safetensors<P: AsRef<Path>>(
 /// - If total size ≤ 5GB, writes a single `model.safetensors`
 /// - Always writes `model.safetensors.index.json` with `{metadata: {total_size}, weight_map}`
 /// - SafeTensors metadata is `{"format": "mlx"}` for compatibility
+///
+/// Note: drains `tensors` as it writes — see `save_safetensors_single`'s docs.
+/// On return (success or failure) `tensors` may be partially drained; callers
+/// shouldn't rely on its contents post-call.
 pub fn save_safetensors_sharded(
     output_dir: &Path,
-    tensors: &HashMap<String, MxArray>,
+    tensors: &mut HashMap<String, MxArray>,
 ) -> Result<()> {
     use tracing::info;
 
@@ -475,6 +546,9 @@ pub fn save_safetensors_sharded(
     let mut weight_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
 
+    let convert_start = std::time::Instant::now();
+    let mut bytes_written_total: u64 = 0;
+
     for (i, shard_names) in shards.iter().enumerate() {
         let shard_filename = if num_shards == 1 {
             "model.safetensors".to_string()
@@ -483,13 +557,44 @@ pub fn save_safetensors_sharded(
         };
 
         let shard_path = output_dir.join(&shard_filename);
+        let shard_bytes: u64 = shard_names
+            .iter()
+            .map(|n| {
+                let a = tensors.get(n).unwrap();
+                a.size().unwrap_or(0) * (a.dtype().map(|d| d.byte_size()).unwrap_or(0) as u64)
+            })
+            .sum();
         info!(
-            "  Writing shard: {} ({} tensors)",
-            shard_filename,
-            shard_names.len()
+            shard_index = i + 1,
+            shard_count = num_shards,
+            shard_file = %shard_filename,
+            tensors = shard_names.len(),
+            shard_mb = (shard_bytes as f64 / (1u64 << 20) as f64),
+            "writing shard"
         );
 
+        let shard_start = std::time::Instant::now();
         save_safetensors_single(&shard_path, tensors, shard_names, Some(metadata.clone()))?;
+        let shard_elapsed = shard_start.elapsed();
+        bytes_written_total += shard_bytes;
+        let convert_elapsed_s = convert_start.elapsed().as_secs_f64().max(1e-6);
+
+        // Snapshot MLX memory after each shard. Helps catch lazy-graph
+        // accumulation, allocator leaks, or runaway page-cache growth that
+        // could silently OOM the process mid-convert on huge MoE checkpoints.
+        let (active_mb, peak_mb, cache_mb) = current_mlx_memory_stats_mb();
+        info!(
+            shard_index = i + 1,
+            shard_count = num_shards,
+            shard_file = %shard_filename,
+            shard_ms = shard_elapsed.as_millis() as u64,
+            shard_mb = (shard_bytes as f64 / (1u64 << 20) as f64),
+            avg_mbps = (bytes_written_total as f64 / (1u64 << 20) as f64) / convert_elapsed_s,
+            mlx_active_mb = active_mb,
+            mlx_peak_mb = peak_mb,
+            mlx_cache_mb = cache_mb,
+            "shard written"
+        );
 
         for name in shard_names {
             weight_map.insert(name.clone(), shard_filename.clone());

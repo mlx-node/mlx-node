@@ -52,6 +52,24 @@ void mlx_set_default_stream(mlx_stream stream) {
   }
 }
 
+// Get the current default device (0 = CPU, 1 = GPU)
+int32_t mlx_default_device() {
+  auto dev = mlx::core::default_device();
+  return (dev == mlx::core::Device::cpu) ? 0 : 1;
+}
+
+// Set the current default device (0 = CPU, 1 = GPU). Logs and ignores on
+// exception (e.g. requested GPU but Metal unavailable).
+void mlx_set_default_device(int32_t device_type) {
+  try {
+    mlx::core::set_default_device(to_device_helper(device_type));
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] Exception in set_default_device: " << e.what() << std::endl;
+  } catch (...) {
+    std::cerr << "[MLX] Unknown exception in set_default_device" << std::endl;
+  }
+}
+
 // Synchronize with the given stream
 void mlx_stream_synchronize(mlx_stream stream) {
   try {
