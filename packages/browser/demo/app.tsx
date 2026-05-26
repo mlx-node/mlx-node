@@ -306,6 +306,11 @@ function App() {
   const maxTokensValueRef = useRef(initialMaxOutputTokens);
   const [generating, setGeneratingState] = useState(false);
   const [sendDisabled, setSendDisabledState] = useState(true);
+  // Shared handle to the MLX inference worker so chapter components can post
+  // their own `runForInspector` requests without rerouting through the main
+  // chat path. The worker itself is owned by the load-model effect below;
+  // this ref is populated when the worker comes up and nulled on teardown.
+  const mlxWorkerRef = useRef<Worker | null>(null);
 
   useEffect(() => {
     const modelDirInput = modelDirInputRef.current;
@@ -1207,6 +1212,7 @@ function App() {
     let worker = new Worker(workerAssetUrl(mlxWorkerUrl), {
       type: 'module',
     });
+    mlxWorkerRef.current = worker;
 
     function postChatRequest() {
       const toolsEnabled = appToolsEnabledRef.current;
@@ -1876,6 +1882,9 @@ function App() {
       if (rafHandle != null) cancelAnimationFrame(rafHandle);
       unmountAllStreamdown();
       worker.terminate();
+      if (mlxWorkerRef.current === worker) {
+        mlxWorkerRef.current = null;
+      }
       delete (window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat;
     };
   }, [configuredModelLabel, configuredModelUrl, loadKickoff, pendingModelSource]);
@@ -2046,7 +2055,7 @@ function App() {
               setLoadKickoff((k) => k + 1);
               dispatchScreen({ type: 'open_free_chat' });
             }}
-            tryItPanel={chapter.id === 'attention' ? <AttentionDemo /> : null}
+            tryItPanel={chapter.id === 'attention' ? <AttentionDemo workerRef={mlxWorkerRef} /> : null}
           >
             {chapter.id === 'attention' ? (
               <AttentionChapterBody />

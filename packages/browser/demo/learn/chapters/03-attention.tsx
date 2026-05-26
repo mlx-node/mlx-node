@@ -3,6 +3,7 @@ import * as React from "react";
 import { Button } from "../../components/ui/button";
 import { Textarea } from "../../components/ui/textarea";
 import type { AttentionRun } from "../../../src/inspector-types";
+import { runForInspector } from "../../lib/inspector-client";
 import { AttentionHeatmap } from "../inspector/AttentionHeatmap";
 import { Prose } from "../Prose";
 import { makeMockAttentionRun } from "../mock-data";
@@ -11,14 +12,21 @@ import { makeMockAttentionRun } from "../mock-data";
  * Chapter 3 — Self-attention.
  *
  * This is the only fully-authored chapter for the first cut. The prose
- * teaches the mechanism end-to-end; the right-hand panel runs a (currently
- * mocked) inspector and renders the resulting attention heatmap.
- *
- * When the backend `runForInspector` hook lands, replace `makeMockAttentionRun`
- * with a real worker call in <AttentionDemo/>.
+ * teaches the mechanism end-to-end; the right-hand panel runs the real
+ * backend `runForInspector` hook when the model is loaded, and falls back to
+ * a mocked AttentionRun (with a visible banner) when it isn't.
  */
 
 const DEFAULT_PROMPT = "The cat sat on the mat.";
+
+export type AttentionDemoProps = {
+  /**
+   * Ref to the shared MLX worker owned by the app shell. `null` while the
+   * model is not loaded — in that case the demo falls back to mock data and
+   * shows a banner so the user knows what they're looking at.
+   */
+  workerRef: React.MutableRefObject<Worker | null>;
+};
 
 export function AttentionChapterBody() {
   return (
@@ -141,36 +149,70 @@ export function AttentionChapterBody() {
       </p>
 
       <p className="mt-6 text-muted-foreground">
-        Type a sentence on the right and hit <em>Run</em>. The heatmap shows a
-        synthetic but realistic-looking attention pattern from a mocked
-        inspector — the live model hook is coming in a separate task. Switch
-        the layer and head selectors to see how the pattern changes.
+        Type a sentence on the right and hit <em>Run</em>. If the model is
+        loaded, the heatmap shows the real post-softmax attention scores from
+        a forward pass; otherwise a synthetic example is shown with a banner
+        above the heatmap. Switch the layer and head selectors to see how the
+        pattern changes.
       </p>
     </Prose>
   );
 }
 
-export function AttentionDemo() {
+type RunStatus =
+  | { kind: "ok" }
+  | { kind: "mock-no-worker" }
+  | { kind: "mock-error"; error: string };
+
+export function AttentionDemo({ workerRef }: AttentionDemoProps) {
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT);
   const [run, setRun] = React.useState<AttentionRun | null>(null);
+  const [status, setStatus] = React.useState<RunStatus | null>(null);
   const [running, setRunning] = React.useState(false);
 
-  function handleRun() {
+  function useMockFallback(reason: RunStatus, logMessage: string) {
+    const mock = makeMockAttentionRun(prompt);
+    console.log(logMessage, {
+      promptLength: prompt.length,
+      seqLen: mock.tokens.length,
+    });
+    setRun(mock);
+    setStatus(reason);
+  }
+
+  async function handleRun() {
     setRunning(true);
-    // Pretend this is async to mirror what the real backend call will look
-    // like, but resolve immediately for the mock.
-    Promise.resolve()
-      .then(() => makeMockAttentionRun(prompt))
-      .then((result) => {
-        // Backend wire-up is being built in parallel — log a reminder for the
-        // dev so it's obvious we're on mock data.
-        console.log(
-          "[attention-demo] using mock AttentionRun; real backend wire-up pending",
-          { promptLength: prompt.length, seqLen: result.tokens.length },
-        );
-        setRun(result);
-      })
-      .finally(() => setRunning(false));
+    const worker = workerRef.current;
+    if (!worker) {
+      useMockFallback(
+        { kind: "mock-no-worker" },
+        "[attention-demo] using mock AttentionRun (model not loaded)",
+      );
+      setRunning(false);
+      return;
+    }
+
+    try {
+      const result = await runForInspector(worker, {
+        prompt,
+        attention: true,
+        maxNewTokens: 1,
+      });
+      setRun(result);
+      setStatus({ kind: "ok" });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(
+        "[attention-demo] runForInspector failed; falling back to mock",
+        err,
+      );
+      useMockFallback(
+        { kind: "mock-error", error: message },
+        "[attention-demo] using mock AttentionRun (backend error)",
+      );
+    } finally {
+      setRunning(false);
+    }
   }
 
   return (
@@ -197,7 +239,25 @@ export function AttentionDemo() {
       </div>
 
       {run ? (
-        <div className="pt-2">
+        <div className="space-y-3 pt-2">
+          {status?.kind === "mock-no-worker" ? (
+            <div
+              role="status"
+              className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+            >
+              Showing example data — load the model first to see real
+              attention scores.
+            </div>
+          ) : null}
+          {status?.kind === "mock-error" ? (
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+            >
+              <strong>Inspector run failed.</strong> Showing example data
+              instead. {status.error}
+            </div>
+          ) : null}
           <AttentionHeatmap run={run} />
         </div>
       ) : (

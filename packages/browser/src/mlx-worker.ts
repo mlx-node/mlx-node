@@ -2638,6 +2638,67 @@ async function handleChatTsfn(data: {
   }
 }
 
+// Inspector hook for the education-app "Try it now" panels. Invokes the
+// model's NAPI `runForInspector` method and replies with an
+// {type:'inspectorResult'|'inspectorError', id, ...} message correlated by
+// the caller-supplied id. Does NOT touch SAB/streaming paths — the inspector
+// run is a short, awaitable Promise<AttentionRun>.
+async function handleRunForInspector(data: {
+  id: string;
+  prompt: string;
+  attention?: boolean;
+  attentionLayers?: number[];
+  maxNewTokens?: number;
+}) {
+  const id = data.id;
+  if (!model || typeof model.runForInspector !== "function") {
+    (self as any).postMessage({
+      type: "inspectorError",
+      id,
+      error: "Model not loaded",
+    });
+    return;
+  }
+  try {
+    const opts: {
+      attention?: boolean;
+      attentionLayers?: number[];
+      maxNewTokens?: number;
+    } = {};
+    if (data.attention !== undefined) opts.attention = data.attention;
+    if (data.attentionLayers !== undefined)
+      opts.attentionLayers = data.attentionLayers;
+    if (data.maxNewTokens !== undefined) opts.maxNewTokens = data.maxNewTokens;
+
+    const result = await model.runForInspector(data.prompt, opts);
+
+    // Float32Array.buffer is transferable for zero-copy postMessage. Collect
+    // every distinct score buffer so we hand off ownership in one call.
+    const transfer: ArrayBuffer[] = [];
+    const seen = new Set<ArrayBuffer>();
+    const layers = Array.isArray(result?.attention) ? result.attention : [];
+    for (const layer of layers) {
+      const scores = layer?.scores;
+      if (
+        scores &&
+        typeof scores === "object" &&
+        scores.buffer instanceof ArrayBuffer &&
+        !seen.has(scores.buffer)
+      ) {
+        seen.add(scores.buffer);
+        transfer.push(scores.buffer);
+      }
+    }
+    (self as any).postMessage(
+      { type: "inspectorResult", id, result },
+      transfer,
+    );
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    (self as any).postMessage({ type: "inspectorError", id, error: message });
+  }
+}
+
 // Catch unhandled errors/rejections on this worker
 self.addEventListener("error", (e) => {
   e.preventDefault();
@@ -2679,6 +2740,9 @@ self.onmessage = (e: MessageEvent) => {
       if (streamFinalizeResolve) {
         streamFinalizeResolve(e.data.numTokens ?? 0);
       }
+      break;
+    case "runForInspector":
+      void handleRunForInspector(e.data);
       break;
   }
 };
