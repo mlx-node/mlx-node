@@ -166,24 +166,19 @@ function fallbackHeuristicTokens(prompt: string): TokenInfo[] {
 // marker "Ġ" with a literal space (some tokenizer outputs use "Ġ", others
 // already emit a literal space depending on decode flags), then render
 // leading whitespace as "·" so the chip is visible.
-function renderTokenText(raw: string): {
-  display: string;
-  hadLeadingSpace: boolean;
-} {
-  if (raw === "") return { display: "∅", hadLeadingSpace: false };
+function renderTokenText(raw: string): { display: string } {
+  if (raw === "") return { display: "∅" };
   let text = raw;
-  let hadLeadingSpace = false;
   if (text.startsWith("Ġ")) {
     text = " " + text.slice(1);
   }
   text = text.replace(/Ġ/g, " ");
   if (text.startsWith(" ")) {
-    hadLeadingSpace = true;
     text = "·" + text.slice(1);
   }
   text = text.replace(/\n/g, "↵").replace(/\t/g, "→");
   if (text.length > 18) text = text.slice(0, 17) + "…";
-  return { display: text, hadLeadingSpace };
+  return { display: text };
 }
 
 function isSpecialToken(tok: TokenInfo): boolean {
@@ -199,6 +194,11 @@ export function TokenizerDemo({ workerRef, abortRef }: TokenizerDemoProps) {
   // Each new request bumps a generation counter so a slow earlier reply
   // doesn't stomp the chips with stale data.
   const reqGenRef = React.useRef(0);
+  // Per-call AbortController for the current in-flight tokenize. Aborting it
+  // when a new keystroke arrives (or on unmount) cancels the worker call
+  // itself, not just its state write — preventing forward-pass stacking on
+  // fast typing.
+  const tokenizeAbortRef = React.useRef<AbortController | null>(null);
 
   const runTokenize = React.useCallback(
     async (text: string) => {
@@ -215,24 +215,45 @@ export function TokenizerDemo({ workerRef, abortRef }: TokenizerDemoProps) {
         );
         return;
       }
+
+      // Cancel any previous in-flight call before starting a new one. The
+      // generation-counter guard below is kept as belt-and-suspenders for the
+      // tiny window between abort dispatch and the listener firing.
+      tokenizeAbortRef.current?.abort();
+      const ctrl = new AbortController();
+      tokenizeAbortRef.current = ctrl;
+
+      // Chain the app-level abort (worker termination) into our local
+      // controller so terminating the worker also tears down this call. We
+      // either short-circuit synchronously or attach a one-shot listener that
+      // we clean up in `finally`.
+      const appSignal = abortRef.current?.signal;
+      if (appSignal?.aborted) {
+        ctrl.abort();
+      }
+      const onAppAbort = () => ctrl.abort();
+      if (appSignal && !appSignal.aborted) {
+        appSignal.addEventListener("abort", onAppAbort, { once: true });
+      }
+
       setRunning(true);
       try {
-        const signal = abortRef.current?.signal;
-        const result = await tokenize(
-          worker,
-          text,
-          signal ? { signal } : undefined,
-        );
+        const result = await tokenize(worker, text, { signal: ctrl.signal });
         if (reqGenRef.current !== myGen) return;
         setTokens(result);
         setStatus({ kind: "ok" });
       } catch (err) {
         if (reqGenRef.current !== myGen) return;
         if (isAbortError(err)) {
-          console.info(
-            "[tokenizer-demo] tokenize aborted (worker terminated)",
-          );
-          setStatus({ kind: "aborted" });
+          // A newer call superseded us — let it set the next state. Only
+          // surface "aborted" UI when the app-level signal (worker
+          // termination) is the cause.
+          if (appSignal?.aborted) {
+            console.info(
+              "[tokenizer-demo] tokenize aborted (worker terminated)",
+            );
+            setStatus({ kind: "aborted" });
+          }
         } else {
           const message = err instanceof Error ? err.message : String(err);
           console.error(
@@ -244,6 +265,12 @@ export function TokenizerDemo({ workerRef, abortRef }: TokenizerDemoProps) {
           setStatus({ kind: "fallback-error", error: message });
         }
       } finally {
+        if (appSignal) {
+          appSignal.removeEventListener("abort", onAppAbort);
+        }
+        if (tokenizeAbortRef.current === ctrl) {
+          tokenizeAbortRef.current = null;
+        }
         if (reqGenRef.current === myGen) setRunning(false);
       }
     },
@@ -258,7 +285,12 @@ export function TokenizerDemo({ workerRef, abortRef }: TokenizerDemoProps) {
     const handle = setTimeout(() => {
       void runTokenize(prompt);
     }, TOKENIZE_DEBOUNCE_MS);
-    return () => clearTimeout(handle);
+    return () => {
+      clearTimeout(handle);
+      // Cancel any pending in-flight tokenize on unmount / prompt change so
+      // an outstanding worker call doesn't keep running after we're gone.
+      tokenizeAbortRef.current?.abort();
+    };
   }, [prompt, runTokenize]);
 
   const charCount = prompt.length;
@@ -356,21 +388,26 @@ export function TokenizerDemo({ workerRef, abortRef }: TokenizerDemoProps) {
 }
 
 function TokenChip({ token, index }: { token: TokenInfo; index: number }) {
-  const { display, hadLeadingSpace } = renderTokenText(token.text);
+  const { display } = renderTokenText(token.text);
   const special = isSpecialToken(token);
   const palette = CHIP_PALETTE[index % CHIP_PALETTE.length]!;
-  const chipId = `tokenizer-demo-tok-${index}`;
-  const idLabel = `id-${chipId}`;
+  const idLabel = `id-tokenizer-demo-tok-${index}`;
+  // Negative ids are synthesized by the heuristic fallback (no worker loaded).
+  // Don't leak them into the tooltip or aria-described id label — they're
+  // implementation detail, not real Qwen3 vocab indices.
+  const isFallback = token.id < 0;
+  const title = isFallback
+    ? `fallback · ${JSON.stringify(token.text)}`
+    : `id ${token.id} · ${JSON.stringify(token.text)}`;
   return (
     <span
       role="listitem"
       aria-describedby={idLabel}
-      title={`id ${token.id} · ${JSON.stringify(token.text)}`}
+      title={title}
       className={[
         "inline-flex items-center gap-1 rounded px-1.5 py-1 text-[13px] font-mono leading-none",
         special ? "italic border border-dashed border-primary/60" : "border border-transparent",
         palette,
-        hadLeadingSpace ? "before:content-[''] before:inline-block" : "",
       ].join(" ")}
     >
       <span>{display}</span>
@@ -378,7 +415,7 @@ function TokenChip({ token, index }: { token: TokenInfo; index: number }) {
         id={idLabel}
         className="text-[10px] opacity-60"
       >
-        {token.id < 0 ? "·" : token.id}
+        {isFallback ? "·" : token.id}
       </span>
     </span>
   );
