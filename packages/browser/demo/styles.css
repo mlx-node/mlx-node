@@ -1019,6 +1019,114 @@
     border-radius: 10px;
     margin: 12px 24px 0;
   }
+
+  /* Per-assistant-message Inspect button (Task 18) */
+  .assistant-inspect-row {
+    margin-top: 8px;
+    display: flex;
+    justify-content: flex-end;
+  }
+  .assistant-inspect-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 8px;
+    padding: 3px 10px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+  }
+  .assistant-inspect-btn:hover {
+    border-color: var(--book-pink);
+    color: var(--book-pink);
+    background: rgba(244, 200, 215, 0.06);
+  }
+  .assistant-inspect-btn:focus-visible {
+    outline: none;
+    border-color: var(--book-pink);
+    box-shadow: 0 0 0 3px rgba(244, 200, 215, 0.25);
+  }
+
+  /* Inspector drawer (right-side slide-in over the chat) */
+  .inspector-drawer-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(15, 13, 17, 0.45);
+    backdrop-filter: blur(2px);
+    z-index: 40;
+    animation: inspectorBackdropIn 0.18s ease;
+  }
+  .inspector-drawer {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 40%;
+    min-width: 320px;
+    max-width: 720px;
+    background: var(--bg);
+    border-left: 1px solid var(--border);
+    box-shadow: -8px 0 32px rgba(0, 0, 0, 0.35);
+    display: flex;
+    flex-direction: column;
+    z-index: 41;
+    animation: inspectorDrawerIn 0.22s ease;
+  }
+  @media (max-width: 720px) {
+    .inspector-drawer {
+      width: 100%;
+      min-width: 0;
+      max-width: none;
+    }
+  }
+  .inspector-drawer-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .inspector-drawer-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .inspector-drawer-subtitle {
+    margin-top: 2px;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    max-width: 38ch;
+  }
+  .inspector-drawer-body {
+    flex: 1 1 0;
+    overflow-y: auto;
+    padding: 16px 18px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  @keyframes inspectorBackdropIn {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes inspectorDrawerIn {
+    from {
+      transform: translateX(8px);
+      opacity: 0;
+    }
+    to {
+      transform: translateX(0);
+      opacity: 1;
+    }
+  }
 }
 
 /* Reduced-motion: freeze the WebGL hero */

@@ -17,6 +17,7 @@ import {
 import { workerAssetUrl } from '../src/worker-asset-url.js';
 import { ChatHeader } from './components/chat/ChatHeader';
 import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
+import { InspectorDrawer } from './components/chat/InspectorDrawer';
 import { PowerComposer } from './components/chat/PowerComposer';
 import { TelemetryStrip } from './components/chat/TelemetryStrip';
 import { Landing } from './components/landing/Landing';
@@ -326,6 +327,11 @@ function App() {
   // hanging the full 60s timeout waiting for a reply from a dead worker.
   // A fresh controller is installed for each kickoff cycle.
   const inspectorAbortRef = useRef<AbortController | null>(null);
+  // Prompt currently being inspected in the chat drawer. `null` = drawer
+  // closed. Set when the user clicks the "Inspect" button on a finished
+  // assistant message; the InspectorDrawer then re-runs the model on this
+  // exact prompt with attention + top-K logits captured.
+  const [inspectedPrompt, setInspectedPrompt] = useState<string | null>(null);
 
   useEffect(() => {
     const modelDirInput = modelDirInputRef.current;
@@ -862,6 +868,12 @@ function App() {
     function createAssistantMessage() {
       const assistantDiv = document.createElement('div');
       assistantDiv.className = 'message assistant';
+      // Stash the prompt that produced this assistant message so the per-
+      // message Inspect button (revealed in finalizeAssistantMessage) can
+      // hand it to the InspectorDrawer for a fresh runForInspector pass.
+      if (currentUserPrompt) {
+        assistantDiv.dataset.userPrompt = currentUserPrompt;
+      }
 
       const thinkingDiv = document.createElement('details');
       thinkingDiv.className = 'thinking';
@@ -1216,6 +1228,25 @@ function App() {
         renderStreamdown(currentResponseDiv, '', false);
       }
       currentAssistantDiv.classList.add('done');
+
+      // Append the per-message Inspect button now that streaming completed.
+      // Hidden during streaming (per Task 18 spec) — only revealed after the
+      // message is final. Click is handled by event delegation on chatEl
+      // below; the button just carries the prompt via data-user-prompt.
+      const promptForInspect = currentAssistantDiv.dataset.userPrompt;
+      if (promptForInspect && !currentAssistantDiv.querySelector('.assistant-inspect-row')) {
+        const inspectRow = document.createElement('div');
+        inspectRow.className = 'assistant-inspect-row';
+        const inspectBtn = document.createElement('button');
+        inspectBtn.type = 'button';
+        inspectBtn.className = 'assistant-inspect-btn';
+        inspectBtn.dataset.action = 'inspect';
+        inspectBtn.textContent = 'Inspect';
+        inspectBtn.title = 'Re-run the model on this prompt and show attention + top-K logits.';
+        inspectRow.appendChild(inspectBtn);
+        currentAssistantDiv.appendChild(inspectRow);
+      }
+
       chatEl.scrollTop = chatEl.scrollHeight;
 
       currentAssistantDiv = null;
@@ -1867,12 +1898,29 @@ function App() {
       }
     };
 
+    // Event delegation for the per-assistant-message "Inspect" button. The
+    // buttons are appended imperatively in finalizeAssistantMessage; this
+    // listener fishes the prompt off the closest .message.assistant ancestor
+    // and lifts it into React state so the InspectorDrawer mounts.
+    const onChatClick = (e: MouseEvent) => {
+      const target = e.target;
+      if (!(target instanceof HTMLElement)) return;
+      const btn = target.closest('[data-action="inspect"]');
+      if (!btn) return;
+      const messageEl = btn.closest('.message.assistant') as HTMLElement | null;
+      const promptForInspect = messageEl?.dataset.userPrompt;
+      if (promptForInspect) {
+        setInspectedPrompt(promptForInspect);
+      }
+    };
+
     sendBtn.addEventListener('click', handleSend);
     promptEl.addEventListener('keydown', onPromptKeyDown);
     promptEl.addEventListener('input', autosizePrompt);
     imageBtn.addEventListener('click', onImageClick);
     imageInput.addEventListener('change', onImageChange);
     document.addEventListener('paste', onPaste);
+    chatEl.addEventListener('click', onChatClick);
 
     // Expose a global reset hook for the new ChatHeader's "Reset Chat" button.
     // Clears the chat DOM, resets the local session history (keeping the
@@ -1888,6 +1936,9 @@ function App() {
       currentToolCallIndicatorDiv = null;
       chatSession.reset();
       chatEl.replaceChildren();
+      // Close the inspector drawer if it's open — its prompt no longer
+      // corresponds to any visible message after the reset.
+      setInspectedPrompt(null);
     };
 
     return () => {
@@ -1897,6 +1948,7 @@ function App() {
       imageBtn.removeEventListener('click', onImageClick);
       imageInput.removeEventListener('change', onImageChange);
       document.removeEventListener('paste', onPaste);
+      chatEl.removeEventListener('click', onChatClick);
       worker.removeEventListener('messageerror', onMessageError);
       activeReaderAbort?.abort();
       if (rafHandle != null) cancelAnimationFrame(rafHandle);
@@ -1982,6 +2034,14 @@ function App() {
             sendDisabled={sendDisabled}
           />
         </div>
+        {inspectedPrompt !== null && screen.kind === 'chat' ? (
+          <InspectorDrawer
+            prompt={inspectedPrompt}
+            workerRef={mlxWorkerRef}
+            abortRef={inspectorAbortRef}
+            onClose={() => setInspectedPrompt(null)}
+          />
+        ) : null}
       </div>
 
       {/*
