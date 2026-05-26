@@ -29,6 +29,7 @@ import { findChapter } from './learn/chapters';
 import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
 import { MultiheadGqaChapterBody, MultiheadGqaDemo } from './learn/chapters/04-multihead-gqa';
 import { TokenizationChapterBody, TokenizerDemo } from './learn/chapters/01-tokenization';
+import { EmbeddingsChapterBody, EmbeddingsDemo } from './learn/chapters/02-embeddings';
 import { RopeChapterBody, RopeDemo } from './learn/chapters/05-rope';
 import { RmsNormChapterBody, RmsNormDemo } from './learn/chapters/06-rms-norm';
 import { MlpChapterBody, MlpDemo } from './learn/chapters/07-mlp';
@@ -2087,6 +2088,8 @@ function App() {
                 <MultiheadGqaDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'tokenization' ? (
                 <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : chapter.id === 'embeddings' ? (
+                <EmbeddingsDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'rope' ? (
                 <RopeDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'rmsnorm' ? (
@@ -2106,6 +2109,8 @@ function App() {
               <MultiheadGqaChapterBody />
             ) : chapter.id === 'tokenization' ? (
               <TokenizationChapterBody />
+            ) : chapter.id === 'embeddings' ? (
+              <EmbeddingsChapterBody />
             ) : chapter.id === 'rope' ? (
               <RopeChapterBody />
             ) : chapter.id === 'rmsnorm' ? (

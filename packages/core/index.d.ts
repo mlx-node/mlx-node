@@ -1027,6 +1027,17 @@ export declare class Qwen35Model {
    */
   runForInspector(prompt: string, opts: InspectorRunOptions): Promise<AttentionRunNapi>;
   /**
+   * Look up embedding rows for a list of token ids.
+   *
+   * Returns a flat row-major `[token_ids.length, hidden_dim]` Float32Array
+   * alongside the model's `hidden_dim`. Used by the Embeddings chapter
+   * (chapter 2) to build a PCA scatter of the model's actual embedding
+   * matrix. Each input id must be in `[0, vocab)`; out-of-range ids are
+   * rejected with an error rather than silently masked so the caller can
+   * fix the tokenization upstream.
+   */
+  embedTokens(tokenIds: Array<number>): Promise<EmbedTokensResult>;
+  /**
    * Start a new chat session.
    *
    * Runs the full jinja chat template once and uses `<|im_end|>` as
@@ -2368,6 +2379,17 @@ export declare const enum DType {
 export declare const enum ElementType {
   Table = 'Table',
   Paragraph = 'Paragraph',
+}
+
+/**
+ * Result of an `embed_tokens` lookup. `embeddings` is a flat row-major
+ * `[token_ids.len(), hidden_dim]` Float32Array; `hidden_dim` matches the
+ * model config's hidden size. Used by the Embeddings chapter (chapter 2)
+ * for PCA scatter rendering.
+ */
+export interface EmbedTokensResult {
+  embeddings: Float32Array;
+  hiddenDim: number;
 }
 
 export interface ForeignConversionOptions {

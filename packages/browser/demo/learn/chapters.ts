@@ -27,8 +27,8 @@ export const CHAPTERS: ChapterMeta[] = [
     number: 2,
     title: "Embeddings",
     blurb:
-      "Tokens become vectors. A 3D PCA scatter of the model's actual embedding matrix.",
-    available: false,
+      "Tokens become vectors. A PCA scatter of the model's actual embedding matrix.",
+    available: true,
   },
   {
     id: "attention",

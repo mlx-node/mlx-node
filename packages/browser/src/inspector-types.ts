@@ -211,6 +211,41 @@ export const TOKENIZE_RESULT_TYPE = 'tokenizeResult' as const;
 export const TOKENIZE_ERROR_TYPE = 'tokenizeError' as const;
 
 // -----------------------------------------------------------------------------
+// Embed worker bridge (chapter 2 — Embeddings).
+// -----------------------------------------------------------------------------
+//
+// The Embeddings chapter projects the model's embedding matrix to 2D with PCA.
+// It tokenizes a curated word list (via the existing `tokenize` message) and
+// then needs the per-token embedding vector — `[N, hidden_dim]` floats. The
+// worker handler calls the NAPI method `model.embedTokens(tokenIds)`, which
+// runs `weight.take(token_ids, axis=0)` on the model thread and returns a
+// flat row-major Float32Array. The buffer is transferred for zero-copy
+// postMessage.
+
+export type EmbedRequest = {
+  type: 'embed';
+  /** Caller-supplied correlation id. The worker echoes this in the response. */
+  id: string;
+  /** Token ids to look up. Each must be in `[0, vocab)`; out-of-range values
+   *  surface as an `embedError` from the backend. */
+  tokenIds: number[];
+};
+
+export type EmbedResult =
+  | {
+      type: 'embedResult';
+      id: string;
+      /** Flat row-major `[tokenIds.length, hiddenDim]` embeddings. */
+      embeddings: Float32Array;
+      hiddenDim: number;
+    }
+  | { type: 'embedError'; id: string; error: string };
+
+export const EMBED_REQUEST_TYPE = 'embed' as const;
+export const EMBED_RESULT_TYPE = 'embedResult' as const;
+export const EMBED_ERROR_TYPE = 'embedError' as const;
+
+// -----------------------------------------------------------------------------
 // Notes for the backend implementer (crates/mlx-core, Rust).
 // -----------------------------------------------------------------------------
 //

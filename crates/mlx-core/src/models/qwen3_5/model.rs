@@ -412,6 +412,14 @@ pub(crate) enum Qwen35Cmd {
         opts: InspectorRunOptions,
         reply: ResponseTx<AttentionRunNapi>,
     },
+    /// Look up embedding rows for a list of token ids. Used by the
+    /// education app's Embeddings chapter (chapter 2) to build a PCA
+    /// scatter of the model's actual embedding matrix. See
+    /// [`Qwen35Inner::embed_tokens_sync`] for the contract.
+    EmbedTokens {
+        token_ids: Vec<u32>,
+        reply: ResponseTx<EmbedTokensResult>,
+    },
     ResetCaches {
         reply: ResponseTx<()>,
     },
@@ -577,6 +585,9 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             reply,
         } => {
             let _ = reply.send(inner.run_for_inspector_sync(prompt, opts));
+        }
+        Qwen35Cmd::EmbedTokens { token_ids, reply } => {
+            let _ = reply.send(inner.embed_tokens_sync(token_ids));
         }
         Qwen35Cmd::ResetCaches { reply } => {
             let _ = reply.send(inner.reset_caches_sync());
@@ -5628,6 +5639,50 @@ impl Qwen35Inner {
         })
     }
 
+    /// Look up embedding rows for a list of token ids and return the flat
+    /// row-major buffer of shape `[token_ids.len(), hidden_size]`.
+    ///
+    /// Used by the Embeddings chapter (chapter 2) to build a PCA scatter of
+    /// the model's actual embedding matrix. The lookup is a single
+    /// `take(token_ids, axis=0)` on the dense embedding weight, materialized
+    /// to host as f32 — modern Qwen3.5 ties the input embedding to the
+    /// `lm_head` so this is exactly the same matrix the model uses both
+    /// directions.
+    pub(crate) fn embed_tokens_sync(&mut self, token_ids: Vec<u32>) -> Result<EmbedTokensResult> {
+        if token_ids.is_empty() {
+            return Err(Error::from_reason("embed_tokens: empty token_ids"));
+        }
+        let vocab = self.config.vocab_size as u32;
+        for &id in &token_ids {
+            if id >= vocab {
+                return Err(Error::from_reason(format!(
+                    "embed_tokens: token id {} out of range (vocab {})",
+                    id, vocab
+                )));
+            }
+        }
+        let hidden_size = self.config.hidden_size as usize;
+        let indices = MxArray::from_uint32(&token_ids, &[token_ids.len() as i64])?;
+        let rows = self.embedding.forward(&indices)?;
+        let rows_f32 = rows.astype(crate::array::DType::Float32)?;
+        rows_f32.eval();
+        let buffer = rows_f32.to_float32_vec()?;
+        let expected_len = token_ids.len() * hidden_size;
+        if buffer.len() != expected_len {
+            return Err(Error::from_reason(format!(
+                "embed_tokens: got {} floats, expected {} ({} tokens x {} hidden)",
+                buffer.len(),
+                expected_len,
+                token_ids.len(),
+                hidden_size,
+            )));
+        }
+        Ok(EmbedTokensResult {
+            embeddings: Float32Array::new(buffer),
+            hidden_dim: hidden_size as i32,
+        })
+    }
+
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
@@ -6956,6 +7011,16 @@ pub struct Qwen3_5GenerationResult {
     pub finish_reason: String,
 }
 
+/// Result of an `embed_tokens` lookup. `embeddings` is a flat row-major
+/// `[token_ids.len(), hidden_dim]` Float32Array; `hidden_dim` matches the
+/// model config's hidden size. Used by the Embeddings chapter (chapter 2)
+/// for PCA scatter rendering.
+#[napi(object)]
+pub struct EmbedTokensResult {
+    pub embeddings: Float32Array,
+    pub hidden_dim: i32,
+}
+
 /// Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE).
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
@@ -7221,6 +7286,26 @@ impl Qwen3_5Model {
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::RunForInspector {
             prompt,
             opts,
+            reply,
+        })
+        .await
+    }
+
+    /// Look up embedding rows for a list of token ids.
+    ///
+    /// Returns a flat row-major `[token_ids.length, hidden_dim]` Float32Array
+    /// alongside the model's `hidden_dim`. Used by the Embeddings chapter
+    /// (chapter 2) to build a PCA scatter of the model's actual embedding
+    /// matrix. Each input id must be in `[0, vocab)`; out-of-range ids are
+    /// rejected with an error rather than silently masked so the caller can
+    /// fix the tokenization upstream.
+    #[napi]
+    pub async fn embed_tokens(
+        &self,
+        token_ids: Vec<u32>,
+    ) -> Result<EmbedTokensResult> {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::EmbedTokens {
+            token_ids,
             reply,
         })
         .await

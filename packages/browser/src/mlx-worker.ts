@@ -61,6 +61,9 @@ import {
 } from "./webgpu-bridge-stub.js";
 import { workerAssetUrl } from "./worker-asset-url.js";
 import {
+  EMBED_ERROR_TYPE,
+  EMBED_REQUEST_TYPE,
+  EMBED_RESULT_TYPE,
   INSPECTOR_ERROR_TYPE,
   INSPECTOR_REQUEST_TYPE,
   INSPECTOR_RESULT_TYPE,
@@ -2768,6 +2771,60 @@ async function handleTokenize(data: { id: string; prompt: string }) {
   }
 }
 
+// Embedding chapter hook (chapter 2). Looks up the model's embedding rows
+// for a list of token ids and replies with a flat row-major `[N, hiddenDim]`
+// Float32Array. The buffer is transferred for zero-copy postMessage. The
+// frontend runs PCA on the result in JS and renders the scatter.
+async function handleEmbed(data: { id: string; tokenIds: number[] }) {
+  const id = data.id;
+  if (!model || typeof model.embedTokens !== "function") {
+    (self as any).postMessage({
+      type: EMBED_ERROR_TYPE,
+      id,
+      error: "Model not loaded",
+    });
+    return;
+  }
+  try {
+    const ids = Array.isArray(data.tokenIds) ? data.tokenIds : [];
+    if (ids.length === 0) {
+      (self as any).postMessage({
+        type: EMBED_ERROR_TYPE,
+        id,
+        error: "embed: empty tokenIds",
+      });
+      return;
+    }
+    const result = await model.embedTokens(ids);
+    const embeddings: Float32Array = result?.embeddings;
+    const hiddenDim: number = result?.hiddenDim ?? 0;
+    const transfer: ArrayBuffer[] = [];
+    if (
+      embeddings &&
+      typeof embeddings === "object" &&
+      embeddings.buffer instanceof ArrayBuffer
+    ) {
+      transfer.push(embeddings.buffer);
+    }
+    (self as any).postMessage(
+      {
+        type: EMBED_RESULT_TYPE,
+        id,
+        embeddings,
+        hiddenDim,
+      },
+      transfer,
+    );
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    (self as any).postMessage({
+      type: EMBED_ERROR_TYPE,
+      id,
+      error: message,
+    });
+  }
+}
+
 // Catch unhandled errors/rejections on this worker
 self.addEventListener("error", (e) => {
   e.preventDefault();
@@ -2815,6 +2872,9 @@ self.onmessage = (e: MessageEvent) => {
       break;
     case TOKENIZE_REQUEST_TYPE:
       void handleTokenize(e.data);
+      break;
+    case EMBED_REQUEST_TYPE:
+      void handleEmbed(e.data);
       break;
   }
 };
