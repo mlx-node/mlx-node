@@ -28,6 +28,7 @@ import { LessonLayout } from './learn/LessonLayout';
 import { findChapter } from './learn/chapters';
 import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
 import { TokenizationChapterBody, TokenizerDemo } from './learn/chapters/01-tokenization';
+import { SamplingChapterBody, SamplingDemo } from './learn/chapters/09-sampling';
 
 const INITIAL_SCREEN: ScreenState = { kind: 'landing' };
 import 'streamdown/styles.css';
@@ -2079,6 +2080,8 @@ function App() {
                 <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'tokenization' ? (
                 <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : chapter.id === 'sampling' ? (
+                <SamplingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : null
             }
           >
@@ -2086,6 +2089,8 @@ function App() {
               <AttentionChapterBody />
             ) : chapter.id === 'tokenization' ? (
               <TokenizationChapterBody />
+            ) : chapter.id === 'sampling' ? (
+              <SamplingChapterBody />
             ) : (
               <div className="text-muted-foreground">
                 This chapter is not yet authored.

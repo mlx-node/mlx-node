@@ -84,7 +84,7 @@ export const CHAPTERS: ChapterMeta[] = [
     title: "Sampling",
     blurb:
       "Logits → softmax → token. Live top-k bar chart, with temperature and top-p sliders.",
-    available: false,
+    available: true,
   },
   {
     id: "kv-cache",
