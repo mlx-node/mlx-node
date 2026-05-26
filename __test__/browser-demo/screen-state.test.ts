@@ -2,7 +2,6 @@ import { describe, it, expect } from "vitest";
 
 import {
   type ScreenState,
-  type ScreenEvent,
   reduceScreen,
   formatTelemetry,
   formatLoadingText,
@@ -14,28 +13,85 @@ describe("reduceScreen", () => {
   it("starts on landing", () => {
     expect(
       reduceScreen(undefined as unknown as ScreenState, { type: "init" }),
-    ).toBe("landing");
+    ).toEqual({ kind: "landing" });
   });
 
   it("landing → loading on LOAD_KICKOFF", () => {
-    expect(reduceScreen("landing", { type: "load_kickoff" })).toBe("loading");
+    expect(reduceScreen({ kind: "landing" }, { type: "load_kickoff" })).toEqual(
+      { kind: "loading" },
+    );
   });
 
   it("loading → chat on MODEL_READY", () => {
-    expect(reduceScreen("loading", { type: "model_ready" })).toBe("chat");
+    expect(reduceScreen({ kind: "loading" }, { type: "model_ready" })).toEqual(
+      { kind: "chat" },
+    );
   });
 
   it("loading → landing on MODEL_ERROR", () => {
-    expect(reduceScreen("loading", { type: "model_error" })).toBe("landing");
+    expect(reduceScreen({ kind: "loading" }, { type: "model_error" })).toEqual(
+      { kind: "landing" },
+    );
   });
 
   it("chat stays on chat on RESET_CHAT (Reset clears messages, not screen)", () => {
-    expect(reduceScreen("chat", { type: "reset_chat" })).toBe("chat");
+    expect(reduceScreen({ kind: "chat" }, { type: "reset_chat" })).toEqual({
+      kind: "chat",
+    });
   });
 
   it("ignores unrelated events", () => {
-    expect(reduceScreen("chat", { type: "load_kickoff" })).toBe("chat");
-    expect(reduceScreen("landing", { type: "model_ready" })).toBe("landing");
+    expect(reduceScreen({ kind: "chat" }, { type: "load_kickoff" })).toEqual({
+      kind: "chat",
+    });
+    expect(
+      reduceScreen({ kind: "landing" }, { type: "model_ready" }),
+    ).toEqual({ kind: "landing" });
+  });
+
+  it("landing → chapter_index on START_LEARNING", () => {
+    expect(
+      reduceScreen({ kind: "landing" }, { type: "start_learning" }),
+    ).toEqual({ kind: "chapter_index" });
+  });
+
+  it("chapter_index → chapter on OPEN_CHAPTER carries chapterId", () => {
+    expect(
+      reduceScreen(
+        { kind: "chapter_index" },
+        { type: "open_chapter", chapterId: "attention" },
+      ),
+    ).toEqual({ kind: "chapter", chapterId: "attention" });
+  });
+
+  it("chapter → chapter_index on BACK_TO_INDEX", () => {
+    expect(
+      reduceScreen(
+        { kind: "chapter", chapterId: "attention" },
+        { type: "back_to_index" },
+      ),
+    ).toEqual({ kind: "chapter_index" });
+  });
+
+  it("MODEL_READY is a no-op from chapter_index (background load must not yank user out of lesson)", () => {
+    expect(
+      reduceScreen({ kind: "chapter_index" }, { type: "model_ready" }),
+    ).toEqual({ kind: "chapter_index" });
+  });
+
+  it("MODEL_READY is a no-op from chapter (background load must not yank user out of lesson)", () => {
+    expect(
+      reduceScreen(
+        { kind: "chapter", chapterId: "attention" },
+        { type: "model_ready" },
+      ),
+    ).toEqual({ kind: "chapter", chapterId: "attention" });
+  });
+
+  it("chapter_index → loading on OPEN_FREE_CHAT", () => {
+    expect(
+      reduceScreen({ kind: "chapter_index" }, { type: "open_free_chat" }),
+    ).toEqual({ kind: "loading" });
   });
 });
 

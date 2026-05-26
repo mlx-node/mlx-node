@@ -21,8 +21,10 @@ export type AttentionHeatmapProps = {
  * Canvas-backed token×token attention heatmap.
  *
  * Why canvas: with sequences of even a few hundred tokens the seq_len² grid
- * gets dense enough that a per-cell DOM element would be slow. A single
- * <canvas> can draw a 1k×1k heatmap in ~10ms with one ImageData blit.
+ * gets dense enough that a per-cell DOM element would be slow. The current
+ * draw implementation uses per-cell fillRect; this is acceptable for the
+ * sequences this demo renders (≤200 tokens). If we ever need to draw larger
+ * sequences, switch to a single ImageData blit.
  *
  * The component:
  *  - lets the user pick a layer and a head via shadcn <Select>
@@ -44,6 +46,17 @@ export function AttentionHeatmap({
     y: number;
     score: number;
   } | null>(null);
+  // Bumped on window resize (and DPR-relevant changes like moving between
+  // monitors or zooming). Used to retrigger the draw effect so the canvas
+  // re-syncs its backing-store size with the current devicePixelRatio.
+  const [resizeTick, setResizeTick] = React.useState(0);
+  React.useEffect(() => {
+    const onResize = () => setResizeTick((n) => n + 1);
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+    };
+  }, []);
 
   // Clamp head if the layer changes and the new layer has fewer heads.
   React.useEffect(() => {
@@ -117,7 +130,7 @@ export function AttentionHeatmap({
       ctx.lineTo(p, board);
       ctx.stroke();
     }
-  }, [run, selectedLayerIdx, selectedHead, seqLen, cellSize, board]);
+  }, [run, selectedLayerIdx, selectedHead, seqLen, cellSize, board, resizeTick]);
 
   function onMouseMove(e: React.MouseEvent<HTMLCanvasElement>) {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -150,6 +163,16 @@ export function AttentionHeatmap({
   }));
   const currentLayer = run.attention[selectedLayerIdx];
   const headCount = currentLayer?.numHeads ?? 0;
+  const currentHead = Math.min(selectedHead, Math.max(0, headCount - 1));
+  const ariaLabel = currentLayer
+    ? `Attention heatmap ${seqLen}×${seqLen}, layer ${currentLayer.layerIndex} head ${currentHead}`
+    : `Attention heatmap ${seqLen}×${seqLen}`;
+  const liveAnnouncement = hover
+    ? `Layer ${currentLayer?.layerIndex ?? selectedLayerIdx} head ${currentHead}, ` +
+      `query token ${hover.queryIndex} (${run.tokens[hover.queryIndex]?.text ?? ""}) ` +
+      `attends to key token ${hover.keyIndex} (${run.tokens[hover.keyIndex]?.text ?? ""}) ` +
+      `with score ${hover.score.toFixed(4)}.`
+    : "";
 
   return (
     <div className="space-y-3">
@@ -221,7 +244,28 @@ export function AttentionHeatmap({
               onMouseLeave={onMouseLeave}
               className="block rounded-sm border border-border"
               style={{ width: board, height: board }}
+              role="img"
+              aria-label={ariaLabel}
             />
+            {/*
+              Screen-reader-only live region. The visual tooltip is purely
+              decorative for sighted users — assistive tech reads this string
+              when the user moves their cursor across cells.
+            */}
+            <div
+              aria-live="polite"
+              aria-atomic="true"
+              style={{
+                position: "absolute",
+                width: 1,
+                height: 1,
+                overflow: "hidden",
+                clip: "rect(0,0,0,0)",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {liveAnnouncement}
+            </div>
             {hover && (
               <HeatmapTooltip
                 hover={hover}
@@ -266,9 +310,11 @@ function HeatmapTooltip({
   keyToken: { text: string };
   board: number;
 }) {
-  // Position the tooltip so it never goes off the right/bottom edge.
-  const left = Math.min(hover.x + 12, board - 220);
-  const top = Math.min(hover.y + 12, board - 80);
+  // Position the tooltip so it never goes off the right/bottom edge. On very
+  // small boards (board < 220), the clamp would underflow to a negative value
+  // and pin the tooltip off-screen to the left — guard with Math.max(0, ...).
+  const left = Math.max(0, Math.min(hover.x + 12, board - 220));
+  const top = Math.max(0, Math.min(hover.y + 12, board - 80));
   return (
     <div
       className="pointer-events-none absolute z-10 rounded-md border border-border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md"

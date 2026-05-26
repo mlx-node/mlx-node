@@ -15,12 +15,18 @@
 // loaded — chapters can run mocked or self-contained widgets. Tapping
 // "Open free chat" from anywhere in learn mode kicks off the model load if
 // it hasn't been loaded already (delegated to the existing load_kickoff path).
+//
+// `model_ready` only transitions to `chat` from `loading`. If a background
+// model load completes while the user is mid-lesson (chapter_index or
+// chapter), it must NOT yank them out of the lesson — `model_ready` is a
+// no-op in those states. The user can still get into chat by dispatching
+// `open_free_chat` explicitly.
 export type ScreenState =
-  | "landing"
-  | "loading"
-  | "chat"
-  | "chapter_index"
-  | "chapter";
+  | { kind: "landing" }
+  | { kind: "loading" }
+  | { kind: "chat" }
+  | { kind: "chapter_index" }
+  | { kind: "chapter"; chapterId: string };
 
 export type ScreenEvent =
   | { type: "init" }
@@ -38,33 +44,37 @@ export function reduceScreen(
   state: ScreenState | undefined,
   event: ScreenEvent,
 ): ScreenState {
-  if (state === undefined || event.type === "init") return "landing";
-  switch (state) {
+  if (state === undefined || event.type === "init") return { kind: "landing" };
+  switch (state.kind) {
     case "landing":
-      if (event.type === "load_kickoff") return "loading";
-      if (event.type === "start_learning") return "chapter_index";
-      return "landing";
+      if (event.type === "load_kickoff") return { kind: "loading" };
+      if (event.type === "start_learning") return { kind: "chapter_index" };
+      return state;
     case "loading":
-      if (event.type === "model_ready") return "chat";
-      if (event.type === "model_error") return "landing";
-      return "loading";
+      if (event.type === "model_ready") return { kind: "chat" };
+      if (event.type === "model_error") return { kind: "landing" };
+      return state;
     case "chat":
-      return "chat";
+      return state;
     case "chapter_index":
-      if (event.type === "open_chapter") return "chapter";
-      if (event.type === "back_to_landing") return "landing";
+      if (event.type === "open_chapter")
+        return { kind: "chapter", chapterId: event.chapterId };
+      if (event.type === "back_to_landing") return { kind: "landing" };
       if (event.type === "open_free_chat" || event.type === "load_kickoff")
-        return "loading";
-      if (event.type === "model_ready") return "chat";
-      return "chapter_index";
+        return { kind: "loading" };
+      // `model_ready` is intentionally a no-op here: if the model finishes
+      // loading in the background while the user is browsing chapters, do
+      // NOT yank them out of the lesson flow.
+      return state;
     case "chapter":
-      if (event.type === "back_to_index") return "chapter_index";
-      if (event.type === "open_chapter") return "chapter";
-      if (event.type === "back_to_landing") return "landing";
+      if (event.type === "back_to_index") return { kind: "chapter_index" };
+      if (event.type === "open_chapter")
+        return { kind: "chapter", chapterId: event.chapterId };
+      if (event.type === "back_to_landing") return { kind: "landing" };
       if (event.type === "open_free_chat" || event.type === "load_kickoff")
-        return "loading";
-      if (event.type === "model_ready") return "chat";
-      return "chapter";
+        return { kind: "loading" };
+      // `model_ready` is intentionally a no-op here — see chapter_index above.
+      return state;
   }
 }
 

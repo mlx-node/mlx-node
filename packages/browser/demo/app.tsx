@@ -27,6 +27,8 @@ import { ChapterIndex } from './learn/ChapterIndex';
 import { LessonLayout } from './learn/LessonLayout';
 import { findChapter } from './learn/chapters';
 import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
+
+const INITIAL_SCREEN: ScreenState = { kind: 'landing' };
 import 'streamdown/styles.css';
 import './styles.css';
 
@@ -268,11 +270,7 @@ function App() {
   const initialAppToolsEnabled = initialUrlParams.get('tools') === '1' || initialUrlParams.get('app_preview') === '1';
   const [appToolsEnabled, setAppToolsEnabledState] = useState(initialAppToolsEnabled);
   const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>('off');
-  const [screen, dispatchScreen] = useReducer(reduceScreen, 'landing' as ScreenState);
-  // Active chapter id when `screen === 'chapter'`. Stored separately from the
-  // ScreenState union to keep the reducer trivial; the reducer's `open_chapter`
-  // event still drives the state transition.
-  const [activeChapterId, setActiveChapterId] = useState<string | null>(null);
+  const [screen, dispatchScreen] = useReducer(reduceScreen, INITIAL_SCREEN);
   const [loadKickoff, setLoadKickoff] = useState(0);
   const [loadingText, setLoadingText] = useState<string | null>(null);
   const [loadingProgress, setLoadingProgress] = useState<LoadingProgress | null>(null);
@@ -1884,7 +1882,7 @@ function App() {
 
   return (
     <div className="app-root">
-      <div className={`chat-layer ${screen === 'chat' ? 'visible' : ''}`}>
+      <div className={`chat-layer ${screen.kind === 'chat' ? 'visible' : ''}`}>
         <div className="app-shell">
           <ChatHeader
             onReset={() => {
@@ -1974,7 +1972,7 @@ function App() {
       <input ref={temperatureInputRef} type="hidden" defaultValue={initialTemperature} />
       <input ref={maxOutputTokensInputRef} type="hidden" defaultValue={initialMaxOutputTokens} />
 
-      {screen === 'landing' && (
+      {screen.kind === 'landing' && (
         <Landing
           onLoad={() => {
             if (hostedModelAvailable === false) {
@@ -1993,12 +1991,9 @@ function App() {
           hostedModelAvailable={hostedModelAvailable}
         />
       )}
-      {screen === 'chapter_index' && (
+      {screen.kind === 'chapter_index' && (
         <ChapterIndex
-          onOpenChapter={(chapterId) => {
-            setActiveChapterId(chapterId);
-            dispatchScreen({ type: 'open_chapter', chapterId });
-          }}
+          onOpenChapter={(chapterId) => dispatchScreen({ type: 'open_chapter', chapterId })}
           onBackToLanding={() => dispatchScreen({ type: 'back_to_landing' })}
           onOpenFreeChat={() => {
             if (hostedModelAvailable === false) {
@@ -2013,30 +2008,32 @@ function App() {
           }}
         />
       )}
-      {screen === 'chapter' && (() => {
-        const chapter = findChapter(activeChapterId);
+      {screen.kind === 'chapter' && (() => {
+        // chapter.id is guaranteed present by the discriminated-union typing —
+        // `open_chapter` carries it on the event and the reducer writes it into
+        // the state. `findChapter` may still return undefined if the id is a
+        // stale value (e.g. a removed chapter), so we narrow defensively.
+        const chapter = findChapter(screen.chapterId);
         if (!chapter) {
-          // Defensive: if state is "chapter" with no/invalid id, fall back to
-          // the chapter index. Should not happen in practice since we set
-          // activeChapterId before dispatching open_chapter.
           return (
-            <ChapterIndex
-              onOpenChapter={(chapterId) => {
-                setActiveChapterId(chapterId);
-                dispatchScreen({ type: 'open_chapter', chapterId });
-              }}
-              onBackToLanding={() => dispatchScreen({ type: 'back_to_landing' })}
-              onOpenFreeChat={() => dispatchScreen({ type: 'open_free_chat' })}
-            />
+            <div className="text-muted-foreground p-6">
+              Unknown chapter: <span className="font-mono">{screen.chapterId}</span>
+              <div className="mt-4">
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => dispatchScreen({ type: 'back_to_index' })}
+                >
+                  Back to chapter index
+                </button>
+              </div>
+            </div>
           );
         }
         return (
           <LessonLayout
             current={chapter}
-            onOpenChapter={(chapterId) => {
-              setActiveChapterId(chapterId);
-              dispatchScreen({ type: 'open_chapter', chapterId });
-            }}
+            onOpenChapter={(chapterId) => dispatchScreen({ type: 'open_chapter', chapterId })}
             onBackToIndex={() => dispatchScreen({ type: 'back_to_index' })}
             onOpenFreeChat={() => {
               if (hostedModelAvailable === false) {
@@ -2061,7 +2058,7 @@ function App() {
           </LessonLayout>
         );
       })()}
-      {screen === 'loading' && <Loading status={loadingText} progress={loadingProgress} />}
+      {screen.kind === 'loading' && <Loading status={loadingText} progress={loadingProgress} />}
     </div>
   );
 }
