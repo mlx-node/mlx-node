@@ -64,6 +64,9 @@ import {
   INSPECTOR_ERROR_TYPE,
   INSPECTOR_REQUEST_TYPE,
   INSPECTOR_RESULT_TYPE,
+  TOKENIZE_ERROR_TYPE,
+  TOKENIZE_REQUEST_TYPE,
+  TOKENIZE_RESULT_TYPE,
 } from "./inspector-types.js";
 
 let model: any = null;
@@ -2708,6 +2711,44 @@ async function handleRunForInspector(data: {
   }
 }
 
+// Tokenization chapter hook. Returns the BPE-tokenized prompt as a
+// {type:'tokenizeResult'|'tokenizeError', id, ...} message correlated by the
+// caller-supplied id. We currently reach the tokenizer through the loaded
+// model's `runForInspector` method (with `attention: false, maxNewTokens: 1`)
+// — that path tokenizes the raw prompt without applying the chat template,
+// which is exactly the "what does the model see for this exact string?" view
+// the lesson needs. The generated token is dropped on this surface.
+async function handleTokenize(data: { id: string; prompt: string }) {
+  const id = data.id;
+  if (!model || typeof model.runForInspector !== "function") {
+    (self as any).postMessage({
+      type: TOKENIZE_ERROR_TYPE,
+      id,
+      error: "Model not loaded",
+    });
+    return;
+  }
+  try {
+    const result = await model.runForInspector(data.prompt, {
+      attention: false,
+      maxNewTokens: 1,
+    });
+    const tokens = Array.isArray(result?.tokens) ? result.tokens : [];
+    (self as any).postMessage({
+      type: TOKENIZE_RESULT_TYPE,
+      id,
+      tokens,
+    });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    (self as any).postMessage({
+      type: TOKENIZE_ERROR_TYPE,
+      id,
+      error: message,
+    });
+  }
+}
+
 // Catch unhandled errors/rejections on this worker
 self.addEventListener("error", (e) => {
   e.preventDefault();
@@ -2752,6 +2793,9 @@ self.onmessage = (e: MessageEvent) => {
       break;
     case INSPECTOR_REQUEST_TYPE:
       void handleRunForInspector(e.data);
+      break;
+    case TOKENIZE_REQUEST_TYPE:
+      void handleTokenize(e.data);
       break;
   }
 };

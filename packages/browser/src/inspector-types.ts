@@ -98,6 +98,36 @@ export const INSPECTOR_RESULT_TYPE = 'inspectorResult' as const;
 export const INSPECTOR_ERROR_TYPE = 'inspectorError' as const;
 
 // -----------------------------------------------------------------------------
+// Tokenize worker bridge (chapter 1 — Tokenization).
+// -----------------------------------------------------------------------------
+//
+// The Tokenization chapter shows the live Qwen3 tokenizer slicing arbitrary
+// strings into BPE sub-words. It needs only the token list (no attention
+// scores, no generation), so we expose a thin worker message that returns a
+// `TokenInfo[]`. The worker's implementation currently reuses the loaded
+// `model.runForInspector` path with `attention: false, maxNewTokens: 1` to
+// reach the tokenizer — the only access point exposed to JS without a Rust
+// change — and discards the generated token. If we later add a tokenizer-only
+// NAPI method the worker handler can switch over transparently.
+
+export type TokenizeRequest = {
+  type: 'tokenize';
+  /** Caller-supplied correlation id. The worker echoes this in the response. */
+  id: string;
+  /** Raw string to tokenize. The tokenizer runs without the chat template — this
+   *  is a "what does the model see for this exact string?" hook. */
+  prompt: string;
+};
+
+export type TokenizeResult =
+  | { type: 'tokenizeResult'; id: string; tokens: TokenInfo[] }
+  | { type: 'tokenizeError'; id: string; error: string };
+
+export const TOKENIZE_REQUEST_TYPE = 'tokenize' as const;
+export const TOKENIZE_RESULT_TYPE = 'tokenizeResult' as const;
+export const TOKENIZE_ERROR_TYPE = 'tokenizeError' as const;
+
+// -----------------------------------------------------------------------------
 // Notes for the backend implementer (crates/mlx-core, Rust).
 // -----------------------------------------------------------------------------
 //

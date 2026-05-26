@@ -20,7 +20,7 @@ export const CHAPTERS: ChapterMeta[] = [
     title: "Tokenization",
     blurb:
       "What is a token? Watch Qwen's BPE tokenizer slice a string into sub-words.",
-    available: false,
+    available: true,
   },
   {
     id: "embeddings",

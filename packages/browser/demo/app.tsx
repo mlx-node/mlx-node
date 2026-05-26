@@ -27,6 +27,7 @@ import { ChapterIndex } from './learn/ChapterIndex';
 import { LessonLayout } from './learn/LessonLayout';
 import { findChapter } from './learn/chapters';
 import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
+import { TokenizationChapterBody, TokenizerDemo } from './learn/chapters/01-tokenization';
 
 const INITIAL_SCREEN: ScreenState = { kind: 'landing' };
 import 'streamdown/styles.css';
@@ -2076,11 +2077,15 @@ function App() {
             tryItPanel={
               chapter.id === 'attention' ? (
                 <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : chapter.id === 'tokenization' ? (
+                <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : null
             }
           >
             {chapter.id === 'attention' ? (
               <AttentionChapterBody />
+            ) : chapter.id === 'tokenization' ? (
+              <TokenizationChapterBody />
             ) : (
               <div className="text-muted-foreground">
                 This chapter is not yet authored.
