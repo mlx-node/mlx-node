@@ -29,6 +29,7 @@ import { findChapter } from './learn/chapters';
 import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
 import { TokenizationChapterBody, TokenizerDemo } from './learn/chapters/01-tokenization';
 import { RmsNormChapterBody, RmsNormDemo } from './learn/chapters/06-rms-norm';
+import { MlpChapterBody, MlpDemo } from './learn/chapters/07-mlp';
 import { SamplingChapterBody, SamplingDemo } from './learn/chapters/09-sampling';
 
 const INITIAL_SCREEN: ScreenState = { kind: 'landing' };
@@ -2083,6 +2084,8 @@ function App() {
                 <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'rmsnorm' ? (
                 <RmsNormDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : chapter.id === 'mlp' ? (
+                <MlpDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'sampling' ? (
                 <SamplingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : null
@@ -2094,6 +2097,8 @@ function App() {
               <TokenizationChapterBody />
             ) : chapter.id === 'rmsnorm' ? (
               <RmsNormChapterBody />
+            ) : chapter.id === 'mlp' ? (
+              <MlpChapterBody />
             ) : chapter.id === 'sampling' ? (
               <SamplingChapterBody />
             ) : (

@@ -68,7 +68,7 @@ export const CHAPTERS: ChapterMeta[] = [
     title: "MLP block",
     blurb:
       "Gated MLP and residual connections — the model's per-token feed-forward step.",
-    available: false,
+    available: true,
   },
   {
     id: "full-block",
