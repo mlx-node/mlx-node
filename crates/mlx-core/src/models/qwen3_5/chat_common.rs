@@ -286,6 +286,73 @@ pub(crate) fn mtp_sparse_accept_enabled() -> bool {
     })
 }
 
+// Diagnostic — per-committed-token top-2 logit trace.
+//
+// `MLX_MTP_TRACE_LOGITS=1` (or `true` / `on`) enables an env-gated
+// per-token logit trace emitted to stderr. For each committed decode
+// token it logs the position index, the committed token id, and the
+// top-2 (token id + logit value) of the forward that produced it:
+//   * the AR `decode_loop!` logs the single-token decode forward;
+//   * `run_mtp_cycle_inner` logs the batched verify forward, per
+//     verify slot.
+//
+// The trace exists to resolve whether an AR-vs-MTP argmax flip is a
+// benign batched-vs-single kernel near-tie (both forwards have the
+// SAME top-2 set with logits agreeing within bf16 epsilon) or a real
+// verify-path bug (the verify forward computes a substantially
+// different logit vector). Default OFF; read once per process and
+// cached. Lines are prefixed `MTP_TRACE_LOGITS` for easy grep.
+pub(crate) fn mtp_trace_logits() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_TRACE_LOGITS") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false, // default OFF — diagnostic instrumentation
+    })
+}
+
+/// Top-2 entries `(id, logit)` of a logits vector — used by the
+/// `MLX_MTP_TRACE_LOGITS` diagnostic.
+pub(crate) struct Top2 {
+    pub top1_id: i32,
+    pub top1_logit: f32,
+    pub top2_id: i32,
+    pub top2_logit: f32,
+}
+
+/// Compute the top-2 `(id, logit)` of a 1-D logits array.
+///
+/// `logits_1d` must be a `[vocab]` array (any float dtype — values are
+/// read back as f32). Uses a descending sort of the indices via
+/// `argsort` then a single `.eval()`; the two winning logit values are
+/// read by flat index from an f32 copy of the logits. No `.unwrap()` /
+/// `.expect()` — every fallible step propagates with `?`, so this is
+/// safe to call from the decode path.
+pub(crate) fn trace_top2(logits_1d: &MxArray, vocab: i64) -> Result<Top2> {
+    use crate::array::DType;
+
+    // argsort is ascending; the last two entries are the top-2.
+    let order = logits_1d.argsort(Some(-1))?;
+    let logits_f32 = logits_1d.astype(DType::Float32)?;
+    order.eval();
+    logits_f32.eval();
+
+    let last = (vocab - 1).max(0) as usize;
+    let second = (vocab - 2).max(0) as usize;
+    let top1_id = order.item_at_int32(last)?;
+    let top2_id = order.item_at_int32(second)?;
+    let top1_logit = logits_f32.item_at_float32(top1_id as usize)?;
+    let top2_logit = logits_f32.item_at_float32(top2_id as usize)?;
+    Ok(Top2 {
+        top1_id,
+        top1_logit,
+        top2_id,
+        top2_logit,
+    })
+}
+
 /// Hash raw image bytes to a u64 key for cache lookup.
 fn hash_image_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -1218,6 +1285,50 @@ macro_rules! decode_loop {
                 ($ops.eval_step)(&next_token, &logits, budget_forced);
                 $profiler.end();
 
+                // Diagnostic — `MLX_MTP_TRACE_LOGITS=1` per-token AR
+                // top-2 logit trace. `logits` is the post-penalty
+                // single-token decode forward that PREDICTS the token
+                // at position `$hist.len() + 1` (the current `$y` sits
+                // at `$hist.len()`). `budget_forced` skips the real
+                // logits, so only trace the sampled path.
+                if !budget_forced
+                    && $crate::models::qwen3_5::chat_common::mtp_trace_logits()
+                {
+                    let logits_1d = if logits.ndim()? == 2 {
+                        logits.squeeze(Some(&[0]))?
+                    } else {
+                        logits.clone()
+                    };
+                    let vocab = logits_1d.shape_at(0)?;
+                    match $crate::models::qwen3_5::chat_common::trace_top2(
+                        &logits_1d, vocab,
+                    ) {
+                        Ok(t2) => {
+                            next_token.eval();
+                            let predicted = next_token.item_at_int32(0)?;
+                            eprintln!(
+                                "MTP_TRACE_LOGITS source=AR pos={} token_id={} \
+                                 top1_id={} top1_logit={:.6} top2_id={} \
+                                 top2_logit={:.6} gap={:.6}",
+                                $hist.len() + 1,
+                                predicted,
+                                t2.top1_id,
+                                t2.top1_logit,
+                                t2.top2_id,
+                                t2.top2_logit,
+                                t2.top1_logit - t2.top2_logit,
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "MTP_TRACE_LOGITS source=AR pos={} ERROR {}",
+                                $hist.len() + 1,
+                                e.reason,
+                            );
+                        }
+                    }
+                }
+
                 Some(next_token)
             } else {
                 None
@@ -1989,6 +2100,58 @@ where
         profiler.end();
     }
 
+    // Diagnostic — `MLX_MTP_TRACE_LOGITS=1` per-committed-token verify
+    // top-2 logit trace. Runs AFTER the accept loop so it is read-only
+    // and does not perturb the sparse/legacy accept hot path. Each
+    // `accepted_tokens[j]` was committed from verify slot `j` of the
+    // batched verify forward; `verify_logits` is `[1, depth+1, vocab]`.
+    // The first `K` slots are accepted drafts; the final slot is the
+    // boundary token (bonus on full accept, residual on rejection).
+    // Position label `token_history.len() + j` aligns with the AR
+    // loop's `$hist.len() + 1` numbering (same prompt base).
+    if mtp_trace_logits() {
+        for (j, &committed_id) in accepted_tokens.iter().enumerate() {
+            let slot = j as i64;
+            let source = if all_accepted && j + 1 == accepted_tokens.len() {
+                "verify-bonus"
+            } else if !all_accepted && j + 1 == accepted_tokens.len() {
+                "verify-residual"
+            } else {
+                "verify-draft"
+            };
+            let v_slice_res = verify_logits
+                .slice(&[0, slot, 0], &[1, slot + 1, vocab])
+                .and_then(|s| s.squeeze(Some(&[0, 1])));
+            match v_slice_res.and_then(|v1d| trace_top2(&v1d, vocab)) {
+                Ok(t2) => {
+                    eprintln!(
+                        "MTP_TRACE_LOGITS source={} verify_slot={} pos={} \
+                         token_id={} top1_id={} top1_logit={:.6} top2_id={} \
+                         top2_logit={:.6} gap={:.6}",
+                        source,
+                        j,
+                        token_history.len() + j,
+                        committed_id,
+                        t2.top1_id,
+                        t2.top1_logit,
+                        t2.top2_id,
+                        t2.top2_logit,
+                        t2.top1_logit - t2.top2_logit,
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "MTP_TRACE_LOGITS source={} verify_slot={} pos={} ERROR {}",
+                        source,
+                        j,
+                        token_history.len() + j,
+                        e.reason,
+                    );
+                }
+            }
+        }
+    }
+
     // Step 5: rollback. `accepted_drafts` is the number of draft
     // tokens (out of `depth`) whose K/V we are KEEPING in BOTH the
     // main and the MTP draft caches. The rest must be discarded.
@@ -2527,9 +2690,12 @@ macro_rules! decode_loop_mtp {
                 //
                 // We just need to seed the cycle's MTP draft inputs
                 // from the chained hidden and the embedding of `$y`.
-                let chained_h = chained_hidden_opt
-                    .take()
-                    .expect("chained_hidden_opt is Some on the chained path (guarded by do_step_a)");
+                let chained_h = chained_hidden_opt.take().ok_or_else(|| {
+                    napi::Error::from_reason(
+                        "chained_hidden_opt is Some on the chained path \
+                         (guarded by do_step_a)",
+                    )
+                })?;
                 // `run_mtp_cycle_inner` already sliced the K-th
                 // position out of the verify hiddens, so `chained_h`
                 // arrives shaped `[1, 1, hidden]` — the same shape the

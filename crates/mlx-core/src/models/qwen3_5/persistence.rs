@@ -1270,15 +1270,61 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         full_attention_interval: gi(&["full_attention_interval"], 4),
         partial_rotary_factor,
         rope_theta,
-        paged_cache_memory_mb: raw
-            .get("paged_cache_memory_mb")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32),
+        paged_cache_memory_mb: {
+            let explicit = raw
+                .get("paged_cache_memory_mb")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let n_mtp_local = gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0);
+            // Stage 1 (MTP-paged enablement): when MTP heads are
+            // present AND the user did not set a budget, default to
+            // 256 MB instead of the global default 2048 MB so that
+            // opt-in Stage 2 benches via `MLX_QWEN35_PAGED_OVERRIDE=1`
+            // do not pay a measurable memory-pressure tax on the dense
+            // MTP path. The 2048 MB upfront `LayerKVPool` allocation
+            // slows dense MTP decode by ~30% on M5 Max at 27B/nvfp4
+            // (and 512 MB still costs ~16%, while 256 MB is within
+            // ~5%). 256 MB covers ~4k tokens of K/V on qwen3.6-27b
+            // (16 attn layers × 4096 × 8 KV heads × 128 head_dim ×
+            // 2 bytes × 2 K+V ≈ 256 MB). Stage 2's paged-attn verify
+            // port can lift this when it needs more capacity.
+            //
+            // This default is harmless on non-paged paths — the field
+            // is only consulted when `use_block_paged_cache=Some(true)`,
+            // which Stage 1 does NOT auto-set; see the comment on
+            // `use_block_paged_cache` below.
+            explicit.or(if n_mtp_local > 0 { Some(256) } else { None })
+        },
         paged_block_size: raw
             .get("paged_block_size")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
-        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
+        // Stage 1 (MTP-paged enablement): we do NOT auto-flip
+        // `use_block_paged_cache` based on `n_mtp_layers > 0`. The
+        // Stage 1 hot path still runs the dense compiled MTP cycle
+        // (verify reads from `g_compiled_caches`, not the paged pool),
+        // so eagerly constructing the paged adapter on every MTP-
+        // capable checkpoint adds ~256 MB of unused GPU memory pressure
+        // AND (more importantly) silently routes pure-AR turns on the
+        // same checkpoint through the slower paged-AR dispatch path
+        // (the pre-existing ~6% gap between flat- and paged-AR decode
+        // on M3/M5 Max). Models WITHOUT MTP heads keep the existing
+        // default (`None` = OFF).
+        //
+        // Opt-in path for Stage 2 readiness benches: set
+        // `use_block_paged_cache=true` explicitly in the model config
+        // OR set the env var `MLX_QWEN35_PAGED_OVERRIDE=1`. The env var
+        // is a single boolean gate that takes precedence over the
+        // config value; `=0` forces OFF for A/B comparisons on a
+        // paged-enabled checkpoint.
+        use_block_paged_cache: {
+            let explicit = raw.get("use_block_paged_cache").and_then(|v| v.as_bool());
+            match std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok().as_deref() {
+                Some("1") | Some("true") | Some("TRUE") => Some(true),
+                Some("0") | Some("false") | Some("FALSE") => Some(false),
+                _ => explicit,
+            }
+        },
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
     })
 }
