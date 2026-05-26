@@ -59,7 +59,7 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 // | (eager verify prewarm)        | ON      | W6.7       | n/a (always)  |
 // | `mtpAdaptiveDepth` (TS field) | ON*     | W6.8       | per-session   |
 // | `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        |
-// | `MLX_MTP_VERIFY_ASYNC_EVAL`   | OFF     | W6.9       | opt-IN        |
+// | `MLX_MTP_VERIFY_ASYNC_EVAL`   | ON      | W6.9       | opt-OUT       |
 // | `MLX_MTP_FUSED_DRAFT`         | OFF     | W6.18      | opt-IN        |
 // | `MLX_MTP_SPARSE_ACCEPT`       | OFF     | W6.19      | opt-IN        |
 //
@@ -144,9 +144,16 @@ pub(crate) fn mtp_use_tape_replay() -> bool {
 // touching the FFI surface, the `MtpOps` closures, or the cycle
 // state machine.
 //
-// Opt-in: `MLX_MTP_VERIFY_ASYNC_EVAL=1` (or `true`). Default OFF until
-// the parity gates have shipped a couple of releases. The env var is
-// read once per process and cached.
+// Opt-out: `MLX_MTP_VERIFY_ASYNC_EVAL=0` (or `false` / `off`) reverts
+// to the synchronous `verify_logits.eval()` barrier. Default ON
+// (Phase 3, 2026-05-26): tape-replay (W6.6) has been stable for
+// multiple releases and the M5 Max controller bench on
+// `qwen3.6-27b-nvfp4-mtp-oproj8` measured the flag lifting the
+// depth-3 ratio from ~1.07× → ~1.13× with byte-identical acceptance.
+// This is the semantic equivalent of MTPLX's `LAZY_VERIFY_LOGITS`
+// (`MTPLX/mtplx/generation.py:49, 3894`) — both defer the
+// verify-logits sync until the accept loop's first downstream
+// `.eval()`. The env var is read once per process and cached.
 //
 // Naming note: an earlier draft of this flag was called
 // `MLX_MTP_PREFETCH`, but the change is overlap-with-CPU-graph-
@@ -160,9 +167,9 @@ pub(crate) fn mtp_verify_async_eval() -> bool {
     *CACHE.get_or_init(|| match std::env::var("MLX_MTP_VERIFY_ASYNC_EVAL") {
         Ok(v) => {
             let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
         }
-        Err(_) => false, // default OFF — flip in a follow-up after parity proven
+        Err(_) => true, // default ON — overlaps verify dispatch with accept-loop graph construction
     })
 }
 
@@ -1881,16 +1888,18 @@ where
         verify_tokens = depth + 1,
         "MTP verify dispatched (batched target forward over depth+1 tokens)"
     );
-    // W6.9 — Async-eval over verify outputs. When
-    // `MLX_MTP_VERIFY_ASYNC_EVAL=1`, we dispatch verify (logits +
-    // hiddens) via `async_eval` instead of the synchronous `eval()`
-    // below. The kernel launch returns immediately, letting the CPU
-    // construct the accept loop's penalty / softmax / slice graph
-    // while the verify command buffer is still executing on the GPU.
-    // The first downstream `eval()` (the accept loop's
-    // `p_target.eval()` at the per-position softmax) syncs on
-    // completion — the same overlap pattern DFlash applies in
-    // `spec_epoch.py:2069`'s `mx.async_eval(posterior)`.
+    // W6.9 — Async-eval over verify outputs. By default (Phase 3
+    // flip, 2026-05-26), we dispatch verify (logits + hiddens) via
+    // `async_eval` instead of the synchronous `eval()` below. The
+    // kernel launch returns immediately, letting the CPU construct
+    // the accept loop's penalty / softmax / slice graph while the
+    // verify command buffer is still executing on the GPU. The first
+    // downstream `eval()` (the accept loop's `p_target.eval()` at
+    // the per-position softmax) syncs on completion — the same
+    // overlap pattern DFlash applies in `spec_epoch.py:2069`'s
+    // `mx.async_eval(posterior)` and the semantic equivalent of
+    // MTPLX's `LAZY_VERIFY_LOGITS` (`MTPLX/mtplx/generation.py:49,
+    // 3894`).
     //
     // We batch `verify_hiddens` into the same async_eval call so MLX's
     // scheduler can fuse it with the verify logits graph (they share
@@ -1899,9 +1908,10 @@ where
     // by the chained-cycle path; for the default Step-A path the
     // batch eval is still cheap (one extra command-buffer entry).
     //
-    // When the env var is OFF (default), behaviour is byte-identical
-    // to pre-W6.9 — `verify_logits.eval()` blocks until verify is
-    // done before the accept loop's softmax graph is built.
+    // `MLX_MTP_VERIFY_ASYNC_EVAL=0` reverts to the synchronous
+    // `verify_logits.eval()` barrier — byte-identical to pre-W6.9
+    // behaviour for parity-debugging or hardware where the overlap
+    // budget is negligible.
     // W6.19 — Fast-path eligibility: at T=0 with all penalties at
     // defaults, the per-position accept decision collapses to
     // `argmax(verify_logits[i]) == draft_id[i]` (Bug #3 invariant

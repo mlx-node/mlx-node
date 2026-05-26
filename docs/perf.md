@@ -75,7 +75,7 @@ the user-set `mtpDepth` and needs per-session resolution.
 | (eager verify prewarm)        | always  | W6.7       | unconditional | No env var. Once-per-process `atomic<bool>` CAS at model load runs 10 dummy shapes (5 depths × 2 tape variants) to warm caches.                                                            |
 | `mtpAdaptiveDepth` (TS field) | ON\*    | W6.8       | per-session   | TS `ChatConfig` field. \* defaults ON when `enableMtp=true` and `mtpDepth` is unset; defaults OFF (pinned) when `mtpDepth` is set explicitly.                                              |
 | `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        | Slower than the default Step-A path at depth ≥ 2 even after the W6.5-resume fix batched the `verify_hidden[K]` slice into the next-cycle `async_eval`. The residual ~18% gap on bf16/M3 Max traces to cross-cycle CPU bookkeeping, not the slice DMA. |
-| `MLX_MTP_VERIFY_ASYNC_EVAL`   | OFF     | W6.9       | opt-IN        | Overlaps verify dispatch with the accept loop's CPU-side graph construction. Composes cleanly with all other flags.                                                                        |
+| `MLX_MTP_VERIFY_ASYNC_EVAL`   | ON      | W6.9       | opt-OUT       | Overlaps verify dispatch with the accept loop's CPU-side graph construction via `async_eval((verify_logits, verify_hiddens))`; the first downstream `.eval()` syncs (semantic analog of MTPLX's `LAZY_VERIFY_LOGITS`). Default ON since Phase 3 (2026-05-26): M5 Max measured +5–6% ratio uplift at depth 3 on `qwen3.6-27b-nvfp4-mtp-oproj8` with byte-identical acceptance. Set to `0` / `false` / `off` to revert to the synchronous barrier. Composes cleanly with all other flags. |
 | `MLX_MTP_FUSED_DRAFT`         | OFF     | W6.18      | opt-IN        | Fuses D draft steps into one compile()d graph. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending Step-A bypass follow-up where the infrastructure will pay off. Dense only — MoE always uses the per-step draft loop. |
 | `MLX_MTP_SPARSE_ACCEPT`       | OFF     | W6.19      | opt-IN        | Batched argmax over D+1 verify positions at T=0 with no penalties; collapses D × full-vocab softmax materializations into one .eval(). Falls back to legacy per-position path at T>0 or when sampling penalties are active. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending hardware/model targets where MLX scheduler exposes the sync cost. |
 | `MLX_MTP_BUCKETED_VERIFY`     | ON      | W6.29      | opt-OUT       | Per-bucket compiled verify graphs (`max_kv_len ∈ {256, 512, 1024, 2048, 4096, 8192}` + LEGACY fallback) so SDPA reads a static `[B, Hkv, bucket_kv_len, head_dim]` slice of the writeback cache. Eager prewarm at the prefill-offset bucket; lazy-trace others (~0.5 s per bucket-transition step). Measured at long decode (max_tokens=32768) on qwen3.5-4b / M3 Max: AR +12.0%, MTP +26.1%. No-op at default short prompts where the first bucket already covers the full cache. Set to `0` / `false` / `off` to force the legacy single-trace path. |
@@ -160,7 +160,8 @@ small-M (`M = depth+1`) quantized matmuls cheaper all **failed**:
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | Batched GEMM (`qmm` / `qmm_t_splitk`) at M=4  | ~38 % slower than `qmv`; split-K low-precision accumulation also degrades acceptance → ratio collapses to ~0.75× | (not re-tested — split-K accuracy regression is hardware-independent) |
 | `multi3` multi-row `qmv` (W6.30 port)         | 0.94× geomean vs stock `qmv` — slower even in its native affine-4-bit M=3 envelope                              | **0.94× geomean** — identical to M3; the M5 Neural Accelerator helps stock `qmv` symmetrically (`oxnode examples/qmv-multi3-microbench.ts`, 2026-05-26) |
-| `FUSED_DRAFT` / `SPARSE_ACCEPT` / `ASYNC_EVAL` | zero measured win (W6.18 / W6.19)                                                                              | (not re-tested — sync-collapse knobs are CPU-side; hardware-invariant) |
+| `FUSED_DRAFT` / `SPARSE_ACCEPT`               | zero measured win (W6.18 / W6.19)                                                                              | (not re-tested — sync-collapse knobs are CPU-side; hardware-invariant) |
+| `VERIFY_ASYNC_EVAL` (W6.9)                    | zero measured win on M3 Max (overlap budget too small)                                                          | **+5–6% ratio** at depth 3 on `qwen3.6-27b-nvfp4-mtp-oproj8` (~1.07× → ~1.13×) with byte-identical acceptance. Flipped to default ON in Phase 3 (2026-05-26). |
 | End-to-end MTP/AR ratio at optimal depth      | 1.14× (depth 1)                                                                                               | **1.15× (depth 1)** — Neural Accelerator does not widen the gap     |
 
 Stock MLX's small-M `qmv` is already near-optimal on both M3 and M5 Max:
@@ -200,8 +201,9 @@ the break-even point.
 Interactions:
 
 - `MLX_MTP_USE_TAPE_REPLAY=0` is safe to combine with all other flags.
-- `MLX_MTP_VERIFY_ASYNC_EVAL=1` composes cleanly with every other knob;
-  parity holds byte-exact at `T=0` across all combinations on qwen3.5-4b.
+- `MLX_MTP_VERIFY_ASYNC_EVAL` (default ON) composes cleanly with every
+  other knob; parity holds byte-exact at `T=0` across all combinations
+  on qwen3.5-4b.
 - Setting `mtpDepth` explicitly disables adaptive depth by default;
   pass `mtpAdaptiveDepth: true` alongside to keep adaptation enabled with
   `mtpDepth` as the initial seed.
