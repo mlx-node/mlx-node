@@ -5419,8 +5419,12 @@ impl Qwen35Inner {
         // order. For 'full' layers we emit the captured payload when the
         // recorder kept it, else the kind=full entry has an empty scores
         // array (frontend treats it as "not captured").
-        let mut captured_by_layer = std::collections::HashMap::<i32, &crate::inspector::CapturedAttention>::new();
-        for cap in &recorder.attention {
+        //
+        // Move captures out of the recorder so we can hand each `scores`
+        // Vec to `Float32Array::new` without cloning the (potentially
+        // 64 MiB) payload.
+        let mut captured_by_layer = std::collections::HashMap::<i32, crate::inspector::CapturedAttention>::new();
+        for cap in std::mem::take(&mut recorder.attention) {
             captured_by_layer.insert(cap.layer_index, cap);
         }
 
@@ -5429,6 +5433,9 @@ impl Qwen35Inner {
             let layer_idx = i as i32;
             let is_linear = self.config.is_linear_layer(i);
             if is_linear {
+                // Intentional empty Float32Array: the frontend treats
+                // `scores.length === 0` as "this layer was not captured",
+                // and linear layers never produce attention matrices.
                 attention_layers_out.push(AttentionLayerNapi {
                     layer_index: layer_idx,
                     kind: "linear".to_string(),
@@ -5436,15 +5443,20 @@ impl Qwen35Inner {
                     num_kv_heads: self.config.linear_num_key_heads,
                     scores: Float32Array::new(Vec::new()),
                 });
-            } else if let Some(cap) = captured_by_layer.get(&layer_idx) {
+            } else if let Some(cap) = captured_by_layer.remove(&layer_idx) {
+                // Move the captured scores Vec into the NAPI Float32Array
+                // (no clone — the CapturedAttention is dropped here).
                 attention_layers_out.push(AttentionLayerNapi {
                     layer_index: layer_idx,
                     kind: "full".to_string(),
                     num_heads: cap.num_heads,
                     num_kv_heads: cap.num_kv_heads,
-                    scores: Float32Array::new(cap.scores.clone()),
+                    scores: Float32Array::new(cap.scores),
                 });
             } else {
+                // Same "not captured" sentinel as the linear branch — the
+                // frontend distinguishes by `kind` while still seeing
+                // `scores.length === 0`.
                 attention_layers_out.push(AttentionLayerNapi {
                     layer_index: layer_idx,
                     kind: "full".to_string(),

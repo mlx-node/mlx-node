@@ -32,6 +32,17 @@ use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::nn::Activations;
 
+/// Soft cap on cumulative attention bytes captured by a single inspector run.
+///
+/// The browser deploy runs in a 4 GiB WASM heap shared with model weights,
+/// KV cache, and lesson scratch buffers. A single Qwen3.5-0.8B full-attention
+/// layer at 1k context costs `32 heads * 1024 * 1024 * 4 bytes = 128 MiB`
+/// in fp32, so 256 MiB allows roughly two such layers — enough for the
+/// lesson UI's typical "compare layer A vs layer B" view while preventing a
+/// misconfigured request (capture every full layer at the context cap) from
+/// silently blowing past the heap budget.
+pub const INSPECTOR_TOTAL_BYTES_SOFT_CAP: usize = 256 * 1024 * 1024;
+
 /// Per-full-attention-layer attention score capture.
 ///
 /// `scores` is the post-softmax attention matrix in row-major
@@ -75,6 +86,10 @@ pub struct InspectorRecorder {
     /// recorder's encounter sequence (matches the forward-pass layer iteration
     /// order).
     pub attention: Vec<CapturedAttention>,
+    /// Cumulative bytes captured into [`Self::attention`]. Used to enforce
+    /// [`INSPECTOR_TOTAL_BYTES_SOFT_CAP`] across all captured layers in a
+    /// single inspector run.
+    pub captured_bytes: usize,
 }
 
 impl InspectorRecorder {
@@ -84,6 +99,7 @@ impl InspectorRecorder {
             attention_enabled,
             attention_layers,
             attention: Vec::new(),
+            captured_bytes: 0,
         }
     }
 
@@ -152,6 +168,25 @@ impl InspectorRecorder {
             )));
         }
 
+        // Soft-cap guard. Compute the f32 byte cost of this capture before
+        // we touch the GPU and reject early if adding it would exceed the
+        // per-run budget. This protects the WASM heap from a misconfigured
+        // "capture every full-attention layer at 1k context" request.
+        let expected_bytes = (num_heads as usize)
+            .saturating_mul(seq_q as usize)
+            .saturating_mul(seq_k as usize)
+            .saturating_mul(4);
+        let captured_bytes_after = self.captured_bytes.saturating_add(expected_bytes);
+        if captured_bytes_after > INSPECTOR_TOTAL_BYTES_SOFT_CAP {
+            return Err(Error::from_reason(format!(
+                "Inspector capture would exceed soft cap: requested {} MiB, total {} MiB, cap {} MiB. \
+                 Capture fewer layers or reduce context length.",
+                expected_bytes / 1024 / 1024,
+                captured_bytes_after / 1024 / 1024,
+                INSPECTOR_TOTAL_BYTES_SOFT_CAP / 1024 / 1024,
+            )));
+        }
+
         // Promote to f32 for the side-branch math so the softmax we emit is
         // identical bit-for-bit on every host. The fused SDPA kernel preserves
         // the input dtype; ours doesn't have to.
@@ -195,7 +230,11 @@ impl InspectorRecorder {
         let scores = if seq_q > 1 {
             // `create_causal_mask` returns a bool [seq_q, seq_k] tensor where
             // TRUE = keep score. Translate to an additive mask: 0 where keep,
-            // -1e9 where mask. (-inf would propagate NaN through any padding.)
+            // -1e9 where mask.
+            // Additive mask: -1e9 on masked positions; softmax(-1e9) ≈ 0 in f32.
+            // The fused SDPA kernel uses -INF internally, so reconstructed
+            // scores match to f32 precision on unmasked cells and are exactly
+            // zero on masked cells.
             let bool_mask = create_causal_mask(
                 seq_q as i32,
                 Some(kv_offset),
@@ -215,7 +254,7 @@ impl InspectorRecorder {
 
         let probs = Activations::softmax(&scores, Some(-1))?;
         probs.eval();
-        let mut buffer = probs.to_float32_vec()?;
+        let buffer = probs.to_float32_vec()?;
 
         // Squeeze the batch axis: layout becomes [H, T_q, T_k] row-major.
         let expected_len = (num_heads as usize) * (seq_q as usize) * (seq_k as usize);
@@ -229,9 +268,6 @@ impl InspectorRecorder {
                 seq_k,
             )));
         }
-        // Pre-shrink any speculative over-allocation so the downstream copy
-        // into a NAPI Float32Array is exact.
-        buffer.shrink_to_fit();
 
         self.attention.push(CapturedAttention {
             layer_index,
@@ -241,6 +277,7 @@ impl InspectorRecorder {
             seq_k: seq_k as i32,
             scores: buffer,
         });
+        self.captured_bytes = captured_bytes_after;
         Ok(())
     }
 }
