@@ -35,6 +35,7 @@ import { RmsNormChapterBody, RmsNormDemo } from './learn/chapters/06-rms-norm';
 import { MlpChapterBody, MlpDemo } from './learn/chapters/07-mlp';
 import { FullBlockChapterBody, FullBlockDemo } from './learn/chapters/08-full-block';
 import { SamplingChapterBody, SamplingDemo } from './learn/chapters/09-sampling';
+import { KvCacheChapterBody, KvCacheDemo } from './learn/chapters/10-kv-cache';
 
 const INITIAL_SCREEN: ScreenState = { kind: 'landing' };
 import 'streamdown/styles.css';
@@ -2100,6 +2101,8 @@ function App() {
                 <FullBlockDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'sampling' ? (
                 <SamplingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : chapter.id === 'kv-cache' ? (
+                <KvCacheDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : null
             }
           >
@@ -2121,6 +2124,8 @@ function App() {
               <FullBlockChapterBody />
             ) : chapter.id === 'sampling' ? (
               <SamplingChapterBody />
+            ) : chapter.id === 'kv-cache' ? (
+              <KvCacheChapterBody />
             ) : (
               <div className="text-muted-foreground">
                 This chapter is not yet authored.

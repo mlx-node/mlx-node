@@ -92,7 +92,7 @@ export const CHAPTERS: ChapterMeta[] = [
     title: "KV cache & hybrid attention",
     blurb:
       "Why inference is fast, and how Qwen3.5 interleaves linear and full attention.",
-    available: false,
+    available: true,
   },
 ];
 
