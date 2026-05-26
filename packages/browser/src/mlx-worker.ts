@@ -60,6 +60,11 @@ import {
   type BridgeStub,
 } from "./webgpu-bridge-stub.js";
 import { workerAssetUrl } from "./worker-asset-url.js";
+import {
+  INSPECTOR_ERROR_TYPE,
+  INSPECTOR_REQUEST_TYPE,
+  INSPECTOR_RESULT_TYPE,
+} from "./inspector-types.js";
 
 let model: any = null;
 let mlxExports: any = null;
@@ -2653,7 +2658,7 @@ async function handleRunForInspector(data: {
   const id = data.id;
   if (!model || typeof model.runForInspector !== "function") {
     (self as any).postMessage({
-      type: "inspectorError",
+      type: INSPECTOR_ERROR_TYPE,
       id,
       error: "Model not loaded",
     });
@@ -2690,12 +2695,16 @@ async function handleRunForInspector(data: {
       }
     }
     (self as any).postMessage(
-      { type: "inspectorResult", id, result },
+      { type: INSPECTOR_RESULT_TYPE, id, result },
       transfer,
     );
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
-    (self as any).postMessage({ type: "inspectorError", id, error: message });
+    (self as any).postMessage({
+      type: INSPECTOR_ERROR_TYPE,
+      id,
+      error: message,
+    });
   }
 }
 
@@ -2741,7 +2750,7 @@ self.onmessage = (e: MessageEvent) => {
         streamFinalizeResolve(e.data.numTokens ?? 0);
       }
       break;
-    case "runForInspector":
+    case INSPECTOR_REQUEST_TYPE:
       void handleRunForInspector(e.data);
       break;
   }

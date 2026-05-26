@@ -82,6 +82,22 @@ export type InspectorResult =
   | { type: 'inspectorError'; id: string; error: string };
 
 // -----------------------------------------------------------------------------
+// Protocol string constants
+// -----------------------------------------------------------------------------
+//
+// The worker (`mlx-worker.ts`) and the main-thread bridge
+// (`demo/lib/inspector-client.ts`) both need to write/read these `type` fields
+// on `postMessage` payloads. Exporting them here keeps the single source of
+// truth in this file so the two ends can't drift on a typo. The TypeScript
+// literal unions above (`type: 'runForInspector'` etc.) are intentionally kept
+// as plain string literals for readability; the constants are the *runtime*
+// values both sides use.
+
+export const INSPECTOR_REQUEST_TYPE = 'runForInspector' as const;
+export const INSPECTOR_RESULT_TYPE = 'inspectorResult' as const;
+export const INSPECTOR_ERROR_TYPE = 'inspectorError' as const;
+
+// -----------------------------------------------------------------------------
 // Notes for the backend implementer (crates/mlx-core, Rust).
 // -----------------------------------------------------------------------------
 //

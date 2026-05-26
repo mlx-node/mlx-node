@@ -311,6 +311,12 @@ function App() {
   // chat path. The worker itself is owned by the load-model effect below;
   // this ref is populated when the worker comes up and nulled on teardown.
   const mlxWorkerRef = useRef<Worker | null>(null);
+  // Abort signal for in-flight inspector calls. The load-model effect's
+  // cleanup function aborts this BEFORE calling `worker.terminate()`, so any
+  // chapter-side `runForInspector` Promise rejects within a tick instead of
+  // hanging the full 60s timeout waiting for a reply from a dead worker.
+  // A fresh controller is installed for each kickoff cycle.
+  const inspectorAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const modelDirInput = modelDirInputRef.current;
@@ -1213,6 +1219,11 @@ function App() {
       type: 'module',
     });
     mlxWorkerRef.current = worker;
+    // Install a fresh AbortController for inspector calls bound to this
+    // worker. The cleanup function below aborts it before terminating the
+    // worker so in-flight `runForInspector` Promises in chapter components
+    // reject immediately instead of waiting on the dead worker's reply.
+    inspectorAbortRef.current = new AbortController();
 
     function postChatRequest() {
       const toolsEnabled = appToolsEnabledRef.current;
@@ -1881,6 +1892,13 @@ function App() {
       activeReaderAbort?.abort();
       if (rafHandle != null) cancelAnimationFrame(rafHandle);
       unmountAllStreamdown();
+      // Abort any in-flight inspector calls BEFORE terminating the worker.
+      // After `terminate()` the worker can never reply, so an outstanding
+      // `runForInspector` Promise would otherwise hang for the full 60s
+      // timeout. Signalling abort lets chapter components show the soft
+      // "cancelled" banner within a tick.
+      inspectorAbortRef.current?.abort();
+      inspectorAbortRef.current = null;
       worker.terminate();
       if (mlxWorkerRef.current === worker) {
         mlxWorkerRef.current = null;
@@ -2055,7 +2073,11 @@ function App() {
               setLoadKickoff((k) => k + 1);
               dispatchScreen({ type: 'open_free_chat' });
             }}
-            tryItPanel={chapter.id === 'attention' ? <AttentionDemo workerRef={mlxWorkerRef} /> : null}
+            tryItPanel={
+              chapter.id === 'attention' ? (
+                <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : null
+            }
           >
             {chapter.id === 'attention' ? (
               <AttentionChapterBody />

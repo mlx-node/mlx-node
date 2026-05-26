@@ -25,7 +25,15 @@ export type AttentionDemoProps = {
    * model is not loaded — in that case the demo falls back to mock data and
    * shows a banner so the user knows what they're looking at.
    */
-  workerRef: React.MutableRefObject<Worker | null>;
+  workerRef: React.RefObject<Worker | null>;
+  /**
+   * Ref to an AbortController bound to the current worker's lifetime. The
+   * app shell aborts this before calling `worker.terminate()` (model swap /
+   * reload kickoff). The Run handler threads `signal` into `runForInspector`
+   * so an in-flight call rejects immediately on teardown instead of hanging
+   * for the full 60s timeout. May be `null` between worker lifecycles.
+   */
+  abortRef: React.RefObject<AbortController | null>;
 };
 
 export function AttentionChapterBody() {
@@ -162,9 +170,17 @@ export function AttentionChapterBody() {
 type RunStatus =
   | { kind: "ok" }
   | { kind: "mock-no-worker" }
-  | { kind: "mock-error"; error: string };
+  | { kind: "mock-error"; error: string }
+  | { kind: "aborted" };
 
-export function AttentionDemo({ workerRef }: AttentionDemoProps) {
+function isAbortError(err: unknown): boolean {
+  return (
+    err instanceof DOMException &&
+    err.name === "AbortError"
+  );
+}
+
+export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT);
   const [run, setRun] = React.useState<AttentionRun | null>(null);
   const [status, setStatus] = React.useState<RunStatus | null>(null);
@@ -193,23 +209,38 @@ export function AttentionDemo({ workerRef }: AttentionDemoProps) {
     }
 
     try {
-      const result = await runForInspector(worker, {
-        prompt,
-        attention: true,
-        maxNewTokens: 1,
-      });
+      const signal = abortRef.current?.signal;
+      const result = await runForInspector(
+        worker,
+        {
+          prompt,
+          attention: true,
+          maxNewTokens: 1,
+        },
+        signal ? { signal } : undefined,
+      );
       setRun(result);
       setStatus({ kind: "ok" });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(
-        "[attention-demo] runForInspector failed; falling back to mock",
-        err,
-      );
-      useMockFallback(
-        { kind: "mock-error", error: message },
-        "[attention-demo] using mock AttentionRun (backend error)",
-      );
+      if (isAbortError(err)) {
+        // Worker was terminated (model reload / swap) mid-call. Treat this as
+        // a soft cancellation, not an error: leave any previously-rendered
+        // run in place and show a neutral banner.
+        console.info(
+          "[attention-demo] runForInspector aborted (worker terminated)",
+        );
+        setStatus({ kind: "aborted" });
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(
+          "[attention-demo] runForInspector failed; falling back to mock",
+          err,
+        );
+        useMockFallback(
+          { kind: "mock-error", error: message },
+          "[attention-demo] using mock AttentionRun (backend error)",
+        );
+      }
     } finally {
       setRunning(false);
     }
@@ -238,6 +269,15 @@ export function AttentionDemo({ workerRef }: AttentionDemoProps) {
         </div>
       </div>
 
+      {status?.kind === "aborted" ? (
+        <div
+          role="status"
+          className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+        >
+          Inspector run cancelled — the model was reloaded. Click{" "}
+          <strong>Run</strong> again to retry.
+        </div>
+      ) : null}
       {run ? (
         <div className="space-y-3 pt-2">
           {status?.kind === "mock-no-worker" ? (
@@ -260,7 +300,7 @@ export function AttentionDemo({ workerRef }: AttentionDemoProps) {
           ) : null}
           <AttentionHeatmap run={run} />
         </div>
-      ) : (
+      ) : status?.kind === "aborted" ? null : (
         <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
           Click <strong>Run</strong> to see the attention heatmap.
         </div>
