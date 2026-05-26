@@ -7,6 +7,7 @@ use crate::array::mask::create_causal_mask;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
+use crate::inspector::InspectorRecorder;
 use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
@@ -314,6 +315,148 @@ impl Qwen3_5Attention {
         // Output projection
         let result = self.o_proj.forward(&gated_output)?;
         Ok(result)
+    }
+
+    /// Inspector-aware forward.
+    ///
+    /// Behaviourally identical to [`Self::forward`] when `recorder` is
+    /// `None` or when `recorder.should_capture_layer(layer_index)` is
+    /// `false`. When capture is on, the post-RoPE / post-QK-norm Q and K
+    /// tensors are materialized and passed to
+    /// [`InspectorRecorder::capture_attention`] *after* the cache update
+    /// (so K reflects the full attended context) but *before* the SDPA
+    /// matmul with V — matching the contract on
+    /// `inspector-types.ts::AttentionLayer.scores`.
+    ///
+    /// This is a separate method (rather than an extra arg on `forward`)
+    /// to keep the chat hot path's call graph byte-identical. The
+    /// inspector recompute is a side branch — the fused SDPA kernel
+    /// still produces the actual layer output, so generation results
+    /// stay bitwise-identical with or without the recorder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_inspector(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut KVCache>,
+        position_ids: Option<&MxArray>,
+        _rope_offset_delta: i32,
+        recorder: Option<&mut InspectorRecorder>,
+        layer_index: i32,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+
+        let q_proj_output = self.q_proj.forward(x)?;
+        let q_per_head = q_proj_output.reshape(&[
+            batch,
+            seq_len,
+            self.num_heads as i64,
+            (self.head_dim * 2) as i64,
+        ])?;
+        let queries = q_per_head.slice_axis(3, 0, self.head_dim as i64)?;
+        let gate = q_per_head.slice_axis(3, self.head_dim as i64, (self.head_dim * 2) as i64)?;
+        let gate = gate.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+
+        let keys = self.k_proj.forward(x)?;
+        let values = self.v_proj.forward(x)?;
+
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+
+        let queries = self.q_norm.forward(&queries)?;
+        let keys = self.k_norm.forward(&keys)?;
+
+        // Inspector runs in text-only mode — VLM / M-RoPE captures are
+        // not in scope for this slice, so we mirror the standard scalar-
+        // offset RoPE branch only.
+        let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
+            // Match the regular forward's M-RoPE branch for parity, even
+            // though the inspector entry point won't drive it for the
+            // current vertical slice.
+            let (cos, sin) = mrope.forward(&queries, pos_ids)?;
+            let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+            let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+            let (q_out, k_out) = apply_multimodal_rotary_pos_emb(
+                &q_t,
+                &k_t,
+                &cos,
+                &sin,
+                mrope.mrope_section_arr().to_vec(),
+            )?;
+            let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
+            let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
+            (q_out, k_out)
+        } else {
+            let offset = cache.as_ref().map_or(0, |c| c.get_offset());
+            let queries = self.rope.forward(&queries, Some(offset))?;
+            let keys = self.rope.forward(&keys, Some(offset))?;
+            (queries, keys)
+        };
+
+        let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        // Capture the cache offset *before* update_and_fetch so the causal
+        // mask can be built against the pre-update KV length when decoding
+        // on top of a prefill (offset > 0 means the cache already has
+        // history; the new query attends to all of it).
+        let pre_update_offset = cache.as_ref().map_or(0, |c| c.get_offset());
+
+        let (keys, values) = if let Some(c) = cache {
+            c.update_and_fetch(&keys, &values)?
+        } else {
+            (keys, values)
+        };
+
+        // Side-branch capture. Runs only when the recorder asked for this
+        // layer — otherwise no extra GPU work.
+        if let Some(rec) = recorder {
+            if rec.should_capture_layer(layer_index) {
+                // Force Q and the (possibly cache-extended) K materialized
+                // before the side branch reads them. Without this the
+                // recorder's `.to_float32_vec()` would block on an
+                // unrelated lazy graph.
+                queries.eval();
+                keys.eval();
+                rec.capture_attention(
+                    layer_index,
+                    &queries,
+                    &keys,
+                    self.scale,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    pre_update_offset,
+                )?;
+            }
+        }
+
+        let output = if let Some(m) = mask {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, Some(m))?
+        } else if seq_len > 1 {
+            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
+        } else {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, None)?
+        };
+
+        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+
+        let gate_sigmoid = Activations::sigmoid(&gate)?;
+        let gated_output = output.mul(&gate_sigmoid)?;
+
+        self.o_proj.forward(&gated_output)
     }
 
     /// Forward pass routed through the block-paged KV adapter.

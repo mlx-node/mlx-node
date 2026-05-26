@@ -1,4 +1,5 @@
 use crate::array::MxArray;
+use crate::inspector::InspectorRecorder;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -156,6 +157,49 @@ impl DecoderLayer {
         let out = h.add(&mlp_out)?;
         log_tensor_stats(&format!("layer.{:02}.decoder.out", self.layer_idx), &out);
         Ok(out)
+    }
+
+    /// Inspector-aware forward pass.
+    ///
+    /// Behaves identically to [`Self::forward`] for Linear (GatedDeltaNet)
+    /// layers — the inspector vertical slice does not capture linear-
+    /// attention recurrent state; the frontend stitches in an empty
+    /// `scores` Float32Array for those layers from the result-side
+    /// metadata.
+    ///
+    /// For Full attention layers, dispatches to
+    /// [`Qwen3_5Attention::forward_with_inspector`] which routes through
+    /// the inspector recorder. `recorder` may be `None` to skip capture
+    /// (e.g. for decode steps that aren't supposed to capture); when
+    /// `Some`, layer filtering is enforced inside the recorder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_inspector(
+        &mut self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+        recorder: Option<&mut InspectorRecorder>,
+    ) -> Result<MxArray> {
+        let layer_idx = self.layer_idx as i32;
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = match &mut self.attn {
+            AttentionType::Linear(gdn) => {
+                let _ = recorder; // linear layers contribute an empty `scores` payload
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward(&normed, mask, ac, use_kernel)?
+            }
+            AttentionType::Full(attn) => {
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                attn.forward_with_inspector(&normed, mask, kvc, position_ids, 0, recorder, layer_idx)?
+            }
+        };
+
+        let h = x.add(&attn_out)?;
+        let normed = self.post_attention_layernorm.forward(&h)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        h.add(&mlp_out)
     }
 
     /// Forward pass with paged-or-flat dispatch for Qwen3.5.

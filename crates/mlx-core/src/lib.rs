@@ -20,6 +20,7 @@ pub mod gradients;
 #[cfg(not(target_family = "wasm"))]
 pub mod grpo;
 pub(crate) mod inference_trace;
+pub mod inspector;
 pub mod model_thread;
 pub mod models;
 pub mod nn;

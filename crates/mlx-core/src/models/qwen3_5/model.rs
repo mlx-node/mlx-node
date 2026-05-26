@@ -10,6 +10,10 @@ use tracing::{info, warn};
 use crate::array::MxArray;
 #[cfg(target_family = "wasm")]
 use crate::chat_stream::{ChatStreamSink, MIN_SAB_LEN, SabSink};
+use crate::inspector::{
+    AttentionLayerNapi, AttentionRunNapi, INSPECTOR_MAX_NEW_TOKENS_CAP, InspectorRecorder,
+    InspectorRunOptions, ModelMetaNapi, TokenInfoNapi,
+};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -398,6 +402,13 @@ pub(crate) enum Qwen35Cmd {
         config: Qwen3_5GenerationConfig,
         reply: ResponseTx<Qwen3_5GenerationResult>,
     },
+    /// Inspector-enabled short generation that captures attention scores.
+    /// See [`Qwen35Inner::run_for_inspector_sync`] for semantics.
+    RunForInspector {
+        prompt: String,
+        opts: InspectorRunOptions,
+        reply: ResponseTx<AttentionRunNapi>,
+    },
     ResetCaches {
         reply: ResponseTx<()>,
     },
@@ -547,6 +558,13 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             reply,
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
+        }
+        Qwen35Cmd::RunForInspector {
+            prompt,
+            opts,
+            reply,
+        } => {
+            let _ = reply.send(inner.run_for_inspector_sync(prompt, opts));
         }
         Qwen35Cmd::ResetCaches { reply } => {
             let _ = reply.send(inner.reset_caches_sync());
@@ -5222,6 +5240,230 @@ impl Qwen35Inner {
         })
     }
 
+    // ========== Inspector entry (run on model thread) ==========
+
+    /// Run a short generation with attention-score capture for the
+    /// education-app Inspector. See `crates/mlx-core/src/inspector.rs`
+    /// for the recorder contract and
+    /// `packages/browser/src/inspector-types.ts` for the JS-side data shape.
+    ///
+    /// Mirrors [`Self::generate_sync`] structurally, but:
+    ///   - Drives forward through `forward_inner_with_inspector` so the
+    ///     post-softmax attention scores are captured on the prefill pass.
+    ///   - Hard-caps `max_new_tokens` at `INSPECTOR_MAX_NEW_TOKENS_CAP`.
+    ///   - Returns the captured attention payload alongside the tokens.
+    ///
+    /// The chat / `generate` hot paths are untouched: the recorder lives
+    /// purely inside this function's stack frame and only the explicit
+    /// `forward_inner_with_inspector` site receives it.
+    pub(crate) fn run_for_inspector_sync(
+        &mut self,
+        prompt: String,
+        opts: InspectorRunOptions,
+    ) -> Result<AttentionRunNapi> {
+        let attention_enabled = opts.attention.unwrap_or(false);
+        let attention_layers = opts.attention_layers.clone();
+        let max_new_tokens_raw = opts.max_new_tokens.unwrap_or(1);
+        if max_new_tokens_raw < 1 {
+            return Err(Error::from_reason(format!(
+                "run_for_inspector requires max_new_tokens >= 1, got {}",
+                max_new_tokens_raw
+            )));
+        }
+        let max_new_tokens = max_new_tokens_raw.min(INSPECTOR_MAX_NEW_TOKENS_CAP);
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        // Tokenize the raw prompt. Inspector runs are intentionally NOT
+        // routed through the jinja chat template — this is a "what does
+        // the model see for this exact string?" hook, and the lessons
+        // typically pass short literal strings ("The cat sat on the").
+        let prompt_token_ids = tokenizer.encode_sync(&prompt, Some(false))?;
+        if prompt_token_ids.is_empty() {
+            return Err(Error::from_reason(
+                "run_for_inspector: empty prompt after tokenization",
+            ));
+        }
+        let prompt_token_ids_for_decode = prompt_token_ids.clone();
+        let prompt_array = MxArray::from_uint32(
+            &prompt_token_ids,
+            &[1, prompt_token_ids.len() as i64],
+        )?;
+
+        // Build the recorder and run prefill with capture.
+        self.init_caches_sync()?;
+        let mut recorder = InspectorRecorder::new(attention_enabled, attention_layers);
+
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        let last_logits = {
+            let _stream_ctx = StreamContext::new(generation_stream);
+            forward_inner_with_inspector(
+                &prompt_array,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                &mut recorder,
+            )?
+        };
+
+        let seq_len = last_logits.shape_at(1)?;
+        let last_logits = last_logits.slice_axis(1, seq_len - 1, seq_len)?;
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
+
+        // Greedy sample the first generated token. Inspector visualisations
+        // are easier to reason about with deterministic argmax; a stochastic
+        // sampler would force the lesson UI to either reseed or accept
+        // surprises mid-screenshot.
+        let sampling_config = Some(SamplingConfig {
+            temperature: Some(0.0),
+            top_k: None,
+            top_p: None,
+            min_p: None,
+        });
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut y = sample(&last_logits, sampling_config)?;
+        let eos_id = self.config.eos_token_id as u32;
+
+        for step in 0..max_new_tokens {
+            y.eval();
+            let token_id = y.item_at_int32(0)? as u32;
+            generated_tokens.push(token_id);
+
+            if step + 1 == max_new_tokens || token_id == eos_id {
+                break;
+            }
+
+            let next_ids = y.reshape(&[1, 1])?;
+            // Decode steps do NOT re-capture attention — we already have
+            // the prefill capture, and decode-step capture would just be
+            // a [num_heads, 1, kv_len] strip per layer per step, which the
+            // current frontend slice doesn't need.
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                forward_inner(
+                    &next_ids,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    Some(&embedding_weight_t),
+                )?
+            };
+            let logits = logits.squeeze(Some(&[1]))?;
+            y = sample(&logits, sampling_config)?;
+        }
+
+        // Always reset caches — the inspector run is one-shot, not a
+        // multi-turn session, and leaving caches populated would leak
+        // state into the next chat turn.
+        self.reset_caches_sync()?;
+
+        // ---- Serialize prompt tokens ----
+        let mut token_infos: Vec<TokenInfoNapi> = Vec::with_capacity(prompt_token_ids.len());
+        for &id in &prompt_token_ids_for_decode {
+            let text = tokenizer
+                .decode_sync(&[id], false)
+                .unwrap_or_else(|_| String::new());
+            token_infos.push(TokenInfoNapi {
+                id: id as i32,
+                text,
+            });
+        }
+
+        // ---- Serialize generated token (first one only — per contract) ----
+        let first_generated = *generated_tokens
+            .first()
+            .ok_or_else(|| Error::from_reason("run_for_inspector produced no tokens"))?;
+        let generated_text = tokenizer
+            .decode_sync(&[first_generated], false)
+            .unwrap_or_else(|_| String::new());
+        let generated_token = TokenInfoNapi {
+            id: first_generated as i32,
+            text: generated_text,
+        };
+
+        // ---- Build model meta + per-layer attention vector ----
+        let num_layers = self.config.num_layers;
+        let mut full_attention_layer_indices: Vec<i32> = Vec::new();
+        for i in 0..(num_layers as usize) {
+            if !self.config.is_linear_layer(i) {
+                full_attention_layer_indices.push(i as i32);
+            }
+        }
+
+        let model_meta = ModelMetaNapi {
+            name: format!(
+                "Qwen3.5-{}H-{}L",
+                self.config.num_heads, self.config.num_layers
+            ),
+            num_layers,
+            full_attention_layer_indices: full_attention_layer_indices.clone(),
+        };
+
+        // ---- Assemble AttentionLayerNapi entries ----
+        //
+        // The contract: one entry per layer captured. For 'linear' layers
+        // we still include an entry with `kind: "linear"` and an empty
+        // `scores` Float32Array so the frontend can reason about layer
+        // order. For 'full' layers we emit the captured payload when the
+        // recorder kept it, else the kind=full entry has an empty scores
+        // array (frontend treats it as "not captured").
+        let mut captured_by_layer = std::collections::HashMap::<i32, &crate::inspector::CapturedAttention>::new();
+        for cap in &recorder.attention {
+            captured_by_layer.insert(cap.layer_index, cap);
+        }
+
+        let mut attention_layers_out: Vec<AttentionLayerNapi> = Vec::with_capacity(num_layers as usize);
+        for i in 0..(num_layers as usize) {
+            let layer_idx = i as i32;
+            let is_linear = self.config.is_linear_layer(i);
+            if is_linear {
+                attention_layers_out.push(AttentionLayerNapi {
+                    layer_index: layer_idx,
+                    kind: "linear".to_string(),
+                    num_heads: self.config.linear_num_value_heads,
+                    num_kv_heads: self.config.linear_num_key_heads,
+                    scores: Float32Array::new(Vec::new()),
+                });
+            } else if let Some(cap) = captured_by_layer.get(&layer_idx) {
+                attention_layers_out.push(AttentionLayerNapi {
+                    layer_index: layer_idx,
+                    kind: "full".to_string(),
+                    num_heads: cap.num_heads,
+                    num_kv_heads: cap.num_kv_heads,
+                    scores: Float32Array::new(cap.scores.clone()),
+                });
+            } else {
+                attention_layers_out.push(AttentionLayerNapi {
+                    layer_index: layer_idx,
+                    kind: "full".to_string(),
+                    num_heads: self.config.num_heads,
+                    num_kv_heads: self.config.num_kv_heads,
+                    scores: Float32Array::new(Vec::new()),
+                });
+            }
+        }
+
+        Ok(AttentionRunNapi {
+            prompt,
+            tokens: token_infos,
+            generated_token,
+            attention: attention_layers_out,
+            model_meta,
+        })
+    }
+
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
@@ -6784,6 +7026,33 @@ impl Qwen3_5Model {
         .await
     }
 
+    /// Run a short inspector-enabled generation that captures attention
+    /// scores for the education-app "Try it now" panels.
+    ///
+    /// See `packages/browser/src/inspector-types.ts` for the canonical
+    /// data shape consumed on the JS side, and
+    /// `crates/mlx-core/src/inspector.rs` for the recorder
+    /// implementation.
+    ///
+    /// Off by default: when `opts.attention` is `false` (or omitted) this
+    /// still runs a short generation and returns layer metadata, but no
+    /// `scores` payloads are populated. The chat / `generate` hot paths
+    /// are completely unaffected by this method — it goes through a
+    /// dedicated command on the model thread.
+    #[napi]
+    pub async fn run_for_inspector(
+        &self,
+        prompt: String,
+        opts: InspectorRunOptions,
+    ) -> Result<AttentionRunNapi> {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::RunForInspector {
+            prompt,
+            opts,
+            reply,
+        })
+        .await
+    }
+
     /// Start a new chat session.
     ///
     /// Runs the full jinja chat template once and uses `<|im_end|>` as
@@ -7495,6 +7764,47 @@ fn forward_inner(
     for i in 0..num_layers {
         let cache = caches.as_mut().map(|c| &mut c[i]);
         h = layers[i].forward(&h, None, cache, None, true)?;
+    }
+
+    let h = final_norm.forward(&h)?;
+    match lm_head {
+        Some(head) => head.forward(&h),
+        None => match embedding_weight_t {
+            Some(wt) => h.matmul(wt),
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                h.matmul(&wt)
+            }
+        },
+    }
+}
+
+/// Inspector-aware mirror of [`forward_inner`].
+///
+/// Threads a single `InspectorRecorder` through every decoder layer.
+/// Each layer's `DecoderLayer::forward_with_inspector` decides whether
+/// to actually capture (only full-attention layers, only when the
+/// recorder asked for that layer index). Used exclusively from
+/// `run_for_inspector_sync` — the chat / `generate` hot paths still
+/// call the original `forward_inner`.
+fn forward_inner_with_inspector(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight_t: Option<&MxArray>,
+    recorder: &mut InspectorRecorder,
+) -> Result<MxArray> {
+    let embedding = Embedding::from_weight(embedding_weight)?;
+    let hidden_states = embedding.forward(input_ids)?;
+    let mut h = hidden_states.clone();
+
+    let num_layers = layers.len();
+    for i in 0..num_layers {
+        let cache = caches.as_mut().map(|c| &mut c[i]);
+        h = layers[i].forward_with_inspector(&h, None, cache, None, true, Some(recorder))?;
     }
 
     let h = final_norm.forward(&h)?;
