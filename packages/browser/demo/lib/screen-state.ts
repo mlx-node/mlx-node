@@ -1,11 +1,38 @@
-export type ScreenState = "landing" | "loading" | "chat";
+// Screen-state machine for the demo SPA.
+//
+// Today's flow (still intact):
+//   landing --load_kickoff--> loading --model_ready--> chat
+//                                       --model_error--> landing
+//
+// New "Inspector" lesson flow (Education App pivot):
+//   landing --start_learning--> chapter_index
+//   chapter_index --open_chapter--> chapter
+//   chapter --back_to_index--> chapter_index
+//   chapter_index --back_to_landing--> landing
+//   any-learn-state --open_free_chat--> loading (then chat via model_ready)
+//
+// The lesson states (chapter_index, chapter) do NOT require the model to be
+// loaded — chapters can run mocked or self-contained widgets. Tapping
+// "Open free chat" from anywhere in learn mode kicks off the model load if
+// it hasn't been loaded already (delegated to the existing load_kickoff path).
+export type ScreenState =
+  | "landing"
+  | "loading"
+  | "chat"
+  | "chapter_index"
+  | "chapter";
 
 export type ScreenEvent =
   | { type: "init" }
   | { type: "load_kickoff" }
   | { type: "model_ready" }
   | { type: "model_error" }
-  | { type: "reset_chat" };
+  | { type: "reset_chat" }
+  | { type: "start_learning" }
+  | { type: "open_chapter"; chapterId: string }
+  | { type: "back_to_index" }
+  | { type: "back_to_landing" }
+  | { type: "open_free_chat" };
 
 export function reduceScreen(
   state: ScreenState | undefined,
@@ -15,6 +42,7 @@ export function reduceScreen(
   switch (state) {
     case "landing":
       if (event.type === "load_kickoff") return "loading";
+      if (event.type === "start_learning") return "chapter_index";
       return "landing";
     case "loading":
       if (event.type === "model_ready") return "chat";
@@ -22,6 +50,21 @@ export function reduceScreen(
       return "loading";
     case "chat":
       return "chat";
+    case "chapter_index":
+      if (event.type === "open_chapter") return "chapter";
+      if (event.type === "back_to_landing") return "landing";
+      if (event.type === "open_free_chat" || event.type === "load_kickoff")
+        return "loading";
+      if (event.type === "model_ready") return "chat";
+      return "chapter_index";
+    case "chapter":
+      if (event.type === "back_to_index") return "chapter_index";
+      if (event.type === "open_chapter") return "chapter";
+      if (event.type === "back_to_landing") return "landing";
+      if (event.type === "open_free_chat" || event.type === "load_kickoff")
+        return "loading";
+      if (event.type === "model_ready") return "chat";
+      return "chapter";
   }
 }
 

@@ -3,6 +3,7 @@ import { DriftingLibrary } from "./DriftingLibrary";
 export type LandingProps = {
   onLoad: () => void;
   onLocalModel: () => void;
+  onStartLearning: () => void;
   errorBanner: string | null;
   hostedModelAvailable?: boolean | null;
   loadDisabled?: boolean;
@@ -13,6 +14,7 @@ const MODEL_LABEL = "0.8B";
 export function Landing({
   onLoad,
   onLocalModel,
+  onStartLearning,
   errorBanner,
   hostedModelAvailable = null,
   loadDisabled = false,
@@ -83,6 +85,18 @@ export function Landing({
             ▾
           </button>
         </div>
+
+        <button
+          type="button"
+          className="btn-start-learning"
+          onClick={onStartLearning}
+        >
+          Start learning →
+        </button>
+        <p className="landing-learn-hint">
+          New to LLMs? Step through 10 chapters that explain how this model
+          actually works.
+        </p>
 
         {errorBanner && (
           <div className="error-banner" style={{ marginTop: 24 }}>

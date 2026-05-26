@@ -23,6 +23,10 @@ import { Landing } from './components/landing/Landing';
 import { Loading, type LoadingProgress } from './components/loading/Loading';
 import { BrowserChatSessionAdapter, type BrowserChatMessage } from './lib/browser-chat-session';
 import { type ScreenState, type ProfileLikeStats, cycleReasoningEffort, reduceScreen } from './lib/screen-state';
+import { ChapterIndex } from './learn/ChapterIndex';
+import { LessonLayout } from './learn/LessonLayout';
+import { findChapter } from './learn/chapters';
+import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
 import 'streamdown/styles.css';
 import './styles.css';
 
@@ -265,6 +269,10 @@ function App() {
   const [appToolsEnabled, setAppToolsEnabledState] = useState(initialAppToolsEnabled);
   const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>('off');
   const [screen, dispatchScreen] = useReducer(reduceScreen, 'landing' as ScreenState);
+  // Active chapter id when `screen === 'chapter'`. Stored separately from the
+  // ScreenState union to keep the reducer trivial; the reducer's `open_chapter`
+  // event still drives the state transition.
+  const [activeChapterId, setActiveChapterId] = useState<string | null>(null);
   const [loadKickoff, setLoadKickoff] = useState(0);
   const [loadingText, setLoadingText] = useState<string | null>(null);
   const [loadingProgress, setLoadingProgress] = useState<LoadingProgress | null>(null);
@@ -1980,10 +1988,79 @@ function App() {
             dispatchScreen({ type: 'load_kickoff' });
           }}
           onLocalModel={() => modelDirInputRef.current?.click()}
+          onStartLearning={() => dispatchScreen({ type: 'start_learning' })}
           errorBanner={errorBanner}
           hostedModelAvailable={hostedModelAvailable}
         />
       )}
+      {screen === 'chapter_index' && (
+        <ChapterIndex
+          onOpenChapter={(chapterId) => {
+            setActiveChapterId(chapterId);
+            dispatchScreen({ type: 'open_chapter', chapterId });
+          }}
+          onBackToLanding={() => dispatchScreen({ type: 'back_to_landing' })}
+          onOpenFreeChat={() => {
+            if (hostedModelAvailable === false) {
+              modelDirInputRef.current?.click();
+              return;
+            }
+            setPendingModelSource(null);
+            setErrorBannerState(null);
+            setLoadingProgress(null);
+            setLoadKickoff((k) => k + 1);
+            dispatchScreen({ type: 'open_free_chat' });
+          }}
+        />
+      )}
+      {screen === 'chapter' && (() => {
+        const chapter = findChapter(activeChapterId);
+        if (!chapter) {
+          // Defensive: if state is "chapter" with no/invalid id, fall back to
+          // the chapter index. Should not happen in practice since we set
+          // activeChapterId before dispatching open_chapter.
+          return (
+            <ChapterIndex
+              onOpenChapter={(chapterId) => {
+                setActiveChapterId(chapterId);
+                dispatchScreen({ type: 'open_chapter', chapterId });
+              }}
+              onBackToLanding={() => dispatchScreen({ type: 'back_to_landing' })}
+              onOpenFreeChat={() => dispatchScreen({ type: 'open_free_chat' })}
+            />
+          );
+        }
+        return (
+          <LessonLayout
+            current={chapter}
+            onOpenChapter={(chapterId) => {
+              setActiveChapterId(chapterId);
+              dispatchScreen({ type: 'open_chapter', chapterId });
+            }}
+            onBackToIndex={() => dispatchScreen({ type: 'back_to_index' })}
+            onOpenFreeChat={() => {
+              if (hostedModelAvailable === false) {
+                modelDirInputRef.current?.click();
+                return;
+              }
+              setPendingModelSource(null);
+              setErrorBannerState(null);
+              setLoadingProgress(null);
+              setLoadKickoff((k) => k + 1);
+              dispatchScreen({ type: 'open_free_chat' });
+            }}
+            tryItPanel={chapter.id === 'attention' ? <AttentionDemo /> : null}
+          >
+            {chapter.id === 'attention' ? (
+              <AttentionChapterBody />
+            ) : (
+              <div className="text-muted-foreground">
+                This chapter is not yet authored.
+              </div>
+            )}
+          </LessonLayout>
+        );
+      })()}
       {screen === 'loading' && <Loading status={loadingText} progress={loadingProgress} />}
     </div>
   );

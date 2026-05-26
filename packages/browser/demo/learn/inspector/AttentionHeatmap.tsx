@@ -1,0 +1,328 @@
+import * as React from "react";
+
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../components/ui/select";
+
+import type { AttentionRun } from "../../../src/inspector-types";
+import { TokenStrip } from "./TokenStrip";
+
+export type AttentionHeatmapProps = {
+  run: AttentionRun;
+  /** Pixel size of each score cell. Capped to fit on screen for long prompts. */
+  preferredCellSize?: number;
+};
+
+/**
+ * Canvas-backed token×token attention heatmap.
+ *
+ * Why canvas: with sequences of even a few hundred tokens the seq_len² grid
+ * gets dense enough that a per-cell DOM element would be slow. A single
+ * <canvas> can draw a 1k×1k heatmap in ~10ms with one ImageData blit.
+ *
+ * The component:
+ *  - lets the user pick a layer and a head via shadcn <Select>
+ *  - draws softmaxed scores with a single-hue (blue → cyan) ramp
+ *  - on hover, shows a tooltip with the query token, key token, and value
+ *  - keeps token strips on top (key) and to the left (query) aligned cell-to-cell
+ */
+export function AttentionHeatmap({
+  run,
+  preferredCellSize = 32,
+}: AttentionHeatmapProps) {
+  const canvasRef = React.useRef<HTMLCanvasElement>(null);
+  const [selectedLayerIdx, setSelectedLayerIdx] = React.useState(0);
+  const [selectedHead, setSelectedHead] = React.useState(0);
+  const [hover, setHover] = React.useState<{
+    queryIndex: number;
+    keyIndex: number;
+    x: number;
+    y: number;
+    score: number;
+  } | null>(null);
+
+  // Clamp head if the layer changes and the new layer has fewer heads.
+  React.useEffect(() => {
+    const layer = run.attention[selectedLayerIdx];
+    if (!layer) return;
+    if (selectedHead >= layer.numHeads) {
+      setSelectedHead(0);
+    }
+  }, [run, selectedLayerIdx, selectedHead]);
+
+  const seqLen = run.tokens.length;
+  // Heatmap area should fit comfortably in the right-side panel. Cap at the
+  // preferred size, but shrink for very long sequences.
+  const maxBoardPx = 360;
+  const cellSize = Math.max(
+    8,
+    Math.min(preferredCellSize, Math.floor(maxBoardPx / Math.max(1, seqLen))),
+  );
+  const board = cellSize * seqLen;
+
+  // Render the heatmap onto the canvas whenever the layer/head/run changes.
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = board * dpr;
+    canvas.height = board * dpr;
+    canvas.style.width = `${board}px`;
+    canvas.style.height = `${board}px`;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Background ("masked / zero") color.
+    ctx.fillStyle = "rgba(255,255,255,0.02)";
+    ctx.fillRect(0, 0, board, board);
+
+    const layer = run.attention[selectedLayerIdx];
+    if (!layer || layer.scores.length === 0) {
+      // Linear layers ship empty scores; show a notice.
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.font = "12px var(--font-mono, monospace)";
+      ctx.fillText("This layer does not expose softmax scores.", 12, 24);
+      return;
+    }
+    const head = Math.min(selectedHead, layer.numHeads - 1);
+    const headStride = seqLen * seqLen;
+    const headOffset = head * headStride;
+
+    for (let i = 0; i < seqLen; i++) {
+      for (let j = 0; j < seqLen; j++) {
+        const v = layer.scores[headOffset + i * seqLen + j] ?? 0;
+        if (v <= 0) continue;
+        ctx.fillStyle = colorForScore(v);
+        ctx.fillRect(j * cellSize, i * cellSize, cellSize, cellSize);
+      }
+    }
+
+    // Grid (subtle).
+    ctx.strokeStyle = "rgba(255,255,255,0.04)";
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= seqLen; i++) {
+      const p = i * cellSize + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(0, p);
+      ctx.lineTo(board, p);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(p, 0);
+      ctx.lineTo(p, board);
+      ctx.stroke();
+    }
+  }, [run, selectedLayerIdx, selectedHead, seqLen, cellSize, board]);
+
+  function onMouseMove(e: React.MouseEvent<HTMLCanvasElement>) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const j = Math.floor(x / cellSize);
+    const i = Math.floor(y / cellSize);
+    if (i < 0 || i >= seqLen || j < 0 || j >= seqLen) {
+      setHover(null);
+      return;
+    }
+    const layer = run.attention[selectedLayerIdx];
+    if (!layer || layer.scores.length === 0) {
+      setHover(null);
+      return;
+    }
+    const head = Math.min(selectedHead, layer.numHeads - 1);
+    const headStride = seqLen * seqLen;
+    const score = layer.scores[head * headStride + i * seqLen + j] ?? 0;
+    setHover({ queryIndex: i, keyIndex: j, x, y, score });
+  }
+
+  function onMouseLeave() {
+    setHover(null);
+  }
+
+  const layerOptions = run.attention.map((layer, idx) => ({
+    idx,
+    label: `Layer ${layer.layerIndex} (${layer.kind})`,
+  }));
+  const currentLayer = run.attention[selectedLayerIdx];
+  const headCount = currentLayer?.numHeads ?? 0;
+
+  return (
+    <div className="space-y-3">
+      {/* Layer + head selectors */}
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="text-xs uppercase tracking-wider text-muted-foreground">
+          Layer
+        </label>
+        <Select
+          value={`${selectedLayerIdx}`}
+          onValueChange={(v) => setSelectedLayerIdx(Number(v))}
+        >
+          <SelectTrigger size="sm" className="min-w-[10rem]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {layerOptions.map((opt) => (
+              <SelectItem key={opt.idx} value={`${opt.idx}`}>
+                {opt.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        <label className="ml-2 text-xs uppercase tracking-wider text-muted-foreground">
+          Head
+        </label>
+        <Select
+          value={`${selectedHead}`}
+          onValueChange={(v) => setSelectedHead(Number(v))}
+        >
+          <SelectTrigger size="sm" className="min-w-[6rem]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {Array.from({ length: headCount }).map((_, h) => (
+              <SelectItem key={h} value={`${h}`}>
+                {`Head ${h}`}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/* Heatmap with aligned token strips */}
+      <div className="inline-block">
+        {/* Top strip: key tokens, indented by the left strip's width. */}
+        <div className="flex" style={{ paddingLeft: 80 }}>
+          <TokenStrip
+            tokens={run.tokens}
+            cellSize={cellSize}
+            orientation="top"
+            highlightIndex={hover?.keyIndex ?? null}
+          />
+        </div>
+        <div className="flex">
+          {/* Left strip: query tokens */}
+          <TokenStrip
+            tokens={run.tokens}
+            cellSize={cellSize}
+            orientation="left"
+            highlightIndex={hover?.queryIndex ?? null}
+          />
+          {/* Canvas itself */}
+          <div className="relative">
+            <canvas
+              ref={canvasRef}
+              onMouseMove={onMouseMove}
+              onMouseLeave={onMouseLeave}
+              className="block rounded-sm border border-border"
+              style={{ width: board, height: board }}
+            />
+            {hover && (
+              <HeatmapTooltip
+                hover={hover}
+                queryToken={run.tokens[hover.queryIndex]!}
+                keyToken={run.tokens[hover.keyIndex]!}
+                board={board}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Color legend */}
+      <Legend />
+
+      {/* Run metadata */}
+      <div className="text-xs text-muted-foreground">
+        <span className="font-mono">{run.modelMeta.name}</span> ·{" "}
+        {seqLen} tokens · next-token prediction:{" "}
+        <span className="font-mono text-foreground">
+          {run.generatedToken.text}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function HeatmapTooltip({
+  hover,
+  queryToken,
+  keyToken,
+  board,
+}: {
+  hover: {
+    queryIndex: number;
+    keyIndex: number;
+    x: number;
+    y: number;
+    score: number;
+  };
+  queryToken: { text: string };
+  keyToken: { text: string };
+  board: number;
+}) {
+  // Position the tooltip so it never goes off the right/bottom edge.
+  const left = Math.min(hover.x + 12, board - 220);
+  const top = Math.min(hover.y + 12, board - 80);
+  return (
+    <div
+      className="pointer-events-none absolute z-10 rounded-md border border-border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md"
+      style={{ left, top, minWidth: 200 }}
+    >
+      <div className="font-mono text-[0.7rem] text-muted-foreground">
+        query {hover.queryIndex} → key {hover.keyIndex}
+      </div>
+      <div className="mt-1">
+        <span className="text-muted-foreground">query:</span>{" "}
+        <span className="font-mono">{JSON.stringify(queryToken.text)}</span>
+      </div>
+      <div>
+        <span className="text-muted-foreground">key:</span>{" "}
+        <span className="font-mono">{JSON.stringify(keyToken.text)}</span>
+      </div>
+      <div className="mt-1">
+        <span className="text-muted-foreground">score:</span>{" "}
+        <span className="font-mono">{hover.score.toFixed(4)}</span>
+      </div>
+    </div>
+  );
+}
+
+function Legend() {
+  // Eight-stop legend matching colorForScore.
+  const stops = Array.from({ length: 8 }, (_, i) => (i + 1) / 8);
+  return (
+    <div className="flex items-center gap-2 text-[0.7rem] text-muted-foreground">
+      <span>0</span>
+      <div className="flex h-3 overflow-hidden rounded-sm border border-border">
+        {stops.map((s) => (
+          <div
+            key={s}
+            style={{ background: colorForScore(s), width: 16, height: "100%" }}
+          />
+        ))}
+      </div>
+      <span>1</span>
+      <span className="ml-2 italic">attention weight</span>
+    </div>
+  );
+}
+
+/**
+ * Single-hue blue ramp for score in [0, 1]. Higher score = brighter, more
+ * saturated. Black-ish for ~0 so the causal upper triangle visually drops out.
+ */
+function colorForScore(v: number): string {
+  const t = Math.max(0, Math.min(1, v));
+  // Lightness 14 → 70, saturation 70%.
+  const l = 14 + t * 56;
+  const s = 70;
+  // 210 hue is a deep blue → 195 leans cyan as it brightens.
+  const h = 210 - t * 15;
+  return `hsl(${h.toFixed(0)} ${s}% ${l.toFixed(0)}%)`;
+}

@@ -346,6 +346,35 @@
     font-size: 1rem;
     line-height: 1;
   }
+  .btn-start-learning {
+    margin-top: 18px;
+    font-family: var(--font-body);
+    font-size: 0.92rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    color: var(--text);
+    background: transparent;
+    border: 1px solid rgba(244, 200, 215, 0.35);
+    padding: 12px 26px;
+    border-radius: 100px;
+    cursor: pointer;
+    transition:
+      background 0.2s,
+      border-color 0.2s,
+      transform 0.2s;
+  }
+  .btn-start-learning:hover {
+    background: rgba(244, 200, 215, 0.1);
+    border-color: rgba(244, 200, 215, 0.6);
+    transform: translateY(-1px);
+  }
+  .landing-learn-hint {
+    margin-top: 10px;
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    color: var(--text-dim);
+    max-width: 320px;
+  }
   .model-select-overlay {
     position: absolute;
     inset: 0;
