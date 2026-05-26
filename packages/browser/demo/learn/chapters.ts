@@ -52,7 +52,7 @@ export const CHAPTERS: ChapterMeta[] = [
     title: "Positional encoding (RoPE)",
     blurb:
       "How the model knows token order, visualized as a rotation per dimension pair.",
-    available: false,
+    available: true,
   },
   {
     id: "rmsnorm",

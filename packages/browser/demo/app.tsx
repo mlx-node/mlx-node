@@ -28,6 +28,7 @@ import { LessonLayout } from './learn/LessonLayout';
 import { findChapter } from './learn/chapters';
 import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
 import { TokenizationChapterBody, TokenizerDemo } from './learn/chapters/01-tokenization';
+import { RopeChapterBody, RopeDemo } from './learn/chapters/05-rope';
 import { RmsNormChapterBody, RmsNormDemo } from './learn/chapters/06-rms-norm';
 import { MlpChapterBody, MlpDemo } from './learn/chapters/07-mlp';
 import { SamplingChapterBody, SamplingDemo } from './learn/chapters/09-sampling';
@@ -2082,6 +2083,8 @@ function App() {
                 <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'tokenization' ? (
                 <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : chapter.id === 'rope' ? (
+                <RopeDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'rmsnorm' ? (
                 <RmsNormDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'mlp' ? (
@@ -2095,6 +2098,8 @@ function App() {
               <AttentionChapterBody />
             ) : chapter.id === 'tokenization' ? (
               <TokenizationChapterBody />
+            ) : chapter.id === 'rope' ? (
+              <RopeChapterBody />
             ) : chapter.id === 'rmsnorm' ? (
               <RmsNormChapterBody />
             ) : chapter.id === 'mlp' ? (
