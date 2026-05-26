@@ -14,6 +14,7 @@
  */
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
+#[cfg(feature = "full")]
 use rust_xlsxwriter::{Format, Workbook};
 use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
@@ -646,6 +647,7 @@ pub fn parse_paddle_response(text: String, config: Option<ParserConfig>) -> Stri
 ///
 /// Each Table element becomes a separate worksheet. Paragraphs are collected
 /// into a "Text" worksheet if any exist.
+#[cfg(feature = "full")]
 fn document_to_xlsx_internal(doc: &ParsedDocument) -> napi::Result<Vec<u8>> {
     let mut workbook = Workbook::new();
     let bold = Format::new().set_bold();
@@ -729,6 +731,7 @@ fn document_to_xlsx_internal(doc: &ParsedDocument) -> napi::Result<Vec<u8>> {
 /// const buffer = documentToXlsx(doc);
 /// writeFileSync('output.xlsx', buffer);
 /// ```
+#[cfg(feature = "full")]
 #[napi]
 pub fn document_to_xlsx(doc: ParsedDocument) -> napi::Result<Buffer> {
     let bytes = document_to_xlsx_internal(&doc)?;
@@ -745,6 +748,7 @@ pub fn document_to_xlsx(doc: ParsedDocument) -> napi::Result<Buffer> {
 ///
 /// saveToXlsx(vlmResult.text, 'output.xlsx');
 /// ```
+#[cfg(feature = "full")]
 #[napi]
 pub fn save_to_xlsx(text: String, file_path: String) -> napi::Result<()> {
     let doc = parse_vlm_output_internal(&text);

@@ -16,7 +16,9 @@ pub mod kv_cache_spec;
 pub mod mlp;
 #[cfg(test)]
 mod mlp_test;
+#[cfg(feature = "full")]
 pub mod paged_attention_inputs;
+#[cfg(feature = "full")]
 pub mod paged_kv_cache_adapter;
 pub mod rotating_kv_cache;
 

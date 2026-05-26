@@ -623,7 +623,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         .map(|a| a.nbytes() as u64)
                         .fold(0u64, |acc, v| acc.saturating_add(v));
 
+                    #[cfg(feature = "full")]
                     let paged_active = inner.paged_adapter.is_some();
+                    #[cfg(not(feature = "full"))]
+                    let paged_active = false;
                     Ok((inner, config, tokenizer, weight_bytes, paged_active))
                 })();
             let (inner, config, tokenizer, weight_bytes, paged_active) = load_result?;

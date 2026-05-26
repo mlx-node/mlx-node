@@ -2,6 +2,7 @@ use crate::array::MxArray;
 use crate::inspector::InspectorRecorder;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
@@ -207,6 +208,7 @@ impl DecoderLayer {
     /// GDN layers keep the existing flat cache path. Full-attention layers
     /// route through `Qwen3_5Attention::forward_paged`, using the compact
     /// full-attention ordinal (`paged_idx`) as the adapter pool index.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_paged_or_flat(
         &mut self,

@@ -1018,7 +1018,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let tokenizer_out = inner.tokenizer.clone();
+            #[cfg(feature = "full")]
             let paged_active = inner.paged_adapter.is_some();
+            #[cfg(not(feature = "full"))]
+            let paged_active = false;
 
             Ok((
                 inner,

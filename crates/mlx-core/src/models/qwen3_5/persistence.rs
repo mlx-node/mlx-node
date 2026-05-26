@@ -876,7 +876,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let tokenizer_out = inner.tokenizer.clone();
+            #[cfg(feature = "full")]
             let paged_active = inner.paged_adapter.is_some();
+            #[cfg(not(feature = "full"))]
+            let paged_active = false;
 
             Ok((
                 inner,
@@ -1604,7 +1607,10 @@ pub async fn load_from_gpu_buffers(
         processor_config_json,
     )?;
     let config_out = inner.config.clone();
+    #[cfg(feature = "full")]
     let paged_active = inner.paged_adapter.is_some();
+    #[cfg(not(feature = "full"))]
+    let paged_active = false;
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
         move || Ok((inner, (config_out.clone(), paged_active))),
         handle_qwen35_cmd,

@@ -84,6 +84,7 @@ pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
 /// call always passes `&[]` here. The hook stays in place so that when
 /// VLM-paged forward integration lands, the call site only needs to swap
 /// in the real image positions.
+#[cfg(feature = "full")]
 pub(crate) fn build_paged_extra_keys(
     total_tokens: usize,
     block_size: u32,

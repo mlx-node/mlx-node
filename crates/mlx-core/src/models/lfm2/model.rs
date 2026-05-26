@@ -19,6 +19,7 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::sample;
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Lfm2Config;
@@ -56,6 +57,7 @@ pub(crate) struct Lfm2Inner {
     /// attention-layer ordinal (the index into `config.full_attn_idxs()`),
     /// not by absolute layer index. `Lfm2DecoderLayer::forward_paged_or_flat`
     /// performs the per-layer dispatch.
+    #[cfg(feature = "full")]
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
 }
 
@@ -243,6 +245,7 @@ impl Lfm2Inner {
         // (greedy byte-equal + prefix-reuse byte-equal at BF16 against
         // real LFM2.5-1.2B weights). Callers can opt out with
         // `use_block_paged_cache: Some(false)`.
+        #[cfg(feature = "full")]
         let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
             let attn_layer_count = config.full_attn_idxs().len() as u32;
             if attn_layer_count == 0 {
@@ -316,6 +319,7 @@ impl Lfm2Inner {
             tokenizer: None,
             cached_token_history: Vec::new(),
             cached_image_key: None,
+            #[cfg(feature = "full")]
             paged_adapter,
         })
     }
@@ -390,6 +394,7 @@ impl Lfm2Inner {
         // call from a prior session would leave block_table populated and
         // a subsequent `chat_sync_core_paged` could mistakenly take the
         // warm-continue path against stale tokens.
+        #[cfg(feature = "full")]
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
@@ -501,6 +506,7 @@ impl Lfm2Inner {
         // through the parallel `chat_sync_core_paged` path. The flat path
         // below stays untouched so off-by-default behavior is byte-
         // identical to before this commit.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             return self.chat_sync_core_paged(
                 tokens,
@@ -739,6 +745,7 @@ impl Lfm2Inner {
     ///   paged turn reprefills conv state from the start of the prompt.
     /// - Pure-cache prompt (every prompt token already in the paged pool)
     ///   is rejected — same caveat as Qwen3's paged path.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged(
         &mut self,
@@ -947,6 +954,7 @@ impl Lfm2Inner {
 
     /// Inner forward + decode loop for `chat_sync_core_paged`. Split out
     /// so the caller can wrap it with `release_request` on either path.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged_inner(
         &mut self,
@@ -1051,6 +1059,7 @@ impl Lfm2Inner {
     /// `cached_prefix_len` is the paged-cache hit length.
     ///
     /// Returns the last position's logits squeezed to `[vocab]`.
+    #[cfg(feature = "full")]
     fn run_paged_prefill_chunk(
         &mut self,
         full_tokens: &[u32],
@@ -1198,6 +1207,7 @@ impl Lfm2Inner {
     }
 
     /// Run one paged decode step: feed `[token_id]` through the model.
+    #[cfg(feature = "full")]
     fn run_paged_decode_step(&mut self, token_id: u32) -> Result<MxArray> {
         // Record the new token + capture its logical position BEFORE
         // record_tokens advances the cursor.
@@ -1365,6 +1375,7 @@ impl Lfm2Inner {
     /// cap as `chat_sync_core_paged` so zero-delta prompts still produce
     /// at least one suffix token to prefill. Numerical equivalence to the
     /// flat path is not asserted here.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged(
         &mut self,
@@ -1619,6 +1630,7 @@ impl Lfm2Inner {
     /// Inner forward + streaming decode loop for
     /// [`Self::chat_stream_sync_core_paged`]. Split out so the caller can
     /// wrap with `release_request` in a try-style flow.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged_inner<'a>(
         &mut self,
@@ -1792,6 +1804,7 @@ impl Lfm2Inner {
         // through the parallel `chat_stream_sync_core_paged` path. The
         // flat path below stays untouched so off-by-default behavior is
         // byte-identical to before this commit.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             return self.chat_stream_sync_core_paged(
                 tokens,

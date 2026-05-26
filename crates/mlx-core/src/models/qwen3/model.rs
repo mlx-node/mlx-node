@@ -23,7 +23,9 @@ use crate::sampling::{
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools;
+#[cfg(feature = "full")]
 use crate::training_model::ModelType;
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::{KVCache, TransformerBlock};
 
@@ -89,6 +91,7 @@ pub(crate) struct Qwen3Inner {
     /// chat-session methods route through `forward_paged_adapter` for
     /// cross-request prefix reuse. Defaults to `None` so the existing flat
     /// `Vec<KVCache>` path stays untouched.
+    #[cfg(feature = "full")]
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     pub(crate) cached_kv_keys: Vec<Option<MxArray>>,
     pub(crate) cached_kv_values: Vec<Option<MxArray>>,
@@ -100,6 +103,7 @@ pub(crate) struct Qwen3Inner {
     pub(crate) cached_image_key: Option<u64>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
+    #[cfg(feature = "full")]
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
 }
 
@@ -184,11 +188,13 @@ pub(crate) enum Qwen3Cmd {
         reply: ResponseTx<BatchGenerationResult>,
     },
     // --- Training commands ---
+    #[cfg(feature = "full")]
     InitTraining {
         config: Box<crate::grpo::engine::GRPOEngineConfig>,
         model_type: crate::training_model::ModelType,
         reply: ResponseTx<()>,
     },
+    #[cfg(feature = "full")]
     GenerateForTraining {
         prompts: Vec<Vec<crate::tokenizer::ChatMessage>>,
         group_size: usize,
@@ -197,6 +203,7 @@ pub(crate) enum Qwen3Cmd {
         tools: Option<Vec<crate::tokenizer::ToolDefinition>>,
         reply: ResponseTx<crate::training_model::GenerationPlainData>,
     },
+    #[cfg(feature = "full")]
     TrainStepGRPO {
         rewards: Vec<f64>,
         group_size: i32,
@@ -208,20 +215,24 @@ pub(crate) enum Qwen3Cmd {
     /// (used by engine skip paths that abort before training).
     /// Also clears cached generation MxArrays.
     /// Returns the new step.
+    #[cfg(feature = "full")]
     BumpSkippedStep {
         reply: ResponseTx<i64>,
     },
     /// Restore the training step counter (for resume from checkpoint).
     /// Does not touch optimizer state — that's loaded via LoadOptimizerState.
+    #[cfg(feature = "full")]
     SetTrainingStep {
         step: i64,
         reply: ResponseTx<()>,
     },
     /// Drop the training state on the model thread.
     /// After this, InitTraining can be called again. No-op if no training state.
+    #[cfg(feature = "full")]
     ResetTraining {
         reply: ResponseTx<()>,
     },
+    #[cfg(feature = "full")]
     TrainStepSFT {
         input_ids: Vec<i32>,
         input_shape: Vec<i64>,
@@ -230,10 +241,12 @@ pub(crate) enum Qwen3Cmd {
         config: crate::sft::engine::SftEngineConfig,
         reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
     },
+    #[cfg(feature = "full")]
     SaveOptimizerState {
         path: String,
         reply: ResponseTx<()>,
     },
+    #[cfg(feature = "full")]
     LoadOptimizerState {
         path: String,
         reply: ResponseTx<()>,
@@ -333,6 +346,7 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
             let _ = reply.send(inner.generate_batch_sync(prompts, group_size, config));
         }
         // --- Training commands ---
+        #[cfg(feature = "full")]
         Qwen3Cmd::InitTraining {
             config,
             model_type,
@@ -340,6 +354,7 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
         } => {
             let _ = reply.send(inner.init_training_sync(*config, model_type));
         }
+        #[cfg(feature = "full")]
         Qwen3Cmd::GenerateForTraining {
             prompts,
             group_size,
@@ -356,6 +371,7 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
                 tools,
             ));
         }
+        #[cfg(feature = "full")]
         Qwen3Cmd::TrainStepGRPO {
             rewards,
             group_size,
@@ -370,6 +386,7 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
                 valid_indices,
             ));
         }
+        #[cfg(feature = "full")]
         Qwen3Cmd::BumpSkippedStep { reply } => {
             let result = if let Some(ref mut ts) = inner.training_state {
                 ts.clear_generation_cache();
@@ -382,6 +399,7 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
             };
             let _ = reply.send(result);
         }
+        #[cfg(feature = "full")]
         Qwen3Cmd::SetTrainingStep { step, reply } => {
             let result = if let Some(ref mut ts) = inner.training_state {
                 ts.step = step;
@@ -393,10 +411,12 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
             };
             let _ = reply.send(result);
         }
+        #[cfg(feature = "full")]
         Qwen3Cmd::ResetTraining { reply } => {
             inner.training_state = None;
             let _ = reply.send(Ok(()));
         }
+        #[cfg(feature = "full")]
         Qwen3Cmd::TrainStepSFT {
             input_ids,
             input_shape,
@@ -413,9 +433,11 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
                 config,
             ));
         }
+        #[cfg(feature = "full")]
         Qwen3Cmd::SaveOptimizerState { path, reply } => {
             let _ = reply.send(inner.save_optimizer_state_sync(path));
         }
+        #[cfg(feature = "full")]
         Qwen3Cmd::LoadOptimizerState { path, reply } => {
             let _ = reply.send(inner.load_optimizer_state_sync(path));
         }
@@ -505,6 +527,7 @@ impl Qwen3Inner {
         // `qwen3_paged_vs_flat_parity` integration test (greedy byte-equal +
         // prefix-reuse byte-equal at BF16 against real Qwen3-0.6B weights).
         // Callers can still opt out with `use_block_paged_cache: Some(false)`.
+        #[cfg(feature = "full")]
         let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
             let block_size = config.paged_block_size.unwrap_or(16);
             let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
@@ -570,12 +593,14 @@ impl Qwen3Inner {
             lm_head,
             kv_caches: None,
             tokenizer: None,
+            #[cfg(feature = "full")]
             paged_adapter,
             cached_kv_keys: Vec::new(),
             cached_kv_values: Vec::new(),
             cached_cache_idx: 0,
             cached_token_history: Vec::new(),
             cached_image_key: None,
+            #[cfg(feature = "full")]
             training_state: None,
         })
     }
@@ -600,6 +625,7 @@ impl Qwen3Inner {
         // call from a prior session would leave block_table populated and
         // a subsequent `chat_sync_core_paged` could mistakenly take the
         // warm-continue path against stale tokens.
+        #[cfg(feature = "full")]
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
@@ -691,6 +717,7 @@ impl Qwen3Inner {
         // `chat_sync_core_paged` path that uses `forward_paged_adapter`
         // instead of `forward_fused`. The flat path is left untouched so
         // turning the flag off is byte-identical to before this commit.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             return self.chat_sync_core_paged(
                 token_ids_vec,
@@ -1169,6 +1196,7 @@ impl Qwen3Inner {
     /// follow-up — this commit's tests assert non-empty / valid-token
     /// output via shape checks, not exact-token equivalence to the flat
     /// path.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged(
         &mut self,
@@ -1476,6 +1504,7 @@ impl Qwen3Inner {
     /// the caller can wrap it with `release_request` in a try-style flow.
     /// Returns `(generated_tokens, generated_logprobs, finish_reason,
     /// first_token_elapsed_ms)`.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged_inner(
         &mut self,
@@ -1703,6 +1732,7 @@ impl Qwen3Inner {
     /// `final_norm` + `lm_head` only run on the last sub-chunk (vocab
     /// projection is throwaway work for non-final chunks; matches vLLM's
     /// `is_prefill_chunk` skip).
+    #[cfg(feature = "full")]
     fn run_paged_prefill_chunk(
         &mut self,
         suffix_tokens: &[u32],
@@ -1730,6 +1760,7 @@ impl Qwen3Inner {
     ///
     /// `chunk_size <= 0` OR `suffix_tokens.len() <= chunk_size` takes the
     /// legacy single-shot path. Anything else loops over `chunks(chunk_size)`.
+    #[cfg(feature = "full")]
     fn run_paged_prefill_chunk_with_size(
         &mut self,
         suffix_tokens: &[u32],
@@ -1799,6 +1830,7 @@ impl Qwen3Inner {
     /// one forward pass. Identical to the pre-chunking implementation.
     /// Used both by the legacy code path (chunk_size <= 0) and the
     /// chunked-path's "small enough to skip chunking" fast path.
+    #[cfg(feature = "full")]
     fn run_paged_prefill_single_shot(
         &mut self,
         suffix_tokens: &[u32],
@@ -1823,6 +1855,7 @@ impl Qwen3Inner {
     /// path and the chunked driver. It must NOT touch `final_norm` /
     /// `lm_head` so the chunked path can skip those on intermediate
     /// chunks.
+    #[cfg(feature = "full")]
     fn run_paged_prefill_one_chunk(
         &mut self,
         chunk_tokens: &[u32],
@@ -1922,6 +1955,7 @@ impl Qwen3Inner {
 
     /// Run one decode step through the paged forward path. Mirrors
     /// `run_paged_prefill_chunk` for a single-token chunk.
+    #[cfg(feature = "full")]
     fn run_paged_decode_step(
         &mut self,
         token_value: u32,
@@ -2005,6 +2039,7 @@ impl Qwen3Inner {
     /// still produce at least one suffix token to prefill. Numerical
     /// equivalence to the flat path is not asserted here (validated
     /// separately via random-init smoke tests).
+    #[cfg(feature = "full")]
     fn chat_stream_sync_core_paged(
         &mut self,
         messages: Vec<ChatMessage>,
@@ -2165,6 +2200,7 @@ impl Qwen3Inner {
     /// Inner forward + streaming decode loop for
     /// [`Self::chat_stream_sync_core_paged`]. Split out so the caller can
     /// wrap with `release_request` in a try-style flow.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged_inner(
         &mut self,
@@ -2467,6 +2503,7 @@ impl Qwen3Inner {
         // path is left untouched so turning the flag off is byte-identical
         // to before this commit. Mirrors the dispatch added to the
         // non-streaming `chat_sync_core`.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             return self.chat_stream_sync_core_paged(messages, config, eos_token_id, cb, cancelled);
         }
@@ -2991,6 +3028,7 @@ impl Qwen3Inner {
         // the full token history (cached + delta) and letting the
         // adapter's `find_cached_prefix` discover the prefix that turn 1
         // registered for reuse. The flat path below stays untouched.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             let mut full_token_history = self.cached_token_history.clone();
             full_token_history.extend(delta_tokens.iter().copied());
@@ -4310,6 +4348,7 @@ impl Qwen3Inner {
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
+    #[cfg(feature = "full")]
     fn init_training_sync(
         &mut self,
         config: crate::grpo::engine::GRPOEngineConfig,
@@ -4348,6 +4387,7 @@ impl Qwen3Inner {
         Ok(())
     }
 
+    #[cfg(feature = "full")]
     fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
         let ts = self.training_state.as_ref().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
@@ -4514,6 +4554,7 @@ impl Qwen3Inner {
         Ok(())
     }
 
+    #[cfg(feature = "full")]
     fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
         let ts = self.training_state.as_mut().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
@@ -4526,6 +4567,7 @@ impl Qwen3Inner {
     /// Tokenizes prompts using Jinja2 chat template, generates completions,
     /// caches MxArray results in training_state for the subsequent training step,
     /// and returns plain data across the thread boundary.
+    #[cfg(feature = "full")]
     fn generate_for_training_thread_sync(
         &mut self,
         prompts: Vec<Vec<ChatMessage>>,
@@ -4624,6 +4666,7 @@ impl Qwen3Inner {
     ///
     /// Uses fresh local KV caches (not the shared inference caches).
     /// Returns GenerationResult with MxArray tokens and logprobs.
+    #[cfg(feature = "full")]
     fn generate_single_for_training_sync(
         &self,
         input_ids: &MxArray,
@@ -4905,6 +4948,7 @@ impl Qwen3Inner {
     /// Consumes cached MxArrays from the generation phase, computes loss and
     /// gradients via autograd, validates and clips gradients, accumulates them,
     /// and applies the optimizer step when accumulation is complete.
+    #[cfg(feature = "full")]
     fn train_step_grpo_sync(
         &mut self,
         rewards: Vec<f64>,
@@ -5236,6 +5280,7 @@ impl Qwen3Inner {
     /// Receives plain data (Vec<i32> + shape) from the SFT engine, reconstructs
     /// MxArrays on the model thread, computes SFT loss + gradients, validates,
     /// clips, accumulates, and applies optimizer step when accumulation is complete.
+    #[cfg(feature = "full")]
     fn train_step_sft_sync(
         &mut self,
         input_ids: Vec<i32>,
@@ -5536,6 +5581,7 @@ impl Qwen3Inner {
     }
 
     /// Accumulate gradients into training state.
+    #[cfg(feature = "full")]
     fn accumulate_gradients_inner(
         ts: &mut crate::training_state::ModelThreadTrainingState,
         new_grads: HashMap<String, MxArray>,
@@ -5579,6 +5625,7 @@ impl Qwen3Inner {
     /// Apply gradients to model weights (SGD or AdamW delta application).
     ///
     /// Direct field access on Qwen3Inner — no locks needed.
+    #[cfg(feature = "full")]
     fn apply_gradients_inner(
         &mut self,
         gradients: HashMap<String, &MxArray>,

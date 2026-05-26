@@ -1,6 +1,7 @@
 use crate::array::MxArray;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
@@ -159,6 +160,7 @@ impl DecoderLayer {
     /// MLP/expert tail. `Linear` layers stay on the flat
     /// `Qwen3_5LayerCache::Linear` path; `FullAttentionPaged` layers
     /// route through `Qwen3_5Attention::forward_paged`.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_paged_or_flat(
         &mut self,

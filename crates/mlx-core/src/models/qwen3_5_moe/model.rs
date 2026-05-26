@@ -40,6 +40,7 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 fn fresh_moe_layer_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
@@ -180,6 +181,7 @@ fn clone_moe_linear_layer_caches(
     Some(cloned)
 }
 
+#[cfg(feature = "full")]
 fn compute_paged_prefix_block_hash(
     tokens: &[u32],
     prefix_len: u32,
@@ -309,6 +311,7 @@ pub(crate) struct Qwen35MoeInner {
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
     /// full-attention layers — same semantics as the dense model.
     /// **Opt-in via `Qwen3_5MoeConfig::use_block_paged_cache`.**
+    #[cfg(feature = "full")]
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
@@ -402,11 +405,13 @@ pub(crate) enum Qwen35MoeCmd {
         reply: ResponseTx<()>,
     },
     // --- Training commands ---
+    #[cfg(feature = "full")]
     InitTraining {
         config: Box<crate::grpo::engine::GRPOEngineConfig>,
         model_type: crate::training_model::ModelType,
         reply: ResponseTx<()>,
     },
+    #[cfg(feature = "full")]
     GenerateForTraining {
         prompts: Vec<Vec<crate::tokenizer::ChatMessage>>,
         group_size: usize,
@@ -415,6 +420,7 @@ pub(crate) enum Qwen35MoeCmd {
         tools: Option<Vec<crate::tokenizer::ToolDefinition>>,
         reply: ResponseTx<crate::training_model::GenerationPlainData>,
     },
+    #[cfg(feature = "full")]
     TrainStepGRPO {
         rewards: Vec<f64>,
         group_size: i32,
@@ -426,20 +432,24 @@ pub(crate) enum Qwen35MoeCmd {
     /// (used by engine skip paths that abort before training).
     /// Also clears cached generation MxArrays.
     /// Returns the new step.
+    #[cfg(feature = "full")]
     BumpSkippedStep {
         reply: ResponseTx<i64>,
     },
     /// Restore the training step counter (for resume from checkpoint).
     /// Does not touch optimizer state — that's loaded via LoadOptimizerState.
+    #[cfg(feature = "full")]
     SetTrainingStep {
         step: i64,
         reply: ResponseTx<()>,
     },
     /// Drop the training state on the model thread.
     /// After this, InitTraining can be called again. No-op if no training state.
+    #[cfg(feature = "full")]
     ResetTraining {
         reply: ResponseTx<()>,
     },
+    #[cfg(feature = "full")]
     TrainStepSFT {
         input_ids: Vec<i32>,
         input_shape: Vec<i64>,
@@ -448,10 +458,12 @@ pub(crate) enum Qwen35MoeCmd {
         config: crate::sft::engine::SftEngineConfig,
         reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
     },
+    #[cfg(feature = "full")]
     SaveOptimizerState {
         path: String,
         reply: ResponseTx<()>,
     },
+    #[cfg(feature = "full")]
     LoadOptimizerState {
         path: String,
         reply: ResponseTx<()>,
@@ -551,6 +563,7 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
             let _ = reply.send(inner.save_model_sync(&save_path));
         }
         // --- Training commands ---
+        #[cfg(feature = "full")]
         Qwen35MoeCmd::InitTraining {
             config,
             model_type,
@@ -558,6 +571,7 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
         } => {
             let _ = reply.send(inner.init_training_sync(*config, model_type));
         }
+        #[cfg(feature = "full")]
         Qwen35MoeCmd::GenerateForTraining {
             prompts,
             group_size,
@@ -574,6 +588,7 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
                 tools,
             ));
         }
+        #[cfg(feature = "full")]
         Qwen35MoeCmd::TrainStepGRPO {
             rewards,
             group_size,
@@ -588,6 +603,7 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
                 valid_indices,
             ));
         }
+        #[cfg(feature = "full")]
         Qwen35MoeCmd::BumpSkippedStep { reply } => {
             let result = if let Some(ref mut ts) = inner.training_state {
                 ts.clear_generation_cache();
@@ -600,6 +616,7 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
             };
             let _ = reply.send(result);
         }
+        #[cfg(feature = "full")]
         Qwen35MoeCmd::SetTrainingStep { step, reply } => {
             let result = if let Some(ref mut ts) = inner.training_state {
                 ts.step = step;
@@ -611,10 +628,12 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
             };
             let _ = reply.send(result);
         }
+        #[cfg(feature = "full")]
         Qwen35MoeCmd::ResetTraining { reply } => {
             inner.training_state = None;
             let _ = reply.send(Ok(()));
         }
+        #[cfg(feature = "full")]
         Qwen35MoeCmd::TrainStepSFT {
             input_ids,
             input_shape,
@@ -631,9 +650,11 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
                 config,
             ));
         }
+        #[cfg(feature = "full")]
         Qwen35MoeCmd::SaveOptimizerState { path, reply } => {
             let _ = reply.send(inner.save_optimizer_state_sync(path));
         }
+        #[cfg(feature = "full")]
         Qwen35MoeCmd::LoadOptimizerState { path, reply } => {
             let _ = reply.send(inner.load_optimizer_state_sync(path));
         }
@@ -736,6 +757,7 @@ impl Qwen35MoeInner {
         // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
         // See `Qwen35Inner::new` (dense model) for the full architectural
         // discussion; this is the MoE-side mirror.
+        #[cfg(feature = "full")]
         let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
             let attn_layer_count = config.full_attention_layer_count() as u32;
             if attn_layer_count == 0 {
@@ -799,12 +821,18 @@ impl Qwen35MoeInner {
             None
         };
 
+        #[cfg(feature = "full")]
         info!(
             "Qwen3.5 MoE inner created: {} layers, fa_idx={}, experts={}, paged={}",
             config.num_layers,
             fa_idx,
             config.num_experts,
             paged_adapter.is_some()
+        );
+        #[cfg(not(feature = "full"))]
+        info!(
+            "Qwen3.5 MoE inner created: {} layers, fa_idx={}, experts={}",
+            config.num_layers, fa_idx, config.num_experts,
         );
 
         Ok(Self {
@@ -829,6 +857,7 @@ impl Qwen35MoeInner {
             model_id,
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
+            #[cfg(feature = "full")]
             paged_adapter,
             #[cfg(not(target_family = "wasm"))]
             training_state: None,
@@ -919,6 +948,7 @@ impl Qwen35MoeInner {
         Ok(trace.finish(total_start))
     }
 
+    #[cfg(feature = "full")]
     fn find_moe_gdn_prefix_checkpoint(
         &self,
         tokens: &[u32],
@@ -950,6 +980,7 @@ impl Qwen35MoeInner {
             .and_then(|checkpoint| clone_moe_linear_layer_caches(&self.config, &checkpoint.caches))
     }
 
+    #[cfg(feature = "full")]
     fn remember_moe_gdn_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
@@ -1018,6 +1049,7 @@ impl Qwen35MoeInner {
         Ok(trace.finish(total_start))
     }
 
+    #[cfg(feature = "full")]
     fn prepare_moe_gdn_prefix_state(
         &mut self,
         tokens: &[u32],
@@ -1309,6 +1341,7 @@ impl Qwen35MoeInner {
 
         // Block-paged dispatch — early-return BEFORE the compile lock.
         // See dense `chat_sync_core` for the compile-lockout rationale.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             if has_images {
                 return Err(Error::from_reason(
@@ -1811,6 +1844,7 @@ impl Qwen35MoeInner {
     /// `linear_cache_arrays` FFI parameter. Falls back to the pure-Rust
     /// paged decode (`paged_forward::run_paged_decode_step`) when weights
     /// have been swapped out by another model load.
+    #[cfg(feature = "full")]
     fn chat_sync_core_paged(
         &mut self,
         tokens: Vec<u32>,
@@ -2081,6 +2115,7 @@ impl Qwen35MoeInner {
         Ok(result)
     }
 
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged_inner(
         &mut self,
@@ -2422,6 +2457,7 @@ impl Qwen35MoeInner {
     /// `chat_stream_sync_core_paged`. See [`Self::chat_sync_core_paged`]
     /// for the C++ compiled paged dispatch rationale; the streaming path
     /// uses the same lock acquisition + fall-back semantics.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged(
         &mut self,
@@ -2783,6 +2819,7 @@ impl Qwen35MoeInner {
         Ok(())
     }
 
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged_inner<'a>(
         &mut self,
@@ -3317,6 +3354,7 @@ impl Qwen35MoeInner {
         let mut first_token_instant: Option<std::time::Instant> = None;
 
         // Block-paged dispatch — early-return BEFORE the compile lock.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             if has_images {
                 return Err(Error::from_reason(
@@ -4007,6 +4045,7 @@ impl Qwen35MoeInner {
         // The delta path drives the paged core with the FULL token
         // history; the adapter's warm-continue path matches the cached
         // prefix automatically.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             return self.chat_sync_core_paged(
                 full_token_history.clone(),
@@ -4686,6 +4725,7 @@ impl Qwen35MoeInner {
         let model_id = self.model_id;
 
         // Block-paged dispatch — early-return BEFORE the compile lock.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             return self.chat_stream_sync_core_paged(
                 full_token_history.clone(),
@@ -5399,6 +5439,7 @@ impl Qwen35MoeInner {
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
+    #[cfg(feature = "full")]
     fn init_training_sync(
         &mut self,
         config: crate::grpo::engine::GRPOEngineConfig,
@@ -5437,6 +5478,7 @@ impl Qwen35MoeInner {
         Ok(())
     }
 
+    #[cfg(feature = "full")]
     fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
         let ts = self.training_state.as_ref().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
@@ -5444,6 +5486,7 @@ impl Qwen35MoeInner {
         ts.save_optimizer_state_sync(&path)
     }
 
+    #[cfg(feature = "full")]
     fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
         let ts = self.training_state.as_mut().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
@@ -5456,6 +5499,7 @@ impl Qwen35MoeInner {
     /// Tokenizes prompts using Jinja2 chat template, generates completions,
     /// caches MxArray results in training_state for the subsequent training step,
     /// and returns plain data across the thread boundary.
+    #[cfg(feature = "full")]
     fn generate_for_training_thread_sync(
         &mut self,
         prompts: Vec<Vec<ChatMessage>>,
@@ -5556,6 +5600,7 @@ impl Qwen35MoeInner {
     ///
     /// Uses fresh local KV caches (not the shared inference caches).
     /// Returns GenerationResult with MxArray tokens and logprobs.
+    #[cfg(feature = "full")]
     fn generate_single_for_training_sync(
         &mut self,
         input_ids: &MxArray,
@@ -5775,6 +5820,7 @@ impl Qwen35MoeInner {
     }
 
     /// GRPO training step: compute loss, gradients, and apply optimizer.
+    #[cfg(feature = "full")]
     fn train_step_grpo_sync(
         &mut self,
         rewards: Vec<f64>,
@@ -6105,6 +6151,7 @@ impl Qwen35MoeInner {
     /// Receives plain data (Vec<i32> + shape) from the SFT engine, reconstructs
     /// MxArrays on the model thread, computes SFT loss + gradients, validates,
     /// clips, accumulates, and applies optimizer step when accumulation is complete.
+    #[cfg(feature = "full")]
     fn train_step_sft_sync(
         &mut self,
         input_ids: Vec<i32>,
@@ -6399,6 +6446,7 @@ impl Qwen35MoeInner {
     }
 
     /// Accumulate gradients into training state.
+    #[cfg(feature = "full")]
     fn accumulate_gradients_inner(
         ts: &mut crate::training_state::ModelThreadTrainingState,
         new_grads: HashMap<String, MxArray>,
@@ -6442,6 +6490,7 @@ impl Qwen35MoeInner {
     /// Apply gradients to model weights (SGD or AdamW delta application).
     ///
     /// Direct field access on Qwen35MoeInner — no locks needed.
+    #[cfg(feature = "full")]
     fn apply_gradients_inner(
         &mut self,
         gradients: HashMap<String, &MxArray>,
@@ -7320,7 +7369,10 @@ impl Qwen3_5MoeModel {
         )?;
 
         let config_out = inner.config.clone();
+        #[cfg(feature = "full")]
         let paged_active = inner.paged_adapter.is_some();
+        #[cfg(not(feature = "full"))]
+        let paged_active = false;
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
             move || Ok((inner, (config_out.clone(), paged_active))),
             handle_qwen35_moe_cmd,
@@ -7652,6 +7704,7 @@ pub(crate) const CPP_PAGED_REQUIRED_BLOCK_SIZE: u32 = 16;
 /// return leaves `g_paged_inited == false` on the C++ side, AND the
 /// status code is now propagated back to Rust (Phase 4 piece 3 review
 /// fix) so a failed init can never be mistaken for a successful one.
+#[cfg(feature = "full")]
 fn init_paged_moe_compiled_session(
     config: &Qwen3_5MoeConfig,
     caches: &[Qwen3_5LayerCache],
@@ -7850,6 +7903,7 @@ fn init_paged_moe_compiled_session(
 ///
 /// On any FFI failure (`output_logits == null`) the helper returns an
 /// `Err` so the dispatcher falls back to pure-Rust paged decode.
+#[cfg(feature = "full")]
 fn forward_moe_cpp_paged(
     input_ids: &MxArray,
     embedding_weight: &MxArray,

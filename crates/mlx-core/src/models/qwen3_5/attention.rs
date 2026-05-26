@@ -11,6 +11,7 @@ use crate::inspector::InspectorRecorder;
 use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
@@ -464,6 +465,7 @@ impl Qwen3_5Attention {
     /// This mirrors the flat full-attention path, but writes K/V into the
     /// paged pool and reads attention K/V back through the adapter. The path is
     /// text-only: image-bearing turns are rejected before dispatching here.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     pub fn forward_paged(
         &self,

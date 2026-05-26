@@ -1,6 +1,7 @@
 use crate::array::MxArray;
 use crate::nn::activations::Activations;
 use crate::nn::{Linear, RMSNorm};
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
@@ -285,6 +286,7 @@ impl Gemma4DecoderLayer {
     ///
     /// `needs_stash` only matters for `Sliding` (mirrors the flat
     /// `forward(...)` call signature).
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_paged_or_flat(
         &self,

@@ -4,6 +4,7 @@ use crate::nn::RMSNorm;
 use crate::transformer::attention::Attention;
 use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -243,6 +244,7 @@ impl TransformerBlock {
     ///   before output projection / residual so the rest of the block stays
     ///   in BF16. The on-device zero-copy fast-path (TODO in the adapter)
     ///   will remove this cast.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     pub fn forward_paged_adapter(
         &self,

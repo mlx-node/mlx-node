@@ -23,6 +23,7 @@ use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools::ToolCallResult;
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::chat_common;
@@ -210,6 +211,7 @@ fn clone_dense_linear_layer_caches(
     Some(cloned)
 }
 
+#[cfg(feature = "full")]
 fn compute_paged_prefix_block_hash(
     tokens: &[u32],
     prefix_len: u32,
@@ -317,6 +319,7 @@ pub(crate) struct Qwen35Inner {
     /// `Qwen3_5LayerCache::Linear` with no cross-request prefix reuse.
     /// The compiled C++ forward path is bypassed entirely on the paged
     /// path.
+    #[cfg(feature = "full")]
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
@@ -417,11 +420,13 @@ pub(crate) enum Qwen35Cmd {
         reply: ResponseTx<()>,
     },
     // --- Training commands ---
+    #[cfg(feature = "full")]
     InitTraining {
         config: Box<crate::grpo::engine::GRPOEngineConfig>,
         model_type: crate::training_model::ModelType,
         reply: ResponseTx<()>,
     },
+    #[cfg(feature = "full")]
     GenerateForTraining {
         prompts: Vec<Vec<crate::tokenizer::ChatMessage>>,
         group_size: usize,
@@ -430,6 +435,7 @@ pub(crate) enum Qwen35Cmd {
         tools: Option<Vec<crate::tokenizer::ToolDefinition>>,
         reply: ResponseTx<crate::training_model::GenerationPlainData>,
     },
+    #[cfg(feature = "full")]
     TrainStepGRPO {
         rewards: Vec<f64>,
         group_size: i32,
@@ -441,20 +447,24 @@ pub(crate) enum Qwen35Cmd {
     /// (used by engine skip paths that abort before training).
     /// Also clears cached generation MxArrays.
     /// Returns the new step.
+    #[cfg(feature = "full")]
     BumpSkippedStep {
         reply: ResponseTx<i64>,
     },
     /// Restore the training step counter (for resume from checkpoint).
     /// Does not touch optimizer state — that's loaded via LoadOptimizerState.
+    #[cfg(feature = "full")]
     SetTrainingStep {
         step: i64,
         reply: ResponseTx<()>,
     },
     /// Drop the training state on the model thread.
     /// After this, InitTraining can be called again. No-op if no training state.
+    #[cfg(feature = "full")]
     ResetTraining {
         reply: ResponseTx<()>,
     },
+    #[cfg(feature = "full")]
     TrainStepSFT {
         input_ids: Vec<i32>,
         input_shape: Vec<i64>,
@@ -463,10 +473,12 @@ pub(crate) enum Qwen35Cmd {
         config: crate::sft::engine::SftEngineConfig,
         reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
     },
+    #[cfg(feature = "full")]
     SaveOptimizerState {
         path: String,
         reply: ResponseTx<()>,
     },
+    #[cfg(feature = "full")]
     LoadOptimizerState {
         path: String,
         reply: ResponseTx<()>,
@@ -573,6 +585,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             let _ = reply.send(inner.save_model_sync(&save_path));
         }
         // --- Training commands ---
+        #[cfg(feature = "full")]
         Qwen35Cmd::InitTraining {
             config,
             model_type,
@@ -580,6 +593,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         } => {
             let _ = reply.send(inner.init_training_sync(*config, model_type));
         }
+        #[cfg(feature = "full")]
         Qwen35Cmd::GenerateForTraining {
             prompts,
             group_size,
@@ -596,6 +610,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
                 tools,
             ));
         }
+        #[cfg(feature = "full")]
         Qwen35Cmd::TrainStepGRPO {
             rewards,
             group_size,
@@ -610,6 +625,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
                 valid_indices,
             ));
         }
+        #[cfg(feature = "full")]
         Qwen35Cmd::BumpSkippedStep { reply } => {
             let result = if let Some(ref mut ts) = inner.training_state {
                 ts.clear_generation_cache();
@@ -622,6 +638,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             };
             let _ = reply.send(result);
         }
+        #[cfg(feature = "full")]
         Qwen35Cmd::SetTrainingStep { step, reply } => {
             let result = if let Some(ref mut ts) = inner.training_state {
                 ts.step = step;
@@ -633,10 +650,12 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             };
             let _ = reply.send(result);
         }
+        #[cfg(feature = "full")]
         Qwen35Cmd::ResetTraining { reply } => {
             inner.training_state = None;
             let _ = reply.send(Ok(()));
         }
+        #[cfg(feature = "full")]
         Qwen35Cmd::TrainStepSFT {
             input_ids,
             input_shape,
@@ -653,9 +672,11 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
                 config,
             ));
         }
+        #[cfg(feature = "full")]
         Qwen35Cmd::SaveOptimizerState { path, reply } => {
             let _ = reply.send(inner.save_optimizer_state_sync(path));
         }
+        #[cfg(feature = "full")]
         Qwen35Cmd::LoadOptimizerState { path, reply } => {
             let _ = reply.send(inner.load_optimizer_state_sync(path));
         }
@@ -791,6 +812,7 @@ impl Qwen35Inner {
         // (`Qwen3_5Attention::forward_paged`) both go through standard
         // `self.rope`, so byte-equal parity holds on text-only inputs
         // even on VLM weights.
+        #[cfg(feature = "full")]
         let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
             let attn_layer_count = config.full_attention_layer_count() as u32;
             if attn_layer_count == 0 {
@@ -879,6 +901,7 @@ impl Qwen35Inner {
             model_id,
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
+            #[cfg(feature = "full")]
             paged_adapter,
             #[cfg(not(target_family = "wasm"))]
             training_state: None,
@@ -960,6 +983,7 @@ impl Qwen35Inner {
         Ok(trace.finish(total_start))
     }
 
+    #[cfg(feature = "full")]
     fn find_dense_gdn_prefix_checkpoint(
         &self,
         tokens: &[u32],
@@ -992,6 +1016,7 @@ impl Qwen35Inner {
             })
     }
 
+    #[cfg(feature = "full")]
     fn remember_dense_gdn_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
@@ -1060,6 +1085,7 @@ impl Qwen35Inner {
         Ok(trace.finish(total_start))
     }
 
+    #[cfg(feature = "full")]
     fn prepare_dense_gdn_prefix_state(
         &mut self,
         tokens: &[u32],
@@ -1623,6 +1649,7 @@ impl Qwen35Inner {
         // forward path is incompatible with per-layer paged dispatch;
         // mixing the two on the same turn would corrupt subsequent
         // flat-path turns' compiled state.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             if has_images {
                 return Err(Error::from_reason(
@@ -1995,6 +2022,7 @@ impl Qwen35Inner {
         // FULL prompt for paged purposes; the paged adapter's
         // warm-continue path picks up the matching prefix
         // automatically.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             return self.chat_sync_core_paged(
                 full_token_history.clone(),
@@ -2552,6 +2580,7 @@ impl Qwen35Inner {
     ///   pool) is rejected — same caveat as LFM2 / Qwen3 paged paths.
     /// * The compiled C++ forward path is bypassed — paged turns run
     ///   the pure-Rust `DecoderLayer::forward_paged_or_flat`.
+    #[cfg(feature = "full")]
     fn chat_sync_core_paged(
         &mut self,
         tokens: Vec<u32>,
@@ -2851,6 +2880,7 @@ impl Qwen35Inner {
     /// `paged_forward::run_paged_decode_step` (fallback) based on
     /// adapter block size and `init_paged_dense_compiled_session`
     /// success.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged_inner(
         &mut self,
@@ -3185,6 +3215,7 @@ impl Qwen35Inner {
     /// Mirrors `chat_sync_core_paged`'s adapter lifecycle and
     /// per-layer dispatch but emits each generated token through the
     /// streaming callback as it is produced.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged(
         &mut self,
@@ -3545,6 +3576,7 @@ impl Qwen35Inner {
     /// `use_cpp_paged` is true. See the sync sibling
     /// `chat_sync_core_paged_inner` for the cpp_session_ready gate
     /// rationale.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     fn chat_stream_sync_core_paged_inner<'a>(
         &mut self,
@@ -4212,6 +4244,7 @@ impl Qwen35Inner {
         // Delta path: drive the paged streaming core with
         // `cached_history + delta` as the full prompt; the adapter's
         // warm-continue path matches the cached prefix automatically.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             return self.chat_stream_sync_core_paged(
                 full_token_history.clone(),
@@ -4624,6 +4657,7 @@ impl Qwen35Inner {
 
         // Block-paged dispatch — early-return BEFORE the compile lock.
         // See `chat_sync_core` for the compile-lockout rationale.
+        #[cfg(feature = "full")]
         if self.paged_adapter.is_some() {
             if has_images {
                 return Err(Error::from_reason(
@@ -5479,6 +5513,7 @@ impl Qwen35Inner {
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
+    #[cfg(feature = "full")]
     fn init_training_sync(
         &mut self,
         config: crate::grpo::engine::GRPOEngineConfig,
@@ -5517,6 +5552,7 @@ impl Qwen35Inner {
         Ok(())
     }
 
+    #[cfg(feature = "full")]
     fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
         let ts = self.training_state.as_ref().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
@@ -5524,6 +5560,7 @@ impl Qwen35Inner {
         ts.save_optimizer_state_sync(&path)
     }
 
+    #[cfg(feature = "full")]
     fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
         let ts = self.training_state.as_mut().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
@@ -5536,6 +5573,7 @@ impl Qwen35Inner {
     /// Tokenizes prompts using Jinja2 chat template, generates completions,
     /// caches MxArray results in training_state for the subsequent training step,
     /// and returns plain data across the thread boundary.
+    #[cfg(feature = "full")]
     fn generate_for_training_thread_sync(
         &mut self,
         prompts: Vec<Vec<ChatMessage>>,
@@ -5636,6 +5674,7 @@ impl Qwen35Inner {
     ///
     /// Uses fresh local KV caches (not the shared inference caches).
     /// Returns GenerationResult with MxArray tokens and logprobs.
+    #[cfg(feature = "full")]
     fn generate_single_for_training_sync(
         &mut self,
         input_ids: &MxArray,
@@ -5856,6 +5895,7 @@ impl Qwen35Inner {
     /// Consumes cached MxArrays from the generation phase, computes loss and
     /// gradients via autograd, validates and clips gradients, accumulates them,
     /// and applies the optimizer step when accumulation is complete.
+    #[cfg(feature = "full")]
     fn train_step_grpo_sync(
         &mut self,
         rewards: Vec<f64>,
@@ -6189,6 +6229,7 @@ impl Qwen35Inner {
     /// Receives plain data (Vec<i32> + shape) from the SFT engine, reconstructs
     /// MxArrays on the model thread, computes SFT loss + gradients, validates,
     /// clips, accumulates, and applies optimizer step when accumulation is complete.
+    #[cfg(feature = "full")]
     fn train_step_sft_sync(
         &mut self,
         input_ids: Vec<i32>,
@@ -6483,6 +6524,7 @@ impl Qwen35Inner {
     }
 
     /// Accumulate gradients into training state.
+    #[cfg(feature = "full")]
     fn accumulate_gradients_inner(
         ts: &mut crate::training_state::ModelThreadTrainingState,
         new_grads: HashMap<String, MxArray>,
@@ -6526,6 +6568,7 @@ impl Qwen35Inner {
     /// Apply gradients to model weights (SGD or AdamW delta application).
     ///
     /// Direct field access on Qwen35Inner — no locks needed.
+    #[cfg(feature = "full")]
     fn apply_gradients_inner(
         &mut self,
         gradients: HashMap<String, &MxArray>,
@@ -7581,7 +7624,10 @@ impl Qwen3_5Model {
         )?;
 
         let config_out = inner.config.clone();
+        #[cfg(feature = "full")]
         let paged_active = inner.paged_adapter.is_some();
+        #[cfg(not(feature = "full"))]
+        let paged_active = false;
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
             move || Ok((inner, (config_out.clone(), paged_active))),
             handle_qwen35_cmd,
@@ -7631,7 +7677,10 @@ impl Qwen3_5Model {
         let inner = persistence::build_model_inner_from_cpu_tensors()?;
 
         let config_out = inner.config.clone();
+        #[cfg(feature = "full")]
         let paged_active = inner.paged_adapter.is_some();
+        #[cfg(not(feature = "full"))]
+        let paged_active = false;
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
             move || Ok((inner, (config_out.clone(), paged_active))),
             handle_qwen35_cmd,
@@ -7927,6 +7976,7 @@ pub(crate) const CPP_PAGED_REQUIRED_BLOCK_SIZE: u32 = 16;
 /// On any failure (missing linear cache, missing pool/scale handle, or
 /// the C++ FFI returning a non-zero status), the helper returns `Err`
 /// so the caller can fall back to the pure-Rust paged decode path.
+#[cfg(feature = "full")]
 fn init_paged_dense_compiled_session(
     config: &Qwen3_5Config,
     caches: &[Qwen3_5LayerCache],
@@ -8092,6 +8142,7 @@ fn init_paged_dense_compiled_session(
 ///
 /// On any FFI failure (`output_logits == null`) the helper returns an
 /// `Err` so the dispatcher falls back to pure-Rust paged decode.
+#[cfg(feature = "full")]
 fn forward_dense_cpp_paged(
     input_ids: &MxArray,
     embedding_weight: &MxArray,

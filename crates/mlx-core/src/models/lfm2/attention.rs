@@ -6,6 +6,7 @@ use crate::array::mask::create_causal_mask;
 use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
+#[cfg(feature = "full")]
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
 
@@ -236,6 +237,7 @@ impl Lfm2Attention {
     ///
     /// Output: `[1, seq_len, hidden_size]` so the residual `h = x + r`
     /// in the decoder layer stays the same.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     pub fn forward_paged(
         &self,
