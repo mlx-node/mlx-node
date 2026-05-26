@@ -27,6 +27,7 @@ import { ChapterIndex } from './learn/ChapterIndex';
 import { LessonLayout } from './learn/LessonLayout';
 import { findChapter } from './learn/chapters';
 import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
+import { MultiheadGqaChapterBody, MultiheadGqaDemo } from './learn/chapters/04-multihead-gqa';
 import { TokenizationChapterBody, TokenizerDemo } from './learn/chapters/01-tokenization';
 import { RopeChapterBody, RopeDemo } from './learn/chapters/05-rope';
 import { RmsNormChapterBody, RmsNormDemo } from './learn/chapters/06-rms-norm';
@@ -2081,6 +2082,8 @@ function App() {
             tryItPanel={
               chapter.id === 'attention' ? (
                 <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+              ) : chapter.id === 'multi-head-gqa' ? (
+                <MultiheadGqaDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'tokenization' ? (
                 <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
               ) : chapter.id === 'rope' ? (
@@ -2096,6 +2099,8 @@ function App() {
           >
             {chapter.id === 'attention' ? (
               <AttentionChapterBody />
+            ) : chapter.id === 'multi-head-gqa' ? (
+              <MultiheadGqaChapterBody />
             ) : chapter.id === 'tokenization' ? (
               <TokenizationChapterBody />
             ) : chapter.id === 'rope' ? (

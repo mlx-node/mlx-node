@@ -30,7 +30,11 @@ const MOCK_TOKENS: TokenInfo[] = [
 const MOCK_GENERATED_TOKEN: TokenInfo = { id: 13130, text: " slept" };
 
 const SEQ_LEN = MOCK_TOKENS.length;
-const NUM_HEADS = 4;
+// Mirrors Qwen3.5-0.8B's real attention shape: 8 query heads, 2 KV heads
+// (group_size = 4). Chapter 4's prose teaches exactly these numbers, so the
+// mock data must agree when the model isn't loaded.
+const NUM_HEADS = 8;
+const NUM_KV_HEADS = 2;
 
 // Deterministic pseudo-random number for layer/head/i/j — good enough to give
 // each head a visibly different pattern. We do not want Math.random because
@@ -47,11 +51,16 @@ function hash(layer: number, head: number, i: number, j: number): number {
  *
  *  Properties:
  *  - causal: only positions j <= i get non-zero pre-softmax mass
- *  - per-head "personality":
+ *  - per-head "personality" (cycles every 4 heads, with a phase-shift for the
+ *    second cycle so heads 4-7 differ visibly from heads 0-3):
  *      head 0: diagonal-biased (each token looks mostly at itself)
  *      head 1: previous-token-biased (looks at the token just before)
  *      head 2: BOS-biased (looks heavily at token 0)
  *      head 3: broad / noisy
+ *      head 4: two-back-biased (variant of "previous-token")
+ *      head 5: end-of-prefix-biased (looks at i-2..i-1, variant of diagonal)
+ *      head 6: BOS+self-biased (sharper variant of BOS)
+ *      head 7: broad / noisy with stronger spread
  *  - rows sum to 1 (softmax invariant)
  */
 function buildRow(
@@ -64,7 +73,7 @@ function buildRow(
   for (let j = 0; j <= i; j++) {
     let logit = 0;
     const noise = (hash(layer, head, i, j) - 0.5) * 0.6;
-    switch (head % 4) {
+    switch (head % 8) {
       case 0:
         // Diagonal-biased
         logit = j === i ? 3.0 : -Math.abs(i - j) * 0.6;
@@ -77,9 +86,25 @@ function buildRow(
         // BOS / first-token-biased
         logit = j === 0 ? 2.5 : j === i ? 1.5 : -j * 0.05;
         break;
-      default:
+      case 3:
         // Broad / noisy
         logit = 0.3 - Math.abs(i - j) * 0.15;
+        break;
+      case 4:
+        // Two-back-biased (phase-shifted previous-token)
+        logit = j === i - 2 ? 3.0 : j === i - 1 ? 1.2 : -Math.abs(i - 2 - j) * 0.4;
+        break;
+      case 5:
+        // Sharper diagonal-biased (self + immediate-previous)
+        logit = j === i ? 2.6 : j === i - 1 ? 2.0 : -Math.abs(i - j) * 0.5;
+        break;
+      case 6:
+        // BOS + self-biased (variant of BOS)
+        logit = j === 0 ? 2.0 : j === i ? 2.4 : -j * 0.08;
+        break;
+      default:
+        // Broad / noisy with stronger spread
+        logit = 0.5 - Math.abs(i - j) * 0.08;
         break;
     }
     // Stir in some layer-dependent variation so switching layers visibly
@@ -117,8 +142,9 @@ function buildLayer(layerIndex: number, seqLen: number): AttentionLayer {
     layerIndex,
     kind: "full",
     numHeads: NUM_HEADS,
-    // GQA-ish: 2 KV heads for the 4 query heads.
-    numKvHeads: 2,
+    // GQA: 2 KV heads for the 8 query heads (group_size = 4), matching the
+    // real Qwen3.5-0.8B config.
+    numKvHeads: NUM_KV_HEADS,
     scores,
   };
 }

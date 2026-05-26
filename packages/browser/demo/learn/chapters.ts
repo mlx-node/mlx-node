@@ -44,7 +44,7 @@ export const CHAPTERS: ChapterMeta[] = [
     title: "Multi-head & GQA",
     blurb:
       "Why heads exist, and how Qwen3.5 shares KV across them with grouped-query attention.",
-    available: false,
+    available: true,
   },
   {
     id: "rope",
