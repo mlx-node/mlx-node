@@ -1871,6 +1871,44 @@ unsafe extern "C-unwind" {
         out_hiddens: *mut *mut mlx_array,
     );
 
+    /// Phase 4b — paged-pool sibling of the batched MTP verify forward.
+    /// Reads K/V from `g_dense_k_pools[]` / `g_dense_v_pools[]` (set up
+    /// via `mlx_qwen35_init_paged`) instead of the BHTD
+    /// `g_compiled_caches[]`. Linear-attention layers source state from
+    /// `g_dense_paged_linear_caches[]`.
+    ///
+    /// Caller MUST construct:
+    ///   - `offset_arr`:   `[1]` int32 — RoPE start position.
+    ///   - `block_table`:  `[1, max_blocks_per_seq]` int32.
+    ///   - `slot_mapping`: `[chunk_size_max]` int64 — pool slot indices
+    ///     for the D+1 new tokens; the trailing slots past index
+    ///     `depth+1` are ignored by the kernel but must be present so
+    ///     the static compile trace stays cache-keyed.
+    ///   - `seq_lens`:     `[1]` int32 — post-write context length.
+    ///   - `cu_seqlens_q`: `[2]` int32 = `[0, depth+1]`.
+    ///
+    /// Output: `*out_logits` ← `[1, depth+1, vocab]`, `*out_hiddens`
+    /// ← `[1, depth+1, hidden]`. Both heap-allocated; caller owns. On
+    /// error both pointers are set to nullptr and a stderr diagnostic
+    /// is emitted; global state (pool / linear / BHTD) is unchanged.
+    ///
+    /// Preconditions: `g_compile_inited == true` AND
+    /// `g_dense_paged_inited == true`. The Rust dispatcher must keep
+    /// the BHTD verify path live as the fallback when either gate is
+    /// false.
+    pub fn mlx_qwen35_forward_batched_verify_paged(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        offset_arr: *mut mlx_array,
+        block_table: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        cu_seqlens_q: *mut mlx_array,
+        out_logits: *mut *mut mlx_array,
+        out_hiddens: *mut *mut mlx_array,
+    );
+
     /// W6.7 follow-up — Eagerly compile the batched verify graphs for
     /// both `WithTape=false` and `WithTape=true` over depths {1..5}.
     ///

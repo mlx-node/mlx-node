@@ -583,6 +583,28 @@ static int bucket_size_for_idx(int idx) {
   return idx == kLegacyBucketIdx ? 0 : kVerifyBuckets[idx];
 }
 
+// Phase 4b — opt-IN gate for the paged-pool MTP verify graph. Default
+// OFF; set `MLX_MTP_VERIFY_PAGED_ATTN` to `1` / `true` / `on`
+// (case-insensitive, surrounding whitespace ignored) to enable.
+// Mirrored in Rust by `chat_common::mtp_verify_paged_attn_enabled()`.
+static bool mtp_verify_paged_attn_enabled() {
+  static const bool enabled = []() {
+    const char* raw = std::getenv("MLX_MTP_VERIFY_PAGED_ATTN");
+    if (!raw) return false;
+    std::string v(raw);
+    size_t s = 0;
+    while (s < v.size() && std::isspace(static_cast<unsigned char>(v[s]))) s++;
+    size_t e = v.size();
+    while (e > s && std::isspace(static_cast<unsigned char>(v[e - 1]))) e--;
+    std::string trimmed = v.substr(s, e - s);
+    for (char& c : trimmed) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return trimmed == "1" || trimmed == "true" || trimmed == "on";
+  }();
+  return enabled;
+}
+
 // Build (and cache) the compiled function for a given (bucket, with_tape).
 // The lambda capture of `bucket_size` (an `int`) gives each closure
 // unique identity — MLX's compile cache then allocates a per-bucket trace.
@@ -597,6 +619,176 @@ static BatchedVerifyFn& get_or_compile_verify_bucket(int bucket_idx, bool with_t
     } else {
       slot = mlx::core::compile([bucket_size](const std::vector<array>& inputs) {
         return qwen35_verify_batched_decode_fn_bucketed<false>(inputs, bucket_size);
+      });
+    }
+  }
+  return slot;
+}
+
+// Phase 4b — paged-pool MTP verify graph. Sibling of
+// `qwen35_verify_batched_decode_fn_bucketed` that reads K/V from the
+// vLLM-style pool instead of the BHTD `[B, Hkv, max_kv_len, D]` cache.
+// Linear-attention layers are unchanged; full-attention layers route
+// through `attn_batched_verify_fn_paged` (paged_kv_write +
+// paged_attention_varlen).
+//
+// Input vector layout:
+//   [0]                      h_3d            [1, T, hidden]              bf16
+//   [1]                      offset_arr      [1]                          int32
+//   [2]                      block_table     [1, max_blocks_per_seq]      int32
+//   [3]                      slot_mapping    [chunk_size_max]             int64
+//   [4]                      seq_lens        [1]                          int32
+//   [5]                      cu_seqlens_q    [2]                          int32
+//   [6 .. 6 + 4N):           per-layer (stride 4):
+//     linear:    (conv_state, recurrent_state, _placeholder_, _placeholder_)
+//     full-attn: (k_pool,     v_pool,          k_scale,        v_scale)
+//
+// Output vector layout:
+//   [0]                      logits          [1, T, vocab]
+//   [1]                      hiddens         [1, T, hidden]
+//   [2 .. 2 + 2N):           per-layer (stride 2):
+//     linear:    (new_conv_state, new_recurrent_state)
+//     full-attn: (new_k_pool,     new_v_pool)
+//   [2 + 2N ..]              tape outputs (WithTape variant only) per linear layer
+template <bool WithTape>
+static std::vector<array> qwen35_verify_batched_decode_fn_paged(
+    const std::vector<array>& inputs) {
+  const auto& cfg = g_compile_config;
+
+  auto h_3d         = inputs[0];
+  auto offset_arr   = inputs[1];
+  auto block_table  = inputs[2];
+  auto slot_mapping = inputs[3];
+  auto seq_lens     = inputs[4];
+  auto cu_seqlens_q = inputs[5];
+
+  constexpr int kHeader = 6;
+  constexpr int kPerLayer = 4;
+  constexpr int BLOCK_SIZE = 16;
+
+  int B = h_3d.shape(0);
+  int T = h_3d.shape(1);
+
+  std::vector<array> new_caches;
+  new_caches.reserve(cfg.num_layers * 2);
+  for (int i = 0; i < cfg.num_layers * 2; i++) {
+    new_caches.push_back(zeros({}, mlx::core::bfloat16));
+  }
+
+  std::vector<array> tape_buf, k_tape_buf, g_tape_buf, qkv_tape_buf;
+  if constexpr (WithTape) {
+    tape_buf.reserve(cfg.num_layers);
+    k_tape_buf.reserve(cfg.num_layers);
+    g_tape_buf.reserve(cfg.num_layers);
+    qkv_tape_buf.reserve(cfg.num_layers);
+    for (int i = 0; i < cfg.num_layers; i++) {
+      tape_buf.push_back(zeros({}, mlx::core::float32));
+      k_tape_buf.push_back(zeros({}, mlx::core::bfloat16));
+      g_tape_buf.push_back(zeros({}, mlx::core::float32));
+      qkv_tape_buf.push_back(zeros({}, mlx::core::bfloat16));
+    }
+  }
+
+  array h = h_3d;
+  for (int i = 0; i < cfg.num_layers; i++) {
+    bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+    std::string lp = "layers." + std::to_string(i);
+
+    auto normed = fast::rms_norm(h, get_weight(lp + ".input_layernorm.weight"),
+                                 cfg.rms_norm_eps);
+
+    int base = kHeader + i * kPerLayer;
+    array layer_out = zeros({}, mlx::core::bfloat16);
+    if (is_linear) {
+      const auto& cs = inputs[base + 0];
+      const auto& rs = inputs[base + 1];
+      if constexpr (WithTape) {
+        auto res = gdn_batched_verify_fn_with_tape(normed, i, cs, rs, cfg);
+        layer_out = std::move(res.output);
+        new_caches[i * 2]     = std::move(res.conv_state);
+        new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+        tape_buf[i]     = std::move(res.tape);
+        k_tape_buf[i]   = std::move(res.k_tape);
+        g_tape_buf[i]   = std::move(res.g_tape);
+        qkv_tape_buf[i] = std::move(res.qkv_tape);
+      } else {
+        auto res = gdn_batched_verify_fn(normed, i, cs, rs, cfg);
+        layer_out = std::move(res.output);
+        new_caches[i * 2]     = std::move(res.conv_state);
+        new_caches[i * 2 + 1] = std::move(res.recurrent_state);
+      }
+    } else {
+      const auto& k_pool  = inputs[base + 0];
+      const auto& v_pool  = inputs[base + 1];
+      const auto& k_scale = inputs[base + 2];
+      const auto& v_scale = inputs[base + 3];
+      auto res = attn_batched_verify_fn_paged(
+          normed, i,
+          k_pool, v_pool,
+          k_scale, v_scale,
+          offset_arr,
+          block_table, slot_mapping,
+          seq_lens, cu_seqlens_q,
+          BLOCK_SIZE,
+          cfg);
+      layer_out = std::move(res.output);
+      new_caches[i * 2]     = std::move(res.keys);
+      new_caches[i * 2 + 1] = std::move(res.values);
+    }
+    h = h + layer_out;
+
+    std::string mp = lp + ".mlp.";
+    int hidden = h.shape(2);
+    auto h_flat = reshape(h, {B * T, hidden});
+    auto mlp_in_flat = fast::rms_norm(h_flat, get_weight(lp + ".post_attention_layernorm.weight"),
+                                      cfg.rms_norm_eps);
+    auto gate    = linear_proj(mlp_in_flat, mp + "gate_proj");
+    auto up      = linear_proj(mlp_in_flat, mp + "up_proj");
+    auto mlp_out = linear_proj(swiglu(gate, up), mp + "down_proj");
+    h = h + reshape(mlp_out, {B, T, hidden});
+  }
+
+  int hidden = h.shape(2);
+  auto h_flat = reshape(h, {B * T, hidden});
+  h_flat = fast::rms_norm(h_flat, get_weight("final_norm.weight"), cfg.rms_norm_eps);
+  auto hidden_out = reshape(h_flat, {B, T, hidden});
+
+  auto logits_flat = cfg.tie_word_embeddings
+      ? linear_proj(h_flat, "embedding")
+      : linear_proj(h_flat, "lm_head");
+  int vocab = logits_flat.shape(-1);
+  auto logits = reshape(logits_flat, {B, T, vocab});
+
+  std::vector<array> result;
+  size_t reserve = 2 + cfg.num_layers * 2;
+  if constexpr (WithTape) reserve += cfg.num_layers * 4;
+  result.reserve(reserve);
+  result.push_back(std::move(logits));
+  result.push_back(std::move(hidden_out));
+  for (auto& c : new_caches) result.push_back(std::move(c));
+  if constexpr (WithTape) {
+    for (int i = 0; i < cfg.num_layers; i++) {
+      result.push_back(std::move(tape_buf[i]));
+      result.push_back(std::move(k_tape_buf[i]));
+      result.push_back(std::move(g_tape_buf[i]));
+      result.push_back(std::move(qkv_tape_buf[i]));
+    }
+  }
+  return result;
+}
+
+static std::array<BatchedVerifyFn, 2> g_verify_compiled_paged{};
+
+static BatchedVerifyFn& get_or_compile_verify_paged(bool with_tape) {
+  auto& slot = g_verify_compiled_paged[with_tape ? 1 : 0];
+  if (!slot) {
+    if (with_tape) {
+      slot = mlx::core::compile([](const std::vector<array>& inputs) {
+        return qwen35_verify_batched_decode_fn_paged<true>(inputs);
+      });
+    } else {
+      slot = mlx::core::compile([](const std::vector<array>& inputs) {
+        return qwen35_verify_batched_decode_fn_paged<false>(inputs);
       });
     }
   }
@@ -1001,6 +1193,16 @@ void mlx_qwen35_forward_batched_verify(
     }
 
     bool with_tape = g_tape_recording_armed;
+    if (mtp_verify_paged_attn_enabled() && g_dense_paged_inited) {
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        fprintf(stderr,
+                "[MLX] MLX_MTP_VERIFY_PAGED_ATTN=1 with paged adapter live, "
+                "but no Rust caller wires the paged-verify inputs yet — "
+                "falling back to BHTD verify path. (Phase 4b/B1 scaffolding.)\n");
+        fflush(stderr);
+      }
+    }
     // W6.29 — pick the smallest bucket >= offset + T. The legacy
     // full-length graph is returned when offset + T exceeds the largest
     // bucket, when the chosen bucket would exceed the allocated KV cache
@@ -1070,6 +1272,205 @@ void mlx_qwen35_forward_batched_verify(
   } catch (...) {
     fprintf(stderr,
             "[MLX] Unknown exception in mlx_qwen35_forward_batched_verify\n");
+    fflush(stderr);
+    if (out_logits) *out_logits = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
+  }
+}
+
+// Phase 4b — paged-pool sibling of `mlx_qwen35_forward_batched_verify`.
+// Reads K/V from `g_dense_k_pools[]` / `g_dense_v_pools[]` (populated
+// by the paged adapter through `mlx_qwen35_init_paged`) instead of the
+// BHTD `g_compiled_caches[]`. Linear-attention layers still source
+// state from `g_dense_paged_linear_caches[]`.
+//
+// Caller MUST construct: `offset_arr` ([1] int32), `block_table`
+// ([1, max_blocks_per_seq] int32), `slot_mapping` ([chunk_size_max]
+// int64), `seq_lens` ([1] int32, post-write context), `cu_seqlens_q`
+// ([2] int32 = [0, T] where T = depth + 1). The paged adapter's
+// `build_paged_attention_inputs(D+1, ...)` already emits the first
+// four; `cu_seqlens_q` is trivially constructible Rust-side.
+//
+// Output: `*out_logits` ← `[1, T, vocab]`, `*out_hiddens`
+// ← `[1, T, hidden]`. Both heap-allocated via `new array(...)`; the
+// caller owns and is responsible for `MxArray::from_handle`. On error
+// both pointers are set to nullptr and a stderr diagnostic is emitted;
+// global state (pools, linear caches, BHTD `g_offset_int`) is left
+// untouched so the Rust caller can fall back.
+//
+// Tape recording follows the same arming as the BHTD path
+// (`g_tape_recording_armed`). Tape outputs flow back into the same
+// `g_gdn_*_tape_acc[]` per-layer accumulators so the existing replay
+// path is reused.
+//
+// NB: this FFI does NOT advance any BHTD cursor (`g_offset_int` /
+// `g_compiled_caches`). The paged adapter's `record_tokens` is the
+// authoritative cursor for the pool, mutated Rust-side around the FFI.
+void mlx_qwen35_forward_batched_verify_paged(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array* offset_arr_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* slot_mapping_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array* cu_seqlens_q_ptr,
+    mlx_array** out_logits,
+    mlx_array** out_hiddens
+) {
+  if (out_logits) *out_logits = nullptr;
+  if (out_hiddens) *out_hiddens = nullptr;
+  if (!input_ids_ptr || !embedding_weight_ptr || !offset_arr_ptr ||
+      !block_table_ptr || !slot_mapping_ptr || !seq_lens_ptr ||
+      !cu_seqlens_q_ptr || !out_logits || !out_hiddens) {
+    return;
+  }
+  if (!g_compile_inited) return;
+  if (!g_dense_paged_inited) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_forward_batched_verify_paged: paged adapter "
+            "not initialised (g_dense_paged_inited=false); call "
+            "mlx_qwen35_init_paged first.\n");
+    fflush(stderr);
+    return;
+  }
+  if (depth < 1 || depth > 5) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_forward_batched_verify_paged: depth %d outside "
+            "[1, 5]\n",
+            depth);
+    fflush(stderr);
+    return;
+  }
+  const auto& cfg = g_compile_config;
+  int T = depth + 1;
+
+  if (qwen35_common::mtp_trace_enabled()) {
+    fprintf(stderr,
+            "[MTP-TRACE] mlx_qwen35_forward_batched_verify_paged: ENTER "
+            "depth=%d T=%d tape_armed=%d\n",
+            depth, T, g_tape_recording_armed ? 1 : 0);
+  }
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+    auto& offset_arr       = *reinterpret_cast<array*>(offset_arr_ptr);
+    auto& block_table      = *reinterpret_cast<array*>(block_table_ptr);
+    auto& slot_mapping     = *reinterpret_cast<array*>(slot_mapping_ptr);
+    auto& seq_lens         = *reinterpret_cast<array*>(seq_lens_ptr);
+    auto& cu_seqlens_q     = *reinterpret_cast<array*>(cu_seqlens_q_ptr);
+
+    if (input_ids.ndim() != 2 || input_ids.shape(0) != 1 ||
+        input_ids.shape(1) != T) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_forward_batched_verify_paged: input_ids shape "
+              "must be [1, %d], got ndim=%d shape=[%lld,%lld]\n",
+              T, input_ids.ndim(),
+              input_ids.ndim() >= 1 ? (long long)input_ids.shape(0) : -1LL,
+              input_ids.ndim() >= 2 ? (long long)input_ids.shape(1) : -1LL);
+      fflush(stderr);
+      return;
+    }
+
+    int expected_pool_layers = cfg.num_layers;
+    if ((int)g_dense_k_pools.size() != expected_pool_layers ||
+        (int)g_dense_v_pools.size() != expected_pool_layers ||
+        (int)g_dense_k_scales.size() != expected_pool_layers ||
+        (int)g_dense_v_scales.size() != expected_pool_layers ||
+        (int)g_dense_paged_linear_caches.size() != expected_pool_layers * 2) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_forward_batched_verify_paged: pool/linear "
+              "cache layer-count mismatch (cfg.num_layers=%d k_pools=%zu "
+              "v_pools=%zu k_scales=%zu v_scales=%zu linear=%zu)\n",
+              expected_pool_layers, g_dense_k_pools.size(),
+              g_dense_v_pools.size(), g_dense_k_scales.size(),
+              g_dense_v_scales.size(), g_dense_paged_linear_caches.size());
+      fflush(stderr);
+      return;
+    }
+
+    auto flat_ids = reshape(input_ids, {-1});
+    auto emb_flat = take(embedding_weight, flat_ids, 0);
+    auto h_3d = reshape(emb_flat, {1, T, cfg.hidden_size});
+
+    std::vector<array> inputs;
+    inputs.reserve(6 + cfg.num_layers * 4);
+    inputs.push_back(std::move(h_3d));
+    inputs.push_back(offset_arr);
+    inputs.push_back(block_table);
+    inputs.push_back(slot_mapping);
+    inputs.push_back(seq_lens);
+    inputs.push_back(cu_seqlens_q);
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (is_linear) {
+        inputs.push_back(g_dense_paged_linear_caches[i * 2]);
+        inputs.push_back(g_dense_paged_linear_caches[i * 2 + 1]);
+        inputs.push_back(zeros({}, mlx::core::bfloat16));
+        inputs.push_back(zeros({}, mlx::core::bfloat16));
+      } else {
+        inputs.push_back(g_dense_k_pools[i]);
+        inputs.push_back(g_dense_v_pools[i]);
+        inputs.push_back(g_dense_k_scales[i]);
+        inputs.push_back(g_dense_v_scales[i]);
+      }
+    }
+
+    bool with_tape = g_tape_recording_armed;
+    auto& fn = get_or_compile_verify_paged(with_tape);
+    auto outputs = fn(inputs);
+
+    array* logits_alloc  = new array(outputs[0]);
+    array* hiddens_alloc = nullptr;
+    try {
+      hiddens_alloc = new array(outputs[1]);
+    } catch (...) {
+      delete logits_alloc;
+      throw;
+    }
+    *out_logits  = reinterpret_cast<mlx_array*>(logits_alloc);
+    *out_hiddens = reinterpret_cast<mlx_array*>(hiddens_alloc);
+
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (is_linear) {
+        g_dense_paged_linear_caches[i * 2]     = outputs[2 + i * 2];
+        g_dense_paged_linear_caches[i * 2 + 1] = outputs[2 + i * 2 + 1];
+      } else {
+        g_dense_k_pools[i] = outputs[2 + i * 2];
+        g_dense_v_pools[i] = outputs[2 + i * 2 + 1];
+      }
+    }
+
+    if (with_tape) {
+      int extra_base = 2 + cfg.num_layers * 2;
+      for (int i = 0; i < cfg.num_layers; i++) {
+        bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+        if (!is_linear) continue;
+        int base = extra_base + i * 4;
+        g_gdn_tape_acc[i]     = outputs[base + 0];
+        g_gdn_k_tape_acc[i]   = outputs[base + 1];
+        g_gdn_g_tape_acc[i]   = outputs[base + 2];
+        g_gdn_qkv_tape_acc[i] = outputs[base + 3];
+      }
+    }
+    if (qwen35_common::mtp_trace_enabled()) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_forward_batched_verify_paged: EXIT OK "
+              "T=%d with_tape=%d\n",
+              T, with_tape ? 1 : 0);
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in mlx_qwen35_forward_batched_verify_paged: %s\n",
+            e.what());
+    fflush(stderr);
+    if (out_logits) *out_logits = nullptr;
+    if (out_hiddens) *out_hiddens = nullptr;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_forward_batched_verify_paged\n");
     fflush(stderr);
     if (out_logits) *out_logits = nullptr;
     if (out_hiddens) *out_hiddens = nullptr;

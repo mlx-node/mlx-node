@@ -173,6 +173,26 @@ pub(crate) fn mtp_verify_async_eval() -> bool {
     })
 }
 
+// Phase 4b — opt-IN gate for the paged-pool MTP verify graph. Default
+// OFF; set `MLX_MTP_VERIFY_PAGED_ATTN` to `1` / `true` / `on`
+// (case-insensitive, surrounding whitespace ignored) to enable. The
+// Rust gate mirrors the C++ `mtp_verify_paged_attn_enabled()` reader
+// in `mlx_qwen35.cpp`; both must agree per process for the dispatcher
+// to route through the new graph. Opposite polarity to
+// `mtp_verify_async_eval` (which defaults ON) because the paged-verify
+// graph is still being validated end-to-end.
+#[allow(dead_code)] // Wired by Phase 4b/B3 once the paged-verify Rust caller lands.
+pub(crate) fn mtp_verify_paged_attn_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_VERIFY_PAGED_ATTN") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    })
+}
+
 // W6.5 — Chained cycles via verify-hidden export.
 //
 // Opt-in: `MLX_MTP_CHAINED_CYCLES=1` (or `true` / `on`). The W6.5-resume

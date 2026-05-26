@@ -128,6 +128,23 @@ extern "C" void mlx_qwen35_forward_batched_verify(
     mlx_array** out_logits,
     mlx_array** out_hiddens);
 
+// Phase 4b — paged-pool sibling of `mlx_qwen35_forward_batched_verify`.
+// Reads K/V from `g_dense_k_pools[]` / `g_dense_v_pools[]` instead of
+// the BHTD `g_compiled_caches[]`. Caller MUST construct `offset_arr`,
+// `block_table`, `slot_mapping`, `seq_lens`, and `cu_seqlens_q` (see
+// the C++ docstring on the definition for shapes).
+extern "C" void mlx_qwen35_forward_batched_verify_paged(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array* offset_arr_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* slot_mapping_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array* cu_seqlens_q_ptr,
+    mlx_array** out_logits,
+    mlx_array** out_hiddens);
+
 // W6.7 follow-up — eagerly compile the batched verify graphs for both
 // `WithTape=false` and `WithTape=true` over depths {1..5}. Defined in
 // `mlx_qwen35.cpp` where it has direct access to the main path's

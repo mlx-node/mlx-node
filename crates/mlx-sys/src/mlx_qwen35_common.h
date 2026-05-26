@@ -1598,6 +1598,106 @@ inline AttnPureResult attn_batched_verify_fn(
   return {output, new_kv_keys, new_kv_values};
 }
 
+// Phase 4b — paged sibling of `attn_batched_verify_fn`. Replaces
+// `slice_update` + SDPA over a BHTD cache with `paged_kv_write` +
+// `paged_attention_varlen` over the vLLM-style pool. Q/K/V projection,
+// QK norm, and RoPE are identical so kernel parity with the BHTD path
+// holds up to the attention math itself (varlen kernel reduces softmax
+// per query row independently of context length, so values can differ
+// within bf16 noise vs. SDPA bucketed verify). The pool tensors
+// returned in `keys` / `values` of `AttnPureResult` are the post-write
+// handles produced by `paged_kv_write`; the caller stashes them back
+// into the global pool slot for the next forward.
+inline AttnPureResult attn_batched_verify_fn_paged(
+    const array& x,                  // [B, T, hidden]
+    int layer_idx,
+    const array& k_pool,             // [num_blocks, num_kv_heads, head_size/x_pack, block_size, x_pack]
+    const array& v_pool,             // [num_blocks, num_kv_heads, head_size, block_size]
+    const array& k_scale,            // [1] f32
+    const array& v_scale,            // [1] f32
+    const array& offset_arr,         // [1] int32 — RoPE start position
+    const array& block_table,        // [1, max_blocks_per_seq] int32
+    const array& slot_mapping,       // [chunk_size_max] int64
+    const array& seq_lens,           // [1] int32 — post-write context
+    const array& cu_seqlens_q,       // [2] int32 — [0, T]
+    int block_size,
+    const BaseConfig& cfg) {
+  int B = x.shape(0);
+  int T = x.shape(1);
+  int hidden = x.shape(2);
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
+
+  auto x_flat = reshape(x, {B * T, hidden});
+
+  auto q_proj = linear_proj(x_flat, pfx + "q_proj");
+  if (has_weight(pfx + "q_proj.bias")) q_proj = q_proj + get_weight(pfx + "q_proj.bias");
+
+  auto qph     = reshape(q_proj, {B, T, cfg.num_heads, cfg.head_dim * 2});
+  auto queries = slice(qph, {0, 0, 0, 0},            {B, T, cfg.num_heads, cfg.head_dim});
+  auto gate    = slice(qph, {0, 0, 0, cfg.head_dim}, {B, T, cfg.num_heads, cfg.head_dim * 2});
+  gate = reshape(gate, {B * T, cfg.num_heads * cfg.head_dim});
+
+  auto keys   = linear_proj(x_flat, pfx + "k_proj");
+  auto values = linear_proj(x_flat, pfx + "v_proj");
+  if (has_weight(pfx + "k_proj.bias")) keys   = keys   + get_weight(pfx + "k_proj.bias");
+  if (has_weight(pfx + "v_proj.bias")) values = values + get_weight(pfx + "v_proj.bias");
+
+  keys   = reshape(keys,   {B, T, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, T, cfg.num_kv_heads, cfg.head_dim});
+
+  queries = fast::rms_norm(queries, get_weight(pfx + "q_norm.weight"), cfg.rms_norm_eps);
+  keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
+
+  queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+  keys    = fast::rope(keys,    cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+
+  auto new_k_flat = reshape(keys,    {B * T, cfg.num_kv_heads, cfg.head_dim});
+  auto new_v_flat = reshape(values,  {B * T, cfg.num_kv_heads, cfg.head_dim});
+  auto q_flat     = reshape(queries, {B * T, cfg.num_heads,    cfg.head_dim});
+
+  constexpr int X_PACK = 8;
+  constexpr int SLIDING_WINDOW = 0;
+  const auto kv_dtype = mlx::core::fast::KvDtype::Bf16;
+
+  auto write_pair = mlx::core::fast::paged_kv_write(
+      k_pool, v_pool,
+      new_k_flat, new_v_flat,
+      slot_mapping,
+      k_scale, v_scale,
+      block_size,
+      cfg.num_kv_heads,
+      cfg.head_dim,
+      X_PACK,
+      kv_dtype);
+  auto new_k_pool = std::move(write_pair.first);
+  auto new_v_pool = std::move(write_pair.second);
+
+  float scale = std::pow((float)cfg.head_dim, -0.5f);
+  auto attn_out = mlx::core::fast::paged_attention_varlen(
+      q_flat,
+      new_k_pool, new_v_pool,
+      block_table, seq_lens, cu_seqlens_q,
+      k_scale, v_scale,
+      scale,
+      /*softcap=*/0.0f,
+      SLIDING_WINDOW,
+      block_size,
+      cfg.num_heads,
+      cfg.num_kv_heads,
+      cfg.head_dim,
+      kv_dtype);
+
+  attn_out = reshape(attn_out, {B * T, cfg.num_heads * cfg.head_dim});
+
+  attn_out = compiled_attn_gate()({attn_out, gate})[0];
+
+  auto out_flat = linear_proj(attn_out, pfx + "o_proj");
+  if (has_weight(pfx + "o_proj.bias")) out_flat = out_flat + get_weight(pfx + "o_proj.bias");
+  auto output = reshape(out_flat, {B, T, hidden});
+
+  return {output, new_k_pool, new_v_pool};
+}
+
 // =====================================================================
 // W6.7 — Batched GDN forward for the MTP verify graph.
 //
