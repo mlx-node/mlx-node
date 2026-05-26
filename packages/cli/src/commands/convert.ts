@@ -56,13 +56,14 @@ Quantization Arguments:
                         Recommended combo: --q-recipe unsloth --q-bits 4 --q-mxfp
                         promotes mlp.gate_proj/up_proj to mxfp4 (q/k/v at 6-bit
                         affine, down_proj at 5-bit affine, router gates at 8-bit
-                        affine, lm_head at 8-bit affine, out_proj stays bf16).
-                        At default --q-bits 3 only down_proj (4b -> mxfp4) gets
-                        the upgrade.
+                        affine, lm_head at 8-bit affine, o_proj/out_proj at
+                        8-bit affine). At default --q-bits 3 only down_proj
+                        (4b -> mxfp4) gets the upgrade.
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
-                        embed=5b, lm_head=6b, attn q/k/v=5b+AWQ, out_proj=bf16)
+                        embed=5b, lm_head=6b, attn q/k/v=5b+AWQ,
+                        o_proj/out_proj/in_proj_a/in_proj_b=8b affine)
                         "unsloth" requires --imatrix-path for quality
   --imatrix-path <path> imatrix GGUF file for AWQ-style pre-scaling
                         Improves quantization quality using calibration data
@@ -194,8 +195,9 @@ export async function run(argv: string[]) {
       process.exit(1);
     }
     // Unsloth recipe defaults to 3-bit base (MLP gate/up at 3-bit, down at 4-bit,
-    // embed_tokens at 5-bit, lm_head at 6-bit, attn q/k/v + SSM in_proj at 5-bit
-    // with AWQ pre-scaling via input_layernorm, out_proj/o_proj kept at bf16).
+    // embed_tokens at 5-bit, lm_head at 6-bit, attn q/k/v + SSM in_proj_qkv/z at
+    // 5-bit with AWQ pre-scaling via input_layernorm, o_proj/out_proj and split
+    // in_proj_a/in_proj_b at 8-bit affine for MTP/AR T=0 bit-exactness).
     // Based on Unsloth's per-tensor KLD analysis. Requires imatrix for AWQ correction
     // on the attention/SSM projections.
     if (quantRecipe === 'unsloth' && !args['q-bits'] && quantMode !== 'nvfp4') {

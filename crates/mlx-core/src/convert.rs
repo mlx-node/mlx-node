@@ -1055,8 +1055,17 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
         return false;
     }
 
-    // Exclude in_proj_a, in_proj_b, and in_proj_ba (low-rank projections in GatedDeltaNet)
-    if key.contains("in_proj_a.") || key.contains("in_proj_b.") || key.contains("in_proj_ba.") {
+    // Exclude in_proj_ba (fused low-rank projection in GatedDeltaNet).
+    //
+    // The split `in_proj_a` / `in_proj_b` projections are intentionally NOT
+    // excluded here: at MTP verify time a plain bf16 `matmul` dispatches a
+    // `gemv` kernel at M=1 (sequential AR/Step-A) but a split-K `steel_matmul`
+    // at M>=2 (batched verify) — different reduction order flips argmax on
+    // near-ties and breaks T=0 MTP/AR bit-exactness. Quantizing them routes
+    // through the row-independent `qmv` kernel instead. They are tiny
+    // (`[48, 5120]`) so this is a parity fix, not a size optimization; recipes
+    // emit an 8-bit affine (group_size 64) override for them.
+    if key.contains("in_proj_ba.") {
         return false;
     }
 
@@ -1400,11 +1409,14 @@ pub(crate) fn build_recipe_predicate(
 ///
 /// Based on Unsloth GGUF benchmarks (https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks):
 ///
-/// - **ssm_out** (`linear_attn.out_proj`): "dramatically increases KLD and the disk space savings
-///   is minuscule" → skip quantization entirely
+/// - **ssm_out** (`linear_attn.out_proj`) and **attn_out** (`self_attn.o_proj`):
+///   "dramatically increases KLD" at low bits → 8-bit affine (group_size 64),
+///   the highest-precision affine option. Quantizing (rather than keeping bf16)
+///   is required for MTP/AR T=0 bit-exactness — see `build_unsloth_recipe`.
 /// - **attn_\***: "especially sensitive for hybrid architectures" → `min(default_bits + 2, 8)`
 /// - **attn_gate** (`linear_attn.in_proj_z`): "performs poorly with MXFP4" → higher bits
-/// - **ssm_beta, ssm_alpha** (`in_proj_a/b`): already excluded by `should_quantize()`
+/// - **ssm_beta, ssm_alpha** (`in_proj_a/b`): 8-bit affine (group_size 64) for
+///   MTP/AR bit-exactness — see `build_unsloth_recipe`.
 /// - **Router gates** → 8-bit affine (standard for MoE routing accuracy)
 /// - **FFN expert weights**: "generally ok to quantize to 3-bit" → default bits
 /// - **ffn_down_exps**: "slightly more sensitive" → `min(default_bits + 1, 8)`
@@ -1430,15 +1442,33 @@ pub(crate) fn build_qwen35_recipe(
             };
         }
 
-        // ssm_out (linear_attn.out_proj): "dramatically increases KLD" — skip entirely.
-        // Disk savings are minuscule and quality impact is severe.
-        if key.contains("linear_attn.out_proj") {
-            return QuantDecision::Skip;
+        // o_proj / out_proj and the split low-rank GDN projections
+        // (`in_proj_a` / `in_proj_b`): 8-bit affine, group_size 64.
+        //
+        // `linear_attn.out_proj` "dramatically increases KLD" at low bits, so
+        // it was historically skipped. It (and `self_attn.o_proj`,
+        // `in_proj_a`, `in_proj_b`) must nonetheless be quantized for MTP/AR
+        // T=0 bit-exactness: a bf16 `matmul` dispatches `gemv` at M=1 but a
+        // split-K `steel_matmul` at M>=2, and the differing reduction order
+        // flips argmax on near-ties. 8-bit affine routes through the
+        // row-independent `qmv` kernel while staying near-bf16 accuracy.
+        // Keeps this recipe consistent with `build_unsloth_recipe`.
+        if key.contains("self_attn.o_proj")
+            || key.contains("linear_attn.out_proj")
+            || key.contains("linear_attn.in_proj_a.")
+            || key.contains("linear_attn.in_proj_b.")
+        {
+            return QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            };
         }
 
-        // Attention projections (q_proj, k_proj, v_proj, o_proj) and
-        // remaining SSM-sensitive weights (in_proj_qkv, in_proj_z).
-        // Note: in_proj_a/b and A_log/dt_bias are already excluded by should_quantize().
+        // Attention projections (q_proj, k_proj, v_proj) and remaining
+        // SSM-sensitive weights (in_proj_qkv, in_proj_z). o_proj is handled
+        // above. Note: A_log/dt_bias and in_proj_ba are excluded by
+        // should_quantize().
         let is_attn_sensitive = key.contains("self_attn.")
             || key.contains("linear_attn.in_proj_qkv")
             || key.contains("linear_attn.in_proj_z");
@@ -1490,9 +1520,10 @@ pub(crate) fn build_qwen35_recipe(
 /// | `embed_tokens`          | N+2     | Q5_K/Q6_K  | KLD ~0.15 — very low sensitivity  |
 /// | `lm_head`               | N+3     | Q6_K/Q8_0  | KLD ~0.05 — safest tensor         |
 /// | `self_attn.q/k/v_proj`  | N+2     | Q5_K/Q6_K  | KLD ~1.5-2.9, AWQ via layernorm   |
-/// | `linear_attn.in_proj_*` | N+2     | Q5_K/Q6_K  | KLD ~2.9, AWQ via layernorm       |
-/// | `self_attn.o_proj`      | bf16    | bf16       | KLD ~1.5, NOT AWQ-correctable     |
-/// | `linear_attn.out_proj`  | bf16    | bf16       | KLD ~6.0, worst tensor by far     |
+/// | `linear_attn.in_proj_qkv/z` | N+2 | Q5_K/Q6_K  | KLD ~2.9, AWQ via layernorm       |
+/// | `self_attn.o_proj`      | 8 affine| Q8_0       | KLD ~1.5, NOT AWQ — 8-bit for parity |
+/// | `linear_attn.out_proj`  | 8 affine| Q8_0       | KLD ~6.0 worst — 8-bit for parity |
+/// | `linear_attn.in_proj_a/b` | 8 affine| Q8_0     | tiny `[48,5120]` — 8-bit for parity |
 /// | `down_proj`             | N+1     | Q4_K/Q5_K  | "slightly more sensitive" than FFN |
 /// | `gate_proj`, `up_proj`  | N       | Q3_K/Q4_K  | "generally ok" at low bits        |
 /// | Router gates            | 8       | Q8_0       | Standard for MoE routing          |
@@ -1501,8 +1532,13 @@ pub(crate) fn build_qwen35_recipe(
 /// ## AWQ Pre-Scaling
 ///
 /// imatrix is **required** — attention/SSM weights fed by input_layernorm can
-/// be AWQ-corrected (layernorm absorbs inverse scales), but o_proj and out_proj
-/// have no preceding norm and must stay bf16.
+/// be AWQ-corrected (layernorm absorbs inverse scales). `o_proj`, `out_proj`,
+/// and the split `in_proj_a`/`in_proj_b` have no preceding norm so cannot be
+/// AWQ-corrected; they are quantized at 8-bit affine (group_size 64) rather
+/// than left bf16 so they route through MLX's row-independent `qmv` kernel —
+/// required for MTP/AR T=0 bit-exactness (a bf16 `matmul` dispatches `gemv` at
+/// M=1 but split-K `steel_matmul` at M>=2, and the differing reduction order
+/// flips argmax on near-ties). 8-bit affine keeps these near bf16 accuracy.
 pub(crate) fn build_unsloth_recipe(
     default_bits: i32,
     default_group_size: i32,
@@ -1576,14 +1612,38 @@ pub(crate) fn build_unsloth_recipe(
         // Attention/SSM projections WITHOUT AWQ pre-scaling:
         // o_proj input comes from attention computation (not a norm layer),
         // out_proj input comes from GDN computation.
-        // These cannot be AWQ-corrected — keep at bf16 for quality.
-        // linear_attn.out_proj: KLD ~6.0 — worst tensor by far.
-        // self_attn.o_proj: KLD ~1.5 — sensitive but not catastrophic.
+        // These cannot be AWQ-corrected. They were previously kept at bf16,
+        // but a plain bf16 `matmul` dispatches a `gemv` kernel at M=1
+        // (sequential AR/Step-A) and a split-K `steel_matmul` at M>=2 (batched
+        // MTP verify) — different reduction order flips argmax on near-ties
+        // and breaks T=0 MTP/AR bit-exactness. Quantizing routes them through
+        // the row-independent `qmv` kernel (bit-identical row 0 at M=1 vs
+        // M=4). Use 8-bit affine, group_size 64: the highest-precision affine
+        // quantization, keeping `out_proj` (KLD ~6.0 — worst tensor) and
+        // `o_proj` (KLD ~1.5) near bf16 accuracy. Do NOT promote these to
+        // nvfp4 — `apply_nvfp4_upgrade` passes 8-bit Custom decisions through
+        // unchanged, which is what we rely on here.
         let is_non_awq_attn =
             key.contains("self_attn.o_proj") || key.contains("linear_attn.out_proj");
 
         if is_non_awq_attn {
-            return QuantDecision::Skip;
+            return QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            };
+        }
+
+        // Split low-rank GDN projections (`linear_attn.in_proj_a` /
+        // `in_proj_b`). Same MTP/AR bit-exactness rationale as o_proj/out_proj:
+        // these are bf16 in the source and must route through `qmv` at verify
+        // time. Tiny (`[48, 5120]`) so 8-bit affine has negligible size cost.
+        if key.contains("linear_attn.in_proj_a.") || key.contains("linear_attn.in_proj_b.") {
+            return QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            };
         }
 
         // ffn_down: "slightly more sensitive" than other FFN variants
