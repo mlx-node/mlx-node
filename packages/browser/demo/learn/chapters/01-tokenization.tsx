@@ -5,6 +5,8 @@ import { Textarea } from "../../components/ui/textarea";
 import type { TokenInfo } from "../../../src/inspector-types";
 import { tokenize } from "../../lib/tokenizer-client";
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 /**
  * Chapter 1 — Tokenization.
@@ -35,10 +37,129 @@ const CHIP_PALETTE = [
 // Special-token text typically wraps `<|...|>` markers (e.g. `<|im_start|>`).
 const SPECIAL_TOKEN_TEXT_RE = /<\|[^|]+\|>/;
 
+/**
+ * Scaffolding metadata for chapter 1 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[0].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "tokenization",
+  objective:
+    "Explain why an LLM splits text into sub-word tokens instead of characters or words.",
+  problem:
+    "Models need a finite vocabulary that balances sequence length against vocabulary size.",
+  minutes: 6,
+  glossary: [
+    {
+      term: "token",
+      definition:
+        "The unit a transformer actually reads — an integer id pointing into the model's vocabulary.",
+    },
+    {
+      term: "BPE",
+      definition:
+        "Byte-Pair Encoding: start from bytes, repeatedly merge the most frequent adjacent pair until the vocabulary is the target size.",
+    },
+    {
+      term: "sub-word",
+      definition:
+        "A token that is smaller than a word but larger than a character, e.g. \"ization\" or \" the\".",
+    },
+    {
+      term: "vocabulary",
+      definition:
+        "The full set of tokens the model knows. Qwen3 ships about 152,000 entries.",
+    },
+    {
+      term: "special token",
+      definition:
+        "A reserved token like <|im_start|> that marks structure (chat turns, end-of-text) rather than literal text.",
+    },
+    {
+      term: "chars/token",
+      definition:
+        "Characters divided by tokens — a quick proxy for how efficiently a string fits the tokenizer's vocabulary.",
+    },
+  ],
+  takeaways: [
+    "Cost scales with tokens, not characters: billing, KV-cache, and latency are all per-token.",
+    "A leading space is part of the token — \"cat\" and \" cat\" are usually different vocabulary entries.",
+    "Different model families tokenize the same string differently, so token counts only compare within one tokenizer.",
+  ],
+  exercise: {
+    prompt:
+      "Using the tokenizer demo, find one sentence that gives you the highest chars/token ratio you can hit, and a different sentence that gives you the lowest.",
+    answer:
+      "Long English words (think \"unbelievably\", \"internationalization\") sit very high because BPE merges long common stems into one token. The low end is emoji, CJK punctuation, or unusual scripts that fall back to byte-level fragments — those routinely drop below 1 char/token.",
+  },
+  quiz: [
+    {
+      id: "q1-why-subword",
+      prompt: "Why do modern LLMs use sub-word tokens instead of words?",
+      options: [
+        { id: "a", label: "Sub-words are always shorter than words." },
+        {
+          id: "b",
+          label:
+            "A word-level vocabulary would need to enumerate every name, typo, and rare word, which makes the embedding matrix impractically large.",
+        },
+        {
+          id: "c",
+          label:
+            "Word-level tokenizers cannot represent punctuation, so they are unusable.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "The vocabulary size has to be finite. Words mean millions of entries (long tail); characters mean very long sequences. Sub-words are the practical middle.",
+    },
+    {
+      id: "q2-chars-per-token",
+      prompt: "What does a higher chars/token ratio usually mean?",
+      options: [
+        {
+          id: "a",
+          label:
+            "The string uses common patterns the tokenizer learned well, so each token covers more characters.",
+        },
+        {
+          id: "b",
+          label: "The model will hallucinate more on that input.",
+        },
+        {
+          id: "c",
+          label:
+            "The text is in a language the model cannot understand.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "Higher chars/token means the tokenizer's merges are an efficient fit for the text — typically prose in well-covered languages.",
+    },
+    {
+      id: "q3-leading-space",
+      prompt:
+        "Are the tokens for \"cat\" at the start of a sentence and \" cat\" mid-sentence the same id?",
+      options: [
+        { id: "a", label: "Yes — BPE strips whitespace before encoding." },
+        {
+          id: "b",
+          label:
+            "No — BPE treats the leading space as part of the token, so they are usually two different vocabulary entries.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "BPE operates on the raw byte stream including spaces, so a space-prefixed word is a distinct symbol from the bare word.",
+    },
+  ],
+};
+
 export function TokenizationChapterBody() {
   return (
-    <Prose>
-      <h1>Tokenization: turning text into the model's vocabulary</h1>
+    <ChapterFrame learning={learning}>
+      <Prose>
+        <h1>Tokenization: turning text into the model's vocabulary</h1>
       <p>
         Before a transformer can do anything with your sentence, the sentence
         has to be cut into pieces the model knows. Those pieces are called{" "}
@@ -126,7 +247,8 @@ export function TokenizationChapterBody() {
         actually compute with — the bridge between integers and the
         continuous space attention operates in.
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 
