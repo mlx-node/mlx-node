@@ -299,6 +299,11 @@ function App() {
   const [loadKickoff, setLoadKickoff] = useState(0);
   const [loadingText, setLoadingText] = useState<string | null>(null);
   const [loadingProgress, setLoadingProgress] = useState<LoadingProgress | null>(null);
+  // Flips to `true` the first time the model worker reports 'ready'. Used to
+  // hide the learning-flow loading banner once the model is usable — survives
+  // subsequent setStatus(...) calls (e.g. "Generating...") so the banner
+  // doesn't reappear while the user is reading prose.
+  const [modelReady, setModelReady] = useState(false);
   const [errorBanner, setErrorBannerState] = useState<string | null>(null);
   const [telemetryStats, setTelemetryStats] = useState<ProfileLikeStats | null>(null);
   const [prefillTokensPerSec, setPrefillTokensPerSec] = useState<number | null>(null);
@@ -471,6 +476,7 @@ function App() {
       setLoadingText(text);
       setLoadingProgress(progress);
       if (state === 'ready') {
+        setModelReady(true);
         dispatchScreen({ type: 'model_ready' });
       } else if (state === 'error') {
         setErrorBannerState(text);
@@ -2152,11 +2158,64 @@ function App() {
             dispatchScreen({ type: 'load_kickoff' });
           }}
           onLocalModel={() => modelDirInputRef.current?.click()}
-          onStartLearning={() => dispatchScreen({ type: 'start_learning' })}
+          onStartLearning={() => {
+            // Kick off the model load alongside the screen transition so the
+            // user doesn't sit on chapter_index reading mock data. The
+            // auto-load effect below covers direct URL landings (bookmarks,
+            // popstate); this handler covers the normal "click Start
+            // learning" path with an explicit user gesture, mirroring the
+            // pattern in onLoad. Skipped when no hosted model is available —
+            // those users need the local model picker, which we deliberately
+            // do NOT auto-open from a learning click.
+            if (loadKickoff === 0 && hostedModelAvailable !== false) {
+              setPendingModelSource(null);
+              setErrorBannerState(null);
+              setLoadingProgress(null);
+              setLoadKickoff((k) => k + 1);
+            }
+            dispatchScreen({ type: 'start_learning' });
+          }}
           errorBanner={errorBanner}
           hostedModelAvailable={hostedModelAvailable}
         />
       )}
+      {(screen.kind === 'chapter_index' || screen.kind === 'chapter') &&
+        loadKickoff > 0 &&
+        !modelReady && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="pointer-events-none fixed inset-x-0 top-0 z-30 flex justify-center px-4 pt-3"
+          >
+            <div className="pointer-events-auto flex w-full max-w-3xl items-center gap-3 rounded-md border border-primary/30 bg-card/95 px-4 py-2 text-xs text-foreground shadow-lg backdrop-blur">
+              <div
+                className="size-3 shrink-0 animate-pulse rounded-full bg-primary"
+                aria-hidden="true"
+              />
+              <div className="min-w-0 flex-1 font-mono">
+                {loadingText ?? 'Loading model…'}
+                {loadingProgress?.file ? (
+                  <span className="ml-2 text-muted-foreground">
+                    {loadingProgress.file.split('/').filter(Boolean).pop() ?? loadingProgress.file}
+                  </span>
+                ) : null}
+              </div>
+              {loadingProgress ? (
+                <div className="flex shrink-0 items-center gap-2">
+                  <div className="h-1.5 w-24 overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full bg-primary transition-[width]"
+                      style={{ width: `${Math.max(0, Math.min(100, loadingProgress.pct))}%` }}
+                    />
+                  </div>
+                  <span className="w-9 text-right font-mono tabular-nums text-muted-foreground">
+                    {Math.round(loadingProgress.pct)}%
+                  </span>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        )}
       {screen.kind === 'chapter_index' && (
         <ChapterIndex
           onOpenChapter={(chapterId) => dispatchScreen({ type: 'open_chapter', chapterId })}
