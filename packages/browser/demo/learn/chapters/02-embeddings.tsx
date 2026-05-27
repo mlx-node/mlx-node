@@ -4,6 +4,8 @@ import { Button } from "../../components/ui/button";
 import { embed } from "../../lib/embed-client";
 import { tokenize } from "../../lib/tokenizer-client";
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 /**
  * Chapter 2 — Embeddings.
@@ -425,9 +427,135 @@ function topNeighbors(
 // Chapter body
 // =============================================================================
 
+/**
+ * Scaffolding metadata for chapter 2 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[1].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "embeddings",
+  objective:
+    "Explain how an integer token id becomes a high-dimensional vector and why nearby vectors mean related tokens.",
+  problem:
+    "The transformer needs a continuous representation of each token so it can express similarity and gradients can flow.",
+  minutes: 7,
+  glossary: [
+    {
+      term: "embedding",
+      definition:
+        "The vector a token id is mapped to — a row of the embedding matrix that the rest of the network operates on.",
+    },
+    {
+      term: "embedding matrix",
+      definition:
+        "Shape [vocab_size, hidden_dim]. For Qwen3.5-0.8B that is roughly 151,936 by 1,024 — about 156M parameters.",
+    },
+    {
+      term: "hidden_dim",
+      definition:
+        "The width of every token's vector as it flows through the model. 1,024 for Qwen3.5-0.8B.",
+    },
+    {
+      term: "tied embeddings",
+      definition:
+        "Sharing the input embedding matrix with the output lm_head so the same vector space reads the prompt and writes the next-token logit.",
+    },
+    {
+      term: "PCA",
+      definition:
+        "Principal component analysis — projects high-dimensional points onto the two directions of greatest variance to make a 2D plot.",
+    },
+    {
+      term: "cosine similarity",
+      definition:
+        "Dot product of two vectors divided by their norms. Measures direction agreement and ignores magnitude; near 1 means very similar.",
+    },
+  ],
+  takeaways: [
+    "The embedding matrix is roughly a fifth of a small model's parameters — it is not a free lookup table.",
+    "PCA is good for spotting clusters but its distances lie, so compute similarity in the full hidden_dim space.",
+    "Tied input/output embeddings force one matrix to do double duty, which constrains what the geometry can encode.",
+  ],
+  exercise: {
+    prompt:
+      "Click Load embeddings, then click an animal like 'tiger'. Then add the custom word 'banana' with the input box. Which existing category does its top-5 nearest-neighbour list lean toward, and why?",
+    answer:
+      "Banana's neighbours skew toward the food cluster (apple, bread, cheese show up high) rather than colors or animals, because the embedding encodes 'edible noun' more strongly than 'yellow object' even though banana is both.",
+  },
+  quiz: [
+    {
+      id: "q1-why-vectors",
+      prompt: "Why does the model embed tokens as vectors instead of just feeding the integer id forward?",
+      options: [
+        {
+          id: "a",
+          label: "Integers can't be passed through a GPU matmul.",
+        },
+        {
+          id: "b",
+          label:
+            "Integers carry no notion of similarity — adjacent ids aren't related, and the model needs a space where 'close' means 'related' so gradients can move things around.",
+        },
+        {
+          id: "c",
+          label: "Vectors save memory compared to the original id.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "The whole point of an embedding is to turn discrete tokens into a continuous space the model can do geometry on. Memory actually goes up, not down.",
+    },
+    {
+      id: "q2-pca-distances",
+      prompt: "Why does the demo compute nearest neighbours in the full 1024-dim space instead of the 2D PCA coordinates?",
+      options: [
+        {
+          id: "a",
+          label:
+            "The top two components only capture a few percent of the variance, so 2D distances drop most of the structure that defines similarity.",
+        },
+        {
+          id: "b",
+          label: "PCA distances are slower to compute than cosine in 1024 dims.",
+        },
+        {
+          id: "c",
+          label: "PCA only works on integer ids, not floating-point vectors.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "PCA projects to the directions of greatest variance, but those two directions explain only a small slice of a 1024-dim cloud. The visual is useful for clusters; the distances mislead.",
+    },
+    {
+      id: "q3-tied-embeddings",
+      prompt: "What does it mean for Qwen3.5 to 'tie' its input embeddings with the output lm_head?",
+      options: [
+        {
+          id: "a",
+          label:
+            "Both layers share the same [vocab_size, hidden_dim] matrix — one matrix reads the prompt and the same matrix turns final hidden states back into logits.",
+        },
+        {
+          id: "b",
+          label: "The model trains them with the same learning rate.",
+        },
+        {
+          id: "c",
+          label: "It forces every token's embedding to have unit L2 norm.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "Tying = literally one shared weight tensor for both directions. Saves parameters and forces a single coherent representation per token.",
+    },
+  ],
+};
+
 export function EmbeddingsChapterBody() {
   return (
-    <Prose>
+    <ChapterFrame learning={learning}>
+      <Prose>
       <h1>Embeddings: turning tokens into vectors</h1>
       <p>
         Tokenization gave the model a sequence of integers — one id per
@@ -525,7 +653,8 @@ export function EmbeddingsChapterBody() {
         positions — the operation that gives "the cat sat on the mat" a
         different meaning from "the mat sat on the cat".
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 

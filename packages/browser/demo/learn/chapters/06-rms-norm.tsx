@@ -16,6 +16,8 @@ import type {
 } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 const DEFAULT_PROMPT = "The river flows softly through the valley.";
 const DEFAULT_NUM_LAYERS = 24;
@@ -53,9 +55,135 @@ const NORM_PAIRS: Array<{
   },
 ];
 
+/**
+ * Scaffolding metadata for chapter 6 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[5].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "rmsnorm",
+  objective:
+    "Explain what RMSNorm does to a hidden vector and why pre-norm makes deep transformers trainable.",
+  problem:
+    "Stacked residual additions cause activation magnitudes to drift, which saturates softmaxes and breaks gradient flow.",
+  minutes: 6,
+  glossary: [
+    {
+      term: "RMSNorm",
+      definition:
+        "Divide x by sqrt(mean(x^2) + eps), then rescale element-wise by a learned gain g. No mean-centering, no bias.",
+    },
+    {
+      term: "LayerNorm",
+      definition:
+        "The older sibling: subtracts mean(x) first, then divides by std, with both gain and bias. RMSNorm drops the centering and bias.",
+    },
+    {
+      term: "pre-norm",
+      definition:
+        "Architecture choice: normalize the residual stream before each sub-block. Residual stream itself stays un-normalized.",
+    },
+    {
+      term: "post-norm",
+      definition:
+        "The original 2017 transformer pattern: residual first, norm last. Easier to interpret, much harder to train deeply.",
+    },
+    {
+      term: "L2 norm",
+      definition:
+        "sqrt(sum of squares) of a vector. A standard magnitude proxy; RMSNorm makes the per-token L2 land near sqrt(hidden_dim).",
+    },
+    {
+      term: "learned gain (g)",
+      definition:
+        "A per-feature scale RMSNorm applies after dividing by RMS. The only learned parameter the normalizer carries.",
+    },
+  ],
+  takeaways: [
+    "RMSNorm collapses input magnitudes to roughly sqrt(hidden_dim) before the next sub-block reads them — about 32 for Qwen3.5-0.8B.",
+    "Pre-norm keeps the residual stream un-normalized so gradients flow through an identity path; that's why 24-layer stacks train at all.",
+    "Dropping LayerNorm's mean-centering and bias is essentially free quality-wise but slightly cheaper to compute — every modern open LLM does it.",
+  ],
+  exercise: {
+    prompt:
+      "After the auto-run, use the Layer selector to flip between layer 0 and layer 22. Compare the L2/tok numbers for 'Pre-attention norm input' vs 'Pre-attention norm output'. How does each value change with depth, and which one stays roughly constant?",
+    answer:
+      "The input L2/tok grows substantially with depth (residual additions accumulate), while the output L2/tok stays in the same order of magnitude (close to sqrt(1024) ≈ 32, modulated by the learned gain). That stability across depth is exactly the job of the norm.",
+  },
+  quiz: [
+    {
+      id: "q1-formula-diff",
+      prompt: "What does RMSNorm drop compared to the older LayerNorm?",
+      options: [
+        {
+          id: "a",
+          label: "The learned gain g.",
+        },
+        {
+          id: "b",
+          label:
+            "The mean-centering step and the additive bias — RMSNorm only divides by RMS and applies a learned gain.",
+        },
+        {
+          id: "c",
+          label: "The division step entirely; it only rescales.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "RMSNorm = LayerNorm minus subtracting the mean and minus the bias. Empirically a wash on quality, a small win on speed.",
+    },
+    {
+      id: "q2-pre-vs-post-norm",
+      prompt: "Why is pre-norm the standard choice for 20+ layer transformers?",
+      options: [
+        {
+          id: "a",
+          label:
+            "Gradients flow through the un-normalized residual path as a clean identity, so deep stacks stay trainable.",
+        },
+        {
+          id: "b",
+          label: "Pre-norm uses fewer parameters than post-norm.",
+        },
+        {
+          id: "c",
+          label: "Pre-norm avoids needing a residual connection.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "Pre-norm keeps the residual highway un-normalized — the norm only touches the input to each sub-block. That preserves an unobstructed gradient path through depth.",
+    },
+    {
+      id: "q3-output-magnitude",
+      prompt: "After RMSNorm and the learned gain, roughly what magnitude does a token's hidden vector L2 land near?",
+      options: [
+        {
+          id: "a",
+          label: "Roughly 1 — RMSNorm normalises every vector to unit length.",
+        },
+        {
+          id: "b",
+          label:
+            "Roughly sqrt(hidden_dim), scaled by the learned gain — about 32 for a 1024-dim hidden state.",
+        },
+        {
+          id: "c",
+          label: "Whatever the input magnitude was, unchanged.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "RMSNorm makes mean(x^2) ≈ 1, so the L2 of x is ≈ sqrt(hidden_dim). The learned gain modulates that per feature but never moves it by orders of magnitude.",
+    },
+  ],
+};
+
 export function RmsNormChapterBody() {
   return (
-    <Prose>
+    <ChapterFrame learning={learning}>
+      <Prose>
       <h1>RMSNorm: keeping activations in check</h1>
       <p>
         A transformer is a tall stack — Qwen3.5-0.8B alone is 24 layers deep.
@@ -132,7 +260,8 @@ y_i   = (x_i / RMS(x)) * g_i`}</code>
         <em>outputs</em> are tame and bounded. That is the entire job of
         RMSNorm — and the reason a 24-layer model can train at all.
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 

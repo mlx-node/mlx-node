@@ -7,6 +7,8 @@ import { runForInspector } from "../../lib/inspector-client";
 import { AttentionHeatmap } from "../inspector/AttentionHeatmap";
 import { renderTokenDisplay } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 /**
  * Chapter 3 — Self-attention.
@@ -40,9 +42,125 @@ export type AttentionDemoProps = {
   abortRef: React.RefObject<AbortController | null>;
 };
 
+/**
+ * Scaffolding metadata for chapter 3 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[2].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "attention",
+  objective:
+    "Read a softmax(QK^T/sqrt(d))V attention map and explain what every cell, row, and column means.",
+  problem:
+    "Without attention, a transformer has no way to let one token's representation depend on what came before it.",
+  minutes: 8,
+  glossary: [
+    {
+      term: "query (Q)",
+      definition:
+        "A learned projection of a token saying 'what am I looking for?' — one query vector per token, per head.",
+    },
+    {
+      term: "key (K)",
+      definition:
+        "A learned projection saying 'what do I offer if you look at me?' — compared with Q via dot product.",
+    },
+    {
+      term: "value (V)",
+      definition:
+        "A learned projection that carries the actual content a token contributes when it is attended to.",
+    },
+    {
+      term: "attention pattern",
+      definition:
+        "One row of softmax(QK^T/sqrt(d)): a probability distribution over earlier positions for a single query token.",
+    },
+    {
+      term: "scaled dot product",
+      definition:
+        "QK^T divided by sqrt(d_head). The scale keeps softmax in a regime where gradients don't vanish as d_head grows.",
+    },
+    {
+      term: "causal mask",
+      definition:
+        "Setting the upper triangle of the score matrix to -inf so position i can only attend to positions 0..i.",
+    },
+  ],
+  takeaways: [
+    "Each row of the heatmap is one query token's attention distribution; rows always sum to 1 after softmax.",
+    "The lower-triangular shape isn't decorative — it's the causal mask preventing the model from cheating during training.",
+    "The scaling by sqrt(d_head) is what lets attention scale to wide heads without softmax collapsing to one cell.",
+  ],
+  exercise: {
+    prompt:
+      "Hit Run on the default 'The cat sat on the' prompt, then in the heatmap pick the bottom row (the last token before the prediction). Which earlier token gets the most attention? What does that tell you about the head you are looking at?",
+    answer:
+      "Most heads put their brightest cell on the previous token (' the') or on ' cat' — that head is doing some mix of 'attend to last token' and 'attend to the noun whose verb I'm continuing'. Different layer/head pairs will look strikingly different — head 0 of an early layer often looks almost diagonal, while deeper heads spread attention farther back.",
+  },
+  quiz: [
+    {
+      id: "q1-row-sum",
+      prompt: "What do the values in a single row of the attention heatmap sum to?",
+      options: [
+        { id: "a", label: "Roughly d_head, because of the sqrt(d_head) scaling." },
+        { id: "b", label: "Exactly 1 — softmax is applied per row." },
+        { id: "c", label: "Whatever the unnormalised dot products happen to be." },
+      ],
+      correctId: "b",
+      explanation:
+        "Softmax over each row produces a probability distribution: every row of the post-softmax matrix sums to 1.",
+    },
+    {
+      id: "q2-scale-by-sqrt-d",
+      prompt: "Why is the score matrix divided by sqrt(d_head) before softmax?",
+      options: [
+        {
+          id: "a",
+          label:
+            "Dot products grow with d_head, so without the scale softmax saturates and gradients vanish.",
+        },
+        {
+          id: "b",
+          label: "It's a normalization step so weights sum to 1.",
+        },
+        {
+          id: "c",
+          label: "To make the result invariant to the choice of token vocabulary.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "Dividing by sqrt(d_head) keeps the variance of the scores roughly constant as the head dimension grows, so softmax stays in an informative regime.",
+    },
+    {
+      id: "q3-why-triangular",
+      prompt: "Why is the attention heatmap lower-triangular instead of a full square?",
+      options: [
+        {
+          id: "a",
+          label: "Empty cells are tokens the tokenizer never emitted.",
+        },
+        {
+          id: "b",
+          label:
+            "A causal mask sets the upper triangle to -infinity before softmax so a token at position i can only look at positions 0..i.",
+        },
+        {
+          id: "c",
+          label: "GPU memory is conserved by skipping the upper half.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "The mask exists so the model can't peek at future tokens during training — otherwise next-token prediction would be trivial.",
+    },
+  ],
+};
+
 export function AttentionChapterBody() {
   return (
-    <Prose>
+    <ChapterFrame learning={learning}>
+      <Prose>
       <h1>Self-attention: how every token looks at every other token</h1>
       <p>
         Up to this chapter we've turned text into tokens (chapter 1) and tokens
@@ -172,7 +290,8 @@ export function AttentionChapterBody() {
         forward pass that produced it. Edit the prompt or change layer /
         head to watch the pattern (and the prediction) change.
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 

@@ -17,6 +17,8 @@ import {
 } from "../inspector/AttentionHeatmap";
 import { renderTokenDisplay } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 // Default prompt deliberately stops mid-sentence — matches chapter 3 so a
 // learner sees the same "model predicts the next word" framing carry over,
@@ -40,9 +42,119 @@ const GROUP_COLORS = [
   { fill: "#84cc16", text: "#f7fee7" },
 ] as const;
 
+/**
+ * Scaffolding metadata for chapter 4 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[3].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "multi-head-gqa",
+  objective:
+    "Explain why attention is run as multiple heads and how grouped-query attention shrinks the KV cache.",
+  problem:
+    "A single attention head can model one pattern at a time, and giving every query head its own K/V blows up cache memory at long context.",
+  minutes: 8,
+  glossary: [
+    {
+      term: "head",
+      definition:
+        "One parallel copy of attention with its own Q/K/V slice. Each head can specialise on a different relationship.",
+    },
+    {
+      term: "num_heads (H)",
+      definition:
+        "How many query heads run in parallel per layer. Qwen3.5-0.8B uses 8.",
+    },
+    {
+      term: "num_kv_heads (G)",
+      definition:
+        "How many K/V heads exist. Under GQA each K/V head is shared across H/G query heads. Qwen3.5-0.8B uses 2.",
+    },
+    {
+      term: "group_size",
+      definition:
+        "H / G — how many query heads share one K/V head. Four for Qwen3.5-0.8B.",
+    },
+    {
+      term: "GQA",
+      definition:
+        "Grouped-query attention: partitions H query heads into G K/V groups so the cache shrinks by H/G with little quality loss.",
+    },
+    {
+      term: "MQA",
+      definition:
+        "Multi-query attention: GQA's extreme where num_kv_heads=1. Smallest cache, biggest expressivity loss.",
+    },
+  ],
+  takeaways: [
+    "Heads in the same K/V group share keys and values — they can still attend differently because their Q projections are separate.",
+    "GQA cuts the KV cache by H/G with almost no quality loss; for Qwen3.5-0.8B that's a 4x saving over full MHA.",
+    "At long context, the KV cache (not the weights) is what fills up memory and dominates decode latency.",
+  ],
+  exercise: {
+    prompt:
+      "After the auto-run, click the Q1 chip in the GQA lane diagram, then click Q2 (its group-mate). Compare the two heatmaps. Are the patterns identical, similar, or very different?",
+    answer:
+      "They share the same K and V, so the patterns rhyme but are not identical — both still light up similar key positions, but the per-row weights differ because Q1 and Q2 have separate Wq. That is exactly the expressivity GQA preserves: same keys, different questions.",
+  },
+  quiz: [
+    {
+      id: "q1-share-kv",
+      prompt: "Under GQA with H=8, G=2, what exactly is shared between Q0, Q1, Q2 and Q3?",
+      options: [
+        { id: "a", label: "The Wq weight matrix." },
+        {
+          id: "b",
+          label:
+            "Their K and V projections — all four query heads dot-product against the same K/V head 0 cache.",
+        },
+        { id: "c", label: "Their final output projection." },
+      ],
+      correctId: "b",
+      explanation:
+        "GQA partitions query heads into groups; every head in a group reads from the same shared K/V. Wq stays distinct per query head.",
+    },
+    {
+      id: "q2-cache-savings",
+      prompt: "For Qwen3.5-0.8B (H=8, G=2) at a fixed sequence length, how much smaller is the KV cache vs full MHA?",
+      options: [
+        { id: "a", label: "Roughly 2x smaller." },
+        { id: "b", label: "Roughly 4x smaller." },
+        { id: "c", label: "Roughly 8x smaller." },
+      ],
+      correctId: "b",
+      explanation:
+        "The cache scales with num_kv_heads, so the ratio is H/G = 8/2 = 4x. The chapter's KV ticker shows this exact number.",
+    },
+    {
+      id: "q3-mqa-vs-gqa",
+      prompt: "Why is GQA usually preferred over MQA in modern open models?",
+      options: [
+        {
+          id: "a",
+          label:
+            "MQA gives up too much expressivity (only one K/V head), while GQA with G=2-8 recovers most of MHA's quality at most of MQA's cache savings.",
+        },
+        {
+          id: "b",
+          label: "MQA requires more KV cache than GQA.",
+        },
+        {
+          id: "c",
+          label: "GQA is faster to train than MQA on every hardware target.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "GQA hits the sweet spot: tiny quality cost vs MHA, similar cache savings to MQA. Llama 3 and Qwen3.5 both use it.",
+    },
+  ],
+};
+
 export function MultiheadGqaChapterBody() {
   return (
-    <Prose>
+    <ChapterFrame learning={learning}>
+      <Prose>
       <h1>Multi-head attention &amp; GQA</h1>
       <p>
         Chapter 3 introduced attention as a single operation:{" "}
@@ -142,7 +254,8 @@ group_size    = H / G        (4 query heads per K/V head)`}</code>
         — same K, different Q, so different attention patterns over the same
         keys.
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 

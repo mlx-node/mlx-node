@@ -2,6 +2,8 @@ import * as React from "react";
 
 import { Button } from "../../components/ui/button";
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 /**
  * Chapter 10 — KV cache & hybrid attention.
@@ -94,9 +96,129 @@ function formatTokens(n: number): string {
   return `${n}`;
 }
 
+/**
+ * Scaffolding metadata for chapter 10 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[9].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "kv-cache",
+  objective:
+    "Explain why the KV cache exists, how it grows with context, and what Qwen3.5's hybrid attention buys you in memory.",
+  problem:
+    "Without caching K and V, each decoded token would redo all of attention from scratch — making generation quadratic in context length.",
+  minutes: 8,
+  glossary: [
+    {
+      term: "KV cache",
+      definition:
+        "Per-layer stored K and V tensors for every prompt and generated token, reused across decode steps so attention stays roughly linear.",
+    },
+    {
+      term: "prefill",
+      definition:
+        "First inference phase: the whole prompt is processed in one matmul-heavy pass that writes K and V for every prompt token.",
+    },
+    {
+      term: "decode",
+      definition:
+        "Per-token generation phase: only the new token's Q/K/V is computed, and Q attends over the cached K/V history.",
+    },
+    {
+      term: "GatedDeltaNet",
+      definition:
+        "Qwen3.5's linear-attention variant. Stores a fixed-size recurrent state per layer instead of a token-by-token KV cache.",
+    },
+    {
+      term: "hybrid attention",
+      definition:
+        "Mixing full softmax-attention layers and linear-attention layers in the same stack. Qwen3.5 uses 6 full + 18 linear.",
+    },
+    {
+      term: "linear state",
+      definition:
+        "Per-layer tensor [linear_heads, head_dim, head_dim] that compresses the entire history; size is independent of sequence length.",
+    },
+  ],
+  takeaways: [
+    "KV cache memory scales linearly with context, and at long context it dwarfs the model weights themselves.",
+    "Qwen3.5's 6 full + 18 linear layout collapses the cache curve because linear layers contribute a constant, not a per-token chunk.",
+    "Full-attention layers handle 'recall this specific token' jobs; linear layers handle the bulk of language flow under a tight memory budget.",
+  ],
+  exercise: {
+    prompt:
+      "Drag the context-length slider from 1k to 131k while watching the three KV cache curves. At 131k tokens, roughly how many times smaller is the hybrid 'actual' curve than the MHA hypothetical curve, and which curve overlaps the hybrid line at short contexts?",
+    answer:
+      "At 131k tokens the hybrid curve sits roughly an order of magnitude below MHA (the 'Savings' tile shows the GQA-to-hybrid ratio at the current context). At short contexts the linear layers' constant state dominates the total, so the hybrid line plateaus while GQA and MHA continue dropping toward it — they only diverge once seq_len grows enough to dominate the per-layer arithmetic.",
+  },
+  quiz: [
+    {
+      id: "q1-why-cache",
+      prompt: "What would happen during decode if the model did not maintain a KV cache?",
+      options: [
+        { id: "a", label: "Decode would still work, just at the same speed." },
+        {
+          id: "b",
+          label:
+            "Each new token would re-compute K and V for the entire history, so decode cost per step would be as expensive as prefill — quadratic in context length over the whole generation.",
+        },
+        {
+          id: "c",
+          label: "The model would lose access to RoPE positions.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "K and V for old tokens don't depend on the new one, so caching them turns decode from quadratic to linear in sequence length.",
+    },
+    {
+      id: "q2-linear-state-size",
+      prompt: "How does a GatedDeltaNet linear-attention layer's memory cost scale with sequence length?",
+      options: [
+        { id: "a", label: "Linearly with seq_len, like a regular KV cache." },
+        {
+          id: "b",
+          label:
+            "It doesn't — the recurrent state is a fixed-size tensor [heads, head_dim, head_dim] regardless of how many tokens have streamed by.",
+        },
+        {
+          id: "c",
+          label: "Quadratically with seq_len.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "That's the whole point of a recurrent compression: the state stays the same size as the sequence grows, at the cost of losing exact per-token recall.",
+    },
+    {
+      id: "q3-why-hybrid",
+      prompt: "Why does Qwen3.5 still keep 6 full-attention layers instead of going fully linear?",
+      options: [
+        {
+          id: "a",
+          label:
+            "Linear attention compresses history and loses exact recall; full layers preserve the ability to look back at one specific earlier token when the model needs it.",
+        },
+        {
+          id: "b",
+          label: "Full layers are required for RoPE to work.",
+        },
+        {
+          id: "c",
+          label: "Full layers run faster than linear ones at long context.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "Linear layers handle pattern continuation cheaply; full layers handle 'look back to that one specific token' jobs. The hybrid recovers most of the quality at a fraction of the cache cost.",
+    },
+  ],
+};
+
 export function KvCacheChapterBody() {
   return (
-    <Prose>
+    <ChapterFrame learning={learning}>
+      <Prose>
       <h1>KV cache &amp; hybrid attention</h1>
       <p>
         Every chapter so far has described what happens for{" "}
@@ -216,7 +338,8 @@ export function KvCacheChapterBody() {
         interleave — click any layer to see what its cache looks like at
         the current context length.
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 

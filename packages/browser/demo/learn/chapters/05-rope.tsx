@@ -1,6 +1,8 @@
 import * as React from "react";
 
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 /**
  * Chapter 5 — Positional encoding (RoPE).
@@ -72,9 +74,132 @@ function formatPeriod(value: number): string {
   return value.toExponential(2);
 }
 
+/**
+ * Scaffolding metadata for chapter 5 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[4].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "rope",
+  objective:
+    "Explain how RoPE injects token order into attention via per-pair rotations, without learned position embeddings.",
+  problem:
+    "Self-attention is permutation-invariant — without a positional signal the model cannot tell 'cat sat on mat' from 'mat sat on cat'.",
+  minutes: 7,
+  glossary: [
+    {
+      term: "RoPE",
+      definition:
+        "Rotary positional embedding. Rotates each (x_2i, x_2i+1) pair of Q and K by an angle m * theta_i before the dot product.",
+    },
+    {
+      term: "pair frequency (theta_i)",
+      definition:
+        "Per-dimension rotation rate: theta_i = base^(-2i / rope_dims). Low i rotates fast, high i rotates slowly.",
+    },
+    {
+      term: "rope_theta (base)",
+      definition:
+        "The base of the frequency exponent. Qwen3.5 uses 1e7, far higher than the original 1e4 — stretches the spectrum for long context.",
+    },
+    {
+      term: "partial rotary factor",
+      definition:
+        "Fraction of each head's dims that RoPE rotates. Qwen3.5 uses 0.25, so 64 of 256 head dims are rotated; the rest pass through.",
+    },
+    {
+      term: "relative-position property",
+      definition:
+        "The dot product of RoPE(q,m) and RoPE(k,n) depends only on m-n, so the model only has to learn relative offsets.",
+    },
+    {
+      term: "unitary rotation",
+      definition:
+        "A rotation preserves vector norms — RoPE changes where vectors point, never how big they are.",
+    },
+  ],
+  takeaways: [
+    "RoPE encodes position as rotation, not addition — magnitudes stay constant and only angles carry the position signal.",
+    "Low-index pairs are high-frequency (fine local position); high-index pairs are low-frequency (coarse global position).",
+    "The dot product after RoPE depends only on m - n, which is why models with RoPE extrapolate to lengths they never saw in training.",
+  ],
+  exercise: {
+    prompt:
+      "Drag the 'Token position m' slider from 0 up to 100. Compare the high-frequency rotation panel (pair 0) with the low-frequency one (pair 28). Which one completes a full turn first, and by how much has the other moved when m=100?",
+    answer:
+      "Pair 0 spins through many full turns by m=100 (its frequency is roughly 1 rad/token in Qwen3.5's spectrum). Pair 28 has barely moved — its frequency is so small the hand is still close to 3 o'clock. That gap is the entire point of using a spectrum of frequencies: short-range vs long-range position in one operation.",
+  },
+  quiz: [
+    {
+      id: "q1-why-rotate",
+      prompt: "What problem does RoPE solve that pure self-attention cannot?",
+      options: [
+        { id: "a", label: "Self-attention output magnitudes are too large." },
+        {
+          id: "b",
+          label:
+            "Self-attention is permutation-invariant — it has no notion of token order until something injects it.",
+        },
+        {
+          id: "c",
+          label: "Self-attention cannot represent negative values.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "Attention computes the same thing if you shuffle inputs (with outputs shuffled to match). Position has to come from somewhere — RoPE injects it into Q and K.",
+    },
+    {
+      id: "q2-low-vs-high",
+      prompt: "Which dimension pairs end up encoding 'coarse global position' under RoPE?",
+      options: [
+        {
+          id: "a",
+          label:
+            "High-index pairs — they have the lowest frequencies and rotate slowly enough to remain distinguishable over long contexts.",
+        },
+        {
+          id: "b",
+          label: "Low-index pairs, because they have the highest frequencies.",
+        },
+        {
+          id: "c",
+          label: "It's random — RoPE assigns roles per training run.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "theta_i = base^(-2i/d), so large i means tiny theta_i. Those pairs barely rotate even across tens of thousands of tokens, which is what 'coarse global position' looks like.",
+    },
+    {
+      id: "q3-relative-pos",
+      prompt: "Why is it called the relative-position property?",
+      options: [
+        {
+          id: "a",
+          label:
+            "The dot product of RoPE'd Q and K depends only on the offset (m - n), not on the absolute positions m and n.",
+        },
+        {
+          id: "b",
+          label: "RoPE positions are stored relative to a chosen anchor token.",
+        },
+        {
+          id: "c",
+          label: "The rotations always relate two adjacent tokens.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "Once you do the algebra, the position-dependence collapses to m - n. That's why a model trained at 4k tokens can extrapolate to much longer contexts.",
+    },
+  ],
+};
+
 export function RopeChapterBody() {
   return (
-    <Prose>
+    <ChapterFrame learning={learning}>
+      <Prose>
       <h1>Positional encoding: how the model knows token order</h1>
       <p>
         Self-attention has a strange property: it is{" "}
@@ -184,7 +309,8 @@ export function RopeChapterBody() {
         Open <em>Self-attention</em> (Chapter 3) and look at how the score
         map favours the diagonal.
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 

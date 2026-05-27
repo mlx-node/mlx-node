@@ -16,6 +16,8 @@ import type {
 } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 const DEFAULT_PROMPT = "Once upon a time, in a forest far away,";
 const DEFAULT_NUM_LAYERS = 24;
@@ -52,9 +54,128 @@ const POINT_META: Record<
   },
 };
 
+/**
+ * Scaffolding metadata for chapter 7 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[6].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "mlp",
+  objective:
+    "Describe how a SwiGLU gated MLP transforms a single token's hidden state and how it relates to the residual stream.",
+  problem:
+    "Attention mixes information across tokens but cannot do per-token feature computation; the MLP is where that work lives.",
+  minutes: 7,
+  glossary: [
+    {
+      term: "MLP block",
+      definition:
+        "The per-token feed-forward sub-block inside a transformer layer. Runs the same little network on every position.",
+    },
+    {
+      term: "SwiGLU",
+      definition:
+        "Gated MLP variant: silu(gate_proj(x)) * up_proj(x), then projected back. The * is element-wise multiplication.",
+    },
+    {
+      term: "SiLU",
+      definition:
+        "Activation z * sigmoid(z). Smooth, near-linear for large positive z, suppresses negatives — acts as a soft gate.",
+    },
+    {
+      term: "intermediate_dim",
+      definition:
+        "The widened scratch space inside the MLP. Usually around 3-4x hidden_dim. 3072 for Qwen3.5-0.8B (vs 1024 hidden).",
+    },
+    {
+      term: "residual stream",
+      definition:
+        "The un-normalized hidden state running the full depth of the model that each block reads from and adds back into.",
+    },
+    {
+      term: "residual connection",
+      definition:
+        "The x_in + part of x_out = x_in + sub_block(norm(x_in)). Lets gradients skip the sub-block and stay healthy.",
+    },
+  ],
+  takeaways: [
+    "The MLP touches every token in isolation — there is no cross-token information flow inside an MLP block.",
+    "Most of a model's parameters live in gate_proj/up_proj/down_proj — these three matrices dominate the parameter count.",
+    "Each MLP writes a small correction to the residual stream; the prediction is the sum of many small writes, not the last block's output.",
+  ],
+  exercise: {
+    prompt:
+      "After the auto-run, look at the 'MLP contribution across all layers' strip. Click the layer with the largest bar and the layer with one of the smallest non-empty bars. How does the 'MLP / layer-output ratio' percentage compare between them?",
+    answer:
+      "Early or middle layers tend to dominate while the deepest layers contribute less, but no single layer is anywhere near 100%. Even the tallest bar is usually a single-digit to low-double-digit percent of the layer's full output L2 — the rest of the magnitude was already in the residual stream when this layer started.",
+  },
+  quiz: [
+    {
+      id: "q1-elementwise",
+      prompt: "In SwiGLU, what kind of multiplication is the * between silu(gate_proj(x)) and up_proj(x)?",
+      options: [
+        { id: "a", label: "Matrix multiplication." },
+        {
+          id: "b",
+          label:
+            "Element-wise: each of the intermediate_dim features in one vector multiplies the corresponding feature in the other.",
+        },
+        { id: "c", label: "Dot product, producing a scalar." },
+      ],
+      correctId: "b",
+      explanation:
+        "The gate-projection produces a 'how much' per feature; the up-projection produces a 'what'. Element-wise multiplication entangles them, and only then does down_proj collapse back to hidden_dim.",
+    },
+    {
+      id: "q2-mlp-magnitude",
+      prompt: "How does a single MLP block's output magnitude usually compare to the residual stream it writes into?",
+      options: [
+        {
+          id: "a",
+          label: "Much smaller — it's a correction added on top, not a replacement.",
+        },
+        {
+          id: "b",
+          label: "Roughly equal — each MLP overwrites the stream's magnitude.",
+        },
+        {
+          id: "c",
+          label: "Much larger — the MLP dominates after the residual add.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "The 'highway' intuition: residual stream magnitude has been accumulating for many layers; one MLP adds a small delta on top. That's why the residual ratio in the demo is small.",
+    },
+    {
+      id: "q3-where-params-live",
+      prompt: "Why does the chapter describe the MLP as 'where most of the parameters live'?",
+      options: [
+        {
+          id: "a",
+          label: "MLP weights are stored at higher precision than attention weights.",
+        },
+        {
+          id: "b",
+          label:
+            "gate_proj, up_proj, and down_proj are large (hidden_dim by intermediate_dim, intermediate_dim ≈ 3-4 × hidden_dim), so the three together dwarf the attention projections.",
+        },
+        {
+          id: "c",
+          label: "The MLP block is repeated more times per layer than attention.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "Each of those three matrices is hidden_dim × intermediate_dim. Multiply that by every layer and you have the bulk of the model's parameters.",
+    },
+  ],
+};
+
 export function MlpChapterBody() {
   return (
-    <Prose>
+    <ChapterFrame learning={learning}>
+      <Prose>
       <h1>The MLP block: per-token feed-forward</h1>
       <p>
         Attention is the part of a transformer that mixes information{" "}
@@ -147,7 +268,8 @@ export function MlpChapterBody() {
         — which is exactly the design choice that makes deep transformers
         learnable.
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 

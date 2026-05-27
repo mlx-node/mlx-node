@@ -11,6 +11,8 @@ import type {
 } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 const DEFAULT_PROMPT = "A transformer stacks the same block many times.";
 const DEFAULT_NUM_LAYERS = 24;
@@ -41,9 +43,125 @@ const POINT_LABELS: Record<CapturePoint, string> = {
   post_mlp_residual: "Layer output",
 };
 
+/**
+ * Scaffolding metadata for chapter 8 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[7].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "full-block",
+  objective:
+    "Read a transformer layer end-to-end: pre-norm, attention, residual, pre-norm, MLP, residual, repeat.",
+  problem:
+    "Each sub-block was introduced in isolation; you still need to see how they wire together and how the stack composes.",
+  minutes: 7,
+  glossary: [
+    {
+      term: "decoder layer",
+      definition:
+        "One pre-norm block: x_attn = x + Attention(RMSNorm(x)); x_out = x_attn + MLP(RMSNorm(x_attn)). Qwen3.5-0.8B stacks 24 of these.",
+    },
+    {
+      term: "residual stream",
+      definition:
+        "The un-normalized hidden state running the full depth of the tower. Every block reads from it and writes a delta back.",
+    },
+    {
+      term: "sub-block",
+      definition:
+        "Either attention or the MLP. Each layer contains exactly two sub-blocks, each wrapped in its own norm + residual.",
+    },
+    {
+      term: "hybrid attention",
+      definition:
+        "Qwen3.5's recipe: every fourth layer uses softmax attention, the rest use a linear variant (GatedDeltaNet).",
+    },
+    {
+      term: "linear attention",
+      definition:
+        "An approximate attention that runs in fixed memory per token. Trades some exact-recall for very cheap long-context decode.",
+    },
+    {
+      term: "capture point",
+      definition:
+        "A named place inside a layer (pre_attn_input, mlp_output, ...) where the inspector reads activation stats out.",
+    },
+  ],
+  takeaways: [
+    "Every layer is the same shape — two pre-norm + sub-block + residual pairs — and that shape stacks 24 times.",
+    "Residual stream magnitude grows with depth even though each individual sub-block's output stays small.",
+    "Qwen3.5 isn't pure transformer — only 6 of its 24 layers use softmax attention; the rest run linear attention.",
+  ],
+  exercise: {
+    prompt:
+      "After the auto-run, drag the 3D tower to face you, then click layer 3 and layer 4. How does the 'Layer 3 - Full attention' label change vs 'Layer 4 - Linear attention', and how do the warm/cool ring colors compare across the tower?",
+    answer:
+      "Layer 3 (and 7, 11, 15, 19, 23) shows the 'Full attention' label and uses a warm orange-to-red ramp; the others show 'Linear attention' and use a cool indigo-to-violet ramp. The colour gradient also shows the residual-stream magnitude climbing as you scan up the tower — a direct picture of the highway accumulating contributions.",
+  },
+  quiz: [
+    {
+      id: "q1-block-order",
+      prompt: "In a Qwen3.5 layer (pre-norm), what is the actual order of operations?",
+      options: [
+        {
+          id: "a",
+          label:
+            "RMSNorm -> Attention -> add to residual; RMSNorm -> MLP -> add to residual.",
+        },
+        {
+          id: "b",
+          label: "Attention -> RMSNorm -> MLP -> RMSNorm -> residual at the end.",
+        },
+        {
+          id: "c",
+          label: "Attention -> MLP -> single RMSNorm at the end.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "Pre-norm wraps each sub-block individually. Each sub-block writes its result back into the un-normalized residual stream.",
+    },
+    {
+      id: "q2-hybrid-full",
+      prompt: "How many of Qwen3.5-0.8B's 24 layers use the softmax attention you read about in chapter 3?",
+      options: [
+        { id: "a", label: "All 24." },
+        { id: "b", label: "6 — one in every four." },
+        { id: "c", label: "12 — every other layer." },
+      ],
+      correctId: "b",
+      explanation:
+        "Layers 3, 7, 11, 15, 19, 23 are full softmax attention. The 18 others run GatedDeltaNet linear attention.",
+    },
+    {
+      id: "q3-residual-grows",
+      prompt: "Why does the per-token L2 of the residual stream grow as you scan up the tower?",
+      options: [
+        {
+          id: "a",
+          label:
+            "Each layer adds its sub-block outputs into the residual stream; magnitudes accumulate even though each individual write is small.",
+        },
+        {
+          id: "b",
+          label: "Later layers use larger learned gains in RMSNorm.",
+        },
+        {
+          id: "c",
+          label: "The model upcasts to higher precision at deeper layers.",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "The residual stream is a sum of additions, never overwrites. Even small contributions compound across 24 layers.",
+    },
+  ],
+};
+
 export function FullBlockChapterBody() {
   return (
-    <Prose>
+    <ChapterFrame learning={learning}>
+      <Prose>
       <h1>The full transformer block</h1>
       <p>
         The last five chapters introduced individual ingredients — attention,
@@ -149,7 +267,8 @@ x_out  = x_attn + MLP(RMSNorm(x_attn))`}</code>
         capture points within the selected layer so you can trace the signal
         from the layer's input through the two sub-blocks and out the top.
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 

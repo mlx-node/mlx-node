@@ -6,6 +6,8 @@ import type { AttentionRun } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
 import { TopKBars } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
+import { ChapterFrame } from "../scaffolding/ChapterFrame";
+import type { ChapterLearningData } from "../scaffolding/learning-data";
 
 /**
  * Chapter 9 — Sampling.
@@ -21,9 +23,132 @@ const DEFAULT_PROMPT = "Once upon a time, in a forest far away";
 const MAX_NEW_TOKENS = 6;
 const TOP_K = 16;
 
+/**
+ * Scaffolding metadata for chapter 9 — drives the header, glossary,
+ * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
+ * `chapterId` must match `CHAPTERS[8].id` in `learn/chapters.ts`.
+ */
+export const learning: ChapterLearningData = {
+  chapterId: "sampling",
+  objective:
+    "Take a vector of logits, apply temperature and top-p, and reason about why each knob shifts the resulting distribution.",
+  problem:
+    "Every forward pass ends with logits; the model still needs a rule for turning that vector into one concrete next token.",
+  minutes: 6,
+  glossary: [
+    {
+      term: "logit",
+      definition:
+        "One unbounded real-valued score per vocab entry. The raw output of the model before any normalization.",
+    },
+    {
+      term: "softmax",
+      definition:
+        "exp(l_i / T) / sum_j exp(l_j / T) — turns logits into a probability distribution that sums to 1.",
+    },
+    {
+      term: "temperature (T)",
+      definition:
+        "Sharpness knob applied before softmax. T<1 sharpens (closer to greedy); T>1 flattens (more diverse).",
+    },
+    {
+      term: "greedy decoding",
+      definition:
+        "Pick argmax(logits) every step. Deterministic and reproducible; tends to fall into repetition loops.",
+    },
+    {
+      term: "top-p (nucleus)",
+      definition:
+        "Keep the smallest set of tokens whose probabilities sum to >= p, renormalize, sample from those. Trims the long tail.",
+    },
+    {
+      term: "top-K",
+      definition:
+        "Keep only the K highest-probability tokens. The widget shows top-K=16 logits per step.",
+    },
+  ],
+  takeaways: [
+    "Logits become probabilities only after softmax — comparing raw logits across runs or models is meaningless.",
+    "Temperature reshapes the distribution; top-p truncates the tail. A common default is T=0.7 with top_p=0.9.",
+    "The model's actually-sampled token may not be the bar with the highest probability after you change the sliders — that's how the sliders steer generation.",
+  ],
+  exercise: {
+    prompt:
+      "After the auto-run, leave temperature at 1.0 and slowly lower top-p from 1.0 to 0.3 while watching the bar chart for step 1. At what point does the chart visibly collapse to one or two bars, and what does the renormalised height tell you?",
+    answer:
+      "Around top_p ≈ 0.5-0.7 the long tail disappears and the top two or three bars shoot up because the surviving mass is re-normalized to sum to 1. By top_p = 0.3 you usually have a single near-100% bar — top-p has effectively turned this step into greedy decoding. That collapse-point depends on how confident the step was: a confident step survives even very small p, an uncertain step needs more.",
+  },
+  quiz: [
+    {
+      id: "q1-greedy-issue",
+      prompt: "Why doesn't production LLM serving just always use greedy decoding?",
+      options: [
+        { id: "a", label: "Greedy is too slow on GPUs." },
+        {
+          id: "b",
+          label:
+            "Greedy is deterministic and reproducible but prone to repetition — once the model finds a high-confidence loop it keeps re-entering it.",
+        },
+        {
+          id: "c",
+          label: "Greedy doesn't work with byte-pair encoding.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "Greedy is a perfectly valid decoder; it's just brittle. A small randomization (T or top-p) is what breaks the model out of locally-optimal loops.",
+    },
+    {
+      id: "q2-temperature-effect",
+      prompt: "What does setting temperature T = 0.2 do to the probability distribution?",
+      options: [
+        {
+          id: "a",
+          label:
+            "Sharpens it — high-logit tokens dominate even more strongly than at T=1, so output behaves closer to greedy.",
+        },
+        {
+          id: "b",
+          label: "Flattens it — small differences in logits get washed out.",
+        },
+        {
+          id: "c",
+          label: "Removes the long tail entirely (equivalent to top-p).",
+        },
+      ],
+      correctId: "a",
+      explanation:
+        "T < 1 divides logits by something smaller than 1 before exp, amplifying differences. The distribution gets spikier.",
+    },
+    {
+      id: "q3-top-p-mechanism",
+      prompt: "Top-p sampling with p = 0.9 means:",
+      options: [
+        {
+          id: "a",
+          label: "Multiply every probability by 0.9.",
+        },
+        {
+          id: "b",
+          label:
+            "Keep the smallest set of tokens whose probabilities sum to >= 0.9, then renormalise that set to sum to 1 and sample from it.",
+        },
+        {
+          id: "c",
+          label: "Drop the 90th percentile of tokens.",
+        },
+      ],
+      correctId: "b",
+      explanation:
+        "Top-p is dynamic: at a confident step the nucleus may be 2-3 tokens, at an uncertain step it may be dozens. That's why it adapts better than a fixed top-K.",
+    },
+  ],
+};
+
 export function SamplingChapterBody() {
   return (
-    <Prose>
+    <ChapterFrame learning={learning}>
+      <Prose>
       <h1>Sampling: turning logits into the next token</h1>
       <p>
         Every forward pass through Qwen3.5 ends the same way: a vector of{" "}
@@ -121,7 +246,8 @@ export function SamplingChapterBody() {
         temperature (1.5) on the same step. The visible "shape" of the bar
         chart is the entire reason sampling parameters matter for an LLM.
       </p>
-    </Prose>
+      </Prose>
+    </ChapterFrame>
   );
 }
 
