@@ -848,10 +848,10 @@ function LayerSidePanel({
             Stores K and V for every token. Cache scales linearly with
             context length.
           </p>
-          <pre className="rounded bg-muted p-2 font-mono text-[11px] leading-5">
-            <code>{`shape  = [2, num_kv_heads=${NUM_KV_HEADS}, seq_len, head_dim=${HEAD_DIM}]
-bytes  = 2 · ${NUM_KV_HEADS} · seq_len · ${HEAD_DIM} · ${BYTES_PER_FLOAT}
-       = ${fullLayerCacheBytes(1)} · seq_len`}</code>
+          <pre className="overflow-x-auto rounded bg-muted p-2 font-mono text-[11px] leading-5">
+            <code>{`shape = [2, kv_heads=${NUM_KV_HEADS}, seq_len, d=${HEAD_DIM}]
+bytes = 2 · ${NUM_KV_HEADS} · seq_len · ${HEAD_DIM} · ${BYTES_PER_FLOAT}
+      = ${fullLayerCacheBytes(1)} · seq_len`}</code>
           </pre>
           <dl className="grid grid-cols-2 gap-x-2 gap-y-1 font-mono text-[11px]">
             <dt className="text-muted-foreground">cache @ {formatTokens(contextLen)}</dt>
@@ -872,10 +872,10 @@ bytes  = 2 · ${NUM_KV_HEADS} · seq_len · ${HEAD_DIM} · ${BYTES_PER_FLOAT}
             Compresses the entire history into a fixed-size recurrent
             state — independent of <code>seq_len</code>.
           </p>
-          <pre className="rounded bg-muted p-2 font-mono text-[11px] leading-5">
-            <code>{`shape  = [num_heads=${LINEAR_NUM_HEADS}, head_dim=${LINEAR_HEAD_DIM}, head_dim=${LINEAR_HEAD_DIM}]
-bytes  = ${LINEAR_NUM_HEADS} · ${LINEAR_HEAD_DIM} · ${LINEAR_HEAD_DIM} · ${BYTES_PER_FLOAT}
-       = ${LINEAR_STATE_SIZE_BYTES} bytes (constant)`}</code>
+          <pre className="overflow-x-auto rounded bg-muted p-2 font-mono text-[11px] leading-5">
+            <code>{`shape = [heads=${LINEAR_NUM_HEADS}, d=${LINEAR_HEAD_DIM}, d=${LINEAR_HEAD_DIM}]
+bytes = ${LINEAR_NUM_HEADS} · ${LINEAR_HEAD_DIM} · ${LINEAR_HEAD_DIM} · ${BYTES_PER_FLOAT}
+      = ${LINEAR_STATE_SIZE_BYTES} bytes (constant)`}</code>
           </pre>
           <dl className="grid grid-cols-2 gap-x-2 gap-y-1 font-mono text-[11px]">
             <dt className="text-muted-foreground">state @ {formatTokens(contextLen)}</dt>
