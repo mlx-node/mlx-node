@@ -64,6 +64,17 @@ export function AttentionHeatmap({
     y: number;
     score: number;
   } | null>(null);
+  // Bumped whenever the `run` prop reference changes so we can restart the
+  // bottom-row "prediction step" flash animation without remounting the
+  // canvas. Same class-toggle pattern as the chapter-3 heatmap wrapper.
+  const lastRowFlashRef = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    const el = lastRowFlashRef.current;
+    if (!el) return;
+    el.classList.remove("last-row-flash");
+    void el.offsetWidth;
+    el.classList.add("last-row-flash");
+  }, [run]);
   // Bumped on window resize (and DPR-relevant changes like moving between
   // monitors or zooming). Used to retrigger the draw effect so the canvas
   // re-syncs its backing-store size with the current devicePixelRatio.
@@ -274,6 +285,24 @@ export function AttentionHeatmap({
             >
               {liveAnnouncement}
             </div>
+            {/*
+              Persistent dashed outline on the bottom row of the heatmap —
+              that row is what produced the next token. The .last-row-flash
+              class is re-added on every successful Run (via the ref + reflow
+              trick) so the outline briefly glows accent-color, then settles
+              back to the steady dashed border.
+            */}
+            <div
+              ref={lastRowFlashRef}
+              className="last-row-highlight pointer-events-none"
+              aria-hidden="true"
+              style={{
+                left: 0,
+                top: board - cellSize,
+                width: board,
+                height: cellSize,
+              }}
+            />
             {hover && (
               <HeatmapTooltip
                 hover={hover}
@@ -289,13 +318,47 @@ export function AttentionHeatmap({
       {/* Color legend */}
       <Legend />
 
-      {/* Run metadata */}
-      <div className="text-xs text-muted-foreground">
-        <span className="font-mono">{run.modelMeta.name}</span> ·{" "}
-        {seqLen} tokens · next-token prediction:{" "}
-        <span className="font-mono text-foreground">
-          {renderTokenDisplay(run.generatedToken.text)}
-        </span>
+      {/* How-to-read panel — teaches a beginner what the matrix and its
+          bottom row actually represent. Always visible. */}
+      <div className="space-y-1.5 rounded-md border border-dashed border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        <div>
+          <span className="font-mono text-foreground">↓</span> row = token doing
+          the looking ·{" "}
+          <span className="font-mono text-foreground">→</span> column = token
+          being looked at · brighter = stronger attention.
+        </div>
+        <div>
+          The outlined <strong className="text-foreground">bottom row</strong>{" "}
+          is the prediction step — those bright cells are the tokens the model
+          focused on when choosing the next word below.
+        </div>
+      </div>
+
+      {/* Next-token card — the concrete artifact of one Run. This is the
+          single thing a learner can point at and say "the model just
+          predicted that". */}
+      <div className="rounded-md border border-primary/40 bg-primary/5 px-4 py-3">
+        <div className="text-[0.7rem] uppercase tracking-wider text-muted-foreground">
+          Next token
+        </div>
+        <div className="mt-1.5 flex flex-wrap items-baseline gap-2">
+          <span className="rounded-md border border-primary/40 bg-background/60 px-2.5 py-1 font-mono text-base text-foreground">
+            {renderTokenDisplay(run.generatedToken.text)}
+          </span>
+          <span className="font-mono text-[0.7rem] text-muted-foreground">
+            id {run.generatedToken.id}
+          </span>
+        </div>
+        <div className="mt-2 text-xs text-muted-foreground">
+          Greedy argmax of the model's vocabulary at the last position. Edit
+          the prompt above and Run again to see this change.
+        </div>
+      </div>
+
+      {/* Model meta footer */}
+      <div className="text-[0.7rem] text-muted-foreground">
+        <span className="font-mono">{run.modelMeta.name}</span> · {seqLen}{" "}
+        tokens
       </div>
     </div>
   );

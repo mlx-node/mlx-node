@@ -1153,3 +1153,35 @@
     box-shadow: 0 0 0 6px oklch(0.85 0.07 25 / 0);
   }
 }
+
+/* Persistent dashed outline on the heatmap's prediction-source bottom row —
+ * teaches an LLM beginner that the last row is the step that produced the
+ * predicted next token. Overlay is absolutely positioned by the component. */
+.last-row-highlight {
+  position: absolute;
+  border: 1px dashed oklch(0.85 0.07 25 / 0.45);
+  border-radius: 2px;
+}
+
+/* Brief glow on every successful Run, applied via class-toggle + reflow
+ * trick by AttentionHeatmap. */
+.last-row-flash {
+  animation: lastRowFlash 800ms ease-out;
+}
+
+@keyframes lastRowFlash {
+  0% {
+    border-color: oklch(0.85 0.07 25 / 1);
+    box-shadow: 0 0 0 3px oklch(0.85 0.07 25 / 0.35);
+  }
+  100% {
+    border-color: oklch(0.85 0.07 25 / 0.45);
+    box-shadow: 0 0 0 0 oklch(0.85 0.07 25 / 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .last-row-flash {
+    animation: none;
+  }
+}
