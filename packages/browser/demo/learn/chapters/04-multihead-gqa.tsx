@@ -15,9 +15,14 @@ import {
   AttentionHeatmap,
   drawAttentionHeatmap,
 } from "../inspector/AttentionHeatmap";
+import { renderTokenDisplay } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
 
-const DEFAULT_PROMPT = "The cat sat on the mat.";
+// Default prompt deliberately stops mid-sentence — matches chapter 3 so a
+// learner sees the same "model predicts the next word" framing carry over,
+// and so the rainbow ghost prediction has something meaningful to render
+// at the end of the prompt.
+const DEFAULT_PROMPT = "The cat sat on the";
 const QWEN_NUM_HEADS = 8;
 const QWEN_NUM_KV_HEADS = 2;
 const QWEN_HEAD_DIM = 256;
@@ -129,10 +134,13 @@ group_size    = H / G        (4 query heads per K/V head)`}</code>
       </p>
 
       <p className="mt-6 text-muted-foreground">
-        Try the widget on the right. The lane diagram shows which query heads
-        share which K/V head. The two-up heatmap compares two query heads in
-        the same group — same K, different Q, so different attention patterns
-        over the same keys.
+        The widget on the right runs the same{" "}
+        <code>"The cat sat on the"</code> prompt as chapter 3 and ghosts the
+        model's predicted next token at the end with a rainbow shimmer. The
+        lane diagram above shows which query heads share which K/V head, and
+        the two-up heatmaps below compare two query heads in the same group
+        — same K, different Q, so different attention patterns over the same
+        keys.
       </p>
     </Prose>
   );
@@ -179,6 +187,10 @@ export function MultiheadGqaDemo({
 }: MultiheadGqaDemoProps) {
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT);
   const [run, setRun] = React.useState<AttentionRun | null>(null);
+  // Mirror of chapter 3: track the exact prompt that produced `run` so we
+  // can ghost the prediction onto the textarea only while it's still
+  // semantically valid (i.e. the user hasn't edited the prompt yet).
+  const [lastRunPrompt, setLastRunPrompt] = React.useState<string | null>(null);
   const [status, setStatus] = React.useState<RunStatus | null>(null);
   const [running, setRunning] = React.useState(false);
   const [selectedLayerIdx, setSelectedLayerIdx] = React.useState(0);
@@ -241,6 +253,7 @@ export function MultiheadGqaDemo({
         attentionLayers: result.attention.length,
       });
       setRun(result);
+      setLastRunPrompt(prompt);
       setStatus({ kind: "ok" });
       setSelectedLayerIdx(0);
       setSelectedHead(0);
@@ -324,14 +337,35 @@ export function MultiheadGqaDemo({
         >
           Prompt
         </label>
-        <Textarea
-          id="multihead-gqa-demo-input"
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          rows={3}
-          className="font-mono text-sm"
-          placeholder={DEFAULT_PROMPT}
-        />
+        {/*
+          Same ghost-prediction overlay pattern as chapter 3: a sibling div
+          mirrors the prompt (invisibly, for layout) and renders the
+          predicted next token at the end with an animated chromatic
+          rainbow. Textarea sits on top with a transparent background so
+          editing still works. The ghost shows only when `prompt ===
+          lastRunPrompt && !running` so a stale prediction doesn't linger.
+        */}
+        <div className="relative">
+          <Textarea
+            id="multihead-gqa-demo-input"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            rows={3}
+            className="relative z-[1] bg-transparent font-mono text-sm"
+            placeholder={DEFAULT_PROMPT}
+          />
+          {run && prompt === lastRunPrompt && !running ? (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-0 z-0 whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 font-mono text-sm text-transparent"
+            >
+              {prompt}
+              <span className="rainbow-text-animated font-mono text-sm">
+                {renderTokenDisplay(run.generatedToken.text)}
+              </span>
+            </div>
+          ) : null}
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button onClick={handleRun} disabled={running}>
             {running ? "Running..." : "Run"}
