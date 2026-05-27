@@ -1264,35 +1264,6 @@ pub struct GgufConversionResult {
     pub source_format: String,
 }
 
-/// RAII guard that pins the MLX default device + stream to CPU for one
-/// GGUF conversion call, then restores the previous values on drop.
-/// See `convert::ConvertDefaultStreamGuard` for the rationale.
-struct ConvertGgufDefaultStreamGuard {
-    saved_device: i32,
-    saved_stream: mlx_sys::mlx_stream,
-}
-
-impl ConvertGgufDefaultStreamGuard {
-    fn enter_cpu() -> Self {
-        let saved_device = unsafe { mlx_sys::mlx_default_device() };
-        let saved_stream = unsafe { mlx_sys::mlx_default_stream(saved_device) };
-        unsafe { mlx_sys::mlx_set_default_device(0) };
-        let cpu_stream = unsafe { mlx_sys::mlx_default_stream(0) };
-        unsafe { mlx_sys::mlx_set_default_stream(cpu_stream) };
-        Self {
-            saved_device,
-            saved_stream,
-        }
-    }
-}
-
-impl Drop for ConvertGgufDefaultStreamGuard {
-    fn drop(&mut self) {
-        unsafe { mlx_sys::mlx_set_default_stream(self.saved_stream) };
-        unsafe { mlx_sys::mlx_set_default_device(self.saved_device) };
-    }
-}
-
 #[napi]
 pub async fn convert_gguf_to_safetensors(
     options: GgufConversionOptions,
@@ -1308,10 +1279,14 @@ pub async fn convert_gguf_to_safetensors(
         )));
     }
 
-    // Route every MLX op in this conversion through the CPU device + stream.
-    // See `convert_model` for the full rationale — same reasoning applies
-    // here for GGUF→SafeTensors conversion of huge MoE checkpoints.
-    let _stream_guard = ConvertGgufDefaultStreamGuard::enter_cpu();
+    // Serialize all conversions process-wide before touching MLX's default
+    // device + stream. Then route every MLX op through CPU for the duration
+    // of this call. See `crate::convert::convert_mutex` and
+    // `crate::convert::CpuConvertGuard` for the full rationale — same
+    // reasoning applies here for GGUF→SafeTensors conversion of huge MoE
+    // checkpoints.
+    let _convert_lock = crate::convert::convert_mutex().lock().await;
+    let _stream_guard = crate::convert::CpuConvertGuard::enter_cpu();
 
     // Parse GGUF header and metadata
     info!("Parsing GGUF file: {}", input_path.display());
@@ -1603,6 +1578,12 @@ pub async fn convert_gguf_to_safetensors(
         .unwrap_or("model.safetensors");
     let safetensors_path = output_dir.join(safetensors_filename);
     info!("Saving to {}", safetensors_path.display());
+    // Capture tensor names BEFORE `save_safetensors` — it drains `weights`
+    // as it streams each tensor to disk so MLX-allocated backing buffers
+    // can be released immediately on large MoE checkpoints. Reading
+    // `weights.keys()` after the save would return an empty list and the
+    // GgufConversionResult would report num_tensors = 0 to JS callers.
+    let tensor_names: Vec<String> = weights.keys().cloned().collect();
     // Add "format: mlx" metadata so loaders (e.g., mlx-vlm) know weights are
     // already in MLX layout and skip sanitize (which would double-apply +1.0 to norms).
     let st_metadata = serde_json::json!({ "format": "mlx" });
@@ -1685,8 +1666,6 @@ pub async fn convert_gguf_to_safetensors(
         .map(|(t, c)| format!("{t}({c})"))
         .collect::<Vec<_>>()
         .join(", ");
-
-    let tensor_names: Vec<String> = weights.keys().cloned().collect();
 
     Ok(GgufConversionResult {
         num_tensors: tensor_names.len() as i32,

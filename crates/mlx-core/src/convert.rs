@@ -31,13 +31,21 @@ use crate::utils::safetensors::load_safetensors_lazy;
 /// not enough — the device must be CPU too. On drop, the previous
 /// device and stream are restored so subsequent inference / training
 /// calls keep using the GPU. See the call sites for the rationale.
-struct ConvertDefaultStreamGuard {
+///
+/// MUST be acquired while holding `CONVERT_MUTEX`'s lock — otherwise two
+/// overlapping conversions can race on the process-wide MLX defaults and
+/// restore each other's `saved_*` fields incorrectly (e.g. both observe
+/// the already-flipped CPU device as "original", then both restore to
+/// CPU, leaving the process pinned to CPU for the next inference call).
+pub(crate) struct CpuConvertGuard {
     saved_device: i32,
     saved_stream: mlx_sys::mlx_stream,
 }
 
-impl ConvertDefaultStreamGuard {
-    fn enter_cpu() -> Self {
+impl CpuConvertGuard {
+    /// Enter the CPU device + stream. The caller is responsible for holding
+    /// `CONVERT_MUTEX` for the lifetime of the returned guard.
+    pub(crate) fn enter_cpu() -> Self {
         let saved_device = unsafe { mlx_sys::mlx_default_device() };
         let saved_stream = unsafe { mlx_sys::mlx_default_stream(saved_device) };
         unsafe { mlx_sys::mlx_set_default_device(0) };
@@ -50,11 +58,25 @@ impl ConvertDefaultStreamGuard {
     }
 }
 
-impl Drop for ConvertDefaultStreamGuard {
+impl Drop for CpuConvertGuard {
     fn drop(&mut self) {
         unsafe { mlx_sys::mlx_set_default_stream(self.saved_stream) };
         unsafe { mlx_sys::mlx_set_default_device(self.saved_device) };
     }
+}
+
+/// Process-wide async mutex serializing all conversion calls.
+///
+/// `convert_model` and `convert_gguf_to_safetensors` mutate MLX's
+/// process-wide default device + default stream via `CpuConvertGuard`,
+/// which is unsafe under concurrency: two overlapping conversions (or a
+/// convert during inference that depends on the GPU default) can race on
+/// the global state. Both NAPI entrypoints `.await` this mutex before
+/// constructing a `CpuConvertGuard`, so only one conversion runs at a
+/// time across the entire Node process.
+pub(crate) fn convert_mutex() -> &'static tokio::sync::Mutex<()> {
+    static CONVERT_MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    CONVERT_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Structure for parsing model.safetensors.index.json
@@ -319,6 +341,11 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
+    // Serialize all conversions process-wide before touching MLX's default
+    // device + stream — see `convert_mutex` and `CpuConvertGuard` docs for
+    // the race this avoids.
+    let _convert_lock = convert_mutex().lock().await;
+
     // Route every MLX op in this conversion through the CPU device + stream.
     //
     // The conversion path is slice / reshape / dtype-cast only — no real math.
@@ -329,7 +356,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // (e.g. Qwen3.5 122B-A10B with 256 experts × 48 layers). CPU has direct
     // access to the mmap'd pages and is immune to the watchdog. `_stream_guard`
     // restores the prior default device + stream when convert_model returns.
-    let _stream_guard = ConvertDefaultStreamGuard::enter_cpu();
+    let _stream_guard = CpuConvertGuard::enter_cpu();
 
     // Check for required files
     let config_path = input_dir.join("config.json");
