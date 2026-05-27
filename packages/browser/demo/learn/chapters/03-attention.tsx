@@ -5,6 +5,7 @@ import { Textarea } from "../../components/ui/textarea";
 import type { AttentionRun } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
 import { AttentionHeatmap } from "../inspector/AttentionHeatmap";
+import { renderTokenDisplay } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
 
 /**
@@ -17,7 +18,10 @@ import { Prose } from "../Prose";
  * by the time this component mounts.
  */
 
-const DEFAULT_PROMPT = "The cat sat on the mat.";
+// Default prompt deliberately stops mid-sentence so the next-token
+// prediction is a meaningful continuation a beginner can read (e.g.
+// " floor" / " mat" / " bed"), not the model picking after a period.
+const DEFAULT_PROMPT = "The cat sat on the";
 
 export type AttentionDemoProps = {
   /**
@@ -180,6 +184,11 @@ function isAbortError(err: unknown): boolean {
 export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT);
   const [run, setRun] = React.useState<AttentionRun | null>(null);
+  // The exact prompt that produced `run`. We compare against the current
+  // textarea content to decide whether to ghost the predicted next token
+  // onto the textarea — if the user edits, the ghost disappears because the
+  // prediction is now stale for the new text.
+  const [lastRunPrompt, setLastRunPrompt] = React.useState<string | null>(null);
   const [status, setStatus] = React.useState<RunStatus | null>(null);
   const [running, setRunning] = React.useState(false);
   // Timestamp (epoch ms) of the most recent successful run. Greedy sampling
@@ -235,6 +244,7 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
         signal ? { signal } : undefined,
       );
       setRun(result);
+      setLastRunPrompt(prompt);
       setStatus({ kind: "ok" });
       setLastRunAt(Date.now());
       setRunFlash((n) => n + 1);
@@ -270,13 +280,39 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
         <label className="text-xs uppercase tracking-wider text-muted-foreground">
           Prompt
         </label>
-        <Textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          rows={3}
-          className="font-mono text-sm"
-          placeholder="The cat sat on the mat."
-        />
+        {/*
+          Ghost-prediction overlay: a div behind the textarea mirrors the
+          current prompt (invisibly, just for layout) and then renders the
+          predicted next token at the end with an animated chromatic rainbow.
+          The textarea sits on top with a transparent background so the user
+          can still type / select / cursor as normal. The overlay's font /
+          padding / line-height MUST exactly match the textarea so the ghost
+          token lands at the caret position.
+
+          We only show the ghost when the prompt is still exactly what the
+          model just ran on (`prompt === lastRunPrompt`) — otherwise the
+          prediction is stale and we hide it until the next Run.
+        */}
+        <div className="relative">
+          <Textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            rows={3}
+            className="relative z-[1] bg-transparent font-mono text-sm"
+            placeholder="The cat sat on the"
+          />
+          {run && prompt === lastRunPrompt && !running ? (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-0 z-0 whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 font-mono text-sm text-transparent"
+            >
+              {prompt}
+              <span className="rainbow-text-animated font-mono text-sm">
+                {renderTokenDisplay(run.generatedToken.text)}
+              </span>
+            </div>
+          ) : null}
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button onClick={handleRun} disabled={running}>
             {running ? "Running..." : "Run"}
