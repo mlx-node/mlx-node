@@ -21,6 +21,8 @@
 // chapter), it must NOT yank them out of the lesson — `model_ready` is a
 // no-op in those states. The user can still get into chat by dispatching
 // `open_free_chat` explicitly.
+import { CHAPTERS } from "../learn/chapters";
+
 export type ScreenState =
   | { kind: "landing" }
   | { kind: "loading" }
@@ -38,13 +40,21 @@ export type ScreenEvent =
   | { type: "open_chapter"; chapterId: string }
   | { type: "back_to_index" }
   | { type: "back_to_landing" }
-  | { type: "open_free_chat" };
+  | { type: "open_free_chat" }
+  // `restore` directly sets the screen state without going through the normal
+  // transition rules. Used by the URL bridge (popstate handling and the
+  // initial-state path in app.tsx) to restore a screen the reducer's
+  // transitions wouldn't otherwise reach (e.g. jumping straight to a chapter
+  // from a deep link). The reducer simply trusts the payload — URL parsing
+  // has already validated it via parseScreenFromUrl.
+  | { type: "restore"; screen: ScreenState };
 
 export function reduceScreen(
   state: ScreenState | undefined,
   event: ScreenEvent,
 ): ScreenState {
   if (state === undefined || event.type === "init") return { kind: "landing" };
+  if (event.type === "restore") return event.screen;
   switch (state.kind) {
     case "landing":
       if (event.type === "load_kickoff") return { kind: "loading" };
@@ -76,6 +86,67 @@ export function reduceScreen(
       // `model_ready` is intentionally a no-op here — see chapter_index above.
       return state;
   }
+}
+
+/**
+ * Parse the current `window.location.search` into a {@link ScreenState} for
+ * cold-load deep linking. Returns `null` for an unrecognized / transient /
+ * invalid URL — the caller falls back to the default landing screen.
+ *
+ * Rules:
+ * - `?screen=landing` → `{ kind: 'landing' }`
+ * - `?screen=loading` → `null` (loading is transient; treat like landing)
+ * - `?screen=chat` → `{ kind: 'chat' }`
+ * - `?screen=chapter_index` → `{ kind: 'chapter_index' }`
+ * - `?screen=chapter&chapterId=<id>` → `{ kind: 'chapter', chapterId }` iff
+ *   the id exists in the {@link CHAPTERS} registry AND `available !== false`.
+ *   Otherwise `null` (falls back to landing).
+ * - Anything else (or no `screen` at all): `null`.
+ *
+ * A malformed URL must never crash the app, so this is wrapped in try/catch.
+ */
+export function parseScreenFromUrl(): ScreenState | null {
+  try {
+    if (typeof window === "undefined") return null;
+    const params = new URLSearchParams(window.location.search);
+    const kind = params.get("screen");
+    if (!kind) return null;
+    switch (kind) {
+      case "landing":
+        return { kind: "landing" };
+      case "loading":
+        // Transient state — do not restore. Caller falls back to landing.
+        return null;
+      case "chat":
+        return { kind: "chat" };
+      case "chapter_index":
+        return { kind: "chapter_index" };
+      case "chapter": {
+        const chapterId = params.get("chapterId");
+        if (!chapterId) return null;
+        const match = CHAPTERS.find((c) => c.id === chapterId);
+        if (!match || match.available === false) return null;
+        return { kind: "chapter", chapterId: match.id };
+      }
+      default:
+        return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Serialize a {@link ScreenState} into the URL query string component (no
+ * leading `?`). Returns `null` to signal the URL must NOT be updated for this
+ * screen (currently only `loading`, which is transient).
+ */
+export function screenToUrlQuery(screen: ScreenState): string | null {
+  if (screen.kind === "loading") return null;
+  const params = new URLSearchParams();
+  params.set("screen", screen.kind);
+  if (screen.kind === "chapter") params.set("chapterId", screen.chapterId);
+  return params.toString();
 }
 
 export type ProfileLikeStats = {

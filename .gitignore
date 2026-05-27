@@ -225,6 +225,9 @@ crates/mlx-sys/mlx
 # Superpowers brainstorm + visual companion artifacts
 .superpowers/
 
+# Playwright MCP debug artifacts (page snapshots + console logs)
+.playwright-mcp/
+
 # Void local state
 node_modules
 .void

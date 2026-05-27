@@ -23,7 +23,14 @@ import { TelemetryStrip } from './components/chat/TelemetryStrip';
 import { Landing } from './components/landing/Landing';
 import { Loading, type LoadingProgress } from './components/loading/Loading';
 import { BrowserChatSessionAdapter, type BrowserChatMessage } from './lib/browser-chat-session';
-import { type ScreenState, type ProfileLikeStats, cycleReasoningEffort, reduceScreen } from './lib/screen-state';
+import {
+  type ScreenState,
+  type ProfileLikeStats,
+  cycleReasoningEffort,
+  parseScreenFromUrl,
+  reduceScreen,
+  screenToUrlQuery,
+} from './lib/screen-state';
 import { ChapterIndex } from './learn/ChapterIndex';
 import { LessonLayout } from './learn/LessonLayout';
 import { findChapter } from './learn/chapters';
@@ -38,7 +45,15 @@ import { FullBlockChapterBody, FullBlockDemo } from './learn/chapters/08-full-bl
 import { SamplingChapterBody, SamplingDemo } from './learn/chapters/09-sampling';
 import { KvCacheChapterBody, KvCacheDemo } from './learn/chapters/10-kv-cache';
 
-const INITIAL_SCREEN: ScreenState = { kind: 'landing' };
+const DEFAULT_INITIAL_SCREEN: ScreenState = { kind: 'landing' };
+
+// useReducer's lazy-init: read the URL once at boot so deep links like
+// /?screen=chapter&chapterId=tokenization land on the right screen directly
+// instead of bouncing through landing. Invalid / transient URLs fall back to
+// landing — see parseScreenFromUrl for the validation rules.
+function getInitialScreen(): ScreenState {
+  return parseScreenFromUrl() ?? DEFAULT_INITIAL_SCREEN;
+}
 import 'streamdown/styles.css';
 import './styles.css';
 
@@ -280,7 +295,7 @@ function App() {
   const initialAppToolsEnabled = initialUrlParams.get('tools') === '1' || initialUrlParams.get('app_preview') === '1';
   const [appToolsEnabled, setAppToolsEnabledState] = useState(initialAppToolsEnabled);
   const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>('off');
-  const [screen, dispatchScreen] = useReducer(reduceScreen, INITIAL_SCREEN);
+  const [screen, dispatchScreen] = useReducer(reduceScreen, undefined, getInitialScreen);
   const [loadKickoff, setLoadKickoff] = useState(0);
   const [loadingText, setLoadingText] = useState<string | null>(null);
   const [loadingProgress, setLoadingProgress] = useState<LoadingProgress | null>(null);
@@ -338,6 +353,41 @@ function App() {
     if (!modelDirInput) return;
     modelDirInput.setAttribute('webkitdirectory', '');
     modelDirInput.setAttribute('directory', '');
+  }, []);
+
+  // URL <-> screen state bridge. Single source of truth for writes lives here:
+  // every screen change calls history.replaceState so a reload restores the
+  // current screen. We use replaceState (not pushState) because intra-app
+  // navigation should not bloat the back stack — the user's back button
+  // takes them OUT of the app, not through every chapter they viewed.
+  // The `loading` screen is skipped (screenToUrlQuery returns null) so
+  // reloading mid-load doesn't restore an unrecoverable transient state.
+  useEffect(() => {
+    const query = screenToUrlQuery(screen);
+    if (query === null) return;
+    try {
+      const existing = window.location.search.startsWith('?')
+        ? window.location.search.slice(1)
+        : window.location.search;
+      if (existing === query) return;
+      const newUrl = `${window.location.pathname}?${query}`;
+      window.history.replaceState(null, '', newUrl);
+    } catch {
+      // history.replaceState can throw in sandboxed iframes / very restricted
+      // contexts. The app must keep working even if URL sync is impossible.
+    }
+  }, [screen]);
+
+  // Browser back/forward → re-parse the URL and restore via the `restore`
+  // reducer event. Bound once at mount with an empty dep array; the handler
+  // reads from window.location at call time so the closure stays trivial.
+  useEffect(() => {
+    const handler = () => {
+      const restored = parseScreenFromUrl();
+      dispatchScreen({ type: 'restore', screen: restored ?? DEFAULT_INITIAL_SCREEN });
+    };
+    window.addEventListener('popstate', handler);
+    return () => window.removeEventListener('popstate', handler);
   }, []);
 
   useEffect(() => {
