@@ -37,6 +37,22 @@ use crate::utils::safetensors::load_safetensors_lazy;
 /// restore each other's `saved_*` fields incorrectly (e.g. both observe
 /// the already-flipped CPU device as "original", then both restore to
 /// CPU, leaving the process pinned to CPU for the next inference call).
+///
+/// **Concurrent-inference limitation (intentional):** `convert_mutex`
+/// only serializes convert-vs-convert. It does NOT block inference /
+/// training entrypoints. If a Node process runs `convert_model` while
+/// also serving inference, those inference ops resolve their stream via
+/// `default_stream(default_device())` and will be silently routed to
+/// CPU until the conversion finishes — typically minutes to hours on
+/// large MoE checkpoints, with severe latency degradation. The
+/// architecturally correct fix is to plumb explicit `Stream` arguments
+/// through every convert-used MLX FFI op so the global default is never
+/// touched; that's a substantial refactor outside the scope of this
+/// change. For the supported usage today (the `mlx convert` CLI exits
+/// after conversion; no other entrypoint in this codebase invokes
+/// convert), this is a non-issue. Callers who embed convert inside a
+/// long-lived multi-tenant Node process should serialize their own
+/// inference against convert externally.
 pub(crate) struct CpuConvertGuard {
     saved_device: i32,
     saved_stream: mlx_sys::mlx_stream,
