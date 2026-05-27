@@ -332,6 +332,211 @@ fn run_paged_prefill_single_shot(
     project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
 }
 
+/// Phase 4b B3.1 — paged prefill variant that ALSO returns the
+/// post-`final_norm` hidden state for every prompt token,
+/// concatenated along the time axis to `[1, prompt_len, hidden]`.
+///
+/// Mirror of `chunked_prefill_with_hidden` (dense / flat path). The
+/// paged-MTP gate inside `chat_sync_core_paged_inner` consumes this so
+/// `prefill_mtp_commit` can seed `g_mtp_committed_len = N` before the
+/// first MTP cycle — without it the MTP draft attends over a
+/// prompt-less context and parity vs the AR run breaks.
+///
+/// Caller MUST gate on `cached_prefix_len == 0` (the dense gate uses
+/// the same `want_prompt_hidden` predicate). On a cache-reuse turn the
+/// prefill only processes the suffix, so the captured hidden would not
+/// cover the full prompt and `prefill_mtp_commit` cannot use it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_paged_prefill_chunk_with_hidden(
+    full_tokens: &[u32],
+    suffix_tokens: &[u32],
+    cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+) -> Result<(MxArray, MxArray)> {
+    let chunk_size = crate::array::paged_prefill_chunk_size();
+    run_paged_prefill_chunk_with_hidden_with_size(
+        full_tokens,
+        suffix_tokens,
+        cached_prefix_len,
+        gdn_prefix_already_primed,
+        embed,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embedding_weight,
+        layer_kinds,
+        paged_adapter,
+        chunk_size,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paged_prefill_chunk_with_hidden_with_size(
+    full_tokens: &[u32],
+    suffix_tokens: &[u32],
+    cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    chunk_size: i32,
+) -> Result<(MxArray, MxArray)> {
+    if suffix_tokens.is_empty() {
+        return Err(Error::from_reason(
+            "run_paged_prefill_chunk_with_hidden called with empty suffix",
+        ));
+    }
+
+    if chunk_size <= 0 || suffix_tokens.len() <= chunk_size as usize {
+        return run_paged_prefill_single_shot_with_hidden(
+            full_tokens,
+            suffix_tokens,
+            cached_prefix_len,
+            gdn_prefix_already_primed,
+            embed,
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            embedding_weight,
+            layer_kinds,
+            paged_adapter,
+        );
+    }
+
+    let chunk_size_usize = chunk_size as usize;
+
+    if cached_prefix_len > 0 && !gdn_prefix_already_primed {
+        let prefix = &full_tokens[..(cached_prefix_len as usize)];
+        run_gdn_only_prefill(prefix, embed, layers, caches)?;
+    }
+
+    let total_chunks = suffix_tokens.len().div_ceil(chunk_size_usize);
+    let mut last_logits: Option<MxArray> = None;
+    let mut hidden_chunks: Vec<MxArray> = Vec::with_capacity(total_chunks);
+    let mut chunk_start_position = cached_prefix_len;
+
+    for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
+        let is_last_chunk = chunk_idx + 1 == total_chunks;
+
+        paged_adapter
+            .record_tokens(chunk)
+            .map_err(Error::from_reason)?;
+
+        let hidden_states = run_paged_prefill_one_chunk(
+            chunk,
+            chunk_start_position,
+            embed,
+            layers,
+            caches,
+            layer_kinds,
+            paged_adapter,
+        )?;
+
+        let chunk_hidden = final_norm.forward(&hidden_states)?;
+        // Materialize hidden BEFORE clear_cache; the hidden is a lazy
+        // handle into graph nodes that the per-layer cache eviction
+        // would otherwise free between chunks.
+        chunk_hidden.eval();
+
+        if is_last_chunk {
+            // Reuse the already-normed last chunk to project last-token
+            // logits — `forward` on a final_norm output is idempotent
+            // would be wasteful; slice directly instead.
+            let chunk_len = chunk_hidden.shape_at(1)?;
+            let last_hidden = chunk_hidden.slice_axis(1, chunk_len - 1, chunk_len)?;
+            let logits = if let Some(head) = lm_head {
+                head.forward(&last_hidden)?
+            } else {
+                let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+                last_hidden.matmul(&weight_t)?
+            };
+            last_logits = Some(logits.squeeze(Some(&[0, 1]))?);
+        } else {
+            crate::array::synchronize_and_clear_cache();
+        }
+
+        hidden_chunks.push(chunk_hidden);
+        chunk_start_position += chunk.len() as u32;
+    }
+
+    let last_logits = last_logits.ok_or_else(|| {
+        Error::from_reason(
+            "chunked prefill (with-hidden) produced no last chunk (unreachable for non-empty suffix)",
+        )
+    })?;
+
+    let prompt_hidden = if hidden_chunks.len() == 1 {
+        hidden_chunks.into_iter().next().ok_or_else(|| {
+            Error::from_reason("run_paged_prefill_chunk_with_hidden: empty hidden chunks")
+        })?
+    } else {
+        let mut acc = hidden_chunks[0].clone();
+        for chunk in &hidden_chunks[1..] {
+            acc = MxArray::concatenate(&acc, chunk, 1)?;
+        }
+        acc
+    };
+
+    Ok((last_logits, prompt_hidden))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paged_prefill_single_shot_with_hidden(
+    full_tokens: &[u32],
+    suffix_tokens: &[u32],
+    cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+) -> Result<(MxArray, MxArray)> {
+    paged_adapter
+        .record_tokens(suffix_tokens)
+        .map_err(Error::from_reason)?;
+
+    if cached_prefix_len > 0 && !gdn_prefix_already_primed {
+        let prefix = &full_tokens[..(cached_prefix_len as usize)];
+        run_gdn_only_prefill(prefix, embed, layers, caches)?;
+    }
+
+    let hidden_states = run_paged_prefill_one_chunk(
+        suffix_tokens,
+        cached_prefix_len,
+        embed,
+        layers,
+        caches,
+        layer_kinds,
+        paged_adapter,
+    )?;
+
+    project_last_token_logits_with_full_hidden(
+        &hidden_states,
+        final_norm,
+        lm_head,
+        embedding_weight,
+    )
+}
+
 fn run_paged_prefill_one_chunk(
     chunk_tokens: &[u32],
     chunk_first_position: u32,
@@ -389,6 +594,33 @@ fn project_last_token_logits(
     };
 
     logits.squeeze(Some(&[0, 1]))
+}
+
+/// Project the FULL pre-norm hidden chunk through `final_norm` and the LM
+/// head, returning `(last_token_logits[vocab], full_chunk_hidden[1, T, hidden])`.
+///
+/// Phase 4b B3.1: the paged prefill variant needs every chunk's
+/// post-`final_norm` hidden so the MTP committed-history prefill seed
+/// (`prefill_mtp_commit`) gets a contiguous `[1, prompt_len, hidden]`
+/// tensor — mirrors `chunked_prefill_with_hidden` on the dense path.
+fn project_last_token_logits_with_full_hidden(
+    hidden_states: &MxArray,
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    let seq_len = hidden_states.shape_at(1)?;
+    let full_hidden = final_norm.forward(hidden_states)?;
+    let last_hidden = full_hidden.slice_axis(1, seq_len - 1, seq_len)?;
+    let logits = if let Some(head) = lm_head {
+        head.forward(&last_hidden)?
+    } else {
+        let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        last_hidden.matmul(&weight_t)?
+    };
+
+    let logits = logits.squeeze(Some(&[0, 1]))?;
+    Ok((logits, full_hidden))
 }
 
 /// Run one paged decode step: feed `[token_id]` through the model.

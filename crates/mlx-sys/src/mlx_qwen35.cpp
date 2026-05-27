@@ -47,6 +47,15 @@ static bool g_compile_inited = false;
 // distinguish "never populated" from "populated with zeros".
 static std::optional<array> g_last_hidden;
 
+// Phase 4b — paged-path sibling of `g_last_hidden`. Stashed at the
+// LM-head boundary inside `dense_compiled_decode_fn_paged` BEFORE the
+// `lm_head` linear runs. Shape is `[B, hidden_size]` after the implicit
+// reshape (paged decode batch is `[1, 1]` → `take` → `[1, hidden]`).
+// Consumed by the paged-MTP gate via `mlx_qwen35_export_last_hidden_paged`
+// to seed the next MTP draft cycle without re-running the main forward.
+// Cleared on `mlx_qwen35_compiled_reset`.
+static std::optional<array> g_last_hidden_paged;
+
 // W6 (MTP) Bug #4 fix — snapshot of the GDN linear-attention caches
 // (conv_state + recurrent_state) plus the decode offset taken BEFORE
 // the verify FFI runs its D+1 sequential forward passes. The verify
@@ -669,7 +678,11 @@ static BatchedVerifyFn& get_or_compile_verify_bucket(int bucket_idx, bool with_t
 template <bool WithTape>
 static std::vector<array> qwen35_verify_batched_decode_fn_paged(
     const std::vector<array>& inputs) {
-  const auto& cfg = g_compile_config;
+  // Phase 4b — read layout from the paged config (`mlx_qwen35_init_paged`).
+  // The verify graph is only callable through the paged-MTP gate, which
+  // requires `g_dense_paged_inited == true`; BHTD `g_compile_config` may
+  // be unset on pure-paged turns.
+  const auto& cfg = g_dense_paged_config;
 
   auto h_3d         = inputs[0];
   auto offset_arr   = inputs[1];
@@ -851,13 +864,17 @@ static BatchedVerifyFn& get_or_compile_verify_paged(bool with_tape) {
 // Output vector layout:
 //   [0]                  logits
 //   [1]                  new_offset:         offset_arr + 1
+//   [2]                  hidden_for_export:  [B, hidden] post-final-norm,
+//                                            pre-lm_head — consumed by
+//                                            the paged-MTP gate via
+//                                            `mlx_qwen35_export_last_hidden_paged`
 //   For each layer i:
 //     If linear:
-//       [2 + i*2 + 0]    new_conv_state
-//       [2 + i*2 + 1]    new_recurrent_state
+//       [3 + i*2 + 0]    new_conv_state
+//       [3 + i*2 + 1]    new_recurrent_state
 //     If full-attention:
-//       [2 + i*2 + 0]    new_k_pool          (post-write pool tensor)
-//       [2 + i*2 + 1]    new_v_pool
+//       [3 + i*2 + 0]    new_k_pool          (post-write pool tensor)
+//       [3 + i*2 + 1]    new_v_pool
 //
 // The 4-input / 2-output stride is identical to the MoE paged graph so
 // the same `attn_for_compile_paged` helper plumbs in unchanged.
@@ -929,8 +946,11 @@ static std::vector<array> dense_compiled_decode_fn_paged(const std::vector<array
     h = h + mlp_out;
   }
 
-  // Final norm + LM head
+  // Final norm + LM head. Capture the post-final-norm tensor BEFORE the
+  // LM head projection so the paged-MTP gate can seed the next MTP draft
+  // cycle from the live hidden state without a second main forward.
   h = fast::rms_norm(h, get_weight("final_norm.weight"), cfg.rms_norm_eps);
+  auto hidden_for_export = h;
   if (cfg.tie_word_embeddings) {
     h = linear_proj(h, "embedding");
   } else {
@@ -940,9 +960,10 @@ static std::vector<array> dense_compiled_decode_fn_paged(const std::vector<array
   auto new_offset = offset_arr + array(1, mlx::core::int32);
 
   std::vector<array> result;
-  result.reserve(2 + cfg.num_layers * 2);
+  result.reserve(3 + cfg.num_layers * 2);
   result.push_back(std::move(h));
   result.push_back(std::move(new_offset));
+  result.push_back(std::move(hidden_for_export));
   for (auto& c : new_caches) result.push_back(std::move(c));
   return result;
 }
@@ -1341,7 +1362,6 @@ void mlx_qwen35_forward_batched_verify_paged(
       !cu_seqlens_q_ptr || !out_logits || !out_hiddens) {
     return;
   }
-  if (!g_compile_inited) return;
   if (!g_dense_paged_inited) {
     fprintf(stderr,
             "[MLX] mlx_qwen35_forward_batched_verify_paged: paged adapter "
@@ -1358,7 +1378,13 @@ void mlx_qwen35_forward_batched_verify_paged(
     fflush(stderr);
     return;
   }
-  const auto& cfg = g_compile_config;
+  // Phase 4b — the paged verify graph reads pool / linear-cache layout
+  // from `g_dense_paged_config` (set by `mlx_qwen35_init_paged`). The
+  // BHTD `g_compile_config` is unset when callers reach this FFI from
+  // the paged-MTP gate, so source the dimensions from the paged config
+  // instead. The two configs share an identical layout for the fields
+  // this code reads (`num_layers`, `hidden_size`, `full_attention_interval`).
+  const auto& cfg = g_dense_paged_config;
   int T = depth + 1;
 
   if (qwen35_common::mtp_trace_enabled()) {
@@ -2138,6 +2164,10 @@ void mlx_qwen35_compiled_reset() {
 
   g_dense_paged_linear_snapshot.clear();
   g_dense_paged_linear_snapshot_taken = false;
+
+  // Phase 4b — drop the paged last-hidden stash so cross-turn handles
+  // can't outlive the underlying compile cache.
+  g_last_hidden_paged = std::nullopt;
 }
 
 // W6 (MTP) — export a heap-allocated deep copy of the post-final-norm
@@ -2170,6 +2200,36 @@ void mlx_qwen35_export_last_hidden(mlx_array** out) {
   }
 }
 
+// Phase 4b — paged-path sibling of `mlx_qwen35_export_last_hidden`.
+// Exports a heap-allocated deep copy of the post-final-norm hidden
+// captured by the most recent `mlx_qwen35_forward_paged` invocation.
+// Returns nullptr if no paged forward has run since the last reset.
+//
+// Lifetime contract: the returned handle is a lazy MLX array whose graph
+// references the paged decode's final_norm output. The caller MUST eval
+// it before reading scalars, and MUST NOT call
+// `mlx_qwen35_compiled_reset` between export and eval (the reset clears
+// `g_dense_paged_*` globals whose handles the hidden may depend on via
+// the cached graph).
+void mlx_qwen35_export_last_hidden_paged(mlx_array** out) {
+  if (!out) return;
+  *out = nullptr;
+  if (!g_dense_paged_inited || !g_last_hidden_paged.has_value()) {
+    return;
+  }
+  try {
+    *out = reinterpret_cast<mlx_array*>(new array(*g_last_hidden_paged));
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_export_last_hidden_paged: %s\n", e.what());
+    fflush(stderr);
+    *out = nullptr;
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in mlx_qwen35_export_last_hidden_paged\n");
+    fflush(stderr);
+    *out = nullptr;
+  }
+}
+
 // Export compiled caches for PromptCache reuse.
 int mlx_qwen35_export_caches(mlx_array** out_ptrs, int max_count) {
   if (!g_compile_inited || g_compiled_caches.empty()) return 0;
@@ -2189,8 +2249,14 @@ int mlx_qwen35_get_cache_offset() {
 // this guard, `mlx_qwen35_get_cache_offset()` silently returns 0 from a
 // fresh `g_offset_int`, and the MTP path would build attention masks
 // against a phantom prefix.
+//
+// Phase 4b: the paged dense path inits via `mlx_qwen35_init_paged`
+// (which sets `g_dense_paged_inited`) instead of
+// `mlx_qwen35_compiled_init_from_prefill`. Both flags signal "weights
+// have been registered and the main forward is ready to run for this
+// model"; either is sufficient for the MTP init precondition.
 int mlx_qwen35_is_compile_inited() {
-  return g_compile_inited ? 1 : 0;
+  return (g_compile_inited || g_dense_paged_inited) ? 1 : 0;
 }
 
 // Test-only helper: forcibly mark the main compiled path as initialised
@@ -2591,14 +2657,15 @@ void mlx_qwen35_forward_paged(
         ? dense_compiled_decode_fn_paged(fn_inputs)
         : compiled_dense_decode_paged()(fn_inputs);
 
-    // Extract: [logits, new_offset, new_caches...]
+    // Extract: [logits, new_offset, hidden_for_export, new_caches...]
     *output_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
+    g_last_hidden_paged = outputs[2];
     g_dense_paged_offset_int++;
     // Stash post-step caches back into the per-layer slots.
     for (int i = 0; i < cfg.num_layers; i++) {
       bool is_linear = dense_paged_is_linear_layer(i);
-      auto& a = outputs[2 + i * 2];
-      auto& b = outputs[2 + i * 2 + 1];
+      auto& a = outputs[3 + i * 2];
+      auto& b = outputs[3 + i * 2 + 1];
       if (is_linear) {
         g_dense_paged_linear_caches[i * 2]     = a;
         g_dense_paged_linear_caches[i * 2 + 1] = b;

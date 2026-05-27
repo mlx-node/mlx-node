@@ -1134,4 +1134,78 @@ mod compiled_ffi_tests {
 
         teardown();
     }
+
+    /// Phase 4b B3 — pool-seeding regression. The paged-MTP gate
+    /// inside `chat_sync_core_paged_inner` depends on the paged
+    /// linear-cache pool being populated by paged prefill before the
+    /// first MTP cycle (decision C in the path-A spec). If the pool
+    /// is empty / un-snapshotted at cycle-1 entry the snapshot FFI
+    /// silently no-ops and `restore_and_replay_main` would leave
+    /// stale state in place on a partial reject.
+    ///
+    /// This test exercises the pool-seeding contract from the gate's
+    /// perspective: force-init the paged linear caches (the same way
+    /// `mlx_qwen35_init_paged` would after a successful pure-Rust
+    /// prefill), take a snapshot, mutate the linear slots to simulate
+    /// a verify forward, then restore and confirm the pre-verify
+    /// values come back. Bf16 noise tolerance is 1e-3 per coordinate
+    /// per the design-pass Q5 note.
+    #[test]
+    fn test_paged_mtp_pool_seeding_after_prefill() {
+        let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe {
+            sys::mlx_qwen35_compiled_reset();
+            sys::mlx_clear_weights();
+        }
+
+        let num_layers: i32 = 4;
+        let full_attention_interval: i32 = 4;
+        unsafe {
+            sys::mlx_qwen35_compiled_test_force_paged_linear_caches(
+                num_layers,
+                full_attention_interval,
+            );
+        }
+
+        let linear_slot_indices: Vec<i32> = (0..num_layers)
+            .filter(|i| ((*i + 1) % full_attention_interval) != 0)
+            .flat_map(|i| [i * 2, i * 2 + 1])
+            .collect();
+        assert!(
+            !linear_slot_indices.is_empty(),
+            "paged-MTP gate requires at least one linear layer to snapshot"
+        );
+
+        let seeded: Vec<f32> = linear_slot_indices
+            .iter()
+            .map(|&idx| unsafe { sys::mlx_qwen35_compiled_test_read_paged_linear_slot(idx) })
+            .collect();
+        for (idx, val) in linear_slot_indices.iter().zip(seeded.iter()) {
+            assert!(
+                !val.is_nan(),
+                "post-prefill slot {idx} must be a populated bf16 scalar (paged-MTP \
+                 gate assumes pool is seeded before cycle 1)"
+            );
+        }
+
+        unsafe { sys::mlx_qwen35_compiled_snapshot_paged_linear_caches() };
+
+        for &idx in &linear_slot_indices {
+            unsafe { sys::mlx_qwen35_compiled_test_write_paged_linear_slot(idx, -123.0) };
+        }
+
+        unsafe { sys::mlx_qwen35_compiled_restore_paged_linear_caches() };
+
+        for (&idx, &expected) in linear_slot_indices.iter().zip(seeded.iter()) {
+            let restored = unsafe { sys::mlx_qwen35_compiled_test_read_paged_linear_slot(idx) };
+            assert!(
+                (restored - expected).abs() < 1e-3,
+                "pool-seeding restore: slot {idx} must return the pre-verify value \
+                 (expected {expected}, got {restored})"
+            );
+        }
+
+        teardown();
+    }
 }
