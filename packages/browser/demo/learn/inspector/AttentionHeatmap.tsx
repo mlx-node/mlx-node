@@ -303,17 +303,18 @@ export function AttentionHeatmap({
                 height: cellSize,
               }}
             />
-            {hover && (
-              <HeatmapTooltip
-                hover={hover}
-                queryToken={run.tokens[hover.queryIndex]!}
-                keyToken={run.tokens[hover.keyIndex]!}
-                board={board}
-              />
-            )}
           </div>
         </div>
       </div>
+
+      {/* Cell inspector — lives outside the heatmap so it never occludes
+          cells on small boards. Updates live on hover; falls back to a
+          short instruction when nothing is hovered. */}
+      <CellInspector
+        hover={hover}
+        queryToken={hover ? run.tokens[hover.queryIndex] : undefined}
+        keyToken={hover ? run.tokens[hover.keyIndex] : undefined}
+      />
 
       {/* Color legend */}
       <Legend />
@@ -364,47 +365,58 @@ export function AttentionHeatmap({
   );
 }
 
-function HeatmapTooltip({
+/**
+ * Persistent cell-inspector bar that lives below the heatmap rather than
+ * floating over its cells. The earlier in-board tooltip occluded data on
+ * small boards (a 7-token prompt yields a 224×224 px board, and the tooltip
+ * was 200×80). Beginners couldn't read the cell they were inspecting because
+ * the tooltip was sitting on top of it.
+ *
+ * The cross-hair token-strip highlights (row label + column label) already
+ * tell the user *which* cell they're hovering visually — this bar adds the
+ * numeric score and the literal token strings without competing for canvas
+ * real estate.
+ */
+function CellInspector({
   hover,
   queryToken,
   keyToken,
-  board,
 }: {
   hover: {
     queryIndex: number;
     keyIndex: number;
-    x: number;
-    y: number;
     score: number;
-  };
-  queryToken: { text: string };
-  keyToken: { text: string };
-  board: number;
+  } | null;
+  queryToken: { text: string } | undefined;
+  keyToken: { text: string } | undefined;
 }) {
-  // Position the tooltip so it never goes off the right/bottom edge. On very
-  // small boards (board < 220), the clamp would underflow to a negative value
-  // and pin the tooltip off-screen to the left — guard with Math.max(0, ...).
-  const left = Math.max(0, Math.min(hover.x + 12, board - 220));
-  const top = Math.max(0, Math.min(hover.y + 12, board - 80));
+  if (!hover || !queryToken || !keyToken) {
+    return (
+      <div
+        className="rounded-md border border-dashed border-border/60 bg-muted/20 px-3 py-2 text-xs text-muted-foreground"
+        aria-live="polite"
+      >
+        Hover any cell to see its query token, key token, and attention score.
+      </div>
+    );
+  }
   return (
     <div
-      className="pointer-events-none absolute z-10 rounded-md border border-border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md"
-      style={{ left, top, minWidth: 200 }}
+      className="rounded-md border border-border bg-card/40 px-3 py-2 font-mono text-xs"
+      aria-live="polite"
     >
-      <div className="font-mono text-[0.7rem] text-muted-foreground">
-        query {hover.queryIndex} → key {hover.keyIndex}
-      </div>
-      <div className="mt-1">
-        <span className="text-muted-foreground">query:</span>{" "}
-        <span className="font-mono">{JSON.stringify(queryToken.text)}</span>
-      </div>
-      <div>
-        <span className="text-muted-foreground">key:</span>{" "}
-        <span className="font-mono">{JSON.stringify(keyToken.text)}</span>
-      </div>
-      <div className="mt-1">
-        <span className="text-muted-foreground">score:</span>{" "}
-        <span className="font-mono">{hover.score.toFixed(4)}</span>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="text-muted-foreground">row {hover.queryIndex}</span>
+        <span className="rounded border border-border/60 bg-background/60 px-1.5 py-0.5 text-foreground">
+          {JSON.stringify(queryToken.text)}
+        </span>
+        <span className="text-muted-foreground">→</span>
+        <span className="text-muted-foreground">column {hover.keyIndex}</span>
+        <span className="rounded border border-border/60 bg-background/60 px-1.5 py-0.5 text-foreground">
+          {JSON.stringify(keyToken.text)}
+        </span>
+        <span className="text-muted-foreground">=</span>
+        <span className="text-foreground">{hover.score.toFixed(4)}</span>
       </div>
     </div>
   );
