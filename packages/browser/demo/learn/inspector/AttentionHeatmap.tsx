@@ -10,6 +10,7 @@ import {
 
 import type { AttentionRun } from "../../../src/inspector-types";
 import { TokenStrip } from "./TokenStrip";
+import { renderTokenDisplay } from "./TopKBars";
 
 export type AttentionHeatmapProps = {
   run: AttentionRun;
@@ -37,8 +38,23 @@ export function AttentionHeatmap({
   preferredCellSize = 32,
 }: AttentionHeatmapProps) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
-  const [selectedLayerIdx, setSelectedLayerIdx] = React.useState(0);
+  // Initial default: prefer the first layer whose kind === 'full' so the
+  // heatmap doesn't open on a linear layer ("This layer does not expose
+  // softmax scores."). Computed lazily so it only runs on mount; subsequent
+  // run swaps are handled by the useEffect below.
+  const [selectedLayerIdx, setSelectedLayerIdx] = React.useState(() => {
+    const idx = run.attention.findIndex((layer) => layer.kind === "full");
+    return idx >= 0 ? idx : 0;
+  });
   const [selectedHead, setSelectedHead] = React.useState(0);
+  // Reset the layer default whenever a NEW run arrives (compared by object
+  // identity). We deliberately do NOT include selectedLayerIdx in the deps —
+  // if we did, manual selection by the user would be immediately reverted.
+  React.useEffect(() => {
+    const idx = run.attention.findIndex((layer) => layer.kind === "full");
+    setSelectedLayerIdx(idx >= 0 ? idx : 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run]);
   const [hover, setHover] = React.useState<{
     queryIndex: number;
     keyIndex: number;
@@ -286,7 +302,7 @@ export function AttentionHeatmap({
         <span className="font-mono">{run.modelMeta.name}</span> ·{" "}
         {seqLen} tokens · next-token prediction:{" "}
         <span className="font-mono text-foreground">
-          {run.generatedToken.text}
+          {renderTokenDisplay(run.generatedToken.text)}
         </span>
       </div>
     </div>
