@@ -2118,6 +2118,129 @@ void mlx_qwen35_compiled_tape_replay(int accepted_steps) {
   mlx_qwen35_compiled_tape_disarm();
 }
 
+// Phase 4b B4 — paged variant of `mlx_qwen35_compiled_tape_arm`.
+//
+// The dense BHTD arm function gates on `g_compile_inited`, which is false
+// on pure-paged turns. The paged verify graph (`qwen35_verify_batched_decode_fn_paged<true>`)
+// already writes per-layer tape into the SHARED `g_gdn_*_tape_acc[]`
+// accumulators when `g_tape_recording_armed == true`, so all we need is
+// an arm that flips the flag based on `g_dense_paged_inited` instead.
+void mlx_qwen35_compiled_tape_arm_paged() {
+  if (!g_dense_paged_inited) {
+    g_tape_recording_armed = false;
+    return;
+  }
+  const auto& cfg = g_dense_paged_config;
+  g_gdn_tape_acc.assign(cfg.num_layers, std::nullopt);
+  g_gdn_k_tape_acc.assign(cfg.num_layers, std::nullopt);
+  g_gdn_g_tape_acc.assign(cfg.num_layers, std::nullopt);
+  g_gdn_qkv_tape_acc.assign(cfg.num_layers, std::nullopt);
+  g_tape_recording_armed = true;
+}
+
+// Phase 4b B4 — paged variant of `mlx_qwen35_compiled_tape_replay`.
+//
+// Reads the tape from the same shared `g_gdn_*_tape_acc[]` accumulators
+// the BHTD replay reads, but applies the first `accepted_steps`
+// innovations to `g_dense_paged_linear_snapshot[]` and writes the result
+// back into `g_dense_paged_linear_caches[]`. Mirrors
+// `mlx_qwen35_compiled_tape_replay` line-for-line on the GDN side; only
+// the snapshot and target arrays differ.
+void mlx_qwen35_compiled_tape_replay_paged(int accepted_steps) {
+  if (!g_dense_paged_inited) {
+    g_tape_recording_armed = false;
+    return;
+  }
+  if (!g_dense_paged_linear_snapshot_taken) {
+    fprintf(stderr,
+            "[MLX] tape_replay_paged: snapshot not taken — falling back\n");
+    fflush(stderr);
+    mlx_qwen35_compiled_tape_disarm();
+    return;
+  }
+  if (accepted_steps <= 0) {
+    fprintf(stderr,
+            "[MLX] tape_replay_paged: accepted_steps=%d must be > 0\n",
+            accepted_steps);
+    fflush(stderr);
+    mlx_qwen35_compiled_tape_disarm();
+    return;
+  }
+  const auto& cfg = g_dense_paged_config;
+  try {
+    int keep = cfg.linear_conv_kernel_dim - 1;
+    for (int i = 0; i < cfg.num_layers; i++) {
+      bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+      if (!is_linear) continue;
+      if (!g_gdn_tape_acc[i].has_value() || !g_gdn_k_tape_acc[i].has_value() ||
+          !g_gdn_g_tape_acc[i].has_value() || !g_gdn_qkv_tape_acc[i].has_value()) {
+        fprintf(stderr,
+                "[MLX] tape_replay_paged: layer %d has empty accumulator — "
+                "did the verify forwards record? Falling back.\n", i);
+        fflush(stderr);
+        mlx_qwen35_compiled_restore_paged_linear_caches();
+        mlx_qwen35_compiled_tape_disarm();
+        return;
+      }
+      auto& tape_full = *g_gdn_tape_acc[i];
+      auto& k_full    = *g_gdn_k_tape_acc[i];
+      auto& g_full    = *g_gdn_g_tape_acc[i];
+      auto& qkv_full  = *g_gdn_qkv_tape_acc[i];
+
+      int recorded = tape_full.shape(1);
+      if (accepted_steps > recorded) {
+        fprintf(stderr,
+                "[MLX] tape_replay_paged: accepted_steps=%d > recorded=%d "
+                "(layer %d). Falling back.\n", accepted_steps, recorded, i);
+        fflush(stderr);
+        mlx_qwen35_compiled_restore_paged_linear_caches();
+        mlx_qwen35_compiled_tape_disarm();
+        return;
+      }
+
+      auto tape_pre = slice(tape_full, {0, 0, 0, 0},
+                            {tape_full.shape(0), accepted_steps,
+                             tape_full.shape(2), tape_full.shape(3)});
+      auto k_pre    = slice(k_full,    {0, 0, 0, 0},
+                            {k_full.shape(0), accepted_steps,
+                             k_full.shape(2), k_full.shape(3)});
+      auto g_pre    = slice(g_full,    {0, 0, 0},
+                            {g_full.shape(0), accepted_steps, g_full.shape(2)});
+      auto qkv_pre  = slice(qkv_full,  {0, 0, 0},
+                            {qkv_full.shape(0), accepted_steps, qkv_full.shape(2)});
+
+      const array& snapshot_rs = g_dense_paged_linear_snapshot[i * 2 + 1];
+      auto new_rs = tape_replay_kernel_call(tape_pre, k_pre, g_pre, snapshot_rs);
+
+      const array& snapshot_cs = g_dense_paged_linear_snapshot[i * 2];
+      auto new_cs = [&]() -> array {
+        if (keep > 0) {
+          auto conv_input = concatenate({snapshot_cs, qkv_pre}, 1);
+          int total = conv_input.shape(1);
+          int start = accepted_steps;
+          int end   = std::min(start + keep, total);
+          return slice(conv_input,
+                       {0, start, 0},
+                       {conv_input.shape(0), end, conv_input.shape(2)});
+        }
+        return snapshot_cs;
+      }();
+
+      g_dense_paged_linear_caches[i * 2]     = std::move(new_cs);
+      g_dense_paged_linear_caches[i * 2 + 1] = std::move(new_rs);
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_compiled_tape_replay_paged: %s\n",
+            e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_compiled_tape_replay_paged\n");
+    fflush(stderr);
+  }
+  mlx_qwen35_compiled_tape_disarm();
+}
+
 // Reset BOTH the legacy flat compiled state AND the Phase 5 piece 1
 // paged-path globals. Keeping these symmetric is required because
 // `mlx_qwen35_init_paged` flips `g_dense_paged_inited` to true

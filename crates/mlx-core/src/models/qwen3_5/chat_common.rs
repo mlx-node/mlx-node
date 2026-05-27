@@ -1559,7 +1559,7 @@ pub(crate) use decode_loop;
 ///             reaches `snapshot_offset + K`.
 ///        On full-accept the macro skips this hook (verify already
 ///        left the linear state advanced through all D drafts).
-pub(crate) struct MtpOps<F, D, V, R, E, EX, B, S, RR, CM>
+pub(crate) struct MtpOps<F, D, V, R, E, EX, B, S, RR, CM, RU>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
@@ -1574,6 +1574,17 @@ where
     // training contract.
     V: FnMut(&MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>,
     R: FnMut(usize, usize),
+    // Phase 4b B4 — invoked from `decode_loop_mtp!` ONLY when a
+    // mid-cycle stop (EOS / cancel / length / repetition cutoff) ends
+    // the emit loop after some but not all of `outcome.tokens` have
+    // been emitted. Receives the count of accepted-but-unemitted
+    // tokens. The paged path uses this to truncate the live paged
+    // adapter so future turns don't reuse KV for tokens the user
+    // never received. Dense / MoE / tests pass a no-op closure (the
+    // dense compiled cursor is driven by `commit_mtp`, which already
+    // ran for the full cycle — no extra rollback is required at this
+    // boundary for dense KV consistency).
+    RU: FnMut(usize),
     E: Fn(&MxArray, &MxArray, bool),
     // W6.5-resume — same shape as `eval_step` but folds the chained
     // `verify_hidden[K]` slice into the SAME `async_eval` batch as
@@ -1655,6 +1666,7 @@ where
     /// `chain_start = 0`. MoE / tests leave this `false` (legacy
     /// cycle-history policy — fused draft stays opt-in there).
     pub committed_history_active: bool,
+    pub rollback_unemitted: RU,
 }
 
 /// Outcome of `run_mtp_cycle_inner` — the list of accepted tokens for
@@ -1684,8 +1696,8 @@ pub(crate) struct MtpCycleOutcome {
 /// is the caller's problem; production callers fold the cycle inside
 /// `DENSE_COMPILED_MUTEX` so a `?` early-return drops the
 /// `CompiledResetGuard` and wipes the C++ state cleanly.
-pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, EX, B, S, RR, CM>(
-    ops: &mut MtpOps<F, D, V, R, E, EX, B, S, RR, CM>,
+pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, EX, B, S, RR, CM, RU>(
+    ops: &mut MtpOps<F, D, V, R, E, EX, B, S, RR, CM, RU>,
     prev_hidden_in: MxArray,
     prev_emb_in: MxArray,
     last_committed_id: u32,
@@ -1707,6 +1719,7 @@ where
     S: FnMut(),
     RR: FnMut(&[u32], &MxArray) -> Result<()>,
     CM: FnMut(&MxArray, &MxArray, &[u32], usize, &MxArray) -> Result<()>,
+    RU: FnMut(usize),
 {
     use crate::array::{DType, MxArray as A};
     use crate::nn::Activations;
@@ -2912,6 +2925,7 @@ macro_rules! decode_loop_mtp {
             // Emit each accepted token through the same stop /
             // streaming pipeline as the single-token loop.
             let mut hit_stop = false;
+            let mut cycle_emitted: usize = 0;
             $profiler.begin("mtp_emit_loop");
             for tok_id in outcome.tokens.iter().copied() {
                 if $gen.len() >= ($max as usize) {
@@ -2921,6 +2935,7 @@ macro_rules! decode_loop_mtp {
                 }
                 $gen.push(tok_id);
                 $hist.push(tok_id);
+                cycle_emitted += 1;
                 let _is_reasoning = $tracker.observe_token(tok_id);
                 $(
                     $last_r = _is_reasoning;
@@ -2963,6 +2978,7 @@ macro_rules! decode_loop_mtp {
                 cycle_committed,
                 gen_len = $gen.len(),
                 hit_stop,
+                cycle_emitted,
                 "MTP cycle emit loop done"
             );
 
@@ -2973,7 +2989,13 @@ macro_rules! decode_loop_mtp {
                 last_clear_at = $gen.len();
             }
 
-            if hit_stop { break; }
+            if hit_stop {
+                let unemitted = outcome.tokens.len().saturating_sub(cycle_emitted);
+                if unemitted > 0 {
+                    ($mtp.rollback_unemitted)(unemitted);
+                }
+                break;
+            }
             // Set `$y` to the last accepted token so the next Step A
             // feeds the right token through main-path forward.
             // (Step A unconditionally re-seeds `prev_hidden_opt` /
@@ -3375,6 +3397,7 @@ mod mtp_cycle_tests {
             // Phase C — cycle-level acceptance tests use the legacy
             // cycle-history policy, so committed-history is inactive.
             committed_history_active: false,
+            rollback_unemitted: |_: usize| {},
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
@@ -3454,6 +3477,7 @@ mod mtp_cycle_tests {
             // Phase C — cycle-level acceptance tests use the legacy
             // cycle-history policy, so committed-history is inactive.
             committed_history_active: false,
+            rollback_unemitted: |_: usize| {},
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xBADC0DE);
@@ -3526,6 +3550,7 @@ mod mtp_cycle_tests {
             // Phase C — cycle-level acceptance tests use the legacy
             // cycle-history policy, so committed-history is inactive.
             committed_history_active: false,
+            rollback_unemitted: |_: usize| {},
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xDEAD);
@@ -3616,6 +3641,7 @@ mod mtp_cycle_tests {
             // Phase C — cycle-level acceptance tests use the legacy
             // cycle-history policy, so committed-history is inactive.
             committed_history_active: false,
+            rollback_unemitted: |_: usize| {},
         };
         let params = default_params();
         let mut rng = StdRng::seed_from_u64(0xFEED);

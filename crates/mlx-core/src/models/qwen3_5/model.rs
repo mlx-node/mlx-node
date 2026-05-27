@@ -2809,6 +2809,7 @@ impl Qwen35Inner {
                     // fused-draft path OFF (its mask excludes the
                     // committed prefix) — see `run_mtp_cycle_inner`.
                     committed_history_active: true,
+                    rollback_unemitted: |_: usize| {},
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -3638,6 +3639,7 @@ impl Qwen35Inner {
             let adapter_fwd = std::rc::Rc::clone(&adapter_cell);
             let adapter_verify = std::rc::Rc::clone(&adapter_cell);
             let adapter_rollback = std::rc::Rc::clone(&adapter_cell);
+            let adapter_rollback_unemitted = std::rc::Rc::clone(&adapter_cell);
 
             let mut mtp_ops = chat_common::MtpOps {
                 forward_with_hidden: |ids: &MxArray,
@@ -3748,29 +3750,21 @@ impl Qwen35Inner {
                     );
                 },
                 snapshot_main_linear: || unsafe {
-                    mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
                     mlx_sys::mlx_qwen35_compiled_snapshot_paged_linear_caches();
                     if chat_common::mtp_use_tape_replay() {
-                        mlx_sys::mlx_qwen35_compiled_tape_arm();
+                        mlx_sys::mlx_qwen35_compiled_tape_arm_paged();
                     }
                 },
-                restore_and_replay_main: |accepted_drafts: &[u32], emb: &MxArray| -> Result<()> {
+                restore_and_replay_main: |accepted_drafts: &[u32], _emb: &MxArray| -> Result<()> {
+                    let steps = accepted_drafts.len() as i32;
                     if chat_common::mtp_use_tape_replay() {
-                        let steps = accepted_drafts.len() as i32;
                         unsafe {
-                            mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
-                            mlx_sys::mlx_qwen35_compiled_restore_paged_linear_caches();
+                            mlx_sys::mlx_qwen35_compiled_tape_replay_paged(steps);
                         }
                         return Ok(());
                     }
                     unsafe {
-                        mlx_sys::mlx_qwen35_compiled_restore_linear_caches();
                         mlx_sys::mlx_qwen35_compiled_restore_paged_linear_caches();
-                    }
-                    for &tok in accepted_drafts {
-                        let id_arr = MxArray::from_int32(&[tok as i32], &[1, 1])?;
-                        let (logits, _hidden) = forward_compiled_with_hidden(&id_arr, emb)?;
-                        logits.eval();
                     }
                     Ok(())
                 },
@@ -3784,6 +3778,16 @@ impl Qwen35Inner {
                     commit_mtp_compiled(seed_hidden, verify_hiddens, committed_ids, k_accepted, emb)
                 },
                 committed_history_active: true,
+                rollback_unemitted: |unemitted: usize| {
+                    if let Ok(mut adapter) = adapter_rollback_unemitted.try_borrow_mut()
+                        && let Err(e) = adapter.rollback_last_tokens(unemitted as u32)
+                    {
+                        tracing::warn!(
+                            target: "mlx_core::qwen3_5::paged",
+                            "MTP-paged rollback_unemitted({unemitted}) failed (ignored): {e}",
+                        );
+                    }
+                },
             };
 
             chat_common::decode_loop_mtp!(
@@ -3805,11 +3809,34 @@ impl Qwen35Inner {
                 generation_stream: generation_stream
             );
 
+            drop(adapter_cell);
+
+            match export_paged_dense_linear_caches(&self.config) {
+                Ok(Some(new_caches)) => {
+                    self.caches = Some(new_caches);
+                    eval_layer_caches(&self.caches)?;
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_mtp_linear_cache_export ok=true"
+                    ));
+                }
+                Ok(None) => {
+                    self.caches = None;
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_mtp_linear_cache_export ok=false reason=not_initialized"
+                    ));
+                }
+                Err(err) => {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_mtp_linear_cache_export ok=false error={}",
+                        err
+                    ));
+                    self.caches = None;
+                }
+            }
+
             unsafe {
                 mlx_sys::mlx_qwen35_mtp_compiled_reset();
             }
-
-            drop(adapter_cell);
 
             return Ok((generated_tokens, finish_reason));
         }
@@ -5408,6 +5435,7 @@ impl Qwen35Inner {
                     // fused-draft path OFF (its mask excludes the
                     // committed prefix) — see `run_mtp_cycle_inner`.
                     committed_history_active: true,
+                    rollback_unemitted: |_: usize| {},
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -6324,6 +6352,7 @@ impl Qwen35Inner {
                     // fused-draft path OFF (its mask excludes the
                     // committed prefix) — see `run_mtp_cycle_inner`.
                     committed_history_active: true,
+                    rollback_unemitted: |_: usize| {},
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,

@@ -609,15 +609,25 @@ fn project_last_token_logits_with_full_hidden(
     lm_head: &Option<Linear>,
     embedding_weight: &MxArray,
 ) -> Result<(MxArray, MxArray)> {
-    let seq_len = hidden_states.shape_at(1)?;
+    let prompt_len = hidden_states.shape_at(1)?;
+    let hidden_dim = hidden_states.shape_at(2)?;
     let full_hidden = final_norm.forward(hidden_states)?;
-    let last_hidden = full_hidden.slice_axis(1, seq_len - 1, seq_len)?;
+    let last_hidden = full_hidden.slice_axis(1, prompt_len - 1, prompt_len)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&last_hidden)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         last_hidden.matmul(&weight_t)?
     };
+
+    // Phase 4b B4 fix #4 — the caller runs `synchronize_and_clear_cache()`
+    // before `prefill_mtp_commit`, which would otherwise free the lazy
+    // graph nodes backing `full_hidden`. Materialise before return.
+    full_hidden.eval();
+    debug_assert_eq!(full_hidden.shape_at(0)?, 1);
+    debug_assert_eq!(full_hidden.shape_at(1)?, prompt_len);
+    debug_assert_eq!(full_hidden.shape_at(2)?, hidden_dim);
+    debug_assert_eq!(full_hidden.dtype()?, crate::array::DType::BFloat16);
 
     let logits = logits.squeeze(Some(&[0, 1]))?;
     Ok((logits, full_hidden))

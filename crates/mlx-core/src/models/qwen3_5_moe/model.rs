@@ -1770,6 +1770,7 @@ impl Qwen35MoeInner {
                     // Phase C — committed-history is dense-only; the
                     // MoE path keeps the legacy cycle-history policy.
                     committed_history_active: false,
+                    rollback_unemitted: |_: usize| {},
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -3931,6 +3932,7 @@ impl Qwen35MoeInner {
                     // Phase C — committed-history is dense-only; the
                     // MoE path keeps the legacy cycle-history policy.
                     committed_history_active: false,
+                    rollback_unemitted: |_: usize| {},
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -4629,6 +4631,7 @@ impl Qwen35MoeInner {
                     // Phase C — committed-history is dense-only; the
                     // MoE path keeps the legacy cycle-history policy.
                     committed_history_active: false,
+                    rollback_unemitted: |_: usize| {},
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -5449,6 +5452,7 @@ impl Qwen35MoeInner {
                     // Phase C — committed-history is dense-only; the
                     // MoE path keeps the legacy cycle-history policy.
                     committed_history_active: false,
+                    rollback_unemitted: |_: usize| {},
                 };
                 chat_common::decode_loop_mtp!(
                     mtp_ops: mtp_ops,

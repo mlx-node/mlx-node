@@ -1637,6 +1637,24 @@ unsafe extern "C-unwind" {
     ///     drafts).
     pub fn mlx_qwen35_compiled_tape_replay(accepted_steps: i32);
 
+    /// Phase 4b B4 — paged variant of `mlx_qwen35_compiled_tape_arm`.
+    /// `mlx_qwen35_compiled_tape_arm` early-returns when
+    /// `g_compile_inited` is false, which is the case on pure-paged
+    /// turns. This variant arms recording when `g_dense_paged_inited`
+    /// is true; the paged verify graph already emits tape into the
+    /// shared `g_gdn_*_tape_acc[]` accumulators under
+    /// `g_tape_recording_armed`.
+    pub fn mlx_qwen35_compiled_tape_arm_paged();
+
+    /// Phase 4b B4 — paged variant of `mlx_qwen35_compiled_tape_replay`.
+    /// Replays the first `accepted_steps` recorded innovations onto
+    /// `g_dense_paged_linear_snapshot[]` and writes the result back
+    /// into `g_dense_paged_linear_caches[]`. Always disarms recording
+    /// afterward. On any precondition violation, falls back to a pure
+    /// snapshot-restore so the next forward starts from the pre-verify
+    /// state.
+    pub fn mlx_qwen35_compiled_tape_replay_paged(accepted_steps: i32);
+
     /// Reset compiled state (call on model reset / new conversation).
     pub fn mlx_qwen35_compiled_reset();
 
