@@ -380,6 +380,16 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
     }
   }
 
+  // Auto-fire one Run on mount — model is guaranteed ready by the gate
+  // around chapter rendering.
+  const didAutoRunRef = React.useRef(false);
+  React.useEffect(() => {
+    if (didAutoRunRef.current) return;
+    didAutoRunRef.current = true;
+    void handleRun();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const hiddenSteps = run?.hiddenStates;
   const numLayers = run?.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS;
   const availableLayers = React.useMemo(() => {

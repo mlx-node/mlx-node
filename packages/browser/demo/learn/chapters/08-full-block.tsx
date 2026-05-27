@@ -442,6 +442,17 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
     }
   }
 
+  // Auto-fire one Run on mount — model is guaranteed ready by the gate
+  // around chapter rendering, so the 3D stack opens on real Qwen3.5 data
+  // instead of the (mock) sample.
+  const didAutoRunRef = React.useRef(false);
+  React.useEffect(() => {
+    if (didAutoRunRef.current) return;
+    didAutoRunRef.current = true;
+    void handleRun();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const hiddenSteps = run?.hiddenStates;
   const numLayers = run?.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS;
   const fullAttnIndices = React.useMemo(

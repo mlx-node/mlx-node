@@ -195,6 +195,11 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
   // the heatmap container — purely visual feedback that "yes, the canvas
   // just re-rendered with new data, even if the pattern looks identical."
   const [runFlash, setRunFlash] = React.useState(0);
+  // Auto-fire one Run on mount. The app gates chapter rendering on
+  // modelReady, so by the time this component mounts the worker is alive
+  // and we can show real data immediately instead of the mock-data
+  // placeholder banner.
+  const didAutoRunRef = React.useRef(false);
 
   function useMockFallback(reason: RunStatus, logMessage: string) {
     const mock = makeMockAttentionRun(prompt);
@@ -257,6 +262,13 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
       setRunning(false);
     }
   }
+
+  React.useEffect(() => {
+    if (didAutoRunRef.current) return;
+    didAutoRunRef.current = true;
+    void handleRun();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="space-y-4">

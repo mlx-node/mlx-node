@@ -790,6 +790,18 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
     }
   }
 
+  // Auto-fire Load on mount — the app gates chapter rendering on the model
+  // being ready, so the worker is alive by this point and the user lands
+  // on a populated PCA scatter instead of an empty "Click Load embeddings"
+  // placeholder.
+  const didAutoLoadRef = React.useRef(false);
+  React.useEffect(() => {
+    if (didAutoLoadRef.current) return;
+    didAutoLoadRef.current = true;
+    void handleLoad();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const neighbors = React.useMemo(() => {
     if (!scatter || selectedIdx == null) return [];
     return topNeighbors(

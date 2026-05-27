@@ -2179,44 +2179,19 @@ function App() {
           hostedModelAvailable={hostedModelAvailable}
         />
       )}
+      {/*
+        Learning flow is gated on a ready model. Entering chapter_index or
+        chapter before the worker reports ready shows the same full Loading
+        screen used by the chat flow — same progress bar, same fade. Chapter
+        components below get to assume the worker is alive, so the
+        "Showing example data — load the model first" mock-data branches are
+        unreachable from the learning path.
+      */}
       {(screen.kind === 'chapter_index' || screen.kind === 'chapter') &&
-        loadKickoff > 0 &&
         !modelReady && (
-          <div
-            role="status"
-            aria-live="polite"
-            className="pointer-events-none fixed inset-x-0 top-0 z-30 flex justify-center px-4 pt-3"
-          >
-            <div className="pointer-events-auto flex w-full max-w-3xl items-center gap-3 rounded-md border border-primary/30 bg-card/95 px-4 py-2 text-xs text-foreground shadow-lg backdrop-blur">
-              <div
-                className="size-3 shrink-0 animate-pulse rounded-full bg-primary"
-                aria-hidden="true"
-              />
-              <div className="min-w-0 flex-1 font-mono">
-                {loadingText ?? 'Loading model…'}
-                {loadingProgress?.file ? (
-                  <span className="ml-2 text-muted-foreground">
-                    {loadingProgress.file.split('/').filter(Boolean).pop() ?? loadingProgress.file}
-                  </span>
-                ) : null}
-              </div>
-              {loadingProgress ? (
-                <div className="flex shrink-0 items-center gap-2">
-                  <div className="h-1.5 w-24 overflow-hidden rounded-full bg-muted">
-                    <div
-                      className="h-full bg-primary transition-[width]"
-                      style={{ width: `${Math.max(0, Math.min(100, loadingProgress.pct))}%` }}
-                    />
-                  </div>
-                  <span className="w-9 text-right font-mono tabular-nums text-muted-foreground">
-                    {Math.round(loadingProgress.pct)}%
-                  </span>
-                </div>
-              ) : null}
-            </div>
-          </div>
+          <Loading status={loadingText} progress={loadingProgress} />
         )}
-      {screen.kind === 'chapter_index' && (
+      {screen.kind === 'chapter_index' && modelReady && (
         <ChapterIndex
           onOpenChapter={(chapterId) => dispatchScreen({ type: 'open_chapter', chapterId })}
           onBackToLanding={() => dispatchScreen({ type: 'back_to_landing' })}
@@ -2233,7 +2208,7 @@ function App() {
           }}
         />
       )}
-      {screen.kind === 'chapter' && (() => {
+      {screen.kind === 'chapter' && modelReady && (() => {
         // chapter.id is guaranteed present by the discriminated-union typing —
         // `open_chapter` carries it on the event and the reducer writes it into
         // the state. `findChapter` may still return undefined if the id is a

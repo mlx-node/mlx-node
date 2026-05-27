@@ -285,6 +285,16 @@ export function MultiheadGqaDemo({
     }
   }
 
+  // Auto-fire one Run on mount — the app gates chapter rendering on the
+  // model being ready, so workerRef.current is alive by this point.
+  const didAutoRunRef = React.useRef(false);
+  React.useEffect(() => {
+    if (didAutoRunRef.current) return;
+    didAutoRunRef.current = true;
+    void handleRun();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const fullLayers = React.useMemo(
     () => (run ? pickFullAttentionLayers(run) : []),
     [run],
