@@ -407,13 +407,14 @@ function App() {
 
   // Auto-kick-off the model load when the user enters the learning flow —
   // either by clicking "Start learning" on the landing, or by opening a
-  // chapter URL directly (bookmark, popstate). Chapters fall back to mock
-  // data while the worker isn't up, so without this the user sees "example
-  // data" banners until they navigate to chat and click Load Model. We only
-  // kickoff once (guarded on loadKickoff === 0); subsequent screen changes
-  // reuse the existing worker. We skip kickoff if no hosted model is
-  // available — that path requires the user to pick a local model directory
-  // and we don't want to auto-open the directory picker.
+  // chapter URL directly (bookmark, popstate). Chapter views aren't rendered
+  // until `modelReady === true`; the gate below queues the chapter URL
+  // behind the Loading screen, so without this kickoff the user would stare
+  // at "Initializing model…" forever. We only kickoff once (guarded on
+  // loadKickoff === 0); subsequent screen changes reuse the existing worker.
+  // We skip kickoff if no hosted model is available — that path requires
+  // the user to pick a local model directory and we don't want to auto-open
+  // the directory picker.
   useEffect(() => {
     if (loadKickoff !== 0) return;
     if (screen.kind !== 'chapter' && screen.kind !== 'chapter_index') return;
@@ -2160,7 +2161,7 @@ function App() {
           onLocalModel={() => modelDirInputRef.current?.click()}
           onStartLearning={() => {
             // Kick off the model load alongside the screen transition so the
-            // user doesn't sit on chapter_index reading mock data. The
+            // user doesn't sit on chapter_index waiting for the model. The
             // auto-load effect below covers direct URL landings (bookmarks,
             // popstate); this handler covers the normal "click Start
             // learning" path with an explicit user gesture, mirroring the
@@ -2182,10 +2183,10 @@ function App() {
       {/*
         Learning flow is gated on a ready model. Entering chapter_index or
         chapter before the worker reports ready shows the same full Loading
-        screen used by the chat flow — same progress bar, same fade. Chapter
-        components below get to assume the worker is alive, so the
-        "Showing example data — load the model first" mock-data branches are
-        unreachable from the learning path.
+        screen used by the chat flow — same progress bar, same fade. The
+        chapter_index and chapter views only render once `modelReady` is
+        true; chapter components below get to assume the worker is alive,
+        so they never need a fallback rendering path.
       */}
       {(screen.kind === 'chapter_index' || screen.kind === 'chapter') &&
         !modelReady && (

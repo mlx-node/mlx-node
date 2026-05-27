@@ -2,7 +2,7 @@ import * as React from "react";
 
 import { Button } from "../../components/ui/button";
 import { Textarea } from "../../components/ui/textarea";
-import type { AttentionRun, LogitsStep } from "../../../src/inspector-types";
+import type { AttentionRun } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
 import { TopKBars } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
@@ -132,84 +132,12 @@ export type SamplingDemoProps = {
 
 type RunStatus =
   | { kind: "ok" }
-  | { kind: "mock-no-worker" }
-  | { kind: "mock-error"; error: string }
+  | { kind: "error"; error: string }
   | { kind: "aborted" }
   | { kind: "empty-prompt" };
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
-}
-
-function makeMockSamplingRun(): AttentionRun {
-  const tokens = [
-    { id: 10001, text: "Once" },
-    { id: 10002, text: " upon" },
-    { id: 10003, text: " a" },
-    { id: 10004, text: " time" },
-  ];
-  const generatedToken = { id: 11001, text: " in" };
-  const stepDistributions: Array<{
-    sampled: { id: number; text: string };
-    candidates: Array<{ id: number; text: string; logit: number }>;
-  }> = [
-    {
-      sampled: { id: 11001, text: " in" },
-      candidates: [
-        { id: 11001, text: " in", logit: 6.2 },
-        { id: 11002, text: " there", logit: 5.4 },
-        { id: 11003, text: ",", logit: 4.9 },
-        { id: 11004, text: " when", logit: 4.5 },
-        { id: 11005, text: " on", logit: 3.7 },
-        { id: 11006, text: " near", logit: 3.1 },
-        { id: 11007, text: " before", logit: 2.6 },
-        { id: 11008, text: " somewhere", logit: 2.1 },
-      ],
-    },
-    {
-      sampled: { id: 12001, text: " a" },
-      candidates: [
-        { id: 12001, text: " a", logit: 7.1 },
-        { id: 12002, text: " an", logit: 5.0 },
-        { id: 12003, text: " the", logit: 4.2 },
-        { id: 12004, text: " one", logit: 3.0 },
-        { id: 12005, text: " our", logit: 2.4 },
-        { id: 12006, text: " this", logit: 1.8 },
-      ],
-    },
-    {
-      sampled: { id: 13001, text: " forest" },
-      candidates: [
-        { id: 13001, text: " forest", logit: 5.6 },
-        { id: 13002, text: " village", logit: 5.1 },
-        { id: 13003, text: " kingdom", logit: 4.7 },
-        { id: 13004, text: " castle", logit: 4.2 },
-        { id: 13005, text: " land", logit: 3.8 },
-        { id: 13006, text: " town", logit: 3.4 },
-        { id: 13007, text: " quiet", logit: 2.9 },
-        { id: 13008, text: " distant", logit: 2.4 },
-      ],
-    },
-  ];
-  const logits: LogitsStep[] = stepDistributions.map((dist, step) => ({
-    step,
-    tokenId: dist.sampled.id,
-    topKIds: dist.candidates.map((c) => c.id),
-    topKLogits: new Float32Array(dist.candidates.map((c) => c.logit)),
-    topKTexts: dist.candidates.map((c) => c.text),
-  }));
-  return {
-    prompt: DEFAULT_PROMPT,
-    tokens,
-    generatedToken,
-    attention: [],
-    modelMeta: {
-      name: "Qwen3.5-0.8B (mock)",
-      numLayers: 8,
-      fullAttentionLayerIndices: [],
-    },
-    logits,
-  };
 }
 
 // Apply temperature + top-p to raw logits, returning candidate ids in their
@@ -310,17 +238,6 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
   // running after the demo is gone.
   React.useEffect(() => () => { runAbortRef.current?.abort(); }, []);
 
-  function applyMockFallback(reason: RunStatus, logMessage: string) {
-    const mock = makeMockSamplingRun();
-    console.log(logMessage, {
-      promptLength: prompt.length,
-      steps: mock.logits?.length ?? 0,
-    });
-    setRun(mock);
-    setStatus(reason);
-    setStepIdx(0);
-  }
-
   async function handleRun() {
     if (prompt.trim().length === 0) {
       setStatus({ kind: "empty-prompt" });
@@ -331,10 +248,10 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
     setRunning(true);
     const worker = workerRef.current;
     if (!worker) {
-      applyMockFallback(
-        { kind: "mock-no-worker" },
-        "[sampling-demo] using mock LogitsStep[] (model not loaded)",
+      console.error(
+        "[sampling-demo] worker is unavailable — chapter view should have been gated on modelReady",
       );
+      setStatus({ kind: "error", error: "Worker is unavailable. Reload the page." });
       setRunning(false);
       return;
     }
@@ -382,14 +299,8 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
         }
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          "[sampling-demo] runForInspector failed; falling back to mock",
-          err,
-        );
-        applyMockFallback(
-          { kind: "mock-error", error: message },
-          "[sampling-demo] using mock LogitsStep[] (backend error)",
-        );
+        console.error("[sampling-demo] runForInspector failed", err);
+        setStatus({ kind: "error", error: message });
       }
     } finally {
       if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
@@ -489,22 +400,12 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
         />
       </div>
 
-      {status?.kind === "mock-no-worker" ? (
-        <div
-          role="status"
-          className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
-        >
-          Showing demo data — load the model from the chat tab first to see
-          real logits.
-        </div>
-      ) : null}
-      {status?.kind === "mock-error" ? (
+      {status?.kind === "error" ? (
         <div
           role="alert"
           className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          <strong>Inspector run failed.</strong> Showing demo data instead.{" "}
-          {status.error}
+          <strong>Inspector run failed.</strong> {status.error}
         </div>
       ) : null}
       {status?.kind === "aborted" ? (

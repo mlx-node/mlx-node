@@ -16,7 +16,6 @@ import {
   drawAttentionHeatmap,
 } from "../inspector/AttentionHeatmap";
 import { Prose } from "../Prose";
-import { makeMockAttentionRun } from "../mock-data";
 
 const DEFAULT_PROMPT = "The cat sat on the mat.";
 const QWEN_NUM_HEADS = 8;
@@ -146,8 +145,7 @@ export type MultiheadGqaDemoProps = {
 
 type RunStatus =
   | { kind: "ok" }
-  | { kind: "mock-no-worker" }
-  | { kind: "mock-error"; error: string }
+  | { kind: "error"; error: string }
   | { kind: "aborted" }
   | { kind: "empty-prompt" };
 
@@ -196,18 +194,6 @@ export function MultiheadGqaDemo({
     [],
   );
 
-  function applyMockFallback(reason: RunStatus, logMessage: string) {
-    const mock = makeMockAttentionRun(prompt);
-    console.log(logMessage, {
-      promptLength: prompt.length,
-      seqLen: mock.tokens.length,
-    });
-    setRun(mock);
-    setStatus(reason);
-    setSelectedLayerIdx(0);
-    setSelectedHead(0);
-  }
-
   async function handleRun() {
     if (prompt.trim().length === 0) {
       setStatus({ kind: "empty-prompt" });
@@ -218,10 +204,10 @@ export function MultiheadGqaDemo({
     setRunning(true);
     const worker = workerRef.current;
     if (!worker) {
-      applyMockFallback(
-        { kind: "mock-no-worker" },
-        "[multihead-gqa-demo] using mock AttentionRun (model not loaded)",
+      console.error(
+        "[multihead-gqa-demo] worker is unavailable — chapter view should have been gated on modelReady",
       );
+      setStatus({ kind: "error", error: "Worker is unavailable. Reload the page." });
       setRunning(false);
       return;
     }
@@ -269,14 +255,8 @@ export function MultiheadGqaDemo({
         }
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          "[multihead-gqa-demo] runForInspector failed; falling back to mock",
-          err,
-        );
-        applyMockFallback(
-          { kind: "mock-error", error: message },
-          "[multihead-gqa-demo] using mock AttentionRun (backend error)",
-        );
+        console.error("[multihead-gqa-demo] runForInspector failed", err);
+        setStatus({ kind: "error", error: message });
       }
     } finally {
       if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
@@ -363,22 +343,12 @@ export function MultiheadGqaDemo({
         </div>
       </div>
 
-      {status?.kind === "mock-no-worker" ? (
-        <div
-          role="status"
-          className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
-        >
-          Showing example data — load the model from the chat tab first to see
-          real attention scores from Qwen3.5-0.8B.
-        </div>
-      ) : null}
-      {status?.kind === "mock-error" ? (
+      {status?.kind === "error" ? (
         <div
           role="alert"
           className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          <strong>Inspector run failed.</strong> Showing example data instead.{" "}
-          {status.error}
+          <strong>Inspector run failed.</strong> {status.error}
         </div>
       ) : null}
       {status?.kind === "aborted" ? (
@@ -478,9 +448,7 @@ export function MultiheadGqaDemo({
               role="status"
               className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
             >
-              No full-attention layers in this run. The mock data set does not
-              cover GQA per-layer scores end-to-end — load the real model to
-              compare heatmaps within a group.
+              No full-attention layers in this run — nothing to compare.
             </div>
           )}
 

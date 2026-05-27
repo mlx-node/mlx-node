@@ -16,9 +16,7 @@ import { Prose } from "../Prose";
  * hidden-dim space (NOT the PCA-projected 2D space — PCA throws away most
  * of the structure).
  *
- * When the model isn't loaded yet, a mock scatter renders with pre-tuned
- * positions so the lesson is still legible. Console logs use the
- * `[embeddings-demo]` prefix.
+ * Console logs use the `[embeddings-demo]` prefix.
  */
 
 // -----------------------------------------------------------------------------
@@ -196,54 +194,6 @@ const ALL_CATEGORIES: Category[] = [
   "country",
   "verb",
   "food",
-];
-
-// -----------------------------------------------------------------------------
-// Mock data — pre-tuned 2D positions clustered by category for the fallback
-// scatter when the model isn't loaded. The numeric structure mirrors what a
-// real PCA projection tends to look like: clear inter-category separation,
-// some intra-category spread.
-// -----------------------------------------------------------------------------
-
-type MockPoint = { word: string; category: Category; x: number; y: number };
-
-const MOCK_SCATTER: MockPoint[] = [
-  // Animals cluster (top-left)
-  { word: "dog", category: "animal", x: -2.3, y: 1.4 },
-  { word: "cat", category: "animal", x: -2.1, y: 1.6 },
-  { word: "fish", category: "animal", x: -2.6, y: 1.0 },
-  { word: "bird", category: "animal", x: -1.9, y: 1.8 },
-  { word: "lion", category: "animal", x: -2.4, y: 1.2 },
-  { word: "horse", category: "animal", x: -2.0, y: 1.5 },
-  // Numbers cluster (top-right)
-  { word: "one", category: "number", x: 2.0, y: 1.8 },
-  { word: "two", category: "number", x: 2.2, y: 1.6 },
-  { word: "three", category: "number", x: 2.1, y: 1.7 },
-  { word: "ten", category: "number", x: 2.3, y: 1.5 },
-  { word: "hundred", category: "number", x: 2.5, y: 1.3 },
-  // Colors cluster (right)
-  { word: "red", category: "color", x: 1.8, y: -0.2 },
-  { word: "blue", category: "color", x: 2.0, y: 0.0 },
-  { word: "green", category: "color", x: 1.7, y: -0.4 },
-  { word: "yellow", category: "color", x: 2.1, y: -0.1 },
-  { word: "purple", category: "color", x: 1.9, y: 0.1 },
-  // Countries cluster (bottom-right)
-  { word: "Japan", category: "country", x: 1.4, y: -1.6 },
-  { word: "France", category: "country", x: 1.6, y: -1.8 },
-  { word: "Brazil", category: "country", x: 1.2, y: -1.5 },
-  { word: "China", category: "country", x: 1.5, y: -1.7 },
-  // Verbs cluster (bottom-left)
-  { word: "run", category: "verb", x: -1.6, y: -1.5 },
-  { word: "walk", category: "verb", x: -1.4, y: -1.7 },
-  { word: "jump", category: "verb", x: -1.8, y: -1.3 },
-  { word: "sing", category: "verb", x: -1.5, y: -1.9 },
-  // Food cluster (left)
-  { word: "apple", category: "food", x: -2.4, y: -0.3 },
-  { word: "pizza", category: "food", x: -2.2, y: -0.5 },
-  { word: "bread", category: "food", x: -2.5, y: -0.1 },
-  { word: "rice", category: "food", x: -2.0, y: -0.4 },
-  { word: "cake", category: "food", x: -2.3, y: -0.6 },
-  { word: "coffee", category: "food", x: -2.1, y: -0.2 },
 ];
 
 // -----------------------------------------------------------------------------
@@ -564,8 +514,7 @@ export type EmbeddingsDemoProps = {
 type RunStatus =
   | { kind: "idle" }
   | { kind: "ok" }
-  | { kind: "mock-no-worker" }
-  | { kind: "mock-error"; error: string }
+  | { kind: "error"; error: string }
   | { kind: "aborted" };
 
 function isAbortError(err: unknown): boolean {
@@ -578,50 +527,7 @@ type LoadedScatter = {
   explainedVariance: [number, number];
   hiddenDim: number;
   embeddings: Float32Array;
-  isMock: boolean;
 };
-
-function makeMockScatter(): LoadedScatter {
-  const points: PointRow[] = MOCK_SCATTER.map((p, i) => ({
-    word: p.word,
-    category: p.category,
-    tokenId: -1 - i,
-    norm: 1,
-  }));
-  // Fake embeddings derived from the mock 2D positions so the
-  // nearest-neighbour computation has *something* sensible to do under the
-  // mock fallback. We tile each (x, y) across a small hidden dim and add a
-  // tiny per-category offset so neighbours cluster by category.
-  const hiddenDim = 16;
-  const embeddings = new Float32Array(points.length * hiddenDim);
-  for (let i = 0; i < MOCK_SCATTER.length; i++) {
-    const { x, y, category } = MOCK_SCATTER[i]!;
-    const off = i * hiddenDim;
-    const catSeed = ALL_CATEGORIES.indexOf(category);
-    for (let c = 0; c < hiddenDim; c++) {
-      const phase = (c * 0.7 + catSeed) % 6.28;
-      embeddings[off + c] = x * Math.cos(phase) + y * Math.sin(phase);
-    }
-  }
-  // Recompute norms.
-  for (let i = 0; i < points.length; i++) {
-    const off = i * hiddenDim;
-    let s = 0;
-    for (let c = 0; c < hiddenDim; c++) s += embeddings[off + c]! ** 2;
-    points[i]!.norm = Math.sqrt(s);
-  }
-  const coords = MOCK_SCATTER.map(
-    (p): [number, number] => [p.x, p.y],
-  );
-  return {
-    points,
-    coords,
-    explainedVariance: [1, 1],
-    hiddenDim,
-    embeddings,
-    isMock: true,
-  };
-}
 
 export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
   const [scatter, setScatter] = React.useState<LoadedScatter | null>(null);
@@ -644,14 +550,6 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
     [],
   );
 
-  function applyMockFallback(reason: RunStatus, logMessage: string) {
-    const mock = makeMockScatter();
-    console.log(logMessage, { points: mock.points.length });
-    setScatter(mock);
-    setStatus(reason);
-    setSelectedIdx(null);
-  }
-
   async function handleLoad() {
     const myGen = ++runGenRef.current;
     setRunning(true);
@@ -659,10 +557,10 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
 
     const worker = workerRef.current;
     if (!worker) {
-      applyMockFallback(
-        { kind: "mock-no-worker" },
-        "[embeddings-demo] using mock scatter (model not loaded)",
+      console.error(
+        "[embeddings-demo] worker is unavailable — chapter view should have been gated on modelReady",
       );
+      setStatus({ kind: "error", error: "Worker is unavailable. Reload the page." });
       setRunning(false);
       return;
     }
@@ -758,7 +656,6 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
         explainedVariance,
         hiddenDim,
         embeddings,
-        isMock: false,
       });
       setStatus({ kind: "ok" });
       setProgress("");
@@ -771,14 +668,8 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
         if (appSignal?.aborted) setStatus({ kind: "aborted" });
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          "[embeddings-demo] failed; falling back to mock",
-          err,
-        );
-        applyMockFallback(
-          { kind: "mock-error", error: message },
-          "[embeddings-demo] using mock scatter (backend error)",
-        );
+        console.error("[embeddings-demo] embed lookup failed", err);
+        setStatus({ kind: "error", error: message });
       }
     } finally {
       if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
@@ -841,29 +732,17 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
           {progress
             ? progress
             : scatter
-              ? scatter.isMock
-                ? "Demo data (model not loaded)"
-                : `${scatter.points.length} words · ${scatter.hiddenDim}-dim embeddings`
+              ? `${scatter.points.length} words · ${scatter.hiddenDim}-dim embeddings`
               : "Tokenize a curated word list, fetch the model's embeddings, project to 2D with PCA."}
         </span>
       </div>
 
-      {status.kind === "mock-no-worker" ? (
-        <div
-          role="status"
-          className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
-        >
-          Showing a hand-tuned demo scatter — load the model from the chat tab
-          first to see the real PCA projection of Qwen3.5's embedding matrix.
-        </div>
-      ) : null}
-      {status.kind === "mock-error" ? (
+      {status.kind === "error" ? (
         <div
           role="alert"
           className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          <strong>Embed lookup failed.</strong> Showing demo scatter instead.{" "}
-          {status.error}
+          <strong>Embed lookup failed.</strong> {status.error}
         </div>
       ) : null}
       {status.kind === "aborted" ? (
@@ -1120,9 +999,8 @@ function ScatterPlot({
       </svg>
       <div className="mt-1 flex items-center justify-between gap-2 px-2 pb-1 font-mono text-[10px] text-muted-foreground">
         <span>
-          {scatter.isMock
-            ? "mock 2D coords"
-            : `PC1=${scatter.explainedVariance[0].toExponential(2)}, PC2=${scatter.explainedVariance[1].toExponential(2)} (eigenvalues)`}
+          PC1={scatter.explainedVariance[0].toExponential(2)}, PC2=
+          {scatter.explainedVariance[1].toExponential(2)} (eigenvalues)
         </span>
         <span>click a point for nearest neighbours</span>
       </div>

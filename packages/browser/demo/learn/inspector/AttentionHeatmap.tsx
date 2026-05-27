@@ -48,10 +48,9 @@ export function AttentionHeatmap({
   });
   const [selectedHead, setSelectedHead] = React.useState(0);
   // Reset only when the user's current selection is no longer a full-attention
-  // layer in the incoming run (e.g. a chapter swapped a 1-layer mock for the
-  // real 24-layer model, or the backend swapped models entirely). If the
-  // selection is still valid we keep it — otherwise typing into the prompt and
-  // clicking Run would silently revert "Layer 7" to "Layer 3" every time.
+  // layer in the incoming run (e.g. the backend swapped models entirely). If
+  // the selection is still valid we keep it — otherwise typing into the prompt
+  // and clicking Run would silently revert "Layer 7" to "Layer 3" every time.
   React.useEffect(() => {
     const current = run.attention[selectedLayerIdx];
     if (current && current.kind === "full") return;

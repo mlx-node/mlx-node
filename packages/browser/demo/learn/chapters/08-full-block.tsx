@@ -160,91 +160,12 @@ export type FullBlockDemoProps = {
 
 type RunStatus =
   | { kind: "ok" }
-  | { kind: "mock-no-worker" }
-  | { kind: "mock-error"; error: string }
+  | { kind: "error"; error: string }
   | { kind: "aborted" }
   | { kind: "empty-prompt" };
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
-}
-
-function makeMockStats(
-  point: CapturePoint,
-  layerIdx: number,
-): HiddenStatePointStats {
-  // Mock `count` is set to HIDDEN_DIM (i.e. seqLen=1) so that the raw `l2Norm`
-  // here equals the per-token L2 the UI displays. Keeps mock values
-  // numerically aligned with the prose without extra arithmetic.
-  const wave = Math.sin((layerIdx + 1) * 0.55);
-  const depth = layerIdx / DEFAULT_NUM_LAYERS;
-  // Residual stream grows roughly linearly with depth.
-  const residualBase = 48 + depth * 90;
-  switch (point) {
-    case "pre_attn_input":
-      return {
-        point,
-        mean: 0.012,
-        std: 1.6 + depth * 0.6,
-        absMax: 8 + depth * 6,
-        l2Norm: residualBase,
-        count: HIDDEN_DIM,
-      };
-    case "post_attn_norm":
-      return {
-        point,
-        mean: 0.001,
-        std: 1.02,
-        absMax: 4.8,
-        l2Norm: Math.sqrt(HIDDEN_DIM),
-        count: HIDDEN_DIM,
-      };
-    case "attn_output":
-      return {
-        point,
-        mean: 0.0005,
-        std: 0.4,
-        absMax: 2.5,
-        l2Norm: 10 + wave * 4,
-        count: HIDDEN_DIM,
-      };
-    case "post_attn_residual":
-      return {
-        point,
-        mean: 0.013,
-        std: 1.7 + depth * 0.6,
-        absMax: 9 + depth * 6,
-        l2Norm: residualBase + 5,
-        count: HIDDEN_DIM,
-      };
-    case "post_mlp_norm":
-      return {
-        point,
-        mean: 0.002,
-        std: 1.01,
-        absMax: 4.9,
-        l2Norm: Math.sqrt(HIDDEN_DIM) * 1.02,
-        count: HIDDEN_DIM,
-      };
-    case "mlp_output":
-      return {
-        point,
-        mean: 0.0007,
-        std: 0.35,
-        absMax: 2.3,
-        l2Norm: 12 + wave * 5,
-        count: HIDDEN_DIM,
-      };
-    case "post_mlp_residual":
-      return {
-        point,
-        mean: 0.015,
-        std: 1.8 + depth * 0.6,
-        absMax: 9.4 + depth * 6,
-        l2Norm: residualBase + 10,
-        count: HIDDEN_DIM,
-      };
-  }
 }
 
 function fullAttentionLayerIndices(numLayers: number): number[] {
@@ -257,41 +178,6 @@ function fullAttentionLayerIndices(numLayers: number): number[] {
     out.push(idx);
   }
   return out;
-}
-
-function makeMockFullBlockRun(): AttentionRun {
-  const tokens = [
-    { id: 1, text: "A" },
-    { id: 2, text: " transformer" },
-    { id: 3, text: " stacks" },
-    { id: 4, text: " the" },
-    { id: 5, text: " same" },
-    { id: 6, text: " block" },
-    { id: 7, text: " many" },
-    { id: 8, text: " times" },
-    { id: 9, text: "." },
-  ];
-  const hiddenStates: HiddenStateStep[] = [
-    {
-      step: 0,
-      layers: Array.from({ length: DEFAULT_NUM_LAYERS }, (_, idx) => ({
-        layerIdx: idx,
-        stats: CAPTURE_POINTS.map((p) => makeMockStats(p, idx)),
-      })),
-    },
-  ];
-  return {
-    prompt: DEFAULT_PROMPT,
-    tokens,
-    generatedToken: { id: 10, text: " (mock)" },
-    attention: [],
-    modelMeta: {
-      name: "Qwen3.5-0.8B (mock)",
-      numLayers: DEFAULT_NUM_LAYERS,
-      fullAttentionLayerIndices: fullAttentionLayerIndices(DEFAULT_NUM_LAYERS),
-    },
-    hiddenStates,
-  };
 }
 
 function getLayerStats(
@@ -333,14 +219,6 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
   const [running, setRunning] = React.useState(false);
   const [selectedLayer, setSelectedLayer] = React.useState(0);
 
-  // Render a mock stack on initial mount so the 3D tower is never empty.
-  React.useEffect(() => {
-    if (run === null) {
-      setRun(makeMockFullBlockRun());
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const runAbortRef = React.useRef<AbortController | null>(null);
   const runGenRef = React.useRef(0);
 
@@ -350,16 +228,6 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
     },
     [],
   );
-
-  function applyMockFallback(reason: RunStatus, logMessage: string) {
-    const mock = makeMockFullBlockRun();
-    console.log(logMessage, {
-      promptLength: prompt.length,
-      layers: mock.hiddenStates?.[0]?.layers.length ?? 0,
-    });
-    setRun(mock);
-    setStatus(reason);
-  }
 
   async function handleRun() {
     if (prompt.trim().length === 0) {
@@ -371,10 +239,10 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
     setRunning(true);
     const worker = workerRef.current;
     if (!worker) {
-      applyMockFallback(
-        { kind: "mock-no-worker" },
-        "[full-block-demo] using mock HiddenStateStep[] (model not loaded)",
+      console.error(
+        "[full-block-demo] worker is unavailable — chapter view should have been gated on modelReady",
       );
+      setStatus({ kind: "error", error: "Worker is unavailable. Reload the page." });
       setRunning(false);
       return;
     }
@@ -426,14 +294,8 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
         }
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          "[full-block-demo] runForInspector failed; falling back to mock",
-          err,
-        );
-        applyMockFallback(
-          { kind: "mock-error", error: message },
-          "[full-block-demo] using mock HiddenStateStep[] (backend error)",
-        );
+        console.error("[full-block-demo] runForInspector failed", err);
+        setStatus({ kind: "error", error: message });
       }
     } finally {
       if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
@@ -443,8 +305,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
   }
 
   // Auto-fire one Run on mount — model is guaranteed ready by the gate
-  // around chapter rendering, so the 3D stack opens on real Qwen3.5 data
-  // instead of the (mock) sample.
+  // around chapter rendering, so the 3D stack opens on real Qwen3.5 data.
   const didAutoRunRef = React.useRef(false);
   React.useEffect(() => {
     if (didAutoRunRef.current) return;
@@ -512,22 +373,12 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
         </div>
       </div>
 
-      {status?.kind === "mock-no-worker" ? (
-        <div
-          role="status"
-          className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
-        >
-          Showing demo data — load the model from the chat tab first to see
-          real activation stats.
-        </div>
-      ) : null}
-      {status?.kind === "mock-error" ? (
+      {status?.kind === "error" ? (
         <div
           role="alert"
           className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          <strong>Inspector run failed.</strong> Showing demo data instead.{" "}
-          {status.error}
+          <strong>Inspector run failed.</strong> {status.error}
         </div>
       ) : null}
       {status?.kind === "aborted" ? (
@@ -545,6 +396,15 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
           className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
         >
           Enter a prompt to see the full transformer block in action.
+        </div>
+      ) : null}
+
+      {!hasData && running ? (
+        <div
+          role="status"
+          className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+        >
+          Running first inspector pass…
         </div>
       ) : null}
 

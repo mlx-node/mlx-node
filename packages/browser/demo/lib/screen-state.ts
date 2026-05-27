@@ -12,7 +12,7 @@
 //   any-learn-state --open_free_chat--> loading (then chat via model_ready)
 //
 // The lesson states (chapter_index, chapter) do NOT require the model to be
-// loaded — chapters can run mocked or self-contained widgets. Tapping
+// loaded — chapters can run self-contained widgets. Tapping
 // "Open free chat" from anywhere in learn mode kicks off the model load if
 // it hasn't been loaded already (delegated to the existing load_kickoff path).
 //

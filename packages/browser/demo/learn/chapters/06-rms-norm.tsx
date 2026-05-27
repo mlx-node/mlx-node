@@ -143,92 +143,12 @@ export type RmsNormDemoProps = {
 
 type RunStatus =
   | { kind: "ok" }
-  | { kind: "mock-no-worker" }
-  | { kind: "mock-error"; error: string }
+  | { kind: "error"; error: string }
   | { kind: "aborted" }
   | { kind: "empty-prompt" };
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
-}
-
-function makeMockStats(point: CapturePoint): HiddenStatePointStats {
-  // Mock `count` is set to HIDDEN_DIM (i.e. seqLen=1) so that the raw `l2Norm`
-  // here equals the per-token L2 the UI displays. This keeps mock values
-  // numerically aligned with the prose without extra arithmetic.
-  switch (point) {
-    case "pre_attn_input":
-      return {
-        point,
-        mean: 0.012,
-        std: 3.74,
-        absMax: 18.6,
-        l2Norm: 120.4,
-        count: HIDDEN_DIM,
-      };
-    case "post_attn_norm":
-      return {
-        point,
-        mean: 0.001,
-        std: 1.03,
-        absMax: 4.9,
-        l2Norm: Math.sqrt(HIDDEN_DIM),
-        count: HIDDEN_DIM,
-      };
-    case "post_attn_residual":
-      return {
-        point,
-        mean: 0.015,
-        std: 4.21,
-        absMax: 22.7,
-        l2Norm: 138.7,
-        count: HIDDEN_DIM,
-      };
-    case "post_mlp_norm":
-      return {
-        point,
-        mean: 0.002,
-        std: 1.02,
-        absMax: 5.1,
-        l2Norm: Math.sqrt(HIDDEN_DIM) * 1.03,
-        count: HIDDEN_DIM,
-      };
-  }
-}
-
-function makeMockRmsRun(): AttentionRun {
-  const tokens = [
-    { id: 1, text: "The" },
-    { id: 2, text: " river" },
-    { id: 3, text: " flows" },
-    { id: 4, text: " softly" },
-    { id: 5, text: " through" },
-    { id: 6, text: " the" },
-    { id: 7, text: " valley" },
-    { id: 8, text: "." },
-    { id: 9, text: "<eos>" },
-  ];
-  const hiddenStates: HiddenStateStep[] = [
-    {
-      step: 0,
-      layers: Array.from({ length: DEFAULT_NUM_LAYERS }, (_, idx) => ({
-        layerIdx: idx,
-        stats: CAPTURE_POINTS.map((p) => makeMockStats(p)),
-      })),
-    },
-  ];
-  return {
-    prompt: DEFAULT_PROMPT,
-    tokens,
-    generatedToken: { id: 10, text: " (mock)" },
-    attention: [],
-    modelMeta: {
-      name: "Qwen3.5-0.8B (mock)",
-      numLayers: DEFAULT_NUM_LAYERS,
-      fullAttentionLayerIndices: [],
-    },
-    hiddenStates,
-  };
 }
 
 function getLayerStats(
@@ -289,16 +209,6 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
     [],
   );
 
-  function applyMockFallback(reason: RunStatus, logMessage: string) {
-    const mock = makeMockRmsRun();
-    console.log(logMessage, {
-      promptLength: prompt.length,
-      layers: mock.hiddenStates?.[0]?.layers.length ?? 0,
-    });
-    setRun(mock);
-    setStatus(reason);
-  }
-
   async function handleRun() {
     if (prompt.trim().length === 0) {
       setStatus({ kind: "empty-prompt" });
@@ -309,10 +219,10 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
     setRunning(true);
     const worker = workerRef.current;
     if (!worker) {
-      applyMockFallback(
-        { kind: "mock-no-worker" },
-        "[rms-norm-demo] using mock HiddenStateStep[] (model not loaded)",
+      console.error(
+        "[rms-norm-demo] worker is unavailable — chapter view should have been gated on modelReady",
       );
+      setStatus({ kind: "error", error: "Worker is unavailable. Reload the page." });
       setRunning(false);
       return;
     }
@@ -364,14 +274,8 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
         }
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          "[rms-norm-demo] runForInspector failed; falling back to mock",
-          err,
-        );
-        applyMockFallback(
-          { kind: "mock-error", error: message },
-          "[rms-norm-demo] using mock HiddenStateStep[] (backend error)",
-        );
+        console.error("[rms-norm-demo] runForInspector failed", err);
+        setStatus({ kind: "error", error: message });
       }
     } finally {
       if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
@@ -402,9 +306,9 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
   }, [hiddenSteps, numLayers]);
 
   // Clamp `selectedLayer` when the available-layers set changes (e.g. a new
-  // run captured a different subset, or the model meta swapped between
-  // real-run and mock). Without this, the <Select> can display a value that
-  // no longer exists in `availableLayers`.
+  // run captured a different subset, or the backend swapped models entirely).
+  // Without this, the <Select> can display a value that no longer exists in
+  // `availableLayers`.
   React.useEffect(() => {
     if (availableLayers.length === 0) return;
     if (!availableLayers.includes(selectedLayer)) {
@@ -512,22 +416,12 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
         </span>
       </div>
 
-      {status?.kind === "mock-no-worker" ? (
-        <div
-          role="status"
-          className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
-        >
-          Showing demo data — load the model from the chat tab first to see
-          real activation stats.
-        </div>
-      ) : null}
-      {status?.kind === "mock-error" ? (
+      {status?.kind === "error" ? (
         <div
           role="alert"
           className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          <strong>Inspector run failed.</strong> Showing demo data instead.{" "}
-          {status.error}
+          <strong>Inspector run failed.</strong> {status.error}
         </div>
       ) : null}
       {status?.kind === "aborted" ? (

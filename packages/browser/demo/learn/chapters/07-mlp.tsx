@@ -158,100 +158,12 @@ export type MlpDemoProps = {
 
 type RunStatus =
   | { kind: "ok" }
-  | { kind: "mock-no-worker" }
-  | { kind: "mock-error"; error: string }
+  | { kind: "error"; error: string }
   | { kind: "aborted" }
   | { kind: "empty-prompt" };
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
-}
-
-function makeMockStats(
-  point: CapturePoint,
-  layerIdx: number,
-): HiddenStatePointStats {
-  // Mock `count` is set to HIDDEN_DIM (i.e. seqLen=1) so that the raw `l2Norm`
-  // here equals the per-token L2 the UI displays. This keeps mock values
-  // numerically aligned with the prose without extra arithmetic.
-  const wave = Math.sin((layerIdx + 1) * 0.7);
-  switch (point) {
-    case "post_attn_residual":
-      return {
-        point,
-        mean: 0.014,
-        std: 1.78,
-        absMax: 9.4,
-        l2Norm: 52 + layerIdx * 0.4,
-        count: HIDDEN_DIM,
-      };
-    case "post_mlp_norm":
-      return {
-        point,
-        mean: 0.001,
-        std: 1.01,
-        absMax: 4.7,
-        l2Norm: Math.sqrt(HIDDEN_DIM),
-        count: HIDDEN_DIM,
-      };
-    case "mlp_output": {
-      const l2 = 12 + wave * 6;
-      return {
-        point,
-        mean: 0.0008,
-        std: 0.36,
-        absMax: 2.4,
-        l2Norm: l2,
-        count: HIDDEN_DIM,
-      };
-    }
-    case "post_mlp_residual":
-      return {
-        point,
-        mean: 0.015,
-        std: 1.84,
-        absMax: 9.9,
-        l2Norm: 58 + layerIdx * 0.4,
-        count: HIDDEN_DIM,
-      };
-  }
-}
-
-function makeMockMlpRun(): AttentionRun {
-  const tokens = [
-    { id: 1, text: "Once" },
-    { id: 2, text: " upon" },
-    { id: 3, text: " a" },
-    { id: 4, text: " time" },
-    { id: 5, text: "," },
-    { id: 6, text: " in" },
-    { id: 7, text: " a" },
-    { id: 8, text: " forest" },
-    { id: 9, text: " far" },
-    { id: 10, text: " away" },
-    { id: 11, text: "," },
-  ];
-  const hiddenStates: HiddenStateStep[] = [
-    {
-      step: 0,
-      layers: Array.from({ length: DEFAULT_NUM_LAYERS }, (_, idx) => ({
-        layerIdx: idx,
-        stats: CAPTURE_POINTS.map((p) => makeMockStats(p, idx)),
-      })),
-    },
-  ];
-  return {
-    prompt: DEFAULT_PROMPT,
-    tokens,
-    generatedToken: { id: 12, text: " (mock)" },
-    attention: [],
-    modelMeta: {
-      name: "Qwen3.5-0.8B (mock)",
-      numLayers: DEFAULT_NUM_LAYERS,
-      fullAttentionLayerIndices: [],
-    },
-    hiddenStates,
-  };
 }
 
 function getLayerStats(
@@ -312,16 +224,6 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
     [],
   );
 
-  function applyMockFallback(reason: RunStatus, logMessage: string) {
-    const mock = makeMockMlpRun();
-    console.log(logMessage, {
-      promptLength: prompt.length,
-      layers: mock.hiddenStates?.[0]?.layers.length ?? 0,
-    });
-    setRun(mock);
-    setStatus(reason);
-  }
-
   async function handleRun() {
     if (prompt.trim().length === 0) {
       setStatus({ kind: "empty-prompt" });
@@ -332,10 +234,10 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
     setRunning(true);
     const worker = workerRef.current;
     if (!worker) {
-      applyMockFallback(
-        { kind: "mock-no-worker" },
-        "[mlp-demo] using mock HiddenStateStep[] (model not loaded)",
+      console.error(
+        "[mlp-demo] worker is unavailable — chapter view should have been gated on modelReady",
       );
+      setStatus({ kind: "error", error: "Worker is unavailable. Reload the page." });
       setRunning(false);
       return;
     }
@@ -387,14 +289,8 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
         }
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(
-          "[mlp-demo] runForInspector failed; falling back to mock",
-          err,
-        );
-        applyMockFallback(
-          { kind: "mock-error", error: message },
-          "[mlp-demo] using mock HiddenStateStep[] (backend error)",
-        );
+        console.error("[mlp-demo] runForInspector failed", err);
+        setStatus({ kind: "error", error: message });
       }
     } finally {
       if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
@@ -510,22 +406,12 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
         </span>
       </div>
 
-      {status?.kind === "mock-no-worker" ? (
-        <div
-          role="status"
-          className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
-        >
-          Showing demo data — load the model from the chat tab first to see
-          real activation stats.
-        </div>
-      ) : null}
-      {status?.kind === "mock-error" ? (
+      {status?.kind === "error" ? (
         <div
           role="alert"
           className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          <strong>Inspector run failed.</strong> Showing demo data instead.{" "}
-          {status.error}
+          <strong>Inspector run failed.</strong> {status.error}
         </div>
       ) : null}
       {status?.kind === "aborted" ? (
