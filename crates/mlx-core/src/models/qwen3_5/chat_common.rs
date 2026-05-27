@@ -173,23 +173,21 @@ pub(crate) fn mtp_verify_async_eval() -> bool {
     })
 }
 
-// Phase 4b — opt-IN gate for the paged-pool MTP verify graph. Default
-// OFF; set `MLX_MTP_VERIFY_PAGED_ATTN` to `1` / `true` / `on`
-// (case-insensitive, surrounding whitespace ignored) to enable. The
-// Rust gate mirrors the C++ `mtp_verify_paged_attn_enabled()` reader
-// in `mlx_qwen35.cpp`; both must agree per process for the dispatcher
-// to route through the new graph. Opposite polarity to
-// `mtp_verify_async_eval` (which defaults ON) because the paged-verify
-// graph is still being validated end-to-end.
-#[allow(dead_code)] // Wired by Phase 4b/B3 once the paged-verify Rust caller lands.
+// Phase 4b — opt-OUT gate for the paged-pool MTP verify graph. Default
+// ON since Phase 4b/B4. Set `MLX_MTP_VERIFY_PAGED_ATTN` to `0` /
+// `false` / `off` (case-insensitive, surrounding whitespace ignored)
+// to fall back to the dense BHTD verify path. The Rust gate mirrors
+// the C++ `mtp_verify_paged_attn_enabled()` reader in `mlx_qwen35.cpp`;
+// both must agree per process for the dispatcher to route through the
+// new graph.
 pub(crate) fn mtp_verify_paged_attn_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("MLX_MTP_VERIFY_PAGED_ATTN") {
         Ok(v) => {
             let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
         }
-        Err(_) => false,
+        Err(_) => true,
     })
 }
 

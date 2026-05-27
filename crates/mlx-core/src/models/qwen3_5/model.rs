@@ -1644,67 +1644,11 @@ impl Qwen35Inner {
 
         let model_id = self.model_id;
 
-        // Block-paged dispatch — early-return BEFORE the compile lock so
-        // the paged path never acquires `COMPILED_LIFECYCLE_MUTEX` /
-        // `COMPILED_WEIGHTS_RWLOCK` and never calls
-        // `mlx_qwen35_compiled_init_from_prefill`. The compiled C++
-        // forward path is incompatible with per-layer paged dispatch;
-        // mixing the two on the same turn would corrupt subsequent
-        // flat-path turns' compiled state.
-        //
-        // Stage 1 (MTP-paged enablement): when MTP is requested AND the
-        // model has MTP weights, fall through to the dense compiled
-        // path even on paged-adapter-enabled models. The dense MTP
-        // pipeline (init_from_prefill + decode_loop_mtp! + dense verify)
-        // is Stage 1's verify mechanism — it reads K/V from
-        // `g_compiled_caches`, not from the paged pool. The paged
-        // adapter remains constructed but the MTP path does NOT
-        // write K/V into the paged pool because the FFI to extract
-        // verify-written K/V out of `g_compiled_caches` is Stage 2
-        // work. Stage 1 therefore RELEASES the paged adapter at the
-        // dispatcher boundary so subsequent paged-AR turns (or a
-        // following MTP-on-paged turn) start from a clean cursor,
-        // avoiding cross-turn corruption caused by reading stale
-        // (or never-written) paged K/V on top of a phantom cursor.
-        //
-        // Subsequent non-MTP turns on the same model still route
-        // through the paged path (the cleanup above leaves the adapter
-        // in "released" state — `chat_sync_core_paged` runs the
-        // cold-start branch which `reset_for_new_request` +
-        // `find_cached_prefix` + `allocate_suffix_blocks`).
-        //
-        // Note: this dispatcher hunk is deliberately KEPT instead of
-        // being relocated into `chat_sync_core_paged` itself because
-        // (a) Stage 1's verify backing is `g_compiled_caches` (dense)
-        // not the paged pool, so a "natively-handled" paged dispatch
-        // would still delegate K/V to the dense path; (b) the
-        // relocation would require either extracting the dense-path
-        // body into a helper (high-risk ~270-line refactor) or
-        // recursing back into `chat_sync_core` via a state flag
-        // (invasive). Stage 2 (paged-attn verify) will swap the
-        // verify graph onto the paged pool — at that point this
-        // bypass collapses naturally because the paged path becomes
-        // self-sufficient. See the controller report for the design
-        // rationale.
-        let mtp_takes_dense_path = p.enable_mtp
-            && self.has_mtp_weights()
-            && self.paged_adapter.is_some()
-            && !chat_common::mtp_verify_paged_attn_enabled();
-        // Stage 1 paged cursor cleanup — see the long comment above.
-        // `release_request` is idempotent (no-op when no live
-        // request) and safe to call from any thread holding `&mut
-        // self`. Errors are logged but not propagated; the dense
-        // path runs regardless.
-        if mtp_takes_dense_path
-            && let Some(ref mut adapter) = self.paged_adapter
-            && let Err(e) = adapter.release_request()
-        {
-            tracing::warn!(
-                target: "mlx_core::qwen3_5::paged",
-                "MTP-on-paged dispatch: release_request failed (ignored): {e}",
-            );
-        }
-        if self.paged_adapter.is_some() && !mtp_takes_dense_path {
+        // Phase 4b — paged dispatch with native MTP support inside
+        // `chat_sync_core_paged_inner`. The Phase 1 bypass that routed
+        // MTP-on-paged to the dense path is removed; the paged path
+        // now self-handles MTP via the gate at `chat_sync_core_paged_inner`.
+        if self.paged_adapter.is_some() {
             if has_images {
                 return Err(Error::from_reason(
                     "Qwen3.5 paged dispatch is text-only; image-bearing turns require \
@@ -1712,12 +1656,6 @@ impl Qwen35Inner {
                 ));
             }
             return self.chat_sync_core_paged(tokens, tokenizer, eos_token_id, p, report_perf);
-        }
-        if mtp_takes_dense_path && has_images {
-            return Err(Error::from_reason(
-                "Qwen3.5 MTP+paged dispatch is text-only; image-bearing MTP turns require \
-                 use_block_paged_cache=false (text-only turns continue to work).",
-            ));
         }
 
         // Check if compiled path will be used
@@ -2122,36 +2060,10 @@ impl Qwen35Inner {
 
         let model_id = self.model_id;
 
-        // Block-paged dispatch — early-return BEFORE the compile lock.
-        // The delta path treats `cached_token_history + delta` as the
-        // FULL prompt for paged purposes; the paged adapter's
-        // warm-continue path picks up the matching prefix
-        // automatically.
-        //
-        // Stage 1 (MTP-paged enablement): when MTP is requested AND the
-        // model has MTP weights, fall through to the dense compiled
-        // path even on paged-adapter-enabled models. See the matching
-        // comment block in `chat_sync_core` for the full rationale,
-        // including the `release_request` cleanup. Releasing the
-        // adapter on the delta entry side covers the case where a
-        // prior session-start turn was paged-AR and left blocks
-        // live — the upcoming MTP-on-paged delta turn does NOT use
-        // those blocks (dense path) and must not leave stale K/V
-        // in place for a subsequent paged-AR turn to misinterpret.
-        let mtp_takes_dense_path = p.enable_mtp
-            && self.has_mtp_weights()
-            && self.paged_adapter.is_some()
-            && !chat_common::mtp_verify_paged_attn_enabled();
-        if mtp_takes_dense_path
-            && let Some(ref mut adapter) = self.paged_adapter
-            && let Err(e) = adapter.release_request()
-        {
-            tracing::warn!(
-                target: "mlx_core::qwen3_5::paged",
-                "MTP-on-paged dispatch (delta): release_request failed (ignored): {e}",
-            );
-        }
-        if self.paged_adapter.is_some() && !mtp_takes_dense_path {
+        // Phase 4b — paged dispatch with native MTP support inside
+        // `chat_sync_core_paged_inner`. The Phase 1 bypass that routed
+        // MTP-on-paged to the dense path is removed.
+        if self.paged_adapter.is_some() {
             return self.chat_sync_core_paged(
                 full_token_history.clone(),
                 tokenizer.clone(),
@@ -3251,7 +3163,7 @@ impl Qwen35Inner {
             gdn_prefix_already_primed,
         );
 
-        let (generated_tokens, finish_reason) = match forward_result {
+        let (generated_tokens, finish_reason, mtp_profiler) = match forward_result {
             Ok(t) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     // Build per-block extra_keys covering the FULL request
@@ -3312,6 +3224,12 @@ impl Qwen35Inner {
                 tokens.len() - cached_prefix_len as usize,
                 generated_tokens.len(),
             )
+            .map(|mut m| {
+                if let Some(prof) = mtp_profiler.as_ref() {
+                    prof.fill_mtp_acceptance(&mut m);
+                }
+                m
+            })
         } else {
             None
         };
@@ -3358,7 +3276,11 @@ impl Qwen35Inner {
         first_token_instant: &mut Option<std::time::Instant>,
         use_cpp_paged: bool,
         gdn_prefix_already_primed: bool,
-    ) -> Result<(Vec<u32>, String)> {
+    ) -> Result<(
+        Vec<u32>,
+        String,
+        Option<crate::decode_profiler::DecodeProfiler>,
+    )> {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
             suffix_len > 0,
@@ -3532,11 +3454,8 @@ impl Qwen35Inner {
         };
 
         // Phase 4b — paged-MTP gate. Mirrors the dense MTP gate at
-        // `chat_sync_core` (model.rs:2546-2820). Gated off by default;
-        // set `MLX_MTP_VERIFY_PAGED_ATTN=1` AND `enable_mtp=true` to
-        // route MTP through the paged verify graph. The bypass tweak at
-        // the four `mtp_takes_dense_path` sites ensures env=1 reaches
-        // this branch instead of being absorbed by the dense path.
+        // `chat_sync_core`. Default ON since Phase 4b/B4; opt out with
+        // `MLX_MTP_VERIFY_PAGED_ATTN=0` to fall back to AR paged decode.
         //
         // Requires `cpp_session_ready` because the AR step inside the
         // cycle (`forward_with_hidden`) consumes the C++ paged graph's
@@ -3838,7 +3757,7 @@ impl Qwen35Inner {
                 mlx_sys::mlx_qwen35_mtp_compiled_reset();
             }
 
-            return Ok((generated_tokens, finish_reason));
+            return Ok((generated_tokens, finish_reason, Some(profiler)));
         }
 
         for step in 0..max_new_tokens {
@@ -4015,7 +3934,7 @@ impl Qwen35Inner {
             }
         }
 
-        Ok((generated_tokens, finish_reason))
+        Ok((generated_tokens, finish_reason, None))
     }
 
     /// Block-paged streaming variant of [`Self::chat_stream_sync_inner`].
@@ -5040,20 +4959,12 @@ impl Qwen35Inner {
 
         let model_id = self.model_id;
 
-        // Block-paged dispatch — early-return BEFORE the compile lock.
-        // Delta path: drive the paged streaming core with
-        // `cached_history + delta` as the full prompt; the adapter's
-        // warm-continue path matches the cached prefix automatically.
-        //
-        // Stage 1 (MTP-paged enablement): when MTP is requested AND the
-        // model has MTP weights, fall through to the dense compiled
-        // path even on paged-adapter-enabled models. See the matching
-        // comment block in `chat_sync_core` for the full rationale,
-        // including the `release_request` cleanup.
-        let mtp_takes_dense_path = p.enable_mtp
-            && self.has_mtp_weights()
-            && self.paged_adapter.is_some()
-            && !chat_common::mtp_verify_paged_attn_enabled();
+        // Phase 4b — paged streaming path does not yet carry an MTP gate;
+        // MTP-on-paged streams continue to fall through to the dense
+        // compiled streaming path. Non-MTP paged streams take the paged
+        // streaming core.
+        let mtp_takes_dense_path =
+            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_some();
         if mtp_takes_dense_path
             && let Some(ref mut adapter) = self.paged_adapter
             && let Err(e) = adapter.release_request()
@@ -5737,18 +5648,12 @@ impl Qwen35Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        // Block-paged dispatch — early-return BEFORE the compile lock.
-        // See `chat_sync_core` for the compile-lockout rationale.
-        //
-        // Stage 1 (MTP-paged enablement): when MTP is requested AND the
-        // model has MTP weights, fall through to the dense compiled
-        // path even on paged-adapter-enabled models. See the matching
-        // comment block in `chat_sync_core` for the full rationale,
-        // including the `release_request` cleanup.
-        let mtp_takes_dense_path = p.enable_mtp
-            && self.has_mtp_weights()
-            && self.paged_adapter.is_some()
-            && !chat_common::mtp_verify_paged_attn_enabled();
+        // Phase 4b — paged streaming path does not yet carry an MTP gate;
+        // MTP-on-paged streams continue to fall through to the dense
+        // compiled streaming path. Non-MTP paged streams take the paged
+        // streaming core.
+        let mtp_takes_dense_path =
+            p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_some();
         if mtp_takes_dense_path
             && let Some(ref mut adapter) = self.paged_adapter
             && let Err(e) = adapter.release_request()

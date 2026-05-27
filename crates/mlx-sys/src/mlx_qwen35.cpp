@@ -608,14 +608,15 @@ static int bucket_size_for_idx(int idx) {
   return idx == kLegacyBucketIdx ? 0 : kVerifyBuckets[idx];
 }
 
-// Phase 4b — opt-IN gate for the paged-pool MTP verify graph. Default
-// OFF; set `MLX_MTP_VERIFY_PAGED_ATTN` to `1` / `true` / `on`
-// (case-insensitive, surrounding whitespace ignored) to enable.
+// Phase 4b — opt-OUT gate for the paged-pool MTP verify graph. Default
+// ON since Phase 4b/B4. Set `MLX_MTP_VERIFY_PAGED_ATTN` to `0` /
+// `false` / `off` (case-insensitive, surrounding whitespace ignored)
+// to fall back to the dense BHTD verify path.
 // Mirrored in Rust by `chat_common::mtp_verify_paged_attn_enabled()`.
 static bool mtp_verify_paged_attn_enabled() {
   static const bool enabled = []() {
     const char* raw = std::getenv("MLX_MTP_VERIFY_PAGED_ATTN");
-    if (!raw) return false;
+    if (!raw) return true;
     std::string v(raw);
     size_t s = 0;
     while (s < v.size() && std::isspace(static_cast<unsigned char>(v[s]))) s++;
@@ -625,7 +626,7 @@ static bool mtp_verify_paged_attn_enabled() {
     for (char& c : trimmed) {
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
-    return trimmed == "1" || trimmed == "true" || trimmed == "on";
+    return !(trimmed == "0" || trimmed == "false" || trimmed == "off");
   }();
   return enabled;
 }
