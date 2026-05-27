@@ -332,21 +332,47 @@ function formatNumber(value: number, digits = 3): string {
   return value.toFixed(digits);
 }
 
+/**
+ * Milliseconds between layer reveals when animating the forward pass up
+ * the tower. 24 layers × 70ms ≈ 1.7s — long enough to read as motion,
+ * short enough not to feel sluggish.
+ */
+const FORWARD_PASS_STEP_MS = 70;
+
 export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT);
   const [run, setRun] = React.useState<AttentionRun | null>(null);
   const [status, setStatus] = React.useState<RunStatus | null>(null);
   const [running, setRunning] = React.useState(false);
   const [selectedLayer, setSelectedLayer] = React.useState(0);
+  /**
+   * Highest layer index currently revealed during the forward-pass
+   * animation. `null` means no animation in progress — show the full
+   * final state of all 24 tiles. During animation, layers with index
+   * above this cursor render as muted gray, and `selectedLayer`
+   * follows the cursor so the right-side stats also march up the stack.
+   */
+  const [revealedUpTo, setRevealedUpTo] = React.useState<number | null>(null);
 
   const runAbortRef = React.useRef<AbortController | null>(null);
   const runGenRef = React.useRef(0);
+  const revealTimerRef = React.useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
+
+  const clearRevealTimer = React.useCallback(() => {
+    if (revealTimerRef.current !== null) {
+      clearInterval(revealTimerRef.current);
+      revealTimerRef.current = null;
+    }
+  }, []);
 
   React.useEffect(
     () => () => {
       runAbortRef.current?.abort();
+      clearRevealTimer();
     },
-    [],
+    [clearRevealTimer],
   );
 
   async function handleRun() {
@@ -356,6 +382,10 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
     }
 
     const myGen = ++runGenRef.current;
+    // Cancel any in-flight reveal animation from a previous run so a
+    // fast double-click doesn't leave two timers racing.
+    clearRevealTimer();
+    setRevealedUpTo(null);
     setRunning(true);
     const worker = workerRef.current;
     if (!worker) {
@@ -399,9 +429,41 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
       });
       setRun(result);
       setStatus({ kind: "ok" });
-      const maxLayer = (result.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS) - 1;
+      const numLayersInResult =
+        result.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS;
+      const maxLayer = numLayersInResult - 1;
       if (selectedLayer > maxLayer) {
         setSelectedLayer(0);
+      }
+      // Animate the forward pass up the tower: reveal one layer at a
+      // time so the learner sees the data climbing the stack. Honor
+      // prefers-reduced-motion by skipping the animation entirely.
+      clearRevealTimer();
+      const reducedMotion =
+        typeof window !== "undefined" &&
+        typeof window.matchMedia === "function" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (reducedMotion) {
+        setRevealedUpTo(null);
+        setSelectedLayer(maxLayer);
+      } else {
+        setRevealedUpTo(0);
+        setSelectedLayer(0);
+        revealTimerRef.current = setInterval(() => {
+          setRevealedUpTo((prev) => {
+            if (prev === null) return null;
+            const next = prev + 1;
+            if (next >= maxLayer) {
+              // Final layer revealed — drop back to "no animation" so
+              // the static color encoding takes over.
+              clearRevealTimer();
+              setSelectedLayer(maxLayer);
+              return null;
+            }
+            setSelectedLayer(next);
+            return next;
+          });
+        }, FORWARD_PASS_STEP_MS);
       }
     } catch (err) {
       if (runGenRef.current !== myGen) return;
@@ -534,6 +596,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
           fullAttnIndices={fullAttnIndices}
           selectedLayer={selectedLayer}
           onSelect={(idx) => setSelectedLayer(idx)}
+          revealedUpTo={revealedUpTo}
         />
         <LayerSidePanel
           layerIdx={selectedLayer}
@@ -565,6 +628,15 @@ type StackViewer3DProps = {
   fullAttnIndices: Set<number>;
   selectedLayer: number;
   onSelect: (layerIdx: number) => void;
+  /**
+   * Index of the highest layer that has been "revealed" by the
+   * forward-pass animation. Layers above this index render as a muted
+   * gray to imply they haven't been computed yet; the layer at this
+   * index gets a brighter emissive boost as the animation cursor. When
+   * `null`, no animation is in progress and every tile shows its
+   * final L2-encoded color.
+   */
+  revealedUpTo: number | null;
 };
 
 const STACK_TOTAL_HEIGHT = 18;
@@ -595,11 +667,16 @@ function colorForL2(
   return cold.lerp(hot, clamped);
 }
 
+/** Muted tone used for layers that haven't been "computed" yet in the
+ *  forward-pass animation. Reads as inert / pre-activation tile. */
+const UNREVEALED_LAYER_COLOR = new THREE.Color(0x2a2f3a);
+
 function StackViewer3D({
   layerOutL2,
   fullAttnIndices,
   selectedLayer,
   onSelect,
+  revealedUpTo,
 }: StackViewer3DProps) {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const onSelectRef = React.useRef(onSelect);
@@ -850,7 +927,11 @@ function StackViewer3D({
     state.requestRender();
   }, [layerOutL2]);
 
-  // Update tile colors when L2 data changes or full-attn set changes.
+  // Update tile colors when L2 data, full-attn set, or animation cursor
+  // changes. During the forward-pass animation, layers above the cursor
+  // render in a muted "pre-activation" gray; the layer at the cursor
+  // gets an extra emissive bump so it reads as the "currently flowing"
+  // tile climbing the tower.
   React.useEffect(() => {
     const state = sceneRef.current;
     if (!state) return;
@@ -865,12 +946,21 @@ function StackViewer3D({
       const layerIdx = mesh.userData.layerIdx as number;
       const value = layerOutL2[i]?.value ?? null;
       const isFull = fullAttnIndices.has(layerIdx);
-      material.color.copy(colorForL2(value, vmin, vmax, isFull));
-      material.emissive.copy(material.color).multiplyScalar(isFull ? 0.18 : 0.04);
+      const isUnrevealed =
+        revealedUpTo !== null && layerIdx > revealedUpTo;
+      const isCursor = revealedUpTo !== null && layerIdx === revealedUpTo;
+      if (isUnrevealed) {
+        material.color.copy(UNREVEALED_LAYER_COLOR);
+        material.emissive.copy(UNREVEALED_LAYER_COLOR).multiplyScalar(0.02);
+      } else {
+        material.color.copy(colorForL2(value, vmin, vmax, isFull));
+        const emissiveScale = isCursor ? 0.45 : isFull ? 0.18 : 0.04;
+        material.emissive.copy(material.color).multiplyScalar(emissiveScale);
+      }
       material.needsUpdate = true;
     }
     state.requestRender();
-  }, [layerOutL2, fullAttnIndices]);
+  }, [layerOutL2, fullAttnIndices, revealedUpTo]);
 
   // Update selection outline when selectedLayer changes.
   React.useEffect(() => {
