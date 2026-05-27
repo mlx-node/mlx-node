@@ -53,13 +53,16 @@ export function AttentionChapterBody() {
 
       <h2>The intuition</h2>
       <p>
-        Imagine reading the sentence <code>"The cat sat on the mat."</code> When
-        you read <code>mat</code> you're implicitly looking back at{" "}
-        <code>cat</code> (because cats sit on mats more often than, say,
-        algorithms do) and at <code>on</code> (because that's the relationship).
-        Self-attention is a learned, differentiable version of that "look
-        back": for every token in the sequence, the model decides{" "}
-        <em>how much</em> it should pay attention to every other token.
+        Imagine you're the model and someone hands you the prompt{" "}
+        <code>"The cat sat on the ___"</code> and asks for the next word. To
+        guess well you have to look back at the earlier tokens:{" "}
+        <code>cat</code> tells you the subject is an animal,{" "}
+        <code>sat</code> tells you it's resting on something,{" "}
+        <code>on the</code> tells you a noun is coming next. Self-attention
+        is a learned, differentiable version of that "look back": for every
+        token in the sequence the model decides <em>how much</em> it should
+        pay attention to every other token. The panel on the right runs
+        exactly this prompt and shows you the attention pattern.
       </p>
 
       <h2>Q, K, V — three projections of the same vector</h2>
@@ -126,7 +129,9 @@ export function AttentionChapterBody() {
         set to <code>-∞</code>) the upper triangle of the score matrix. After
         softmax those cells become 0. That's why the heatmap on the right is{" "}
         <strong>lower-triangular</strong>: row <em>i</em> only attends to{" "}
-        keys <em>0 … i</em>.
+        keys <em>0 … i</em>. The bottom row — the last token of the prompt —
+        is the only row that gets to see the whole sentence, which is why
+        that row is the one that produces the next-word prediction.
       </p>
 
       <h2>What each cell in the heatmap means</h2>
@@ -161,9 +166,11 @@ export function AttentionChapterBody() {
       </p>
 
       <p className="mt-6 text-muted-foreground">
-        Type a sentence on the right and hit <em>Run</em>. The heatmap shows
-        the real post-softmax attention scores from a forward pass. Switch
-        the layer and head selectors to see how the pattern changes.
+        Hit <em>Run</em> on the right. The model's predicted next token
+        appears at the end of the prompt with a rainbow shimmer, and the
+        heatmap shows the real post-softmax attention scores from the
+        forward pass that produced it. Edit the prompt or change layer /
+        head to watch the pattern (and the prediction) change.
       </p>
     </Prose>
   );
