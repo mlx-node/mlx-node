@@ -196,6 +196,20 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
   // modelReady, so by the time this component mounts the worker is alive
   // and we can show real data immediately.
   const didAutoRunRef = React.useRef(false);
+  // Ref to the heatmap container so we can restart its CSS flash animation
+  // without remounting the AttentionHeatmap subtree — remounting would
+  // reset the Layer/Head <Select>s back to their defaults on every run.
+  const heatmapWrapRef = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    if (runFlash === 0) return;
+    const el = heatmapWrapRef.current;
+    if (!el) return;
+    el.classList.remove("run-flash-on-mount");
+    // Force a reflow so removing + re-adding the class actually restarts
+    // the keyframe animation. Reading offsetWidth is the standard trick.
+    void el.offsetWidth;
+    el.classList.add("run-flash-on-mount");
+  }, [runFlash]);
 
   async function handleRun() {
     setRunning(true);
@@ -272,7 +286,7 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
           </span>
           {lastRunAt !== null ? <LastRunPill timestamp={lastRunAt} /> : null}
         </div>
-        {lastRunAt !== null && !running ? (
+        {lastRunAt !== null ? (
           <p className="text-xs text-muted-foreground">
             Greedy sampling is deterministic — clicking <strong>Run</strong>{" "}
             again on the same prompt produces an identical heatmap. Edit the
@@ -302,8 +316,8 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
       {run ? (
         <div className="space-y-3 pt-2">
           <div
-            key={runFlash}
-            className="run-flash-on-mount rounded-md"
+            ref={heatmapWrapRef}
+            className="rounded-md"
           >
             <AttentionHeatmap run={run} />
           </div>
