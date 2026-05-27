@@ -2742,7 +2742,11 @@ async function handleRunForInspector(data: {
 // the lesson needs. The generated token is dropped on this surface.
 async function handleTokenize(data: { id: string; prompt: string }) {
   const id = data.id;
-  if (!model || typeof model.runForInspector !== "function") {
+  if (
+    !model ||
+    typeof model.encodeTokens !== "function" ||
+    typeof model.decodeTokens !== "function"
+  ) {
     (self as any).postMessage({
       type: TOKENIZE_ERROR_TYPE,
       id,
@@ -2751,11 +2755,12 @@ async function handleTokenize(data: { id: string; prompt: string }) {
     return;
   }
   try {
-    const result = await model.runForInspector(data.prompt, {
-      attention: false,
-      maxNewTokens: 1,
-    });
-    const tokens = Array.isArray(result?.tokens) ? result.tokens : [];
+    const ids = await model.encodeTokens(data.prompt);
+    const texts = ids.length > 0 ? await model.decodeTokens(ids) : [];
+    const tokens = ids.map((tokenId, i) => ({
+      id: tokenId,
+      text: texts[i] ?? "",
+    }));
     (self as any).postMessage({
       type: TOKENIZE_RESULT_TYPE,
       id,

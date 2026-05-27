@@ -420,6 +420,20 @@ pub(crate) enum Qwen35Cmd {
         token_ids: Vec<u32>,
         reply: ResponseTx<EmbedTokensResult>,
     },
+    /// Tokenizer-only encode: run the loaded tokenizer over `text` and
+    /// return the resulting token ids. No forward pass, no cache touch.
+    /// See [`Qwen35Inner::encode_tokens_sync`] for the contract.
+    EncodeTokens {
+        text: String,
+        reply: ResponseTx<Vec<u32>>,
+    },
+    /// Tokenizer-only decode: turn each id into its string fragment.
+    /// Returns one string per input id (parallel with the input). See
+    /// [`Qwen35Inner::decode_tokens_sync`] for the contract.
+    DecodeTokens {
+        token_ids: Vec<u32>,
+        reply: ResponseTx<Vec<String>>,
+    },
     ResetCaches {
         reply: ResponseTx<()>,
     },
@@ -588,6 +602,12 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         }
         Qwen35Cmd::EmbedTokens { token_ids, reply } => {
             let _ = reply.send(inner.embed_tokens_sync(token_ids));
+        }
+        Qwen35Cmd::EncodeTokens { text, reply } => {
+            let _ = reply.send(inner.encode_tokens_sync(text));
+        }
+        Qwen35Cmd::DecodeTokens { token_ids, reply } => {
+            let _ = reply.send(inner.decode_tokens_sync(token_ids));
         }
         Qwen35Cmd::ResetCaches { reply } => {
             let _ = reply.send(inner.reset_caches_sync());
@@ -5683,6 +5703,40 @@ impl Qwen35Inner {
         })
     }
 
+    /// Tokenizer-only encode. Runs the loaded tokenizer over `text` with
+    /// `add_special_tokens = false` (mirroring `run_for_inspector_sync`)
+    /// and returns the resulting token ids. No forward pass, no cache
+    /// touch — used by the inspector tokenize hook so chapter 1's
+    /// debounced live retokenize and chapter 2's per-word embedding
+    /// lookup don't pay for a transformer prefill.
+    pub(crate) fn encode_tokens_sync(&self, text: String) -> Result<Vec<u32>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        tokenizer.encode_sync(&text, Some(false))
+    }
+
+    /// Tokenizer-only decode. Decodes each id in isolation (one call per
+    /// id) so the returned `Vec<String>` is parallel with the input and
+    /// each entry contains exactly the fragment that token contributes —
+    /// matching the per-id `decode_sync(&[id], false)` shape that
+    /// `run_for_inspector_sync` uses when populating `TokenInfo.text`.
+    pub(crate) fn decode_tokens_sync(&self, token_ids: Vec<u32>) -> Result<Vec<String>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        let mut out: Vec<String> = Vec::with_capacity(token_ids.len());
+        for &id in &token_ids {
+            let text = tokenizer
+                .decode_sync(&[id], false)
+                .unwrap_or_else(|_| String::new());
+            out.push(text);
+        }
+        Ok(out)
+    }
+
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
@@ -7305,6 +7359,34 @@ impl Qwen3_5Model {
         token_ids: Vec<u32>,
     ) -> Result<EmbedTokensResult> {
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::EmbedTokens {
+            token_ids,
+            reply,
+        })
+        .await
+    }
+
+    /// Tokenizer-only encode: run the loaded tokenizer over `text` and
+    /// return the resulting token ids. No forward pass, no cache touch.
+    /// Used by the inspector tokenize hook so chapter 1's debounced
+    /// live retokenize and chapter 2's per-word embedding lookup don't
+    /// pay for a transformer prefill the way `runForInspector` does.
+    #[napi]
+    pub async fn encode_tokens(&self, text: String) -> Result<Vec<u32>> {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::EncodeTokens {
+            text,
+            reply,
+        })
+        .await
+    }
+
+    /// Tokenizer-only decode: turn each id into its string fragment.
+    /// Returns one string per input id (parallel with the input). Each
+    /// fragment is what `decode_sync(&[id], false)` yields, matching
+    /// the per-id text the inspector run uses to populate
+    /// `TokenInfo.text`.
+    #[napi]
+    pub async fn decode_tokens(&self, token_ids: Vec<u32>) -> Result<Vec<String>> {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::DecodeTokens {
             token_ids,
             reply,
         })

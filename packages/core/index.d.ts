@@ -1038,6 +1038,22 @@ export declare class Qwen35Model {
    */
   embedTokens(tokenIds: Array<number>): Promise<EmbedTokensResult>;
   /**
+   * Tokenizer-only encode: run the loaded tokenizer over `text` and
+   * return the resulting token ids. No forward pass, no cache touch.
+   * Used by the inspector tokenize hook so chapter 1's debounced
+   * live retokenize and chapter 2's per-word embedding lookup don't
+   * pay for a transformer prefill the way `runForInspector` does.
+   */
+  encodeTokens(text: string): Promise<Array<number>>;
+  /**
+   * Tokenizer-only decode: turn each id into its string fragment.
+   * Returns one string per input id (parallel with the input). Each
+   * fragment is what `decode_sync(&[id], false)` yields, matching
+   * the per-id text the inspector run uses to populate
+   * `TokenInfo.text`.
+   */
+  decodeTokens(tokenIds: Array<number>): Promise<Array<string>>;
+  /**
    * Start a new chat session.
    *
    * Runs the full jinja chat template once and uses `<|im_end|>` as
