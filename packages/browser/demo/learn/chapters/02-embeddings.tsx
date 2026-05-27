@@ -212,9 +212,18 @@ function pca2D(
 ): {
   coords: Array<[number, number]>;
   explainedVariance: [number, number];
+  means: Float32Array;
+  v1: Float32Array;
+  v2: Float32Array;
 } {
   if (numRows === 0 || numCols === 0) {
-    return { coords: [], explainedVariance: [0, 0] };
+    return {
+      coords: [],
+      explainedVariance: [0, 0],
+      means: new Float32Array(numCols),
+      v1: new Float32Array(numCols),
+      v2: new Float32Array(numCols),
+    };
   }
 
   // Center: subtract column means in place on a copy of `data`.
@@ -258,7 +267,25 @@ function pca2D(
     }
     coords[r] = [a, b];
   }
-  return { coords, explainedVariance: [lambda1, lambda2] };
+  return { coords, explainedVariance: [lambda1, lambda2], means, v1, v2 };
+}
+
+// Project a single hidden-dim embedding row into the (v1, v2) basis computed
+// by `pca2D` over the curated word set. Used to plot user-added custom words
+// on the SAME chart without re-running PCA.
+function projectIntoBasis(
+  row: Float32Array,
+  basis: { means: Float32Array; v1: Float32Array; v2: Float32Array },
+): [number, number] {
+  let x = 0;
+  let y = 0;
+  const d = row.length;
+  for (let i = 0; i < d; i++) {
+    const centered = row[i]! - basis.means[i]!;
+    x += centered * basis.v1[i]!;
+    y += centered * basis.v2[i]!;
+  }
+  return [x, y];
 }
 
 // Power iteration on X^T X via the implicit `X^T (X v)` product. The optional
@@ -527,18 +554,35 @@ type LoadedScatter = {
   explainedVariance: [number, number];
   hiddenDim: number;
   embeddings: Float32Array;
+  pcaBasis: { means: Float32Array; v1: Float32Array; v2: Float32Array };
 };
+
+type CustomPoint = {
+  word: string;
+  tokenCount: number;
+  embedding: Float32Array;
+  coords: [number, number];
+};
+
+type Selected =
+  | { kind: "builtin"; index: number }
+  | { kind: "custom"; index: number };
 
 export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
   const [scatter, setScatter] = React.useState<LoadedScatter | null>(null);
   const [status, setStatus] = React.useState<RunStatus>({ kind: "idle" });
   const [running, setRunning] = React.useState(false);
   const [progress, setProgress] = React.useState<string>("");
-  const [selectedIdx, setSelectedIdx] = React.useState<number | null>(null);
+  const [selected, setSelected] = React.useState<Selected | null>(null);
   const [hoverIdx, setHoverIdx] = React.useState<number | null>(null);
   const [activeCategories, setActiveCategories] = React.useState<Set<Category>>(
     () => new Set(ALL_CATEGORIES),
   );
+  const [customPoints, setCustomPoints] = React.useState<CustomPoint[]>([]);
+  const [customInput, setCustomInput] = React.useState("");
+  const [customNote, setCustomNote] = React.useState<string | null>(null);
+  const [customError, setCustomError] = React.useState<string | null>(null);
+  const [adding, setAdding] = React.useState(false);
 
   const runAbortRef = React.useRef<AbortController | null>(null);
   const runGenRef = React.useRef(0);
@@ -553,7 +597,11 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
   async function handleLoad() {
     const myGen = ++runGenRef.current;
     setRunning(true);
-    setSelectedIdx(null);
+    setSelected(null);
+    setCustomPoints([]);
+    setCustomInput("");
+    setCustomNote(null);
+    setCustomError(null);
 
     const worker = workerRef.current;
     if (!worker) {
@@ -625,7 +673,7 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
       // Yield to the event loop so the progress text renders before we
       // start the (short) PCA computation.
       await new Promise((r) => setTimeout(r, 0));
-      const { coords, explainedVariance } = pca2D(
+      const { coords, explainedVariance, means, v1, v2 } = pca2D(
         embeddings,
         keptWords.length,
         hiddenDim,
@@ -656,6 +704,7 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
         explainedVariance,
         hiddenDim,
         embeddings,
+        pcaBasis: { means, v1, v2 },
       });
       setStatus({ kind: "ok" });
       setProgress("");
@@ -693,19 +742,85 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const neighbors = React.useMemo(() => {
-    if (!scatter || selectedIdx == null) return [];
-    return topNeighbors(
-      scatter.embeddings,
-      scatter.hiddenDim,
-      scatter.points,
-      selectedIdx,
-      5,
-    );
-  }, [scatter, selectedIdx]);
+  // Per-custom-point L2 norms in the full hidden-dim space, recomputed when
+  // the custom-points list changes. Built-in norms are precomputed on load.
+  const customNorms = React.useMemo(() => {
+    return customPoints.map((p) => {
+      let s = 0;
+      const emb = p.embedding;
+      for (let i = 0; i < emb.length; i++) s += emb[i]! * emb[i]!;
+      return Math.sqrt(s);
+    });
+  }, [customPoints]);
 
-  const neighborSet = React.useMemo(
-    () => new Set(neighbors.map((n) => n.idx)),
+  // Neighbour search runs over the UNION of built-in + custom points in the
+  // full 1024-dim space. Returns refs into either set via the `kind` tag.
+  type NeighborRef =
+    | { kind: "builtin"; index: number; sim: number }
+    | { kind: "custom"; index: number; sim: number };
+  const neighbors = React.useMemo<NeighborRef[]>(() => {
+    if (!scatter || selected == null) return [];
+    const hiddenDim = scatter.hiddenDim;
+    // Source vector + its norm.
+    let srcOffset = -1;
+    let srcEmbedding: Float32Array | null = null;
+    let srcNorm = 0;
+    if (selected.kind === "builtin") {
+      const row = scatter.points[selected.index];
+      if (!row) return [];
+      srcOffset = selected.index * hiddenDim;
+      srcEmbedding = scatter.embeddings;
+      srcNorm = row.norm;
+    } else {
+      const p = customPoints[selected.index];
+      if (!p) return [];
+      srcEmbedding = p.embedding;
+      srcOffset = 0;
+      srcNorm = customNorms[selected.index] ?? 0;
+    }
+    if (srcNorm === 0 || srcEmbedding == null) return [];
+
+    const scores: NeighborRef[] = [];
+    // Compare against built-in points.
+    for (let i = 0; i < scatter.points.length; i++) {
+      if (selected.kind === "builtin" && selected.index === i) continue;
+      const normB = scatter.points[i]!.norm;
+      if (normB === 0) continue;
+      const offB = i * hiddenDim;
+      let dot = 0;
+      for (let c = 0; c < hiddenDim; c++) {
+        dot += srcEmbedding[srcOffset + c]! * scatter.embeddings[offB + c]!;
+      }
+      scores.push({
+        kind: "builtin",
+        index: i,
+        sim: dot / (srcNorm * normB),
+      });
+    }
+    // Compare against custom points.
+    for (let i = 0; i < customPoints.length; i++) {
+      if (selected.kind === "custom" && selected.index === i) continue;
+      const normB = customNorms[i] ?? 0;
+      if (normB === 0) continue;
+      const emb = customPoints[i]!.embedding;
+      let dot = 0;
+      for (let c = 0; c < hiddenDim; c++) {
+        dot += srcEmbedding[srcOffset + c]! * emb[c]!;
+      }
+      scores.push({
+        kind: "custom",
+        index: i,
+        sim: dot / (srcNorm * normB),
+      });
+    }
+    scores.sort((a, b) => b.sim - a.sim);
+    return scores.slice(0, 5);
+  }, [scatter, selected, customPoints, customNorms]);
+
+  // For visual highlighting of neighbour points in the SVG. Use a string-key
+  // set so we can tag custom vs built-in without index collisions.
+  const neighborKeySet = React.useMemo(
+    () => new Set(neighbors.map((n) => `${n.kind}:${n.index}`)),
     [neighbors],
   );
 
@@ -716,6 +831,73 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
       else next.add(cat);
       return next;
     });
+  }
+
+  async function handleAddCustom() {
+    const trimmed = customInput.trim();
+    if (trimmed.length === 0) return;
+    if (!scatter) return;
+
+    // Duplicate check (case-insensitive against existing custom points). If
+    // the word is already plotted, just re-select it instead of double-adding.
+    const lowered = trimmed.toLowerCase();
+    const existingIdx = customPoints.findIndex(
+      (p) => p.word.toLowerCase() === lowered,
+    );
+    if (existingIdx >= 0) {
+      setSelected({ kind: "custom", index: existingIdx });
+      return;
+    }
+
+    const worker = workerRef.current;
+    if (!worker) {
+      setCustomError("Worker is unavailable. Reload the page.");
+      return;
+    }
+
+    setAdding(true);
+    setCustomError(null);
+    setCustomNote(null);
+
+    try {
+      const tokens = await tokenize(worker, " " + trimmed);
+      if (tokens.length === 0) {
+        setCustomError("Couldn't tokenize that input.");
+        return;
+      }
+      if (tokens.length > 1) {
+        setCustomNote(
+          `"${trimmed}" tokenizes as ${tokens.length} pieces — plotting the first.`,
+        );
+      } else {
+        setCustomNote(null);
+      }
+
+      let embedResult: { embeddings: Float32Array; hiddenDim: number };
+      try {
+        embedResult = await embed(worker, [tokens[0]!.id]);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setCustomError(message);
+        return;
+      }
+
+      const row = embedResult.embeddings.slice(0, embedResult.hiddenDim);
+      const coords = projectIntoBasis(row, scatter.pcaBasis);
+
+      setCustomPoints((prev) => [
+        ...prev,
+        {
+          word: trimmed,
+          tokenCount: tokens.length,
+          embedding: row,
+          coords,
+        },
+      ]);
+      setCustomInput("");
+    } finally {
+      setAdding(false);
+    }
   }
 
   return (
@@ -781,14 +963,59 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
         })}
       </div>
 
+      <div className="space-y-1">
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            placeholder="Try your own word — e.g. 'banana'"
+            value={customInput}
+            onChange={(e) => setCustomInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void handleAddCustom();
+              }
+            }}
+            disabled={adding || !scatter}
+            className="flex h-8 w-full rounded-md border border-input bg-transparent px-3 py-1 text-xs font-mono shadow-xs outline-none transition-[color,box-shadow] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30"
+          />
+          <Button
+            size="sm"
+            onClick={() => void handleAddCustom()}
+            disabled={adding || !customInput.trim() || !scatter}
+          >
+            {adding ? "Adding…" : "Add"}
+          </Button>
+          {customPoints.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => {
+                setCustomPoints([]);
+                setSelected(null);
+              }}
+              className="text-xs text-muted-foreground hover:text-foreground underline-offset-2 hover:underline"
+            >
+              Clear ({customPoints.length})
+            </button>
+          ) : null}
+        </div>
+        {customNote ? (
+          <p className="text-xs text-muted-foreground">{customNote}</p>
+        ) : null}
+        {customError ? (
+          <p className="text-xs text-destructive">{customError}</p>
+        ) : null}
+      </div>
+
       {scatter ? (
         <ScatterPlot
           scatter={scatter}
-          selectedIdx={selectedIdx}
+          selected={selected}
           hoverIdx={hoverIdx}
-          neighborSet={neighborSet}
+          neighborKeySet={neighborKeySet}
           activeCategories={activeCategories}
-          onSelect={(idx) => setSelectedIdx(idx)}
+          customPoints={customPoints}
+          onSelect={(sel) => setSelected(sel)}
           onHover={(idx) => setHoverIdx(idx)}
         />
       ) : (
@@ -798,10 +1025,11 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
         </div>
       )}
 
-      {scatter && selectedIdx != null ? (
+      {scatter && selected != null ? (
         <NeighborList
           scatter={scatter}
-          selectedIdx={selectedIdx}
+          selected={selected}
+          customPoints={customPoints}
           neighbors={neighbors}
         />
       ) : scatter ? (
@@ -824,28 +1052,41 @@ const SCATTER_PADDING = 28;
 
 function ScatterPlot({
   scatter,
-  selectedIdx,
+  selected,
   hoverIdx,
-  neighborSet,
+  neighborKeySet,
   activeCategories,
+  customPoints,
   onSelect,
   onHover,
 }: {
   scatter: LoadedScatter;
-  selectedIdx: number | null;
+  selected: Selected | null;
   hoverIdx: number | null;
-  neighborSet: Set<number>;
+  neighborKeySet: Set<string>;
   activeCategories: Set<Category>;
-  onSelect: (idx: number) => void;
+  customPoints: CustomPoint[];
+  onSelect: (sel: Selected) => void;
   onHover: (idx: number | null) => void;
 }) {
   const { coords, points } = scatter;
+  const selectedBuiltinIdx =
+    selected?.kind === "builtin" ? selected.index : null;
   const bounds = React.useMemo(() => {
     let xMin = Infinity;
     let xMax = -Infinity;
     let yMin = Infinity;
     let yMax = -Infinity;
     for (const [x, y] of coords) {
+      if (x < xMin) xMin = x;
+      if (x > xMax) xMax = x;
+      if (y < yMin) yMin = y;
+      if (y > yMax) yMax = y;
+    }
+    // Custom points must fit too — extend the bounds to include them so a
+    // user-typed outlier doesn't get clipped off the SVG.
+    for (const p of customPoints) {
+      const [x, y] = p.coords;
       if (x < xMin) xMin = x;
       if (x > xMax) xMax = x;
       if (y < yMin) yMin = y;
@@ -861,7 +1102,7 @@ function ScatterPlot({
       yMax += 0.5;
     }
     return { xMin, xMax, yMin, yMax };
-  }, [coords]);
+  }, [coords, customPoints]);
 
   function project(x: number, y: number): [number, number] {
     const w = SCATTER_WIDTH - 2 * SCATTER_PADDING;
@@ -877,7 +1118,7 @@ function ScatterPlot({
     return [px, py];
   }
 
-  const hoveredOrSelected = hoverIdx ?? selectedIdx;
+  const hasFocus = hoverIdx != null || selected != null;
 
   return (
     <div className="rounded-md border border-border bg-background p-2">
@@ -946,9 +1187,9 @@ function ScatterPlot({
           const visible = activeCategories.has(p.category);
           if (!visible) return null;
           const [px, py] = project(x, y);
-          const isSelected = i === selectedIdx;
+          const isSelected = i === selectedBuiltinIdx;
           const isHover = i === hoverIdx;
-          const isNeighbor = neighborSet.has(i);
+          const isNeighbor = neighborKeySet.has(`builtin:${i}`);
           const r = isSelected ? 6 : isHover ? 5 : isNeighbor ? 4.5 : 3;
           const stroke = isSelected
             ? "var(--foreground)"
@@ -964,16 +1205,13 @@ function ScatterPlot({
                 r={r}
                 fill={CATEGORY_COLORS[p.category]}
                 fillOpacity={
-                  hoveredOrSelected != null &&
-                  !isSelected &&
-                  !isNeighbor &&
-                  !isHover
+                  hasFocus && !isSelected && !isNeighbor && !isHover
                     ? 0.4
                     : 0.9
                 }
                 stroke={stroke}
                 strokeWidth={strokeWidth}
-                onClick={() => onSelect(i)}
+                onClick={() => onSelect({ kind: "builtin", index: i })}
                 onMouseEnter={() => onHover(i)}
                 onMouseLeave={() => onHover(null)}
                 style={{ cursor: "pointer" }}
@@ -996,6 +1234,57 @@ function ScatterPlot({
             </g>
           );
         })}
+
+        {/* Custom user-added points (rendered on top so they don't get
+            occluded by built-in clusters). */}
+        {customPoints.map((p, i) => {
+          const [px, py] = project(p.coords[0], p.coords[1]);
+          const isSelected =
+            selected?.kind === "custom" && selected.index === i;
+          const isNeighbor = neighborKeySet.has(`custom:${i}`);
+          return (
+            <g
+              key={`custom-${i}`}
+              onClick={() => onSelect({ kind: "custom", index: i })}
+              className="cursor-pointer"
+            >
+              {/* outer halo ring */}
+              <circle
+                cx={px}
+                cy={py}
+                r={9}
+                fill="none"
+                stroke="var(--foreground)"
+                strokeOpacity={isSelected || isNeighbor ? 0.6 : 0.35}
+                strokeWidth={1}
+              />
+              {/* main marker — neutral fill to distinguish from category colors */}
+              <circle
+                cx={px}
+                cy={py}
+                r={5}
+                fill="var(--background)"
+                stroke="var(--foreground)"
+                strokeWidth={isSelected ? 2.5 : 1.5}
+              >
+                <title>
+                  {p.word}
+                  {p.tokenCount > 1
+                    ? ` · ${p.tokenCount} tokens (plotting first)`
+                    : ""}
+                </title>
+              </circle>
+              <text
+                x={px + 8}
+                y={py + 4}
+                fontSize="11"
+                className="pointer-events-none select-none fill-foreground"
+              >
+                {p.word}
+              </text>
+            </g>
+          );
+        })}
       </svg>
       <div className="mt-1 flex items-center justify-between gap-2 px-2 pb-1 font-mono text-[10px] text-muted-foreground">
         <span>
@@ -1014,37 +1303,75 @@ function ScatterPlot({
 
 function NeighborList({
   scatter,
-  selectedIdx,
+  selected,
+  customPoints,
   neighbors,
 }: {
   scatter: LoadedScatter;
-  selectedIdx: number;
-  neighbors: Array<{ idx: number; sim: number }>;
+  selected: Selected;
+  customPoints: CustomPoint[];
+  neighbors: Array<
+    | { kind: "builtin"; index: number; sim: number }
+    | { kind: "custom"; index: number; sim: number }
+  >;
 }) {
-  const sel = scatter.points[selectedIdx]!;
+  // Resolve the selected point's display metadata. Built-in points carry a
+  // category and tokenId; custom points are neutral and tagged "(custom)".
+  let selWord: string;
+  let selSwatch: string;
+  let selSuffix: string;
+  if (selected.kind === "builtin") {
+    const sel = scatter.points[selected.index];
+    if (!sel) return null;
+    selWord = sel.word;
+    selSwatch = CATEGORY_COLORS[sel.category];
+    selSuffix = `${CATEGORY_LABELS[sel.category]}${sel.tokenId >= 0 ? ` · id ${sel.tokenId}` : ""}`;
+  } else {
+    const sel = customPoints[selected.index];
+    if (!sel) return null;
+    selWord = sel.word;
+    selSwatch = "var(--foreground)";
+    selSuffix =
+      sel.tokenCount > 1
+        ? `custom · ${sel.tokenCount} tokens (first plotted)`
+        : "custom";
+  }
   return (
     <div className="rounded-md border border-border bg-background p-3">
       <div className="mb-2 flex items-center gap-2 text-xs">
         <span
           aria-hidden="true"
           className="inline-block h-2.5 w-2.5 rounded-full"
-          style={{ backgroundColor: CATEGORY_COLORS[sel.category] }}
+          style={{ backgroundColor: selSwatch }}
         />
-        <span className="font-mono text-foreground">{sel.word}</span>
-        <span className="text-muted-foreground">
-          ({CATEGORY_LABELS[sel.category]}
-          {sel.tokenId >= 0 ? ` · id ${sel.tokenId}` : ""})
-        </span>
+        <span className="font-mono text-foreground">{selWord}</span>
+        <span className="text-muted-foreground">({selSuffix})</span>
         <span className="ml-auto text-muted-foreground">
           top-5 nearest in {scatter.hiddenDim}-dim cosine
         </span>
       </div>
       <ol className="space-y-1">
-        {neighbors.map(({ idx, sim }, rank) => {
-          const p = scatter.points[idx]!;
+        {neighbors.map((n, rank) => {
+          let word: string;
+          let swatch: string;
+          let suffix: string;
+          let key: string;
+          if (n.kind === "builtin") {
+            const p = scatter.points[n.index]!;
+            word = p.word;
+            swatch = CATEGORY_COLORS[p.category];
+            suffix = CATEGORY_LABELS[p.category];
+            key = `builtin-${n.index}`;
+          } else {
+            const p = customPoints[n.index]!;
+            word = p.word;
+            swatch = "var(--foreground)";
+            suffix = "custom";
+            key = `custom-${n.index}`;
+          }
           return (
             <li
-              key={idx}
+              key={key}
               className="grid grid-cols-[1.5rem_auto_minmax(0,1fr)_4rem] items-center gap-2 text-xs"
             >
               <span className="font-mono text-muted-foreground">
@@ -1053,16 +1380,14 @@ function NeighborList({
               <span
                 aria-hidden="true"
                 className="inline-block h-2 w-2 rounded-full"
-                style={{ backgroundColor: CATEGORY_COLORS[p.category] }}
+                style={{ backgroundColor: swatch }}
               />
               <span className="truncate">
-                <span className="font-mono">{p.word}</span>
-                <span className="ml-2 text-muted-foreground">
-                  {CATEGORY_LABELS[p.category]}
-                </span>
+                <span className="font-mono">{word}</span>
+                <span className="ml-2 text-muted-foreground">{suffix}</span>
               </span>
               <span className="text-right font-mono text-foreground/80">
-                {sim.toFixed(3)}
+                {n.sim.toFixed(3)}
               </span>
             </li>
           );
