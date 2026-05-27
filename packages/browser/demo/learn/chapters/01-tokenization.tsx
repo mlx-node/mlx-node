@@ -7,6 +7,8 @@ import { tokenize } from "../../lib/tokenizer-client";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
+import { BpeMergeWalkthrough } from "../widgets/BpeMergeWalkthrough";
+import { TrickyCases } from "../widgets/TrickyCases";
 
 /**
  * Chapter 1 — Tokenization.
@@ -240,6 +242,25 @@ export function TokenizationChapterBody() {
         "tokens" is the lingua franca of LLM cost and capacity, not
         "characters" or "words."
       </p>
+
+      <h2>Watching BPE build a token</h2>
+      <p>
+        The widget below walks through a stylised version of BPE on the input{" "}
+        <code>"unbelievable"</code>. Each step merges one adjacent pair of
+        fragments into a new symbol — the same operation BPE training runs
+        many millions of times against a corpus to learn its merge order.
+      </p>
+
+      <BpeMergeWalkthrough />
+
+      <h2>Tokenization quirks worth seeing</h2>
+      <p>
+        Most surprises beginners hit with LLM cost or behaviour trace back to
+        one of these. Each row shows a small input alongside the tokens it
+        usually decomposes into.
+      </p>
+
+      <TrickyCases />
 
       <p className="mt-6 text-muted-foreground">
         In the next chapter (<em>Embeddings</em>) we'll see how each of these

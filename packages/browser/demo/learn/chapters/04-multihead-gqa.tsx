@@ -19,6 +19,8 @@ import { renderTokenDisplay } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
+import { MhaVsGqaCacheBar } from "../widgets/MhaVsGqaCacheBar";
+import { PatternDetectorPanel } from "../widgets/PatternDetectorPanel";
 
 // Default prompt deliberately stops mid-sentence — matches chapter 3 so a
 // learner sees the same "model predicts the next word" framing carry over,
@@ -244,6 +246,25 @@ group_size    = H / G        (4 query heads per K/V head)`}</code>
         consensus today is that GQA with a moderate group size (typically 4–8)
         recovers most of MHA's quality at most of MQA's cache savings.
       </p>
+
+      <h2>What different heads end up doing</h2>
+      <p>
+        You can&apos;t read a head&apos;s job off its weight matrices —
+        you have to look at the patterns it produces on real inputs. Here
+        are three common archetypes drawn as illustrative heatmaps.
+      </p>
+
+      <PatternDetectorPanel />
+
+      <h2>How big is the KV cache, really?</h2>
+      <p>
+        Numbers make the savings concrete. The bars below compare the
+        whole-model KV cache for a hypothetical MHA Qwen3.5-0.8B against the
+        actual GQA layout at an 8k context — the level a chat session can
+        hit in a few turns.
+      </p>
+
+      <MhaVsGqaCacheBar />
 
       <p className="mt-6 text-muted-foreground">
         The widget on the right runs the same{" "}

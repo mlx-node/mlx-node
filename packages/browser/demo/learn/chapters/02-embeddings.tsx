@@ -6,6 +6,7 @@ import { tokenize } from "../../lib/tokenizer-client";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
+import { CosineSimilarityTool } from "../widgets/CosineSimilarityTool";
 
 /**
  * Chapter 2 — Embeddings.
@@ -646,6 +647,31 @@ export function EmbeddingsChapterBody() {
           surprising near-misses across categories.
         </li>
       </ul>
+
+      <h2>Cosine similarity, side by side</h2>
+      <p>
+        The scatter on the right is a 2D projection. The panel below skips
+        the projection entirely: each pair&apos;s cosine similarity is
+        measured in the model&apos;s full 1024-dim embedding space and shown
+        as a bar. The ordering teaches the lesson — identical &gt; synonym
+        &gt; related &gt; antonym &gt; cross-language &gt; unrelated.
+      </p>
+
+      <CosineSimilarityTool />
+
+      <h2>Why so many dimensions?</h2>
+      <p>
+        If we tried to do this in 3D, almost every concept would collide.
+        There simply isn&apos;t room for "animals", "countries", "colors",
+        "verbs", "syntactic role", "register", "language", and a dozen other
+        axes of meaning to vary independently in a three-axis space.
+        Qwen3.5-0.8B uses <strong>1,024</strong> embedding dimensions, which
+        gives the model a generous amount of "room" — each independent
+        feature can occupy its own direction without crowding the others.
+        The PCA scatter above is a 2D projection of that 1024-dim space; the
+        clusters survive the projection because they really are clusters,
+        but most of the geometry is in the axes we threw away.
+      </p>
 
       <p className="mt-6 text-muted-foreground">
         Up next (<em>Self-attention</em>) we'll watch how these vectors

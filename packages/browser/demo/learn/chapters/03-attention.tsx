@@ -9,6 +9,8 @@ import { renderTokenDisplay } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
+import { CausalMaskVisual } from "../widgets/CausalMaskVisual";
+import { ToyAttentionExample } from "../widgets/ToyAttentionExample";
 
 /**
  * Chapter 3 — Self-attention.
@@ -282,6 +284,26 @@ export function AttentionChapterBody() {
         related noun." Stacking attention layers lets later layers compose
         these patterns: chapter 4 looks at heads, chapter 8 at the full stack.
       </p>
+
+      <h2>Working a tiny example by hand</h2>
+      <p>
+        The matrix algebra is easier to feel with concrete numbers. The
+        widget below walks through two tokens — "The" and "cat" — through
+        every step of the attention formula. All numbers are computed from
+        fixed Q, K, V values; step through and watch the score matrix,
+        scale, mask, softmax, and final output appear.
+      </p>
+
+      <ToyAttentionExample />
+
+      <h2>The causal mask, cell by cell</h2>
+      <p>
+        A 5×5 picture of the mask makes "row <em>i</em> can only see
+        columns <em>0..i</em>" concrete. Click any cell to see what it
+        means.
+      </p>
+
+      <CausalMaskVisual />
 
       <p className="mt-6 text-muted-foreground">
         Hit <em>Run</em> on the right. The model's predicted next token

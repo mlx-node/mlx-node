@@ -4,6 +4,8 @@ import { Button } from "../../components/ui/button";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
+import { KvGrowthCurve } from "../widgets/KvGrowthCurve";
+import { PrefillVsDecodeChart } from "../widgets/PrefillVsDecodeChart";
 
 /**
  * Chapter 10 — KV cache & hybrid attention.
@@ -330,6 +332,46 @@ export function KvCacheChapterBody() {
         attention entirely. The trend is clear: cache is the bottleneck,
         and architectures will keep getting reshaped around it.
       </p>
+
+      <div className="not-prose my-4 rounded-md border border-amber-500/50 bg-amber-500/5 p-4">
+        <div className="text-xs uppercase tracking-wider text-amber-700 dark:text-amber-300">
+          Misconception
+        </div>
+        <div className="mt-1 text-sm font-semibold text-foreground">
+          The KV cache is not a Python dict.
+        </div>
+        <p className="mt-2 text-[12px] leading-relaxed text-foreground/85">
+          People sometimes picture it as a hashmap from token text or
+          position to (k, v) tuples. It isn&apos;t. The cache is a
+          pre-allocated tensor of shape{" "}
+          <code className="rounded bg-background px-1 py-0.5 font-mono text-[11px]">
+            [layers, 2, batch, kv_heads, max_seq, head_dim]
+          </code>{" "}
+          that each attention layer writes into and reads from, with a
+          position counter telling it how much of the tensor is live. The
+          "key" is the position index, not a hash. It&apos;s a buffer, not
+          a hashmap.
+        </p>
+      </div>
+
+      <h2>Prefill vs decode, in time</h2>
+      <p>
+        Memory is one axis; wall-clock time is the other. The chart below
+        contrasts prefill (one parallel matmul over the whole prompt) with
+        decode (many small sequential matmuls, one per generated token).
+      </p>
+
+      <PrefillVsDecodeChart />
+
+      <h2>How the cache grows with context</h2>
+      <p>
+        And here, plotted in isolation, is the cache-vs-context curve for
+        each layout. The formula is unpacked underneath: every factor in{" "}
+        <code>2 · L · kv_heads · d · seq · bf16</code> is a knob someone is
+        working on right now.
+      </p>
+
+      <KvGrowthCurve />
 
       <p className="mt-6 text-muted-foreground">
         The right-hand widget plots the cache curves for MHA, GQA-only, and
