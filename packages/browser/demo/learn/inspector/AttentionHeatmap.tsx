@@ -8,7 +8,7 @@ import {
   SelectValue,
 } from "../../components/ui/select";
 
-import type { AttentionRun } from "../../../src/inspector-types";
+import type { AttentionLayer, AttentionRun } from "../../../src/inspector-types";
 import { TokenStrip } from "./TokenStrip";
 import { renderTokenDisplay } from "./TopKBars";
 
@@ -120,17 +120,7 @@ export function AttentionHeatmap({
       return;
     }
     const head = Math.min(selectedHead, layer.numHeads - 1);
-    const headStride = seqLen * seqLen;
-    const headOffset = head * headStride;
-
-    for (let i = 0; i < seqLen; i++) {
-      for (let j = 0; j < seqLen; j++) {
-        const v = layer.scores[headOffset + i * seqLen + j] ?? 0;
-        if (v <= 0) continue;
-        ctx.fillStyle = colorForScore(v);
-        ctx.fillRect(j * cellSize, i * cellSize, cellSize, cellSize);
-      }
-    }
+    drawAttentionHeatmap(ctx, layer, head, cellSize);
 
     // Grid (subtle).
     ctx.strokeStyle = "rgba(255,255,255,0.04)";
@@ -387,4 +377,45 @@ function colorForScore(v: number): string {
   // 210 hue is a deep blue → 195 leans cyan as it brightens.
   const h = 210 - t * 15;
   return `hsl(${h.toFixed(0)} ${s}% ${l.toFixed(0)}%)`;
+}
+
+/**
+ * Pure draw helper for the per-cell attention grid. Iterates the seqLen×seqLen
+ * grid for `headIdx` in `layer.scores`, mapping each score → CSS color via
+ * `options.colorFn` (defaults to the canonical {@link colorForScore} ramp used
+ * by {@link AttentionHeatmap}), and writes one `fillRect` per non-zero cell.
+ *
+ * The caller owns:
+ *  - canvas backing-store sizing (`canvas.width` / `.height`)
+ *  - DPR scaling via `ctx.setTransform(dpr, 0, 0, dpr, 0, 0)`
+ *  - background fill (so masked / zero cells show the panel background)
+ *  - any post-draw decoration (grid lines, axes)
+ *
+ * This is a pure CanvasRenderingContext2D writer — no React, no state, no
+ * DPR math. Shared between {@link AttentionHeatmap} and the per-head
+ * `SmallHeatmap` panels in chapter 4 so the iteration + mapping stay in sync.
+ */
+export function drawAttentionHeatmap(
+  ctx: CanvasRenderingContext2D,
+  layer: AttentionLayer,
+  headIdx: number,
+  pixelSize: number,
+  options?: { colorFn?: (v: number) => string },
+): void {
+  const colorFn = options?.colorFn ?? colorForScore;
+  const seqLen = Math.round(
+    Math.sqrt(layer.scores.length / Math.max(1, layer.numHeads)),
+  );
+  if (seqLen === 0) return;
+  const safeHead = Math.min(headIdx, layer.numHeads - 1);
+  const headStride = seqLen * seqLen;
+  const headOffset = safeHead * headStride;
+  for (let i = 0; i < seqLen; i++) {
+    for (let j = 0; j < seqLen; j++) {
+      const v = layer.scores[headOffset + i * seqLen + j] ?? 0;
+      if (v <= 0) continue;
+      ctx.fillStyle = colorFn(v);
+      ctx.fillRect(j * pixelSize, i * pixelSize, pixelSize, pixelSize);
+    }
+  }
 }

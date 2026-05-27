@@ -11,7 +11,10 @@ import {
 import { Textarea } from "../../components/ui/textarea";
 import type { AttentionLayer, AttentionRun } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
-import { AttentionHeatmap } from "../inspector/AttentionHeatmap";
+import {
+  AttentionHeatmap,
+  drawAttentionHeatmap,
+} from "../inspector/AttentionHeatmap";
 import { Prose } from "../Prose";
 import { makeMockAttentionRun } from "../mock-data";
 
@@ -856,19 +859,9 @@ function SmallHeatmap({
       ctx.fillText("No scores available.", 8, 18);
       return;
     }
-    const safeHead = Math.min(head, layer.numHeads - 1);
-    const headStride = seqLen * seqLen;
-    const headOffset = safeHead * headStride;
-    for (let i = 0; i < seqLen; i++) {
-      for (let j = 0; j < seqLen; j++) {
-        const v = layer.scores[headOffset + i * seqLen + j] ?? 0;
-        if (v <= 0) continue;
-        ctx.fillStyle = accent
-          ? colorAccent(v)
-          : colorNeutral(v);
-        ctx.fillRect(j * cellSize, i * cellSize, cellSize, cellSize);
-      }
-    }
+    drawAttentionHeatmap(ctx, layer, head, cellSize, {
+      colorFn: accent ? colorAccent : colorNeutral,
+    });
   }, [run, layer, head, seqLen, cellSize, board, accent]);
 
   return (
