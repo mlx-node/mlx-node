@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { Button } from "../../components/ui/button";
+import { DemoCallout } from "../inspector/DemoCallout";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
@@ -473,6 +474,14 @@ export function KvCacheDemo(_props: KvCacheDemoProps) {
             setAutoplay((p) => !p);
           }
         }}
+      />
+
+      <DemoCallout
+        items={[
+          "Drag the context slider toward 131k tokens — the MHA-hypothetical curve explodes while Qwen's actual hybrid stays modest.",
+          "The MHA total at 32k is ~6 GB — that's what every layer storing full K/V would cost.",
+          "Hybrid wins at long context because the linear layers cost a constant 512 KB each regardless of seq_len.",
+        ]}
       />
     </div>
   );

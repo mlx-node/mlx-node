@@ -1,5 +1,6 @@
 import * as React from "react";
 
+import { DemoCallout } from "../inspector/DemoCallout";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
@@ -405,6 +406,14 @@ export function RopeDemo(_props: RopeDemoProps) {
       <DotProductChart
         values={dotCurve}
         queryPos={DOT_QUERY_POS}
+      />
+
+      <DemoCallout
+        items={[
+          "Each pair of dimensions rotates at its own frequency — high-index pairs rotate slowly, low-index pairs rotate fast.",
+          "Drag the position slider: pair 0 sweeps through many rotations, pair 28 barely moves.",
+          "Relative position emerges from the rotation: token at pos 5 and key at pos 3 see the same relative angle as pos 10 → 8.",
+        ]}
       />
     </div>
   );

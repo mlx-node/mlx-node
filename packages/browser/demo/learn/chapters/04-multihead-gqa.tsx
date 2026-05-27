@@ -15,6 +15,7 @@ import {
   AttentionHeatmap,
   drawAttentionHeatmap,
 } from "../inspector/AttentionHeatmap";
+import { DemoCallout } from "../inspector/DemoCallout";
 import { renderTokenDisplay } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
@@ -645,6 +646,14 @@ export function MultiheadGqaDemo({
           query heads within a K/V group.
         </div>
       )}
+
+      <DemoCallout
+        items={[
+          "Q1 and Q2 in the same group share their K and V projections — that's the GQA cache savings.",
+          "Each query in a group can still learn a different attention pattern even though the keys are shared.",
+          "Compare a full-attention layer with a linear (GatedDeltaNet) layer to see how Qwen3.5 mixes both.",
+        ]}
+      />
     </div>
   );
 }

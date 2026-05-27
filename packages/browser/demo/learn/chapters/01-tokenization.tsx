@@ -4,6 +4,7 @@ import { Button } from "../../components/ui/button";
 import { Textarea } from "../../components/ui/textarea";
 import type { TokenInfo } from "../../../src/inspector-types";
 import { tokenize } from "../../lib/tokenizer-client";
+import { DemoCallout } from "../inspector/DemoCallout";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
@@ -526,6 +527,14 @@ export function TokenizerDemo({ workerRef, abortRef }: TokenizerDemoProps) {
         {tokenCount} tokens · {charCount} characters · ratio:
         characters/token = {ratio}
       </div>
+
+      <DemoCallout
+        items={[
+          "The dot prefix · marks a leading space — \"cat\" and \" cat\" are different tokens.",
+          "Tokens with a dashed border are special tokens like <|im_start|> — Qwen's chat-template markers.",
+          "Try the multilingual button: chars-per-token drops sharply for CJK and rare scripts.",
+        ]}
+      />
     </div>
   );
 }

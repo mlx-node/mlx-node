@@ -3,10 +3,12 @@ import * as React from "react";
 import { Button } from "../../components/ui/button";
 import { embed } from "../../lib/embed-client";
 import { tokenize } from "../../lib/tokenizer-client";
+import { DemoCallout } from "../inspector/DemoCallout";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
 import { CosineSimilarityTool } from "../widgets/CosineSimilarityTool";
+import { ShapeProblem } from "../widgets/ShapeProblem";
 
 /**
  * Chapter 2 — Embeddings.
@@ -602,6 +604,16 @@ export function EmbeddingsChapterBody() {
         shared matrix.
       </p>
 
+      <ShapeProblem
+        question="How big is Qwen3's embedding matrix? And how much does tied embeddings save?"
+        formula="params = vocab_size × hidden_dim"
+        values={[
+          { label: "vocab_size", value: "152,064" },
+          { label: "hidden_dim", value: "1024" },
+        ]}
+        answer="152,064 × 1024 ≈ 155.7M parameters — about 20% of Qwen3-0.8B's total 800M. Tied embeddings reuse this exact matrix for the output projection (unembed), saving another 155.7M. Without tying, the embedding+unembed alone would be roughly the size of a small standalone model."
+      />
+
       <h2>PCA: a 2D window into a 1024-dim space</h2>
       <p>
         We can't see 1024 dimensions, so we project. <strong>Principal
@@ -647,6 +659,31 @@ export function EmbeddingsChapterBody() {
           surprising near-misses across categories.
         </li>
       </ul>
+
+      <h2>Why cosine, not Euclidean?</h2>
+      <p>
+        Cosine similarity measures the <em>angle</em> between two vectors,
+        which is what encodes semantic <em>direction</em> in embedding
+        space. Euclidean distance measures the full vector difference,
+        which conflates direction with magnitude. The magnitudes that come
+        out of training depend on optimization dynamics and aren&apos;t
+        semantically meaningful — two synonyms can have very different
+        norms but nearly the same direction. That&apos;s why cosine is the
+        standard for embedding similarity. Some retrieval systems do use
+        L2 on pre-normalised vectors, which is mathematically equivalent.
+      </p>
+
+      <h2>The scatter is for orientation, not measurement</h2>
+      <p>
+        The PCA scatter projects 1024-dim vectors onto just two axes, so it
+        throws away 1022 dimensions of structure. Two points that look
+        close on screen might be far apart in the real space, and vice
+        versa. The colour groups still cluster (the dominant axes of
+        variance often pick those up), but don&apos;t use the literal pixel
+        distance for similarity — use the cosine number from the panel
+        below. Treat the scatter as a navigation aid for finding clusters,
+        not a ruler.
+      </p>
 
       <h2>Cosine similarity, side by side</h2>
       <p>
@@ -1193,6 +1230,14 @@ export function EmbeddingsDemo({ workerRef, abortRef }: EmbeddingsDemoProps) {
           (cosine similarity in the full {scatter.hiddenDim}-dim space).
         </div>
       ) : null}
+
+      <DemoCallout
+        items={[
+          "Click a dot in the scatter to pin it and reveal its top-5 nearest neighbours by cosine similarity.",
+          "Tokens from the same colour group tend to cluster together — that's the embedding space organising itself.",
+          "Add a custom word with the input field above; it will land near the cluster that fits its meaning.",
+        ]}
+      />
     </div>
   );
 }

@@ -4,6 +4,7 @@ import { Button } from "../../components/ui/button";
 import { Textarea } from "../../components/ui/textarea";
 import type { AttentionRun } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
+import { DemoCallout } from "../inspector/DemoCallout";
 import { TopKBars } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
@@ -676,6 +677,14 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
           generation steps.
         </div>
       )}
+
+      <DemoCallout
+        items={[
+          "Drag top-p from 1.0 toward 0.3 — the bars collapse to just the top few candidates.",
+          "Drop temperature toward 0.0 — the distribution sharpens onto the top option (this is greedy in the limit).",
+          "Push temperature past 1.5 — the bars flatten and unrelated tokens start sneaking in.",
+        ]}
+      />
     </div>
   );
 }

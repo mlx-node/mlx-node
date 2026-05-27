@@ -5,6 +5,7 @@ import { Textarea } from "../../components/ui/textarea";
 import type { AttentionRun } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
 import { AttentionHeatmap } from "../inspector/AttentionHeatmap";
+import { DemoCallout } from "../inspector/DemoCallout";
 import { renderTokenDisplay } from "../inspector/TopKBars";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
@@ -511,6 +512,14 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
           Click <strong>Run</strong> to see the attention heatmap.
         </div>
       )}
+
+      <DemoCallout
+        items={[
+          "The brightness of each cell is the attention weight — bright means \"this query is looking hard at that key\".",
+          "The outlined bottom row is the prediction step: those bright cells are what the model focused on when picking the next token.",
+          "Switch layer/head dropdowns to see different patterns — some heads track recency, some track syntax.",
+        ]}
+      />
     </div>
   );
 }

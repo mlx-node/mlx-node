@@ -15,6 +15,7 @@ import type {
   HiddenStateStep,
 } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
+import { DemoCallout } from "../inspector/DemoCallout";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
@@ -570,6 +571,14 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
           a single forward pass.
         </div>
       )}
+
+      <DemoCallout
+        items={[
+          "SwiGLU multiplies a gate and a value: the bars are roughly gate × value before the down projection.",
+          "Different layers spend wildly different amounts in their MLPs — find the tallest and the smallest.",
+          "The MLP-to-output ratio shows how much the MLP changes the residual stream at each layer.",
+        ]}
+      />
     </div>
   );
 }

@@ -15,6 +15,7 @@ import type {
   HiddenStateStep,
 } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
+import { DemoCallout } from "../inspector/DemoCallout";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
@@ -591,6 +592,14 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
           activation stats for a single forward pass.
         </div>
       )}
+
+      <DemoCallout
+        items={[
+          "Look at how the input distribution gets squeezed: the output L2 norm lands near sqrt(hidden_dim) regardless of input scale.",
+          "Compare layer 0 vs a deep layer — late layers have larger residual streams, so the divisor RMS is bigger.",
+          "RMSNorm has only a learned gain (no shift) — that's the simplification over LayerNorm.",
+        ]}
+      />
     </div>
   );
 }

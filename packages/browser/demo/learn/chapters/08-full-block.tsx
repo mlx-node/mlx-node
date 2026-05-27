@@ -10,6 +10,7 @@ import type {
   HiddenStateStep,
 } from "../../../src/inspector-types";
 import { runForInspector } from "../../lib/inspector-client";
+import { DemoCallout } from "../inspector/DemoCallout";
 import { Prose } from "../Prose";
 import { ChapterFrame } from "../scaffolding/ChapterFrame";
 import type { ChapterLearningData } from "../scaffolding/learning-data";
@@ -543,6 +544,14 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
           numLayers={numLayers}
         />
       </div>
+
+      <DemoCallout
+        items={[
+          "Rotate the tower — each layer is Norm → Attention → Norm → MLP, with a residual skipping each sub-block.",
+          "The colour ramp shows attention type: cooler colours are linear (GatedDeltaNet), warmer are full attention.",
+          "Six of the 24 layers are full attention; the rest are linear. That's the hybrid pattern from Chapter 10.",
+        ]}
+      />
     </div>
   );
 }
