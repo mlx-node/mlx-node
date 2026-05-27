@@ -1134,4 +1134,22 @@
   .landing-bg-canvas canvas {
     animation: none;
   }
+  .run-flash-on-mount {
+    animation: none;
+  }
+}
+
+/* Brief outline flash on chapter "Run" success — feedback that the heatmap
+ * actually re-rendered, since identical prompts produce identical patterns. */
+.run-flash-on-mount {
+  animation: runFlash 600ms ease-out;
+}
+
+@keyframes runFlash {
+  0% {
+    box-shadow: 0 0 0 0 oklch(0.85 0.07 25 / 0.85);
+  }
+  100% {
+    box-shadow: 0 0 0 6px oklch(0.85 0.07 25 / 0);
+  }
 }

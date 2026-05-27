@@ -185,6 +185,16 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
   const [run, setRun] = React.useState<AttentionRun | null>(null);
   const [status, setStatus] = React.useState<RunStatus | null>(null);
   const [running, setRunning] = React.useState(false);
+  // Timestamp (epoch ms) of the most recent successful run. Greedy sampling
+  // is deterministic, so re-running the same prompt produces an identical
+  // heatmap — without this timestamp the user has no way to tell their click
+  // actually did anything. Bumped on every successful run; rendered as a
+  // live-updating "Last run: just now / 5s ago / 1m ago" pill.
+  const [lastRunAt, setLastRunAt] = React.useState<number | null>(null);
+  // Bumps on every successful run so we can trigger a brief border flash on
+  // the heatmap container — purely visual feedback that "yes, the canvas
+  // just re-rendered with new data, even if the pattern looks identical."
+  const [runFlash, setRunFlash] = React.useState(0);
 
   function useMockFallback(reason: RunStatus, logMessage: string) {
     const mock = makeMockAttentionRun(prompt);
@@ -221,6 +231,8 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
       );
       setRun(result);
       setStatus({ kind: "ok" });
+      setLastRunAt(Date.now());
+      setRunFlash((n) => n + 1);
     } catch (err) {
       if (isAbortError(err)) {
         // Worker was terminated (model reload / swap) mid-call. Treat this as
@@ -259,14 +271,23 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
           className="font-mono text-sm"
           placeholder="The cat sat on the mat."
         />
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button onClick={handleRun} disabled={running}>
             {running ? "Running..." : "Run"}
           </Button>
           <span className="text-xs text-muted-foreground">
             Generates one token, captures attention scores.
           </span>
+          {lastRunAt !== null ? <LastRunPill timestamp={lastRunAt} /> : null}
         </div>
+        {lastRunAt !== null && !running ? (
+          <p className="text-xs text-muted-foreground">
+            Greedy sampling is deterministic — clicking <strong>Run</strong>{" "}
+            again on the same prompt produces an identical heatmap. Edit the
+            prompt above (or try a different layer/head) to see the pattern
+            change.
+          </p>
+        ) : null}
       </div>
 
       {status?.kind === "aborted" ? (
@@ -298,7 +319,12 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
               instead. {status.error}
             </div>
           ) : null}
-          <AttentionHeatmap run={run} />
+          <div
+            key={runFlash}
+            className="run-flash-on-mount rounded-md"
+          >
+            <AttentionHeatmap run={run} />
+          </div>
         </div>
       ) : status?.kind === "aborted" ? null : (
         <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
@@ -306,5 +332,36 @@ export function AttentionDemo({ workerRef, abortRef }: AttentionDemoProps) {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * A tiny "Last run: just now / 5s ago / 1m ago" pill that ticks every second
+ * so the user gets active feedback that their Run click did something. The
+ * timer cleans up on unmount; once the elapsed time crosses a minute we ease
+ * off to a 15s refresh so we don't churn React renders forever. */
+function LastRunPill({ timestamp }: { timestamp: number }) {
+  const [, force] = React.useReducer((n: number) => n + 1, 0);
+  React.useEffect(() => {
+    const elapsedMs = Date.now() - timestamp;
+    const interval = elapsedMs < 60_000 ? 1_000 : 15_000;
+    const handle = window.setInterval(() => force(), interval);
+    return () => window.clearInterval(handle);
+  }, [timestamp]);
+  const elapsedSec = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  const label =
+    elapsedSec < 2
+      ? "just now"
+      : elapsedSec < 60
+        ? `${elapsedSec}s ago`
+        : `${Math.round(elapsedSec / 60)}m ago`;
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-primary"
+      aria-live="polite"
+    >
+      <span className="size-1.5 rounded-full bg-primary" aria-hidden="true" />
+      Last run: {label}
+    </span>
   );
 }
