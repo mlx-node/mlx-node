@@ -400,6 +400,26 @@ function App() {
     };
   }, [configuredModelUrl]);
 
+  // Auto-kick-off the model load when the user enters the learning flow —
+  // either by clicking "Start learning" on the landing, or by opening a
+  // chapter URL directly (bookmark, popstate). Chapters fall back to mock
+  // data while the worker isn't up, so without this the user sees "example
+  // data" banners until they navigate to chat and click Load Model. We only
+  // kickoff once (guarded on loadKickoff === 0); subsequent screen changes
+  // reuse the existing worker. We skip kickoff if no hosted model is
+  // available — that path requires the user to pick a local model directory
+  // and we don't want to auto-open the directory picker.
+  useEffect(() => {
+    if (loadKickoff !== 0) return;
+    if (screen.kind !== 'chapter' && screen.kind !== 'chapter_index') return;
+    if (hostedModelAvailable === false) return;
+    if (hostedModelAvailable === null) return; // still probing
+    setPendingModelSource(null);
+    setErrorBannerState(null);
+    setLoadingProgress(null);
+    setLoadKickoff(1);
+  }, [screen.kind, loadKickoff, hostedModelAvailable]);
+
   function handleLocalModelInputChange(event: ChangeEvent<HTMLInputElement>) {
     const source = modelSourceFromLocalFiles(Array.from(event.currentTarget.files ?? []));
     event.currentTarget.value = '';

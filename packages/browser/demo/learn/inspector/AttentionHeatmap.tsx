@@ -47,14 +47,17 @@ export function AttentionHeatmap({
     return idx >= 0 ? idx : 0;
   });
   const [selectedHead, setSelectedHead] = React.useState(0);
-  // Reset the layer default whenever a NEW run arrives (compared by object
-  // identity). We deliberately do NOT include selectedLayerIdx in the deps —
-  // if we did, manual selection by the user would be immediately reverted.
+  // Reset only when the user's current selection is no longer a full-attention
+  // layer in the incoming run (e.g. a chapter swapped a 1-layer mock for the
+  // real 24-layer model, or the backend swapped models entirely). If the
+  // selection is still valid we keep it — otherwise typing into the prompt and
+  // clicking Run would silently revert "Layer 7" to "Layer 3" every time.
   React.useEffect(() => {
+    const current = run.attention[selectedLayerIdx];
+    if (current && current.kind === "full") return;
     const idx = run.attention.findIndex((layer) => layer.kind === "full");
     setSelectedLayerIdx(idx >= 0 ? idx : 0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run]);
+  }, [run, selectedLayerIdx]);
   const [hover, setHover] = React.useState<{
     queryIndex: number;
     keyIndex: number;
