@@ -7,16 +7,12 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 
 import { Landing } from '../components/landing/Landing';
+import { triggerLocalPicker } from '../lib/local-model-picker';
 import { useModelLoader } from '../providers/model-loader';
 
 function LandingRouteComponent() {
   const navigate = useNavigate();
   const { hostedModelAvailable, errorBanner, kickoffLoad, status } = useModelLoader();
-
-  const triggerLocalPicker = () => {
-    const input = document.getElementById('model-dir-input') as HTMLInputElement | null;
-    input?.click();
-  };
 
   return (
     <Landing

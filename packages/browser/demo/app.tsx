@@ -2,7 +2,7 @@ import type { ChatStreamChunk, ToolCallResult, ToolDefinition } from '@mlx-node/
 import { ToolCallTagBuffer } from '@mlx-node/lm/tools';
 import { createCodePlugin } from '@streamdown/code';
 import { RouterProvider } from '@tanstack/react-router';
-import { type ChangeEvent, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 
 import { FreeChatProvider, type FreeChatContextValue } from './providers/free-chat';
@@ -25,28 +25,15 @@ import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
 import { type LoadingProgress } from './components/loading/Loading';
 import { BrowserChatSessionAdapter, type BrowserChatMessage } from './lib/browser-chat-session';
 import {
-  type ScreenState,
   type ProfileLikeStats,
+  type ReasoningEffort,
   cycleReasoningEffort,
-  parseScreenFromUrl,
-  reduceScreen,
-  screenToUrlQuery,
 } from './lib/screen-state';
 
-const DEFAULT_INITIAL_SCREEN: ScreenState = { kind: 'landing' };
-
-// useReducer's lazy-init: read the URL once at boot so deep links like
-// /?screen=chapter&chapterId=tokenization land on the right screen directly
-// instead of bouncing through landing. Invalid / transient URLs fall back to
-// landing — see parseScreenFromUrl for the validation rules.
-function getInitialScreen(): ScreenState {
-  return parseScreenFromUrl() ?? DEFAULT_INITIAL_SCREEN;
-}
 import 'streamdown/styles.css';
 import './styles.css';
 
 type StatusState = 'info' | 'ready' | 'error';
-type ReasoningEffort = 'off' | 'low' | 'medium' | 'high';
 const DEFAULT_MODEL_LABEL = 'qwen3.5-0.8b-mlx-bf16';
 const DEFAULT_MODEL_URL = '/model';
 const MAX_BROWSER_OUTPUT_TOKENS = 36864;
@@ -283,7 +270,6 @@ function App() {
   const initialAppToolsEnabled = initialUrlParams.get('tools') === '1' || initialUrlParams.get('app_preview') === '1';
   const [appToolsEnabled, setAppToolsEnabledState] = useState(initialAppToolsEnabled);
   const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>('off');
-  const [screen, dispatchScreen] = useReducer(reduceScreen, undefined, getInitialScreen);
   const [loadKickoff, setLoadKickoff] = useState(0);
   const [loadingText, setLoadingText] = useState<string | null>(null);
   const [loadingProgress, setLoadingProgress] = useState<LoadingProgress | null>(null);
@@ -348,29 +334,6 @@ function App() {
     modelDirInput.setAttribute('directory', '');
   }, []);
 
-  // URL <-> screen-state bridge — DISABLED in Phase 2.C. TanStack Router now
-  // owns history; running this in parallel would cause the two systems to
-  // fight (router writes pathnames while this rewrote the URL with query
-  // strings). The original body is intentionally absent — Phase 2.D removes
-  // the surrounding screen reducer and its URL helpers entirely. Kept as a
-  // no-op so the `screen`-dep wiring stays adjacent to where it belongs
-  // for cleanup purposes.
-  useEffect(() => {
-    // Intentionally empty — removed in Phase 2.D after RouterProvider mount.
-    void screen;
-    void screenToUrlQuery;
-  }, [screen]);
-
-  // popstate handler — DISABLED in Phase 2.C. TanStack Router subscribes to
-  // popstate internally; the legacy `restore` reducer event no longer drives
-  // rendering, so listening here would only confuse the surviving reducer
-  // state. Phase 2.D removes this effect entirely.
-  useEffect(() => {
-    // Intentionally empty — removed in Phase 2.D after RouterProvider mount.
-    void parseScreenFromUrl;
-    void DEFAULT_INITIAL_SCREEN;
-  }, []);
-
   useEffect(() => {
     let cancelled = false;
     hasHostedModel(configuredModelUrl).then((available) => {
@@ -381,27 +344,6 @@ function App() {
     };
   }, [configuredModelUrl]);
 
-  // Auto-kick-off the model load when the user enters the learning flow —
-  // either by clicking "Start learning" on the landing, or by opening a
-  // chapter URL directly (bookmark, popstate). Chapter views aren't rendered
-  // until `modelReady === true`; the gate below queues the chapter URL
-  // behind the Loading screen, so without this kickoff the user would stare
-  // at "Initializing model…" forever. We only kickoff once (guarded on
-  // loadKickoff === 0); subsequent screen changes reuse the existing worker.
-  // We skip kickoff if no hosted model is available — that path requires
-  // the user to pick a local model directory and we don't want to auto-open
-  // the directory picker.
-  useEffect(() => {
-    if (loadKickoff !== 0) return;
-    if (screen.kind !== 'chapter' && screen.kind !== 'chapter_index') return;
-    if (hostedModelAvailable === false) return;
-    if (hostedModelAvailable === null) return; // still probing
-    setPendingModelSource(null);
-    setErrorBannerState(null);
-    setLoadingProgress(null);
-    setLoadKickoff(1);
-  }, [screen.kind, loadKickoff, hostedModelAvailable]);
-
   function handleLocalModelInputChange(event: ChangeEvent<HTMLInputElement>) {
     const source = modelSourceFromLocalFiles(Array.from(event.currentTarget.files ?? []));
     event.currentTarget.value = '';
@@ -410,7 +352,6 @@ function App() {
     setErrorBannerState(null);
     setLoadingProgress(null);
     setLoadKickoff((k) => k + 1);
-    dispatchScreen({ type: 'load_kickoff' });
   }
 
   useEffect(() => {
@@ -454,10 +395,8 @@ function App() {
       setLoadingProgress(progress);
       if (state === 'ready') {
         setModelReady(true);
-        dispatchScreen({ type: 'model_ready' });
       } else if (state === 'error') {
         setErrorBannerState(text);
-        dispatchScreen({ type: 'model_error' });
       }
     }
 
@@ -2104,12 +2043,9 @@ function App() {
   const resetChatCallback = useCallback(() => {
     // The chat reset hook is installed on window.__mlxResetChat by the big
     // useEffect once the chat session is established. If present we call it
-    // (clears DOM and history). The legacy screen reducer transition is kept
-    // alive for now — Phase 2.D removes it along with the rest of the dead
-    // reducer wiring. Also navigate back to '/' as the post-reset destination.
+    // (clears DOM and history). Navigate back to '/' as the post-reset destination.
     const resetHook = (window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat;
     if (resetHook) resetHook();
-    dispatchScreen({ type: 'reset_chat' });
     void router.navigate({ to: '/' });
   }, []);
 

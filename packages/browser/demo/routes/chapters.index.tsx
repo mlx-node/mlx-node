@@ -10,6 +10,7 @@ import { useEffect } from 'react';
 
 import { Loading } from '../components/loading/Loading';
 import { ChapterIndex } from '../learn/ChapterIndex';
+import { triggerLocalPicker } from '../lib/local-model-picker';
 import { useModelLoader } from '../providers/model-loader';
 
 function ChaptersIndexRouteComponent() {
@@ -31,11 +32,6 @@ function ChaptersIndexRouteComponent() {
   if (status !== 'ready') {
     return <Loading status={loadingText || null} progress={loadingProgress} />;
   }
-
-  const triggerLocalPicker = () => {
-    const input = document.getElementById('model-dir-input') as HTMLInputElement | null;
-    input?.click();
-  };
 
   return (
     <ChapterIndex

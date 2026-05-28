@@ -10,6 +10,7 @@ import { useEffect } from 'react';
 
 import { Loading } from '../components/loading/Loading';
 import { LessonLayout } from '../learn/LessonLayout';
+import { triggerLocalPicker } from '../lib/local-model-picker';
 import { findChapter } from '../learn/chapters';
 import { AttentionChapterBody, AttentionDemo } from '../learn/chapters/03-attention';
 import { MultiheadGqaChapterBody, MultiheadGqaDemo } from '../learn/chapters/04-multihead-gqa';
@@ -44,11 +45,6 @@ function ChapterRouteComponent() {
   if (status !== 'ready') {
     return <Loading status={loadingText || null} progress={loadingProgress} />;
   }
-
-  const triggerLocalPicker = () => {
-    const input = document.getElementById('model-dir-input') as HTMLInputElement | null;
-    input?.click();
-  };
 
   return (
     <LessonLayout

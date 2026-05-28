@@ -27,10 +27,9 @@ function ChatRouteComponent() {
     kickoffLoad();
   }, [status, hostedModelAvailable, kickoffLoad]);
 
-  // Sentinel for the layout reserved by ChatLayerOverlay (rendered in
-  // __root.tsx). The overlay overlaps everything when visible so the empty
-  // slot below is hidden in practice.
-  return <div className="chat-route-slot" aria-hidden="true" />;
+  // ChatLayerOverlay (in __root.tsx) covers the full viewport when visible;
+  // this route component has nothing else to render.
+  return null;
 }
 
 export const Route = createFileRoute('/chat')({
