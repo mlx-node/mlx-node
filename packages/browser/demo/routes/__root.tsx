@@ -4,6 +4,10 @@
 // query-param SPA (app.tsx) so deep-links continue to work after Phase 2.C
 // migration. Unknown keys are stripped (Zod strips by default on .parse()).
 // Normalization to canonical names happens in Phase 2.B.
+//
+// IMPORTANT: Zod strips unknown keys silently — any new legacy query param
+// consumed by app.tsx MUST be added to searchSchema before Phase 2.C mounts
+// <RouterProvider />, or that param will be lost from the URL after navigation.
 
 import { createRootRoute, Outlet } from '@tanstack/react-router';
 import { z } from 'zod';
@@ -26,9 +30,10 @@ export const searchSchema = z.object({
   temperature: z.coerce.number().min(0).max(2).optional(),
   temp: z.coerce.number().min(0).max(2).optional(),
 
-  // App-preview / tools toggle — legacy aliases: tools, app_preview
-  tools: z.coerce.number().int().min(0).max(1).optional(),
-  app_preview: z.coerce.number().int().min(0).max(1).optional(),
+  // App-preview / tools toggle — legacy aliases: tools, app_preview.
+  // Coerces ?tools=1 / ?tools=true → true, ?tools=0 / ?tools=false → false.
+  tools: z.coerce.number().int().min(0).max(1).transform(v => v === 1).optional(),
+  app_preview: z.coerce.number().int().min(0).max(1).transform(v => v === 1).optional(),
 });
 
 export type RootSearch = z.infer<typeof searchSchema>;

@@ -12,7 +12,12 @@ import { createRouter } from '@tanstack/react-router';
 // It is gitignored and must never be committed.
 import { routeTree } from './routeTree.gen';
 
-export const router = createRouter({ routeTree });
+export const router = createRouter({
+  routeTree,
+  defaultPreload: 'intent',
+  // TODO(phase-2.c): wire defaultErrorComponent and defaultNotFoundComponent
+  // before <RouterProvider /> is mounted in app.tsx.
+});
 
 // Register the router for type safety throughout the app.
 declare module '@tanstack/react-router' {
