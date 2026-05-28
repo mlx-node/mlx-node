@@ -2119,7 +2119,7 @@ __metadata:
     three: "npm:^0.184.0"
     typescript: "npm:^5.7.0"
     vite: "npm:^6.3.0"
-    void: "npm:0.7.5"
+    void: "npm:0.9.0"
   languageName: unknown
   linkType: soft
 
@@ -8207,6 +8207,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"es-module-lexer@npm:^2.1.0":
+  version: 2.1.0
+  resolution: "es-module-lexer@npm:2.1.0"
+  checksum: 10c0/93bcf2454fa72d67fe3ccd0abef8ce7933f5840a319513418a643dd8e9c6aa8f49709cecfae02ded722805dd327232d30723a807cc52e6809d6ac697c62c29fb
+  languageName: node
+  linkType: hard
+
 "es-toolkit@npm:^1.39.7, es-toolkit@npm:^1.41.0":
   version: 1.45.1
   resolution: "es-toolkit@npm:1.45.1"
@@ -12381,9 +12388,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"void@npm:0.7.5":
-  version: 0.7.5
-  resolution: "void@npm:0.7.5"
+"void@npm:0.9.0":
+  version: 0.9.0
+  resolution: "void@npm:0.9.0"
   dependencies:
     "@cloudflare/sandbox": "npm:^0.10.0"
     "@cloudflare/vite-plugin": "npm:^1.36.3"
@@ -12398,13 +12405,14 @@ __metadata:
     drizzle-orm: "npm:^0.45.2"
     drizzle-valibot: "npm:^0.4.2"
     drizzle-zod: "npm:^0.8.3"
+    es-module-lexer: "npm:^2.1.0"
     hono: "npm:^4.12.18"
     ignore: "npm:^7.0.5"
     jsonc-parser: "npm:3.3.1"
     pg: "npm:^8.20.0"
     wrangler: "npm:^4.90.0"
   peerDependencies:
-    "@void/md": 0.7.5
+    "@void/md": 0.9.0
     arktype: ">=2.0.0"
     valibot: ">=1.0.0-beta.7"
     vite: ^8.0.0
@@ -12420,7 +12428,7 @@ __metadata:
       optional: true
   bin:
     void: dist/cli/cli.mjs
-  checksum: 10c0/177f2cdaa55443cbe4161a637d70f1068bbd50eeeaf25aafcb388f25852599f22663cccbd3bf490d1c7df9e08747ecf04e1106d6e0c8a38a31183133591bcc94
+  checksum: 10c0/eb9709dfa455df28f65505fc55a22e78245239050de9be62dc4b0566012d8977c38b41f2ad9a03ac821c30e9d64ab12265be308f384975febbd84f5fab2fca16
   languageName: node
   linkType: hard
 

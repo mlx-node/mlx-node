@@ -40,6 +40,6 @@
     "tailwindcss": "^4.2.4",
     "typescript": "^5.7.0",
     "vite": "^6.3.0",
-    "void": "0.7.5"
+    "void": "0.9.0"
   }
 }
