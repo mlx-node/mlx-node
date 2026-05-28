@@ -126,6 +126,43 @@ function stripChatSpecials(text: string): string {
   return text.slice(0, cut).trimEnd();
 }
 
+/**
+ * Find the byte offset in `joined` where it first diverges from `prompt`.
+ * If `prompt` is fully a prefix of `joined`, returns `prompt.length`.
+ *
+ * Used to dedupe the chat-tuned model's habit of echoing the user's
+ * prompt at the start of its assistant reply. With prompt "The cat sat on
+ * the" and joined reply "The cat sat on the **red rug**, ...", this
+ * returns 18 — the index in the reply where the new content begins.
+ */
+function findDivergeOffset(prompt: string, joined: string): number {
+  const limit = Math.min(prompt.length, joined.length);
+  for (let i = 0; i < limit; i++) {
+    if (prompt[i] !== joined[i]) return i;
+  }
+  return limit;
+}
+
+/**
+ * Given a character offset (from `findDivergeOffset`) and a list of
+ * tokens whose `.text` joins to form the full reply, return the index
+ * of the FIRST token whose content extends past the offset — i.e.
+ * the first "new" token after the prompt echo.
+ *
+ * If the echo aligns exactly on a token boundary (common for chat-tuned
+ * models), this is the index immediately after the last echoed token.
+ * Otherwise it's the token that straddles the divergence point.
+ */
+function findFirstNewTokenIdx(divergeOffset: number, tokens: ReadonlyArray<{ text: string }>): number {
+  if (divergeOffset === 0) return 0;
+  let cumulative = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    cumulative += tokens[i].text.length;
+    if (cumulative > divergeOffset) return i;
+  }
+  return tokens.length;
+}
+
 /** A sub-stage inside one of the 24 layer cards. */
 type SubStage = { id: string; label: string; durationMs: number };
 
@@ -532,6 +569,21 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
       : run.generatedToken.text
     : '';
   const generatedReplyRaw = stripChatSpecials(generatedReplyRawJoined);
+  // Dedupe the prompt-echo prefix. Chat-tuned Qwen3.5 routinely starts
+  // its assistant reply by repeating the user's input verbatim before
+  // adding new content; the diagram should focus on the "new" portion,
+  // not the echo. `divergeOffset` is the index in the joined reply
+  // where it first stops matching the prompt — everything before that
+  // is the echo, everything from there on is new.
+  const divergeOffset = run ? findDivergeOffset(run.prompt, generatedReplyRawJoined) : 0;
+  const firstNewTokenIdx =
+    run && run.generatedTokens && run.generatedTokens.length > 0
+      ? findFirstNewTokenIdx(divergeOffset, run.generatedTokens)
+      : 0;
+  const firstNewTokenInfo =
+    run && run.generatedTokens && run.generatedTokens.length > 0
+      ? (run.generatedTokens[firstNewTokenIdx] ?? run.generatedToken)
+      : run?.generatedToken;
   // Token count for the visible portion of the reply. We walk the
   // generatedTokens array and stop at the first token whose text contains
   // a special-turn marker — matching the same stripping logic above so
@@ -546,20 +598,31 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
     }
     return toks.length;
   })();
+  // Number of "new" tokens — tokens past the prompt-echo prefix. Used in
+  // the reveal caption ("N new tokens") so the count reflects what the
+  // learner actually sees.
+  const newTokenCount = Math.max(0, visibleTokenCount - firstNewTokenIdx);
   // For the multi-token reply we want BPE cleanup (Ġ → space, leading-space
   // dot, newline glyphs) WITHOUT the 17-char truncation that
   // `renderTokenDisplay` enforces for single-token chips. Inline the
   // cleanup so the full sentence renders.
   const generatedReplyDisplay = run ? cleanupTokenText(generatedReplyRaw) : '';
-  // For the FIRST-token highlight we keep the truncated single-token helper
-  // so a long single token still fits in the chip width.
-  const generatedTokenText = run ? renderTokenDisplay(run.generatedToken.text) : '';
-  // The "rest" of the reply (after the highlighted first token) needs a
-  // matching cleanup — single-token-truncated `generatedTokenText` and
-  // full-reply `generatedReplyDisplay` use different rules, so we can't
-  // just `.slice()` one against the other. Build the rest from a
-  // cleaned-but-not-truncated first token instead.
-  const generatedTokenTextFull = run ? cleanupTokenText(run.generatedToken.text) : '';
+  // The deduped reply — everything past the prompt echo. This is what we
+  // show in the bottom reveal as the model's "new" contribution; if the
+  // model didn't echo (divergeOffset === 0) it's identical to the full
+  // reply.
+  const dedupedReplyRaw = run ? stripChatSpecials(generatedReplyRawJoined.slice(divergeOffset)) : '';
+  const dedupedReplyDisplay = run ? cleanupTokenText(dedupedReplyRaw) : '';
+  // The echoed prefix (for muted-tone rendering in the reveal). Empty
+  // when there's no echo.
+  const echoedPrefixDisplay =
+    run && divergeOffset > 0 ? cleanupTokenText(generatedReplyRawJoined.slice(0, divergeOffset)) : '';
+  // For the FIRST-NEW-token highlight (rainbow chip in the ghost overlay
+  // and the reveal). Truncated to 17 chars for single-token chip widths.
+  const firstNewTokenText = firstNewTokenInfo ? renderTokenDisplay(firstNewTokenInfo.text) : '';
+  // Full-length (untruncated) form, used as the anchor for slicing the
+  // "rest" of the deduped reply in the bottom reveal.
+  const firstNewTokenTextFull = firstNewTokenInfo ? cleanupTokenText(firstNewTokenInfo.text) : '';
   const showTokenReveal = (status.kind === 'replaying' && activeStage === 'sampling') || status.kind === 'done';
 
   return (
@@ -609,7 +672,12 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
                   className="pointer-events-none absolute inset-0 z-0 whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 font-mono text-sm text-transparent"
                 >
                   {prompt}
-                  <span className="rainbow-text-animated font-mono text-sm">{generatedReplyDisplay}</span>
+                  {/* Single-token ghost: just the first "new" token (i.e.
+                      the first token past the prompt-echo prefix). Showing
+                      the whole multi-token reply here turned the prompt
+                      box into a wall of text and visually duplicated the
+                      user's input — both fixed by reducing to one chip. */}
+                  <span className="rainbow-text-animated font-mono text-sm">{firstNewTokenTextFull}</span>
                 </div>
               ) : null}
             </div>
@@ -691,10 +759,12 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
           activeLayer={activeLayer}
           fullAttentionLayerIndices={fullAttentionLayerIndices}
           onOpenChapter={onOpenChapter}
-          generatedTokenText={generatedTokenText}
-          generatedTokenTextFull={generatedTokenTextFull}
-          generatedReplyDisplay={generatedReplyDisplay}
-          generatedTokenCount={visibleTokenCount}
+          firstNewTokenText={firstNewTokenText}
+          firstNewTokenTextFull={firstNewTokenTextFull}
+          dedupedReplyDisplay={dedupedReplyDisplay}
+          echoedPrefixDisplay={echoedPrefixDisplay}
+          visibleTokenCount={visibleTokenCount}
+          newTokenCount={newTokenCount}
           showTokenReveal={showTokenReveal}
           reducedMotion={reducedMotion}
         />
@@ -717,19 +787,26 @@ type StageStackProps = {
   activeLayer: { kind: 'layer'; index: number; subId: string } | null;
   fullAttentionLayerIndices: Set<number>;
   onOpenChapter: (chapterId: string) => void;
-  /** The first generated token, used for the highlighted lead-in of the
-   *  reply reveal. Truncated to 17 chars + ellipsis for chip width. */
-  generatedTokenText: string;
-  /** The first generated token with BPE cleanup but NO length truncation.
-   *  Used as the anchor for slicing `generatedReplyDisplay` so the "rest"
-   *  of the reply is computed against matching transform rules. */
-  generatedTokenTextFull: string;
-  /** The full assistant reply (all generated tokens joined and display-
-   *  escaped, no truncation). Includes the first token at the start. */
-  generatedReplyDisplay: string;
-  /** Number of tokens generated for the reply (1 if only the next-token
-   *  contract was used). */
-  generatedTokenCount: number;
+  /** The first "new" generated token (past the prompt-echo prefix),
+   *  used for the highlighted lead-in of the reply reveal. Truncated to
+   *  17 chars + ellipsis for chip width. */
+  firstNewTokenText: string;
+  /** Same first-new token with BPE cleanup but NO length truncation;
+   *  used as the slice anchor against `dedupedReplyDisplay` so the
+   *  "rest" of the reply is computed against matching transform rules. */
+  firstNewTokenTextFull: string;
+  /** The assistant reply with the prompt-echo prefix stripped (BPE-
+   *  cleaned, special-token markers cut). When the model didn't echo
+   *  the prompt this is identical to the full reply. */
+  dedupedReplyDisplay: string;
+  /** The portion of the reply that echoed the prompt (BPE-cleaned).
+   *  Rendered muted before the rainbow continuation so the learner can
+   *  see what the model literally echoed back. Empty when no echo. */
+  echoedPrefixDisplay: string;
+  /** Total number of model-generated tokens minus chat-template specials. */
+  visibleTokenCount: number;
+  /** Number of "new" tokens — tokens past the prompt-echo prefix. */
+  newTokenCount: number;
   showTokenReveal: boolean;
   reducedMotion: boolean;
 };
@@ -758,10 +835,12 @@ function StageStack({
   activeLayer,
   fullAttentionLayerIndices,
   onOpenChapter,
-  generatedTokenText,
-  generatedTokenTextFull,
-  generatedReplyDisplay,
-  generatedTokenCount,
+  firstNewTokenText,
+  firstNewTokenTextFull,
+  dedupedReplyDisplay,
+  echoedPrefixDisplay,
+  visibleTokenCount,
+  newTokenCount,
   showTokenReveal,
   reducedMotion,
 }: StageStackProps) {
@@ -853,14 +932,18 @@ function StageStack({
             />
           ))}
 
-          {/* Generated-reply reveal — only shown once we're at or past the
-              sampling stage. Shows the *full assistant reply* (joined from
-              `run.generatedTokens`) so the chat-template demo doesn't dead-
-              end on a lonely "The" or "Hello" scaffold token. The first
-              token is highlighted because that's the literal "next token"
-              the one captured forward pass produced; the rest are decode
-              steps that follow without per-layer capture, included for
-              pedagogical clarity. */}
+          {/* Generated-reply reveal. Three layered pieces:
+                1. Echoed prefix (muted) — chat-tuned models often start
+                   their reply by repeating the user's input. Showing it
+                   greyed-out makes the echo legible while keeping the
+                   focus on the model's new contribution.
+                2. First "new" token highlighted in rainbow — the
+                   pedagogically interesting "next token" that isn't
+                   just an echo of the prompt.
+                3. Rest of the new reply in normal foreground tone.
+              When the model doesn't echo at all, piece 1 is empty and
+              the reveal degenerates to the original "first token rainbow
+              + rest muted" structure. */}
           <div
             className="mt-2 flex flex-col items-center gap-1 transition-opacity duration-300"
             style={{ opacity: showTokenReveal ? 1 : 0 }}
@@ -871,19 +954,17 @@ function StageStack({
               className="max-w-[42rem] rounded-md border border-primary/60 bg-primary/10 px-3 py-1.5 text-center font-mono text-sm font-semibold text-foreground"
               data-stage-id="generated-reply"
             >
-              <span className="rainbow-text-animated">{generatedTokenText || '…'}</span>
-              {generatedTokenCount > 1 && generatedReplyDisplay !== generatedTokenTextFull ? (
-                // Use the un-truncated single-token cleanup as the
-                // anchor for the slice — `generatedTokenText` may end
-                // with an ellipsis if the first token is unusually
-                // long, which would make `.slice()` chop the wrong
-                // amount off the reply.
-                <span className="text-foreground/80">{generatedReplyDisplay.slice(generatedTokenTextFull.length)}</span>
+              {echoedPrefixDisplay ? <span className="text-muted-foreground/60">{echoedPrefixDisplay}</span> : null}
+              <span className="rainbow-text-animated">{firstNewTokenText || '…'}</span>
+              {newTokenCount > 1 && dedupedReplyDisplay !== firstNewTokenTextFull ? (
+                <span className="text-foreground/80">{dedupedReplyDisplay.slice(firstNewTokenTextFull.length)}</span>
               ) : null}
             </span>
             <span className="font-mono text-[10px] text-muted-foreground/70">
-              first token highlighted · {generatedTokenCount} token
-              {generatedTokenCount === 1 ? '' : 's'} total
+              {echoedPrefixDisplay ? 'first new token highlighted · ' : 'first token highlighted · '}
+              {newTokenCount} new
+              {visibleTokenCount > newTokenCount ? ` / ${visibleTokenCount} total` : ''} token
+              {newTokenCount === 1 ? '' : 's'}
             </span>
           </div>
         </div>
