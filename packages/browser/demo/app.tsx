@@ -2080,7 +2080,7 @@ function App() {
       kickoffLoad,
       resetForModelLoad: resetForModelLoadCallback,
     };
-  }, [errorBanner, modelReady, loadKickoff, hostedModelAvailable, loadingText, loadingProgress, modelLine, kickoffLoad, resetForModelLoadCallback]);
+  }, [errorBanner, modelReady, loadKickoff, hostedModelAvailable, loadingText, loadingProgress, modelLine, resetForModelLoadCallback]);
 
   const setTemperatureCallback = useCallback((v: number) => {
     temperatureValueRef.current = v;
@@ -2135,9 +2135,9 @@ function App() {
 
   return (
     <ModelLoaderProvider value={modelLoaderValue}>
-    <FreeChatProvider value={freeChatValue}>
-    <TelemetryProvider value={telemetryValue}>
-    <div className="app-root">
+      <FreeChatProvider value={freeChatValue}>
+        <TelemetryProvider value={telemetryValue}>
+          <div className="app-root">
       <div className={`chat-layer ${screen.kind === 'chat' ? 'visible' : ''}`}>
         <div className="app-shell">
           <ChatHeader
@@ -2391,9 +2391,9 @@ function App() {
         );
       })()}
       {screen.kind === 'loading' && <Loading status={loadingText} progress={loadingProgress} />}
-    </div>
-    </TelemetryProvider>
-    </FreeChatProvider>
+          </div>
+        </TelemetryProvider>
+      </FreeChatProvider>
     </ModelLoaderProvider>
   );
 }
