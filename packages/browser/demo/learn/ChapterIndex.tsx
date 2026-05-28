@@ -588,12 +588,20 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
                   className="pointer-events-none absolute inset-0 z-0 whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 font-mono text-sm text-transparent"
                 >
                   {prompt}
-                  {/* Single-token ghost: just the first "new" token (i.e.
-                      the first token past the prompt-echo prefix). Showing
-                      the whole multi-token reply here turned the prompt
-                      box into a wall of text and visually duplicated the
-                      user's input — both fixed by reducing to one chip. */}
+                  {/* Multi-token ghost: the FIRST new token gets the rainbow
+                      shimmer (drawing the learner's eye to "this is the model's
+                      next prediction"), and the rest of the deduped reply is
+                      rendered in muted gray so the learner can see the full
+                      completion as a faint continuation — like a Copilot
+                      ghost-text completion. The prompt itself stays invisible
+                      (text-transparent on the wrapper) so it lines up under
+                      the textarea text. */}
                   <span className="rainbow-text-animated font-mono text-sm">{firstNewTokenTextFull}</span>
+                  {dedupedReplyDisplay.length > firstNewTokenTextFull.length ? (
+                    <span className="font-mono text-sm text-muted-foreground/60">
+                      {dedupedReplyDisplay.slice(firstNewTokenTextFull.length)}
+                    </span>
+                  ) : null}
                 </div>
               ) : null}
             </div>

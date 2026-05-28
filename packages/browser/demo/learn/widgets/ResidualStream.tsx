@@ -55,10 +55,18 @@ export function ResidualStream() {
   }, [playing]);
 
   const W = 520;
-  const H = 360;
+  // 400 / 30 px stream-top headroom — earlier values of H=360, topY=30 put
+  // the lm_head box (y=topY-14 to topY+16 ⇒ 16..46) at exactly the same y
+  // as the h4 tick at the top of the fully-filled stream (h4 height=60,
+  // tick y = baseY-300 = 30), so the box visually swallowed the tick label
+  // and the stream column poked through the box's interior. Bumping H to
+  // 400 + topY to 20 gives a clean ~34px gap between the lm_head box
+  // bottom (y=36) and the h4 tick (y=70), and the arrow from stream top
+  // into lm_head now has visible length (~30px).
+  const H = 400;
   const streamX = 200;
   const baseY = H - 30;
-  const topY = 30;
+  const topY = 20;
   const streamW = 28;
 
   // Cumulative height at each step (after k writes have happened). step=0
