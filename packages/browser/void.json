@@ -28,7 +28,7 @@
       ]
     },
     "fallbacks": {
-      "/*": "/"
+      "/*": "/index.html"
     }
   },
   "worker": {
