@@ -19,6 +19,7 @@
     "@mlx-node/lm": "workspace:*",
     "@napi-rs/wasm-runtime": "^1.1.2",
     "@streamdown/code": "^1.1.1",
+    "@tanstack/react-router": "^1.170.8",
     "buffer": "^6.0.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -29,10 +30,12 @@
     "react-dom": "^19.2.5",
     "streamdown": "^2.5.0",
     "tailwind-merge": "^3.5.0",
-    "three": "^0.184.0"
+    "three": "^0.184.0",
+    "zod": "^3.25.28"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.4",
+    "@tanstack/router-plugin": "^1.168.11",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@types/three": "^0.184.0",

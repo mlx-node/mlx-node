@@ -1,1 +1,5 @@
 /.vitest-attachments
+# TanStack Router generated route tree (build artifact)
+/demo/routeTree.gen.ts
+# TanStack Router plugin temp directory
+/.tanstack/
