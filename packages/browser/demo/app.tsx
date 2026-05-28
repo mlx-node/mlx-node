@@ -28,7 +28,7 @@ import {
   type ProfileLikeStats,
   type ReasoningEffort,
   cycleReasoningEffort,
-} from './lib/screen-state';
+} from './lib/display-helpers';
 
 import 'streamdown/styles.css';
 import './styles.css';
@@ -2142,15 +2142,6 @@ function App() {
             <input ref={temperatureInputRef} type="hidden" defaultValue={initialTemperature} />
             <input ref={maxOutputTokensInputRef} type="hidden" defaultValue={initialMaxOutputTokens} />
 
-            {/*
-              Phase 2.C: the entire screen-switch block previously living here
-              was migrated into route components under demo/routes. The router
-              now owns history; the chat-layer overlay is mounted from
-              __root.tsx as a sibling to <Outlet />. The legacy `screen`
-              reducer is kept alive for now (transition events still fire from
-              the big useEffect) but no one reads `screen.kind` for rendering.
-              Phase 2.D will remove the reducer and its imports.
-            */}
             <RouterProvider router={router} />
           </div>
         </TelemetryProvider>

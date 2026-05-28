@@ -1,4 +1,4 @@
-import { type ProfileLikeStats, formatTelemetry } from "../../lib/screen-state";
+import { type ProfileLikeStats, formatTelemetry } from "../../lib/display-helpers";
 
 export type TelemetryStripProps = {
   stats: ProfileLikeStats | null;

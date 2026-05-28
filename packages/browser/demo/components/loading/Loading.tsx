@@ -1,4 +1,4 @@
-import { formatLoadingText } from "../../lib/screen-state";
+import { formatLoadingText } from "../../lib/display-helpers";
 
 export type LoadingProgress = {
   pct: number;

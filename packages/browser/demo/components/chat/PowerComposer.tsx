@@ -1,7 +1,7 @@
 import { ArrowUp, ImagePlus, Mic } from "lucide-react";
 import { type FormEvent, type RefObject } from "react";
 
-import { type ReasoningEffort } from "../../lib/screen-state";
+import { type ReasoningEffort } from "../../lib/display-helpers";
 
 import { PillStepper } from "./PillStepper";
 

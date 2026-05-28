@@ -1,5 +1,5 @@
 import * as React from 'react';
-import type { ProfileLikeStats } from '../lib/screen-state';
+import type { ProfileLikeStats } from '../lib/display-helpers';
 
 export type { ProfileLikeStats };
 
