@@ -1,8 +1,12 @@
 import type { ChatStreamChunk, ToolCallResult, ToolDefinition } from '@mlx-node/core';
 import { ToolCallTagBuffer } from '@mlx-node/lm/tools';
 import { createCodePlugin } from '@streamdown/code';
-import { type ChangeEvent, useEffect, useReducer, useRef, useState } from 'react';
+import { type ChangeEvent, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+
+import { FreeChatProvider, type FreeChatContextValue } from './providers/free-chat';
+import { ModelLoaderProvider, type ModelLoaderContextValue } from './providers/model-loader';
+import { TelemetryProvider, type TelemetryContextValue } from './providers/telemetry';
 import { Streamdown } from 'streamdown';
 
 import { createSabRingOverHeap } from '../src/chat-stream-sab.js';
@@ -2045,7 +2049,94 @@ function App() {
     };
   }, [configuredModelLabel, configuredModelUrl, loadKickoff, pendingModelSource]);
 
+  const kickoffLoad = useCallback(() => {
+    setLoadKickoff((k) => k + 1);
+  }, []);
+
+  // resetForModelLoad is defined inside the useEffect above, but the providers
+  // only need a stable no-op reference at the React level — the real call
+  // goes through the effect's closure. Expose a stable identity here for
+  // context consumers that call it as a callback (Phase 2.C).
+  const resetForModelLoadCallback = useCallback((_label?: string) => {
+    // Intentionally empty: the real resetForModelLoad lives inside the
+    // big useEffect and is not accessible as a React-level callback.
+    // Phase 2.C route components should trigger it through kickoffLoad +
+    // state setters rather than calling this directly.
+  }, []);
+
+  const modelLoaderValue = useMemo<ModelLoaderContextValue>(() => {
+    const status =
+      errorBanner != null ? 'error'
+      : modelReady ? 'ready'
+      : loadKickoff > 0 || hostedModelAvailable === true ? 'loading'
+      : 'idle';
+    return {
+      status,
+      loadingText: loadingText ?? '',
+      loadingProgress,
+      modelLine,
+      errorBanner,
+      hostedModelAvailable,
+      kickoffLoad,
+      resetForModelLoad: resetForModelLoadCallback,
+    };
+  }, [errorBanner, modelReady, loadKickoff, hostedModelAvailable, loadingText, loadingProgress, modelLine, kickoffLoad, resetForModelLoadCallback]);
+
+  const setTemperatureCallback = useCallback((v: number) => {
+    temperatureValueRef.current = v;
+    setTemperatureValue(v);
+    if (temperatureInputRef.current) temperatureInputRef.current.value = `${v}`;
+  }, []);
+
+  const setMaxTokensCallback = useCallback((v: number) => {
+    maxTokensValueRef.current = v;
+    setMaxTokensValue(v);
+    if (maxOutputTokensInputRef.current) maxOutputTokensInputRef.current.value = `${v}`;
+  }, []);
+
+  const setToolsEnabledCallback = useCallback((v: boolean) => {
+    setAppToolsEnabledState(v);
+    appToolsEnabledRef.current = v;
+  }, []);
+
+  const cycleReasoningCallback = useCallback(() => {
+    const next = cycleReasoningEffort(reasoningEffort);
+    reasoningEffortRef.current = next;
+    setReasoningEffortState(next);
+  }, [reasoningEffort]);
+
+  // handleSend is defined inside the useEffect; expose a stable no-op here.
+  // Phase 2.C consumers drive send through the prompt textarea + DOM events.
+  const sendMessageCallback = useCallback(() => {
+    // Intentionally empty: the real handleSend lives inside the big useEffect.
+  }, []);
+
+  const freeChatValue = useMemo<FreeChatContextValue>(() => ({
+    temperature: temperatureValue,
+    maxTokens: maxTokensValue,
+    toolsEnabled: appToolsEnabled,
+    reasoningEffort,
+    generating,
+    setTemperature: setTemperatureCallback,
+    setMaxTokens: setMaxTokensCallback,
+    setToolsEnabled: setToolsEnabledCallback,
+    cycleReasoning: cycleReasoningCallback,
+    sendMessage: sendMessageCallback,
+    promptRef,
+    chatRef,
+  }), [temperatureValue, maxTokensValue, appToolsEnabled, reasoningEffort, generating, setTemperatureCallback, setMaxTokensCallback, setToolsEnabledCallback, cycleReasoningCallback, sendMessageCallback, promptRef, chatRef]);
+
+  const telemetryValue = useMemo<TelemetryContextValue>(() => ({
+    stats: telemetryStats,
+    prefillTokensPerSecond: prefillTokensPerSec,
+    decodeTokensPerSecond: decodeTokensPerSec,
+    modelLine,
+  }), [telemetryStats, prefillTokensPerSec, decodeTokensPerSec, modelLine]);
+
   return (
+    <ModelLoaderProvider value={modelLoaderValue}>
+    <FreeChatProvider value={freeChatValue}>
+    <TelemetryProvider value={telemetryValue}>
     <div className="app-root">
       <div className={`chat-layer ${screen.kind === 'chat' ? 'visible' : ''}`}>
         <div className="app-shell">
@@ -2301,6 +2392,9 @@ function App() {
       })()}
       {screen.kind === 'loading' && <Loading status={loadingText} progress={loadingProgress} />}
     </div>
+    </TelemetryProvider>
+    </FreeChatProvider>
+    </ModelLoaderProvider>
   );
 }
 
