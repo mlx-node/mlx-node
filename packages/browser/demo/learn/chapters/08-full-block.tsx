@@ -1,21 +1,21 @@
-import * as React from "react";
-import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import * as React from 'react';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
-import { Button } from "../../components/ui/button";
-import { Textarea } from "../../components/ui/textarea";
-import type {
-  AttentionRun,
-  HiddenStatePointStats,
-  HiddenStateStep,
-} from "../../../src/inspector-types";
-import { runForInspector } from "../../lib/inspector-client";
-import { DemoCallout } from "../inspector/DemoCallout";
-import { Prose } from "../Prose";
-import { ChapterFrame } from "../scaffolding/ChapterFrame";
-import type { ChapterLearningData } from "../scaffolding/learning-data";
+import type { AttentionRun, HiddenStatePointStats, HiddenStateStep } from '../../../src/inspector-types';
+import { Button } from '../../components/ui/button';
+import { Textarea } from '../../components/ui/textarea';
+import { runForInspector } from '../../lib/inspector-client';
+import { DemoCallout } from '../inspector/DemoCallout';
+import { Prose } from '../Prose';
+import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import type { ChapterLearningData } from '../scaffolding/learning-data';
+import { MathDisplay } from '../scaffolding/MathDisplay';
+import { RunButton } from '../scaffolding/RunButton';
+import { useRunFlash } from '../scaffolding/useRunFlash';
+import { StackCollapsedView } from '../widgets/StackCollapsedView';
 
-const DEFAULT_PROMPT = "A transformer stacks the same block many times.";
+const DEFAULT_PROMPT = 'A transformer stacks the same block many times.';
 const DEFAULT_NUM_LAYERS = 24;
 // Qwen3.5-0.8B; matches the model's hidden_size.
 const HIDDEN_DIM = 1024;
@@ -23,25 +23,25 @@ const HIDDEN_DIM = 1024;
 const FULL_ATTN_INTERVAL = 4;
 
 const CAPTURE_POINTS = [
-  "pre_attn_input",
-  "post_attn_norm",
-  "attn_output",
-  "post_attn_residual",
-  "post_mlp_norm",
-  "mlp_output",
-  "post_mlp_residual",
+  'pre_attn_input',
+  'post_attn_norm',
+  'attn_output',
+  'post_attn_residual',
+  'post_mlp_norm',
+  'mlp_output',
+  'post_mlp_residual',
 ] as const;
 
 type CapturePoint = (typeof CAPTURE_POINTS)[number];
 
 const POINT_LABELS: Record<CapturePoint, string> = {
-  pre_attn_input: "Layer input",
-  post_attn_norm: "After pre-attn RMSNorm",
-  attn_output: "Attention output",
-  post_attn_residual: "After attn residual",
-  post_mlp_norm: "After pre-MLP RMSNorm",
-  mlp_output: "MLP output",
-  post_mlp_residual: "Layer output",
+  pre_attn_input: 'Layer input',
+  post_attn_norm: 'After pre-attn RMSNorm',
+  attn_output: 'Attention output',
+  post_attn_residual: 'After attn residual',
+  post_mlp_norm: 'After pre-MLP RMSNorm',
+  mlp_output: 'MLP output',
+  post_mlp_residual: 'Layer output',
 };
 
 /**
@@ -50,46 +50,45 @@ const POINT_LABELS: Record<CapturePoint, string> = {
  * `chapterId` must match `CHAPTERS[7].id` in `learn/chapters.ts`.
  */
 export const learning: ChapterLearningData = {
-  chapterId: "full-block",
-  objective:
-    "Read a transformer layer end-to-end: pre-norm, attention, residual, pre-norm, MLP, residual, repeat.",
+  chapterId: 'full-block',
+  objective: 'Read a transformer layer end-to-end: pre-norm, attention, residual, pre-norm, MLP, residual, repeat.',
   problem:
-    "Each sub-block was introduced in isolation; you still need to see how they wire together and how the stack composes.",
+    'Each sub-block was introduced in isolation; you still need to see how they wire together and how the stack composes.',
   minutes: 7,
   glossary: [
     {
-      term: "decoder layer",
+      term: 'decoder layer',
       definition:
-        "One pre-norm block: x_attn = x + Attention(RMSNorm(x)); x_out = x_attn + MLP(RMSNorm(x_attn)). Qwen3.5-0.8B stacks 24 of these.",
+        'One pre-norm block: x_attn = x + Attention(RMSNorm(x)); x_out = x_attn + MLP(RMSNorm(x_attn)). Qwen3.5-0.8B stacks 24 of these.',
     },
     {
-      term: "residual stream",
+      term: 'residual stream',
       definition:
-        "The un-normalized hidden state running the full depth of the tower. Every block reads from it and writes a delta back.",
+        'The un-normalized hidden state running the full depth of the tower. Every block reads from it and writes a delta back.',
     },
     {
-      term: "sub-block",
+      term: 'sub-block',
       definition:
-        "Either attention or the MLP. Each layer contains exactly two sub-blocks, each wrapped in its own norm + residual.",
+        'Either attention or the MLP. Each layer contains exactly two sub-blocks, each wrapped in its own norm + residual.',
     },
     {
-      term: "hybrid attention",
+      term: 'hybrid attention',
       definition:
         "Qwen3.5's recipe: every fourth layer uses softmax attention, the rest use a linear variant (GatedDeltaNet).",
     },
     {
-      term: "linear attention",
+      term: 'linear attention',
       definition:
-        "An approximate attention that runs in fixed memory per token. Trades some exact-recall for very cheap long-context decode.",
+        'An approximate attention that runs in fixed memory per token. Trades some exact-recall for very cheap long-context decode.',
     },
     {
-      term: "capture point",
+      term: 'capture point',
       definition:
-        "A named place inside a layer (pre_attn_input, mlp_output, ...) where the inspector reads activation stats out.",
+        'A named place inside a layer (pre_attn_input, mlp_output, ...) where the inspector reads activation stats out.',
     },
   ],
   takeaways: [
-    "Every layer is the same shape — two pre-norm + sub-block + residual pairs — and that shape stacks 24 times.",
+    'Every layer is the same shape — two pre-norm + sub-block + residual pairs — and that shape stacks 24 times.',
     "Residual stream magnitude grows with depth even though each individual sub-block's output stays small.",
     "Qwen3.5 isn't pure transformer — only 6 of its 24 layers use softmax attention; the rest run linear attention.",
   ],
@@ -101,60 +100,59 @@ export const learning: ChapterLearningData = {
   },
   quiz: [
     {
-      id: "q1-block-order",
-      prompt: "In a Qwen3.5 layer (pre-norm), what is the actual order of operations?",
+      id: 'q1-block-order',
+      prompt: 'In a Qwen3.5 layer (pre-norm), what is the actual order of operations?',
       options: [
         {
-          id: "a",
-          label:
-            "RMSNorm -> Attention -> add to residual; RMSNorm -> MLP -> add to residual.",
+          id: 'a',
+          label: 'RMSNorm -> Attention -> add to residual; RMSNorm -> MLP -> add to residual.',
         },
         {
-          id: "b",
-          label: "Attention -> RMSNorm -> MLP -> RMSNorm -> residual at the end.",
+          id: 'b',
+          label: 'Attention -> RMSNorm -> MLP -> RMSNorm -> residual at the end.',
         },
         {
-          id: "c",
-          label: "Attention -> MLP -> single RMSNorm at the end.",
+          id: 'c',
+          label: 'Attention -> MLP -> single RMSNorm at the end.',
         },
       ],
-      correctId: "a",
+      correctId: 'a',
       explanation:
-        "Pre-norm wraps each sub-block individually. Each sub-block writes its result back into the un-normalized residual stream.",
+        'Pre-norm wraps each sub-block individually. Each sub-block writes its result back into the un-normalized residual stream.',
     },
     {
-      id: "q2-hybrid-full",
+      id: 'q2-hybrid-full',
       prompt: "How many of Qwen3.5-0.8B's 24 layers use the softmax attention you read about in chapter 3?",
       options: [
-        { id: "a", label: "All 24." },
-        { id: "b", label: "6 — one in every four." },
-        { id: "c", label: "12 — every other layer." },
+        { id: 'a', label: 'All 24.' },
+        { id: 'b', label: '6 — one in every four.' },
+        { id: 'c', label: '12 — every other layer.' },
       ],
-      correctId: "b",
+      correctId: 'b',
       explanation:
-        "Layers 3, 7, 11, 15, 19, 23 are full softmax attention. The 18 others run GatedDeltaNet linear attention.",
+        'Layers 3, 7, 11, 15, 19, 23 are full softmax attention. The 18 others run GatedDeltaNet linear attention.',
     },
     {
-      id: "q3-residual-grows",
-      prompt: "Why does the per-token L2 of the residual stream grow as you scan up the tower?",
+      id: 'q3-residual-grows',
+      prompt: 'Why does the per-token L2 of the residual stream grow as you scan up the tower?',
       options: [
         {
-          id: "a",
+          id: 'a',
           label:
-            "Each layer adds its sub-block outputs into the residual stream; magnitudes accumulate even though each individual write is small.",
+            'Each layer adds its sub-block outputs into the residual stream; magnitudes accumulate even though each individual write is small.',
         },
         {
-          id: "b",
-          label: "Later layers use larger learned gains in RMSNorm.",
+          id: 'b',
+          label: 'Later layers use larger learned gains in RMSNorm.',
         },
         {
-          id: "c",
-          label: "The model upcasts to higher precision at deeper layers.",
+          id: 'c',
+          label: 'The model upcasts to higher precision at deeper layers.',
         },
       ],
-      correctId: "a",
+      correctId: 'a',
       explanation:
-        "The residual stream is a sum of additions, never overwrites. Even small contributions compound across 24 layers.",
+        'The residual stream is a sum of additions, never overwrites. Even small contributions compound across 24 layers.',
     },
   ],
 };
@@ -163,111 +161,92 @@ export function FullBlockChapterBody() {
   return (
     <ChapterFrame learning={learning}>
       <Prose>
-      <h1>The full transformer block</h1>
-      <p>
-        The last five chapters introduced individual ingredients — attention,
-        multi-head &amp; GQA, RoPE, RMSNorm, the gated MLP — as if each lived
-        in isolation. They do not. Every one of Qwen3.5-0.8B's 24 decoder
-        layers stitches them together in the <em>same</em> fixed pattern, then
-        the model stacks that pattern 24 times. This chapter zooms out: one
-        layer as a whole, and a stack of them as a tower.
-      </p>
+        <h1>The full transformer block</h1>
+        <p>
+          The last five chapters introduced individual ingredients — attention, multi-head &amp; GQA, RoPE, RMSNorm, the
+          gated MLP — as if each lived in isolation. They do not. Every one of Qwen3.5-0.8B's 24 decoder layers stitches
+          them together in the <em>same</em> fixed pattern, then the model stacks that pattern 24 times. This chapter
+          zooms out: one layer as a whole, and a stack of them as a tower.
+        </p>
 
-      <h2>Pre-norm: norm, sub-block, residual</h2>
-      <p>
-        Qwen3.5 follows the modern <strong>pre-norm</strong> recipe. Inside
-        each layer there are two sub-blocks (attention and MLP), and each is
-        wrapped the same way: normalize the input, run the sub-block on the
-        normalized copy, add the result back into the residual stream.
-      </p>
-      <pre>
-        <code>{`x_attn = x + Attention(RMSNorm(x))
-x_out  = x_attn + MLP(RMSNorm(x_attn))`}</code>
-      </pre>
-      <p>
-        Two RMSNorms, two residual adds, one attention, one MLP — that is the
-        full layer. The 3D widget below shows it as a tall, narrow tower:
-        the residual stream runs from bottom to top, and each "ring" you can
-        see in the tower is one of those 24 layers.
-      </p>
+        <h2>Pre-norm: norm, sub-block, residual</h2>
+        <p>
+          Qwen3.5 follows the modern <strong>pre-norm</strong> recipe. Inside each layer there are two sub-blocks
+          (attention and MLP), and each is wrapped the same way: normalize the input, run the sub-block on the
+          normalized copy, add the result back into the residual stream.
+        </p>
+        <MathDisplay
+          latex={String.raw`\begin{aligned} x_\text{attn} &= x + \text{Attention}\bigl(\text{RMSNorm}(x)\bigr) \\ x_\text{out} &= x_\text{attn} + \text{MLP}\bigl(\text{RMSNorm}(x_\text{attn})\bigr) \end{aligned}`}
+        />
+        <p>
+          Two RMSNorms, two residual adds, one attention, one MLP — that is the full layer. The 3D widget below shows it
+          as a tall, narrow tower: the residual stream runs from bottom to top, and each "ring" you can see in the tower
+          is one of those 24 layers.
+        </p>
 
-      <h2>What each piece contributes</h2>
-      <ul>
-        <li>
-          <strong>Attention</strong> (chapter 3) — the only place in the layer
-          where information moves <em>across tokens</em>. Without it, every
-          position would evolve independently.
-        </li>
-        <li>
-          <strong>Multi-head &amp; GQA</strong> (chapter 4) — attention is run
-          in parallel by many heads sharing a smaller pool of K/V projections,
-          so the model can look at several patterns at once without inflating
-          the KV cache.
-        </li>
-        <li>
-          <strong>RoPE</strong> (chapter 5) — the rotation applied to Q and K
-          inside attention. It's how the model knows token 5 is later than
-          token 3 without a separate position embedding.
-        </li>
-        <li>
-          <strong>RMSNorm</strong> (chapter 6) — applied <em>before</em> each
-          sub-block. It collapses the magnitude of the input to roughly{" "}
-          <code>sqrt(hidden_dim)</code> ≈ {Math.sqrt(HIDDEN_DIM).toFixed(0)} so
-          the attention scores and MLP activations don't explode.
-        </li>
-        <li>
-          <strong>MLP</strong> (chapter 7) — a per-token feed-forward with the
-          SwiGLU gated nonlinearity. It is where most of the parameters live,
-          and where per-token feature computation happens.
-        </li>
-      </ul>
+        <h2>What each piece contributes</h2>
+        <ul>
+          <li>
+            <strong>Attention</strong> (chapter 3) — the only place in the layer where information moves{' '}
+            <em>across tokens</em>. Without it, every position would evolve independently.
+          </li>
+          <li>
+            <strong>Multi-head &amp; GQA</strong> (chapter 4) — attention is run in parallel by many heads sharing a
+            smaller pool of K/V projections, so the model can look at several patterns at once without inflating the KV
+            cache.
+          </li>
+          <li>
+            <strong>RoPE</strong> (chapter 5) — the rotation applied to Q and K inside attention. It's how the model
+            knows token 5 is later than token 3 without a separate position embedding.
+          </li>
+          <li>
+            <strong>RMSNorm</strong> (chapter 6) — applied <em>before</em> each sub-block. It collapses the magnitude of
+            the input to roughly <code>sqrt(hidden_dim)</code> ≈ {Math.sqrt(HIDDEN_DIM).toFixed(0)} so the attention
+            scores and MLP activations don't explode.
+          </li>
+          <li>
+            <strong>MLP</strong> (chapter 7) — a per-token feed-forward with the SwiGLU gated nonlinearity. It is where
+            most of the parameters live, and where per-token feature computation happens.
+          </li>
+        </ul>
 
-      <h2>The residual highway</h2>
-      <p>
-        Notice that nothing inside the layer <em>replaces</em> the hidden
-        state — both the attention and the MLP results are <em>added</em> to
-        whatever was already there. The residual stream is a highway that
-        runs the full depth of the model. Each block reads from it, computes
-        a small correction, and writes the correction back. The model's final
-        prediction is the accumulation of every block's contribution, not the
-        output of the last block alone.
-      </p>
-      <p>
-        Two consequences fall out. First, gradients: backprop can flow
-        straight through the identity path even in a 24-layer stack, which is
-        why deep transformers train at all. Second, magnitudes: the residual
-        stream grows in L2 with depth (each layer adds a non-zero
-        contribution), while every <em>individual</em> sub-block's output
-        stays small. The 3D widget colors each ring by the per-token L2 of
-        the layer output — you can see the magnitude climb as you scan up
-        the tower.
-      </p>
+        <StackCollapsedView />
 
-      <h2>Hybrid attention: not every layer is "full"</h2>
-      <p>
-        Qwen3.5 is a <strong>hybrid</strong> stack. Most layers use a fast
-        linear-attention variant called <em>GatedDeltaNet</em>; only every
-        fourth layer (indices 3, 7, 11, 15, 19, 23 on the 0.8B model) uses
-        the classic <code>softmax(QKᵀ/√d)</code> formulation from chapter 3.
-        Linear-attention layers do almost all the across-token mixing under
-        the tight memory budget of long contexts; full-attention layers
-        appear at fixed intervals to do the heavy modelling that linear
-        attention can't. The 3D widget highlights full-attention layers in a
-        warmer color so you can see the interleave at a glance. Chapter 10
-        will dig into how this hybrid recipe works and why it's the new
-        default for high-throughput open LLMs.
-      </p>
+        <h2>The residual highway</h2>
+        <p>
+          Notice that nothing inside the layer <em>replaces</em> the hidden state — both the attention and the MLP
+          results are <em>added</em> to whatever was already there. The residual stream is a highway that runs the full
+          depth of the model. Each block reads from it, computes a small correction, and writes the correction back. The
+          model's final prediction is the accumulation of every block's contribution, not the output of the last block
+          alone.
+        </p>
+        <p>
+          Two consequences fall out. First, gradients: backprop can flow straight through the identity path even in a
+          24-layer stack, which is why deep transformers train at all. Second, magnitudes: the residual stream grows in
+          L2 with depth (each layer adds a non-zero contribution), while every <em>individual</em> sub-block's output
+          stays small. The 3D widget colors each ring by the per-token L2 of the layer output — you can see the
+          magnitude climb as you scan up the tower.
+        </p>
 
-      <h2>What the widget shows</h2>
-      <p>
-        Press <em>Run</em> to capture all seven hidden-state stats per layer
-        for a single forward pass. The 3D tower renders 24 stacked tiles —
-        one per layer — colored by per-token L2 of the layer output. Drag to
-        rotate, scroll to zoom, click a layer to inspect its stats in the
-        side panel. The mini bar chart inside the panel walks the seven
-        capture points within the selected layer so you can trace the signal
-        from the layer's input through the two sub-blocks and out the top.
-      </p>
+        <h2>Hybrid attention: not every layer is "full"</h2>
+        <p>
+          Qwen3.5 is a <strong>hybrid</strong> stack. Most layers use a fast linear-attention variant called{' '}
+          <em>GatedDeltaNet</em>; only every fourth layer (indices 3, 7, 11, 15, 19, 23 on the 0.8B model) uses the
+          classic <code>softmax(QKᵀ/√d)</code> formulation from chapter 3. Linear-attention layers do almost all the
+          across-token mixing under the tight memory budget of long contexts; full-attention layers appear at fixed
+          intervals to do the heavy modelling that linear attention can't. The 3D widget highlights full-attention
+          layers in a warmer color so you can see the interleave at a glance. Chapter 10 will dig into how this hybrid
+          recipe works and why it's the new default for high-throughput open LLMs.
+        </p>
+
+        <h2>What the widget shows</h2>
+        <p>
+          Press <em>Run</em> to capture all seven hidden-state stats per layer for a single forward pass. The 3D tower
+          renders 24 stacked tiles — one per layer — colored by per-token L2 of the layer output. Drag to rotate, scroll
+          to zoom, click a layer to inspect its stats in the side panel. The mini bar chart inside the panel walks the
+          seven capture points within the selected layer so you can trace the signal from the layer's input through the
+          two sub-blocks and out the top.
+        </p>
       </Prose>
     </ChapterFrame>
   );
@@ -278,23 +257,15 @@ export type FullBlockDemoProps = {
   abortRef: React.RefObject<AbortController | null>;
 };
 
-type RunStatus =
-  | { kind: "ok" }
-  | { kind: "error"; error: string }
-  | { kind: "aborted" }
-  | { kind: "empty-prompt" };
+type RunStatus = { kind: 'ok' } | { kind: 'error'; error: string } | { kind: 'aborted' } | { kind: 'empty-prompt' };
 
 function isAbortError(err: unknown): boolean {
-  return err instanceof DOMException && err.name === "AbortError";
+  return err instanceof DOMException && err.name === 'AbortError';
 }
 
 function fullAttentionLayerIndices(numLayers: number): number[] {
   const out: number[] = [];
-  for (
-    let idx = FULL_ATTN_INTERVAL - 1;
-    idx < numLayers;
-    idx += FULL_ATTN_INTERVAL
-  ) {
+  for (let idx = FULL_ATTN_INTERVAL - 1; idx < numLayers; idx += FULL_ATTN_INTERVAL) {
     out.push(idx);
   }
   return out;
@@ -326,7 +297,7 @@ function perTokenL2(stats: HiddenStatePointStats | undefined): number | null {
 }
 
 function formatNumber(value: number, digits = 3): string {
-  if (!Number.isFinite(value)) return "—";
+  if (!Number.isFinite(value)) return '—';
   if (Math.abs(value) >= 1000) return value.toFixed(0);
   if (Math.abs(value) >= 10) return value.toFixed(1);
   return value.toFixed(digits);
@@ -345,6 +316,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
   const [status, setStatus] = React.useState<RunStatus | null>(null);
   const [running, setRunning] = React.useState(false);
   const [selectedLayer, setSelectedLayer] = React.useState(0);
+  const resultFlashRef = useRunFlash(running);
   /**
    * Highest layer index currently revealed during the forward-pass
    * animation. `null` means no animation in progress — show the full
@@ -356,9 +328,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
 
   const runAbortRef = React.useRef<AbortController | null>(null);
   const runGenRef = React.useRef(0);
-  const revealTimerRef = React.useRef<ReturnType<typeof setInterval> | null>(
-    null,
-  );
+  const revealTimerRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
 
   const clearRevealTimer = React.useCallback(() => {
     if (revealTimerRef.current !== null) {
@@ -377,7 +347,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
 
   async function handleRun() {
     if (prompt.trim().length === 0) {
-      setStatus({ kind: "empty-prompt" });
+      setStatus({ kind: 'empty-prompt' });
       return;
     }
 
@@ -389,10 +359,8 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
     setRunning(true);
     const worker = workerRef.current;
     if (!worker) {
-      console.error(
-        "[full-block-demo] worker is unavailable — chapter view should have been gated on modelReady",
-      );
-      setStatus({ kind: "error", error: "Worker is unavailable. Reload the page." });
+      console.error('[full-block-demo] worker is unavailable — chapter view should have been gated on modelReady');
+      setStatus({ kind: 'error', error: 'Worker is unavailable. Reload the page.' });
       setRunning(false);
       return;
     }
@@ -407,7 +375,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
     }
     const onAppAbort = () => ctrl.abort();
     if (appSignal && !appSignal.aborted) {
-      appSignal.addEventListener("abort", onAppAbort, { once: true });
+      appSignal.addEventListener('abort', onAppAbort, { once: true });
     }
 
     try {
@@ -423,14 +391,13 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
         { signal: ctrl.signal },
       );
       if (runGenRef.current !== myGen) return;
-      console.log("[full-block-demo] runForInspector ok", {
+      console.log('[full-block-demo] runForInspector ok', {
         promptLength: prompt.length,
         layers: result.hiddenStates?.[0]?.layers.length ?? 0,
       });
       setRun(result);
-      setStatus({ kind: "ok" });
-      const numLayersInResult =
-        result.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS;
+      setStatus({ kind: 'ok' });
+      const numLayersInResult = result.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS;
       const maxLayer = numLayersInResult - 1;
       if (selectedLayer > maxLayer) {
         setSelectedLayer(0);
@@ -440,9 +407,9 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
       // prefers-reduced-motion by skipping the animation entirely.
       clearRevealTimer();
       const reducedMotion =
-        typeof window !== "undefined" &&
-        typeof window.matchMedia === "function" &&
-        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        typeof window !== 'undefined' &&
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       if (reducedMotion) {
         setRevealedUpTo(null);
         setSelectedLayer(maxLayer);
@@ -468,19 +435,17 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
     } catch (err) {
       if (runGenRef.current !== myGen) return;
       if (isAbortError(err)) {
-        console.info(
-          "[full-block-demo] runForInspector aborted (worker terminated or superseded)",
-        );
+        console.info('[full-block-demo] runForInspector aborted (worker terminated or superseded)');
         if (appSignal?.aborted) {
-          setStatus({ kind: "aborted" });
+          setStatus({ kind: 'aborted' });
         }
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error("[full-block-demo] runForInspector failed", err);
-        setStatus({ kind: "error", error: message });
+        console.error('[full-block-demo] runForInspector failed', err);
+        setStatus({ kind: 'error', error: message });
       }
     } finally {
-      if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
+      if (appSignal) appSignal.removeEventListener('abort', onAppAbort);
       if (runAbortRef.current === ctrl) runAbortRef.current = null;
       if (runGenRef.current === myGen) setRunning(false);
     }
@@ -499,11 +464,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
   const hiddenSteps = run?.hiddenStates;
   const numLayers = run?.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS;
   const fullAttnIndices = React.useMemo(
-    () =>
-      new Set(
-        run?.modelMeta?.fullAttentionLayerIndices ??
-          fullAttentionLayerIndices(numLayers),
-      ),
+    () => new Set(run?.modelMeta?.fullAttentionLayerIndices ?? fullAttentionLayerIndices(numLayers)),
     [run?.modelMeta?.fullAttentionLayerIndices, numLayers],
   );
 
@@ -513,27 +474,21 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
     const step = hiddenSteps[0];
     if (!step) return out;
     for (const layer of step.layers) {
-      const stat = layer.stats.find((s) => s.point === "post_mlp_residual");
+      const stat = layer.stats.find((s) => s.point === 'post_mlp_residual');
       out.push({ layerIdx: layer.layerIdx, value: perTokenL2(stat) });
     }
     out.sort((a, b) => a.layerIdx - b.layerIdx);
     return out;
   }, [hiddenSteps]);
 
-  const layerStats = React.useMemo(
-    () => getLayerStats(hiddenSteps, selectedLayer),
-    [hiddenSteps, selectedLayer],
-  );
+  const layerStats = React.useMemo(() => getLayerStats(hiddenSteps, selectedLayer), [hiddenSteps, selectedLayer]);
 
   const hasData = Boolean(hiddenSteps && hiddenSteps.length > 0);
 
   return (
     <div className="space-y-4">
       <div className="space-y-2">
-        <label
-          htmlFor="full-block-demo-input"
-          className="text-xs uppercase tracking-wider text-muted-foreground"
-        >
+        <label htmlFor="full-block-demo-input" className="text-xs uppercase tracking-wider text-muted-foreground">
           Prompt
         </label>
         <Textarea
@@ -545,17 +500,14 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
           placeholder={DEFAULT_PROMPT}
         />
         <div className="flex flex-wrap items-center gap-2">
-          <Button onClick={handleRun} disabled={running}>
-            {running ? "Running..." : "Run"}
-          </Button>
+          <RunButton onClick={handleRun} running={running} />
           <span className="text-xs text-muted-foreground">
-            Captures all seven hidden-state stats per layer for a single
-            forward pass.
+            Captures all seven hidden-state stats per layer for a single forward pass.
           </span>
         </div>
       </div>
 
-      {status?.kind === "error" ? (
+      {status?.kind === 'error' ? (
         <div
           role="alert"
           className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
@@ -563,16 +515,15 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
           <strong>Inspector run failed.</strong> {status.error}
         </div>
       ) : null}
-      {status?.kind === "aborted" ? (
+      {status?.kind === 'aborted' ? (
         <div
           role="status"
           className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
         >
-          Request cancelled — model was reloaded. Click <strong>Run</strong>{" "}
-          again to retry.
+          Request cancelled — model was reloaded. Click <strong>Run</strong> again to retry.
         </div>
       ) : null}
-      {status?.kind === "empty-prompt" ? (
+      {status?.kind === 'empty-prompt' ? (
         <div
           role="alert"
           className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
@@ -590,7 +541,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
         </div>
       ) : null}
 
-      <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+      <div ref={resultFlashRef} className="grid grid-cols-1 gap-3 p-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
         <StackViewer3D
           layerOutL2={layerOutL2}
           fullAttnIndices={fullAttnIndices}
@@ -603,15 +554,15 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
           isFullAttention={fullAttnIndices.has(selectedLayer)}
           layerStats={layerStats}
           hasData={hasData}
-          modelName={run?.modelMeta?.name ?? "—"}
+          modelName={run?.modelMeta?.name ?? '—'}
           numLayers={numLayers}
         />
       </div>
 
       <DemoCallout
         items={[
-          "Rotate the tower — each layer is Norm → Attention → Norm → MLP, with a residual skipping each sub-block.",
-          "The colour ramp shows attention type: cooler colours are linear (GatedDeltaNet), warmer are full attention.",
+          'Rotate the tower — each layer is Norm → Attention → Norm → MLP, with a residual skipping each sub-block.',
+          'The colour ramp shows attention type: cooler colours are linear (GatedDeltaNet), warmer are full attention.',
           "Six of the 24 layers are full attention; the rest are linear. That's the hybrid pattern from Chapter 10.",
         ]}
       />
@@ -643,12 +594,7 @@ const STACK_TOTAL_HEIGHT = 18;
 const STACK_RADIUS = 1.6;
 const STACK_LAYER_GAP = 0.12;
 
-function colorForL2(
-  value: number | null,
-  vmin: number,
-  vmax: number,
-  isFullAttn: boolean,
-): THREE.Color {
+function colorForL2(value: number | null, vmin: number, vmax: number, isFullAttn: boolean): THREE.Color {
   // Two-ramp scheme:
   //   linear-attn layers ramp cool→warm purple/blue.
   //   full-attn  layers ramp warm orange→red to mark the interleave.
@@ -671,13 +617,7 @@ function colorForL2(
  *  forward-pass animation. Reads as inert / pre-activation tile. */
 const UNREVEALED_LAYER_COLOR = new THREE.Color(0x2a2f3a);
 
-function StackViewer3D({
-  layerOutL2,
-  fullAttnIndices,
-  selectedLayer,
-  onSelect,
-  revealedUpTo,
-}: StackViewer3DProps) {
+function StackViewer3D({ layerOutL2, fullAttnIndices, selectedLayer, onSelect, revealedUpTo }: StackViewer3DProps) {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const onSelectRef = React.useRef(onSelect);
   const selectedLayerRef = React.useRef(selectedLayer);
@@ -714,14 +654,20 @@ function StackViewer3D({
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setClearColor(0x000000, 0);
     container.appendChild(renderer.domElement);
-    renderer.domElement.style.display = "block";
-    renderer.domElement.style.width = "100%";
-    renderer.domElement.style.height = "100%";
-    renderer.domElement.style.touchAction = "none";
+    renderer.domElement.style.display = 'block';
+    renderer.domElement.style.width = '100%';
+    renderer.domElement.style.height = '100%';
+    renderer.domElement.style.touchAction = 'none';
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 200);
-    camera.position.set(7, 8, 10);
+    // The tower is STACK_TOTAL_HEIGHT (~18) units tall. With a 40° vertical
+    // FOV, the camera needs to sit at distance ≈ 18 / (2·tan(20°)) ≈ 24.7
+    // for the tower to *just* fill the canvas vertically. We pull a little
+    // further (≈ 27) so all 24 layers are visible with breathing room on
+    // top and bottom — earlier (5, 8, 7) zoomed in too far and clipped
+    // both ends of the tower in landscape layouts.
+    camera.position.set(10, 11, 25);
     camera.lookAt(0, STACK_TOTAL_HEIGHT / 2, 0);
 
     scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 0.7));
@@ -778,8 +724,8 @@ function StackViewer3D({
       }
     }
 
-    controls.addEventListener("change", () => requestRender());
-    controls.addEventListener("start", () => requestRender());
+    controls.addEventListener('change', () => requestRender());
+    controls.addEventListener('start', () => requestRender());
 
     function fit() {
       const w = container!.clientWidth;
@@ -802,9 +748,7 @@ function StackViewer3D({
       const hits = raycaster.intersectObjects(layerMeshes, false);
       if (hits.length === 0) return null;
       const hit = hits[0]!.object as THREE.Mesh;
-      return typeof hit.userData.layerIdx === "number"
-        ? (hit.userData.layerIdx as number)
-        : null;
+      return typeof hit.userData.layerIdx === 'number' ? (hit.userData.layerIdx as number) : null;
     }
 
     let pointerDown: { x: number; y: number } | null = null;
@@ -820,8 +764,8 @@ function StackViewer3D({
       const idx = pickLayerAt(ev.clientX, ev.clientY);
       if (idx !== null) onSelectRef.current(idx);
     };
-    renderer.domElement.addEventListener("pointerdown", handlePointerDown);
-    renderer.domElement.addEventListener("pointerup", handlePointerUp);
+    renderer.domElement.addEventListener('pointerdown', handlePointerDown);
+    renderer.domElement.addEventListener('pointerup', handlePointerUp);
 
     sceneRef.current = {
       renderer,
@@ -838,8 +782,8 @@ function StackViewer3D({
         if (damperFrameId !== null) cancelAnimationFrame(damperFrameId);
         ro.disconnect();
         controls.dispose();
-        renderer.domElement.removeEventListener("pointerdown", handlePointerDown);
-        renderer.domElement.removeEventListener("pointerup", handlePointerUp);
+        renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
+        renderer.domElement.removeEventListener('pointerup', handlePointerUp);
         for (const mesh of layerMeshes) {
           mesh.geometry.dispose();
           const mat = mesh.material as THREE.Material | THREE.Material[];
@@ -882,13 +826,8 @@ function StackViewer3D({
     state.layerMaterials.length = 0;
 
     const numLayers = layerOutL2.length || DEFAULT_NUM_LAYERS;
-    const tileHeight = Math.max(
-      0.15,
-      STACK_TOTAL_HEIGHT / numLayers - STACK_LAYER_GAP,
-    );
-    const finite = layerOutL2
-      .map((d) => d.value)
-      .filter((v): v is number => v !== null && Number.isFinite(v));
+    const tileHeight = Math.max(0.15, STACK_TOTAL_HEIGHT / numLayers - STACK_LAYER_GAP);
+    const finite = layerOutL2.map((d) => d.value).filter((v): v is number => v !== null && Number.isFinite(v));
     const vmin = finite.length > 0 ? Math.min(...finite) : 0;
     const vmax = finite.length > 0 ? Math.max(...finite) : 1;
 
@@ -905,12 +844,7 @@ function StackViewer3D({
       });
       // Use a slightly chamfered cylinder to read as "ring of a tower". Open
       // top + bottom would look like a tube; closed cylinders read as tiles.
-      const geom = new THREE.CylinderGeometry(
-        STACK_RADIUS,
-        STACK_RADIUS,
-        tileHeight,
-        24,
-      );
+      const geom = new THREE.CylinderGeometry(STACK_RADIUS, STACK_RADIUS, tileHeight, 24);
       const mesh = new THREE.Mesh(geom, material);
       const yBase = i * (tileHeight + STACK_LAYER_GAP);
       mesh.position.set(0, yBase + tileHeight / 2, 0);
@@ -935,9 +869,7 @@ function StackViewer3D({
   React.useEffect(() => {
     const state = sceneRef.current;
     if (!state) return;
-    const finite = layerOutL2
-      .map((d) => d.value)
-      .filter((v): v is number => v !== null && Number.isFinite(v));
+    const finite = layerOutL2.map((d) => d.value).filter((v): v is number => v !== null && Number.isFinite(v));
     const vmin = finite.length > 0 ? Math.min(...finite) : 0;
     const vmax = finite.length > 0 ? Math.max(...finite) : 1;
     for (let i = 0; i < state.layerMeshes.length; i++) {
@@ -946,8 +878,7 @@ function StackViewer3D({
       const layerIdx = mesh.userData.layerIdx as number;
       const value = layerOutL2[i]?.value ?? null;
       const isFull = fullAttnIndices.has(layerIdx);
-      const isUnrevealed =
-        revealedUpTo !== null && layerIdx > revealedUpTo;
+      const isUnrevealed = revealedUpTo !== null && layerIdx > revealedUpTo;
       const isCursor = revealedUpTo !== null && layerIdx === revealedUpTo;
       if (isUnrevealed) {
         material.color.copy(UNREVEALED_LAYER_COLOR);
@@ -966,9 +897,7 @@ function StackViewer3D({
   React.useEffect(() => {
     const state = sceneRef.current;
     if (!state) return;
-    const targetMesh = state.layerMeshes.find(
-      (m) => m.userData.layerIdx === selectedLayer,
-    );
+    const targetMesh = state.layerMeshes.find((m) => m.userData.layerIdx === selectedLayer);
     if (!targetMesh) {
       state.selectionEdges.visible = false;
       state.requestRender();
@@ -987,12 +916,8 @@ function StackViewer3D({
   return (
     <div className="space-y-2 rounded-md border border-border bg-background p-3">
       <div className="flex items-center justify-between">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Transformer stack — 24 layers
-        </div>
-        <div className="text-[11px] text-muted-foreground">
-          drag to rotate · scroll to zoom · click a layer
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">Transformer stack — 24 layers</div>
+        <div className="text-[11px] text-muted-foreground">drag to rotate · scroll to zoom · click a layer</div>
       </div>
       <div
         ref={containerRef}
@@ -1012,8 +937,7 @@ function Legend() {
           aria-hidden
           className="inline-block h-3 w-3 rounded-sm"
           style={{
-            background:
-              "linear-gradient(to right, rgb(79,70,229), rgb(147,51,234))",
+            background: 'linear-gradient(to right, rgb(79,70,229), rgb(147,51,234))',
           }}
         />
         Linear attention (GatedDeltaNet)
@@ -1023,15 +947,12 @@ function Legend() {
           aria-hidden
           className="inline-block h-3 w-3 rounded-sm"
           style={{
-            background:
-              "linear-gradient(to right, rgb(249,201,122), rgb(239,68,68))",
+            background: 'linear-gradient(to right, rgb(249,201,122), rgb(239,68,68))',
           }}
         />
         Full attention (softmax QKᵀ)
       </span>
-      <span className="ml-auto">
-        color = per-token L2 of layer output (post-residual)
-      </span>
+      <span className="ml-auto">color = per-token L2 of layer output (post-residual)</span>
     </div>
   );
 }
@@ -1059,11 +980,11 @@ function LayerSidePanel({
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex items-baseline justify-between">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Layer {layerIdx} · {isFullAttention ? "Full attention" : "Linear attention"}
+          Layer {layerIdx} · {isFullAttention ? 'Full attention' : 'Linear attention'}
         </div>
         <div className="text-[11px] text-muted-foreground">
           {modelName}
-          {hasData ? ` · ${numLayers} layers` : ""}
+          {hasData ? ` · ${numLayers} layers` : ''}
         </div>
       </div>
 
@@ -1071,64 +992,38 @@ function LayerSidePanel({
 
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         {CAPTURE_POINTS.map((point) => (
-          <StatBox
-            key={point}
-            title={POINT_LABELS[point]}
-            stats={layerStats[point]}
-          />
+          <StatBox key={point} title={POINT_LABELS[point]} stats={layerStats[point]} />
         ))}
       </div>
     </div>
   );
 }
 
-function StatBox({
-  title,
-  stats,
-}: {
-  title: string;
-  stats: HiddenStatePointStats | undefined;
-}) {
+function StatBox({ title, stats }: { title: string; stats: HiddenStatePointStats | undefined }) {
   const l2 = perTokenL2(stats);
   return (
     <div className="rounded-md border border-border bg-background p-2 text-xs">
-      <div className="mb-1 uppercase tracking-wider text-[10px] text-muted-foreground">
-        {title}
-      </div>
+      <div className="mb-1 uppercase tracking-wider text-[10px] text-muted-foreground">{title}</div>
       <dl className="grid grid-cols-2 gap-x-2 gap-y-0.5 font-mono">
         <dt className="text-muted-foreground">L2/tok</dt>
-        <dd className="text-right text-foreground/90">
-          {l2 !== null ? formatNumber(l2, 2) : "—"}
-        </dd>
+        <dd className="text-right text-foreground/90">{l2 !== null ? formatNumber(l2, 2) : '—'}</dd>
         <dt className="text-muted-foreground">|max|</dt>
-        <dd className="text-right text-foreground/90">
-          {stats ? formatNumber(stats.absMax, 2) : "—"}
-        </dd>
+        <dd className="text-right text-foreground/90">{stats ? formatNumber(stats.absMax, 2) : '—'}</dd>
         <dt className="text-muted-foreground">std</dt>
-        <dd className="text-right text-foreground/90">
-          {stats ? formatNumber(stats.std) : "—"}
-        </dd>
+        <dd className="text-right text-foreground/90">{stats ? formatNumber(stats.std) : '—'}</dd>
         <dt className="text-muted-foreground">mean</dt>
-        <dd className="text-right text-foreground/90">
-          {stats ? formatNumber(stats.mean) : "—"}
-        </dd>
+        <dd className="text-right text-foreground/90">{stats ? formatNumber(stats.mean) : '—'}</dd>
       </dl>
     </div>
   );
 }
 
-function PerPointBarChart({
-  layerStats,
-}: {
-  layerStats: Partial<Record<CapturePoint, HiddenStatePointStats>>;
-}) {
+function PerPointBarChart({ layerStats }: { layerStats: Partial<Record<CapturePoint, HiddenStatePointStats>> }) {
   const values = CAPTURE_POINTS.map((point) => ({
     point,
     value: perTokenL2(layerStats[point]),
   }));
-  const finite = values
-    .map((v) => v.value)
-    .filter((v): v is number => v !== null && Number.isFinite(v));
+  const finite = values.map((v) => v.value).filter((v): v is number => v !== null && Number.isFinite(v));
   const maxValue = finite.length > 0 ? Math.max(...finite) : 1;
   return (
     <div
@@ -1143,9 +1038,7 @@ function PerPointBarChart({
         {values.map(({ point, value }) => {
           const safeMax = maxValue > 0 ? maxValue : 1;
           const pct =
-            value === null || !Number.isFinite(value)
-              ? 0
-              : Math.max(0, Math.min(100, (value / safeMax) * 100));
+            value === null || !Number.isFinite(value) ? 0 : Math.max(0, Math.min(100, (value / safeMax) * 100));
           return (
             <div
               key={point}
@@ -1156,13 +1049,10 @@ function PerPointBarChart({
                 {POINT_LABELS[point]}
               </span>
               <div className="relative h-3 w-full overflow-hidden rounded bg-muted">
-                <div
-                  className="h-full bg-primary/80"
-                  style={{ width: `${pct}%` }}
-                />
+                <div className="h-full bg-primary/80" style={{ width: `${pct}%` }} />
               </div>
               <span className="text-right font-mono text-foreground/80">
-                {value === null ? "—" : formatNumber(value, 2)}
+                {value === null ? '—' : formatNumber(value, 2)}
               </span>
             </div>
           );

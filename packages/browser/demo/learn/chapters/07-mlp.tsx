@@ -1,57 +1,41 @@
-import * as React from "react";
+import * as React from 'react';
 
-import { Button } from "../../components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "../../components/ui/select";
-import { Textarea } from "../../components/ui/textarea";
-import type {
-  AttentionRun,
-  HiddenStatePointStats,
-  HiddenStateStep,
-} from "../../../src/inspector-types";
-import { runForInspector } from "../../lib/inspector-client";
-import { DemoCallout } from "../inspector/DemoCallout";
-import { Prose } from "../Prose";
-import { ChapterFrame } from "../scaffolding/ChapterFrame";
-import type { ChapterLearningData } from "../scaffolding/learning-data";
+import type { AttentionRun, HiddenStatePointStats, HiddenStateStep } from '../../../src/inspector-types';
+import { Textarea } from '../../components/ui/textarea';
+import { runForInspector } from '../../lib/inspector-client';
+import { DemoCallout } from '../inspector/DemoCallout';
+import { Prose } from '../Prose';
+import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import type { ChapterLearningData } from '../scaffolding/learning-data';
+import { MathDisplay } from '../scaffolding/MathDisplay';
+import { RunButton } from '../scaffolding/RunButton';
+import { useRunFlash } from '../scaffolding/useRunFlash';
+import { FfnNeurons } from '../widgets/FfnNeurons';
 
-const DEFAULT_PROMPT = "Once upon a time, in a forest far away,";
+const DEFAULT_PROMPT = 'Once upon a time, in a forest far away,';
 const DEFAULT_NUM_LAYERS = 24;
 // Qwen3.5-0.8B; matches the model's hidden_size.
 const HIDDEN_DIM = 1024;
-const CAPTURE_POINTS = [
-  "post_attn_residual",
-  "post_mlp_norm",
-  "mlp_output",
-  "post_mlp_residual",
-] as const;
+const CAPTURE_POINTS = ['post_attn_residual', 'post_mlp_norm', 'mlp_output', 'post_mlp_residual'] as const;
 
 type CapturePoint = (typeof CAPTURE_POINTS)[number];
 
-const POINT_META: Record<
-  CapturePoint,
-  { title: string; description: string }
-> = {
+const POINT_META: Record<CapturePoint, { title: string; description: string }> = {
   post_attn_residual: {
-    title: "Input to MLP path",
+    title: 'Input to MLP path',
     description: "Residual stream entering this layer's MLP sub-block.",
   },
   post_mlp_norm: {
-    title: "After pre-MLP RMSNorm",
-    description: "Norm collapses the magnitude to ~sqrt(hidden_dim).",
+    title: 'After pre-MLP RMSNorm',
+    description: 'Norm collapses the magnitude to ~sqrt(hidden_dim).',
   },
   mlp_output: {
-    title: "MLP output (correction)",
-    description: "Raw MLP output, before the residual add — typically small.",
+    title: 'MLP output (correction)',
+    description: 'Raw MLP output, before the residual add — typically small.',
   },
   post_mlp_residual: {
-    title: "Layer output",
-    description: "Input + correction. This is what the next layer reads.",
+    title: 'Layer output',
+    description: 'Input + correction. This is what the next layer reads.',
   },
 };
 
@@ -61,46 +45,46 @@ const POINT_META: Record<
  * `chapterId` must match `CHAPTERS[6].id` in `learn/chapters.ts`.
  */
 export const learning: ChapterLearningData = {
-  chapterId: "mlp",
+  chapterId: 'mlp',
   objective:
     "Describe how a SwiGLU gated MLP transforms a single token's hidden state and how it relates to the residual stream.",
   problem:
-    "Attention mixes information across tokens but cannot do per-token feature computation; the MLP is where that work lives.",
+    'Attention mixes information across tokens but cannot do per-token feature computation; the MLP is where that work lives.',
   minutes: 7,
   glossary: [
     {
-      term: "MLP block",
+      term: 'MLP block',
       definition:
-        "The per-token feed-forward sub-block inside a transformer layer. Runs the same little network on every position.",
+        'The per-token feed-forward sub-block inside a transformer layer. Runs the same little network on every position.',
     },
     {
-      term: "SwiGLU",
+      term: 'SwiGLU',
       definition:
-        "Gated MLP variant: silu(gate_proj(x)) * up_proj(x), then projected back. The * is element-wise multiplication.",
+        'Gated MLP variant: silu(gate_proj(x)) * up_proj(x), then projected back. The * is element-wise multiplication.',
     },
     {
-      term: "SiLU",
+      term: 'SiLU',
       definition:
-        "Activation z * sigmoid(z). Smooth, near-linear for large positive z, suppresses negatives — acts as a soft gate.",
+        'Activation z * sigmoid(z). Smooth, near-linear for large positive z, suppresses negatives — acts as a soft gate.',
     },
     {
-      term: "intermediate_dim",
+      term: 'intermediate_dim',
       definition:
-        "The widened scratch space inside the MLP. Usually around 3-4x hidden_dim. 3072 for Qwen3.5-0.8B (vs 1024 hidden).",
+        'The widened scratch space inside the MLP. Usually around 3-4x hidden_dim. 3072 for Qwen3.5-0.8B (vs 1024 hidden).',
     },
     {
-      term: "residual stream",
+      term: 'residual stream',
       definition:
-        "The un-normalized hidden state running the full depth of the model that each block reads from and adds back into.",
+        'The un-normalized hidden state running the full depth of the model that each block reads from and adds back into.',
     },
     {
-      term: "residual connection",
+      term: 'residual connection',
       definition:
-        "The x_in + part of x_out = x_in + sub_block(norm(x_in)). Lets gradients skip the sub-block and stay healthy.",
+        'The x_in + part of x_out = x_in + sub_block(norm(x_in)). Lets gradients skip the sub-block and stay healthy.',
     },
   ],
   takeaways: [
-    "The MLP touches every token in isolation — there is no cross-token information flow inside an MLP block.",
+    'The MLP touches every token in isolation — there is no cross-token information flow inside an MLP block.',
     "Most of a model's parameters live in gate_proj/up_proj/down_proj — these three matrices dominate the parameter count.",
     "Each MLP writes a small correction to the residual stream; the prediction is the sum of many small writes, not the last block's output.",
   ],
@@ -112,61 +96,61 @@ export const learning: ChapterLearningData = {
   },
   quiz: [
     {
-      id: "q1-elementwise",
-      prompt: "In SwiGLU, what kind of multiplication is the * between silu(gate_proj(x)) and up_proj(x)?",
+      id: 'q1-elementwise',
+      prompt: 'In SwiGLU, what kind of multiplication is the * between silu(gate_proj(x)) and up_proj(x)?',
       options: [
-        { id: "a", label: "Matrix multiplication." },
+        { id: 'a', label: 'Matrix multiplication.' },
         {
-          id: "b",
+          id: 'b',
           label:
-            "Element-wise: each of the intermediate_dim features in one vector multiplies the corresponding feature in the other.",
+            'Element-wise: each of the intermediate_dim features in one vector multiplies the corresponding feature in the other.',
         },
-        { id: "c", label: "Dot product, producing a scalar." },
+        { id: 'c', label: 'Dot product, producing a scalar.' },
       ],
-      correctId: "b",
+      correctId: 'b',
       explanation:
         "The gate-projection produces a 'how much' per feature; the up-projection produces a 'what'. Element-wise multiplication entangles them, and only then does down_proj collapse back to hidden_dim.",
     },
     {
-      id: "q2-mlp-magnitude",
+      id: 'q2-mlp-magnitude',
       prompt: "How does a single MLP block's output magnitude usually compare to the residual stream it writes into?",
       options: [
         {
-          id: "a",
+          id: 'a',
           label: "Much smaller — it's a correction added on top, not a replacement.",
         },
         {
-          id: "b",
+          id: 'b',
           label: "Roughly equal — each MLP overwrites the stream's magnitude.",
         },
         {
-          id: "c",
-          label: "Much larger — the MLP dominates after the residual add.",
+          id: 'c',
+          label: 'Much larger — the MLP dominates after the residual add.',
         },
       ],
-      correctId: "a",
+      correctId: 'a',
       explanation:
         "The 'highway' intuition: residual stream magnitude has been accumulating for many layers; one MLP adds a small delta on top. That's why the residual ratio in the demo is small.",
     },
     {
-      id: "q3-where-params-live",
+      id: 'q3-where-params-live',
       prompt: "Why does the chapter describe the MLP as 'where most of the parameters live'?",
       options: [
         {
-          id: "a",
-          label: "MLP weights are stored at higher precision than attention weights.",
+          id: 'a',
+          label: 'MLP weights are stored at higher precision than attention weights.',
         },
         {
-          id: "b",
+          id: 'b',
           label:
-            "gate_proj, up_proj, and down_proj are large (hidden_dim by intermediate_dim, intermediate_dim ≈ 3-4 × hidden_dim), so the three together dwarf the attention projections.",
+            'gate_proj, up_proj, and down_proj are large (hidden_dim by intermediate_dim, intermediate_dim ≈ 3-4 × hidden_dim), so the three together dwarf the attention projections.',
         },
         {
-          id: "c",
-          label: "The MLP block is repeated more times per layer than attention.",
+          id: 'c',
+          label: 'The MLP block is repeated more times per layer than attention.',
         },
       ],
-      correctId: "b",
+      correctId: 'b',
       explanation:
         "Each of those three matrices is hidden_dim × intermediate_dim. Multiply that by every layer and you have the bulk of the model's parameters.",
     },
@@ -177,98 +161,81 @@ export function MlpChapterBody() {
   return (
     <ChapterFrame learning={learning}>
       <Prose>
-      <h1>The MLP block: per-token feed-forward</h1>
-      <p>
-        Attention is the part of a transformer that mixes information{" "}
-        <em>across tokens</em>: every position can read from every other
-        position via softmax(QKᵀ)·V. The MLP block is the opposite — it touches
-        every token in <em>isolation</em>, running the same little neural
-        network on each position's hidden vector and writing the result back to
-        that same position. Across-token mixing happens in attention; per-token
-        computation happens in the MLP. A transformer layer alternates between
-        the two.
-      </p>
+        <h1>The MLP block: per-token feed-forward</h1>
+        <p>
+          Attention is the part of a transformer that mixes information <em>across tokens</em>: every position can read
+          from every other position via softmax(QKᵀ)·V. The MLP block is the opposite — it touches every token in{' '}
+          <em>isolation</em>, running the same little neural network on each position's hidden vector and writing the
+          result back to that same position. Across-token mixing happens in attention; per-token computation happens in
+          the MLP. A transformer layer alternates between the two.
+        </p>
 
-      <h2>Pre-MLP norm, then a gated MLP, then a residual add</h2>
-      <p>
-        Like its attention sibling, the MLP sub-block in Qwen3.5 is wrapped in
-        a pre-norm + residual pattern:
-      </p>
-      <pre>
-        <code>{`x_out = x_in + mlp(rmsnorm(x_in))`}</code>
-      </pre>
-      <p>
-        The <strong>residual connection</strong> is the <code>x_in +</code>{" "}
-        part. It exists for two reasons. First, gradients: backprop can flow
-        straight through the identity path, so even a 24-layer stack stays
-        trainable. Second, semantics: think of the residual stream as a
-        <em> highway</em> that runs the full depth of the model. Each block
-        reads from the highway, computes a small contribution, and adds it
-        back. The model's prediction is the accumulation of every block's
-        contribution — not the output of the last block alone.
-      </p>
+        <h2>Pre-MLP norm, then a gated MLP, then a residual add</h2>
+        <p>Like its attention sibling, the MLP sub-block in Qwen3.5 is wrapped in a pre-norm + residual pattern:</p>
+        <MathDisplay
+          latex={String.raw`x_\text{out} = x_\text{in} + \text{mlp}\bigl(\text{rmsnorm}(x_\text{in})\bigr)`}
+        />
+        <p>
+          The <strong>residual connection</strong> is the <code>x_in +</code> part. It exists for two reasons. First,
+          gradients: backprop can flow straight through the identity path, so even a 24-layer stack stays trainable.
+          Second, semantics: think of the residual stream as a<em> highway</em> that runs the full depth of the model.
+          Each block reads from the highway, computes a small contribution, and adds it back. The model's prediction is
+          the accumulation of every block's contribution — not the output of the last block alone.
+        </p>
 
-      <h2>What "gated MLP" actually means</h2>
-      <p>
-        Qwen3.5 (like Llama, Mistral, and most modern open LLMs) uses the
-        <strong> SwiGLU-style gated MLP</strong>. It has three linear
-        projections per layer:
-      </p>
-      <ul>
-        <li>
-          <code>gate_proj</code>: hidden_dim → intermediate_dim. Its output is
-          run through a <strong>SiLU</strong> activation (also called Swish):
-          <code> silu(z) = z · sigmoid(z)</code>. SiLU is smooth and nearly
-          linear for large positive <code>z</code>, but suppresses negative
-          values — a soft gate.
-        </li>
-        <li>
-          <code>up_proj</code>: hidden_dim → intermediate_dim. This is the
-          "value" path — the actual features being passed through.
-        </li>
-        <li>
-          <code>down_proj</code>: intermediate_dim → hidden_dim. Projects the
-          element-wise product back to the residual stream's width.
-        </li>
-      </ul>
-      <pre>
-        <code>{`MLP(x) = down_proj( silu(gate_proj(x))  *  up_proj(x) )`}</code>
-      </pre>
-      <p>
-        Read this expression carefully. The <code>*</code> is{" "}
-        <em>element-wise</em>, not matrix multiplication: each of the
-        intermediate_dim features in <code>silu(gate_proj(x))</code> multiplies
-        the corresponding feature in <code>up_proj(x)</code>. The
-        gate-projection decides <em>how much</em> of each feature passes
-        through; the up-projection supplies the value. The two are entangled
-        per feature, then collapsed back to hidden_dim by <code>down_proj</code>.
-      </p>
-      <p>
-        The intermediate dimension is where the model has its "scratch
-        space" — usually around 4× the hidden dim (Qwen3.5-0.8B uses 3072 for a
-        1024-dim hidden state). Most of the model's parameters live in these
-        three matrices.
-      </p>
+        <h2>What "gated MLP" actually means</h2>
+        <p>
+          Qwen3.5 (like Llama, Mistral, and most modern open LLMs) uses the
+          <strong> SwiGLU-style gated MLP</strong>. It has three linear projections per layer:
+        </p>
+        <ul>
+          <li>
+            <code>gate_proj</code>: hidden_dim → intermediate_dim. Its output is run through a <strong>SiLU</strong>{' '}
+            activation (also called Swish):
+            <code> silu(z) = z · sigmoid(z)</code>. SiLU is smooth and nearly linear for large positive <code>z</code>,
+            but suppresses negative values — a soft gate.
+          </li>
+          <li>
+            <code>up_proj</code>: hidden_dim → intermediate_dim. This is the "value" path — the actual features being
+            passed through.
+          </li>
+          <li>
+            <code>down_proj</code>: intermediate_dim → hidden_dim. Projects the element-wise product back to the
+            residual stream's width.
+          </li>
+        </ul>
+        <MathDisplay
+          latex={String.raw`\text{MLP}(x) = \text{down\_proj}\!\bigl(\,\text{silu}(\text{gate\_proj}(x)) \,\odot\, \text{up\_proj}(x)\bigr)`}
+        />
+        <p>
+          Read this expression carefully. The <code>*</code> is <em>element-wise</em>, not matrix multiplication: each
+          of the intermediate_dim features in <code>silu(gate_proj(x))</code> multiplies the corresponding feature in{' '}
+          <code>up_proj(x)</code>. The gate-projection decides <em>how much</em> of each feature passes through; the
+          up-projection supplies the value. The two are entangled per feature, then collapsed back to hidden_dim by{' '}
+          <code>down_proj</code>.
+        </p>
+        <p>
+          The intermediate dimension is where the model has its "scratch space" — usually around 4× the hidden dim
+          (Qwen3.5-0.8B uses 3072 for a 1024-dim hidden state). Most of the model's parameters live in these three
+          matrices.
+        </p>
 
-      <h2>The MLP contributes a small correction</h2>
-      <p>
-        Here is the surprising part: the MLP's raw output is{" "}
-        <em>much smaller</em> than the residual stream it writes into. The
-        residual stream has been accumulating contributions for many layers,
-        so its per-token L2 grows. Each individual MLP's output is a small
-        delta on top — a correction, not a replacement. Watch the chart
-        below: <strong>MLP output</strong> per-token L2 is a fraction of the
-        layer's full output L2. The bulk of the magnitude in the residual
-        stream came from the input, not from this layer's MLP.
-      </p>
-      <p>
-        This is the "highway" intuition made quantitative. The all-layers
-        strip shows that the size of the per-layer MLP contribution varies
-        across depth: some layers contribute more than others, but no single
-        layer dominates. Predictions emerge from the sum of many small writes
-        — which is exactly the design choice that makes deep transformers
-        learnable.
-      </p>
+        <FfnNeurons />
+
+        <h2>The MLP contributes a small correction</h2>
+        <p>
+          Here is the surprising part: the MLP's raw output is <em>much smaller</em> than the residual stream it writes
+          into. The residual stream has been accumulating contributions for many layers, so its per-token L2 grows. Each
+          individual MLP's output is a small delta on top — a correction, not a replacement. Watch the chart below:{' '}
+          <strong>MLP output</strong> per-token L2 is a fraction of the layer's full output L2. The bulk of the
+          magnitude in the residual stream came from the input, not from this layer's MLP.
+        </p>
+        <p>
+          This is the "highway" intuition made quantitative. The all-layers strip shows that the size of the per-layer
+          MLP contribution varies across depth: some layers contribute more than others, but no single layer dominates.
+          Predictions emerge from the sum of many small writes — which is exactly the design choice that makes deep
+          transformers learnable.
+        </p>
       </Prose>
     </ChapterFrame>
   );
@@ -279,14 +246,10 @@ export type MlpDemoProps = {
   abortRef: React.RefObject<AbortController | null>;
 };
 
-type RunStatus =
-  | { kind: "ok" }
-  | { kind: "error"; error: string }
-  | { kind: "aborted" }
-  | { kind: "empty-prompt" };
+type RunStatus = { kind: 'ok' } | { kind: 'error'; error: string } | { kind: 'aborted' } | { kind: 'empty-prompt' };
 
 function isAbortError(err: unknown): boolean {
-  return err instanceof DOMException && err.name === "AbortError";
+  return err instanceof DOMException && err.name === 'AbortError';
 }
 
 function getLayerStats(
@@ -324,7 +287,7 @@ function perTokenL2(stats: HiddenStatePointStats | undefined): number | null {
 }
 
 function formatNumber(value: number, digits = 3): string {
-  if (!Number.isFinite(value)) return "—";
+  if (!Number.isFinite(value)) return '—';
   if (Math.abs(value) >= 1000) return value.toFixed(0);
   if (Math.abs(value) >= 10) return value.toFixed(1);
   return value.toFixed(digits);
@@ -336,6 +299,10 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
   const [status, setStatus] = React.useState<RunStatus | null>(null);
   const [running, setRunning] = React.useState(false);
   const [selectedLayer, setSelectedLayer] = React.useState(0);
+  // Track the prompt that produced the currently displayed stats so we can
+  // disable Run when re-clicking would produce identical numbers.
+  const [lastRunPrompt, setLastRunPrompt] = React.useState<string | null>(null);
+  const resultFlashRef = useRunFlash(running);
 
   const runAbortRef = React.useRef<AbortController | null>(null);
   const runGenRef = React.useRef(0);
@@ -349,7 +316,7 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
 
   async function handleRun() {
     if (prompt.trim().length === 0) {
-      setStatus({ kind: "empty-prompt" });
+      setStatus({ kind: 'empty-prompt' });
       return;
     }
 
@@ -357,10 +324,8 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
     setRunning(true);
     const worker = workerRef.current;
     if (!worker) {
-      console.error(
-        "[mlp-demo] worker is unavailable — chapter view should have been gated on modelReady",
-      );
-      setStatus({ kind: "error", error: "Worker is unavailable. Reload the page." });
+      console.error('[mlp-demo] worker is unavailable — chapter view should have been gated on modelReady');
+      setStatus({ kind: 'error', error: 'Worker is unavailable. Reload the page.' });
       setRunning(false);
       return;
     }
@@ -375,7 +340,7 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
     }
     const onAppAbort = () => ctrl.abort();
     if (appSignal && !appSignal.aborted) {
-      appSignal.addEventListener("abort", onAppAbort, { once: true });
+      appSignal.addEventListener('abort', onAppAbort, { once: true });
     }
 
     try {
@@ -391,12 +356,13 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
         { signal: ctrl.signal },
       );
       if (runGenRef.current !== myGen) return;
-      console.log("[mlp-demo] runForInspector ok", {
+      console.log('[mlp-demo] runForInspector ok', {
         promptLength: prompt.length,
         layers: result.hiddenStates?.[0]?.layers.length ?? 0,
       });
       setRun(result);
-      setStatus({ kind: "ok" });
+      setStatus({ kind: 'ok' });
+      setLastRunPrompt(prompt);
       const maxLayer = (result.modelMeta?.numLayers ?? DEFAULT_NUM_LAYERS) - 1;
       if (selectedLayer > maxLayer) {
         setSelectedLayer(0);
@@ -404,19 +370,17 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
     } catch (err) {
       if (runGenRef.current !== myGen) return;
       if (isAbortError(err)) {
-        console.info(
-          "[mlp-demo] runForInspector aborted (worker terminated or superseded)",
-        );
+        console.info('[mlp-demo] runForInspector aborted (worker terminated or superseded)');
         if (appSignal?.aborted) {
-          setStatus({ kind: "aborted" });
+          setStatus({ kind: 'aborted' });
         }
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error("[mlp-demo] runForInspector failed", err);
-        setStatus({ kind: "error", error: message });
+        console.error('[mlp-demo] runForInspector failed', err);
+        setStatus({ kind: 'error', error: message });
       }
     } finally {
-      if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
+      if (appSignal) appSignal.removeEventListener('abort', onAppAbort);
       if (runAbortRef.current === ctrl) runAbortRef.current = null;
       if (runGenRef.current === myGen) setRunning(false);
     }
@@ -450,10 +414,7 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
     }
   }, [availableLayers, selectedLayer]);
 
-  const layerStats = React.useMemo(
-    () => getLayerStats(hiddenSteps, selectedLayer),
-    [hiddenSteps, selectedLayer],
-  );
+  const layerStats = React.useMemo(() => getLayerStats(hiddenSteps, selectedLayer), [hiddenSteps, selectedLayer]);
 
   const allLayersMlpL2 = React.useMemo(() => {
     if (!hiddenSteps || hiddenSteps.length === 0) return [];
@@ -463,7 +424,7 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
       .slice()
       .sort((a, b) => a.layerIdx - b.layerIdx)
       .map((layer) => {
-        const stat = layer.stats.find((s) => s.point === "mlp_output");
+        const stat = layer.stats.find((s) => s.point === 'mlp_output');
         return { layerIdx: layer.layerIdx, value: perTokenL2(stat) };
       });
   }, [hiddenSteps]);
@@ -473,10 +434,7 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
   return (
     <div className="space-y-4">
       <div className="space-y-2">
-        <label
-          htmlFor="mlp-demo-input"
-          className="text-xs uppercase tracking-wider text-muted-foreground"
-        >
+        <label htmlFor="mlp-demo-input" className="text-xs uppercase tracking-wider text-muted-foreground">
           Prompt
         </label>
         <Textarea
@@ -488,48 +446,47 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
           placeholder={DEFAULT_PROMPT}
         />
         <div className="flex flex-wrap items-center gap-2">
-          <Button onClick={handleRun} disabled={running}>
-            {running ? "Running..." : "Run"}
-          </Button>
+          <RunButton
+            onClick={handleRun}
+            running={running}
+            disabled={lastRunPrompt !== null && lastRunPrompt === prompt}
+          />
           <span className="text-xs text-muted-foreground">
-            Captures MLP path activation stats for a single forward pass.
+            {lastRunPrompt !== null && lastRunPrompt === prompt && !running
+              ? 'Stats are current. Edit the prompt above to capture a new forward pass.'
+              : 'Captures MLP path activation stats for a single forward pass.'}
           </span>
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <label
-          htmlFor="mlp-demo-layer"
-          className="text-xs uppercase tracking-wider text-muted-foreground"
-        >
+      <div className="flex flex-wrap items-center gap-3">
+        <label htmlFor="mlp-demo-layer" className="text-xs uppercase tracking-wider text-muted-foreground">
           Layer
         </label>
-        <Select
-          value={`${selectedLayer}`}
-          onValueChange={(v) => setSelectedLayer(Number(v))}
-        >
-          <SelectTrigger
-            id="mlp-demo-layer"
-            size="sm"
-            className="min-w-[8rem]"
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {availableLayers.map((idx) => (
-              <SelectItem key={idx} value={`${idx}`}>
-                {`Layer ${idx}`}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <input
+          id="mlp-demo-layer"
+          type="range"
+          min={0}
+          max={Math.max(availableLayers.length - 1, 0)}
+          step={1}
+          value={Math.max(availableLayers.indexOf(selectedLayer), 0)}
+          disabled={availableLayers.length === 0}
+          onChange={(e) => {
+            const idx = Number.parseInt(e.target.value, 10);
+            const next = availableLayers[idx];
+            if (next !== undefined) setSelectedLayer(next);
+          }}
+          aria-valuetext={`Layer ${selectedLayer}`}
+          className="h-2 w-48 cursor-pointer appearance-none rounded-full bg-muted accent-primary disabled:cursor-not-allowed disabled:opacity-50"
+        />
+        <span className="font-mono text-xs tabular-nums text-foreground/80">{`Layer ${selectedLayer}`}</span>
         <span className="text-xs text-muted-foreground">
-          {run?.modelMeta?.name ?? "—"}
-          {hasData ? ` · ${numLayers} layers` : ""}
+          {run?.modelMeta?.name ?? '—'}
+          {hasData ? ` · ${numLayers} layers` : ''}
         </span>
       </div>
 
-      {status?.kind === "error" ? (
+      {status?.kind === 'error' ? (
         <div
           role="alert"
           className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
@@ -537,16 +494,15 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
           <strong>Inspector run failed.</strong> {status.error}
         </div>
       ) : null}
-      {status?.kind === "aborted" ? (
+      {status?.kind === 'aborted' ? (
         <div
           role="status"
           className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
         >
-          Request cancelled — model was reloaded. Click <strong>Run</strong>{" "}
-          again to retry.
+          Request cancelled — model was reloaded. Click <strong>Run</strong> again to retry.
         </div>
       ) : null}
-      {status?.kind === "empty-prompt" ? (
+      {status?.kind === 'empty-prompt' ? (
         <div
           role="alert"
           className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
@@ -556,7 +512,7 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
       ) : null}
 
       {hasData ? (
-        <div className="space-y-3">
+        <div ref={resultFlashRef} className="space-y-3 p-1">
           <MlpStatsGrid layerStats={layerStats} />
           <ContributionVsOutputChart layerStats={layerStats} />
           <AllLayersStrip
@@ -567,16 +523,15 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
         </div>
       ) : (
         <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
-          Click <strong>Run</strong> to capture MLP path activation stats for
-          a single forward pass.
+          Click <strong>Run</strong> to capture MLP path activation stats for a single forward pass.
         </div>
       )}
 
       <DemoCallout
         items={[
-          "SwiGLU multiplies a gate and a value: the bars are roughly gate × value before the down projection.",
-          "Different layers spend wildly different amounts in their MLPs — find the tallest and the smallest.",
-          "The MLP-to-output ratio shows how much the MLP changes the residual stream at each layer.",
+          'SwiGLU multiplies a gate and a value: the bars are roughly gate × value before the down projection.',
+          'Different layers spend wildly different amounts in their MLPs — find the tallest and the smallest.',
+          'The MLP-to-output ratio shows how much the MLP changes the residual stream at each layer.',
         ]}
       />
     </div>
@@ -595,39 +550,23 @@ function StatBox({
   const l2 = perTokenL2(stats);
   return (
     <div className="rounded-md border border-border bg-background p-3 text-xs">
-      <div className="mb-1 uppercase tracking-wider text-muted-foreground">
-        {title}
-      </div>
-      <div className="mb-2 text-[11px] text-muted-foreground/80">
-        {description}
-      </div>
+      <div className="mb-1 uppercase tracking-wider text-muted-foreground">{title}</div>
+      <div className="mb-2 text-[11px] text-muted-foreground/80">{description}</div>
       <dl className="grid grid-cols-2 gap-x-3 gap-y-1 font-mono">
         <dt className="text-muted-foreground">L2/tok</dt>
-        <dd className="text-right text-foreground/90">
-          {l2 !== null ? formatNumber(l2, 2) : "—"}
-        </dd>
+        <dd className="text-right text-foreground/90">{l2 !== null ? formatNumber(l2, 2) : '—'}</dd>
         <dt className="text-muted-foreground">|max|</dt>
-        <dd className="text-right text-foreground/90">
-          {stats ? formatNumber(stats.absMax, 2) : "—"}
-        </dd>
+        <dd className="text-right text-foreground/90">{stats ? formatNumber(stats.absMax, 2) : '—'}</dd>
         <dt className="text-muted-foreground">std</dt>
-        <dd className="text-right text-foreground/90">
-          {stats ? formatNumber(stats.std) : "—"}
-        </dd>
+        <dd className="text-right text-foreground/90">{stats ? formatNumber(stats.std) : '—'}</dd>
         <dt className="text-muted-foreground">mean</dt>
-        <dd className="text-right text-foreground/90">
-          {stats ? formatNumber(stats.mean) : "—"}
-        </dd>
+        <dd className="text-right text-foreground/90">{stats ? formatNumber(stats.mean) : '—'}</dd>
       </dl>
     </div>
   );
 }
 
-function MlpStatsGrid({
-  layerStats,
-}: {
-  layerStats: Partial<Record<CapturePoint, HiddenStatePointStats>>;
-}) {
+function MlpStatsGrid({ layerStats }: { layerStats: Partial<Record<CapturePoint, HiddenStatePointStats>> }) {
   return (
     <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
       {CAPTURE_POINTS.map((point) => (
@@ -649,12 +588,9 @@ function ContributionVsOutputChart({
 }) {
   const mlp = perTokenL2(layerStats.mlp_output);
   const layerOut = perTokenL2(layerStats.post_mlp_residual);
-  const finite = [mlp, layerOut].filter(
-    (v): v is number => v !== null && Number.isFinite(v),
-  );
+  const finite = [mlp, layerOut].filter((v): v is number => v !== null && Number.isFinite(v));
   const maxValue = finite.length > 0 ? Math.max(...finite) : 1;
-  const ratio =
-    mlp !== null && layerOut !== null && layerOut > 0 ? mlp / layerOut : null;
+  const ratio = mlp !== null && layerOut !== null && layerOut > 0 ? mlp / layerOut : null;
   return (
     <div
       role="list"
@@ -665,57 +601,30 @@ function ContributionVsOutputChart({
         Magnitude: MLP contribution vs layer output
       </div>
       <div role="listitem" className="space-y-1">
-        <BarRow
-          label="MLP only"
-          value={mlp}
-          max={maxValue}
-          accent={false}
-        />
+        <BarRow label="MLP only" value={mlp} max={maxValue} accent={false} />
         <BarRow label="Layer out" value={layerOut} max={maxValue} accent />
       </div>
       <div className="pt-1 text-[11px] text-muted-foreground">
-        The MLP adds a small correction; the residual stream carries the bulk
-        of the signal.
-        {ratio !== null
-          ? ` MLP / layer-output ratio: ${formatNumber(ratio * 100, 1)}%.`
-          : ""}
+        The MLP adds a small correction; the residual stream carries the bulk of the signal.
+        {ratio !== null ? ` MLP / layer-output ratio: ${formatNumber(ratio * 100, 1)}%.` : ''}
       </div>
     </div>
   );
 }
 
-function BarRow({
-  label,
-  value,
-  max,
-  accent,
-}: {
-  label: string;
-  value: number | null;
-  max: number;
-  accent: boolean;
-}) {
+function BarRow({ label, value, max, accent }: { label: string; value: number | null; max: number; accent: boolean }) {
   const safeMax = max > 0 ? max : 1;
-  const pct =
-    value === null || !Number.isFinite(value)
-      ? 0
-      : Math.max(0, Math.min(100, (value / safeMax) * 100));
+  const pct = value === null || !Number.isFinite(value) ? 0 : Math.max(0, Math.min(100, (value / safeMax) * 100));
   return (
     <div className="grid grid-cols-[5rem_minmax(0,1fr)_4.5rem] items-center gap-2 text-[12px]">
-      <span className="font-mono uppercase tracking-wider text-muted-foreground">
-        {label}
-      </span>
+      <span className="font-mono uppercase tracking-wider text-muted-foreground">{label}</span>
       <div className="relative h-4 w-full overflow-hidden rounded bg-muted">
         <div
-          className={["h-full", accent ? "bg-primary" : "bg-foreground/40"].join(
-            " ",
-          )}
+          className={['h-full', accent ? 'bg-primary' : 'bg-foreground/40'].join(' ')}
           style={{ width: `${pct}%` }}
         />
       </div>
-      <span className="text-right font-mono text-foreground/80">
-        {value === null ? "—" : formatNumber(value, 2)}
-      </span>
+      <span className="text-right font-mono text-foreground/80">{value === null ? '—' : formatNumber(value, 2)}</span>
     </div>
   );
 }
@@ -729,26 +638,18 @@ function AllLayersStrip({
   selectedLayer: number;
   onSelect: (idx: number) => void;
 }) {
-  const finite = data
-    .map((d) => d.value)
-    .filter((v): v is number => v !== null && Number.isFinite(v));
+  const finite = data.map((d) => d.value).filter((v): v is number => v !== null && Number.isFinite(v));
   const maxValue = finite.length > 0 ? Math.max(...finite) : 1;
   return (
     <div className="space-y-2 rounded-md border border-border bg-background p-3">
       <div className="text-xs uppercase tracking-wider text-muted-foreground">
         MLP contribution across all layers (per-token L2 of mlp_output)
       </div>
-      <div
-        role="list"
-        aria-label="Per-layer MLP output magnitude"
-        className="flex h-20 items-end gap-[2px]"
-      >
+      <div role="list" aria-label="Per-layer MLP output magnitude" className="flex h-20 items-end gap-[2px]">
         {data.map(({ layerIdx, value }) => {
           const safeMax = maxValue > 0 ? maxValue : 1;
           const pct =
-            value === null || !Number.isFinite(value)
-              ? 0
-              : Math.max(2, Math.min(100, (value / safeMax) * 100));
+            value === null || !Number.isFinite(value) ? 0 : Math.max(2, Math.min(100, (value / safeMax) * 100));
           const isSelected = layerIdx === selectedLayer;
           return (
             <button
@@ -756,24 +657,20 @@ function AllLayersStrip({
               type="button"
               role="listitem"
               onClick={() => onSelect(layerIdx)}
-              title={`Layer ${layerIdx}: ${
-                value === null ? "—" : formatNumber(value, 2)
-              }`}
-              aria-label={`Layer ${layerIdx} MLP L2 ${
-                value === null ? "unknown" : formatNumber(value, 2)
-              }`}
+              title={`Layer ${layerIdx}: ${value === null ? '—' : formatNumber(value, 2)}`}
+              aria-label={`Layer ${layerIdx} MLP L2 ${value === null ? 'unknown' : formatNumber(value, 2)}`}
               aria-pressed={isSelected}
               className={[
-                "group relative flex h-full min-w-[10px] flex-1 items-end rounded-sm transition-colors",
-                "hover:bg-muted",
-              ].join(" ")}
+                'group relative flex h-full min-w-[10px] flex-1 items-end rounded-sm transition-colors',
+                'hover:bg-muted',
+              ].join(' ')}
             >
               <span
                 className={[
-                  "block w-full rounded-sm",
-                  isSelected ? "bg-primary" : "bg-foreground/40",
-                  "group-hover:bg-primary/80",
-                ].join(" ")}
+                  'block w-full rounded-sm',
+                  isSelected ? 'bg-primary' : 'bg-foreground/40',
+                  'group-hover:bg-primary/80',
+                ].join(' ')}
                 style={{ height: `${pct}%` }}
               />
             </button>
@@ -782,9 +679,7 @@ function AllLayersStrip({
       </div>
       <div className="flex items-center justify-between text-[11px] text-muted-foreground">
         <span>Layer 0</span>
-        <span>
-          Selected: layer {selectedLayer} — click any bar to focus.
-        </span>
+        <span>Selected: layer {selectedLayer} — click any bar to focus.</span>
         <span>Layer {data.length > 0 ? data[data.length - 1]!.layerIdx : 0}</span>
       </div>
     </div>

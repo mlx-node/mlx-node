@@ -22,6 +22,7 @@
     "buffer": "^6.0.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "katex": "^0.17.0",
     "lucide-react": "^1.11.0",
     "radix-ui": "^1.4.3",
     "react": "^19.2.5",

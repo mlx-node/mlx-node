@@ -16,6 +16,15 @@ export type AttentionHeatmapProps = {
   run: AttentionRun;
   /** Pixel size of each score cell. Capped to fit on screen for long prompts. */
   preferredCellSize?: number;
+  /**
+   * Bumped by the parent on every successful Run to trigger a top-to-bottom
+   * causal-reveal animation. The component animates an internal progress
+   * counter from 0 to seqLen rows; the draw step honors that via the
+   * `revealRows` option in {@link drawAttentionHeatmap}. Default `0` means
+   * "no animation, fully revealed" — used when the heatmap is embedded
+   * outside a Run-driven flow (e.g. chapter 4's small per-head panels).
+   */
+  runKey?: number;
 };
 
 /**
@@ -36,6 +45,7 @@ export type AttentionHeatmapProps = {
 export function AttentionHeatmap({
   run,
   preferredCellSize = 32,
+  runKey = 0,
 }: AttentionHeatmapProps) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
   // Initial default: prefer the first layer whose kind === 'full' so the
@@ -97,6 +107,50 @@ export function AttentionHeatmap({
   }, [run, selectedLayerIdx, selectedHead]);
 
   const seqLen = run.tokens.length;
+  // Causal-reveal animation: each Run (parent bumps `runKey`) animates this
+  // float from 0 → seqLen over `revealDurationMs`, fading in rows top-to-
+  // bottom. Default state is `seqLen` (no reveal in progress, fully drawn)
+  // so the canvas paints normally whenever runKey === 0 or layer/head
+  // change during static viewing.
+  const [revealRows, setRevealRows] = React.useState<number>(seqLen);
+  React.useEffect(() => {
+    if (runKey === 0 || seqLen === 0) {
+      setRevealRows(seqLen);
+      return;
+    }
+    const reducedMotion =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reducedMotion) {
+      setRevealRows(seqLen);
+      return;
+    }
+    // ~280 ms per row, capped so a long prompt doesn't make the animation
+    // drag for many seconds. 1800 ms is enough for ~6 rows at full speed
+    // and visibly faster (but still legible) for longer prompts.
+    const perRow = 280;
+    const revealDurationMs = Math.min(2200, perRow * seqLen);
+    setRevealRows(0);
+    let rafId: number | null = null;
+    let startTime: number | null = null;
+    const step = (t: number) => {
+      if (startTime === null) startTime = t;
+      const elapsed = t - startTime;
+      const progress = Math.min(1, elapsed / revealDurationMs);
+      // Ease-out cubic — fast initial rows, gentle landing on the last row.
+      const eased = 1 - Math.pow(1 - progress, 3);
+      setRevealRows(eased * seqLen);
+      if (progress < 1) {
+        rafId = requestAnimationFrame(step);
+      }
+    };
+    rafId = requestAnimationFrame(step);
+    return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [runKey, seqLen]);
+
   // Heatmap area should fit comfortably in the right-side panel. Cap at the
   // preferred size, but shrink for very long sequences.
   const maxBoardPx = 360;
@@ -133,7 +187,7 @@ export function AttentionHeatmap({
       return;
     }
     const head = Math.min(selectedHead, layer.numHeads - 1);
-    drawAttentionHeatmap(ctx, layer, head, cellSize);
+    drawAttentionHeatmap(ctx, layer, head, cellSize, { revealRows });
 
     // Grid (subtle).
     ctx.strokeStyle = "rgba(255,255,255,0.04)";
@@ -149,7 +203,7 @@ export function AttentionHeatmap({
       ctx.lineTo(p, board);
       ctx.stroke();
     }
-  }, [run, selectedLayerIdx, selectedHead, seqLen, cellSize, board, resizeTick]);
+  }, [run, selectedLayerIdx, selectedHead, seqLen, cellSize, board, resizeTick, revealRows]);
 
   function onMouseMove(e: React.MouseEvent<HTMLCanvasElement>) {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -337,8 +391,18 @@ export function AttentionHeatmap({
 
       {/* Next-token card — the concrete artifact of one Run. This is the
           single thing a learner can point at and say "the model just
-          predicted that". */}
-      <div className="rounded-md border border-primary/40 bg-primary/5 px-4 py-3">
+          predicted that". After a Run, fades in just after the causal row
+          reveal in the canvas finishes — delay is reveal duration + small
+          buffer. Key bumps via runKey so each Run replays the animation. */}
+      <div
+        key={`next-token-${runKey}`}
+        className={runKey > 0 ? "attn-next-token-pop rounded-md border border-primary/40 bg-primary/5 px-4 py-3" : "rounded-md border border-primary/40 bg-primary/5 px-4 py-3"}
+        style={
+          runKey > 0
+            ? { animationDelay: `${Math.min(2200, 280 * seqLen) + 100}ms` }
+            : undefined
+        }
+      >
         <div className="text-[0.7rem] uppercase tracking-wider text-muted-foreground">
           Next token
         </div>
@@ -477,17 +541,37 @@ export function drawAttentionHeatmap(
   layer: AttentionLayer,
   headIdx: number,
   pixelSize: number,
-  options?: { colorFn?: (v: number) => string },
+  options?: {
+    colorFn?: (v: number) => string;
+    /**
+     * Number of rows to reveal, as a float in [0, seqLen]. Used by the
+     * chapter-3 Run animation to do a top-to-bottom causal sweep. Rows below
+     * `floor(revealRows)` are not drawn; the row at `floor(revealRows)` is
+     * drawn at fractional alpha = `revealRows - floor(revealRows)`. Default
+     * is `seqLen` (no animation — fully reveal everything).
+     */
+    revealRows?: number;
+  },
 ): void {
   const colorFn = options?.colorFn ?? colorForScore;
   const seqLen = Math.round(
     Math.sqrt(layer.scores.length / Math.max(1, layer.numHeads)),
   );
   if (seqLen === 0) return;
+  const reveal =
+    options?.revealRows === undefined
+      ? seqLen
+      : Math.max(0, Math.min(seqLen, options.revealRows));
+  const fullRows = Math.floor(reveal);
+  const partialAlpha = reveal - fullRows;
   const safeHead = Math.min(headIdx, layer.numHeads - 1);
   const headStride = seqLen * seqLen;
   const headOffset = safeHead * headStride;
   for (let i = 0; i < seqLen; i++) {
+    if (i > fullRows) break;
+    const alpha = i < fullRows ? 1 : partialAlpha;
+    if (alpha <= 0) continue;
+    ctx.globalAlpha = alpha;
     for (let j = 0; j < seqLen; j++) {
       const v = layer.scores[headOffset + i * seqLen + j] ?? 0;
       if (v <= 0) continue;
@@ -495,4 +579,5 @@ export function drawAttentionHeatmap(
       ctx.fillRect(j * pixelSize, i * pixelSize, pixelSize, pixelSize);
     }
   }
+  ctx.globalAlpha = 1;
 }

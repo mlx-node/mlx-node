@@ -1,4 +1,4 @@
-@import "tailwindcss";
+@import 'tailwindcss';
 @source "../../../node_modules/streamdown/dist/*.js";
 @source "../../../node_modules/@streamdown/code/dist/*.js";
 
@@ -70,11 +70,9 @@
   --color-input: var(--input);
   --color-ring: var(--ring);
 
-  --font-display: "Instrument Serif", ui-serif, Georgia, serif;
-  --font-body:
-    "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
-    sans-serif;
-  --font-mono: "DM Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-display: 'Instrument Serif', ui-serif, Georgia, serif;
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 @layer base {
@@ -93,16 +91,8 @@
     @apply text-foreground antialiased;
     font-family: var(--font-body);
     background:
-      radial-gradient(
-        1200px 600px at 80% -10%,
-        rgba(244, 200, 215, 0.08) 0%,
-        transparent 60%
-      ),
-      radial-gradient(
-        900px 500px at 10% 110%,
-        rgba(97, 92, 237, 0.1) 0%,
-        transparent 65%
-      ),
+      radial-gradient(1200px 600px at 80% -10%, rgba(244, 200, 215, 0.08) 0%, transparent 60%),
+      radial-gradient(900px 500px at 10% 110%, rgba(97, 92, 237, 0.1) 0%, transparent 65%),
       radial-gradient(207% 123% at 50% 0%, #2a2530 0%, #0f0d11 100%) fixed;
     color: var(--text);
     overflow: hidden;
@@ -155,7 +145,7 @@
   }
   /* Soft elliptical halo behind the text — no hard panel edges */
   .landing-content::before {
-    content: "";
+    content: '';
     position: absolute;
     inset: -14% -22%;
     z-index: -1;
@@ -184,7 +174,7 @@
     gap: 8px;
   }
   .landing-tag::before {
-    content: "";
+    content: '';
     width: 6px;
     height: 6px;
     border-radius: 50%;
@@ -227,12 +217,7 @@
     border: 1px solid rgba(244, 200, 215, 0.34);
     border-radius: 999px;
     background:
-      linear-gradient(
-        90deg,
-        rgba(244, 200, 215, 0.14),
-        rgba(136, 132, 246, 0.16),
-        rgba(186, 212, 232, 0.1)
-      ),
+      linear-gradient(90deg, rgba(244, 200, 215, 0.14), rgba(136, 132, 246, 0.16), rgba(186, 212, 232, 0.1)),
       rgba(15, 13, 17, 0.45);
     box-shadow:
       inset 0 1px 0 rgba(236, 228, 218, 0.12),
@@ -266,7 +251,7 @@
     color: var(--text);
   }
   .landing-void-mark::before {
-    content: "";
+    content: '';
     width: 7px;
     height: 7px;
     border-radius: 50%;
@@ -533,7 +518,7 @@
     gap: 5px;
   }
   .chat-header-status::before {
-    content: "";
+    content: '';
     width: 6px;
     height: 6px;
     border-radius: 50%;
@@ -622,7 +607,7 @@
     position: relative;
   }
   .message.assistant.generating::after {
-    content: "";
+    content: '';
     display: inline-block;
     width: 7px;
     height: 1em;
@@ -745,7 +730,7 @@
     background: var(--border);
     border-radius: 8px;
   }
-  .composer-textarea[data-overflow="true"] {
+  .composer-textarea[data-overflow='true'] {
     overflow-y: auto;
   }
   .composer-textarea::placeholder {
@@ -1037,7 +1022,10 @@
     letter-spacing: 0.08em;
     text-transform: uppercase;
     cursor: pointer;
-    transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+    transition:
+      border-color 0.15s ease,
+      color 0.15s ease,
+      background 0.15s ease;
   }
   .assistant-inspect-btn:hover {
     border-color: var(--book-pink);
@@ -1139,18 +1127,39 @@
   }
 }
 
-/* Brief outline flash on chapter "Run" success — feedback that the heatmap
- * actually re-rendered, since identical prompts produce identical patterns. */
+/* Outline flash on chapter "Run" success — feedback that the result
+ * panel actually re-rendered, since identical prompts produce identical
+ * output under greedy sampling. Used by every chapter's result container
+ * via the `useRunFlash` hook.
+ *
+ * The 1.4s duration is deliberately long: the animation needs to be
+ * obvious enough for the human eye to land on it even when the user is
+ * looking at the Run button at the moment of click, then glances down at
+ * the result panel a beat later. Shorter durations were tested and felt
+ * like nothing happened. */
 .run-flash-on-mount {
-  animation: runFlash 600ms ease-out;
+  animation: runFlash 1400ms ease-out;
+  border-radius: 0.5rem;
 }
 
 @keyframes runFlash {
   0% {
-    box-shadow: 0 0 0 0 oklch(0.85 0.07 25 / 0.85);
+    box-shadow:
+      0 0 0 0 oklch(0.85 0.12 25 / 0.85),
+      inset 0 0 0 1.5px oklch(0.85 0.12 25 / 0.7);
+    background-color: oklch(0.85 0.12 25 / 0.12);
+  }
+  25% {
+    box-shadow:
+      0 0 0 5px oklch(0.85 0.12 25 / 0.55),
+      inset 0 0 0 1.5px oklch(0.85 0.12 25 / 0.55);
+    background-color: oklch(0.85 0.12 25 / 0.1);
   }
   100% {
-    box-shadow: 0 0 0 6px oklch(0.85 0.07 25 / 0);
+    box-shadow:
+      0 0 0 14px oklch(0.85 0.12 25 / 0),
+      inset 0 0 0 1.5px oklch(0.85 0.12 25 / 0);
+    background-color: oklch(0.85 0.12 25 / 0);
   }
 }
 
@@ -1182,6 +1191,34 @@
 
 @media (prefers-reduced-motion: reduce) {
   .last-row-flash {
+    animation: none;
+  }
+}
+
+/* Press-flash for the shared <RunButton/>. The component remounts itself
+ * via a key on every click, so the animation restarts on each press —
+ * gives a tactile "the click landed" signal even when the resulting
+ * inspector run finishes faster than the human reaction window. */
+.run-button-press {
+  animation: runButtonPress 380ms ease-out;
+}
+
+@keyframes runButtonPress {
+  0% {
+    transform: scale(0.94);
+    box-shadow: 0 0 0 0 oklch(0.85 0.07 25 / 0.85);
+  }
+  40% {
+    transform: scale(1.03);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 8px oklch(0.85 0.07 25 / 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .run-button-press {
     animation: none;
   }
 }
@@ -1221,5 +1258,153 @@
 @media (prefers-reduced-motion: reduce) {
   .rainbow-text-animated {
     animation: none;
+  }
+}
+
+/* Chapter 4 (Multi-head & GQA) Run animation — teaches the "4 queries route
+ * to the same K/V" punchline by drawing each connection line in sequence,
+ * pulsing each Q chip as its line lands, and glowing the destination K/V box
+ * when its group completes. The whole sequence is held to ~1s so the lesson
+ * lands fast. A second Run remounts the lane subtree via a key prop, which
+ * restarts every animation from its delayed-from state. */
+.gqa-line {
+  stroke-dasharray: 220;
+  animation: gqa-line-draw 440ms ease-out both;
+}
+
+@keyframes gqa-line-draw {
+  from {
+    stroke-dashoffset: 220;
+    opacity: 0;
+  }
+  to {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+.gqa-chip {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: gqa-chip-pulse 680ms ease-out both;
+}
+
+@keyframes gqa-chip-pulse {
+  0% {
+    transform: scale(1);
+    filter: brightness(1);
+  }
+  45% {
+    transform: scale(1.16);
+    filter: brightness(1.55);
+  }
+  100% {
+    transform: scale(1);
+    filter: brightness(1);
+  }
+}
+
+.gqa-kv {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: gqa-kv-glow 1040ms ease-out both;
+}
+
+@keyframes gqa-kv-glow {
+  0%,
+  100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.55) drop-shadow(0 0 6px currentColor);
+  }
+}
+
+/* Savings card "4× smaller" badge pop — anchors the cache-tick number
+ * animation with a satisfying landing beat. Applied via a key-bumped span. */
+.gqa-savings-pop {
+  display: inline-block;
+  transform-origin: center;
+  animation: gqa-savings-pop 1040ms cubic-bezier(0.34, 1.45, 0.64, 1) both;
+}
+
+@keyframes gqa-savings-pop {
+  0% {
+    transform: scale(0.55);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.14);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gqa-line {
+    stroke-dasharray: none;
+    animation: none;
+  }
+  .gqa-chip,
+  .gqa-kv,
+  .gqa-savings-pop {
+    animation: none;
+  }
+}
+
+/* Chapter 3 (Attention heatmap) Next-token panel reveal — fades in + slides
+ * up slightly once the causal row-reveal animation in the canvas finishes.
+ * The container delays via inline animation-delay tuned to seqLen. */
+.attn-next-token-pop {
+  animation: attn-next-token-pop 360ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes attn-next-token-pop {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .attn-next-token-pop {
+    animation: none;
+  }
+}
+
+/* Multi-head concat (chapter 4) — used to stage the heads sliding into
+   the concatenated wide matrix. Each head element sets its own
+   animation-delay so the slide-in cascades head-by-head. */
+@keyframes mhFade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes mhSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-32px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [style*='mhFade'],
+  [style*='mhSlideIn'] {
+    animation: none !important;
   }
 }

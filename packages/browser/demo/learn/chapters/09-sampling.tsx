@@ -1,15 +1,18 @@
-import * as React from "react";
+import * as React from 'react';
 
-import { Button } from "../../components/ui/button";
-import { Textarea } from "../../components/ui/textarea";
-import type { AttentionRun } from "../../../src/inspector-types";
-import { runForInspector } from "../../lib/inspector-client";
-import { DemoCallout } from "../inspector/DemoCallout";
-import { TopKBars } from "../inspector/TopKBars";
-import { Prose } from "../Prose";
-import { ChapterFrame } from "../scaffolding/ChapterFrame";
-import type { ChapterLearningData } from "../scaffolding/learning-data";
-import { SamplingFailureModes } from "../widgets/SamplingFailureModes";
+import type { AttentionRun } from '../../../src/inspector-types';
+import { Button } from '../../components/ui/button';
+import { Textarea } from '../../components/ui/textarea';
+import { runForInspector } from '../../lib/inspector-client';
+import { DemoCallout } from '../inspector/DemoCallout';
+import { TopKBars } from '../inspector/TopKBars';
+import { Prose } from '../Prose';
+import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import type { ChapterLearningData } from '../scaffolding/learning-data';
+import { MathDisplay } from '../scaffolding/MathDisplay';
+import { RunButton } from '../scaffolding/RunButton';
+import { useRunFlash } from '../scaffolding/useRunFlash';
+import { SamplingFailureModes } from '../widgets/SamplingFailureModes';
 
 /**
  * Chapter 9 — Sampling.
@@ -21,7 +24,7 @@ import { SamplingFailureModes } from "../widgets/SamplingFailureModes";
  * the controls does NOT re-run the model.
  */
 
-const DEFAULT_PROMPT = "Once upon a time, in a forest far away";
+const DEFAULT_PROMPT = 'Once upon a time, in a forest far away';
 const MAX_NEW_TOKENS = 6;
 const TOP_K = 16;
 
@@ -31,116 +34,114 @@ const TOP_K = 16;
  * `chapterId` must match `CHAPTERS[8].id` in `learn/chapters.ts`.
  */
 export const learning: ChapterLearningData = {
-  chapterId: "sampling",
+  chapterId: 'sampling',
   objective:
-    "Take a vector of logits, apply temperature and top-p, and reason about why each knob shifts the resulting distribution.",
+    'Take a vector of logits, apply temperature and top-p, and reason about why each knob shifts the resulting distribution.',
   problem:
-    "Every forward pass ends with logits; the model still needs a rule for turning that vector into one concrete next token.",
+    'Every forward pass ends with logits; the model still needs a rule for turning that vector into one concrete next token.',
   minutes: 6,
   glossary: [
     {
-      term: "logit",
+      term: 'logit',
       definition:
-        "One unbounded real-valued score per vocab entry. The raw output of the model before any normalization.",
+        'One unbounded real-valued score per vocab entry. The raw output of the model before any normalization.',
     },
     {
-      term: "softmax",
-      definition:
-        "exp(l_i / T) / sum_j exp(l_j / T) — turns logits into a probability distribution that sums to 1.",
+      term: 'softmax',
+      definition: 'exp(l_i / T) / sum_j exp(l_j / T) — turns logits into a probability distribution that sums to 1.',
     },
     {
-      term: "temperature (T)",
+      term: 'temperature (T)',
       definition:
-        "Sharpness knob applied before softmax. T<1 sharpens (closer to greedy); T>1 flattens (more diverse).",
+        'Sharpness knob applied before softmax. T<1 sharpens (closer to greedy); T>1 flattens (more diverse).',
     },
     {
-      term: "greedy decoding",
+      term: 'greedy decoding',
       definition:
-        "Pick argmax(logits) every step. Deterministic and reproducible; tends to fall into repetition loops.",
+        'Pick argmax(logits) every step. Deterministic and reproducible; tends to fall into repetition loops.',
     },
     {
-      term: "top-p (nucleus)",
+      term: 'top-p (nucleus)',
       definition:
-        "Keep the smallest set of tokens whose probabilities sum to >= p, renormalize, sample from those. Trims the long tail.",
+        'Keep the smallest set of tokens whose probabilities sum to >= p, renormalize, sample from those. Trims the long tail.',
     },
     {
-      term: "top-K",
-      definition:
-        "Keep only the K highest-probability tokens. The widget shows top-K=16 logits per step.",
+      term: 'top-K',
+      definition: 'Keep only the K highest-probability tokens. The widget shows top-K=16 logits per step.',
     },
   ],
   takeaways: [
-    "Logits become probabilities only after softmax — comparing raw logits across runs or models is meaningless.",
-    "Temperature reshapes the distribution; top-p truncates the tail. A common default is T=0.7 with top_p=0.9.",
+    'Logits become probabilities only after softmax — comparing raw logits across runs or models is meaningless.',
+    'Temperature reshapes the distribution; top-p truncates the tail. A common default is T=0.7 with top_p=0.9.',
     "The model's actually-sampled token may not be the bar with the highest probability after you change the sliders — that's how the sliders steer generation.",
   ],
   exercise: {
     prompt:
-      "After the auto-run, leave temperature at 1.0 and slowly lower top-p from 1.0 to 0.3 while watching the bar chart for step 1. At what point does the chart visibly collapse to one or two bars, and what does the renormalised height tell you?",
+      'After the auto-run, leave temperature at 1.0 and slowly lower top-p from 1.0 to 0.3 while watching the bar chart for step 1. At what point does the chart visibly collapse to one or two bars, and what does the renormalised height tell you?',
     answer:
-      "Around top_p ≈ 0.5-0.7 the long tail disappears and the top two or three bars shoot up because the surviving mass is re-normalized to sum to 1. By top_p = 0.3 you usually have a single near-100% bar — top-p has effectively turned this step into greedy decoding. That collapse-point depends on how confident the step was: a confident step survives even very small p, an uncertain step needs more.",
+      'Around top_p ≈ 0.5-0.7 the long tail disappears and the top two or three bars shoot up because the surviving mass is re-normalized to sum to 1. By top_p = 0.3 you usually have a single near-100% bar — top-p has effectively turned this step into greedy decoding. That collapse-point depends on how confident the step was: a confident step survives even very small p, an uncertain step needs more.',
   },
   quiz: [
     {
-      id: "q1-greedy-issue",
+      id: 'q1-greedy-issue',
       prompt: "Why doesn't production LLM serving just always use greedy decoding?",
       options: [
-        { id: "a", label: "Greedy is too slow on GPUs." },
+        { id: 'a', label: 'Greedy is too slow on GPUs.' },
         {
-          id: "b",
+          id: 'b',
           label:
-            "Greedy is deterministic and reproducible but prone to repetition — once the model finds a high-confidence loop it keeps re-entering it.",
+            'Greedy is deterministic and reproducible but prone to repetition — once the model finds a high-confidence loop it keeps re-entering it.',
         },
         {
-          id: "c",
+          id: 'c',
           label: "Greedy doesn't work with byte-pair encoding.",
         },
       ],
-      correctId: "b",
+      correctId: 'b',
       explanation:
         "Greedy is a perfectly valid decoder; it's just brittle. A small randomization (T or top-p) is what breaks the model out of locally-optimal loops.",
     },
     {
-      id: "q2-temperature-effect",
-      prompt: "What does setting temperature T = 0.2 do to the probability distribution?",
+      id: 'q2-temperature-effect',
+      prompt: 'What does setting temperature T = 0.2 do to the probability distribution?',
       options: [
         {
-          id: "a",
+          id: 'a',
           label:
-            "Sharpens it — high-logit tokens dominate even more strongly than at T=1, so output behaves closer to greedy.",
+            'Sharpens it — high-logit tokens dominate even more strongly than at T=1, so output behaves closer to greedy.',
         },
         {
-          id: "b",
-          label: "Flattens it — small differences in logits get washed out.",
+          id: 'b',
+          label: 'Flattens it — small differences in logits get washed out.',
         },
         {
-          id: "c",
-          label: "Removes the long tail entirely (equivalent to top-p).",
+          id: 'c',
+          label: 'Removes the long tail entirely (equivalent to top-p).',
         },
       ],
-      correctId: "a",
+      correctId: 'a',
       explanation:
-        "T < 1 divides logits by something smaller than 1 before exp, amplifying differences. The distribution gets spikier.",
+        'T < 1 divides logits by something smaller than 1 before exp, amplifying differences. The distribution gets spikier.',
     },
     {
-      id: "q3-top-p-mechanism",
-      prompt: "Top-p sampling with p = 0.9 means:",
+      id: 'q3-top-p-mechanism',
+      prompt: 'Top-p sampling with p = 0.9 means:',
       options: [
         {
-          id: "a",
-          label: "Multiply every probability by 0.9.",
+          id: 'a',
+          label: 'Multiply every probability by 0.9.',
         },
         {
-          id: "b",
+          id: 'b',
           label:
-            "Keep the smallest set of tokens whose probabilities sum to >= 0.9, then renormalise that set to sum to 1 and sample from it.",
+            'Keep the smallest set of tokens whose probabilities sum to >= 0.9, then renormalise that set to sum to 1 and sample from it.',
         },
         {
-          id: "c",
-          label: "Drop the 90th percentile of tokens.",
+          id: 'c',
+          label: 'Drop the 90th percentile of tokens.',
         },
       ],
-      correctId: "b",
+      correctId: 'b',
       explanation:
         "Top-p is dynamic: at a confident step the nucleus may be 2-3 tokens, at an uncertain step it may be dozens. That's why it adapts better than a fixed top-K.",
     },
@@ -151,114 +152,93 @@ export function SamplingChapterBody() {
   return (
     <ChapterFrame learning={learning}>
       <Prose>
-      <h1>Sampling: turning logits into the next token</h1>
-      <p>
-        Every forward pass through Qwen3.5 ends the same way: a vector of{" "}
-        <strong>logits</strong> — one real number per token in the model's
-        vocabulary (~152k for Qwen3). A logit is an unbounded score:{" "}
-        <em>how strongly</em> the model recommends that token as the next one.
-        Sampling is the step that turns that vector into a single concrete
-        choice.
-      </p>
+        <h1>Sampling: turning logits into the next token</h1>
+        <p>
+          Every forward pass through Qwen3.5 ends the same way: a vector of <strong>logits</strong> — one real number
+          per token in the model's vocabulary (~152k for Qwen3). A logit is an unbounded score: <em>how strongly</em>{' '}
+          the model recommends that token as the next one. Sampling is the step that turns that vector into a single
+          concrete choice.
+        </p>
 
-      <h2>Why not just pick the maximum?</h2>
-      <p>
-        The simplest rule is <strong>greedy decoding</strong>: take{" "}
-        <code>argmax(logits)</code> at every step. It's deterministic and
-        reproducible, but it has a famous failure mode — repetition. The
-        instant the model finds a phrase whose continuation it's confident
-        about, it keeps re-entering the same loop, because that loop is always
-        the locally-best choice. Greedy decoding also throws away a lot of
-        information: if two tokens have nearly equal logits, picking one and
-        ignoring the other is a fragile tie-break.
-      </p>
+        <h2>Why not just pick the maximum?</h2>
+        <p>
+          The simplest rule is <strong>greedy decoding</strong>: take <code>argmax(logits)</code> at every step. It's
+          deterministic and reproducible, but it has a famous failure mode — repetition. The instant the model finds a
+          phrase whose continuation it's confident about, it keeps re-entering the same loop, because that loop is
+          always the locally-best choice. Greedy decoding also throws away a lot of information: if two tokens have
+          nearly equal logits, picking one and ignoring the other is a fragile tie-break.
+        </p>
 
-      <h2>Softmax: logits → probabilities</h2>
-      <p>
-        To sample, we first convert logits into a proper probability
-        distribution with the <strong>softmax</strong> function:
-      </p>
-      <pre>
-        <code>{`p_i = exp(l_i / T) / Σ_j exp(l_j / T)`}</code>
-      </pre>
-      <p>
-        Two things are happening here. The exponential makes every value
-        positive; the division by the sum makes them sum to 1. The numerator
-        also includes a <strong>temperature</strong> <code>T</code> that
-        scales the raw logits before the exponential. Temperature acts as a
-        sharpness knob:
-      </p>
-      <ul>
-        <li>
-          <code>T &lt; 1</code> sharpens the distribution — high-logit tokens
-          dominate even more, so output looks more like greedy.
-        </li>
-        <li>
-          <code>T &gt; 1</code> flattens the distribution — small differences
-          in logits are washed out, so output is more diverse but less
-          coherent.
-        </li>
-        <li>
-          <code>T = 0</code> collapses to greedy (argmax). The widget clamps
-          to a tiny positive value to avoid dividing by zero, which is
-          numerically equivalent.
-        </li>
-      </ul>
+        <h2>Softmax: logits → probabilities</h2>
+        <p>
+          To sample, we first convert logits into a proper probability distribution with the <strong>softmax</strong>{' '}
+          function:
+        </p>
+        <MathDisplay latex={String.raw`p_i = \frac{\exp(l_i / T)}{\sum_j \exp(l_j / T)}`} />
+        <p>
+          Two things are happening here. The exponential makes every value positive; the division by the sum makes them
+          sum to 1. The numerator also includes a <strong>temperature</strong> <code>T</code> that scales the raw logits
+          before the exponential. Temperature acts as a sharpness knob:
+        </p>
+        <ul>
+          <li>
+            <code>T &lt; 1</code> sharpens the distribution — high-logit tokens dominate even more, so output looks more
+            like greedy.
+          </li>
+          <li>
+            <code>T &gt; 1</code> flattens the distribution — small differences in logits are washed out, so output is
+            more diverse but less coherent.
+          </li>
+          <li>
+            <code>T = 0</code> collapses to greedy (argmax). The widget clamps to a tiny positive value to avoid
+            dividing by zero, which is numerically equivalent.
+          </li>
+        </ul>
 
-      <TemperatureWorkedExample />
+        <TemperatureWorkedExample />
 
-      <h2>Top-p (nucleus) sampling</h2>
-      <p>
-        Even with a sensible temperature, the long tail of the vocabulary
-        still has tiny non-zero probability mass — and once in a while the
-        sampler will land there. Most of those tail tokens are nonsense in
-        context. <strong>Top-p sampling</strong> (also called{" "}
-        <strong>nucleus sampling</strong>) trims the tail:
-      </p>
-      <ul>
-        <li>Sort tokens by probability, descending.</li>
-        <li>
-          Walk the sorted list and keep accumulating probability until the
-          cumulative sum reaches <code>p</code>.
-        </li>
-        <li>Throw everything after that away.</li>
-        <li>Renormalize the survivors so they sum to 1 again.</li>
-        <li>Sample from this nucleus.</li>
-      </ul>
-      <p>
-        A common default is <code>T = 0.7</code> with <code>top_p = 0.9</code>
-        : the temperature gives the model some room to be creative, and top-p
-        guarantees we never sample from the absurd tail. The widget on the
-        right lets you sweep both knobs over a captured run and see what would
-        have happened.
-      </p>
+        <h2>Top-p (nucleus) sampling</h2>
+        <p>
+          Even with a sensible temperature, the long tail of the vocabulary still has tiny non-zero probability mass —
+          and once in a while the sampler will land there. Most of those tail tokens are nonsense in context.{' '}
+          <strong>Top-p sampling</strong> (also called <strong>nucleus sampling</strong>) trims the tail:
+        </p>
+        <ul>
+          <li>Sort tokens by probability, descending.</li>
+          <li>
+            Walk the sorted list and keep accumulating probability until the cumulative sum reaches <code>p</code>.
+          </li>
+          <li>Throw everything after that away.</li>
+          <li>Renormalize the survivors so they sum to 1 again.</li>
+          <li>Sample from this nucleus.</li>
+        </ul>
+        <p>
+          A common default is <code>T = 0.7</code> with <code>top_p = 0.9</code>: the temperature gives the model some
+          room to be creative, and top-p guarantees we never sample from the absurd tail. The widget on the right lets
+          you sweep both knobs over a captured run and see what would have happened.
+        </p>
 
-      <h2>How the widget works</h2>
-      <p>
-        Pressing <em>Run</em> generates <code>{MAX_NEW_TOKENS}</code> tokens
-        with the inspector capturing the top-<code>{TOP_K}</code> raw logits
-        at every step. The temperature and top-p sliders then re-apply
-        softmax + truncation to the cached logits — no re-running the model.
-        The bar that's highlighted is the token Qwen <em>actually</em>{" "}
-        sampled (using its own internal sampler); compare it to the highest
-        bar under your slider settings to see how a different temperature
-        might have steered the generation.
-      </p>
+        <h2>How the widget works</h2>
+        <p>
+          Pressing <em>Run</em> generates <code>{MAX_NEW_TOKENS}</code> tokens with the inspector capturing the top-
+          <code>{TOP_K}</code> raw logits at every step. The temperature and top-p sliders then re-apply softmax +
+          truncation to the cached logits — no re-running the model. The bar that's highlighted is the token Qwen{' '}
+          <em>actually</em> sampled (using its own internal sampler); compare it to the highest bar under your slider
+          settings to see how a different temperature might have steered the generation.
+        </p>
 
-      <h2>When sampling goes wrong</h2>
-      <p>
-        Two failure modes are worth seeing side-by-side: a low-temperature
-        greedy run that loops, and a high-temperature run that turns into
-        gibberish. The middle panel shows a sensible production setting.
-      </p>
+        <h2>When sampling goes wrong</h2>
+        <p>
+          Two failure modes are worth seeing side-by-side: a low-temperature greedy run that loops, and a
+          high-temperature run that turns into gibberish. The middle panel shows a sensible production setting.
+        </p>
 
-      <SamplingFailureModes />
+        <SamplingFailureModes />
 
-      <p className="mt-6 text-muted-foreground">
-        Tip: try a low temperature (0.2) on a confident step versus a high
-        temperature (1.5) on the same step. The visible "shape" of the bar
-        chart is the entire reason sampling parameters matter for an LLM.
-      </p>
+        <p className="mt-6 text-muted-foreground">
+          Tip: try a low temperature (0.2) on a confident step versus a high temperature (1.5) on the same step. The
+          visible "shape" of the bar chart is the entire reason sampling parameters matter for an LLM.
+        </p>
       </Prose>
     </ChapterFrame>
   );
@@ -283,19 +263,19 @@ function softmaxWithT(logits: number[], T: number): number[] {
 function TemperatureWorkedExample() {
   const rows = [
     {
-      label: "T = 1.0",
+      label: 'T = 1.0',
       probs: softmaxWithT(WORKED_LOGITS, 1.0),
-      shape: "Default. The top token wins but the others keep a meaningful slice.",
+      shape: 'Default. The top token wins but the others keep a meaningful slice.',
     },
     {
-      label: "T = 2.0",
+      label: 'T = 2.0',
       probs: softmaxWithT(WORKED_LOGITS, 2.0),
-      shape: "Flatter. Differences between logits get washed out — diversity up.",
+      shape: 'Flatter. Differences between logits get washed out — diversity up.',
     },
     {
-      label: "T = 0.5",
+      label: 'T = 0.5',
       probs: softmaxWithT(WORKED_LOGITS, 0.5),
-      shape: "Sharper. The top logit absorbs almost all the mass — closer to greedy.",
+      shape: 'Sharper. The top logit absorbs almost all the mass — closer to greedy.',
     },
   ];
   return (
@@ -304,11 +284,10 @@ function TemperatureWorkedExample() {
         Worked softmax · 4 logits across three temperatures
       </div>
       <div className="rounded-md bg-muted/40 px-3 py-2 font-mono text-[12px] leading-6 text-foreground/90">
-        p<sub>i</sub> = exp(logits<sub>i</sub> / T) / &sum;<sub>j</sub>{" "}
-        exp(logits<sub>j</sub> / T)
+        p<sub>i</sub> = exp(logits<sub>i</sub> / T) / &sum;<sub>j</sub> exp(logits<sub>j</sub> / T)
       </div>
       <div className="font-mono text-[11px] text-muted-foreground">
-        logits = [{WORKED_LOGITS.map((l) => l.toFixed(2)).join(", ")}]
+        logits = [{WORKED_LOGITS.map((l) => l.toFixed(2)).join(', ')}]
       </div>
       <div className="overflow-x-auto">
         <table className="w-full border-collapse font-mono text-[11px]">
@@ -316,10 +295,7 @@ function TemperatureWorkedExample() {
             <tr>
               <th className="px-2 py-1 text-left text-muted-foreground">T</th>
               {WORKED_LOGITS.map((_, i) => (
-                <th
-                  key={`h-${i}`}
-                  className="px-2 py-1 text-right text-muted-foreground"
-                >
+                <th key={`h-${i}`} className="px-2 py-1 text-right text-muted-foreground">
                   p<sub>{i}</sub>
                 </th>
               ))}
@@ -329,20 +305,13 @@ function TemperatureWorkedExample() {
           <tbody>
             {rows.map((row, i) => (
               <tr key={`row-${i}`} className="border-t border-border/60">
-                <td className="px-2 py-1 text-left text-foreground/90">
-                  {row.label}
-                </td>
+                <td className="px-2 py-1 text-left text-foreground/90">{row.label}</td>
                 {row.probs.map((p, j) => (
-                  <td
-                    key={`cell-${i}-${j}`}
-                    className="px-2 py-1 text-right text-foreground/85"
-                  >
+                  <td key={`cell-${i}-${j}`} className="px-2 py-1 text-right text-foreground/85">
                     {p.toFixed(2)}
                   </td>
                 ))}
-                <td className="px-2 py-1 text-left text-[11px] text-muted-foreground">
-                  {row.shape}
-                </td>
+                <td className="px-2 py-1 text-left text-[11px] text-muted-foreground">{row.shape}</td>
               </tr>
             ))}
           </tbody>
@@ -357,14 +326,10 @@ export type SamplingDemoProps = {
   abortRef: React.RefObject<AbortController | null>;
 };
 
-type RunStatus =
-  | { kind: "ok" }
-  | { kind: "error"; error: string }
-  | { kind: "aborted" }
-  | { kind: "empty-prompt" };
+type RunStatus = { kind: 'ok' } | { kind: 'error'; error: string } | { kind: 'aborted' } | { kind: 'empty-prompt' };
 
 function isAbortError(err: unknown): boolean {
-  return err instanceof DOMException && err.name === "AbortError";
+  return err instanceof DOMException && err.name === 'AbortError';
 }
 
 // Apply temperature + top-p to raw logits, returning candidate ids in their
@@ -406,9 +371,7 @@ function applySampling(
   // Sort indices by probability descending. We need to remember the original
   // position so we can return ids in the requested (descending-logit) order
   // after truncation.
-  const order = Array.from({ length: n }, (_, i) => i).sort(
-    (a, b) => probs[b]! - probs[a]!,
-  );
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => probs[b]! - probs[a]!);
 
   // Determine cutoff in sorted order.
   let cutoff = order.length;
@@ -448,6 +411,7 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
   const [run, setRun] = React.useState<AttentionRun | null>(null);
   const [status, setStatus] = React.useState<RunStatus | null>(null);
   const [running, setRunning] = React.useState(false);
+  const resultFlashRef = useRunFlash(running);
   const [temperature, setTemperature] = React.useState(1.0);
   const [topP, setTopP] = React.useState(1.0);
   const [stepIdx, setStepIdx] = React.useState(0);
@@ -463,11 +427,16 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
 
   // Abort any in-flight run on unmount so the worker call doesn't keep
   // running after the demo is gone.
-  React.useEffect(() => () => { runAbortRef.current?.abort(); }, []);
+  React.useEffect(
+    () => () => {
+      runAbortRef.current?.abort();
+    },
+    [],
+  );
 
   async function handleRun() {
     if (prompt.trim().length === 0) {
-      setStatus({ kind: "empty-prompt" });
+      setStatus({ kind: 'empty-prompt' });
       return;
     }
 
@@ -475,10 +444,8 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
     setRunning(true);
     const worker = workerRef.current;
     if (!worker) {
-      console.error(
-        "[sampling-demo] worker is unavailable — chapter view should have been gated on modelReady",
-      );
-      setStatus({ kind: "error", error: "Worker is unavailable. Reload the page." });
+      console.error('[sampling-demo] worker is unavailable — chapter view should have been gated on modelReady');
+      setStatus({ kind: 'error', error: 'Worker is unavailable. Reload the page.' });
       setRunning(false);
       return;
     }
@@ -494,7 +461,7 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
     }
     const onAppAbort = () => ctrl.abort();
     if (appSignal && !appSignal.aborted) {
-      appSignal.addEventListener("abort", onAppAbort, { once: true });
+      appSignal.addEventListener('abort', onAppAbort, { once: true });
     }
 
     try {
@@ -508,29 +475,27 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
         { signal: ctrl.signal },
       );
       if (runGenRef.current !== myGen) return;
-      console.log("[sampling-demo] runForInspector ok", {
+      console.log('[sampling-demo] runForInspector ok', {
         promptLength: prompt.length,
         steps: result.logits?.length ?? 0,
       });
       setRun(result);
-      setStatus({ kind: "ok" });
+      setStatus({ kind: 'ok' });
       setStepIdx(0);
     } catch (err) {
       if (runGenRef.current !== myGen) return;
       if (isAbortError(err)) {
-        console.info(
-          "[sampling-demo] runForInspector aborted (worker terminated or superseded)",
-        );
+        console.info('[sampling-demo] runForInspector aborted (worker terminated or superseded)');
         if (appSignal?.aborted) {
-          setStatus({ kind: "aborted" });
+          setStatus({ kind: 'aborted' });
         }
       } else {
         const message = err instanceof Error ? err.message : String(err);
-        console.error("[sampling-demo] runForInspector failed", err);
-        setStatus({ kind: "error", error: message });
+        console.error('[sampling-demo] runForInspector failed', err);
+        setStatus({ kind: 'error', error: message });
       }
     } finally {
-      if (appSignal) appSignal.removeEventListener("abort", onAppAbort);
+      if (appSignal) appSignal.removeEventListener('abort', onAppAbort);
       if (runAbortRef.current === ctrl) runAbortRef.current = null;
       if (runGenRef.current === myGen) setRunning(false);
     }
@@ -548,30 +513,23 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
 
   const steps = run?.logits ?? [];
   const hasSteps = steps.length > 0;
-  const safeStepIdx = hasSteps
-    ? Math.min(Math.max(stepIdx, 0), steps.length - 1)
-    : 0;
-  const currentStep = hasSteps ? steps[safeStepIdx] ?? null : null;
+  const safeStepIdx = hasSteps ? Math.min(Math.max(stepIdx, 0), steps.length - 1) : 0;
+  const currentStep = hasSteps ? (steps[safeStepIdx] ?? null) : null;
 
   const distribution = React.useMemo(() => {
     if (!currentStep) return null;
-    return applySampling(
-      currentStep.topKLogits,
-      currentStep.topKIds,
-      temperature,
-      topP,
-    );
+    return applySampling(currentStep.topKLogits, currentStep.topKIds, temperature, topP);
   }, [currentStep, temperature, topP]);
 
   // Walk topKTexts using each step's tokenId to find the actually-sampled
   // text. For exact-tie logits this may differ from `topKIds[0]` (see
   // inspector-types.ts).
   const actualGeneration = React.useMemo(() => {
-    if (!hasSteps) return "";
-    let out = "";
+    if (!hasSteps) return '';
+    let out = '';
     for (const s of steps) {
       const idx = s.topKIds.indexOf(s.tokenId);
-      out += idx >= 0 ? s.topKTexts[idx] ?? "" : "";
+      out += idx >= 0 ? (s.topKTexts[idx] ?? '') : '';
     }
     return out;
   }, [hasSteps, steps]);
@@ -579,10 +537,7 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
   return (
     <div className="space-y-4">
       <div className="space-y-2">
-        <label
-          htmlFor="sampling-demo-input"
-          className="text-xs uppercase tracking-wider text-muted-foreground"
-        >
+        <label htmlFor="sampling-demo-input" className="text-xs uppercase tracking-wider text-muted-foreground">
           Prompt
         </label>
         <Textarea
@@ -594,12 +549,9 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
           placeholder={DEFAULT_PROMPT}
         />
         <div className="flex items-center gap-2">
-          <Button onClick={handleRun} disabled={running}>
-            {running ? "Running..." : "Run"}
-          </Button>
+          <RunButton onClick={handleRun} running={running} />
           <span className="text-xs text-muted-foreground">
-            Generates {MAX_NEW_TOKENS} tokens, captures top-{TOP_K} logits per
-            step.
+            Generates {MAX_NEW_TOKENS} tokens, captures top-{TOP_K} logits per step.
           </span>
         </div>
       </div>
@@ -627,7 +579,7 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
         />
       </div>
 
-      {status?.kind === "error" ? (
+      {status?.kind === 'error' ? (
         <div
           role="alert"
           className="rounded-md border border-destructive/60 bg-destructive/10 px-3 py-2 text-xs text-destructive"
@@ -635,16 +587,15 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
           <strong>Inspector run failed.</strong> {status.error}
         </div>
       ) : null}
-      {status?.kind === "aborted" ? (
+      {status?.kind === 'aborted' ? (
         <div
           role="status"
           className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
         >
-          Request cancelled — model was reloaded. Click <strong>Run</strong>{" "}
-          again to retry.
+          Request cancelled — model was reloaded. Click <strong>Run</strong> again to retry.
         </div>
       ) : null}
-      {status?.kind === "empty-prompt" ? (
+      {status?.kind === 'empty-prompt' ? (
         <div
           role="alert"
           className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
@@ -654,35 +605,27 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
       ) : null}
 
       {currentStep && distribution ? (
-        <div className="space-y-3">
-          <StepNavigator
-            stepIdx={safeStepIdx}
-            stepCount={steps.length}
-            onStep={setStepIdx}
-          />
+        <div ref={resultFlashRef} className="space-y-3 p-1">
+          <StepNavigator stepIdx={safeStepIdx} stepCount={steps.length} onStep={setStepIdx} />
           <TopKBars
             ids={distribution.ids}
             probs={distribution.probs}
             texts={currentStep.topKTexts}
             sampledTokenId={currentStep.tokenId}
           />
-          <GenerationFooter
-            prompt={run?.prompt ?? prompt}
-            generated={actualGeneration}
-          />
+          <GenerationFooter prompt={run?.prompt ?? prompt} generated={actualGeneration} />
         </div>
       ) : (
         <div className="rounded-md border border-dashed border-border p-6 text-sm text-muted-foreground">
-          Click <strong>Run</strong> to capture logits and visualize a few
-          generation steps.
+          Click <strong>Run</strong> to capture logits and visualize a few generation steps.
         </div>
       )}
 
       <DemoCallout
         items={[
-          "Drag top-p from 1.0 toward 0.3 — the bars collapse to just the top few candidates.",
-          "Drop temperature toward 0.0 — the distribution sharpens onto the top option (this is greedy in the limit).",
-          "Push temperature past 1.5 — the bars flatten and unrelated tokens start sneaking in.",
+          'Drag top-p from 1.0 toward 0.3 — the bars collapse to just the top few candidates.',
+          'Drop temperature toward 0.0 — the distribution sharpens onto the top option (this is greedy in the limit).',
+          'Push temperature past 1.5 — the bars flatten and unrelated tokens start sneaking in.',
         ]}
       />
     </div>
@@ -741,12 +684,7 @@ function StepNavigator({
 }) {
   return (
     <div className="flex items-center justify-between gap-2">
-      <Button
-        variant="outline"
-        size="sm"
-        onClick={() => onStep(Math.max(0, stepIdx - 1))}
-        disabled={stepIdx <= 0}
-      >
+      <Button variant="outline" size="sm" onClick={() => onStep(Math.max(0, stepIdx - 1))} disabled={stepIdx <= 0}>
         ‹ Prev
       </Button>
       <div className="font-mono text-xs text-muted-foreground">
@@ -764,13 +702,7 @@ function StepNavigator({
   );
 }
 
-function GenerationFooter({
-  prompt,
-  generated,
-}: {
-  prompt: string;
-  generated: string;
-}) {
+function GenerationFooter({ prompt, generated }: { prompt: string; generated: string }) {
   return (
     <div className="rounded-md bg-muted/40 px-3 py-2 font-mono text-xs">
       <div className="text-muted-foreground">Generated text (greedy / actual):</div>
