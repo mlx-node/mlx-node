@@ -13,7 +13,7 @@
  * and invoked via wasmTable.get(fnPtr)(...args).
  */
 
-import { roundUpBucket } from "./buffer-bucket.js";
+import { roundUpBucket } from './buffer-bucket.js';
 import {
   RpcFn,
   CMD_OFFSET,
@@ -38,7 +38,7 @@ import {
   MAX_DISPATCH_BATCH_ENTRIES,
   MAX_DISPATCH_BATCH_UNIFORM,
   DISPATCH_BATCH_HEADER_BYTES,
-} from "./rpc-protocol.js";
+} from './rpc-protocol.js';
 
 export interface BridgeStats {
   /** Total rpcCall invocations observed since the last reset. */
@@ -245,27 +245,18 @@ export function createBridgeStub(
     return _wasmMalloc(size) >>> 0;
   }
   const optimizationControl =
-    options?.optimizationControlBuffer &&
-    options.optimizationControlBuffer.byteLength >= 8
-      ? new Int32Array(
-          options.optimizationControlBuffer,
-          0,
-          options.optimizationControlBuffer.byteLength >= 12 ? 3 : 2,
-        )
+    options?.optimizationControlBuffer && options.optimizationControlBuffer.byteLength >= 8
+      ? new Int32Array(options.optimizationControlBuffer, 0, options.optimizationControlBuffer.byteLength >= 12 ? 3 : 2)
       : null;
   const defaultFusionEnabled = options?.fusionEnabled !== false;
   const defaultPassCachingEnabled = options?.passCachingEnabled !== false;
   function fusionEnabled(): boolean {
     if (!defaultFusionEnabled) return false;
-    return optimizationControl
-      ? Atomics.load(optimizationControl, 0) !== 0
-      : true;
+    return optimizationControl ? Atomics.load(optimizationControl, 0) !== 0 : true;
   }
   function passCachingEnabled(): boolean {
     if (!defaultPassCachingEnabled) return false;
-    return optimizationControl
-      ? Atomics.load(optimizationControl, 1) !== 0
-      : true;
+    return optimizationControl ? Atomics.load(optimizationControl, 1) !== 0 : true;
   }
   // Get a fresh Uint8Array view of WASM heap. wasmMemory.buffer always reflects
   // current size after memory.grow() (WebAssembly.Memory getter returns fresh SAB).
@@ -357,13 +348,8 @@ export function createBridgeStub(
   // stay in stub-local fallback Maps to avoid having to size the SAB for
   // the ~2 GB fake-handle index range.
   const bufMetaSab =
-    bufferMetadataBuffer &&
-    bufferMetadataBuffer.byteLength >= BUFFER_METADATA_SIZE_BYTES
-      ? new Uint32Array(
-          bufferMetadataBuffer,
-          0,
-          BUFFER_METADATA_MAX_HANDLES * 2,
-        )
+    bufferMetadataBuffer && bufferMetadataBuffer.byteLength >= BUFFER_METADATA_SIZE_BYTES
+      ? new Uint32Array(bufferMetadataBuffer, 0, BUFFER_METADATA_MAX_HANDLES * 2)
       : null;
   // Fallback / fake-handle storage. Used for handles that don't fit in the
   // SAB index range (fakes) and for test paths that don't supply a SAB.
@@ -448,11 +434,7 @@ export function createBridgeStub(
   }
   const submitQuarantinedPoolReleases: QuarantinedPoolRelease[] = [];
 
-  function poolReleasedBufferNow(
-    handle: number,
-    size: number,
-    usage: number,
-  ): void {
+  function poolReleasedBufferNow(handle: number, size: number, usage: number): void {
     const bucketSize = roundUpBucket(size);
     if (!isPoolableSize(bucketSize)) {
       queueRelease(handle);
@@ -489,7 +471,7 @@ export function createBridgeStub(
         bufferPool.delete(key);
         continue;
       }
-      const sep = key.indexOf(":");
+      const sep = key.indexOf(':');
       const bucketSize = Number(key.slice(sep + 1));
       removeBufferPoolBytes(bucketSize);
       bumpPoolStat(POOL_STAT_EVICTIONS);
@@ -607,21 +589,13 @@ export function createBridgeStub(
     deferredCreations.delete(fakeHandle);
     const sizeLo = def.size & 0xffffffff;
     const sizeHi = Math.floor(def.size / 0x100000000);
-    const realHandle = rpcCall(
-      RpcFn.CREATE_BUFFER_FROM_DATA,
-      def.usage,
-      sizeLo,
-      sizeHi,
-      def.wasmPtr,
-    );
+    const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, def.usage, sizeLo, sizeHi, def.wasmPtr);
     // Scrub the fake handle's shadow size entry (set when the fake was created)
     // so the metadata table doesn't accumulate stale fake-handle keys.
     clearBufferMeta(fakeHandle);
     wasmFree(def.wasmPtr);
     if (realHandle <= 0) {
-      throw new Error(
-        `[Bridge Stub] failed to materialize deferred GPU buffer fake=${fakeHandle} size=${def.size}`,
-      );
+      throw new Error(`[Bridge Stub] failed to materialize deferred GPU buffer fake=${fakeHandle} size=${def.size}`);
     }
     deferredBufferRemap.set(fakeHandle, realHandle);
     setBufferMeta(realHandle, def.size, def.usage);
@@ -674,14 +648,7 @@ export function createBridgeStub(
       // Allocate temporary WASM memory to pass data through RPC
       const wasmPtr = wasmMalloc(pending.data.byteLength);
       heap().set(pending.data, wasmPtr);
-      rpcCall(
-        RpcFn.QUEUE_WRITE_BUFFER,
-        resolved,
-        0,
-        0,
-        wasmPtr,
-        pending.data.byteLength,
-      );
+      rpcCall(RpcFn.QUEUE_WRITE_BUFFER, resolved, 0, 0, wasmPtr, pending.data.byteLength);
       wasmFree(wasmPtr);
     }
     pendingWriteBuffers.clear();
@@ -779,7 +746,7 @@ export function createBridgeStub(
   function acquireCommandLock(context: string): void {
     while (Atomics.compareExchange(cmdView, I_LOCK, 0, 1) !== 0) {
       const wait = Atomics.wait(cmdView, I_LOCK, 1, 10_000);
-      if (wait === "timed-out") {
+      if (wait === 'timed-out') {
         console.warn(`[Bridge Stub] waiting for command lock (${context})`);
       }
     }
@@ -806,11 +773,8 @@ export function createBridgeStub(
   // NOTE 2026-04-16: batching uses a dedicated SAB per worker. It can be
   // toggled at request boundaries by optimizationControlBuffer so VLM image
   // prefill can stay conservative without slowing down text-only decode.
-  const batchAvailable =
-    batchEnabled === true && dispatchBatchBuffer !== undefined;
-  const batchU32 = batchAvailable
-    ? new Uint32Array(dispatchBatchBuffer!)
-    : null;
+  const batchAvailable = batchEnabled === true && dispatchBatchBuffer !== undefined;
+  const batchU32 = batchAvailable ? new Uint32Array(dispatchBatchBuffer!) : null;
   const batchU8 = batchAvailable ? new Uint8Array(dispatchBatchBuffer!) : null;
   const batchBufferIdVal = batchBufferId ?? 0;
   let batchCount = 0;
@@ -847,7 +811,7 @@ export function createBridgeStub(
     // assertNotPoisoned guard, but we check here too so re-entrant call sites
     // (e.g. from flushPendingReleases) surface the poisoning even if they
     // never reach the rpcCall inside.
-    assertNotPoisoned("flushDispatchBatchInner");
+    assertNotPoisoned('flushDispatchBatchInner');
     const count = batchCount;
     const bytes = batchBytes;
     batchCount = 0;
@@ -890,15 +854,11 @@ export function createBridgeStub(
     if (uniformSize > MAX_DISPATCH_BATCH_UNIFORM) return false;
 
     const uniformPadded = (uniformSize + 3) & ~3;
-    const recordSize =
-      DISPATCH_BATCH_HEADER_BYTES + entryCount * 12 + uniformPadded;
+    const recordSize = DISPATCH_BATCH_HEADER_BYTES + entryCount * 12 + uniformPadded;
     // Flush first if this record would overflow the batch SAB or exceed the
     // per-flush cap. Note: flushing resets batchBytes/batchCount to 0 so the
     // staged record always starts at offset 0 after a flush.
-    if (
-      batchCount >= MAX_DISPATCH_BATCH ||
-      batchBytes + recordSize > DISPATCH_BATCH_BUFFER_SIZE
-    ) {
+    if (batchCount >= MAX_DISPATCH_BATCH || batchBytes + recordSize > DISPATCH_BATCH_BUFFER_SIZE) {
       flushDispatchBatchInner();
     }
     let cursor = batchBytes;
@@ -910,10 +870,7 @@ export function createBridgeStub(
     batchU32[base + 4] = record.x >>> 0;
     batchU32[base + 5] = record.y >>> 0;
     batchU32[base + 6] = record.z >>> 0;
-    batchU32[base + 7] =
-      opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM
-        ? record.uniformEntryIdx >>> 0
-        : 0;
+    batchU32[base + 7] = opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM ? record.uniformEntryIdx >>> 0 : 0;
     batchU32[base + 8] = uniformSize;
     batchU32[base + 9] = entryCount;
     cursor += DISPATCH_BATCH_HEADER_BYTES;
@@ -949,7 +906,7 @@ export function createBridgeStub(
 
   function rpcCallReleaseBatch(handles: number[]): void {
     if (handles.length === 0) return;
-    assertNotPoisoned("rpcCallReleaseBatch");
+    assertNotPoisoned('rpcCallReleaseBatch');
     acquireCommandLock(`BUFFER_RELEASE_BATCH(${handles.length})`);
     try {
       bumpBridgeStats(RpcFn.BUFFER_RELEASE_BATCH);
@@ -1003,29 +960,24 @@ export function createBridgeStub(
   function drainSharedCommandSlot(context: string): void {
     const status = Atomics.load(cmdView, STATUS_INDEX);
     if (status === STATUS.IDLE) return;
-    let waitResult: "ok" | "not-equal" | "timed-out" = "not-equal";
+    let waitResult: 'ok' | 'not-equal' | 'timed-out' = 'not-equal';
     if (status === STATUS.PENDING) {
       waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 10_000);
-      if (waitResult === "timed-out") {
+      if (waitResult === 'timed-out') {
         const msg = `[RPC TIMEOUT] BUFFER_RELEASE_BATCH (F&F) drain timed out after 10s (${context})`;
         console.error(msg);
         try {
-          (self as any).postMessage({ type: "error", message: msg });
+          (self as any).postMessage({ type: 'error', message: msg });
         } catch {}
-        waitResult = Atomics.wait(
-          cmdView,
-          STATUS_INDEX,
-          STATUS.PENDING,
-          30_000,
-        );
-        if (waitResult === "timed-out") {
+        waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 30_000);
+        if (waitResult === 'timed-out') {
           const fatalMsg = `[RPC FATAL] BUFFER_RELEASE_BATCH (F&F) total 40s timeout — bridge poisoned, gpu-worker likely hung (${context})`;
           console.error(fatalMsg);
           try {
-            (self as any).postMessage({ type: "error", message: fatalMsg });
+            (self as any).postMessage({ type: 'error', message: fatalMsg });
             (self as any).postMessage({
-              type: "bridge-poisoned",
-              reason: "buffer-release-batch-timeout",
+              type: 'bridge-poisoned',
+              reason: 'buffer-release-batch-timeout',
               message: fatalMsg,
             });
           } catch {}
@@ -1039,15 +991,13 @@ export function createBridgeStub(
     Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
     ffPending = false;
     if (rpcError !== 0) {
-      throw new Error(
-        `[RPC ERROR] BUFFER_RELEASE_BATCH (F&F) failed in gpu-worker (${context})`,
-      );
+      throw new Error(`[RPC ERROR] BUFFER_RELEASE_BATCH (F&F) failed in gpu-worker (${context})`);
     }
   }
 
   function drainFireAndForget(): void {
     if (!ffPending) return;
-    acquireCommandLock("drainFireAndForget");
+    acquireCommandLock('drainFireAndForget');
     try {
       ffPending = false;
     } finally {
@@ -1074,7 +1024,7 @@ export function createBridgeStub(
     if (pendingReleases.length === 0) return;
     // Throw fast before drainFireAndForget so we don't try to drain a
     // poisoned state.
-    assertNotPoisoned("flushPendingReleases");
+    assertNotPoisoned('flushPendingReleases');
     // Ordering invariant: BUFFER_RELEASE_BATCH must be observed by the
     // gpu-worker AFTER any staged DISPATCH_BATCH and AFTER any prior F&F
     // release.
@@ -1165,7 +1115,7 @@ export function createBridgeStub(
     }
   }
 
-  function recordRpcTimeout(fnId: number, suffix = ""): void {
+  function recordRpcTimeout(fnId: number, suffix = ''): void {
     rpcCount++;
     if (rpcHistory.length >= RPC_HISTORY_SIZE) rpcHistory.shift();
     rpcHistory.push({ n: rpcCount, fn: fnId });
@@ -1177,11 +1127,11 @@ export function createBridgeStub(
     if (suffix) {
       console.error(
         `[RPC TIMEOUT] Last ${rpcHistory.length} calls:`,
-        rpcHistory.map((h) => `#${h.n}:fn=${h.fn}`).join(", "),
+        rpcHistory.map((h) => `#${h.n}:fn=${h.fn}`).join(', '),
       );
     }
     try {
-      (self as any).postMessage({ type: "error", message: msg });
+      (self as any).postMessage({ type: 'error', message: msg });
     } catch {}
   }
 
@@ -1212,16 +1162,11 @@ export function createBridgeStub(
 
     Atomics.store(cmdView, STATUS_INDEX, STATUS.PENDING);
     Atomics.notify(cmdView, STATUS_INDEX);
-    const waitResult = Atomics.wait(
-      cmdView,
-      STATUS_INDEX,
-      STATUS.PENDING,
-      10_000,
-    );
-    if (waitResult === "timed-out") {
-      recordRpcTimeout(fnId, hiArgs ? " (rpcCallWithHi)" : "");
+    const waitResult = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 10_000);
+    if (waitResult === 'timed-out') {
+      recordRpcTimeout(fnId, hiArgs ? ' (rpcCallWithHi)' : '');
       const retry = Atomics.wait(cmdView, STATUS_INDEX, STATUS.PENDING, 30_000);
-      if (retry === "timed-out") {
+      if (retry === 'timed-out') {
         console.error(`[RPC FATAL] fn=${fnId} total 40s timeout — returning 0`);
         Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
         return { result: 0, callbackSnapshot: null };
@@ -1243,18 +1188,13 @@ export function createBridgeStub(
     Atomics.store(cmdView, STATUS_INDEX, STATUS.IDLE);
     if (errorFlag !== 0) {
       cmdU32[I_ERROR] = 0;
-      const recent = rpcHistory.map((h) => `#${h.n}:fn=${h.fn}`).join(", ");
-      throw new Error(
-        `[RPC ERROR] gpu-worker failed fn=${fnId}${recent ? ` recent=[${recent}]` : ""}`,
-      );
+      const recent = rpcHistory.map((h) => `#${h.n}:fn=${h.fn}`).join(', ');
+      throw new Error(`[RPC ERROR] gpu-worker failed fn=${fnId}${recent ? ` recent=[${recent}]` : ''}`);
     }
     return { result, callbackSnapshot };
   }
 
-  function drainCallbackSnapshot(
-    fnId: number,
-    callbackSnapshot: CallbackSnapshot | null,
-  ): void {
+  function drainCallbackSnapshot(fnId: number, callbackSnapshot: CallbackSnapshot | null): void {
     if (!callbackSnapshot) return;
     try {
       drainCallbacks(callbackSnapshot);
@@ -1263,16 +1203,7 @@ export function createBridgeStub(
     }
   }
 
-  function rpcCall(
-    fnId: number,
-    a0 = 0,
-    a1 = 0,
-    a2 = 0,
-    a3 = 0,
-    a4 = 0,
-    a5 = 0,
-    a6 = 0,
-  ): number {
+  function rpcCall(fnId: number, a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0): number {
     // Throw fast before any cmd-SAB writes if a prior F&F drain timed out.
     // Must come BEFORE drainFireAndForget so we don't try to drain a poisoned
     // state.
@@ -1333,19 +1264,12 @@ export function createBridgeStub(
     if (fnId !== RpcFn.GET_STATS) {
       bumpBridgeStats(fnId);
     }
-    const preserveCallbackCount =
-      fnId === RpcFn.FUSED_FULL_DISPATCH ||
-      fnId === RpcFn.FUSED_DISPATCH_WITH_UNIFORM;
+    const preserveCallbackCount = fnId === RpcFn.FUSED_FULL_DISPATCH || fnId === RpcFn.FUSED_DISPATCH_WITH_UNIFORM;
     let result = 0;
     let callbackSnapshot: CallbackSnapshot | null = null;
     acquireCommandLock(`rpcCall(fn=${fnId})`);
     try {
-      const submitted = submitLockedRpc(
-        fnId,
-        [a0, a1, a2, a3, a4, a5, a6],
-        null,
-        preserveCallbackCount,
-      );
+      const submitted = submitLockedRpc(fnId, [a0, a1, a2, a3, a4, a5, a6], null, preserveCallbackCount);
       result = submitted.result;
       callbackSnapshot = submitted.callbackSnapshot;
     } finally {
@@ -1359,11 +1283,7 @@ export function createBridgeStub(
    * RPC call that also writes high-bits for u64 arguments.
    * hiArgs maps arg index -> high 32 bits.
    */
-  function rpcCallWithHi(
-    fnId: number,
-    args: number[],
-    hiArgs: Record<number, number>,
-  ): number {
+  function rpcCallWithHi(fnId: number, args: number[], hiArgs: Record<number, number>): number {
     // Throw fast before any cmd-SAB writes if a prior F&F drain timed out.
     // Must come BEFORE drainFireAndForget so we don't try to drain a poisoned
     // state.
@@ -1408,10 +1328,7 @@ export function createBridgeStub(
     if (batchCount > 0) {
       flushDispatchBatchInner();
     }
-    if (
-      pendingReleases.length > 0 &&
-      fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM
-    ) {
+    if (pendingReleases.length > 0 && fnId !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
       flushPendingReleases();
     }
     drainFireAndForget();
@@ -1432,9 +1349,7 @@ export function createBridgeStub(
       const uniformSize = uniformData?.byteLength ?? 0;
       cmdU32[CMD_OFFSET.UNIFORM_DATA_SIZE >>> 2] = uniformSize >>> 0;
       if (uniformSize > 0 && uniformData) {
-        new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformSize).set(
-          uniformData,
-        );
+        new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformSize).set(uniformData);
       }
 
       const submitted = submitLockedRpc(fnId, args, null, true);
@@ -1466,7 +1381,7 @@ export function createBridgeStub(
     if (count === 0) return null;
 
     const result = cmdDataView.getUint32(CMD_OFFSET.RESULT, true);
-    const records: CallbackSnapshot["records"] = [];
+    const records: CallbackSnapshot['records'] = [];
 
     for (let i = 0; i < count; i++) {
       const base = CMD_OFFSET.CALLBACK_BASE + i * CALLBACK_ENTRY_SIZE;
@@ -1488,24 +1403,12 @@ export function createBridgeStub(
       switch (fnId) {
         case RpcFn.INSTANCE_REQUEST_ADAPTER:
           // WGPURequestAdapterCallback(WGPURequestAdapterStatus, WGPUAdapter, char* msg, void* ud)
-          callCallback(
-            fnPtr,
-            status,
-            result /* adapterHandle */,
-            0,
-            userdataPtr,
-          );
+          callCallback(fnPtr, status, result /* adapterHandle */, 0, userdataPtr);
           break;
 
         case RpcFn.ADAPTER_REQUEST_DEVICE:
           // WGPURequestDeviceCallback(WGPURequestDeviceStatus, WGPUDevice, char* msg, void* ud)
-          callCallback(
-            fnPtr,
-            status,
-            result /* deviceHandle */,
-            0,
-            userdataPtr,
-          );
+          callCallback(fnPtr, status, result /* deviceHandle */, 0, userdataPtr);
           break;
 
         default:
@@ -1534,12 +1437,7 @@ export function createBridgeStub(
       return rpcCall(RpcFn.CREATE_INSTANCE);
     },
 
-    wgpuInstanceRequestAdapter(
-      _instance: number,
-      _optsPtr: number,
-      callbackPtr: number,
-      userdataPtr: number,
-    ): void {
+    wgpuInstanceRequestAdapter(_instance: number, _optsPtr: number, callbackPtr: number, userdataPtr: number): void {
       rpcCall(RpcFn.INSTANCE_REQUEST_ADAPTER, 0, 0, callbackPtr, userdataPtr);
     },
 
@@ -1548,12 +1446,7 @@ export function createBridgeStub(
     },
 
     // ===== Adapter =====
-    wgpuAdapterRequestDevice(
-      _adapter: number,
-      _descPtr: number,
-      callbackPtr: number,
-      userdataPtr: number,
-    ): void {
+    wgpuAdapterRequestDevice(_adapter: number, _descPtr: number, callbackPtr: number, userdataPtr: number): void {
       rpcCall(RpcFn.ADAPTER_REQUEST_DEVICE, 0, 0, callbackPtr, userdataPtr);
     },
 
@@ -1662,9 +1555,7 @@ export function createBridgeStub(
         // stub pool safe to pop-and-return without re-creating.
         const h2 = rpcCall(RpcFn.DEVICE_CREATE_BUFFER, descPtr, bucketSize);
         if (h2 <= 0) {
-          throw new Error(
-            `[Bridge Stub] failed to create GPU buffer size=${size} bucket=${bucketSize} usage=${usage}`,
-          );
+          throw new Error(`[Bridge Stub] failed to create GPU buffer size=${size} bucket=${bucketSize} usage=${usage}`);
         }
         if (h2 > 0 && h2 < FAKE_HANDLE_BASE) {
           // Eager (size, usage) cache — drops BUFFER_GET_SIZE RPCs and gives
@@ -1770,19 +1661,11 @@ export function createBridgeStub(
       return rpcCall(RpcFn.DEVICE_GET_LIMITS, limitsPtr);
     },
 
-    wgpuDeviceSetUncapturedErrorCallback(
-      _device: number,
-      _cb: number,
-      _ud: number,
-    ): void {
+    wgpuDeviceSetUncapturedErrorCallback(_device: number, _cb: number, _ud: number): void {
       rpcCall(RpcFn.DEVICE_SET_ERROR_CALLBACK);
     },
 
-    wgpuDeviceSetDeviceLostCallback(
-      _device: number,
-      _cb: number,
-      _ud: number,
-    ): void {
+    wgpuDeviceSetDeviceLostCallback(_device: number, _cb: number, _ud: number): void {
       rpcCall(RpcFn.DEVICE_SET_LOST_CALLBACK);
     },
 
@@ -1791,11 +1674,7 @@ export function createBridgeStub(
     },
 
     // ===== Queue =====
-    wgpuQueueSubmit(
-      _queue: number,
-      count: number,
-      cmdBufArrayPtr: number,
-    ): void {
+    wgpuQueueSubmit(_queue: number, count: number, cmdBufArrayPtr: number): void {
       // Flush any deferred writeBuffer calls before submitting
       flushPendingWrites();
       if (pendingFinishEncoder >= 0) {
@@ -1830,21 +1709,10 @@ export function createBridgeStub(
       // Large or offset writes: send immediately
       const offsetLo = Number(bufferOffset & 0xffffffffn);
       const offsetHi = Number(bufferOffset >> 32n);
-      rpcCall(
-        RpcFn.QUEUE_WRITE_BUFFER,
-        resolved,
-        offsetLo,
-        offsetHi,
-        dataPtr,
-        size,
-      );
+      rpcCall(RpcFn.QUEUE_WRITE_BUFFER, resolved, offsetLo, offsetHi, dataPtr, size);
     },
 
-    wgpuQueueOnSubmittedWorkDone(
-      _queue: number,
-      callbackPtr: number,
-      userdataPtr: number,
-    ): void {
+    wgpuQueueOnSubmittedWorkDone(_queue: number, callbackPtr: number, userdataPtr: number): void {
       rpcCall(RpcFn.QUEUE_ON_SUBMITTED_WORK_DONE, callbackPtr, userdataPtr);
     },
 
@@ -1855,39 +1723,24 @@ export function createBridgeStub(
     // ===== Command Encoder =====
     // Cache active compute pass to avoid begin/end per dispatch.
     // C++ creates a new pass for each eval, but we reuse the existing one.
-    wgpuCommandEncoderBeginComputePass(
-      encoderHandle: number,
-      _descPtr: number,
-    ): number {
+    wgpuCommandEncoderBeginComputePass(encoderHandle: number, _descPtr: number): number {
       if (!passCachingEnabled()) {
-        const handle = rpcCall(
-          RpcFn.CMD_ENCODER_BEGIN_COMPUTE_PASS,
-          encoderHandle,
-        );
+        const handle = rpcCall(RpcFn.CMD_ENCODER_BEGIN_COMPUTE_PASS, encoderHandle);
         activeComputePass = handle;
         activeComputePassEncoder = encoderHandle;
         return handle;
       }
-      if (
-        activeComputePass >= 0 &&
-        activeComputePassEncoder === encoderHandle
-      ) {
+      if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
         // Reuse existing pass
         return activeComputePass;
       }
       // End previous pass if it was for a different encoder
-      if (
-        activeComputePass >= 0 &&
-        activeComputePassEncoder !== encoderHandle
-      ) {
+      if (activeComputePass >= 0 && activeComputePassEncoder !== encoderHandle) {
         rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
         rpcCall(RpcFn.COMPUTE_PASS_RELEASE, activeComputePass);
         activeComputePass = -1;
       }
-      const handle = rpcCall(
-        RpcFn.CMD_ENCODER_BEGIN_COMPUTE_PASS,
-        encoderHandle,
-      );
+      const handle = rpcCall(RpcFn.CMD_ENCODER_BEGIN_COMPUTE_PASS, encoderHandle);
       activeComputePass = handle;
       activeComputePassEncoder = encoderHandle;
       return handle;
@@ -1912,26 +1765,14 @@ export function createBridgeStub(
       const sizeHi = Number(size >> 32n);
 
       if (!passCachingEnabled()) {
-        if (
-          activeComputePass >= 0 &&
-          activeComputePassEncoder === encoderHandle
-        ) {
+        if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
           rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
           activeComputePass = -1;
           activeComputePassEncoder = -1;
         }
         rpcCallWithHi(
           RpcFn.CMD_ENCODER_COPY_BUFFER,
-          [
-            encoderHandle,
-            resolvedSrc,
-            srcOffsetLo,
-            srcOffsetHi,
-            resolvedDst,
-            dstOffsetLo,
-            dstOffsetHi,
-            sizeLo,
-          ],
+          [encoderHandle, resolvedSrc, srcOffsetLo, srcOffsetHi, resolvedDst, dstOffsetLo, dstOffsetHi, sizeLo],
           { 0: sizeHi },
         );
         return;
@@ -1942,11 +1783,7 @@ export function createBridgeStub(
       const dstOff32 = Number(dstOffset);
       const size32 = Number(size);
 
-      if (
-        srcOffset <= 0xffffffff &&
-        dstOffset <= 0xffffffff &&
-        size <= 0xffffffff
-      ) {
+      if (srcOffset <= 0xffffffff && dstOffset <= 0xffffffff && size <= 0xffffffff) {
         // FUSED: end pass (if active) + copy + begin new pass = 1 RPC instead of 3-4
         let passHandle = 0;
         if (activeComputePass >= 0) {
@@ -1971,26 +1808,14 @@ export function createBridgeStub(
         activeComputePassEncoder = encoderHandle;
       } else {
         // Fallback: 64-bit offsets or different encoder — use separate RPCs
-        if (
-          activeComputePass >= 0 &&
-          activeComputePassEncoder === encoderHandle
-        ) {
+        if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
           rpcCall(RpcFn.COMPUTE_PASS_END, activeComputePass);
           activeComputePass = -1;
           activeComputePassEncoder = -1;
         }
         rpcCallWithHi(
           RpcFn.CMD_ENCODER_COPY_BUFFER,
-          [
-            encoderHandle,
-            resolvedSrc,
-            srcOffsetLo,
-            srcOffsetHi,
-            resolvedDst,
-            dstOffsetLo,
-            dstOffsetHi,
-            sizeLo,
-          ],
+          [encoderHandle, resolvedSrc, srcOffsetLo, srcOffsetHi, resolvedDst, dstOffsetLo, dstOffsetHi, sizeLo],
           { 0: sizeHi },
         );
       }
@@ -1999,10 +1824,7 @@ export function createBridgeStub(
     wgpuCommandEncoderFinish(encoderHandle: number, _descPtr: number): number {
       // Buffer everything for FUSED_SUBMIT — pass end, finish, submit all in one RPC
       flushPendingCompute();
-      if (
-        activeComputePass >= 0 &&
-        activeComputePassEncoder === encoderHandle
-      ) {
+      if (activeComputePass >= 0 && activeComputePassEncoder === encoderHandle) {
         pendingFinishPass = activeComputePass;
         activeComputePass = -1;
         activeComputePassEncoder = -1;
@@ -2034,10 +1856,7 @@ export function createBridgeStub(
     // ===== Compute Pass Encoder (with auto-fusion) =====
     // Buffer setPipeline + setBindGroup calls, flush them in a single fused RPC
     // when dispatch is called. This reduces 3+ RPC roundtrips to 1.
-    wgpuComputePassEncoderSetPipeline(
-      passHandle: number,
-      pipelineHandle: number,
-    ): void {
+    wgpuComputePassEncoderSetPipeline(passHandle: number, pipelineHandle: number): void {
       if (!fusionEnabled()) {
         flushPendingCompute();
         rpcCall(RpcFn.COMPUTE_PASS_SET_PIPELINE, passHandle, pipelineHandle);
@@ -2073,18 +1892,10 @@ export function createBridgeStub(
         );
         return;
       }
-      if (
-        groupIndex === 0 &&
-        dynamicOffsetCount === 0 &&
-        pendingPipeline >= 0
-      ) {
+      if (groupIndex === 0 && dynamicOffsetCount === 0 && pendingPipeline >= 0) {
         // Buffer for fusion with upcoming dispatch
         pendingBindGroup = bgHandle;
-      } else if (
-        groupIndex === 1 &&
-        dynamicOffsetCount === 0 &&
-        pendingPipeline >= 0
-      ) {
+      } else if (groupIndex === 1 && dynamicOffsetCount === 0 && pendingPipeline >= 0) {
         // Buffer bind group 1 for FUSED_DISPATCH_2BG
         pendingBindGroup1 = bgHandle;
       } else {
@@ -2102,12 +1913,7 @@ export function createBridgeStub(
       }
     },
 
-    wgpuComputePassEncoderDispatchWorkgroups(
-      passHandle: number,
-      x: number,
-      y: number,
-      z: number,
-    ): void {
+    wgpuComputePassEncoderDispatchWorkgroups(passHandle: number, x: number, y: number, z: number): void {
       if (!fusionEnabled()) {
         flushPendingCompute();
         rpcCall(RpcFn.COMPUTE_PASS_DISPATCH, passHandle, x, y, z);
@@ -2124,27 +1930,14 @@ export function createBridgeStub(
       if (pendingReleases.length >= MAX_RELEASE_BATCH) {
         flushPendingReleases();
       }
-      if (
-        pendingPipeline >= 0 &&
-        pendingBindGroup >= 0 &&
-        pendingBindGroup1 >= 0
-      ) {
+      if (pendingPipeline >= 0 && pendingBindGroup >= 0 && pendingBindGroup1 >= 0) {
         // 2 bind groups: materialize any fake handles and use FUSED_DISPATCH_2BG
         const usedBg0 = pendingBindGroup;
         const usedBg1 = pendingBindGroup1;
         flushPendingWrites();
         const realBg0 = materializeBg(usedBg0);
         const realBg1 = materializeBg(usedBg1);
-        rpcCall(
-          RpcFn.FUSED_DISPATCH_2BG,
-          pendingPass,
-          pendingPipeline,
-          realBg0,
-          realBg1,
-          x,
-          y,
-          z,
-        );
+        rpcCall(RpcFn.FUSED_DISPATCH_2BG, pendingPass, pendingPipeline, realBg0, realBg1, x, y, z);
         pendingPipeline = -1;
         pendingBindGroup = -1;
         pendingBindGroup1 = -1;
@@ -2213,10 +2006,7 @@ export function createBridgeStub(
           for (let i = 0; i < entryCount; i++) {
             const e = bgDesc.entries[i];
             // Use 0 for deferred creation entry (gpu-worker will create buffer)
-            dispatchEntries[i * 3] =
-              i === uniformEntryIdx && deferredInfo
-                ? 0
-                : resolveBufferHandle(e.bufferHandle);
+            dispatchEntries[i * 3] = i === uniformEntryIdx && deferredInfo ? 0 : resolveBufferHandle(e.bufferHandle);
             dispatchEntries[i * 3 + 1] = e.sizeLo;
             dispatchEntries[i * 3 + 2] = e.sizeHi;
           }
@@ -2256,16 +2046,7 @@ export function createBridgeStub(
               // rpcCall exempts FUSED_* opcodes, so we must flush by hand.
               const result = rpcCallPreparedFusedDispatch(
                 RpcFn.FUSED_DISPATCH_WITH_UNIFORM,
-                [
-                  pendingPass,
-                  pendingPipeline,
-                  bgDesc.layoutHandle,
-                  x,
-                  y,
-                  z,
-                  uniformEntryIdx,
-                  usage,
-                ],
+                [pendingPass, pendingPipeline, bgDesc.layoutHandle, x, y, z, uniformEntryIdx, usage],
                 dispatchEntries,
                 uniformData,
               );
@@ -2321,8 +2102,7 @@ export function createBridgeStub(
               setBufferMeta(realHandle, deferredInfo.size, deferredInfo.usage);
               // Rewrite the entry with the real handle. Only valid when we
               // actually got a real handle back.
-              const base =
-                (CMD_OFFSET.CALLBACK_BASE + uniformEntryIdx * 12) >>> 2;
+              const base = (CMD_OFFSET.CALLBACK_BASE + uniformEntryIdx * 12) >>> 2;
               cmdU32[base] = realHandle;
             }
             flushPendingWrites();
@@ -2363,15 +2143,7 @@ export function createBridgeStub(
           // release was deferred until dispatch cannot reach the gpu-worker.
           flushPendingWrites();
           const realBg = materializeBg(usedBg);
-          rpcCall(
-            RpcFn.FUSED_DISPATCH,
-            pendingPass,
-            pendingPipeline,
-            realBg,
-            x,
-            y,
-            z,
-          );
+          rpcCall(RpcFn.FUSED_DISPATCH, pendingPass, pendingPipeline, realBg, x, y, z);
         }
         pendingPipeline = -1;
         pendingBindGroup = -1;
@@ -2424,11 +2196,7 @@ export function createBridgeStub(
       return BigInt(lo) | (BigInt(hi) << 32n);
     },
 
-    wgpuBufferGetMappedRange(
-      bufferHandle: number,
-      offset: number,
-      size: number,
-    ): number {
+    wgpuBufferGetMappedRange(bufferHandle: number, offset: number, size: number): number {
       // Fast path: deferred mappedAtCreation buffer — return WASM shadow (no RPC)
       const mapped = mappedAtCreationBuffers.get(bufferHandle);
       if (mapped) {
@@ -2450,25 +2218,15 @@ export function createBridgeStub(
       }
       const wasmPtr = wasmMalloc(actualSize);
       if (wasmPtr === 0) {
-        console.error("[Bridge Stub] malloc failed for getMappedRange");
+        console.error('[Bridge Stub] malloc failed for getMappedRange');
         return 0;
       }
       // Track for wasmFree on unmap
       unmapPtrs.set(bufferHandle, wasmPtr);
-      return rpcCall(
-        RpcFn.BUFFER_GET_MAPPED_RANGE,
-        resolveBufferHandle(bufferHandle),
-        offset,
-        size,
-        wasmPtr,
-      );
+      return rpcCall(RpcFn.BUFFER_GET_MAPPED_RANGE, resolveBufferHandle(bufferHandle), offset, size, wasmPtr);
     },
 
-    wgpuBufferGetConstMappedRange(
-      bufferHandle: number,
-      offset: number,
-      size: number,
-    ): number {
+    wgpuBufferGetConstMappedRange(bufferHandle: number, offset: number, size: number): number {
       // Read path: gpu-worker copies GPU data into readback buffer,
       // then wasm-worker copies from readback buffer to WASM heap.
       // This avoids the growable SharedArrayBuffer issue where the gpu-worker
@@ -2482,7 +2240,7 @@ export function createBridgeStub(
         actualSize = lo + hi * 0x100000000 - offset;
       }
       if (!readbackView) {
-        throw new Error("[Bridge Stub] readback buffer is not initialized");
+        throw new Error('[Bridge Stub] readback buffer is not initialized');
       }
       if (actualSize > readbackView.byteLength) {
         throw new Error(
@@ -2491,21 +2249,12 @@ export function createBridgeStub(
       }
       const wasmPtr = wasmMalloc(actualSize);
       if (wasmPtr === 0) {
-        console.error(
-          "[Bridge Stub] malloc failed for getConstMappedRange, size=",
-          actualSize,
-        );
+        console.error('[Bridge Stub] malloc failed for getConstMappedRange, size=', actualSize);
         return 0;
       }
       unmapPtrs.set(bufferHandle, wasmPtr);
       // gpu-worker writes to readbackBuffer (NOT wasmMemory)
-      rpcCall(
-        RpcFn.BUFFER_GET_CONST_MAPPED_RANGE,
-        resolveBufferHandle(bufferHandle),
-        offset,
-        size,
-        0,
-      );
+      rpcCall(RpcFn.BUFFER_GET_CONST_MAPPED_RANGE, resolveBufferHandle(bufferHandle), offset, size, 0);
       // Copy from readback buffer to WASM heap via fresh Memory.buffer view.
       // heap() always reflects the current memory size after growth.
       if (actualSize > 0) {
@@ -2533,13 +2282,7 @@ export function createBridgeStub(
           // Large buffer: create immediately (won't fit in inline dispatch data)
           const sizeLo = mapped.size & 0xffffffff;
           const sizeHi = Math.floor(mapped.size / 0x100000000);
-          const realHandle = rpcCall(
-            RpcFn.CREATE_BUFFER_FROM_DATA,
-            mapped.usage,
-            sizeLo,
-            sizeHi,
-            mapped.wasmPtr,
-          );
+          const realHandle = rpcCall(RpcFn.CREATE_BUFFER_FROM_DATA, mapped.usage, sizeLo, sizeHi, mapped.wasmPtr);
           // JS-F016: guard against RPC failure (realHandle === 0). Storing a
           // 0-valued remap turns every future reference to the fake handle
           // into a null dereference on the gpu-worker side.
@@ -2576,15 +2319,7 @@ export function createBridgeStub(
       callbackPtr: number,
       userdataPtr: number,
     ): void {
-      rpcCall(
-        RpcFn.BUFFER_MAP_ASYNC,
-        resolveBufferHandle(bufferHandle),
-        mode,
-        offset,
-        size,
-        callbackPtr,
-        userdataPtr,
-      );
+      rpcCall(RpcFn.BUFFER_MAP_ASYNC, resolveBufferHandle(bufferHandle), mode, offset, size, callbackPtr, userdataPtr);
     },
 
     wgpuBufferDestroy(bufferHandle: number): void {
@@ -2684,12 +2419,7 @@ export function createBridgeStub(
         diagReleaseUnpoolable++;
         bumpPoolStat(POOL_STAT_RELEASE_UNPOOLABLE);
       }
-      if (
-        size !== undefined &&
-        usage !== undefined &&
-        isPoolable(resolved, usage) &&
-        isPoolableSize(size)
-      ) {
+      if (size !== undefined && usage !== undefined && isPoolable(resolved, usage) && isPoolableSize(size)) {
         // Do not make a released buffer available to later creates until the
         // current command buffer has been submitted. Recorded dispatches hold
         // GPUBuffer references, so reusing the same buffer before submit can
@@ -2703,18 +2433,11 @@ export function createBridgeStub(
     },
 
     // ===== Pipeline =====
-    wgpuComputePipelineGetBindGroupLayout(
-      pipelineHandle: number,
-      index: number,
-    ): number {
+    wgpuComputePipelineGetBindGroupLayout(pipelineHandle: number, index: number): number {
       const key = pipelineHandle * 4 + index;
       const cached = layoutCache.get(key);
       if (cached !== undefined) return cached;
-      const handle = rpcCall(
-        RpcFn.PIPELINE_GET_BIND_GROUP_LAYOUT,
-        pipelineHandle,
-        index,
-      );
+      const handle = rpcCall(RpcFn.PIPELINE_GET_BIND_GROUP_LAYOUT, pipelineHandle, index);
       layoutCache.set(key, handle);
       return handle;
     },
@@ -2730,10 +2453,7 @@ export function createBridgeStub(
 
     // ===== Release =====
     wgpuBindGroupRelease(handle: number): void {
-      if (
-        pendingBgData.has(handle) &&
-        (handle === pendingBindGroup || handle === pendingBindGroup1)
-      ) {
+      if (pendingBgData.has(handle) && (handle === pendingBindGroup || handle === pendingBindGroup1)) {
         // A compute pass retains the bind group after setBindGroup. Keep the
         // eagerly parsed descriptor alive until the pending dispatch/flush uses it.
         releasedPendingBindGroups.add(handle);
@@ -2815,24 +2535,15 @@ export function createBridgeStub(
       pm = Atomics.load(poolStatsArr, POOL_STAT_MISSES);
       dCreateAll = Atomics.load(poolStatsArr, POOL_STAT_CREATE_ALL);
       dCreateMCD = Atomics.load(poolStatsArr, POOL_STAT_CREATE_MAPPED_COPY_DST);
-      dCreateMNCD = Atomics.load(
-        poolStatsArr,
-        POOL_STAT_CREATE_MAPPED_NO_COPY_DST,
-      );
+      dCreateMNCD = Atomics.load(poolStatsArr, POOL_STAT_CREATE_MAPPED_NO_COPY_DST);
       dRelAll = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_ALL);
       dRelUnk = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_UNKNOWN);
       dRelUnp = Atomics.load(poolStatsArr, POOL_STAT_RELEASE_UNPOOLABLE);
       dPoolEvictions = Atomics.load(poolStatsArr, POOL_STAT_EVICTIONS);
       dBatchAttempt = Atomics.load(poolStatsArr, POOL_STAT_BATCH_ATTEMPT);
       dBatchStaged = Atomics.load(poolStatsArr, POOL_STAT_BATCH_STAGED);
-      dBatchDeferredBlock = Atomics.load(
-        poolStatsArr,
-        POOL_STAT_BATCH_DEFERRED_BLOCK,
-      );
-      dBatchStageRefused = Atomics.load(
-        poolStatsArr,
-        POOL_STAT_BATCH_STAGE_REFUSED,
-      );
+      dBatchDeferredBlock = Atomics.load(poolStatsArr, POOL_STAT_BATCH_DEFERRED_BLOCK);
+      dBatchStageRefused = Atomics.load(poolStatsArr, POOL_STAT_BATCH_STAGE_REFUSED);
     }
     return {
       rpcCount: bridgeRpcCount,
@@ -2871,8 +2582,7 @@ export function createBridgeStub(
     diagBatchStageRefused = 0;
     poisonedRpcCount = 0;
     if (poolStatsArr) {
-      for (let i = 0; i < POOL_STATS_SLOTS; i++)
-        Atomics.store(poolStatsArr, i, 0);
+      for (let i = 0; i < POOL_STATS_SLOTS; i++) Atomics.store(poolStatsArr, i, 0);
     }
   }
 

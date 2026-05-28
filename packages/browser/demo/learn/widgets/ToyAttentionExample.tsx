@@ -1,6 +1,6 @@
-import * as React from "react";
+import * as React from 'react';
 
-import { Button } from "../../components/ui/button";
+import { Button } from '../../components/ui/button';
 
 /**
  * A hand-worked 2-token attention example. All numbers are computed at module
@@ -11,7 +11,7 @@ import { Button } from "../../components/ui/button";
  */
 
 // Tokens
-const TOKEN_NAMES = ["The", "cat"];
+const TOKEN_NAMES = ['The', 'cat'];
 
 // Hand-picked embeddings, weights, etc. Kept in 2-d so the matrix algebra
 // stays printable. Q and K use identity projections — Q[The] = x[The], etc. —
@@ -60,7 +60,7 @@ function dot(a: number[], b: number[]): number {
 }
 
 function fmt(n: number): string {
-  if (!Number.isFinite(n)) return n > 0 ? "∞" : "-∞";
+  if (!Number.isFinite(n)) return n > 0 ? '∞' : '-∞';
   return n.toFixed(2);
 }
 
@@ -74,9 +74,7 @@ const SCORES = Q.map((q) => K.map((k) => dot(q, k)));
 const SCALED = SCORES.map((row) => row.map((s) => s / SQRT_D_K));
 
 // Causal-masked scaled scores: upper triangle (j > i) becomes -Infinity.
-const MASKED = SCALED.map((row, i) =>
-  row.map((v, j) => (j > i ? Number.NEGATIVE_INFINITY : v)),
-);
+const MASKED = SCALED.map((row, i) => row.map((v, j) => (j > i ? Number.NEGATIVE_INFINITY : v)));
 
 function softmaxRow(row: number[]): number[] {
   const finite = row.filter((v) => Number.isFinite(v));
@@ -107,12 +105,10 @@ type Card = {
 
 const CARDS: Card[] = [
   {
-    title: "1. Embeddings",
+    title: '1. Embeddings',
     body: (
       <div className="space-y-1">
-        <p className="text-[12px] text-foreground/85">
-          Two tokens, each a tiny 2-d vector.
-        </p>
+        <p className="text-[12px] text-foreground/85">Two tokens, each a tiny 2-d vector.</p>
         <pre className="rounded bg-muted p-2 font-mono text-[11px] leading-5">
           <code>
             {`x[The] = [${fmt(X[0]![0]!)}, ${fmt(X[0]![1]!)}]
@@ -123,12 +119,11 @@ x[cat] = [${fmt(X[1]![0]!)}, ${fmt(X[1]![1]!)}]`}
     ),
   },
   {
-    title: "2. Q = x · W_Q, K = x · W_K, V = x · W_V",
+    title: '2. Q = x · W_Q, K = x · W_K, V = x · W_V',
     body: (
       <div className="space-y-1">
         <p className="text-[12px] text-foreground/85">
-          W_Q and W_K are identity; W_V is non-identity so the final mix is
-          visible.
+          W_Q and W_K are identity; W_V is non-identity so the final mix is visible.
         </p>
         <pre className="rounded bg-muted p-2 font-mono text-[11px] leading-5">
           <code>
@@ -141,18 +136,16 @@ V[The] = [${fmt(V[0]![0]!)}, ${fmt(V[0]![1]!)}]   V[cat] = [${fmt(V[1]![0]!)}, $
     ),
   },
   {
-    title: "3. Scores = Q · K^T",
+    title: '3. Scores = Q · K^T',
     body: (
       <div className="space-y-1">
-        <p className="text-[12px] text-foreground/85">
-          Each cell (i, j) is the dot product of Q[i] with K[j].
-        </p>
+        <p className="text-[12px] text-foreground/85">Each cell (i, j) is the dot product of Q[i] with K[j].</p>
         <Matrix2x2 rows={SCORES} rowLabels={TOKEN_NAMES} colLabels={TOKEN_NAMES} />
       </div>
     ),
   },
   {
-    title: "4. Scale by sqrt(d_k)",
+    title: '4. Scale by sqrt(d_k)',
     body: (
       <div className="space-y-1">
         <p className="text-[12px] text-foreground/85">
@@ -163,37 +156,36 @@ V[The] = [${fmt(V[0]![0]!)}, ${fmt(V[0]![1]!)}]   V[cat] = [${fmt(V[1]![0]!)}, $
     ),
   },
   {
-    title: "5. Mask (causal)",
+    title: '5. Mask (causal)',
     body: (
       <div className="space-y-1">
         <p className="text-[12px] text-foreground/85">
-          Token &quot;The&quot; cannot see &quot;cat&quot; (it comes later) —
-          set the upper-right cell to -inf so it disappears after softmax.
+          Token &quot;The&quot; cannot see &quot;cat&quot; (it comes later) — set the upper-right cell to -inf so it
+          disappears after softmax.
         </p>
         <Matrix2x2 rows={MASKED} rowLabels={TOKEN_NAMES} colLabels={TOKEN_NAMES} />
       </div>
     ),
   },
   {
-    title: "6. Softmax per row",
+    title: '6. Softmax per row',
     body: (
       <div className="space-y-1">
         <p className="text-[12px] text-foreground/85">
-          Each row becomes a probability distribution. Row &quot;The&quot;
-          has only one valid key, so it attends 100% to itself.
+          Each row becomes a probability distribution. Row &quot;The&quot; has only one valid key, so it attends 100% to
+          itself.
         </p>
         <Matrix2x2 rows={ATTN} rowLabels={TOKEN_NAMES} colLabels={TOKEN_NAMES} highlight />
       </div>
     ),
   },
   {
-    title: "7. Output = attn · V",
+    title: '7. Output = attn · V',
     body: (
       <div className="space-y-1">
         <p className="text-[12px] text-foreground/85">
-          Mix the value vectors using the attention weights. &quot;The&quot;
-          ends up exactly V[The]; &quot;cat&quot; is a weighted blend of
-          V[The] and V[cat].
+          Mix the value vectors using the attention weights. &quot;The&quot; ends up exactly V[The]; &quot;cat&quot; is
+          a weighted blend of V[The] and V[cat].
         </p>
         <pre className="rounded bg-muted p-2 font-mono text-[11px] leading-5">
           <code>
@@ -224,10 +216,7 @@ function Matrix2x2({
           <tr>
             <th className="px-2 py-1 text-left text-muted-foreground" />
             {colLabels.map((c, i) => (
-              <th
-                key={`col-${i}`}
-                className="px-2 py-1 text-right text-muted-foreground"
-              >
+              <th key={`col-${i}`} className="px-2 py-1 text-right text-muted-foreground">
                 K[{c}]
               </th>
             ))}
@@ -236,15 +225,10 @@ function Matrix2x2({
         <tbody>
           {rows.map((row, i) => (
             <tr key={`row-${i}`}>
-              <th className="border-t border-border/60 px-2 py-1 text-left text-muted-foreground">
-                Q[{rowLabels[i]}]
-              </th>
+              <th className="border-t border-border/60 px-2 py-1 text-left text-muted-foreground">Q[{rowLabels[i]}]</th>
               {row.map((v, j) => {
                 const isMasked = !Number.isFinite(v);
-                const intensity =
-                  highlight && Number.isFinite(v)
-                    ? Math.max(0, Math.min(1, v))
-                    : 0;
+                const intensity = highlight && Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0;
                 return (
                   <td
                     key={`cell-${i}-${j}`}
@@ -257,11 +241,7 @@ function Matrix2x2({
                         : undefined
                     }
                   >
-                    {isMasked ? (
-                      <span className="text-muted-foreground/60">-∞</span>
-                    ) : (
-                      fmt(v)
-                    )}
+                    {isMasked ? <span className="text-muted-foreground/60">-∞</span> : fmt(v)}
                   </td>
                 );
               })}
@@ -295,15 +275,11 @@ export function ToyAttentionExample() {
             <div
               key={`card-${i}`}
               className={[
-                "rounded-md border p-3 transition-opacity",
-                isActive
-                  ? "border-primary/40 bg-primary/5 opacity-100"
-                  : "border-border/60 bg-muted/20 opacity-60",
-              ].join(" ")}
+                'rounded-md border p-3 transition-opacity',
+                isActive ? 'border-primary/40 bg-primary/5 opacity-100' : 'border-border/60 bg-muted/20 opacity-60',
+              ].join(' ')}
             >
-              <div className="mb-1 text-[12px] font-semibold text-foreground">
-                {card.title}
-              </div>
+              <div className="mb-1 text-[12px] font-semibold text-foreground">{card.title}</div>
               {card.body}
             </div>
           );
@@ -322,19 +298,12 @@ export function ToyAttentionExample() {
         <Button
           size="sm"
           variant="outline"
-          onClick={() =>
-            setStepIdx(Math.min(CARDS.length - 1, safeIdx + 1))
-          }
+          onClick={() => setStepIdx(Math.min(CARDS.length - 1, safeIdx + 1))}
           disabled={safeIdx >= CARDS.length - 1}
         >
           Next
         </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => setStepIdx(0)}
-          disabled={safeIdx === 0}
-        >
+        <Button size="sm" variant="outline" onClick={() => setStepIdx(0)} disabled={safeIdx === 0}>
           Reset
         </Button>
         <span className="ml-2 text-[11px] text-muted-foreground">

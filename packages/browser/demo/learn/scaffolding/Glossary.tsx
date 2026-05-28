@@ -1,6 +1,6 @@
-import * as React from "react";
+import * as React from 'react';
 
-import type { GlossaryTerm } from "./learning-data";
+import type { GlossaryTerm } from './learning-data';
 
 export type GlossaryProps = {
   terms: GlossaryTerm[];
@@ -19,15 +19,12 @@ export function Glossary({ terms }: GlossaryProps) {
     <details className="group rounded-lg border border-border bg-card/40 px-4 py-3 text-sm">
       <summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-foreground/90 [&::-webkit-details-marker]:hidden">
         <span className="font-medium">
-          Glossary <span className="text-muted-foreground">·</span>{" "}
+          Glossary <span className="text-muted-foreground">·</span>{' '}
           <span className="text-muted-foreground">
-            {terms.length} term{terms.length === 1 ? "" : "s"}
+            {terms.length} term{terms.length === 1 ? '' : 's'}
           </span>
         </span>
-        <span
-          aria-hidden="true"
-          className="text-xs text-muted-foreground transition-transform group-open:rotate-90"
-        >
+        <span aria-hidden="true" className="text-xs text-muted-foreground transition-transform group-open:rotate-90">
           ▸
         </span>
       </summary>

@@ -9,12 +9,12 @@
 // Wired in Phase 2.C alongside the RouterProvider mount. Visibility is
 // controlled from __root.tsx based on the current pathname (=== '/chat').
 
+import { useFreeChat } from '../providers/free-chat';
+import { useTelemetry } from '../providers/telemetry';
 import { ChatHeader } from './chat/ChatHeader';
 import { InspectorDrawer } from './chat/InspectorDrawer';
 import { PowerComposer } from './chat/PowerComposer';
 import { TelemetryStrip } from './chat/TelemetryStrip';
-import { useFreeChat } from '../providers/free-chat';
-import { useTelemetry } from '../providers/telemetry';
 
 export function ChatLayerOverlay({ visible }: { visible: boolean }) {
   const {

@@ -1,7 +1,6 @@
-import * as React from "react";
-
-import katex from "katex";
-import "katex/dist/katex.min.css";
+import katex from 'katex';
+import * as React from 'react';
+import 'katex/dist/katex.min.css';
 
 /**
  * Render a LaTeX math expression. Block-level (display) by default; pass
@@ -12,19 +11,13 @@ import "katex/dist/katex.min.css";
  * that other React wrappers have. The horizontal-scroll container handles
  * wide formulas gracefully on narrow viewports.
  */
-export function MathDisplay({
-  latex,
-  inline = false,
-}: {
-  latex: string;
-  inline?: boolean;
-}) {
+export function MathDisplay({ latex, inline = false }: { latex: string; inline?: boolean }) {
   const html = React.useMemo(
     () =>
       katex.renderToString(latex, {
         throwOnError: false,
         displayMode: !inline,
-        output: "html",
+        output: 'html',
       }),
     [latex, inline],
   );

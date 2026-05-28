@@ -55,9 +55,7 @@ function fmtProb(v: number): string {
 }
 
 function MatrixHeader({ label }: { label: string }) {
-  return (
-    <div className="mb-1 text-center text-[10px] uppercase tracking-wider text-muted-foreground">{label}</div>
-  );
+  return <div className="mb-1 text-center text-[10px] uppercase tracking-wider text-muted-foreground">{label}</div>;
 }
 
 function CornerLabel() {
@@ -80,7 +78,10 @@ function ColHeaders() {
 function ScoreCell({ v, mute }: { v: number; mute?: boolean }) {
   return (
     <td
-      className={['border border-border/60 px-1.5 py-0.5 text-center font-mono text-[11px]', mute ? 'text-muted-foreground/60' : 'text-foreground/85'].join(' ')}
+      className={[
+        'border border-border/60 px-1.5 py-0.5 text-center font-mono text-[11px]',
+        mute ? 'text-muted-foreground/60' : 'text-foreground/85',
+      ].join(' ')}
     >
       {fmt(v)}
     </td>
@@ -154,15 +155,13 @@ export function CausalMaskAsSum() {
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Causal mask as a matrix sum</div>
-        <div className="text-[11px] text-muted-foreground">
-          scores + mask = masked scores → softmax → weights
-        </div>
+        <div className="text-[11px] text-muted-foreground">scores + mask = masked scores → softmax → weights</div>
       </div>
 
       <p className="text-[12px] text-foreground/85">
-        "Set the upper triangle to <code>-∞</code>" reads more cleanly as an addition: the mask is literally a matrix
-        of <code>0</code> on/below the diagonal and <code>-∞</code> above. After softmax, the <code>-∞</code> cells
-        become exactly <code>0</code>, so every row is a valid probability distribution over earlier positions only.
+        "Set the upper triangle to <code>-∞</code>" reads more cleanly as an addition: the mask is literally a matrix of{' '}
+        <code>0</code> on/below the diagonal and <code>-∞</code> above. After softmax, the <code>-∞</code> cells become
+        exactly <code>0</code>, so every row is a valid probability distribution over earlier positions only.
       </p>
 
       <div className="flex flex-wrap items-stretch justify-center gap-2 overflow-x-auto">
@@ -262,9 +261,9 @@ export function CausalMaskAsSum() {
       </div>
 
       <p className="text-[11px] text-muted-foreground">
-        Numbers in the leftmost matrix are illustrative, not from the model. The point is the operation, not the
-        values — every row of the rightmost matrix sums to <span className="font-mono">1.00</span>, and every cell above
-        the diagonal is exactly <span className="font-mono">0</span>.
+        Numbers in the leftmost matrix are illustrative, not from the model. The point is the operation, not the values
+        — every row of the rightmost matrix sums to <span className="font-mono">1.00</span>, and every cell above the
+        diagonal is exactly <span className="font-mono">0</span>.
       </p>
     </div>
   );

@@ -1,4 +1,4 @@
-import * as React from "react";
+import * as React from 'react';
 
 /**
  * A horizontal bar chart comparing whole-model KV cache memory between a
@@ -18,7 +18,7 @@ function cacheBytes(kvHeads: number): number {
 }
 
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
   if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -39,17 +39,17 @@ type Row = {
 
 const ROWS: Row[] = [
   {
-    label: "MHA hypothetical",
+    label: 'MHA hypothetical',
     detail: `num_kv_heads = ${NUM_HEADS} (same as query heads)`,
     bytes: MHA_BYTES,
-    color: "#94a3b8",
+    color: '#94a3b8',
     accent: false,
   },
   {
-    label: "GQA actual",
+    label: 'GQA actual',
     detail: `num_kv_heads = ${NUM_KV_HEADS} (Qwen3.5-0.8B config)`,
     bytes: GQA_BYTES,
-    color: "#22c55e",
+    color: '#22c55e',
     accent: true,
   },
 ];
@@ -62,9 +62,7 @@ export function MhaVsGqaCacheBar() {
         <div className="text-xs uppercase tracking-wider text-muted-foreground">
           KV cache · whole model · seq_len = {SEQ_LEN.toLocaleString()}
         </div>
-        <div className="text-[11px] text-muted-foreground">
-          24 layers · head_dim = {HEAD_DIM} · bf16
-        </div>
+        <div className="text-[11px] text-muted-foreground">24 layers · head_dim = {HEAD_DIM} · bf16</div>
       </div>
 
       <div className="space-y-2">
@@ -74,9 +72,7 @@ export function MhaVsGqaCacheBar() {
             <div key={`row-${i}`} className="space-y-1">
               <div className="flex items-baseline justify-between text-[12px]">
                 <span className="font-mono text-foreground/90">{r.label}</span>
-                <span className="font-mono text-foreground/80">
-                  {formatBytes(r.bytes)}
-                </span>
+                <span className="font-mono text-foreground/80">{formatBytes(r.bytes)}</span>
               </div>
               <div
                 className="relative h-6 w-full overflow-hidden rounded-sm bg-muted/60"
@@ -85,9 +81,9 @@ export function MhaVsGqaCacheBar() {
               >
                 <div
                   className={[
-                    "absolute inset-y-0 left-0 transition-all",
-                    r.accent ? "ring-1 ring-primary/50" : "",
-                  ].join(" ")}
+                    'absolute inset-y-0 left-0 transition-all',
+                    r.accent ? 'ring-1 ring-primary/50' : '',
+                  ].join(' ')}
                   style={{
                     width: `${pct.toFixed(1)}%`,
                     backgroundColor: r.color,
@@ -101,9 +97,8 @@ export function MhaVsGqaCacheBar() {
       </div>
 
       <div className="rounded-md border border-primary/40 bg-primary/5 px-3 py-2 text-[12px] text-foreground/90">
-        GQA is <span className="font-mono">{RATIO.toFixed(1)}×</span> smaller
-        than the equivalent MHA layout — that&apos;s the whole reason it ships
-        in every modern open model. Hidden behind every fast LLM inference is
+        GQA is <span className="font-mono">{RATIO.toFixed(1)}×</span> smaller than the equivalent MHA layout —
+        that&apos;s the whole reason it ships in every modern open model. Hidden behind every fast LLM inference is
         grouped-query attention.
       </div>
     </div>

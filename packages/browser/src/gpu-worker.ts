@@ -15,7 +15,7 @@
  * command buffer instead of being invoked via wasmTable.get().
  */
 
-import { roundUpBucket } from "./buffer-bucket.js";
+import { roundUpBucket } from './buffer-bucket.js';
 import {
   RpcFn,
   CMD_OFFSET,
@@ -39,11 +39,11 @@ import {
   MAX_DISPATCH_BATCH,
   MAX_DISPATCH_BATCH_ENTRIES,
   MAX_DISPATCH_BATCH_UNIFORM,
-} from "./rpc-protocol.js";
+} from './rpc-protocol.js';
 
 // Revision marker: changes worker asset URLs after enabling COOP/COEP headers
 // on Void, avoiding stale immutable edge-cache entries without those headers.
-(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = "2026-05-15";
+(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = '2026-05-15';
 
 // ---------- Phase 0 RPC Histogram (?profile=1 observability) ----------
 //
@@ -95,7 +95,7 @@ const bufferLogicalSizesArr: (number | undefined)[] = [undefined];
 const bufferUsagesArr: (number | undefined)[] = [undefined];
 let nextHandle = 1;
 let currentFnId = 0;
-let currentDispatchContext = "";
+let currentDispatchContext = '';
 
 // Shared with every wasm-side bridge stub. Handles imported directly in this
 // worker, such as local-model weight buffers, never pass through
@@ -103,21 +103,15 @@ let currentDispatchContext = "";
 const BUFFER_METADATA_MAX_HANDLES = 1 << 20;
 let bufferMetaU32: Uint32Array | null = null;
 
-function setSharedBufferMeta(
-  handle: number,
-  size: number,
-  usage: number,
-): void {
-  if (!bufferMetaU32 || handle <= 0 || handle >= BUFFER_METADATA_MAX_HANDLES)
-    return;
+function setSharedBufferMeta(handle: number, size: number, usage: number): void {
+  if (!bufferMetaU32 || handle <= 0 || handle >= BUFFER_METADATA_MAX_HANDLES) return;
   const base = handle * 2;
   Atomics.store(bufferMetaU32, base + 1, usage >>> 0);
   Atomics.store(bufferMetaU32, base, size >>> 0);
 }
 
 function clearSharedBufferMeta(handle: number): void {
-  if (!bufferMetaU32 || handle <= 0 || handle >= BUFFER_METADATA_MAX_HANDLES)
-    return;
+  if (!bufferMetaU32 || handle <= 0 || handle >= BUFFER_METADATA_MAX_HANDLES) return;
   const base = handle * 2;
   Atomics.store(bufferMetaU32, base, 0);
   Atomics.store(bufferMetaU32, base + 1, 0);
@@ -276,10 +270,7 @@ function addHandle(obj: any): number {
   // in practice — but the leak guard is still in place for truly long
   // sessions.
   const RECYCLE_WATERMARK = 1 << 19;
-  if (
-    nextHandle >= RECYCLE_WATERMARK &&
-    freeHandleList.length >= RECYCLE_DELAY
-  ) {
+  if (nextHandle >= RECYCLE_WATERMARK && freeHandleList.length >= RECYCLE_DELAY) {
     const id = freeHandleList.shift()!;
     handles[id] = obj;
     return id;
@@ -289,22 +280,20 @@ function addHandle(obj: any): number {
   return id;
 }
 
-function getHandle<T>(id: number, label = "handle"): T {
+function getHandle<T>(id: number, label = 'handle'): T {
   const obj = handles[id];
   if (!obj) {
-    const context = currentDispatchContext ? ` ${currentDispatchContext}` : "";
-    throw new Error(
-      `[GPU Worker] Invalid ${label}: ${id} (fn=${currentFnId}${context})`,
-    );
+    const context = currentDispatchContext ? ` ${currentDispatchContext}` : '';
+    throw new Error(`[GPU Worker] Invalid ${label}: ${id} (fn=${currentFnId}${context})`);
   }
   return obj as T;
 }
 
-function postRpcError(fnId: number, err: unknown, context = ""): void {
+function postRpcError(fnId: number, err: unknown, context = ''): void {
   const message = err instanceof Error ? err.message : String(err);
   const stack = err instanceof Error ? err.stack : undefined;
   try {
-    self.postMessage({ type: "rpc-error", fnId, message, stack, context });
+    self.postMessage({ type: 'rpc-error', fnId, message, stack, context });
   } catch {
     // ignore postMessage failures during worker teardown
   }
@@ -348,18 +337,10 @@ function invalidateBindGroupCacheForHandle(handle: number): void {
 }
 
 function hasUnsubmittedGpuWork(): boolean {
-  return (
-    activeCommandEncoders.size > 0 ||
-    pendingCommandBuffers.size > 0 ||
-    passEncoderMap.size > 0
-  );
+  return activeCommandEncoders.size > 0 || pendingCommandBuffers.size > 0 || passEncoderMap.size > 0;
 }
 
-function poolBufferHandleNow(
-  handle: number,
-  size: number,
-  usage: number,
-): void {
+function poolBufferHandleNow(handle: number, size: number, usage: number): void {
   if (!isPoolableSize(size)) {
     destroyBufferHandleAfterSubmittedWork(handle);
     return;
@@ -388,7 +369,7 @@ function evictOnePooledBuffer(): boolean {
       bufferPool.delete(key);
       continue;
     }
-    const sep = key.indexOf(":");
+    const sep = key.indexOf(':');
     const size = Number(key.slice(sep + 1));
     removeBufferPoolBytes(size);
     destroyBufferHandleAfterSubmittedWork(evicted);
@@ -414,7 +395,7 @@ function drainPendingBufferDestroys(): void {
     try {
       buffer.destroy();
     } catch (err) {
-      console.error("[GPU Worker] GPUBuffer destroy failed:", err);
+      console.error('[GPU Worker] GPUBuffer destroy failed:', err);
     }
   }
 }
@@ -432,15 +413,12 @@ function schedulePendingBufferDestroyBatch(): void {
           try {
             buffer.destroy();
           } catch (err) {
-            console.error(
-              "[GPU Worker] deferred GPUBuffer destroy failed:",
-              err,
-            );
+            console.error('[GPU Worker] deferred GPUBuffer destroy failed:', err);
           }
         }
       },
       (err) => {
-        console.error("[GPU Worker] deferred GPUBuffer destroy failed:", err);
+        console.error('[GPU Worker] deferred GPUBuffer destroy failed:', err);
       },
     );
   });
@@ -555,7 +533,7 @@ function getWasmBytes(): Uint8Array {
 }
 
 function readString(ptr: number): string {
-  if (ptr === 0) return "";
+  if (ptr === 0) return '';
   const bytes = getWasmBytes();
   let end = ptr;
   const maxLen = bytes.byteLength;
@@ -592,10 +570,7 @@ const passEncoderMap = new Map<number, number>(); // passHandle → encoderHandl
 
 const RESTART_PASS_AFTER_EACH_DISPATCH = false;
 
-function endOpenComputePassesForEncoder(
-  encoderHandle: number,
-  keepPassHandle = 0,
-): void {
+function endOpenComputePassesForEncoder(encoderHandle: number, keepPassHandle = 0): void {
   // The bridge stub normally sends the pass handle that must be ended before
   // copy/finish, but large decode/VLM paths can expose stale stub-side pass
   // state. WebGPU rejects copyBufferToBuffer/finish while any pass for the same
@@ -713,7 +688,7 @@ const activeMappings = new Map<number, MappedRangeInfo>();
 // ---------- Worker Init ----------
 
 self.onmessage = async (e: MessageEvent) => {
-  if (e.data.type === "init") {
+  if (e.data.type === 'init') {
     cmdBuffer = e.data.cmdBuffer;
     wasmMemoryObj = e.data.wasmMemory; // WebAssembly.Memory object
     readbackView = new Uint8Array(e.data.readbackBuffer);
@@ -755,20 +730,12 @@ self.onmessage = async (e: MessageEvent) => {
     // when absent, GET_STATS still returns the scalar total via RESULT but
     // the per-opcode histogram is a no-op. Every production init (mlx-worker)
     // supplies this; test harnesses may not.
-    if (
-      e.data.statsBuffer &&
-      (e.data.statsBuffer as SharedArrayBuffer).byteLength >= STATS_BUFFER_SIZE
-    ) {
-      statsU32 = new Uint32Array(
-        e.data.statsBuffer as SharedArrayBuffer,
-        0,
-        STATS_OPCODE_SLOTS,
-      );
+    if (e.data.statsBuffer && (e.data.statsBuffer as SharedArrayBuffer).byteLength >= STATS_BUFFER_SIZE) {
+      statsU32 = new Uint32Array(e.data.statsBuffer as SharedArrayBuffer, 0, STATS_OPCODE_SLOTS);
     }
     if (
       e.data.bufferMetadataBuffer &&
-      (e.data.bufferMetadataBuffer as SharedArrayBuffer).byteLength >=
-        BUFFER_METADATA_MAX_HANDLES * 8
+      (e.data.bufferMetadataBuffer as SharedArrayBuffer).byteLength >= BUFFER_METADATA_MAX_HANDLES * 8
     ) {
       bufferMetaU32 = new Uint32Array(
         e.data.bufferMetadataBuffer as SharedArrayBuffer,
@@ -781,8 +748,8 @@ self.onmessage = async (e: MessageEvent) => {
     const gpu = navigator.gpu;
     if (!gpu) {
       self.postMessage({
-        type: "error",
-        message: "WebGPU not available in gpu-worker",
+        type: 'error',
+        message: 'WebGPU not available in gpu-worker',
       });
       return;
     }
@@ -790,38 +757,32 @@ self.onmessage = async (e: MessageEvent) => {
     const _adapter = await gpu.requestAdapter();
     if (!_adapter) {
       self.postMessage({
-        type: "error",
-        message: "No WebGPU adapter available",
+        type: 'error',
+        message: 'No WebGPU adapter available',
       });
       return;
     }
     adapter = _adapter;
 
     // 1A: Runtime feature detection
-    hasShaderF16 = adapter.features.has("shader-f16");
-    const hasSubgroups = adapter.features.has("subgroups");
-    const hasTimestampQuery = adapter.features.has("timestamp-query");
+    hasShaderF16 = adapter.features.has('shader-f16');
+    const hasSubgroups = adapter.features.has('subgroups');
+    const hasTimestampQuery = adapter.features.has('timestamp-query');
     const requiredFeatures: GPUFeatureName[] = [];
-    if (hasShaderF16) requiredFeatures.push("shader-f16");
-    if (hasSubgroups) requiredFeatures.push("subgroups");
-    if (hasTimestampQuery) requiredFeatures.push("timestamp-query");
+    if (hasShaderF16) requiredFeatures.push('shader-f16');
+    if (hasSubgroups) requiredFeatures.push('subgroups');
+    if (hasTimestampQuery) requiredFeatures.push('timestamp-query');
     console.log(
       `[GPU Worker] Detected features: shader-f16=${hasShaderF16}, subgroups=${hasSubgroups}, timestamp-query=${hasTimestampQuery}`,
     );
 
     const maxBufferSize = adapter.limits.maxBufferSize;
-    const maxStorageBufferBindingSize = Math.min(
-      adapter.limits.maxStorageBufferBindingSize,
-      maxBufferSize,
-    );
+    const maxStorageBufferBindingSize = Math.min(adapter.limits.maxStorageBufferBindingSize, maxBufferSize);
 
     device = await adapter.requestDevice({
       requiredFeatures,
       requiredLimits: {
-        maxStorageBuffersPerShaderStage: Math.min(
-          adapter.limits.maxStorageBuffersPerShaderStage,
-          16,
-        ),
+        maxStorageBuffersPerShaderStage: Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 16),
         maxBufferSize,
         maxStorageBufferBindingSize,
         maxComputeWorkgroupSizeX: 256,
@@ -832,13 +793,9 @@ self.onmessage = async (e: MessageEvent) => {
         // D=256 tile SDPA needs ~25 KiB shared memory (BQ*D + BK*D + extras).
         // The WebGPU minimum is 16384 (16 KiB); request the adapter's max
         // (32768 on Apple M3) so D=256 kernels can compile and run.
-        maxComputeWorkgroupStorageSize:
-          adapter.limits.maxComputeWorkgroupStorageSize,
+        maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
         maxBindGroups: 4,
-        maxBindingsPerBindGroup: Math.min(
-          adapter.limits.maxBindingsPerBindGroup,
-          16,
-        ),
+        maxBindingsPerBindGroup: Math.min(adapter.limits.maxBindingsPerBindGroup, 16),
       },
     });
     queue = device.queue;
@@ -847,9 +804,9 @@ self.onmessage = async (e: MessageEvent) => {
       const error = (event as GPUUncapturedErrorEvent).error;
       const message = `${error.constructor.name}: ${error.message}`;
       fatalGpuError = message;
-      console.error("[GPU Worker] Uncaptured error:", message);
+      console.error('[GPU Worker] Uncaptured error:', message);
       try {
-        self.postMessage({ type: "gpu-error", message });
+        self.postMessage({ type: 'gpu-error', message });
       } catch {
         // ignore postMessage failures
       }
@@ -888,13 +845,13 @@ self.onmessage = async (e: MessageEvent) => {
     }
 
     // Pre-register handles for pre-created objects
-    instanceHandle = addHandle({ __brand: "instance" });
+    instanceHandle = addHandle({ __brand: 'instance' });
     adapterHandle = addHandle(adapter);
     deviceHandle = addHandle(device);
     queueHandle = addHandle(queue);
 
     self.postMessage({
-      type: "ready",
+      type: 'ready',
       instanceHandle,
       adapterHandle,
       deviceHandle,
@@ -910,7 +867,7 @@ self.onmessage = async (e: MessageEvent) => {
     commandLoop();
   }
 
-  if (e.data.type === "upload_weights") {
+  if (e.data.type === 'upload_weights') {
     // Bulk weight upload: read directly from a transferred ArrayBuffer (or
     // SharedArrayBuffer for older callers), create GPU buffers. Browser model
     // loading uses transferable ArrayBuffers for transient upload batches so
@@ -974,20 +931,20 @@ self.onmessage = async (e: MessageEvent) => {
     // all stay upconverted. Step B/C will extend this allowlist once the
     // corresponding packed kernels land.
     const isMatmulConsumedWeight = (name: string): boolean => {
-      if (!name.endsWith(".weight")) return false;
+      if (!name.endsWith('.weight')) return false;
       // Linear projections — all routed through linear_proj() →
       // matmul(x, transpose(weight)) in mlx_qwen35_common.h. Both decode (GEMV)
       // and prefill (GEMM) of these weights consume the buffer with
       // b_transposed=true, which is the only path that has a packed kernel.
       // MLP (SwiGLU) projections.
-      if (name.endsWith(".mlp.gate_proj.weight")) return true;
-      if (name.endsWith(".mlp.up_proj.weight")) return true;
-      if (name.endsWith(".mlp.down_proj.weight")) return true;
+      if (name.endsWith('.mlp.gate_proj.weight')) return true;
+      if (name.endsWith('.mlp.up_proj.weight')) return true;
+      if (name.endsWith('.mlp.down_proj.weight')) return true;
       // Self-attention projections.
-      if (name.endsWith(".self_attn.q_proj.weight")) return true;
-      if (name.endsWith(".self_attn.k_proj.weight")) return true;
-      if (name.endsWith(".self_attn.v_proj.weight")) return true;
-      if (name.endsWith(".self_attn.o_proj.weight")) return true;
+      if (name.endsWith('.self_attn.q_proj.weight')) return true;
+      if (name.endsWith('.self_attn.k_proj.weight')) return true;
+      if (name.endsWith('.self_attn.v_proj.weight')) return true;
+      if (name.endsWith('.self_attn.o_proj.weight')) return true;
       // Linear (gated-delta) attention projections. in_proj_qkvz /
       // in_proj_ba are PRE-MERGED in JS (mlx-worker.ts) before upload so
       // the merged buffer takes its OWN PackedBf16 opt-in on first upload
@@ -995,9 +952,9 @@ self.onmessage = async (e: MessageEvent) => {
       // already a single weight. All three land on matmul(x, W.T) via
       // linear_proj() in mlx_qwen35_common.h → b_transposed=true packed
       // kernel.
-      if (name.endsWith(".linear_attn.out_proj.weight")) return true;
-      if (name.endsWith(".linear_attn.in_proj_qkvz.weight")) return true;
-      if (name.endsWith(".linear_attn.in_proj_ba.weight")) return true;
+      if (name.endsWith('.linear_attn.out_proj.weight')) return true;
+      if (name.endsWith('.linear_attn.in_proj_qkvz.weight')) return true;
+      if (name.endsWith('.linear_attn.in_proj_ba.weight')) return true;
       return false;
     };
 
@@ -1043,23 +1000,23 @@ self.onmessage = async (e: MessageEvent) => {
     // accidentally grabs `linear_attn.norm.weight` or future vision
     // norms.
     const isNormConsumedWeight = (name: string): boolean => {
-      if (!name.endsWith(".weight")) return false;
+      if (!name.endsWith('.weight')) return false;
       // Reject vision-tower tensors explicitly — belt and suspenders in
       // case a future refactor drops the endsWith-specific check below.
-      if (name.startsWith("vision_tower.")) return false;
+      if (name.startsWith('vision_tower.')) return false;
       // Per-layer pre-attention RMSNorm.
-      if (name.endsWith(".input_layernorm.weight")) return true;
+      if (name.endsWith('.input_layernorm.weight')) return true;
       // Per-layer post-attention RMSNorm (feeds the MLP).
-      if (name.endsWith(".post_attention_layernorm.weight")) return true;
+      if (name.endsWith('.post_attention_layernorm.weight')) return true;
       // Per-layer full-attention q/k RMSNorm (GQA head normalization).
-      if (name.endsWith(".self_attn.q_norm.weight")) return true;
-      if (name.endsWith(".self_attn.k_norm.weight")) return true;
+      if (name.endsWith('.self_attn.q_norm.weight')) return true;
+      if (name.endsWith('.self_attn.k_norm.weight')) return true;
       // Final LM-head norm. Matches both the text-only (`model.norm.weight`)
       // and VL (`language_model.model.norm.weight`) names via the shared
       // `.model.norm.weight` tail, without leaking matches to
       // `.linear_attn.norm.weight` or any `vision_tower.*.norm.weight`.
-      if (name === "model.norm.weight") return true;
-      if (name.endsWith(".model.norm.weight")) return true;
+      if (name === 'model.norm.weight') return true;
+      if (name.endsWith('.model.norm.weight')) return true;
       return false;
     };
 
@@ -1071,31 +1028,23 @@ self.onmessage = async (e: MessageEvent) => {
     const unpackedBf16Names: string[] = [];
     const MAX_WRITE_CHUNK_BYTES = 16 * 1024 * 1024;
     const writeBufferChunked = (buffer: GPUBuffer, data: Uint8Array): void => {
-      for (
-        let offset = 0;
-        offset < data.byteLength;
-        offset += MAX_WRITE_CHUNK_BYTES
-      ) {
+      for (let offset = 0; offset < data.byteLength; offset += MAX_WRITE_CHUNK_BYTES) {
         const size = Math.min(MAX_WRITE_CHUNK_BYTES, data.byteLength - offset);
         queue.writeBuffer(buffer, offset, data, offset, size);
       }
     };
     for (const tensor of tensors) {
-      const isBf16 = tensor.dtype === "BF16";
-      const isF16 = tensor.dtype === "F16";
+      const isBf16 = tensor.dtype === 'BF16';
+      const isF16 = tensor.dtype === 'F16';
       const numElements = tensor.byteSize / (isBf16 || isF16 ? 2 : 4);
       // Synthetic (pre-merged) tensors live in mergedBuffer starting at
       // tensor.byteOffset (a raw offset into the merged blob, NOT offset by
       // the safetensors dataOffset). Real safetensors tensors live in
       // weightsBuffer at dataOffset + tensor.byteOffset.
       const srcBuffer = tensor.fromMerged ? mergedBuffer : weightsBuffer;
-      const srcByteOffset = tensor.fromMerged
-        ? tensor.byteOffset
-        : dataOffset + tensor.byteOffset;
+      const srcByteOffset = tensor.fromMerged ? tensor.byteOffset : dataOffset + tensor.byteOffset;
       if (tensor.fromMerged && !mergedBuffer) {
-        throw new Error(
-          `Tensor ${tensor.name} marked fromMerged but mergedBuffer missing`,
-        );
+        throw new Error(`Tensor ${tensor.name} marked fromMerged but mergedBuffer missing`);
       }
       if (!srcBuffer) {
         throw new Error(`Upload buffer missing for tensor ${tensor.name}`);
@@ -1111,18 +1060,14 @@ self.onmessage = async (e: MessageEvent) => {
       // weights can require loader-side sanitization before use, so keep them
       // on the legacy path until the post-sanitized GPU load path can pack them.
       const matmulConsumed =
-        usePackBf16 &&
-        isBf16 &&
-        numElements >= PACKED_MIN_ELEMENTS &&
-        isMatmulConsumedWeight(tensor.name);
+        usePackBf16 && isBf16 && numElements >= PACKED_MIN_ELEMENTS && isMatmulConsumedWeight(tensor.name);
       const normConsumed = false;
       const packedEligible = matmulConsumed || normConsumed;
       if (
         isBf16 &&
         usePackBf16 &&
         (numElements >= PACKED_MIN_ELEMENTS ||
-          (numElements >= NORM_PACKED_MIN_ELEMENTS &&
-            isNormConsumedWeight(tensor.name)))
+          (numElements >= NORM_PACKED_MIN_ELEMENTS && isNormConsumedWeight(tensor.name)))
       ) {
         if (packedEligible) {
           packedNames.push(tensor.name);
@@ -1131,8 +1076,7 @@ self.onmessage = async (e: MessageEvent) => {
         }
       }
       // bf16 expands to f32 for legacy storage; f16 stays native when shader-f16 is available.
-      const needsExpand =
-        (isBf16 && !packedEligible) || (isF16 && !hasShaderF16);
+      const needsExpand = (isBf16 && !packedEligible) || (isF16 && !hasShaderF16);
 
       let gpuByteSize: number;
       if (packedEligible) {
@@ -1156,7 +1100,7 @@ self.onmessage = async (e: MessageEvent) => {
         uploadBytes.set(src);
         // Pad the trailing odd slot with zero bytes (already zero-initialized
         // in uploadBytes) — explicit comment for future maintainers.
-        uploadedDtypes.push("BF16");
+        uploadedDtypes.push('BF16');
         packedBf16Flags.push(true);
       } else if (needsExpand) {
         // Convert bf16/f16 → f32 in a CPU-side upload buffer.
@@ -1180,8 +1124,7 @@ self.onmessage = async (e: MessageEvent) => {
             } else if (exp === 31) {
               dstF32[j] = mant === 0 ? (sign ? -Infinity : Infinity) : NaN;
             } else {
-              dstF32[j] =
-                (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + mant / 1024);
+              dstF32[j] = (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + mant / 1024);
             }
           }
         }
@@ -1189,7 +1132,7 @@ self.onmessage = async (e: MessageEvent) => {
         // must remain logically BF16 so downstream ops pick the same dtypes
         // as native/common loading. The WebGPU backend tracks the widened
         // physical storage separately.
-        uploadedDtypes.push(isBf16 ? "BF16" : "F32");
+        uploadedDtypes.push(isBf16 ? 'BF16' : 'F32');
         packedBf16Flags.push(false);
       } else {
         const src = new Uint8Array(srcBuffer, srcByteOffset, tensor.byteSize);
@@ -1200,10 +1143,7 @@ self.onmessage = async (e: MessageEvent) => {
 
       const gpuBuffer = device.createBuffer({
         size: alignedSize,
-        usage:
-          GPUBufferUsage.STORAGE |
-          GPUBufferUsage.COPY_SRC |
-          GPUBufferUsage.COPY_DST,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
         mappedAtCreation: false,
       });
       writeBufferChunked(gpuBuffer, uploadBytes);
@@ -1211,23 +1151,18 @@ self.onmessage = async (e: MessageEvent) => {
       const handle = addHandle(gpuBuffer);
       bufferSizesArr[handle] = alignedSize;
       bufferLogicalSizesArr[handle] = alignedSize;
-      bufferUsagesArr[handle] =
-        GPUBufferUsage.STORAGE |
-        GPUBufferUsage.COPY_SRC |
-        GPUBufferUsage.COPY_DST;
+      bufferUsagesArr[handle] = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
       setSharedBufferMeta(
         handle,
         alignedSize,
-        GPUBufferUsage.STORAGE |
-          GPUBufferUsage.COPY_SRC |
-          GPUBufferUsage.COPY_DST,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       );
       handles.push(handle);
       uploadedByteSizes.push(alignedSize);
     }
 
     self.postMessage({
-      type: "weights_uploaded",
+      type: 'weights_uploaded',
       handles,
       uploadedDtypes,
       uploadedByteSizes,
@@ -1274,10 +1209,7 @@ function dispatchFusedRecord(
   uniformByteOffset: number,
   uniformUsage: number,
 ): number {
-  const layout = getHandle<GPUBindGroupLayout>(
-    layoutHandle,
-    "bind-group layout",
-  );
+  const layout = getHandle<GPUBindGroupLayout>(layoutHandle, 'bind-group layout');
   let newBufferHandle = 0;
   // Task E: if this dispatch's deferred-uniform path allocated a dedicated
   // uniform buffer (HOT MISS), remember it so the bind-group-cache insert
@@ -1289,17 +1221,9 @@ function dispatchFusedRecord(
   // Stage 1: optional uniform write (only for FUSED_DISPATCH_WITH_UNIFORM).
   // Must run BEFORE createBindGroup so the patched handle (for deferred
   // creation) lands in entries[uniformEntryIdx].
-  if (
-    opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM &&
-    uniformDataSize > 0 &&
-    uniformBuffer !== null
-  ) {
+  if (opcode === RpcFn.FUSED_DISPATCH_WITH_UNIFORM && uniformDataSize > 0 && uniformBuffer !== null) {
     const uniformBufHandle = entrySrc[entrySrcBase + uniformEntryIdx * 3];
-    const uniformData = new Uint8Array(
-      uniformBuffer,
-      uniformByteOffset,
-      uniformDataSize,
-    );
+    const uniformData = new Uint8Array(uniformBuffer, uniformByteOffset, uniformDataSize);
     if (uniformBufHandle === 0) {
       // This dispatch needs an inline parameter buffer. Do not reuse one buffer
       // across recorded dispatches: command buffers keep a reference to the
@@ -1317,7 +1241,7 @@ function dispatchFusedRecord(
       entrySrc[entrySrcBase + uniformEntryIdx * 3 + 2] = 0;
       newBufferHandle = h;
     } else {
-      const existing = getHandle<GPUBuffer>(uniformBufHandle, "uniform buffer");
+      const existing = getHandle<GPUBuffer>(uniformBufHandle, 'uniform buffer');
       queue.writeBuffer(existing, 0, uniformData);
     }
   }
@@ -1340,10 +1264,7 @@ function dispatchFusedRecord(
   if (cachedEntriesForPipeline !== undefined) {
     for (let c = cachedEntriesForPipeline.length - 1; c >= 0; c--) {
       const cached = cachedEntriesForPipeline[c]!;
-      if (
-        cached.layoutHandle !== layoutHandle ||
-        cached.entryCount !== entryCount
-      ) {
+      if (cached.layoutHandle !== layoutHandle || cached.entryCount !== entryCount) {
         continue;
       }
       hit = true;
@@ -1372,10 +1293,7 @@ function dispatchFusedRecord(
     const entries: GPUBindGroupEntry[] = [];
     let eIdx = entrySrcBase;
     for (let i = 0; i < entryCount; i++) {
-      const buffer = getHandle<GPUBuffer>(
-        entrySrc[eIdx],
-        `bind-group buffer[${i}]`,
-      );
+      const buffer = getHandle<GPUBuffer>(entrySrc[eIdx], `bind-group buffer[${i}]`);
       const sizeLo = entrySrc[eIdx + 1];
       const sizeHi = entrySrc[eIdx + 2];
       eIdx += 3;
@@ -1412,10 +1330,8 @@ function dispatchFusedRecord(
   }
 
   // Stage 3: issue the dispatch on the cached compute pass.
-  const pass = getHandle<GPUComputePassEncoder>(passHandle, "compute pass");
-  pass.setPipeline(
-    getHandle<GPUComputePipeline>(pipelineHandle, "compute pipeline"),
-  );
+  const pass = getHandle<GPUComputePassEncoder>(passHandle, 'compute pass');
+  pass.setPipeline(getHandle<GPUComputePipeline>(pipelineHandle, 'compute pipeline'));
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(x, y, z);
   endAndRestartPassIfForced(passHandle);
@@ -1491,31 +1407,21 @@ function handleDispatchBatch(): void {
   const batchBufferId = cmdU32[I_ARG0 + 2] ?? 0;
   const buf = batchBuffers.get(batchBufferId);
   if (!buf) {
-    throw new Error(
-      `[GPU Worker] Missing DISPATCH_BATCH buffer id=${batchBufferId}`,
-    );
+    throw new Error(`[GPU Worker] Missing DISPATCH_BATCH buffer id=${batchBufferId}`);
   }
   const batchCount = cmdU32[I_ARG0];
   const batchBytes = cmdU32[I_ARG0 + 1];
   if (batchCount > MAX_DISPATCH_BATCH) {
-    throw new Error(
-      `[GPU Worker] Invalid DISPATCH_BATCH count=${batchCount} max=${MAX_DISPATCH_BATCH}`,
-    );
+    throw new Error(`[GPU Worker] Invalid DISPATCH_BATCH count=${batchCount} max=${MAX_DISPATCH_BATCH}`);
   }
   if (batchCount === 0 && batchBytes > 0) {
-    throw new Error(
-      `[GPU Worker] Invalid DISPATCH_BATCH bytes=${batchBytes} with count=0`,
-    );
+    throw new Error(`[GPU Worker] Invalid DISPATCH_BATCH bytes=${batchBytes} with count=0`);
   }
   if (batchBytes > DISPATCH_BATCH_BUFFER_SIZE) {
-    throw new Error(
-      `[GPU Worker] Invalid DISPATCH_BATCH bytes=${batchBytes} max=${DISPATCH_BATCH_BUFFER_SIZE}`,
-    );
+    throw new Error(`[GPU Worker] Invalid DISPATCH_BATCH bytes=${batchBytes} max=${DISPATCH_BATCH_BUFFER_SIZE}`);
   }
   if ((batchBytes & 3) !== 0) {
-    throw new Error(
-      `[GPU Worker] Invalid DISPATCH_BATCH bytes=${batchBytes}; expected 4-byte alignment`,
-    );
+    throw new Error(`[GPU Worker] Invalid DISPATCH_BATCH bytes=${batchBytes}; expected 4-byte alignment`);
   }
   const sab = buf.u32;
   const sabBuffer = buf.sab;
@@ -1537,13 +1443,8 @@ function handleDispatchBatch(): void {
     const uniformEntryIdx = sab[base + 7];
     const uniformSize = sab[base + 8];
     const entryCount = sab[base + 9];
-    if (
-      opcode !== RpcFn.FUSED_FULL_DISPATCH &&
-      opcode !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM
-    ) {
-      throw new Error(
-        `[GPU Worker] Invalid DISPATCH_BATCH opcode=${opcode} record=${r}`,
-      );
+    if (opcode !== RpcFn.FUSED_FULL_DISPATCH && opcode !== RpcFn.FUSED_DISPATCH_WITH_UNIFORM) {
+      throw new Error(`[GPU Worker] Invalid DISPATCH_BATCH opcode=${opcode} record=${r}`);
     }
     if (entryCount > MAX_DISPATCH_BATCH_ENTRIES) {
       throw new Error(
@@ -1561,11 +1462,9 @@ function handleDispatchBatch(): void {
       );
     }
     const entryBase = base + (DISPATCH_BATCH_HEADER_BYTES >>> 2);
-    const uniformByteOffset =
-      cursor + DISPATCH_BATCH_HEADER_BYTES + entryCount * 12;
+    const uniformByteOffset = cursor + DISPATCH_BATCH_HEADER_BYTES + entryCount * 12;
     const uniformPadded = (uniformSize + 3) & ~3;
-    const nextCursor =
-      cursor + DISPATCH_BATCH_HEADER_BYTES + entryCount * 12 + uniformPadded;
+    const nextCursor = cursor + DISPATCH_BATCH_HEADER_BYTES + entryCount * 12 + uniformPadded;
     if (nextCursor > batchBytes) {
       throw new Error(
         `[GPU Worker] Truncated DISPATCH_BATCH record=${r} cursor=${cursor} next=${nextCursor} bytes=${batchBytes}`,
@@ -1592,7 +1491,7 @@ function handleDispatchBatch(): void {
         0,
       );
     } finally {
-      currentDispatchContext = "";
+      currentDispatchContext = '';
     }
     if (newBufferHandle !== 0) {
       throw new Error(
@@ -1616,10 +1515,7 @@ function handleFusedSubmit(): void {
   if (passHandle > 0 && handles[passHandle] !== undefined) {
     releaseHandle(passHandle);
   }
-  const encoder = getHandle<GPUCommandEncoder>(
-    encoderHandle,
-    "fused submit encoder",
-  );
+  const encoder = getHandle<GPUCommandEncoder>(encoderHandle, 'fused submit encoder');
   const cmdBuf = encoder.finish();
   queue.submit([cmdBuf]);
   activeCommandEncoders.delete(encoderHandle);
@@ -1638,17 +1534,14 @@ function handleFusedCopyBuffer(): void {
   const dstOffset = cmdU32[I_ARG0 + 5];
   const size = cmdU32[I_ARG0 + 6];
 
-  const encoder = getHandle<GPUCommandEncoder>(
-    encoderHandle,
-    "fused copy encoder",
-  );
+  const encoder = getHandle<GPUCommandEncoder>(encoderHandle, 'fused copy encoder');
 
   endOpenComputePassesForEncoder(encoderHandle, passHandle);
 
   encoder.copyBufferToBuffer(
-    getHandle<GPUBuffer>(srcHandle, "fused copy src"),
+    getHandle<GPUBuffer>(srcHandle, 'fused copy src'),
     srcOffset,
-    getHandle<GPUBuffer>(dstHandle, "fused copy dst"),
+    getHandle<GPUBuffer>(dstHandle, 'fused copy dst'),
     dstOffset,
     size,
   );
@@ -1693,10 +1586,7 @@ async function commandLoop(): Promise<void> {
           spinHitTotal++;
           spinConsecutiveHits++;
           spinConsecutiveMisses = 0;
-          if (
-            spinConsecutiveHits >= SPIN_ADAPT_K &&
-            spinDispatchBudget < SPIN_MAX
-          ) {
+          if (spinConsecutiveHits >= SPIN_ADAPT_K && spinDispatchBudget < SPIN_MAX) {
             spinDispatchBudget = Math.min(SPIN_MAX, spinDispatchBudget * 2);
             spinConsecutiveHits = 0;
           }
@@ -1704,10 +1594,7 @@ async function commandLoop(): Promise<void> {
           spinMissTotal++;
           spinConsecutiveMisses++;
           spinConsecutiveHits = 0;
-          if (
-            spinConsecutiveMisses >= SPIN_ADAPT_K &&
-            spinDispatchBudget > SPIN_MIN
-          ) {
+          if (spinConsecutiveMisses >= SPIN_ADAPT_K && spinDispatchBudget > SPIN_MIN) {
             spinDispatchBudget = Math.max(SPIN_MIN, spinDispatchBudget >>> 1);
             spinConsecutiveMisses = 0;
           }
@@ -1725,11 +1612,7 @@ async function commandLoop(): Promise<void> {
           currentStatus = Atomics.load(cmdView, STATUS_INDEX);
           if (currentStatus === STATUS.PENDING) break;
 
-          const result = Atomics.waitAsync(
-            cmdView,
-            STATUS_INDEX,
-            currentStatus,
-          );
+          const result = Atomics.waitAsync(cmdView, STATUS_INDEX, currentStatus);
           if (result.async) {
             // Real wait — resolves when notify fires or timeout elapses.
             await result.value;
@@ -1739,9 +1622,7 @@ async function commandLoop(): Promise<void> {
           currentStatus = Atomics.load(cmdView, STATUS_INDEX);
           waitLoops++;
           if (waitLoops % 1000 === 0) {
-            console.log(
-              `[GPU Worker] waiting for PENDING, status=${currentStatus}, loops=${waitLoops}`,
-            );
+            console.log(`[GPU Worker] waiting for PENDING, status=${currentStatus}, loops=${waitLoops}`);
           }
         }
       }
@@ -1749,7 +1630,7 @@ async function commandLoop(): Promise<void> {
 
     const fnId = cmdU32[0]; // CMD_OFFSET.FN_ID / 4 = 0
     currentFnId = fnId;
-    currentDispatchContext = "";
+    currentDispatchContext = '';
 
     // Phase 0 observability: bump per-opcode histogram here — BEFORE the
     // fast-path dispatch — so fused-dispatch opcodes (which short-circuit
@@ -1765,7 +1646,7 @@ async function commandLoop(): Promise<void> {
     // Fast path: hot dispatch functions bypass processCommand entirely.
     if (fatalGpuError !== null) {
       const err = new Error(fatalGpuError);
-      postRpcError(fnId, err, "uncaptured-gpu-error");
+      postRpcError(fnId, err, 'uncaptured-gpu-error');
       cmdU32[I_ERROR] = 1;
       cmdU32[I_RESULT] = 0;
       spinBudget = 0;
@@ -1773,11 +1654,8 @@ async function commandLoop(): Promise<void> {
       try {
         handleFusedDispatchWithUniform();
       } catch (err) {
-        console.error(
-          `[GPU Worker] Error in FUSED_DISPATCH_WITH_UNIFORM:`,
-          err,
-        );
-        postRpcError(fnId, err, "FUSED_DISPATCH_WITH_UNIFORM");
+        console.error(`[GPU Worker] Error in FUSED_DISPATCH_WITH_UNIFORM:`, err);
+        postRpcError(fnId, err, 'FUSED_DISPATCH_WITH_UNIFORM');
         cmdU32[I_ERROR] = 1;
         cmdU32[I_RESULT] = 0;
       }
@@ -1787,7 +1665,7 @@ async function commandLoop(): Promise<void> {
         handleFusedFullDispatch();
       } catch (err) {
         console.error(`[GPU Worker] Error in FUSED_FULL_DISPATCH:`, err);
-        postRpcError(fnId, err, "FUSED_FULL_DISPATCH");
+        postRpcError(fnId, err, 'FUSED_FULL_DISPATCH');
         cmdU32[I_ERROR] = 1;
         cmdU32[I_RESULT] = 0;
       }
@@ -1797,7 +1675,7 @@ async function commandLoop(): Promise<void> {
         handleDispatchBatch();
       } catch (err) {
         console.error(`[GPU Worker] Error in DISPATCH_BATCH:`, err);
-        postRpcError(fnId, err, "DISPATCH_BATCH");
+        postRpcError(fnId, err, 'DISPATCH_BATCH');
         cmdU32[I_ERROR] = 1;
         cmdU32[I_RESULT] = 0;
       }
@@ -1807,7 +1685,7 @@ async function commandLoop(): Promise<void> {
         handleFusedCopyBuffer();
       } catch (err) {
         console.error(`[GPU Worker] Error in FUSED_COPY_BUFFER:`, err);
-        postRpcError(fnId, err, "FUSED_COPY_BUFFER");
+        postRpcError(fnId, err, 'FUSED_COPY_BUFFER');
         cmdU32[I_ERROR] = 1;
         cmdU32[I_RESULT] = 0;
       }
@@ -1817,7 +1695,7 @@ async function commandLoop(): Promise<void> {
         handleFusedSubmit();
       } catch (err) {
         console.error(`[GPU Worker] Error in FUSED_SUBMIT:`, err);
-        postRpcError(fnId, err, "FUSED_SUBMIT");
+        postRpcError(fnId, err, 'FUSED_SUBMIT');
         cmdU32[I_ERROR] = 1;
         cmdU32[I_RESULT] = 0;
       }
@@ -1831,7 +1709,7 @@ async function commandLoop(): Promise<void> {
         // test output (browser console isn't piped into the test runner).
         try {
           const msg = err instanceof Error ? err.message : String(err);
-          self.postMessage({ type: "rpc-error", fnId, message: msg });
+          self.postMessage({ type: 'rpc-error', fnId, message: msg });
         } catch {
           // ignore postMessage failures
         }
@@ -2015,8 +1893,7 @@ async function processCommand(fnId: number): Promise<void> {
         // Prefer the stub-supplied override (already bucketed by the stub's
         // pool logic). Fall back to our own bucketing when the stub didn't
         // pass one (older callers, tests, or non-pooled create paths).
-        const bucketSize =
-          physicalOverride > 0 ? physicalOverride : roundUpBucket(size);
+        const bucketSize = physicalOverride > 0 ? physicalOverride : roundUpBucket(size);
         const stack = bufferPool.get(poolKey(usage, bucketSize));
         if (stack !== undefined && stack.length > 0) {
           const reused = stack.pop()!;
@@ -2082,9 +1959,7 @@ async function processCommand(fnId: number): Promise<void> {
       //   4: label (ptr4)
       const nextInChainPtr = view.getUint32(descPtr, true);
       if (nextInChainPtr === 0) {
-        throw new Error(
-          "[GPU Worker] ShaderModule descriptor has no nextInChain",
-        );
+        throw new Error('[GPU Worker] ShaderModule descriptor has no nextInChain');
       }
       // WGPUShaderModuleWGSLDescriptor (12 bytes):
       //   0: chain.next (ptr4)
@@ -2113,9 +1988,9 @@ async function processCommand(fnId: number): Promise<void> {
       const moduleHandle = view.getUint32(descPtr + 16, true);
       const entryPointPtr = view.getUint32(descPtr + 20, true);
       const module = getHandle<GPUShaderModule>(moduleHandle);
-      const entryPoint = entryPointPtr ? readString(entryPointPtr) : "main";
+      const entryPoint = entryPointPtr ? readString(entryPointPtr) : 'main';
       const pipeline = device.createComputePipeline({
-        layout: "auto",
+        layout: 'auto',
         compute: { module, entryPoint },
       });
       setResult(addHandle(pipeline));
@@ -2255,7 +2130,7 @@ async function processCommand(fnId: number): Promise<void> {
 
     case RpcFn.DEVICE_SET_LOST_CALLBACK: {
       device.lost.then((info) => {
-        console.error("[GPU Worker] Device lost:", info.message);
+        console.error('[GPU Worker] Device lost:', info.message);
       });
       setResult(0);
       break;
@@ -2493,13 +2368,10 @@ async function processCommand(fnId: number): Promise<void> {
       // bucket size would cause it to read past the initialized range
       // into the bucket's zero-padded tail (correctness bug).
       const bufferHandle = arg0();
-      getHandle<GPUBuffer>(bufferHandle, "buffer for getSize");
-      const size =
-        bufferLogicalSizesArr[bufferHandle] ?? bufferSizesArr[bufferHandle];
+      getHandle<GPUBuffer>(bufferHandle, 'buffer for getSize');
+      const size = bufferLogicalSizesArr[bufferHandle] ?? bufferSizesArr[bufferHandle];
       if (size === undefined) {
-        throw new Error(
-          `[GPU Worker] Missing size metadata for buffer ${bufferHandle}`,
-        );
+        throw new Error(`[GPU Worker] Missing size metadata for buffer ${bufferHandle}`);
       }
       setResultBig(size & 0xffffffff, Math.floor(size / 0x100000000));
       break;
@@ -2554,14 +2426,10 @@ async function processCommand(fnId: number): Promise<void> {
       // on this worker doesn't reflect wasm-worker's memory growth.
       const src = new Uint8Array(jsRange);
       if (!readbackView) {
-        throw new Error(
-          `readback buffer is not initialized for ${size} byte mapped range`,
-        );
+        throw new Error(`readback buffer is not initialized for ${size} byte mapped range`);
       }
       if (size > readbackView.byteLength) {
-        throw new Error(
-          `readback ${size} bytes exceeds shared readback buffer ${readbackView.byteLength} bytes`,
-        );
+        throw new Error(`readback ${size} bytes exceeds shared readback buffer ${readbackView.byteLength} bytes`);
       }
       readbackView.set(src, 0);
 
@@ -2590,11 +2458,7 @@ async function processCommand(fnId: number): Promise<void> {
         // spec-required to work across SharedArrayBuffer sources, so no
         // feature probe is needed here.
         const base = getWasmBytes();
-        const src = new Uint8Array(
-          base.buffer,
-          base.byteOffset + mapping.wasmPtr,
-          mapping.size,
-        );
+        const src = new Uint8Array(base.buffer, base.byteOffset + mapping.wasmPtr, mapping.size);
         const dst = new Uint8Array(mapping.jsRange);
         dst.set(src);
       }
@@ -2625,7 +2489,7 @@ async function processCommand(fnId: number): Promise<void> {
         await buffer.mapAsync(gpuMode, offset, size);
         pushCallback({ fnPtr: callbackPtr, status: 0, userdataPtr });
       } catch (err) {
-        console.error("[GPU Worker] mapAsync failed:", err);
+        console.error('[GPU Worker] mapAsync failed:', err);
         pushCallback({ fnPtr: callbackPtr, status: 1, userdataPtr });
       }
       setResult(0);
@@ -2857,11 +2721,7 @@ async function processCommand(fnId: number): Promise<void> {
       if (uniformDataSize > 0) {
         const uniformBufHandle = cmdU32[I_CB_BASE + uniformEntryIdx * 3];
         const uniformBuffer = getHandle<GPUBuffer>(uniformBufHandle);
-        const uniformData = new Uint8Array(
-          cmdBuffer,
-          CMD_OFFSET.UNIFORM_DATA,
-          uniformDataSize,
-        );
+        const uniformData = new Uint8Array(cmdBuffer, CMD_OFFSET.UNIFORM_DATA, uniformDataSize);
         queue.writeBuffer(uniformBuffer, 0, uniformData);
       }
 
@@ -2924,9 +2784,7 @@ async function processCommand(fnId: number): Promise<void> {
       // This is handled via postMessage, not RPC, because the GPU buffer
       // object can't be serialized through SharedArrayBuffer.
       // This case should not be reached; it exists for protocol completeness.
-      console.warn(
-        "[GPU Worker] ADD_GPU_BUFFER via RPC is not supported. Use postMessage.",
-      );
+      console.warn('[GPU Worker] ADD_GPU_BUFFER via RPC is not supported. Use postMessage.');
       setResult(0);
       break;
     }
@@ -2947,13 +2805,10 @@ async function processCommand(fnId: number): Promise<void> {
         // re-enter the pool, so bucketing would just waste memory with no
         // reuse payoff.
         const physicalSize = poolable ? roundUpBucket(size) : size;
-        const stack = poolable
-          ? bufferPool.get(poolKey(usage, physicalSize))
-          : undefined;
+        const stack = poolable ? bufferPool.get(poolKey(usage, physicalSize)) : undefined;
         if (stack !== undefined && stack.length > 0) {
           handle = stack.pop()!;
-          if (stack.length === 0)
-            bufferPool.delete(poolKey(usage, physicalSize));
+          if (stack.length === 0) bufferPool.delete(poolKey(usage, physicalSize));
           removeBufferPoolBytes(physicalSize);
           bufferPoolHitCount++;
           // Overwrite the pooled buffer's contents with the new data (only
@@ -2980,10 +2835,7 @@ async function processCommand(fnId: number): Promise<void> {
         }
         setResult(handle);
       } catch (e) {
-        console.error(
-          `[GPU Worker] CREATE_BUFFER_FROM_DATA failed: size=${size} usage=0x${usage.toString(16)}`,
-          e,
-        );
+        console.error(`[GPU Worker] CREATE_BUFFER_FROM_DATA failed: size=${size} usage=0x${usage.toString(16)}`, e);
         setResult(0);
       }
       break;

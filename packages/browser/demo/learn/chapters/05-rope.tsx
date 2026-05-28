@@ -575,9 +575,7 @@ function RotationPanel({
     const wm = ((a % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
     const dx = cx + r * Math.cos(wm);
     const dy = cy - r * Math.sin(wm);
-    trailDots.push(
-      <circle key={m} cx={dx} cy={dy} r={1.6} className="fill-primary" fillOpacity={0.28} />,
-    );
+    trailDots.push(<circle key={m} cx={dx} cy={dy} r={1.6} className="fill-primary" fillOpacity={0.28} />);
   }
 
   const turns = angle / (2 * Math.PI);

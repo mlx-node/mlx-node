@@ -19,18 +19,16 @@ import {
   type AttentionRun,
   type InspectorRequest,
   type InspectorResult,
-} from "../../src/inspector-types";
+} from '../../src/inspector-types';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 function makeAbortError(): DOMException {
-  return new DOMException("Inspector run aborted", "AbortError");
+  return new DOMException('Inspector run aborted', 'AbortError');
 }
 
 function nextInspectorId(): string {
-  const cryptoObj = globalThis.crypto as
-    | { randomUUID?: () => string }
-    | undefined;
+  const cryptoObj = globalThis.crypto as { randomUUID?: () => string } | undefined;
   if (cryptoObj?.randomUUID) {
     return cryptoObj.randomUUID();
   }
@@ -61,11 +59,11 @@ export type InspectorClientOptions = {
  */
 export function runForInspector(
   worker: Worker | null,
-  req: Omit<InspectorRequest, "type" | "id">,
+  req: Omit<InspectorRequest, 'type' | 'id'>,
   options?: InspectorClientOptions,
 ): Promise<AttentionRun> {
   if (!worker) {
-    return Promise.reject(new Error("MLX worker is not available"));
+    return Promise.reject(new Error('MLX worker is not available'));
   }
   const signal = options?.signal;
   if (signal?.aborted) {
@@ -79,13 +77,13 @@ export function runForInspector(
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
     const cleanup = () => {
-      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener('message', onMessage);
       if (timeoutHandle != null) {
         clearTimeout(timeoutHandle);
         timeoutHandle = null;
       }
       if (signal) {
-        signal.removeEventListener("abort", onAbort);
+        signal.removeEventListener('abort', onAbort);
       }
     };
 
@@ -105,11 +103,11 @@ export function runForInspector(
 
     const onMessage = (event: MessageEvent) => {
       const msg = event.data as InspectorResult | undefined;
-      if (!msg || typeof msg !== "object") return;
+      if (!msg || typeof msg !== 'object') return;
       if (msg.type === INSPECTOR_RESULT_TYPE && msg.id === id) {
         settleResolve(msg.result);
       } else if (msg.type === INSPECTOR_ERROR_TYPE && msg.id === id) {
-        settleReject(new Error(msg.error || "Inspector run failed"));
+        settleReject(new Error(msg.error || 'Inspector run failed'));
       }
     };
 
@@ -117,15 +115,13 @@ export function runForInspector(
       settleReject(makeAbortError());
     };
 
-    worker.addEventListener("message", onMessage);
+    worker.addEventListener('message', onMessage);
     if (signal) {
-      signal.addEventListener("abort", onAbort);
+      signal.addEventListener('abort', onAbort);
     }
 
     timeoutHandle = setTimeout(() => {
-      settleReject(
-        new Error(`Inspector run timed out after ${timeoutMs}ms`),
-      );
+      settleReject(new Error(`Inspector run timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
     const request: InspectorRequest = {
@@ -133,16 +129,11 @@ export function runForInspector(
       id,
       prompt: req.prompt,
       ...(req.attention !== undefined ? { attention: req.attention } : {}),
-      ...(req.attentionLayers !== undefined
-        ? { attentionLayers: req.attentionLayers }
-        : {}),
+      ...(req.attentionLayers !== undefined ? { attentionLayers: req.attentionLayers } : {}),
       ...(req.logits !== undefined ? { logits: req.logits } : {}),
-      ...(req.hiddenStates !== undefined
-        ? { hiddenStates: req.hiddenStates }
-        : {}),
-      ...(req.maxNewTokens !== undefined
-        ? { maxNewTokens: req.maxNewTokens }
-        : {}),
+      ...(req.hiddenStates !== undefined ? { hiddenStates: req.hiddenStates } : {}),
+      ...(req.maxNewTokens !== undefined ? { maxNewTokens: req.maxNewTokens } : {}),
+      ...(req.applyChatTemplate !== undefined ? { applyChatTemplate: req.applyChatTemplate } : {}),
     };
 
     try {

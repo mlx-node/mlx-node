@@ -7,8 +7,8 @@
 
 import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
-import webgpuWorkerUrl from './webgpu-worker.mjs?worker&url';
 import { createWebGPUBridge } from './webgpu-bridge.js';
+import webgpuWorkerUrl from './webgpu-worker.mjs?worker&url';
 import { workerAssetUrl } from './worker-asset-url.js';
 
 export interface MLXBrowserOptions {

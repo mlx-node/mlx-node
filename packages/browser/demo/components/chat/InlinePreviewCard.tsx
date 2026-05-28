@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState } from 'react';
 
 export type InlinePreviewCardProps = {
   title: string;
@@ -39,13 +39,13 @@ export function InlinePreviewCard({ title, srcdoc }: InlinePreviewCardProps) {
               <button
                 type="button"
                 style={{
-                  background: "none",
-                  border: "1px solid var(--border)",
-                  color: "var(--text-dim)",
+                  background: 'none',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-dim)',
                   borderRadius: 6,
-                  padding: "4px 10px",
-                  cursor: "pointer",
-                  fontFamily: "var(--font-mono)",
+                  padding: '4px 10px',
+                  cursor: 'pointer',
+                  fontFamily: 'var(--font-mono)',
                   fontSize: 11,
                 }}
                 onClick={() => setFullscreen(false)}

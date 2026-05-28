@@ -48,15 +48,30 @@ export function FfnNeurons() {
 
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
-      <div className="text-xs uppercase tracking-wider text-muted-foreground">
-        Same MLP, drawn as neurons
-      </div>
+      <div className="text-xs uppercase tracking-wider text-muted-foreground">Same MLP, drawn as neurons</div>
       <p className="text-[12px] text-foreground/85">
         The matmul view above tells you the dimensions. The neuron view tells you the <em>topology</em>: two parallel
         wide projections (the gate and the value), an element-wise product, and a narrow projection back. Symbolic
         widths shown — Qwen3.5-0.8B uses <span className="font-mono">1024 → 3072 → 1024</span>.
       </p>
-      <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label="Gated MLP drawn as a node graph">
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className="block h-auto w-full"
+        role="img"
+        aria-label="Gated MLP drawn as a node graph"
+      >
+        {/* schematic note — make it explicit this is topology, not real activations */}
+        <text
+          x={W - 6}
+          y={H - 2}
+          fontSize={9}
+          textAnchor="end"
+          fill="currentColor"
+          fillOpacity={0.45}
+          fontStyle="italic"
+        >
+          schematic — 6 / 12 nodes shown, model uses 1024 / 3072
+        </text>
         {/* column headers */}
         <text x={xIn} y={14} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
           hidden in
@@ -116,8 +131,24 @@ export function FfnNeurons() {
           const yProd = evenY(INTER, TOP - 12, BOT + 14, j);
           return (
             <g key={`prod-edges-${j}`}>
-              <line x1={xGate + 4} y1={yGate} x2={xProd - 4} y2={yProd} stroke="oklch(0.7 0.13 60)" strokeOpacity={0.35} strokeWidth={0.7} />
-              <line x1={xUp + 4} y1={yUp} x2={xProd - 4} y2={yProd} stroke="oklch(0.7 0.13 220)" strokeOpacity={0.35} strokeWidth={0.7} />
+              <line
+                x1={xGate + 4}
+                y1={yGate}
+                x2={xProd - 4}
+                y2={yProd}
+                stroke="oklch(0.7 0.13 60)"
+                strokeOpacity={0.35}
+                strokeWidth={0.7}
+              />
+              <line
+                x1={xUp + 4}
+                y1={yUp}
+                x2={xProd - 4}
+                y2={yProd}
+                stroke="oklch(0.7 0.13 220)"
+                strokeOpacity={0.35}
+                strokeWidth={0.7}
+              />
             </g>
           );
         })}

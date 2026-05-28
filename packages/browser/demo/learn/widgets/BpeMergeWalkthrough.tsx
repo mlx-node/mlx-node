@@ -1,6 +1,6 @@
-import * as React from "react";
+import * as React from 'react';
 
-import { Button } from "../../components/ui/button";
+import { Button } from '../../components/ui/button';
 
 /**
  * BPE merge walkthrough — a stepped, illustrative animation that shows how
@@ -16,11 +16,11 @@ import { Button } from "../../components/ui/button";
 // Chip palette mirrors chapter 1's CHIP_PALETTE so the visual language is
 // consistent across the chapter.
 const CHIP_PALETTE = [
-  "bg-sky-100 dark:bg-sky-950/40 text-sky-900 dark:text-sky-100",
-  "bg-amber-100 dark:bg-amber-950/40 text-amber-900 dark:text-amber-100",
-  "bg-emerald-100 dark:bg-emerald-950/40 text-emerald-900 dark:text-emerald-100",
-  "bg-rose-100 dark:bg-rose-950/40 text-rose-900 dark:text-rose-100",
-  "bg-violet-100 dark:bg-violet-950/40 text-violet-900 dark:text-violet-100",
+  'bg-sky-100 dark:bg-sky-950/40 text-sky-900 dark:text-sky-100',
+  'bg-amber-100 dark:bg-amber-950/40 text-amber-900 dark:text-amber-100',
+  'bg-emerald-100 dark:bg-emerald-950/40 text-emerald-900 dark:text-emerald-100',
+  'bg-rose-100 dark:bg-rose-950/40 text-rose-900 dark:text-rose-100',
+  'bg-violet-100 dark:bg-violet-950/40 text-violet-900 dark:text-violet-100',
 ];
 
 type Step = {
@@ -33,38 +33,36 @@ type Step = {
 // Each step is the *result* after a merge. Step 0 is the byte-level start.
 const STEPS: Step[] = [
   {
-    fragments: ["u", "n", "b", "e", "l", "i", "e", "v", "a", "b", "l", "e"],
-    description:
-      "Start at the byte level. Every character is its own fragment — 12 in total.",
+    fragments: ['u', 'n', 'b', 'e', 'l', 'i', 'e', 'v', 'a', 'b', 'l', 'e'],
+    description: 'Start at the byte level. Every character is its own fragment — 12 in total.',
   },
   {
-    fragments: ["u", "n", "b", "el", "i", "e", "v", "a", "b", "l", "e"],
-    description: "Merge the adjacent pair e+l → el.",
+    fragments: ['u', 'n', 'b', 'el', 'i', 'e', 'v', 'a', 'b', 'l', 'e'],
+    description: 'Merge the adjacent pair e+l → el.',
   },
   {
-    fragments: ["u", "n", "b", "el", "i", "ev", "a", "b", "l", "e"],
-    description: "Merge the adjacent pair e+v → ev.",
+    fragments: ['u', 'n', 'b', 'el', 'i', 'ev', 'a', 'b', 'l', 'e'],
+    description: 'Merge the adjacent pair e+v → ev.',
   },
   {
-    fragments: ["u", "n", "b", "el", "i", "ev", "a", "b", "le"],
-    description: "Merge the adjacent pair l+e → le.",
+    fragments: ['u', 'n', 'b', 'el', 'i', 'ev', 'a', 'b', 'le'],
+    description: 'Merge the adjacent pair l+e → le.',
   },
   {
-    fragments: ["u", "n", "b", "el", "i", "ev", "a", "ble"],
-    description: "Merge the adjacent pair b+le → ble.",
+    fragments: ['u', 'n', 'b', 'el', 'i', 'ev', 'a', 'ble'],
+    description: 'Merge the adjacent pair b+le → ble.',
   },
   {
-    fragments: ["un", "b", "el", "i", "ev", "a", "ble"],
-    description: "Merge the adjacent pair u+n → un.",
+    fragments: ['un', 'b', 'el', 'i', 'ev', 'a', 'ble'],
+    description: 'Merge the adjacent pair u+n → un.',
   },
   {
-    fragments: ["unb", "el", "i", "ev", "a", "ble"],
-    description: "Merge the adjacent pair un+b → unb.",
+    fragments: ['unb', 'el', 'i', 'ev', 'a', 'ble'],
+    description: 'Merge the adjacent pair un+b → unb.',
   },
   {
-    fragments: ["un", "bel", "iev", "able"],
-    description:
-      "Final landing — a plausible vocabulary entry sequence. The actual Qwen3 split may differ.",
+    fragments: ['un', 'bel', 'iev', 'able'],
+    description: 'Final landing — a plausible vocabulary entry sequence. The actual Qwen3 split may differ.',
   },
 ];
 
@@ -110,10 +108,8 @@ export function BpeMergeWalkthrough() {
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          BPE merge walkthrough · input{" "}
-          <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-            unbelievable
-          </code>
+          BPE merge walkthrough · input{' '}
+          <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">unbelievable</code>
         </div>
         <div className="text-[11px] text-muted-foreground">
           Step {safeIdx + 1} of {STEPS.length}
@@ -132,9 +128,9 @@ export function BpeMergeWalkthrough() {
               key={`${safeIdx}-${i}-${frag}`}
               role="listitem"
               className={[
-                "inline-flex items-center rounded px-1.5 py-1 text-[13px] font-mono leading-none border border-transparent",
+                'inline-flex items-center rounded px-1.5 py-1 text-[13px] font-mono leading-none border border-transparent',
                 palette,
-              ].join(" ")}
+              ].join(' ')}
             >
               {frag}
             </span>
@@ -142,41 +138,28 @@ export function BpeMergeWalkthrough() {
         })}
       </div>
 
-      <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-foreground/85">
-        {step.description}
-      </div>
+      <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-foreground/85">{step.description}</div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => go(safeIdx - 1)}
-          disabled={safeIdx === 0}
-        >
+        <Button size="sm" variant="outline" onClick={() => go(safeIdx - 1)} disabled={safeIdx === 0}>
           Prev
         </Button>
         <Button size="sm" onClick={togglePlay}>
-          {autoplay ? "Pause" : atEnd ? "Replay" : "Play"}
+          {autoplay ? 'Pause' : atEnd ? 'Replay' : 'Play'}
         </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => go(safeIdx + 1)}
-          disabled={atEnd}
-        >
+        <Button size="sm" variant="outline" onClick={() => go(safeIdx + 1)} disabled={atEnd}>
           Next
         </Button>
         <span className="ml-2 text-[11px] text-muted-foreground">
           {step.fragments.length} fragment
-          {step.fragments.length === 1 ? "" : "s"}
+          {step.fragments.length === 1 ? '' : 's'}
         </span>
       </div>
 
       <p className="text-[11px] text-muted-foreground">
-        Note: this merge order is illustrative — it teaches the pattern of
-        merging adjacent pairs. The real Qwen3 vocabulary was learned from a
-        massive training corpus and its merges differ in both order and final
-        token boundaries.
+        Note: this merge order is illustrative — it teaches the pattern of merging adjacent pairs. The real Qwen3
+        vocabulary was learned from a massive training corpus and its merges differ in both order and final token
+        boundaries.
       </p>
     </div>
   );

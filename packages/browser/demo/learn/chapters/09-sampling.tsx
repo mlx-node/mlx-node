@@ -15,7 +15,7 @@ import { useRunFlash } from '../scaffolding/useRunFlash';
 import { SamplingFailureModes } from '../widgets/SamplingFailureModes';
 
 /**
- * Chapter 9 — Sampling.
+ * Chapter 10 — Sampling.
  *
  * Prose explains how logits → softmax → token works, including temperature
  * and top-p (nucleus) sampling. The interactive widget runs the real backend
@@ -29,9 +29,9 @@ const MAX_NEW_TOKENS = 6;
 const TOP_K = 16;
 
 /**
- * Scaffolding metadata for chapter 9 — drives the header, glossary,
+ * Scaffolding metadata for chapter 10 — drives the header, glossary,
  * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
- * `chapterId` must match `CHAPTERS[8].id` in `learn/chapters.ts`.
+ * `chapterId` must match the 'sampling' entry in `learn/chapters.ts`.
  */
 export const learning: ChapterLearningData = {
   chapterId: 'sampling',
@@ -415,6 +415,11 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
   const [temperature, setTemperature] = React.useState(1.0);
   const [topP, setTopP] = React.useState(1.0);
   const [stepIdx, setStepIdx] = React.useState(0);
+  // Bumped whenever the displayed distribution changes (new run, step nav, or
+  // a slider tweak that re-applies softmax/top-p). `<TopKBars runKey>` uses
+  // this to remount its bar fills and re-fire the grow-in animation, so users
+  // *see* the distribution reshape rather than snap into place.
+  const [runKey, setRunKey] = React.useState(0);
 
   // Per-call AbortController so a second click of "Run" tears down the
   // previous in-flight request before starting a new one.
@@ -521,6 +526,13 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
     return applySampling(currentStep.topKLogits, currentStep.topKIds, temperature, topP);
   }, [currentStep, temperature, topP]);
 
+  // Re-animate the bars whenever the distribution that we're rendering
+  // actually changes — new run, step nav, or a slider tweak.
+  React.useEffect(() => {
+    if (!distribution) return;
+    setRunKey((k) => k + 1);
+  }, [distribution]);
+
   // Walk topKTexts using each step's tokenId to find the actually-sampled
   // text. For exact-tie logits this may differ from `topKIds[0]` (see
   // inspector-types.ts).
@@ -612,6 +624,7 @@ export function SamplingDemo({ workerRef, abortRef }: SamplingDemoProps) {
             probs={distribution.probs}
             texts={currentStep.topKTexts}
             sampledTokenId={currentStep.tokenId}
+            runKey={runKey}
           />
           <GenerationFooter prompt={run?.prompt ?? prompt} generated={actualGeneration} />
         </div>

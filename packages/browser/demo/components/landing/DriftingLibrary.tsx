@@ -1,22 +1,20 @@
-import { useEffect, useRef } from "react";
-import * as THREE from "three";
+import { useEffect, useRef } from 'react';
+import * as THREE from 'three';
 
-const PINK   = 0xF4C8D7;
-const BLUE   = 0xBAD4E8;
-const CREAM  = 0xF0DDB8;
-const LILAC  = 0xE0D0E8;
-const PEACH  = 0xF6D2BC;
-const SAGE   = 0xCFE0CC;
+const PINK = 0xf4c8d7;
+const BLUE = 0xbad4e8;
+const CREAM = 0xf0ddb8;
+const LILAC = 0xe0d0e8;
+const PEACH = 0xf6d2bc;
+const SAGE = 0xcfe0cc;
 const BOOK_COLORS = [PINK, BLUE, CREAM, LILAC, PEACH, SAGE];
 
 const BOOK_COUNT = 120;
 
 function hasWebGlSupport(): boolean {
   try {
-    const canvas = document.createElement("canvas");
-    return Boolean(
-      canvas.getContext("webgl2") || canvas.getContext("webgl"),
-    );
+    const canvas = document.createElement('canvas');
+    return Boolean(canvas.getContext('webgl2') || canvas.getContext('webgl'));
   } catch {
     return false;
   }
@@ -24,10 +22,12 @@ function hasWebGlSupport(): boolean {
 
 function makeBook(color: number): THREE.Group {
   const grp = new THREE.Group();
-  const w = 0.42, h = 0.62, t = 0.13;
+  const w = 0.42,
+    h = 0.62,
+    t = 0.13;
   const pages = new THREE.Mesh(
     new THREE.BoxGeometry(w * 0.94, h * 0.96, t * 0.78),
-    new THREE.MeshStandardMaterial({ color: 0xF8F2E4, roughness: 0.95 }),
+    new THREE.MeshStandardMaterial({ color: 0xf8f2e4, roughness: 0.95 }),
   );
   grp.add(pages);
   const cover = new THREE.Mesh(
@@ -39,12 +39,13 @@ function makeBook(color: number): THREE.Group {
 }
 
 function makeGlowSprite(): THREE.Sprite {
-  const c = document.createElement("canvas");
-  c.width = 256; c.height = 256;
-  const g = c.getContext("2d")!;
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 256;
+  const g = c.getContext('2d')!;
   const rg = g.createRadialGradient(128, 128, 0, 128, 128, 128);
-  rg.addColorStop(0, "rgba(97,92,237,0.30)");
-  rg.addColorStop(1, "rgba(97,92,237,0)");
+  rg.addColorStop(0, 'rgba(97,92,237,0.30)');
+  rg.addColorStop(1, 'rgba(97,92,237,0)');
   g.fillStyle = rg;
   g.fillRect(0, 0, 256, 256);
   const tex = new THREE.CanvasTexture(c);
@@ -64,7 +65,7 @@ export function DriftingLibrary() {
     const container = containerRef.current;
     if (!container) return;
 
-    const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
     if (!hasWebGlSupport()) return;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -75,23 +76,23 @@ export function DriftingLibrary() {
       return;
     }
     renderer.setPixelRatio(dpr);
-    renderer.setClearColor(0x0F0D11, 1);
+    renderer.setClearColor(0x0f0d11, 1);
     container.appendChild(renderer.domElement);
-    renderer.domElement.style.width = "100%";
-    renderer.domElement.style.height = "100%";
-    renderer.domElement.style.display = "block";
+    renderer.domElement.style.width = '100%';
+    renderer.domElement.style.height = '100%';
+    renderer.domElement.style.display = 'block';
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0x0F0D11, 9, 22);
+    scene.fog = new THREE.Fog(0x0f0d11, 9, 22);
     const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
     camera.position.set(0, 0, 11);
     camera.lookAt(0, 0, 0);
 
-    scene.add(new THREE.HemisphereLight(0xFFE8D8, 0x2A2030, 0.5));
-    const key = new THREE.DirectionalLight(0xFFD8B0, 1.0);
+    scene.add(new THREE.HemisphereLight(0xffe8d8, 0x2a2030, 0.5));
+    const key = new THREE.DirectionalLight(0xffd8b0, 1.0);
     key.position.set(3, 4, 4);
     scene.add(key);
-    const rim = new THREE.DirectionalLight(0x8884F6, 0.35);
+    const rim = new THREE.DirectionalLight(0x8884f6, 0.35);
     rim.position.set(-4, 2, -3);
     scene.add(rim);
 

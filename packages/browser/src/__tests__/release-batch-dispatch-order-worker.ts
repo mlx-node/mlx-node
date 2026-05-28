@@ -97,10 +97,7 @@ self.onmessage = (e: MessageEvent) => {
       heapView.setUint32(descPtr + 12, 0 /* entryCount */, true);
       heapView.setUint32(descPtr + 16, 0 /* entriesPtr */, true);
 
-      const bgHandle = (stub.imports.wgpuDeviceCreateBindGroup as (device: number, desc: number) => number)(
-        3,
-        descPtr,
-      );
+      const bgHandle = (stub.imports.wgpuDeviceCreateBindGroup as (device: number, desc: number) => number)(3, descPtr);
 
       // Set up the pending compute-pass state so the dispatch takes the
       // FUSED_FULL_DISPATCH staging path.
@@ -110,21 +107,20 @@ self.onmessage = (e: MessageEvent) => {
         passHandle,
         pipelineHandle,
       );
-      (stub.imports.wgpuComputePassEncoderSetBindGroup as (
-        pass: number,
-        grpIdx: number,
-        bg: number,
-        dynOffCount: number,
-        dynOffPtr: number,
-      ) => void)(passHandle, 0, bgHandle, 0, 0);
+      (
+        stub.imports.wgpuComputePassEncoderSetBindGroup as (
+          pass: number,
+          grpIdx: number,
+          bg: number,
+          dynOffCount: number,
+          dynOffPtr: number,
+        ) => void
+      )(passHandle, 0, bgHandle, 0, 0);
       // Dispatch: stages one record. No RPC is issued yet because the
       // staging path returned true. batchCount is now 1 inside the stub.
-      (stub.imports.wgpuComputePassEncoderDispatchWorkgroups as (
-        pass: number,
-        x: number,
-        y: number,
-        z: number,
-      ) => void)(passHandle, 1, 1, 1);
+      (
+        stub.imports.wgpuComputePassEncoderDispatchWorkgroups as (pass: number, x: number, y: number, z: number) => void
+      )(passHandle, 1, 1, 1);
 
       // ---- Step 2: trigger flushPendingReleases via queueRelease's
       // MAX_RELEASE_BATCH auto-flush. The release path for an unknown

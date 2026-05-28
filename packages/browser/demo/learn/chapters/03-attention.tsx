@@ -14,6 +14,7 @@ import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { AttentionFanout } from '../widgets/AttentionFanout';
 import { CausalMaskAsSum } from '../widgets/CausalMaskAsSum';
+import { CausalMaskToggle } from '../widgets/CausalMaskToggle';
 import { CausalMaskVisual } from '../widgets/CausalMaskVisual';
 import { ToyAttentionExample } from '../widgets/ToyAttentionExample';
 
@@ -92,7 +93,7 @@ export const learning: ChapterLearningData = {
   ],
   takeaways: [
     "Each row of the heatmap is one query token's attention distribution; rows always sum to 1 after softmax.",
-    "The lower-triangular shape isn't decorative — it's the causal mask preventing the model from cheating during training.",
+    "The lower-triangular shape isn't decorative — it's the causal mask, the only thing keeping training honest and the reason all positions can be trained in parallel.",
     'The scaling by sqrt(d_head) is what lets attention scale to wide heads without softmax collapsing to one cell.',
   ],
   exercise: {
@@ -228,14 +229,33 @@ export function AttentionChapterBody() {
           as the new representation of token <em>i</em>.
         </p>
 
-        <h2>Causal masking</h2>
+        <h2>Causal masking — and why it's the load-bearing wall of decoder LLMs</h2>
         <p>
-          During training (and inference for generative LLMs) we don't want a token to peek at tokens that come after it
-          — otherwise the model would cheat at next-token prediction. Before the softmax we zero out (well, set to{' '}
-          <code>-∞</code>) the upper triangle of the score matrix. After softmax those cells become 0. That's why the
-          heatmap on the right is <strong>lower-triangular</strong>: row <em>i</em> only attends to keys <em>0 … i</em>.
-          The bottom row — the last token of the prompt — is the only row that gets to see the whole sentence, which is
-          why that row is the one that produces the next-word prediction.
+          Self-attention as defined so far is symmetric: every token can see every other token. For an encoder (think
+          BERT — fill-in-the-blank tasks) that's fine. For a generative LLM it's a catastrophe. The whole point of
+          training is to predict the next token from what came before. If the model is allowed to look at what comes{' '}
+          <em>after</em> while training, it can short-circuit the entire problem by copying.
+        </p>
+        <p>
+          So before the softmax we set the upper-triangle of <code>QKᵀ</code> to <code>-∞</code>. After softmax those
+          cells become exactly <code>0</code> — token <em>i</em> can only attend to keys <em>0 … i</em>. The heatmap on
+          the right is <strong>lower-triangular</strong> for exactly this reason. The bottom row — the last token of the
+          prompt — is the only row that sees the whole prompt, which is why <em>that</em> row produces the next-token
+          prediction.
+        </p>
+        <p>
+          The toggle widget below makes this concrete: flip the mask off, and watch the model's attention for the very
+          first token reach forward into the future of the sequence.
+        </p>
+
+        <CausalMaskToggle />
+
+        <p>
+          A subtle but important consequence: the mask is what makes <strong>parallel training</strong> possible. With
+          the mask in place, you can shove the entire sequence into the model in one forward pass and compute the loss
+          at every position simultaneously — each position's prediction is independent of the others because none of
+          them can see ahead. Without the mask, you'd have to feed tokens one by one. The triangular sparsity pattern is
+          the single architectural decision that makes decoder-only training tractable at scale.
         </p>
 
         <h2>What each cell in the heatmap means</h2>
@@ -275,8 +295,8 @@ export function AttentionChapterBody() {
         <h2>The causal mask, as a matrix sum</h2>
         <p>
           "Set the upper triangle to <code>-∞</code>" reads more cleanly as an addition: the mask is a matrix of{' '}
-          <code>0</code> on/below the diagonal and <code>-∞</code> above. We add it elementwise to the raw scores,
-          then softmax row-by-row. The <code>-∞</code> cells become exactly zero — every row is now a probability
+          <code>0</code> on/below the diagonal and <code>-∞</code> above. We add it elementwise to the raw scores, then
+          softmax row-by-row. The <code>-∞</code> cells become exactly zero — every row is now a probability
           distribution over earlier positions only.
         </p>
 

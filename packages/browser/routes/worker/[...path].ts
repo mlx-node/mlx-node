@@ -63,9 +63,7 @@ export const GET = defineHandler(async (c) => {
   }
 
   const cacheControl =
-    asset.status === 304 || (asset.status >= 200 && asset.status < 400)
-      ? WORKER_CACHE_CONTROL
-      : ERROR_CACHE_CONTROL;
+    asset.status === 304 || (asset.status >= 200 && asset.status < 400) ? WORKER_CACHE_CONTROL : ERROR_CACHE_CONTROL;
 
   return new Response(asset.body, {
     status: asset.status,

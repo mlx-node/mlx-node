@@ -21,6 +21,16 @@ function LandingRouteComponent() {
           triggerLocalPicker();
           return;
         }
+        // If the model is already loaded (e.g. the user reloaded the
+        // Landing page after visiting a chapter, or returned via the
+        // browser back button), kickoffLoad() is an internal no-op and
+        // the button would appear broken. Navigate straight to the chat
+        // surface instead — that's the obvious "use the loaded model"
+        // next step and matches the new "Open Chat →" label.
+        if (status === 'ready') {
+          void navigate({ to: '/chat', search: (prev) => prev });
+          return;
+        }
         kickoffLoad();
       }}
       onLocalModel={triggerLocalPicker}
@@ -39,6 +49,7 @@ function LandingRouteComponent() {
       }}
       errorBanner={errorBanner}
       hostedModelAvailable={hostedModelAvailable}
+      modelReady={status === 'ready'}
     />
   );
 }

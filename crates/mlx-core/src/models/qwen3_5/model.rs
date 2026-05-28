@@ -5364,11 +5364,28 @@ impl Qwen35Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        // Tokenize the raw prompt. Inspector runs are intentionally NOT
-        // routed through the jinja chat template — this is a "what does
-        // the model see for this exact string?" hook, and the lessons
-        // typically pass short literal strings ("The cat sat on the").
-        let prompt_token_ids = tokenizer.encode_sync(&prompt, Some(false))?;
+        // Tokenize the prompt. By default the inspector skips the jinja
+        // chat template — this is a "what does the model see for this exact
+        // string?" hook, useful for lessons that show raw BPE tokenization
+        // (e.g. "The cat sat on the"). When `apply_chat_template` is true we
+        // wrap the prompt as a single-turn user message and apply the same
+        // jinja template the chat path uses; this puts the chat-tuned model
+        // back in-distribution so the predicted next token matches what the
+        // model would actually say in a conversation, instead of the often-
+        // weird argmax raw text produces.
+        let prompt_token_ids = if opts.apply_chat_template.unwrap_or(false) {
+            let messages = vec![ChatMessage {
+                role: "user".to_string(),
+                content: prompt.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                images: None,
+            }];
+            tokenizer.apply_chat_template_sync(&messages, Some(true), None, Some(false))?
+        } else {
+            tokenizer.encode_sync(&prompt, Some(false))?
+        };
         if prompt_token_ids.is_empty() {
             return Err(Error::from_reason(
                 "run_for_inspector: empty prompt after tokenization",
@@ -5501,7 +5518,12 @@ impl Qwen35Inner {
             });
         }
 
-        // ---- Serialize generated token (first one only — per contract) ----
+        // ---- Serialize generated tokens ----
+        // `generated_token` is the first one (kept for back-compat with the
+        // existing inspector contract — callers that only render "the next
+        // token" can keep using it). `generated_tokens` is the full decode
+        // sequence, used by the forward-pass diagram to render the model's
+        // complete reply when the chat template is applied.
         let first_generated = *generated_tokens
             .first()
             .ok_or_else(|| Error::from_reason("run_for_inspector produced no tokens"))?;
@@ -5512,6 +5534,17 @@ impl Qwen35Inner {
             id: first_generated as i32,
             text: generated_text,
         };
+        let mut generated_tokens_napi: Vec<TokenInfoNapi> =
+            Vec::with_capacity(generated_tokens.len());
+        for &id in &generated_tokens {
+            let text = tokenizer
+                .decode_sync(&[id], false)
+                .unwrap_or_else(|_| String::new());
+            generated_tokens_napi.push(TokenInfoNapi {
+                id: id as i32,
+                text,
+            });
+        }
 
         // ---- Build model meta + per-layer attention vector ----
         let num_layers = self.config.num_layers;
@@ -5652,6 +5685,7 @@ impl Qwen35Inner {
             prompt,
             tokens: token_infos,
             generated_token,
+            generated_tokens: generated_tokens_napi,
             attention: attention_layers_out,
             model_meta,
             logits: logits_out,

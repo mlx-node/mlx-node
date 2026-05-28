@@ -68,14 +68,27 @@ export function MultiheadConcat() {
 
       <p className="text-[12px] text-foreground/85">
         Each of the <span className="font-mono">{H}</span> heads produces a slice of shape{' '}
-        <span className="font-mono">[seq_len, d_head] = [{SEQ_LEN}, {D_HEAD}]</span>. We stack them side-by-side along
-        the feature axis to recover a <span className="font-mono">[{SEQ_LEN}, {D_MODEL}]</span> matrix, then project by{' '}
-        the learned output matrix <span className="font-mono">W<sub>O</sub></span> back to{' '}
-        <span className="font-mono">d_model</span>. Heads don't talk to each other inside attention — they only mix
-        afterward, here.
+        <span className="font-mono">
+          [seq_len, d_head] = [{SEQ_LEN}, {D_HEAD}]
+        </span>
+        . We stack them side-by-side along the feature axis to recover a{' '}
+        <span className="font-mono">
+          [{SEQ_LEN}, {D_MODEL}]
+        </span>{' '}
+        matrix, then project by the learned output matrix{' '}
+        <span className="font-mono">
+          W<sub>O</sub>
+        </span>{' '}
+        back to <span className="font-mono">d_model</span>. Heads don't talk to each other inside attention — they only
+        mix afterward, here.
       </p>
 
-      <svg viewBox={`0 0 ${W} ${totalH}`} className="block h-auto w-full" role="img" aria-label="Multi-head concat diagram">
+      <svg
+        viewBox={`0 0 ${W} ${totalH}`}
+        className="block h-auto w-full"
+        role="img"
+        aria-label="Multi-head concat diagram"
+      >
         <defs>
           <marker id="mh-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
             <path d="M 0 0 L 10 5 L 0 10 Z" fill="currentColor" opacity={0.55} />
@@ -106,7 +119,10 @@ export function MultiheadConcat() {
                 fillOpacity={0.85}
                 fontFamily="ui-monospace, monospace"
               >
-                Z<tspan baselineShift="sub" fontSize={7}>{i}</tspan>
+                Z
+                <tspan baselineShift="sub" fontSize={7}>
+                  {i}
+                </tspan>
               </text>
               <text
                 x={x + HEAD_W / 2}
@@ -221,7 +237,10 @@ export function MultiheadConcat() {
           fontFamily="ui-monospace, monospace"
           style={{ animation: `mhFade 400ms ease-out 1050ms both` }}
         >
-          W<tspan baselineShift="sub" fontSize={8}>O</tspan>
+          W
+          <tspan baselineShift="sub" fontSize={8}>
+            O
+          </tspan>
         </text>
         <text
           x={CONCAT_X + CONCAT_W + 60}
@@ -266,7 +285,10 @@ export function MultiheadConcat() {
           fontFamily="ui-monospace, monospace"
           style={{ animation: `mhFade 400ms ease-out 1250ms both` }}
         >
-          Z<tspan baselineShift="sub" fontSize={7}>attn</tspan>
+          Z
+          <tspan baselineShift="sub" fontSize={7}>
+            attn
+          </tspan>
         </text>
         <text
           x={CONCAT_X + CONCAT_W + 174}
@@ -282,10 +304,13 @@ export function MultiheadConcat() {
       </svg>
 
       <div className="text-[11px] text-muted-foreground">
-        Color = head identity. In the concat block each color owns a fixed band of <span className="font-mono">{D_HEAD}</span>{' '}
-        feature dimensions; <span className="font-mono">W<sub>O</sub></span> is the only place head outputs ever mix.
-        This is also why <em>cross-head</em> reasoning is shallow — anything heads have to share has to be encoded
-        through the residual stream across multiple layers.
+        Color = head identity. In the concat block each color owns a fixed band of{' '}
+        <span className="font-mono">{D_HEAD}</span> feature dimensions;{' '}
+        <span className="font-mono">
+          W<sub>O</sub>
+        </span>{' '}
+        is the only place head outputs ever mix. This is also why <em>cross-head</em> reasoning is shallow — anything
+        heads have to share has to be encoded through the residual stream across multiple layers.
       </div>
     </div>
   );

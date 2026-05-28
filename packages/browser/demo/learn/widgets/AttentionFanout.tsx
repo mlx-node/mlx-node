@@ -215,23 +215,17 @@ export function AttentionFanout({ run }: { run: AttentionRun }) {
           <text x={targetX} y={BOT_Y + 5} fontSize={12} textAnchor="middle" className="fill-primary" fontWeight={600}>
             {renderToken(queryTokenText)}
           </text>
-          <text
-            x={targetX}
-            y={BOT_Y + 26}
-            fontSize={9}
-            textAnchor="middle"
-            fill="currentColor"
-            fillOpacity={0.55}
-          >
+          <text x={targetX} y={BOT_Y + 26} fontSize={9} textAnchor="middle" fill="currentColor" fillOpacity={0.55}>
             query · position {lastRow}
           </text>
         </g>
       </svg>
 
       <div className="text-[11px] text-muted-foreground">
-        Strongest pull: <span className="font-mono text-foreground/85">{renderToken(run.tokens[argmax]?.text ?? '?')}</span> at position{' '}
-        {argmax} with weight <span className="font-mono text-foreground/85">{(weights[argmax] ?? 0).toFixed(3)}</span>. Weights along the row sum
-        to <span className="font-mono">{weights.reduce((a, b) => a + b, 0).toFixed(2)}</span>.
+        Strongest pull:{' '}
+        <span className="font-mono text-foreground/85">{renderToken(run.tokens[argmax]?.text ?? '?')}</span> at position{' '}
+        {argmax} with weight <span className="font-mono text-foreground/85">{(weights[argmax] ?? 0).toFixed(3)}</span>.
+        Weights along the row sum to <span className="font-mono">{weights.reduce((a, b) => a + b, 0).toFixed(2)}</span>.
       </div>
     </div>
   );

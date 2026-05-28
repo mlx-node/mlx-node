@@ -1,4 +1,4 @@
-import * as React from "react";
+import * as React from 'react';
 
 /**
  * Visualises the 5x5 causal mask for the prompt
@@ -7,10 +7,10 @@ import * as React from "react";
  * shows a sentence describing what that cell means.
  */
 
-const TOKENS = ["The", " cat", " sat", " on", " the"];
+const TOKENS = ['The', ' cat', ' sat', ' on', ' the'];
 
 function renderToken(text: string): string {
-  if (text.startsWith(" ")) return "·" + text.slice(1);
+  if (text.startsWith(' ')) return '·' + text.slice(1);
   return text;
 }
 
@@ -26,10 +26,10 @@ export function CausalMaskVisual() {
   });
 
   function selectionMessage(): string {
-    if (!selected) return "Click any cell.";
+    if (!selected) return 'Click any cell.';
     const { i, j } = selected;
-    const qName = trimmed(TOKENS[i] ?? "");
-    const kName = trimmed(TOKENS[j] ?? "");
+    const qName = trimmed(TOKENS[i] ?? '');
+    const kName = trimmed(TOKENS[j] ?? '');
     if (i >= j) {
       return `Row ${i} attends to col ${j}: "${qName}" can see "${kName}".`;
     }
@@ -39,12 +39,8 @@ export function CausalMaskVisual() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Causal mask · 5 × 5
-        </div>
-        <div className="text-[11px] text-muted-foreground">
-          Green = allowed (i &gt;= j) · gray = masked (i &lt; j)
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">Causal mask · 5 × 5</div>
+        <div className="text-[11px] text-muted-foreground">Green = allowed (i &gt;= j) · gray = masked (i &lt; j)</div>
       </div>
 
       <div className="overflow-x-auto">
@@ -76,30 +72,26 @@ export function CausalMaskVisual() {
                 </th>
                 {TOKENS.map((_col, j) => {
                   const allowed = i >= j;
-                  const isSel =
-                    selected && selected.i === i && selected.j === j;
+                  const isSel = selected && selected.i === i && selected.j === j;
                   return (
-                    <td
-                      key={`cell-${i}-${j}`}
-                      className="border border-border/60 p-0"
-                    >
+                    <td key={`cell-${i}-${j}`} className="border border-border/60 p-0">
                       <button
                         type="button"
                         onClick={() => setSelected({ i, j })}
                         title={
                           allowed
-                            ? `(${i},${j}) allowed — "${trimmed(row)}" can see "${trimmed(TOKENS[j] ?? "")}"`
+                            ? `(${i},${j}) allowed — "${trimmed(row)}" can see "${trimmed(TOKENS[j] ?? '')}"`
                             : `(${i},${j}) masked — would be the future`
                         }
                         className={[
-                          "block h-10 w-10 text-[11px] font-mono leading-none transition-colors focus:outline-none",
+                          'block h-10 w-10 text-[11px] font-mono leading-none transition-colors focus:outline-none',
                           allowed
-                            ? "bg-emerald-500/20 text-emerald-900 dark:text-emerald-100 hover:bg-emerald-500/35"
-                            : "bg-muted/60 text-muted-foreground hover:bg-muted",
-                          isSel ? "ring-2 ring-primary ring-offset-1" : "",
-                        ].join(" ")}
+                            ? 'bg-emerald-500/20 text-emerald-900 dark:text-emerald-100 hover:bg-emerald-500/35'
+                            : 'bg-muted/60 text-muted-foreground hover:bg-muted',
+                          isSel ? 'ring-2 ring-primary ring-offset-1' : '',
+                        ].join(' ')}
                       >
-                        {allowed ? "✓" : "/"}
+                        {allowed ? '✓' : '/'}
                       </button>
                     </td>
                   );
@@ -110,22 +102,18 @@ export function CausalMaskVisual() {
         </table>
       </div>
 
-      <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-foreground/85">
-        {selectionMessage()}
-      </div>
+      <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-foreground/85">{selectionMessage()}</div>
 
       <div className="space-y-1.5 text-[12px] text-foreground/85">
         <p>
-          <strong>At training time</strong>, the mask makes teacher forcing
-          safe: we feed the whole sentence in parallel and predict each next
-          token, but no position can see its own future answer. Without the
-          mask, next-token prediction would be a trivial copy.
+          <strong>At training time</strong>, the mask makes teacher forcing safe: we feed the whole sentence in parallel
+          and predict each next token, but no position can see its own future answer. Without the mask, next-token
+          prediction would be a trivial copy.
         </p>
         <p>
-          <strong>At inference time</strong>, the same mask is still applied
-          even though token <em>N + 1</em> physically doesn&apos;t exist yet —
-          this keeps the math identical between train and serve, which is what
-          makes KV caching (chapter 10) valid.
+          <strong>At inference time</strong>, the same mask is still applied even though token <em>N + 1</em> physically
+          doesn&apos;t exist yet — this keeps the math identical between train and serve, which is what makes KV caching
+          (chapter 11) valid.
         </p>
       </div>
     </div>

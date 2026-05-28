@@ -1,4 +1,4 @@
-import * as React from "react";
+import * as React from 'react';
 
 /**
  * Three illustrative 6x6 attention heatmaps showing common archetypes of
@@ -8,7 +8,7 @@ import * as React from "react";
  */
 
 const SIZE = 6;
-const TOKEN_LABELS = ["t0", "t1", "t2", "t3", "t4", "t5"];
+const TOKEN_LABELS = ['t0', 't1', 't2', 't3', 't4', 't5'];
 
 type Pattern = {
   label: string;
@@ -72,21 +72,18 @@ function buildSyntactic(): number[][] {
 
 const PATTERNS: Pattern[] = [
   {
-    label: "Positional head",
-    caption:
-      "Detector: position. Each token mostly attends to itself; minor leak to neighbours.",
+    label: 'Positional head',
+    caption: 'Detector: position. Each token mostly attends to itself; minor leak to neighbours.',
     weights: buildPositional(),
   },
   {
-    label: "Recency head",
-    caption:
-      "Detector: recency. Strong attention to the immediately-prior token.",
+    label: 'Recency head',
+    caption: 'Detector: recency. Strong attention to the immediately-prior token.',
     weights: buildRecency(),
   },
   {
-    label: "Syntactic head",
-    caption:
-      'Detector: syntactic head. Late tokens look back at the determiner ("t0").',
+    label: 'Syntactic head',
+    caption: 'Detector: syntactic head. Late tokens look back at the determiner ("t0").',
     weights: buildSyntactic(),
   },
 ];
@@ -108,10 +105,7 @@ function HeatGrid({ weights }: { weights: number[][] }) {
     >
       <div />
       {TOKEN_LABELS.map((c) => (
-        <div
-          key={`col-${c}`}
-          className="text-center font-mono text-[9px] text-muted-foreground"
-        >
+        <div key={`col-${c}`} className="text-center font-mono text-[9px] text-muted-foreground">
           {c}
         </div>
       ))}
@@ -143,28 +137,22 @@ export function PatternDetectorPanel() {
         </div>
       </div>
       <p className="text-[12px] text-foreground/85">
-        Different heads learn to detect different things. You can&apos;t tell
-        what a head detects from its weights alone — you have to see the
-        patterns it produces on real inputs. Here are three common archetypes
-        a typical mid-size LLM contains, drawn as illustrative heatmaps.
+        Different heads learn to detect different things. You can&apos;t tell what a head detects from its weights alone
+        — you have to see the patterns it produces on real inputs. Here are three common archetypes a typical mid-size
+        LLM contains, drawn as illustrative heatmaps.
       </p>
       <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
         {PATTERNS.map((p, i) => (
-          <div
-            key={`pattern-${i}`}
-            className="space-y-2 rounded-md border border-border/60 bg-muted/20 p-3"
-          >
-            <div className="text-[12px] font-semibold text-foreground">
-              {p.label}
-            </div>
+          <div key={`pattern-${i}`} className="space-y-2 rounded-md border border-border/60 bg-muted/20 p-3">
+            <div className="text-[12px] font-semibold text-foreground">{p.label}</div>
             <HeatGrid weights={p.weights} />
             <p className="text-[11px] text-muted-foreground">{p.caption}</p>
           </div>
         ))}
       </div>
       <p className="text-[11px] text-muted-foreground">
-        These are hand-built diagrams, not measured from any specific model.
-        Real heads are messier and often mix multiple of these archetypes.
+        These are hand-built diagrams, not measured from any specific model. Real heads are messier and often mix
+        multiple of these archetypes.
       </p>
     </div>
   );

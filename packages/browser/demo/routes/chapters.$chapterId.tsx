@@ -9,19 +9,22 @@ import { createFileRoute, redirect, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 
 import { Loading } from '../components/loading/Loading';
-import { LessonLayout } from '../learn/LessonLayout';
-import { triggerLocalPicker } from '../lib/local-model-picker';
 import { findChapter } from '../learn/chapters';
-import { AttentionChapterBody, AttentionDemo } from '../learn/chapters/03-attention';
-import { MultiheadGqaChapterBody, MultiheadGqaDemo } from '../learn/chapters/04-multihead-gqa';
 import { TokenizationChapterBody, TokenizerDemo } from '../learn/chapters/01-tokenization';
 import { EmbeddingsChapterBody, EmbeddingsDemo } from '../learn/chapters/02-embeddings';
+import { AttentionChapterBody, AttentionDemo } from '../learn/chapters/03-attention';
+import { MultiheadGqaChapterBody, MultiheadGqaDemo } from '../learn/chapters/04-multihead-gqa';
 import { RopeChapterBody, RopeDemo } from '../learn/chapters/05-rope';
 import { RmsNormChapterBody, RmsNormDemo } from '../learn/chapters/06-rms-norm';
 import { MlpChapterBody, MlpDemo } from '../learn/chapters/07-mlp';
 import { FullBlockChapterBody, FullBlockDemo } from '../learn/chapters/08-full-block';
+import { LmHeadChapterBody, LmHeadDemo } from '../learn/chapters/09-lm-head';
 import { SamplingChapterBody, SamplingDemo } from '../learn/chapters/09-sampling';
 import { KvCacheChapterBody, KvCacheDemo } from '../learn/chapters/10-kv-cache';
+import { TrainingChapterBody, TrainingDemo } from '../learn/chapters/12-training';
+import { ScalingChapterBody, ScalingDemo } from '../learn/chapters/13-scaling';
+import { LessonLayout } from '../learn/LessonLayout';
+import { triggerLocalPicker } from '../lib/local-model-picker';
 import { useFreeChat } from '../providers/free-chat';
 import { useModelLoader } from '../providers/model-loader';
 
@@ -29,8 +32,7 @@ function ChapterRouteComponent() {
   const { chapter } = Route.useRouteContext();
   const navigate = useNavigate();
   const { mlxWorkerRef, inspectorAbortRef } = useFreeChat();
-  const { status, loadingText, loadingProgress, hostedModelAvailable, kickoffLoad } =
-    useModelLoader();
+  const { status, loadingText, loadingProgress, hostedModelAvailable, kickoffLoad } = useModelLoader();
 
   // Auto-kickoff the model load on direct URL landings (bookmark, hard reload
   // of /chapters/<id>). Skipped when no hosted model is available since that
@@ -80,10 +82,16 @@ function ChapterRouteComponent() {
           <MlpDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
         ) : chapter.id === 'full-block' ? (
           <FullBlockDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+        ) : chapter.id === 'lm-head' ? (
+          <LmHeadDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
         ) : chapter.id === 'sampling' ? (
           <SamplingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
         ) : chapter.id === 'kv-cache' ? (
           <KvCacheDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+        ) : chapter.id === 'training' ? (
+          <TrainingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+        ) : chapter.id === 'scaling' ? (
+          <ScalingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
         ) : null
       }
     >
@@ -103,10 +111,16 @@ function ChapterRouteComponent() {
         <MlpChapterBody />
       ) : chapter.id === 'full-block' ? (
         <FullBlockChapterBody />
+      ) : chapter.id === 'lm-head' ? (
+        <LmHeadChapterBody />
       ) : chapter.id === 'sampling' ? (
         <SamplingChapterBody />
       ) : chapter.id === 'kv-cache' ? (
         <KvCacheChapterBody />
+      ) : chapter.id === 'training' ? (
+        <TrainingChapterBody />
+      ) : chapter.id === 'scaling' ? (
+        <ScalingChapterBody />
       ) : (
         <div className="text-muted-foreground">This chapter is not yet authored.</div>
       )}

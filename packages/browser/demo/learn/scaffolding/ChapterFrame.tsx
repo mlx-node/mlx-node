@@ -1,11 +1,11 @@
-import * as React from "react";
+import * as React from 'react';
 
-import { ChapterHeader } from "./ChapterHeader";
-import { EngineeringTakeaways } from "./EngineeringTakeaways";
-import { Glossary } from "./Glossary";
-import { MiniExercise } from "./MiniExercise";
-import { QuickCheck } from "./QuickCheck";
-import type { ChapterLearningData } from "./learning-data";
+import { ChapterHeader } from './ChapterHeader';
+import { EngineeringTakeaways } from './EngineeringTakeaways';
+import { Glossary } from './Glossary';
+import type { ChapterLearningData } from './learning-data';
+import { MiniExercise } from './MiniExercise';
+import { QuickCheck } from './QuickCheck';
 
 export type ChapterFrameProps = {
   learning: ChapterLearningData;
@@ -23,22 +23,12 @@ export type ChapterFrameProps = {
 export function ChapterFrame({ learning, children }: ChapterFrameProps) {
   return (
     <div className="space-y-8">
-      <ChapterHeader
-        objective={learning.objective}
-        problem={learning.problem}
-        minutes={learning.minutes}
-      />
+      <ChapterHeader objective={learning.objective} problem={learning.problem} minutes={learning.minutes} />
       <Glossary terms={learning.glossary} />
       <div>{children}</div>
       <EngineeringTakeaways takeaways={learning.takeaways} />
-      <MiniExercise
-        prompt={learning.exercise.prompt}
-        answer={learning.exercise.answer}
-      />
-      <QuickCheck
-        chapterId={learning.chapterId}
-        questions={learning.quiz}
-      />
+      <MiniExercise prompt={learning.exercise.prompt} answer={learning.exercise.answer} />
+      <QuickCheck chapterId={learning.chapterId} questions={learning.quiz} />
     </div>
   );
 }

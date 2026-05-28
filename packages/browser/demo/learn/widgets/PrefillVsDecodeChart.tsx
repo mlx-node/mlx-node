@@ -1,4 +1,4 @@
-import * as React from "react";
+import * as React from 'react';
 
 /**
  * Two-bar comparison showing the time per phase for a hypothetical 1024
@@ -31,30 +31,22 @@ export function PrefillVsDecodeChart() {
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Prefill vs decode · {PROMPT_TOKENS} prompt + {DECODE_TOKENS} decode
-          tokens
+          Prefill vs decode · {PROMPT_TOKENS} prompt + {DECODE_TOKENS} decode tokens
         </div>
-        <div className="text-[11px] text-muted-foreground">
-          Illustrative ballpark numbers
-        </div>
+        <div className="text-[11px] text-muted-foreground">Illustrative ballpark numbers</div>
       </div>
 
       <div className="space-y-2">
         <div className="flex items-baseline justify-between text-[12px]">
           <span className="font-mono text-foreground/90">Prefill</span>
-          <span className="font-mono text-foreground/80">
-            ~{formatMs(PREFILL_MS)} (one big matmul)
-          </span>
+          <span className="font-mono text-foreground/80">~{formatMs(PREFILL_MS)} (one big matmul)</span>
         </div>
         <div
           className="relative h-8 w-full overflow-hidden rounded-sm bg-muted/60"
           role="img"
           aria-label={`prefill bar: ${formatMs(PREFILL_MS)} (${prefillPct.toFixed(1)}% of total)`}
         >
-          <div
-            className="absolute inset-y-0 left-0 bg-sky-500"
-            style={{ width: `${prefillPct.toFixed(2)}%` }}
-          />
+          <div className="absolute inset-y-0 left-0 bg-sky-500" style={{ width: `${prefillPct.toFixed(2)}%` }} />
           <div className="absolute inset-0 flex items-center justify-end pr-2 font-mono text-[10px] text-foreground/70">
             {prefillPct.toFixed(1)}%
           </div>
@@ -63,8 +55,7 @@ export function PrefillVsDecodeChart() {
         <div className="flex items-baseline justify-between pt-2 text-[12px]">
           <span className="font-mono text-foreground/90">Decode</span>
           <span className="font-mono text-foreground/80">
-            ~{formatMs(DECODE_PER_TOKEN_MS)} × {DECODE_TOKENS} ={" "}
-            {formatMs(DECODE_TOTAL_MS)}
+            ~{formatMs(DECODE_PER_TOKEN_MS)} × {DECODE_TOKENS} = {formatMs(DECODE_TOTAL_MS)}
           </span>
         </div>
         <div
@@ -72,10 +63,7 @@ export function PrefillVsDecodeChart() {
           role="img"
           aria-label={`decode bar: ${formatMs(DECODE_TOTAL_MS)} (${decodePct.toFixed(1)}% of total) split into ${DECODE_TOKENS} per-token matmuls`}
         >
-          <div
-            className="absolute inset-y-0 left-0 flex"
-            style={{ width: `${decodePct.toFixed(2)}%` }}
-          >
+          <div className="absolute inset-y-0 left-0 flex" style={{ width: `${decodePct.toFixed(2)}%` }}>
             {Array.from({ length: visibleSegments }).map((_, i) => (
               <div
                 key={`seg-${i}`}
@@ -90,22 +78,18 @@ export function PrefillVsDecodeChart() {
       </div>
 
       <p className="text-[12px] text-foreground/85">
-        Prefill is one parallel matmul; decode is N small sequential matmuls.
-        That&apos;s why your first token comes fast and the rest stream.
+        Prefill is one parallel matmul; decode is N small sequential matmuls. That&apos;s why your first token comes
+        fast and the rest stream.
       </p>
 
       <div className="grid grid-cols-2 gap-2 text-[11px]">
         <div className="rounded-md border border-border/60 bg-muted/20 p-2">
           <div className="text-muted-foreground">Time to first token</div>
-          <div className="mt-1 font-mono text-foreground/90">
-            ~{formatMs(PREFILL_MS + DECODE_PER_TOKEN_MS)}
-          </div>
+          <div className="mt-1 font-mono text-foreground/90">~{formatMs(PREFILL_MS + DECODE_PER_TOKEN_MS)}</div>
         </div>
         <div className="rounded-md border border-border/60 bg-muted/20 p-2">
           <div className="text-muted-foreground">Total wall time</div>
-          <div className="mt-1 font-mono text-foreground/90">
-            ~{formatMs(total)}
-          </div>
+          <div className="mt-1 font-mono text-foreground/90">~{formatMs(total)}</div>
         </div>
       </div>
     </div>

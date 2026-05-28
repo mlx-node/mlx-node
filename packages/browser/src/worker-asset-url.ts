@@ -1,8 +1,5 @@
 export function workerAssetUrl(input: URL | string) {
-  const url =
-    input instanceof URL
-      ? input
-      : new URL(input, globalThis.location?.href ?? 'http://localhost/');
+  const url = input instanceof URL ? input : new URL(input, globalThis.location?.href ?? 'http://localhost/');
 
   if (!url.pathname.startsWith('/assets/')) {
     return url;

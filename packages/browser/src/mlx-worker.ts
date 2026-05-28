@@ -9,57 +9,27 @@
  *
  * The main thread communicates via postMessage only.
  */
-import { Buffer } from "buffer";
+import { Buffer } from 'buffer';
 (globalThis as any).Buffer = Buffer;
 
 // Revision marker: changes worker asset URLs after enabling COOP/COEP headers
 // on Void, avoiding stale immutable edge-cache entries without those headers.
-(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = "2026-05-15";
+(globalThis as any).__MLX_VOID_COEP_WORKER_ASSET_REV = '2026-05-15';
 
 // Patch TextDecoder to handle SharedArrayBuffer views.
 // WASM memory is a SharedArrayBuffer (for threads support), but TextDecoder
 // rejects shared views. Copy to a non-shared buffer before decoding.
 const _origDecode = TextDecoder.prototype.decode;
-TextDecoder.prototype.decode = function (
-  input?: BufferSource | null,
-  options?: TextDecodeOptions,
-) {
-  if (
-    input &&
-    ArrayBuffer.isView(input) &&
-    (input.buffer as any) instanceof SharedArrayBuffer
-  ) {
+TextDecoder.prototype.decode = function (input?: BufferSource | null, options?: TextDecodeOptions) {
+  if (input && ArrayBuffer.isView(input) && (input.buffer as any) instanceof SharedArrayBuffer) {
     input = (input as Uint8Array).slice();
   }
   return _origDecode.call(this, input, options);
 };
 
-import {
-  instantiateNapiModule,
-  getDefaultContext,
-  WASI,
-} from "@napi-rs/wasm-runtime";
+import { instantiateNapiModule, getDefaultContext, WASI } from '@napi-rs/wasm-runtime';
 
-import {
-  CMD_OFFSET,
-  READBACK_BUFFER_SIZE,
-  DISPATCH_BATCH_BUFFER_SIZE,
-  STATS_BUFFER_SIZE,
-} from "./rpc-protocol.js";
-import {
-  parseSafeTensorsHeaderBytes,
-  dtypeToCode,
-  type TensorInfo,
-} from "./safetensors.js";
-import gpuWorkerUrl from "./gpu-worker.ts?worker&url";
-import webgpuWorkerUrl from "./webgpu-worker.mjs?worker&url";
-import {
-  createBridgeStub,
-  POOL_STATS_SIZE_BYTES,
-  BUFFER_METADATA_SIZE_BYTES,
-  type BridgeStub,
-} from "./webgpu-bridge-stub.js";
-import { workerAssetUrl } from "./worker-asset-url.js";
+import gpuWorkerUrl from './gpu-worker.ts?worker&url';
 import {
   EMBED_ERROR_TYPE,
   EMBED_REQUEST_TYPE,
@@ -70,7 +40,17 @@ import {
   TOKENIZE_ERROR_TYPE,
   TOKENIZE_REQUEST_TYPE,
   TOKENIZE_RESULT_TYPE,
-} from "./inspector-types.js";
+} from './inspector-types.js';
+import { CMD_OFFSET, READBACK_BUFFER_SIZE, DISPATCH_BATCH_BUFFER_SIZE, STATS_BUFFER_SIZE } from './rpc-protocol.js';
+import { parseSafeTensorsHeaderBytes, dtypeToCode, type TensorInfo } from './safetensors.js';
+import {
+  createBridgeStub,
+  POOL_STATS_SIZE_BYTES,
+  BUFFER_METADATA_SIZE_BYTES,
+  type BridgeStub,
+} from './webgpu-bridge-stub.js';
+import webgpuWorkerUrl from './webgpu-worker.mjs?worker&url';
+import { workerAssetUrl } from './worker-asset-url.js';
 
 let model: any = null;
 let mlxExports: any = null;
@@ -92,31 +72,29 @@ let modelGenerationDefaults: Record<string, number | boolean> = {};
 const PACKED_GPU_WEIGHT_UPLOAD_ENABLED = false;
 
 type UploadTensorInfo = TensorInfo & { fromMerged?: boolean };
-type ReasoningEffort = "off" | "low" | "medium" | "high";
+type ReasoningEffort = 'off' | 'low' | 'medium' | 'high';
 type LocalModelFile = File & { webkitRelativePath?: string };
 type HuggingFaceModelConfig = {
   repoId: string;
   revision?: string;
 };
 
-function normalizeGenerationConfig(
-  raw: unknown,
-): Record<string, number | boolean> {
-  if (!raw || typeof raw !== "object") return {};
+function normalizeGenerationConfig(raw: unknown): Record<string, number | boolean> {
+  if (!raw || typeof raw !== 'object') return {};
   const cfg = raw as Record<string, unknown>;
   const out: Record<string, number | boolean> = {};
   const assignNumber = (src: string, dst: string = src) => {
     const value = cfg[src];
-    if (typeof value === "number" && Number.isFinite(value)) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
       out[dst] = value;
     }
   };
-  assignNumber("temperature");
-  assignNumber("top_k", "topK");
-  assignNumber("top_p", "topP");
-  assignNumber("min_p", "minP");
-  assignNumber("repetition_penalty", "repetitionPenalty");
-  if (typeof cfg.do_sample === "boolean") out.doSample = cfg.do_sample;
+  assignNumber('temperature');
+  assignNumber('top_k', 'topK');
+  assignNumber('top_p', 'topP');
+  assignNumber('min_p', 'minP');
+  assignNumber('repetition_penalty', 'repetitionPenalty');
+  if (typeof cfg.do_sample === 'boolean') out.doSample = cfg.do_sample;
   return out;
 }
 
@@ -132,13 +110,13 @@ const MAX_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES = 1024 * 1024 * 1024;
 const MIN_WEIGHT_UPLOAD_BATCH_BYTES = 32 * 1024 * 1024;
 const MAX_WEIGHT_UPLOAD_BATCH_BYTES = MAX_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
 const LARGE_TENSOR_SOLO_BATCH_BYTES = 384 * 1024 * 1024;
-const HF_CACHE_NAME = "mlx-browser-huggingface-models-v1";
-const HF_CACHE_ORIGIN = "https://mlx-node-browser.local";
-const MODEL_FILE_CACHE_NAME = "mlx-browser-model-files-v1";
+const HF_CACHE_NAME = 'mlx-browser-huggingface-models-v1';
+const HF_CACHE_ORIGIN = 'https://mlx-node-browser.local';
+const MODEL_FILE_CACHE_NAME = 'mlx-browser-model-files-v1';
 
 type ModelSource =
   | {
-      kind: "remote";
+      kind: 'remote';
       baseUrl: string;
       label: string;
       fileCache: Map<string, Uint8Array>;
@@ -146,14 +124,14 @@ type ModelSource =
       cacheKey: string;
     }
   | {
-      kind: "local";
+      kind: 'local';
       files: Map<string, LocalModelFile>;
       label: string;
       blobCache: Map<string, Blob>;
       cacheKey: string;
     }
   | {
-      kind: "huggingface";
+      kind: 'huggingface';
       repoId: string;
       revision: string;
       resolvedRevision?: string;
@@ -164,37 +142,34 @@ type ModelSource =
 
 function formatModelLabel(source: ModelSource, config: any): string {
   const textConfig = config?.text_config ?? config;
-  const rawModelType = String(
-    textConfig?.model_type ?? config?.model_type ?? "model",
-  );
+  const rawModelType = String(textConfig?.model_type ?? config?.model_type ?? 'model');
   let family = rawModelType
-    .replace(/_text$/i, "")
-    .replace(/qwen3_5_moe/i, "Qwen3.5 MoE")
-    .replace(/qwen3_5/i, "Qwen3.5")
-    .replace(/qwen3_6/i, "Qwen3.6")
-    .replace(/_/g, " ");
+    .replace(/_text$/i, '')
+    .replace(/qwen3_5_moe/i, 'Qwen3.5 MoE')
+    .replace(/qwen3_5/i, 'Qwen3.5')
+    .replace(/qwen3_6/i, 'Qwen3.6')
+    .replace(/_/g, ' ');
   family = family
     .split(/\s+/)
     .filter(Boolean)
-    .map((part) => (part.toLowerCase() === "qwen" ? "Qwen" : part))
-    .join(" ");
+    .map((part) => (part.toLowerCase() === 'qwen' ? 'Qwen' : part))
+    .join(' ');
   const layers = Number(textConfig?.num_hidden_layers ?? 0) || 0;
   const hidden = Number(textConfig?.hidden_size ?? 0) || 0;
   const experts = Number(textConfig?.num_experts ?? 0) || 0;
   const bits = Number(config?.quantization?.bits ?? 0) || 0;
   const details = [
-    layers > 0 ? `${layers}L` : "",
-    hidden > 0 ? `${hidden}h` : "",
-    experts > 0 ? `${experts}e` : "",
-    bits > 0 ? `Q${bits}` : "",
+    layers > 0 ? `${layers}L` : '',
+    hidden > 0 ? `${hidden}h` : '',
+    experts > 0 ? `${experts}e` : '',
+    bits > 0 ? `Q${bits}` : '',
   ].filter(Boolean);
-  const configLabel =
-    details.length > 0 ? `${family} ${details.join(" ")}` : family;
-  if (source.kind === "remote" && source.label && source.label !== "/model") {
+  const configLabel = details.length > 0 ? `${family} ${details.join(' ')}` : family;
+  if (source.kind === 'remote' && source.label && source.label !== '/model') {
     return source.label;
   }
-  if (source.kind === "remote") return configLabel || source.label;
-  if (source.label && source.label !== "local model") return source.label;
+  if (source.kind === 'remote') return configLabel || source.label;
+  if (source.label && source.label !== 'local model') return source.label;
   return configLabel || source.label;
 }
 
@@ -216,22 +191,16 @@ type UploadWeightsResult = {
   debugUnpackedBf16Total?: number;
 };
 
-const REASONING_TOKEN_BUDGET: Record<
-  Exclude<ReasoningEffort, "off">,
-  number
-> = {
+const REASONING_TOKEN_BUDGET: Record<Exclude<ReasoningEffort, 'off'>, number> = {
   low: 32,
   medium: 128,
   high: 256,
 };
 
-function normalizeReasoningEffort(
-  value: unknown,
-  enableThinking?: boolean,
-): ReasoningEffort {
-  if (value === "off" || value === "none") return "off";
-  if (value === "low" || value === "medium" || value === "high") return value;
-  return enableThinking === true ? "high" : "off";
+function normalizeReasoningEffort(value: unknown, enableThinking?: boolean): ReasoningEffort {
+  if (value === 'off' || value === 'none') return 'off';
+  if (value === 'low' || value === 'medium' || value === 'high') return value;
+  return enableThinking === true ? 'high' : 'off';
 }
 
 function buildChatConfig(data: {
@@ -242,25 +211,17 @@ function buildChatConfig(data: {
 }) {
   const baseConfig = {
     ...modelGenerationDefaults,
-    ...(data.config ?? {}),
+    ...data.config,
   };
-  const requestedEffort = normalizeReasoningEffort(
-    data.reasoningEffort,
-    data.enableThinking,
-  );
-  const hasImages =
-    Array.isArray(data.messages) && hasMessageImages(data.messages);
-  const hasTools =
-    Array.isArray(baseConfig.tools) && baseConfig.tools.length > 0;
-  const effort =
-    requestedEffort === "off" && hasImages && !hasTools
-      ? "low"
-      : requestedEffort;
+  const requestedEffort = normalizeReasoningEffort(data.reasoningEffort, data.enableThinking);
+  const hasImages = Array.isArray(data.messages) && hasMessageImages(data.messages);
+  const hasTools = Array.isArray(baseConfig.tools) && baseConfig.tools.length > 0;
+  const effort = requestedEffort === 'off' && hasImages && !hasTools ? 'low' : requestedEffort;
 
-  if (effort === "off") {
+  if (effort === 'off') {
     return {
       ...baseConfig,
-      reasoningEffort: "none",
+      reasoningEffort: 'none',
       includeReasoning: false,
       reportPerformance: true,
     };
@@ -270,79 +231,57 @@ function buildChatConfig(data: {
     ...baseConfig,
     // Qwen3.5 maps `low` to no-thinking internally, so the browser uses the
     // thinking template with a low token cap to provide a true low effort.
-    reasoningEffort: effort === "low" ? "medium" : effort,
+    reasoningEffort: effort === 'low' ? 'medium' : effort,
     thinkingTokenBudget: REASONING_TOKEN_BUDGET[effort],
-    includeReasoning: requestedEffort !== "off",
+    includeReasoning: requestedEffort !== 'off',
     reportPerformance: true,
   };
 }
 
 function isVisionTensorName(name: string): boolean {
-  return (
-    name.startsWith("vision_tower.") ||
-    name.startsWith("visual.") ||
-    name.startsWith("model.visual.")
-  );
+  return name.startsWith('vision_tower.') || name.startsWith('visual.') || name.startsWith('model.visual.');
 }
 
 function hasMessageImages(messages: any[]): boolean {
-  return messages.some(
-    (message) => Array.isArray(message?.images) && message.images.length > 0,
-  );
+  return messages.some((message) => Array.isArray(message?.images) && message.images.length > 0);
 }
 
 function rejectUnsupportedImages(messages: any[]): boolean {
   if (modelSupportsImages || !hasMessageImages(messages)) return false;
   post({
-    type: "error",
-    message: "Image input is unavailable for the loaded text-only model.",
+    type: 'error',
+    message: 'Image input is unavailable for the loaded text-only model.',
   });
   return true;
 }
 
-function setBridgeOptimizations(
-  fusionEnabled: boolean,
-  passCachingEnabled: boolean,
-  dispatchBatchEnabled: boolean,
-) {
+function setBridgeOptimizations(fusionEnabled: boolean, passCachingEnabled: boolean, dispatchBatchEnabled: boolean) {
   if (!bridgeOptimizationControl) return;
   Atomics.store(bridgeOptimizationControl, 0, fusionEnabled ? 1 : 0);
   Atomics.store(bridgeOptimizationControl, 1, passCachingEnabled ? 1 : 0);
   Atomics.store(bridgeOptimizationControl, 2, dispatchBatchEnabled ? 1 : 0);
 }
 
-async function withBridgeModeForMessages<T>(
-  messages: any[],
-  run: () => Promise<T>,
-): Promise<T> {
+async function withBridgeModeForMessages<T>(messages: any[], run: () => Promise<T>): Promise<T> {
   const imageRequest = hasMessageImages(messages);
   if (!bridgeOptimizationControl) return run();
 
   const previousFusion = Atomics.load(bridgeOptimizationControl, 0) !== 0;
   const previousPassCaching = Atomics.load(bridgeOptimizationControl, 1) !== 0;
-  const previousDispatchBatch =
-    Atomics.load(bridgeOptimizationControl, 2) !== 0;
+  const previousDispatchBatch = Atomics.load(bridgeOptimizationControl, 2) !== 0;
   if (imageRequest) {
     // VLM prefill still needs the conservative bridge path because it has
     // cross-worker pass ownership and copy/restart patterns that are not yet
     // safe with the text decode fusion stack.
     setBridgeOptimizations(false, false, false);
   } else {
-    setBridgeOptimizations(
-      configuredFusionEnabled,
-      true,
-      configuredDispatchBatchEnabled,
-    );
+    setBridgeOptimizations(configuredFusionEnabled, true, configuredDispatchBatchEnabled);
   }
 
   try {
     return await run();
   } finally {
-    setBridgeOptimizations(
-      previousFusion,
-      previousPassCaching,
-      previousDispatchBatch,
-    );
+    setBridgeOptimizations(previousFusion, previousPassCaching, previousDispatchBatch);
   }
 }
 
@@ -375,34 +314,30 @@ function uploadWeightsToGpu(
   return new Promise((resolve, reject) => {
     const onMessage = (ev: MessageEvent) => {
       const msg = ev.data;
-      if (msg?.type === "weights_uploaded") {
+      if (msg?.type === 'weights_uploaded') {
         cleanup();
         resolve(msg);
-      } else if (
-        msg?.type === "error" ||
-        msg?.type === "rpc-error" ||
-        msg?.type === "gpu-error"
-      ) {
+      } else if (msg?.type === 'error' || msg?.type === 'rpc-error' || msg?.type === 'gpu-error') {
         cleanup();
-        reject(new Error(msg.message || "GPU weight upload failed"));
+        reject(new Error(msg.message || 'GPU weight upload failed'));
       }
     };
     const onError = (ev: ErrorEvent) => {
       cleanup();
-      reject(new Error(ev.message || "GPU worker error during weight upload"));
+      reject(new Error(ev.message || 'GPU worker error during weight upload'));
     };
     const cleanup = () => {
-      gpuWorker.removeEventListener("message", onMessage);
-      gpuWorker.removeEventListener("error", onError);
+      gpuWorker.removeEventListener('message', onMessage);
+      gpuWorker.removeEventListener('error', onError);
     };
-    gpuWorker.addEventListener("message", onMessage);
-    gpuWorker.addEventListener("error", onError);
+    gpuWorker.addEventListener('message', onMessage);
+    gpuWorker.addEventListener('error', onError);
     const transfer: Transferable[] = [];
     if (weightsBuffer instanceof ArrayBuffer) transfer.push(weightsBuffer);
     if (mergedBuffer instanceof ArrayBuffer) transfer.push(mergedBuffer);
     gpuWorker.postMessage(
       {
-        type: "upload_weights",
+        type: 'upload_weights',
         weightsBuffer,
         mergedBuffer,
         dataOffset,
@@ -414,21 +349,15 @@ function uploadWeightsToGpu(
   });
 }
 
-type UploadItem =
-  | { kind: "tensor"; tensor: TensorInfo }
-  | { kind: "merge"; plan: LinearAttentionMergePlan };
+type UploadItem = { kind: 'tensor'; tensor: TensorInfo } | { kind: 'merge'; plan: LinearAttentionMergePlan };
 
 function uploadItemByteSize(item: UploadItem): number {
-  return item.kind === "tensor"
-    ? item.tensor.byteSize
-    : item.plan.tensor.byteSize;
+  return item.kind === 'tensor' ? item.tensor.byteSize : item.plan.tensor.byteSize;
 }
 
 function defaultWeightUploadBatchBytes(): number {
-  const deviceMemory = (globalThis.navigator as
-    | (Navigator & { deviceMemory?: unknown })
-    | undefined)?.deviceMemory;
-  if (typeof deviceMemory !== "number" || !Number.isFinite(deviceMemory)) {
+  const deviceMemory = (globalThis.navigator as (Navigator & { deviceMemory?: unknown }) | undefined)?.deviceMemory;
+  if (typeof deviceMemory !== 'number' || !Number.isFinite(deviceMemory)) {
     return DEFAULT_WEIGHT_UPLOAD_BATCH_BYTES;
   }
   if (deviceMemory >= 64) return MAX_MEMORY_WEIGHT_UPLOAD_BATCH_BYTES;
@@ -443,17 +372,14 @@ function defaultWeightUploadBatchBytes(): number {
 }
 
 function normalizeWeightUploadBatchBytes(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
     return defaultWeightUploadBatchBytes();
   }
-  return Math.min(
-    MAX_WEIGHT_UPLOAD_BATCH_BYTES,
-    Math.max(MIN_WEIGHT_UPLOAD_BATCH_BYTES, Math.floor(value)),
-  );
+  return Math.min(MAX_WEIGHT_UPLOAD_BATCH_BYTES, Math.max(MIN_WEIGHT_UPLOAD_BATCH_BYTES, Math.floor(value)));
 }
 
 function describeUploadItem(item: UploadItem): UploadTensorInfo {
-  if (item.kind === "tensor") {
+  if (item.kind === 'tensor') {
     return { ...item.tensor };
   }
   return { ...item.plan.tensor };
@@ -484,10 +410,7 @@ async function uploadPreparedWeightItems(
   gpuWorker: Worker,
   uploadPackedBf16: boolean,
   weightUploadBatchBytes: number,
-  onProgress: (
-    uploaded: UploadWeightsResult,
-    tensors: UploadTensorInfo[],
-  ) => void,
+  onProgress: (uploaded: UploadWeightsResult, tensors: UploadTensorInfo[]) => void,
 ): Promise<{ debugPackedTotal: number; debugUnpackedBf16Total: number }> {
   let debugPackedTotal = 0;
   let debugUnpackedBf16Total = 0;
@@ -502,17 +425,13 @@ async function uploadPreparedWeightItems(
     while (startIndex < items.length) {
       const item = items[startIndex]!;
       const itemBytes = uploadItemByteSize(item);
-      if (
-        batchItems.length > 0 &&
-        batchBytes + itemBytes > activeBatchBytes
-      ) {
+      if (batchItems.length > 0 && batchBytes + itemBytes > activeBatchBytes) {
         break;
       }
       batchItems.push(item);
       batchBytes += itemBytes;
       startIndex++;
-      if (batchItems.length === 1 && itemBytes >= LARGE_TENSOR_SOLO_BATCH_BYTES)
-        break;
+      if (batchItems.length === 1 && itemBytes >= LARGE_TENSOR_SOLO_BATCH_BYTES) break;
       if (batchBytes >= activeBatchBytes) break;
     }
 
@@ -520,18 +439,12 @@ async function uploadPreparedWeightItems(
     try {
       batchBuffer = new ArrayBuffer(batchBytes);
     } catch (error) {
-      if (
-        batchItems.length > 1 &&
-        activeBatchBytes > MIN_WEIGHT_UPLOAD_BATCH_BYTES
-      ) {
-        activeBatchBytes = Math.max(
-          MIN_WEIGHT_UPLOAD_BATCH_BYTES,
-          Math.floor(activeBatchBytes / 2),
-        );
+      if (batchItems.length > 1 && activeBatchBytes > MIN_WEIGHT_UPLOAD_BATCH_BYTES) {
+        activeBatchBytes = Math.max(MIN_WEIGHT_UPLOAD_BATCH_BYTES, Math.floor(activeBatchBytes / 2));
         startIndex = batchStartIndex;
         post({
-          type: "progress",
-          step: "init_model",
+          type: 'progress',
+          step: 'init_model',
           message:
             `Upload batch allocation failed; retrying ${weightFile} with ` +
             `${Math.round(activeBatchBytes / 1024 / 1024)} MB batches...`,
@@ -549,33 +462,12 @@ async function uploadPreparedWeightItems(
       uploadTensor.byteOffset = cursor;
       uploadTensor.fromMerged = false;
 
-      if (item.kind === "tensor") {
-        await copyTensorBytesInto(
-          source,
-          weightFile,
-          dataOffset,
-          item.tensor,
-          batchView,
-          cursor,
-        );
+      if (item.kind === 'tensor') {
+        await copyTensorBytesInto(source, weightFile, dataOffset, item.tensor, batchView, cursor);
       } else {
         const { left, right } = item.plan;
-        await copyTensorBytesInto(
-          source,
-          weightFile,
-          dataOffset,
-          left,
-          batchView,
-          cursor,
-        );
-        await copyTensorBytesInto(
-          source,
-          weightFile,
-          dataOffset,
-          right,
-          batchView,
-          cursor + left.byteSize,
-        );
+        await copyTensorBytesInto(source, weightFile, dataOffset, left, batchView, cursor);
+        await copyTensorBytesInto(source, weightFile, dataOffset, right, batchView, cursor + left.byteSize);
       }
 
       batchTensors.push(uploadTensor);
@@ -583,21 +475,14 @@ async function uploadPreparedWeightItems(
     }
 
     post({
-      type: "progress",
-      step: "init_model",
+      type: 'progress',
+      step: 'init_model',
       message:
         `Uploading ${weightFile}: ${uploadedItemCount + batchItems.length}/${items.length}` +
         ` tensors (${(batchBytes / 1024 / 1024).toFixed(0)} MB batch)...`,
     });
 
-    const uploaded = await uploadWeightsToGpu(
-      gpuWorker,
-      batchBuffer,
-      0,
-      batchTensors,
-      undefined,
-      uploadPackedBf16,
-    );
+    const uploaded = await uploadWeightsToGpu(gpuWorker, batchBuffer, 0, batchTensors, undefined, uploadPackedBf16);
     if (uploaded.handles.length !== batchTensors.length) {
       throw new Error(
         `GPU upload returned ${uploaded.handles.length} handles for ${batchTensors.length} tensors in ${weightFile}`,
@@ -614,21 +499,21 @@ async function uploadPreparedWeightItems(
 }
 
 function normalizeModelPath(path: string): string {
-  return path.replace(/\\/g, "/").replace(/^\/+/, "");
+  return path.replace(/\\/g, '/').replace(/^\/+/, '');
 }
 
 function normalizeHfRepoId(value: string): string {
   return value
     .trim()
-    .replace(/^https:\/\/huggingface\.co\//i, "")
-    .replace(/^hf:\/\//i, "")
-    .replace(/^models\//i, "")
-    .replace(/\/(?:tree|resolve)\/.*$/i, "")
-    .replace(/^\/+|\/+$/g, "");
+    .replace(/^https:\/\/huggingface\.co\//i, '')
+    .replace(/^hf:\/\//i, '')
+    .replace(/^models\//i, '')
+    .replace(/\/(?:tree|resolve)\/.*$/i, '')
+    .replace(/^\/+|\/+$/g, '');
 }
 
 function encodePathParts(value: string): string {
-  return value.split("/").map(encodeURIComponent).join("/");
+  return value.split('/').map(encodeURIComponent).join('/');
 }
 
 function formatBytes(value: number): string {
@@ -654,8 +539,7 @@ function stableCacheHash(value: string): string {
 }
 
 function remoteCacheKey(baseUrl: string): string {
-  const href = new URL(`${baseUrl.replace(/\/+$/, "")}/`, self.location.href)
-    .href;
+  const href = new URL(`${baseUrl.replace(/\/+$/, '')}/`, self.location.href).href;
   return `remote-${stableCacheHash(href)}`;
 }
 
@@ -663,28 +547,19 @@ function localCacheKey(label: string, entries: Array<[string, LocalModelFile]>):
   const signature = entries
     .map(([path, file]) => `${path}\0${file.size}\0${file.lastModified}`)
     .sort()
-    .join("\n");
+    .join('\n');
   return `local-${stableCacheHash(`${label}\n${signature}`)}`;
 }
 
-function hfResolveUrl(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
-  path: string,
-): string {
+function hfResolveUrl(source: Extract<ModelSource, { kind: 'huggingface' }>, path: string): string {
   const repoId = encodePathParts(source.repoId);
-  const revision = encodeURIComponent(
-    source.resolvedRevision ?? source.revision,
-  );
+  const revision = encodeURIComponent(source.resolvedRevision ?? source.revision);
   return `https://huggingface.co/${repoId}/resolve/${revision}/${encodePathParts(path)}`;
 }
 
-function hfTreeUrl(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
-): string {
+function hfTreeUrl(source: Extract<ModelSource, { kind: 'huggingface' }>): string {
   const repoId = encodePathParts(source.repoId);
-  const revision = encodeURIComponent(
-    source.resolvedRevision ?? source.revision,
-  );
+  const revision = encodeURIComponent(source.resolvedRevision ?? source.revision);
   return `https://huggingface.co/api/models/${repoId}/tree/${revision}?recursive=1`;
 }
 
@@ -692,10 +567,7 @@ function isPinnedHfRevision(revision: string): boolean {
   return /^[0-9a-f]{40}$/i.test(revision);
 }
 
-function hfCacheRequest(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
-  path: string,
-): Request {
+function hfCacheRequest(source: Extract<ModelSource, { kind: 'huggingface' }>, path: string): Request {
   const revision = source.resolvedRevision ?? source.revision;
   const key =
     `${HF_CACHE_ORIGIN}/huggingface/` +
@@ -706,12 +578,12 @@ function hfCacheRequest(
 }
 
 async function openHfCache(): Promise<Cache | null> {
-  if (typeof caches === "undefined") return null;
+  if (typeof caches === 'undefined') return null;
   try {
     return await caches.open(HF_CACHE_NAME);
   } catch (e) {
     post({
-      type: "log",
+      type: 'log',
       message: `[HF] Cache Storage unavailable: ${String(e)}`,
     });
     return null;
@@ -719,18 +591,18 @@ async function openHfCache(): Promise<Cache | null> {
 }
 
 async function fetchHfNetworkResponse(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
+  source: Extract<ModelSource, { kind: 'huggingface' }>,
   path: string,
   optional = false,
 ): Promise<Response | undefined> {
   const normalizedPath = normalizeModelPath(path);
   post({
-    type: "progress",
-    step: "download",
+    type: 'progress',
+    step: 'download',
     message: `Downloading ${normalizedPath} from Hugging Face...`,
   });
   const resp = await fetch(hfResolveUrl(source, normalizedPath), {
-    headers: { Accept: "application/octet-stream" },
+    headers: { Accept: 'application/octet-stream' },
   });
   if (!resp.ok) {
     if (optional && resp.status === 404) return undefined;
@@ -739,11 +611,11 @@ async function fetchHfNetworkResponse(
     );
   }
 
-  const commit = resp.headers.get("x-repo-commit");
+  const commit = resp.headers.get('x-repo-commit');
   if (commit && source.resolvedRevision !== commit) {
     source.resolvedRevision = commit;
     post({
-      type: "log",
+      type: 'log',
       message: `[HF] ${source.repoId}@${source.revision} resolved to ${commit.slice(0, 12)}`,
     });
   }
@@ -751,16 +623,14 @@ async function fetchHfNetworkResponse(
 }
 
 async function fetchHfFileResponse(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
+  source: Extract<ModelSource, { kind: 'huggingface' }>,
   path: string,
   optional = false,
 ): Promise<Response | undefined> {
   const normalizedPath = normalizeModelPath(path);
   const cache = await openHfCache();
   const shouldResolveRevision =
-    source.resolvedRevision == null &&
-    normalizedPath === "config.json" &&
-    !isPinnedHfRevision(source.revision);
+    source.resolvedRevision == null && normalizedPath === 'config.json' && !isPinnedHfRevision(source.revision);
 
   if (cache && !shouldResolveRevision) {
     const cached = await cache.match(hfCacheRequest(source, normalizedPath));
@@ -778,7 +648,7 @@ async function fetchHfFileResponse(
       if (cached) return cached;
     } catch (e) {
       post({
-        type: "log",
+        type: 'log',
         message: `[HF] Could not persist ${normalizedPath}; continuing without browser cache: ${String(e)}`,
       });
     }
@@ -788,7 +658,7 @@ async function fetchHfFileResponse(
 }
 
 async function getHfOpfsRevisionDirectory(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
+  source: Extract<ModelSource, { kind: 'huggingface' }>,
   create: boolean,
 ): Promise<any | null> {
   const storage = (navigator as any).storage;
@@ -800,15 +670,12 @@ async function getHfOpfsRevisionDirectory(
     dir = await dir.getDirectoryHandle(encodeURIComponent(source.repoId), {
       create,
     });
-    dir = await dir.getDirectoryHandle(
-      encodeURIComponent(source.resolvedRevision ?? source.revision),
-      { create },
-    );
+    dir = await dir.getDirectoryHandle(encodeURIComponent(source.resolvedRevision ?? source.revision), { create });
     return dir;
   } catch (e) {
     if (!create) return null;
     post({
-      type: "log",
+      type: 'log',
       message: `[HF] OPFS cache unavailable: ${String(e)}`,
     });
     return null;
@@ -816,14 +683,14 @@ async function getHfOpfsRevisionDirectory(
 }
 
 async function getHfOpfsFileHandle(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
+  source: Extract<ModelSource, { kind: 'huggingface' }>,
   path: string,
   create: boolean,
 ): Promise<any | null> {
   let dir = await getHfOpfsRevisionDirectory(source, create);
   if (!dir) return null;
 
-  const parts = normalizeModelPath(path).split("/").filter(Boolean);
+  const parts = normalizeModelPath(path).split('/').filter(Boolean);
   const fileName = parts.pop();
   if (!fileName) return null;
 
@@ -839,7 +706,7 @@ async function getHfOpfsFileHandle(
 }
 
 async function readHfOpfsFileBlob(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
+  source: Extract<ModelSource, { kind: 'huggingface' }>,
   path: string,
 ): Promise<Blob | undefined> {
   const handle = await getHfOpfsFileHandle(source, path, false);
@@ -848,18 +715,13 @@ async function readHfOpfsFileBlob(
   return file.size > 0 ? file : undefined;
 }
 
-function maybePostHfDownloadProgress(
-  path: string,
-  loaded: number,
-  total: number,
-  lastPct: number,
-): number {
+function maybePostHfDownloadProgress(path: string, loaded: number, total: number, lastPct: number): number {
   if (total > 0) {
     const pct = Math.min(100, Math.floor((loaded / total) * 100));
     if (pct === 100 || pct >= lastPct + 5) {
       post({
-        type: "progress",
-        step: "download",
+        type: 'progress',
+        step: 'download',
         pct,
         message: `Caching ${path} from Hugging Face... ${pct}%`,
       });
@@ -871,8 +733,8 @@ function maybePostHfDownloadProgress(
   const loadedMb = Math.floor(loaded / 1024 / 1024);
   if (loadedMb >= lastPct + 128) {
     post({
-      type: "progress",
-      step: "download",
+      type: 'progress',
+      step: 'download',
       message: `Caching ${path} from Hugging Face... ${loadedMb} MB`,
     });
     return loadedMb;
@@ -881,7 +743,7 @@ function maybePostHfDownloadProgress(
 }
 
 async function downloadHfFileToOpfs(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
+  source: Extract<ModelSource, { kind: 'huggingface' }>,
   path: string,
 ): Promise<Blob | undefined> {
   const normalizedPath = normalizeModelPath(path);
@@ -895,7 +757,7 @@ async function downloadHfFileToOpfs(
 
   const writable = await handle.createWritable();
   try {
-    const total = Number(resp.headers.get("content-length") ?? "0") || 0;
+    const total = Number(resp.headers.get('content-length') ?? '0') || 0;
     let loaded = 0;
     let lastProgress = total > 0 ? -5 : -128;
 
@@ -907,12 +769,7 @@ async function downloadHfFileToOpfs(
         if (!value) continue;
         await writable.write(value);
         loaded += value.byteLength;
-        lastProgress = maybePostHfDownloadProgress(
-          normalizedPath,
-          loaded,
-          total,
-          lastProgress,
-        );
+        lastProgress = maybePostHfDownloadProgress(normalizedPath, loaded, total, lastProgress);
       }
     } else {
       const blob = await resp.blob();
@@ -933,10 +790,7 @@ async function downloadHfFileToOpfs(
   }
 }
 
-async function readHfFileBlob(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
-  path: string,
-): Promise<Blob> {
+async function readHfFileBlob(source: Extract<ModelSource, { kind: 'huggingface' }>, path: string): Promise<Blob> {
   const normalizedPath = normalizeModelPath(path);
   const cached = source.blobCache.get(normalizedPath);
   if (cached) return cached;
@@ -960,14 +814,9 @@ async function readHfFileBlob(
   return blob;
 }
 
-type BrowserCachedModelSource =
-  | Extract<ModelSource, { kind: "remote" }>
-  | Extract<ModelSource, { kind: "local" }>;
+type BrowserCachedModelSource = Extract<ModelSource, { kind: 'remote' }> | Extract<ModelSource, { kind: 'local' }>;
 
-async function getModelFileCacheDirectory(
-  cacheKey: string,
-  create: boolean,
-): Promise<any | null> {
+async function getModelFileCacheDirectory(cacheKey: string, create: boolean): Promise<any | null> {
   const storage = (navigator as any).storage;
   if (!storage?.getDirectory) return null;
 
@@ -979,24 +828,20 @@ async function getModelFileCacheDirectory(
   } catch (e) {
     if (!create) return null;
     post({
-      type: "log",
+      type: 'log',
       message: `[CACHE] OPFS model cache unavailable: ${String(e)}`,
     });
     return null;
   }
 }
 
-async function getModelFileCacheHandle(
-  cacheKey: string,
-  path: string,
-  create: boolean,
-): Promise<any | null> {
+async function getModelFileCacheHandle(cacheKey: string, path: string, create: boolean): Promise<any | null> {
   let dir = await getModelFileCacheDirectory(cacheKey, create);
   if (!dir) return null;
 
-  const parts = normalizeModelPath(path).split("/").filter(Boolean);
+  const parts = normalizeModelPath(path).split('/').filter(Boolean);
   const fileName = parts.pop();
-  if (!fileName || parts.some((part) => part === "." || part === "..")) {
+  if (!fileName || parts.some((part) => part === '.' || part === '..')) {
     return null;
   }
 
@@ -1011,38 +856,31 @@ async function getModelFileCacheHandle(
   }
 }
 
-async function readModelFileCacheBlob(
-  source: BrowserCachedModelSource,
-  path: string,
-): Promise<Blob | undefined> {
+async function readModelFileCacheBlob(source: BrowserCachedModelSource, path: string): Promise<Blob | undefined> {
   const normalizedPath = normalizeModelPath(path);
   const cached = source.blobCache.get(normalizedPath);
   if (cached) return cached;
 
-  const handle = await getModelFileCacheHandle(
-    source.cacheKey,
-    normalizedPath,
-    false,
-  );
+  const handle = await getModelFileCacheHandle(source.cacheKey, normalizedPath, false);
   if (!handle) return undefined;
   const file = await handle.getFile();
   if (file.size <= 0) return undefined;
   source.blobCache.set(normalizedPath, file);
   post({
-    type: "progress",
-    step: "download",
+    type: 'progress',
+    step: 'download',
     pct: 100,
     file: normalizedPath,
     loadedBytes: file.size,
     totalBytes: file.size,
-    cacheSource: "browser",
+    cacheSource: 'browser',
     message: `Using cached ${normalizedPath} (${formatBytes(file.size)})`,
   });
   return file;
 }
 
 function maybePostModelFileProgress(
-  action: "Downloading" | "Caching",
+  action: 'Downloading' | 'Caching',
   path: string,
   loaded: number,
   total: number,
@@ -1052,13 +890,13 @@ function maybePostModelFileProgress(
     const pct = Math.min(100, Math.floor((loaded / total) * 100));
     if (pct === 100 || pct >= lastPct + 3) {
       post({
-        type: "progress",
-        step: "download",
+        type: 'progress',
+        step: 'download',
         pct,
         file: path,
         loadedBytes: loaded,
         totalBytes: total,
-        cacheSource: "network",
+        cacheSource: 'network',
         message: `${action} ${path}... ${pct}% (${formatBytes(loaded)} / ${formatBytes(total)})`,
       });
       return pct;
@@ -1069,11 +907,11 @@ function maybePostModelFileProgress(
   const loadedMb = Math.floor(loaded / 1024 / 1024);
   if (loadedMb >= lastPct + 128) {
     post({
-      type: "progress",
-      step: "download",
+      type: 'progress',
+      step: 'download',
       file: path,
       loadedBytes: loaded,
-      cacheSource: "network",
+      cacheSource: 'network',
       message: `${action} ${path}... ${loadedMb} MB`,
     });
     return loadedMb;
@@ -1085,19 +923,15 @@ async function writeResponseToModelCache(
   source: BrowserCachedModelSource,
   path: string,
   resp: Response,
-  action: "Downloading" | "Caching",
+  action: 'Downloading' | 'Caching',
 ): Promise<Blob | undefined> {
   const normalizedPath = normalizeModelPath(path);
-  const handle = await getModelFileCacheHandle(
-    source.cacheKey,
-    normalizedPath,
-    true,
-  );
+  const handle = await getModelFileCacheHandle(source.cacheKey, normalizedPath, true);
   if (!handle) return undefined;
 
   const writable = await handle.createWritable();
   try {
-    const total = Number(resp.headers.get("content-length") ?? "0") || 0;
+    const total = Number(resp.headers.get('content-length') ?? '0') || 0;
     let loaded = 0;
     let lastProgress = total > 0 ? -3 : -128;
 
@@ -1109,13 +943,7 @@ async function writeResponseToModelCache(
         if (!value) continue;
         await writable.write(value);
         loaded += value.byteLength;
-        lastProgress = maybePostModelFileProgress(
-          action,
-          normalizedPath,
-          loaded,
-          total,
-          lastProgress,
-        );
+        lastProgress = maybePostModelFileProgress(action, normalizedPath, loaded, total, lastProgress);
       }
     } else {
       const blob = await resp.blob();
@@ -1139,7 +967,7 @@ async function writeResponseToModelCache(
 }
 
 async function fetchRemoteFileToModelCache(
-  source: Extract<ModelSource, { kind: "remote" }>,
+  source: Extract<ModelSource, { kind: 'remote' }>,
   path: string,
   optional = false,
 ): Promise<Blob | undefined> {
@@ -1148,28 +976,21 @@ async function fetchRemoteFileToModelCache(
 
   if (!optional) {
     post({
-      type: "progress",
-      step: "download",
+      type: 'progress',
+      step: 'download',
       file: normalizedPath,
       message: `Downloading ${normalizedPath}...`,
     });
   }
   const resp = await fetch(`${source.baseUrl}/${normalizedPath}`, {
-    headers: { Accept: "application/octet-stream" },
+    headers: { Accept: 'application/octet-stream' },
   });
   if (optional && resp.status === 204) return undefined;
   if (!resp.ok) {
     if (optional && resp.status === 404) return undefined;
-    throw new Error(
-      `Failed to fetch ${normalizedPath}: HTTP ${resp.status} ${resp.statusText}`,
-    );
+    throw new Error(`Failed to fetch ${normalizedPath}: HTTP ${resp.status} ${resp.statusText}`);
   }
-  const cached = await writeResponseToModelCache(
-    source,
-    normalizedPath,
-    resp,
-    "Downloading",
-  );
+  const cached = await writeResponseToModelCache(source, normalizedPath, resp, 'Downloading');
   if (cached) return cached;
   try {
     await resp.body?.cancel();
@@ -1180,16 +1001,12 @@ async function fetchRemoteFileToModelCache(
 }
 
 async function copyLocalFileToModelCache(
-  source: Extract<ModelSource, { kind: "local" }>,
+  source: Extract<ModelSource, { kind: 'local' }>,
   path: string,
   file: LocalModelFile,
 ): Promise<Blob | undefined> {
   const normalizedPath = normalizeModelPath(path);
-  const handle = await getModelFileCacheHandle(
-    source.cacheKey,
-    normalizedPath,
-    true,
-  );
+  const handle = await getModelFileCacheHandle(source.cacheKey, normalizedPath, true);
   if (!handle) return undefined;
 
   const writable = await handle.createWritable();
@@ -1206,18 +1023,12 @@ async function copyLocalFileToModelCache(
         if (!value) continue;
         await writable.write(value);
         loaded += value.byteLength;
-        lastProgress = maybePostModelFileProgress(
-          "Caching",
-          normalizedPath,
-          loaded,
-          total,
-          lastProgress,
-        );
+        lastProgress = maybePostModelFileProgress('Caching', normalizedPath, loaded, total, lastProgress);
       }
     } else {
       await writable.write(file);
       loaded = file.size;
-      maybePostModelFileProgress("Caching", normalizedPath, loaded, loaded, -3);
+      maybePostModelFileProgress('Caching', normalizedPath, loaded, loaded, -3);
     }
 
     await writable.close();
@@ -1235,7 +1046,7 @@ async function copyLocalFileToModelCache(
 }
 
 async function readRemoteFileBlob(
-  source: Extract<ModelSource, { kind: "remote" }>,
+  source: Extract<ModelSource, { kind: 'remote' }>,
   path: string,
   optional = false,
 ): Promise<Blob | undefined> {
@@ -1246,21 +1057,18 @@ async function readRemoteFileBlob(
   try {
     return await fetchRemoteFileToModelCache(source, normalizedPath, optional);
   } catch (e) {
-    if (optional && e instanceof Error && e.message.includes("HTTP 404")) {
+    if (optional && e instanceof Error && e.message.includes('HTTP 404')) {
       return undefined;
     }
     post({
-      type: "log",
+      type: 'log',
       message: `[CACHE] Could not persist ${normalizedPath}; falling back to range fetches: ${String(e)}`,
     });
     return undefined;
   }
 }
 
-async function readLocalFileBlob(
-  source: Extract<ModelSource, { kind: "local" }>,
-  path: string,
-): Promise<Blob> {
+async function readLocalFileBlob(source: Extract<ModelSource, { kind: 'local' }>, path: string): Promise<Blob> {
   const normalizedPath = normalizeModelPath(path);
   const cached = await readModelFileCacheBlob(source, normalizedPath);
   if (cached) return cached;
@@ -1272,7 +1080,7 @@ async function readLocalFileBlob(
     if (copied) return copied;
   } catch (e) {
     post({
-      type: "log",
+      type: 'log',
       message: `[CACHE] Could not copy ${normalizedPath} into browser storage; using selected file directly: ${String(e)}`,
     });
   }
@@ -1280,30 +1088,24 @@ async function readLocalFileBlob(
   return file;
 }
 
-async function listHfRepoFiles(
-  source: Extract<ModelSource, { kind: "huggingface" }>,
-): Promise<string[]> {
+async function listHfRepoFiles(source: Extract<ModelSource, { kind: 'huggingface' }>): Promise<string[]> {
   if (source.files) return source.files;
 
   post({
-    type: "progress",
-    step: "download",
+    type: 'progress',
+    step: 'download',
     message: `Listing files from ${source.label}...`,
   });
   const resp = await fetch(hfTreeUrl(source), {
-    headers: { Accept: "application/json" },
+    headers: { Accept: 'application/json' },
   });
   if (!resp.ok) {
-    throw new Error(
-      `Failed to list ${source.label}: HTTP ${resp.status} ${resp.statusText}`,
-    );
+    throw new Error(`Failed to list ${source.label}: HTTP ${resp.status} ${resp.statusText}`);
   }
 
   const tree = (await resp.json()) as Array<{ path?: string; type?: string }>;
   source.files = tree
-    .filter(
-      (entry) => entry.path && (entry.type == null || entry.type === "file"),
-    )
+    .filter((entry) => entry.path && (entry.type == null || entry.type === 'file'))
     .map((entry) => normalizeModelPath(entry.path!));
   return source.files;
 }
@@ -1315,31 +1117,24 @@ function createModelSource(
   modelLabel?: string,
 ): ModelSource {
   if (modelFiles && modelFiles.length > 0) {
-    const rawPaths = modelFiles.map((file) =>
-      normalizeModelPath(file.webkitRelativePath || file.name),
-    );
-    const firstRoot = rawPaths[0]?.split("/")[0] ?? "";
+    const rawPaths = modelFiles.map((file) => normalizeModelPath(file.webkitRelativePath || file.name));
+    const firstRoot = rawPaths[0]?.split('/')[0] ?? '';
     const stripRoot =
-      firstRoot.length > 0 &&
-      rawPaths.every(
-        (path) => path === firstRoot || path.startsWith(`${firstRoot}/`),
-      );
+      firstRoot.length > 0 && rawPaths.every((path) => path === firstRoot || path.startsWith(`${firstRoot}/`));
 
     const files = new Map<string, LocalModelFile>();
     for (let i = 0; i < modelFiles.length; i++) {
       const file = modelFiles[i]!;
       const rawPath = rawPaths[i] || file.name;
-      const stripped = stripRoot
-        ? rawPath.split("/").slice(1).join("/") || file.name
-        : rawPath;
+      const stripped = stripRoot ? rawPath.split('/').slice(1).join('/') || file.name : rawPath;
       files.set(stripped, file);
       files.set(rawPath, file);
       if (!files.has(file.name)) files.set(file.name, file);
     }
 
-    const label = stripRoot ? firstRoot : "local model";
+    const label = stripRoot ? firstRoot : 'local model';
     return {
-      kind: "local",
+      kind: 'local',
       files,
       label,
       blobCache: new Map(),
@@ -1347,11 +1142,11 @@ function createModelSource(
     };
   }
 
-  const repoId = hfModel?.repoId ? normalizeHfRepoId(hfModel.repoId) : "";
+  const repoId = hfModel?.repoId ? normalizeHfRepoId(hfModel.repoId) : '';
   if (repoId) {
-    const revision = hfModel?.revision?.trim() || "main";
+    const revision = hfModel?.revision?.trim() || 'main';
     return {
-      kind: "huggingface",
+      kind: 'huggingface',
       repoId,
       revision,
       label: `hf:${repoId}@${revision}`,
@@ -1359,9 +1154,9 @@ function createModelSource(
     };
   }
 
-  const baseUrl = modelUrl.replace(/\/+$/, "");
+  const baseUrl = modelUrl.replace(/\/+$/, '');
   return {
-    kind: "remote",
+    kind: 'remote',
     baseUrl,
     label: modelLabel?.trim() || modelUrl,
     fileCache: new Map(),
@@ -1370,46 +1165,34 @@ function createModelSource(
   };
 }
 
-async function readSourceText(
-  source: ModelSource,
-  path: string,
-  optional = false,
-): Promise<string | undefined> {
+async function readSourceText(source: ModelSource, path: string, optional = false): Promise<string | undefined> {
   const normalizedPath = normalizeModelPath(path);
-  if (source.kind === "local") {
+  if (source.kind === 'local') {
     try {
       return (await readLocalFileBlob(source, normalizedPath)).text();
     } catch (e) {
-      if (optional && e instanceof Error && e.message.includes("is missing")) {
+      if (optional && e instanceof Error && e.message.includes('is missing')) {
         return undefined;
       }
       throw e;
     }
   }
 
-  if (source.kind === "huggingface") {
+  if (source.kind === 'huggingface') {
     const resp = await fetchHfFileResponse(source, normalizedPath, optional);
     if (!resp) return undefined;
     const text = await resp.text();
-    const contentType = resp.headers.get("content-type") ?? "";
-    if (
-      optional &&
-      contentType.includes("text/html") &&
-      text.trimStart().startsWith("<!doctype")
-    ) {
+    const contentType = resp.headers.get('content-type') ?? '';
+    if (optional && contentType.includes('text/html') && text.trimStart().startsWith('<!doctype')) {
       return undefined;
     }
     return text;
   }
 
-  const cachedRemoteBlob = await readRemoteFileBlob(
-    source,
-    normalizedPath,
-    optional,
-  );
+  const cachedRemoteBlob = await readRemoteFileBlob(source, normalizedPath, optional);
   if (cachedRemoteBlob) {
     const text = await cachedRemoteBlob.text();
-    if (text.trimStart().toLowerCase().startsWith("<!doctype")) {
+    if (text.trimStart().toLowerCase().startsWith('<!doctype')) {
       if (optional) return undefined;
       throw new Error(
         `Model source ${source.baseUrl} served the app HTML for ${normalizedPath}; the hosted /model files are not deployed. Choose a local model directory or deploy the model assets separately.`,
@@ -1422,16 +1205,11 @@ async function readSourceText(
   if (optional && resp.status === 204) return undefined;
   if (!resp.ok) {
     if (optional && resp.status === 404) return undefined;
-    throw new Error(
-      `Failed to fetch ${normalizedPath}: HTTP ${resp.status} ${resp.statusText}`,
-    );
+    throw new Error(`Failed to fetch ${normalizedPath}: HTTP ${resp.status} ${resp.statusText}`);
   }
   const text = await resp.text();
-  const contentType = resp.headers.get("content-type") ?? "";
-  if (
-    contentType.includes("text/html") &&
-    text.trimStart().startsWith("<!doctype")
-  ) {
+  const contentType = resp.headers.get('content-type') ?? '';
+  if (contentType.includes('text/html') && text.trimStart().startsWith('<!doctype')) {
     if (optional) return undefined;
     throw new Error(
       `Model source ${source.baseUrl} served the app HTML for ${normalizedPath}; the hosted /model files are not deployed. Choose a local model directory or deploy the model assets separately.`,
@@ -1440,36 +1218,25 @@ async function readSourceText(
   return text;
 }
 
-async function readSourceSlice(
-  source: ModelSource,
-  path: string,
-  start: number,
-  end: number,
-): Promise<Uint8Array> {
+async function readSourceSlice(source: ModelSource, path: string, start: number, end: number): Promise<Uint8Array> {
   const normalizedPath = normalizeModelPath(path);
   if (end < start) {
-    throw new Error(
-      `Invalid byte range for ${normalizedPath}: ${start}-${end}`,
-    );
+    throw new Error(`Invalid byte range for ${normalizedPath}: ${start}-${end}`);
   }
   if (end === start) return new Uint8Array(0);
 
-  if (source.kind === "local") {
+  if (source.kind === 'local') {
     const blob = await readLocalFileBlob(source, normalizedPath);
     if (end > blob.size) {
-      throw new Error(
-        `Local range for ${normalizedPath} exceeds file size: ${end}/${blob.size}`,
-      );
+      throw new Error(`Local range for ${normalizedPath} exceeds file size: ${end}/${blob.size}`);
     }
     return new Uint8Array(await blob.slice(start, end).arrayBuffer());
   }
 
-  if (source.kind === "huggingface") {
+  if (source.kind === 'huggingface') {
     const blob = await readHfFileBlob(source, normalizedPath);
     if (end > blob.size) {
-      throw new Error(
-        `Hugging Face range for ${normalizedPath} exceeds file size: ${end}/${blob.size}`,
-      );
+      throw new Error(`Hugging Face range for ${normalizedPath} exceeds file size: ${end}/${blob.size}`);
     }
     return new Uint8Array(await blob.slice(start, end).arrayBuffer());
   }
@@ -1477,9 +1244,7 @@ async function readSourceSlice(
   const cachedBlob = await readRemoteFileBlob(source, normalizedPath);
   if (cachedBlob) {
     if (end > cachedBlob.size) {
-      throw new Error(
-        `Cached range for ${normalizedPath} exceeds file size: ${end}/${cachedBlob.size}`,
-      );
+      throw new Error(`Cached range for ${normalizedPath} exceeds file size: ${end}/${cachedBlob.size}`);
     }
     return new Uint8Array(await cachedBlob.slice(start, end).arrayBuffer());
   }
@@ -1487,9 +1252,7 @@ async function readSourceSlice(
   const cached = source.fileCache.get(normalizedPath);
   if (cached) {
     if (end > cached.byteLength) {
-      throw new Error(
-        `Cached range for ${normalizedPath} exceeds file size: ${end}/${cached.byteLength}`,
-      );
+      throw new Error(`Cached range for ${normalizedPath} exceeds file size: ${end}/${cached.byteLength}`);
     }
     return cached.subarray(start, end);
   }
@@ -1498,16 +1261,12 @@ async function readSourceSlice(
     headers: { Range: `bytes=${start}-${end - 1}` },
   });
   if (!resp.ok) {
-    throw new Error(
-      `Failed to fetch ${normalizedPath}: HTTP ${resp.status} ${resp.statusText}`,
-    );
+    throw new Error(`Failed to fetch ${normalizedPath}: HTTP ${resp.status} ${resp.statusText}`);
   }
   const bytes = new Uint8Array(await resp.arrayBuffer());
   if (resp.status === 206) {
     if (bytes.byteLength !== end - start) {
-      throw new Error(
-        `Range fetch for ${normalizedPath} returned ${bytes.byteLength} bytes, expected ${end - start}`,
-      );
+      throw new Error(`Range fetch for ${normalizedPath} returned ${bytes.byteLength} bytes, expected ${end - start}`);
     }
     return bytes;
   }
@@ -1527,17 +1286,9 @@ async function readSafeTensorsHeader(
   path: string,
 ): Promise<{ tensors: TensorInfo[]; dataOffset: number }> {
   const prefix = await readSourceSlice(source, path, 0, 8);
-  const headerLen = Number(
-    new DataView(
-      prefix.buffer,
-      prefix.byteOffset,
-      prefix.byteLength,
-    ).getBigUint64(0, true),
-  );
+  const headerLen = Number(new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength).getBigUint64(0, true));
   if (!Number.isSafeInteger(headerLen) || headerLen <= 0) {
-    throw new Error(
-      `Invalid safetensors header length in ${path}: ${headerLen}`,
-    );
+    throw new Error(`Invalid safetensors header length in ${path}: ${headerLen}`);
   }
   const dataOffset = 8 + headerLen;
   const headerBytes = await readSourceSlice(source, path, 8, dataOffset);
@@ -1545,11 +1296,7 @@ async function readSafeTensorsHeader(
 }
 
 async function discoverWeightFiles(source: ModelSource): Promise<string[]> {
-  const indexJson = await readSourceText(
-    source,
-    "model.safetensors.index.json",
-    true,
-  );
+  const indexJson = await readSourceText(source, 'model.safetensors.index.json', true);
   if (indexJson) {
     try {
       const parsed = JSON.parse(indexJson) as {
@@ -1559,43 +1306,43 @@ async function discoverWeightFiles(source: ModelSource): Promise<string[]> {
       if (files.length > 0) return files;
     } catch {
       post({
-        type: "log",
-        message: "[MODEL] Ignoring invalid model.safetensors.index.json",
+        type: 'log',
+        message: '[MODEL] Ignoring invalid model.safetensors.index.json',
       });
     }
   }
 
-  if (source.kind === "local") {
+  if (source.kind === 'local') {
     const files = [...source.files.keys()]
-      .filter((path) => path.endsWith(".safetensors") && !path.includes("/"))
+      .filter((path) => path.endsWith('.safetensors') && !path.includes('/'))
       .filter((path, index, array) => array.indexOf(path) === index)
       .sort((a, b) => {
-        if (a === "model.safetensors") return -1;
-        if (b === "model.safetensors") return 1;
+        if (a === 'model.safetensors') return -1;
+        if (b === 'model.safetensors') return 1;
         return a.localeCompare(b, undefined, { numeric: true });
       });
     if (files.length > 0) return files;
   }
 
-  if (source.kind === "huggingface") {
+  if (source.kind === 'huggingface') {
     try {
       const files = (await listHfRepoFiles(source))
-        .filter((path) => path.endsWith(".safetensors") && !path.includes("/"))
+        .filter((path) => path.endsWith('.safetensors') && !path.includes('/'))
         .sort((a, b) => {
-          if (a === "model.safetensors") return -1;
-          if (b === "model.safetensors") return 1;
+          if (a === 'model.safetensors') return -1;
+          if (b === 'model.safetensors') return 1;
           return a.localeCompare(b, undefined, { numeric: true });
         });
       if (files.length > 0) return files;
     } catch (e) {
       post({
-        type: "log",
+        type: 'log',
         message: `[HF] Could not list repository files; falling back to model.safetensors: ${String(e)}`,
       });
     }
   }
 
-  return ["model.safetensors"];
+  return ['model.safetensors'];
 }
 
 // Phase 0 (?profile=1) state. When enabled, handleChat* wraps each
@@ -1619,19 +1366,16 @@ function formatUnknownError(e: unknown): { message: string; stack?: string } {
     return { message: e.message || String(e), stack: e.stack };
   }
 
-  if (typeof ErrorEvent !== "undefined" && e instanceof ErrorEvent) {
+  if (typeof ErrorEvent !== 'undefined' && e instanceof ErrorEvent) {
     const inner = formatUnknownError(e.error);
-    const location =
-      e.filename || e.lineno || e.colno
-        ? `${e.filename}:${e.lineno}:${e.colno}`
-        : undefined;
+    const location = e.filename || e.lineno || e.colno ? `${e.filename}:${e.lineno}:${e.colno}` : undefined;
     return {
-      message: e.message || inner.message || "Worker error",
+      message: e.message || inner.message || 'Worker error',
       stack: inner.stack || location,
     };
   }
 
-  return { message: typeof e === "string" ? e : String(e) };
+  return { message: typeof e === 'string' ? e : String(e) };
 }
 
 async function handleInit(data: {
@@ -1675,19 +1419,15 @@ async function handleInit(data: {
   const compileGdnG = data.compileGdnG !== false;
   const enableVlm = data.enableVlm !== false;
   const fuseDispatch = data.fuseDispatch !== false;
-  const weightUploadBatchBytes = normalizeWeightUploadBatchBytes(
-    data.weightUploadBatchBytes,
-  );
+  const weightUploadBatchBytes = normalizeWeightUploadBatchBytes(data.weightUploadBatchBytes);
   configuredFusionEnabled = fuseDispatch;
   configuredDispatchBatchEnabled = dispatchBatch;
   try {
     // 1. Spawn gpu-worker (owns GPUDevice, event loop free for GPU callbacks)
-    post({ type: "progress", step: "gpu", message: "Initializing WebGPU..." });
+    post({ type: 'progress', step: 'gpu', message: 'Initializing WebGPU...' });
     const cmdBuffer = new SharedArrayBuffer(CMD_OFFSET.TOTAL);
     const readbackBuffer = new SharedArrayBuffer(READBACK_BUFFER_SIZE);
-    const poolStatsBuffer = profileEnabled
-      ? new SharedArrayBuffer(POOL_STATS_SIZE_BYTES)
-      : undefined;
+    const poolStatsBuffer = profileEnabled ? new SharedArrayBuffer(POOL_STATS_SIZE_BYTES) : undefined;
     nextWorkerBatchIndex = 1;
     // Phase 2: dedicated dispatch-batch SABs — one per worker (main + up to
     // asyncWorkPoolSize child workers). Each worker gets its own SAB so
@@ -1708,9 +1448,7 @@ async function handleInit(data: {
     // one stub were released from another and the release-side metadata
     // lookup came up empty. Sized for ~35 back-to-back Qwen3.5-0.8B
     // decodes; see webgpu-bridge-stub.ts for the capacity calculation.
-    const bufferMetadataBuffer = new SharedArrayBuffer(
-      BUFFER_METADATA_SIZE_BYTES,
-    );
+    const bufferMetadataBuffer = new SharedArrayBuffer(BUFFER_METADATA_SIZE_BYTES);
     // JS-F010: dedicated 1 KiB stats SAB for the gpu-worker's per-opcode
     // RPC histogram. Replaces the old scheme that striped the histogram
     // across the cmd SAB's CALLBACK_BASE / UNIFORM_DATA / reserved regions
@@ -1718,16 +1456,10 @@ async function handleInit(data: {
     // single-slot and a fused dispatch would silently lose its UNIFORM_DATA
     // bytes). Plumbed into both the gpu-worker init message and every
     // createBridgeStub call so main + child workers share the same view.
-    const statsBuffer = profileEnabled
-      ? new SharedArrayBuffer(STATS_BUFFER_SIZE)
-      : undefined;
+    const statsBuffer = profileEnabled ? new SharedArrayBuffer(STATS_BUFFER_SIZE) : undefined;
     const optimizationControlBuffer = new SharedArrayBuffer(12);
     bridgeOptimizationControl = new Int32Array(optimizationControlBuffer);
-    setBridgeOptimizations(
-      configuredFusionEnabled,
-      false,
-      configuredDispatchBatchEnabled,
-    );
+    setBridgeOptimizations(configuredFusionEnabled, false, configuredDispatchBatchEnabled);
     // WASM module requires min 1002 pages (~66 MB). We use 4096 (~268 MB)
     // for headroom during WASM init (thread stacks, emnapi, etc.) and let
     // memory.grow expand as needed — keeps total well under the 2 GB JS
@@ -1741,17 +1473,17 @@ async function handleInit(data: {
     wasmMemory = sharedMemory;
 
     const gpuWorker = new Worker(workerAssetUrl(gpuWorkerUrl), {
-      type: "module",
+      type: 'module',
     });
 
     // Wait for gpu-worker to create GPUDevice and be ready
     const gpuReady = await new Promise<any>((resolve, reject) => {
       gpuWorker.onmessage = (e) => {
-        if (e.data.type === "ready") resolve(e.data);
-        else if (e.data.type === "error") reject(new Error(e.data.message));
+        if (e.data.type === 'ready') resolve(e.data);
+        else if (e.data.type === 'error') reject(new Error(e.data.message));
       };
       gpuWorker.postMessage({
-        type: "init",
+        type: 'init',
         cmdBuffer,
         readbackBuffer,
         wasmMemory: sharedMemory, // Send Memory object, not .buffer — .buffer getter always returns current byteLength after grow()
@@ -1760,16 +1492,16 @@ async function handleInit(data: {
         bufferMetadataBuffer,
       });
     });
-    post({ type: "progress", step: "gpu", message: "WebGPU ready" });
-    gpuWorker.addEventListener("message", (event: MessageEvent) => {
+    post({ type: 'progress', step: 'gpu', message: 'WebGPU ready' });
+    gpuWorker.addEventListener('message', (event: MessageEvent) => {
       const msg = event.data;
-      if (msg?.type === "gpu-error" || msg?.type === "rpc-error") {
-        const context = msg.context ? ` (${msg.context})` : "";
+      if (msg?.type === 'gpu-error' || msg?.type === 'rpc-error') {
+        const context = msg.context ? ` (${msg.context})` : '';
         const detail = `[GPU] ${msg.type}${context}: ${msg.message}`;
-        post({ type: "log", message: detail });
-        if (msg.stack) post({ type: "log", message: msg.stack });
-        if (msg.type === "gpu-error") {
-          post({ type: "error", message: detail });
+        post({ type: 'log', message: detail });
+        if (msg.stack) post({ type: 'log', message: msg.stack });
+        if (msg.type === 'gpu-error') {
+          post({ type: 'error', message: detail });
         }
       }
     });
@@ -1803,25 +1535,25 @@ async function handleInit(data: {
     bridgeRef = bridge;
 
     // 3. Load WASM with bridge stub
-    post({ type: "progress", step: "wasm", message: "Loading WASM module..." });
+    post({ type: 'progress', step: 'wasm', message: 'Loading WASM module...' });
     // Forward lines starting with [MLX-KERNEL] to the main thread so we can
     // verify which matmul kernel variants fire. The WASM stderr lands on
     // the mlx-worker's own devtools target which isn't readable from the
     // main frame console.
     const wasi = new WASI({
-      version: "preview1",
+      version: 'preview1',
       print: function (...args: unknown[]) {
-        const line = args.map(String).join(" ");
-        if (line.includes("[MLX-KERNEL]")) {
-          post({ type: "log", message: line });
+        const line = args.map(String).join(' ');
+        if (line.includes('[MLX-KERNEL]')) {
+          post({ type: 'log', message: line });
         } else {
           console.log(...args);
         }
       },
       printErr: function (...args: unknown[]) {
-        const line = args.map(String).join(" ");
-        if (line.includes("[MLX-KERNEL]")) {
-          post({ type: "log", message: line });
+        const line = args.map(String).join(' ');
+        if (line.includes('[MLX-KERNEL]')) {
+          post({ type: 'log', message: line });
         } else {
           console.error(...args);
         }
@@ -1830,7 +1562,7 @@ async function handleInit(data: {
     const context = getDefaultContext();
     const wasmFile = await fetch(data.wasmUrl).then((r) => r.arrayBuffer());
 
-    const cppExceptionTag = new WebAssembly.Tag({ parameters: ["i32"] });
+    const cppExceptionTag = new WebAssembly.Tag({ parameters: ['i32'] });
     cppTag = cppExceptionTag;
 
     // Task 4's SabSink declares extern "C" fn __wasm_i32_atomic_wait /
@@ -1844,16 +1576,11 @@ async function handleInit(data: {
     const cxxStubs = {
       __cpp_exception: cppExceptionTag,
       _ZN3mlx4core3gpu4initEv: () => {},
-      __wasm_i32_atomic_wait: (
-        ptr: number,
-        expected: number,
-        timeoutNs: bigint,
-      ): number => {
+      __wasm_i32_atomic_wait: (ptr: number, expected: number, timeoutNs: bigint): number => {
         const index = ptr >>> 2;
-        const timeoutMs =
-          timeoutNs === -1n ? Infinity : Number(timeoutNs / 1_000_000n);
+        const timeoutMs = timeoutNs === -1n ? Infinity : Number(timeoutNs / 1_000_000n);
         const result = Atomics.wait(sharedI32, index, expected, timeoutMs);
-        return result === "ok" ? 0 : result === "not-equal" ? 1 : 2;
+        return result === 'ok' ? 0 : result === 'not-equal' ? 1 : 2;
       },
       __wasm_atomic_notify: (ptr: number, count: number): number => {
         return Atomics.notify(sharedI32, ptr >>> 2, count);
@@ -1872,26 +1599,24 @@ async function handleInit(data: {
         // poll_instance() which is a no-op on WASM — the event loop never
         // runs, the callback never fires, infinite loop.
         const w = new Worker(workerAssetUrl(webgpuWorkerUrl), {
-          type: "module",
+          type: 'module',
         });
-        w.addEventListener("message", (event: MessageEvent) => {
+        w.addEventListener('message', (event: MessageEvent) => {
           const msg = event.data;
-          if (msg?.type === "__mlx_child_error") {
+          if (msg?.type === '__mlx_child_error') {
             post({
-              type: "error",
+              type: 'error',
               message: msg.message,
               stack: msg.stack,
             });
           }
         });
-        w.addEventListener("error", (event: ErrorEvent) => {
+        w.addEventListener('error', (event: ErrorEvent) => {
           post({
-            type: "error",
+            type: 'error',
             message: `WASM child worker error: ${event.message}`,
             stack:
-              event.error instanceof Error
-                ? event.error.stack
-                : `${event.filename}:${event.lineno}:${event.colno}`,
+              event.error instanceof Error ? event.error.stack : `${event.filename}:${event.lineno}:${event.colno}`,
           });
         });
         // Child pthreads can outlive the compute-pass lifetime observed by the
@@ -1902,13 +1627,10 @@ async function handleInit(data: {
         // Child pthreads share the optimization-control SAB with the main
         // worker, so text decode keeps the fast bridge path while VLM image
         // prefill can temporarily force immediate bridge calls.
-        const workerDispatchBatch =
-          dispatchBatch && workerBatchIndex < batchBuffers.length;
-        const workerBatchBuffer = workerDispatchBatch
-          ? batchBuffers[workerBatchIndex]
-          : undefined;
+        const workerDispatchBatch = dispatchBatch && workerBatchIndex < batchBuffers.length;
+        const workerBatchBuffer = workerDispatchBatch ? batchBuffers[workerBatchIndex] : undefined;
         w.postMessage({
-          type: "__mlx_rpc_config",
+          type: '__mlx_rpc_config',
           cmdBuffer,
           readbackBuffer,
           poolStatsBuffer,
@@ -1953,7 +1675,7 @@ async function handleInit(data: {
         wasmInst = instance;
         bridge.setInstance(instance);
         for (const name of Object.keys(instance.exports)) {
-          if (name.startsWith("__napi_register__")) {
+          if (name.startsWith('__napi_register__')) {
             (instance.exports[name] as Function)();
           }
         }
@@ -1965,115 +1687,98 @@ async function handleInit(data: {
     // wgpu_buffer() checks this flag on first upload to decide whether an
     // eligible bf16 weight gets flipped into StorageMode::PackedBf16. Toggling
     // after the fact is a no-op for already-uploaded buffers.
-    if (typeof mlxExports.wgpuSetPackedBf16Enabled === "function") {
+    if (typeof mlxExports.wgpuSetPackedBf16Enabled === 'function') {
       mlxExports.wgpuSetPackedBf16Enabled(packBf16);
     }
     // Flip the SDPA fallback kill-switch. When true, the WebGPU backend's
     // fast/tile SDPA kernels are bypassed in favor of the decomposed
     // matmul→softmax→matmul path — used by the demo to A/B the fused
     // kernels against the baseline without a rebuild.
-    if (typeof mlxExports.wgpuSetSdpaFallbackForced === "function") {
+    if (typeof mlxExports.wgpuSetSdpaFallbackForced === 'function') {
       mlxExports.wgpuSetSdpaFallbackForced(sdpaFallback);
     }
     // Phase 6b SwiGLU MLP compile fast path. The setter flips a process-wide
     // std::atomic<bool> in mlx_fused_ops.cpp so the next call to
     // mlx_swiglu_mlp_forward routes the element-wise tail through
     // mlx::core::compile. Default ON; disable via ?compile_mlp=0.
-    if (typeof mlxExports.wgpuSetSwigluCompileEnabled === "function") {
+    if (typeof mlxExports.wgpuSetSwigluCompileEnabled === 'function') {
       mlxExports.wgpuSetSwigluCompileEnabled(compileMlp);
     }
     // Phase 6c GDN pre-recurrence compile fast path. Same pattern as Phase
     // 6b — process-wide atomic flag, flipped before any model forward pass
     // runs. Default ON; disable via ?compile_gdn_pre=0.
-    if (typeof mlxExports.wgpuSetGdnPreCompileEnabled === "function") {
+    if (typeof mlxExports.wgpuSetGdnPreCompileEnabled === 'function') {
       mlxExports.wgpuSetGdnPreCompileEnabled(compileGdnPre);
     }
     // Phase 6d GDN post-recurrence compile fast path. Same pattern as
     // Phase 6b/6c — process-wide atomic flag, flipped before any forward
     // pass runs. Default ON; disable via ?compile_gdn_post=0.
-    if (typeof mlxExports.wgpuSetGdnPostCompileEnabled === "function") {
+    if (typeof mlxExports.wgpuSetGdnPostCompileEnabled === 'function') {
       mlxExports.wgpuSetGdnPostCompileEnabled(compileGdnPost);
     }
     // Phase 6e GDN decay-gate (compute_g) compile fast path. Same pattern
     // as 6b/6c/6d — process-wide atomic flag, flipped before any forward
     // pass runs. Default ON; disable via ?compile_gdn_g=0.
-    if (typeof mlxExports.wgpuSetGdnGCompileEnabled === "function") {
+    if (typeof mlxExports.wgpuSetGdnGCompileEnabled === 'function') {
       mlxExports.wgpuSetGdnGCompileEnabled(compileGdnG);
     }
     const flagSuffix =
-      (packBf16 ? " pack_bf16=1" : "") +
-      (sdpaFallback ? " sdpa_fallback=1" : "") +
-      (compileMlp ? " compile_mlp=1" : "") +
-      (compileGdnPre ? " compile_gdn_pre=1" : "") +
-      (compileGdnPost ? " compile_gdn_post=1" : "") +
-      (compileGdnG ? " compile_gdn_g=1" : "") +
+      (packBf16 ? ' pack_bf16=1' : '') +
+      (sdpaFallback ? ' sdpa_fallback=1' : '') +
+      (compileMlp ? ' compile_mlp=1' : '') +
+      (compileGdnPre ? ' compile_gdn_pre=1' : '') +
+      (compileGdnPost ? ' compile_gdn_post=1' : '') +
+      (compileGdnG ? ' compile_gdn_g=1' : '') +
       ` weight_upload_batch=${Math.round(weightUploadBatchBytes / 1024 / 1024)}MB` +
-      (fuseDispatch ? "" : " fuse_dispatch=0");
+      (fuseDispatch ? '' : ' fuse_dispatch=0');
     post({
-      type: "progress",
-      step: "wasm",
-      message: `WASM loaded${flagSuffix ? " (" + flagSuffix.trim() + ")" : ""}`,
+      type: 'progress',
+      step: 'wasm',
+      message: `WASM loaded${flagSuffix ? ' (' + flagSuffix.trim() + ')' : ''}`,
     });
 
     // 3. Load model files. The source can be either /model over HTTP or a
     // directory selected by the user in the browser. We process safetensors
     // one shard at a time so large local checkpoints never need one giant JS
     // ArrayBuffer.
-    const modelSource = createModelSource(
-      data.modelUrl,
-      data.modelFiles,
-      data.hfModel,
-      data.modelLabel,
-    );
+    const modelSource = createModelSource(data.modelUrl, data.modelFiles, data.hfModel, data.modelLabel);
     post({
-      type: "progress",
-      step: "model",
+      type: 'progress',
+      step: 'model',
       message: `Loading config from ${modelSource.label}...`,
     });
-    const configJson = await readSourceText(modelSource, "config.json");
-    if (!configJson) throw new Error("config.json is empty");
+    const configJson = await readSourceText(modelSource, 'config.json');
+    if (!configJson) throw new Error('config.json is empty');
     const config = JSON.parse(configJson) as {
       model_type?: string;
       text_config?: { model_type?: string };
     };
-    const modelType = String(
-      config.model_type ?? config.text_config?.model_type ?? "",
-    );
+    const modelType = String(config.model_type ?? config.text_config?.model_type ?? '');
     const modelLabel = formatModelLabel(modelSource, config);
 
-    post({ type: "progress", step: "model", message: "Loading tokenizer..." });
-    const tokenizerJson = await readSourceText(modelSource, "tokenizer.json");
-    if (!tokenizerJson) throw new Error("tokenizer.json is empty");
-    const tokenizerConfigJson = await readSourceText(
-      modelSource,
-      "tokenizer_config.json",
-      true,
-    );
-    const generationConfigJson = await readSourceText(
-      modelSource,
-      "generation_config.json",
-      true,
-    );
-    modelGenerationDefaults = generationConfigJson
-      ? normalizeGenerationConfig(JSON.parse(generationConfigJson))
-      : {};
+    post({ type: 'progress', step: 'model', message: 'Loading tokenizer...' });
+    const tokenizerJson = await readSourceText(modelSource, 'tokenizer.json');
+    if (!tokenizerJson) throw new Error('tokenizer.json is empty');
+    const tokenizerConfigJson = await readSourceText(modelSource, 'tokenizer_config.json', true);
+    const generationConfigJson = await readSourceText(modelSource, 'generation_config.json', true);
+    modelGenerationDefaults = generationConfigJson ? normalizeGenerationConfig(JSON.parse(generationConfigJson)) : {};
     if (Object.keys(modelGenerationDefaults).length > 0) {
       post({
-        type: "log",
+        type: 'log',
         message: `[MODEL] generation defaults ${JSON.stringify(modelGenerationDefaults)}`,
       });
     }
 
     let processorConfigJson: string | undefined;
-    for (const file of ["preprocessor_config.json", "processor_config.json"]) {
+    for (const file of ['preprocessor_config.json', 'processor_config.json']) {
       processorConfigJson = await readSourceText(modelSource, file, true);
       if (processorConfigJson) break;
     }
 
     const weightFiles = await discoverWeightFiles(modelSource);
     post({
-      type: "log",
-      message: `[MODEL] ${modelSource.label}: model_type=${modelType || "unknown"}, safetensors=${weightFiles.length}`,
+      type: 'log',
+      message: `[MODEL] ${modelSource.label}: model_type=${modelType || 'unknown'}, safetensors=${weightFiles.length}`,
     });
 
     // 4. Parse safetensors and build the model. Prefer the GPU-buffer path:
@@ -2085,24 +1790,19 @@ async function handleInit(data: {
 
     const DenseModel = mlxExports.Qwen35Model || mlxExports.Qwen3_5Model;
     const MoeModel = mlxExports.Qwen35MoeModel || mlxExports.Qwen3_5MoeModel;
-    const Qwen35Model = modelType.includes("moe") ? MoeModel : DenseModel;
+    const Qwen35Model = modelType.includes('moe') ? MoeModel : DenseModel;
     if (!Qwen35Model) {
-      throw new Error(
-        `No WASM model class exported for model_type=${modelType}`,
-      );
+      throw new Error(`No WASM model class exported for model_type=${modelType}`);
     }
-    if (typeof Qwen35Model.loadFromGpuBuffers !== "function") {
-      throw new Error(
-        `${modelType || "Qwen3.5"} does not export loadFromGpuBuffers in this WASM build`,
-      );
+    if (typeof Qwen35Model.loadFromGpuBuffers !== 'function') {
+      throw new Error(`${modelType || 'Qwen3.5'} does not export loadFromGpuBuffers in this WASM build`);
     }
 
     const uploadPackedBf16 = packBf16 && PACKED_GPU_WEIGHT_UPLOAD_ENABLED;
     if (packBf16 && !uploadPackedBf16) {
       post({
-        type: "log",
-        message:
-          "[GPU] Packed bf16 GPU-buffer upload disabled for correctness; using f32-expanded weights",
+        type: 'log',
+        message: '[GPU] Packed bf16 GPU-buffer upload disabled for correctness; using f32-expanded weights',
       });
     }
 
@@ -2117,44 +1817,37 @@ async function handleInit(data: {
     for (let shardIndex = 0; shardIndex < weightFiles.length; shardIndex++) {
       const weightFile = weightFiles[shardIndex]!;
       post({
-        type: "progress",
-        step: "download",
+        type: 'progress',
+        step: 'download',
         message: `Loading weights ${shardIndex + 1}/${weightFiles.length}: ${weightFile}`,
       });
       post({
-        type: "progress",
-        step: "init_model",
+        type: 'progress',
+        step: 'init_model',
         message: `Parsing ${weightFile}...`,
       });
-      const { tensors, dataOffset } = await readSafeTensorsHeader(
-        modelSource,
-        weightFile,
-      );
+      const { tensors, dataOffset } = await readSafeTensorsHeader(modelSource, weightFile);
       totalTensorCount += tensors.length;
-      const visionTensorCount = tensors.filter((tensor) =>
-        isVisionTensorName(tensor.name),
-      ).length;
+      const visionTensorCount = tensors.filter((tensor) => isVisionTensorName(tensor.name)).length;
       totalVisionTensorCount += visionTensorCount;
-      const tensorsForModel = enableVlm
-        ? tensors
-        : tensors.filter((tensor) => !isVisionTensorName(tensor.name));
+      const tensorsForModel = enableVlm ? tensors : tensors.filter((tensor) => !isVisionTensorName(tensor.name));
 
       const prepared = planMergedLinearAttentionTensors(tensorsForModel);
       totalMergedCount += prepared.mergedCount;
       const uploadItems: UploadItem[] = [
         ...prepared.tensors.map((tensor) => ({
-          kind: "tensor" as const,
+          kind: 'tensor' as const,
           tensor,
         })),
         ...prepared.mergePlans.map((plan) => ({
-          kind: "merge" as const,
+          kind: 'merge' as const,
           plan,
         })),
       ];
       post({
-        type: "progress",
-        step: "init_model",
-        message: `Uploading ${weightFile}: ${uploadItems.length} GPU tensors${prepared.mergedCount ? ` (${prepared.mergedCount} merged)` : ""}...`,
+        type: 'progress',
+        step: 'init_model',
+        message: `Uploading ${weightFile}: ${uploadItems.length} GPU tensors${prepared.mergedCount ? ` (${prepared.mergedCount} merged)` : ''}...`,
       });
 
       const uploadDebug = await uploadPreparedWeightItems(
@@ -2171,9 +1864,7 @@ async function handleInit(data: {
             gpuTensors.push({
               name: tensor.name,
               handle: uploaded.handles[i]!,
-              dtypeCode: dtypeToCode(
-                uploaded.uploadedDtypes[i] ?? tensor.dtype,
-              ),
+              dtypeCode: dtypeToCode(uploaded.uploadedDtypes[i] ?? tensor.dtype),
               shape: tensor.shape,
               byteSize: uploaded.uploadedByteSizes[i] ?? tensor.byteSize,
               packedBf16: uploaded.packedBf16Flags[i] === true,
@@ -2188,15 +1879,15 @@ async function handleInit(data: {
 
     modelSupportsImages = enableVlm && totalVisionTensorCount > 0;
     post({
-      type: "log",
+      type: 'log',
       message: modelSupportsImages
         ? `[MODEL] Vision input enabled (${totalVisionTensorCount} vision tensors)`
         : totalVisionTensorCount > 0
           ? `[MODEL] Vision tensors present (${totalVisionTensorCount}) but VLM input is disabled by ?disable_vlm=1`
-          : "[MODEL] Vision input unavailable for this model",
+          : '[MODEL] Vision input unavailable for this model',
     });
     post({
-      type: "log",
+      type: 'log',
       message:
         `[GPU] Uploaded ${totalUploadedCount}/${totalTensorCount} tensors` +
         ` merged=${totalMergedCount}` +
@@ -2205,9 +1896,9 @@ async function handleInit(data: {
     });
 
     post({
-      type: "progress",
-      step: "init_model",
-      message: "Building model from GPU buffers...",
+      type: 'progress',
+      step: 'init_model',
+      message: 'Building model from GPU buffers...',
     });
     const t1 = performance.now();
     model = await Qwen35Model.loadFromGpuBuffers(
@@ -2218,8 +1909,8 @@ async function handleInit(data: {
       processorConfigJson ?? null,
     );
     post({
-      type: "progress",
-      step: "init_model",
+      type: 'progress',
+      step: 'init_model',
       message: `Model ready (${(performance.now() - t1).toFixed(0)}ms)`,
     });
 
@@ -2229,31 +1920,30 @@ async function handleInit(data: {
     // the first real image request warm the VLM path instead.
     if (modelSupportsImages) {
       post({
-        type: "log",
-        message: "[WARMUP] skipped for VLM-capable model",
+        type: 'log',
+        message: '[WARMUP] skipped for VLM-capable model',
       });
-      post({ type: "progress", step: "warmup", message: "Warmup skipped" });
-    } else if (typeof model.chat === "function") {
-      post({ type: "progress", step: "warmup", message: "Warming up..." });
-      const warmupResult = await model.chat([{ role: "user", content: "hi" }], {
+      post({ type: 'progress', step: 'warmup', message: 'Warmup skipped' });
+    } else if (typeof model.chat === 'function') {
+      post({ type: 'progress', step: 'warmup', message: 'Warming up...' });
+      const warmupResult = await model.chat([{ role: 'user', content: 'hi' }], {
         maxNewTokens: 2,
         temperature: 0,
-        reasoningEffort: "none",
+        reasoningEffort: 'none',
         includeReasoning: false,
         reuseCache: false,
       });
       post({
-        type: "log",
+        type: 'log',
         message: `[WARMUP] rawText=${warmupResult.rawText} text=${warmupResult.text} finish=${warmupResult.finishReason}`,
       });
-      post({ type: "progress", step: "warmup", message: "Warmup complete" });
+      post({ type: 'progress', step: 'warmup', message: 'Warmup complete' });
     } else {
       post({
-        type: "log",
-        message:
-          "[WARMUP] skipped because chat() is not exported by this WASM build",
+        type: 'log',
+        message: '[WARMUP] skipped because chat() is not exported by this WASM build',
       });
-      post({ type: "progress", step: "warmup", message: "Warmup skipped" });
+      post({ type: 'progress', step: 'warmup', message: 'Warmup skipped' });
     }
 
     // Ship the shared WASM memory to the main thread so it can mount the
@@ -2268,14 +1958,14 @@ async function handleInit(data: {
     // actually run its microtask until chatStreamSab returns. The main
     // thread is never blocked during decode, so the reader drains live.
     post({
-      type: "ready",
+      type: 'ready',
       sharedMemory,
       supportsImages: modelSupportsImages,
       modelLabel,
     });
   } catch (e) {
     post({
-      type: "error",
+      type: 'error',
       message: String(e),
       stack: e instanceof Error ? e.stack : undefined,
     });
@@ -2293,20 +1983,20 @@ function resetProfileCounters(): void {
   try {
     bridgeRef?.resetBridgeStats();
   } catch (e) {
-    console.warn("[mlx-worker] resetBridgeStats failed:", e);
+    console.warn('[mlx-worker] resetBridgeStats failed:', e);
   }
   try {
-    if (mlxExports && typeof mlxExports.wgpuResetDispatchStats === "function") {
+    if (mlxExports && typeof mlxExports.wgpuResetDispatchStats === 'function') {
       mlxExports.wgpuResetDispatchStats();
     }
   } catch (e) {
-    console.warn("[mlx-worker] wgpuResetDispatchStats failed:", e);
+    console.warn('[mlx-worker] wgpuResetDispatchStats failed:', e);
   }
   try {
     // Zero the gpu-worker histogram too (reset=1 on the RPC).
     bridgeRef?.fetchGpuWorkerStats(true);
   } catch (e) {
-    console.warn("[mlx-worker] fetchGpuWorkerStats(reset=true) failed:", e);
+    console.warn('[mlx-worker] fetchGpuWorkerStats(reset=true) failed:', e);
   }
 }
 
@@ -2344,13 +2034,13 @@ function postProfileSnapshot(numTokens: number): void {
     };
     let totalDispatches = 0;
     let totalPassEnds = 0;
-    if (mlxExports && typeof mlxExports.wgpuGetDispatchStats === "function") {
+    if (mlxExports && typeof mlxExports.wgpuGetDispatchStats === 'function') {
       const arr = mlxExports.wgpuGetDispatchStats() as number[];
       totalDispatches = arr[0] ?? 0;
       totalPassEnds = arr[1] ?? 0;
     }
     post({
-      type: "profile",
+      type: 'profile',
       stats: {
         numTokens,
         totalDispatches,
@@ -2371,19 +2061,15 @@ function postProfileSnapshot(numTokens: number): void {
         poolHits: bridgeStats.poolHits,
         poolMisses: bridgeStats.poolMisses,
         diagCreateAll: (bridgeStats as any).diagCreateAll ?? 0,
-        diagCreateMappedCopyDst:
-          (bridgeStats as any).diagCreateMappedCopyDst ?? 0,
-        diagCreateMappedNoCopyDst:
-          (bridgeStats as any).diagCreateMappedNoCopyDst ?? 0,
+        diagCreateMappedCopyDst: (bridgeStats as any).diagCreateMappedCopyDst ?? 0,
+        diagCreateMappedNoCopyDst: (bridgeStats as any).diagCreateMappedNoCopyDst ?? 0,
         diagReleaseAll: (bridgeStats as any).diagReleaseAll ?? 0,
-        diagReleaseUnknownHandle:
-          (bridgeStats as any).diagReleaseUnknownHandle ?? 0,
+        diagReleaseUnknownHandle: (bridgeStats as any).diagReleaseUnknownHandle ?? 0,
         diagReleaseUnpoolable: (bridgeStats as any).diagReleaseUnpoolable ?? 0,
         diagPoolEvictions: (bridgeStats as any).diagPoolEvictions ?? 0,
         diagBatchAttempt: (bridgeStats as any).diagBatchAttempt ?? 0,
         diagBatchStaged: (bridgeStats as any).diagBatchStaged ?? 0,
-        diagBatchDeferredBlock:
-          (bridgeStats as any).diagBatchDeferredBlock ?? 0,
+        diagBatchDeferredBlock: (bridgeStats as any).diagBatchDeferredBlock ?? 0,
         diagBatchStageRefused: (bridgeStats as any).diagBatchStageRefused ?? 0,
         // JS-F008: RPCs dropped because the bridge was poisoned by an
         // earlier BUFFER_RELEASE_BATCH F&F drain timeout. Non-zero here
@@ -2392,7 +2078,7 @@ function postProfileSnapshot(numTokens: number): void {
       },
     });
   } catch (e) {
-    console.warn("[mlx-worker] postProfileSnapshot failed:", e);
+    console.warn('[mlx-worker] postProfileSnapshot failed:', e);
   }
 }
 
@@ -2406,25 +2092,25 @@ async function handleChat(data: {
   messages: any[];
   config?: any;
   useSab?: boolean;
-  mode?: "sab" | "tsfn" | "baseline";
+  mode?: 'sab' | 'tsfn' | 'baseline';
   enableThinking?: boolean;
   reasoningEffort?: ReasoningEffort;
 }) {
   if (!wasmMemory || !wasmMalloc || !wasmFree) {
     post({
-      type: "error",
-      message: "handleChat called before WASM init complete",
+      type: 'error',
+      message: 'handleChat called before WASM init complete',
     });
     return;
   }
   if (rejectUnsupportedImages(data.messages)) return;
-  const mode = data.mode ?? (data.useSab === false ? "tsfn" : "sab");
+  const mode = data.mode ?? (data.useSab === false ? 'tsfn' : 'sab');
 
-  if (mode === "tsfn") {
+  if (mode === 'tsfn') {
     await handleChatTsfn(data);
     return;
   }
-  if (mode === "baseline") {
+  if (mode === 'baseline') {
     await handleChatBaseline(data);
     return;
   }
@@ -2440,7 +2126,7 @@ async function handleChat(data: {
   const ringOffset = mallocFn(SAB_RING_SIZE);
   if (ringOffset === 0) {
     post({
-      type: "error",
+      type: 'error',
       message: `Failed to malloc ${SAB_RING_SIZE} bytes for SAB ring`,
     });
     return;
@@ -2486,17 +2172,13 @@ async function handleChat(data: {
     // SabSink writes them. Main thread NEVER blocks during WASM decode (this
     // worker does), so its Atomics.waitAsync microtasks run immediately and
     // tokens render live. See the 'stream-finalize' handler below.
-    post({ type: "stream-sab-open", ringOffset, size: SAB_RING_SIZE });
+    post({ type: 'stream-sab-open', ringOffset, size: SAB_RING_SIZE });
 
     await withBridgeModeForMessages(data.messages, async () => {
       // chatStreamSab writes directly into the heap-backed ring — no TSFN on the
       // hot decode path. It returns a handle once the stream is running and
       // resolves when the producer has written the done record.
-      const handle = await model.chatStreamSab(
-        data.messages,
-        chatConfig,
-        sabBuf,
-      );
+      const handle = await model.chatStreamSab(data.messages, chatConfig, sabBuf);
       void handle;
 
       // Wait for the main-thread reader to drain the done-chunk and send us
@@ -2506,8 +2188,8 @@ async function handleChat(data: {
       const numTokens = await finalizePromise;
       const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
       post({
-        type: "progress",
-        step: "chat",
+        type: 'progress',
+        step: 'chat',
         message: `chatStream completed in ${elapsed}s`,
       });
       postProfileSnapshot(numTokens);
@@ -2519,7 +2201,7 @@ async function handleChat(data: {
       message = e.message;
       stack = e.stack;
     }
-    post({ type: "error", message, stack });
+    post({ type: 'error', message, stack });
   } finally {
     streamFinalizeResolve = null;
     freeRing();
@@ -2537,18 +2219,16 @@ async function handleChatBaseline(data: {
     const chatConfig = buildChatConfig(data);
     resetProfileCounters();
     const t0 = performance.now();
-    const result = await withBridgeModeForMessages(data.messages, () =>
-      model.chat(data.messages, chatConfig),
-    );
+    const result = await withBridgeModeForMessages(data.messages, () => model.chat(data.messages, chatConfig));
     const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
     post({
-      type: "progress",
-      step: "chat",
+      type: 'progress',
+      step: 'chat',
       message: `chat (non-stream) completed in ${elapsed}s`,
     });
     postProfileSnapshot(result.numTokens ?? 0);
     post({
-      type: "result",
+      type: 'result',
       text: result.text,
       rawText: result.rawText,
       numTokens: result.numTokens,
@@ -2570,7 +2250,7 @@ async function handleChatBaseline(data: {
       message = e.message;
       stack = e.stack;
     }
-    post({ type: "error", message, stack });
+    post({ type: 'error', message, stack });
   }
 }
 
@@ -2590,51 +2270,45 @@ async function handleChatTsfn(data: {
       doneResolve = r;
     });
     await withBridgeModeForMessages(data.messages, async () => {
-      const handle = await model.chatStream(
-        data.messages,
-        chatConfig,
-        (err: Error | null, chunk: any) => {
-          if (err) {
-            post({ type: "error", message: err.message, stack: err.stack });
-            doneResolve?.();
-            return;
-          }
-          if (chunk.done) {
-            const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-            post({
-              type: "progress",
-              step: "chat",
-              message: `chatStream completed in ${elapsed}s`,
-            });
-            postProfileSnapshot(chunk.numTokens ?? 0);
-            post({
-              type: "result",
-              text: chunk.text,
-              rawText: chunk.rawText,
-              numTokens: chunk.numTokens,
-              finishReason: chunk.finishReason,
-              toolCalls: chunk.toolCalls,
-              thinking: chunk.thinking,
-              performance: chunk.performance
-                ? {
-                    ttftMs: chunk.performance.ttftMs,
-                    prefillTokensPerSecond:
-                      chunk.performance.prefillTokensPerSecond,
-                    decodeTokensPerSecond:
-                      chunk.performance.decodeTokensPerSecond,
-                  }
-                : null,
-            });
-            doneResolve?.();
-          } else {
-            post({
-              type: "chunk",
-              text: chunk.text,
-              isReasoning: chunk.isReasoning ?? false,
-            });
-          }
-        },
-      );
+      const handle = await model.chatStream(data.messages, chatConfig, (err: Error | null, chunk: any) => {
+        if (err) {
+          post({ type: 'error', message: err.message, stack: err.stack });
+          doneResolve?.();
+          return;
+        }
+        if (chunk.done) {
+          const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+          post({
+            type: 'progress',
+            step: 'chat',
+            message: `chatStream completed in ${elapsed}s`,
+          });
+          postProfileSnapshot(chunk.numTokens ?? 0);
+          post({
+            type: 'result',
+            text: chunk.text,
+            rawText: chunk.rawText,
+            numTokens: chunk.numTokens,
+            finishReason: chunk.finishReason,
+            toolCalls: chunk.toolCalls,
+            thinking: chunk.thinking,
+            performance: chunk.performance
+              ? {
+                  ttftMs: chunk.performance.ttftMs,
+                  prefillTokensPerSecond: chunk.performance.prefillTokensPerSecond,
+                  decodeTokensPerSecond: chunk.performance.decodeTokensPerSecond,
+                }
+              : null,
+          });
+          doneResolve?.();
+        } else {
+          post({
+            type: 'chunk',
+            text: chunk.text,
+            isReasoning: chunk.isReasoning ?? false,
+          });
+        }
+      });
       void handle;
       await doneP;
     });
@@ -2645,7 +2319,7 @@ async function handleChatTsfn(data: {
       message = e.message;
       stack = e.stack;
     }
-    post({ type: "error", message, stack });
+    post({ type: 'error', message, stack });
   }
 }
 
@@ -2662,13 +2336,14 @@ async function handleRunForInspector(data: {
   logits?: { topK: number };
   hiddenStates?: { layers?: number[]; points?: string[] };
   maxNewTokens?: number;
+  applyChatTemplate?: boolean;
 }) {
   const id = data.id;
-  if (!model || typeof model.runForInspector !== "function") {
+  if (!model || typeof model.runForInspector !== 'function') {
     (self as any).postMessage({
       type: INSPECTOR_ERROR_TYPE,
       id,
-      error: "Model not loaded",
+      error: 'Model not loaded',
     });
     return;
   }
@@ -2679,13 +2354,14 @@ async function handleRunForInspector(data: {
       logits?: { topK: number };
       hiddenStates?: { layers?: number[]; points?: string[] };
       maxNewTokens?: number;
+      applyChatTemplate?: boolean;
     } = {};
     if (data.attention !== undefined) opts.attention = data.attention;
-    if (data.attentionLayers !== undefined)
-      opts.attentionLayers = data.attentionLayers;
+    if (data.attentionLayers !== undefined) opts.attentionLayers = data.attentionLayers;
     if (data.logits !== undefined) opts.logits = data.logits;
     if (data.hiddenStates !== undefined) opts.hiddenStates = data.hiddenStates;
     if (data.maxNewTokens !== undefined) opts.maxNewTokens = data.maxNewTokens;
+    if (data.applyChatTemplate !== undefined) opts.applyChatTemplate = data.applyChatTemplate;
 
     const result = await model.runForInspector(data.prompt, opts);
 
@@ -2696,12 +2372,7 @@ async function handleRunForInspector(data: {
     const layers = Array.isArray(result?.attention) ? result.attention : [];
     for (const layer of layers) {
       const scores = layer?.scores;
-      if (
-        scores &&
-        typeof scores === "object" &&
-        scores.buffer instanceof ArrayBuffer &&
-        !seen.has(scores.buffer)
-      ) {
+      if (scores && typeof scores === 'object' && scores.buffer instanceof ArrayBuffer && !seen.has(scores.buffer)) {
         seen.add(scores.buffer);
         transfer.push(scores.buffer);
       }
@@ -2709,20 +2380,12 @@ async function handleRunForInspector(data: {
     const logitsSteps = Array.isArray(result?.logits) ? result.logits : [];
     for (const step of logitsSteps) {
       const buf = step?.topKLogits;
-      if (
-        buf &&
-        typeof buf === "object" &&
-        buf.buffer instanceof ArrayBuffer &&
-        !seen.has(buf.buffer)
-      ) {
+      if (buf && typeof buf === 'object' && buf.buffer instanceof ArrayBuffer && !seen.has(buf.buffer)) {
         seen.add(buf.buffer);
         transfer.push(buf.buffer);
       }
     }
-    (self as any).postMessage(
-      { type: INSPECTOR_RESULT_TYPE, id, result },
-      transfer,
-    );
+    (self as any).postMessage({ type: INSPECTOR_RESULT_TYPE, id, result }, transfer);
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     (self as any).postMessage({
@@ -2742,15 +2405,11 @@ async function handleRunForInspector(data: {
 // the lesson needs. The generated token is dropped on this surface.
 async function handleTokenize(data: { id: string; prompt: string }) {
   const id = data.id;
-  if (
-    !model ||
-    typeof model.encodeTokens !== "function" ||
-    typeof model.decodeTokens !== "function"
-  ) {
+  if (!model || typeof model.encodeTokens !== 'function' || typeof model.decodeTokens !== 'function') {
     (self as any).postMessage({
       type: TOKENIZE_ERROR_TYPE,
       id,
-      error: "Model not loaded",
+      error: 'Model not loaded',
     });
     return;
   }
@@ -2759,7 +2418,7 @@ async function handleTokenize(data: { id: string; prompt: string }) {
     const texts = ids.length > 0 ? await model.decodeTokens(ids) : [];
     const tokens = ids.map((tokenId, i) => ({
       id: tokenId,
-      text: texts[i] ?? "",
+      text: texts[i] ?? '',
     }));
     (self as any).postMessage({
       type: TOKENIZE_RESULT_TYPE,
@@ -2782,11 +2441,11 @@ async function handleTokenize(data: { id: string; prompt: string }) {
 // frontend runs PCA on the result in JS and renders the scatter.
 async function handleEmbed(data: { id: string; tokenIds: number[] }) {
   const id = data.id;
-  if (!model || typeof model.embedTokens !== "function") {
+  if (!model || typeof model.embedTokens !== 'function') {
     (self as any).postMessage({
       type: EMBED_ERROR_TYPE,
       id,
-      error: "Model not loaded",
+      error: 'Model not loaded',
     });
     return;
   }
@@ -2796,7 +2455,7 @@ async function handleEmbed(data: { id: string; tokenIds: number[] }) {
       (self as any).postMessage({
         type: EMBED_ERROR_TYPE,
         id,
-        error: "embed: empty tokenIds",
+        error: 'embed: empty tokenIds',
       });
       return;
     }
@@ -2804,11 +2463,7 @@ async function handleEmbed(data: { id: string; tokenIds: number[] }) {
     const embeddings: Float32Array = result?.embeddings;
     const hiddenDim: number = result?.hiddenDim ?? 0;
     const transfer: ArrayBuffer[] = [];
-    if (
-      embeddings &&
-      typeof embeddings === "object" &&
-      embeddings.buffer instanceof ArrayBuffer
-    ) {
+    if (embeddings && typeof embeddings === 'object' && embeddings.buffer instanceof ArrayBuffer) {
       transfer.push(embeddings.buffer);
     }
     (self as any).postMessage(
@@ -2831,26 +2486,24 @@ async function handleEmbed(data: { id: string; tokenIds: number[] }) {
 }
 
 // Catch unhandled errors/rejections on this worker
-self.addEventListener("error", (e) => {
+self.addEventListener('error', (e) => {
   e.preventDefault();
   const details = formatUnknownError((e as ErrorEvent).error ?? e);
   const location =
-    (e as ErrorEvent).filename ||
-    (e as ErrorEvent).lineno ||
-    (e as ErrorEvent).colno
+    (e as ErrorEvent).filename || (e as ErrorEvent).lineno || (e as ErrorEvent).colno
       ? `${(e as ErrorEvent).filename}:${(e as ErrorEvent).lineno}:${(e as ErrorEvent).colno}`
       : undefined;
   post({
-    type: "error",
+    type: 'error',
     message: `Worker error: ${(e as ErrorEvent).message || details.message}`,
     stack: details.stack || location,
   });
 });
-self.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
+self.addEventListener('unhandledrejection', (e: PromiseRejectionEvent) => {
   e.preventDefault();
   const details = formatUnknownError(e.reason);
   post({
-    type: "error",
+    type: 'error',
     message: `Unhandled rejection: ${details.message}`,
     stack: details.stack,
   });
@@ -2858,13 +2511,13 @@ self.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
 
 self.onmessage = (e: MessageEvent) => {
   switch (e.data.type) {
-    case "init":
+    case 'init':
       handleInit(e.data);
       break;
-    case "chat":
+    case 'chat':
       handleChat(e.data);
       break;
-    case "stream-finalize":
+    case 'stream-finalize':
       // Main-thread SAB reader saw the done-chunk and is handing us the
       // token count so we can emit the profile snapshot with correct
       // ratios before freeing the ring. See handleChat above.

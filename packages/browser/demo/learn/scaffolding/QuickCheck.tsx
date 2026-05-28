@@ -1,7 +1,7 @@
-import * as React from "react";
+import * as React from 'react';
 
-import { Card, CardContent, CardHeader, CardTitle } from "../../components/ui/card";
-import type { QuizQuestion } from "./learning-data";
+import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/card';
+import type { QuizQuestion } from './learning-data';
 
 export type QuickCheckProps = {
   chapterId: string;
@@ -15,21 +15,18 @@ function storageKey(chapterId: string): string {
   return `mlx:chapter:${chapterId}:quiz`;
 }
 
-function loadAnswers(
-  chapterId: string,
-  questions: QuizQuestion[],
-): AnswerMap {
+function loadAnswers(chapterId: string, questions: QuizQuestion[]): AnswerMap {
   // Defensive: SSR, privacy mode, JSON corruption all return {}.
   // Also drop any persisted question/option ids that no longer exist —
   // otherwise a content edit (new question, renamed option id) can leave
   // a "ghost answered" state where the explanation shows but no radio is
   // checked, and the question is counted wrong in the score header.
   try {
-    if (typeof window === "undefined" || !window.localStorage) return {};
+    if (typeof window === 'undefined' || !window.localStorage) return {};
     const raw = window.localStorage.getItem(storageKey(chapterId));
     if (!raw) return {};
     const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return {};
     }
     // Build (questionId -> Set<optionId>) once so the loop below is O(n+m).
@@ -39,7 +36,7 @@ function loadAnswers(
     }
     const out: AnswerMap = {};
     for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if (typeof v !== "string") continue;
+      if (typeof v !== 'string') continue;
       const valid = validOptionsByQ.get(k);
       if (valid && valid.has(v)) out[k] = v;
     }
@@ -51,7 +48,7 @@ function loadAnswers(
 
 function saveAnswers(chapterId: string, answers: AnswerMap): void {
   try {
-    if (typeof window === "undefined" || !window.localStorage) return;
+    if (typeof window === 'undefined' || !window.localStorage) return;
     window.localStorage.setItem(storageKey(chapterId), JSON.stringify(answers));
   } catch {
     // Privacy mode or quota — silently drop. The in-memory state still works.
@@ -60,7 +57,7 @@ function saveAnswers(chapterId: string, answers: AnswerMap): void {
 
 function clearAnswers(chapterId: string): void {
   try {
-    if (typeof window === "undefined" || !window.localStorage) return;
+    if (typeof window === 'undefined' || !window.localStorage) return;
     window.localStorage.removeItem(storageKey(chapterId));
   } catch {
     // Same defensive policy as saveAnswers.
@@ -89,17 +86,16 @@ export function QuickCheck({ chapterId, questions }: QuickCheckProps) {
     // back to the cleaned set so we don't keep re-filtering on every load.
     try {
       const raw =
-        typeof window !== "undefined" && window.localStorage
+        typeof window !== 'undefined' && window.localStorage
           ? window.localStorage.getItem(storageKey(chapterId))
           : null;
-      const persisted =
-        raw && typeof raw === "string" ? JSON.parse(raw) : null;
+      const persisted = raw && typeof raw === 'string' ? JSON.parse(raw) : null;
       const persistedKeys =
-        persisted && typeof persisted === "object" && !Array.isArray(persisted)
+        persisted && typeof persisted === 'object' && !Array.isArray(persisted)
           ? Object.keys(persisted as Record<string, unknown>).sort()
           : [];
       const cleanedKeys = Object.keys(loaded).sort();
-      if (persistedKeys.join(",") !== cleanedKeys.join(",")) {
+      if (persistedKeys.join(',') !== cleanedKeys.join(',')) {
         saveAnswers(chapterId, loaded);
       }
     } catch {
@@ -123,27 +119,16 @@ export function QuickCheck({ chapterId, questions }: QuickCheckProps) {
     setAnswers({});
   }, [chapterId]);
 
-  const answeredCount = questions.reduce(
-    (n, q) => (answers[q.id] ? n + 1 : n),
-    0,
-  );
-  const correctCount = questions.reduce(
-    (n, q) => (answers[q.id] === q.correctId ? n + 1 : n),
-    0,
-  );
+  const answeredCount = questions.reduce((n, q) => (answers[q.id] ? n + 1 : n), 0);
+  const correctCount = questions.reduce((n, q) => (answers[q.id] === q.correctId ? n + 1 : n), 0);
 
   return (
     <Card className="gap-3 py-4">
       <CardHeader className="px-6 [.border-b]:pb-0">
         <div className="flex items-center justify-between gap-3">
-          <CardTitle className="text-base text-foreground">
-            Quick check
-          </CardTitle>
+          <CardTitle className="text-base text-foreground">Quick check</CardTitle>
           {answeredCount > 0 ? (
-            <span
-              aria-live="polite"
-              className="font-mono text-xs text-muted-foreground"
-            >
+            <span aria-live="polite" className="font-mono text-xs text-muted-foreground">
               {correctCount} / {questions.length} correct
             </span>
           ) : null}
@@ -184,13 +169,7 @@ type QuestionRowProps = {
   onSelect: (optionId: string) => void;
 };
 
-function QuestionRow({
-  chapterId,
-  question,
-  index,
-  selectedId,
-  onSelect,
-}: QuestionRowProps) {
+function QuestionRow({ chapterId, question, index, selectedId, onSelect }: QuestionRowProps) {
   // Radio group name must be unique per (chapter, question) so multiple
   // QuickCheck instances or remounts don't bleed into each other.
   const name = `quickcheck-${chapterId}-${question.id}`;
@@ -206,22 +185,21 @@ function QuestionRow({
         {question.options.map((opt) => {
           const checked = selectedId === opt.id;
           const isThisCorrect = answered && opt.id === question.correctId;
-          const isThisWrongPick =
-            answered && checked && opt.id !== question.correctId;
+          const isThisWrongPick = answered && checked && opt.id !== question.correctId;
           const stateClass = isThisCorrect
-            ? "border-emerald-500/50 bg-emerald-500/10 text-foreground"
+            ? 'border-emerald-500/50 bg-emerald-500/10 text-foreground'
             : isThisWrongPick
-              ? "border-destructive/50 bg-destructive/10 text-foreground"
+              ? 'border-destructive/50 bg-destructive/10 text-foreground'
               : checked
-                ? "border-primary/50 bg-primary/5 text-foreground"
-                : "border-border bg-background hover:bg-accent/40 text-foreground/85";
+                ? 'border-primary/50 bg-primary/5 text-foreground'
+                : 'border-border bg-background hover:bg-accent/40 text-foreground/85';
           return (
             <label
               key={opt.id}
               className={[
-                "flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2 text-sm transition-colors",
+                'flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2 text-sm transition-colors',
                 stateClass,
-              ].join(" ")}
+              ].join(' ')}
             >
               <input
                 type="radio"
@@ -233,17 +211,11 @@ function QuestionRow({
               />
               <span className="flex-1">{opt.label}</span>
               {isThisCorrect ? (
-                <span
-                  aria-label="correct answer"
-                  className="font-mono text-xs text-emerald-700 dark:text-emerald-400"
-                >
+                <span aria-label="correct answer" className="font-mono text-xs text-emerald-700 dark:text-emerald-400">
                   correct
                 </span>
               ) : isThisWrongPick ? (
-                <span
-                  aria-label="incorrect"
-                  className="font-mono text-xs text-destructive"
-                >
+                <span aria-label="incorrect" className="font-mono text-xs text-destructive">
                   not quite
                 </span>
               ) : null}
@@ -254,11 +226,11 @@ function QuestionRow({
       {answered && question.explanation ? (
         <p
           className={[
-            "rounded-md border px-3 py-2 text-xs",
+            'rounded-md border px-3 py-2 text-xs',
             isCorrect
-              ? "border-emerald-500/30 bg-emerald-500/5 text-foreground/85"
-              : "border-amber-500/30 bg-amber-500/5 text-foreground/85",
-          ].join(" ")}
+              ? 'border-emerald-500/30 bg-emerald-500/5 text-foreground/85'
+              : 'border-amber-500/30 bg-amber-500/5 text-foreground/85',
+          ].join(' ')}
         >
           {question.explanation}
         </p>

@@ -1,44 +1,34 @@
-const GENERATED_ROLE_PREFIX =
-  /^\s*(?:\((?:user|assistant|system)\)|(?:user|assistant|system))\s*:\s*/i;
+const GENERATED_ROLE_PREFIX = /^\s*(?:\((?:user|assistant|system)\)|(?:user|assistant|system))\s*:\s*/i;
 
 function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function stripGeneratedRolePrefix(text: string): string {
   let cleaned = text;
   for (let i = 0; i < 3; i++) {
-    const next = cleaned.replace(GENERATED_ROLE_PREFIX, "");
+    const next = cleaned.replace(GENERATED_ROLE_PREFIX, '');
     if (next === cleaned) break;
     cleaned = next;
   }
   return cleaned.trimStart();
 }
 
-function stripGeneratedPromptEcho(
-  text: string,
-  latestUserText?: string,
-): string {
+function stripGeneratedPromptEcho(text: string, latestUserText?: string): string {
   const prompt = latestUserText?.trim();
   if (!prompt) return text;
 
   const escaped = escapeRegExp(prompt);
   const patterns = [
-    new RegExp(
-      `^\\s*(?:\\((?:user)\\)|user)\\s*:\\s*${escaped}(?:\\s*\\r?\\n)+\\s*`,
-      "i",
-    ),
-    new RegExp(`^\\s*${escaped}(?:\\s*\\r?\\n)+\\s*`, "i"),
-    new RegExp(
-      `^\\s*(?:\\((?:user)\\)|user)\\s*:\\s*${escaped}\\s*(?:[!?。！？]+\\s*)?`,
-      "i",
-    ),
-    new RegExp(`^\\s*${escaped}\\s*(?:[!?。！？]+\\s*)?`, "i"),
+    new RegExp(`^\\s*(?:\\((?:user)\\)|user)\\s*:\\s*${escaped}(?:\\s*\\r?\\n)+\\s*`, 'i'),
+    new RegExp(`^\\s*${escaped}(?:\\s*\\r?\\n)+\\s*`, 'i'),
+    new RegExp(`^\\s*(?:\\((?:user)\\)|user)\\s*:\\s*${escaped}\\s*(?:[!?。！？]+\\s*)?`, 'i'),
+    new RegExp(`^\\s*${escaped}\\s*(?:[!?。！？]+\\s*)?`, 'i'),
   ];
 
   let cleaned = text;
   for (const pattern of patterns) {
-    const next = cleaned.replace(pattern, "");
+    const next = cleaned.replace(pattern, '');
     if (next !== cleaned) {
       cleaned = next;
       break;
@@ -48,17 +38,15 @@ function stripGeneratedPromptEcho(
 }
 
 function stripLeadingDecodeFragment(text: string): string {
-  return text
-    .replace(/^\s*[A-Z]\s*(?:\r?\n){2,}(?=[A-Z])/u, "")
-    .replace(/^\s*[!?]+\s*(?=[A-Z0-9"'(])/u, "");
+  return text.replace(/^\s*[A-Z]\s*(?:\r?\n){2,}(?=[A-Z])/u, '').replace(/^\s*[!?]+\s*(?=[A-Z0-9"'(])/u, '');
 }
 
 function normalizeSentenceForRepeat(sentence: string): string {
   return sentence
     .trim()
     .toLowerCase()
-    .replace(/^(?:okay|sure|hello|hi)[,!]?\s+/u, "")
-    .replace(/\s+/g, " ");
+    .replace(/^(?:okay|sure|hello|hi)[,!]?\s+/u, '')
+    .replace(/\s+/g, ' ');
 }
 
 function splitSentences(text: string): string[] {
@@ -66,10 +54,10 @@ function splitSentences(text: string): string[] {
   let start = 0;
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
-    if (char !== "." && char !== "!" && char !== "?") continue;
+    if (char !== '.' && char !== '!' && char !== '?') continue;
 
-    const previous = text[i - 1] ?? "";
-    const next = text[i + 1] ?? "";
+    const previous = text[i - 1] ?? '';
+    const next = text[i + 1] ?? '';
     if (/\d/u.test(previous) && /\d/u.test(next)) continue;
     if (next && !/\s/u.test(next)) continue;
 
@@ -87,21 +75,19 @@ function collapseRepeatedSentences(text: string): string {
   if (!parts || parts.length < 2) return text;
 
   const collapsed: string[] = [];
-  let previous = "";
+  let previous = '';
   for (const part of parts) {
     const normalized = normalizeSentenceForRepeat(part);
     if (normalized && normalized === previous) continue;
     collapsed.push(part);
     if (normalized) previous = normalized;
   }
-  return collapsed.join("").trimStart();
+  return collapsed.join('').trimStart();
 }
 
 function cleanAssistantContent(text: string, latestUserText?: string): string {
   return collapseRepeatedSentences(
-    stripLeadingDecodeFragment(
-      stripGeneratedPromptEcho(stripGeneratedRolePrefix(text), latestUserText),
-    ),
+    stripLeadingDecodeFragment(stripGeneratedPromptEcho(stripGeneratedRolePrefix(text), latestUserText)),
   );
 }
 
@@ -127,38 +113,38 @@ const PLAIN_THOUGHT_START_RE =
 const FINAL_ANSWER_BOUNDARY_RE =
   /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(?:final\s+answer|answer|response)\s*:?\s*(?:\*\*)?\s*(?:\r?\n|$)/iu;
 const REASONING_PREFIX_LABELS = [
-  "analyze",
-  "analyse",
-  "check against",
-  "draft response",
-  "final output",
-  "here is a thinking process",
-  "here is a thought process",
+  'analyze',
+  'analyse',
+  'check against',
+  'draft response',
+  'final output',
+  'here is a thinking process',
+  'here is a thought process',
   "here's a thinking process",
   "here's a thought process",
-  "identify",
-  "plan",
-  "refine",
-  "synthesize",
-  "synthesise",
-  "thinking process",
-  "thought process",
+  'identify',
+  'plan',
+  'refine',
+  'synthesize',
+  'synthesise',
+  'thinking process',
+  'thought process',
 ];
 
 function unwrapThoughtDisclosure(text: string): string {
   let cleaned = text;
   for (let i = 0; i < 4; i++) {
-    const next = cleaned.replace(THOUGHT_DETAILS_RE, "$1");
+    const next = cleaned.replace(THOUGHT_DETAILS_RE, '$1');
     if (next === cleaned) break;
     cleaned = next;
   }
   return cleaned
-    .replace(THOUGHT_DETAILS_START_RE, "")
-    .replace(PARTIAL_THOUGHT_DETAILS_OPEN_RE, "")
-    .replace(THOUGHT_SUMMARY_TAG_RE, "")
-    .replace(PARTIAL_THOUGHT_SUMMARY_START_RE, "")
-    .replace(/<\/summary>/giu, "")
-    .replace(/<\/details>/giu, "")
+    .replace(THOUGHT_DETAILS_START_RE, '')
+    .replace(PARTIAL_THOUGHT_DETAILS_OPEN_RE, '')
+    .replace(THOUGHT_SUMMARY_TAG_RE, '')
+    .replace(PARTIAL_THOUGHT_SUMMARY_START_RE, '')
+    .replace(/<\/summary>/giu, '')
+    .replace(/<\/details>/giu, '')
     .trim();
 }
 
@@ -166,50 +152,44 @@ export function looksLikeReasoningText(text: string | null | undefined): boolean
   return !!text && REASONING_TEXT_RE.test(text);
 }
 
-export function couldStillBeReasoningTextPrefix(
-  text: string | null | undefined,
-): boolean {
+export function couldStillBeReasoningTextPrefix(text: string | null | undefined): boolean {
   if (!text) return false;
   const trimmed = text.trimStart().toLowerCase();
   if (!trimmed) return true;
-  if (/^<\s*\/?\s*(?:t|th|thi|thin|think|l|lo|lon|long|longcat|longcat_?|longcat_t|longcat_th|longcat_thi|longcat_thin|longcat_think|d|de|det|deta|detai|detail|details|s|su|sum|summ|summa|summar|summary)?$/iu.test(trimmed)) {
+  if (
+    /^<\s*\/?\s*(?:t|th|thi|thin|think|l|lo|lon|long|longcat|longcat_?|longcat_t|longcat_th|longcat_thi|longcat_thin|longcat_think|d|de|det|deta|detai|detail|details|s|su|sum|summ|summa|summar|summary)?$/iu.test(
+      trimmed,
+    )
+  ) {
     return true;
   }
   if (/^(?:#{1,6}\s*)?$/u.test(trimmed)) return true;
   if (/^(?:\d{1,3}\.?\s*)$/u.test(trimmed)) return true;
 
   const probe = trimmed
-    .replace(/^(?:#{1,6}\s*)/u, "")
-    .replace(/^(?:\d{1,3}\.?\s*)/u, "")
-    .replace(/^\*{1,2}/u, "")
+    .replace(/^(?:#{1,6}\s*)/u, '')
+    .replace(/^(?:\d{1,3}\.?\s*)/u, '')
+    .replace(/^\*{1,2}/u, '')
     .trimStart();
   if (!probe) return true;
 
-  return REASONING_PREFIX_LABELS.some(
-    (label) => label.startsWith(probe) && probe.length < label.length,
-  );
+  return REASONING_PREFIX_LABELS.some((label) => label.startsWith(probe) && probe.length < label.length);
 }
 
-function splitPlainThoughtText(
-  text: string,
-  latestUserText?: string,
-): { text: string; thinking: string } | null {
+function splitPlainThoughtText(text: string, latestUserText?: string): { text: string; thinking: string } | null {
   if (!PLAIN_THOUGHT_START_RE.test(text)) return null;
 
   const boundary = FINAL_ANSWER_BOUNDARY_RE.exec(text);
   if (!boundary || boundary.index <= 0) {
     return {
       thinking: sanitizeThinkingText(text),
-      text: "",
+      text: '',
     };
   }
 
   return {
     thinking: sanitizeThinkingText(text.slice(0, boundary.index)),
-    text: cleanAssistantContent(
-      text.slice(boundary.index + boundary[0].length),
-      latestUserText,
-    ),
+    text: cleanAssistantContent(text.slice(boundary.index + boundary[0].length), latestUserText),
   };
 }
 
@@ -225,10 +205,7 @@ function splitLeadingThoughtDisclosure(
   };
 }
 
-function splitThinkTaggedText(
-  text: string,
-  latestUserText?: string,
-): { text: string; thinking: string } | null {
+function splitThinkTaggedText(text: string, latestUserText?: string): { text: string; thinking: string } | null {
   const open = THINK_OPEN_TAG_RE.exec(text);
   const searchFrom = open ? open.index + open[0].length : 0;
   const close = THINK_CLOSE_TAG_RE.exec(text.slice(searchFrom));
@@ -236,24 +213,21 @@ function splitThinkTaggedText(
 
   const closeIndex = searchFrom + close.index;
   return {
-    text: cleanAssistantContent(
-      text.slice(closeIndex + close[0].length),
-      latestUserText,
-    ),
+    text: cleanAssistantContent(text.slice(closeIndex + close[0].length), latestUserText),
     thinking: sanitizeThinkingText(text.slice(searchFrom, closeIndex)),
   };
 }
 
 export function sanitizeThinkingText(text: string | null | undefined): string {
-  if (!text) return "";
-  return unwrapThoughtDisclosure(text.replace(THINK_TAG_RE, ""));
+  if (!text) return '';
+  return unwrapThoughtDisclosure(text.replace(THINK_TAG_RE, ''));
 }
 
 export function splitAssistantThinking(
   text: string | null | undefined,
   latestUserText?: string,
 ): { text: string; thinking: string } {
-  if (!text) return { text: "", thinking: "" };
+  if (!text) return { text: '', thinking: '' };
 
   const disclosure = splitLeadingThoughtDisclosure(text, latestUserText);
   if (disclosure) return disclosure;
@@ -266,13 +240,10 @@ export function splitAssistantThinking(
 
   return {
     text: cleanAssistantContent(text, latestUserText),
-    thinking: "",
+    thinking: '',
   };
 }
 
-export function sanitizeAssistantText(
-  text: string | null | undefined,
-  latestUserText?: string,
-): string {
+export function sanitizeAssistantText(text: string | null | undefined, latestUserText?: string): string {
   return splitAssistantThinking(text, latestUserText).text;
 }

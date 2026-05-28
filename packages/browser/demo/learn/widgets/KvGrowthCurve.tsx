@@ -1,4 +1,4 @@
-import * as React from "react";
+import * as React from 'react';
 
 /**
  * Small SVG line chart showing KV-cache memory as a function of context
@@ -19,8 +19,7 @@ const NUM_FULL_LAYERS = NUM_LAYERS / FULL_LAYER_INTERVAL; // 6
 const NUM_LINEAR_LAYERS = NUM_LAYERS - NUM_FULL_LAYERS; // 18
 const LINEAR_NUM_HEADS = 16;
 const LINEAR_HEAD_DIM = 128;
-const LINEAR_STATE_BYTES =
-  LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM * BYTES_PER_FLOAT;
+const LINEAR_STATE_BYTES = LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM * BYTES_PER_FLOAT;
 
 const X_TICKS = [1024, 4096, 16384, 65536, 262144];
 const X_MIN = X_TICKS[0]!;
@@ -34,13 +33,12 @@ function gqaBytes(seqLen: number): number {
 }
 function hybridBytes(seqLen: number): number {
   return (
-    NUM_FULL_LAYERS * 2 * NUM_KV_HEADS * HEAD_DIM * seqLen * BYTES_PER_FLOAT +
-    NUM_LINEAR_LAYERS * LINEAR_STATE_BYTES
+    NUM_FULL_LAYERS * 2 * NUM_KV_HEADS * HEAD_DIM * seqLen * BYTES_PER_FLOAT + NUM_LINEAR_LAYERS * LINEAR_STATE_BYTES
   );
 }
 
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
   if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -92,12 +90,7 @@ export function KvGrowthCurve() {
   }
 
   function pathFor(fn: (n: number) => number): string {
-    return (
-      "M " +
-      samples
-        .map((n) => `${xFor(n).toFixed(2)} ${yFor(fn(n)).toFixed(2)}`)
-        .join(" L ")
-    );
+    return 'M ' + samples.map((n) => `${xFor(n).toFixed(2)} ${yFor(fn(n)).toFixed(2)}`).join(' L ');
   }
 
   const mhaPath = pathFor(mhaBytes);
@@ -112,12 +105,8 @@ export function KvGrowthCurve() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          KV cache growth · log-log
-        </div>
-        <div className="text-[11px] text-muted-foreground">
-          Whole-model bytes vs context length
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">KV cache growth · log-log</div>
+        <div className="text-[11px] text-muted-foreground">Whole-model bytes vs context length</div>
       </div>
 
       <svg
@@ -130,22 +119,8 @@ export function KvGrowthCurve() {
           const y = yFor(b);
           return (
             <g key={`y-${idx}`}>
-              <line
-                x1={PAD_LEFT}
-                x2={WIDTH - PAD_RIGHT}
-                y1={y}
-                y2={y}
-                stroke="currentColor"
-                strokeOpacity={0.07}
-              />
-              <text
-                x={PAD_LEFT - 6}
-                y={y + 3}
-                fontSize={9}
-                textAnchor="end"
-                fill="currentColor"
-                fillOpacity={0.55}
-              >
+              <line x1={PAD_LEFT} x2={WIDTH - PAD_RIGHT} y1={y} y2={y} stroke="currentColor" strokeOpacity={0.07} />
+              <text x={PAD_LEFT - 6} y={y + 3} fontSize={9} textAnchor="end" fill="currentColor" fillOpacity={0.55}>
                 {formatBytes(b)}
               </text>
             </g>
@@ -155,22 +130,8 @@ export function KvGrowthCurve() {
           const x = xFor(t);
           return (
             <g key={`x-${idx}`}>
-              <line
-                x1={x}
-                x2={x}
-                y1={PAD_TOP}
-                y2={PAD_TOP + INNER_H}
-                stroke="currentColor"
-                strokeOpacity={0.07}
-              />
-              <text
-                x={x}
-                y={HEIGHT - 14}
-                fontSize={9}
-                textAnchor="middle"
-                fill="currentColor"
-                fillOpacity={0.55}
-              >
+              <line x1={x} x2={x} y1={PAD_TOP} y2={PAD_TOP + INNER_H} stroke="currentColor" strokeOpacity={0.07} />
+              <text x={x} y={HEIGHT - 14} fontSize={9} textAnchor="middle" fill="currentColor" fillOpacity={0.55}>
                 {formatTokens(t)}
               </text>
             </g>
@@ -188,13 +149,7 @@ export function KvGrowthCurve() {
           context length (tokens, log scale)
         </text>
 
-        <path
-          d={mhaPath}
-          fill="none"
-          stroke="#94a3b8"
-          strokeWidth={1.5}
-          strokeDasharray="4 3"
-        />
+        <path d={mhaPath} fill="none" stroke="#94a3b8" strokeWidth={1.5} strokeDasharray="4 3" />
         <path d={gqaPath} fill="none" stroke="#f59e0b" strokeWidth={1.8} />
         <path d={hybridPath} fill="none" stroke="#22c55e" strokeWidth={2} />
       </svg>
@@ -210,37 +165,30 @@ export function KvGrowthCurve() {
       <div className="rounded-md border border-border/60 bg-muted/20 p-2 font-mono text-[11px] leading-relaxed text-foreground/85">
         <code className="bg-transparent p-0">
           bytes_per_full_layer = 2 · kv_heads · d · seq · bf16
-          {"\n"}
-          {"             "}= 2 · {NUM_KV_HEADS} · {HEAD_DIM} · seq · {BYTES_PER_FLOAT}
-          {"\n"}
-          bytes_per_linear_layer = constant ({formatBytes(LINEAR_STATE_BYTES)})
-          {"\n"}
-          total = {NUM_FULL_LAYERS} · bytes_per_full_layer + {NUM_LINEAR_LAYERS} ·
-          bytes_per_linear_layer
+          {'\n'}
+          {'             '}= 2 · {NUM_KV_HEADS} · {HEAD_DIM} · seq · {BYTES_PER_FLOAT}
+          {'\n'}
+          bytes_per_linear_layer = constant ({formatBytes(LINEAR_STATE_BYTES)}){'\n'}
+          total = {NUM_FULL_LAYERS} · bytes_per_full_layer + {NUM_LINEAR_LAYERS} · bytes_per_linear_layer
         </code>
       </div>
 
       <div className="space-y-1 text-[11px] text-muted-foreground">
         <div>
-          <span className="font-mono text-foreground/80">2</span> — keys and
-          values are stored separately.
+          <span className="font-mono text-foreground/80">2</span> — keys and values are stored separately.
         </div>
         <div>
-          <span className="font-mono text-foreground/80">kv_heads</span> — the
-          {" "}
-          number of K/V heads per layer (after GQA grouping).
+          <span className="font-mono text-foreground/80">kv_heads</span> — the number of K/V heads per layer (after GQA
+          grouping).
         </div>
         <div>
-          <span className="font-mono text-foreground/80">d</span> — the per-head
-          dimension <code>head_dim</code>.
+          <span className="font-mono text-foreground/80">d</span> — the per-head dimension <code>head_dim</code>.
         </div>
         <div>
-          <span className="font-mono text-foreground/80">seq</span> — context
-          length in tokens (the X axis above).
+          <span className="font-mono text-foreground/80">seq</span> — context length in tokens (the X axis above).
         </div>
         <div>
-          <span className="font-mono text-foreground/80">bf16</span> — 2 bytes
-          per float in the cache.
+          <span className="font-mono text-foreground/80">bf16</span> — 2 bytes per float in the cache.
         </div>
       </div>
     </div>
@@ -266,7 +214,7 @@ function LegendDot({
           y2={3}
           stroke={color}
           strokeWidth={2}
-          strokeDasharray={dashed ? "4 3" : undefined}
+          strokeDasharray={dashed ? '4 3' : undefined}
         />
       </svg>
       <span>{children}</span>

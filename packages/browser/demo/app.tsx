@@ -4,15 +4,9 @@ import { createCodePlugin } from '@streamdown/code';
 import { RouterProvider } from '@tanstack/react-router';
 import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-
-import { FreeChatProvider, type FreeChatContextValue } from './providers/free-chat';
-import { ModelLoaderProvider, type ModelLoaderContextValue } from './providers/model-loader';
-import { TelemetryProvider, type TelemetryContextValue } from './providers/telemetry';
-import { router } from './router';
 import { Streamdown } from 'streamdown';
 
 import { createSabRingOverHeap } from '../src/chat-stream-sab.js';
-import mlxWorkerUrl from '../src/mlx-worker.ts?worker&url';
 import {
   couldStillBeReasoningTextPrefix,
   looksLikeReasoningText,
@@ -20,16 +14,16 @@ import {
   sanitizeThinkingText as sanitizeThinkingMarkup,
   splitAssistantThinking,
 } from '../src/generated-text.js';
+import mlxWorkerUrl from '../src/mlx-worker.ts?worker&url';
 import { workerAssetUrl } from '../src/worker-asset-url.js';
 import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
 import { type LoadingProgress } from './components/loading/Loading';
 import { BrowserChatSessionAdapter, type BrowserChatMessage } from './lib/browser-chat-session';
-import {
-  type ProfileLikeStats,
-  type ReasoningEffort,
-  cycleReasoningEffort,
-} from './lib/display-helpers';
-
+import { type ProfileLikeStats, type ReasoningEffort, cycleReasoningEffort } from './lib/display-helpers';
+import { FreeChatProvider, type FreeChatContextValue } from './providers/free-chat';
+import { ModelLoaderProvider, type ModelLoaderContextValue } from './providers/model-loader';
+import { TelemetryProvider, type TelemetryContextValue } from './providers/telemetry';
+import { router } from './router';
 import 'streamdown/styles.css';
 import './styles.css';
 
@@ -268,8 +262,10 @@ function App() {
   const configuredModelUrl = resolveConfiguredModelUrl(initialUrlParams);
   const configuredModelLabel = resolveConfiguredModelLabel(initialUrlParams);
   const initialAppToolsEnabled =
-    initialUrlParams.get('tools') === '1' || initialUrlParams.get('tools') === 'true' ||
-    initialUrlParams.get('app_preview') === '1' || initialUrlParams.get('app_preview') === 'true';
+    initialUrlParams.get('tools') === '1' ||
+    initialUrlParams.get('tools') === 'true' ||
+    initialUrlParams.get('app_preview') === '1' ||
+    initialUrlParams.get('app_preview') === 'true';
   const [appToolsEnabled, setAppToolsEnabledState] = useState(initialAppToolsEnabled);
   const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>('off');
   const [loadKickoff, setLoadKickoff] = useState(0);
@@ -764,9 +760,7 @@ function App() {
           toolCallId: call.id,
           content: JSON.stringify({
             ok: false,
-            error: `create_app_preview requires html, css, or js content. Parsed keys: ${
-              keys.join(', ') || '(none)'
-            }.`,
+            error: `create_app_preview requires html, css, or js content. Parsed keys: ${keys.join(', ') || '(none)'}.`,
           }),
         };
       }
@@ -1987,10 +1981,13 @@ function App() {
     // need a local-file picker still trigger it via the #model-dir-input
     // <input> separately.
     const currentStatus =
-      errorBannerRef.current != null ? 'error'
-      : modelReadyRef.current ? 'ready'
-      : loadKickoffRef.current > 0 ? 'loading'
-      : 'idle';
+      errorBannerRef.current != null
+        ? 'error'
+        : modelReadyRef.current
+          ? 'ready'
+          : loadKickoffRef.current > 0
+            ? 'loading'
+            : 'idle';
     if (currentStatus === 'loading' || currentStatus === 'ready') return;
     setPendingModelSource(null);
     setErrorBannerState(null);
@@ -2011,10 +2008,13 @@ function App() {
 
   const modelLoaderValue = useMemo<ModelLoaderContextValue>(() => {
     const status =
-      errorBanner != null ? 'error'
-      : modelReady ? 'ready'
-      : loadKickoff > 0 || hostedModelAvailable === true ? 'loading'
-      : 'idle';
+      errorBanner != null
+        ? 'error'
+        : modelReady
+          ? 'ready'
+          : loadKickoff > 0 || hostedModelAvailable === true
+            ? 'loading'
+            : 'idle';
     return {
       status,
       loadingText: loadingText ?? '',
@@ -2025,7 +2025,16 @@ function App() {
       kickoffLoad,
       resetForModelLoad: resetForModelLoadCallback,
     };
-  }, [errorBanner, modelReady, loadKickoff, hostedModelAvailable, loadingText, loadingProgress, modelLine, resetForModelLoadCallback]);
+  }, [
+    errorBanner,
+    modelReady,
+    loadKickoff,
+    hostedModelAvailable,
+    loadingText,
+    loadingProgress,
+    modelLine,
+    resetForModelLoadCallback,
+  ]);
 
   const setTemperatureCallback = useCallback((v: number) => {
     temperatureValueRef.current = v;
@@ -2065,57 +2074,63 @@ function App() {
     void router.navigate({ to: '/', search: (prev) => prev });
   }, []);
 
-  const freeChatValue = useMemo<FreeChatContextValue>(() => ({
-    temperature: temperatureValue,
-    maxTokens: maxTokensValue,
-    toolsEnabled: appToolsEnabled,
-    reasoningEffort,
-    generating,
-    sendDisabled,
-    setTemperature: setTemperatureCallback,
-    setMaxTokens: setMaxTokensCallback,
-    setToolsEnabled: setToolsEnabledCallback,
-    cycleReasoning: cycleReasoningCallback,
-    sendMessage: sendMessageCallback,
-    resetChat: resetChatCallback,
-    promptRef,
-    chatRef,
-    sendRef,
-    imageButtonRef,
-    imageInputRef,
-    inspectedPrompt,
-    setInspectedPrompt,
-    mlxWorkerRef,
-    inspectorAbortRef,
-  }), [
-    temperatureValue,
-    maxTokensValue,
-    appToolsEnabled,
-    reasoningEffort,
-    generating,
-    sendDisabled,
-    setTemperatureCallback,
-    setMaxTokensCallback,
-    setToolsEnabledCallback,
-    cycleReasoningCallback,
-    sendMessageCallback,
-    resetChatCallback,
-    promptRef,
-    chatRef,
-    sendRef,
-    imageButtonRef,
-    imageInputRef,
-    inspectedPrompt,
-    mlxWorkerRef,
-    inspectorAbortRef,
-  ]);
+  const freeChatValue = useMemo<FreeChatContextValue>(
+    () => ({
+      temperature: temperatureValue,
+      maxTokens: maxTokensValue,
+      toolsEnabled: appToolsEnabled,
+      reasoningEffort,
+      generating,
+      sendDisabled,
+      setTemperature: setTemperatureCallback,
+      setMaxTokens: setMaxTokensCallback,
+      setToolsEnabled: setToolsEnabledCallback,
+      cycleReasoning: cycleReasoningCallback,
+      sendMessage: sendMessageCallback,
+      resetChat: resetChatCallback,
+      promptRef,
+      chatRef,
+      sendRef,
+      imageButtonRef,
+      imageInputRef,
+      inspectedPrompt,
+      setInspectedPrompt,
+      mlxWorkerRef,
+      inspectorAbortRef,
+    }),
+    [
+      temperatureValue,
+      maxTokensValue,
+      appToolsEnabled,
+      reasoningEffort,
+      generating,
+      sendDisabled,
+      setTemperatureCallback,
+      setMaxTokensCallback,
+      setToolsEnabledCallback,
+      cycleReasoningCallback,
+      sendMessageCallback,
+      resetChatCallback,
+      promptRef,
+      chatRef,
+      sendRef,
+      imageButtonRef,
+      imageInputRef,
+      inspectedPrompt,
+      mlxWorkerRef,
+      inspectorAbortRef,
+    ],
+  );
 
-  const telemetryValue = useMemo<TelemetryContextValue>(() => ({
-    stats: telemetryStats,
-    prefillTokensPerSecond: prefillTokensPerSec,
-    decodeTokensPerSecond: decodeTokensPerSec,
-    modelLine,
-  }), [telemetryStats, prefillTokensPerSec, decodeTokensPerSec, modelLine]);
+  const telemetryValue = useMemo<TelemetryContextValue>(
+    () => ({
+      stats: telemetryStats,
+      prefillTokensPerSecond: prefillTokensPerSec,
+      decodeTokensPerSecond: decodeTokensPerSec,
+      modelLine,
+    }),
+    [telemetryStats, prefillTokensPerSec, decodeTokensPerSec, modelLine],
+  );
 
   return (
     <ModelLoaderProvider value={modelLoaderValue}>

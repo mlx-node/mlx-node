@@ -1,4 +1,4 @@
-import * as React from "react";
+import * as React from 'react';
 
 /**
  * Curated cosine-similarity pairs. Values are illustrative ballpark numbers
@@ -17,52 +17,52 @@ type Pair = {
 
 const PAIRS: Pair[] = [
   {
-    a: "cat",
-    b: "cat",
+    a: 'cat',
+    b: 'cat',
     similarity: 1.0,
-    note: "Identical token — sanity check. Cosine of a vector with itself is exactly 1.",
+    note: 'Identical token — sanity check. Cosine of a vector with itself is exactly 1.',
   },
   {
-    a: "cat",
-    b: " cat",
+    a: 'cat',
+    b: ' cat',
     similarity: 0.72,
-    note: "Same word, different leading-space token. Close, but not identical — they really are two ids.",
+    note: 'Same word, different leading-space token. Close, but not identical — they really are two ids.',
   },
   {
-    a: "king",
-    b: "queen",
+    a: 'king',
+    b: 'queen',
     similarity: 0.65,
-    note: "Synonym-like pair from the same semantic role.",
+    note: 'Synonym-like pair from the same semantic role.',
   },
   {
-    a: "Paris",
-    b: "France",
+    a: 'Paris',
+    b: 'France',
     similarity: 0.58,
-    note: "Different categories (city, country) but tightly related in training text.",
+    note: 'Different categories (city, country) but tightly related in training text.',
   },
   {
-    a: "hot",
-    b: "cold",
+    a: 'hot',
+    b: 'cold',
     similarity: 0.48,
-    note: "Antonyms are often surprisingly close — they appear in similar grammatical slots.",
+    note: 'Antonyms are often surprisingly close — they appear in similar grammatical slots.',
   },
   {
-    a: "dog",
-    b: "perro",
+    a: 'dog',
+    b: 'perro',
     similarity: 0.22,
-    note: "Cross-language: shared concept, very different surface form. Weak overlap.",
+    note: 'Cross-language: shared concept, very different surface form. Weak overlap.',
   },
   {
-    a: "cat",
-    b: "stapler",
+    a: 'cat',
+    b: 'stapler',
     similarity: 0.18,
-    note: "Unrelated common nouns. Low but non-zero — both are just nouns to the model.",
+    note: 'Unrelated common nouns. Low but non-zero — both are just nouns to the model.',
   },
   {
-    a: "xyz",
-    b: "thrombosis",
+    a: 'xyz',
+    b: 'thrombosis',
     similarity: 0.05,
-    note: "Rare and unrelated. Near-orthogonal in the embedding space.",
+    note: 'Rare and unrelated. Near-orthogonal in the embedding space.',
   },
 ];
 
@@ -76,7 +76,7 @@ function similarityHue(sim: number): string {
 }
 
 function renderToken(text: string): string {
-  if (text.startsWith(" ")) return "·" + text.slice(1);
+  if (text.startsWith(' ')) return '·' + text.slice(1);
   return text;
 }
 
@@ -84,12 +84,8 @@ export function CosineSimilarityTool() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Cosine similarity · curated pairs
-        </div>
-        <div className="text-[11px] text-muted-foreground">
-          Measured against Qwen3.5-0.8B&apos;s embedding matrix
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">Cosine similarity · curated pairs</div>
+        <div className="text-[11px] text-muted-foreground">Measured against Qwen3.5-0.8B&apos;s embedding matrix</div>
       </div>
 
       <div className="space-y-1.5">
@@ -126,22 +122,16 @@ export function CosineSimilarityTool() {
                   />
                 </div>
               </div>
-              <div className="text-right font-mono text-[12px] text-foreground/80">
-                {p.similarity.toFixed(2)}
-              </div>
-              <div className="col-span-full text-[11px] text-muted-foreground">
-                {p.note}
-              </div>
+              <div className="text-right font-mono text-[12px] text-foreground/80">{p.similarity.toFixed(2)}</div>
+              <div className="col-span-full text-[11px] text-muted-foreground">{p.note}</div>
             </div>
           );
         })}
       </div>
 
       <p className="text-[11px] text-muted-foreground">
-        Values are illustrative; real measurements may vary by about +/- 0.1
-        between model builds. The teaching point is the *ordering*: identical
-        &gt; synonym &gt; related &gt; antonym &gt; cross-language &gt;
-        unrelated.
+        Values are illustrative; real measurements may vary by about +/- 0.1 between model builds. The teaching point is
+        the *ordering*: identical &gt; synonym &gt; related &gt; antonym &gt; cross-language &gt; unrelated.
       </p>
     </div>
   );

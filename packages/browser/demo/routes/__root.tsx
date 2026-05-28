@@ -43,8 +43,22 @@ export const searchSchema = z.object({
 
   // App-preview / tools toggle — legacy aliases: tools, app_preview.
   // Coerces ?tools=1 / ?tools=true → true, ?tools=0 / ?tools=false → false.
-  tools: z.coerce.number().int().min(0).max(1).transform(v => v === 1).optional().catch(undefined),
-  app_preview: z.coerce.number().int().min(0).max(1).transform(v => v === 1).optional().catch(undefined),
+  tools: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(1)
+    .transform((v) => v === 1)
+    .optional()
+    .catch(undefined),
+  app_preview: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(1)
+    .transform((v) => v === 1)
+    .optional()
+    .catch(undefined),
 });
 
 export type RootSearch = z.infer<typeof searchSchema>;

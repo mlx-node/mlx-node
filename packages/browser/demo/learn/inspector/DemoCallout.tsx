@@ -1,12 +1,7 @@
-import * as React from "react";
-import { EyeIcon } from "lucide-react";
+import { EyeIcon } from 'lucide-react';
+import * as React from 'react';
 
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "../../components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/card';
 
 export type DemoCalloutProps = {
   /** Short, demo-specific observations the reader should notice in the UI. */
@@ -26,10 +21,7 @@ export function DemoCallout({ items }: DemoCalloutProps) {
     <Card className="gap-3 border-primary/30 bg-primary/5 py-4">
       <CardHeader className="px-6 [.border-b]:pb-0">
         <CardTitle className="flex items-center gap-2 text-base text-foreground">
-          <EyeIcon
-            aria-hidden="true"
-            className="size-4 text-primary"
-          />
+          <EyeIcon aria-hidden="true" className="size-4 text-primary" />
           What to look for
         </CardTitle>
       </CardHeader>

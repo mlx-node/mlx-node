@@ -7,11 +7,7 @@
  * Wire format defined in crates/mlx-core/src/chat_stream/wire.rs.
  */
 
-import type {
-  ChatStreamChunk,
-  PerformanceMetrics,
-  ToolCallResult,
-} from "@mlx-node/core";
+import type { ChatStreamChunk, PerformanceMetrics, ToolCallResult } from '@mlx-node/core';
 
 // ---------------------------------------------------------------------------
 // Header layout — matches SAB_HEADER_OFFSET_* constants in wire.rs
@@ -97,10 +93,7 @@ export interface SabRing {
    * @param onChunk - Called for each decoded ChatStreamChunk.
    * @param onError - Called on KIND_ERROR records or decode failures.
    */
-  reader: (
-    onChunk: (chunk: ChatStreamChunk) => void,
-    onError: (e: Error) => void,
-  ) => AbortController;
+  reader: (onChunk: (chunk: ChatStreamChunk) => void, onError: (e: Error) => void) => AbortController;
 }
 
 export interface SabRingOverHeap {
@@ -111,10 +104,7 @@ export interface SabRingOverHeap {
    * @param onChunk - Called for each decoded ChatStreamChunk.
    * @param onError - Called on KIND_ERROR records or decode failures.
    */
-  reader: (
-    onChunk: (chunk: ChatStreamChunk) => void,
-    onError: (e: Error) => void,
-  ) => AbortController;
+  reader: (onChunk: (chunk: ChatStreamChunk) => void, onError: (e: Error) => void) => AbortController;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,9 +119,7 @@ export interface SabRingOverHeap {
  */
 export function createSabRing(sizeBytes: number = 262_144): SabRing {
   if (sizeBytes < MIN_SAB_BYTES) {
-    throw new RangeError(
-      `createSabRing: sizeBytes (${sizeBytes}) < MIN_SAB_BYTES (${MIN_SAB_BYTES})`,
-    );
+    throw new RangeError(`createSabRing: sizeBytes (${sizeBytes}) < MIN_SAB_BYTES (${MIN_SAB_BYTES})`);
   }
 
   const sab = new SharedArrayBuffer(sizeBytes);
@@ -141,14 +129,11 @@ export function createSabRing(sizeBytes: number = 262_144): SabRing {
   const bodyU8 = new Uint8Array(sab, SAB_HEADER_BYTES);
   const bodyLen = bodyU8.length;
 
-  function reader(
-    onChunk: (chunk: ChatStreamChunk) => void,
-    onError: (e: Error) => void,
-  ): AbortController {
+  function reader(onChunk: (chunk: ChatStreamChunk) => void, onError: (e: Error) => void): AbortController {
     const abort = new AbortController();
 
     // On abort: set cancelled flag and wake any producer waiting for space.
-    abort.signal.addEventListener("abort", () => {
+    abort.signal.addEventListener('abort', () => {
       Atomics.store(headerI32, CANCELLED_IDX, 1);
       // Wake the WASM producer if it is sleeping in wait_for_space (waits on read_cur).
       Atomics.notify(headerI32, READ_CUR_IDX);
@@ -179,14 +164,10 @@ export function createSabRingOverHeap(
   byteLength: number,
 ): SabRingOverHeap {
   if (byteLength < MIN_SAB_BYTES) {
-    throw new RangeError(
-      `createSabRingOverHeap: byteLength (${byteLength}) < MIN_SAB_BYTES (${MIN_SAB_BYTES})`,
-    );
+    throw new RangeError(`createSabRingOverHeap: byteLength (${byteLength}) < MIN_SAB_BYTES (${MIN_SAB_BYTES})`);
   }
   if (heapOffset % 4 !== 0) {
-    throw new RangeError(
-      `createSabRingOverHeap: heapOffset must be 4-byte aligned (got ${heapOffset})`,
-    );
+    throw new RangeError(`createSabRingOverHeap: heapOffset must be 4-byte aligned (got ${heapOffset})`);
   }
 
   const bodyOffset = heapOffset + SAB_HEADER_BYTES;
@@ -195,18 +176,13 @@ export function createSabRingOverHeap(
   // Zero the 32-byte header so seq/write_cur/read_cur/cancelled start at 0.
   new Uint8Array(memory.buffer, heapOffset, SAB_HEADER_BYTES).fill(0);
 
-  const headerView = (): Int32Array =>
-    new Int32Array(memory.buffer, heapOffset, SAB_HEADER_BYTES / 4);
-  const bodyView = (): Uint8Array =>
-    new Uint8Array(memory.buffer, bodyOffset, bodyLen);
+  const headerView = (): Int32Array => new Int32Array(memory.buffer, heapOffset, SAB_HEADER_BYTES / 4);
+  const bodyView = (): Uint8Array => new Uint8Array(memory.buffer, bodyOffset, bodyLen);
 
-  function reader(
-    onChunk: (chunk: ChatStreamChunk) => void,
-    onError: (e: Error) => void,
-  ): AbortController {
+  function reader(onChunk: (chunk: ChatStreamChunk) => void, onError: (e: Error) => void): AbortController {
     const abort = new AbortController();
 
-    abort.signal.addEventListener("abort", () => {
+    abort.signal.addEventListener('abort', () => {
       const h = headerView();
       Atomics.store(h, CANCELLED_IDX, 1);
       Atomics.notify(h, READ_CUR_IDX);
@@ -214,14 +190,7 @@ export function createSabRingOverHeap(
       Atomics.notify(h, SEQ_IDX);
     });
 
-    void runLoopHeap(
-      headerView,
-      bodyView,
-      bodyLen,
-      onChunk,
-      onError,
-      abort.signal,
-    );
+    void runLoopHeap(headerView, bodyView, bodyLen, onChunk, onError, abort.signal);
     return abort;
   }
 
@@ -255,24 +224,11 @@ async function runLoopHeap(
 
       if (payloadLen > 0) {
         const payloadStart = (readCur + RECORD_HEADER_BYTES) % bodyLen;
-        copyFromRing(
-          bodyU8,
-          payloadStart,
-          bodyLen,
-          scratch,
-          RECORD_HEADER_BYTES,
-          payloadLen,
-        );
+        copyFromRing(bodyU8, payloadStart, bodyLen, scratch, RECORD_HEADER_BYTES, payloadLen);
       }
 
       try {
-        dispatchRecord(
-          kind,
-          flags,
-          scratch.subarray(RECORD_HEADER_BYTES, totalLen),
-          onChunk,
-          onError,
-        );
+        dispatchRecord(kind, flags, scratch.subarray(RECORD_HEADER_BYTES, totalLen), onChunk, onError);
       } catch (e) {
         onError(e instanceof Error ? e : new Error(String(e)));
       }
@@ -288,12 +244,7 @@ async function runLoopHeap(
     const currentSeq = Atomics.load(headerI32, SEQ_IDX);
     if (currentSeq === lastSeq) {
       // Timeout-polled wait — see READER_WAIT_TIMEOUT_MS for rationale.
-      const { async, value } = Atomics.waitAsync(
-        headerI32,
-        SEQ_IDX,
-        lastSeq,
-        READER_WAIT_TIMEOUT_MS,
-      );
+      const { async, value } = Atomics.waitAsync(headerI32, SEQ_IDX, lastSeq, READER_WAIT_TIMEOUT_MS);
       const _result = async ? await value : (value as string);
     }
     lastSeq = Atomics.load(headerView(), SEQ_IDX);
@@ -337,25 +288,12 @@ async function runLoop(
       // Copy payload (if any) into scratch immediately after the header.
       if (payloadLen > 0) {
         const payloadStart = (readCur + RECORD_HEADER_BYTES) % bodyLen;
-        copyFromRing(
-          bodyU8,
-          payloadStart,
-          bodyLen,
-          scratch,
-          RECORD_HEADER_BYTES,
-          payloadLen,
-        );
+        copyFromRing(bodyU8, payloadStart, bodyLen, scratch, RECORD_HEADER_BYTES, payloadLen);
       }
 
       // Dispatch the record to the appropriate callback.
       try {
-        dispatchRecord(
-          kind,
-          flags,
-          scratch.subarray(RECORD_HEADER_BYTES, totalLen),
-          onChunk,
-          onError,
-        );
+        dispatchRecord(kind, flags, scratch.subarray(RECORD_HEADER_BYTES, totalLen), onChunk, onError);
       } catch (e) {
         onError(e instanceof Error ? e : new Error(String(e)));
       }
@@ -381,12 +319,7 @@ async function runLoop(
     // -----------------------------------------------------------------------
     const currentSeq = Atomics.load(headerI32, SEQ_IDX);
     if (currentSeq === lastSeq) {
-      const { async, value } = Atomics.waitAsync(
-        headerI32,
-        SEQ_IDX,
-        lastSeq,
-        READER_WAIT_TIMEOUT_MS,
-      );
+      const { async, value } = Atomics.waitAsync(headerI32, SEQ_IDX, lastSeq, READER_WAIT_TIMEOUT_MS);
       // value is a Promise<string> when async=true, or a string when async=false
       // ("not-equal" means seq already changed before the wait).
       const _result = async ? await value : (value as string);
@@ -472,30 +405,27 @@ function dispatchRecord(
  */
 function jsonToChunk(j: Record<string, unknown>): ChatStreamChunk {
   let performance: PerformanceMetrics | undefined;
-  if (j["performance"] != null) {
-    const p = j["performance"] as Record<string, unknown>;
+  if (j['performance'] != null) {
+    const p = j['performance'] as Record<string, unknown>;
     performance = {
-      ttftMs: p["ttft_ms"] as number,
-      prefillTokensPerSecond: p["prefill_tokens_per_second"] as number,
-      decodeTokensPerSecond: p["decode_tokens_per_second"] as number,
+      ttftMs: p['ttft_ms'] as number,
+      prefillTokensPerSecond: p['prefill_tokens_per_second'] as number,
+      decodeTokensPerSecond: p['decode_tokens_per_second'] as number,
     };
   }
 
   const chunk: ChatStreamChunk = {
-    text: (j["text"] as string) ?? "",
-    done: (j["done"] as boolean) ?? false,
+    text: (j['text'] as string) ?? '',
+    done: (j['done'] as boolean) ?? false,
   };
 
-  if (j["finish_reason"] != null)
-    chunk.finishReason = j["finish_reason"] as string;
-  if (j["tool_calls"] != null)
-    chunk.toolCalls = j["tool_calls"] as ToolCallResult[];
-  if (j["thinking"] != null) chunk.thinking = j["thinking"] as string;
-  if (j["num_tokens"] != null) chunk.numTokens = j["num_tokens"] as number;
-  if (j["raw_text"] != null) chunk.rawText = j["raw_text"] as string;
+  if (j['finish_reason'] != null) chunk.finishReason = j['finish_reason'] as string;
+  if (j['tool_calls'] != null) chunk.toolCalls = j['tool_calls'] as ToolCallResult[];
+  if (j['thinking'] != null) chunk.thinking = j['thinking'] as string;
+  if (j['num_tokens'] != null) chunk.numTokens = j['num_tokens'] as number;
+  if (j['raw_text'] != null) chunk.rawText = j['raw_text'] as string;
   if (performance != null) chunk.performance = performance;
-  if (j["is_reasoning"] != null)
-    chunk.isReasoning = j["is_reasoning"] as boolean;
+  if (j['is_reasoning'] != null) chunk.isReasoning = j['is_reasoning'] as boolean;
 
   return chunk;
 }

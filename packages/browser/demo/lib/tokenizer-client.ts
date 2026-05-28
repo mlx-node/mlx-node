@@ -19,18 +19,16 @@ import {
   type TokenInfo,
   type TokenizeRequest,
   type TokenizeResult,
-} from "../../src/inspector-types";
+} from '../../src/inspector-types';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 function makeAbortError(): DOMException {
-  return new DOMException("Tokenize aborted", "AbortError");
+  return new DOMException('Tokenize aborted', 'AbortError');
 }
 
 function nextTokenizeId(): string {
-  const cryptoObj = globalThis.crypto as
-    | { randomUUID?: () => string }
-    | undefined;
+  const cryptoObj = globalThis.crypto as { randomUUID?: () => string } | undefined;
   if (cryptoObj?.randomUUID) {
     return cryptoObj.randomUUID();
   }
@@ -64,7 +62,7 @@ export function tokenize(
   options?: TokenizerClientOptions,
 ): Promise<TokenInfo[]> {
   if (!worker) {
-    return Promise.reject(new Error("MLX worker is not available"));
+    return Promise.reject(new Error('MLX worker is not available'));
   }
   const signal = options?.signal;
   if (signal?.aborted) {
@@ -78,13 +76,13 @@ export function tokenize(
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
     const cleanup = () => {
-      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener('message', onMessage);
       if (timeoutHandle != null) {
         clearTimeout(timeoutHandle);
         timeoutHandle = null;
       }
       if (signal) {
-        signal.removeEventListener("abort", onAbort);
+        signal.removeEventListener('abort', onAbort);
       }
     };
 
@@ -104,11 +102,11 @@ export function tokenize(
 
     const onMessage = (event: MessageEvent) => {
       const msg = event.data as TokenizeResult | undefined;
-      if (!msg || typeof msg !== "object") return;
+      if (!msg || typeof msg !== 'object') return;
       if (msg.type === TOKENIZE_RESULT_TYPE && msg.id === id) {
         settleResolve(msg.tokens);
       } else if (msg.type === TOKENIZE_ERROR_TYPE && msg.id === id) {
-        settleReject(new Error(msg.error || "Tokenize failed"));
+        settleReject(new Error(msg.error || 'Tokenize failed'));
       }
     };
 
@@ -116,9 +114,9 @@ export function tokenize(
       settleReject(makeAbortError());
     };
 
-    worker.addEventListener("message", onMessage);
+    worker.addEventListener('message', onMessage);
     if (signal) {
-      signal.addEventListener("abort", onAbort);
+      signal.addEventListener('abort', onAbort);
     }
 
     timeoutHandle = setTimeout(() => {

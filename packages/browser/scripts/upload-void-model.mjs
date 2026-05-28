@@ -5,10 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
-const defaultModelDir = path.resolve(
-  dirname,
-  '../../../../mlx-node/.cache/models/qwen3.5-0.8b-mlx-bf16',
-);
+const defaultModelDir = path.resolve(dirname, '../../../../mlx-node/.cache/models/qwen3.5-0.8b-mlx-bf16');
 const defaultBaseUrl = 'https://mlx.void.app';
 const defaultPrefix = 'models/qwen3.5-0.8b-mlx-bf16';
 const defaultPartSize = 32 * 1024 * 1024;
@@ -138,9 +135,7 @@ async function uploadMultipart(uploadBaseUrl, token, key, filePath, size, conten
         parts.push(part);
 
         offset += bytesRead;
-        process.stdout.write(
-          `\r  multipart ${partNumber} (${Math.min(100, Math.floor((offset / size) * 100))}%)`,
-        );
+        process.stdout.write(`\r  multipart ${partNumber} (${Math.min(100, Math.floor((offset / size) * 100))}%)`);
         partNumber += 1;
       }
       process.stdout.write('\n');

@@ -23,7 +23,7 @@ class TestBridge {
 
     worker.onmessage = (e: MessageEvent) => {
       const { type, name, passed, error, info } = e.data;
-      if (type === "result") {
+      if (type === 'result') {
         const p = this.pending.get(name);
         if (p) {
           this.pending.delete(name);
@@ -34,15 +34,12 @@ class TestBridge {
   }
 
   static async create(): Promise<TestBridge> {
-    const worker = new Worker(new URL("../test-worker.ts", import.meta.url), {
-      type: "module",
+    const worker = new Worker(new URL('../test-worker.ts', import.meta.url), {
+      type: 'module',
     });
 
     const testNames = await new Promise<string[]>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("Test worker init timeout (60s)")),
-        60_000,
-      );
+      const timer = setTimeout(() => reject(new Error('Test worker init timeout (60s)')), 60_000);
 
       worker.onerror = (err) => {
         clearTimeout(timer);
@@ -51,10 +48,10 @@ class TestBridge {
 
       worker.onmessage = (e: MessageEvent) => {
         const { type } = e.data;
-        if (type === "ready") {
+        if (type === 'ready') {
           clearTimeout(timer);
           resolve(e.data.tests as string[]);
-        } else if (type === "error") {
+        } else if (type === 'error') {
           clearTimeout(timer);
           reject(new Error(e.data.message));
         }
@@ -62,8 +59,8 @@ class TestBridge {
       };
 
       worker.postMessage({
-        type: "init-vitest",
-        wasmUrl: "/mlx-core.opt.wasm",
+        type: 'init-vitest',
+        wasmUrl: '/mlx-core.opt.wasm',
       });
     });
 
@@ -73,13 +70,13 @@ class TestBridge {
   runTest(name: string): Promise<TestResult> {
     return new Promise((resolve) => {
       this.pending.set(name, { resolve });
-      this.worker.postMessage({ type: "run", name });
+      this.worker.postMessage({ type: 'run', name });
     });
   }
 
   terminate(): void {
     for (const pending of this.pending.values()) {
-      pending.resolve({ passed: false, error: "Test worker terminated" });
+      pending.resolve({ passed: false, error: 'Test worker terminated' });
     }
     this.pending.clear();
     this.worker.terminate();
@@ -117,8 +114,8 @@ export function terminateBridge(): void {
   initPromise = null;
 }
 
-if (typeof globalThis.addEventListener === "function") {
+if (typeof globalThis.addEventListener === 'function') {
   const cleanup = () => terminateBridge();
-  globalThis.addEventListener("pagehide", cleanup, { once: true });
-  globalThis.addEventListener("beforeunload", cleanup, { once: true });
+  globalThis.addEventListener('pagehide', cleanup, { once: true });
+  globalThis.addEventListener('beforeunload', cleanup, { once: true });
 }

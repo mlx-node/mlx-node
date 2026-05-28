@@ -1,12 +1,7 @@
-import * as React from "react";
+import * as React from 'react';
 
-import { Button } from "../../components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "../../components/ui/card";
+import { Button } from '../../components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/card';
 
 export type ShapeProblemProps = {
   /** Headline question, e.g. "How big is Qwen3's embedding matrix?" */
@@ -24,12 +19,7 @@ export type ShapeProblemProps = {
  * give the reader a concrete number to compute (parameter count, KV-cache
  * footprint, MLP intermediate size, etc.) instead of just reading prose.
  */
-export function ShapeProblem({
-  question,
-  formula,
-  values,
-  answer,
-}: ShapeProblemProps) {
+export function ShapeProblem({ question, formula, values, answer }: ShapeProblemProps) {
   const [open, setOpen] = React.useState(false);
   return (
     <Card className="gap-3 py-4">
@@ -44,23 +34,14 @@ export function ShapeProblem({
           <tbody>
             {values.map((v, i) => (
               <tr key={i} className="border-b border-border last:border-b-0">
-                <td className="py-1.5 pr-4 font-mono text-muted-foreground">
-                  {v.label}
-                </td>
-                <td className="py-1.5 text-right font-mono text-foreground">
-                  {v.value}
-                </td>
+                <td className="py-1.5 pr-4 font-mono text-muted-foreground">{v.label}</td>
+                <td className="py-1.5 text-right font-mono text-foreground">{v.value}</td>
               </tr>
             ))}
           </tbody>
         </table>
-        <Button
-          variant="outline"
-          size="sm"
-          aria-expanded={open}
-          onClick={() => setOpen((v) => !v)}
-        >
-          {open ? "Hide answer" : "Show answer"}
+        <Button variant="outline" size="sm" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+          {open ? 'Hide answer' : 'Show answer'}
         </Button>
         {open ? (
           <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground/85">

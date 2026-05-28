@@ -19,10 +19,7 @@ export type TelemetryView = {
   modelLine: string;
 };
 
-function formatTokRate(
-  label: string,
-  value: number | null | undefined,
-): string {
+function formatTokRate(label: string, value: number | null | undefined): string {
   const rate = value ?? 0;
   return rate > 0 ? `${label} ${Math.round(rate)} tok/s` : `${label} —`;
 }
@@ -41,17 +38,14 @@ export function formatTelemetry(
   decodeTokensPerSecond: number | null | undefined,
   modelLine: string,
 ): TelemetryView {
-  const decodeTokPerSec = formatTokRate("decode", decodeTokensPerSecond);
-  const prefillTokPerSec = formatTokRate("prefill", prefillTokensPerSecond);
+  const decodeTokPerSec = formatTokRate('decode', decodeTokensPerSecond);
+  const prefillTokPerSec = formatTokRate('prefill', prefillTokensPerSecond);
 
-  let gpuRpc = "—";
-  let pool = "—";
+  let gpuRpc = '—';
+  let pool = '—';
 
   if (stats && stats.numTokens) {
-    const rpcPerTok =
-      stats.gpuRpcCount && stats.numTokens
-        ? Math.round(stats.gpuRpcCount / stats.numTokens)
-        : null;
+    const rpcPerTok = stats.gpuRpcCount && stats.numTokens ? Math.round(stats.gpuRpcCount / stats.numTokens) : null;
     if (rpcPerTok != null) {
       gpuRpc = `${rpcPerTok.toLocaleString()} gpu-rpc/tok`;
     }
@@ -68,16 +62,14 @@ export function formatTelemetry(
 }
 
 export function formatLoadingText(status: string | null): string {
-  return status && status.trim().length > 0 ? status : "Initializing model…";
+  return status && status.trim().length > 0 ? status : 'Initializing model…';
 }
 
-export type ReasoningEffort = "off" | "low" | "medium" | "high";
+export type ReasoningEffort = 'off' | 'low' | 'medium' | 'high';
 
-const REASONING_CYCLE: ReasoningEffort[] = ["off", "low", "medium", "high"];
+const REASONING_CYCLE: ReasoningEffort[] = ['off', 'low', 'medium', 'high'];
 
-export function cycleReasoningEffort(
-  current: ReasoningEffort,
-): ReasoningEffort {
+export function cycleReasoningEffort(current: ReasoningEffort): ReasoningEffort {
   const i = REASONING_CYCLE.indexOf(current);
   return REASONING_CYCLE[(i + 1) % REASONING_CYCLE.length];
 }

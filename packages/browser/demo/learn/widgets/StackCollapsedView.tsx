@@ -80,7 +80,9 @@ function CollapsedSlab({ from, to }: { from: number; to: number }) {
         <div className="text-xs font-mono text-muted-foreground">
           Layers {from} … {to}
         </div>
-        <div className="mt-0.5 text-[11px] text-muted-foreground/80">structure same as above · {to - from + 1} more</div>
+        <div className="mt-0.5 text-[11px] text-muted-foreground/80">
+          structure same as above · {to - from + 1} more
+        </div>
       </div>
       {/* Decorative tick marks to suggest "many of these" without drawing every one. */}
       <div className="pointer-events-none absolute inset-x-3 top-1 flex gap-1 opacity-30" aria-hidden="true">

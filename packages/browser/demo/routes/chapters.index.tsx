@@ -11,12 +11,13 @@ import { useEffect } from 'react';
 import { Loading } from '../components/loading/Loading';
 import { ChapterIndex } from '../learn/ChapterIndex';
 import { triggerLocalPicker } from '../lib/local-model-picker';
+import { useFreeChat } from '../providers/free-chat';
 import { useModelLoader } from '../providers/model-loader';
 
 function ChaptersIndexRouteComponent() {
   const navigate = useNavigate();
-  const { status, loadingText, loadingProgress, hostedModelAvailable, kickoffLoad } =
-    useModelLoader();
+  const { mlxWorkerRef, inspectorAbortRef } = useFreeChat();
+  const { status, loadingText, loadingProgress, hostedModelAvailable, kickoffLoad } = useModelLoader();
 
   // Auto-kickoff the model load when the user lands directly on /chapters via
   // bookmark / hard reload. The Landing route also kicks off on "Start
@@ -35,6 +36,8 @@ function ChaptersIndexRouteComponent() {
 
   return (
     <ChapterIndex
+      workerRef={mlxWorkerRef}
+      abortRef={inspectorAbortRef}
       onOpenChapter={(chapterId) => {
         void navigate({ to: '/chapters/$chapterId', params: { chapterId }, search: (prev) => prev });
       }}

@@ -1,4 +1,4 @@
-import { DriftingLibrary } from "./DriftingLibrary";
+import { DriftingLibrary } from './DriftingLibrary';
 
 export type LandingProps = {
   onLoad: () => void;
@@ -7,9 +7,15 @@ export type LandingProps = {
   errorBanner: string | null;
   hostedModelAvailable?: boolean | null;
   loadDisabled?: boolean;
+  /** When true, the model is already loaded in the worker. We flip the
+   *  primary CTA label to "Open Chat →" so a returning user (or anyone
+   *  who already loaded the model on a previous visit and got cached
+   *  weights) sees an obvious next action instead of a "Load Model"
+   *  button that silently no-ops because there's nothing to load. */
+  modelReady?: boolean;
 };
 
-const MODEL_LABEL = "0.8B";
+const MODEL_LABEL = '0.8B';
 
 export function Landing({
   onLoad,
@@ -18,10 +24,13 @@ export function Landing({
   errorBanner,
   hostedModelAvailable = null,
   loadDisabled = false,
+  modelReady = false,
 }: LandingProps) {
   const primaryLabel =
     hostedModelAvailable === false ? (
-      "Choose Local Model"
+      'Choose Local Model'
+    ) : modelReady ? (
+      <>Open Chat →</>
     ) : (
       <>
         Load Model (<span>{MODEL_LABEL}</span>)
@@ -37,17 +46,14 @@ export function Landing({
           Qwen 3.5 <em>Vision</em>
         </h1>
         <p className="landing-sub">
-          Run a multimodal vision-language model entirely in your browser. No
-          server, no API keys — powered by <code>@mlx-node/browser</code> and
-          WebGPU.
+          Run a multimodal vision-language model entirely in your browser. No server, no API keys — powered by{' '}
+          <code>@mlx-node/browser</code> and WebGPU.
         </p>
 
         <div className="landing-void-ad" aria-label="Hosted on Void Platform">
           <span className="landing-void-eyebrow">Hosted on</span>
           <span className="landing-void-mark">Void Platform</span>
-          <span className="landing-void-copy">
-            Edge assets · WebGPU isolation
-          </span>
+          <span className="landing-void-copy">Edge assets · WebGPU isolation</span>
         </div>
 
         <div className="landing-specs">
@@ -72,7 +78,7 @@ export function Landing({
             onClick={onLoad}
             disabled={loadDisabled || hostedModelAvailable === null}
           >
-            {hostedModelAvailable === null ? "Checking Model..." : primaryLabel}
+            {hostedModelAvailable === null ? 'Checking Model...' : primaryLabel}
           </button>
           <button
             type="button"
@@ -86,16 +92,11 @@ export function Landing({
           </button>
         </div>
 
-        <button
-          type="button"
-          className="btn-start-learning"
-          onClick={onStartLearning}
-        >
+        <button type="button" className="btn-start-learning" onClick={onStartLearning}>
           Start learning →
         </button>
         <p className="landing-learn-hint">
-          New to LLMs? Step through 10 chapters that explain how this model
-          actually works.
+          New to LLMs? Step through 13 chapters that explain how this model actually works.
         </p>
 
         {errorBanner && (
@@ -105,11 +106,7 @@ export function Landing({
         )}
       </div>
 
-      <img
-        className="landing-mascot"
-        src="/capybara.png"
-        alt="Qwen capybara mascot"
-      />
+      <img className="landing-mascot" src="/capybara.png" alt="Qwen capybara mascot" />
 
       <div className="landing-footer">
         Built with <code>@mlx-node/browser</code>

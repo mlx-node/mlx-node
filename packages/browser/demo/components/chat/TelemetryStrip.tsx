@@ -1,4 +1,4 @@
-import { type ProfileLikeStats, formatTelemetry } from "../../lib/display-helpers";
+import { type ProfileLikeStats, formatTelemetry } from '../../lib/display-helpers';
 
 export type TelemetryStripProps = {
   stats: ProfileLikeStats | null;
@@ -13,12 +13,7 @@ export function TelemetryStrip({
   decodeTokensPerSecond,
   modelLine,
 }: TelemetryStripProps) {
-  const view = formatTelemetry(
-    stats,
-    prefillTokensPerSecond,
-    decodeTokensPerSecond,
-    modelLine,
-  );
+  const view = formatTelemetry(stats, prefillTokensPerSecond, decodeTokensPerSecond, modelLine);
   return (
     <div className="telemetry-strip" role="status" aria-label="Telemetry">
       <span className="pill-tok">{view.decodeTokPerSec}</span>

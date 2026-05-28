@@ -1,33 +1,35 @@
-import { ArrowLeftIcon, MessageSquareIcon, PlayIcon } from "lucide-react";
-import * as React from "react";
+import { ArrowLeftIcon, MessageSquareIcon } from 'lucide-react';
+import * as React from 'react';
 
-import { Badge } from "../components/ui/badge";
-import { Button } from "../components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "../components/ui/card";
-import { CHAPTERS, type ChapterMeta } from "./chapters";
+import type { AttentionRun } from '../../src/inspector-types';
+import { Badge } from '../components/ui/badge';
+import { Button } from '../components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
+import { Textarea } from '../components/ui/textarea';
+import { runForInspector } from '../lib/inspector-client';
+import { CHAPTERS, type ChapterMeta } from './chapters';
+import { cleanupTokenText, renderTokenDisplay } from './inspector/TopKBars';
+import { RunButton } from './scaffolding/RunButton';
+import { useRunFlash } from './scaffolding/useRunFlash';
 
 export type ChapterIndexProps = {
   onOpenChapter: (chapterId: string) => void;
   onBackToLanding: () => void;
   onOpenFreeChat: () => void;
+  workerRef: React.RefObject<Worker | null>;
+  abortRef: React.RefObject<AbortController | null>;
 };
 
 // (Previous "curriculum phase" colour bands lived here. They drove the
-// horizontal pill rail that has been replaced by the animated forward-pass
-// flow below — see {@link ForwardPassFlow}. The flow's lit-stage gradient
-// renders the same "conceptual grouping" idea more directly, by showing
-// where each chapter's content actually fires inside one inference step.)
+// horizontal pill rail that has been replaced by the real-forward-pass
+// flow below — see {@link ForwardPassFlow}.)
 
 export function ChapterIndex({
   onOpenChapter,
   onBackToLanding,
   onOpenFreeChat,
+  workerRef,
+  abortRef,
 }: ChapterIndexProps) {
   return (
     <div className="absolute inset-0 z-10 overflow-y-auto bg-background">
@@ -42,12 +44,7 @@ export function ChapterIndex({
             <ArrowLeftIcon className="size-4" />
             Back
           </button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onOpenFreeChat}
-            className="gap-2"
-          >
+          <Button variant="outline" size="sm" onClick={onOpenFreeChat} className="gap-2">
             <MessageSquareIcon className="size-4" />
             Open free chat
           </Button>
@@ -58,20 +55,18 @@ export function ChapterIndex({
           <div className="mb-2 font-mono text-xs uppercase tracking-[0.2em] text-primary">
             Learn LLMs · powered by Qwen3.5 in your browser
           </div>
-          <h1 className="text-4xl font-semibold tracking-tight text-foreground">
-            Chapters
-          </h1>
+          <h1 className="text-4xl font-semibold tracking-tight text-foreground">Chapters</h1>
           <p className="mt-3 max-w-2xl text-muted-foreground">
-            Ten guided lessons that explain how a modern transformer LLM works,
-            using the real model running in your browser via WebGPU. Read the
-            prose on the left, then poke at the live model on the right.
+            Thirteen guided lessons that explain how a modern transformer LLM works, using the real model running in
+            your browser via WebGPU. Read the prose on the left, then poke at the live model on the right.
           </p>
         </div>
 
-        {/* Animated forward-pass flow — shows the order each chapter's
-            content runs inside the model. Replaces the older horizontal
-            "Suggested order" pill rail. */}
-        <ForwardPassFlow onOpenChapter={onOpenChapter} />
+        {/* Real forward-pass flow — runs the live model, captures per-layer
+            data, and replays it through an Apple-Wallet-style card stack
+            that shuffles between layers, with full vs linear-attention
+            cards getting distinct treatments. */}
+        <ForwardPassFlow onOpenChapter={onOpenChapter} workerRef={workerRef} abortRef={abortRef} />
 
         {/* Grid of chapter cards */}
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -79,730 +74,1120 @@ export function ChapterIndex({
             <ChapterCard
               key={chapter.id}
               chapter={chapter}
-              onOpen={() =>
-                chapter.available ? onOpenChapter(chapter.id) : undefined
-              }
+              onOpen={() => (chapter.available ? onOpenChapter(chapter.id) : undefined)}
             />
           ))}
         </div>
 
         <p className="mt-10 text-xs text-muted-foreground">
-          Each chapter is self-contained, but the suggested order builds the
-          model from the bottom up — text in, attention through the middle,
-          sampling out.
+          Each chapter is self-contained, but the suggested order builds the model from the bottom up — text in,
+          attention through the middle, sampling out.
         </p>
       </div>
     </div>
   );
 }
 
-/**
- * Animated forward-pass flow diagram.
- *
- * Visualizes what one inference step actually does inside the model, with
- * a glowing "hidden-state" dot that travels through every stage. Each
- * stage cross-references a chapter — click any stage to open the chapter
- * that explains it. The middle of the flow is wrapped in a "× 24 layers"
- * boundary that, during animation, ticks a layer counter from 1 to 24 to
- * convey that the loop body repeats 24 times for every forward pass.
- *
- * Replaces the older horizontal "Suggested order" pill rail. The lesson is
- * the same — order matters — but now the order is the real execution
- * order, not the teaching order.
- *
- * Honors prefers-reduced-motion: skips the traveling dot and counter
- * animations and just shows the static diagram with the final dot at the
- * sampling stage.
- */
-type StageId =
-  | "tokenize"
-  | "embedding"
-  | "rmsnorm_pre"
-  | "attn"
-  | "attn_rope"
-  | "attn_mha"
-  | "attn_kvcache"
-  | "residual_attn"
-  | "rmsnorm_post"
-  | "mlp"
-  | "residual_mlp"
-  | "final_norm"
-  | "lm_head"
-  | "sampling";
+// ----------------------------------------------------------------------------
+// ForwardPassFlow — real model run + Apple-Wallet card-stack replay.
+// ----------------------------------------------------------------------------
+//
+// The diagram is hybrid: a left rail with the traveling "hidden state" dot
+// + a card-stack viewport where 24 layer cards are absolutely positioned
+// and transforms shift in lock-step as the active layer changes. Each card
+// shows its sub-stage list; the active sub-stage gets a highlight bar that
+// slides between rows.
+//
+// Layer types: full-attention layers (Qwen3_5Attention) get a cyan ring
+// and a 12-step internal sequence ending in MLP + residuals. Linear layers
+// (GatedDeltaNet — most of Qwen3.5) get an amber ring and a GDN-specific
+// 10-step sequence. The card visual + internal animation match the layer
+// type so you can see when the model switches mode.
 
-type StageVisual = {
-  id: StageId;
-  label: string;
-  /** Chapter id to open on click — undefined means non-clickable (e.g. residual). */
-  chapterId?: string;
-  /** Chapter number shown as a pill on the right of the box. */
-  chapterNum?: number;
-  /** Top-left SVG y. */
-  y: number;
-  /** Height in SVG units. */
-  height: number;
-  /** Box variant — controls width + styling. */
-  variant: "outer" | "inner" | "sub" | "residual";
+const NUM_LAYERS = 24;
+const DEFAULT_PROMPT = 'The cat sat on the';
+
+/**
+ * Cut the raw generated text off at the first chat-template special-token
+ * marker. Qwen3.5 emits `<|im_end|>` when the assistant's turn ends, and
+ * sometimes follows with `<|endoftext|>`; neither belongs in the
+ * pedagogical reveal. The literal markers `<|...|>` arrive verbatim in
+ * the decoded token text (they're tokens whose detokenized form is just
+ * that string), so a plain string search is enough — no need to know
+ * their numeric IDs.
+ */
+const SPECIAL_TURN_MARKERS = ['<|im_end|>', '<|endoftext|>', '<|im_start|>'] as const;
+function stripChatSpecials(text: string): string {
+  let cut = text.length;
+  for (const marker of SPECIAL_TURN_MARKERS) {
+    const idx = text.indexOf(marker);
+    if (idx >= 0 && idx < cut) cut = idx;
+  }
+  return text.slice(0, cut).trimEnd();
+}
+
+/** A sub-stage inside one of the 24 layer cards. */
+type SubStage = { id: string; label: string; durationMs: number };
+
+/** Full-attention layer (e.g. Qwen3.5 layers 3, 7, 11, 15, 19, 23).
+ *  Each step has a >= 65 ms dwell so the human eye can still follow at 1×
+ *  but the whole replay feels snappy. Earlier values were 2× this; ½×
+ *  restores the slower-paced reading speed for first-time learners. */
+const FULL_ATTN_SUBS: readonly SubStage[] = [
+  { id: 'pre_norm', label: 'RMSNorm (pre)', durationMs: 75 },
+  { id: 'qkv_proj', label: 'Q · K · V projection', durationMs: 75 },
+  { id: 'rope', label: 'RoPE on Q · K', durationMs: 90 },
+  { id: 'gqa_split', label: '8 Q heads · 2 KV heads (GQA)', durationMs: 90 },
+  { id: 'attn_score', label: 'Q @ Kᵀ · scale', durationMs: 90 },
+  { id: 'causal_mask', label: 'Causal mask', durationMs: 75 },
+  { id: 'softmax', label: 'Softmax', durationMs: 100 },
+  { id: 'attn_v', label: 'Attn @ V · out-proj', durationMs: 90 },
+  { id: 'residual_attn', label: '+ residual', durationMs: 65 },
+  { id: 'post_norm', label: 'RMSNorm (post)', durationMs: 75 },
+  { id: 'mlp', label: 'MLP block (SwiGLU)', durationMs: 125 },
+  { id: 'residual_mlp', label: '+ residual', durationMs: 65 },
+];
+// Sum ≈ 1.015s per full-attention layer at 1× (was 2.03s before halving).
+
+/** Linear-attention layer (GatedDeltaNet — most of Qwen3.5's layers). */
+const LINEAR_ATTN_SUBS: readonly SubStage[] = [
+  { id: 'pre_norm', label: 'RMSNorm (pre)', durationMs: 75 },
+  { id: 'gdn_gates', label: 'b · a · c · g gates', durationMs: 100 },
+  { id: 'gdn_qkv', label: 'q · k · v projections', durationMs: 90 },
+  { id: 'gdn_recurrent', label: 'S ← α·S + β·k⊗v (recurrent state)', durationMs: 140 },
+  { id: 'gdn_output_gate', label: 'Gated output', durationMs: 90 },
+  { id: 'gdn_out_proj', label: 'Out projection', durationMs: 75 },
+  { id: 'residual_attn', label: '+ residual', durationMs: 65 },
+  { id: 'post_norm', label: 'RMSNorm (post)', durationMs: 75 },
+  { id: 'mlp', label: 'MLP block (SwiGLU)', durationMs: 125 },
+  { id: 'residual_mlp', label: '+ residual', durationMs: 65 },
+];
+// Sum ≈ 0.90s per linear-attention layer at 1× (was 1.80s before halving).
+
+/** Chapter links for sub-stage rows. Both layer types share most rows. */
+const SUB_CHAPTER: Record<string, string | undefined> = {
+  pre_norm: 'rmsnorm',
+  qkv_proj: 'attention',
+  rope: 'rope',
+  gqa_split: 'multi-head-gqa',
+  attn_score: 'attention',
+  causal_mask: 'attention',
+  softmax: 'attention',
+  attn_v: 'attention',
+  residual_attn: 'full-block',
+  post_norm: 'rmsnorm',
+  mlp: 'mlp',
+  residual_mlp: 'full-block',
+  gdn_gates: 'kv-cache',
+  gdn_qkv: 'kv-cache',
+  gdn_recurrent: 'kv-cache',
+  gdn_output_gate: 'kv-cache',
+  gdn_out_proj: 'kv-cache',
 };
 
-// Layout constants. The SVG is rendered with a fixed viewBox and scales
-// responsively, so all positions here are in SVG units.
-const SVG_WIDTH = 600;
-const OUTER_X = 150;
-const OUTER_W = 300;
-const LOOP_X = 50;
-const LOOP_W = 500;
-const INNER_X = 110;
-const INNER_W = 380;
-const SUB_X = 150;
-const SUB_W = 300;
-const RES_X = 200;
-const RES_W = 200;
+/** Stage ids. The layer scenes carry both the layer index and the sub-stage
+ *  id (a string from one of the layer-type sequences). */
+type StageId =
+  | 'tokenize'
+  | 'embedding'
+  | { kind: 'layer'; index: number; subId: string }
+  | 'final_norm'
+  | 'lm_head'
+  | 'sampling';
 
-const STAGES: readonly StageVisual[] = [
-  { id: "tokenize", label: "Tokenize", chapterId: "tokenization", chapterNum: 1, y: 18, height: 36, variant: "outer" },
-  { id: "embedding", label: "Embedding lookup", chapterId: "embeddings", chapterNum: 2, y: 82, height: 36, variant: "outer" },
-  // Loop boundary spans y=146 to y=506
-  { id: "rmsnorm_pre", label: "RMSNorm", chapterId: "rmsnorm", chapterNum: 6, y: 178, height: 32, variant: "inner" },
-  { id: "attn", label: "Self-attention", chapterId: "attention", chapterNum: 3, y: 234, height: 28, variant: "inner" },
-  { id: "attn_rope", label: "apply RoPE to Q, K", chapterId: "rope", chapterNum: 5, y: 270, height: 22, variant: "sub" },
-  { id: "attn_mha", label: "8 query heads · 2 K/V heads", chapterId: "multi-head-gqa", chapterNum: 4, y: 296, height: 22, variant: "sub" },
-  { id: "attn_kvcache", label: "read past K/V · append new", chapterId: "kv-cache", chapterNum: 10, y: 322, height: 22, variant: "sub" },
-  { id: "residual_attn", label: "+ residual", y: 354, height: 22, variant: "residual" },
-  { id: "rmsnorm_post", label: "RMSNorm", chapterId: "rmsnorm", chapterNum: 6, y: 388, height: 32, variant: "inner" },
-  { id: "mlp", label: "MLP block (SwiGLU)", chapterId: "mlp", chapterNum: 7, y: 444, height: 32, variant: "inner" },
-  { id: "residual_mlp", label: "+ residual", y: 500, height: 22, variant: "residual" },
-  // (loop boundary ends ~y=536)
-  { id: "final_norm", label: "Final RMSNorm", chapterId: "rmsnorm", chapterNum: 6, y: 564, height: 32, variant: "outer" },
-  { id: "lm_head", label: "LM head → 152K logits", y: 628, height: 32, variant: "outer" },
-  { id: "sampling", label: "Sampling → next token", chapterId: "sampling", chapterNum: 9, y: 692, height: 36, variant: "outer" },
-];
+function isLayerStage(s: StageId): s is { kind: 'layer'; index: number; subId: string } {
+  return typeof s === 'object' && s !== null && (s as { kind?: string }).kind === 'layer';
+}
 
-const LOOP_TOP_Y = 146;
-const LOOP_BOTTOM_Y = 536;
-// 750 was tight; the "next token → ·floor" reveal that appears under
-// Sampling needs ~50 more units of canvas so it isn't clipped.
-const SVG_HEIGHT = 800;
+/** Dwell for the fixed top/bottom stages. Halved from the prior values so
+ *  the whole replay is 2× faster by default; the ½× speed button restores
+ *  the slower pace for first-time readers, and 4× is for impatient
+ *  re-viewers. */
+const FIXED_DWELL_MS: Record<string, number> = {
+  tokenize: 300,
+  embedding: 300,
+  final_norm: 300,
+  lm_head: 400,
+  sampling: 750,
+};
 
-function stageX(variant: StageVisual["variant"]): { x: number; w: number } {
-  switch (variant) {
-    case "outer":
-      return { x: OUTER_X, w: OUTER_W };
-    case "inner":
-      return { x: INNER_X, w: INNER_W };
-    case "sub":
-      return { x: SUB_X, w: SUB_W };
-    case "residual":
-      return { x: RES_X, w: RES_W };
+type Scene = { stage: StageId; durationMs: number };
+
+const DEFAULT_FULL_ATTN_SET = new Set<number>([3, 7, 11, 15, 19, 23]);
+
+function buildScenes(fullAttn: Set<number>): Scene[] {
+  const scenes: Scene[] = [];
+  scenes.push({ stage: 'tokenize', durationMs: FIXED_DWELL_MS.tokenize! });
+  scenes.push({ stage: 'embedding', durationMs: FIXED_DWELL_MS.embedding! });
+  for (let i = 0; i < NUM_LAYERS; i++) {
+    const subs = fullAttn.has(i) ? FULL_ATTN_SUBS : LINEAR_ATTN_SUBS;
+    for (const sub of subs) {
+      scenes.push({ stage: { kind: 'layer', index: i, subId: sub.id }, durationMs: sub.durationMs });
+    }
   }
+  scenes.push({ stage: 'final_norm', durationMs: FIXED_DWELL_MS.final_norm! });
+  scenes.push({ stage: 'lm_head', durationMs: FIXED_DWELL_MS.lm_head! });
+  scenes.push({ stage: 'sampling', durationMs: FIXED_DWELL_MS.sampling! });
+  return scenes;
 }
 
-function stageById(id: StageId): StageVisual {
-  const found = STAGES.find((s) => s.id === id);
-  if (!found) throw new Error(`Unknown stage id: ${id}`);
-  return found;
+type RunStatus =
+  | { kind: 'idle' }
+  | { kind: 'running' } // worker call in flight, before replay starts
+  | { kind: 'replaying' }
+  | { kind: 'paused' }
+  | { kind: 'done' }
+  | { kind: 'error'; error: string }
+  | { kind: 'aborted' }
+  | { kind: 'empty-prompt' };
+
+type Speed = 0.5 | 1 | 2 | 4;
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === 'AbortError';
 }
 
-// Dot lives in the fixed left margin (x=DOT_GUTTER_X) and slides
-// vertically as scenes advance. Aligned with the centre-line of each
-// active stage, it reads as a "you are here" pointer next to the boxes
-// — never overlapping text, never ambiguous about which box is current.
-// Earlier iterations placed the dot on the central spine, which either
-// covered the box label or sat in the arrow gutter above the box (making
-// it look mid-transit between the previous stage and the active one).
-const DOT_GUTTER_X = 80;
-function dotPosition(id: StageId): { cx: number; cy: number } {
-  const stage = stageById(id);
-  return { cx: DOT_GUTTER_X, cy: stage.y + stage.height / 2 };
-}
-
-// Scene script — what the dot does on Play. Each scene names the stage it
-// arrives at and how long it stays there before moving to the next. The
-// layer-counter ticks independently while the dot is inside the loop.
-type Scene = { active: StageId; durationMs: number };
-const SCENES: readonly Scene[] = [
-  { active: "tokenize", durationMs: 800 },
-  { active: "embedding", durationMs: 800 },
-  // Loop body — one visible iteration.
-  { active: "rmsnorm_pre", durationMs: 600 },
-  { active: "attn", durationMs: 500 },
-  { active: "attn_rope", durationMs: 450 },
-  { active: "attn_mha", durationMs: 450 },
-  { active: "attn_kvcache", durationMs: 500 },
-  { active: "residual_attn", durationMs: 400 },
-  { active: "rmsnorm_post", durationMs: 600 },
-  { active: "mlp", durationMs: 700 },
-  { active: "residual_mlp", durationMs: 1200 }, // hold here while counter races to 24
-  // Exit loop.
-  { active: "final_norm", durationMs: 700 },
-  { active: "lm_head", durationMs: 800 },
-  { active: "sampling", durationMs: 1200 },
-];
-
-const LOOP_STAGES = new Set<StageId>([
-  "rmsnorm_pre",
-  "attn",
-  "attn_rope",
-  "attn_mha",
-  "attn_kvcache",
-  "residual_attn",
-  "rmsnorm_post",
-  "mlp",
-  "residual_mlp",
-]);
-
-/** Hard-coded example used to ground the animation in a concrete prompt.
- * We don't actually run the model here — the index page mounts before the
- * worker is even started — but the prompt + predicted next token give the
- * user a real, gradable artifact ("for THIS sentence, the model would
- * produce THIS token") instead of an abstract pipeline diagram. */
-const EXAMPLE_PROMPT = "The cat sat on the";
-const EXAMPLE_PREDICTED_TOKEN = "·floor";
-
-function ForwardPassFlow({
-  onOpenChapter,
-}: {
+type ForwardPassFlowProps = {
   onOpenChapter: (chapterId: string) => void;
-}) {
-  // Current scene index. Before the user clicks Run we sit at scene 0 with
-  // the dot perched above Tokenize — the diagram is fully drawn but motion
-  // hasn't started yet. status === "idle" gates that.
+  workerRef: React.RefObject<Worker | null>;
+  abortRef: React.RefObject<AbortController | null>;
+};
+
+function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlowProps) {
+  const [prompt, setPrompt] = React.useState<string>(DEFAULT_PROMPT);
+  const [status, setStatus] = React.useState<RunStatus>({ kind: 'idle' });
+  const [run, setRun] = React.useState<AttentionRun | null>(null);
   const [activeIdx, setActiveIdx] = React.useState<number>(0);
-  // Layer counter ticks from 1 to 24 while the dot is in the loop.
-  const [layerCounter, setLayerCounter] = React.useState<number>(1);
-  // Lifecycle: "idle" before first Run, "playing" while the timeline runs,
-  // "done" when the dot has reached Sampling.
-  const [status, setStatus] = React.useState<"idle" | "playing" | "done">("idle");
-  // Bumped on each Run / Replay click to (re)schedule the animation.
-  // -1 means "never clicked" — we stay idle on mount.
-  const [runTick, setRunTick] = React.useState<number>(-1);
+  const [speed, setSpeed] = React.useState<Speed>(1);
+  const reducedMotion = usePrefersReducedMotion();
 
-  React.useEffect(() => {
-    if (runTick < 0) return; // idle on initial mount
+  const fullAttentionLayerIndices = React.useMemo(() => {
+    if (!run) return DEFAULT_FULL_ATTN_SET;
+    const set = new Set<number>();
+    // `run.attention` carries an entry for EVERY layer (the Rust side emits
+    // a stub `kind: 'linear'` entry with empty scores for linear layers so
+    // the frontend can reason about layer order). We only want the layers
+    // whose `kind === 'full'` to render as full-attention cards.
+    for (const a of run.attention ?? []) {
+      if (a.kind === 'full') set.add(a.layerIndex);
+    }
+    // modelMeta carries only the full-attention indices by contract, so
+    // unioning it is safe (and serves as a fallback when `attention` is
+    // empty — e.g. an inspector request that disabled attention capture).
+    for (const i of run.modelMeta?.fullAttentionLayerIndices ?? []) set.add(i);
+    // Fall back to the default if the run didn't carry any (e.g. pre-run).
+    return set.size === 0 ? DEFAULT_FULL_ATTN_SET : set;
+  }, [run]);
 
-    const reducedMotion =
-      typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const scenes = React.useMemo(() => buildScenes(fullAttentionLayerIndices), [fullAttentionLayerIndices]);
 
-    if (reducedMotion) {
-      // Snap to the final state — dot at sampling, counter at 24.
-      setActiveIdx(SCENES.length - 1);
-      setLayerCounter(24);
-      setStatus("done");
+  // Track which layer card is on the front of the stack. The dot uses this
+  // too to know when it's "inside the layer block" vs at head/tail.
+  const activeStage: StageId = scenes[activeIdx]?.stage ?? 'tokenize';
+  const activeLayer = isLayerStage(activeStage) ? activeStage : null;
+
+  // Total replay duration in seconds at 1× speed (for the helper copy).
+  const totalReplayMs = React.useMemo(() => scenes.reduce((sum, s) => sum + s.durationMs, 0), [scenes]);
+
+  // -- worker call lifecycle ----------------------------------------------
+  const runGenRef = React.useRef(0);
+  const runAbortRef = React.useRef<AbortController | null>(null);
+  const didAutoRunRef = React.useRef(false);
+  const resultFlashRef = useRunFlash<HTMLDivElement>(status.kind === 'running' || status.kind === 'replaying');
+
+  const handleRun = React.useCallback(async () => {
+    if (prompt.trim().length === 0) {
+      setStatus({ kind: 'empty-prompt' });
+      return;
+    }
+    const myGen = ++runGenRef.current;
+    setStatus({ kind: 'running' });
+    // Reset the cursor to the top while the worker call is in flight. This
+    // makes the "Re-run" gesture visually concrete — the cards pop back to
+    // layer 0 before the new replay starts.
+    setActiveIdx(0);
+
+    const worker = workerRef.current;
+    if (!worker) {
+      setStatus({ kind: 'error', error: 'Worker is unavailable. Reload the page.' });
       return;
     }
 
-    setActiveIdx(0);
-    setLayerCounter(1);
-    setStatus("playing");
+    runAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    runAbortRef.current = ctrl;
 
-    const sceneTimers: ReturnType<typeof setTimeout>[] = [];
-    let acc = 0;
-    SCENES.forEach((scene, i) => {
-      if (i === 0) return; // scene 0 starts immediately
-      acc += SCENES[i - 1]!.durationMs;
-      const t = setTimeout(() => setActiveIdx(i), acc);
-      sceneTimers.push(t);
-    });
-    const totalMs = acc + SCENES[SCENES.length - 1]!.durationMs;
-    const doneTimer = setTimeout(() => setStatus("done"), totalMs);
-    sceneTimers.push(doneTimer);
+    const appSignal = abortRef.current?.signal;
+    if (appSignal?.aborted) ctrl.abort();
+    const onAppAbort = () => ctrl.abort();
+    if (appSignal && !appSignal.aborted) appSignal.addEventListener('abort', onAppAbort, { once: true });
 
-    // Layer counter: start at the first loop scene and tick 1 → 24
-    // across the loop section. We compute the loop start/end offsets so
-    // the counter pace adapts to the actual scene durations.
-    const firstLoopIdx = SCENES.findIndex((s) => LOOP_STAGES.has(s.active));
-    const lastLoopIdx = SCENES.map((s, i) => (LOOP_STAGES.has(s.active) ? i : -1))
-      .filter((i) => i >= 0)
-      .reduce((a, b) => Math.max(a, b), -1);
-    let loopStartMs = 0;
-    for (let i = 0; i < firstLoopIdx; i++) loopStartMs += SCENES[i]!.durationMs;
-    let loopEndMs = loopStartMs;
-    for (let i = firstLoopIdx; i <= lastLoopIdx; i++) {
-      loopEndMs += SCENES[i]!.durationMs;
-    }
-    const counterTimers: ReturnType<typeof setInterval | typeof setTimeout>[] = [];
-    const counterStart = setTimeout(() => {
-      const duration = Math.max(100, loopEndMs - loopStartMs - 200);
-      const ticksTotal = 23; // we already start at 1
-      const tickMs = duration / ticksTotal;
-      let tick = 0;
-      const counterInterval = setInterval(() => {
-        tick += 1;
-        setLayerCounter((prev) => Math.min(24, prev + 1));
-        if (tick >= ticksTotal) {
-          clearInterval(counterInterval);
+    try {
+      const result = await runForInspector(
+        worker,
+        {
+          prompt,
+          attention: true,
+          // NOTE: we deliberately do NOT request `hiddenStates` here.
+          // Requesting it routes every decode step through the
+          // inspector-aware forward path (see qwen3_5/model.rs ~L5474),
+          // which `.eval()`s per-layer stats mid-pass and serializes the
+          // GPU pipeline. With `maxNewTokens > 1` that turns one fast
+          // multi-token decode into N slow ones — easily blowing past
+          // the 60s default timeout for N=32. We don't render
+          // hidden-state stats in the v1 stacked-layer diagram anyway,
+          // so this is free perf. If a future tooltip needs L2 norms,
+          // re-enable it AND drop maxNewTokens back to 1 for that run.
+          logits: { topK: 12 },
+          // Generate the *full assistant reply* (up to 32 tokens) instead
+          // of just one. With chat template applied the first decoded
+          // token is often a scaffold word like "The" or "Hello" — useless
+          // on its own. Letting the model continue for 32 tokens surfaces
+          // the actually-meaningful answer ("The cat sat on the floor.
+          // Cats often choose..."). The forward-pass animation is keyed
+          // to the *prefill* trace, which is captured once regardless of
+          // how many decode steps follow — so adding more tokens here
+          // doesn't change the per-layer visualization, only the bottom
+          // reveal text. Capped at INSPECTOR_MAX_NEW_TOKENS_CAP=64 in the
+          // Rust side; 32 is a comfortable middle ground that keeps the
+          // worker call sub-second on M3.
+          maxNewTokens: 32,
+          // Wrap the prompt in the model's Jinja2 chat template before
+          // tokenizing. The diagram is meant to show "what does the chat
+          // model do with this prompt?", not "what does raw text mode
+          // produce?" — without the template Qwen3.5-0.8B (an instruct-
+          // tuned model) falls out of its training distribution and the
+          // greedy argmax often lands on weird tokens like `1`. With the
+          // template the predicted tokens reflect what the assistant
+          // would actually say next.
+          applyChatTemplate: true,
+        },
+        {
+          signal: ctrl.signal,
+          // Even with the hiddenStates capture dropped, generating 32
+          // tokens with a chat-template-wrapped prompt + attention
+          // capture can take 30–60s on the slower WASM/WebGPU paths.
+          // 60s default is too tight; give ourselves real headroom.
+          timeoutMs: 180_000,
+        },
+      );
+      if (runGenRef.current !== myGen) return;
+      setRun(result);
+      // Reset to scene 0 and start replay. The effect below schedules the
+      // per-scene transitions; here we just flip status into 'replaying'.
+      setActiveIdx(0);
+      if (reducedMotion) {
+        // Skip the long replay — snap to done. Read the *future* scene
+        // count from the captured run via a fresh buildScenes call so we
+        // don't read stale `scenes` here.
+        const set = new Set<number>();
+        // Same filter as the memo above: only `kind === 'full'` counts.
+        for (const a of result.attention ?? []) {
+          if (a.kind === 'full') set.add(a.layerIndex);
         }
-      }, tickMs);
-      counterTimers.push(counterInterval);
-    }, loopStartMs + 50);
-    counterTimers.push(counterStart);
-
-    return () => {
-      for (const t of sceneTimers) clearTimeout(t);
-      for (const t of counterTimers) {
-        clearTimeout(t as ReturnType<typeof setTimeout>);
-        clearInterval(t as ReturnType<typeof setInterval>);
+        for (const i of result.modelMeta?.fullAttentionLayerIndices ?? []) set.add(i);
+        const finalScenes = buildScenes(set.size === 0 ? DEFAULT_FULL_ATTN_SET : set);
+        setActiveIdx(finalScenes.length - 1);
+        setStatus({ kind: 'done' });
+      } else {
+        setStatus({ kind: 'replaying' });
       }
-    };
-  }, [runTick]);
+    } catch (err) {
+      if (runGenRef.current !== myGen) return;
+      if (isAbortError(err)) {
+        if (appSignal?.aborted) setStatus({ kind: 'aborted' });
+        else setStatus({ kind: 'idle' });
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        setStatus({ kind: 'error', error: message });
+      }
+    } finally {
+      if (appSignal) appSignal.removeEventListener('abort', onAppAbort);
+      if (runAbortRef.current === ctrl) runAbortRef.current = null;
+    }
+  }, [prompt, workerRef, abortRef, reducedMotion]);
 
-  const activeStageId = SCENES[activeIdx]?.active ?? "tokenize";
-  const activeStage = stageById(activeStageId);
-  const { cx, cy } = dotPosition(activeStageId);
+  // Auto-fire one run on mount — the route gates rendering on
+  // status === 'ready' so the worker is already alive here.
+  React.useEffect(() => {
+    if (didAutoRunRef.current) return;
+    didAutoRunRef.current = true;
+    void handleRun();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const runButtonLabel =
-    status === "idle" ? "Run" : status === "playing" ? "Restart" : "Replay";
+  // Cleanup on unmount.
+  React.useEffect(
+    () => () => {
+      runAbortRef.current?.abort();
+    },
+    [],
+  );
+
+  // -- replay timer -------------------------------------------------------
+  //
+  // We drive the scene cursor with a single scheduled timeout, restarted on
+  // each scene transition. Pause stores the remaining time in the current
+  // scene (so resume can schedule that remainder rather than a full dwell).
+  // Re-running clears everything via the runGenRef/status flip.
+  const sceneStartRef = React.useRef<number>(0); // performance.now() when the current scene began
+  const sceneRemainingRef = React.useRef<number | null>(null); // ms remaining (used on resume)
+
+  React.useEffect(() => {
+    if (status.kind !== 'replaying') return undefined;
+    const scene = scenes[activeIdx];
+    if (!scene) return undefined;
+    const fullDwell = scene.durationMs / speed;
+    // Honour leftover time from a pause within the same scene. The pause
+    // handler stores `sceneRemainingRef`; the resume handler leaves it set
+    // so this effect picks it up. Any other transition (scene change,
+    // re-run) clears it.
+    const dwell = sceneRemainingRef.current != null ? sceneRemainingRef.current : fullDwell;
+    sceneStartRef.current = performance.now();
+
+    const isLast = activeIdx >= scenes.length - 1;
+    const t = setTimeout(() => {
+      sceneRemainingRef.current = null;
+      if (isLast) {
+        setStatus({ kind: 'done' });
+      } else {
+        setActiveIdx((i) => Math.min(scenes.length - 1, i + 1));
+      }
+    }, dwell);
+
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeIdx, status.kind, speed, scenes]);
+
+  // Clear any stashed remaining time when the scene changes (so the next
+  // scene starts at its full dwell, not the previous scene's leftover).
+  React.useEffect(() => {
+    sceneRemainingRef.current = null;
+  }, [activeIdx]);
+
+  // Pause / resume.
+  const pause = React.useCallback(() => {
+    if (status.kind !== 'replaying') return;
+    const elapsed = performance.now() - sceneStartRef.current;
+    const scene = scenes[activeIdx];
+    const baseDwell = scene ? scene.durationMs / speed : 0;
+    sceneRemainingRef.current = Math.max(0, baseDwell - elapsed);
+    setStatus({ kind: 'paused' });
+  }, [status.kind, activeIdx, speed, scenes]);
+
+  const resume = React.useCallback(() => {
+    if (status.kind !== 'paused') return;
+    setStatus({ kind: 'replaying' });
+    // When status flips to 'replaying' the scheduling effect above sees the
+    // current activeIdx and re-schedules. The stashed remaining time from
+    // pause() is picked up automatically.
+  }, [status.kind]);
+
+  // Speed change while replaying: leave activeIdx where it is, the
+  // scheduling effect re-fires because `speed` is a dep.
+  const onSpeedClick = (s: Speed) => () => setSpeed(s);
+
+  // Status pill content.
+  const layerProgress = activeLayer ? activeLayer.index + 1 : 0;
+  const statusText = (() => {
+    switch (status.kind) {
+      case 'idle':
+        return 'Ready to run.';
+      case 'running':
+        return 'Running real inference…';
+      case 'replaying':
+        if (activeLayer) return `Replaying · layer ${layerProgress} / ${NUM_LAYERS}`;
+        if (activeStage === 'tokenize') return 'Replaying · tokenize';
+        if (activeStage === 'embedding') return 'Replaying · embedding';
+        if (activeStage === 'final_norm') return 'Replaying · final RMSNorm';
+        if (activeStage === 'lm_head') return 'Replaying · LM head';
+        if (activeStage === 'sampling') return 'Replaying · sampling';
+        return 'Replaying…';
+      case 'paused':
+        return activeLayer ? `Paused · layer ${layerProgress} / ${NUM_LAYERS}` : 'Paused';
+      case 'done':
+        return 'Done — token revealed below.';
+      case 'aborted':
+        return 'Run cancelled.';
+      case 'empty-prompt':
+        return 'Enter a prompt to run.';
+      case 'error':
+        return `Error: ${status.error}`;
+    }
+  })();
+
+  const isBusy = status.kind === 'running' || status.kind === 'replaying' || status.kind === 'paused';
+  // The full assistant reply, joined from generated_tokens. Falls back to
+  // the single generatedToken for older payloads without the array field.
+  //
+  // Qwen3.5's chat eos is `<|im_end|>` but the model's `eos_token_id` is
+  // sometimes set to `<|endoftext|>`, so the decode loop on the Rust side
+  // doesn't break on the assistant-turn-end marker — both can leak into
+  // the reply ("...cat.<|im_end|>\n<|endoftext|>"). We strip from the
+  // first occurrence of either special-token marker onward so the
+  // learner sees only the natural-language portion of the reply.
+  const generatedReplyRawJoined = run
+    ? run.generatedTokens && run.generatedTokens.length > 0
+      ? run.generatedTokens.map((t) => t.text).join('')
+      : run.generatedToken.text
+    : '';
+  const generatedReplyRaw = stripChatSpecials(generatedReplyRawJoined);
+  // Token count for the visible portion of the reply. We walk the
+  // generatedTokens array and stop at the first token whose text contains
+  // a special-turn marker — matching the same stripping logic above so
+  // the displayed "N tokens" count agrees with what the learner sees.
+  const visibleTokenCount = (() => {
+    if (!run) return 0;
+    const toks = run.generatedTokens;
+    if (!toks || toks.length === 0) return 1;
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i]?.text ?? '';
+      if (SPECIAL_TURN_MARKERS.some((m) => t.includes(m))) return i;
+    }
+    return toks.length;
+  })();
+  // For the multi-token reply we want BPE cleanup (Ġ → space, leading-space
+  // dot, newline glyphs) WITHOUT the 17-char truncation that
+  // `renderTokenDisplay` enforces for single-token chips. Inline the
+  // cleanup so the full sentence renders.
+  const generatedReplyDisplay = run ? cleanupTokenText(generatedReplyRaw) : '';
+  // For the FIRST-token highlight we keep the truncated single-token helper
+  // so a long single token still fits in the chip width.
+  const generatedTokenText = run ? renderTokenDisplay(run.generatedToken.text) : '';
+  // The "rest" of the reply (after the highlighted first token) needs a
+  // matching cleanup — single-token-truncated `generatedTokenText` and
+  // full-reply `generatedReplyDisplay` use different rules, so we can't
+  // just `.slice()` one against the other. Build the rest from a
+  // cleaned-but-not-truncated first token instead.
+  const generatedTokenTextFull = run ? cleanupTokenText(run.generatedToken.text) : '';
+  const showTokenReveal = (status.kind === 'replaying' && activeStage === 'sampling') || status.kind === 'done';
 
   return (
     <div className="mb-8 space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
-          One forward pass, end to end
+          One forward pass, end to end — real model run
         </div>
         <div className="text-[11px] text-muted-foreground">
-          The dot is the hidden state. Each box is a stage — click to open
-          its chapter.
+          The card on top is the current layer. Click any sub-stage to open its chapter.
         </div>
       </div>
 
-      {/* Prompt + Run row — grounds the abstract pipeline in a concrete
-          example. The prompt is fixed (we don't run the real model on the
-          index page) but the predicted next token revealed at the end is
-          the actual greedy completion the chapters' demos produce. */}
-      <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-border bg-muted/20 px-3 py-2">
-        <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-          Prompt
-        </span>
-        <code className="rounded bg-background px-2 py-0.5 font-mono text-xs text-foreground">
-          {EXAMPLE_PROMPT}
-        </code>
-        <button
-          type="button"
-          onClick={() => setRunTick((n) => n + 1)}
-          disabled={status === "playing"}
-          className="ml-auto inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-xs font-medium text-foreground hover:bg-primary/20 disabled:opacity-50"
-        >
-          <PlayIcon className="size-3.5" />
-          {runButtonLabel}
-        </button>
-        <span className="basis-full text-[11px] text-muted-foreground">
-          Click <strong>Run</strong> to watch the model compute the next
-          token for this prompt — one full forward pass through every stage
-          below.
-        </span>
-      </div>
+      {/* Prompt + controls row */}
+      <div className="space-y-2 rounded-md border border-dashed border-border bg-muted/20 px-3 py-2">
+        <div className="flex flex-wrap items-end gap-2">
+          <div className="min-w-[16rem] flex-1">
+            <label className="block font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Prompt</label>
+            {/*
+              Ghost-prediction overlay — same pattern as chapter 3 (Attention)
+              and chapter 4 (GQA). A sibling div sits behind the textarea,
+              mirrors the prompt invisibly (text-transparent), then renders the
+              actually-sampled next token at the end with the rainbow shimmer.
+              The textarea has `bg-transparent` so the ghost shows through.
 
-      <div className="overflow-x-auto">
-        <svg
-          role="img"
-          aria-label="Animated diagram of one transformer forward pass — tokenize, embedding lookup, 24 layers, final norm, LM head, sampling"
-          viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`}
-          className="block h-auto w-full max-w-[680px]"
-        >
-          {/* Loop boundary box. */}
-          <rect
-            x={LOOP_X}
-            y={LOOP_TOP_Y}
-            width={LOOP_W}
-            height={LOOP_BOTTOM_Y - LOOP_TOP_Y}
-            rx={12}
-            className="fill-emerald-500/5 stroke-emerald-500/40"
-            strokeDasharray="6 4"
-            strokeWidth={1.4}
-          />
-          {/* Loop title pill (× 24 layers · ch 8). Wider than the earlier
-              132u so the text doesn't bleed past the rounded background. */}
-          <rect
-            x={LOOP_X + 14}
-            y={LOOP_TOP_Y - 12}
-            width={180}
-            height={24}
-            rx={12}
-            className="fill-background stroke-emerald-500/60"
-            strokeWidth={1}
-          />
-          <text
-            x={LOOP_X + 14 + 90}
-            y={LOOP_TOP_Y + 5}
-            textAnchor="middle"
-            className="fill-foreground"
-            style={{
-              fontFamily: "var(--font-mono, monospace)",
-              fontSize: 11,
-              letterSpacing: "0.04em",
-            }}
-          >
-            × 24 layers · chapter 8
-          </text>
-          {/* Loop iteration counter pill (right side). Widened from 78u
-              so "layer 24 / 24" fits without clipping the trailing "4". */}
-          <rect
-            x={LOOP_X + LOOP_W - 124}
-            y={LOOP_TOP_Y - 12}
-            width={110}
-            height={24}
-            rx={12}
-            className="fill-background stroke-emerald-500/60"
-            strokeWidth={1}
-          />
-          <text
-            x={LOOP_X + LOOP_W - 124 + 55}
-            y={LOOP_TOP_Y + 5}
-            textAnchor="middle"
-            className="fill-foreground"
-            style={{
-              fontFamily: "var(--font-mono, monospace)",
-              fontSize: 11,
-            }}
-          >
-            layer {layerCounter} / 24
-          </text>
-
-          {/* Connecting arrows between stages. */}
-          {STAGES.map((stage, i) => {
-            if (i === STAGES.length - 1) return null;
-            const next = STAGES[i + 1]!;
-            // Suppress arrows between sub-items of attention and between
-            // residual rows where the spacing is too tight for an arrow head.
-            const skip = stage.variant === "sub" && next.variant === "sub";
-            if (skip) return null;
-            const fromX = SVG_WIDTH / 2;
-            const fromY = stage.y + stage.height;
-            const toX = SVG_WIDTH / 2;
-            const toY = next.y;
-            return (
-              <line
-                key={`arrow-${stage.id}-${next.id}`}
-                x1={fromX}
-                y1={fromY + 2}
-                x2={toX}
-                y2={toY - 4}
-                className="stroke-muted-foreground/50"
-                strokeWidth={1.2}
-                markerEnd="url(#fp-arrowhead)"
+              Visibility gate:
+              - `run` exists (we've completed at least one forward pass)
+              - `prompt === run.prompt` (the prompt hasn't been edited since)
+              - `status.kind === 'done'` (the *visible* replay has finished —
+                even though the real inference completes in <1 s and we know
+                the token long before, holding the reveal until the dot has
+                walked all 24 layers and the sampling stage finishes prevents
+                the "answer-before-the-work" optics where the predicted token
+                appears at layer 19/24 and makes the diagram look fake).
+            */}
+            <div className="relative mt-1">
+              <Textarea
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                rows={2}
+                className="relative z-[1] bg-transparent font-mono text-sm"
+                placeholder="The cat sat on the"
               />
-            );
-          })}
-
-          <defs>
-            <marker
-              id="fp-arrowhead"
-              viewBox="0 0 10 10"
-              refX="8"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
-              <path d="M 0 0 L 10 5 L 0 10 z" className="fill-muted-foreground/60" />
-            </marker>
-          </defs>
-
-          {/* Stage boxes. */}
-          {STAGES.map((stage) => {
-            const { x, w } = stageX(stage.variant);
-            const isActive = stage.id === activeStageId;
-            // For the parent attention header: also highlight when one of
-            // its sub-items is the active scene.
-            const isAttnHeader =
-              stage.id === "attn" &&
-              (activeStageId === "attn_rope" ||
-                activeStageId === "attn_mha" ||
-                activeStageId === "attn_kvcache");
-            const lit = isActive || isAttnHeader;
-            const clickable = stage.chapterId !== undefined;
-            const handleClick = () => {
-              if (stage.chapterId) onOpenChapter(stage.chapterId);
-            };
-            // Background + border classes per variant + lit state.
-            const fill =
-              stage.variant === "residual"
-                ? "transparent"
-                : lit
-                  ? "url(#fp-lit-grad)"
-                  : "var(--background)";
-            const strokeClass =
-              stage.variant === "residual"
-                ? "stroke-muted-foreground/30"
-                : lit
-                  ? "stroke-primary"
-                  : stage.variant === "sub"
-                    ? "stroke-emerald-500/30"
-                    : "stroke-border";
-            const textColor =
-              stage.variant === "residual" ? "fill-muted-foreground" : "fill-foreground";
-            return (
-              <g
-                key={stage.id}
-                role={clickable ? "button" : undefined}
-                tabIndex={clickable ? 0 : undefined}
-                aria-label={
-                  clickable
-                    ? `Open chapter ${stage.chapterNum}: ${stage.label}`
-                    : undefined
-                }
-                onClick={clickable ? handleClick : undefined}
-                onKeyDown={
-                  clickable
-                    ? (e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          handleClick();
-                        }
-                      }
-                    : undefined
-                }
-                style={
-                  clickable
-                    ? { cursor: "pointer", outline: "none" }
-                    : { pointerEvents: "none" }
-                }
-              >
-                <rect
-                  x={x}
-                  y={stage.y}
-                  width={w}
-                  height={stage.height}
-                  rx={stage.variant === "residual" ? 10 : 8}
-                  fill={fill}
+              {run && prompt === run.prompt && status.kind === 'done' ? (
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-0 z-0 whitespace-pre-wrap break-words rounded-md border border-transparent px-3 py-2 font-mono text-sm text-transparent"
+                >
+                  {prompt}
+                  <span className="rainbow-text-animated font-mono text-sm">{generatedReplyDisplay}</span>
+                </div>
+              ) : null}
+            </div>
+          </div>
+          <div className="flex flex-col items-end gap-2">
+            <RunButton
+              onClick={handleRun}
+              running={isBusy}
+              label={status.kind === 'done' ? 'Re-run' : 'Run'}
+              runningLabel={status.kind === 'running' ? 'Running…' : 'Replaying…'}
+            />
+            <div className="flex items-center gap-1">
+              {status.kind === 'paused' ? (
+                <Button size="sm" variant="outline" onClick={resume} className="h-7 px-2 text-xs">
+                  Play
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={pause}
+                  disabled={status.kind !== 'replaying'}
+                  className="h-7 px-2 text-xs"
+                >
+                  Pause
+                </Button>
+              )}
+            </div>
+            <div className="flex items-center gap-1" role="group" aria-label="Replay speed">
+              <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Speed</span>
+              {([0.5, 1, 2, 4] as const).map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={onSpeedClick(s)}
+                  aria-pressed={speed === s}
                   className={[
-                    strokeClass,
-                    stage.variant === "residual" ? "" : "transition-colors",
-                  ].join(" ")}
-                  strokeWidth={lit ? 1.6 : 1}
-                  strokeDasharray={stage.variant === "residual" ? "4 3" : undefined}
-                />
-                <text
-                  x={x + 14}
-                  y={stage.y + stage.height / 2 + 4}
-                  className={textColor}
-                  style={{
-                    fontFamily:
-                      stage.variant === "sub"
-                        ? "var(--font-mono, monospace)"
-                        : "inherit",
-                    fontSize: stage.variant === "sub" ? 11 : 13,
-                    fontWeight:
-                      stage.variant === "inner" || stage.variant === "outer"
-                        ? 500
-                        : 400,
-                  }}
+                    'rounded border px-1.5 py-0.5 font-mono text-[11px]',
+                    speed === s
+                      ? 'border-primary/60 bg-primary/15 text-foreground'
+                      : 'border-border bg-background text-muted-foreground hover:bg-muted/40',
+                  ].join(' ')}
                 >
-                  {stage.variant === "sub" ? `└─ ${stage.label}` : stage.label}
-                </text>
-                {/* Chapter number pill on the right. */}
-                {stage.chapterNum ? (
-                  <g>
-                    <rect
-                      x={x + w - 56}
-                      y={stage.y + stage.height / 2 - 10}
-                      width={44}
-                      height={20}
-                      rx={10}
-                      className={
-                        lit
-                          ? "fill-primary/15 stroke-primary/50"
-                          : "fill-muted/40 stroke-border"
-                      }
-                      strokeWidth={1}
-                    />
-                    <text
-                      x={x + w - 34}
-                      y={stage.y + stage.height / 2 + 4}
-                      textAnchor="middle"
-                      className="fill-muted-foreground"
-                      style={{
-                        fontFamily: "var(--font-mono, monospace)",
-                        fontSize: 10,
-                      }}
-                    >
-                      ch {stage.chapterNum}
-                    </text>
-                  </g>
-                ) : null}
-              </g>
-            );
-          })}
-
-          <defs>
-            <linearGradient id="fp-lit-grad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="var(--primary)" stopOpacity="0.18" />
-              <stop offset="100%" stopColor="var(--primary)" stopOpacity="0.06" />
-            </linearGradient>
-            <radialGradient id="fp-dot-grad">
-              <stop offset="0%" stopColor="var(--primary)" stopOpacity="1" />
-              <stop offset="60%" stopColor="var(--primary)" stopOpacity="0.7" />
-              <stop offset="100%" stopColor="var(--primary)" stopOpacity="0" />
-            </radialGradient>
-          </defs>
-
-          {/* Predicted next token reveal — appears when the dot reaches the
-              Sampling stage and stays until the next Run. Tied to the actual
-              token the chapter-3/4 demos produce for the example prompt. */}
-          {(() => {
-            const samplingStage = stageById("sampling");
-            const showPrediction =
-              activeStageId === "sampling" || status === "done";
-            const cyPred = samplingStage.y + samplingStage.height + 18;
-            return (
-              <g
-                style={{
-                  opacity: showPrediction ? 1 : 0,
-                  transition: "opacity 320ms ease-out",
-                }}
-                aria-hidden={!showPrediction}
-              >
-                <text
-                  x={SVG_WIDTH / 2}
-                  y={cyPred}
-                  textAnchor="middle"
-                  className="fill-muted-foreground"
-                  style={{
-                    fontFamily: "var(--font-mono, monospace)",
-                    fontSize: 12,
-                  }}
-                >
-                  next token →
-                </text>
-                <rect
-                  x={SVG_WIDTH / 2 - 48}
-                  y={cyPred + 8}
-                  width={96}
-                  height={26}
-                  rx={6}
-                  className="fill-primary/15 stroke-primary/60"
-                  strokeWidth={1.2}
-                />
-                <text
-                  x={SVG_WIDTH / 2}
-                  y={cyPred + 26}
-                  textAnchor="middle"
-                  className="fill-foreground"
-                  style={{
-                    fontFamily: "var(--font-mono, monospace)",
-                    fontSize: 14,
-                    fontWeight: 600,
-                  }}
-                >
-                  {EXAMPLE_PREDICTED_TOKEN}
-                </text>
-              </g>
-            );
-          })()}
-
-          {/* The traveling "hidden state" dot. CSS transition smoothly tweens
-              its (cx, cy) between scenes. Floats just above the active box
-              in the arrow gutter so it never overlaps box text. The dot is
-              hidden in the "idle" state — it appears once Run is clicked. */}
-          {status !== "idle" ? (
-            <>
-              <circle
-                cx={cx}
-                cy={cy}
-                r={12}
-                fill="url(#fp-dot-grad)"
-                style={{
-                  transition:
-                    "cx 320ms cubic-bezier(0.4, 0, 0.2, 1), cy 320ms cubic-bezier(0.4, 0, 0.2, 1)",
-                }}
-                aria-hidden="true"
-              />
-              <circle
-                cx={cx}
-                cy={cy}
-                r={4}
-                className="fill-primary"
-                style={{
-                  transition:
-                    "cx 320ms cubic-bezier(0.4, 0, 0.2, 1), cy 320ms cubic-bezier(0.4, 0, 0.2, 1)",
-                }}
-                aria-hidden="true"
-              />
-            </>
-          ) : null}
-        </svg>
+                  {s === 0.5 ? '½×' : `${s}×`}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 text-[11px]">
+          <span
+            role="status"
+            aria-live="polite"
+            className={[
+              'inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 font-mono',
+              status.kind === 'error'
+                ? 'border-destructive/60 bg-destructive/10 text-destructive'
+                : status.kind === 'empty-prompt'
+                  ? 'border-amber-500/40 bg-amber-500/10 text-foreground'
+                  : 'border-border bg-muted/40 text-foreground',
+            ].join(' ')}
+          >
+            {(status.kind === 'running' || status.kind === 'replaying') && (
+              <span aria-hidden="true" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
+            )}
+            {statusText}
+          </span>
+          <span className="text-muted-foreground">
+            Real inference, real per-layer trace — replayed through a card stack at ~0.9–1.0 s/layer so you can watch
+            each sub-stage fire. Total replay ~{Math.round(totalReplayMs / 1000)}s at 1× speed (½× to slow down for
+            reading, 4× to skim).
+          </span>
+        </div>
       </div>
 
-      <div
-        className="text-xs text-muted-foreground"
-        aria-live="polite"
-      >
-        {status === "idle" ? (
-          <>Click <strong>Run</strong> above to start the animation.</>
-        ) : (
-          <>
-            {status === "playing" ? "Now:" : "Done — "}{" "}
-            <span className="font-mono text-foreground">{activeStage.label}</span>
-            {activeStage.chapterNum ? (
-              <span className="ml-1.5 text-muted-foreground">
-                (chapter {activeStage.chapterNum})
-              </span>
-            ) : null}
-          </>
-        )}
+      <div ref={resultFlashRef} className="rounded-md">
+        <StageStack
+          activeStage={activeStage}
+          activeLayer={activeLayer}
+          fullAttentionLayerIndices={fullAttentionLayerIndices}
+          onOpenChapter={onOpenChapter}
+          generatedTokenText={generatedTokenText}
+          generatedTokenTextFull={generatedTokenTextFull}
+          generatedReplyDisplay={generatedReplyDisplay}
+          generatedTokenCount={visibleTokenCount}
+          showTokenReveal={showTokenReveal}
+          reducedMotion={reducedMotion}
+        />
       </div>
 
       <p className="text-xs text-muted-foreground">
-        All chapters are independent — click any box to open that chapter.
-        This isn't a recommended <em>reading</em> order; it's the order each
-        chapter's content runs inside the model.
+        Watch the stack: full-attention layers (cyan) compute Q · Kᵀ · softmax over all past tokens; linear layers
+        (amber, GatedDeltaNet) maintain a recurrent state — Qwen3.5 interleaves them 1:3.
       </p>
     </div>
   );
 }
 
-function ChapterCard({
-  chapter,
-  onOpen,
+// ----------------------------------------------------------------------------
+// StageStack — left rail dot + card-stack viewport.
+// ----------------------------------------------------------------------------
+
+type StageStackProps = {
+  activeStage: StageId;
+  activeLayer: { kind: 'layer'; index: number; subId: string } | null;
+  fullAttentionLayerIndices: Set<number>;
+  onOpenChapter: (chapterId: string) => void;
+  /** The first generated token, used for the highlighted lead-in of the
+   *  reply reveal. Truncated to 17 chars + ellipsis for chip width. */
+  generatedTokenText: string;
+  /** The first generated token with BPE cleanup but NO length truncation.
+   *  Used as the anchor for slicing `generatedReplyDisplay` so the "rest"
+   *  of the reply is computed against matching transform rules. */
+  generatedTokenTextFull: string;
+  /** The full assistant reply (all generated tokens joined and display-
+   *  escaped, no truncation). Includes the first token at the start. */
+  generatedReplyDisplay: string;
+  /** Number of tokens generated for the reply (1 if only the next-token
+   *  contract was used). */
+  generatedTokenCount: number;
+  showTokenReveal: boolean;
+  reducedMotion: boolean;
+};
+
+const FIXED_HEAD: { id: 'tokenize' | 'embedding'; label: string; chapterId: string; chapterNum: number }[] = [
+  { id: 'tokenize', label: 'Tokenize', chapterId: 'tokenization', chapterNum: 1 },
+  { id: 'embedding', label: 'Embedding lookup', chapterId: 'embeddings', chapterNum: 2 },
+];
+
+const FIXED_TAIL: {
+  id: 'final_norm' | 'lm_head' | 'sampling';
+  label: string;
+  chapterId: string;
+  chapterNum: number;
+}[] = [
+  { id: 'final_norm', label: 'Final RMSNorm', chapterId: 'rmsnorm', chapterNum: 6 },
+  { id: 'lm_head', label: 'LM head → 152K logits', chapterId: 'lm-head', chapterNum: 9 },
+  { id: 'sampling', label: 'Sampling → next token', chapterId: 'sampling', chapterNum: 10 },
+];
+
+/** Card-stack viewport height in px. Tall enough for the front card body. */
+const STACK_VIEWPORT_HEIGHT = 360;
+
+function StageStack({
+  activeStage,
+  activeLayer,
+  fullAttentionLayerIndices,
+  onOpenChapter,
+  generatedTokenText,
+  generatedTokenTextFull,
+  generatedReplyDisplay,
+  generatedTokenCount,
+  showTokenReveal,
+  reducedMotion,
+}: StageStackProps) {
+  const inLayerBlock = activeLayer !== null;
+  const activeLayerIndex = activeLayer?.index ?? null;
+  const activeSubId = activeLayer?.subId ?? null;
+
+  // Dot y-position — five logical slots: tokenize, embedding, layer-block,
+  // final_norm, lm_head, sampling. Each fixed chip has its own slot; the
+  // layer block has ONE shared slot anchored to the front-card centre.
+  const dotSlot: 'tokenize' | 'embedding' | 'layer' | 'final_norm' | 'lm_head' | 'sampling' = isLayerStage(activeStage)
+    ? 'layer'
+    : activeStage;
+
+  return (
+    <div className="rounded-md border border-border bg-background p-3">
+      <div className="relative">
+        {/* Left rail with the traveling dot. The rail spans head + stack +
+            tail; the dot sits in a single y-slot per logical phase. */}
+        <DotRail slot={dotSlot} activeSubId={activeSubId} reducedMotion={reducedMotion} />
+
+        {/* Right column: head chips, card stack, tail chips. */}
+        <div className="flex flex-col gap-1.5 pl-10">
+          {FIXED_HEAD.map((s) => (
+            <FixedChip
+              key={s.id}
+              id={s.id}
+              label={s.label}
+              chapterId={s.chapterId}
+              chapterNum={s.chapterNum}
+              active={s.id === activeStage}
+              onOpenChapter={onOpenChapter}
+            />
+          ))}
+
+          {/* Card-stack viewport — Apple-Wallet-style coordinated shuffle. */}
+          <div className="mt-2 rounded-md border border-dashed border-emerald-500/40 bg-emerald-500/[0.04] p-2">
+            <div className="mb-2 flex items-center justify-between px-1 text-[10px] font-mono tracking-wider text-emerald-700/80 dark:text-emerald-300/80">
+              <span>× {NUM_LAYERS} LAYERS · chapter 8 (full block)</span>
+              <span
+                className={[
+                  'rounded-md border px-2 py-0.5 font-mono text-[11px] tracking-wider',
+                  inLayerBlock
+                    ? 'border-primary/60 bg-primary/10 text-foreground'
+                    : 'border-border bg-muted/40 text-muted-foreground',
+                ].join(' ')}
+              >
+                Layer {(activeLayerIndex ?? -1) + 1} / {NUM_LAYERS}
+              </span>
+            </div>
+
+            <div
+              className="relative w-full"
+              style={{ height: STACK_VIEWPORT_HEIGHT, perspective: '1200px' }}
+              data-stage-id="card-stack"
+            >
+              {Array.from({ length: NUM_LAYERS }, (_, i) => {
+                const isFull = fullAttentionLayerIndices.has(i);
+                // When the diagram is outside the layer block, anchor the
+                // stack to layer 0 (head) or layer 23 (tail) so the cards
+                // settle in a stable resting state.
+                const stackAnchor =
+                  activeLayerIndex ?? (activeStage === 'tokenize' || activeStage === 'embedding' ? 0 : NUM_LAYERS - 1);
+                const rel = i - stackAnchor;
+                return (
+                  <LayerCard
+                    key={i}
+                    index={i}
+                    isFull={isFull}
+                    rel={rel}
+                    activeSubId={inLayerBlock && rel === 0 ? activeSubId : null}
+                    onOpenChapter={onOpenChapter}
+                    reducedMotion={reducedMotion}
+                  />
+                );
+              })}
+            </div>
+          </div>
+
+          {FIXED_TAIL.map((s) => (
+            <FixedChip
+              key={s.id}
+              id={s.id}
+              label={s.label}
+              chapterId={s.chapterId}
+              chapterNum={s.chapterNum}
+              active={s.id === activeStage}
+              onOpenChapter={onOpenChapter}
+            />
+          ))}
+
+          {/* Generated-reply reveal — only shown once we're at or past the
+              sampling stage. Shows the *full assistant reply* (joined from
+              `run.generatedTokens`) so the chat-template demo doesn't dead-
+              end on a lonely "The" or "Hello" scaffold token. The first
+              token is highlighted because that's the literal "next token"
+              the one captured forward pass produced; the rest are decode
+              steps that follow without per-layer capture, included for
+              pedagogical clarity. */}
+          <div
+            className="mt-2 flex flex-col items-center gap-1 transition-opacity duration-300"
+            style={{ opacity: showTokenReveal ? 1 : 0 }}
+            aria-hidden={!showTokenReveal}
+          >
+            <span className="font-mono text-[11px] text-muted-foreground">model reply →</span>
+            <span
+              className="max-w-[42rem] rounded-md border border-primary/60 bg-primary/10 px-3 py-1.5 text-center font-mono text-sm font-semibold text-foreground"
+              data-stage-id="generated-reply"
+            >
+              <span className="rainbow-text-animated">{generatedTokenText || '…'}</span>
+              {generatedTokenCount > 1 && generatedReplyDisplay !== generatedTokenTextFull ? (
+                // Use the un-truncated single-token cleanup as the
+                // anchor for the slice — `generatedTokenText` may end
+                // with an ellipsis if the first token is unusually
+                // long, which would make `.slice()` chop the wrong
+                // amount off the reply.
+                <span className="text-foreground/80">{generatedReplyDisplay.slice(generatedTokenTextFull.length)}</span>
+              ) : null}
+            </span>
+            <span className="font-mono text-[10px] text-muted-foreground/70">
+              first token highlighted · {generatedTokenCount} token
+              {generatedTokenCount === 1 ? '' : 's'} total
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// DotRail — left-gutter rail with five logical y-slots.
+// ----------------------------------------------------------------------------
+//
+// The dot's vertical position is driven by which logical phase we're in:
+// the two head chips, the entire card-stack region (single anchored y),
+// and the three tail chips. During the layer block the dot stays put and
+// pulses with each sub-stage swap.
+
+type DotRailProps = {
+  slot: 'tokenize' | 'embedding' | 'layer' | 'final_norm' | 'lm_head' | 'sampling';
+  activeSubId: string | null;
+  reducedMotion: boolean;
+};
+
+// y offsets in px, measured from the rail's top. The layer slot anchors to
+// the vertical centre of the card-stack viewport; the rest line up with the
+// fixed chips' centres. These numbers are coupled to the chip heights +
+// gap-1.5 (6 px) used in the column.
+const SLOT_Y: Record<DotRailProps['slot'], number> = {
+  tokenize: 16, // first chip centre (py-1.5 + line height ≈ 32 px tall)
+  embedding: 54, // second chip centre
+  layer: 92 + STACK_VIEWPORT_HEIGHT / 2 + 24, // mid of the viewport (after the in-viewport header bar)
+  final_norm: 92 + STACK_VIEWPORT_HEIGHT + 50 + 16, // first tail chip centre
+  lm_head: 92 + STACK_VIEWPORT_HEIGHT + 50 + 54,
+  sampling: 92 + STACK_VIEWPORT_HEIGHT + 50 + 92,
+};
+
+function DotRail({ slot, activeSubId, reducedMotion }: DotRailProps) {
+  const y = SLOT_Y[slot];
+  // Pulse the dot on each sub-stage swap during the layer block. Using
+  // `activeSubId` as a `key` triggers React to remount the inner pulse
+  // element, restarting its CSS keyframe.
+  return (
+    <div
+      aria-hidden="true"
+      className="pointer-events-none absolute left-3 top-0 z-10"
+      style={{
+        width: 0,
+        height: 0,
+        transform: `translateY(${y}px)`,
+        transition: reducedMotion ? 'none' : 'transform 380ms cubic-bezier(0.4, 0, 0.2, 1)',
+      }}
+    >
+      <span
+        className="block rounded-full bg-primary/25 blur-[6px]"
+        style={{ position: 'absolute', left: -12, top: -12, width: 24, height: 24 }}
+      />
+      <span
+        key={slot === 'layer' ? (activeSubId ?? 'idle') : slot}
+        className="block rounded-full bg-primary shadow-[0_0_6px_var(--primary)]"
+        style={{
+          position: 'absolute',
+          left: -5,
+          top: -5,
+          width: 10,
+          height: 10,
+          animation: reducedMotion ? undefined : 'dotPulse 240ms ease-out',
+        }}
+      />
+      <style>{`@keyframes dotPulse { 0% { transform: scale(1); } 50% { transform: scale(1.15); } 100% { transform: scale(1); } }`}</style>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// FixedChip — the small chips used for tokenize / embedding / norm / head /
+// sampling above and below the card stack.
+// ----------------------------------------------------------------------------
+
+function FixedChip({
+  id,
+  label,
+  chapterId,
+  chapterNum,
+  active,
+  onOpenChapter,
 }: {
-  chapter: ChapterMeta;
-  onOpen: () => void;
+  id: StageId & string;
+  label: string;
+  chapterId: string;
+  chapterNum: number;
+  active: boolean;
+  onOpenChapter: (chapterId: string) => void;
 }) {
+  return (
+    <div
+      data-stage-id={id}
+      role="button"
+      tabIndex={0}
+      aria-label={`Open chapter ${chapterNum}: ${label}`}
+      onClick={() => onOpenChapter(chapterId)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onOpenChapter(chapterId);
+        }
+      }}
+      className={[
+        'flex cursor-pointer items-center justify-between rounded-md border px-3 py-1.5 text-sm transition-colors hover:bg-muted/30',
+        active ? 'border-primary bg-primary/10 text-foreground' : 'border-border bg-background text-foreground',
+      ].join(' ')}
+      style={{ outline: 'none' }}
+    >
+      <span className={active ? 'font-medium' : ''}>{label}</span>
+      <span
+        className={[
+          'rounded-md border px-1.5 py-0.5 font-mono text-[10px]',
+          active
+            ? 'border-primary/60 bg-primary/10 text-foreground'
+            : 'border-border bg-muted/40 text-muted-foreground',
+        ].join(' ')}
+      >
+        ch {chapterNum}
+      </span>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// LayerCard — one of the 24 absolutely-positioned cards in the stack.
+// ----------------------------------------------------------------------------
+//
+// `rel` is `index - activeLayer` (or the anchor for non-layer scenes). The
+// card translates / scales / fades in lock-step with every other card on
+// each `rel` change → Apple-Wallet shuffle effect.
+
+type LayerCardProps = {
+  index: number;
+  isFull: boolean;
+  rel: number;
+  /** Active sub-stage id when this card is the front (`rel === 0`); null
+   *  otherwise so peeking cards don't render a highlight bar. */
+  activeSubId: string | null;
+  onOpenChapter: (chapterId: string) => void;
+  reducedMotion: boolean;
+};
+
+function LayerCard({ index, isFull, rel, activeSubId, onOpenChapter, reducedMotion }: LayerCardProps) {
+  // Map `rel` to a transform / opacity slot. Cards beyond ±3 fade away.
+  const { translateY, scale, opacity, zIndex } = (() => {
+    if (rel === 0) return { translateY: 0, scale: 1, opacity: 1, zIndex: 30 };
+    if (rel === 1) return { translateY: 50, scale: 0.94, opacity: 0.55, zIndex: 25 };
+    if (rel === 2) return { translateY: 85, scale: 0.9, opacity: 0.32, zIndex: 20 };
+    if (rel === 3) return { translateY: 110, scale: 0.87, opacity: 0.18, zIndex: 15 };
+    if (rel >= 4) return { translateY: 160, scale: 0.85, opacity: 0, zIndex: 10 };
+    if (rel === -1) return { translateY: -220, scale: 0.96, opacity: 0, zIndex: 5 };
+    // rel <= -2 — history slides further off the top.
+    return { translateY: -260, scale: 0.95, opacity: 0, zIndex: 1 };
+  })();
+
+  const cardState = rel === 0 ? 'front' : rel > 0 ? 'peek' : 'history';
+  const chapterId = isFull ? 'attention' : 'kv-cache';
+  const chapterNum = isFull ? 3 : 11;
+  const subs = isFull ? FULL_ATTN_SUBS : LINEAR_ATTN_SUBS;
+
+  return (
+    <div
+      data-layer-index={index}
+      data-card-state={cardState}
+      data-stage-id={`layer:${index}`}
+      className={[
+        'absolute left-2 right-2 rounded-lg border bg-background/95 backdrop-blur-sm',
+        isFull
+          ? 'border-cyan-500/40 ring-1 ring-cyan-500/30 dark:border-cyan-400/40 dark:ring-cyan-400/30'
+          : 'border-amber-500/40 ring-1 ring-amber-500/30 dark:border-amber-400/40 dark:ring-amber-400/30',
+        rel >= 4 || rel <= -1 ? 'pointer-events-none' : '',
+      ].join(' ')}
+      style={{
+        top: 0,
+        transform: `translate3d(0, ${translateY}px, 0) scale(${scale})`,
+        transformOrigin: 'top center',
+        opacity,
+        zIndex,
+        transition: reducedMotion ? 'none' : 'transform 380ms cubic-bezier(0.34, 1.4, 0.64, 1), opacity 320ms ease-out',
+        boxShadow: rel === 0 ? '0 12px 32px -8px rgba(0,0,0,0.25)' : '0 4px 12px -4px rgba(0,0,0,0.15)',
+      }}
+    >
+      {/* Card header — always visible even when peeking. */}
+      <div className="flex items-center justify-between gap-2 border-b border-border/50 px-3 py-2">
+        <span className="flex items-center gap-2">
+          <span className="font-mono tabular-nums text-sm font-semibold text-foreground">
+            #{index.toString().padStart(2, '0')}
+          </span>
+          <span
+            className={[
+              'rounded border px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider',
+              isFull
+                ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300'
+                : 'border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+            ].join(' ')}
+            title={isFull ? 'Full softmax attention layer' : 'Linear-attention layer (GatedDeltaNet)'}
+          >
+            {isFull ? 'FULL ATTN' : 'LINEAR · GDN'}
+          </span>
+          <span className="text-xs text-muted-foreground">decoder layer</span>
+        </span>
+        <button
+          type="button"
+          onClick={() => onOpenChapter(chapterId)}
+          className="rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/60"
+        >
+          ch {chapterNum}
+        </button>
+      </div>
+
+      {/* Card body — sub-stage list. Visually meaningful on the front card;
+          gets clipped under cards above for peeks. */}
+      <div className="space-y-0.5 px-2 py-2">
+        {subs.map((sub) => {
+          const isActive = activeSubId === sub.id;
+          const subChapter = SUB_CHAPTER[sub.id];
+          return (
+            <div
+              key={sub.id}
+              data-stage-id={`layer:${index}:${sub.id}`}
+              role={subChapter ? 'button' : undefined}
+              tabIndex={subChapter && rel === 0 ? 0 : -1}
+              onClick={subChapter && rel === 0 ? () => onOpenChapter(subChapter) : undefined}
+              onKeyDown={(e) => {
+                if (!subChapter || rel !== 0) return;
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onOpenChapter(subChapter);
+                }
+              }}
+              className={[
+                'flex items-center gap-2 rounded-sm border-l-2 px-2 py-1 font-mono text-[11px]',
+                reducedMotion ? '' : 'transition-colors duration-200',
+                isActive ? 'border-primary bg-primary/15 text-foreground' : 'border-transparent text-muted-foreground',
+                subChapter && rel === 0 ? 'cursor-pointer hover:bg-muted/30' : '',
+              ].join(' ')}
+            >
+              <span aria-hidden="true" className="text-muted-foreground/40">
+                └─
+              </span>
+              <span>{sub.label}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
+
+function usePrefersReducedMotion(): boolean {
+  const [reduced, setReduced] = React.useState<boolean>(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  });
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, []);
+  return reduced;
+}
+
+function ChapterCard({ chapter, onOpen }: { chapter: ChapterMeta; onOpen: () => void }) {
   const interactive = chapter.available;
   return (
     <Card
       onClick={interactive ? onOpen : undefined}
-      role={interactive ? "button" : undefined}
+      role={interactive ? 'button' : undefined}
       tabIndex={interactive ? 0 : -1}
       onKeyDown={(e) => {
         if (!interactive) return;
-        if (e.key === "Enter" || e.key === " ") {
+        if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           onOpen();
         }
       }}
       className={
-        interactive
-          ? "cursor-pointer transition-colors hover:bg-card/80 hover:border-primary/40"
-          : "opacity-60"
+        interactive ? 'cursor-pointer transition-colors hover:bg-card/80 hover:border-primary/40' : 'opacity-60'
       }
       aria-disabled={!interactive}
     >
       <CardHeader>
         <div className="mb-1 flex items-center justify-between">
           <span className="font-mono text-xs text-muted-foreground">
-            Ch. {chapter.number.toString().padStart(2, "0")}
+            Ch. {chapter.number.toString().padStart(2, '0')}
           </span>
-          {chapter.available ? (
-            <Badge variant="default">Ready</Badge>
-          ) : (
-            <Badge variant="secondary">Coming soon</Badge>
-          )}
+          {chapter.available ? <Badge variant="default">Ready</Badge> : <Badge variant="secondary">Coming soon</Badge>}
         </div>
         <CardTitle className="text-lg">{chapter.title}</CardTitle>
         <CardDescription>{chapter.blurb}</CardDescription>
       </CardHeader>
       <CardContent>
-        <span
-          className={
-            interactive
-              ? "text-sm text-primary"
-              : "text-sm text-muted-foreground"
-          }
-        >
-          {interactive ? "Open chapter →" : "Not yet authored"}
+        <span className={interactive ? 'text-sm text-primary' : 'text-sm text-muted-foreground'}>
+          {interactive ? 'Open chapter →' : 'Not yet authored'}
         </span>
       </CardContent>
     </Card>

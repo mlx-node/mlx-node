@@ -1,4 +1,4 @@
-import { formatLoadingText } from "../../lib/display-helpers";
+import { formatLoadingText } from '../../lib/display-helpers';
 
 export type LoadingProgress = {
   pct: number;
@@ -29,7 +29,7 @@ function formatBytes(value: number): string {
 function formatFileName(file: string | undefined): string | null {
   const trimmed = file?.trim();
   if (!trimmed) return null;
-  return trimmed.split("/").filter(Boolean).pop() ?? trimmed;
+  return trimmed.split('/').filter(Boolean).pop() ?? trimmed;
 }
 
 export function Loading({ status, progress }: LoadingProps) {
@@ -39,10 +39,10 @@ export function Loading({ status, progress }: LoadingProps) {
     progress?.loadedBytes != null && progress.totalBytes != null
       ? `${formatBytes(progress.loadedBytes)} / ${formatBytes(progress.totalBytes)}`
       : null;
-  const meta = [fileName, bytes, progress?.cacheSource].filter(Boolean).join(" · ");
+  const meta = [fileName, bytes, progress?.cacheSource].filter(Boolean).join(' · ');
 
   return (
-    <div className="overlay-screen" style={{ background: "var(--bg)" }}>
+    <div className="overlay-screen" style={{ background: 'var(--bg)' }}>
       <div className="loading-stack">
         <div className="loader-ring" aria-hidden="true" />
         <div>
@@ -58,9 +58,7 @@ export function Loading({ status, progress }: LoadingProps) {
               </div>
             </div>
           )}
-          <div className="loader-sub">
-            Model weights are cached for future visits.
-          </div>
+          <div className="loader-sub">Model weights are cached for future visits.</div>
         </div>
       </div>
     </div>

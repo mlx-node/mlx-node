@@ -26,7 +26,7 @@ const CAPTURE_POINTS = ['pre_attn_input', 'post_attn_norm', 'post_attn_residual'
 /** Seeded Gaussian via a small LCG + Box-Muller. Reproducible across renders. */
 function seededGaussianVector(dim: number, seed: number): Float32Array {
   const v = new Float32Array(dim);
-  let s = (seed >>> 0) || 1;
+  let s = seed >>> 0 || 1;
   function nextU(): number {
     s = (Math.imul(s, 1103515245) + 12345) >>> 0;
     return ((s & 0x7fffffff) + 1) / 0x80000001;
@@ -241,8 +241,8 @@ export function RmsNormChapterBody() {
           The learned gain <code>g</code> is the only parameter the normalizer carries — one scalar per feature, length
           equal to <code>hidden_dim</code>. Divide by RMS first to make the vector's average squared magnitude land at
           1, then let <code>g</code> reweight each feature however the model wants. Initially <code>g = 1</code> for
-          every feature, so before training RMSNorm just standardises magnitudes; during training the model learns
-          which features matter more than others and bakes that into <code>g</code>.
+          every feature, so before training RMSNorm just standardises magnitudes; during training the model learns which
+          features matter more than others and bakes that into <code>g</code>.
         </p>
 
         <p>Side-by-side with the older LayerNorm, the simplification is obvious:</p>
@@ -259,8 +259,7 @@ y = (x - mean(x)) / sqrt(var(x) + ε) * g + b
         </pre>
         <p>
           Dropping the mean-subtraction and bias is the entire difference. Llama, Mistral, Qwen, DeepSeek — every open
-          LLM you'll meet uses RMSNorm; the simpler formula is empirically a wash on quality and modestly faster to
-          run.
+          LLM you'll meet uses RMSNorm; the simpler formula is empirically a wash on quality and modestly faster to run.
         </p>
 
         <h2>Pre-norm vs. post-norm</h2>
@@ -273,10 +272,10 @@ y = (x - mean(x)) / sqrt(var(x) + ε) * g + b
 
         <h2>What the demo shows you</h2>
         <p>
-          The <strong>L2/tok across layers</strong> chart (top of the demo panel) is the punchline of this chapter —
-          one curve drifting up, one curve held flat. The per-layer breakdown below it lets you spot-check a single
-          layer's stats. And the <em>scale-invariance playground</em> at the bottom is a synthetic 256-dim vector you
-          can stretch by 0.1×–10× to convince yourself the output magnitude really doesn't depend on the input scale.
+          The <strong>L2/tok across layers</strong> chart (top of the demo panel) is the punchline of this chapter — one
+          curve drifting up, one curve held flat. The per-layer breakdown below it lets you spot-check a single layer's
+          stats. And the <em>scale-invariance playground</em> at the bottom is a synthetic 256-dim vector you can
+          stretch by 0.1×–10× to convince yourself the output magnitude really doesn't depend on the input scale.
         </p>
       </Prose>
     </ChapterFrame>
@@ -583,9 +582,7 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
       {hasData ? (
         <div ref={resultFlashRef} className="space-y-3 p-1">
           <LayerDriftChart steps={hiddenSteps} />
-          <div className="text-xs uppercase tracking-wider text-muted-foreground">
-            Single-layer breakdown
-          </div>
+          <div className="text-xs uppercase tracking-wider text-muted-foreground">Single-layer breakdown</div>
           <NormStatsGrid layerStats={layerStats} />
           <L2BeforeAfterChart layerStats={layerStats} />
           {aggregate ? (
@@ -610,7 +607,7 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
         items={[
           'The drift chart is the headline: residual L2 climbs, norm L2 stays anchored near √hidden_dim.',
           'The playground proves it synthetically — pull the slider to 0.1× or 10×, the output L2 still parks at √256 ≈ 16.',
-          "RMSNorm preserves direction (cosine = 1.0000). It only rescales magnitude, never rotates the vector.",
+          'RMSNorm preserves direction (cosine = 1.0000). It only rescales magnitude, never rotates the vector.',
         ]}
       />
     </div>
@@ -800,7 +797,10 @@ function LayerDriftChart({ steps }: { steps: HiddenStateStep[] | undefined }) {
   const referenceY = yFor(reference);
 
   // First and last *finite* values, with their layer indices, for endpoint labels.
-  function endpoints(vals: Array<number | null>): { first?: { layer: number; v: number }; last?: { layer: number; v: number } } {
+  function endpoints(vals: Array<number | null>): {
+    first?: { layer: number; v: number };
+    last?: { layer: number; v: number };
+  } {
     let first: { layer: number; v: number } | undefined;
     let last: { layer: number; v: number } | undefined;
     for (let i = 0; i < vals.length; i++) {
@@ -862,7 +862,13 @@ function LayerDriftChart({ steps }: { steps: HiddenStateStep[] | undefined }) {
         {/* endpoint markers + value labels for the residual line */}
         {inputEnds.first ? (
           <g>
-            <circle cx={xFor(inputEnds.first.layer)} cy={yFor(inputEnds.first.v)} r={3} fill="currentColor" fillOpacity={0.8} />
+            <circle
+              cx={xFor(inputEnds.first.layer)}
+              cy={yFor(inputEnds.first.v)}
+              r={3}
+              fill="currentColor"
+              fillOpacity={0.8}
+            />
             <text
               x={xFor(inputEnds.first.layer) + 6}
               y={yFor(inputEnds.first.v) - 5}
@@ -876,7 +882,13 @@ function LayerDriftChart({ steps }: { steps: HiddenStateStep[] | undefined }) {
         ) : null}
         {inputEnds.last ? (
           <g>
-            <circle cx={xFor(inputEnds.last.layer)} cy={yFor(inputEnds.last.v)} r={3} fill="currentColor" fillOpacity={0.8} />
+            <circle
+              cx={xFor(inputEnds.last.layer)}
+              cy={yFor(inputEnds.last.v)}
+              r={3}
+              fill="currentColor"
+              fillOpacity={0.8}
+            />
             <text
               x={xFor(inputEnds.last.layer) - 4}
               y={yFor(inputEnds.last.v) - 5}
@@ -937,10 +949,11 @@ function LayerDriftChart({ steps }: { steps: HiddenStateStep[] | undefined }) {
             const outHi = Math.max(...outsAll);
             return (
               <>
-                Residual L2/tok climbs {inputEnds.first.v.toFixed(1)} → {inputEnds.last.v.toFixed(1)} ({growthFactor.toFixed(0)}×
-                over {data.xs.length} layers) — that's the drift. After RMSNorm + learned gain, L2/tok lives in the{' '}
-                {outLo.toFixed(0)}–{outHi.toFixed(0)} band anchored at √{HIDDEN_DIM} ≈ {reference.toFixed(0)}. Without the
-                gain it would be dead flat at {reference.toFixed(0)}; the per-layer variation you see is g doing its job.
+                Residual L2/tok climbs {inputEnds.first.v.toFixed(1)} → {inputEnds.last.v.toFixed(1)} (
+                {growthFactor.toFixed(0)}× over {data.xs.length} layers) — that's the drift. After RMSNorm + learned
+                gain, L2/tok lives in the {outLo.toFixed(0)}–{outHi.toFixed(0)} band anchored at √{HIDDEN_DIM} ≈{' '}
+                {reference.toFixed(0)}. Without the gain it would be dead flat at {reference.toFixed(0)}; the per-layer
+                variation you see is g doing its job.
               </>
             );
           })()
@@ -977,7 +990,7 @@ function ScaleInvariancePlayground() {
       a2 += inp[i]! * inp[i]!;
       b2 += out[i]! * out[i]!;
     }
-    const cos = dot / Math.sqrt((a2 * b2) || 1);
+    const cos = dot / Math.sqrt(a2 * b2 || 1);
     return { input: inp, output: out, inputL2: vecL2(inp), outputL2: vecL2(out), cos };
   }, [baseVec, scale]);
 
@@ -987,9 +1000,7 @@ function ScaleInvariancePlayground() {
 
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
-      <div className="text-xs uppercase tracking-wider text-muted-foreground">
-        Try it: RMSNorm is scale-invariant
-      </div>
+      <div className="text-xs uppercase tracking-wider text-muted-foreground">Try it: RMSNorm is scale-invariant</div>
       <p className="text-[11px] leading-relaxed text-muted-foreground">
         A fixed seeded 256-dim Gaussian, multiplied by the slider's scale, then run through{' '}
         <code className="text-foreground/80">y = x / sqrt(mean(x²) + ε)</code> with g = 1. Move the slider and watch the
@@ -1022,7 +1033,9 @@ function ScaleInvariancePlayground() {
         <div className="rounded border border-primary/40 bg-primary/5 px-2 py-1.5">
           <div className="uppercase tracking-wider text-muted-foreground">output L2</div>
           <div className="mt-0.5 font-mono text-base text-primary">{computed.outputL2.toFixed(1)}</div>
-          <div className="mt-1 text-[10px] text-muted-foreground">parks at √{DIM} ≈ {Math.sqrt(DIM).toFixed(1)}</div>
+          <div className="mt-1 text-[10px] text-muted-foreground">
+            parks at √{DIM} ≈ {Math.sqrt(DIM).toFixed(1)}
+          </div>
         </div>
       </div>
       <div className="grid grid-cols-2 gap-3">
@@ -1046,8 +1059,8 @@ function ScaleInvariancePlayground() {
         RMSNorm only changes magnitude; direction is preserved bit-for-bit.
       </div>
       <div className="text-[10px] text-muted-foreground/80">
-        Note: we use g = 1 here for clarity. Real models multiply each output element by a learned scalar g
-        <sub>i</sub> — that reweights features but never changes the cosine.
+        Note: we use g = 1 here for clarity. Real models multiply each output element by a learned scalar g<sub>i</sub>{' '}
+        — that reweights features but never changes the cosine.
       </div>
     </div>
   );
@@ -1120,7 +1133,15 @@ function NormFlowBox({ variant }: { variant: 'pre' | 'post' }) {
         aria-label={isPre ? 'Pre-norm sub-block diagram' : 'Post-norm sub-block diagram'}
       >
         <defs>
-          <marker id={`arrow-${variant}`} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <marker
+            id={`arrow-${variant}`}
+            viewBox="0 0 10 10"
+            refX="8"
+            refY="5"
+            markerWidth="6"
+            markerHeight="6"
+            orient="auto"
+          >
             <path d="M 0 0 L 10 5 L 0 10 Z" fill="currentColor" opacity={0.55} />
           </marker>
         </defs>
@@ -1133,7 +1154,15 @@ function NormFlowBox({ variant }: { variant: 'pre' | 'post' }) {
             {/* split: norm path on the left, residual highway on the right (dashed) */}
             <line x1={W / 2} y1={18} x2={W / 2} y2={28} stroke="currentColor" strokeOpacity={0.4} />
             <line x1={W / 2} y1={28} x2={70} y2={48} stroke="currentColor" strokeOpacity={0.4} />
-            <line x1={W / 2} y1={28} x2={W / 2} y2={148} stroke="currentColor" strokeOpacity={0.3} strokeDasharray="3 3" />
+            <line
+              x1={W / 2}
+              y1={28}
+              x2={W / 2}
+              y2={148}
+              stroke="currentColor"
+              strokeOpacity={0.3}
+              strokeDasharray="3 3"
+            />
             <text x={W / 2 + 6} y={90} fontSize={9} fill="currentColor" fillOpacity={0.5}>
               residual
             </text>
@@ -1141,13 +1170,32 @@ function NormFlowBox({ variant }: { variant: 'pre' | 'post' }) {
               (un-normed)
             </text>
             {/* RMSNorm box (accented) */}
-            <rect x={35} y={48} width={70} height={28} rx={5} className="fill-primary/15" stroke="currentColor" strokeOpacity={0.35} />
+            <rect
+              x={35}
+              y={48}
+              width={70}
+              height={28}
+              rx={5}
+              className="fill-primary/15"
+              stroke="currentColor"
+              strokeOpacity={0.35}
+            />
             <text x={70} y={66} fontSize={11} textAnchor="middle" className="fill-primary">
               RMSNorm
             </text>
             <line x1={70} y1={76} x2={70} y2={94} stroke="currentColor" strokeOpacity={0.4} />
             {/* attn / mlp */}
-            <rect x={35} y={94} width={70} height={28} rx={5} fill="currentColor" fillOpacity={0.06} stroke="currentColor" strokeOpacity={0.35} />
+            <rect
+              x={35}
+              y={94}
+              width={70}
+              height={28}
+              rx={5}
+              fill="currentColor"
+              fillOpacity={0.06}
+              stroke="currentColor"
+              strokeOpacity={0.35}
+            />
             <text x={70} y={112} fontSize={11} textAnchor="middle" fill="currentColor" fillOpacity={0.8}>
               attn / mlp
             </text>
@@ -1158,7 +1206,15 @@ function NormFlowBox({ variant }: { variant: 'pre' | 'post' }) {
             <text x={W / 2} y={152} fontSize={12} textAnchor="middle" fill="currentColor" fillOpacity={0.8}>
               +
             </text>
-            <line x1={W / 2} y1={158} x2={W / 2} y2={178} stroke="currentColor" strokeOpacity={0.55} markerEnd={`url(#arrow-${variant})`} />
+            <line
+              x1={W / 2}
+              y1={158}
+              x2={W / 2}
+              y2={178}
+              stroke="currentColor"
+              strokeOpacity={0.55}
+              markerEnd={`url(#arrow-${variant})`}
+            />
             <text x={W / 2} y={194} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
               x_out
             </text>
@@ -1168,12 +1224,30 @@ function NormFlowBox({ variant }: { variant: 'pre' | 'post' }) {
             {/* residual stream on right (still un-normed inside the block) */}
             <line x1={W / 2} y1={18} x2={W / 2} y2={28} stroke="currentColor" strokeOpacity={0.4} />
             <line x1={W / 2} y1={28} x2={70} y2={48} stroke="currentColor" strokeOpacity={0.4} />
-            <line x1={W / 2} y1={28} x2={W / 2} y2={114} stroke="currentColor" strokeOpacity={0.3} strokeDasharray="3 3" />
+            <line
+              x1={W / 2}
+              y1={28}
+              x2={W / 2}
+              y2={114}
+              stroke="currentColor"
+              strokeOpacity={0.3}
+              strokeDasharray="3 3"
+            />
             <text x={W / 2 + 6} y={80} fontSize={9} fill="currentColor" fillOpacity={0.5}>
               residual
             </text>
             {/* attn / mlp first */}
-            <rect x={35} y={48} width={70} height={28} rx={5} fill="currentColor" fillOpacity={0.06} stroke="currentColor" strokeOpacity={0.35} />
+            <rect
+              x={35}
+              y={48}
+              width={70}
+              height={28}
+              rx={5}
+              fill="currentColor"
+              fillOpacity={0.06}
+              stroke="currentColor"
+              strokeOpacity={0.35}
+            />
             <text x={70} y={66} fontSize={11} textAnchor="middle" fill="currentColor" fillOpacity={0.8}>
               attn / mlp
             </text>
@@ -1186,11 +1260,28 @@ function NormFlowBox({ variant }: { variant: 'pre' | 'post' }) {
             </text>
             {/* RMSNorm sits on the residual highway */}
             <line x1={W / 2} y1={124} x2={W / 2} y2={140} stroke="currentColor" strokeOpacity={0.4} />
-            <rect x={W / 2 - 35} y={140} width={70} height={28} rx={5} className="fill-primary/15" stroke="currentColor" strokeOpacity={0.35} />
+            <rect
+              x={W / 2 - 35}
+              y={140}
+              width={70}
+              height={28}
+              rx={5}
+              className="fill-primary/15"
+              stroke="currentColor"
+              strokeOpacity={0.35}
+            />
             <text x={W / 2} y={158} fontSize={11} textAnchor="middle" className="fill-primary">
               RMSNorm
             </text>
-            <line x1={W / 2} y1={168} x2={W / 2} y2={178} stroke="currentColor" strokeOpacity={0.55} markerEnd={`url(#arrow-${variant})`} />
+            <line
+              x1={W / 2}
+              y1={168}
+              x2={W / 2}
+              y2={178}
+              stroke="currentColor"
+              strokeOpacity={0.55}
+              markerEnd={`url(#arrow-${variant})`}
+            />
             <text x={W / 2} y={194} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
               x_out
             </text>

@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll } from 'vitest';
+
 import { getBridge, runTest } from './test-bridge';
 
 beforeAll(() => getBridge(), 60_000);
@@ -79,8 +80,8 @@ describe('Compile & GPU Buffers', () => {
     }
   });
 
-  test('gpu buffer array: create from eval\'d buffer, matmul 3 rounds', async () => {
-    const r = await runTest('gpu buffer array: create from eval\'d buffer, matmul 3 rounds');
+  test("gpu buffer array: create from eval'd buffer, matmul 3 rounds", async () => {
+    const r = await runTest("gpu buffer array: create from eval'd buffer, matmul 3 rounds");
     expect(r.passed, r.error).toBe(true);
   });
 

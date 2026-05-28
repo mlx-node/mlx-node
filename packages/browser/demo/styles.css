@@ -1223,6 +1223,36 @@
   }
 }
 
+/* Per-row grow-in for the top-K bar chart (chapter 9 LM head, chapter 10
+ * Sampling, Free Chat inspector). The bar fill carries an inline
+ * `width: <pct>%` for its resting state; this animation only touches
+ * `transform: scaleX`, so once the keyframe ends the inline width takes
+ * over with no jump. `transform-origin: left` (applied via the
+ * `origin-left` utility on the element) makes the bar sweep out from the
+ * label side. A per-row `--row` custom property staggers the bars top-down,
+ * so the eye naturally traces the distribution from highest-prob downward.
+ * The bars are keyed on `runKey` in the component, so a remount restarts
+ * the animation on every fresh distribution. */
+.bar-grow-in {
+  animation: barGrowIn 600ms cubic-bezier(0.4, 0, 0.2, 1) both;
+  animation-delay: calc(var(--row, 0) * 30ms);
+}
+
+@keyframes barGrowIn {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar-grow-in {
+    animation: none;
+  }
+}
+
 /* Animated chromatic rainbow for the predicted-token ghost text inside the
  * chapter-3 prompt textarea. The text is drawn by clipping a sweeping
  * gradient to the glyphs, so it shimmers without obscuring the underlying

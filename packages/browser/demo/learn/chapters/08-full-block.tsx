@@ -13,6 +13,7 @@ import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
+import { ResidualStream } from '../widgets/ResidualStream';
 import { StackCollapsedView } from '../widgets/StackCollapsedView';
 
 const DEFAULT_PROMPT = 'A transformer stacks the same block many times.';
@@ -212,20 +213,34 @@ export function FullBlockChapterBody() {
 
         <StackCollapsedView />
 
-        <h2>The residual highway</h2>
+        <h2>The residual stream</h2>
         <p>
-          Notice that nothing inside the layer <em>replaces</em> the hidden state — both the attention and the MLP
-          results are <em>added</em> to whatever was already there. The residual stream is a highway that runs the full
-          depth of the model. Each block reads from it, computes a small correction, and writes the correction back. The
-          model's final prediction is the accumulation of every block's contribution, not the output of the last block
-          alone.
+          The single most important and least-named concept in a decoder LLM is the <strong>residual stream</strong>: a
+          per-token vector that enters the layer stack from the embedding, gets <em>written into</em> by every
+          sub-block, and is read by the LM head at the top. Nothing inside the layer <em>replaces</em> it — both
+          attention and MLP results are <em>added</em> back. Every operation is literally <code>h := h + Δ</code>.
         </p>
         <p>
-          Two consequences fall out. First, gradients: backprop can flow straight through the identity path even in a
-          24-layer stack, which is why deep transformers train at all. Second, magnitudes: the residual stream grows in
-          L2 with depth (each layer adds a non-zero contribution), while every <em>individual</em> sub-block's output
-          stays small. The 3D widget colors each ring by the per-token L2 of the layer output — you can see the
-          magnitude climb as you scan up the tower.
+          The animation below shows it concretely: a single hidden vector, two layers' worth of writes (attention and
+          MLP, twice), and the LM head at the top reading the accumulated total. The bar grows because every write is a
+          strict add — the stream never shortens.
+        </p>
+
+        <ResidualStream />
+
+        <p>
+          Two consequences fall out. First, <strong>gradients</strong>: backprop can flow straight through the identity
+          path even in a 24-layer stack, which is why deep transformers train at all. Without the residual, every layer
+          would multiply the gradient signal, and a stack this deep would vanish or explode. Second,{' '}
+          <strong>magnitudes</strong>: the residual stream grows in L2 with depth (each layer adds a non-zero
+          contribution), while every <em>individual</em> sub-block's output stays small. The 3D widget on the right
+          colors each ring by the per-token L2 of the layer output — you can see the magnitude climb as you scan up the
+          tower, exactly mirroring the bar growing in the animation.
+        </p>
+        <p className="text-muted-foreground">
+          <strong>Mental model:</strong> think of the residual stream as a piece of working memory that the network
+          shares across all 24 layers. Each layer doesn't <em>transform</em> the representation; it <em>contributes</em>{' '}
+          to a shared running sum. The "thinking" is the accumulation.
         </p>
 
         <h2>Hybrid attention: not every layer is "full"</h2>
@@ -235,7 +250,7 @@ export function FullBlockChapterBody() {
           classic <code>softmax(QKᵀ/√d)</code> formulation from chapter 3. Linear-attention layers do almost all the
           across-token mixing under the tight memory budget of long contexts; full-attention layers appear at fixed
           intervals to do the heavy modelling that linear attention can't. The 3D widget highlights full-attention
-          layers in a warmer color so you can see the interleave at a glance. Chapter 10 will dig into how this hybrid
+          layers in a warmer color so you can see the interleave at a glance. Chapter 11 will dig into how this hybrid
           recipe works and why it's the new default for high-throughput open LLMs.
         </p>
 
@@ -563,7 +578,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
         items={[
           'Rotate the tower — each layer is Norm → Attention → Norm → MLP, with a residual skipping each sub-block.',
           'The colour ramp shows attention type: cooler colours are linear (GatedDeltaNet), warmer are full attention.',
-          "Six of the 24 layers are full attention; the rest are linear. That's the hybrid pattern from Chapter 10.",
+          "Six of the 24 layers are full attention; the rest are linear. That's the hybrid pattern from Chapter 11.",
         ]}
       />
     </div>

@@ -1,15 +1,15 @@
-import * as React from "react";
+import * as React from 'react';
 
-import { Button } from "../../components/ui/button";
-import { DemoCallout } from "../inspector/DemoCallout";
-import { Prose } from "../Prose";
-import { ChapterFrame } from "../scaffolding/ChapterFrame";
-import type { ChapterLearningData } from "../scaffolding/learning-data";
-import { KvGrowthCurve } from "../widgets/KvGrowthCurve";
-import { PrefillVsDecodeChart } from "../widgets/PrefillVsDecodeChart";
+import { Button } from '../../components/ui/button';
+import { DemoCallout } from '../inspector/DemoCallout';
+import { Prose } from '../Prose';
+import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import type { ChapterLearningData } from '../scaffolding/learning-data';
+import { KvGrowthCurve } from '../widgets/KvGrowthCurve';
+import { PrefillVsDecodeChart } from '../widgets/PrefillVsDecodeChart';
 
 /**
- * Chapter 10 — KV cache & hybrid attention.
+ * Chapter 11 — KV cache & hybrid attention.
  *
  * JS-only: every number here is derivable from Qwen3.5-0.8B's config (see
  * packages/browser/demo/public/model/config.json and the layer_types array
@@ -36,10 +36,9 @@ const CHART_MIN_CONTEXT = 256;
 
 // Layer indices that use full softmax attention. Mirrors the layer_types
 // array in the model's config.json: every 4th layer (1-indexed) is full.
-const FULL_LAYER_INDICES: number[] = Array.from(
-  { length: NUM_LAYERS },
-  (_, i) => i,
-).filter((i) => (i + 1) % FULL_ATTENTION_INTERVAL === 0);
+const FULL_LAYER_INDICES: number[] = Array.from({ length: NUM_LAYERS }, (_, i) => i).filter(
+  (i) => (i + 1) % FULL_ATTENTION_INTERVAL === 0,
+);
 const FULL_LAYER_SET = new Set<number>(FULL_LAYER_INDICES);
 const NUM_FULL_LAYERS = FULL_LAYER_INDICES.length;
 const NUM_LINEAR_LAYERS = NUM_LAYERS - NUM_FULL_LAYERS;
@@ -50,21 +49,10 @@ const NUM_LINEAR_LAYERS = NUM_LAYERS - NUM_FULL_LAYERS;
 // the linear attention block in Qwen3.5's config.
 const LINEAR_NUM_HEADS = 16;
 const LINEAR_HEAD_DIM = 128;
-const LINEAR_STATE_SIZE_BYTES =
-  LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM * BYTES_PER_FLOAT;
+const LINEAR_STATE_SIZE_BYTES = LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM * BYTES_PER_FLOAT;
 
-const DECODE_PROMPT_TOKENS: ReadonlyArray<string> = [
-  "The",
-  " cat",
-  " sat",
-  " on",
-  " the",
-];
-const DECODE_GENERATED_TOKENS: ReadonlyArray<string> = [
-  " mat",
-  ".",
-  " It",
-];
+const DECODE_PROMPT_TOKENS: ReadonlyArray<string> = ['The', ' cat', ' sat', ' on', ' the'];
+const DECODE_GENERATED_TOKENS: ReadonlyArray<string> = [' mat', '.', ' It'];
 const DECODE_TOTAL_STEPS = DECODE_PROMPT_TOKENS.length + DECODE_GENERATED_TOKENS.length;
 const DECODE_AUTOPLAY_MS = 1100;
 
@@ -78,14 +66,11 @@ function gqaAllLayersBytes(seqLen: number): number {
   return NUM_LAYERS * fullLayerCacheBytes(seqLen);
 }
 function hybridBytes(seqLen: number): number {
-  return (
-    NUM_FULL_LAYERS * fullLayerCacheBytes(seqLen) +
-    NUM_LINEAR_LAYERS * LINEAR_STATE_SIZE_BYTES
-  );
+  return NUM_FULL_LAYERS * fullLayerCacheBytes(seqLen) + NUM_LINEAR_LAYERS * LINEAR_STATE_SIZE_BYTES;
 }
 
 function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
   if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -93,58 +78,58 @@ function formatBytes(bytes: number): string {
 }
 
 function formatTokens(n: number): string {
-  if (!Number.isFinite(n)) return "—";
+  if (!Number.isFinite(n)) return '—';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return `${n}`;
 }
 
 /**
- * Scaffolding metadata for chapter 10 — drives the header, glossary,
+ * Scaffolding metadata for chapter 11 — drives the header, glossary,
  * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
- * `chapterId` must match `CHAPTERS[9].id` in `learn/chapters.ts`.
+ * `chapterId` must match the 'kv-cache' entry in `learn/chapters.ts`.
  */
 export const learning: ChapterLearningData = {
-  chapterId: "kv-cache",
+  chapterId: 'kv-cache',
   objective:
     "Explain why the KV cache exists, how it grows with context, and what Qwen3.5's hybrid attention buys you in memory.",
   problem:
-    "Without caching K and V, each decoded token would redo all of attention from scratch — making generation quadratic in context length.",
+    'Without caching K and V, each decoded token would redo all of attention from scratch — making generation quadratic in context length.',
   minutes: 8,
   glossary: [
     {
-      term: "KV cache",
+      term: 'KV cache',
       definition:
-        "Per-layer stored K and V tensors for every prompt and generated token, reused across decode steps so attention stays roughly linear.",
+        'Per-layer stored K and V tensors for every prompt and generated token, reused across decode steps so attention stays roughly linear.',
     },
     {
-      term: "prefill",
+      term: 'prefill',
       definition:
-        "First inference phase: the whole prompt is processed in one matmul-heavy pass that writes K and V for every prompt token.",
+        'First inference phase: the whole prompt is processed in one matmul-heavy pass that writes K and V for every prompt token.',
     },
     {
-      term: "decode",
+      term: 'decode',
       definition:
         "Per-token generation phase: only the new token's Q/K/V is computed, and Q attends over the cached K/V history.",
     },
     {
-      term: "GatedDeltaNet",
+      term: 'GatedDeltaNet',
       definition:
         "Qwen3.5's linear-attention variant. Stores a fixed-size recurrent state per layer instead of a token-by-token KV cache.",
     },
     {
-      term: "hybrid attention",
+      term: 'hybrid attention',
       definition:
-        "Mixing full softmax-attention layers and linear-attention layers in the same stack. Qwen3.5 uses 6 full + 18 linear.",
+        'Mixing full softmax-attention layers and linear-attention layers in the same stack. Qwen3.5 uses 6 full + 18 linear.',
     },
     {
-      term: "linear state",
+      term: 'linear state',
       definition:
-        "Per-layer tensor [linear_heads, head_dim, head_dim] that compresses the entire history; size is independent of sequence length.",
+        'Per-layer tensor [linear_heads, head_dim, head_dim] that compresses the entire history; size is independent of sequence length.',
     },
   ],
   takeaways: [
-    "KV cache memory scales linearly with context, and at long context it dwarfs the model weights themselves.",
+    'KV cache memory scales linearly with context, and at long context it dwarfs the model weights themselves.',
     "Qwen3.5's 6 full + 18 linear layout collapses the cache curve because linear layers contribute a constant, not a per-token chunk.",
     "Full-attention layers handle 'recall this specific token' jobs; linear layers handle the bulk of language flow under a tight memory budget.",
   ],
@@ -156,62 +141,62 @@ export const learning: ChapterLearningData = {
   },
   quiz: [
     {
-      id: "q1-why-cache",
-      prompt: "What would happen during decode if the model did not maintain a KV cache?",
+      id: 'q1-why-cache',
+      prompt: 'What would happen during decode if the model did not maintain a KV cache?',
       options: [
-        { id: "a", label: "Decode would still work, just at the same speed." },
+        { id: 'a', label: 'Decode would still work, just at the same speed.' },
         {
-          id: "b",
+          id: 'b',
           label:
-            "Each new token would re-compute K and V for the entire history, so decode cost per step would be as expensive as prefill — quadratic in context length over the whole generation.",
+            'Each new token would re-compute K and V for the entire history, so decode cost per step would be as expensive as prefill — quadratic in context length over the whole generation.',
         },
         {
-          id: "c",
-          label: "The model would lose access to RoPE positions.",
+          id: 'c',
+          label: 'The model would lose access to RoPE positions.',
         },
       ],
-      correctId: "b",
+      correctId: 'b',
       explanation:
         "K and V for old tokens don't depend on the new one, so caching them turns decode from quadratic to linear in sequence length.",
     },
     {
-      id: "q2-linear-state-size",
+      id: 'q2-linear-state-size',
       prompt: "How does a GatedDeltaNet linear-attention layer's memory cost scale with sequence length?",
       options: [
-        { id: "a", label: "Linearly with seq_len, like a regular KV cache." },
+        { id: 'a', label: 'Linearly with seq_len, like a regular KV cache.' },
         {
-          id: "b",
+          id: 'b',
           label:
             "It doesn't — the recurrent state is a fixed-size tensor [heads, head_dim, head_dim] regardless of how many tokens have streamed by.",
         },
         {
-          id: "c",
-          label: "Quadratically with seq_len.",
+          id: 'c',
+          label: 'Quadratically with seq_len.',
         },
       ],
-      correctId: "b",
+      correctId: 'b',
       explanation:
         "That's the whole point of a recurrent compression: the state stays the same size as the sequence grows, at the cost of losing exact per-token recall.",
     },
     {
-      id: "q3-why-hybrid",
-      prompt: "Why does Qwen3.5 still keep 6 full-attention layers instead of going fully linear?",
+      id: 'q3-why-hybrid',
+      prompt: 'Why does Qwen3.5 still keep 6 full-attention layers instead of going fully linear?',
       options: [
         {
-          id: "a",
+          id: 'a',
           label:
-            "Linear attention compresses history and loses exact recall; full layers preserve the ability to look back at one specific earlier token when the model needs it.",
+            'Linear attention compresses history and loses exact recall; full layers preserve the ability to look back at one specific earlier token when the model needs it.',
         },
         {
-          id: "b",
-          label: "Full layers are required for RoPE to work.",
+          id: 'b',
+          label: 'Full layers are required for RoPE to work.',
         },
         {
-          id: "c",
-          label: "Full layers run faster than linear ones at long context.",
+          id: 'c',
+          label: 'Full layers run faster than linear ones at long context.',
         },
       ],
-      correctId: "a",
+      correctId: 'a',
       explanation:
         "Linear layers handle pattern continuation cheaply; full layers handle 'look back to that one specific token' jobs. The hybrid recovers most of the quality at a fraction of the cache cost.",
     },
@@ -222,165 +207,131 @@ export function KvCacheChapterBody() {
   return (
     <ChapterFrame learning={learning}>
       <Prose>
-      <h1>KV cache &amp; hybrid attention</h1>
-      <p>
-        Every chapter so far has described what happens for{" "}
-        <em>one forward pass</em>. But generation is a sequence of forward
-        passes — one per output token — and naively each pass would redo all
-        the attention work for every token in the history. That would make
-        decode quadratic in the context length, which is obviously hopeless
-        once you have a 32k-token document in the prompt. The fix is a piece
-        of engineering, not a new architecture: cache the parts that don't
-        change between steps. That cache is what dominates inference memory
-        and shapes most of the architectural decisions you see in modern
-        LLMs.
-      </p>
-
-      <h2>Prefill versus decode</h2>
-      <p>
-        Inference has two phases. <strong>Prefill</strong> takes the whole
-        prompt at once and computes K, V and the hidden states for every
-        token in one big matmul-heavy pass. <strong>Decode</strong> then
-        generates one token at a time: feed the previous output back in,
-        compute K/V/Q for just <em>that</em> single new token, and read the
-        K/V of all earlier tokens out of a cache instead of recomputing
-        them. Without the cache, each decode step would be as expensive as
-        prefill — with it, decode cost is roughly linear in the cache size.
-      </p>
-
-      <h2>Why caching K and V works</h2>
-      <p>
-        At decode step <code>t</code>, every layer needs the attention output
-        for the new token: <code>softmax(q_t · K^T / √d) · V</code>. The Q
-        is brand new (it comes from the just-computed hidden state). The K
-        and V for the new token are also new. But the K and V for tokens{" "}
-        <code>0..t-1</code> were already computed in earlier steps —{" "}
-        <em>and they don't depend on token <code>t</code></em>. So we save
-        them once and read them back forever.
-      </p>
-      <p>
-        Shape-wise, the cache stores, per layer, two tensors of shape{" "}
-        <code>[num_kv_heads, seq_len, head_dim]</code>. As <code>seq_len</code>{" "}
-        grows, the cache grows linearly. That's the catch: cache memory is
-        proportional to context length, and for long contexts it dwarfs the
-        weights.
-      </p>
-
-      <h2>The arithmetic for Qwen3.5-0.8B</h2>
-      <p>
-        Per full-attention layer, per token, the cache costs{" "}
-        <code>2 · num_kv_heads · head_dim · 2 bytes = 2 · {NUM_KV_HEADS} ·{" "}
-        {HEAD_DIM} · {BYTES_PER_FLOAT} = {fullLayerCacheBytes(1)} bytes</code>.
-        At a 32k-token context, one full-attention layer holds{" "}
-        <code>{formatBytes(fullLayerCacheBytes(32_768))}</code>. If every one
-        of the {NUM_LAYERS} layers were full-attention, the whole-model cache
-        would be <code>{formatBytes(gqaAllLayersBytes(32_768))}</code> — for
-        the <em>smallest</em> Qwen3.5 variant. Bigger Qwen3.5 sizes scale
-        from there.
-      </p>
-      <p>
-        This is why KV cache memory, not weights, is the headline number for
-        modern serving. It's also why a generation of architectural
-        decisions — multi-query attention, grouped-query attention, sliding
-        windows, and linear-attention variants — have all been driven by
-        cutting the cache without giving up too much quality.
-      </p>
-
-      <h2>Qwen3.5's answer: hybrid attention</h2>
-      <p>
-        Qwen3.5 interleaves two different kinds of attention layer.{" "}
-        <strong>Six</strong> of its {NUM_LAYERS} layers (one in every four,
-        at indices {FULL_LAYER_INDICES.join(", ")}) are conventional
-        full-attention layers — the ones from Chapter 3, with the linear-in-
-        <code>seq_len</code> KV cache. The other {NUM_LINEAR_LAYERS} layers
-        use a <strong>linear attention variant called GatedDeltaNet</strong>.
-        Instead of caching K and V per token, a GatedDeltaNet layer compresses
-        the entire history into a <em>fixed-size recurrent state</em> of
-        shape <code>[num_heads, head_dim, head_dim]</code>. The state is
-        rolled forward at each step the way an RNN's hidden state is —
-        independent of how many tokens have streamed by.
-      </p>
-      <p>
-        With {LINEAR_NUM_HEADS} linear heads at{" "}
-        <code>head_dim = {LINEAR_HEAD_DIM}</code>, each linear layer's state
-        is a constant{" "}
-        <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code> regardless of
-        context. So total cache for Qwen3.5-0.8B is{" "}
-        <code>6 × full + 18 × constant</code> — the chart on the right
-        plots that against a hypothetical Qwen with full attention on every
-        layer.
-      </p>
-
-      <h2>The trade-off</h2>
-      <p>
-        Linear attention is approximate. It cannot perfectly recall an
-        arbitrary single token from way back in the history the way full
-        softmax attention can — its compressed state mixes everything
-        together. What it does well is the bulk of language processing:
-        pattern continuation, syntactic flow, local style. Interleaving with
-        the six full-attention layers brings the exact-recall capability
-        back where it's needed. Concretely: linear layers run the long-
-        context flow, full layers handle "look back to <em>that</em> one
-        specific token" jobs.
-      </p>
-
-      <h2>Why this is the future</h2>
-      <p>
-        As context lengths push past 1M tokens, quadratic-memory attention
-        becomes untenable — both as cache and as compute. Hybrid attention
-        is one of the techniques the field is exploring. Pure state-space
-        models like Mamba take it further still by removing softmax
-        attention entirely. The trend is clear: cache is the bottleneck,
-        and architectures will keep getting reshaped around it.
-      </p>
-
-      <div className="not-prose my-4 rounded-md border border-amber-500/50 bg-amber-500/5 p-4">
-        <div className="text-xs uppercase tracking-wider text-amber-700 dark:text-amber-300">
-          Misconception
-        </div>
-        <div className="mt-1 text-sm font-semibold text-foreground">
-          The KV cache is not a Python dict.
-        </div>
-        <p className="mt-2 text-[12px] leading-relaxed text-foreground/85">
-          People sometimes picture it as a hashmap from token text or
-          position to (k, v) tuples. It isn&apos;t. The cache is a
-          pre-allocated tensor of shape{" "}
-          <code className="rounded bg-background px-1 py-0.5 font-mono text-[11px]">
-            [layers, 2, batch, kv_heads, max_seq, head_dim]
-          </code>{" "}
-          that each attention layer writes into and reads from, with a
-          position counter telling it how much of the tensor is live. The
-          "key" is the position index, not a hash. It&apos;s a buffer, not
-          a hashmap.
+        <h1>KV cache &amp; hybrid attention</h1>
+        <p>
+          Every chapter so far has described what happens for <em>one forward pass</em>. But generation is a sequence of
+          forward passes — one per output token — and naively each pass would redo all the attention work for every
+          token in the history. That would make decode quadratic in the context length, which is obviously hopeless once
+          you have a 32k-token document in the prompt. The fix is a piece of engineering, not a new architecture: cache
+          the parts that don't change between steps. That cache is what dominates inference memory and shapes most of
+          the architectural decisions you see in modern LLMs.
         </p>
-      </div>
 
-      <h2>Prefill vs decode, in time</h2>
-      <p>
-        Memory is one axis; wall-clock time is the other. The chart below
-        contrasts prefill (one parallel matmul over the whole prompt) with
-        decode (many small sequential matmuls, one per generated token).
-      </p>
+        <h2>Prefill versus decode</h2>
+        <p>
+          Inference has two phases. <strong>Prefill</strong> takes the whole prompt at once and computes K, V and the
+          hidden states for every token in one big matmul-heavy pass. <strong>Decode</strong> then generates one token
+          at a time: feed the previous output back in, compute K/V/Q for just <em>that</em> single new token, and read
+          the K/V of all earlier tokens out of a cache instead of recomputing them. Without the cache, each decode step
+          would be as expensive as prefill — with it, decode cost is roughly linear in the cache size.
+        </p>
 
-      <PrefillVsDecodeChart />
+        <h2>Why caching K and V works</h2>
+        <p>
+          At decode step <code>t</code>, every layer needs the attention output for the new token:{' '}
+          <code>softmax(q_t · K^T / √d) · V</code>. The Q is brand new (it comes from the just-computed hidden state).
+          The K and V for the new token are also new. But the K and V for tokens <code>0..t-1</code> were already
+          computed in earlier steps —{' '}
+          <em>
+            and they don't depend on token <code>t</code>
+          </em>
+          . So we save them once and read them back forever.
+        </p>
+        <p>
+          Shape-wise, the cache stores, per layer, two tensors of shape <code>[num_kv_heads, seq_len, head_dim]</code>.
+          As <code>seq_len</code> grows, the cache grows linearly. That's the catch: cache memory is proportional to
+          context length, and for long contexts it dwarfs the weights.
+        </p>
 
-      <h2>How the cache grows with context</h2>
-      <p>
-        And here, plotted in isolation, is the cache-vs-context curve for
-        each layout. The formula is unpacked underneath: every factor in{" "}
-        <code>2 · L · kv_heads · d · seq · bf16</code> is a knob someone is
-        working on right now.
-      </p>
+        <h2>The arithmetic for Qwen3.5-0.8B</h2>
+        <p>
+          Per full-attention layer, per token, the cache costs{' '}
+          <code>
+            2 · num_kv_heads · head_dim · 2 bytes = 2 · {NUM_KV_HEADS} · {HEAD_DIM} · {BYTES_PER_FLOAT} ={' '}
+            {fullLayerCacheBytes(1)} bytes
+          </code>
+          . At a 32k-token context, one full-attention layer holds{' '}
+          <code>{formatBytes(fullLayerCacheBytes(32_768))}</code>. If every one of the {NUM_LAYERS} layers were
+          full-attention, the whole-model cache would be <code>{formatBytes(gqaAllLayersBytes(32_768))}</code> — for the{' '}
+          <em>smallest</em> Qwen3.5 variant. Bigger Qwen3.5 sizes scale from there.
+        </p>
+        <p>
+          This is why KV cache memory, not weights, is the headline number for modern serving. It's also why a
+          generation of architectural decisions — multi-query attention, grouped-query attention, sliding windows, and
+          linear-attention variants — have all been driven by cutting the cache without giving up too much quality.
+        </p>
 
-      <KvGrowthCurve />
+        <h2>Qwen3.5's answer: hybrid attention</h2>
+        <p>
+          Qwen3.5 interleaves two different kinds of attention layer. <strong>Six</strong> of its {NUM_LAYERS} layers
+          (one in every four, at indices {FULL_LAYER_INDICES.join(', ')}) are conventional full-attention layers — the
+          ones from Chapter 3, with the linear-in-
+          <code>seq_len</code> KV cache. The other {NUM_LINEAR_LAYERS} layers use a{' '}
+          <strong>linear attention variant called GatedDeltaNet</strong>. Instead of caching K and V per token, a
+          GatedDeltaNet layer compresses the entire history into a <em>fixed-size recurrent state</em> of shape{' '}
+          <code>[num_heads, head_dim, head_dim]</code>. The state is rolled forward at each step the way an RNN's hidden
+          state is — independent of how many tokens have streamed by.
+        </p>
+        <p>
+          With {LINEAR_NUM_HEADS} linear heads at <code>head_dim = {LINEAR_HEAD_DIM}</code>, each linear layer's state
+          is a constant <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code> regardless of context. So total cache for
+          Qwen3.5-0.8B is <code>6 × full + 18 × constant</code> — the chart on the right plots that against a
+          hypothetical Qwen with full attention on every layer.
+        </p>
 
-      <p className="mt-6 text-muted-foreground">
-        The right-hand widget plots the cache curves for MHA, GQA-only, and
-        Qwen3.5's hybrid layout; drag the context slider to read off
-        memory at any length. The layer strip below it shows the exact
-        interleave — click any layer to see what its cache looks like at
-        the current context length.
-      </p>
+        <h2>The trade-off</h2>
+        <p>
+          Linear attention is approximate. It cannot perfectly recall an arbitrary single token from way back in the
+          history the way full softmax attention can — its compressed state mixes everything together. What it does well
+          is the bulk of language processing: pattern continuation, syntactic flow, local style. Interleaving with the
+          six full-attention layers brings the exact-recall capability back where it's needed. Concretely: linear layers
+          run the long- context flow, full layers handle "look back to <em>that</em> one specific token" jobs.
+        </p>
+
+        <h2>Why this is the future</h2>
+        <p>
+          As context lengths push past 1M tokens, quadratic-memory attention becomes untenable — both as cache and as
+          compute. Hybrid attention is one of the techniques the field is exploring. Pure state-space models like Mamba
+          take it further still by removing softmax attention entirely. The trend is clear: cache is the bottleneck, and
+          architectures will keep getting reshaped around it.
+        </p>
+
+        <div className="not-prose my-4 rounded-md border border-amber-500/50 bg-amber-500/5 p-4">
+          <div className="text-xs uppercase tracking-wider text-amber-700 dark:text-amber-300">Misconception</div>
+          <div className="mt-1 text-sm font-semibold text-foreground">The KV cache is not a Python dict.</div>
+          <p className="mt-2 text-[12px] leading-relaxed text-foreground/85">
+            People sometimes picture it as a hashmap from token text or position to (k, v) tuples. It isn&apos;t. The
+            cache is a pre-allocated tensor of shape{' '}
+            <code className="rounded bg-background px-1 py-0.5 font-mono text-[11px]">
+              [layers, 2, batch, kv_heads, max_seq, head_dim]
+            </code>{' '}
+            that each attention layer writes into and reads from, with a position counter telling it how much of the
+            tensor is live. The "key" is the position index, not a hash. It&apos;s a buffer, not a hashmap.
+          </p>
+        </div>
+
+        <h2>Prefill vs decode, in time</h2>
+        <p>
+          Memory is one axis; wall-clock time is the other. The chart below contrasts prefill (one parallel matmul over
+          the whole prompt) with decode (many small sequential matmuls, one per generated token).
+        </p>
+
+        <PrefillVsDecodeChart />
+
+        <h2>How the cache grows with context</h2>
+        <p>
+          And here, plotted in isolation, is the cache-vs-context curve for each layout. The formula is unpacked
+          underneath: every factor in <code>2 · L · kv_heads · d · seq · bf16</code> is a knob someone is working on
+          right now.
+        </p>
+
+        <KvGrowthCurve />
+
+        <p className="mt-6 text-muted-foreground">
+          The right-hand widget plots the cache curves for MHA, GQA-only, and Qwen3.5's hybrid layout; drag the context
+          slider to read off memory at any length. The layer strip below it shows the exact interleave — click any layer
+          to see what its cache looks like at the current context length.
+        </p>
       </Prose>
     </ChapterFrame>
   );
@@ -395,12 +346,8 @@ export type KvCacheDemoProps = {
 
 export function KvCacheDemo(_props: KvCacheDemoProps) {
   const [contextLen, setContextLen] = React.useState(DEFAULT_CONTEXT_LEN);
-  const [selectedLayer, setSelectedLayer] = React.useState(
-    FULL_LAYER_INDICES[0] ?? 3,
-  );
-  const [decodeStep, setDecodeStep] = React.useState(
-    DECODE_PROMPT_TOKENS.length - 1,
-  );
+  const [selectedLayer, setSelectedLayer] = React.useState(FULL_LAYER_INDICES[0] ?? 3);
+  const [decodeStep, setDecodeStep] = React.useState(DECODE_PROMPT_TOKENS.length - 1);
   const [autoplay, setAutoplay] = React.useState(false);
 
   React.useEffect(() => {
@@ -418,7 +365,7 @@ export function KvCacheDemo(_props: KvCacheDemoProps) {
   }, [autoplay]);
 
   React.useEffect(() => {
-    console.info("[kv-cache-demo] context-length update", {
+    console.info('[kv-cache-demo] context-length update', {
       contextLen,
       hybridBytes: hybridBytes(contextLen),
       gqaAllLayersBytes: gqaAllLayersBytes(contextLen),
@@ -429,34 +376,22 @@ export function KvCacheDemo(_props: KvCacheDemoProps) {
   return (
     <div className="space-y-4">
       <div className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-        All numbers below are derived from Qwen3.5-0.8B's config:{" "}
-        num_layers={NUM_LAYERS}, num_heads={NUM_HEADS}, num_kv_heads=
+        All numbers below are derived from Qwen3.5-0.8B's config: num_layers={NUM_LAYERS}, num_heads={NUM_HEADS},
+        num_kv_heads=
         {NUM_KV_HEADS}, head_dim={HEAD_DIM}, full_attention_interval=
         {FULL_ATTENTION_INTERVAL}, max_position_embeddings=
         {formatTokens(MAX_POSITION)}. No model inference needed.
       </div>
 
-      <MemoryChart
-        contextLen={contextLen}
-        onContextLen={setContextLen}
-      />
+      <MemoryChart contextLen={contextLen} onContextLen={setContextLen} />
 
-      <ContextSlider
-        contextLen={contextLen}
-        onContextLen={setContextLen}
-      />
+      <ContextSlider contextLen={contextLen} onContextLen={setContextLen} />
 
       <CacheStats contextLen={contextLen} />
 
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-        <LayerStrip
-          selectedLayer={selectedLayer}
-          onSelect={setSelectedLayer}
-        />
-        <LayerSidePanel
-          layerIdx={selectedLayer}
-          contextLen={contextLen}
-        />
+        <LayerStrip selectedLayer={selectedLayer} onSelect={setSelectedLayer} />
+        <LayerSidePanel layerIdx={selectedLayer} contextLen={contextLen} />
       </div>
 
       <DecodeAnimation
@@ -480,7 +415,7 @@ export function KvCacheDemo(_props: KvCacheDemoProps) {
         items={[
           "Drag the context slider toward 131k tokens — the MHA-hypothetical curve explodes while Qwen's actual hybrid stays modest.",
           "The MHA total at 32k is ~6 GB — that's what every layer storing full K/V would cost.",
-          "Hybrid wins at long context because the linear layers cost a constant 512 KB each regardless of seq_len.",
+          'Hybrid wins at long context because the linear layers cost a constant 512 KB each regardless of seq_len.',
         ]}
       />
     </div>
@@ -502,13 +437,7 @@ function logSpacePositions(samples: number): number[] {
   });
 }
 
-function MemoryChart({
-  contextLen,
-  onContextLen,
-}: {
-  contextLen: number;
-  onContextLen: (n: number) => void;
-}) {
+function MemoryChart({ contextLen, onContextLen }: { contextLen: number; onContextLen: (n: number) => void }) {
   const samples = React.useMemo(() => logSpacePositions(CHART_SAMPLES), []);
 
   const width = 560;
@@ -526,10 +455,7 @@ function MemoryChart({
     gqaAllLayersBytes(CHART_MAX_CONTEXT),
     hybridBytes(CHART_MAX_CONTEXT),
   );
-  const yMinBytes = Math.min(
-    hybridBytes(CHART_MIN_CONTEXT),
-    LINEAR_STATE_SIZE_BYTES * NUM_LINEAR_LAYERS,
-  );
+  const yMinBytes = Math.min(hybridBytes(CHART_MIN_CONTEXT), LINEAR_STATE_SIZE_BYTES * NUM_LINEAR_LAYERS);
   const logYMin = Math.log10(Math.max(1024, yMinBytes));
   const logYMax = Math.log10(yMaxBytes);
 
@@ -537,9 +463,7 @@ function MemoryChart({
   const logXMax = Math.log10(CHART_MAX_CONTEXT);
 
   function xFor(seqLen: number): number {
-    const t =
-      (Math.log10(Math.max(CHART_MIN_CONTEXT, seqLen)) - logXMin) /
-      (logXMax - logXMin);
+    const t = (Math.log10(Math.max(CHART_MIN_CONTEXT, seqLen)) - logXMin) / (logXMax - logXMin);
     return padLeft + Math.max(0, Math.min(1, t)) * innerW;
   }
   function yFor(bytes: number): number {
@@ -549,12 +473,7 @@ function MemoryChart({
   }
 
   function pathFor(fn: (n: number) => number): string {
-    return (
-      "M " +
-      samples
-        .map((n) => `${xFor(n).toFixed(2)} ${yFor(fn(n)).toFixed(2)}`)
-        .join(" L ")
-    );
+    return 'M ' + samples.map((n) => `${xFor(n).toFixed(2)} ${yFor(fn(n)).toFixed(2)}`).join(' L ');
   }
 
   const mhaPath = pathFor(mhaBaselineBytes);
@@ -591,9 +510,7 @@ function MemoryChart({
         <div className="text-xs uppercase tracking-wider text-muted-foreground">
           KV cache memory vs context length (log–log)
         </div>
-        <div className="text-[11px] text-muted-foreground">
-          Click or drag inside the chart to move the marker.
-        </div>
+        <div className="text-[11px] text-muted-foreground">Click or drag inside the chart to move the marker.</div>
       </div>
       <svg
         ref={svgRef}
@@ -609,28 +526,14 @@ function MemoryChart({
           if (e.buttons === 0) return;
           handlePoint(e);
         }}
-        style={{ cursor: "ew-resize", touchAction: "none" }}
+        style={{ cursor: 'ew-resize', touchAction: 'none' }}
       >
         {yTicks.map((b, idx) => {
           const y = yFor(b);
           return (
             <g key={`y-${idx}`}>
-              <line
-                x1={padLeft}
-                x2={width - padRight}
-                y1={y}
-                y2={y}
-                stroke="currentColor"
-                strokeOpacity={0.07}
-              />
-              <text
-                x={padLeft - 6}
-                y={y + 3}
-                fontSize={9}
-                textAnchor="end"
-                fill="currentColor"
-                fillOpacity={0.55}
-              >
+              <line x1={padLeft} x2={width - padRight} y1={y} y2={y} stroke="currentColor" strokeOpacity={0.07} />
+              <text x={padLeft - 6} y={y + 3} fontSize={9} textAnchor="end" fill="currentColor" fillOpacity={0.55}>
                 {formatBytes(b)}
               </text>
             </g>
@@ -640,22 +543,8 @@ function MemoryChart({
           const x = xFor(t);
           return (
             <g key={`x-${idx}`}>
-              <line
-                x1={x}
-                x2={x}
-                y1={padTop}
-                y2={padTop + innerH}
-                stroke="currentColor"
-                strokeOpacity={0.07}
-              />
-              <text
-                x={x}
-                y={height - 20}
-                fontSize={9}
-                textAnchor="middle"
-                fill="currentColor"
-                fillOpacity={0.55}
-              >
+              <line x1={x} x2={x} y1={padTop} y2={padTop + innerH} stroke="currentColor" strokeOpacity={0.07} />
+              <text x={x} y={height - 20} fontSize={9} textAnchor="middle" fill="currentColor" fillOpacity={0.55}>
                 {formatTokens(t)}
               </text>
             </g>
@@ -673,25 +562,9 @@ function MemoryChart({
           context length (tokens, log scale)
         </text>
 
-        <path
-          d={mhaPath}
-          fill="none"
-          stroke="#94a3b8"
-          strokeWidth={1.5}
-          strokeDasharray="4 3"
-        />
-        <path
-          d={gqaPath}
-          fill="none"
-          stroke="#f59e0b"
-          strokeWidth={1.8}
-        />
-        <path
-          d={hybridPath}
-          fill="none"
-          stroke="#22c55e"
-          strokeWidth={2}
-        />
+        <path d={mhaPath} fill="none" stroke="#94a3b8" strokeWidth={1.5} strokeDasharray="4 3" />
+        <path d={gqaPath} fill="none" stroke="#f59e0b" strokeWidth={1.8} />
+        <path d={hybridPath} fill="none" stroke="#22c55e" strokeWidth={2} />
 
         <line
           x1={markerX}
@@ -711,9 +584,7 @@ function MemoryChart({
           fontSize={10}
           fill="currentColor"
           fillOpacity={0.7}
-          textAnchor={
-            markerX > padLeft + innerW * 0.75 ? "end" : "start"
-          }
+          textAnchor={markerX > padLeft + innerW * 0.75 ? 'end' : 'start'}
         >
           {formatTokens(contextLen)} tok
         </text>
@@ -722,12 +593,8 @@ function MemoryChart({
         <LegendDot color="#94a3b8" dashed>
           MHA (hypothetical, num_kv_heads = num_heads)
         </LegendDot>
-        <LegendDot color="#f59e0b">
-          GQA every layer (num_kv_heads = {NUM_KV_HEADS})
-        </LegendDot>
-        <LegendDot color="#22c55e">
-          Hybrid (Qwen3.5 actual)
-        </LegendDot>
+        <LegendDot color="#f59e0b">GQA every layer (num_kv_heads = {NUM_KV_HEADS})</LegendDot>
+        <LegendDot color="#22c55e">Hybrid (Qwen3.5 actual)</LegendDot>
       </div>
     </div>
   );
@@ -752,7 +619,7 @@ function LegendDot({
           y2={3}
           stroke={color}
           strokeWidth={2}
-          strokeDasharray={dashed ? "4 3" : undefined}
+          strokeDasharray={dashed ? '4 3' : undefined}
         />
       </svg>
       <span>{children}</span>
@@ -764,30 +631,18 @@ function LegendDot({
 // Context-length slider + cache stats.
 // -----------------------------------------------------------------------------
 
-function ContextSlider({
-  contextLen,
-  onContextLen,
-}: {
-  contextLen: number;
-  onContextLen: (n: number) => void;
-}) {
+function ContextSlider({ contextLen, onContextLen }: { contextLen: number; onContextLen: (n: number) => void }) {
   // Slider is log-scaled in [CHART_MIN_CONTEXT, MAX_POSITION].
   const logLo = Math.log10(CHART_MIN_CONTEXT);
   const logHi = Math.log10(MAX_POSITION);
-  const sliderValue = (Math.log10(Math.max(CHART_MIN_CONTEXT, contextLen)) - logLo) /
-    (logHi - logLo);
+  const sliderValue = (Math.log10(Math.max(CHART_MIN_CONTEXT, contextLen)) - logLo) / (logHi - logLo);
   return (
     <div className="space-y-1">
       <div className="flex items-center justify-between text-xs text-muted-foreground">
-        <label
-          htmlFor="kv-cache-demo-context"
-          className="uppercase tracking-wider"
-        >
+        <label htmlFor="kv-cache-demo-context" className="uppercase tracking-wider">
           Context length
         </label>
-        <span className="font-mono text-foreground/80">
-          {formatTokens(contextLen)} tokens
-        </span>
+        <span className="font-mono text-foreground/80">{formatTokens(contextLen)} tokens</span>
       </div>
       <input
         id="kv-cache-demo-context"
@@ -814,11 +669,7 @@ function CacheStats({ contextLen }: { contextLen: number }) {
   const savingsVsGqa = gqa > 0 ? gqa / hybrid : 0;
   return (
     <div className="grid grid-cols-1 gap-2 rounded-md border border-border bg-background p-3 sm:grid-cols-3">
-      <StatTile
-        label="MHA total"
-        value={formatBytes(mha)}
-        sub={`24 layers × full · num_kv_heads = ${NUM_HEADS}`}
-      />
+      <StatTile label="MHA total" value={formatBytes(mha)} sub={`24 layers × full · num_kv_heads = ${NUM_HEADS}`} />
       <StatTile
         label="GQA every layer"
         value={formatBytes(gqa)}
@@ -848,15 +699,11 @@ function StatTile({
   return (
     <div
       className={[
-        "rounded-md border p-2",
-        accent
-          ? "border-primary/50 bg-primary/5"
-          : "border-border bg-muted/30",
-      ].join(" ")}
+        'rounded-md border p-2',
+        accent ? 'border-primary/50 bg-primary/5' : 'border-border bg-muted/30',
+      ].join(' ')}
     >
-      <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-        {label}
-      </div>
+      <div className="text-[11px] uppercase tracking-wider text-muted-foreground">{label}</div>
       <div className="mt-1 font-mono text-sm text-foreground">{value}</div>
       <div className="text-[11px] text-muted-foreground">{sub}</div>
     </div>
@@ -867,13 +714,7 @@ function StatTile({
 // Layer strip.
 // -----------------------------------------------------------------------------
 
-function LayerStrip({
-  selectedLayer,
-  onSelect,
-}: {
-  selectedLayer: number;
-  onSelect: (i: number) => void;
-}) {
+function LayerStrip({ selectedLayer, onSelect }: { selectedLayer: number; onSelect: (i: number) => void }) {
   const width = 320;
   const height = 360;
   const padTop = 32;
@@ -887,12 +728,8 @@ function LayerStrip({
   return (
     <div className="space-y-2 rounded-md border border-border bg-background p-3">
       <div className="flex items-baseline justify-between">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Layer interleave · 24 layers
-        </div>
-        <div className="text-[11px] text-muted-foreground">
-          F = full · L = linear (GatedDeltaNet)
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">Layer interleave · 24 layers</div>
+        <div className="text-[11px] text-muted-foreground">F = full · L = linear (GatedDeltaNet)</div>
       </div>
       <svg
         viewBox={`0 0 ${width} ${height}`}
@@ -900,37 +737,30 @@ function LayerStrip({
         aria-label="Vertical strip of 24 layer bars, every fourth one (indices 3, 7, 11, 15, 19, 23) coloured amber for full attention, the rest violet for GatedDeltaNet linear attention."
         className="mx-auto block h-auto w-full max-w-[380px]"
       >
-        <text
-          x={width / 2}
-          y={18}
-          fontSize={10}
-          textAnchor="middle"
-          fill="currentColor"
-          fillOpacity={0.55}
-        >
+        <text x={width / 2} y={18} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.55}>
           input → output (top to bottom)
         </text>
         {Array.from({ length: NUM_LAYERS }).map((_, i) => {
           const isFull = FULL_LAYER_SET.has(i);
           const isSelected = i === selectedLayer;
           const y = padTop + i * (barH + 2);
-          const fill = isFull ? "#f59e0b" : "#7c3aed";
-          const labelColor = "white";
+          const fill = isFull ? '#f59e0b' : '#7c3aed';
+          const labelColor = 'white';
           return (
             <g
               key={`layer-${i}`}
               role="button"
               tabIndex={0}
-              aria-label={`Select layer ${i} (${isFull ? "full attention" : "linear attention"})`}
+              aria-label={`Select layer ${i} (${isFull ? 'full attention' : 'linear attention'})`}
               aria-pressed={isSelected}
               onClick={() => onSelect(i)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
+                if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
                   onSelect(i);
                 }
               }}
-              style={{ cursor: "pointer", outline: "none" }}
+              style={{ cursor: 'pointer', outline: 'none' }}
             >
               <rect
                 x={padLeftInside}
@@ -959,9 +789,9 @@ function LayerStrip({
                 fontSize={Math.min(10, barH - 2)}
                 fill={labelColor}
                 pointerEvents="none"
-                style={{ fontFamily: "var(--font-mono, monospace)" }}
+                style={{ fontFamily: 'var(--font-mono, monospace)' }}
               >
-                {`#${i.toString().padStart(2, "0")}`}
+                {`#${i.toString().padStart(2, '0')}`}
               </text>
               <text
                 x={padLeftInside + innerW - 10}
@@ -971,57 +801,47 @@ function LayerStrip({
                 fill={labelColor}
                 pointerEvents="none"
                 style={{
-                  fontFamily: "var(--font-mono, monospace)",
+                  fontFamily: 'var(--font-mono, monospace)',
                   fontWeight: 600,
                 }}
               >
-                {isFull ? "F" : "L"}
+                {isFull ? 'F' : 'L'}
               </text>
             </g>
           );
         })}
       </svg>
       <div className="text-[11px] text-muted-foreground">
-        Full-attention layers at indices {FULL_LAYER_INDICES.join(", ")} — one
-        in every {FULL_ATTENTION_INTERVAL}.
+        Full-attention layers at indices {FULL_LAYER_INDICES.join(', ')} — one in every {FULL_ATTENTION_INTERVAL}.
       </div>
     </div>
   );
 }
 
-function LayerSidePanel({
-  layerIdx,
-  contextLen,
-}: {
-  layerIdx: number;
-  contextLen: number;
-}) {
+function LayerSidePanel({ layerIdx, contextLen }: { layerIdx: number; contextLen: number }) {
   const isFull = FULL_LAYER_SET.has(layerIdx);
   const groupSize = NUM_HEADS / NUM_KV_HEADS;
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex items-baseline justify-between">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Layer {layerIdx} · {isFull ? "Full attention" : "Linear (GatedDeltaNet)"}
+          Layer {layerIdx} · {isFull ? 'Full attention' : 'Linear (GatedDeltaNet)'}
         </div>
         <span
           className={[
-            "rounded px-2 py-0.5 font-mono text-[10px]",
+            'rounded px-2 py-0.5 font-mono text-[10px]',
             isFull
-              ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"
-              : "bg-violet-500/15 text-violet-700 dark:text-violet-300",
-          ].join(" ")}
+              ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+              : 'bg-violet-500/15 text-violet-700 dark:text-violet-300',
+          ].join(' ')}
         >
-          {isFull ? "F" : "L"}
+          {isFull ? 'F' : 'L'}
         </span>
       </div>
 
       {isFull ? (
         <div className="space-y-2 text-[12px] text-foreground/85">
-          <p>
-            Stores K and V for every token. Cache scales linearly with
-            context length.
-          </p>
+          <p>Stores K and V for every token. Cache scales linearly with context length.</p>
           <pre className="overflow-x-auto rounded bg-muted p-2 font-mono text-[11px] leading-5">
             <code>{`shape = [2, kv_heads=${NUM_KV_HEADS}, seq_len, d=${HEAD_DIM}]
 bytes = 2 · ${NUM_KV_HEADS} · seq_len · ${HEAD_DIM} · ${BYTES_PER_FLOAT}
@@ -1029,9 +849,7 @@ bytes = 2 · ${NUM_KV_HEADS} · seq_len · ${HEAD_DIM} · ${BYTES_PER_FLOAT}
           </pre>
           <dl className="grid grid-cols-2 gap-x-2 gap-y-1 font-mono text-[11px]">
             <dt className="text-muted-foreground">cache @ {formatTokens(contextLen)}</dt>
-            <dd className="text-right text-foreground/90">
-              {formatBytes(fullLayerCacheBytes(contextLen))}
-            </dd>
+            <dd className="text-right text-foreground/90">{formatBytes(fullLayerCacheBytes(contextLen))}</dd>
             <dt className="text-muted-foreground">Q heads / KV head</dt>
             <dd className="text-right text-foreground/90">{groupSize}</dd>
             <dt className="text-muted-foreground">head_dim</dt>
@@ -1043,8 +861,7 @@ bytes = 2 · ${NUM_KV_HEADS} · seq_len · ${HEAD_DIM} · ${BYTES_PER_FLOAT}
       ) : (
         <div className="space-y-2 text-[12px] text-foreground/85">
           <p>
-            Compresses the entire history into a fixed-size recurrent
-            state — independent of <code>seq_len</code>.
+            Compresses the entire history into a fixed-size recurrent state — independent of <code>seq_len</code>.
           </p>
           <pre className="overflow-x-auto rounded bg-muted p-2 font-mono text-[11px] leading-5">
             <code>{`shape = [heads=${LINEAR_NUM_HEADS}, d=${LINEAR_HEAD_DIM}, d=${LINEAR_HEAD_DIM}]
@@ -1053,9 +870,7 @@ bytes = ${LINEAR_NUM_HEADS} · ${LINEAR_HEAD_DIM} · ${LINEAR_HEAD_DIM} · ${BYT
           </pre>
           <dl className="grid grid-cols-2 gap-x-2 gap-y-1 font-mono text-[11px]">
             <dt className="text-muted-foreground">state @ {formatTokens(contextLen)}</dt>
-            <dd className="text-right text-foreground/90">
-              {formatBytes(LINEAR_STATE_SIZE_BYTES)}
-            </dd>
+            <dd className="text-right text-foreground/90">{formatBytes(LINEAR_STATE_SIZE_BYTES)}</dd>
             <dt className="text-muted-foreground">linear heads</dt>
             <dd className="text-right text-foreground/90">{LINEAR_NUM_HEADS}</dd>
             <dt className="text-muted-foreground">linear head_dim</dt>
@@ -1095,12 +910,12 @@ function DecodeAnimation({
   const sequence = [
     ...DECODE_PROMPT_TOKENS.map((text, i) => ({
       text,
-      kind: "prompt" as const,
+      kind: 'prompt' as const,
       idx: i,
     })),
     ...DECODE_GENERATED_TOKENS.map((text, i) => ({
       text,
-      kind: "gen" as const,
+      kind: 'gen' as const,
       idx: prefillCount + i,
     })),
   ];
@@ -1151,22 +966,10 @@ function DecodeAnimation({
         aria-label="Decode animation: a row of token slots where the active token's Q attends to all previously cached K and V positions."
         className="block h-auto w-full"
       >
-        <text
-          x={padX}
-          y={queryY - 6}
-          fontSize={10}
-          fill="currentColor"
-          fillOpacity={0.55}
-        >
+        <text x={padX} y={queryY - 6} fontSize={10} fill="currentColor" fillOpacity={0.55}>
           ACTIVE Q
         </text>
-        <text
-          x={padX}
-          y={rowY + slotH + 16}
-          fontSize={10}
-          fill="currentColor"
-          fillOpacity={0.55}
-        >
+        <text x={padX} y={rowY + slotH + 16} fontSize={10} fill="currentColor" fillOpacity={0.55}>
           CACHED K, V (per full-attention layer)
         </text>
 
@@ -1174,35 +977,22 @@ function DecodeAnimation({
           const x = slotX(i);
           const isCached = i <= cachedThrough;
           const isActive = i === activeIdx;
-          const isGenerated = tok.kind === "gen";
-          const fill = isCached
-            ? isGenerated
-              ? "#22c55e"
-              : "#3b82f6"
-            : "transparent";
-          const stroke = isCached
-            ? "transparent"
-            : "rgba(148,163,184,0.45)";
+          const isGenerated = tok.kind === 'gen';
+          const fill = isCached ? (isGenerated ? '#22c55e' : '#3b82f6') : 'transparent';
+          const stroke = isCached ? 'transparent' : 'rgba(148,163,184,0.45)';
           return (
             <g key={`slot-${i}`}>
               {/* Active query bubble above the row. */}
               {isActive ? (
                 <g>
-                  <rect
-                    x={x + 6}
-                    y={queryY}
-                    width={slotW - 12}
-                    height={slotH - 14}
-                    rx={5}
-                    fill="#fb923c"
-                  />
+                  <rect x={x + 6} y={queryY} width={slotW - 12} height={slotH - 14} rx={5} fill="#fb923c" />
                   <text
                     x={x + slotW / 2}
                     y={queryY + 16}
                     fontSize={11}
                     textAnchor="middle"
                     fill="white"
-                    style={{ fontFamily: "var(--font-mono, monospace)" }}
+                    style={{ fontFamily: 'var(--font-mono, monospace)' }}
                   >
                     q
                   </text>
@@ -1217,7 +1007,7 @@ function DecodeAnimation({
                 rx={5}
                 fill={fill}
                 stroke={stroke}
-                strokeDasharray={isCached ? undefined : "3 3"}
+                strokeDasharray={isCached ? undefined : '3 3'}
                 strokeWidth={1.2}
               />
               <text
@@ -1225,11 +1015,11 @@ function DecodeAnimation({
                 y={rowY + slotH / 2 + 4}
                 fontSize={11}
                 textAnchor="middle"
-                fill={isCached ? "white" : "currentColor"}
+                fill={isCached ? 'white' : 'currentColor'}
                 fillOpacity={isCached ? 1 : 0.5}
-                style={{ fontFamily: "var(--font-mono, monospace)" }}
+                style={{ fontFamily: 'var(--font-mono, monospace)' }}
               >
-                {tok.text.trim() === "" ? "·" : tok.text.trim()}
+                {tok.text.trim() === '' ? '·' : tok.text.trim()}
               </text>
               <text
                 x={x + slotW / 2}
@@ -1247,27 +1037,15 @@ function DecodeAnimation({
 
         {/* Attention reach arcs: the active Q attends to every cached K/V (and itself). */}
         {Array.from({ length: cachedThrough + 1 }).map((_, i) => (
-          <path
-            key={`arc-${i}`}
-            d={arcTo(i)}
-            fill="none"
-            stroke="#fb923c"
-            strokeOpacity={0.5}
-            strokeWidth={1.2}
-          />
+          <path key={`arc-${i}`} d={arcTo(i)} fill="none" stroke="#fb923c" strokeOpacity={0.5} strokeWidth={1.2} />
         ))}
       </svg>
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => onStep(Math.max(0, step - 1))}
-          disabled={step === 0}
-        >
+        <Button size="sm" variant="outline" onClick={() => onStep(Math.max(0, step - 1))} disabled={step === 0}>
           Prev
         </Button>
         <Button size="sm" onClick={onTogglePlay}>
-          {autoplay ? "Pause" : step >= DECODE_TOTAL_STEPS - 1 ? "Replay" : "Play"}
+          {autoplay ? 'Pause' : step >= DECODE_TOTAL_STEPS - 1 ? 'Replay' : 'Play'}
         </Button>
         <Button
           size="sm"
@@ -1279,8 +1057,8 @@ function DecodeAnimation({
         </Button>
         <span className="ml-2 text-[11px] text-muted-foreground">
           {isPrefill
-            ? "Prefill: K/V for every prompt token written in parallel."
-            : "Decode: K/V for the new token appended; Q attends over the whole cache."}
+            ? 'Prefill: K/V for every prompt token written in parallel.'
+            : 'Decode: K/V for the new token appended; Q attends over the whole cache.'}
         </span>
       </div>
     </div>

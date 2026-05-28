@@ -1,9 +1,8 @@
-import { ArrowUp, ImagePlus, Mic } from "lucide-react";
-import { type FormEvent, type RefObject } from "react";
+import { ArrowUp, ImagePlus, Mic } from 'lucide-react';
+import { type FormEvent, type RefObject } from 'react';
 
-import { type ReasoningEffort } from "../../lib/display-helpers";
-
-import { PillStepper } from "./PillStepper";
+import { type ReasoningEffort } from '../../lib/display-helpers';
+import { PillStepper } from './PillStepper';
 
 export type PowerComposerProps = {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
@@ -44,31 +43,20 @@ export function PowerComposer(props: PowerComposerProps) {
 
   function onTextareaInput(e: FormEvent<HTMLTextAreaElement>) {
     const ta = e.currentTarget;
-    ta.style.height = "auto";
+    ta.style.height = 'auto';
     const next = Math.min(ta.scrollHeight, 132);
     ta.style.height = `${next}px`;
-    ta.dataset.overflow = ta.scrollHeight > 132 ? "true" : "false";
+    ta.dataset.overflow = ta.scrollHeight > 132 ? 'true' : 'false';
   }
 
   return (
     <div className="composer-frame">
       <div className="composer-card">
         <div className="composer-row">
-          <button
-            ref={imageButtonRef}
-            type="button"
-            className="composer-icon-btn"
-            aria-label="Attach image"
-            disabled
-          >
+          <button ref={imageButtonRef} type="button" className="composer-icon-btn" aria-label="Attach image" disabled>
             <ImagePlus size={18} aria-hidden="true" />
           </button>
-          <input
-            ref={imageInputRef}
-            type="file"
-            accept="image/*"
-            style={{ display: "none" }}
-          />
+          <input ref={imageInputRef} type="file" accept="image/*" style={{ display: 'none' }} />
           <textarea
             ref={textareaRef}
             id="prompt"
@@ -77,11 +65,7 @@ export function PowerComposer(props: PowerComposerProps) {
             className="composer-textarea"
             onInput={onTextareaInput}
           />
-          <button
-            type="button"
-            className="composer-icon-btn"
-            aria-label="Voice input"
-          >
+          <button type="button" className="composer-icon-btn" aria-label="Voice input">
             <Mic size={18} aria-hidden="true" />
           </button>
           <button
@@ -89,7 +73,7 @@ export function PowerComposer(props: PowerComposerProps) {
             type="button"
             id="send"
             className="composer-send"
-            aria-label={generating ? "Generating" : "Send"}
+            aria-label={generating ? 'Generating' : 'Send'}
             disabled={sendDisabled || generating}
           >
             <ArrowUp size={18} aria-hidden="true" />
@@ -98,7 +82,7 @@ export function PowerComposer(props: PowerComposerProps) {
         <div className="composer-pills">
           <button
             type="button"
-            className={`pill${reasoningEffort !== "off" ? " active" : ""}`}
+            className={`pill${reasoningEffort !== 'off' ? ' active' : ''}`}
             onClick={onCycleReasoning}
             disabled={generating}
           >
@@ -124,11 +108,11 @@ export function PowerComposer(props: PowerComposerProps) {
           />
           <button
             type="button"
-            className={`pill qwen${toolsEnabled ? " active" : ""}`}
+            className={`pill qwen${toolsEnabled ? ' active' : ''}`}
             onClick={onToggleTools}
             disabled={generating}
           >
-            tools · {toolsEnabled ? "on" : "off"}
+            tools · {toolsEnabled ? 'on' : 'off'}
           </button>
         </div>
       </div>

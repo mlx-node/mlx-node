@@ -57,10 +57,7 @@ function extractWasmExceptionMessage(err) {
 function formatWorkerError(err) {
   if (err instanceof ErrorEvent) {
     const inner = formatWorkerError(err.error);
-    const location =
-      err.filename || err.lineno || err.colno
-        ? `${err.filename}:${err.lineno}:${err.colno}`
-        : '';
+    const location = err.filename || err.lineno || err.colno ? `${err.filename}:${err.lineno}:${err.colno}` : '';
     return {
       message: err.message || inner.message,
       stack: inner.stack || location,

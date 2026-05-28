@@ -18,18 +18,16 @@ import {
   EMBED_RESULT_TYPE,
   type EmbedRequest,
   type EmbedResult,
-} from "../../src/inspector-types";
+} from '../../src/inspector-types';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 function makeAbortError(): DOMException {
-  return new DOMException("Embed aborted", "AbortError");
+  return new DOMException('Embed aborted', 'AbortError');
 }
 
 function nextEmbedId(): string {
-  const cryptoObj = globalThis.crypto as
-    | { randomUUID?: () => string }
-    | undefined;
+  const cryptoObj = globalThis.crypto as { randomUUID?: () => string } | undefined;
   if (cryptoObj?.randomUUID) {
     return cryptoObj.randomUUID();
   }
@@ -69,7 +67,7 @@ export function embed(
   options?: EmbedClientOptions,
 ): Promise<EmbedClientResult> {
   if (!worker) {
-    return Promise.reject(new Error("MLX worker is not available"));
+    return Promise.reject(new Error('MLX worker is not available'));
   }
   const signal = options?.signal;
   if (signal?.aborted) {
@@ -83,13 +81,13 @@ export function embed(
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
     const cleanup = () => {
-      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener('message', onMessage);
       if (timeoutHandle != null) {
         clearTimeout(timeoutHandle);
         timeoutHandle = null;
       }
       if (signal) {
-        signal.removeEventListener("abort", onAbort);
+        signal.removeEventListener('abort', onAbort);
       }
     };
 
@@ -109,11 +107,11 @@ export function embed(
 
     const onMessage = (event: MessageEvent) => {
       const msg = event.data as EmbedResult | undefined;
-      if (!msg || typeof msg !== "object") return;
+      if (!msg || typeof msg !== 'object') return;
       if (msg.type === EMBED_RESULT_TYPE && msg.id === id) {
         settleResolve({ embeddings: msg.embeddings, hiddenDim: msg.hiddenDim });
       } else if (msg.type === EMBED_ERROR_TYPE && msg.id === id) {
-        settleReject(new Error(msg.error || "Embed failed"));
+        settleReject(new Error(msg.error || 'Embed failed'));
       }
     };
 
@@ -121,9 +119,9 @@ export function embed(
       settleReject(makeAbortError());
     };
 
-    worker.addEventListener("message", onMessage);
+    worker.addEventListener('message', onMessage);
     if (signal) {
-      signal.addEventListener("abort", onAbort);
+      signal.addEventListener('abort', onAbort);
     }
 
     timeoutHandle = setTimeout(() => {

@@ -32,13 +32,7 @@ export interface FreeChatContextValue {
 
 const FreeChatContext = React.createContext<FreeChatContextValue | null>(null);
 
-export function FreeChatProvider({
-  value,
-  children,
-}: {
-  value: FreeChatContextValue;
-  children: React.ReactNode;
-}) {
+export function FreeChatProvider({ value, children }: { value: FreeChatContextValue; children: React.ReactNode }) {
   return <FreeChatContext.Provider value={value}>{children}</FreeChatContext.Provider>;
 }
 
