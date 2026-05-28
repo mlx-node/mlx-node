@@ -36,10 +36,10 @@ function ChaptersIndexRouteComponent() {
   return (
     <ChapterIndex
       onOpenChapter={(chapterId) => {
-        void navigate({ to: '/chapters/$chapterId', params: { chapterId } });
+        void navigate({ to: '/chapters/$chapterId', params: { chapterId }, search: (prev) => prev });
       }}
       onBackToLanding={() => {
-        void navigate({ to: '/' });
+        void navigate({ to: '/', search: (prev) => prev });
       }}
       onOpenFreeChat={() => {
         if (hostedModelAvailable === false) {
@@ -47,7 +47,7 @@ function ChaptersIndexRouteComponent() {
           return;
         }
         kickoffLoad();
-        void navigate({ to: '/chat' });
+        void navigate({ to: '/chat', search: (prev) => prev });
       }}
     />
   );

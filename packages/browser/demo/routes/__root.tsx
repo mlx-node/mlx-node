@@ -25,26 +25,26 @@ import { findChapter } from '../learn/chapters';
 
 export const searchSchema = z.object({
   // Model URL — legacy aliases: model_url, modelUrl, model
-  model_url: z.string().optional(),
-  modelUrl: z.string().optional(),
-  model: z.string().optional(),
+  model_url: z.string().optional().catch(undefined),
+  modelUrl: z.string().optional().catch(undefined),
+  model: z.string().optional().catch(undefined),
 
   // Model display label — legacy aliases: model_label, modelLabel
-  model_label: z.string().optional(),
-  modelLabel: z.string().optional(),
+  model_label: z.string().optional().catch(undefined),
+  modelLabel: z.string().optional().catch(undefined),
 
   // Max output tokens — legacy aliases: max_new_tokens, maxOutputTokens
-  max_new_tokens: z.coerce.number().int().positive().optional(),
-  maxOutputTokens: z.coerce.number().int().positive().optional(),
+  max_new_tokens: z.coerce.number().int().positive().optional().catch(undefined),
+  maxOutputTokens: z.coerce.number().int().positive().optional().catch(undefined),
 
   // Sampling temperature — legacy aliases: temperature, temp
-  temperature: z.coerce.number().min(0).max(2).optional(),
-  temp: z.coerce.number().min(0).max(2).optional(),
+  temperature: z.coerce.number().min(0).max(2).optional().catch(undefined),
+  temp: z.coerce.number().min(0).max(2).optional().catch(undefined),
 
   // App-preview / tools toggle — legacy aliases: tools, app_preview.
   // Coerces ?tools=1 / ?tools=true → true, ?tools=0 / ?tools=false → false.
-  tools: z.coerce.number().int().min(0).max(1).transform(v => v === 1).optional(),
-  app_preview: z.coerce.number().int().min(0).max(1).transform(v => v === 1).optional(),
+  tools: z.coerce.number().int().min(0).max(1).transform(v => v === 1).optional().catch(undefined),
+  app_preview: z.coerce.number().int().min(0).max(1).transform(v => v === 1).optional().catch(undefined),
 });
 
 export type RootSearch = z.infer<typeof searchSchema>;

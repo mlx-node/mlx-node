@@ -35,7 +35,7 @@ function LandingRouteComponent() {
         if (status !== 'ready' && hostedModelAvailable !== false) {
           kickoffLoad();
         }
-        void navigate({ to: '/chapters' });
+        void navigate({ to: '/chapters', search: (prev) => prev });
       }}
       errorBanner={errorBanner}
       hostedModelAvailable={hostedModelAvailable}

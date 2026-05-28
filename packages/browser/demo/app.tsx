@@ -267,7 +267,9 @@ function App() {
   const initialUrlParams = new URLSearchParams(location.search);
   const configuredModelUrl = resolveConfiguredModelUrl(initialUrlParams);
   const configuredModelLabel = resolveConfiguredModelLabel(initialUrlParams);
-  const initialAppToolsEnabled = initialUrlParams.get('tools') === '1' || initialUrlParams.get('app_preview') === '1';
+  const initialAppToolsEnabled =
+    initialUrlParams.get('tools') === '1' || initialUrlParams.get('tools') === 'true' ||
+    initialUrlParams.get('app_preview') === '1' || initialUrlParams.get('app_preview') === 'true';
   const [appToolsEnabled, setAppToolsEnabledState] = useState(initialAppToolsEnabled);
   const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>('off');
   const [loadKickoff, setLoadKickoff] = useState(0);
@@ -1960,22 +1962,36 @@ function App() {
     };
   }, [configuredModelLabel, configuredModelUrl, loadKickoff, pendingModelSource]);
 
-  // Ref-mirror of loadKickoff so kickoffLoad() can check "already kicked off"
-  // without re-binding on every loadKickoff change (which would invalidate
-  // any consumer's useEffect deps that capture the callback identity).
+  // Ref-mirrors so kickoffLoad() can read current status without re-binding
+  // on every state change (which would invalidate any consumer's useEffect
+  // deps that capture the callback identity).
   const loadKickoffRef = useRef(0);
   useEffect(() => {
     loadKickoffRef.current = loadKickoff;
   }, [loadKickoff]);
+  const errorBannerRef = useRef<string | null>(null);
+  useEffect(() => {
+    errorBannerRef.current = errorBanner;
+  }, [errorBanner]);
+  const modelReadyRef = useRef(false);
+  useEffect(() => {
+    modelReadyRef.current = modelReady;
+  }, [modelReady]);
 
   const kickoffLoad = useCallback(() => {
     // Mirror the prior Landing/ChapterIndex/LessonLayout handlers so route
     // components only need to call kickoffLoad() (instead of inlining the
-    // state reset). Idempotent — once a kickoff has fired the model load
-    // effect owns the worker and we must not re-kickoff or the load effect
-    // would tear down the live worker. Routes that need a local-file picker
-    // still trigger it via the #model-dir-input <input> separately.
-    if (loadKickoffRef.current > 0) return;
+    // state reset). Allow a new kickoff only when status is 'idle' or 'error'
+    // (the latter enables retry after a transient load failure). Block when
+    // 'loading' (already in-flight) or 'ready' (already done). Routes that
+    // need a local-file picker still trigger it via the #model-dir-input
+    // <input> separately.
+    const currentStatus =
+      errorBannerRef.current != null ? 'error'
+      : modelReadyRef.current ? 'ready'
+      : loadKickoffRef.current > 0 ? 'loading'
+      : 'idle';
+    if (currentStatus === 'loading' || currentStatus === 'ready') return;
     setPendingModelSource(null);
     setErrorBannerState(null);
     setLoadingProgress(null);
@@ -2046,7 +2062,7 @@ function App() {
     // (clears DOM and history). Navigate back to '/' as the post-reset destination.
     const resetHook = (window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat;
     if (resetHook) resetHook();
-    void router.navigate({ to: '/' });
+    void router.navigate({ to: '/', search: (prev) => prev });
   }, []);
 
   const freeChatValue = useMemo<FreeChatContextValue>(() => ({

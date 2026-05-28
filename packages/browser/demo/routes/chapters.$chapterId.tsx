@@ -50,10 +50,10 @@ function ChapterRouteComponent() {
     <LessonLayout
       current={chapter}
       onOpenChapter={(chapterId) => {
-        void navigate({ to: '/chapters/$chapterId', params: { chapterId } });
+        void navigate({ to: '/chapters/$chapterId', params: { chapterId }, search: (prev) => prev });
       }}
       onBackToIndex={() => {
-        void navigate({ to: '/chapters' });
+        void navigate({ to: '/chapters', search: (prev) => prev });
       }}
       onOpenFreeChat={() => {
         if (hostedModelAvailable === false) {
@@ -61,7 +61,7 @@ function ChapterRouteComponent() {
           return;
         }
         kickoffLoad();
-        void navigate({ to: '/chat' });
+        void navigate({ to: '/chat', search: (prev) => prev });
       }}
       tryItPanel={
         chapter.id === 'attention' ? (
