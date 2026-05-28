@@ -5448,6 +5448,21 @@ impl Qwen35Inner {
         let mut current_logits = last_logits;
         let mut y = sample(&current_logits, sampling_config)?;
         let eos_id = self.config.eos_token_id as u32;
+        // Build the full stop-token set. `config.json:eos_token_id` for
+        // Qwen3.5 is `<|endoftext|>` (the LM head's pre-train EOS), but
+        // the chat template ends the assistant turn with `<|im_end|>`.
+        // Without stopping on `<|im_end|>` the decode loop sails past
+        // the actual turn boundary and emits scaffold tokens after it
+        // (newline + `<|endoftext|>` typically), forcing the frontend
+        // to do post-hoc string parsing to clean up the reply. Resolve
+        // both via the tokenizer's vocab so the IDs come from the same
+        // source of truth that built the prompt.
+        let mut stop_token_ids: Vec<u32> = vec![eos_id];
+        if let Some(id) = tokenizer.im_end_id() {
+            if !stop_token_ids.contains(&id) {
+                stop_token_ids.push(id);
+            }
+        }
 
         for step in 0..max_new_tokens {
             y.eval();
@@ -5458,7 +5473,15 @@ impl Qwen35Inner {
                 recorder.capture_logits(step as u32, token_id, &current_logits)?;
             }
 
-            if step + 1 == max_new_tokens || token_id == eos_id {
+            if step + 1 == max_new_tokens || stop_token_ids.contains(&token_id) {
+                // Drop the stop token from the visible reply — it's
+                // structural, not content. The decode loop has already
+                // pushed it above so we pop it back off here. Doing this
+                // in Rust (where the token ID is known) is cleaner than
+                // having the frontend grep for `<|im_end|>` strings.
+                if stop_token_ids.contains(&token_id) {
+                    generated_tokens.pop();
+                }
                 break;
             }
 
@@ -5545,6 +5568,41 @@ impl Qwen35Inner {
                 text,
             });
         }
+
+        // ---- Compute echo-token boundary ----
+        //
+        // Chat-tuned models routinely start their assistant reply by
+        // repeating the user's prompt verbatim before saying anything
+        // new ("The cat sat on the **red rug**..." for prompt "The cat
+        // sat on the"). Walk the decoded reply token-by-token and count
+        // how many leading tokens match the prompt as a prefix — the
+        // frontend uses this index to slice the reply into echo vs.
+        // new portions without doing its own string parsing.
+        //
+        // We compare against the *original* `prompt` string (the user's
+        // input, before chat-template wrapping). When `apply_chat_template
+        // = false`, the prompt isn't wrapped, so this dedup is generally
+        // a no-op for raw-text completion — first-token-diverges
+        // immediately and `echo_token_count` is 0.
+        let echo_token_count: u32 = {
+            let mut cumulative = String::new();
+            let mut count: u32 = 0;
+            for tok in &generated_tokens_napi {
+                let next = format!("{}{}", cumulative, tok.text);
+                if next.len() > prompt.len() {
+                    // This token would extend past the prompt; it's the
+                    // first token containing genuinely new content.
+                    break;
+                }
+                if !prompt.starts_with(next.as_str()) {
+                    // Diverged from the prompt before reaching its end.
+                    break;
+                }
+                cumulative = next;
+                count += 1;
+            }
+            count
+        };
 
         // ---- Build model meta + per-layer attention vector ----
         let num_layers = self.config.num_layers;
@@ -5686,6 +5744,7 @@ impl Qwen35Inner {
             tokens: token_infos,
             generated_token,
             generated_tokens: generated_tokens_napi,
+            echo_token_count,
             attention: attention_layers_out,
             model_meta,
             logits: logits_out,

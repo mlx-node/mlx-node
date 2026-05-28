@@ -792,6 +792,14 @@ pub struct AttentionRunNapi {
     /// often a scaffold word ("The", "Hello") and the actually-meaningful
     /// content shows up over the next several tokens.
     pub generated_tokens: Vec<TokenInfoNapi>,
+    /// Number of leading tokens in `generated_tokens` whose cumulative
+    /// text matches the user's prompt as a prefix. Chat-tuned models
+    /// (Qwen3.5, Gemma, LFM2) routinely start their assistant reply by
+    /// echoing the user's input verbatim — `echo_token_count` tells
+    /// the frontend exactly how many leading tokens to treat as echo so
+    /// it can render them differently from the model's "new" content
+    /// without re-doing the string match. Zero when no echo.
+    pub echo_token_count: u32,
     pub attention: Vec<AttentionLayerNapi>,
     pub model_meta: ModelMetaNapi,
     /// Per-step top-K logits, in generation order. Present iff

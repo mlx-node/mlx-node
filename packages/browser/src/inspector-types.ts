@@ -63,6 +63,16 @@ export type AttentionRun = {
    *  scaffold token. Optional for backward compatibility with cached
    *  inspector runs that predate this field. */
   generatedTokens?: TokenInfo[];
+  /** Number of leading `generatedTokens` whose cumulative text matches
+   *  `prompt` as a prefix — the chat-tuned model's "prompt echo" count.
+   *  Tokens `[0, echoTokenCount)` are echoed prompt content;
+   *  `generatedTokens[echoTokenCount]` is the first genuinely "new"
+   *  token the assistant generated. Zero when no echo (raw-text
+   *  completion mode, or model that doesn't repeat the prompt).
+   *  Computed in Rust against the post-decode token IDs and the
+   *  original user prompt string — single source of truth.
+   *  Optional for back-compat with cached runs predating the field. */
+  echoTokenCount?: number;
   /** One entry per layer captured. Order matches `modelMeta.fullAttentionLayerIndices`. */
   attention: AttentionLayer[];
   /** Model identification + which layers carry attention scores. */

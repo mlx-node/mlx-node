@@ -107,61 +107,12 @@ export function ChapterIndex({
 const NUM_LAYERS = 24;
 const DEFAULT_PROMPT = 'The cat sat on the';
 
-/**
- * Cut the raw generated text off at the first chat-template special-token
- * marker. Qwen3.5 emits `<|im_end|>` when the assistant's turn ends, and
- * sometimes follows with `<|endoftext|>`; neither belongs in the
- * pedagogical reveal. The literal markers `<|...|>` arrive verbatim in
- * the decoded token text (they're tokens whose detokenized form is just
- * that string), so a plain string search is enough — no need to know
- * their numeric IDs.
- */
-const SPECIAL_TURN_MARKERS = ['<|im_end|>', '<|endoftext|>', '<|im_start|>'] as const;
-function stripChatSpecials(text: string): string {
-  let cut = text.length;
-  for (const marker of SPECIAL_TURN_MARKERS) {
-    const idx = text.indexOf(marker);
-    if (idx >= 0 && idx < cut) cut = idx;
-  }
-  return text.slice(0, cut).trimEnd();
-}
-
-/**
- * Find the byte offset in `joined` where it first diverges from `prompt`.
- * If `prompt` is fully a prefix of `joined`, returns `prompt.length`.
- *
- * Used to dedupe the chat-tuned model's habit of echoing the user's
- * prompt at the start of its assistant reply. With prompt "The cat sat on
- * the" and joined reply "The cat sat on the **red rug**, ...", this
- * returns 18 — the index in the reply where the new content begins.
- */
-function findDivergeOffset(prompt: string, joined: string): number {
-  const limit = Math.min(prompt.length, joined.length);
-  for (let i = 0; i < limit; i++) {
-    if (prompt[i] !== joined[i]) return i;
-  }
-  return limit;
-}
-
-/**
- * Given a character offset (from `findDivergeOffset`) and a list of
- * tokens whose `.text` joins to form the full reply, return the index
- * of the FIRST token whose content extends past the offset — i.e.
- * the first "new" token after the prompt echo.
- *
- * If the echo aligns exactly on a token boundary (common for chat-tuned
- * models), this is the index immediately after the last echoed token.
- * Otherwise it's the token that straddles the divergence point.
- */
-function findFirstNewTokenIdx(divergeOffset: number, tokens: ReadonlyArray<{ text: string }>): number {
-  if (divergeOffset === 0) return 0;
-  let cumulative = 0;
-  for (let i = 0; i < tokens.length; i++) {
-    cumulative += tokens[i].text.length;
-    if (cumulative > divergeOffset) return i;
-  }
-  return tokens.length;
-}
+// Note: dedup boundary (echoTokenCount) and chat-template special-token
+// stopping now come straight from the Rust inspector (see
+// inspector.rs::AttentionRunNapi.echo_token_count and the stop_token_ids
+// set in qwen3_5/model.rs::run_for_inspector_sync). The frontend just
+// reads the structured count instead of regex-matching token text — the
+// tokenizer is the source of truth for what counts as a stop marker.
 
 /** A sub-stage inside one of the 24 layer cards. */
 type SubStage = { id: string; label: string; durationMs: number };
@@ -554,69 +505,34 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
   })();
 
   const isBusy = status.kind === 'running' || status.kind === 'replaying' || status.kind === 'paused';
-  // The full assistant reply, joined from generated_tokens. Falls back to
-  // the single generatedToken for older payloads without the array field.
-  //
-  // Qwen3.5's chat eos is `<|im_end|>` but the model's `eos_token_id` is
-  // sometimes set to `<|endoftext|>`, so the decode loop on the Rust side
-  // doesn't break on the assistant-turn-end marker — both can leak into
-  // the reply ("...cat.<|im_end|>\n<|endoftext|>"). We strip from the
-  // first occurrence of either special-token marker onward so the
-  // learner sees only the natural-language portion of the reply.
-  const generatedReplyRawJoined = run
-    ? run.generatedTokens && run.generatedTokens.length > 0
-      ? run.generatedTokens.map((t) => t.text).join('')
-      : run.generatedToken.text
-    : '';
-  const generatedReplyRaw = stripChatSpecials(generatedReplyRawJoined);
-  // Dedupe the prompt-echo prefix. Chat-tuned Qwen3.5 routinely starts
-  // its assistant reply by repeating the user's input verbatim before
-  // adding new content; the diagram should focus on the "new" portion,
-  // not the echo. `divergeOffset` is the index in the joined reply
-  // where it first stops matching the prompt — everything before that
-  // is the echo, everything from there on is new.
-  const divergeOffset = run ? findDivergeOffset(run.prompt, generatedReplyRawJoined) : 0;
-  const firstNewTokenIdx =
-    run && run.generatedTokens && run.generatedTokens.length > 0
-      ? findFirstNewTokenIdx(divergeOffset, run.generatedTokens)
-      : 0;
-  const firstNewTokenInfo =
-    run && run.generatedTokens && run.generatedTokens.length > 0
-      ? (run.generatedTokens[firstNewTokenIdx] ?? run.generatedToken)
-      : run?.generatedToken;
-  // Token count for the visible portion of the reply. We walk the
-  // generatedTokens array and stop at the first token whose text contains
-  // a special-turn marker — matching the same stripping logic above so
-  // the displayed "N tokens" count agrees with what the learner sees.
-  const visibleTokenCount = (() => {
-    if (!run) return 0;
-    const toks = run.generatedTokens;
-    if (!toks || toks.length === 0) return 1;
-    for (let i = 0; i < toks.length; i++) {
-      const t = toks[i]?.text ?? '';
-      if (SPECIAL_TURN_MARKERS.some((m) => t.includes(m))) return i;
-    }
-    return toks.length;
-  })();
-  // Number of "new" tokens — tokens past the prompt-echo prefix. Used in
-  // the reveal caption ("N new tokens") so the count reflects what the
-  // learner actually sees.
-  const newTokenCount = Math.max(0, visibleTokenCount - firstNewTokenIdx);
-  // For the multi-token reply we want BPE cleanup (Ġ → space, leading-space
-  // dot, newline glyphs) WITHOUT the 17-char truncation that
-  // `renderTokenDisplay` enforces for single-token chips. Inline the
-  // cleanup so the full sentence renders.
-  const generatedReplyDisplay = run ? cleanupTokenText(generatedReplyRaw) : '';
+  // Consume the structured Rust response directly: no string-match dedup,
+  // no regex stripping. The Rust inspector already:
+  //   - breaks the decode at `<|im_end|>` / `<|endoftext|>`
+  //     (qwen3_5/model.rs::run_for_inspector_sync builds stop_token_ids
+  //      from the tokenizer and pops the stop token off the array)
+  //   - reports `echoTokenCount` — the count of leading tokens whose
+  //     cumulative text matches the user's prompt as a prefix
+  //     (computed in run_for_inspector_sync using token-text equality,
+  //      not regex)
+  // The frontend just slices the array. That's the whole job.
+  const allTokens = run?.generatedTokens ?? (run ? [run.generatedToken] : []);
+  const echoCountFromRust = run?.echoTokenCount ?? 0;
+  const echoTokenCount = Math.max(0, Math.min(echoCountFromRust, allTokens.length));
+  const echoTokens = allTokens.slice(0, echoTokenCount);
+  const newTokens = allTokens.slice(echoTokenCount);
+  const visibleTokenCount = allTokens.length;
+  const newTokenCount = newTokens.length;
+  const firstNewTokenInfo = newTokens[0] ?? run?.generatedToken;
   // The deduped reply — everything past the prompt echo. This is what we
-  // show in the bottom reveal as the model's "new" contribution; if the
-  // model didn't echo (divergeOffset === 0) it's identical to the full
-  // reply.
-  const dedupedReplyRaw = run ? stripChatSpecials(generatedReplyRawJoined.slice(divergeOffset)) : '';
-  const dedupedReplyDisplay = run ? cleanupTokenText(dedupedReplyRaw) : '';
+  // show in the bottom reveal as the model's "new" contribution. We use
+  // `cleanupTokenText` (not `renderTokenDisplay`) to apply BPE cleanup
+  // (Ġ → space, newline glyphs) WITHOUT the 17-char truncation that
+  // `renderTokenDisplay` enforces for single-token chips.
+  const dedupedReplyDisplay = run ? cleanupTokenText(newTokens.map((t) => t.text).join('')) : '';
   // The echoed prefix (for muted-tone rendering in the reveal). Empty
   // when there's no echo.
   const echoedPrefixDisplay =
-    run && divergeOffset > 0 ? cleanupTokenText(generatedReplyRawJoined.slice(0, divergeOffset)) : '';
+    run && echoTokens.length > 0 ? cleanupTokenText(echoTokens.map((t) => t.text).join('')) : '';
   // For the FIRST-NEW-token highlight (rainbow chip in the ghost overlay
   // and the reveal). Truncated to 17 chars for single-token chip widths.
   const firstNewTokenText = firstNewTokenInfo ? renderTokenDisplay(firstNewTokenInfo.text) : '';
