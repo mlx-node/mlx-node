@@ -1,12 +1,14 @@
 import type { ChatStreamChunk, ToolCallResult, ToolDefinition } from '@mlx-node/core';
 import { ToolCallTagBuffer } from '@mlx-node/lm/tools';
 import { createCodePlugin } from '@streamdown/code';
+import { RouterProvider } from '@tanstack/react-router';
 import { type ChangeEvent, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 
 import { FreeChatProvider, type FreeChatContextValue } from './providers/free-chat';
 import { ModelLoaderProvider, type ModelLoaderContextValue } from './providers/model-loader';
 import { TelemetryProvider, type TelemetryContextValue } from './providers/telemetry';
+import { router } from './router';
 import { Streamdown } from 'streamdown';
 
 import { createSabRingOverHeap } from '../src/chat-stream-sab.js';
@@ -19,13 +21,8 @@ import {
   splitAssistantThinking,
 } from '../src/generated-text.js';
 import { workerAssetUrl } from '../src/worker-asset-url.js';
-import { ChatHeader } from './components/chat/ChatHeader';
 import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
-import { InspectorDrawer } from './components/chat/InspectorDrawer';
-import { PowerComposer } from './components/chat/PowerComposer';
-import { TelemetryStrip } from './components/chat/TelemetryStrip';
-import { Landing } from './components/landing/Landing';
-import { Loading, type LoadingProgress } from './components/loading/Loading';
+import { type LoadingProgress } from './components/loading/Loading';
 import { BrowserChatSessionAdapter, type BrowserChatMessage } from './lib/browser-chat-session';
 import {
   type ScreenState,
@@ -35,19 +32,6 @@ import {
   reduceScreen,
   screenToUrlQuery,
 } from './lib/screen-state';
-import { ChapterIndex } from './learn/ChapterIndex';
-import { LessonLayout } from './learn/LessonLayout';
-import { findChapter } from './learn/chapters';
-import { AttentionChapterBody, AttentionDemo } from './learn/chapters/03-attention';
-import { MultiheadGqaChapterBody, MultiheadGqaDemo } from './learn/chapters/04-multihead-gqa';
-import { TokenizationChapterBody, TokenizerDemo } from './learn/chapters/01-tokenization';
-import { EmbeddingsChapterBody, EmbeddingsDemo } from './learn/chapters/02-embeddings';
-import { RopeChapterBody, RopeDemo } from './learn/chapters/05-rope';
-import { RmsNormChapterBody, RmsNormDemo } from './learn/chapters/06-rms-norm';
-import { MlpChapterBody, MlpDemo } from './learn/chapters/07-mlp';
-import { FullBlockChapterBody, FullBlockDemo } from './learn/chapters/08-full-block';
-import { SamplingChapterBody, SamplingDemo } from './learn/chapters/09-sampling';
-import { KvCacheChapterBody, KvCacheDemo } from './learn/chapters/10-kv-cache';
 
 const DEFAULT_INITIAL_SCREEN: ScreenState = { kind: 'landing' };
 
@@ -364,39 +348,27 @@ function App() {
     modelDirInput.setAttribute('directory', '');
   }, []);
 
-  // URL <-> screen state bridge. Single source of truth for writes lives here:
-  // every screen change calls history.replaceState so a reload restores the
-  // current screen. We use replaceState (not pushState) because intra-app
-  // navigation should not bloat the back stack — the user's back button
-  // takes them OUT of the app, not through every chapter they viewed.
-  // The `loading` screen is skipped (screenToUrlQuery returns null) so
-  // reloading mid-load doesn't restore an unrecoverable transient state.
+  // URL <-> screen-state bridge — DISABLED in Phase 2.C. TanStack Router now
+  // owns history; running this in parallel would cause the two systems to
+  // fight (router writes pathnames while this rewrote the URL with query
+  // strings). The original body is intentionally absent — Phase 2.D removes
+  // the surrounding screen reducer and its URL helpers entirely. Kept as a
+  // no-op so the `screen`-dep wiring stays adjacent to where it belongs
+  // for cleanup purposes.
   useEffect(() => {
-    const query = screenToUrlQuery(screen);
-    if (query === null) return;
-    try {
-      const existing = window.location.search.startsWith('?')
-        ? window.location.search.slice(1)
-        : window.location.search;
-      if (existing === query) return;
-      const newUrl = `${window.location.pathname}?${query}`;
-      window.history.replaceState(null, '', newUrl);
-    } catch {
-      // history.replaceState can throw in sandboxed iframes / very restricted
-      // contexts. The app must keep working even if URL sync is impossible.
-    }
+    // Intentionally empty — removed in Phase 2.D after RouterProvider mount.
+    void screen;
+    void screenToUrlQuery;
   }, [screen]);
 
-  // Browser back/forward → re-parse the URL and restore via the `restore`
-  // reducer event. Bound once at mount with an empty dep array; the handler
-  // reads from window.location at call time so the closure stays trivial.
+  // popstate handler — DISABLED in Phase 2.C. TanStack Router subscribes to
+  // popstate internally; the legacy `restore` reducer event no longer drives
+  // rendering, so listening here would only confuse the surviving reducer
+  // state. Phase 2.D removes this effect entirely.
   useEffect(() => {
-    const handler = () => {
-      const restored = parseScreenFromUrl();
-      dispatchScreen({ type: 'restore', screen: restored ?? DEFAULT_INITIAL_SCREEN });
-    };
-    window.addEventListener('popstate', handler);
-    return () => window.removeEventListener('popstate', handler);
+    // Intentionally empty — removed in Phase 2.D after RouterProvider mount.
+    void parseScreenFromUrl;
+    void DEFAULT_INITIAL_SCREEN;
   }, []);
 
   useEffect(() => {
@@ -2049,7 +2021,25 @@ function App() {
     };
   }, [configuredModelLabel, configuredModelUrl, loadKickoff, pendingModelSource]);
 
+  // Ref-mirror of loadKickoff so kickoffLoad() can check "already kicked off"
+  // without re-binding on every loadKickoff change (which would invalidate
+  // any consumer's useEffect deps that capture the callback identity).
+  const loadKickoffRef = useRef(0);
+  useEffect(() => {
+    loadKickoffRef.current = loadKickoff;
+  }, [loadKickoff]);
+
   const kickoffLoad = useCallback(() => {
+    // Mirror the prior Landing/ChapterIndex/LessonLayout handlers so route
+    // components only need to call kickoffLoad() (instead of inlining the
+    // state reset). Idempotent — once a kickoff has fired the model load
+    // effect owns the worker and we must not re-kickoff or the load effect
+    // would tear down the live worker. Routes that need a local-file picker
+    // still trigger it via the #model-dir-input <input> separately.
+    if (loadKickoffRef.current > 0) return;
+    setPendingModelSource(null);
+    setErrorBannerState(null);
+    setLoadingProgress(null);
     setLoadKickoff((k) => k + 1);
   }, []);
 
@@ -2111,20 +2101,62 @@ function App() {
     // Intentionally empty: the real handleSend lives inside the big useEffect.
   }, []);
 
+  const resetChatCallback = useCallback(() => {
+    // The chat reset hook is installed on window.__mlxResetChat by the big
+    // useEffect once the chat session is established. If present we call it
+    // (clears DOM and history). The legacy screen reducer transition is kept
+    // alive for now — Phase 2.D removes it along with the rest of the dead
+    // reducer wiring. Also navigate back to '/' as the post-reset destination.
+    const resetHook = (window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat;
+    if (resetHook) resetHook();
+    dispatchScreen({ type: 'reset_chat' });
+    void router.navigate({ to: '/' });
+  }, []);
+
   const freeChatValue = useMemo<FreeChatContextValue>(() => ({
     temperature: temperatureValue,
     maxTokens: maxTokensValue,
     toolsEnabled: appToolsEnabled,
     reasoningEffort,
     generating,
+    sendDisabled,
     setTemperature: setTemperatureCallback,
     setMaxTokens: setMaxTokensCallback,
     setToolsEnabled: setToolsEnabledCallback,
     cycleReasoning: cycleReasoningCallback,
     sendMessage: sendMessageCallback,
+    resetChat: resetChatCallback,
     promptRef,
     chatRef,
-  }), [temperatureValue, maxTokensValue, appToolsEnabled, reasoningEffort, generating, setTemperatureCallback, setMaxTokensCallback, setToolsEnabledCallback, cycleReasoningCallback, sendMessageCallback, promptRef, chatRef]);
+    sendRef,
+    imageButtonRef,
+    imageInputRef,
+    inspectedPrompt,
+    setInspectedPrompt,
+    mlxWorkerRef,
+    inspectorAbortRef,
+  }), [
+    temperatureValue,
+    maxTokensValue,
+    appToolsEnabled,
+    reasoningEffort,
+    generating,
+    sendDisabled,
+    setTemperatureCallback,
+    setMaxTokensCallback,
+    setToolsEnabledCallback,
+    cycleReasoningCallback,
+    sendMessageCallback,
+    resetChatCallback,
+    promptRef,
+    chatRef,
+    sendRef,
+    imageButtonRef,
+    imageInputRef,
+    inspectedPrompt,
+    mlxWorkerRef,
+    inspectorAbortRef,
+  ]);
 
   const telemetryValue = useMemo<TelemetryContextValue>(() => ({
     stats: telemetryStats,
@@ -2138,259 +2170,52 @@ function App() {
       <FreeChatProvider value={freeChatValue}>
         <TelemetryProvider value={telemetryValue}>
           <div className="app-root">
-      <div className={`chat-layer ${screen.kind === 'chat' ? 'visible' : ''}`}>
-        <div className="app-shell">
-          <ChatHeader
-            onReset={() => {
-              // The existing useEffect installs a global reset hook on
-              // window.__mlxResetChat when the chat session is established. If
-              // it's set, call it; the chat DOM will clear and the underlying
-              // chat session will be reset.
-              if ((window as unknown as { __mlxResetChat?: () => void }).__mlxResetChat) {
-                (window as unknown as { __mlxResetChat: () => void }).__mlxResetChat();
-              }
-              dispatchScreen({ type: 'reset_chat' });
-            }}
-          />
-          {/*
-        Hidden ref-only status element. The legacy app-header rendered the
-        Initializing status pill; we kept the ref so the existing useEffect's
-        statusEl.textContent / statusEl.className mutations remain safe. The
-        new ChatHeader shows its own static "Ready on WebGPU" status.
-      */}
-          <span ref={statusRef} id="status" style={{ display: 'none' }} aria-hidden="true" />
+            {/*
+              Hidden ref-only status element. The legacy app-header rendered the
+              Initializing status pill; we kept the ref so the existing
+              useEffect's statusEl.textContent / statusEl.className mutations
+              remain safe. The new ChatHeader shows its own static "Ready on
+              WebGPU" status. Moved to the App root so the imperative writes
+              continue to work after the chat-layer JSX migrated into
+              ChatLayerOverlay.
+            */}
+            <span ref={statusRef} id="status" style={{ display: 'none' }} aria-hidden="true" />
 
-          <div className="chat-messages" id="chat" ref={chatRef} />
+            {/*
+              Always-mounted hidden file input for picking a local model
+              directory. Lives at the App root so route components can open it
+              before a model worker exists; route components find it via
+              document.getElementById('model-dir-input') and call .click().
+            */}
+            <input
+              id="model-dir-input"
+              ref={modelDirInputRef}
+              type="file"
+              multiple
+              {...DIRECTORY_PICKER_INPUT_PROPS}
+              className="hidden"
+              onChange={handleLocalModelInputChange}
+            />
+            {/*
+              Hidden inputs preserved so the existing useEffect's
+              readTemperature() and readMaxOutputTokens() helpers (which read
+              from .value) keep working unchanged. The PowerComposer (mounted
+              inside ChatLayerOverlay) mirrors React state into these via
+              setTemperature / setMaxTokens in the FreeChat context.
+            */}
+            <input ref={temperatureInputRef} type="hidden" defaultValue={initialTemperature} />
+            <input ref={maxOutputTokensInputRef} type="hidden" defaultValue={initialMaxOutputTokens} />
 
-          <TelemetryStrip
-            stats={telemetryStats}
-            prefillTokensPerSecond={prefillTokensPerSec}
-            decodeTokensPerSecond={decodeTokensPerSec}
-            modelLine={modelLine}
-          />
-
-          <PowerComposer
-            textareaRef={promptRef}
-            sendRef={sendRef}
-            imageButtonRef={imageButtonRef}
-            imageInputRef={imageInputRef}
-            reasoningEffort={reasoningEffort}
-            onCycleReasoning={() => {
-              const next = cycleReasoningEffort(reasoningEffort);
-              reasoningEffortRef.current = next;
-              setReasoningEffortState(next);
-            }}
-            temperature={temperatureValue}
-            onTemperatureChange={(v) => {
-              temperatureValueRef.current = v;
-              setTemperatureValue(v);
-              if (temperatureInputRef.current) temperatureInputRef.current.value = `${v}`;
-            }}
-            maxTokens={maxTokensValue}
-            onMaxTokensChange={(v) => {
-              maxTokensValueRef.current = v;
-              setMaxTokensValue(v);
-              if (maxOutputTokensInputRef.current) maxOutputTokensInputRef.current.value = `${v}`;
-            }}
-            toolsEnabled={appToolsEnabled}
-            onToggleTools={() => {
-              const next = !appToolsEnabled;
-              setAppToolsEnabledState(next);
-              appToolsEnabledRef.current = next;
-            }}
-            generating={generating}
-            sendDisabled={sendDisabled}
-          />
-        </div>
-        {inspectedPrompt !== null && screen.kind === 'chat' ? (
-          <InspectorDrawer
-            prompt={inspectedPrompt}
-            workerRef={mlxWorkerRef}
-            abortRef={inspectorAbortRef}
-            onClose={() => setInspectedPrompt(null)}
-          />
-        ) : null}
-      </div>
-
-      {/*
-        Always-mounted hidden file input for picking a local model directory.
-        Lives at the App root so the landing screen can open it before a model
-        worker exists; React captures the selected files and starts the worker
-        directly from those local File objects.
-      */}
-      <input
-        id="model-dir-input"
-        ref={modelDirInputRef}
-        type="file"
-        multiple
-        {...DIRECTORY_PICKER_INPUT_PROPS}
-        className="hidden"
-        onChange={handleLocalModelInputChange}
-      />
-      {/*
-        Hidden inputs preserved so the existing useEffect's readTemperature() and
-        readMaxOutputTokens() helpers (which read from .value) keep working
-        unchanged. The PowerComposer mirrors React state into these via its
-        onTemperatureChange / onMaxTokensChange callbacks.
-      */}
-      <input ref={temperatureInputRef} type="hidden" defaultValue={initialTemperature} />
-      <input ref={maxOutputTokensInputRef} type="hidden" defaultValue={initialMaxOutputTokens} />
-
-      {screen.kind === 'landing' && (
-        <Landing
-          onLoad={() => {
-            if (hostedModelAvailable === false) {
-              modelDirInputRef.current?.click();
-              return;
-            }
-            setPendingModelSource(null);
-            setErrorBannerState(null);
-            setLoadingProgress(null);
-            setLoadKickoff((k) => k + 1);
-            dispatchScreen({ type: 'load_kickoff' });
-          }}
-          onLocalModel={() => modelDirInputRef.current?.click()}
-          onStartLearning={() => {
-            // Kick off the model load alongside the screen transition so the
-            // user doesn't sit on chapter_index waiting for the model. The
-            // auto-load effect below covers direct URL landings (bookmarks,
-            // popstate); this handler covers the normal "click Start
-            // learning" path with an explicit user gesture, mirroring the
-            // pattern in onLoad. Skipped when no hosted model is available —
-            // those users need the local model picker, which we deliberately
-            // do NOT auto-open from a learning click.
-            if (loadKickoff === 0 && hostedModelAvailable !== false) {
-              setPendingModelSource(null);
-              setErrorBannerState(null);
-              setLoadingProgress(null);
-              setLoadKickoff((k) => k + 1);
-            }
-            dispatchScreen({ type: 'start_learning' });
-          }}
-          errorBanner={errorBanner}
-          hostedModelAvailable={hostedModelAvailable}
-        />
-      )}
-      {/*
-        Learning flow is gated on a ready model. Entering chapter_index or
-        chapter before the worker reports ready shows the same full Loading
-        screen used by the chat flow — same progress bar, same fade. The
-        chapter_index and chapter views only render once `modelReady` is
-        true; chapter components below get to assume the worker is alive,
-        so they never need a fallback rendering path.
-      */}
-      {(screen.kind === 'chapter_index' || screen.kind === 'chapter') &&
-        !modelReady && (
-          <Loading status={loadingText} progress={loadingProgress} />
-        )}
-      {screen.kind === 'chapter_index' && modelReady && (
-        <ChapterIndex
-          onOpenChapter={(chapterId) => dispatchScreen({ type: 'open_chapter', chapterId })}
-          onBackToLanding={() => dispatchScreen({ type: 'back_to_landing' })}
-          onOpenFreeChat={() => {
-            if (hostedModelAvailable === false) {
-              modelDirInputRef.current?.click();
-              return;
-            }
-            setPendingModelSource(null);
-            setErrorBannerState(null);
-            setLoadingProgress(null);
-            setLoadKickoff((k) => k + 1);
-            dispatchScreen({ type: 'open_free_chat' });
-          }}
-        />
-      )}
-      {screen.kind === 'chapter' && modelReady && (() => {
-        // chapter.id is guaranteed present by the discriminated-union typing —
-        // `open_chapter` carries it on the event and the reducer writes it into
-        // the state. `findChapter` may still return undefined if the id is a
-        // stale value (e.g. a removed chapter), so we narrow defensively.
-        const chapter = findChapter(screen.chapterId);
-        if (!chapter) {
-          return (
-            <div className="text-muted-foreground p-6">
-              Unknown chapter: <span className="font-mono">{screen.chapterId}</span>
-              <div className="mt-4">
-                <button
-                  type="button"
-                  className="underline"
-                  onClick={() => dispatchScreen({ type: 'back_to_index' })}
-                >
-                  Back to chapter index
-                </button>
-              </div>
-            </div>
-          );
-        }
-        return (
-          <LessonLayout
-            current={chapter}
-            onOpenChapter={(chapterId) => dispatchScreen({ type: 'open_chapter', chapterId })}
-            onBackToIndex={() => dispatchScreen({ type: 'back_to_index' })}
-            onOpenFreeChat={() => {
-              if (hostedModelAvailable === false) {
-                modelDirInputRef.current?.click();
-                return;
-              }
-              setPendingModelSource(null);
-              setErrorBannerState(null);
-              setLoadingProgress(null);
-              setLoadKickoff((k) => k + 1);
-              dispatchScreen({ type: 'open_free_chat' });
-            }}
-            tryItPanel={
-              chapter.id === 'attention' ? (
-                <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : chapter.id === 'multi-head-gqa' ? (
-                <MultiheadGqaDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : chapter.id === 'tokenization' ? (
-                <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : chapter.id === 'embeddings' ? (
-                <EmbeddingsDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : chapter.id === 'rope' ? (
-                <RopeDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : chapter.id === 'rmsnorm' ? (
-                <RmsNormDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : chapter.id === 'mlp' ? (
-                <MlpDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : chapter.id === 'full-block' ? (
-                <FullBlockDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : chapter.id === 'sampling' ? (
-                <SamplingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : chapter.id === 'kv-cache' ? (
-                <KvCacheDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-              ) : null
-            }
-          >
-            {chapter.id === 'attention' ? (
-              <AttentionChapterBody />
-            ) : chapter.id === 'multi-head-gqa' ? (
-              <MultiheadGqaChapterBody />
-            ) : chapter.id === 'tokenization' ? (
-              <TokenizationChapterBody />
-            ) : chapter.id === 'embeddings' ? (
-              <EmbeddingsChapterBody />
-            ) : chapter.id === 'rope' ? (
-              <RopeChapterBody />
-            ) : chapter.id === 'rmsnorm' ? (
-              <RmsNormChapterBody />
-            ) : chapter.id === 'mlp' ? (
-              <MlpChapterBody />
-            ) : chapter.id === 'full-block' ? (
-              <FullBlockChapterBody />
-            ) : chapter.id === 'sampling' ? (
-              <SamplingChapterBody />
-            ) : chapter.id === 'kv-cache' ? (
-              <KvCacheChapterBody />
-            ) : (
-              <div className="text-muted-foreground">
-                This chapter is not yet authored.
-              </div>
-            )}
-          </LessonLayout>
-        );
-      })()}
-      {screen.kind === 'loading' && <Loading status={loadingText} progress={loadingProgress} />}
+            {/*
+              Phase 2.C: the entire screen-switch block previously living here
+              was migrated into route components under demo/routes. The router
+              now owns history; the chat-layer overlay is mounted from
+              __root.tsx as a sibling to <Outlet />. The legacy `screen`
+              reducer is kept alive for now (transition events still fire from
+              the big useEffect) but no one reads `screen.kind` for rendering.
+              Phase 2.D will remove the reducer and its imports.
+            */}
+            <RouterProvider router={router} />
           </div>
         </TelemetryProvider>
       </FreeChatProvider>

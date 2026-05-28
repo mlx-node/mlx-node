@@ -8,9 +8,16 @@
 // IMPORTANT: Zod strips unknown keys silently — any new legacy query param
 // consumed by app.tsx MUST be added to searchSchema before Phase 2.C mounts
 // <RouterProvider />, or that param will be lost from the URL after navigation.
+//
+// Phase 2.C: the root component renders <Outlet /> for child routes plus the
+// always-mounted <ChatLayerOverlay />. Visibility of the chat overlay is
+// driven by the current pathname (=== '/chat'); the JSX stays mounted so the
+// imperative chat-DOM `useEffect` in app.tsx keeps writing to live refs.
 
-import { createRootRoute, Outlet } from '@tanstack/react-router';
+import { createRootRoute, Outlet, useRouterState } from '@tanstack/react-router';
 import { z } from 'zod';
+
+import { ChatLayerOverlay } from '../components/ChatLayerOverlay';
 
 export const searchSchema = z.object({
   // Model URL — legacy aliases: model_url, modelUrl, model
@@ -38,7 +45,18 @@ export const searchSchema = z.object({
 
 export type RootSearch = z.infer<typeof searchSchema>;
 
+function RootComponent() {
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const isChatRoute = pathname === '/chat';
+  return (
+    <>
+      <Outlet />
+      <ChatLayerOverlay visible={isChatRoute} />
+    </>
+  );
+}
+
 export const Route = createRootRoute({
   validateSearch: (search) => searchSchema.parse(search),
-  component: () => <Outlet />,
+  component: RootComponent,
 });
