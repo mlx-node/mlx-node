@@ -1049,11 +1049,13 @@ fn packed_group_bytes(params: &HashMap<String, MxArray>, base: &str) -> Option<u
 ///      so the tied lm_head matmul keeps reading a dense `get_weight()`. With
 ///      tied embeddings (lfm2 ties), that dense table is genuinely materialized
 ///      — it dominates the undercount (~`vocab × hidden × 2` bytes).
-///   2. The **dense-MLP** projections of the first `num_dense_layers` layers.
-///      `MLP::forward` takes the legacy `get_weight()` path (lfm2 never calls
-///      `finalize_gate_up`), which reads the dense dequant copy that
-///      `Linear::load_quantized` eagerly builds — materializing an
-///      `out × in` bf16 array per projection.
+///   2. The **dense-MLP** projections. `MLP::forward` takes the legacy
+///      `get_weight()` path (lfm2 never calls `finalize_gate_up`), which reads
+///      the dense dequant copy that `Linear::load_quantized` eagerly builds —
+///      materializing an `out × in` bf16 array per projection. The count of
+///      dense-MLP layers is `num_hidden_layers` for a PURE-DENSE checkpoint
+///      (every layer is a dense MLP) but only the leading `num_dense_layers`
+///      for a MoE checkpoint (the rest are packed-resident MoE experts).
 ///
 /// Attention / conv quantized linears do NOT add a dense copy: their `forward`
 /// uses the quantized backend and never reads `get_weight()`, so the lazy
@@ -1081,11 +1083,24 @@ fn compute_weight_bytes(params: &HashMap<String, MxArray>, config: &Lfm2Config) 
         total = total.saturating_add(dense.saturating_sub(packed));
     }
 
-    // (2) Quantized dense-MLP projections (only the first `num_dense_layers`,
-    // which take the legacy `get_weight()` forward path). MoE expert
-    // projections stay packed (gather_qmm reads the packed backend), so they
-    // are intentionally excluded.
-    let num_dense = config.num_dense_layers.unwrap_or(0).max(0) as usize;
+    // (2) Quantized dense-MLP projections, which take the legacy
+    // `get_weight()` forward path and therefore materialize a dense bf16
+    // dequant copy.
+    //
+    // How many layers are dense MLPs depends on whether the checkpoint is MoE:
+    //   - PURE-DENSE (`!is_moe()`): `num_dense_layers` is `None` (a MoE-only
+    //     field), but EVERY one of the `num_hidden_layers` layers is a dense
+    //     MLP (`decoder_layer.rs` builds `FeedForward::Dense` for all of them).
+    //     So the dense-MLP count is `num_hidden_layers`.
+    //   - MoE (`is_moe()`): only the leading `num_dense_layers` layers are
+    //     dense MLPs; the rest are MoE experts using packed
+    //     QuantizedSwitchLinear (gather_qmm reads the packed backend and never
+    //     materializes a dense copy), so they are intentionally excluded.
+    let num_dense = if config.is_moe() {
+        config.num_dense_layers.unwrap_or(0).max(0) as usize
+    } else {
+        config.num_hidden_layers.max(0) as usize
+    };
     if num_dense > 0 {
         // Dense-in-MoE layers use `intermediate_size`; pure-dense lfm2 uses the
         // computed ff dim. `is_moe()` distinguishes the two.
@@ -1978,6 +1993,90 @@ mod tests {
             "compute_weight_bytes must add the dense-MLP deltas for the {} dense layers: \
              counted={counted}, packed={packed}, expected_extra={expected_dense_extra}",
             config.num_dense_layers.unwrap()
+        );
+        assert!(
+            expected_dense_extra > 0,
+            "test setup error: expected a positive dense-MLP delta"
+        );
+    }
+
+    #[test]
+    fn weight_bytes_counts_dense_mlp_delta_for_pure_dense_quantized_checkpoint() {
+        // A PURE-DENSE (non-MoE) checkpoint has `num_dense_layers = None`, but
+        // EVERY one of `num_hidden_layers` layers is a dense MLP that
+        // materializes a dense bf16 dequant copy via the legacy
+        // `get_weight()` forward path. The OLD formula keyed the dense-MLP
+        // delta off `num_dense_layers.unwrap_or(0)` (== 0 here) and undercounted
+        // all of them. The fix uses `num_hidden_layers` when `!is_moe()`.
+        let mut config = tiny_moe_config(true);
+        // Make it pure-dense: clear all MoE-only fields.
+        config.num_experts = None; // is_moe() == false
+        config.num_experts_per_tok = None;
+        config.num_dense_layers = None;
+        config.intermediate_size = None;
+        config.moe_intermediate_size = None;
+        // Dense ff dim comes from `computed_ff_dim()`. Pin it deterministically:
+        // with auto-adjust off, `computed_ff_dim() == block_ff_dim`.
+        config.num_hidden_layers = 2;
+        config.hidden_size = 64;
+        config.block_ff_dim = 128;
+        config.block_auto_adjust_ff_dim = false;
+        config.vocab_size = 32;
+        assert!(!config.is_moe(), "test config must be pure-dense");
+        let ff = config.computed_ff_dim() as i64;
+        assert_eq!(
+            ff, 128,
+            "computed_ff_dim must equal the pinned block_ff_dim"
+        );
+
+        let hidden = config.hidden_size as i64;
+
+        let make_quant = |out: i64, inf: i64| {
+            let n = (out * inf) as usize;
+            let data: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+            let dense = MxArray::from_float32(&data, &[out, inf])
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16");
+            quantize_affine(&dense, 64, 4)
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        // Plain bf16 embedding (no .scales) so this test isolates the dense-MLP
+        // delta across ALL layers.
+        params.insert(
+            "embed_tokens.weight".into(),
+            bf16(&[config.vocab_size as i64, hidden], 0.01),
+        );
+
+        // Quantize the dense-MLP projections of EVERY layer.
+        let mut expected_dense_extra: u64 = 0;
+        for l in 0..(config.num_hidden_layers as usize) {
+            for (proj, out, inf) in [
+                ("gate_proj", ff, hidden),
+                ("up_proj", ff, hidden),
+                ("down_proj", hidden, ff),
+            ] {
+                let (qw, qs, qb) = make_quant(out, inf);
+                let base = format!("layers.{l}.feed_forward.{proj}");
+                params.insert(format!("{base}.weight"), qw);
+                params.insert(format!("{base}.scales"), qs);
+                params.insert(format!("{base}.biases"), qb);
+                let dense = (out as u64) * (inf as u64) * 2;
+                let packed = packed_group_bytes(&params, &base).expect("packed proj");
+                expected_dense_extra =
+                    expected_dense_extra.saturating_add(dense.saturating_sub(packed));
+            }
+        }
+
+        let packed = packed_only_bytes(&params);
+        let counted = compute_weight_bytes(&params, &config);
+        assert!(
+            counted >= packed + expected_dense_extra,
+            "compute_weight_bytes must add the dense-MLP deltas for ALL {} layers of a \
+             pure-dense quantized checkpoint: counted={counted}, packed={packed}, \
+             expected_extra={expected_dense_extra}",
+            config.num_hidden_layers
         );
         assert!(
             expected_dense_extra > 0,
