@@ -135,16 +135,16 @@ impl ShortConv {
         self.conv.set_bias(b)
     }
 
-    pub fn set_in_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.in_proj.set_weight(w)
-    }
+    // NOTE: in_proj / out_proj WEIGHTS are loaded via the `*_proj_mut()`
+    // accessors below (driving `Linear::load_quantized` / `Linear::set_weight`
+    // for quantized/bf16 checkpoints uniformly). The former
+    // `set_{in,out}_proj_weight` shims were removed after that switch left them
+    // with zero callers. The LAYER biases keep dedicated setters because the
+    // `*_mut()` accessors expose only the `Linear` (whose bias is set via its
+    // own API, but the persistence layer uses these named helpers).
 
     pub fn set_in_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
         self.in_proj.set_bias(b)
-    }
-
-    pub fn set_out_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.out_proj.set_weight(w)
     }
 
     pub fn set_out_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {

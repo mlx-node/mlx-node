@@ -313,22 +313,12 @@ impl Lfm2Attention {
     }
 
     // ========== Weight setters ==========
-
-    pub fn set_q_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.q_proj.set_weight(w)
-    }
-
-    pub fn set_k_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.k_proj.set_weight(w)
-    }
-
-    pub fn set_v_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.v_proj.set_weight(w)
-    }
-
-    pub fn set_out_proj_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.out_proj.set_weight(w)
-    }
+    //
+    // NOTE: q/k/v/out_proj weights are loaded via the `*_proj_mut()` accessors
+    // below (which drive `Linear::load_quantized` or `Linear::set_weight`
+    // uniformly for quantized/bf16 checkpoints). The former
+    // `set_{q,k,v,out}_proj_weight` shims were removed after that switch left
+    // them with zero callers.
 
     pub fn set_q_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.q_layernorm.set_weight(w)

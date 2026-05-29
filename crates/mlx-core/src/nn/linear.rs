@@ -111,7 +111,14 @@ impl Linear {
     }
 
     /// Load quantized weights. `forward()` will use quantized_matmul.
-    /// The dense `weight` is lazily dequantized for `get_weight()`.
+    ///
+    /// EAGERLY constructs an (unevaluated) dequant graph for the dense `weight`
+    /// — `mlx_dequantize` is called here at load, building the graph node now;
+    /// MLX's laziness means the actual dense table only materializes on the
+    /// first `eval`/use of `get_weight()` (e.g. a tied-embedding lm_head
+    /// matmul). Callers whose `forward()` path never reads `get_weight()` (it
+    /// uses the quantized backend directly) thus keep the weight packed-only
+    /// resident, since the dequant node is never evaluated.
     pub fn load_quantized(
         &mut self,
         weight: &MxArray,

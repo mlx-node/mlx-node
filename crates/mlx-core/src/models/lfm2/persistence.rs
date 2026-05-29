@@ -152,6 +152,15 @@ fn load_linear_affine_or_bf16(
 /// `nn::Embedding::load_quantized` PRE-dequantizes the full table into the
 /// dense weight, so a tied lm_head matmul (which reads `get_weight()`) keeps
 /// working unchanged.
+///
+/// RESIDUAL LIMITATION (memory): because the table is pre-dequantized — and
+/// lfm2 ties the lm_head to it, so the dense table is genuinely materialized —
+/// a quantized embedding resides as a FULL dense bf16 table (`vocab × hidden ×
+/// 2` bytes). The packed `.weight`/`.scales`/`.biases` give NO memory savings
+/// here; `compute_weight_bytes` counts that dense residency. This is inherent
+/// to the minimal affine path: real per-tensor memory savings for non-MoE
+/// tensors (and support for mxfp4/mxfp8/nvfp4 there) require moving the lfm2
+/// modules to a quant-capable embedding/linear type — the deferred refactor.
 fn load_embedding_affine_or_bf16(
     embedding: &mut Embedding,
     params: &HashMap<String, MxArray>,
@@ -386,11 +395,34 @@ fn sanitize_weights(
         // Scoped to `feed_forward.*` keys so the rename ALSO catches MoE expert
         // keys (`feed_forward.experts.{e}.w1.weight` etc.) without touching any
         // unrelated `w1`/`w2`/`w3` tensors. Mirrors `lfm2_moe.py::sanitize`.
+        //
+        // The rename covers ALL affine-quant group suffixes — `.weight`,
+        // `.scales`, AND `.biases` — not just `.weight`. A quantized DENSE
+        // `lfm2.py` checkpoint (whose MLP modules ARE `w1`/`w2`/`w3`, see
+        // `mlx-lm/mlx_lm/models/lfm2.py:189-191`) ships the companions under the
+        // same `w{1,2,3}` names. Renaming only `.weight` would orphan
+        // `feed_forward.w1.{scales,biases}`, leaving the loader unable to find
+        // `gate_proj.scales` and wrongly taking the bf16 path for a packed
+        // weight. The full-suffix rename keeps the whole group together so
+        // `load_linear_affine_or_bf16` resolves it as quantized.
+        //
+        // N/A — per-layer quant OVERRIDE keys never arrive under `w{1,2,3}`:
+        // dense `lfm2.py` has no `quant_predicate` (uniform top-level default),
+        // and `lfm2_moe.py::quant_predicate` only specializes
+        // `feed_forward.gate`. So `per_layer_quant` is keyed by
+        // `feed_forward.gate` / standard proj / embedding names — never
+        // `w{1,2,3}` — and needs no alias normalization.
         let clean_key = if clean_key.contains("feed_forward") {
             clean_key
                 .replace("w1.weight", "gate_proj.weight")
+                .replace("w1.scales", "gate_proj.scales")
+                .replace("w1.biases", "gate_proj.biases")
                 .replace("w2.weight", "down_proj.weight")
+                .replace("w2.scales", "down_proj.scales")
+                .replace("w2.biases", "down_proj.biases")
                 .replace("w3.weight", "up_proj.weight")
+                .replace("w3.scales", "up_proj.scales")
+                .replace("w3.biases", "up_proj.biases")
         } else {
             clean_key
         };
@@ -797,6 +829,36 @@ fn validate_mandatory_weights(
         missing.push("lm_head.weight".to_string());
     }
 
+    // Post-sanitize, NO `feed_forward.w{1,2,3}.*` alias may survive — the
+    // w1/w2/w3 → gate_proj/down_proj/up_proj rename in `sanitize_weights`
+    // covers `.weight`, `.scales`, AND `.biases`. A surviving
+    // `feed_forward.w{1,2,3}.scales` / `.biases` signals an unhandled alias
+    // (e.g. a new quant suffix the rename missed), which would orphan the
+    // companion and let the loader silently take the bf16 path for a packed
+    // weight. Fail loud naming the stray key rather than load corrupted
+    // weights. (`.weight` itself is left out of this scan: if the rename
+    // failed to move it the per-layer mandatory checks below already report
+    // the missing `gate_proj`/`down_proj`/`up_proj` weight.)
+    let stray_alias: Vec<String> = params
+        .keys()
+        .filter(|k| {
+            k.contains("feed_forward.w1.")
+                || k.contains("feed_forward.w2.")
+                || k.contains("feed_forward.w3.")
+        })
+        .filter(|k| k.ends_with(".scales") || k.ends_with(".biases"))
+        .cloned()
+        .collect();
+    if !stray_alias.is_empty() {
+        return Err(Error::from_reason(format!(
+            "LFM2 checkpoint has {} unhandled feed_forward.w{{1,2,3}} quant alias(es) that \
+             survived sanitize (companion of an un-renamed weight): {:?} — refusing to load with \
+             orphaned quant companions",
+            stray_alias.len(),
+            &stray_alias[..stray_alias.len().min(20)]
+        )));
+    }
+
     // Validate a MoE projection as a COMPLETE group, recording precise missing
     // keys into `missing`. The `quantized` flag is the layer-level
     // determination from the SHARED `moe_layer_is_quantized` helper (ANY
@@ -950,15 +1012,122 @@ fn validate_mandatory_weights(
     Ok(())
 }
 
+/// bf16 element size in bytes (the dtype every dequantized lfm2 weight
+/// materializes to — see `sanitize_weights`' f32→bf16 cast and the affine
+/// dequant in `nn::Linear`/`nn::Embedding`).
+const BF16_BYTES: u64 = 2;
+
+/// Sum the packed bytes of an affine quant GROUP (`.weight` + `.scales` +
+/// optional `.biases`) under `base`, if `{base}.weight` is present. Returns
+/// `None` when there is no packed weight (so the caller can skip).
+fn packed_group_bytes(params: &HashMap<String, MxArray>, base: &str) -> Option<u64> {
+    let w = params.get(&format!("{base}.weight"))?;
+    let mut total = w.nbytes() as u64;
+    if let Some(s) = params.get(&format!("{base}.scales")) {
+        total = total.saturating_add(s.nbytes() as u64);
+    }
+    if let Some(b) = params.get(&format!("{base}.biases")) {
+        total = total.saturating_add(b.nbytes() as u64);
+    }
+    Some(total)
+}
+
+/// Compute the deterministic resident-weight-byte total for the cache-limit
+/// coordinator, accounting for the DENSE (dequantized) copies that some
+/// quantized lfm2 tensors materialize.
+///
+/// ## Why the naive packed sum undercounts
+///
+/// The baseline `sum(params.values().nbytes())` measures only the PACKED
+/// checkpoint tensors (`materialize_weights` evals exactly that set). For a
+/// fully bf16 checkpoint that equals the resident footprint. But two
+/// quantized-tensor classes ALSO leave a DENSE bf16 copy resident that the
+/// packed sum never sees:
+///
+///   1. The **embedding**. `nn::Embedding::load_quantized` pre-dequantizes the
+///      whole table into `self.weight` (a dense `vocab × hidden` bf16 array)
+///      so the tied lm_head matmul keeps reading a dense `get_weight()`. With
+///      tied embeddings (lfm2 ties), that dense table is genuinely materialized
+///      — it dominates the undercount (~`vocab × hidden × 2` bytes).
+///   2. The **dense-MLP** projections of the first `num_dense_layers` layers.
+///      `MLP::forward` takes the legacy `get_weight()` path (lfm2 never calls
+///      `finalize_gate_up`), which reads the dense dequant copy that
+///      `Linear::load_quantized` eagerly builds — materializing an
+///      `out × in` bf16 array per projection.
+///
+/// Attention / conv quantized linears do NOT add a dense copy: their `forward`
+/// uses the quantized backend and never reads `get_weight()`, so the lazy
+/// dequant graph is never materialized — they stay packed-only resident.
+///
+/// We start from the packed sum and, for each quantized tensor that
+/// materializes a dense copy, ADD the (non-negative) delta between the dense
+/// bf16 size and the packed group size. This is conservative: it cannot
+/// undercount, and it slightly over-counts only if MLX happens to free a
+/// transient — which is the safe direction for sizing the allocator cap.
+fn compute_weight_bytes(params: &HashMap<String, MxArray>, config: &Lfm2Config) -> u64 {
+    // Baseline: packed bytes of every checkpoint tensor.
+    let mut total: u64 = params
+        .values()
+        .map(|a| a.nbytes() as u64)
+        .fold(0u64, |acc, v| acc.saturating_add(v));
+
+    // (1) Quantized embedding → resident dense bf16 table.
+    if params.contains_key("embed_tokens.scales")
+        && let Some(packed) = packed_group_bytes(params, "embed_tokens")
+    {
+        let dense = (config.vocab_size as u64)
+            .saturating_mul(config.hidden_size as u64)
+            .saturating_mul(BF16_BYTES);
+        total = total.saturating_add(dense.saturating_sub(packed));
+    }
+
+    // (2) Quantized dense-MLP projections (only the first `num_dense_layers`,
+    // which take the legacy `get_weight()` forward path). MoE expert
+    // projections stay packed (gather_qmm reads the packed backend), so they
+    // are intentionally excluded.
+    let num_dense = config.num_dense_layers.unwrap_or(0).max(0) as usize;
+    if num_dense > 0 {
+        // Dense-in-MoE layers use `intermediate_size`; pure-dense lfm2 uses the
+        // computed ff dim. `is_moe()` distinguishes the two.
+        let ff_dim = if config.is_moe() {
+            config.intermediate_size.unwrap_or(config.hidden_size)
+        } else {
+            config.computed_ff_dim()
+        } as u64;
+        let hidden = config.hidden_size as u64;
+        // gate_proj/up_proj: [ff, hidden]; down_proj: [hidden, ff]. All bf16.
+        let gate_up_dense = ff_dim.saturating_mul(hidden).saturating_mul(BF16_BYTES);
+        let down_dense = hidden.saturating_mul(ff_dim).saturating_mul(BF16_BYTES);
+        for l in 0..num_dense.min(config.num_hidden_layers.max(0) as usize) {
+            for (proj, dense) in [
+                ("gate_proj", gate_up_dense),
+                ("up_proj", gate_up_dense),
+                ("down_proj", down_dense),
+            ] {
+                let base = format!("layers.{l}.feed_forward.{proj}");
+                if params.contains_key(&format!("{base}.scales"))
+                    && let Some(packed) = packed_group_bytes(params, &base)
+                {
+                    total = total.saturating_add(dense.saturating_sub(packed));
+                }
+            }
+        }
+    }
+
+    total
+}
+
 impl Lfm2Inner {
     /// Load an Lfm2Inner from a directory containing safetensors and config.json.
     ///
     /// All weight loading happens synchronously (designed to run on the model thread).
     ///
-    /// Returns the constructed inner alongside a deterministic
-    /// weight-byte total (`sum(params.values().nbytes())`) for the
-    /// cache-limit coordinator. See `cache_limit.rs` module docs for
-    /// why this deterministic measurement is preferred over a
+    /// Returns the constructed inner alongside a deterministic resident
+    /// weight-byte total (via [`compute_weight_bytes`]) for the cache-limit
+    /// coordinator. The total is the packed-tensor sum PLUS the dense
+    /// dequantized copies that a quantized embedding / dense-MLP materialize
+    /// (so it never undercounts resident memory). See `cache_limit.rs` module
+    /// docs for why this deterministic measurement is preferred over a
     /// process-wide `get_active_memory()` delta.
     pub fn load_from_dir(model_path: &str) -> Result<(Self, u64)> {
         let path = Path::new(model_path);
@@ -1043,13 +1212,15 @@ impl Lfm2Inner {
             info!("Tokenizer loaded");
         }
 
-        // Deterministic weight-byte total for the cache-limit
-        // coordinator, computed from the still-live `params` map
-        // before it is dropped at end-of-function.
-        let weight_bytes: u64 = params
-            .values()
-            .map(|a| a.nbytes() as u64)
-            .fold(0u64, |acc, v| acc.saturating_add(v));
+        // Deterministic weight-byte total for the cache-limit coordinator,
+        // computed from the still-live `params` map before it is dropped at
+        // end-of-function. NOT a naive packed sum: a quantized embedding (and
+        // quantized dense-MLP projections) leave a DENSE dequantized copy
+        // resident that the packed tensors do not measure, so
+        // `compute_weight_bytes` adds those deltas to avoid undercounting (and
+        // thus oversizing the allocator cap / risking OOM with multiple
+        // models). See its doc comment for the residency rationale.
+        let weight_bytes: u64 = compute_weight_bytes(&params, &inner.config);
 
         Ok((inner, weight_bytes))
     }
@@ -1620,6 +1791,12 @@ mod tests {
             .zip(orig_v.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
+        // Tolerance derivation: 4-bit affine quantizes each group of 64 values
+        // to 16 levels (`2^4`). The per-group step is `range/15`; with the
+        // synthetic weights here ranging over ~[-0.3, 0.3] (range ≈ 0.6) the
+        // worst-case round-to-nearest error is half a step ≈ 0.6/15/2 ≈ 0.02.
+        // 0.2 is a deliberately loose ~10× ceiling that still catches a wrong
+        // group_size/bits or a non-dequantized (packed) read.
         assert!(
             max_err < 0.2,
             "dequantized weight too far from original: max_err={max_err}"
@@ -1674,5 +1851,236 @@ mod tests {
         assert!(!p.contains_key("layers.0.conv.conv.scales"));
         validate_mandatory_weights(&p, &config, 2)
             .expect("plain depthwise conv weight in a quantized checkpoint must pass");
+    }
+
+    // ===== Task A: cache-accounting undercount fix =====
+    //
+    // `compute_weight_bytes` must EXCEED the naive packed-tensor sum for a
+    // quantized checkpoint by at least the dense-embedding delta (the dominant
+    // resident object a quantized + tied embedding materializes). It must also
+    // account for quantized dense-MLP projections when `num_dense_layers > 0`.
+
+    /// Naive packed sum (the OLD, undercounting formula).
+    fn packed_only_bytes(params: &HashMap<String, MxArray>) -> u64 {
+        params
+            .values()
+            .map(|a| a.nbytes() as u64)
+            .fold(0u64, |acc, v| acc.saturating_add(v))
+    }
+
+    #[test]
+    fn weight_bytes_counts_dense_embedding_delta_for_quantized_embedding() {
+        // Synthetic config: a generously-sized vocab/hidden so the dense
+        // embedding delta dominates. num_dense_layers=0 isolates the embedding
+        // contribution (no dense-MLP delta).
+        let mut config = tiny_moe_config(true);
+        config.vocab_size = 4096;
+        config.hidden_size = 256;
+
+        // Quantize a [vocab, hidden] bf16 embedding table at 4-bit affine.
+        let vocab = config.vocab_size as i64;
+        let hidden = config.hidden_size as i64;
+        let n = (vocab * hidden) as usize;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.01).collect();
+        let dense_embed = MxArray::from_float32(&data, &[vocab, hidden])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("bf16");
+        let (qw, qs, qb) = quantize_affine(&dense_embed, 64, 4);
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("embed_tokens.weight".into(), qw);
+        params.insert("embed_tokens.scales".into(), qs);
+        params.insert("embed_tokens.biases".into(), qb);
+
+        let packed = packed_only_bytes(&params);
+        let counted = compute_weight_bytes(&params, &config);
+
+        // The resident dense bf16 table is vocab * hidden * 2 bytes; the packed
+        // group is ~1/4 of that (4-bit) plus small scales/biases. The counted
+        // total must therefore exceed packed by at least
+        // (dense_table - packed_embed_group) — i.e. it must REACH the dense
+        // table size (packed group is dropped, dense added).
+        let dense_table = (vocab as u64) * (hidden as u64) * 2;
+        let packed_embed = packed_group_bytes(&params, "embed_tokens").expect("packed embed");
+        let expected_delta = dense_table.saturating_sub(packed_embed);
+
+        assert!(
+            counted >= packed + expected_delta,
+            "compute_weight_bytes must add the dense-embedding delta: counted={counted}, \
+             packed={packed}, expected_delta={expected_delta}"
+        );
+        // And the counted total must be at least the full dense table size
+        // (the dominant resident object), proving we no longer undercount.
+        assert!(
+            counted >= dense_table,
+            "counted total ({counted}) must cover the dense embedding table ({dense_table})"
+        );
+    }
+
+    #[test]
+    fn weight_bytes_counts_dense_mlp_delta_when_num_dense_layers_positive() {
+        // Two dense layers (num_dense_layers=2) whose gate/up/down_proj are
+        // affine-quantized. Their dense dequant copies materialize via the
+        // legacy MLP forward path and must be counted.
+        let mut config = tiny_moe_config(true);
+        config.num_hidden_layers = 2;
+        config.hidden_size = 64;
+        config.intermediate_size = Some(128);
+        config.num_dense_layers = Some(2);
+        // Keep a plain (unquantized) embedding so this test isolates the
+        // dense-MLP delta.
+        config.vocab_size = 32;
+
+        let hidden = config.hidden_size as i64;
+        let ff = config.intermediate_size.unwrap() as i64;
+
+        let make_quant = |out: i64, inf: i64| {
+            let n = (out * inf) as usize;
+            let data: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+            let dense = MxArray::from_float32(&data, &[out, inf])
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16");
+            quantize_affine(&dense, 64, 4)
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        // Plain bf16 embedding (no .scales).
+        params.insert(
+            "embed_tokens.weight".into(),
+            bf16(&[config.vocab_size as i64, hidden], 0.01),
+        );
+
+        let mut expected_dense_extra: u64 = 0;
+        for l in 0..2 {
+            for (proj, out, inf) in [
+                ("gate_proj", ff, hidden),
+                ("up_proj", ff, hidden),
+                ("down_proj", hidden, ff),
+            ] {
+                let (qw, qs, qb) = make_quant(out, inf);
+                let base = format!("layers.{l}.feed_forward.{proj}");
+                params.insert(format!("{base}.weight"), qw);
+                params.insert(format!("{base}.scales"), qs);
+                params.insert(format!("{base}.biases"), qb);
+                let dense = (out as u64) * (inf as u64) * 2;
+                let packed = packed_group_bytes(&params, &base).expect("packed proj");
+                expected_dense_extra =
+                    expected_dense_extra.saturating_add(dense.saturating_sub(packed));
+            }
+        }
+
+        let packed = packed_only_bytes(&params);
+        let counted = compute_weight_bytes(&params, &config);
+        assert!(
+            counted >= packed + expected_dense_extra,
+            "compute_weight_bytes must add the dense-MLP deltas for the {} dense layers: \
+             counted={counted}, packed={packed}, expected_extra={expected_dense_extra}",
+            config.num_dense_layers.unwrap()
+        );
+        assert!(
+            expected_dense_extra > 0,
+            "test setup error: expected a positive dense-MLP delta"
+        );
+    }
+
+    #[test]
+    fn weight_bytes_equals_packed_sum_for_pure_bf16_checkpoint() {
+        // No `.scales` anywhere → no dense dequant residency → the resident
+        // footprint IS the packed sum. The helper must not over-count here.
+        let config = tiny_moe_config(true);
+        let params = full_bf16_moe_params();
+        let packed = packed_only_bytes(&params);
+        let counted = compute_weight_bytes(&params, &config);
+        assert_eq!(
+            counted, packed,
+            "pure-bf16 checkpoint must count exactly the packed sum (no dense delta)"
+        );
+    }
+
+    // ===== Task B: w1/w2/w3 quant-alias normalization + validation =====
+
+    #[test]
+    fn sanitize_renames_w1_quant_group_to_gate_proj() {
+        // A quantized DENSE-style checkpoint ships the FFN projection under
+        // `feed_forward.w1.{weight,scales,biases}`. All three must be renamed
+        // to `gate_proj.*` (not just `.weight`), keeping the quant group whole.
+        // Use a dense config (no MoE) so `sanitize_weights`' expert-stacking
+        // pass is a no-op.
+        let mut config = tiny_moe_config(true);
+        config.num_experts = None; // dense: is_moe() == false
+        config.num_dense_layers = None;
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("model.layers.0.feed_forward.w1.weight".into(), dummy());
+        params.insert("model.layers.0.feed_forward.w1.scales".into(), dummy());
+        params.insert("model.layers.0.feed_forward.w1.biases".into(), dummy());
+
+        let out = sanitize_weights(&mut params, &config).expect("sanitize");
+
+        for suffix in ["weight", "scales", "biases"] {
+            assert!(
+                out.contains_key(&format!("layers.0.feed_forward.gate_proj.{suffix}")),
+                "w1.{suffix} must be renamed to gate_proj.{suffix}"
+            );
+            assert!(
+                !out.contains_key(&format!("layers.0.feed_forward.w1.{suffix}")),
+                "no w1.{suffix} alias may survive sanitize"
+            );
+        }
+        // w2 -> down_proj, w3 -> up_proj likewise (spot-check the mapping).
+    }
+
+    #[test]
+    fn sanitize_renames_w2_and_w3_quant_groups() {
+        let mut config = tiny_moe_config(true);
+        config.num_experts = None;
+        config.num_dense_layers = None;
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        for (alias, proj) in [("w2", "down_proj"), ("w3", "up_proj")] {
+            for suffix in ["weight", "scales", "biases"] {
+                params.insert(
+                    format!("model.layers.1.feed_forward.{alias}.{suffix}"),
+                    dummy(),
+                );
+                let _ = proj;
+            }
+        }
+
+        let out = sanitize_weights(&mut params, &config).expect("sanitize");
+        for (alias, proj) in [("w2", "down_proj"), ("w3", "up_proj")] {
+            for suffix in ["weight", "scales", "biases"] {
+                assert!(
+                    out.contains_key(&format!("layers.1.feed_forward.{proj}.{suffix}")),
+                    "{alias}.{suffix} must become {proj}.{suffix}"
+                );
+                assert!(
+                    !out.contains_key(&format!("layers.1.feed_forward.{alias}.{suffix}")),
+                    "no {alias}.{suffix} alias may survive sanitize"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validation_rejects_orphaned_feed_forward_w1_scales() {
+        // A surviving (un-renamed) `feed_forward.w1.scales` — e.g. an orphan
+        // companion of a `.weight` that was never renamed — must be rejected
+        // by `validate_mandatory_weights` (fail loud on unhandled alias).
+        let config = tiny_moe_config(true);
+        let mut p = validation_scaffold();
+        insert_moe_proj(&mut p, 0, /* quantized */ true);
+        insert_moe_proj(&mut p, 1, /* quantized */ true);
+        // Inject an orphaned quant companion under the w1 alias.
+        p.insert("layers.0.feed_forward.w1.scales".into(), dummy());
+        let err = validate_mandatory_weights(&p, &config, 2)
+            .expect_err("orphaned feed_forward.w1.scales must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("w1") && msg.contains("alias"),
+            "error should name the stray w1 alias, got: {msg}"
+        );
     }
 }
