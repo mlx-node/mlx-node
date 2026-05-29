@@ -3687,6 +3687,13 @@ mod paged_adapter_construction_tests {
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
             use_block_paged_cache: use_block_paged,
+            intermediate_size: None,
+            moe_intermediate_size: None,
+            num_experts: None,
+            num_experts_per_tok: None,
+            num_dense_layers: None,
+            norm_topk_prob: true,
+            use_expert_bias: true,
         }
     }
 
@@ -3864,7 +3871,9 @@ mod paged_adapter_construction_tests {
                 }
             }
 
-            let mlp = &mut layer.feed_forward;
+            let mlp = layer
+                .dense_mlp_mut()
+                .expect("paged_tiny_config layers are all dense MLPs");
             let w = mlp.get_gate_proj_weight();
             mlp.set_gate_proj_weight(&cast(&w)).expect("set gate");
             let w = mlp.get_up_proj_weight();

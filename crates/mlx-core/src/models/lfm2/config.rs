@@ -91,6 +91,44 @@ pub struct Lfm2Config {
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,
+
+    // ===== LFM2.5 MoE options (`model_type: "lfm2_moe"`, e.g. lfm2.5-8b-a1b) =====
+    // All optional/defaulted so existing DENSE LFM2 checkpoints parse unchanged.
+    // Mirrors `mlx-lm/mlx_lm/models/lfm2_moe.py` ModelArgs.
+    /// MLP intermediate size for the DENSE-in-MoE layers (`layer_idx <
+    /// num_dense_layers`). Used DIRECTLY (no 2/3 `computed_ff_dim()` shrink).
+    /// Only present on MoE checkpoints.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub intermediate_size: Option<i32>,
+
+    /// Per-expert MLP intermediate size for the sparse MoE layers.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub moe_intermediate_size: Option<i32>,
+
+    /// Total number of routed experts.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub num_experts: Option<i32>,
+
+    /// Top-k experts selected per token.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub num_experts_per_tok: Option<i32>,
+
+    /// Number of leading DENSE layers before MoE layers begin.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub num_dense_layers: Option<i32>,
+
+    /// Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`).
+    #[serde(default = "default_true")]
+    pub norm_topk_prob: bool,
+
+    /// Add the learned per-expert bias to the post-softmax gates BEFORE top-k.
+    #[serde(default = "default_true")]
+    pub use_expert_bias: bool,
 }
 
 impl Lfm2Config {
@@ -134,6 +172,23 @@ impl Lfm2Config {
             .enumerate()
             .filter_map(|(i, t)| if t == "full_attention" { Some(i) } else { None })
             .collect()
+    }
+
+    /// Whether this is an LFM2.5 MoE checkpoint (`model_type: "lfm2_moe"`).
+    ///
+    /// Detected via the presence of `num_experts` in config.json — dense
+    /// LFM2 checkpoints never carry it.
+    pub fn is_moe(&self) -> bool {
+        self.num_experts.is_some()
+    }
+
+    /// Whether the layer at `idx` uses a sparse MoE feed-forward block.
+    ///
+    /// MoE layers are those at or after `num_dense_layers` in a MoE
+    /// checkpoint (`mlx-lm` `lfm2_moe.py:238-245`). Dense checkpoints always
+    /// return false.
+    pub fn is_moe_layer(&self, idx: usize) -> bool {
+        self.is_moe() && (idx as i32) >= self.num_dense_layers.unwrap_or(0)
     }
 }
 
@@ -183,6 +238,13 @@ mod tests {
             paged_cache_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
+            intermediate_size: None,
+            moe_intermediate_size: None,
+            num_experts: None,
+            num_experts_per_tok: None,
+            num_dense_layers: None,
+            norm_topk_prob: true,
+            use_expert_bias: true,
         }
     }
 
@@ -301,5 +363,93 @@ mod tests {
         assert_eq!(cfg.use_block_paged_cache, Some(true));
         assert_eq!(cfg.paged_block_size, Some(16));
         assert_eq!(cfg.paged_cache_memory_mb, Some(256));
+    }
+
+    /// A dense LFM2 config (no MoE keys) must keep `is_moe()` false thanks to
+    /// serde defaults, and every layer must be non-MoE.
+    #[test]
+    fn test_dense_config_is_not_moe() {
+        let cfg = test_config();
+        assert!(!cfg.is_moe());
+        for i in 0..(cfg.num_hidden_layers as usize) {
+            assert!(!cfg.is_moe_layer(i));
+        }
+        // serde defaults preserved
+        assert!(cfg.norm_topk_prob);
+        assert!(cfg.use_expert_bias);
+        assert_eq!(cfg.num_experts, None);
+    }
+
+    /// A MoE config.json with all 7 new fields deserializes and the
+    /// `is_moe()`/`is_moe_layer()` predicates split dense vs MoE layers at
+    /// `num_dense_layers`.
+    #[test]
+    fn test_moe_config_deserialize_and_predicates() {
+        let json = r#"{
+            "model_type": "lfm2_moe",
+            "vocab_size": 65536,
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "max_position_embeddings": 128000,
+            "norm_eps": 1e-5,
+            "conv_bias": false,
+            "conv_L_cache": 3,
+            "block_dim": 2048,
+            "block_ff_dim": 12288,
+            "layer_types": ["conv","conv","full_attention","conv"],
+            "intermediate_size": 8192,
+            "moe_intermediate_size": 1024,
+            "num_experts": 32,
+            "num_experts_per_tok": 4,
+            "num_dense_layers": 2,
+            "norm_topk_prob": true,
+            "use_expert_bias": true
+        }"#;
+        let cfg: Lfm2Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.is_moe());
+        assert_eq!(cfg.intermediate_size, Some(8192));
+        assert_eq!(cfg.moe_intermediate_size, Some(1024));
+        assert_eq!(cfg.num_experts, Some(32));
+        assert_eq!(cfg.num_experts_per_tok, Some(4));
+        assert_eq!(cfg.num_dense_layers, Some(2));
+        // layers 0,1 dense; 2,3 MoE
+        assert!(!cfg.is_moe_layer(0));
+        assert!(!cfg.is_moe_layer(1));
+        assert!(cfg.is_moe_layer(2));
+        assert!(cfg.is_moe_layer(3));
+    }
+
+    /// `norm_topk_prob` / `use_expert_bias` round-trip false through serde.
+    #[test]
+    fn test_moe_bool_flags_round_trip_false() {
+        let json = r#"{
+            "vocab_size": 100,
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "norm_eps": 1e-5,
+            "conv_bias": false,
+            "conv_L_cache": 3,
+            "block_dim": 64,
+            "block_ff_dim": 64,
+            "layer_types": ["conv", "full_attention"],
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "num_dense_layers": 0,
+            "moe_intermediate_size": 32,
+            "intermediate_size": 64,
+            "norm_topk_prob": false,
+            "use_expert_bias": false
+        }"#;
+        let cfg: Lfm2Config = serde_json::from_str(json).unwrap();
+        assert!(!cfg.norm_topk_prob);
+        assert!(!cfg.use_expert_bias);
+        // num_dense_layers=0 → every layer is MoE
+        assert!(cfg.is_moe_layer(0));
+        assert!(cfg.is_moe_layer(1));
     }
 }

@@ -8,6 +8,7 @@ use super::attention::Lfm2Attention;
 use super::config::Lfm2Config;
 use super::layer_cache::Lfm2LayerCache;
 use super::short_conv::ShortConv;
+use super::sparse_moe::Lfm2SparseMoeBlock;
 
 /// Per-layer routing kind for the paged dispatch.
 ///
@@ -33,6 +34,27 @@ pub(crate) enum OperatorType {
     Attention(Lfm2Attention),
 }
 
+/// Per-layer feed-forward block.
+///
+/// Dense LFM2 checkpoints (and the first `num_dense_layers` layers of a MoE
+/// checkpoint) use a standard SwiGLU `MLP`; the remaining MoE-checkpoint
+/// layers use a sparse top-k `Lfm2SparseMoeBlock`. Both expose the same
+/// `forward(&MxArray) -> Result<MxArray>` contract so the residual path in
+/// the decoder layer is identical.
+pub(crate) enum FeedForward {
+    Dense(MLP),
+    Moe(Lfm2SparseMoeBlock),
+}
+
+impl FeedForward {
+    fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        match self {
+            FeedForward::Dense(mlp) => mlp.forward(x),
+            FeedForward::Moe(moe) => moe.forward(x),
+        }
+    }
+}
+
 /// A single decoder layer in the LFM2 model.
 ///
 /// Follows `lfm2.py:197-234` (Lfm2DecoderLayer class).
@@ -43,7 +65,7 @@ pub(crate) enum OperatorType {
 ///   out = h + feed_forward(ffn_norm(h))
 pub struct Lfm2DecoderLayer {
     pub(crate) operator: OperatorType,
-    pub(crate) feed_forward: MLP,
+    pub(crate) feed_forward: FeedForward,
     pub(crate) operator_norm: RMSNorm,
     pub(crate) ffn_norm: RMSNorm,
 }
@@ -71,9 +93,25 @@ impl Lfm2DecoderLayer {
             OperatorType::Conv(ShortConv::new(h, config.conv_l_cache, config.conv_bias)?)
         };
 
-        // MLP uses the auto-adjusted ff_dim
-        let ff_dim = config.computed_ff_dim();
-        let feed_forward = MLP::new(h as u32, ff_dim as u32)?;
+        // Per-layer feed-forward: sparse MoE for MoE-checkpoint layers
+        // (`layer_idx >= num_dense_layers`), dense SwiGLU otherwise.
+        let feed_forward = if config.is_moe_layer(layer_idx) {
+            FeedForward::Moe(Lfm2SparseMoeBlock::new(config)?)
+        } else {
+            // Dense-in-MoE layers use `intermediate_size` DIRECTLY (no 2/3
+            // `computed_ff_dim()` shrink — see lfm2_moe.py MLP). Pure-dense
+            // checkpoints keep the existing `computed_ff_dim()` path.
+            let ff_dim = if config.is_moe() {
+                config.intermediate_size.ok_or_else(|| {
+                    Error::from_reason(
+                        "lfm2_moe dense layer requires intermediate_size in config.json",
+                    )
+                })?
+            } else {
+                config.computed_ff_dim()
+            };
+            FeedForward::Dense(MLP::new(h as u32, ff_dim as u32)?)
+        };
 
         let eps = Some(config.norm_eps);
         let operator_norm = RMSNorm::new(h as u32, eps)?;
@@ -229,8 +267,26 @@ impl Lfm2DecoderLayer {
         }
     }
 
-    /// Get a mutable reference to the feed-forward MLP.
-    pub fn feed_forward_mut(&mut self) -> &mut MLP {
-        &mut self.feed_forward
+    /// Get a mutable reference to the dense feed-forward MLP.
+    /// Returns `None` if this layer uses a sparse MoE block.
+    pub fn dense_mlp_mut(&mut self) -> Option<&mut MLP> {
+        match &mut self.feed_forward {
+            FeedForward::Dense(m) => Some(m),
+            FeedForward::Moe(_) => None,
+        }
+    }
+
+    /// Get a mutable reference to the sparse MoE feed-forward block.
+    /// Returns `None` if this layer uses a dense MLP.
+    pub fn moe_mut(&mut self) -> Option<&mut Lfm2SparseMoeBlock> {
+        match &mut self.feed_forward {
+            FeedForward::Moe(m) => Some(m),
+            FeedForward::Dense(_) => None,
+        }
+    }
+
+    /// Whether this layer's feed-forward is a sparse MoE block.
+    pub fn is_moe_layer(&self) -> bool {
+        matches!(self.feed_forward, FeedForward::Moe(_))
     }
 }

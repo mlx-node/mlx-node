@@ -3456,6 +3456,24 @@ export interface Lfm2Config {
    * fully flat `Lfm2LayerCache` path on all layers.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * MLP intermediate size for the DENSE-in-MoE layers (`layer_idx <
+   * num_dense_layers`). Used DIRECTLY (no 2/3 `computed_ff_dim()` shrink).
+   * Only present on MoE checkpoints.
+   */
+  intermediateSize?: number | undefined;
+  /** Per-expert MLP intermediate size for the sparse MoE layers. */
+  moeIntermediateSize?: number | undefined;
+  /** Total number of routed experts. */
+  numExperts?: number | undefined;
+  /** Top-k experts selected per token. */
+  numExpertsPerTok?: number | undefined;
+  /** Number of leading DENSE layers before MoE layers begin. */
+  numDenseLayers?: number | undefined;
+  /** Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`). */
+  normTopkProb: boolean;
+  /** Add the learned per-expert bias to the post-softmax gates BEFORE top-k. */
+  useExpertBias: boolean;
 }
 
 export interface MemorySnapshot {
