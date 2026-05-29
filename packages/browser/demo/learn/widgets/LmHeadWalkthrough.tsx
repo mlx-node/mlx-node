@@ -6,7 +6,7 @@ import * as React from 'react';
  *
  *   last_hidden ∈ R^d    ×    embed_tokens.weight ∈ R^{V×d}^T  =  logits ∈ R^V
  *
- * For Qwen3.5-0.8B: d=1024, V=151,936. The animation uses symbolic dimensions
+ * For Qwen3.5-0.8B: d=1024, V=248,320. The animation uses symbolic dimensions
  * (a short cell strip for the hidden state, a wide grid for the matrix, a
  * vocab-wide strip for the logits) — the point is the topology, not the
  * actual shapes.
@@ -18,7 +18,7 @@ import * as React from 'react';
  */
 
 const HIDDEN_CELLS = 12; // symbolic — stands in for d=1024
-const VOCAB_CELLS = 36; // symbolic — stands in for V=152k
+const VOCAB_CELLS = 36; // symbolic — stands in for V=248k
 
 export function LmHeadWalkthrough() {
   const [beamCol, setBeamCol] = React.useState(0);
@@ -87,7 +87,7 @@ export function LmHeadWalkthrough() {
         One matrix-vector product at the very top of the stack:{' '}
         <span className="font-mono">logits = last_hidden @ embed_tokens.weight.T</span>. For Qwen3.5-0.8B that means a
         <span className="font-mono"> [1, 1024]</span> vector multiplied by a{' '}
-        <span className="font-mono">[1024, 151936]</span> matrix → a <span className="font-mono">[1, 151936]</span>{' '}
+        <span className="font-mono">[1024, 248320]</span> matrix → a <span className="font-mono">[1, 248320]</span>{' '}
         output, one score per vocab token. The scan beam shows which output column is being produced.
       </p>
 
@@ -157,7 +157,7 @@ export function LmHeadWalkthrough() {
           fill="currentColor"
           fillOpacity={0.45}
         >
-          [d=1024, V=151,936]
+          [d=1024, V=248,320]
         </text>
         {/* matrix cells — color modulates by row+col so it doesn't look like a flat block */}
         {Array.from({ length: HIDDEN_CELLS }, (_, r) =>
@@ -224,7 +224,7 @@ export function LmHeadWalkthrough() {
           fill="currentColor"
           fillOpacity={0.45}
         >
-          V = 151,936 entries
+          V = 248,320 entries
         </text>
         {fakeLogits.map((v, i) => {
           const filled = i <= beamCol;

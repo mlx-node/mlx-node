@@ -105,6 +105,13 @@ export const CHAPTERS: ChapterMeta[] = [
     blurb: 'LR warmup + cosine, gradient clipping, weight decay — the engineering that makes training converge.',
     available: true,
   },
+  {
+    id: 'architecture',
+    number: 14,
+    title: 'The whole model, end to end',
+    blurb: 'Every piece on one interactive map — hover any block to see what it does.',
+    available: true,
+  },
 ];
 
 export function findChapter(id: string | null | undefined): ChapterMeta | null {

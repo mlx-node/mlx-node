@@ -70,7 +70,7 @@ export const learning: ChapterLearningData = {
     {
       term: 'intermediate_dim',
       definition:
-        'The widened scratch space inside the MLP. Usually around 3-4x hidden_dim. 3072 for Qwen3.5-0.8B (vs 1024 hidden).',
+        'The widened scratch space inside the MLP. Usually around 3-4x hidden_dim. 3584 for Qwen3.5-0.8B (vs 1024 hidden).',
     },
     {
       term: 'residual stream',
@@ -216,7 +216,7 @@ export function MlpChapterBody() {
         </p>
         <p>
           The intermediate dimension is where the model has its "scratch space" — usually around 4× the hidden dim
-          (Qwen3.5-0.8B uses 3072 for a 1024-dim hidden state). Most of the model's parameters live in these three
+          (Qwen3.5-0.8B uses 3584 for a 1024-dim hidden state). Most of the model's parameters live in these three
           matrices.
         </p>
 

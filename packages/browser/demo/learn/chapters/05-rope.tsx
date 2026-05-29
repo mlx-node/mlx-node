@@ -241,6 +241,13 @@ export function RopeChapterBody() {
           latex={String.raw`\begin{pmatrix} x'_{2i} \\ x'_{2i+1} \end{pmatrix} = \begin{pmatrix} \cos(m\theta_i) & -\sin(m\theta_i) \\ \sin(m\theta_i) & \cos(m\theta_i) \end{pmatrix} \begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix}`}
         />
         <p>
+          <strong>One implementation detail:</strong> the pairs are drawn here as neighbours (<code>x_0</code> with{' '}
+          <code>x_1</code>) for clarity, but Qwen3.5 — like most Llama/HF-style models — uses the mathematically
+          equivalent <em>rotate-half</em> layout: dimension <code>i</code> is paired with its counterpart{' '}
+          <code>i + d/2</code> in the second half of the vector. Same angles, same frequencies, same relative-position
+          property; only <em>which</em> two dimensions share a rotation differs.
+        </p>
+        <p>
           Rotation is <strong>unitary</strong> — it preserves vector norms — so RoPE doesn't change how big Q and K are,
           only where they point. The position information rides on the angle, not the magnitude.
         </p>

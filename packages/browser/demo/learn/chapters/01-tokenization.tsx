@@ -15,7 +15,7 @@ import { TrickyCases } from '../widgets/TrickyCases';
  * Chapter 1 — Tokenization.
  *
  * Plain TSX prose followed by `<TokenizerDemo />`, a live encode/decode
- * widget that calls the real Qwen3 tokenizer through the loaded worker.
+ * widget that calls the real Qwen3.5 tokenizer through the loaded worker.
  * When the model isn't loaded yet a yellow banner explains the fallback
  * and the chips render a heuristic whitespace split so the lesson is still
  * legible. The console.log convention mirrors chapter 3.
@@ -64,7 +64,7 @@ export const learning: ChapterLearningData = {
     },
     {
       term: 'vocabulary',
-      definition: 'The full set of tokens the model knows. Qwen3 ships about 152,000 entries.',
+      definition: 'The full set of tokens the model knows. Qwen3.5 ships about 248,320 entries.',
     },
     {
       term: 'special token',
@@ -156,8 +156,8 @@ export function TokenizationChapterBody() {
           Before a transformer can do anything with your sentence, the sentence has to be cut into pieces the model
           knows. Those pieces are called <strong>tokens</strong>, and the rule that decides where the cuts go is called
           the <em>tokenizer</em>. Tokens are not characters, and they are not words — they are something in between,
-          chosen by an algorithm called <strong>Byte-Pair Encoding (BPE)</strong>. The widget on the right runs Qwen3's
-          exact tokenizer in your browser. Type, watch the chips refresh.
+          chosen by an algorithm called <strong>Byte-Pair Encoding (BPE)</strong>. The widget on the right runs
+          Qwen3.5's exact tokenizer in your browser. Type, watch the chips refresh.
         </p>
 
         <h2>Why sub-words?</h2>
@@ -176,9 +176,10 @@ export function TokenizationChapterBody() {
           statistically frequent in the training corpus.
         </p>
 
-        <h2>What Qwen3 does specifically</h2>
+        <h2>What Qwen3.5 does specifically</h2>
         <p>
-          Qwen3 ships with a BPE tokenizer of roughly <strong>152,000</strong> entries. A few quirks are worth knowing:
+          Qwen3.5 ships with a BPE tokenizer of roughly <strong>248,320</strong> entries. A few quirks are worth
+          knowing:
         </p>
         <ul>
           <li>
@@ -189,9 +190,9 @@ export function TokenizationChapterBody() {
           </li>
           <li>
             <strong>Special tokens mark structure.</strong> Sequences like <code>&lt;|im_start|&gt;</code> and{' '}
-            <code>&lt;|im_end|&gt;</code> aren't text the model generates — they're chat-turn boundaries used by Qwen3's
-            chat template. The widget renders any token whose decoded text contains <code>&lt;|…|&gt;</code> with a
-            dashed border so you can spot them.
+            <code>&lt;|im_end|&gt;</code> aren't text the model generates — they're chat-turn boundaries used by
+            Qwen3.5's chat template. The widget renders any token whose decoded text contains <code>&lt;|…|&gt;</code>{' '}
+            with a dashed border so you can spot them.
           </li>
           <li>
             <strong>Multilingual coverage isn't uniform.</strong> Latin-script words are usually one or two tokens; CJK
@@ -433,7 +434,7 @@ export function TokenizerDemo({ workerRef, abortRef }: TokenizerDemoProps) {
           role="status"
           className="rounded-md border border-dashed border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
         >
-          Showing a whitespace split — load the model first to see the real Qwen3 BPE tokens.
+          Showing a whitespace split — load the model first to see the real Qwen3.5 BPE tokens.
         </div>
       ) : null}
       {status?.kind === 'fallback-error' ? (
@@ -487,7 +488,7 @@ function TokenChip({ token, index }: { token: TokenInfo; index: number }) {
   const idLabel = `id-tokenizer-demo-tok-${index}`;
   // Negative ids are synthesized by the heuristic fallback (no worker loaded).
   // Don't leak them into the tooltip or aria-described id label — they're
-  // implementation detail, not real Qwen3 vocab indices.
+  // implementation detail, not real Qwen3.5 vocab indices.
   const isFallback = token.id < 0;
   const title = isFallback
     ? `fallback · ${JSON.stringify(token.text)}`

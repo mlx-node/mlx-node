@@ -155,9 +155,9 @@ export function SamplingChapterBody() {
         <h1>Sampling: turning logits into the next token</h1>
         <p>
           Every forward pass through Qwen3.5 ends the same way: a vector of <strong>logits</strong> — one real number
-          per token in the model's vocabulary (~152k for Qwen3). A logit is an unbounded score: <em>how strongly</em>{' '}
-          the model recommends that token as the next one. Sampling is the step that turns that vector into a single
-          concrete choice.
+          per token in the model's vocabulary (~248k). A logit is an unbounded score: <em>how strongly</em> the model
+          recommends that token as the next one. Sampling is the step that turns that vector into a single concrete
+          choice.
         </p>
 
         <h2>Why not just pick the maximum?</h2>

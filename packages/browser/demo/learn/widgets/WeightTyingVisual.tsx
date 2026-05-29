@@ -100,7 +100,7 @@ export function WeightTyingVisual() {
       <p className="text-[12px] text-foreground/85">
         Qwen3.5-0.8B (and most modern decoder LLMs) sets <span className="font-mono">tie_word_embeddings = true</span>.
         That means the embedding matrix at the input and the LM head at the output are{' '}
-        <em>literally the same tensor</em> in memory — the same <span className="font-mono">[151,936 × 1024]</span> grid
+        <em>literally the same tensor</em> in memory — the same <span className="font-mono">[248,320 × 1024]</span> grid
         of floats, used once for <span className="font-mono">id → vector</span> and once (transposed) for{' '}
         <span className="font-mono">vector → vocab scores</span>.
       </p>
@@ -289,9 +289,9 @@ export function WeightTyingVisual() {
 
       <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-[12px]">
         <strong>Parameter savings:</strong> the matrix is{' '}
-        <span className="font-mono">151,936 × 1024 ≈ 155.6M floats</span>. Tying skips a second copy at the LM head — a
-        ~155M-parameter reduction on a 0.8B-parameter model. That's nearly 20% of the model, gone, just by reusing the
-        dictionary.
+        <span className="font-mono">248,320 × 1024 ≈ 254.3M floats</span>. Tying skips a second copy at the LM head — a
+        ~254M-parameter reduction on a 0.8B-parameter model. That's close to a third of the model, gone, just by reusing
+        the dictionary.
       </div>
 
       <p className="text-[11px] text-muted-foreground">

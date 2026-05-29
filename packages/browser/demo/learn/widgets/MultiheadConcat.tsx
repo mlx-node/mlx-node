@@ -310,7 +310,9 @@ export function MultiheadConcat() {
           W<sub>O</sub>
         </span>{' '}
         is the only place head outputs ever mix. This is also why <em>cross-head</em> reasoning is shallow — anything
-        heads have to share has to be encoded through the residual stream across multiple layers.
+        heads have to share has to be encoded through the residual stream across multiple layers. Widths here are
+        schematic for legibility — Qwen3.5-0.8B actually uses 8 heads of head-dim 256 (concat 8 × 256 = 2048), projected
+        back to the 1024-dim residual stream.
       </div>
     </div>
   );

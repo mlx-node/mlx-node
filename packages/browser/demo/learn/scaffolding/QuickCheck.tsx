@@ -201,21 +201,26 @@ function QuestionRow({ chapterId, question, index, selectedId, onSelect }: Quest
                 stateClass,
               ].join(' ')}
             >
-              <input
-                type="radio"
-                name={name}
-                value={opt.id}
-                checked={checked}
-                onChange={() => onSelect(opt.id)}
-                className="mt-0.5"
-              />
+              {/* Wrap the native radio in a box exactly one text line tall and
+                  center it there. Combined with the label's items-start, the dot
+                  lands on the optical center of the FIRST line regardless of how
+                  many lines the answer wraps to — no magic-pixel nudge. */}
+              <span className="flex h-5 shrink-0 items-center">
+                <input type="radio" name={name} value={opt.id} checked={checked} onChange={() => onSelect(opt.id)} />
+              </span>
               <span className="flex-1">{opt.label}</span>
               {isThisCorrect ? (
-                <span aria-label="correct answer" className="font-mono text-xs text-emerald-700 dark:text-emerald-400">
+                <span
+                  aria-label="correct answer"
+                  className="flex h-5 shrink-0 items-center font-mono text-xs text-emerald-700 dark:text-emerald-400"
+                >
                   correct
                 </span>
               ) : isThisWrongPick ? (
-                <span aria-label="incorrect" className="font-mono text-xs text-destructive">
+                <span
+                  aria-label="incorrect"
+                  className="flex h-5 shrink-0 items-center font-mono text-xs text-destructive"
+                >
                   not quite
                 </span>
               ) : null}

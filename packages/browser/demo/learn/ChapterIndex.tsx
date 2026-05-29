@@ -107,12 +107,22 @@ export function ChapterIndex({
 const NUM_LAYERS = 24;
 const DEFAULT_PROMPT = 'The cat sat on the';
 
-// Note: dedup boundary (echoTokenCount) and chat-template special-token
-// stopping now come straight from the Rust inspector (see
+// How many predicted tokens the reveal shows. This diagram runs the model
+// in *completion* mode (no chat template — see handleRun), and we measured
+// that greedy raw completion stays clean for the first few tokens, then
+// degenerates into verbatim repetition loops past ~5–6. So we cap the
+// revealed window: rainbow-highlight the first predicted token, show the
+// next few in muted gray, and stop before the loop sets in.
+const REVEAL_TOKEN_CAP = 5;
+
+// Note: dedup boundary (echoTokenCount) and special-token stopping come
+// straight from the Rust inspector (see
 // inspector.rs::AttentionRunNapi.echo_token_count and the stop_token_ids
 // set in qwen3_5/model.rs::run_for_inspector_sync). The frontend just
 // reads the structured count instead of regex-matching token text — the
-// tokenizer is the source of truth for what counts as a stop marker.
+// tokenizer is the source of truth for what counts as a stop marker. In
+// completion mode the model continues the prompt rather than restating
+// it, so echoTokenCount is ~always 0 and the dedup is a harmless no-op.
 
 /** A sub-stage inside one of the 24 layer cards. */
 type SubStage = { id: string; label: string; durationMs: number };
@@ -321,34 +331,34 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
           // inspector-aware forward path (see qwen3_5/model.rs ~L5474),
           // which `.eval()`s per-layer stats mid-pass and serializes the
           // GPU pipeline. With `maxNewTokens > 1` that turns one fast
-          // multi-token decode into N slow ones — easily blowing past
-          // the 60s default timeout for N=32. We don't render
-          // hidden-state stats in the v1 stacked-layer diagram anyway,
-          // so this is free perf. If a future tooltip needs L2 norms,
+          // multi-token decode into N slow ones. We don't render
+          // hidden-state stats in the stacked-layer diagram anyway, so
+          // this is free perf. If a future tooltip needs L2 norms,
           // re-enable it AND drop maxNewTokens back to 1 for that run.
           logits: { topK: 12 },
-          // Generate the *full assistant reply* (up to 32 tokens) instead
-          // of just one. With chat template applied the first decoded
-          // token is often a scaffold word like "The" or "Hello" — useless
-          // on its own. Letting the model continue for 32 tokens surfaces
-          // the actually-meaningful answer ("The cat sat on the floor.
-          // Cats often choose..."). The forward-pass animation is keyed
-          // to the *prefill* trace, which is captured once regardless of
-          // how many decode steps follow — so adding more tokens here
-          // doesn't change the per-layer visualization, only the bottom
-          // reveal text. Capped at INSPECTOR_MAX_NEW_TOKENS_CAP=64 in the
-          // Rust side; 32 is a comfortable middle ground that keeps the
-          // worker call sub-second on M3.
-          maxNewTokens: 32,
-          // Wrap the prompt in the model's Jinja2 chat template before
-          // tokenizing. The diagram is meant to show "what does the chat
-          // model do with this prompt?", not "what does raw text mode
-          // produce?" — without the template Qwen3.5-0.8B (an instruct-
-          // tuned model) falls out of its training distribution and the
-          // greedy argmax often lands on weird tokens like `1`. With the
-          // template the predicted tokens reflect what the assistant
-          // would actually say next.
-          applyChatTemplate: true,
+          // Short decode budget. This diagram teaches next-token
+          // prediction, so we reveal only the first few predicted tokens
+          // (rainbow first + gray continuation, capped at
+          // REVEAL_TOKEN_CAP). We measured greedy decoding on this model:
+          // the first ~5 tokens are clean and on-topic ("The cat sat on
+          // the" → " floor, and the cat"), but past ~5–6 tokens raw
+          // greedy generation degenerates into verbatim repetition loops.
+          // Generate a hair more than the reveal cap (8 vs 5) for echo
+          // headroom; the UI never shows past REVEAL_TOKEN_CAP. The
+          // forward-pass animation is keyed to the *prefill* trace
+          // (captured once), so the decode budget only affects the reveal
+          // text, not the per-layer visualization.
+          maxNewTokens: 8,
+          // Completion mode — do NOT wrap the prompt in the chat template.
+          // The diagram visualizes "one forward pass → the next token",
+          // i.e. text completion ("The cat sat on the" → " floor"), not a
+          // chat assistant's reply. We A/B-tested both: the chat template
+          // makes the model *reply* to the prompt instead of *continuing*
+          // it, which muddies the next-token lesson. (Contrary to an
+          // earlier note here, raw greedy does NOT emit junk tokens on
+          // natural prompts — its only failure mode is the long-window
+          // repetition handled by the short reveal cap above.)
+          applyChatTemplate: false,
         },
         {
           signal: ctrl.signal,
@@ -511,21 +521,29 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
   //     (qwen3_5/model.rs::run_for_inspector_sync builds stop_token_ids
   //      from the tokenizer and pops the stop token off the array)
   //   - reports `echoTokenCount` — the count of leading tokens whose
-  //     cumulative text matches the user's prompt as a prefix
-  //     (computed in run_for_inspector_sync using token-text equality,
-  //      not regex)
-  // The frontend just slices the array. That's the whole job.
+  //     cumulative text matches the prompt as a prefix. In completion
+  //     mode (no chat template) the model continues the prompt rather
+  //     than restating it, so this is ~always 0; we keep the slice so a
+  //     rare restatement still renders muted.
+  // The frontend slices the array, then caps the revealed window to
+  // REVEAL_TOKEN_CAP tokens (raw greedy loops past ~5 — see handleRun).
   const allTokens = run?.generatedTokens ?? (run ? [run.generatedToken] : []);
   const echoCountFromRust = run?.echoTokenCount ?? 0;
   const echoTokenCount = Math.max(0, Math.min(echoCountFromRust, allTokens.length));
   const echoTokens = allTokens.slice(0, echoTokenCount);
-  const newTokens = allTokens.slice(echoTokenCount);
-  const visibleTokenCount = allTokens.length;
+  const newTokens = allTokens.slice(echoTokenCount, echoTokenCount + REVEAL_TOKEN_CAP);
   const newTokenCount = newTokens.length;
-  const firstNewTokenInfo = newTokens[0] ?? run?.generatedToken;
-  // The deduped reply — everything past the prompt echo. This is what we
-  // show in the bottom reveal as the model's "new" contribution. We use
-  // `cleanupTokenText` (not `renderTokenDisplay`) to apply BPE cleanup
+  // The rainbow "next token" highlight must come from the SAME capped,
+  // post-echo window as the count (`newTokenCount`) and the rest-text
+  // (`dedupedReplyDisplay`) — never from `run.generatedToken` directly. If the
+  // continuation is empty (echo consumed the whole window, or a cached/compat
+  // run reported `generatedTokens: []`), this is `undefined`, so the highlight,
+  // the reveal text, and the count all agree on "nothing to show" rather than
+  // the ghost rendering an echoed token while the count reads 0.
+  const firstNewTokenInfo = newTokens[0];
+  // The predicted continuation — the capped window of completion tokens.
+  // This is what we show in the bottom reveal as the model's prediction.
+  // We use `cleanupTokenText` (not `renderTokenDisplay`) to apply BPE cleanup
   // (Ġ → space, newline glyphs) WITHOUT the 17-char truncation that
   // `renderTokenDisplay` enforces for single-token chips.
   const dedupedReplyDisplay = run ? cleanupTokenText(newTokens.map((t) => t.text).join('')) : '';
@@ -687,7 +705,6 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
           firstNewTokenTextFull={firstNewTokenTextFull}
           dedupedReplyDisplay={dedupedReplyDisplay}
           echoedPrefixDisplay={echoedPrefixDisplay}
-          visibleTokenCount={visibleTokenCount}
           newTokenCount={newTokenCount}
           showTokenReveal={showTokenReveal}
           reducedMotion={reducedMotion}
@@ -711,25 +728,23 @@ type StageStackProps = {
   activeLayer: { kind: 'layer'; index: number; subId: string } | null;
   fullAttentionLayerIndices: Set<number>;
   onOpenChapter: (chapterId: string) => void;
-  /** The first "new" generated token (past the prompt-echo prefix),
-   *  used for the highlighted lead-in of the reply reveal. Truncated to
-   *  17 chars + ellipsis for chip width. */
+  /** The first predicted token, used for the highlighted lead-in of the
+   *  reveal. Truncated to 17 chars + ellipsis for chip width. */
   firstNewTokenText: string;
-  /** Same first-new token with BPE cleanup but NO length truncation;
+  /** Same first predicted token with BPE cleanup but NO length truncation;
    *  used as the slice anchor against `dedupedReplyDisplay` so the
-   *  "rest" of the reply is computed against matching transform rules. */
+   *  "rest" of the continuation is computed against matching transform
+   *  rules. */
   firstNewTokenTextFull: string;
-  /** The assistant reply with the prompt-echo prefix stripped (BPE-
-   *  cleaned, special-token markers cut). When the model didn't echo
-   *  the prompt this is identical to the full reply. */
+  /** The predicted continuation (capped reveal window, BPE-cleaned). In
+   *  the rare case the completion restated the prompt, that echo prefix
+   *  is stripped from this. */
   dedupedReplyDisplay: string;
-  /** The portion of the reply that echoed the prompt (BPE-cleaned).
-   *  Rendered muted before the rainbow continuation so the learner can
-   *  see what the model literally echoed back. Empty when no echo. */
+  /** The portion of the completion that restated the prompt (BPE-cleaned).
+   *  Rendered muted before the rainbow continuation. Empty in the normal
+   *  completion case — the model continues rather than restates. */
   echoedPrefixDisplay: string;
-  /** Total number of model-generated tokens minus chat-template specials. */
-  visibleTokenCount: number;
-  /** Number of "new" tokens — tokens past the prompt-echo prefix. */
+  /** Number of predicted tokens shown (the reveal window, ≤ REVEAL_TOKEN_CAP). */
   newTokenCount: number;
   showTokenReveal: boolean;
   reducedMotion: boolean;
@@ -763,7 +778,6 @@ function StageStack({
   firstNewTokenTextFull,
   dedupedReplyDisplay,
   echoedPrefixDisplay,
-  visibleTokenCount,
   newTokenCount,
   showTokenReveal,
   reducedMotion,
@@ -856,24 +870,21 @@ function StageStack({
             />
           ))}
 
-          {/* Generated-reply reveal. Three layered pieces:
-                1. Echoed prefix (muted) — chat-tuned models often start
-                   their reply by repeating the user's input. Showing it
-                   greyed-out makes the echo legible while keeping the
-                   focus on the model's new contribution.
-                2. First "new" token highlighted in rainbow — the
-                   pedagogically interesting "next token" that isn't
-                   just an echo of the prompt.
-                3. Rest of the new reply in normal foreground tone.
-              When the model doesn't echo at all, piece 1 is empty and
-              the reveal degenerates to the original "first token rainbow
-              + rest muted" structure. */}
+          {/* Predicted-continuation reveal. Three layered pieces:
+                1. Echoed prefix (muted) — only present in the rare case
+                   the completion restates the prompt; greyed-out so it
+                   stays legible without stealing focus. Empty in the
+                   normal completion case.
+                2. First predicted token highlighted in rainbow — the
+                   "next token" this whole diagram is about.
+                3. The next few predicted tokens in normal foreground
+                   tone (the window is capped at REVEAL_TOKEN_CAP). */}
           <div
             className="mt-2 flex flex-col items-center gap-1 transition-opacity duration-300"
             style={{ opacity: showTokenReveal ? 1 : 0 }}
             aria-hidden={!showTokenReveal}
           >
-            <span className="font-mono text-[11px] text-muted-foreground">model reply →</span>
+            <span className="font-mono text-[11px] text-muted-foreground">next tokens →</span>
             <span
               className="max-w-[42rem] rounded-md border border-primary/60 bg-primary/10 px-3 py-1.5 text-center font-mono text-sm font-semibold text-foreground"
               data-stage-id="generated-reply"
@@ -886,9 +897,7 @@ function StageStack({
             </span>
             <span className="font-mono text-[10px] text-muted-foreground/70">
               {echoedPrefixDisplay ? 'first new token highlighted · ' : 'first token highlighted · '}
-              {newTokenCount} new
-              {visibleTokenCount > newTokenCount ? ` / ${visibleTokenCount} total` : ''} token
-              {newTokenCount === 1 ? '' : 's'}
+              {newTokenCount} predicted token{newTokenCount === 1 ? '' : 's'}
             </span>
           </div>
         </div>

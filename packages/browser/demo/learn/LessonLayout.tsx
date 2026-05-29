@@ -9,8 +9,13 @@ export type LessonLayoutProps = {
   current: ChapterMeta;
   /** The main reading column — typically a <Prose> with chapter text. */
   children: React.ReactNode;
-  /** The right-hand "Try it now" panel content. */
-  tryItPanel: React.ReactNode;
+  /**
+   * The right-hand "Try it now" panel content. When falsy, the third column is
+   * dropped entirely and the reading column widens to fill the space — used by
+   * chapters whose interactive content lives inline in the body (e.g. the
+   * full-width architecture poster).
+   */
+  tryItPanel?: React.ReactNode;
   onOpenChapter: (chapterId: string) => void;
   onBackToIndex: () => void;
   onOpenFreeChat: () => void;
@@ -41,6 +46,8 @@ export function LessonLayout({
     tryItRef.current?.scrollTo({ top: 0, behavior: 'instant' });
   }, [current.id]);
 
+  const hasTryIt = Boolean(tryItPanel);
+
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-background">
       {/* Header bar */}
@@ -62,23 +69,36 @@ export function LessonLayout({
         </Button>
       </div>
 
-      {/* Three-column body: sidebar | prose | try-it-now */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[220px_minmax(0,1fr)_minmax(0,1fr)]">
+      {/* Body: sidebar | prose | (optional) try-it-now. When the chapter has no
+          try-it panel, the reading column spans the full remaining width. */}
+      <div
+        className={[
+          'grid min-h-0 flex-1 grid-cols-1',
+          hasTryIt ? 'lg:grid-cols-[220px_minmax(0,1fr)_minmax(0,1fr)]' : 'lg:grid-cols-[220px_minmax(0,1fr)]',
+        ].join(' ')}
+      >
         <aside className="hidden border-r border-border lg:block">
           <ChapterSidebar currentId={current.id} onOpenChapter={onOpenChapter} />
         </aside>
 
         <main ref={mainRef} className="min-h-0 overflow-y-auto px-8 py-10">
-          {children}
+          {/* Chapters with a try-it panel keep their natural (narrow) reading
+              column from the 3-col grid. Panel-less chapters (the full-width
+              architecture poster) span the whole remaining width, which would
+              otherwise stretch prose and cards edge-to-edge on wide screens —
+              so cap and center the content to a comfortable poster width. */}
+          {hasTryIt ? children : <div className="mx-auto w-full max-w-[1400px]">{children}</div>}
         </main>
 
-        <section ref={tryItRef} className="min-h-0 overflow-y-auto border-l border-border bg-card/30 p-6">
-          <div className="mb-4 flex items-center gap-2">
-            <PlayIcon className="size-4 text-primary" />
-            <h2 className="text-sm font-semibold uppercase tracking-wider text-foreground">Try it now</h2>
-          </div>
-          {tryItPanel}
-        </section>
+        {hasTryIt ? (
+          <section ref={tryItRef} className="min-h-0 overflow-y-auto border-l border-border bg-card/30 p-6">
+            <div className="mb-4 flex items-center gap-2">
+              <PlayIcon className="size-4 text-primary" />
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-foreground">Try it now</h2>
+            </div>
+            {tryItPanel}
+          </section>
+        ) : null}
       </div>
     </div>
   );

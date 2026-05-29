@@ -426,7 +426,7 @@ export const learning: ChapterLearningData = {
     {
       term: 'embedding matrix',
       definition:
-        'Shape [vocab_size, hidden_dim]. For Qwen3.5-0.8B that is roughly 151,936 by 1,024 — about 156M parameters.',
+        'Shape [vocab_size, hidden_dim]. For Qwen3.5-0.8B that is roughly 248,320 by 1,024 — about 254M parameters.',
     },
     {
       term: 'hidden_dim',
@@ -449,7 +449,7 @@ export const learning: ChapterLearningData = {
     },
   ],
   takeaways: [
-    "The embedding matrix is roughly a fifth of a small model's parameters — it is not a free lookup table.",
+    "The embedding matrix is roughly a third of a small model's parameters — it is not a free lookup table.",
     'PCA is good for spotting clusters but its distances lie, so compute similarity in the full hidden_dim space.',
     'Tied input/output embeddings force one matrix to do double duty, which constrains what the geometry can encode.',
   ],
@@ -557,8 +557,8 @@ export function EmbeddingsChapterBody() {
         <p>
           The embedding lookup is a single matrix multiply (or, equivalently, a row gather): given an integer id, take
           row <code>id</code> of the embedding matrix. The matrix has shape <code>[vocab_size, hidden_dim]</code>. For
-          Qwen3.5-0.8B that's about <code>151,936 × 1,024 ≈ 156 million</code> parameters in this one table — roughly
-          one-fifth of the whole model.
+          Qwen3.5-0.8B that's about <code>248,320 × 1,024 ≈ 254 million</code> parameters in this one table — roughly a
+          third of the whole model.
         </p>
         <p>
           Modern LLMs (Qwen3.5 included) often <strong>tie</strong> the input embedding to the output unembedding (the{' '}
@@ -569,13 +569,13 @@ export function EmbeddingsChapterBody() {
         </p>
 
         <ShapeProblem
-          question="How big is Qwen3's embedding matrix? And how much does tied embeddings save?"
+          question="How big is Qwen3.5's embedding matrix? And how much does tied embeddings save?"
           formula="params = vocab_size × hidden_dim"
           values={[
-            { label: 'vocab_size', value: '152,064' },
+            { label: 'vocab_size', value: '248,320' },
             { label: 'hidden_dim', value: '1024' },
           ]}
-          answer="152,064 × 1024 ≈ 155.7M parameters — about 20% of Qwen3-0.8B's total 800M. Tied embeddings reuse this exact matrix for the output projection (unembed), saving another 155.7M. Without tying, the embedding+unembed alone would be roughly the size of a small standalone model."
+          answer="248,320 × 1024 ≈ 254.3M parameters — about a third of Qwen3.5-0.8B's total 800M. Tied embeddings reuse this exact matrix for the output projection (unembed), saving another 254.3M. Without tying, the embedding+unembed alone would be roughly the size of a small standalone model."
         />
 
         <h2>PCA: a 2D window into a 1024-dim space</h2>

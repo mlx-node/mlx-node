@@ -23,6 +23,7 @@ import { SamplingChapterBody, SamplingDemo } from '../learn/chapters/09-sampling
 import { KvCacheChapterBody, KvCacheDemo } from '../learn/chapters/10-kv-cache';
 import { TrainingChapterBody, TrainingDemo } from '../learn/chapters/12-training';
 import { ScalingChapterBody, ScalingDemo } from '../learn/chapters/13-scaling';
+import { ArchitectureChapterBody } from '../learn/chapters/14-architecture';
 import { LessonLayout } from '../learn/LessonLayout';
 import { triggerLocalPicker } from '../lib/local-model-picker';
 import { useFreeChat } from '../providers/free-chat';
@@ -93,6 +94,8 @@ function ChapterRouteComponent() {
         ) : chapter.id === 'scaling' ? (
           <ScalingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
         ) : null
+        /* 'architecture' renders its interactive poster inline in the body and
+           intentionally has no "Try it now" panel (the column is dropped). */
       }
     >
       {chapter.id === 'attention' ? (
@@ -121,6 +124,8 @@ function ChapterRouteComponent() {
         <TrainingChapterBody />
       ) : chapter.id === 'scaling' ? (
         <ScalingChapterBody />
+      ) : chapter.id === 'architecture' ? (
+        <ArchitectureChapterBody />
       ) : (
         <div className="text-muted-foreground">This chapter is not yet authored.</div>
       )}

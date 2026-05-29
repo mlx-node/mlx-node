@@ -5,7 +5,7 @@ import * as React from 'react';
  * matrix multiplications, so the "wide intermediate scratch space" claim
  * has a visual referent.
  *
- * We use a symbolic 6 → 12 → 6 layout (not Qwen's 1024 → 3072 → 1024, which
+ * We use a symbolic 6 → 12 → 6 layout (not Qwen's 1024 → 3584 → 1024, which
  * would be an unreadable carpet of lines). The dual gate/up paths into the
  * elementwise product, then down_proj back to hidden, are all drawn — the
  * topology is what we're teaching, not the dimensions.
@@ -52,7 +52,7 @@ export function FfnNeurons() {
       <p className="text-[12px] text-foreground/85">
         The matmul view above tells you the dimensions. The neuron view tells you the <em>topology</em>: two parallel
         wide projections (the gate and the value), an element-wise product, and a narrow projection back. Symbolic
-        widths shown — Qwen3.5-0.8B uses <span className="font-mono">1024 → 3072 → 1024</span>.
+        widths shown — Qwen3.5-0.8B uses <span className="font-mono">1024 → 3584 → 1024</span>.
       </p>
       <svg
         viewBox={`0 0 ${W} ${H}`}
@@ -70,7 +70,7 @@ export function FfnNeurons() {
           fillOpacity={0.45}
           fontStyle="italic"
         >
-          schematic — 6 / 12 nodes shown, model uses 1024 / 3072
+          schematic — 6 / 12 nodes shown, model uses 1024 / 3584
         </text>
         {/* column headers */}
         <text x={xIn} y={14} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>

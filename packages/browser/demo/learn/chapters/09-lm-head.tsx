@@ -51,11 +51,11 @@ export const learning: ChapterLearningData = {
     {
       term: 'weight tying',
       definition:
-        'Reusing embed_tokens.weight as the LM head, so the input lookup and output projection share the same tensor (saves ~20% of params on small models).',
+        'Reusing embed_tokens.weight as the LM head, so the input lookup and output projection share the same tensor (saves a large fraction of params on small models).',
     },
     {
       term: 'vocabulary size (V)',
-      definition: 'Number of distinct tokens the tokenizer can emit. Qwen3.5 uses V = 151,936.',
+      definition: 'Number of distinct tokens the tokenizer can emit. Qwen3.5 uses V = 248,320.',
     },
     {
       term: 'hidden dim (d)',
@@ -71,7 +71,7 @@ export const learning: ChapterLearningData = {
   takeaways: [
     'The LM head is just one matmul: last_hidden @ embed_tokens.T → logits. Every vocab entry gets one score.',
     'Each column of the weight matrix is a learned "fingerprint" for one vocab token; the highest logit is the one most aligned with the hidden state.',
-    'Qwen3.5 ties embed_tokens.weight with lm_head.weight — the same ~155M-float tensor is used at the input lookup AND the output projection.',
+    'Qwen3.5 ties embed_tokens.weight with lm_head.weight — the same ~254M-float tensor is used at the input lookup AND the output projection.',
   ],
   exercise: {
     prompt:
@@ -85,12 +85,12 @@ export const learning: ChapterLearningData = {
       prompt: 'What is the shape of the LM head matrix for Qwen3.5-0.8B?',
       options: [
         { id: 'a', label: '[1024, 1024] — one hidden vector per token.' },
-        { id: 'b', label: '[151936, 1024] — one row per vocab token, of width equal to the hidden dim.' },
-        { id: 'c', label: '[151936, 151936] — a vocab × vocab transition matrix.' },
+        { id: 'b', label: '[248320, 1024] — one row per vocab token, of width equal to the hidden dim.' },
+        { id: 'c', label: '[248320, 248320] — a vocab × vocab transition matrix.' },
       ],
       correctId: 'b',
       explanation:
-        'The matrix has one row per vocab entry and one column per hidden dimension; the matmul against a [1, 1024] hidden state produces a [1, 151936] logit vector.',
+        'The matrix has one row per vocab entry and one column per hidden dimension; the matmul against a [1, 1024] hidden state produces a [1, 248320] logit vector.',
     },
     {
       id: 'q2-tying',
@@ -112,7 +112,7 @@ export const learning: ChapterLearningData = {
       ],
       correctId: 'b',
       explanation:
-        'With tying, the forward pass reads `embed_tokens.weight` for token-id → vector at the bottom, then re-uses its transpose at the top for vector → logits. Same ~155M floats, used twice.',
+        'With tying, the forward pass reads `embed_tokens.weight` for token-id → vector at the bottom, then re-uses its transpose at the top for vector → logits. Same ~254M floats, used twice.',
     },
     {
       id: 'q3-direction',
@@ -155,9 +155,9 @@ export function LmHeadChapterBody() {
         <MathDisplay latex={String.raw`\text{logits} = h_{\text{last}} \cdot W_{\text{lm}}^\top`} />
         <p>
           <code>h_last</code> is the last token's hidden state — shape <code>[1, 1024]</code> at decode time.{' '}
-          <code>W_lm</code> is the LM head weight matrix — shape <code>[V, d] = [151,936, 1024]</code> for Qwen3.5-0.8B.
-          The transpose makes it <code>[1024, 151,936]</code>; multiplying gives an output of shape{' '}
-          <code>[1, 151,936]</code> — one logit per token in the vocabulary.
+          <code>W_lm</code> is the LM head weight matrix — shape <code>[V, d] = [248,320, 1024]</code> for Qwen3.5-0.8B.
+          The transpose makes it <code>[1024, 248,320]</code>; multiplying gives an output of shape{' '}
+          <code>[1, 248,320]</code> — one logit per token in the vocabulary.
         </p>
         <p>
           The animation walks the matmul cell by cell. The scan beam highlights one output column at a time, with the
@@ -190,7 +190,7 @@ export function LmHeadChapterBody() {
         <p>
           Here's the surprising part. The matrix <code>W_lm</code> in the formula above isn't a separately-learned
           tensor. For Qwen3.5 (and most modern decoder LLMs sub-7B), it is <em>literally</em> the embedding matrix from
-          chapter 2 — the same <code>[151,936, 1024]</code> grid of floats that mapped token ids to vectors at the
+          chapter 2 — the same <code>[248,320, 1024]</code> grid of floats that mapped token ids to vectors at the
           bottom of the stack is reused (transposed) at the top.
         </p>
 
@@ -204,7 +204,7 @@ export function LmHeadChapterBody() {
           whenever the residual stream looks like that row — and <code>row_j · h</code> is exactly that test.
         </p>
         <p>
-          The practical win: a sub-billion-parameter model saves ~155M parameters (about 20% of the entire model) by not
+          The practical win: a sub-billion-parameter model saves ~254M parameters (close to a third of its total) by not
           duplicating the matrix. The trade-off: a small quality loss at very large scale, which is why GPT-style models
           beyond a few billion parameters sometimes <em>untie</em> the head. For Qwen3.5-0.8B, the savings dominate.
         </p>
