@@ -359,6 +359,120 @@ impl Qwen3Tokenizer {
         )
     }
 
+    /// Neutralize the HuggingFace `{% generation %}` / `{% endgeneration %}`
+    /// Jinja statement tags so a stock minijinja `Environment` can parse the
+    /// template.
+    ///
+    /// These block tags are a HuggingFace-specific extension that ONLY delimit
+    /// which emitted tokens are "assistant-generated" (for
+    /// `return_assistant_tokens_mask` during training). They render their body
+    /// verbatim and NEVER change the produced string. minijinja does not
+    /// implement them, so the LFM2.5 chat template
+    /// (`{%- generation -%}` … `{%- endgeneration -%}` inside the
+    /// `if message.role == "assistant"` branch) trips
+    /// `syntax error: unknown statement generation` at parse time.
+    ///
+    /// We rewrite each `generation`/`endgeneration` tag to a no-op
+    /// `{% set __hf_generation_noop = true %}` statement that PRESERVES the
+    /// exact leading/trailing whitespace-control dashes of the original, so
+    /// minijinja's whitespace trimming behaves identically and the rendered
+    /// output stays byte-identical to HuggingFace's renderer. Two sequential
+    /// no-op `set`s replacing a balanced open/close pair keep any enclosing
+    /// `if`/`for` balanced.
+    ///
+    /// The scan matches ONLY a statement tag whose sole keyword is the bare
+    /// word `generation` or `endgeneration`. It must never touch the
+    /// `add_generation_prompt` variable, `{{ ... }}` expressions, filters, or
+    /// any identifier that merely *contains* the substring "generation"
+    /// (e.g. `add_generation_prompt`, `generation_config`).
+    fn neutralize_generation_tags(template: &str) -> String {
+        // Fast path: nothing to rewrite if the whole word never appears.
+        if !template.contains("generation") {
+            return template.to_string();
+        }
+        let bytes = template.as_bytes();
+        let mut out = String::with_capacity(template.len());
+        // `last` marks the start of the not-yet-flushed verbatim run. Working
+        // on byte indices is safe here: a matching tag is ASCII-only and the
+        // `{%` we key on is itself ASCII, so every boundary we cut on lands on
+        // a char boundary of the original (valid UTF-8) string.
+        let mut last = 0usize;
+        let mut i = 0usize;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'{'
+                && bytes[i + 1] == b'%'
+                && let Some((replacement, consumed)) = Self::match_generation_tag(&bytes[i..])
+            {
+                out.push_str(&template[last..i]);
+                out.push_str(&replacement);
+                i += consumed;
+                last = i;
+                continue;
+            }
+            i += 1;
+        }
+        out.push_str(&template[last..]);
+        out
+    }
+
+    /// Try to match a `generation`/`endgeneration` statement tag at the start
+    /// of `s` (which begins with `{%`). On success returns the no-op
+    /// replacement string (preserving the original dash/whitespace-control
+    /// markers) and the number of bytes consumed from `s`. Returns `None` if
+    /// `s` does not start with such a tag.
+    fn match_generation_tag(s: &[u8]) -> Option<(String, usize)> {
+        debug_assert!(s.len() >= 2 && s[0] == b'{' && s[1] == b'%');
+        let mut p = 2usize;
+
+        // Optional leading whitespace-control dash directly after `{%`.
+        let lead_dash = s.get(p) == Some(&b'-');
+        if lead_dash {
+            p += 1;
+        }
+
+        // Optional whitespace before the keyword.
+        while s.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
+            p += 1;
+        }
+
+        // The bare keyword: `generation` or `endgeneration`.
+        let kw_start = p;
+        while s
+            .get(p)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            p += 1;
+        }
+        let keyword = &s[kw_start..p];
+        if keyword != b"generation" && keyword != b"endgeneration" {
+            return None;
+        }
+
+        // Optional whitespace after the keyword.
+        while s.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
+            p += 1;
+        }
+
+        // Optional trailing whitespace-control dash directly before `%}`.
+        let trail_dash = s.get(p) == Some(&b'-');
+        if trail_dash {
+            p += 1;
+        }
+
+        // Must close with `%}` — anything else means this wasn't a bare
+        // `generation`/`endgeneration` tag (e.g. it had arguments) so we
+        // leave it untouched.
+        if s.get(p) == Some(&b'%') && s.get(p + 1) == Some(&b'}') {
+            p += 2;
+            let open = if lead_dash { "{%-" } else { "{%" };
+            let close = if trail_dash { "-%}" } else { "%}" };
+            let replacement = format!("{} set __hf_generation_noop = true {}", open, close);
+            Some((replacement, p))
+        } else {
+            None
+        }
+    }
+
     /// Load tokenizer from file synchronously (for internal use)
     ///
     /// # Arguments
@@ -1035,7 +1149,13 @@ impl Qwen3Tokenizer {
             },
         );
 
-        env.add_template("chat", template_str)
+        // Neutralize HuggingFace `{% generation %}` / `{% endgeneration %}`
+        // block tags before parsing — minijinja doesn't implement them, and
+        // they never alter the rendered output (LFM2.5 et al. use them only to
+        // mark assistant-generated token spans for training masks).
+        let template_str = Self::neutralize_generation_tags(template_str);
+
+        env.add_template("chat", &template_str)
             .map_err(|e| format!("Template parse error: {}", e))?;
 
         let tmpl = env
@@ -1888,6 +2008,214 @@ mod tests {
         assert!(
             !extract_assistant(&r_after_stock).contains("<think>"),
             "stock gate (preserve_thinking=false) should drop <think> when a new user turn appends — sanity check on the control",
+        );
+    }
+
+    /// The HuggingFace `{% generation %}`/`{% endgeneration %}` block tags
+    /// (used by LFM2.5-8B-A1B) only mark assistant-generated token spans for
+    /// training masks — they render their body verbatim and never change the
+    /// output string. minijinja doesn't implement them, so we rewrite them to
+    /// no-op `set` statements before parsing. This proves the rewrite is
+    /// transparent: rendering the template with the tags present is
+    /// byte-identical to rendering it with the tags removed by hand, including
+    /// every whitespace-control dash.
+    #[test]
+    fn generation_tags_render_transparently() {
+        // Minimal template that wraps the assistant content in
+        // generation/endgeneration with the dash variant LFM2.5 ships.
+        let with_tags = "{%- for m in messages -%}{{- m.role -}}{%- if m.role == 'assistant' -%}{%- generation -%}{{- ':' + m.content -}}{%- endgeneration -%}{%- endif -%}{%- endfor -%}";
+        // The same template with the tags deleted by hand — the ground truth
+        // HuggingFace's renderer (which treats the tags as transparent)
+        // produces.
+        let without_tags = "{%- for m in messages -%}{{- m.role -}}{%- if m.role == 'assistant' -%}{{- ':' + m.content -}}{%- endif -%}{%- endfor -%}";
+
+        let msgs = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: None,
+                images: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "hello there".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: None,
+                images: None,
+            },
+        ];
+
+        let rendered_with = Qwen3Tokenizer::render_chat_template_jinja2(
+            with_tags, &msgs, None, false, None, "<bos>", "<eos>",
+        )
+        .expect("template with generation tags should parse and render");
+        let rendered_without = Qwen3Tokenizer::render_chat_template_jinja2(
+            without_tags,
+            &msgs,
+            None,
+            false,
+            None,
+            "<bos>",
+            "<eos>",
+        )
+        .expect("hand-stripped template should render");
+
+        assert_eq!(
+            rendered_with, rendered_without,
+            "generation/endgeneration tags must be a no-op on the rendered output",
+        );
+        // Sanity: the body is actually rendered (not swallowed).
+        assert_eq!(rendered_with, "userassistant:hello there");
+    }
+
+    /// Guard against a false positive: the `add_generation_prompt` VARIABLE
+    /// (and any identifier merely containing the substring "generation") must
+    /// NOT be rewritten by `neutralize_generation_tags`. If it were, the
+    /// `if add_generation_prompt` branch would break and the assistant prompt
+    /// prefix would be dropped or duplicated.
+    #[test]
+    fn add_generation_prompt_variable_is_untouched() {
+        let template = "{%- for m in messages -%}{{- m.content -}}{%- endfor -%}{%- if add_generation_prompt -%}<assistant>{%- endif -%}";
+        // The transform must leave this template completely unchanged.
+        assert_eq!(
+            Qwen3Tokenizer::neutralize_generation_tags(template),
+            template,
+            "add_generation_prompt and other 'generation'-containing identifiers must not be rewritten",
+        );
+
+        let msg = ChatMessage {
+            role: "user".to_string(),
+            content: "ping".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            images: None,
+        };
+        let with_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
+            template,
+            std::slice::from_ref(&msg),
+            None,
+            true,
+            None,
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        assert_eq!(with_prompt, "ping<assistant>");
+
+        let without_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
+            template,
+            std::slice::from_ref(&msg),
+            None,
+            false,
+            None,
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        assert_eq!(without_prompt, "ping");
+    }
+
+    /// Unit coverage of the scanner across every dash/whitespace variant and
+    /// the must-not-match cases, independent of a full render.
+    #[test]
+    fn neutralize_generation_tags_handles_all_variants() {
+        let cases = [
+            (
+                "{%- generation -%}",
+                "{%- set __hf_generation_noop = true -%}",
+            ),
+            ("{% generation %}", "{% set __hf_generation_noop = true %}"),
+            (
+                "{%- generation %}",
+                "{%- set __hf_generation_noop = true %}",
+            ),
+            (
+                "{% generation -%}",
+                "{% set __hf_generation_noop = true -%}",
+            ),
+            (
+                "{%- endgeneration -%}",
+                "{%- set __hf_generation_noop = true -%}",
+            ),
+            (
+                "{% endgeneration %}",
+                "{% set __hf_generation_noop = true %}",
+            ),
+            (
+                "{%-endgeneration-%}",
+                "{%- set __hf_generation_noop = true -%}",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                Qwen3Tokenizer::neutralize_generation_tags(input),
+                expected,
+                "variant `{input}` should rewrite to `{expected}`",
+            );
+        }
+
+        // Must-not-match: identifiers containing the substring, the variable,
+        // expressions, and tags with extra arguments.
+        let untouched = [
+            "{%- if add_generation_prompt -%}x{%- endif -%}",
+            "{{ generation_config }}",
+            "{{ generation }}",
+            "{%- set generation_count = 1 -%}",
+            "{%- for generation in generations -%}{%- endfor -%}",
+        ];
+        for input in untouched {
+            assert_eq!(
+                Qwen3Tokenizer::neutralize_generation_tags(input),
+                input,
+                "`{input}` must be left unchanged",
+            );
+        }
+    }
+
+    /// End-to-end: load the real LFM2.5-8B-A1B chat_template.jinja (which uses
+    /// `{%- generation -%}` / `{%- endgeneration -%}`), render a single
+    /// user-message conversation with `add_generation_prompt=true`, and assert
+    /// it parses, renders, and ends with the assistant prompt prefix. Skips
+    /// silently when the model isn't checked out locally.
+    #[test]
+    fn lfm2_full_template_renders_with_generation_tags() {
+        let path = "/Users/brooklyn/.cache/huggingface/models--LiquidAI--LFM2.5-8B-A1B/snapshots/e20b8981cea25d2758f541d2cdadccf4906334bd/chat_template.jinja";
+        let Ok(tmpl) = std::fs::read_to_string(path) else {
+            // Fixture not present on this machine — nothing to assert.
+            return;
+        };
+        // LFM2.5's template calls strftime_now() only inside the `if tools`
+        // branch, which we don't exercise here, so the stock env suffices.
+        let msgs = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello!".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            images: None,
+        }];
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            &tmpl, &msgs, None, true, None, "<bos>", "<eos>",
+        )
+        .unwrap_or_else(|e| panic!("LFM2.5 template render failed: {e}"));
+
+        assert!(
+            rendered.contains("<|im_start|>user\nHello!<|im_end|>"),
+            "rendered prompt missing user turn:\n{rendered}",
+        );
+        // Line 103-104 of the template: `add_generation_prompt` appends the
+        // assistant prompt prefix. Confirmed against the on-disk template.
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n"),
+            "rendered prompt must end with the assistant prompt prefix:\n{rendered}",
         );
     }
 
