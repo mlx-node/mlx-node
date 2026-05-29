@@ -360,6 +360,38 @@ fn sanitize_weights(
     Ok(sanitized)
 }
 
+/// The router/expert projection bases of a MoE layer that may carry a
+/// quantized `.scales` companion tensor: the router `gate` and the three
+/// stacked expert projections. Centralized so the quant-detection helper and
+/// the dense-branch stray-`.scales` rejection scan the identical key set.
+fn moe_proj_bases(prefix: &str) -> [String; 4] {
+    [
+        format!("{prefix}.feed_forward.gate"),
+        format!("{prefix}.feed_forward.switch_mlp.gate_proj"),
+        format!("{prefix}.feed_forward.switch_mlp.up_proj"),
+        format!("{prefix}.feed_forward.switch_mlp.down_proj"),
+    ]
+}
+
+/// Decide whether the MoE layer at `prefix` is quantized.
+///
+/// A layer is quantized iff ANY of its router/expert projections ships a
+/// `.scales` companion tensor — not just `switch_mlp.gate_proj.scales`. Keying
+/// off a single sentinel let a truncated/mixed checkpoint that happened to be
+/// missing exactly that one tensor (while still carrying packed uint32
+/// `.weight`s plus other `.scales`) misclassify as DENSE and silently load
+/// packed expert weights through the bf16 `SwitchLinear` setters, producing
+/// corrupted output instead of failing loud.
+///
+/// SHARED between `apply_weights` (the load path) and
+/// `validate_mandatory_weights` so the two can never diverge on the
+/// dense-vs-quantized determination.
+fn moe_layer_is_quantized(params: &HashMap<String, MxArray>, prefix: &str) -> bool {
+    moe_proj_bases(prefix)
+        .iter()
+        .any(|base| params.contains_key(&format!("{base}.scales")))
+}
+
 /// Apply sanitized weights to an Lfm2Inner.
 ///
 /// `quant_bits` / `quant_group_size` / `top_level_mode` / `per_layer_quant`
@@ -425,10 +457,12 @@ fn apply_weights(
             })?;
 
             // A quantized expert checkpoint ships pre-stacked
-            // `switch_mlp.{proj}.scales` alongside the packed `.weight`.
-            let is_quant = params.contains_key(&format!(
-                "{prefix}.feed_forward.switch_mlp.gate_proj.scales"
-            ));
+            // `switch_mlp.{proj}.scales` alongside the packed `.weight`. Detect
+            // via the SHARED `moe_layer_is_quantized` helper (ANY projection's
+            // `.scales`, not just `gate_proj`) so a truncated/mixed checkpoint
+            // missing one sentinel cannot smuggle packed weights through the
+            // dense setters. `validate_mandatory_weights` uses the same helper.
+            let is_quant = moe_layer_is_quantized(params, &prefix);
 
             // ----- router gate -----
             let gate_prefix = format!("{prefix}.feed_forward.gate");
@@ -479,6 +513,23 @@ fn apply_weights(
                     })?;
                 moe.set_switch_mlp(SwitchGLU::new_quantized(g, u, d));
             } else {
+                // DENSE (bf16) MoE branch. `is_quant` is false, so NO projection
+                // carries a `.scales`. Belt-and-braces: if a partial-quant
+                // checkpoint nonetheless ships a stray `.scales` on any
+                // router/expert projection, the bf16 setters would install the
+                // packed uint32 `.weight` as if it were a dense tensor and
+                // corrupt routing. `moe_layer_is_quantized` already guarantees
+                // none is present, but re-scan and fail loud rather than rely on
+                // that invariant holding across future edits.
+                for base in moe_proj_bases(&prefix) {
+                    if params.contains_key(&format!("{base}.scales")) {
+                        return Err(Error::from_reason(format!(
+                            "lfm2_moe: layer {i} classified bf16 (dense) but \
+                             '{base}.scales' is present (partial quantized \
+                             checkpoint) — refusing to load packed weights as bf16"
+                        )));
+                    }
+                }
                 if let Some(w) = params.get(&format!("{gate_prefix}.weight")) {
                     moe.set_gate_weight(w)?;
                 }
@@ -606,15 +657,17 @@ fn validate_mandatory_weights(
 
     // Validate a MoE projection as a COMPLETE group, recording precise missing
     // keys into `missing`. The `quantized` flag is the layer-level
-    // determination (presence of `switch_mlp.gate_proj.scales`) — it MUST match
-    // the apply path's `is_quant` branch so validation and load agree.
+    // determination from the SHARED `moe_layer_is_quantized` helper (ANY
+    // projection's `.scales`) — it MUST match the apply path's `is_quant`
+    // branch so validation and load agree.
     //
     // Every quantized switch-linear / linear builder in qwen3_5_moe requires
     // BOTH `.weight` AND `.scales` (they early-return `None` otherwise); affine
     // `.biases` is optional in those builders, so it is NOT mandated here.
     // Acceptance rules:
     //   - plain layer (`quantized=false`): each proj needs a plain `.weight`;
-    //     a stray `.scales` is harmless (apply path ignores it on this branch).
+    //     a stray `.scales` on ANY projection is REJECTED — it signals a
+    //     partial-quant checkpoint the dense apply path now refuses to load.
     //   - quantized layer (`quantized=true`): each proj — including the router
     //     gate — needs the FULL group (`.weight` AND `.scales`). A lone
     //     `.scales` or a plain-only `.weight` is REJECTED, because the
@@ -626,8 +679,17 @@ fn validate_mandatory_weights(
         if !has_weight {
             missing.push(format!("{base}.weight"));
         }
-        if quantized && !has_scales {
-            missing.push(format!("{base}.scales"));
+        if quantized {
+            if !has_scales {
+                missing.push(format!("{base}.scales"));
+            }
+        } else if has_scales {
+            // Dense layer carrying a stray `.scales`: partial-quant checkpoint.
+            // Mirror the apply path's fail-loud rejection so a misclassified
+            // layer can never load packed uint32 weights as bf16.
+            missing.push(format!(
+                "{base}.scales (unexpected: partial quantized checkpoint)"
+            ));
         }
     };
 
@@ -648,18 +710,15 @@ fn validate_mandatory_weights(
         // Feed-forward requirements differ for dense vs MoE layers.
         if config.is_moe_layer(i) {
             // Router gate + the three stacked expert projections. A layer is
-            // quantized iff its stacked `gate_proj.scales` is present — the
-            // SAME predicate the apply path uses for `is_quant`. On a quantized
-            // layer every projection (gate included) must be a full
-            // weight+scales group; on a plain layer each needs a plain weight.
-            // `expert_bias` is optional (the block zero-inits).
-            let gate = format!("{prefix}.feed_forward.gate");
-            let gp = format!("{prefix}.feed_forward.switch_mlp.gate_proj");
-            let up = format!("{prefix}.feed_forward.switch_mlp.up_proj");
-            let dp = format!("{prefix}.feed_forward.switch_mlp.down_proj");
-            let quantized = params.contains_key(&format!("{gp}.scales"));
-            for base in [&gate, &gp, &up, &dp] {
-                push_missing_proj(&mut missing, base, quantized);
+            // quantized iff ANY projection ships a `.scales` — the SAME
+            // `moe_layer_is_quantized` predicate the apply path uses for
+            // `is_quant`. On a quantized layer every projection (gate included)
+            // must be a full weight+scales group; on a plain layer each needs a
+            // plain weight and NO stray `.scales`. `expert_bias` is optional
+            // (the block zero-inits).
+            let quantized = moe_layer_is_quantized(params, &prefix);
+            for base in moe_proj_bases(&prefix) {
+                push_missing_proj(&mut missing, &base, quantized);
             }
         } else {
             for key in [
@@ -1169,6 +1228,59 @@ mod tests {
         assert!(
             msg.contains("up_proj.scales"),
             "error should name the missing scales half, got: {msg}"
+        );
+    }
+
+    /// Finding A regression: an otherwise-complete quantized MoE layer that is
+    /// missing ONLY `switch_mlp.gate_proj.scales` (the former single sentinel)
+    /// must still be detected as quantized — via the OTHER projections'
+    /// `.scales` (`up_proj`/`down_proj`/`gate`) — and REJECTED for the missing
+    /// `gate_proj.scales` half. Before the shared `moe_layer_is_quantized`
+    /// helper, dropping just that one key flipped the layer to "dense" and let
+    /// its packed uint32 `.weight`s load through the bf16 setters as garbage.
+    #[test]
+    fn validation_rejects_quantized_layer_missing_only_gate_proj_scales() {
+        let config = tiny_moe_config(true);
+        let mut p = validation_scaffold();
+        insert_moe_proj(&mut p, 0, /* quantized */ true);
+        insert_moe_proj(&mut p, 1, /* quantized */ true);
+        // Drop ONLY the old sentinel from layer 0; up_proj/down_proj/gate still
+        // carry their `.scales`, so the layer is unambiguously quantized.
+        p.remove("layers.0.feed_forward.switch_mlp.gate_proj.scales");
+        let err = validate_mandatory_weights(&p, &config, 2)
+            .expect_err("quantized layer missing only gate_proj.scales must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("gate_proj.scales"),
+            "error should name the missing gate_proj.scales half, got: {msg}"
+        );
+    }
+
+    /// Finding A regression: an otherwise-bf16 (dense) MoE layer carrying a
+    /// STRAY lone `.scales` on a single projection (and no packed sibling
+    /// scales elsewhere is required) is a partial-quant checkpoint and must be
+    /// REJECTED. The layer is detected quantized by `moe_layer_is_quantized`
+    /// (any `.scales`), so the remaining plain-only projections then fail the
+    /// complete-group check — either way validation must Err, never Ok.
+    #[test]
+    fn validation_rejects_dense_layer_with_stray_scales() {
+        let config = tiny_moe_config(true);
+        let mut p = validation_scaffold();
+        // Both layers bf16 (plain `.weight` only).
+        insert_moe_proj(&mut p, 0, /* quantized */ false);
+        insert_moe_proj(&mut p, 1, /* quantized */ false);
+        // Inject a single stray `.scales` on layer 1's up_proj — the rest of
+        // the layer is plain bf16.
+        p.insert(
+            "layers.1.feed_forward.switch_mlp.up_proj.scales".into(),
+            dummy(),
+        );
+        let err = validate_mandatory_weights(&p, &config, 2)
+            .expect_err("dense MoE layer with a stray .scales must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scales"),
+            "error should mention the stray scales, got: {msg}"
         );
     }
 }

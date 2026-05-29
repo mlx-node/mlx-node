@@ -394,25 +394,133 @@ impl Qwen3Tokenizer {
         let mut out = String::with_capacity(template.len());
         // `last` marks the start of the not-yet-flushed verbatim run. Working
         // on byte indices is safe here: a matching tag is ASCII-only and the
-        // `{%` we key on is itself ASCII, so every boundary we cut on lands on
-        // a char boundary of the original (valid UTF-8) string.
+        // `{%`/`{{`/`{#` we key on are themselves ASCII, so every boundary we
+        // cut on lands on a char boundary of the original (valid UTF-8) string.
         let mut last = 0usize;
         let mut i = 0usize;
         while i + 1 < bytes.len() {
-            if bytes[i] == b'{'
-                && bytes[i + 1] == b'%'
-                && let Some((replacement, consumed)) = Self::match_generation_tag(&bytes[i..])
-            {
-                out.push_str(&template[last..i]);
-                out.push_str(&replacement);
-                i += consumed;
-                last = i;
+            // The scanner only rewrites REAL statement tags at template
+            // top-level. Literal `{% generation %}` text that appears INSIDE a
+            // `{{ ... }}` expression, a `{# ... #}` comment, or a
+            // `{% raw %} ... {% endraw %}` block is rendered verbatim by Jinja,
+            // so rewriting it there would change the output bytes and break the
+            // byte-identical guarantee. Detect and SKIP those regions wholesale.
+            if bytes[i] == b'{' && bytes[i + 1] == b'{' {
+                // `{{ ... }}` expression: advance past the closing `}}`.
+                i = Self::skip_to_close(bytes, i + 2, b'}', b'}');
                 continue;
+            }
+            if bytes[i] == b'{' && bytes[i + 1] == b'#' {
+                // `{# ... #}` comment: advance past the closing `#}`.
+                i = Self::skip_to_close(bytes, i + 2, b'#', b'}');
+                continue;
+            }
+            if bytes[i] == b'{' && bytes[i + 1] == b'%' {
+                // A `{% raw %}` statement opens a verbatim block: skip the whole
+                // body (and the matching `{% endraw %}`) without rewriting.
+                if let Some(raw_consumed) = Self::match_keyword_tag(&bytes[i..], b"raw") {
+                    let body_start = i + raw_consumed;
+                    let after = Self::skip_to_endraw(bytes, body_start);
+                    i = after;
+                    continue;
+                }
+                // Top-level statement tag: attempt the generation rewrite.
+                if let Some((replacement, consumed)) = Self::match_generation_tag(&bytes[i..]) {
+                    out.push_str(&template[last..i]);
+                    out.push_str(&replacement);
+                    i += consumed;
+                    last = i;
+                    continue;
+                }
             }
             i += 1;
         }
         out.push_str(&template[last..]);
         out
+    }
+
+    /// Advance past a two-byte close delimiter (`c0 c1`, e.g. `}}` or `#}`)
+    /// starting the search at `from`. Returns the index just AFTER the close, or
+    /// `bytes.len()` if the delimiter never appears (unterminated region — we
+    /// then treat the rest of the template as opaque, which is correct: an
+    /// unterminated `{{`/`{#`/raw block is a template error minijinja would also
+    /// reject, and we must not rewrite anything inside it).
+    fn skip_to_close(bytes: &[u8], from: usize, c0: u8, c1: u8) -> usize {
+        let mut j = from;
+        while j + 1 < bytes.len() {
+            if bytes[j] == c0 && bytes[j + 1] == c1 {
+                return j + 2;
+            }
+            j += 1;
+        }
+        bytes.len()
+    }
+
+    /// Starting at `from` (just after a `{% raw %}` open tag), advance past the
+    /// matching `{% endraw %}` (handling the dash/whitespace variants exactly as
+    /// `match_keyword_tag` does). Returns the index just AFTER the `endraw` tag,
+    /// or `bytes.len()` if no `endraw` is found. Any `{% generation %}` text
+    /// between the two is left verbatim.
+    fn skip_to_endraw(bytes: &[u8], from: usize) -> usize {
+        let mut j = from;
+        while j + 1 < bytes.len() {
+            if bytes[j] == b'{'
+                && bytes[j + 1] == b'%'
+                && let Some(consumed) = Self::match_keyword_tag(&bytes[j..], b"endraw")
+            {
+                return j + consumed;
+            }
+            j += 1;
+        }
+        bytes.len()
+    }
+
+    /// Match a bare keyword statement tag (`{% <kw> %}`) at the start of `s`
+    /// (which must begin with `{%`), tolerating the optional leading/trailing
+    /// whitespace-control dashes and surrounding whitespace — the SAME grammar
+    /// `match_generation_tag` accepts. Returns the number of bytes consumed on a
+    /// match, else `None`. Used to recognize `raw`/`endraw` so verbatim blocks
+    /// are skipped without rewriting their body.
+    fn match_keyword_tag(s: &[u8], kw: &[u8]) -> Option<usize> {
+        if s.len() < 2 || s[0] != b'{' || s[1] != b'%' {
+            return None;
+        }
+        let mut p = 2usize;
+
+        // Optional leading whitespace-control dash directly after `{%`.
+        if s.get(p) == Some(&b'-') {
+            p += 1;
+        }
+        // Optional whitespace before the keyword.
+        while s.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
+            p += 1;
+        }
+        // The bare keyword token (alphanumeric / underscore run).
+        let kw_start = p;
+        while s
+            .get(p)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            p += 1;
+        }
+        if &s[kw_start..p] != kw {
+            return None;
+        }
+        // Optional whitespace after the keyword.
+        while s.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
+            p += 1;
+        }
+        // Optional trailing whitespace-control dash directly before `%}`.
+        if s.get(p) == Some(&b'-') {
+            p += 1;
+        }
+        // Must close with `%}` — anything else means extra arguments, so this
+        // is not the bare `raw`/`endraw` tag we recognize.
+        if s.get(p) == Some(&b'%') && s.get(p + 1) == Some(&b'}') {
+            Some(p + 2)
+        } else {
+            None
+        }
     }
 
     /// Try to match a `generation`/`endgeneration` statement tag at the start
@@ -2177,6 +2285,137 @@ mod tests {
                 "`{input}` must be left unchanged",
             );
         }
+    }
+
+    /// Finding B regression: literal `{% generation %}` text appearing INSIDE a
+    /// `{{ ... }}` expression or a `{% raw %} ... {% endraw %}` block is
+    /// rendered verbatim by Jinja, so the scanner must NOT rewrite it — doing so
+    /// would change the output bytes and break the byte-identical guarantee. A
+    /// `{# ... #}` comment is also a skip region. Meanwhile a REAL top-level
+    /// `{%- generation -%}...{%- endgeneration -%}` must still be neutralized.
+    #[test]
+    fn neutralize_generation_tags_is_region_aware() {
+        // 1. Literal tag text inside a `{{ ... }}` expression: PRESERVED.
+        let expr = r#"{{ "{% generation %}" }}"#;
+        assert_eq!(
+            Qwen3Tokenizer::neutralize_generation_tags(expr),
+            expr,
+            "literal `{{% generation %}}` inside a {{{{ ... }}}} expression must be preserved",
+        );
+
+        // 2. Literal tag text inside a `{% raw %} ... {% endraw %}` block:
+        // PRESERVED (both the open generation and the close endgeneration).
+        let raw = "{% raw %}{% generation %}{% endgeneration %}{% endraw %}";
+        assert_eq!(
+            Qwen3Tokenizer::neutralize_generation_tags(raw),
+            raw,
+            "literal generation tags inside a {{% raw %}} block must be preserved",
+        );
+
+        // 2b. Dash/whitespace variants of raw/endraw still bound the block.
+        let raw_dash = "{%- raw -%}{%- generation -%}{%- endraw -%}";
+        assert_eq!(
+            Qwen3Tokenizer::neutralize_generation_tags(raw_dash),
+            raw_dash,
+            "dash-variant {{%- raw -%}} block must preserve its body",
+        );
+
+        // 3. Literal tag text inside a `{# ... #}` comment: PRESERVED.
+        let comment = "{# {% generation %} #}";
+        assert_eq!(
+            Qwen3Tokenizer::neutralize_generation_tags(comment),
+            comment,
+            "literal generation tag inside a {{# ... #}} comment must be preserved",
+        );
+
+        // 4. A REAL top-level tag pair OUTSIDE any skip region is still
+        // neutralized — even when a raw block precedes it in the same template.
+        let mixed =
+            "{% raw %}{% generation %}{% endraw %}{%- generation -%}body{%- endgeneration -%}";
+        let expected = "{% raw %}{% generation %}{% endraw %}{%- set __hf_generation_noop = true -%}body{%- set __hf_generation_noop = true -%}";
+        assert_eq!(
+            Qwen3Tokenizer::neutralize_generation_tags(mixed),
+            expected,
+            "real top-level generation tags must still be neutralized; raw body preserved",
+        );
+    }
+
+    /// Finding B end-to-end: a template that emits literal `{% generation %}`
+    /// text via a `{{ ... }}` expression and a `{% raw %}` block must RENDER
+    /// with that literal text intact (byte-identical), while a real top-level
+    /// generation tag pair around the assistant content is transparent.
+    #[test]
+    fn generation_tags_inside_literals_render_byte_identical() {
+        // `with_scan` is what we feed the (rewriting) loader; `ground_truth` is
+        // the same template with the REAL top-level tags hand-stripped (Jinja's
+        // transparent semantics) and the literal text left exactly as-is.
+        let with_scan = concat!(
+            "{%- for m in messages -%}",
+            "{{- m.role -}}",
+            r#"{{ "{% generation %}" }}"#,
+            "{% raw %}{% generation %}{% endraw %}",
+            "{%- if m.role == 'assistant' -%}",
+            "{%- generation -%}{{- ':' + m.content -}}{%- endgeneration -%}",
+            "{%- endif -%}",
+            "{%- endfor -%}",
+        );
+        let ground_truth = concat!(
+            "{%- for m in messages -%}",
+            "{{- m.role -}}",
+            r#"{{ "{% generation %}" }}"#,
+            "{% raw %}{% generation %}{% endraw %}",
+            "{%- if m.role == 'assistant' -%}",
+            "{{- ':' + m.content -}}",
+            "{%- endif -%}",
+            "{%- endfor -%}",
+        );
+
+        let msgs = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: None,
+                images: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "hello there".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: None,
+                images: None,
+            },
+        ];
+
+        let rendered_with = Qwen3Tokenizer::render_chat_template_jinja2(
+            with_scan, &msgs, None, false, None, "<bos>", "<eos>",
+        )
+        .expect("template with literal generation tags should parse and render");
+        let rendered_truth = Qwen3Tokenizer::render_chat_template_jinja2(
+            ground_truth,
+            &msgs,
+            None,
+            false,
+            None,
+            "<bos>",
+            "<eos>",
+        )
+        .expect("ground-truth template should render");
+
+        assert_eq!(
+            rendered_with, rendered_truth,
+            "literal `{{% generation %}}` text must survive verbatim; real tags transparent",
+        );
+        // Sanity: the literal text is actually present in the output, once per
+        // message (the `{{ ... }}` expression and the raw block each emit it).
+        assert!(
+            rendered_with.contains("{% generation %}{% generation %}"),
+            "literal generation text must appear in the render:\n{rendered_with}",
+        );
     }
 
     /// End-to-end: load the real LFM2.5-8B-A1B chat_template.jinja (which uses
