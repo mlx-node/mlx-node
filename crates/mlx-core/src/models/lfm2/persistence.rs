@@ -1051,8 +1051,10 @@ fn packed_group_bytes(params: &HashMap<String, MxArray>, base: &str) -> Option<u
 ///      — it dominates the undercount (~`vocab × hidden × 2` bytes).
 ///   2. The **dense-MLP** projections. `MLP::forward` takes the legacy
 ///      `get_weight()` path (lfm2 never calls `finalize_gate_up`), which reads
-///      the dense dequant copy that `Linear::load_quantized` eagerly builds —
-///      materializing an `out × in` bf16 array per projection. The count of
+///      the dense dequant copy that `Linear::load_quantized` materializes —
+///      an `out × in` bf16 array per projection. Crucially, `Linear` ALSO
+///      RETAINS the packed weight/scales/biases in its quantized backend, so
+///      BOTH the packed group and the dense copy are resident. The count of
 ///      dense-MLP layers is `num_hidden_layers` for a PURE-DENSE checkpoint
 ///      (every layer is a dense MLP) but only the leading `num_dense_layers`
 ///      for a MoE checkpoint (the rest are packed-resident MoE experts).
@@ -1061,11 +1063,18 @@ fn packed_group_bytes(params: &HashMap<String, MxArray>, base: &str) -> Option<u
 /// uses the quantized backend and never reads `get_weight()`, so the lazy
 /// dequant graph is never materialized — they stay packed-only resident.
 ///
-/// We start from the packed sum and, for each quantized tensor that
-/// materializes a dense copy, ADD the (non-negative) delta between the dense
-/// bf16 size and the packed group size. This is conservative: it cannot
-/// undercount, and it slightly over-counts only if MLX happens to free a
-/// transient — which is the safe direction for sizing the allocator cap.
+/// We start from the packed sum and add the dense residency each quantized
+/// tensor leaves behind, with TWO accounting rules reflecting whether the
+/// packed group survives:
+///   - **embedding**: `Embedding::load_quantized` FREES the packed tensors and
+///     keeps only the dense table, so we add the REPLACEMENT delta
+///     (`dense − packed`) → net resident `dense`.
+///   - **dense-MLP**: `Linear::load_quantized` RETAINS the packed backend AND
+///     materializes the dense `self.weight`, so both are resident; the packed
+///     group is already in the baseline, so we add the FULL `dense` on top.
+///
+/// This is conservative: it cannot undercount, and over-counts only if MLX
+/// frees a transient — the safe direction for sizing the allocator cap.
 fn compute_weight_bytes(params: &HashMap<String, MxArray>, config: &Lfm2Config) -> u64 {
     // Baseline: packed bytes of every checkpoint tensor.
     let mut total: u64 = params
@@ -1120,10 +1129,17 @@ fn compute_weight_bytes(params: &HashMap<String, MxArray>, config: &Lfm2Config) 
                 ("down_proj", down_dense),
             ] {
                 let base = format!("layers.{l}.feed_forward.{proj}");
+                // `Linear::load_quantized` RETAINS the packed backend AND
+                // materializes the dense `self.weight` (read by the legacy
+                // `MLP::forward` get_weight path), so BOTH are resident. The
+                // packed group is already in the baseline, so add the FULL
+                // dense bf16 size on top (NOT `dense - packed`). The `.scales`
+                // + complete-group guard ensures we only count a genuinely
+                // quantized projection.
                 if params.contains_key(&format!("{base}.scales"))
-                    && let Some(packed) = packed_group_bytes(params, &base)
+                    && packed_group_bytes(params, &base).is_some()
                 {
-                    total = total.saturating_add(dense.saturating_sub(packed));
+                    total = total.saturating_add(dense);
                 }
             }
         }
@@ -1979,10 +1995,12 @@ mod tests {
                 params.insert(format!("{base}.weight"), qw);
                 params.insert(format!("{base}.scales"), qs);
                 params.insert(format!("{base}.biases"), qb);
+                // `Linear` retains the packed backend AND the dense copy, so
+                // the resident extra beyond the packed baseline is the FULL
+                // dense bf16 size (not `dense - packed`). The old buggy formula
+                // would fail this tightened bound.
                 let dense = (out as u64) * (inf as u64) * 2;
-                let packed = packed_group_bytes(&params, &base).expect("packed proj");
-                expected_dense_extra =
-                    expected_dense_extra.saturating_add(dense.saturating_sub(packed));
+                expected_dense_extra = expected_dense_extra.saturating_add(dense);
             }
         }
 
@@ -1990,8 +2008,9 @@ mod tests {
         let counted = compute_weight_bytes(&params, &config);
         assert!(
             counted >= packed + expected_dense_extra,
-            "compute_weight_bytes must add the dense-MLP deltas for the {} dense layers: \
-             counted={counted}, packed={packed}, expected_extra={expected_dense_extra}",
+            "compute_weight_bytes must add the FULL dense-MLP bytes (packed backend is \
+             retained) for the {} dense layers: counted={counted}, packed={packed}, \
+             expected_extra={expected_dense_extra}",
             config.num_dense_layers.unwrap()
         );
         assert!(
@@ -2062,10 +2081,9 @@ mod tests {
                 params.insert(format!("{base}.weight"), qw);
                 params.insert(format!("{base}.scales"), qs);
                 params.insert(format!("{base}.biases"), qb);
+                // Full dense bytes on top of the retained packed backend.
                 let dense = (out as u64) * (inf as u64) * 2;
-                let packed = packed_group_bytes(&params, &base).expect("packed proj");
-                expected_dense_extra =
-                    expected_dense_extra.saturating_add(dense.saturating_sub(packed));
+                expected_dense_extra = expected_dense_extra.saturating_add(dense);
             }
         }
 
@@ -2073,9 +2091,9 @@ mod tests {
         let counted = compute_weight_bytes(&params, &config);
         assert!(
             counted >= packed + expected_dense_extra,
-            "compute_weight_bytes must add the dense-MLP deltas for ALL {} layers of a \
-             pure-dense quantized checkpoint: counted={counted}, packed={packed}, \
-             expected_extra={expected_dense_extra}",
+            "compute_weight_bytes must add the FULL dense-MLP bytes for ALL {} layers of a \
+             pure-dense quantized checkpoint (packed backend retained): counted={counted}, \
+             packed={packed}, expected_extra={expected_dense_extra}",
             config.num_hidden_layers
         );
         assert!(
