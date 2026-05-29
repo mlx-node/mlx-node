@@ -118,6 +118,14 @@ impl Lfm2SparseMoeBlock {
         Ok(())
     }
 
+    /// Test-only inspector: whether an expert bias is currently installed.
+    /// Used by persistence tests to assert the loader honors
+    /// `config.use_expert_bias` for version-skewed checkpoints.
+    #[cfg(test)]
+    pub fn expert_bias_is_some(&self) -> bool {
+        self.expert_bias.is_some()
+    }
+
     /// Forward pass. Input `x` is `[B, T, D]`; output is `[B, T, D]`.
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         let shape = x.shape()?;
