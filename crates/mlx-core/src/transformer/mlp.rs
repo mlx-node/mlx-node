@@ -153,6 +153,33 @@ impl MLP {
         Ok(())
     }
 
+    // Mutable projection accessors.
+    //
+    // Expose the underlying `Linear`s so a persistence layer can drive
+    // affine-quantized loads (`Linear::load_quantized`) or plain bf16 loads
+    // uniformly without this shared module needing to know about each model's
+    // quantization scheme. Each accessor invalidates the E39 stacked-MLP cache
+    // (`gate_up_proj_wt` / `down_proj_wt`), because a caller obtaining a `&mut
+    // Linear` may replace the weight; a stale stacked cache would otherwise be
+    // served by `forward()`. The caller must re-run `finalize_gate_up()` if it
+    // wants the stacked fast path after mutating a projection. This mirrors the
+    // invalidation already done by `set_{gate,up,down}_proj_weight`.
+
+    pub fn gate_proj_mut(&mut self) -> &mut Linear {
+        self.gate_up_proj_wt = None;
+        &mut self.gate_proj
+    }
+
+    pub fn up_proj_mut(&mut self) -> &mut Linear {
+        self.gate_up_proj_wt = None;
+        &mut self.up_proj
+    }
+
+    pub fn down_proj_mut(&mut self) -> &mut Linear {
+        self.down_proj_wt = None;
+        &mut self.down_proj
+    }
+
     // Weight getters for backward pass
 
     pub fn get_gate_proj_weight(&self) -> MxArray {

@@ -23,6 +23,8 @@ use crate::models::qwen3_5_moe::quantized_linear::{
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 use crate::tokenizer::Qwen3Tokenizer;
 
+use crate::nn::{Embedding, Linear};
+
 use super::config::Lfm2Config;
 use super::model::{Lfm2Inner, Lfm2Model, handle_lfm2_cmd};
 
@@ -93,6 +95,92 @@ fn build_lfm2_gate_ql(
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
         }
     }
+}
+
+/// Load a NON-MoE `Linear` either affine-quantized or plain bf16, keyed off
+/// the presence of `{base}.scales`.
+///
+/// SCOPE: `nn::Linear::load_quantized` is **affine-only** (it hardcodes the
+/// `"affine"` dequant mode). The canonical `mlx_lm.convert --quantize` default
+/// IS affine, which is the only non-MoE quantization we support today. If the
+/// tensor ships `.scales` but its resolved per-layer mode is NOT affine
+/// (mxfp4 / mxfp8 / nvfp4), we FAIL LOUD naming the tensor rather than feed a
+/// non-affine packed weight into the affine dequant kernel and silently emit
+/// garbage. Extending non-MoE tensors to the MXFP/NVFP formats would require
+/// the larger refactor of the lfm2 module field types to a quant-capable enum,
+/// which is intentionally out of scope here.
+///
+/// `default_plq` is the top-level affine default (bits/group_size from
+/// `config.json`'s `quantization` block). `effective_plq_for` applies any
+/// per-layer override for `base` (none exist for non-MoE bases in canonical
+/// checkpoints, but the lookup keeps us correct if one is ever present).
+fn load_linear_affine_or_bf16(
+    linear: &mut Linear,
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<()> {
+    if let Some(scales) = params.get(&format!("{base}.scales")) {
+        let weight = params.get(&format!("{base}.weight")).ok_or_else(|| {
+            Error::from_reason(format!(
+                "lfm2: quantized tensor '{base}' has '.scales' but is missing its packed '.weight'"
+            ))
+        })?;
+        let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
+        if !matches!(plq.mode, PerLayerMode::Affine) {
+            return Err(Error::from_reason(format!(
+                "lfm2: non-MoE tensor '{base}' is quantized with mode {:?}, but non-affine \
+                 quantization (mxfp4/mxfp8/nvfp4) of non-MoE lfm2 tensors is not yet supported; \
+                 only affine (the `mlx_lm.convert --quantize` default) is. Re-quantize this \
+                 checkpoint with affine mode, or quantize only the MoE router gate / experts.",
+                plq.mode
+            )));
+        }
+        let biases = params.get(&format!("{base}.biases"));
+        linear.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
+    } else if let Some(w) = params.get(&format!("{base}.weight")) {
+        linear.set_weight(w)?;
+    }
+    Ok(())
+}
+
+/// Load a NON-MoE `Embedding` either affine-quantized or plain bf16, keyed off
+/// `{base}.scales`. Same affine-only scope and fail-loud contract as
+/// [`load_linear_affine_or_bf16`].
+///
+/// `nn::Embedding::load_quantized` PRE-dequantizes the full table into the
+/// dense weight, so a tied lm_head matmul (which reads `get_weight()`) keeps
+/// working unchanged.
+fn load_embedding_affine_or_bf16(
+    embedding: &mut Embedding,
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<()> {
+    if let Some(scales) = params.get(&format!("{base}.scales")) {
+        let weight = params.get(&format!("{base}.weight")).ok_or_else(|| {
+            Error::from_reason(format!(
+                "lfm2: quantized embedding '{base}' has '.scales' but is missing its packed \
+                 '.weight'"
+            ))
+        })?;
+        let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
+        if !matches!(plq.mode, PerLayerMode::Affine) {
+            return Err(Error::from_reason(format!(
+                "lfm2: embedding '{base}' is quantized with mode {:?}, but non-affine \
+                 quantization (mxfp4/mxfp8/nvfp4) of the lfm2 embedding is not yet supported; \
+                 only affine (the `mlx_lm.convert --quantize` default) is.",
+                plq.mode
+            )));
+        }
+        let biases = params.get(&format!("{base}.biases"));
+        embedding.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
+    } else if let Some(w) = params.get(&format!("{base}.weight")) {
+        embedding.load_weight(w)?;
+    }
+    Ok(())
 }
 
 /// Compute the fallback `(default_plq, default_gate_plq)` PLQs. Mirrors
@@ -420,21 +508,26 @@ fn apply_weights(
     // per-layer loop can consult it without re-borrowing `inner`.
     let use_expert_bias = inner.config.use_expert_bias;
 
-    // Embedding
-    if let Some(w) = params.get("embed_tokens.weight") {
-        inner.embed_tokens.load_weight(w)?;
-    }
+    // Embedding (affine-quantized when `embed_tokens.scales` is present, else
+    // plain bf16). A fully quantized `mlx_lm.convert --quantize` checkpoint
+    // quantizes the embedding table; `load_quantized` pre-dequantizes it so the
+    // tied lm_head matmul keeps reading a dense `get_weight()`.
+    load_embedding_affine_or_bf16(
+        &mut inner.embed_tokens,
+        params,
+        "embed_tokens",
+        per_layer_quant,
+        default_plq,
+    )?;
 
-    // Output norm (embedding_norm)
+    // Output norm (embedding_norm) — never quantized.
     if let Some(w) = params.get("embedding_norm.weight") {
         inner.embedding_norm.set_weight(w)?;
     }
 
-    // Separate lm_head when tie_embedding is false
-    if let Some(ref mut head) = inner.lm_head
-        && let Some(w) = params.get("lm_head.weight")
-    {
-        head.set_weight(w)?;
+    // Separate lm_head when tie_embedding is false (affine-quantized or bf16).
+    if let Some(ref mut head) = inner.lm_head {
+        load_linear_affine_or_bf16(head, params, "lm_head", per_layer_quant, default_plq)?;
     }
 
     // Per-layer weights
@@ -567,15 +660,33 @@ fn apply_weights(
                     "layer {i} reported dense but dense_mlp_mut() was None"
                 ))
             })?;
-            if let Some(w) = params.get(&format!("{}.feed_forward.gate_proj.weight", prefix)) {
-                ff.set_gate_proj_weight(w)?;
-            }
-            if let Some(w) = params.get(&format!("{}.feed_forward.up_proj.weight", prefix)) {
-                ff.set_up_proj_weight(w)?;
-            }
-            if let Some(w) = params.get(&format!("{}.feed_forward.down_proj.weight", prefix)) {
-                ff.set_down_proj_weight(w)?;
-            }
+            // Dense-MLP projections: affine-quantized when their `.scales` are
+            // present, else plain bf16. `MLP::forward` reads `get_weight()`
+            // (the pre-dequantized dense table for quantized linears), so no
+            // forward change is needed. lfm2 never calls `finalize_gate_up`, so
+            // the E39 stacked fast path is inert here — and the `*_mut`
+            // accessors invalidate that cache anyway.
+            load_linear_affine_or_bf16(
+                ff.gate_proj_mut(),
+                params,
+                &format!("{prefix}.feed_forward.gate_proj"),
+                per_layer_quant,
+                default_plq,
+            )?;
+            load_linear_affine_or_bf16(
+                ff.up_proj_mut(),
+                params,
+                &format!("{prefix}.feed_forward.up_proj"),
+                per_layer_quant,
+                default_plq,
+            )?;
+            load_linear_affine_or_bf16(
+                ff.down_proj_mut(),
+                params,
+                &format!("{prefix}.feed_forward.down_proj"),
+                per_layer_quant,
+                default_plq,
+            )?;
         }
 
         // Operator-specific weights
@@ -583,18 +694,36 @@ fn apply_weights(
             // Attention layer
             if let Some(attn) = layer.attention_mut() {
                 let attn_prefix = format!("{}.self_attn", prefix);
-                if let Some(w) = params.get(&format!("{}.q_proj.weight", attn_prefix)) {
-                    attn.set_q_proj_weight(w)?;
-                }
-                if let Some(w) = params.get(&format!("{}.k_proj.weight", attn_prefix)) {
-                    attn.set_k_proj_weight(w)?;
-                }
-                if let Some(w) = params.get(&format!("{}.v_proj.weight", attn_prefix)) {
-                    attn.set_v_proj_weight(w)?;
-                }
-                if let Some(w) = params.get(&format!("{}.out_proj.weight", attn_prefix)) {
-                    attn.set_out_proj_weight(w)?;
-                }
+                // q/k/v/out_proj: affine-quantized when `.scales` present, else
+                // bf16. q/k_layernorm are never quantized.
+                load_linear_affine_or_bf16(
+                    attn.q_proj_mut(),
+                    params,
+                    &format!("{attn_prefix}.q_proj"),
+                    per_layer_quant,
+                    default_plq,
+                )?;
+                load_linear_affine_or_bf16(
+                    attn.k_proj_mut(),
+                    params,
+                    &format!("{attn_prefix}.k_proj"),
+                    per_layer_quant,
+                    default_plq,
+                )?;
+                load_linear_affine_or_bf16(
+                    attn.v_proj_mut(),
+                    params,
+                    &format!("{attn_prefix}.v_proj"),
+                    per_layer_quant,
+                    default_plq,
+                )?;
+                load_linear_affine_or_bf16(
+                    attn.out_proj_mut(),
+                    params,
+                    &format!("{attn_prefix}.out_proj"),
+                    per_layer_quant,
+                    default_plq,
+                )?;
                 if let Some(w) = params.get(&format!("{}.q_layernorm.weight", attn_prefix)) {
                     attn.set_q_layernorm_weight(w)?;
                 }
@@ -606,21 +735,34 @@ fn apply_weights(
             // Conv layer
             if let Some(conv) = layer.conv_mut() {
                 let conv_prefix = format!("{}.conv", prefix);
+                // The depthwise `conv.conv.weight` is NEVER quantized — keep
+                // the dedicated bf16 setter.
                 if let Some(w) = params.get(&format!("{}.conv.weight", conv_prefix)) {
                     conv.set_conv_weight(w)?;
                 }
                 if let Some(w) = params.get(&format!("{}.conv.bias", conv_prefix)) {
                     conv.set_conv_bias(Some(w))?;
                 }
-                if let Some(w) = params.get(&format!("{}.in_proj.weight", conv_prefix)) {
-                    conv.set_in_proj_weight(w)?;
-                }
+                // in_proj / out_proj: affine-quantized when `.scales` present,
+                // else bf16. Their LAYER bias (`.bias`, distinct from the affine
+                // quant zero-point `.biases`) is applied separately afterwards.
+                load_linear_affine_or_bf16(
+                    conv.in_proj_mut(),
+                    params,
+                    &format!("{conv_prefix}.in_proj"),
+                    per_layer_quant,
+                    default_plq,
+                )?;
                 if let Some(w) = params.get(&format!("{}.in_proj.bias", conv_prefix)) {
                     conv.set_in_proj_bias(Some(w))?;
                 }
-                if let Some(w) = params.get(&format!("{}.out_proj.weight", conv_prefix)) {
-                    conv.set_out_proj_weight(w)?;
-                }
+                load_linear_affine_or_bf16(
+                    conv.out_proj_mut(),
+                    params,
+                    &format!("{conv_prefix}.out_proj"),
+                    per_layer_quant,
+                    default_plq,
+                )?;
                 if let Some(w) = params.get(&format!("{}.out_proj.bias", conv_prefix)) {
                     conv.set_out_proj_bias(Some(w))?;
                 }
@@ -692,6 +834,22 @@ fn validate_mandatory_weights(
             ));
         }
     };
+
+    // NON-MoE linears + the embedding are quantized INDEPENDENTLY per tensor.
+    // A fully quantized `mlx_lm.convert --quantize` checkpoint quantizes the
+    // embedding and every attention / conv-proj / dense-MLP linear; the loader
+    // (`load_linear_affine_or_bf16` / `load_embedding_affine_or_bf16`) resolves
+    // each tensor on its OWN `.scales` presence:
+    //   - `.scales` present → load affine-quantized from the `.weight`+`.scales`
+    //     group (a lone `.scales` with no packed `.weight` is caught by the
+    //     mandatory `.weight` checks below, which fail loud naming the missing
+    //     packed weight).
+    //   - `.scales` absent  → load plain bf16 from `.weight`.
+    // There is no group-level coupling for non-MoE tensors, so a `.scales`
+    // companion alongside its `.weight` is simply accepted (quantized) — no
+    // extra rejection rule is needed beyond the existing per-key `.weight`
+    // requirements. The depthwise `conv.conv.weight` is never quantized and is
+    // required as a plain `.weight`.
 
     // Per-layer weights
     for i in 0..num_layers {
@@ -1282,5 +1440,239 @@ mod tests {
             msg.contains("scales"),
             "error should mention the stray scales, got: {msg}"
         );
+    }
+
+    // ===== Non-MoE per-tensor quant validation =====
+    //
+    // A fully quantized `mlx_lm.convert --quantize` checkpoint quantizes the
+    // embedding plus EVERY non-MoE linear (attention q/k/v/out_proj, conv
+    // in/out_proj, dense-MLP gate/up/down_proj, and lm_head when untied). Each
+    // such tensor ships a `.scales` companion alongside its packed `.weight`.
+    // The validator treats each non-MoE linear/embedding INDEPENDENTLY: if
+    // `{base}.scales` is present, both `.weight` AND `.scales` are required;
+    // otherwise a plain `.weight` is required. Norms and the depthwise
+    // `conv.conv.weight` are never quantized — plain `.weight` only.
+
+    /// Add the `.scales` companion for every non-MoE quantizable base in the
+    /// `tiny_moe_config` scaffold (embedding + attention q/k/v/out_proj + conv
+    /// in/out_proj). Mirrors what a fully quantized affine checkpoint ships.
+    /// The depthwise `conv.conv.weight` and all norms stay plain.
+    fn quantize_non_moe_scaffold(p: &mut HashMap<String, MxArray>) {
+        for base in [
+            "embed_tokens",
+            "layers.0.conv.in_proj",
+            "layers.0.conv.out_proj",
+            "layers.1.self_attn.q_proj",
+            "layers.1.self_attn.k_proj",
+            "layers.1.self_attn.v_proj",
+            "layers.1.self_attn.out_proj",
+        ] {
+            p.insert(format!("{base}.scales"), dummy());
+        }
+    }
+
+    #[test]
+    fn validation_accepts_quantized_non_moe_tensors() {
+        // Fully quantized affine checkpoint: every non-MoE linear + the
+        // embedding carries a complete `.weight`+`.scales` group. MoE
+        // projections are quantized too. Must pass.
+        let config = tiny_moe_config(true);
+        let mut p = validation_scaffold();
+        quantize_non_moe_scaffold(&mut p);
+        insert_moe_proj(&mut p, 0, /* quantized */ true);
+        insert_moe_proj(&mut p, 1, /* quantized */ true);
+        validate_mandatory_weights(&p, &config, 2)
+            .expect("fully quantized affine checkpoint must pass");
+    }
+
+    #[test]
+    fn validation_rejects_quantized_embedding_missing_weight() {
+        // Embedding ships `.scales` WITHOUT its packed `.weight` — a truncated
+        // quantized checkpoint the affine embedding loader cannot consume.
+        let config = tiny_moe_config(true);
+        let mut p = validation_scaffold();
+        quantize_non_moe_scaffold(&mut p);
+        insert_moe_proj(&mut p, 0, /* quantized */ true);
+        insert_moe_proj(&mut p, 1, /* quantized */ true);
+        p.remove("embed_tokens.weight");
+        let err = validate_mandatory_weights(&p, &config, 2)
+            .expect_err("quantized embedding missing .weight must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("embed_tokens.weight"),
+            "error should name the missing packed embedding weight, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_attention_proj_lone_scales() {
+        // Attention q_proj ships `.scales` WITHOUT its packed `.weight`.
+        let config = tiny_moe_config(true);
+        let mut p = validation_scaffold();
+        quantize_non_moe_scaffold(&mut p);
+        insert_moe_proj(&mut p, 0, /* quantized */ true);
+        insert_moe_proj(&mut p, 1, /* quantized */ true);
+        p.remove("layers.1.self_attn.q_proj.weight");
+        let err = validate_mandatory_weights(&p, &config, 2)
+            .expect_err("attention q_proj lone .scales (missing .weight) must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("q_proj.weight"),
+            "error should name the missing packed attention weight, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_accepts_mixed_quant_and_plain_non_moe_tensors() {
+        // Non-MoE quantization is PER-TENSOR independent: in a single
+        // checkpoint some non-MoE linears may be quantized (`.weight`+`.scales`)
+        // while siblings are plain bf16 (`.weight` only). The loader resolves
+        // each tensor on its own `.scales` presence, so a mixed layer must
+        // validate — there is no group-level coupling for non-MoE tensors.
+        let config = tiny_moe_config(true);
+        let mut p = validation_scaffold();
+        insert_moe_proj(&mut p, 0, /* quantized */ true);
+        insert_moe_proj(&mut p, 1, /* quantized */ true);
+        // Quantize ONLY q_proj + the embedding; leave k/v/out_proj + conv
+        // projections plain bf16.
+        p.insert("embed_tokens.scales".into(), dummy());
+        p.insert("layers.1.self_attn.q_proj.scales".into(), dummy());
+        validate_mandatory_weights(&p, &config, 2)
+            .expect("per-tensor mixed quant/plain non-MoE tensors must pass");
+    }
+
+    // ===== Non-MoE affine quantized loading (loader helper) =====
+
+    /// Affine-quantize a 2D bf16 weight via `mlx_quantize`, returning
+    /// `(packed_weight, scales, biases)` keyed under `base.*` in a param map.
+    fn quantize_affine(
+        weight: &MxArray,
+        group_size: i32,
+        bits: i32,
+    ) -> (MxArray, MxArray, MxArray) {
+        let mut out_q: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                group_size,
+                bits,
+                c"affine".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize affine failed");
+        assert!(!out_b.is_null(), "affine quantize must return biases");
+        (
+            MxArray::from_handle(out_q, "q").expect("q"),
+            MxArray::from_handle(out_s, "s").expect("s"),
+            MxArray::from_handle(out_b, "b").expect("b"),
+        )
+    }
+
+    /// A non-MoE `Linear` whose checkpoint ships affine `.weight`+`.scales`+
+    /// `.biases` must load as a QUANTIZED backend, and its pre-dequantized
+    /// `get_weight()` must approximate the original dense weight.
+    #[test]
+    fn loader_installs_affine_quantized_backend_for_non_moe_linear() {
+        // out=4, in=64 (one full affine group of 64 at 4-bit).
+        let out = 4u32;
+        let inf = 64u32;
+        let n = (out * inf) as i64;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        let dense = MxArray::from_float32(&data, &[out as i64, inf as i64])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("bf16");
+        let (qw, qs, qb) = quantize_affine(&dense, 64, 4);
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("x_proj.weight".into(), qw);
+        params.insert("x_proj.scales".into(), qs);
+        params.insert("x_proj.biases".into(), qb);
+
+        let mut linear = Linear::new(inf, out, Some(false)).expect("Linear::new");
+        let default_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
+        load_linear_affine_or_bf16(&mut linear, &params, "x_proj", &HashMap::new(), default_plq)
+            .expect("affine quantized load must succeed");
+
+        assert!(
+            linear.is_quantized(),
+            "linear must hold a quantized backend after affine load"
+        );
+
+        // Dequantized weight should be close to the original (4-bit affine).
+        // Compare element-wise via host extraction (mirrors the convert.rs
+        // quantize tests) — avoids a device-side scalar reduction.
+        let recon = linear
+            .get_weight()
+            .astype(DType::Float32)
+            .expect("recon f32");
+        let orig = dense.astype(DType::Float32).expect("orig f32");
+        let recon_v: Vec<f32> = recon.to_float32().expect("recon vec").to_vec();
+        let orig_v: Vec<f32> = orig.to_float32().expect("orig vec").to_vec();
+        assert_eq!(recon_v.len(), orig_v.len(), "shape mismatch after dequant");
+        let max_err = recon_v
+            .iter()
+            .zip(orig_v.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 0.2,
+            "dequantized weight too far from original: max_err={max_err}"
+        );
+    }
+
+    /// A non-MoE tensor whose RESOLVED mode is non-affine (mxfp4/mxfp8/nvfp4)
+    /// must FAIL LOUD — `nn::Linear::load_quantized` is affine-only.
+    #[test]
+    fn loader_fails_loud_on_non_affine_non_moe_tensor() {
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        // Presence of `.scales` marks the tensor quantized; shapes are
+        // irrelevant because the mode check fails before any dequant call.
+        params.insert("x_proj.weight".into(), dummy());
+        params.insert("x_proj.scales".into(), dummy());
+
+        // Force a non-affine resolved mode via a per-layer override.
+        let mut plq_map: HashMap<String, PerLayerQuant> = HashMap::new();
+        plq_map.insert(
+            "x_proj".into(),
+            default_per_layer_quant(4, 32, PerLayerMode::Mxfp4),
+        );
+
+        let mut linear = Linear::new(8, 8, Some(false)).expect("Linear::new");
+        let default_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
+        let err = load_linear_affine_or_bf16(&mut linear, &params, "x_proj", &plq_map, default_plq)
+            .expect_err("non-affine non-MoE tensor must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("x_proj") && msg.contains("not yet supported"),
+            "fail-loud message must name the tensor and the limitation, got: {msg}"
+        );
+        assert!(
+            !linear.is_quantized(),
+            "linear must NOT be mutated when the affine-mode check fails"
+        );
+    }
+
+    #[test]
+    fn validation_accepts_conv_depthwise_weight_without_scales() {
+        // The depthwise `conv.conv.weight` is NEVER quantized: even in a fully
+        // quantized checkpoint it ships as a plain bf16 `.weight` with NO
+        // `.scales`. That must NOT be flagged as a stray-scales / missing-half
+        // error — validation must accept it.
+        let config = tiny_moe_config(true);
+        let mut p = validation_scaffold();
+        quantize_non_moe_scaffold(&mut p);
+        insert_moe_proj(&mut p, 0, /* quantized */ true);
+        insert_moe_proj(&mut p, 1, /* quantized */ true);
+        // Sanity: conv.conv.weight present and plain (no scales).
+        assert!(p.contains_key("layers.0.conv.conv.weight"));
+        assert!(!p.contains_key("layers.0.conv.conv.scales"));
+        validate_mandatory_weights(&p, &config, 2)
+            .expect("plain depthwise conv weight in a quantized checkpoint must pass");
     }
 }

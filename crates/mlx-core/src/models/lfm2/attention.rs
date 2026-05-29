@@ -337,4 +337,27 @@ impl Lfm2Attention {
     pub fn set_k_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.k_layernorm.set_weight(w)
     }
+
+    // ========== Mutable projection accessors ==========
+    //
+    // Expose the underlying `Linear`s so the persistence layer can drive
+    // affine-quantized loads (`Linear::load_quantized`) or plain bf16 loads
+    // (`Linear::set_weight`) uniformly for a fully quantized checkpoint. The
+    // `forward` path dispatches quantized vs dense transparently.
+
+    pub fn q_proj_mut(&mut self) -> &mut Linear {
+        &mut self.q_proj
+    }
+
+    pub fn k_proj_mut(&mut self) -> &mut Linear {
+        &mut self.k_proj
+    }
+
+    pub fn v_proj_mut(&mut self) -> &mut Linear {
+        &mut self.v_proj
+    }
+
+    pub fn out_proj_mut(&mut self) -> &mut Linear {
+        &mut self.out_proj
+    }
 }

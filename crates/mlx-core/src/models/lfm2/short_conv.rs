@@ -150,4 +150,18 @@ impl ShortConv {
     pub fn set_out_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
         self.out_proj.set_bias(b)
     }
+
+    // ========== Mutable projection accessors ==========
+    //
+    // Expose `in_proj` / `out_proj` so the persistence layer can drive
+    // affine-quantized or plain bf16 loads uniformly. The depthwise `conv`
+    // weight is never quantized and keeps its dedicated `set_conv_weight`.
+
+    pub fn in_proj_mut(&mut self) -> &mut Linear {
+        &mut self.in_proj
+    }
+
+    pub fn out_proj_mut(&mut self) -> &mut Linear {
+        &mut self.out_proj
+    }
 }
