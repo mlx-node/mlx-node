@@ -21,7 +21,8 @@ export type ModelType =
   | 'qianfan-ocr'
   | 'harrier'
   | 'gemma4'
-  | 'lfm2';
+  | 'lfm2'
+  | 'lfm2_moe';
 
 const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
   'qwen3',
@@ -32,6 +33,7 @@ const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
   'harrier',
   'gemma4',
   'lfm2',
+  'lfm2_moe',
 ]);
 
 /**
@@ -58,6 +60,7 @@ export async function loadModel(modelPath: string): Promise<LoadableModel> {
     case 'gemma4':
       return Gemma4Model.load(modelPath) as unknown as Promise<LoadableModel>;
     case 'lfm2':
+    case 'lfm2_moe':
       return Lfm2Model.load(modelPath) as unknown as Promise<LoadableModel>;
   }
 }
