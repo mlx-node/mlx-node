@@ -14,6 +14,7 @@ using namespace lfm2_common;
 extern "C" {
 void mlx_store_weight(const char* name, mlx_array* weight);
 void mlx_clear_weights();
+size_t mlx_weight_count();
 }
 
 // =============================================================================
@@ -35,11 +36,11 @@ void mlx_clear_weights();
 // =============================================================================
 
 namespace {
-// File-local active model id. Phase 0/2b-1 have no setter, so it stays 0 and the
-// Rust gate (`mlx_lfm2_get_model_id() == model_id`, where model_id >= 1) is
-// always false — the compiled path is OFF (Phase 2b-2 wires the shared-id
-// ownership and flips it on).
-uint64_t g_lfm2_active_model_id = 0;
+// Model-id ownership is the SHARED g_active_model_id atom, read via
+// qwen35_common::g_active_model_id() in mlx_lfm2_get_model_id below and published
+// by mlx_set_model_id during registration (Phase 2b-2). lfm2 keeps NO private id:
+// a separate one over the shared g_weights() map would collide with a co-resident
+// qwen3.5 model (see the QWEN35_MODEL_ID_COUNTER invariant in lfm2/model.rs).
 
 // Decode-graph config consumed by `lfm2_decode_fn`. Set by the caller (the
 // 2b-1 probe; 2b-2 `init_from_prefill`) before invoking the loop. `g_lfm2_config`
@@ -162,10 +163,12 @@ std::vector<array> lfm2_decode_fn(const std::vector<array>& inputs) {
 extern "C" {
 
 // GATE source. Returns 0 in Phase 0 (no setter wired) → compiled path OFF.
-uint64_t mlx_lfm2_get_model_id() { return g_lfm2_active_model_id; }
+uint64_t mlx_lfm2_get_model_id() {
+  return qwen35_common::g_active_model_id().load(std::memory_order_acquire);
+}
 
 // Inert: no weights are registered into a compiled graph yet.
-size_t mlx_lfm2_weight_count() { return 0; }
+size_t mlx_lfm2_weight_count() { return mlx_weight_count(); }
 
 // Inert: accepts the prefill config the real graph will need, does nothing.
 // (Phase 1+ builds and seeds the compiled decode graph from these args.)
@@ -204,7 +207,7 @@ void mlx_lfm2_moe_forward(
 }
 
 // Inert: nothing to tear down yet.
-void mlx_lfm2_moe_reset() { g_lfm2_active_model_id = 0; }
+void mlx_lfm2_moe_reset() {}
 
 // =============================================================================
 // Component-parity probes (TEST-ONLY). These register ONE layer's weights into

@@ -57,14 +57,23 @@ pub(crate) static QWEN35_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 =
 /// between has_weight() / get_weight() in linear_proj().
 pub(crate) static COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-/// Acquire the compiled weight read lock and verify model ownership in one step.
-/// Returns `Some(guard)` if this model owns the compiled weights, `None` otherwise.
-/// The guard must be held for the lifetime of the compiled decode to prevent
-/// Process-wide mutex serializing the dense compiled forward lifecycle across
-/// model instances. Within a single model instance, the dedicated model thread
-/// serializes calls. But with multiple model instances, compiled C++ forward
-/// calls from different model threads can collide on process-wide globals.
-static DENSE_COMPILED_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Process-wide mutex serializing the compiled forward LIFECYCLE (per-turn
+/// init / decode / reset) across model instances AND model families.
+///
+/// Within a single model instance the dedicated model thread serializes calls,
+/// but distinct models run on distinct OS threads (one per model, see
+/// `model_thread.rs`), so a qwen3.5 compiled decode and an lfm2 compiled decode
+/// genuinely run in parallel. They collide on the SAME process-global C++
+/// globals: the `g_weights()` map (read by the NOT id-aware `get_weight` /
+/// `get_weight_t`), the shared `g_active_model_id` atom, and each family's
+/// compiled decode state (`g_*_caches` / `g_*_offset_int`).
+///
+/// `pub(crate)` and family-agnostic by design: EVERY model that drives a
+/// compiled path over the shared registry (qwen3.5 dense + MoE, lfm2, …) MUST
+/// serialize its compiled lifecycle on THIS one instance — never a private
+/// per-family mutex, which would provide zero mutual exclusion against an
+/// in-flight compiled decode from another family.
+pub(crate) static COMPILED_LIFECYCLE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
     (0..config.num_layers as usize)
@@ -650,7 +659,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
 /// [`Qwen35Inner::chat_tokens_delta_sync`].
 ///
 /// The caller is responsible for:
-///   - acquiring `DENSE_COMPILED_MUTEX` and `COMPILED_WEIGHTS_RWLOCK` in
+///   - acquiring `COMPILED_LIFECYCLE_MUTEX` and `COMPILED_WEIGHTS_RWLOCK` in
 ///     the correct order (when `use_compiled == true`),
 ///   - constructing a `WiredLimitContext` tied to `generation_stream` for
 ///     the lifetime of the call,
@@ -1600,7 +1609,7 @@ impl Qwen35Inner {
         let model_id = self.model_id;
 
         // Block-paged dispatch — early-return BEFORE the compile lock so
-        // the paged path never acquires `DENSE_COMPILED_MUTEX` /
+        // the paged path never acquires `COMPILED_LIFECYCLE_MUTEX` /
         // `COMPILED_WEIGHTS_RWLOCK` and never calls
         // `mlx_qwen35_compiled_init_from_prefill`. The compiled C++
         // forward path is incompatible with per-layer paged dispatch;
@@ -1622,7 +1631,7 @@ impl Qwen35Inner {
         // Serialize compiled lifecycle across model instances
         let _compiled_lock = if use_compiled {
             Some(
-                DENSE_COMPILED_MUTEX
+                COMPILED_LIFECYCLE_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )
@@ -1992,7 +2001,7 @@ impl Qwen35Inner {
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _compiled_lock = if use_compiled {
             Some(
-                DENSE_COMPILED_MUTEX
+                COMPILED_LIFECYCLE_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )
@@ -2208,7 +2217,7 @@ impl Qwen35Inner {
     /// loop's running history), and the decode loop mutates it in place.
     ///
     /// The caller is responsible for:
-    /// - Holding the `DENSE_COMPILED_MUTEX` / `COMPILED_WEIGHTS_RWLOCK` guards
+    /// - Holding the `COMPILED_LIFECYCLE_MUTEX` / `COMPILED_WEIGHTS_RWLOCK` guards
     ///   (when `inputs.use_compiled == true`) for the lifetime of this call.
     /// - Creating a `WiredLimitContext` tied to `inputs.generation_stream` for
     ///   the lifetime of this call.
@@ -2583,13 +2592,13 @@ impl Qwen35Inner {
         // still registered (no other model swapped `g_active_model_id`),
         // we can run `mlx_qwen35_init_paged` + `mlx_qwen35_forward_paged`.
         // Both the legacy flat compiled path and the new paged compiled
-        // path share `DENSE_COMPILED_MUTEX`/`COMPILED_WEIGHTS_RWLOCK` for
+        // path share `COMPILED_LIFECYCLE_MUTEX`/`COMPILED_WEIGHTS_RWLOCK` for
         // process-wide serialization.
         let model_id = self.model_id;
         let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _dense_lock = if use_cpp_paged {
             Some(
-                DENSE_COMPILED_MUTEX
+                COMPILED_LIFECYCLE_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )
@@ -3227,7 +3236,7 @@ impl Qwen35Inner {
         let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _dense_lock = if use_cpp_paged {
             Some(
-                DENSE_COMPILED_MUTEX
+                COMPILED_LIFECYCLE_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )
@@ -4208,7 +4217,7 @@ impl Qwen35Inner {
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _compiled_lock = if use_compiled {
             Some(
-                DENSE_COMPILED_MUTEX
+                COMPILED_LIFECYCLE_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )
@@ -4626,7 +4635,7 @@ impl Qwen35Inner {
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _compiled_lock = if use_compiled {
             Some(
-                DENSE_COMPILED_MUTEX
+                COMPILED_LIFECYCLE_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )
