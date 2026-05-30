@@ -1504,6 +1504,9 @@ pub async fn convert_gguf_to_safetensors(
                 quant_group_size,
                 &quant_mode_str,
                 &*predicate,
+                // GGUF conversion never targets lfm2 here; keep the embedding
+                // bf16 (the legacy embedding-skip behavior).
+                false,
             )?;
         } else {
             // No recipe: --q-mxfp overrides the global mode + group_size so the
@@ -1534,6 +1537,8 @@ pub async fn convert_gguf_to_safetensors(
                 quant_bits,
                 effective_gs,
                 &effective_mode,
+                // GGUF conversion never targets lfm2 here; keep the embedding bf16.
+                false,
             )?;
             if !per_layer_overrides.is_empty() {
                 info!(

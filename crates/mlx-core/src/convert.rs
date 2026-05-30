@@ -667,6 +667,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // downstream loaders dispatch to the correct builder.
     let mut quant_mode_effective = quant_mode.clone();
     let mut quant_group_size_effective = quant_group_size;
+    // lfm2/lfm2_moe opt INTO quantizing the token embedding: their
+    // `nn::Embedding` installs a PACKED-quantized backend (gather-dequant
+    // lookup + quantized tied-head matmul), so the embedding table can be
+    // quantized for real memory savings. Every other family keeps the embedding
+    // bf16 (unchanged). A TIED `lm_head` is dropped at sanitize, so this never
+    // quantizes an output head.
+    let embed_quantizable = matches!(model_type.as_deref(), Some("lfm2") | Some("lfm2_moe"));
     if do_quantize {
         info!(
             "Quantizing weights: bits={}, group_size={}, mode={}{}",
@@ -708,6 +715,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 quant_group_size,
                 &quant_mode,
                 &*predicate,
+                embed_quantizable,
             )?;
 
             // Build per-layer overrides for ALL quantized tensors so that the
@@ -766,6 +774,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 quant_group_size,
                 &quant_mode,
                 &*predicate,
+                embed_quantizable,
             )?;
         } else {
             // No recipe: --q-mxfp overrides the global mode + group_size so the
@@ -793,6 +802,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 quant_bits,
                 effective_gs,
                 &effective_mode,
+                embed_quantizable,
             )?;
             if !per_layer_overrides.is_empty() {
                 info!(
@@ -942,7 +952,17 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 }
 
 /// Determine whether a weight key should be quantized.
-fn should_quantize(key: &str) -> bool {
+///
+/// `embed_quantizable` opts the model family INTO quantizing the token
+/// embedding (`embed_tokens` / `embedding.`). This is `true` ONLY for
+/// lfm2/lfm2_moe, whose `nn::Embedding` now installs a PACKED-quantized backend
+/// (`load_quantized_packed`) that gather-then-dequantizes on lookup and runs a
+/// quantized matmul for the tied head — so the embedding can be quantized for
+/// real memory savings. For every other family (qwen3_5, gemma4, …) it is
+/// `false` and the embedding is skipped, preserving the prior behavior. A TIED
+/// `lm_head` is always excluded (it is dropped at sanitize time) — the
+/// `lm_head` skip below is unconditional.
+fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
     // Only .weight keys (not .scales, .biases, etc.)
     if !key.ends_with(".weight") {
         return false;
@@ -953,8 +973,17 @@ fn should_quantize(key: &str) -> bool {
         return false;
     }
 
-    // Exclude embeddings and lm_head (output projection shares vocab dimension)
-    if key.contains("embed_tokens") || key.contains("embedding.") || key.contains("lm_head") {
+    // lm_head (output head) is ALWAYS excluded — for tied models it is dropped
+    // at sanitize, for untied models it shares the vocab dimension and loads
+    // through an affine-only head loader.
+    if key.contains("lm_head") {
+        return false;
+    }
+
+    // Token embeddings: excluded by default (vocab-dim tensor). lfm2/lfm2_moe
+    // opt in via `embed_quantizable` — their packed embedding backend handles
+    // a quantized table (gather-dequant lookup + quantized tied-head matmul).
+    if !embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding.")) {
         return false;
     }
 
@@ -1276,7 +1305,7 @@ pub(crate) fn build_recipe_predicate(
         }
 
         // Non-quantizable weights are skipped
-        if !should_quantize(key) {
+        if !should_quantize(key, /* embed_quantizable */ false) {
             return QuantDecision::Skip;
         }
 
@@ -1334,7 +1363,7 @@ pub(crate) fn build_qwen35_recipe(
     let gs = default_group_size;
 
     Box::new(move |key: &str| -> QuantDecision {
-        if !should_quantize(key) {
+        if !should_quantize(key, /* embed_quantizable */ false) {
             return QuantDecision::Skip;
         }
 
@@ -1461,7 +1490,7 @@ pub(crate) fn build_unsloth_recipe(
             };
         }
 
-        if !should_quantize(key) {
+        if !should_quantize(key, /* embed_quantizable */ false) {
             return QuantDecision::Skip;
         }
 
@@ -1980,6 +2009,7 @@ fn quantize_weights_inner(
     default_group_size: i32,
     default_mode: &str,
     predicate: Option<&(dyn Fn(&str) -> QuantDecision + Send + Sync)>,
+    embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
     use std::ffi::CString;
 
@@ -2002,7 +2032,7 @@ fn quantize_weights_inner(
             match pred(key) {
                 QuantDecision::Skip => continue,
                 QuantDecision::Default => {
-                    if !should_quantize(key) {
+                    if !should_quantize(key, embed_quantizable) {
                         continue;
                     }
                     entries.push(QuantEntry {
@@ -2027,7 +2057,7 @@ fn quantize_weights_inner(
             }
         } else {
             // Legacy path: use should_quantize + is_router_gate
-            if !should_quantize(key) {
+            if !should_quantize(key, embed_quantizable) {
                 continue;
             }
             // Mirror `apply_mxfp_upgrade`'s exclusions for affine-only
@@ -2051,9 +2081,17 @@ fn quantize_weights_inner(
             //
             // `embed_tokens` matches both the top-level Gemma4 embedding
             // and the PLE `embed_tokens_per_layer` via substring.
+            //
+            // EXCEPTION (lfm2/lfm2_moe): when `embed_quantizable`, the lfm2
+            // PACKED embedding backend (`load_quantized_packed`) DOES support
+            // mxfp4/mxfp8/nvfp4 (mode threaded through gather-dequant +
+            // quantized matmul), so the embedding keys must NOT be force-
+            // downgraded to affine here — they keep the global non-affine mode.
             let is_non_affine_default =
                 default_mode == "mxfp4" || default_mode == "mxfp8" || default_mode == "nvfp4";
-            if is_non_affine_default && is_affine_only_key(key) {
+            let is_lfm2_packed_embed =
+                embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
+            if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
                 entries.push(QuantEntry {
                     key: key.clone(),
                     bits: 8,
@@ -2195,31 +2233,49 @@ fn quantize_weights(
     bits: i32,
     group_size: i32,
     mode: &str,
+    embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    quantize_weights_inner(weights, bits, group_size, mode, None)
+    quantize_weights_inner(weights, bits, group_size, mode, None, embed_quantizable)
 }
 
 /// Public wrapper for quantize_weights, accessible from other crate modules (e.g., GGUF converter).
 /// Returns the per-layer override map; see `quantize_weights` for why this matters.
+///
+/// `embed_quantizable` gates quantizing the token embedding (lfm2/lfm2_moe only);
+/// see `should_quantize`. GGUF/other callers pass `false` to preserve the
+/// embedding-skip behavior.
 pub(crate) fn quantize_weights_pub(
     weights: &mut HashMap<String, MxArray>,
     bits: i32,
     group_size: i32,
     mode: &str,
+    embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    quantize_weights(weights, bits, group_size, mode)
+    quantize_weights(weights, bits, group_size, mode, embed_quantizable)
 }
 
 /// Quantize weights with a recipe predicate, returning per-layer overrides.
 /// Used by GGUF converter and convert_model when a recipe is specified.
+///
+/// `embed_quantizable` only affects the predicate's `Default` fall-through and
+/// the legacy `is_affine_only_key` force (lfm2/lfm2_moe opt-in); a recipe that
+/// emits explicit `Custom`/`Skip` decisions for the embedding is unaffected.
 pub(crate) fn quantize_weights_with_recipe_pub(
     weights: &mut HashMap<String, MxArray>,
     bits: i32,
     group_size: i32,
     mode: &str,
     predicate: &(dyn Fn(&str) -> QuantDecision + Send + Sync),
+    embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    quantize_weights_inner(weights, bits, group_size, mode, Some(predicate))
+    quantize_weights_inner(
+        weights,
+        bits,
+        group_size,
+        mode,
+        Some(predicate),
+        embed_quantizable,
+    )
 }
 
 /// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
@@ -4778,13 +4834,46 @@ mod tests {
     #[test]
     fn lfm2_depthwise_conv_not_quantized() {
         // The depthwise short conv must never be quantized.
-        assert!(!should_quantize("model.layers.0.conv.conv.weight"));
+        assert!(!should_quantize(
+            "model.layers.0.conv.conv.weight",
+            /* embed_quantizable */ false
+        ));
         // But the conv in/out projections (standard matmuls) SHOULD be.
-        assert!(should_quantize("model.layers.0.conv.in_proj.weight"));
-        assert!(should_quantize("model.layers.0.conv.out_proj.weight"));
+        assert!(should_quantize("model.layers.0.conv.in_proj.weight", false));
+        assert!(should_quantize(
+            "model.layers.0.conv.out_proj.weight",
+            false
+        ));
         // And stacked experts SHOULD be quantizable.
         assert!(should_quantize(
-            "model.layers.1.feed_forward.switch_mlp.gate_proj.weight"
+            "model.layers.1.feed_forward.switch_mlp.gate_proj.weight",
+            false
         ));
+    }
+
+    #[test]
+    fn embed_tokens_quantized_only_when_embed_quantizable() {
+        // Default (non-lfm2): the token embedding is SKIPPED (preserves
+        // qwen3_5/gemma4 behavior).
+        assert!(!should_quantize(
+            "model.embed_tokens.weight",
+            /* embed_quantizable */ false
+        ));
+        assert!(!should_quantize(
+            "model.language_model.embedding.weight",
+            false
+        ));
+
+        // lfm2/lfm2_moe opt-in: the PACKED embedding backend handles a
+        // quantized table, so the embedding IS quantizable.
+        assert!(should_quantize(
+            "model.embed_tokens.weight",
+            /* embed_quantizable */ true
+        ));
+
+        // A TIED lm_head is ALWAYS excluded, even when embeds are quantizable
+        // (it is dropped at sanitize; we never quantize an output head here).
+        assert!(!should_quantize("lm_head.weight", true));
+        assert!(!should_quantize("lm_head.weight", false));
     }
 }

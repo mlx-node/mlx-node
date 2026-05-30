@@ -379,13 +379,15 @@ impl Lfm2Inner {
         // 3. Output norm
         h = self.embedding_norm.forward(&h)?;
 
-        // 4. LM head or tied embeddings
+        // 4. LM head or tied embeddings. The tied path routes through
+        // `Embedding::as_linear`, which handles BOTH a packed-quantized
+        // embedding (`mlx_quantized_matmul` on the packed tensors — no dense
+        // table) AND a dense bf16 embedding (`h @ get_weight()^T`, numerically
+        // identical to the prior matmul).
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&h)?
         } else {
-            let weight = self.embed_tokens.get_weight();
-            let weight_t = weight.transpose(Some(&[1, 0]))?;
-            h.matmul(&weight_t)?
+            self.embed_tokens.as_linear(&h)?
         };
 
         Ok(logits)
@@ -1213,14 +1215,13 @@ impl Lfm2Inner {
             crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
         }
 
-        // Output norm + lm_head.
+        // Output norm + lm_head. Tied path → `Embedding::as_linear` (packed
+        // quantized matmul or dense `h @ weight^T`).
         hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
         } else {
-            let weight = self.embed_tokens.get_weight();
-            let weight_t = weight.transpose(Some(&[1, 0]))?;
-            hidden_states.matmul(&weight_t)?
+            self.embed_tokens.as_linear(&hidden_states)?
         };
 
         // Slice the last token's logits.
@@ -1307,13 +1308,13 @@ impl Lfm2Inner {
             }
         }
 
+        // Tied path → `Embedding::as_linear` (packed quantized matmul or dense
+        // `h @ weight^T`).
         hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
         } else {
-            let weight = self.embed_tokens.get_weight();
-            let weight_t = weight.transpose(Some(&[1, 0]))?;
-            hidden_states.matmul(&weight_t)?
+            self.embed_tokens.as_linear(&hidden_states)?
         };
         Ok(logits)
     }

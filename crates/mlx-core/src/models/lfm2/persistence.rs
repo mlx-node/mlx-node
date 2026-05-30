@@ -15,14 +15,13 @@ use crate::models::quant_dispatch::{
 use crate::models::qwen3_5::persistence_common::{dequant_fp8_weights, load_all_safetensors};
 use crate::models::qwen3_5_moe::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
-    LinearProj, MLPVariant, QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
+    LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, NVFP4_BITS,
+    NVFP4_GROUP_SIZE, QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
     try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
     try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
     try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
     try_build_quantized_linear,
 };
-#[cfg(test)]
-use crate::models::qwen3_5_moe::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE};
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -243,23 +242,35 @@ fn load_dense_mlp_variant(
     Ok(())
 }
 
-/// Load a NON-MoE `Embedding` either affine-quantized or plain bf16, keyed off
-/// `{base}.scales`. Same affine-only scope and fail-loud contract as
-/// [`load_lm_head_affine_or_bf16`] (embedding is out of scope for #1a; a
-/// quant-capable embedding lands in #1b).
+/// Map a resolved `PerLayerMode` to the MLX quantization mode string threaded
+/// into `mlx_dequantize` / `mlx_quantized_matmul`. The per-mode group_size /
+/// bits constants are forced by the FP modes (the `.scales` companion encodes
+/// the format); affine carries its own `bits` / `group_size` from the PLQ.
+fn plq_to_packed_params(plq: PerLayerQuant) -> (i32, i32, &'static str) {
+    match plq.mode {
+        PerLayerMode::Affine => (plq.group_size, plq.bits, "affine"),
+        PerLayerMode::Mxfp8 => (MXFP8_GROUP_SIZE, MXFP8_BITS, "mxfp8"),
+        PerLayerMode::Mxfp4 => (MXFP4_GROUP_SIZE, MXFP4_BITS, "mxfp4"),
+        PerLayerMode::Nvfp4 => (NVFP4_GROUP_SIZE, NVFP4_BITS, "nvfp4"),
+    }
+}
+
+/// Load a NON-MoE `Embedding` either PACKED-quantized (ANY mode) or plain bf16,
+/// keyed off `{base}.scales`.
 ///
-/// `nn::Embedding::load_quantized` PRE-dequantizes the full table into the
-/// dense weight, so a tied lm_head matmul (which reads `get_weight()`) keeps
-/// working unchanged.
+/// #1b: the embedding now stays PACKED-resident. `nn::Embedding::
+/// load_quantized_packed` retains the packed `.weight`/`.scales`/(`.biases`)
+/// AS-IS — it does NOT pre-dequantize the table — so a fully-quantized lfm2
+/// checkpoint (incl. the embedding) saves the full `vocab × hidden × 2` bytes
+/// the old dense table cost. `forward` gather-then-dequantizes only the looked-
+/// up rows; the tied lm_head logits path calls `Embedding::as_linear` (a
+/// `mlx_quantized_matmul` on the packed tensors), so the dense table is never
+/// materialized.
 ///
-/// RESIDUAL LIMITATION (memory): because the table is pre-dequantized — and
-/// lfm2 ties the lm_head to it, so the dense table is genuinely materialized —
-/// a quantized embedding resides as a FULL dense bf16 table (`vocab × hidden ×
-/// 2` bytes). The packed `.weight`/`.scales`/`.biases` give NO memory savings
-/// here; `compute_weight_bytes` counts that dense residency. This is inherent
-/// to the minimal affine path: real per-tensor memory savings for non-MoE
-/// tensors (and support for mxfp4/mxfp8/nvfp4 there) require moving the lfm2
-/// modules to a quant-capable embedding/linear type — the deferred refactor.
+/// All four modes are supported (affine + mxfp4/mxfp8/nvfp4): the mode is
+/// resolved via `effective_plq_for` and threaded into the packed backend.
+/// mxfp4/mxfp8/nvfp4 groups ship `.weight` + `.scales` only (no `.biases`);
+/// affine ships `.weight` + `.scales` + optional `.biases`.
 fn load_embedding_affine_or_bf16(
     embedding: &mut Embedding,
     params: &HashMap<String, MxArray>,
@@ -275,16 +286,10 @@ fn load_embedding_affine_or_bf16(
             ))
         })?;
         let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-        if !matches!(plq.mode, PerLayerMode::Affine) {
-            return Err(Error::from_reason(format!(
-                "lfm2: embedding '{base}' is quantized with mode {:?}, but non-affine \
-                 quantization (mxfp4/mxfp8/nvfp4) of the lfm2 embedding is not yet supported; \
-                 only affine (the `mlx_lm.convert --quantize` default) is.",
-                plq.mode
-            )));
-        }
+        let (group_size, bits, mode) = plq_to_packed_params(plq);
+        // mxfp4/mxfp8/nvfp4 carry no quant biases; affine may.
         let biases = params.get(&format!("{base}.biases"));
-        embedding.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
+        embedding.load_quantized_packed(weight, scales, biases, group_size, bits, mode)?;
     } else if let Some(w) = params.get(&format!("{base}.weight")) {
         embedding.load_weight(w)?;
     }
@@ -680,10 +685,13 @@ fn apply_weights(
     // per-layer loop can consult it without re-borrowing `inner`.
     let use_expert_bias = inner.config.use_expert_bias;
 
-    // Embedding (affine-quantized when `embed_tokens.scales` is present, else
-    // plain bf16). A fully quantized `mlx_lm.convert --quantize` checkpoint
-    // quantizes the embedding table; `load_quantized` pre-dequantizes it so the
-    // tied lm_head matmul keeps reading a dense `get_weight()`.
+    // Embedding (PACKED-quantized when `embed_tokens.scales` is present, ANY
+    // mode; else plain bf16). A fully quantized checkpoint (incl. the embedding)
+    // installs a packed backend via `load_quantized_packed`: the dense table is
+    // never materialized (real memory savings), `forward` gather-then-
+    // dequantizes only the looked-up rows, and the tied lm_head logits path
+    // calls `Embedding::as_linear` (a `mlx_quantized_matmul` on the packed
+    // tensors).
     load_embedding_affine_or_bf16(
         &mut inner.embed_tokens,
         params,
@@ -1144,79 +1152,42 @@ fn validate_mandatory_weights(
     Ok(())
 }
 
-/// bf16 element size in bytes (the dtype every dequantized lfm2 weight
-/// materializes to — see `sanitize_weights`' f32→bf16 cast and the affine
-/// dequant in `nn::Linear`/`nn::Embedding`).
-const BF16_BYTES: u64 = 2;
-
-/// Sum the packed bytes of an affine quant GROUP (`.weight` + `.scales` +
-/// optional `.biases`) under `base`, if `{base}.weight` is present. Returns
-/// `None` when there is no packed weight (so the caller can skip).
-fn packed_group_bytes(params: &HashMap<String, MxArray>, base: &str) -> Option<u64> {
-    let w = params.get(&format!("{base}.weight"))?;
-    let mut total = w.nbytes() as u64;
-    if let Some(s) = params.get(&format!("{base}.scales")) {
-        total = total.saturating_add(s.nbytes() as u64);
-    }
-    if let Some(b) = params.get(&format!("{base}.biases")) {
-        total = total.saturating_add(b.nbytes() as u64);
-    }
-    Some(total)
-}
-
 /// Compute the deterministic resident-weight-byte total for the cache-limit
-/// coordinator, accounting for the DENSE (dequantized) copy the quantized
-/// embedding materializes.
+/// coordinator.
 ///
-/// ## Why the naive packed sum undercounts
+/// ## The packed sum IS the resident footprint (no dense deltas)
 ///
-/// The baseline `sum(params.values().nbytes())` measures only the PACKED
-/// checkpoint tensors (`materialize_weights` evals exactly that set). For a
-/// fully bf16 checkpoint that equals the resident footprint. The one
-/// quantized-tensor class that ALSO leaves a DENSE bf16 copy resident — which
-/// the packed sum never sees — is the **embedding**.
-/// `nn::Embedding::load_quantized` pre-dequantizes the whole table into
-/// `self.weight` (a dense `vocab × hidden` bf16 array) so the tied lm_head
-/// matmul keeps reading a dense `get_weight()`. With tied embeddings (lfm2
-/// ties), that dense table is genuinely materialized — it dominates the
-/// undercount (~`vocab × hidden × 2` bytes). The embedding stays on the
-/// affine/dense path (out of scope for #1a; a quant-capable embedding lands in
-/// #1b).
+/// The baseline `sum(params.values().nbytes())` measures the PACKED checkpoint
+/// tensors (`materialize_weights` evals exactly that set). After #1b EVERY
+/// quantized lfm2 tensor class stays PACKED-resident — none materializes a
+/// dense dequant copy:
 ///
-/// ALL the quantized NON-MoE linears (attention q/k/v/out, conv in/out,
-/// dense-MLP gate/up/down) are now mode-aware `LinearProj`/`MLPVariant`
-/// backed by `QuantizedLinear`: their `forward` runs `mlx_quantized_matmul`
-/// on the PACKED weight and NEVER reads `get_weight()`, so no dense dequant
-/// copy is ever materialized — they are packed-only resident, exactly like the
-/// MoE experts. (Before #1a the dense-MLP went through `Linear::load_quantized`
-/// plus the legacy `MLP::forward` get_weight path, which DID materialize a
-/// dense copy; that dense-MLP delta is therefore removed here.)
+/// - **Non-MoE linears** (attention q/k/v/out, conv in/out, dense-MLP gate/up/
+///   down) are mode-aware `LinearProj`/`MLPVariant` backed by `QuantizedLinear`:
+///   `forward` runs `mlx_quantized_matmul` on the packed weight, never reading
+///   `get_weight()` (#1a).
+/// - **MoE experts** are `QuantizedSwitchLinear` (`gather_qmm` on packed
+///   tensors).
+/// - **Embedding** now installs a PACKED backend via
+///   `nn::Embedding::load_quantized_packed` (#1b): the dense `vocab × hidden`
+///   table is NEVER materialized — `forward` gather-then-dequantizes only the
+///   looked-up rows, and the tied lm_head logits path runs
+///   `Embedding::as_linear` (`mlx_quantized_matmul` on the packed tensors). The
+///   packed embedding group is already in the baseline `params` sum, so its
+///   resident footprint = packed (no `dense − packed` adder).
 ///
-/// So only the embedding adds a residency delta: `Embedding::load_quantized`
-/// FREES the packed tensors and keeps only the dense table, so we add the
-/// REPLACEMENT delta (`dense − packed`) → net resident `dense`.
-///
-/// This is conservative: it cannot undercount, and over-counts only if MLX
-/// frees a transient — the safe direction for sizing the allocator cap.
-fn compute_weight_bytes(params: &HashMap<String, MxArray>, config: &Lfm2Config) -> u64 {
-    // Baseline: packed bytes of every checkpoint tensor.
-    let mut total: u64 = params
+/// So for a fully-quantized lfm2 checkpoint (incl. the embedding) the resident
+/// footprint is EXACTLY the packed sum — no dense residency to add. The helper
+/// remains a function of `config` for forward compatibility but no longer needs
+/// it.
+fn compute_weight_bytes(params: &HashMap<String, MxArray>, _config: &Lfm2Config) -> u64 {
+    // Resident footprint = packed bytes of every checkpoint tensor. All
+    // quantized lfm2 tensor classes (non-MoE linears, MoE experts, embedding)
+    // are packed-only resident, so there is no dense dequant copy to add.
+    params
         .values()
         .map(|a| a.nbytes() as u64)
-        .fold(0u64, |acc, v| acc.saturating_add(v));
-
-    // Quantized embedding → resident dense bf16 table (the only non-MoE tensor
-    // class that still materializes a dense dequant copy; see fn docs).
-    if params.contains_key("embed_tokens.scales")
-        && let Some(packed) = packed_group_bytes(params, "embed_tokens")
-    {
-        let dense = (config.vocab_size as u64)
-            .saturating_mul(config.hidden_size as u64)
-            .saturating_mul(BF16_BYTES);
-        total = total.saturating_add(dense.saturating_sub(packed));
-    }
-
-    total
+        .fold(0u64, |acc, v| acc.saturating_add(v))
 }
 
 impl Lfm2Inner {
@@ -1226,11 +1197,11 @@ impl Lfm2Inner {
     ///
     /// Returns the constructed inner alongside a deterministic resident
     /// weight-byte total (via [`compute_weight_bytes`]) for the cache-limit
-    /// coordinator. The total is the packed-tensor sum PLUS the dense
-    /// dequantized copies that a quantized embedding / dense-MLP materialize
-    /// (so it never undercounts resident memory). See `cache_limit.rs` module
-    /// docs for why this deterministic measurement is preferred over a
-    /// process-wide `get_active_memory()` delta.
+    /// coordinator. After #1b every quantized lfm2 tensor class (non-MoE
+    /// linears, MoE experts, embedding) is packed-only resident, so the total is
+    /// exactly the packed-tensor sum — no dense dequant copies to add. See
+    /// `cache_limit.rs` module docs for why this deterministic measurement is
+    /// preferred over a process-wide `get_active_memory()` delta.
     pub fn load_from_dir(model_path: &str) -> Result<(Self, u64)> {
         let path = Path::new(model_path);
 
@@ -2092,14 +2063,14 @@ mod tests {
             .expect("plain depthwise conv weight in a quantized checkpoint must pass");
     }
 
-    // ===== Task A: cache-accounting undercount fix =====
+    // ===== Task A: cache-accounting (packed-only resident) =====
     //
-    // `compute_weight_bytes` must EXCEED the naive packed-tensor sum for a
-    // quantized checkpoint by at least the dense-embedding delta (the dominant
-    // resident object a quantized + tied embedding materializes). It must also
-    // account for quantized dense-MLP projections when `num_dense_layers > 0`.
+    // After #1b every quantized lfm2 tensor class — non-MoE linears, MoE
+    // experts, AND the embedding — is PACKED-only resident: none materializes a
+    // dense dequant copy. So `compute_weight_bytes` must equal the packed
+    // checkpoint sum exactly, with NO dense delta added.
 
-    /// Naive packed sum (the OLD, undercounting formula).
+    /// Packed checkpoint sum (= the resident footprint after #1b).
     fn packed_only_bytes(params: &HashMap<String, MxArray>) -> u64 {
         params
             .values()
@@ -2108,10 +2079,12 @@ mod tests {
     }
 
     #[test]
-    fn weight_bytes_counts_dense_embedding_delta_for_quantized_embedding() {
-        // Synthetic config: a generously-sized vocab/hidden so the dense
-        // embedding delta dominates. num_dense_layers=0 isolates the embedding
-        // contribution (no dense-MLP delta).
+    fn weight_bytes_is_packed_only_for_quantized_embedding() {
+        // A quantized (PACKED) embedding no longer materializes a dense bf16
+        // table — `nn::Embedding::load_quantized_packed` keeps the packed
+        // group, and the tied lm_head logits path uses `Embedding::as_linear`
+        // (mlx_quantized_matmul). So `compute_weight_bytes` must NOT add a
+        // dense-embedding delta: counted == packed.
         let mut config = tiny_moe_config(true);
         config.vocab_size = 4096;
         config.hidden_size = 256;
@@ -2135,25 +2108,20 @@ mod tests {
         let packed = packed_only_bytes(&params);
         let counted = compute_weight_bytes(&params, &config);
 
-        // The resident dense bf16 table is vocab * hidden * 2 bytes; the packed
-        // group is ~1/4 of that (4-bit) plus small scales/biases. The counted
-        // total must therefore exceed packed by at least
-        // (dense_table - packed_embed_group) — i.e. it must REACH the dense
-        // table size (packed group is dropped, dense added).
-        let dense_table = (vocab as u64) * (hidden as u64) * 2;
-        let packed_embed = packed_group_bytes(&params, "embed_tokens").expect("packed embed");
-        let expected_delta = dense_table.saturating_sub(packed_embed);
-
-        assert!(
-            counted >= packed + expected_delta,
-            "compute_weight_bytes must add the dense-embedding delta: counted={counted}, \
-             packed={packed}, expected_delta={expected_delta}"
+        // The packed group is ~1/4 of the old dense table (4-bit) plus small
+        // scales/biases. The resident footprint is now EXACTLY that packed sum
+        // — no dense table is ever materialized.
+        assert_eq!(
+            counted, packed,
+            "quantized PACKED embedding must be packed-only resident (no dense delta): \
+             counted={counted}, packed={packed}"
         );
-        // And the counted total must be at least the full dense table size
-        // (the dominant resident object), proving we no longer undercount.
+        // Sanity: the packed embedding is far smaller than the old dense table
+        // (the ~500MB savings this change unlocks at real vocab/hidden).
+        let dense_table = (vocab as u64) * (hidden as u64) * 2;
         assert!(
-            counted >= dense_table,
-            "counted total ({counted}) must cover the dense embedding table ({dense_table})"
+            counted < dense_table,
+            "packed-only count ({counted}) must be well below the old dense table ({dense_table})"
         );
     }
 
