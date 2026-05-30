@@ -1863,6 +1863,38 @@ unsafe extern "C-unwind" {
     /// Tear down the compiled lfm2 graph state. Phase 0 stub resets the model
     /// id to 0.
     pub fn mlx_lfm2_moe_reset();
+
+    /// TEST-ONLY component probe: run a sequence of `T` lfm2 attention decode
+    /// steps (B=1, `x_seq` is `[T, hidden]`) through the compiled
+    /// `lfm2_attn_pure_fn`, threading the KV cache, and return the LAST step's
+    /// output `[1, num_heads*head_dim]` (caller owns; nullptr on error).
+    /// Registers the passed weights into the shared map, runs, then clears it.
+    /// Weights are natural `[out, in]` / `[head_dim]`. Phase-1 parity gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_attn_seq(
+        x_seq: *mut mlx_array,
+        q_w: *mut mlx_array,
+        k_w: *mut mlx_array,
+        v_w: *mut mlx_array,
+        out_w: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        k_norm_w: *mut mlx_array,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: run the dense SwiGLU MLP through
+    /// `lfm2_dense_mlp` and return the output array (caller owns; nullptr on
+    /// error). Weights are natural `[out, in]`.
+    pub fn mlx_lfm2_probe_dense_mlp(
+        x: *mut mlx_array,
+        gate_w: *mut mlx_array,
+        up_w: *mut mlx_array,
+        down_w: *mut mlx_array,
+    ) -> *mut mlx_array;
 }
 
 // Gradient computation types
