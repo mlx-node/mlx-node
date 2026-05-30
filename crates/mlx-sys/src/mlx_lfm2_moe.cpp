@@ -87,13 +87,21 @@ void mlx_lfm2_moe_forward(
 void mlx_lfm2_moe_reset() { g_lfm2_active_model_id = 0; }
 
 // =============================================================================
-// Component-parity probes (test-only). These register ONE layer's weights into
+// Component-parity probes (TEST-ONLY). These register ONE layer's weights into
 // the shared weight map, run the compiled pure-fn, and return the output so a
-// Rust test can compare it to the native Rust-side forward. They are the
-// Phase-1 parity gate (the full compiled forward is not end-to-end runnable
-// until the ShortConv operator lands in Phase 2). Each probe `mlx_clear_weights`
-// first for a clean slate; in the mlx-core unit-test binary no other code
-// touches `g_weights()`, so this is race-free.
+// Rust test can compare it to the native Rust-side forward.
+//
+// CALLER CONTRACT — these are DESTRUCTIVE on the process-global `g_weights()`
+// registry: each does `mlx_clear_weights -> store -> run -> mlx_clear_weights`,
+// and `mlx_clear_weights` ALSO resets the active model id. That registry is the
+// SAME one the production compiled paths (qwen3.5 / qwen3.5-MoE / gemma4, and
+// eventually lfm2) own during registration + inference, guarded process-wide by
+// the Rust `COMPILED_WEIGHTS_RWLOCK`. A probe call that overlaps a live compiled
+// registration/inference would wipe its weights mid-flight. So every caller MUST
+// hold `COMPILED_WEIGHTS_RWLOCK` (write) across the whole probe call — the Rust
+// parity tests do exactly this. Do NOT call these from any production path; they
+// exist solely for the component-parity gate (the full compiled forward is not
+// end-to-end runnable until the backbone lands in Phase 2+).
 // =============================================================================
 
 // Run a SEQUENCE of `T` lfm2 attention decode steps (B=1, offset 0..T-1)
@@ -178,6 +186,67 @@ mlx_array* mlx_lfm2_probe_dense_mlp(
     return reinterpret_cast<mlx_array*>(out);
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_dense_mlp: %s\n", e.what());
+    fflush(stderr);
+    mlx_clear_weights();
+    return nullptr;
+  } catch (...) {
+    mlx_clear_weights();
+    return nullptr;
+  }
+}
+
+// Run a SEQUENCE of `T` lfm2 ShortConv decode steps (B=1, offset 0..T-1)
+// through `lfm2_conv_pure_fn`, threading the conv state ([1, l_cache-1, hidden],
+// zeros init), and return the LAST step's output `[1, hidden]`. Running a
+// sequence (not a single step) is what exercises the causal conv window and the
+// state carry-over: on step 0 the state is all-zeros, so only step >=1 mixes
+// real history through the depthwise kernel.
+//
+// `x_seq` is `[T, hidden]` (one decode input per row). Linear weights are
+// natural `[out, in]` (in_proj [3H,H], out_proj [H,H]); the depthwise conv
+// weight is MLX-layout `[hidden, l_cache, 1]` (3D, NOT transposed) and is stored
+// under the DOUBLED key `layers.0.conv.conv.weight` (block prefix `conv.` +
+// nn.Conv1d submodule `conv`) to match the real checkpoint (persistence.rs:907)
+// — do NOT collapse it to a single `conv.weight`. Biases (iff conv_bias != 0)
+// are in_proj `[3H]`, conv `[hidden]`, out_proj `[hidden]`; the bias pointers
+// may be null when conv_bias == 0. Caller owns the returned array; null on error.
+mlx_array* mlx_lfm2_probe_conv_seq(
+    mlx_array* x_seq_ptr,
+    mlx_array* in_proj_w, mlx_array* conv_w, mlx_array* out_proj_w,
+    mlx_array* in_proj_b, mlx_array* conv_b, mlx_array* out_proj_b,
+    int l_cache, int conv_bias) {
+  try {
+    mlx_clear_weights();
+    mlx_store_weight("layers.0.conv.in_proj.weight", in_proj_w);
+    mlx_store_weight("layers.0.conv.out_proj.weight", out_proj_w);
+    mlx_store_weight("layers.0.conv.conv.weight", conv_w);  // [hidden, l_cache, 1]
+    if (conv_bias) {
+      mlx_store_weight("layers.0.conv.in_proj.bias", in_proj_b);
+      mlx_store_weight("layers.0.conv.conv.bias", conv_b);
+      mlx_store_weight("layers.0.conv.out_proj.bias", out_proj_b);
+    }
+
+    auto& x_seq = *reinterpret_cast<array*>(x_seq_ptr);
+    int T = x_seq.shape(0);
+    int hidden = x_seq.shape(1);
+
+    // conv state slot: [B=1, l_cache-1, hidden], zeros, input dtype (bf16).
+    auto state = zeros({1, l_cache - 1, hidden}, x_seq.dtype());
+
+    array last_out = zeros({1, hidden}, x_seq.dtype());
+    for (int i = 0; i < T; i++) {
+      auto x_i = reshape(slice(x_seq, {i, 0}, {i + 1, hidden}), {1, hidden});
+      auto res = lfm2_conv_pure_fn(x_i, /*layer_idx=*/0, state, l_cache, hidden,
+                                   conv_bias != 0);
+      state = res.new_state;
+      last_out = res.output;
+    }
+    mlx::core::eval({last_out});
+    auto* out = new array(last_out);
+    mlx_clear_weights();
+    return reinterpret_cast<mlx_array*>(out);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] mlx_lfm2_probe_conv_seq: %s\n", e.what());
     fflush(stderr);
     mlx_clear_weights();
     return nullptr;

@@ -1895,6 +1895,27 @@ unsafe extern "C-unwind" {
         up_w: *mut mlx_array,
         down_w: *mut mlx_array,
     ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: run a sequence of `T` lfm2 ShortConv decode
+    /// steps (B=1, `x_seq` is `[T, hidden]`) through the compiled
+    /// `lfm2_conv_pure_fn`, threading the conv state, and return the LAST step's
+    /// output `[1, hidden]` (caller owns; nullptr on error). Linear weights are
+    /// natural `[out, in]` (in_proj `[3H,H]`, out_proj `[H,H]`); the depthwise
+    /// conv weight is MLX-layout `[hidden, l_cache, 1]` (NOT transposed). When
+    /// `conv_bias == 0` the three bias pointers are ignored (pass null). Phase-2
+    /// parity gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_conv_seq(
+        x_seq: *mut mlx_array,
+        in_proj_w: *mut mlx_array,
+        conv_w: *mut mlx_array,
+        out_proj_w: *mut mlx_array,
+        in_proj_b: *mut mlx_array,
+        conv_b: *mut mlx_array,
+        out_proj_b: *mut mlx_array,
+        l_cache: i32,
+        conv_bias: i32,
+    ) -> *mut mlx_array;
 }
 
 // Gradient computation types

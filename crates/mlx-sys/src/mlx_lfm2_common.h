@@ -156,4 +156,105 @@ inline array lfm2_dense_mlp(const array& x, int layer_idx) {
   return linear_proj(swiglu(gate, up), mp + "down_proj");
 }
 
+// Result of one ShortConv decode step: output + the conv state to write back.
+struct Lfm2ConvResult {
+  array output;
+  array new_state;
+};
+
+// =====================================================================
+// Single-token decode for an lfm2 ShortConv (gated depthwise Conv1d) layer.
+//
+// Token-for-token port of the `ShortConv::forward` decode branch
+// (short_conv.rs:69-127) / `lfm2.py:134-170`:
+//   BCx = in_proj(x)                       [B, 3*hidden]  (+bias iff conv_bias)
+//   B,C,x = split into 3 along last axis (ORDER: B, C, x)
+//   Bx = B * x                             [B, hidden]
+//   bx_3d = reshape(Bx, [B, 1, hidden])
+//   conv_in = concatenate(conv_state, bx_3d, axis=1)   [B, l_cache, hidden]
+//   new_state = last (l_cache-1) rows of conv_in (axis 1)  [B, l_cache-1, hidden]
+//   conv_out = conv1d(conv_in, W[H,K,1], 1,0,1, groups=hidden)  [B, 1, hidden]
+//                                          (+conv bias [hidden] iff conv_bias)
+//   y = C * conv_out                       [B, 1, hidden]  (C broadcasts over T)
+//   out = out_proj(reshape(y, [B,hidden]))              (+bias iff conv_bias)
+//
+// ASSUMES single-token decode (one token/step, fully-warm cache): the native
+// Rust `ShortConv::forward` decode branch makes the same simplification — no SSM
+// `conv_mask` / no `cache.lengths`-aware retention (those only matter for ragged
+// batched prefill, lfm2.py:143-163). Do NOT reuse this for batched decode with
+// ragged lengths without adding the mask + length-aware retention.
+//
+// x:          [B, hidden] (2D decode input — already operator-normed by caller).
+// conv_state: [B, l_cache-1, hidden] (zeros on the first step, prior new_state
+//             after). Threaded by the caller across decode steps (slot 0).
+// Weight keys (registered under layers.{layer_idx}.conv.*): note the DOUBLED
+// `conv.conv` for the depthwise weight — the ShortConv block prefix is
+// `...conv.` and the nn.Conv1d submodule inside it is ALSO named `conv`, so the
+// real checkpoint key is `layers.{i}.conv.conv.weight` (persistence.rs:907).
+// Since `pfx` already ends in `conv.`, the depthwise leaf is `"conv.weight"`.
+//   in_proj.weight [3H,H] (+in_proj.bias [3H]), out_proj.weight [H,H]
+//   (+out_proj.bias [H]), conv.conv.weight [H, l_cache, 1] (+conv.conv.bias [H]).
+// Biases are present iff conv_bias=true (a single config flag gates all three).
+// =====================================================================
+inline Lfm2ConvResult lfm2_conv_pure_fn(
+    const array& x,
+    int layer_idx,
+    const array& conv_state,
+    int l_cache,
+    int hidden,
+    bool conv_bias) {
+  using namespace qwen35_common;
+  int B = x.shape(0);
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".conv.";
+
+  // 1. in_proj: [B, hidden] -> [B, 3*hidden]. linear_proj does NOT add the
+  //    additive bias, so add it manually (broadcasts over [3H]) when present.
+  auto bcx = linear_proj(x, pfx + "in_proj");
+  if (conv_bias) {
+    bcx = add(bcx, get_weight(pfx + "in_proj.bias"));
+  }
+
+  // 2. split into B, C, x along the last axis (ORDER: B, C, x — input gate B*x,
+  //    output gate C). Each [B, hidden].
+  auto b_gate = slice(bcx, {0, 0}, {B, hidden});
+  auto c_gate = slice(bcx, {0, hidden}, {B, hidden * 2});
+  auto x_val = slice(bcx, {0, hidden * 2}, {B, hidden * 3});
+
+  // 3. input gate Bx = B * x, then reshape to time-major [B, 1, hidden].
+  auto bx = b_gate * x_val;
+  auto bx_3d = reshape(bx, {B, 1, hidden});
+
+  // 4. conv state: prepend (l_cache-1) cached positions on the time axis.
+  //    conv_in length is exactly l_cache; new_state keeps the LAST (l_cache-1).
+  //    Same form as the GDN conv path (mlx_qwen35_common.h:521-524).
+  auto conv_in = concatenate({conv_state, bx_3d}, 1);  // [B, l_cache, hidden]
+  int total_len = l_cache;
+  int keep = l_cache - 1;
+  auto new_state =
+      slice(conv_in, {0, total_len - keep, 0}, {B, total_len, hidden});  // [B, l_cache-1, hidden]
+
+  // 5. depthwise conv1d: weight [hidden, l_cache, 1] (3D, NOT auto-transposed),
+  //    stride 1, pad 0, dil 1, groups = hidden (DEPTHWISE). Input length
+  //    l_cache, kernel l_cache -> output length 1 -> [B, 1, hidden].
+  auto conv_w = get_weight(pfx + "conv.weight");  // -> layers.{i}.conv.conv.weight
+  auto conv_out = mlx::core::conv1d(conv_in, conv_w, /*stride=*/1, /*padding=*/0,
+                                    /*dilation=*/1, /*groups=*/hidden);  // [B, 1, hidden]
+  if (conv_bias) {
+    // conv1d has no bias param; add [hidden] manually (broadcasts over [B,1,hidden]).
+    conv_out = add(conv_out, get_weight(pfx + "conv.bias"));  // -> layers.{i}.conv.conv.bias
+  }
+
+  // 6. output gate y = C * conv_out. c_gate is [B, hidden]; reshape to
+  //    [B, 1, hidden] so it broadcasts cleanly against conv_out [B, 1, hidden].
+  auto y = reshape(c_gate, {B, 1, hidden}) * conv_out;  // [B, 1, hidden]
+
+  // 7. out_proj: [B, hidden] -> [B, hidden] (+bias iff conv_bias).
+  auto out = linear_proj(reshape(y, {B, hidden}), pfx + "out_proj");
+  if (conv_bias) {
+    out = add(out, get_weight(pfx + "out_proj.bias"));
+  }
+
+  return {out, new_state};
+}
+
 }  // namespace lfm2_common
