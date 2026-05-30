@@ -28,7 +28,7 @@ Optional Arguments:
   --dtype, -d <type>    Target dtype (default: bfloat16)
                         Options: float32, float16, bfloat16
   --model-type, -m      Model type (auto-detected if not specified)
-                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, qianfan-ocr, privacy-filter
+                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr, privacy-filter
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -73,6 +73,8 @@ Model Types:
   paddleocr-vl          PaddleOCR-VL weight sanitization
   qwen3_5               Qwen3.5 dense model (FP8 dequant, key remapping)
   qwen3_5_moe           Qwen3.5 MoE model (FP8 dequant, expert stacking)
+  lfm2_moe              LFM2 MoE model (MLP rename, conv transpose, expert stacking; affine quant only)
+  lfm2                  LFM2 dense model (MLP rename, conv transpose; affine quant only)
   pp-lcnet-ori          PP-LCNet orientation classifier (Paddle -> SafeTensors)
   uvdoc                 UVDoc unwarping model (Paddle/PyTorch -> SafeTensors)
   qianfan-ocr           Qianfan-OCR InternVL model (key renaming, conv2d transposition)
@@ -368,6 +370,9 @@ export async function run(argv: string[]) {
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'gemma4' || config.model_type === 'gemma4_text') {
         modelType = 'gemma4';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'lfm2_moe' || config.model_type === 'lfm2') {
+        modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'openai_privacy_filter') {
         modelType = 'privacy-filter';

@@ -304,6 +304,25 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
+    // LFM2 affine-only gate: the lfm2 loader quantizes NON-MoE tensors
+    // (attention/conv/dense-MLP projections) through `Linear::load_quantized`,
+    // which hardcodes the "affine" dequant kernel. Emitting mxfp4/mxfp8/nvfp4
+    // weights for those tensors would be silently mis-dequantized at load time
+    // and produce garbage. Reject every non-affine mode up front with a clear
+    // message until a quant-capable non-MoE loader lands (fast-follow #1).
+    if do_quantize
+        && matches!(model_type.as_deref(), Some("lfm2_moe" | "lfm2"))
+        && (quant_mxfp || quant_mode != "affine")
+    {
+        return Err(Error::from_reason(format!(
+            "lfm2/lfm2_moe quantization currently supports affine mode only \
+             (got mode='{}'{}). mxfp4/mxfp8/nvfp4 are not yet supported (pending a \
+             non-MoE quant-capable loader). Re-run with the default --q-mode affine.",
+            quant_mode,
+            if quant_mxfp { " with --q-mxfp" } else { "" }
+        )));
+    }
+
     // Validate recipe
     if let Some(ref recipe) = quant_recipe {
         if !do_quantize {
@@ -500,7 +519,10 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
     // For models with a sanitizer that handles FP8 dequant + dtype conversion
     // (e.g. qwen3_5_moe), skip the generic dtype conversion and let the sanitizer do it.
-    let has_custom_sanitizer = matches!(model_type.as_deref(), Some("qwen3_5_moe" | "qwen3_5"));
+    let has_custom_sanitizer = matches!(
+        model_type.as_deref(),
+        Some("qwen3_5_moe" | "qwen3_5" | "lfm2_moe" | "lfm2")
+    );
 
     // True for models whose sanitizer arm manages quantization itself — the
     // generic quantize block below must skip these to avoid double-quantizing.
@@ -594,6 +616,17 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             );
             sanitize_qwen35_moe(converted_tensors, &config, &target_dtype)?
         }
+        Some("lfm2_moe" | "lfm2") => {
+            info!(
+                "Applying LFM2 weight sanitization (MLP rename, conv transpose, expert stacking)..."
+            );
+            sanitize_lfm2_moe(
+                converted_tensors,
+                &config,
+                &target_dtype,
+                tie_word_embeddings,
+            )?
+        }
         Some("qianfan-ocr") => {
             info!(
                 "Applying Qianfan-OCR weight sanitization (key renaming, conv2d transposition)..."
@@ -619,7 +652,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         // scope and we want to suppress the generic quantize pass for it.
         Some(other) => {
             return Err(Error::from_reason(format!(
-                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, qianfan-ocr, gemma4, privacy-filter",
+                "Unknown model type: '{}'. Supported: paddleocr-vl, qwen3_5_moe, qwen3_5, lfm2_moe, lfm2, qianfan-ocr, gemma4, privacy-filter",
                 other
             )));
         }
@@ -942,6 +975,16 @@ fn should_quantize(key: &str) -> bool {
         return false;
     }
 
+    // Exclude LFM2's depthwise short conv (`*.conv.conv.weight`, shape
+    // [channels, kernel, 1] after the sanitizer transpose). The lfm2 loader
+    // NEVER quantizes this tensor — it routes it through the dedicated bf16
+    // `set_conv_weight` setter. Belt-and-braces over the `last_dim % group_size`
+    // guard below (last dim is 1, which already fails divisibility), so a future
+    // group_size of 1 can never sneak it into the affine quantizer.
+    if key.ends_with("conv.conv.weight") {
+        return false;
+    }
+
     // Exclude A_log and dt_bias (GatedDeltaNet parameters)
     if key.contains("A_log") || key.contains("dt_bias") {
         return false;
@@ -964,6 +1007,11 @@ fn is_router_gate(key: &str) -> bool {
     // Naming differs across model families:
     // - Qwen3.x MoE: `.mlp.gate.weight`, `.mlp.shared_expert_gate.weight`
     // - Gemma4 MoE: `.mlp.router.proj.weight` (also affine-only at load)
+    // - LFM2 MoE: `.feed_forward.gate.weight` — the per-layer router that
+    //   selects top-K experts. The lfm2 loader resolves its quant params via a
+    //   direct `feed_forward.gate` override lookup (`build_lfm2_gate_ql`), so it
+    //   must receive the explicit 8-bit affine override rather than the low-bit
+    //   default; otherwise routing noise destroys generation quality.
     //
     // Note: `router.proj` is *also* listed in `is_affine_only_key` so the
     // load path refuses non-affine modes. Matching it here as well ensures
@@ -974,6 +1022,7 @@ fn is_router_gate(key: &str) -> bool {
     stripped.ends_with(".mlp.gate")
         || stripped.ends_with(".shared_expert_gate")
         || stripped.ends_with(".router.proj")
+        || stripped.ends_with(".feed_forward.gate")
 }
 
 /// Check if a key is loaded through an affine-only dequantization path and
@@ -2679,6 +2728,186 @@ fn sanitize_qwen35_moe(
     Ok(new_weights)
 }
 
+/// Sanitize an LFM2 / LFM2-MoE HuggingFace checkpoint into the exact on-disk
+/// layout the lfm2 loader (`models::lfm2::persistence::sanitize_weights`) reads.
+///
+/// INVERSE-CONSISTENCY with the loader is the contract here. The loader STRIPS
+/// the `model.` prefix on read, applies the SAME MLP rename, the SAME conv
+/// transpose, and the SAME expert stacking. So this converter must:
+///
+/// - KEEP the on-disk `model.` prefix (do NOT re-prefix to
+///   `language_model.model.*` — that is qwen3_5_moe-specific and would break
+///   the lfm2 loader's `strip_prefix("model.")`).
+/// - Rename `feed_forward.{w1,w2,w3}` -> `{gate_proj,down_proj,up_proj}` (covers
+///   both dense `feed_forward.wN` and per-expert `experts.{e}.wN`).
+/// - Transpose the depthwise short conv `*.conv.conv.weight` from
+///   `[channels, 1, kernel]` to `[channels, kernel, 1]` (shape[-1] > shape[1]).
+/// - Stack per-expert projections into
+///   `feed_forward.switch_mlp.{proj}.weight` of shape `[num_experts, out, in]`
+///   for every MoE layer (`num_dense_layers..num_hidden_layers`).
+/// - Keep `feed_forward.expert_bias` (f32) untouched and EXCLUDE it from the
+///   f32->target dtype cast.
+/// - Drop `lm_head.weight` when embeddings are tied.
+/// - Cast remaining f32 tensors to `target_dtype`, skipping quantized groups
+///   (`.weight`/`.scales`/`.biases`) and `expert_bias`.
+///
+/// Dense `lfm2` (no `num_experts`) takes the same path minus expert stacking —
+/// every layer's `feed_forward` is dense `{gate,up,down}_proj` after the rename.
+///
+/// Note: this runs BEFORE the generic quantize pass. The lfm2 affine-only gate
+/// upstream guarantees only affine quantization reaches that pass.
+fn sanitize_lfm2_moe(
+    weights: HashMap<String, MxArray>,
+    config: &serde_json::Value,
+    target_dtype_str: &str,
+    tie_word_embeddings: bool,
+) -> Result<HashMap<String, MxArray>> {
+    let target_dtype = match target_dtype_str {
+        "float32" | "f32" => DType::Float32,
+        "float16" | "f16" => DType::Float16,
+        "bfloat16" | "bf16" => DType::BFloat16,
+        other => {
+            warn!("Unknown target dtype '{}', defaulting to bfloat16", other);
+            DType::BFloat16
+        }
+    };
+
+    // LFM2 has no `text_config` nesting — every field is top-level.
+    let num_hidden_layers = config
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    // `num_experts` absent => dense `lfm2` (no expert stacking).
+    let num_experts = config
+        .get("num_experts")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let num_dense_layers = config
+        .get("num_dense_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    info!(
+        "  lfm2 sanitize: num_hidden_layers={}, num_dense_layers={}, num_experts={:?}, target_dtype={:?}",
+        num_hidden_layers, num_dense_layers, num_experts, target_dtype
+    );
+
+    // Step 1: key rename + conv transpose + lm_head drop. KEEP the `model.`
+    // prefix; the loader strips it on read.
+    let mut new_weights: HashMap<String, MxArray> = HashMap::new();
+    for (key, value) in weights.into_iter() {
+        // Drop the tied output head — the loader reuses embed_tokens via
+        // `as_linear()`. (Generic pass already drops it, but a non-tied caller
+        // may still ship one we must keep; only drop when tied.)
+        if key.ends_with("lm_head.weight") && tie_word_embeddings {
+            continue;
+        }
+
+        // Conv transpose: `*.conv.conv.weight` where shape[-1] > shape[1] is the
+        // HF `[channels, 1, kernel]` layout; transpose to `[channels, kernel, 1]`.
+        // Mirrors lfm2 loader `sanitize_weights`.
+        let value = if key.ends_with("conv.conv.weight") {
+            let ndim = value.ndim().unwrap_or(0);
+            if ndim == 3 {
+                let dim1 = value.shape_at(1).unwrap_or(0);
+                let dim2 = value.shape_at(2).unwrap_or(0);
+                if dim2 > dim1 {
+                    value.transpose(Some(&[0, 2, 1]))?
+                } else {
+                    value
+                }
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+
+        // MLP rename scoped to `feed_forward.*` so it catches both dense
+        // (`feed_forward.wN.weight`) and expert (`experts.{e}.wN.weight`) keys
+        // without disturbing unrelated tensors. We only emit bf16/f32 `.weight`
+        // tensors here (quantization runs later), so renaming `.weight` alone is
+        // sufficient — no `.scales`/`.biases` companions exist yet.
+        let new_key = if key.contains("feed_forward") {
+            key.replace("w1.weight", "gate_proj.weight")
+                .replace("w2.weight", "down_proj.weight")
+                .replace("w3.weight", "up_proj.weight")
+        } else {
+            key
+        };
+
+        new_weights.insert(new_key, value);
+    }
+
+    // Step 2: stack per-expert projections for every MoE layer. Byte-identical
+    // to the loader's stacking (`mx.stack` over axis 0 ->
+    // `[num_experts, out, in]`). Skipped entirely for dense `lfm2`.
+    if let Some(num_experts) = num_experts {
+        for l in num_dense_layers..num_hidden_layers {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                let key0 = format!("model.layers.{l}.feed_forward.experts.0.{proj}.weight");
+                if !new_weights.contains_key(&key0) {
+                    continue;
+                }
+                let mut arrs = Vec::with_capacity(num_experts);
+                for e in 0..num_experts {
+                    let kk = format!("model.layers.{l}.feed_forward.experts.{e}.{proj}.weight");
+                    let a = new_weights.remove(&kk).ok_or_else(|| {
+                        Error::from_reason(format!("lfm2: missing expert weight {kk}"))
+                    })?;
+                    arrs.push(a);
+                }
+                let refs: Vec<&MxArray> = arrs.iter().collect();
+                let stacked = MxArray::stack(refs, Some(0))?; // [num_experts, out, in]
+                new_weights.insert(
+                    format!("model.layers.{l}.feed_forward.switch_mlp.{proj}.weight"),
+                    stacked,
+                );
+            }
+        }
+    }
+
+    info!(
+        "  After lfm2 rename + expert stacking: {} tensors",
+        new_weights.len()
+    );
+
+    // Step 3: cast remaining f32 tensors to the target dtype. EXCLUDE
+    // `expert_bias` (loader keeps it f32 per `cast_predicate`) and skip any
+    // quantized tensor groups (none exist on this path, but mirror
+    // `sanitize_qwen35_moe` for safety against a pre-quantized source).
+    let quantized_bases: std::collections::HashSet<String> = new_weights
+        .keys()
+        .filter(|k| k.ends_with(".scales"))
+        .map(|k| k.strip_suffix(".scales").unwrap_or(k.as_str()).to_string())
+        .collect();
+    let keys: Vec<String> = new_weights.keys().cloned().collect();
+    for k in keys {
+        if k.ends_with(".expert_bias") {
+            continue;
+        }
+        if k.ends_with(".scales") || k.ends_with(".biases") {
+            continue;
+        }
+        if let Some(base) = k.strip_suffix(".weight")
+            && quantized_bases.contains(base)
+        {
+            continue; // packed quantized weight — leave as-is
+        }
+        let v = new_weights
+            .get(&k)
+            .ok_or_else(|| Error::from_reason(format!("lfm2: tensor {k} vanished during cast")))?;
+        if v.dtype()? == DType::Float32 {
+            let converted = v.astype(target_dtype)?;
+            new_weights.insert(k, converted);
+        }
+    }
+
+    info!("  After lfm2 sanitization: {} tensors", new_weights.len());
+
+    Ok(new_weights)
+}
+
 // ── AWQ Pre-Scaling ─────────────────────────────────────────────────────────
 
 /// Apply AWQ-style pre-scaling using imatrix importance scores.
@@ -4306,5 +4535,263 @@ mod tests {
             "expected MXFP8 error to be much larger than affine 8-bit on router-gate-shaped tensor; \
              got mxfp8={err_mxfp8}, affine8={err_affine}"
         );
+    }
+
+    // ── LFM2 convert sanitizer ──────────────────────────────────────────────
+
+    /// bf16 array filled with `fill`, shaped as given.
+    fn lfm2_bf16(shape: &[i64], fill: f32) -> MxArray {
+        let n: i64 = shape.iter().product();
+        let data: Vec<f32> = vec![fill; n.max(0) as usize];
+        MxArray::from_float32(&data, shape)
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("astype bf16")
+    }
+
+    /// f32 array filled with `fill` (for `expert_bias`).
+    fn lfm2_f32(shape: &[i64], fill: f32) -> MxArray {
+        let n: i64 = shape.iter().product();
+        let data: Vec<f32> = vec![fill; n.max(0) as usize];
+        MxArray::from_float32(&data, shape).expect("from_float32")
+    }
+
+    /// Tiny LFM2-MoE config: 3 layers, 1 dense + 2 MoE, 4 experts. Conv layer 0
+    /// (dense), MoE layers 1 and 2.
+    fn lfm2_moe_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "lfm2_moe",
+            "num_hidden_layers": 3,
+            "num_dense_layers": 1,
+            "num_experts": 4,
+            "tie_word_embeddings": true,
+        })
+    }
+
+    /// Build a small HF-style LFM2-MoE param map (keys carry the `model.` prefix
+    /// exactly as on disk). Layer 0 dense, layers 1-2 MoE.
+    fn lfm2_moe_hf_params() -> HashMap<String, MxArray> {
+        let h = 4i64;
+        let inter = 8i64; // dense intermediate
+        let moe_inter = 6i64; // expert intermediate
+        let experts = 4i64;
+
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+        // Tied output head present on disk — must be dropped.
+        p.insert("lm_head.weight".into(), lfm2_bf16(&[16, h], 0.01));
+
+        // Layer 0: dense conv layer.
+        p.insert(
+            "model.layers.0.operator_norm.weight".into(),
+            lfm2_bf16(&[h], 1.0),
+        );
+        p.insert(
+            "model.layers.0.ffn_norm.weight".into(),
+            lfm2_bf16(&[h], 1.0),
+        );
+        // HF conv weight: [channels, 1, kernel] -> must transpose to [channels, kernel, 1].
+        p.insert(
+            "model.layers.0.conv.conv.weight".into(),
+            lfm2_bf16(&[h, 1, 3], 0.5),
+        );
+        p.insert(
+            "model.layers.0.conv.in_proj.weight".into(),
+            lfm2_bf16(&[3 * h, h], 0.1),
+        );
+        p.insert(
+            "model.layers.0.conv.out_proj.weight".into(),
+            lfm2_bf16(&[h, h], 0.1),
+        );
+        // Dense feed-forward w1/w2/w3 -> gate/down/up.
+        p.insert(
+            "model.layers.0.feed_forward.w1.weight".into(),
+            lfm2_bf16(&[inter, h], 0.1),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w2.weight".into(),
+            lfm2_bf16(&[h, inter], 0.1),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w3.weight".into(),
+            lfm2_bf16(&[inter, h], 0.1),
+        );
+
+        // Layers 1 + 2: MoE (one conv-ish + one attention; operator type is
+        // irrelevant to the sanitizer — only the feed_forward matters here).
+        for l in 1..=2 {
+            let pre = format!("model.layers.{l}");
+            p.insert(format!("{pre}.operator_norm.weight"), lfm2_bf16(&[h], 1.0));
+            p.insert(format!("{pre}.ffn_norm.weight"), lfm2_bf16(&[h], 1.0));
+            // Router gate + expert bias (f32, must stay f32).
+            p.insert(
+                format!("{pre}.feed_forward.gate.weight"),
+                lfm2_bf16(&[experts, h], 0.05),
+            );
+            p.insert(
+                format!("{pre}.feed_forward.expert_bias"),
+                lfm2_f32(&[experts], 0.0),
+            );
+            for e in 0..experts {
+                p.insert(
+                    format!("{pre}.feed_forward.experts.{e}.w1.weight"),
+                    lfm2_bf16(&[moe_inter, h], 0.1),
+                );
+                p.insert(
+                    format!("{pre}.feed_forward.experts.{e}.w2.weight"),
+                    lfm2_bf16(&[h, moe_inter], 0.1),
+                );
+                p.insert(
+                    format!("{pre}.feed_forward.experts.{e}.w3.weight"),
+                    lfm2_bf16(&[moe_inter, h], 0.1),
+                );
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn lfm2_sanitize_produces_loader_consistent_keys() {
+        let cfg = lfm2_moe_config();
+        let out = sanitize_lfm2_moe(lfm2_moe_hf_params(), &cfg, "bfloat16", true)
+            .expect("sanitize_lfm2_moe");
+
+        // `model.` prefix KEPT (loader strips it on read).
+        assert!(out.contains_key("model.embed_tokens.weight"));
+        assert!(out.contains_key("model.embedding_norm.weight"));
+        // Must NOT re-prefix to `language_model.model.*`.
+        assert!(
+            !out.keys().any(|k| k.starts_with("language_model.")),
+            "lfm2 keys must not be re-prefixed with language_model.*: {:?}",
+            out.keys().collect::<Vec<_>>()
+        );
+
+        // lm_head dropped (tied).
+        assert!(!out.contains_key("lm_head.weight"));
+
+        // Dense layer 0: w1/w2/w3 renamed.
+        assert!(out.contains_key("model.layers.0.feed_forward.gate_proj.weight"));
+        assert!(out.contains_key("model.layers.0.feed_forward.down_proj.weight"));
+        assert!(out.contains_key("model.layers.0.feed_forward.up_proj.weight"));
+        assert!(!out.contains_key("model.layers.0.feed_forward.w1.weight"));
+        assert!(!out.contains_key("model.layers.0.feed_forward.w2.weight"));
+        assert!(!out.contains_key("model.layers.0.feed_forward.w3.weight"));
+
+        // Conv weight transposed [4,1,3] -> [4,3,1].
+        let conv = out
+            .get("model.layers.0.conv.conv.weight")
+            .expect("conv weight present");
+        let shape = conv.shape().expect("shape");
+        assert_eq!(
+            shape.to_vec(),
+            vec![4, 3, 1],
+            "conv weight must be transposed"
+        );
+
+        // MoE layers 1 + 2: experts stacked into switch_mlp.{proj} [E, out, in].
+        for l in 1..=2 {
+            let pre = format!("model.layers.{l}");
+            for (proj, out_dim, in_dim) in [
+                ("gate_proj", 6i64, 4i64),
+                ("up_proj", 6i64, 4i64),
+                ("down_proj", 4i64, 6i64),
+            ] {
+                let key = format!("{pre}.feed_forward.switch_mlp.{proj}.weight");
+                let stacked = out.get(&key).unwrap_or_else(|| panic!("missing {key}"));
+                let shape = stacked.shape().expect("shape");
+                assert_eq!(
+                    shape.to_vec(),
+                    vec![4, out_dim, in_dim],
+                    "{key} must be [num_experts, out, in]"
+                );
+            }
+            // Individual expert keys consumed.
+            assert!(
+                !out.keys()
+                    .any(|k| k.contains(&format!("layers.{l}.feed_forward.experts."))),
+                "individual expert keys for layer {l} must be consumed"
+            );
+            // Router gate preserved under `feed_forward.gate.weight`.
+            assert!(out.contains_key(&format!("{pre}.feed_forward.gate.weight")));
+            // expert_bias preserved AND still f32.
+            let bias = out
+                .get(&format!("{pre}.feed_forward.expert_bias"))
+                .expect("expert_bias present");
+            assert_eq!(
+                bias.dtype().expect("dtype"),
+                DType::Float32,
+                "expert_bias must stay f32"
+            );
+        }
+    }
+
+    #[test]
+    fn lfm2_sanitize_dense_has_no_expert_stacking() {
+        // Dense `lfm2` config: no `num_experts` -> no stacking, all feed_forward
+        // is dense {gate,up,down}_proj after the rename.
+        let cfg = serde_json::json!({
+            "model_type": "lfm2",
+            "num_hidden_layers": 1,
+            "num_dense_layers": 0,
+            "tie_word_embeddings": false,
+        });
+        let h = 4i64;
+        let inter = 8i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+        p.insert(
+            "model.layers.0.feed_forward.w1.weight".into(),
+            lfm2_bf16(&[inter, h], 0.1),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w2.weight".into(),
+            lfm2_bf16(&[h, inter], 0.1),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w3.weight".into(),
+            lfm2_bf16(&[inter, h], 0.1),
+        );
+
+        let out = sanitize_lfm2_moe(p, &cfg, "bfloat16", false).expect("sanitize dense lfm2");
+        assert!(out.contains_key("model.layers.0.feed_forward.gate_proj.weight"));
+        assert!(out.contains_key("model.layers.0.feed_forward.up_proj.weight"));
+        assert!(out.contains_key("model.layers.0.feed_forward.down_proj.weight"));
+        assert!(
+            !out.keys().any(|k| k.contains("switch_mlp")),
+            "dense lfm2 must not produce switch_mlp keys"
+        );
+    }
+
+    #[test]
+    fn lfm2_router_gate_is_router_gate() {
+        // The lfm2 router (`feed_forward.gate`) MUST be treated as a router gate
+        // so it routes to the 8-bit affine branch.
+        assert!(is_router_gate(
+            "language_model.model.layers.5.feed_forward.gate.weight"
+        ));
+        assert!(is_router_gate("model.layers.5.feed_forward.gate.weight"));
+        // Sanity: qwen-style gates still match.
+        assert!(is_router_gate("model.layers.0.mlp.gate.weight"));
+    }
+
+    #[test]
+    fn lfm2_depthwise_conv_not_quantized() {
+        // The depthwise short conv must never be quantized.
+        assert!(!should_quantize("model.layers.0.conv.conv.weight"));
+        // But the conv in/out projections (standard matmuls) SHOULD be.
+        assert!(should_quantize("model.layers.0.conv.in_proj.weight"));
+        assert!(should_quantize("model.layers.0.conv.out_proj.weight"));
+        // And stacked experts SHOULD be quantizable.
+        assert!(should_quantize(
+            "model.layers.1.feed_forward.switch_mlp.gate_proj.weight"
+        ));
     }
 }
