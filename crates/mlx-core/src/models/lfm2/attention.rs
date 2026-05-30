@@ -1,6 +1,7 @@
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::mask::create_causal_mask;
+use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -16,10 +17,10 @@ use napi::bindgen_prelude::*;
 /// - Standard RoPE (neox-style, base=1M)
 /// - No bias on any projection
 pub struct Lfm2Attention {
-    pub(crate) q_proj: Linear,
-    pub(crate) k_proj: Linear,
-    pub(crate) v_proj: Linear,
-    pub(crate) out_proj: Linear,
+    pub(crate) q_proj: LinearProj,
+    pub(crate) k_proj: LinearProj,
+    pub(crate) v_proj: LinearProj,
+    pub(crate) out_proj: LinearProj,
     pub(crate) q_layernorm: RMSNorm,
     pub(crate) k_layernorm: RMSNorm,
     rope: RoPE,
@@ -43,10 +44,10 @@ impl Lfm2Attention {
         let q_dim = (num_heads * head_dim) as u32;
         let kv_dim = (num_kv_heads * head_dim) as u32;
 
-        let q_proj = Linear::new(h, q_dim, Some(false))?;
-        let k_proj = Linear::new(h, kv_dim, Some(false))?;
-        let v_proj = Linear::new(h, kv_dim, Some(false))?;
-        let out_proj = Linear::new(q_dim, h, Some(false))?;
+        let q_proj = LinearProj::Standard(Linear::new(h, q_dim, Some(false))?);
+        let k_proj = LinearProj::Standard(Linear::new(h, kv_dim, Some(false))?);
+        let v_proj = LinearProj::Standard(Linear::new(h, kv_dim, Some(false))?);
+        let out_proj = LinearProj::Standard(Linear::new(q_dim, h, Some(false))?);
 
         let q_layernorm = RMSNorm::new(head_dim as u32, Some(norm_eps))?;
         let k_layernorm = RMSNorm::new(head_dim as u32, Some(norm_eps))?;
@@ -315,10 +316,11 @@ impl Lfm2Attention {
     // ========== Weight setters ==========
     //
     // NOTE: q/k/v/out_proj weights are loaded via the `*_proj_mut()` accessors
-    // below (which drive `Linear::load_quantized` or `Linear::set_weight`
-    // uniformly for quantized/bf16 checkpoints). The former
-    // `set_{q,k,v,out}_proj_weight` shims were removed after that switch left
-    // them with zero callers.
+    // below, which expose the mode-aware `LinearProj`. The persistence layer
+    // either installs a `QuantizedLinear` backend (any of affine / mxfp4 /
+    // mxfp8 / nvfp4) via `LinearProj::set_quantized`, or sets a dense bf16
+    // weight via `LinearProj::set_weight`. The `forward` path dispatches
+    // quantized vs dense transparently. q/k_layernorm are never quantized.
 
     pub fn set_q_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.q_layernorm.set_weight(w)
@@ -330,24 +332,25 @@ impl Lfm2Attention {
 
     // ========== Mutable projection accessors ==========
     //
-    // Expose the underlying `Linear`s so the persistence layer can drive
-    // affine-quantized loads (`Linear::load_quantized`) or plain bf16 loads
-    // (`Linear::set_weight`) uniformly for a fully quantized checkpoint. The
-    // `forward` path dispatches quantized vs dense transparently.
+    // Expose the mode-aware `LinearProj`s so the persistence layer can install
+    // a quantized backend (affine / mxfp4 / mxfp8 / nvfp4) via
+    // `set_quantized`, or a plain bf16 weight via `set_weight`, uniformly for a
+    // fully quantized checkpoint. The `forward` path dispatches quantized vs
+    // dense transparently.
 
-    pub fn q_proj_mut(&mut self) -> &mut Linear {
+    pub fn q_proj_mut(&mut self) -> &mut LinearProj {
         &mut self.q_proj
     }
 
-    pub fn k_proj_mut(&mut self) -> &mut Linear {
+    pub fn k_proj_mut(&mut self) -> &mut LinearProj {
         &mut self.k_proj
     }
 
-    pub fn v_proj_mut(&mut self) -> &mut Linear {
+    pub fn v_proj_mut(&mut self) -> &mut LinearProj {
         &mut self.v_proj
     }
 
-    pub fn out_proj_mut(&mut self) -> &mut Linear {
+    pub fn out_proj_mut(&mut self) -> &mut LinearProj {
         &mut self.out_proj
     }
 }

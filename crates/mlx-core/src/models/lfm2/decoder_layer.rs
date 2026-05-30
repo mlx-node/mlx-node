@@ -1,4 +1,5 @@
 use crate::array::MxArray;
+use crate::models::qwen3_5_moe::quantized_linear::MLPVariant;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -37,12 +38,18 @@ pub(crate) enum OperatorType {
 /// Per-layer feed-forward block.
 ///
 /// Dense LFM2 checkpoints (and the first `num_dense_layers` layers of a MoE
-/// checkpoint) use a standard SwiGLU `MLP`; the remaining MoE-checkpoint
+/// checkpoint) use a standard SwiGLU MLP; the remaining MoE-checkpoint
 /// layers use a sparse top-k `Lfm2SparseMoeBlock`. Both expose the same
 /// `forward(&MxArray) -> Result<MxArray>` contract so the residual path in
 /// the decoder layer is identical.
+///
+/// The dense arm holds an `MLPVariant` (shared with qwen3_5) so its gate/up/
+/// down projections can each be quantized in ANY mode (affine / mxfp4 / mxfp8
+/// / nvfp4) — the quantized arm runs three `QuantizedLinear::forward` + swiglu
+/// with no dense `get_weight()` materialization, while the `Standard` arm is
+/// the eager-dense `MLP` (default at construction).
 pub(crate) enum FeedForward {
-    Dense(MLP),
+    Dense(MLPVariant),
     Moe(Lfm2SparseMoeBlock),
 }
 
@@ -110,7 +117,7 @@ impl Lfm2DecoderLayer {
             } else {
                 config.computed_ff_dim()
             };
-            FeedForward::Dense(MLP::new(h as u32, ff_dim as u32)?)
+            FeedForward::Dense(MLPVariant::Standard(MLP::new(h as u32, ff_dim as u32)?))
         };
 
         let eps = Some(config.norm_eps);
@@ -267,9 +274,13 @@ impl Lfm2DecoderLayer {
         }
     }
 
-    /// Get a mutable reference to the dense feed-forward MLP.
+    /// Get a mutable reference to the dense feed-forward `MLPVariant`.
     /// Returns `None` if this layer uses a sparse MoE block.
-    pub fn dense_mlp_mut(&mut self) -> Option<&mut MLP> {
+    ///
+    /// The returned `MLPVariant` is `Standard` at construction; the
+    /// persistence layer swaps it to `Quantized` in place when the dense-MLP
+    /// projections ship `.scales`.
+    pub fn dense_mlp_mut(&mut self) -> Option<&mut MLPVariant> {
         match &mut self.feed_forward {
             FeedForward::Dense(m) => Some(m),
             FeedForward::Moe(_) => None,

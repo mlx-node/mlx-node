@@ -304,24 +304,17 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
-    // LFM2 affine-only gate: the lfm2 loader quantizes NON-MoE tensors
-    // (attention/conv/dense-MLP projections) through `Linear::load_quantized`,
-    // which hardcodes the "affine" dequant kernel. Emitting mxfp4/mxfp8/nvfp4
-    // weights for those tensors would be silently mis-dequantized at load time
-    // and produce garbage. Reject every non-affine mode up front with a clear
-    // message until a quant-capable non-MoE loader lands (fast-follow #1).
-    if do_quantize
-        && matches!(model_type.as_deref(), Some("lfm2_moe" | "lfm2"))
-        && (quant_mxfp || quant_mode != "affine")
-    {
-        return Err(Error::from_reason(format!(
-            "lfm2/lfm2_moe quantization currently supports affine mode only \
-             (got mode='{}'{}). mxfp4/mxfp8/nvfp4 are not yet supported (pending a \
-             non-MoE quant-capable loader). Re-run with the default --q-mode affine.",
-            quant_mode,
-            if quant_mxfp { " with --q-mxfp" } else { "" }
-        )));
-    }
+    // LFM2 mxfp/nvfp now SUPPORTED for non-MoE linears (fast-follow #1a): the
+    // lfm2 loader's attention / conv / dense-MLP projections are mode-aware
+    // `LinearProj`/`MLPVariant` backed by `QuantizedLinear`, which threads the
+    // resolved mode (affine / mxfp4 / mxfp8 / nvfp4) into `mlx_quantized_matmul`
+    // at forward time. The MoE experts/gate already supported all four modes.
+    // The EMBEDDING and lm_head remain excluded from quantization (vocab-dim
+    // tensors): `should_quantize` skips `embed_tokens`/`lm_head`, so an
+    // mxfp8/mxfp4/nvfp4 lfm2 checkpoint ships quantized experts + attn/conv/
+    // dense-MLP and a plain bf16 embedding — which the #1a loader can load. A
+    // quant-capable embedding lands in #1b; the prior affine-only gate is thus
+    // removed.
 
     // Validate recipe
     if let Some(ref recipe) = quant_recipe {

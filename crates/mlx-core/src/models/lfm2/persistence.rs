@@ -15,11 +15,14 @@ use crate::models::quant_dispatch::{
 use crate::models::qwen3_5::persistence_common::{dequant_fp8_weights, load_all_safetensors};
 use crate::models::qwen3_5_moe::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
-    QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint, try_build_mxfp4_quantized_linear,
-    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
-    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
-    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
+    LinearProj, MLPVariant, QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
+    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
+    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
+    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
+    try_build_quantized_linear,
 };
+#[cfg(test)]
+use crate::models::qwen3_5_moe::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE};
 use crate::models::qwen3_5_moe::switch_glu::SwitchGLU;
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -97,57 +100,153 @@ fn build_lfm2_gate_ql(
     }
 }
 
-/// Load a NON-MoE `Linear` either affine-quantized or plain bf16, keyed off
-/// the presence of `{base}.scales`.
+/// Build a NON-MoE `QuantizedLinear` for `base`, dispatching on the resolved
+/// per-layer quant mode. Mirrors `build_lfm2_gate_ql` but for the standalone
+/// non-MoE projections (attention q/k/v/out, conv in/out, dense-MLP gate/up/
+/// down). Supports ALL four modes (affine / mxfp4 / mxfp8 / nvfp4) by routing
+/// to the matching qwen3_5 builder; the returned `QuantizedLinear` threads the
+/// correct mode into `mlx_quantized_matmul` at forward time. Returns `None`
+/// when the `.weight`/`.scales` group is incomplete (the caller fails loud).
+fn build_lfm2_non_moe_ql(
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Option<QuantizedLinear> {
+    // Non-MoE bases never take the gate branch of `effective_plq_for` (it keys
+    // on `.mlp.gate` / `.mlp.shared_expert_gate`), so `gate_default = None`.
+    let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
+    match plq.mode {
+        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, base),
+        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, base),
+        PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, base),
+        PerLayerMode::Affine => try_build_quantized_linear(params, base, plq.group_size, plq.bits),
+    }
+}
+
+/// Load a NON-MoE `LinearProj` either quantized (ANY mode) or plain bf16, keyed
+/// off the presence of `{base}.scales`.
 ///
-/// SCOPE: `nn::Linear::load_quantized` is **affine-only** (it hardcodes the
-/// `"affine"` dequant mode). The canonical `mlx_lm.convert --quantize` default
-/// IS affine, which is the only non-MoE quantization we support today. If the
-/// tensor ships `.scales` but its resolved per-layer mode is NOT affine
-/// (mxfp4 / mxfp8 / nvfp4), we FAIL LOUD naming the tensor rather than feed a
-/// non-affine packed weight into the affine dequant kernel and silently emit
-/// garbage. Extending non-MoE tensors to the MXFP/NVFP formats would require
-/// the larger refactor of the lfm2 module field types to a quant-capable enum,
-/// which is intentionally out of scope here.
+/// The lfm2 non-MoE module fields are now mode-aware `LinearProj`s (shared with
+/// qwen3_5), so a quantized projection installs a `QuantizedLinear` backend
+/// whose `forward` threads the resolved mode (affine / mxfp4 / mxfp8 / nvfp4)
+/// into `mlx_quantized_matmul`. There is NO dense `get_weight()`
+/// materialization on the forward path — the projection stays packed-only
+/// resident.
 ///
-/// `default_plq` is the top-level affine default (bits/group_size from
+/// mxfp4/mxfp8/nvfp4 groups ship only `.weight` + `.scales` (no affine
+/// `.biases`); affine ships `.weight` + `.scales` + optional `.biases`. The
+/// per-mode builders already encode that (the FP-mode builders pass `None` for
+/// the quant biases). The additive LAYER bias (`.bias`, e.g. lfm2
+/// `conv_bias=true`) is applied separately by the caller via the dedicated
+/// `set_*_proj_bias` helpers, which dispatch across both `LinearProj` arms.
+///
+/// `default_plq` is the top-level default (bits/group_size/mode from
 /// `config.json`'s `quantization` block). `effective_plq_for` applies any
-/// per-layer override for `base` (none exist for non-MoE bases in canonical
-/// checkpoints, but the lookup keeps us correct if one is ever present).
-fn load_linear_affine_or_bf16(
-    linear: &mut Linear,
+/// per-layer override for `base`.
+fn load_linear_proj_quantized_or_bf16(
+    proj: &mut LinearProj,
     params: &HashMap<String, MxArray>,
     base: &str,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     default_plq: PerLayerQuant,
 ) -> Result<()> {
-    if let Some(scales) = params.get(&format!("{base}.scales")) {
-        let weight = params.get(&format!("{base}.weight")).ok_or_else(|| {
-            Error::from_reason(format!(
-                "lfm2: quantized tensor '{base}' has '.scales' but is missing its packed '.weight'"
-            ))
-        })?;
-        let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
-        if !matches!(plq.mode, PerLayerMode::Affine) {
-            return Err(Error::from_reason(format!(
-                "lfm2: non-MoE tensor '{base}' is quantized with mode {:?}, but non-affine \
-                 quantization (mxfp4/mxfp8/nvfp4) of non-MoE lfm2 tensors is not yet supported; \
-                 only affine (the `mlx_lm.convert --quantize` default) is. Re-quantize this \
-                 checkpoint with affine mode, or quantize only the MoE router gate / experts.",
-                plq.mode
-            )));
-        }
-        let biases = params.get(&format!("{base}.biases"));
-        linear.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
+    if params.contains_key(&format!("{base}.scales")) {
+        // A `.scales` companion marks the tensor quantized. The packed
+        // `.weight` MUST be present; `build_lfm2_non_moe_ql` returns `None`
+        // otherwise — fail loud naming the tensor rather than leave random
+        // init (mirrors the MoE branch's fail-loud contract).
+        let ql =
+            build_lfm2_non_moe_ql(params, base, per_layer_quant, default_plq).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "lfm2: quantized non-MoE tensor '{base}' has '.scales' but its packed \
+                     '.weight' could not be resolved (missing weight/scales) — refusing to load \
+                     with random init"
+                ))
+            })?;
+        proj.set_quantized(ql);
     } else if let Some(w) = params.get(&format!("{base}.weight")) {
-        linear.set_weight(w)?;
+        proj.set_weight(w, base)?;
+    }
+    Ok(())
+}
+
+/// Load a NON-MoE dense `MLPVariant` (gate/up/down projections) either
+/// quantized (ANY mode) or plain bf16, keyed off the presence of the
+/// gate-proj's `.scales`.
+///
+/// Non-MoE quant is PER-TENSOR independent, but a dense MLP's three
+/// projections are co-quantized by `mlx_lm.convert` (all or none), so we key
+/// the variant swap off `{base}.gate_proj.scales` and then require the whole
+/// group via `build_lfm2_non_moe_ql` (fail loud on any missing half). When
+/// quantized, the `MLPVariant` is swapped in place to `Quantized`, whose
+/// forward runs three `QuantizedLinear::forward` + swiglu with NO dense
+/// `get_weight()` copy. When not, the existing `Standard(MLP)` arm loads its
+/// weights through the eager-dense `Linear` setters (unchanged behavior).
+fn load_dense_mlp_variant(
+    ff: &mut MLPVariant,
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<()> {
+    let gate_base = format!("{prefix}.gate_proj");
+    let up_base = format!("{prefix}.up_proj");
+    let down_base = format!("{prefix}.down_proj");
+
+    if params.contains_key(&format!("{gate_base}.scales")) {
+        // Quantized dense MLP: build all three projections and swap the variant
+        // to `Quantized` in place. A missing half on ANY projection fails loud
+        // (validate_mandatory_weights already rejects lone-half groups, but the
+        // builder-level guard catches any skew it cannot see).
+        let gate_proj = build_lfm2_non_moe_ql(params, &gate_base, per_layer_quant, default_plq)
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "lfm2: quantized dense-MLP projection '{gate_base}' could not be built \
+                     (missing weight/scales)"
+                ))
+            })?;
+        let up_proj = build_lfm2_non_moe_ql(params, &up_base, per_layer_quant, default_plq)
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "lfm2: quantized dense-MLP projection '{up_base}' could not be built \
+                     (missing weight/scales)"
+                ))
+            })?;
+        let down_proj = build_lfm2_non_moe_ql(params, &down_base, per_layer_quant, default_plq)
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "lfm2: quantized dense-MLP projection '{down_base}' could not be built \
+                     (missing weight/scales)"
+                ))
+            })?;
+        *ff = MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+        };
+    } else {
+        // Plain bf16 dense MLP. The variant is `Standard(MLP)` (default at
+        // construction); load each projection's weight through the eager-dense
+        // `Linear` setters. lfm2 never calls `finalize_gate_up`, so the E39
+        // stacked fast path stays inert and `set_*_proj_weight` is sufficient.
+        if let Some(w) = params.get(&format!("{gate_base}.weight")) {
+            ff.set_gate_proj_weight(w)?;
+        }
+        if let Some(w) = params.get(&format!("{up_base}.weight")) {
+            ff.set_up_proj_weight(w)?;
+        }
+        if let Some(w) = params.get(&format!("{down_base}.weight")) {
+            ff.set_down_proj_weight(w)?;
+        }
     }
     Ok(())
 }
 
 /// Load a NON-MoE `Embedding` either affine-quantized or plain bf16, keyed off
 /// `{base}.scales`. Same affine-only scope and fail-loud contract as
-/// [`load_linear_affine_or_bf16`].
+/// [`load_lm_head_affine_or_bf16`] (embedding is out of scope for #1a; a
+/// quant-capable embedding lands in #1b).
 ///
 /// `nn::Embedding::load_quantized` PRE-dequantizes the full table into the
 /// dense weight, so a tied lm_head matmul (which reads `get_weight()`) keeps
@@ -188,6 +287,47 @@ fn load_embedding_affine_or_bf16(
         embedding.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
     } else if let Some(w) = params.get(&format!("{base}.weight")) {
         embedding.load_weight(w)?;
+    }
+    Ok(())
+}
+
+/// Load the separate (untied) `lm_head` `Linear` either affine-quantized or
+/// plain bf16, keyed off `{base}.scales`.
+///
+/// SCOPE (#1a): the lm_head — like the embedding — is OUT OF SCOPE for the
+/// non-MoE mode-aware refactor. It shares the vocab dimension and is excluded
+/// from quantization by the converter (`should_quantize` skips `lm_head`, and
+/// `is_affine_only_key` lists it), so in practice it always loads plain bf16.
+/// We keep the affine-only fail-loud path here (matching the prior behavior)
+/// for any hand-quantized untied head: `nn::Linear::load_quantized` is
+/// affine-only, so a non-affine `.scales` is rejected rather than silently
+/// mis-dequantized. A quant-capable lm_head/embedding lands in #1b.
+fn load_lm_head_affine_or_bf16(
+    linear: &mut Linear,
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<()> {
+    if let Some(scales) = params.get(&format!("{base}.scales")) {
+        let weight = params.get(&format!("{base}.weight")).ok_or_else(|| {
+            Error::from_reason(format!(
+                "lfm2: quantized tensor '{base}' has '.scales' but is missing its packed '.weight'"
+            ))
+        })?;
+        let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
+        if !matches!(plq.mode, PerLayerMode::Affine) {
+            return Err(Error::from_reason(format!(
+                "lfm2: lm_head '{base}' is quantized with mode {:?}, but non-affine quantization \
+                 (mxfp4/mxfp8/nvfp4) of the lfm2 lm_head is not yet supported; only affine (the \
+                 `mlx_lm.convert --quantize` default) is.",
+                plq.mode
+            )));
+        }
+        let biases = params.get(&format!("{base}.biases"));
+        linear.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
+    } else if let Some(w) = params.get(&format!("{base}.weight")) {
+        linear.set_weight(w)?;
     }
     Ok(())
 }
@@ -404,7 +544,7 @@ fn sanitize_weights(
         // `feed_forward.w1.{scales,biases}`, leaving the loader unable to find
         // `gate_proj.scales` and wrongly taking the bf16 path for a packed
         // weight. The full-suffix rename keeps the whole group together so
-        // `load_linear_affine_or_bf16` resolves it as quantized.
+        // `load_dense_mlp_variant` resolves it as quantized.
         //
         // N/A — per-layer quant OVERRIDE keys never arrive under `w{1,2,3}`:
         // dense `lfm2.py` has no `quant_predicate` (uniform top-level default),
@@ -558,8 +698,10 @@ fn apply_weights(
     }
 
     // Separate lm_head when tie_embedding is false (affine-quantized or bf16).
+    // Out of scope for #1a's non-MoE mode-aware refactor (vocab-dim tensor,
+    // converter-excluded); stays on the affine-only path.
     if let Some(ref mut head) = inner.lm_head {
-        load_linear_affine_or_bf16(head, params, "lm_head", per_layer_quant, default_plq)?;
+        load_lm_head_affine_or_bf16(head, params, "lm_head", per_layer_quant, default_plq)?;
     }
 
     // Per-layer weights
@@ -692,30 +834,15 @@ fn apply_weights(
                     "layer {i} reported dense but dense_mlp_mut() was None"
                 ))
             })?;
-            // Dense-MLP projections: affine-quantized when their `.scales` are
-            // present, else plain bf16. `MLP::forward` reads `get_weight()`
-            // (the pre-dequantized dense table for quantized linears), so no
-            // forward change is needed. lfm2 never calls `finalize_gate_up`, so
-            // the E39 stacked fast path is inert here — and the `*_mut`
-            // accessors invalidate that cache anyway.
-            load_linear_affine_or_bf16(
-                ff.gate_proj_mut(),
+            // Dense-MLP projections: quantized (ANY mode) when their gate-proj
+            // `.scales` is present, else plain bf16. A quantized dense MLP
+            // swaps the `MLPVariant` to `Quantized` (three `QuantizedLinear`s +
+            // swiglu, packed-only resident, NO dense `get_weight()` copy); the
+            // bf16 path keeps the eager-dense `Standard(MLP)` arm.
+            load_dense_mlp_variant(
+                ff,
                 params,
-                &format!("{prefix}.feed_forward.gate_proj"),
-                per_layer_quant,
-                default_plq,
-            )?;
-            load_linear_affine_or_bf16(
-                ff.up_proj_mut(),
-                params,
-                &format!("{prefix}.feed_forward.up_proj"),
-                per_layer_quant,
-                default_plq,
-            )?;
-            load_linear_affine_or_bf16(
-                ff.down_proj_mut(),
-                params,
-                &format!("{prefix}.feed_forward.down_proj"),
+                &format!("{prefix}.feed_forward"),
                 per_layer_quant,
                 default_plq,
             )?;
@@ -726,30 +853,30 @@ fn apply_weights(
             // Attention layer
             if let Some(attn) = layer.attention_mut() {
                 let attn_prefix = format!("{}.self_attn", prefix);
-                // q/k/v/out_proj: affine-quantized when `.scales` present, else
-                // bf16. q/k_layernorm are never quantized.
-                load_linear_affine_or_bf16(
+                // q/k/v/out_proj: quantized (ANY mode) when `.scales` present,
+                // else bf16. q/k_layernorm are never quantized.
+                load_linear_proj_quantized_or_bf16(
                     attn.q_proj_mut(),
                     params,
                     &format!("{attn_prefix}.q_proj"),
                     per_layer_quant,
                     default_plq,
                 )?;
-                load_linear_affine_or_bf16(
+                load_linear_proj_quantized_or_bf16(
                     attn.k_proj_mut(),
                     params,
                     &format!("{attn_prefix}.k_proj"),
                     per_layer_quant,
                     default_plq,
                 )?;
-                load_linear_affine_or_bf16(
+                load_linear_proj_quantized_or_bf16(
                     attn.v_proj_mut(),
                     params,
                     &format!("{attn_prefix}.v_proj"),
                     per_layer_quant,
                     default_plq,
                 )?;
-                load_linear_affine_or_bf16(
+                load_linear_proj_quantized_or_bf16(
                     attn.out_proj_mut(),
                     params,
                     &format!("{attn_prefix}.out_proj"),
@@ -775,10 +902,13 @@ fn apply_weights(
                 if let Some(w) = params.get(&format!("{}.conv.bias", conv_prefix)) {
                     conv.set_conv_bias(Some(w))?;
                 }
-                // in_proj / out_proj: affine-quantized when `.scales` present,
-                // else bf16. Their LAYER bias (`.bias`, distinct from the affine
-                // quant zero-point `.biases`) is applied separately afterwards.
-                load_linear_affine_or_bf16(
+                // in_proj / out_proj: quantized (ANY mode) when `.scales`
+                // present, else bf16. Their LAYER bias (`.bias`, distinct from
+                // the affine quant zero-point `.biases`) is applied separately
+                // afterwards via `set_*_proj_bias`, which dispatches across both
+                // `LinearProj` arms (a quantized projection threads the additive
+                // bias through `QuantizedLinear::set_bias`).
+                load_linear_proj_quantized_or_bf16(
                     conv.in_proj_mut(),
                     params,
                     &format!("{conv_prefix}.in_proj"),
@@ -788,7 +918,7 @@ fn apply_weights(
                 if let Some(w) = params.get(&format!("{}.in_proj.bias", conv_prefix)) {
                     conv.set_in_proj_bias(Some(w))?;
                 }
-                load_linear_affine_or_bf16(
+                load_linear_proj_quantized_or_bf16(
                     conv.out_proj_mut(),
                     params,
                     &format!("{conv_prefix}.out_proj"),
@@ -898,14 +1028,16 @@ fn validate_mandatory_weights(
     };
 
     // NON-MoE linears + the embedding are quantized INDEPENDENTLY per tensor.
-    // A fully quantized `mlx_lm.convert --quantize` checkpoint quantizes the
-    // embedding and every attention / conv-proj / dense-MLP linear; the loader
-    // (`load_linear_affine_or_bf16` / `load_embedding_affine_or_bf16`) resolves
-    // each tensor on its OWN `.scales` presence:
-    //   - `.scales` present → load affine-quantized from the `.weight`+`.scales`
-    //     group (a lone `.scales` with no packed `.weight` is caught by the
-    //     mandatory `.weight` checks below, which fail loud naming the missing
-    //     packed weight).
+    // A fully quantized `mlx_lm.convert --quantize` checkpoint quantizes every
+    // attention / conv-proj / dense-MLP linear (the embedding stays bf16 until
+    // #1b); the loader (`load_linear_proj_quantized_or_bf16` /
+    // `load_dense_mlp_variant` / `load_embedding_affine_or_bf16`) resolves each
+    // tensor on its OWN `.scales` presence:
+    //   - `.scales` present → load quantized (ANY mode for the non-MoE linears;
+    //     affine-only for the embedding) from the `.weight`+`.scales` group (a
+    //     lone `.scales` with no packed `.weight` is caught by the mandatory
+    //     `.weight` checks below, which fail loud naming the missing packed
+    //     weight).
     //   - `.scales` absent  → load plain bf16 from `.weight`.
     // There is no group-level coupling for non-MoE tensors, so a `.scales`
     // companion alongside its `.weight` is simply accepted (quantized) — no
@@ -1033,45 +1165,36 @@ fn packed_group_bytes(params: &HashMap<String, MxArray>, base: &str) -> Option<u
 }
 
 /// Compute the deterministic resident-weight-byte total for the cache-limit
-/// coordinator, accounting for the DENSE (dequantized) copies that some
-/// quantized lfm2 tensors materialize.
+/// coordinator, accounting for the DENSE (dequantized) copy the quantized
+/// embedding materializes.
 ///
 /// ## Why the naive packed sum undercounts
 ///
 /// The baseline `sum(params.values().nbytes())` measures only the PACKED
 /// checkpoint tensors (`materialize_weights` evals exactly that set). For a
-/// fully bf16 checkpoint that equals the resident footprint. But two
-/// quantized-tensor classes ALSO leave a DENSE bf16 copy resident that the
-/// packed sum never sees:
+/// fully bf16 checkpoint that equals the resident footprint. The one
+/// quantized-tensor class that ALSO leaves a DENSE bf16 copy resident — which
+/// the packed sum never sees — is the **embedding**.
+/// `nn::Embedding::load_quantized` pre-dequantizes the whole table into
+/// `self.weight` (a dense `vocab × hidden` bf16 array) so the tied lm_head
+/// matmul keeps reading a dense `get_weight()`. With tied embeddings (lfm2
+/// ties), that dense table is genuinely materialized — it dominates the
+/// undercount (~`vocab × hidden × 2` bytes). The embedding stays on the
+/// affine/dense path (out of scope for #1a; a quant-capable embedding lands in
+/// #1b).
 ///
-///   1. The **embedding**. `nn::Embedding::load_quantized` pre-dequantizes the
-///      whole table into `self.weight` (a dense `vocab × hidden` bf16 array)
-///      so the tied lm_head matmul keeps reading a dense `get_weight()`. With
-///      tied embeddings (lfm2 ties), that dense table is genuinely materialized
-///      — it dominates the undercount (~`vocab × hidden × 2` bytes).
-///   2. The **dense-MLP** projections. `MLP::forward` takes the legacy
-///      `get_weight()` path (lfm2 never calls `finalize_gate_up`), which reads
-///      the dense dequant copy that `Linear::load_quantized` materializes —
-///      an `out × in` bf16 array per projection. Crucially, `Linear` ALSO
-///      RETAINS the packed weight/scales/biases in its quantized backend, so
-///      BOTH the packed group and the dense copy are resident. The count of
-///      dense-MLP layers is `num_hidden_layers` for a PURE-DENSE checkpoint
-///      (every layer is a dense MLP) but only the leading `num_dense_layers`
-///      for a MoE checkpoint (the rest are packed-resident MoE experts).
+/// ALL the quantized NON-MoE linears (attention q/k/v/out, conv in/out,
+/// dense-MLP gate/up/down) are now mode-aware `LinearProj`/`MLPVariant`
+/// backed by `QuantizedLinear`: their `forward` runs `mlx_quantized_matmul`
+/// on the PACKED weight and NEVER reads `get_weight()`, so no dense dequant
+/// copy is ever materialized — they are packed-only resident, exactly like the
+/// MoE experts. (Before #1a the dense-MLP went through `Linear::load_quantized`
+/// plus the legacy `MLP::forward` get_weight path, which DID materialize a
+/// dense copy; that dense-MLP delta is therefore removed here.)
 ///
-/// Attention / conv quantized linears do NOT add a dense copy: their `forward`
-/// uses the quantized backend and never reads `get_weight()`, so the lazy
-/// dequant graph is never materialized — they stay packed-only resident.
-///
-/// We start from the packed sum and add the dense residency each quantized
-/// tensor leaves behind, with TWO accounting rules reflecting whether the
-/// packed group survives:
-///   - **embedding**: `Embedding::load_quantized` FREES the packed tensors and
-///     keeps only the dense table, so we add the REPLACEMENT delta
-///     (`dense − packed`) → net resident `dense`.
-///   - **dense-MLP**: `Linear::load_quantized` RETAINS the packed backend AND
-///     materializes the dense `self.weight`, so both are resident; the packed
-///     group is already in the baseline, so we add the FULL `dense` on top.
+/// So only the embedding adds a residency delta: `Embedding::load_quantized`
+/// FREES the packed tensors and keeps only the dense table, so we add the
+/// REPLACEMENT delta (`dense − packed`) → net resident `dense`.
 ///
 /// This is conservative: it cannot undercount, and over-counts only if MLX
 /// frees a transient — the safe direction for sizing the allocator cap.
@@ -1082,7 +1205,8 @@ fn compute_weight_bytes(params: &HashMap<String, MxArray>, config: &Lfm2Config) 
         .map(|a| a.nbytes() as u64)
         .fold(0u64, |acc, v| acc.saturating_add(v));
 
-    // (1) Quantized embedding → resident dense bf16 table.
+    // Quantized embedding → resident dense bf16 table (the only non-MoE tensor
+    // class that still materializes a dense dequant copy; see fn docs).
     if params.contains_key("embed_tokens.scales")
         && let Some(packed) = packed_group_bytes(params, "embed_tokens")
     {
@@ -1090,59 +1214,6 @@ fn compute_weight_bytes(params: &HashMap<String, MxArray>, config: &Lfm2Config) 
             .saturating_mul(config.hidden_size as u64)
             .saturating_mul(BF16_BYTES);
         total = total.saturating_add(dense.saturating_sub(packed));
-    }
-
-    // (2) Quantized dense-MLP projections, which take the legacy
-    // `get_weight()` forward path and therefore materialize a dense bf16
-    // dequant copy.
-    //
-    // How many layers are dense MLPs depends on whether the checkpoint is MoE:
-    //   - PURE-DENSE (`!is_moe()`): `num_dense_layers` is `None` (a MoE-only
-    //     field), but EVERY one of the `num_hidden_layers` layers is a dense
-    //     MLP (`decoder_layer.rs` builds `FeedForward::Dense` for all of them).
-    //     So the dense-MLP count is `num_hidden_layers`.
-    //   - MoE (`is_moe()`): only the leading `num_dense_layers` layers are
-    //     dense MLPs; the rest are MoE experts using packed
-    //     QuantizedSwitchLinear (gather_qmm reads the packed backend and never
-    //     materializes a dense copy), so they are intentionally excluded.
-    let num_dense = if config.is_moe() {
-        config.num_dense_layers.unwrap_or(0).max(0) as usize
-    } else {
-        config.num_hidden_layers.max(0) as usize
-    };
-    if num_dense > 0 {
-        // Dense-in-MoE layers use `intermediate_size`; pure-dense lfm2 uses the
-        // computed ff dim. `is_moe()` distinguishes the two.
-        let ff_dim = if config.is_moe() {
-            config.intermediate_size.unwrap_or(config.hidden_size)
-        } else {
-            config.computed_ff_dim()
-        } as u64;
-        let hidden = config.hidden_size as u64;
-        // gate_proj/up_proj: [ff, hidden]; down_proj: [hidden, ff]. All bf16.
-        let gate_up_dense = ff_dim.saturating_mul(hidden).saturating_mul(BF16_BYTES);
-        let down_dense = hidden.saturating_mul(ff_dim).saturating_mul(BF16_BYTES);
-        for l in 0..num_dense.min(config.num_hidden_layers.max(0) as usize) {
-            for (proj, dense) in [
-                ("gate_proj", gate_up_dense),
-                ("up_proj", gate_up_dense),
-                ("down_proj", down_dense),
-            ] {
-                let base = format!("layers.{l}.feed_forward.{proj}");
-                // `Linear::load_quantized` RETAINS the packed backend AND
-                // materializes the dense `self.weight` (read by the legacy
-                // `MLP::forward` get_weight path), so BOTH are resident. The
-                // packed group is already in the baseline, so add the FULL
-                // dense bf16 size on top (NOT `dense - packed`). The `.scales`
-                // + complete-group guard ensures we only count a genuinely
-                // quantized projection.
-                if params.contains_key(&format!("{base}.scales"))
-                    && packed_group_bytes(params, &base).is_some()
-                {
-                    total = total.saturating_add(dense);
-                }
-            }
-        }
     }
 
     total
@@ -1775,9 +1846,68 @@ mod tests {
         )
     }
 
-    /// A non-MoE `Linear` whose checkpoint ships affine `.weight`+`.scales`+
-    /// `.biases` must load as a QUANTIZED backend, and its pre-dequantized
-    /// `get_weight()` must approximate the original dense weight.
+    /// Quantize a 2D bf16 weight via `mlx_quantize` in MXFP8 mode, returning
+    /// `(packed_weight, scales)` — MXFP8 has NO biases (uint8 E8M0 scales).
+    fn quantize_mxfp8(weight: &MxArray) -> (MxArray, MxArray) {
+        let mut out_q: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                MXFP8_GROUP_SIZE,
+                MXFP8_BITS,
+                c"mxfp8".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize mxfp8 failed");
+        // mxfp8 emits no biases; `out_b` is null/ignored.
+        (
+            MxArray::from_handle(out_q, "q").expect("q"),
+            MxArray::from_handle(out_s, "s").expect("s"),
+        )
+    }
+
+    /// Dequantize a packed `QuantizedLinear`'s weight back to a dense f32 host
+    /// vector via `mlx_quantized_matmul` against an identity-like probe is
+    /// overkill; instead compare against an explicit `mlx_dequantize` of the
+    /// packed group, threading the QL's own mode/group/bits. Returns the
+    /// reconstructed f32 host values.
+    fn dequant_ql_to_f32(
+        weight: &MxArray,
+        scales: &MxArray,
+        biases: Option<&MxArray>,
+        group_size: i32,
+        bits: i32,
+        mode: &str,
+    ) -> Vec<f32> {
+        let biases_ptr = biases.map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
+        let mode_c = std::ffi::CString::new(mode).expect("mode cstring");
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                weight.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases_ptr,
+                group_size,
+                bits,
+                -1,
+                mode_c.as_ptr(),
+            )
+        };
+        let recon = MxArray::from_handle(handle, "dequant")
+            .expect("dequant")
+            .astype(DType::Float32)
+            .expect("recon f32");
+        recon.to_float32().expect("recon vec").to_vec()
+    }
+
+    /// A non-MoE `LinearProj` whose checkpoint ships affine `.weight`+`.scales`+
+    /// `.biases` must load as a QUANTIZED backend, and its packed weight must
+    /// dequantize close to the original dense weight (no dense `get_weight()`
+    /// materialization on the forward path — the QL stays packed-only).
     #[test]
     fn loader_installs_affine_quantized_backend_for_non_moe_linear() {
         // out=4, in=64 (one full affine group of 64 at 4-bit).
@@ -1796,25 +1926,36 @@ mod tests {
         params.insert("x_proj.scales".into(), qs);
         params.insert("x_proj.biases".into(), qb);
 
-        let mut linear = Linear::new(inf, out, Some(false)).expect("Linear::new");
+        let mut proj =
+            LinearProj::Standard(Linear::new(inf, out, Some(false)).expect("Linear::new"));
         let default_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
-        load_linear_affine_or_bf16(&mut linear, &params, "x_proj", &HashMap::new(), default_plq)
-            .expect("affine quantized load must succeed");
+        load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &params,
+            "x_proj",
+            &HashMap::new(),
+            default_plq,
+        )
+        .expect("affine quantized load must succeed");
 
-        assert!(
-            linear.is_quantized(),
-            "linear must hold a quantized backend after affine load"
+        let ql = match &proj {
+            LinearProj::Quantized(ql) => ql,
+            LinearProj::Standard(_) => {
+                panic!("proj must hold a quantized backend after affine load")
+            }
+        };
+
+        // Reconstruct from the PACKED group (QL never materializes a dense
+        // get_weight on the forward path) and compare element-wise.
+        let recon_v = dequant_ql_to_f32(
+            ql.get_weight(),
+            ql.get_scales(),
+            ql.get_biases(),
+            64,
+            4,
+            "affine",
         );
-
-        // Dequantized weight should be close to the original (4-bit affine).
-        // Compare element-wise via host extraction (mirrors the convert.rs
-        // quantize tests) — avoids a device-side scalar reduction.
-        let recon = linear
-            .get_weight()
-            .astype(DType::Float32)
-            .expect("recon f32");
         let orig = dense.astype(DType::Float32).expect("orig f32");
-        let recon_v: Vec<f32> = recon.to_float32().expect("recon vec").to_vec();
         let orig_v: Vec<f32> = orig.to_float32().expect("orig vec").to_vec();
         assert_eq!(recon_v.len(), orig_v.len(), "shape mismatch after dequant");
         let max_err = recon_v
@@ -1834,35 +1975,102 @@ mod tests {
         );
     }
 
-    /// A non-MoE tensor whose RESOLVED mode is non-affine (mxfp4/mxfp8/nvfp4)
-    /// must FAIL LOUD — `nn::Linear::load_quantized` is affine-only.
+    /// A non-MoE `LinearProj` whose RESOLVED mode is MXFP8 must now LOAD (no
+    /// fail-loud): #1a makes the non-MoE linears mode-aware, so the loader
+    /// installs an MXFP8 `QuantizedLinear` (mode="mxfp8", group_size=32,
+    /// bits=8, NO biases) whose packed weight dequantizes back close to the
+    /// original. This is the proof the formerly-rejected non-affine path now
+    /// works.
     #[test]
-    fn loader_fails_loud_on_non_affine_non_moe_tensor() {
-        let mut params: HashMap<String, MxArray> = HashMap::new();
-        // Presence of `.scales` marks the tensor quantized; shapes are
-        // irrelevant because the mode check fails before any dequant call.
-        params.insert("x_proj.weight".into(), dummy());
-        params.insert("x_proj.scales".into(), dummy());
+    fn loader_installs_mxfp8_quantized_backend_for_non_moe_linear() {
+        // out=4, in=64 (two full mxfp8 groups of 32). Use the mxfp8 group_size.
+        let out = 4u32;
+        let inf = 64u32;
+        let n = (out * inf) as i64;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 9) as f32 - 4.0) * 0.05).collect();
+        let dense = MxArray::from_float32(&data, &[out as i64, inf as i64])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("bf16");
+        let (qw, qs) = quantize_mxfp8(&dense);
 
-        // Force a non-affine resolved mode via a per-layer override.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("x_proj.weight".into(), qw);
+        params.insert("x_proj.scales".into(), qs);
+        // NOTE: NO `.biases` for mxfp8.
+
+        let mut proj =
+            LinearProj::Standard(Linear::new(inf, out, Some(false)).expect("Linear::new"));
+        // Force MXFP8 as the resolved mode via a per-layer override (the same
+        // path a converted mxfp8 checkpoint takes through `effective_plq_for`).
         let mut plq_map: HashMap<String, PerLayerQuant> = HashMap::new();
         plq_map.insert(
             "x_proj".into(),
-            default_per_layer_quant(4, 32, PerLayerMode::Mxfp4),
+            default_per_layer_quant(MXFP8_BITS, MXFP8_GROUP_SIZE, PerLayerMode::Mxfp8),
+        );
+        let default_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
+        load_linear_proj_quantized_or_bf16(&mut proj, &params, "x_proj", &plq_map, default_plq)
+            .expect("mxfp8 quantized load must succeed (no fail-loud)");
+
+        let ql = match &proj {
+            LinearProj::Quantized(ql) => ql,
+            LinearProj::Standard(_) => {
+                panic!("proj must hold a quantized backend after mxfp8 load")
+            }
+        };
+        assert!(
+            ql.get_biases().is_none(),
+            "mxfp8 QuantizedLinear must carry no quant biases"
         );
 
-        let mut linear = Linear::new(8, 8, Some(false)).expect("Linear::new");
-        let default_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
-        let err = load_linear_affine_or_bf16(&mut linear, &params, "x_proj", &plq_map, default_plq)
-            .expect_err("non-affine non-MoE tensor must fail loud");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("x_proj") && msg.contains("not yet supported"),
-            "fail-loud message must name the tensor and the limitation, got: {msg}"
+        let recon_v = dequant_ql_to_f32(
+            ql.get_weight(),
+            ql.get_scales(),
+            None,
+            MXFP8_GROUP_SIZE,
+            MXFP8_BITS,
+            "mxfp8",
         );
+        let orig = dense.astype(DType::Float32).expect("orig f32");
+        let orig_v: Vec<f32> = orig.to_float32().expect("orig vec").to_vec();
+        assert_eq!(recon_v.len(), orig_v.len(), "shape mismatch after dequant");
+        let max_err = recon_v
+            .iter()
+            .zip(orig_v.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // MXFP8 (8-bit E4M3-ish micro-scaled) is much finer than 4-bit affine;
+        // a loose 0.1 ceiling still catches a wrong mode/group_size/bits or a
+        // packed (non-dequantized) read.
         assert!(
-            !linear.is_quantized(),
-            "linear must NOT be mutated when the affine-mode check fails"
+            max_err < 0.1,
+            "mxfp8 dequantized weight too far from original: max_err={max_err}"
+        );
+    }
+
+    /// A plain (no `.scales`) non-MoE `LinearProj` must load as a dense bf16
+    /// `Standard` arm — unchanged behavior for unquantized checkpoints.
+    #[test]
+    fn loader_keeps_standard_arm_for_plain_bf16_non_moe_linear() {
+        let out = 4u32;
+        let inf = 8u32;
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("x_proj.weight".into(), bf16(&[out as i64, inf as i64], 0.1));
+
+        let mut proj =
+            LinearProj::Standard(Linear::new(inf, out, Some(false)).expect("Linear::new"));
+        let default_plq = default_per_layer_quant(4, 64, PerLayerMode::Affine);
+        load_linear_proj_quantized_or_bf16(
+            &mut proj,
+            &params,
+            "x_proj",
+            &HashMap::new(),
+            default_plq,
+        )
+        .expect("plain bf16 load must succeed");
+        assert!(
+            matches!(proj, LinearProj::Standard(_)),
+            "plain bf16 (no .scales) must keep the Standard arm"
         );
     }
 
@@ -1950,17 +2158,22 @@ mod tests {
     }
 
     #[test]
-    fn weight_bytes_counts_dense_mlp_delta_when_num_dense_layers_positive() {
+    fn weight_bytes_no_dense_mlp_delta_when_num_dense_layers_positive() {
         // Two dense layers (num_dense_layers=2) whose gate/up/down_proj are
-        // affine-quantized. Their dense dequant copies materialize via the
-        // legacy MLP forward path and must be counted.
+        // affine-quantized. After #1a the dense MLP is a `MLPVariant::Quantized`
+        // backed by `QuantizedLinear`: its forward runs `mlx_quantized_matmul`
+        // on the PACKED weight and NEVER materializes a dense `get_weight()`
+        // copy. So the resident footprint of a quantized dense-MLP projection is
+        // EXACTLY its packed group — no extra dense delta. With a plain bf16
+        // embedding (no .scales), `compute_weight_bytes` must equal the packed
+        // sum.
         let mut config = tiny_moe_config(true);
         config.num_hidden_layers = 2;
         config.hidden_size = 64;
         config.intermediate_size = Some(128);
         config.num_dense_layers = Some(2);
-        // Keep a plain (unquantized) embedding so this test isolates the
-        // dense-MLP delta.
+        // Plain (unquantized) embedding so this test isolates the dense-MLP
+        // accounting.
         config.vocab_size = 32;
 
         let hidden = config.hidden_size as i64;
@@ -1983,7 +2196,6 @@ mod tests {
             bf16(&[config.vocab_size as i64, hidden], 0.01),
         );
 
-        let mut expected_dense_extra: u64 = 0;
         for l in 0..2 {
             for (proj, out, inf) in [
                 ("gate_proj", ff, hidden),
@@ -1995,38 +2207,27 @@ mod tests {
                 params.insert(format!("{base}.weight"), qw);
                 params.insert(format!("{base}.scales"), qs);
                 params.insert(format!("{base}.biases"), qb);
-                // `Linear` retains the packed backend AND the dense copy, so
-                // the resident extra beyond the packed baseline is the FULL
-                // dense bf16 size (not `dense - packed`). The old buggy formula
-                // would fail this tightened bound.
-                let dense = (out as u64) * (inf as u64) * 2;
-                expected_dense_extra = expected_dense_extra.saturating_add(dense);
             }
         }
 
         let packed = packed_only_bytes(&params);
         let counted = compute_weight_bytes(&params, &config);
-        assert!(
-            counted >= packed + expected_dense_extra,
-            "compute_weight_bytes must add the FULL dense-MLP bytes (packed backend is \
-             retained) for the {} dense layers: counted={counted}, packed={packed}, \
-             expected_extra={expected_dense_extra}",
-            config.num_dense_layers.unwrap()
-        );
-        assert!(
-            expected_dense_extra > 0,
-            "test setup error: expected a positive dense-MLP delta"
+        // Quantized dense-MLP is packed-only resident now → NO dense delta. With
+        // a plain bf16 embedding the counted total is EXACTLY the packed sum.
+        assert_eq!(
+            counted, packed,
+            "quantized dense-MLP must be packed-only resident (no dense delta): \
+             counted={counted}, packed={packed}"
         );
     }
 
     #[test]
-    fn weight_bytes_counts_dense_mlp_delta_for_pure_dense_quantized_checkpoint() {
-        // A PURE-DENSE (non-MoE) checkpoint has `num_dense_layers = None`, but
-        // EVERY one of `num_hidden_layers` layers is a dense MLP that
-        // materializes a dense bf16 dequant copy via the legacy
-        // `get_weight()` forward path. The OLD formula keyed the dense-MLP
-        // delta off `num_dense_layers.unwrap_or(0)` (== 0 here) and undercounted
-        // all of them. The fix uses `num_hidden_layers` when `!is_moe()`.
+    fn weight_bytes_no_dense_mlp_delta_for_pure_dense_quantized_checkpoint() {
+        // A PURE-DENSE (non-MoE) checkpoint with every layer's dense-MLP
+        // projections affine-quantized. After #1a these are
+        // `MLPVariant::Quantized` (packed-only resident, no dense `get_weight()`
+        // copy), so `compute_weight_bytes` must NOT add a dense-MLP delta. With
+        // a plain bf16 embedding it equals the packed sum exactly.
         let mut config = tiny_moe_config(true);
         // Make it pure-dense: clear all MoE-only fields.
         config.num_experts = None; // is_moe() == false
@@ -2062,14 +2263,13 @@ mod tests {
 
         let mut params: HashMap<String, MxArray> = HashMap::new();
         // Plain bf16 embedding (no .scales) so this test isolates the dense-MLP
-        // delta across ALL layers.
+        // accounting across ALL layers.
         params.insert(
             "embed_tokens.weight".into(),
             bf16(&[config.vocab_size as i64, hidden], 0.01),
         );
 
         // Quantize the dense-MLP projections of EVERY layer.
-        let mut expected_dense_extra: u64 = 0;
         for l in 0..(config.num_hidden_layers as usize) {
             for (proj, out, inf) in [
                 ("gate_proj", ff, hidden),
@@ -2081,24 +2281,15 @@ mod tests {
                 params.insert(format!("{base}.weight"), qw);
                 params.insert(format!("{base}.scales"), qs);
                 params.insert(format!("{base}.biases"), qb);
-                // Full dense bytes on top of the retained packed backend.
-                let dense = (out as u64) * (inf as u64) * 2;
-                expected_dense_extra = expected_dense_extra.saturating_add(dense);
             }
         }
 
         let packed = packed_only_bytes(&params);
         let counted = compute_weight_bytes(&params, &config);
-        assert!(
-            counted >= packed + expected_dense_extra,
-            "compute_weight_bytes must add the FULL dense-MLP bytes for ALL {} layers of a \
-             pure-dense quantized checkpoint (packed backend retained): counted={counted}, \
-             packed={packed}, expected_extra={expected_dense_extra}",
-            config.num_hidden_layers
-        );
-        assert!(
-            expected_dense_extra > 0,
-            "test setup error: expected a positive dense-MLP delta"
+        assert_eq!(
+            counted, packed,
+            "quantized dense-MLP (pure-dense checkpoint) must be packed-only resident — no dense \
+             delta: counted={counted}, packed={packed}"
         );
     }
 

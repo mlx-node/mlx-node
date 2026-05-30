@@ -1,5 +1,6 @@
 use crate::array::MxArray;
 use crate::models::qwen3_5::arrays_cache::ArraysCache;
+use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
 use crate::nn::{Conv1d, Linear};
 use napi::bindgen_prelude::*;
 
@@ -16,8 +17,8 @@ use napi::bindgen_prelude::*;
 ///   return out_proj(y)
 pub struct ShortConv {
     pub(crate) conv: Conv1d,
-    pub(crate) in_proj: Linear,
-    pub(crate) out_proj: Linear,
+    pub(crate) in_proj: LinearProj,
+    pub(crate) out_proj: LinearProj,
     l_cache: i32,
     hidden_size: i32,
 }
@@ -45,8 +46,8 @@ impl ShortConv {
             Some(conv_bias), // bias
         )?;
 
-        let in_proj = Linear::new(h, 3 * h, Some(conv_bias))?;
-        let out_proj = Linear::new(h, h, Some(conv_bias))?;
+        let in_proj = LinearProj::Standard(Linear::new(h, 3 * h, Some(conv_bias))?);
+        let out_proj = LinearProj::Standard(Linear::new(h, h, Some(conv_bias))?);
 
         Ok(Self {
             conv,
@@ -136,32 +137,52 @@ impl ShortConv {
     }
 
     // NOTE: in_proj / out_proj WEIGHTS are loaded via the `*_proj_mut()`
-    // accessors below (driving `Linear::load_quantized` / `Linear::set_weight`
-    // for quantized/bf16 checkpoints uniformly). The former
-    // `set_{in,out}_proj_weight` shims were removed after that switch left them
-    // with zero callers. The LAYER biases keep dedicated setters because the
-    // `*_mut()` accessors expose only the `Linear` (whose bias is set via its
-    // own API, but the persistence layer uses these named helpers).
+    // accessors below, which expose the mode-aware `LinearProj`. The
+    // persistence layer either installs a `QuantizedLinear` backend (affine /
+    // mxfp4 / mxfp8 / nvfp4) via `set_quantized`, or sets a dense bf16 weight
+    // via `set_weight`. The LAYER biases (additive `.bias`, distinct from the
+    // affine quant zero-point `.biases`) keep dedicated setters that dispatch
+    // across BOTH arms: a quantized `LinearProj` threads the bias through
+    // `QuantizedLinear::set_bias`. The depthwise `conv` weight is never
+    // quantized and keeps its dedicated `set_conv_weight`.
 
     pub fn set_in_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        self.in_proj.set_bias(b)
+        set_linear_proj_bias(&mut self.in_proj, b)
     }
 
     pub fn set_out_proj_bias(&mut self, b: Option<&MxArray>) -> Result<()> {
-        self.out_proj.set_bias(b)
+        set_linear_proj_bias(&mut self.out_proj, b)
     }
 
     // ========== Mutable projection accessors ==========
     //
-    // Expose `in_proj` / `out_proj` so the persistence layer can drive
-    // affine-quantized or plain bf16 loads uniformly. The depthwise `conv`
-    // weight is never quantized and keeps its dedicated `set_conv_weight`.
+    // Expose the mode-aware `LinearProj`s so the persistence layer can install
+    // a quantized backend (affine / mxfp4 / mxfp8 / nvfp4) via `set_quantized`,
+    // or a plain bf16 weight via `set_weight`. The depthwise `conv` weight is
+    // never quantized and keeps its dedicated `set_conv_weight`.
 
-    pub fn in_proj_mut(&mut self) -> &mut Linear {
+    pub fn in_proj_mut(&mut self) -> &mut LinearProj {
         &mut self.in_proj
     }
 
-    pub fn out_proj_mut(&mut self) -> &mut Linear {
+    pub fn out_proj_mut(&mut self) -> &mut LinearProj {
         &mut self.out_proj
+    }
+}
+
+/// Set the additive layer bias on a `LinearProj`, dispatching across both
+/// arms. The `Standard` arm uses `Linear::set_bias` (which copies + shape-
+/// checks); the `Quantized` arm threads the bias through
+/// `QuantizedLinear::set_bias` (the additive `.bias`, NOT the affine quant
+/// `.biases`). mxfp4/mxfp8/nvfp4 projections never ship a `.biases`, but they
+/// CAN ship an additive `.bias` (lfm2 `conv_bias=true`), so this must work for
+/// every mode.
+fn set_linear_proj_bias(proj: &mut LinearProj, b: Option<&MxArray>) -> Result<()> {
+    match proj {
+        LinearProj::Standard(l) => l.set_bias(b),
+        LinearProj::Quantized(ql) => {
+            ql.set_bias(b.cloned());
+            Ok(())
+        }
     }
 }

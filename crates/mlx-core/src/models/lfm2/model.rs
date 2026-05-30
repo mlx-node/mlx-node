@@ -3849,13 +3849,15 @@ mod paged_adapter_construction_tests {
             match &mut layer.operator {
                 OperatorType::Attention(attn) => {
                     let w = attn.q_proj.get_weight();
-                    attn.q_proj.set_weight(&cast(&w)).expect("set q");
+                    attn.q_proj.set_weight(&cast(&w), "q_proj").expect("set q");
                     let w = attn.k_proj.get_weight();
-                    attn.k_proj.set_weight(&cast(&w)).expect("set k");
+                    attn.k_proj.set_weight(&cast(&w), "k_proj").expect("set k");
                     let w = attn.v_proj.get_weight();
-                    attn.v_proj.set_weight(&cast(&w)).expect("set v");
+                    attn.v_proj.set_weight(&cast(&w), "v_proj").expect("set v");
                     let w = attn.out_proj.get_weight();
-                    attn.out_proj.set_weight(&cast(&w)).expect("set o");
+                    attn.out_proj
+                        .set_weight(&cast(&w), "out_proj")
+                        .expect("set o");
                     let w = attn.q_layernorm.get_weight();
                     attn.q_layernorm.set_weight(&cast(&w)).expect("set qn");
                     let w = attn.k_layernorm.get_weight();
@@ -3865,9 +3867,13 @@ mod paged_adapter_construction_tests {
                     let w = conv.conv.get_weight();
                     conv.conv.set_weight(&cast(&w)).expect("set conv_w");
                     let w = conv.in_proj.get_weight();
-                    conv.in_proj.set_weight(&cast(&w)).expect("set in_proj");
+                    conv.in_proj
+                        .set_weight(&cast(&w), "in_proj")
+                        .expect("set in_proj");
                     let w = conv.out_proj.get_weight();
-                    conv.out_proj.set_weight(&cast(&w)).expect("set out_proj");
+                    conv.out_proj
+                        .set_weight(&cast(&w), "out_proj")
+                        .expect("set out_proj");
                 }
             }
 
