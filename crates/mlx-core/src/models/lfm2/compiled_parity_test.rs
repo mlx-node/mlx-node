@@ -173,6 +173,103 @@ fn compiled_attn_seq_matches_native() {
     );
 }
 
+/// The ARRAY-OFFSET attn variant `lfm2_attn_pure_fn_arr` (fixed padded KV cache +
+/// per-step static additive mask — the path the compiled decode loop uses) must
+/// ALSO match the native `Lfm2Attention::forward` over the same `T`-step decode,
+/// proving the fixed-cache+mask+array-offset path is numerically identical to
+/// native BEFORE it is wired into `lfm2_decode_fn`.
+#[test]
+fn compiled_attn_arr_seq_matches_native() {
+    let _guard = COMPILED_WEIGHTS_RWLOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let hidden = 64i64;
+    let num_heads = 4i64;
+    let num_kv_heads = 2i64;
+    let head_dim = 16i64;
+    let norm_eps = 1e-5f64;
+    let rope_theta = 1_000_000.0f64;
+    let t = 4i64;
+
+    let q_w = det(&[num_heads * head_dim, hidden], 1);
+    let k_w = det(&[num_kv_heads * head_dim, hidden], 2);
+    let v_w = det(&[num_kv_heads * head_dim, hidden], 3);
+    let out_w = det(&[hidden, num_heads * head_dim], 4);
+    let qn_w = det_norm(head_dim, 5);
+    let kn_w = det_norm(head_dim, 6);
+
+    let x_data: Vec<f32> = (0..(t * hidden))
+        .map(|i| (((i * 97 + 5).rem_euclid(19)) as f32 - 9.0) * 0.04)
+        .collect();
+    let x_seq = MxArray::from_float32(&x_data, &[t, hidden])
+        .expect("x_seq")
+        .astype(DType::BFloat16)
+        .expect("bf16");
+
+    // ----- native: T decode steps through a shared KVCache -----
+    let mut attn = Lfm2Attention::new(
+        hidden as i32,
+        num_heads as i32,
+        num_kv_heads as i32,
+        head_dim as i32,
+        norm_eps,
+        rope_theta,
+    )
+    .expect("attn new");
+    attn.q_proj_mut().set_weight(&q_w, "q_proj").expect("q");
+    attn.k_proj_mut().set_weight(&k_w, "k_proj").expect("k");
+    attn.v_proj_mut().set_weight(&v_w, "v_proj").expect("v");
+    attn.out_proj_mut()
+        .set_weight(&out_w, "out_proj")
+        .expect("o");
+    attn.set_q_layernorm_weight(&qn_w).expect("qn");
+    attn.set_k_layernorm_weight(&kn_w).expect("kn");
+
+    let mut cache = KVCache::new();
+    let mut native_last: Option<MxArray> = None;
+    for i in 0..t {
+        let row = &x_data[(i * hidden) as usize..((i + 1) * hidden) as usize];
+        let x_i = MxArray::from_float32(row, &[1, 1, hidden])
+            .expect("x_i")
+            .astype(DType::BFloat16)
+            .expect("bf16");
+        native_last = Some(
+            attn.forward(&x_i, None, Some(&mut cache))
+                .expect("native fwd"),
+        );
+    }
+    let native_last = native_last.expect("ran >=1 step");
+
+    // ----- probe: same T steps through the array-offset compiled variant -----
+    let out_ptr = unsafe {
+        mlx_sys::mlx_lfm2_probe_attn_arr_seq(
+            x_seq.as_raw_ptr(),
+            q_w.as_raw_ptr(),
+            k_w.as_raw_ptr(),
+            v_w.as_raw_ptr(),
+            out_w.as_raw_ptr(),
+            qn_w.as_raw_ptr(),
+            kn_w.as_raw_ptr(),
+            num_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            rope_theta as f32,
+            norm_eps as f32,
+        )
+    };
+    assert!(
+        !out_ptr.is_null(),
+        "mlx_lfm2_probe_attn_arr_seq returned null"
+    );
+    let probe_out = MxArray::from_handle(out_ptr, "probe_attn_arr").expect("probe handle");
+
+    let d = max_abs(&to_vec(&native_last), &to_vec(&probe_out));
+    assert!(
+        d < 2e-2,
+        "array-offset compiled attn must match native single-layer decode: max_abs={d}"
+    );
+}
+
 /// The compiled `lfm2_dense_mlp` must match the native `MLP::forward`
 /// (validates `linear_proj` + `swiglu` wiring + the weight-store/transpose
 /// round-trip).
@@ -338,4 +435,253 @@ fn compiled_conv_seq_matches_native() {
 #[test]
 fn compiled_conv_seq_matches_native_with_bias() {
     run_conv_parity(true);
+}
+
+/// 2b-1 end-to-end-SHAPED gate: the full `lfm2_decode_fn` assembly (driven via
+/// the synthetic-model probe) must match a hand-assembled native `[conv, attn,
+/// conv]` dense stack over the same `T`-step decode. Exercises the per-layer
+/// conv/attn dispatch (from `is_attn[]`), the operator_norm→op→+res→ffn_norm→
+/// mlp→+res order, the conv-state vs KV slot interleaving at uniform stride 2,
+/// the final `embedding_norm`, and the tied `embed_tokens` head. The probe runs
+/// `lfm2_decode_fn` EAGERLY and `mlx_lfm2_get_model_id()` is untouched, so the
+/// production gate stays OFF.
+#[test]
+fn compiled_decode_seq_matches_native() {
+    use crate::nn::{Embedding, RMSNorm};
+
+    let _guard = COMPILED_WEIGHTS_RWLOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let hidden = 64i64;
+    let num_heads = 4i64;
+    let num_kv_heads = 2i64;
+    let head_dim = 16i64; // hidden == num_heads * head_dim
+    let inter = 128i64;
+    let l_cache = 3i64;
+    let vocab = 32i64;
+    let t = 4i64;
+    let norm_eps = 1e-5f64;
+    let rope_theta = 1_000_000.0f64;
+    let is_attn = [0i32, 1, 0]; // [conv, attn, conv]
+    let n = is_attn.len();
+    let token_ids: Vec<i32> = (0..t as i32).map(|i| (i * 7 + 1) % vocab as i32).collect();
+
+    // ---- shared weights: the SAME arrays are fed to BOTH native and probe ----
+    let embed_w = det(&[vocab, hidden], 101);
+    let emb_norm_w = det_norm(hidden, 102);
+    let op_norm: Vec<MxArray> = (0..n).map(|i| det_norm(hidden, 110 + i as i64)).collect();
+    let ffn_norm: Vec<MxArray> = (0..n).map(|i| det_norm(hidden, 120 + i as i64)).collect();
+    let gate: Vec<MxArray> = (0..n)
+        .map(|i| det(&[inter, hidden], 130 + i as i64))
+        .collect();
+    let up: Vec<MxArray> = (0..n)
+        .map(|i| det(&[inter, hidden], 140 + i as i64))
+        .collect();
+    let down: Vec<MxArray> = (0..n)
+        .map(|i| det(&[hidden, inter], 150 + i as i64))
+        .collect();
+
+    // attn-only tensors: Some at attn layers, None (→ null ptr) at conv layers.
+    let attn_t = |i: usize, shape: &[i64], seed: i64| -> Option<MxArray> {
+        (is_attn[i] == 1).then(|| det(shape, seed))
+    };
+    let attn_norm_t = |i: usize, seed: i64| -> Option<MxArray> {
+        (is_attn[i] == 1).then(|| det_norm(head_dim, seed))
+    };
+    let q: Vec<Option<MxArray>> = (0..n)
+        .map(|i| attn_t(i, &[num_heads * head_dim, hidden], 160 + i as i64))
+        .collect();
+    let k: Vec<Option<MxArray>> = (0..n)
+        .map(|i| attn_t(i, &[num_kv_heads * head_dim, hidden], 170 + i as i64))
+        .collect();
+    let v: Vec<Option<MxArray>> = (0..n)
+        .map(|i| attn_t(i, &[num_kv_heads * head_dim, hidden], 180 + i as i64))
+        .collect();
+    let o: Vec<Option<MxArray>> = (0..n)
+        .map(|i| attn_t(i, &[hidden, num_heads * head_dim], 190 + i as i64))
+        .collect();
+    let qn: Vec<Option<MxArray>> = (0..n).map(|i| attn_norm_t(i, 200 + i as i64)).collect();
+    let kn: Vec<Option<MxArray>> = (0..n).map(|i| attn_norm_t(i, 210 + i as i64)).collect();
+
+    // conv-only tensors: Some at conv layers, None (→ null ptr) at attn layers.
+    let conv_t = |i: usize, shape: &[i64], seed: i64| -> Option<MxArray> {
+        (is_attn[i] == 0).then(|| det(shape, seed))
+    };
+    let in_proj: Vec<Option<MxArray>> = (0..n)
+        .map(|i| conv_t(i, &[3 * hidden, hidden], 220 + i as i64))
+        .collect();
+    let conv_w: Vec<Option<MxArray>> = (0..n)
+        .map(|i| conv_t(i, &[hidden, l_cache, 1], 230 + i as i64))
+        .collect();
+    let out_proj: Vec<Option<MxArray>> = (0..n)
+        .map(|i| conv_t(i, &[hidden, hidden], 240 + i as i64))
+        .collect();
+
+    // ---- native: hand-assembled [conv, attn, conv] stack ----
+    let mut embed = Embedding::new(vocab as u32, hidden as u32).expect("embed");
+    embed.set_weight(&embed_w).expect("embed w");
+    let mut emb_norm = RMSNorm::new(hidden as u32, Some(norm_eps)).expect("emb norm");
+    emb_norm.set_weight(&emb_norm_w).expect("emb norm w");
+
+    enum Op {
+        Conv(ShortConv),
+        Attn(Lfm2Attention),
+    }
+    let mut ops: Vec<Op> = Vec::new();
+    let mut op_norms: Vec<RMSNorm> = Vec::new();
+    let mut ffn_norms: Vec<RMSNorm> = Vec::new();
+    let mut mlps: Vec<MLP> = Vec::new();
+    for i in 0..n {
+        let mut onrm = RMSNorm::new(hidden as u32, Some(norm_eps)).expect("on");
+        onrm.set_weight(&op_norm[i]).expect("on w");
+        op_norms.push(onrm);
+        let mut fnrm = RMSNorm::new(hidden as u32, Some(norm_eps)).expect("fn");
+        fnrm.set_weight(&ffn_norm[i]).expect("fn w");
+        ffn_norms.push(fnrm);
+        let mut mlp = MLP::new(hidden as u32, inter as u32).expect("mlp");
+        mlp.set_gate_proj_weight(&gate[i]).expect("g");
+        mlp.set_up_proj_weight(&up[i]).expect("u");
+        mlp.set_down_proj_weight(&down[i]).expect("d");
+        mlps.push(mlp);
+        if is_attn[i] == 1 {
+            let mut attn = Lfm2Attention::new(
+                hidden as i32,
+                num_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                norm_eps,
+                rope_theta,
+            )
+            .expect("attn");
+            attn.q_proj_mut()
+                .set_weight(q[i].as_ref().expect("q"), "q")
+                .expect("q set");
+            attn.k_proj_mut()
+                .set_weight(k[i].as_ref().expect("k"), "k")
+                .expect("k set");
+            attn.v_proj_mut()
+                .set_weight(v[i].as_ref().expect("v"), "v")
+                .expect("v set");
+            attn.out_proj_mut()
+                .set_weight(o[i].as_ref().expect("o"), "o")
+                .expect("o set");
+            attn.set_q_layernorm_weight(qn[i].as_ref().expect("qn"))
+                .expect("qn set");
+            attn.set_k_layernorm_weight(kn[i].as_ref().expect("kn"))
+                .expect("kn set");
+            ops.push(Op::Attn(attn));
+        } else {
+            let mut conv = ShortConv::new(hidden as i32, l_cache as i32, false).expect("conv");
+            conv.in_proj_mut()
+                .set_weight(in_proj[i].as_ref().expect("ip"), "in_proj")
+                .expect("ip set");
+            conv.set_conv_weight(conv_w[i].as_ref().expect("cw"))
+                .expect("cw set");
+            conv.out_proj_mut()
+                .set_weight(out_proj[i].as_ref().expect("op"), "out_proj")
+                .expect("op set");
+            ops.push(Op::Conv(conv));
+        }
+    }
+
+    let mut conv_caches: Vec<Option<ArraysCache>> = (0..n)
+        .map(|i| (is_attn[i] == 0).then(|| ArraysCache::new(1)))
+        .collect();
+    let mut kv_caches: Vec<Option<KVCache>> = (0..n)
+        .map(|i| (is_attn[i] == 1).then(KVCache::new))
+        .collect();
+
+    let mut native_last: Option<MxArray> = None;
+    for &tok in &token_ids {
+        let ids = MxArray::from_int32(&[tok], &[1, 1]).expect("ids");
+        let mut h = embed.forward(&ids).expect("embed fwd"); // [1,1,hidden]
+        for i in 0..n {
+            let normed = op_norms[i].forward(&h).expect("on fwd");
+            let r = match &ops[i] {
+                Op::Conv(c) => c
+                    .forward(&normed, conv_caches[i].as_mut())
+                    .expect("conv fwd"),
+                Op::Attn(a) => a
+                    .forward(&normed, None, kv_caches[i].as_mut())
+                    .expect("attn fwd"),
+            };
+            h = h.add(&r).expect("res1");
+            let fn_in = ffn_norms[i].forward(&h).expect("fn fwd");
+            let ffn_out = mlps[i].forward(&fn_in).expect("mlp fwd");
+            h = h.add(&ffn_out).expect("res2");
+        }
+        h = emb_norm.forward(&h).expect("emb norm fwd");
+        native_last = Some(embed.as_linear(&h).expect("as_linear")); // [1,1,vocab]
+    }
+    let native_last = native_last.expect("ran >=1 step");
+
+    // ---- probe: per-category pointer arrays (null for the irrelevant kind) ----
+    let nullp = std::ptr::null_mut::<mlx_sys::mlx_array>();
+    let optr = |slots: &[Option<MxArray>]| -> Vec<*mut mlx_sys::mlx_array> {
+        slots
+            .iter()
+            .map(|o| o.as_ref().map_or(nullp, |a| a.as_raw_ptr()))
+            .collect()
+    };
+    let reqr = |slots: &[MxArray]| -> Vec<*mut mlx_sys::mlx_array> {
+        slots.iter().map(|a| a.as_raw_ptr()).collect()
+    };
+    let op_norm_p = reqr(&op_norm);
+    let ffn_norm_p = reqr(&ffn_norm);
+    let gate_p = reqr(&gate);
+    let up_p = reqr(&up);
+    let down_p = reqr(&down);
+    let q_p = optr(&q);
+    let k_p = optr(&k);
+    let v_p = optr(&v);
+    let o_p = optr(&o);
+    let qn_p = optr(&qn);
+    let kn_p = optr(&kn);
+    let in_p = optr(&in_proj);
+    let cw_p = optr(&conv_w);
+    let op_p = optr(&out_proj);
+
+    let out_ptr = unsafe {
+        mlx_sys::mlx_lfm2_probe_decode_seq(
+            embed_w.as_raw_ptr(),
+            emb_norm_w.as_raw_ptr(),
+            is_attn.as_ptr(),
+            n as i32,
+            hidden as i32,
+            num_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            l_cache as i32,
+            rope_theta as f32,
+            norm_eps as f32,
+            token_ids.as_ptr(),
+            t as i32,
+            op_norm_p.as_ptr(),
+            ffn_norm_p.as_ptr(),
+            gate_p.as_ptr(),
+            up_p.as_ptr(),
+            down_p.as_ptr(),
+            q_p.as_ptr(),
+            k_p.as_ptr(),
+            v_p.as_ptr(),
+            o_p.as_ptr(),
+            qn_p.as_ptr(),
+            kn_p.as_ptr(),
+            in_p.as_ptr(),
+            cw_p.as_ptr(),
+            op_p.as_ptr(),
+        )
+    };
+    assert!(
+        !out_ptr.is_null(),
+        "mlx_lfm2_probe_decode_seq returned null"
+    );
+    let probe = MxArray::from_handle(out_ptr, "probe_decode").expect("probe handle");
+
+    let d = max_abs(&to_vec(&native_last), &to_vec(&probe));
+    assert!(
+        d < 2e-2,
+        "compiled decode_fn must match native dense [conv,attn,conv] stack: max_abs={d}"
+    );
 }

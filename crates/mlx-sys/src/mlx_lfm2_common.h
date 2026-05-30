@@ -143,6 +143,71 @@ inline Lfm2AttnResult lfm2_attn_pure_fn(
 }
 
 // =====================================================================
+// Array-offset variant of lfm2_attn_pure_fn for the COMPILED decode graph.
+//
+// Identical math to the scalar fn above (same lfm2 specifics: GQA, per-head q/k
+// RMSNorm, NO q-gate/bias, neox RoPE over the full head_dim applied AFTER the
+// transpose, out_proj), with exactly two substitutions so the graph topology is
+// invariant across decode steps (mirrors qwen35 `attn_for_compile`):
+//   - fast::rope takes the *array* offset overload (not a baked-in int)
+//   - slice_update's KV start index is reshape(offset_arr, {1}) (not array(int))
+// Always uses the fixed-shape padded KV cache + static additive mask
+// (positions <= offset -> 0, else -inf), the compile-safe path — so this is the
+// dynamic_kv=false branch with an array offset. The scalar fn is kept unchanged
+// so the Phase-2a operator probes stay green; the decode loop calls THIS one.
+// =====================================================================
+inline Lfm2AttnResult lfm2_attn_pure_fn_arr(
+    const array& x,
+    int layer_idx,
+    const array& kv_keys,
+    const array& kv_values,
+    const array& attn_mask,
+    const array& offset_arr,
+    const Lfm2MoeConfig& cfg) {
+  using namespace qwen35_common;
+  int B = x.shape(0);
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
+
+  auto queries = linear_proj(x, pfx + "q_proj");
+  auto keys = linear_proj(x, pfx + "k_proj");
+  auto values = linear_proj(x, pfx + "v_proj");
+
+  queries = reshape(queries, {B, 1, cfg.num_heads, cfg.head_dim});
+  keys = reshape(keys, {B, 1, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, 1, cfg.num_kv_heads, cfg.head_dim});
+
+  queries =
+      mlx::core::fast::rms_norm(queries, get_weight(pfx + "q_layernorm.weight"), cfg.norm_eps);
+  keys = mlx::core::fast::rms_norm(keys, get_weight(pfx + "k_layernorm.weight"), cfg.norm_eps);
+
+  // Transpose to [B,H,T,D] FIRST, then RoPE (lfm2 ordering — position axis = T).
+  queries = transpose(queries, {0, 2, 1, 3});
+  keys = transpose(keys, {0, 2, 1, 3});
+  values = transpose(values, {0, 2, 1, 3});
+
+  // RoPE with the ARRAY offset overload (graph-safe).
+  queries =
+      mlx::core::fast::rope(queries, cfg.head_dim, false, cfg.rope_theta, 1.0f, offset_arr);
+  keys = mlx::core::fast::rope(keys, cfg.head_dim, false, cfg.rope_theta, 1.0f, offset_arr);
+
+  // KV cache update via slice_update at axis 2, ARRAY start index.
+  auto offset_1d = reshape(offset_arr, {1});
+  auto new_kv_keys = mlx::core::slice_update(kv_keys, keys, offset_1d, {2});
+  auto new_kv_values = mlx::core::slice_update(kv_values, values, offset_1d, {2});
+
+  // SDPA over the fixed-shape padded cache + static additive mask.
+  float scale = std::pow(static_cast<float>(cfg.head_dim), -0.5f);
+  array attn_out = mlx::core::fast::scaled_dot_product_attention(
+      queries, new_kv_keys, new_kv_values, scale, "", attn_mask, {});
+
+  attn_out = transpose(attn_out, {0, 2, 1, 3});
+  attn_out = reshape(attn_out, {B, cfg.num_heads * cfg.head_dim});
+  auto output = linear_proj(attn_out, pfx + "out_proj");
+
+  return {output, new_kv_keys, new_kv_values};
+}
+
+// =====================================================================
 // Dense SwiGLU MLP for an lfm2 layer (mirrors `MLP::forward` / lfm2.py).
 //   down_proj(swiglu(gate_proj(x), up_proj(x))), keys
 //   layers.{i}.feed_forward.{gate,up,down}_proj.

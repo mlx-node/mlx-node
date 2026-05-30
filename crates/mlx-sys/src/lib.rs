@@ -1916,6 +1916,71 @@ unsafe extern "C-unwind" {
         l_cache: i32,
         conv_bias: i32,
     ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: run a `T`-step lfm2 attention decode sequence
+    /// through the ARRAY-OFFSET compiled variant `lfm2_attn_pure_fn_arr` (fixed
+    /// padded KV cache + per-step static additive mask + array RoPE/slice_update —
+    /// the path the compiled decode loop uses), returning the LAST step's output
+    /// `[1, num_heads*head_dim]` (caller owns; nullptr on error). Same weight
+    /// layout as `mlx_lfm2_probe_attn_seq`. Caller MUST hold
+    /// `COMPILED_WEIGHTS_RWLOCK` (write). Phase-2b-1 parity gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_attn_arr_seq(
+        x_seq: *mut mlx_array,
+        q_w: *mut mlx_array,
+        k_w: *mut mlx_array,
+        v_w: *mut mlx_array,
+        out_w: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        k_norm_w: *mut mlx_array,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+    ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: run a SYNTHETIC small dense lfm2 model through
+    /// the full `lfm2_decode_fn` assembly for `T` decode steps and return the
+    /// LAST step's logits `[1, vocab]` (caller owns; nullptr on error). The 2b-1
+    /// end-to-end-shaped parity gate (per-layer conv/attn dispatch, norm/residual
+    /// order, cache-slot interleaving, tied head) — runs EAGER (un-compiled), gate
+    /// stays OFF. Per-layer weights are arrays-of-pointers indexed by layer; conv
+    /// layers ignore attn pointers and vice versa (read per `is_attn[i]`).
+    /// `is_attn` and `token_ids` have lengths `num_layers` and `T`. The embedding
+    /// table is stored under `embed_tokens.weight` (tied head). Caller MUST hold
+    /// `COMPILED_WEIGHTS_RWLOCK` (write). Arg order is byte-identical to the C++
+    /// definition in mlx_lfm2_moe.cpp — keep them in sync.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_decode_seq(
+        embed_w: *mut mlx_array,
+        emb_norm_w: *mut mlx_array,
+        is_attn: *const i32,
+        num_layers: i32,
+        hidden: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        l_cache: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+        token_ids: *const i32,
+        t: i32,
+        op_norm_w: *const *mut mlx_array,
+        ffn_norm_w: *const *mut mlx_array,
+        gate_w: *const *mut mlx_array,
+        up_w: *const *mut mlx_array,
+        down_w: *const *mut mlx_array,
+        q_w: *const *mut mlx_array,
+        k_w: *const *mut mlx_array,
+        v_w: *const *mut mlx_array,
+        out_w: *const *mut mlx_array,
+        qn_w: *const *mut mlx_array,
+        kn_w: *const *mut mlx_array,
+        in_proj_w: *const *mut mlx_array,
+        conv_w: *const *mut mlx_array,
+        out_proj_w: *const *mut mlx_array,
+    ) -> *mut mlx_array;
 }
 
 // Gradient computation types

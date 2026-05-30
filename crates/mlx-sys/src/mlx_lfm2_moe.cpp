@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
+#include <vector>
 
 using namespace lfm2_common;
 
@@ -33,10 +35,128 @@ void mlx_clear_weights();
 // =============================================================================
 
 namespace {
-// File-local active model id. Phase 0 has no setter, so it stays 0 and the
+// File-local active model id. Phase 0/2b-1 have no setter, so it stays 0 and the
 // Rust gate (`mlx_lfm2_get_model_id() == model_id`, where model_id >= 1) is
-// always false.
+// always false — the compiled path is OFF (Phase 2b-2 wires the shared-id
+// ownership and flips it on).
 uint64_t g_lfm2_active_model_id = 0;
+
+// Decode-graph config consumed by `lfm2_decode_fn`. Set by the caller (the
+// 2b-1 probe; 2b-2 `init_from_prefill`) before invoking the loop. `g_lfm2_config`
+// is the POD shape; `g_lfm2_is_attn` is the per-layer dispatch (1=attn, 0=conv),
+// length num_layers — kept OUT of the POD (which must stay copyable per cfg).
+lfm2_common::Lfm2MoeConfig g_lfm2_config;
+std::vector<int> g_lfm2_is_attn;
+
+// =====================================================================
+// Full single-token decode loop over the dense lfm2 backbone, assembled from
+// the parity-proven pure-fns (lfm2_attn_pure_fn_arr / lfm2_conv_pure_fn /
+// lfm2_dense_mlp). Mirrors the qwen35 `moe_compiled_decode_fn` SHAPE: uniform
+// 2N input/output cache stride so the compile-cache key is invariant.
+//
+//   inputs:  [h([B,hidden]), offset_arr(scalar i32),
+//             slot[0].a, slot[0].b, ..., slot[N-1].a, slot[N-1].b]
+//   outputs: [logits([B,vocab]), new_offset, new_slot[0].a, ..., new_slot[N-1].b]
+//
+// Per layer (matching native decoder_layer.rs:151-171):
+//   normed = rms_norm(h, operator_norm);  h += op(normed)            (residual 1)
+//   ffn_in = rms_norm(h, ffn_norm);        h += dense_mlp(ffn_in)     (residual 2)
+// then rms_norm(h, embedding_norm) and the tied `embed_tokens` LM head.
+//
+// Cache slots (uniform stride 2, indexed by ABSOLUTE layer idx):
+//   attn layer i: slot.a = kv_keys, slot.b = kv_values
+//                 [B, num_kv_heads, max_kv_len, head_dim]
+//   conv layer i: slot.a = conv_state [B, l_cache-1, hidden];
+//                 slot.b = UNUSED placeholder (pre-seeded scalar bf16 zero, left
+//                 untouched — no input->output identity edge).
+//
+// INVARIANT: every attention KV cache is padded to the SAME max_kv_len; the
+// additive decode mask (positions <= offset -> 0, else -inf) is derived from the
+// first attention layer's key cache. (2b-1 calls this EAGERLY via the probe;
+// 2b-2 wraps it in mlx::core::compile.)
+// =====================================================================
+std::vector<array> lfm2_decode_fn(const std::vector<array>& inputs) {
+  using namespace lfm2_common;
+  using namespace qwen35_common;
+  const auto& cfg = g_lfm2_config;
+  auto h = inputs[0];           // [B, hidden]
+  auto offset_arr = inputs[1];  // scalar int32
+
+  // Static additive mask [1,1,1,max_kv_len] from the first attention layer.
+  int first_attn = -1;
+  for (int i = 0; i < cfg.num_layers; i++) {
+    if (g_lfm2_is_attn[i]) {
+      first_attn = i;
+      break;
+    }
+  }
+  int max_kv_len = (first_attn >= 0) ? inputs[2 + first_attn * 2].shape(2) : 1;
+  auto positions = arange(0, max_kv_len, mlx::core::int32);
+  auto valid = less_equal(positions, offset_arr);
+  auto attn_mask = reshape(
+      where(valid, array(0.0f, mlx::core::bfloat16),
+            array(-std::numeric_limits<float>::infinity(), mlx::core::bfloat16)),
+      {1, 1, 1, max_kv_len});
+
+  // Pre-seed all output cache slots (conv slot.b stays this scalar zero).
+  std::vector<array> new_caches;
+  new_caches.reserve(cfg.num_layers * 2);
+  for (int i = 0; i < cfg.num_layers * 2; i++) {
+    new_caches.push_back(zeros({}, mlx::core::bfloat16));
+  }
+
+  for (int i = 0; i < cfg.num_layers; i++) {
+    std::string lp = "layers." + std::to_string(i);
+
+    // (1) operator_norm BEFORE the op, residual after.
+    auto normed =
+        mlx::core::fast::rms_norm(h, get_weight(lp + ".operator_norm.weight"), cfg.norm_eps);
+    if (g_lfm2_is_attn[i]) {
+      const auto& kk = inputs[2 + i * 2];
+      const auto& kv = inputs[2 + i * 2 + 1];
+      auto res = lfm2_attn_pure_fn_arr(normed, i, kk, kv, attn_mask, offset_arr, cfg);
+      h = h + res.output;
+      new_caches[i * 2] = res.keys;
+      new_caches[i * 2 + 1] = res.values;
+    } else {
+      const auto& cs = inputs[2 + i * 2];
+      auto res = lfm2_conv_pure_fn(normed, i, cs, cfg.conv_l_cache, cfg.hidden_size,
+                                   /*conv_bias=*/false);
+      h = h + res.output;
+      new_caches[i * 2] = res.new_state;
+      // slot.b left as the pre-seeded scalar zero (unused for conv layers).
+    }
+
+    // (2) ffn_norm BEFORE the FFN, residual after (EVERY layer).
+    //
+    // DENSE-FFN ONLY (Phase 2 scope). Every layer routes through
+    // `lfm2_dense_mlp`, which is CORRECT for the dense `lfm2` backbone
+    // (LFM2.5-1.2B: all layers are dense SwiGLU). It is WRONG for `lfm2_moe`,
+    // whose layers >= num_dense_layers are `Lfm2SparseMoeBlock` (router +
+    // expert_bias + top-k + switch_mlp). Adding that sparse dispatch here is
+    // Phase 3. Until it lands, the Phase-2b-2 gate flip MUST gate on the dense
+    // model only (`!config.is_moe()`) so an lfm2_moe checkpoint can never
+    // silently take this dense-only path and compute the wrong FFN.
+    auto ffn_in =
+        mlx::core::fast::rms_norm(h, get_weight(lp + ".ffn_norm.weight"), cfg.norm_eps);
+    h = h + lfm2_dense_mlp(ffn_in, i);
+  }
+
+  // Final norm + tied LM head (linear_proj appends ".weight"; tie reads
+  // embed_tokens.weight via get_weight_t, untied reads lm_head.weight).
+  h = mlx::core::fast::rms_norm(h, get_weight("embedding_norm.weight"), cfg.norm_eps);
+  h = cfg.tie_embedding ? linear_proj(h, "embed_tokens") : linear_proj(h, "lm_head");
+
+  auto new_offset = offset_arr + array(1, mlx::core::int32);
+  std::vector<array> out;
+  out.reserve(2 + cfg.num_layers * 2);
+  out.push_back(h);
+  out.push_back(new_offset);
+  for (auto& c : new_caches) {
+    out.push_back(c);
+  }
+  return out;
+}
 }  // namespace
 
 extern "C" {
@@ -247,6 +367,193 @@ mlx_array* mlx_lfm2_probe_conv_seq(
     return reinterpret_cast<mlx_array*>(out);
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_conv_seq: %s\n", e.what());
+    fflush(stderr);
+    mlx_clear_weights();
+    return nullptr;
+  } catch (...) {
+    mlx_clear_weights();
+    return nullptr;
+  }
+}
+
+// Run a SEQUENCE of `T` lfm2 attention decode steps through the ARRAY-OFFSET
+// compiled variant `lfm2_attn_pure_fn_arr` (the one the decode loop will use):
+// fixed-shape padded KV cache [1, num_kv_heads, T, head_dim] + a per-step static
+// additive mask (positions <= offset -> 0, else -inf), array offset = step index.
+// Returns the LAST step's output [1, num_heads*head_dim]. Gates the array variant
+// (fixed-cache + mask + array RoPE/slice_update) independently of the scalar
+// dynamic_kv path, BEFORE it is wired into lfm2_decode_fn.
+//
+// TEST-ONLY + DESTRUCTIVE on g_weights() — caller MUST hold COMPILED_WEIGHTS_RWLOCK
+// (write); see the probe-section contract above. Weights natural [out,in] /
+// [head_dim]. Caller owns the returned array; nullptr on error.
+mlx_array* mlx_lfm2_probe_attn_arr_seq(
+    mlx_array* x_seq_ptr,
+    mlx_array* q_w, mlx_array* k_w, mlx_array* v_w, mlx_array* out_w,
+    mlx_array* q_norm_w, mlx_array* k_norm_w,
+    int num_heads, int num_kv_heads, int head_dim,
+    float rope_theta, float norm_eps) {
+  try {
+    mlx_clear_weights();
+    mlx_store_weight("layers.0.self_attn.q_proj.weight", q_w);
+    mlx_store_weight("layers.0.self_attn.k_proj.weight", k_w);
+    mlx_store_weight("layers.0.self_attn.v_proj.weight", v_w);
+    mlx_store_weight("layers.0.self_attn.out_proj.weight", out_w);
+    mlx_store_weight("layers.0.self_attn.q_layernorm.weight", q_norm_w);
+    mlx_store_weight("layers.0.self_attn.k_layernorm.weight", k_norm_w);
+
+    Lfm2MoeConfig cfg{};
+    cfg.num_heads = num_heads;
+    cfg.num_kv_heads = num_kv_heads;
+    cfg.head_dim = head_dim;
+    cfg.rope_theta = rope_theta;
+    cfg.norm_eps = norm_eps;
+
+    auto& x_seq = *reinterpret_cast<array*>(x_seq_ptr);
+    int T = x_seq.shape(0);
+    int hidden = x_seq.shape(1);
+
+    auto kv_keys = zeros({1, num_kv_heads, T, head_dim}, x_seq.dtype());
+    auto kv_values = zeros({1, num_kv_heads, T, head_dim}, x_seq.dtype());
+    auto positions = arange(0, T, mlx::core::int32);
+
+    array last_out = zeros({1, num_heads * head_dim}, x_seq.dtype());
+    for (int i = 0; i < T; i++) {
+      auto x_i = reshape(slice(x_seq, {i, 0}, {i + 1, hidden}), {1, hidden});
+      auto offset_arr = array(i, mlx::core::int32);
+      // Static additive mask [1,1,1,T]: positions <= offset -> 0, else -inf.
+      auto valid = less_equal(positions, offset_arr);
+      auto mask = reshape(
+          where(valid, array(0.0f, mlx::core::bfloat16),
+                array(-std::numeric_limits<float>::infinity(), mlx::core::bfloat16)),
+          {1, 1, 1, T});
+      auto res = lfm2_attn_pure_fn_arr(x_i, 0, kv_keys, kv_values, mask, offset_arr, cfg);
+      kv_keys = res.keys;
+      kv_values = res.values;
+      last_out = res.output;
+    }
+    mlx::core::eval({last_out});
+    auto* out = new array(last_out);
+    mlx_clear_weights();
+    return reinterpret_cast<mlx_array*>(out);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] mlx_lfm2_probe_attn_arr_seq: %s\n", e.what());
+    fflush(stderr);
+    mlx_clear_weights();
+    return nullptr;
+  } catch (...) {
+    mlx_clear_weights();
+    return nullptr;
+  }
+}
+
+// Run a SYNTHETIC small dense lfm2 model through the FULL `lfm2_decode_fn`
+// assembly for `T` decode steps and return the LAST step's logits [1, vocab].
+// This is the 2b-1 end-to-end-SHAPED parity gate: it exercises the per-layer
+// conv-vs-attn dispatch (from is_attn[]), the operator_norm->op->+res->ffn_norm->
+// mlp->+res order, the conv-state vs KV slot interleaving at uniform stride 2,
+// the final embedding_norm, and the tied embed_tokens head — WITHOUT the real
+// checkpoint and WITHOUT flipping the production gate (mlx_lfm2_get_model_id
+// stays 0). `lfm2_decode_fn` is invoked EAGERLY (un-compiled) so a graph-trace
+// bug cannot be masked; the compiled path is validated in 2b-2.
+//
+// Per-layer weights are passed as arrays-of-pointers indexed by layer; conv
+// layers ignore the attn pointers and vice versa (read per is_attn[i]). The
+// embedding table is stored under "embed_tokens.weight" (the tied head's
+// linear_proj appends ".weight" and reads get_weight_t). Weights natural
+// [out,in] / [head_dim]; conv weight [hidden,l_cache,1]. token_ids has length T.
+//
+// TEST-ONLY + DESTRUCTIVE on g_weights() — caller MUST hold COMPILED_WEIGHTS_RWLOCK
+// (write); see the probe-section contract above. Caller owns the returned array;
+// nullptr on error.
+mlx_array* mlx_lfm2_probe_decode_seq(
+    mlx_array* embed_w_ptr, mlx_array* emb_norm_ptr,
+    const int* is_attn, int num_layers,
+    int hidden, int num_heads, int num_kv_heads, int head_dim,
+    int l_cache, float rope_theta, float norm_eps,
+    const int* token_ids, int T,
+    mlx_array** op_norm_w, mlx_array** ffn_norm_w,
+    mlx_array** gate_w, mlx_array** up_w, mlx_array** down_w,
+    mlx_array** q_w, mlx_array** k_w, mlx_array** v_w, mlx_array** out_w,
+    mlx_array** qn_w, mlx_array** kn_w,
+    mlx_array** in_proj_w, mlx_array** conv_w, mlx_array** out_proj_w) {
+  try {
+    mlx_clear_weights();
+    auto& embed_w = *reinterpret_cast<array*>(embed_w_ptr);
+    // Tied head: linear_proj(h,"embed_tokens") -> get_weight_t("embed_tokens.weight").
+    mlx_store_weight("embed_tokens.weight", embed_w_ptr);
+    mlx_store_weight("embedding_norm.weight", emb_norm_ptr);
+    for (int i = 0; i < num_layers; i++) {
+      std::string lp = "layers." + std::to_string(i);
+      mlx_store_weight((lp + ".operator_norm.weight").c_str(), op_norm_w[i]);
+      mlx_store_weight((lp + ".ffn_norm.weight").c_str(), ffn_norm_w[i]);
+      mlx_store_weight((lp + ".feed_forward.gate_proj.weight").c_str(), gate_w[i]);
+      mlx_store_weight((lp + ".feed_forward.up_proj.weight").c_str(), up_w[i]);
+      mlx_store_weight((lp + ".feed_forward.down_proj.weight").c_str(), down_w[i]);
+      if (is_attn[i]) {
+        mlx_store_weight((lp + ".self_attn.q_proj.weight").c_str(), q_w[i]);
+        mlx_store_weight((lp + ".self_attn.k_proj.weight").c_str(), k_w[i]);
+        mlx_store_weight((lp + ".self_attn.v_proj.weight").c_str(), v_w[i]);
+        mlx_store_weight((lp + ".self_attn.out_proj.weight").c_str(), out_w[i]);
+        mlx_store_weight((lp + ".self_attn.q_layernorm.weight").c_str(), qn_w[i]);
+        mlx_store_weight((lp + ".self_attn.k_layernorm.weight").c_str(), kn_w[i]);
+      } else {
+        mlx_store_weight((lp + ".conv.in_proj.weight").c_str(), in_proj_w[i]);
+        mlx_store_weight((lp + ".conv.conv.weight").c_str(), conv_w[i]);  // [H,l_cache,1]
+        mlx_store_weight((lp + ".conv.out_proj.weight").c_str(), out_proj_w[i]);
+      }
+    }
+
+    g_lfm2_config = Lfm2MoeConfig{};
+    g_lfm2_config.num_layers = num_layers;
+    g_lfm2_config.hidden_size = hidden;
+    g_lfm2_config.num_heads = num_heads;
+    g_lfm2_config.num_kv_heads = num_kv_heads;
+    g_lfm2_config.head_dim = head_dim;
+    g_lfm2_config.conv_l_cache = l_cache;
+    g_lfm2_config.rope_theta = rope_theta;
+    g_lfm2_config.norm_eps = norm_eps;
+    g_lfm2_config.tie_embedding = true;
+    g_lfm2_config.max_kv_len = T;
+    g_lfm2_is_attn.assign(is_attn, is_attn + num_layers);
+
+    // Local cache vector (uniform stride 2). conv -> (state, scalar placeholder);
+    // attn -> (kv_keys, kv_values) padded to T.
+    std::vector<array> caches;
+    caches.reserve(num_layers * 2);
+    for (int i = 0; i < num_layers; i++) {
+      if (is_attn[i]) {
+        caches.push_back(zeros({1, num_kv_heads, T, head_dim}, mlx::core::bfloat16));
+        caches.push_back(zeros({1, num_kv_heads, T, head_dim}, mlx::core::bfloat16));
+      } else {
+        caches.push_back(zeros({1, l_cache - 1, hidden}, mlx::core::bfloat16));
+        caches.push_back(zeros({}, mlx::core::bfloat16));  // unused placeholder
+      }
+    }
+
+    array last_logits = zeros({1, embed_w.shape(0)}, mlx::core::bfloat16);
+    for (int t = 0; t < T; t++) {
+      auto idx = reshape(array(token_ids[t], mlx::core::int32), {1});
+      auto h = take(embed_w, idx, 0);  // [1, hidden]
+      std::vector<array> in;
+      in.reserve(2 + num_layers * 2);
+      in.push_back(h);
+      in.push_back(array(t, mlx::core::int32));  // offset = t
+      for (auto& c : caches) {
+        in.push_back(c);
+      }
+      auto outs = lfm2_decode_fn(in);  // EAGER (un-compiled)
+      last_logits = outs[0];
+      for (int i = 0; i < num_layers * 2; i++) {
+        caches[i] = outs[2 + i];
+      }
+    }
+    mlx::core::eval({last_logits});
+    auto* out = new array(last_logits);
+    mlx_clear_weights();
+    return reinterpret_cast<mlx_array*>(out);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] mlx_lfm2_probe_decode_seq: %s\n", e.what());
     fflush(stderr);
     mlx_clear_weights();
     return nullptr;
