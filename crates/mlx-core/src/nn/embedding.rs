@@ -219,20 +219,52 @@ impl Embedding {
             mode: mode.to_string(),
         });
         self.is_quantized_flag = true;
+        // Drop the full-shape `[vocab, hidden]` dense `weight` graph allocated by
+        // `new()` (a `random_normal` node): the packed backend is now the sole
+        // source of truth, so replace it with a genuinely tiny placeholder. This
+        // guarantees no full dense table can ever be materialized off `self.weight`
+        // (whether via an accidental eval of the lazy graph or a stray
+        // `get_weight()` caller) — the real table only exists packed. `get_weight()`
+        // dequantizes on demand from the packed backend, so it never reads this
+        // placeholder for packed embeddings.
+        self.weight = MxArray::zeros(&[1, 1], Some(crate::array::DType::BFloat16))?;
         Ok(())
     }
 
     /// Get the embedding weight matrix (always returns dense bf16).
-    /// For LEGACY quantized embeddings, returns the pre-dequantized full table.
-    /// For PACKED-quantized embeddings this is only the placeholder — callers
-    /// that need a tied-head matmul must use `as_linear` instead.
+    ///
+    /// - Plain bf16 / LEGACY pre-dequantized embeddings: returns the dense
+    ///   `self.weight` table directly.
+    /// - PACKED-quantized embeddings (`load_quantized_packed`): `self.weight` is
+    ///   only a tiny placeholder, so this DEQUANTIZES the full table on demand
+    ///   from the packed backend and returns CORRECT `[vocab, hidden]` data — it
+    ///   never returns the placeholder. The dense table is materialized only if a
+    ///   caller actually evals the result; the production lfm2 logits path uses
+    ///   `as_linear` (a `mlx_quantized_matmul` on the packed tensors) and never
+    ///   hits this, so no full dense table is resident under normal operation.
     pub fn get_weight(&self) -> MxArray {
+        if let Some(ref q) = self.quantized_packed {
+            // Dequantize the full packed table on demand. `unwrap_or_else` keeps
+            // this getter infallible: on the (effectively impossible) dequant
+            // error for already-validated packed data, fall back to the
+            // placeholder rather than panicking — correctness-critical callers
+            // route through `as_linear`, not `get_weight()`.
+            return dequantize(
+                &q.weight,
+                &q.scales,
+                q.biases.as_ref(),
+                q.group_size,
+                q.bits,
+                &q.mode,
+            )
+            .unwrap_or_else(|_| self.weight.clone());
+        }
         self.weight.clone()
     }
 
-    /// Get the embedding weight matrix (alias for get_weight)
+    /// Get the embedding weight matrix (alias for `get_weight`; packed-aware).
     pub fn weight(&self) -> MxArray {
-        self.weight.clone()
+        self.get_weight()
     }
 
     /// Set the embedding weight matrix (alias for load_weight for consistency)
@@ -436,6 +468,52 @@ mod tests {
         assert!(
             max_err < 1e-3,
             "packed affine forward must match dequant-then-gather: max_err={max_err}"
+        );
+    }
+
+    /// PACKED embedding must NOT keep the full `[vocab, hidden]` dense table from
+    /// `new()` resident: `load_quantized_packed` replaces `self.weight` with a
+    /// tiny placeholder, and `get_weight()` dequantizes the FULL table on demand
+    /// from the packed backend — returning correct `[vocab, hidden]` data, never
+    /// the placeholder or the stale random init. (Regression for the Codex [high]
+    /// finding: the packed path previously left the full random table installed.)
+    #[test]
+    fn packed_get_weight_dequantizes_not_placeholder() {
+        let vocab = 8i64;
+        let hidden = 64i64; // one affine group of 64
+        let n = (vocab * hidden) as usize;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.02).collect();
+        let dense = MxArray::from_float32(&data, &[vocab, hidden])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("bf16");
+        let (qw, qs, qb) = quantize_affine(&dense, 64, 4);
+
+        let mut emb = Embedding::new(vocab as u32, hidden as u32).expect("new");
+        emb.load_quantized_packed(&qw, &qs, Some(&qb), 64, 4, "affine")
+            .expect("load packed affine");
+        assert!(emb.is_packed_quantized());
+
+        // The on-disk placeholder is tiny — the full dense table is NOT resident.
+        assert_eq!(
+            emb.weight.shape().expect("placeholder shape").as_ref(),
+            &[1, 1],
+            "packed load must replace self.weight with a [1,1] placeholder"
+        );
+
+        // get_weight() must return the CORRECT full table (shape + values), via
+        // on-demand dequant — NOT the [1,1] placeholder, NOT stale random init.
+        let got = emb.get_weight();
+        assert_eq!(
+            got.shape().expect("get_weight shape").as_ref(),
+            &[vocab, hidden],
+            "packed get_weight() must return the full [vocab, hidden] table"
+        );
+        let full = dequantize(&qw, &qs, Some(&qb), 64, 4, "affine").expect("dequant full");
+        let max_err = max_abs_err(&to_f32_vec(&got), &to_f32_vec(&full));
+        assert!(
+            max_err < 1e-6,
+            "packed get_weight() must equal the on-demand dequantized table: max_err={max_err}"
         );
     }
 

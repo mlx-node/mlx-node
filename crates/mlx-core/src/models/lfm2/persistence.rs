@@ -997,6 +997,35 @@ fn validate_mandatory_weights(
         )));
     }
 
+    // Reject orphaned PER-EXPERT quant metadata. `sanitize_weights` stacks only
+    // the per-expert `feed_forward.experts.{e}.{proj}.weight` tensors into a
+    // single `switch_mlp.{proj}.weight`; it has NO path that stacks the matching
+    // `.scales`/`.biases` (per-expert pre-quantized expert inputs are
+    // unsupported). If such a checkpoint is loaded, the `.weight`s would stack
+    // (as packed uint32!) while the companions stay orphaned under
+    // `experts.{e}.{proj}.scales`, the layer would misclassify as DENSE (its
+    // `switch_mlp.{proj}.scales` is absent), and the bf16 setters would install
+    // packed uint32 weights as if dense — silent corruption. Fail loud naming
+    // the stray companions rather than load garbage. (The matching `.weight`
+    // half, if it survived unstacked, is caught by the mandatory
+    // `switch_mlp.{proj}.weight` check below.)
+    let orphan_expert_quant: Vec<String> = params
+        .keys()
+        .filter(|k| k.contains("feed_forward.experts."))
+        .filter(|k| k.ends_with(".scales") || k.ends_with(".biases"))
+        .cloned()
+        .collect();
+    if !orphan_expert_quant.is_empty() {
+        return Err(Error::from_reason(format!(
+            "LFM2 MoE checkpoint has {} per-expert quant companion(s) \
+             (feed_forward.experts.*.{{scales,biases}}) that cannot be stacked into the \
+             switch_mlp expert tensors: {:?} — per-expert pre-quantized experts are \
+             unsupported; convert to a stacked-then-quantized checkpoint (switch_mlp.*.scales)",
+            orphan_expert_quant.len(),
+            &orphan_expert_quant[..orphan_expert_quant.len().min(20)]
+        )));
+    }
+
     // Validate a MoE projection as a COMPLETE group, recording precise missing
     // keys into `missing`. The `quantized` flag is the layer-level
     // determination from the SHARED `moe_layer_is_quantized` helper (ANY
@@ -1287,12 +1316,13 @@ impl Lfm2Inner {
 
         // Deterministic weight-byte total for the cache-limit coordinator,
         // computed from the still-live `params` map before it is dropped at
-        // end-of-function. NOT a naive packed sum: a quantized embedding (and
-        // quantized dense-MLP projections) leave a DENSE dequantized copy
-        // resident that the packed tensors do not measure, so
-        // `compute_weight_bytes` adds those deltas to avoid undercounting (and
-        // thus oversizing the allocator cap / risking OOM with multiple
-        // models). See its doc comment for the residency rationale.
+        // end-of-function. After #1b every quantized lfm2 tensor class is
+        // packed-only resident — the embedding installs a PACKED backend (its
+        // dense `vocab × hidden` table is never materialized; `self.weight` is a
+        // tiny placeholder), and the non-MoE/dense-MLP/MoE linears all run
+        // `mlx_quantized_matmul`/`gather_qmm` on packed tensors. So the resident
+        // footprint is EXACTLY the packed-tensor sum with NO dense dequant deltas
+        // to add. See `compute_weight_bytes`'s doc comment for the rationale.
         let weight_bytes: u64 = compute_weight_bytes(&params, &inner.config);
 
         Ok((inner, weight_bytes))
@@ -1683,6 +1713,38 @@ mod tests {
         assert!(
             msg.contains("scales"),
             "error should mention the stray scales, got: {msg}"
+        );
+    }
+
+    /// Codex [medium] regression: per-expert quant companions
+    /// (`feed_forward.experts.{e}.{proj}.{scales,biases}`) that survive sanitize
+    /// (only `.weight` is stackable into `switch_mlp.*`) must be REJECTED.
+    /// Otherwise the packed uint32 `.weight`s would stack, the layer would
+    /// misclassify as dense (its `switch_mlp.*.scales` is absent), and the bf16
+    /// setters would install packed weights as garbage. Validation must fail loud
+    /// naming the orphaned companions.
+    #[test]
+    fn validation_rejects_orphaned_per_expert_quant_companions() {
+        let config = tiny_moe_config(true);
+        let mut p = validation_scaffold();
+        // Both layers otherwise complete bf16 (so nothing else trips first).
+        insert_moe_proj(&mut p, 0, /* quantized */ false);
+        insert_moe_proj(&mut p, 1, /* quantized */ false);
+        // Inject orphaned per-expert quant metadata that sanitize cannot stack.
+        p.insert(
+            "layers.1.feed_forward.experts.0.gate_proj.scales".into(),
+            dummy(),
+        );
+        p.insert(
+            "layers.1.feed_forward.experts.2.down_proj.biases".into(),
+            dummy(),
+        );
+        let err = validate_mandatory_weights(&p, &config, 2)
+            .expect_err("orphaned per-expert quant companions must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("feed_forward.experts.") && msg.contains("per-expert"),
+            "error should name the orphaned per-expert companions, got: {msg}"
         );
     }
 
