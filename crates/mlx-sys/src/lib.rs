@@ -1810,6 +1810,59 @@ unsafe extern "C-unwind" {
         ),
         ctx: *mut std::os::raw::c_void,
     ) -> i32;
+
+    // ============================================
+    // LFM2.5 MoE Compiled Forward Pass (Phase 0 scaffold — INERT)
+    //
+    // The C++ side (`mlx_lfm2_moe.cpp`) stubs these out: `mlx_lfm2_get_model_id`
+    // returns 0 so the Rust dispatcher's `== model_id` gate is never satisfied
+    // and the native forward always runs. The real compiled graph lands later.
+    // ============================================
+
+    /// Active lfm2 compiled-path model id (0 = no model owns the compiled
+    /// path). The Rust dispatcher takes the compiled path only when this equals
+    /// the model's own `model_id`. Phase 0 stub returns 0.
+    pub fn mlx_lfm2_get_model_id() -> u64;
+
+    /// Number of weights registered into the lfm2 compiled graph. Phase 0 stub
+    /// returns 0.
+    pub fn mlx_lfm2_weight_count() -> usize;
+
+    /// Initialize the compiled lfm2 decode graph from prefill state. Phase 0
+    /// stub is a no-op.
+    pub fn mlx_lfm2_moe_init_from_prefill(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+        conv_l_cache: i32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        num_dense_layers: i32,
+        norm_topk_prob: i32,
+        use_expert_bias: i32,
+        tie_embedding: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        cache_arrays: *mut *mut mlx_array,
+        prefill_offset: i32,
+    );
+
+    /// Run one compiled lfm2 decode step. Phase 0 stub writes a null
+    /// `*output_logits` so callers fall back to the native forward.
+    pub fn mlx_lfm2_moe_forward(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    /// Tear down the compiled lfm2 graph state. Phase 0 stub resets the model
+    /// id to 0.
+    pub fn mlx_lfm2_moe_reset();
 }
 
 // Gradient computation types

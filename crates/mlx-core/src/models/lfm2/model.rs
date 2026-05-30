@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -24,6 +24,19 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use super::config::Lfm2Config;
 use super::decoder_layer::{Lfm2DecoderLayer, Lfm2LayerKind};
 use super::layer_cache::Lfm2LayerCache;
+
+/// Per-model id allocator for the compiled C++ forward path (Phase 0 scaffold).
+///
+/// Each loaded `Lfm2Inner` claims a unique non-zero id. The compiled path is
+/// taken only when the C++ side's active model id (`mlx_lfm2_get_model_id()`)
+/// equals this model's id — which, in the inert Phase 0 scaffold, never happens
+/// (the C++ stub returns 0 and nothing sets it). Starts at 1 so 0 means "no
+/// model owns the compiled path".
+///
+/// Phase 1 NOTE: the compiled path shares the SAME process-global weight map as
+/// the qwen3.5 path, so before the gate is flipped on, model-id ownership must
+/// be reconciled across models (single source of truth + collision-free ids).
+static LFM2_COMPILED_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
@@ -57,6 +70,11 @@ pub(crate) struct Lfm2Inner {
     /// not by absolute layer index. `Lfm2DecoderLayer::forward_paged_or_flat`
     /// performs the per-layer dispatch.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Unique non-zero id for the compiled C++ forward path (Phase 0 scaffold).
+    /// See [`LFM2_COMPILED_MODEL_ID_COUNTER`]. Used by
+    /// [`Lfm2Inner::compiled_path_active`] to gate the (not-yet-enabled)
+    /// compiled path.
+    pub(crate) model_id: u64,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -351,11 +369,25 @@ impl Lfm2Inner {
             cached_token_history: Vec::new(),
             cached_image_key: None,
             paged_adapter,
+            model_id: LFM2_COMPILED_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         })
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
         self.tokenizer = Some(tokenizer);
+    }
+
+    /// Whether the compiled C++ forward path owns this model's weights and may
+    /// be taken for decode. The compiled path is active only when the C++ side's
+    /// active model id equals this model's [`Lfm2Inner::model_id`].
+    ///
+    /// Phase 0 scaffold: ALWAYS false — the C++ stub
+    /// (`mlx_lfm2_get_model_id()`) returns 0 and nothing registers/sets an id,
+    /// so the native forward always runs. Phase 1 wires registration + the real
+    /// compiled graph and this becomes the live dispatch gate.
+    pub(crate) fn compiled_path_active(&self) -> bool {
+        let active = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
+        active != 0 && active == self.model_id
     }
 
     /// Forward pass through the full model.
@@ -364,6 +396,14 @@ impl Lfm2Inner {
     ///
     /// Returns logits [B, T, vocab_size].
     fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+        // Compiled C++ forward path dispatch hook (Phase 0 scaffold). Always
+        // false today — the C++ stub keeps the gate off — so this is an inert
+        // probe of the FFI round-trip. Phase 1 branches here into the compiled
+        // decode graph when the compiled path owns this model's weights.
+        if self.compiled_path_active() {
+            warn!("lfm2 compiled forward path is gated on but not implemented; using native path");
+        }
+
         // 1. Token embeddings (no scaling)
         let mut h = self.embed_tokens.forward(input_ids)?;
 
