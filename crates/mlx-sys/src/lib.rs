@@ -1828,8 +1828,20 @@ unsafe extern "C-unwind" {
     /// returns 0.
     pub fn mlx_lfm2_weight_count() -> usize;
 
-    /// Initialize the compiled lfm2 decode graph from prefill state. Phase 0
-    /// stub is a no-op.
+    /// Initialize the compiled lfm2 decode graph from prefill state.
+    ///
+    /// `is_attn` is a `num_layers`-long per-layer dispatch map (1 = full
+    /// attention, 0 = conv), built dynamically from `config.is_attention_layer`.
+    /// It is appended BEFORE `cache_arrays` and the C++ param order
+    /// (`mlx_lfm2_moe_init_from_prefill` in mlx_lfm2_moe.cpp) MUST match this
+    /// byte-for-byte or the ABI is silently miswired.
+    ///
+    /// Cache slot layout (stride 2 by ABSOLUTE layer idx): attn layer i →
+    /// `cache_arrays[i*2]` = kv_keys, `[i*2+1]` = kv_values
+    /// (`[B,num_kv_heads,kv_len,head_dim]`, padded to `max_kv_len` C++-side);
+    /// conv layer i → `cache_arrays[i*2]` = conv_state `[B,l_cache-1,hidden]`,
+    /// `[i*2+1]` = null (the conv branch never reads it).
+    #[allow(clippy::too_many_arguments)]
     pub fn mlx_lfm2_moe_init_from_prefill(
         num_layers: i32,
         hidden_size: i32,
@@ -1847,12 +1859,14 @@ unsafe extern "C-unwind" {
         tie_embedding: i32,
         max_kv_len: i32,
         batch_size: i32,
+        is_attn: *const i32,
         cache_arrays: *mut *mut mlx_array,
         prefill_offset: i32,
     );
 
-    /// Run one compiled lfm2 decode step. Phase 0 stub writes a null
-    /// `*output_logits` so callers fall back to the native forward.
+    /// Run one compiled lfm2 decode step. Writes a null `*output_logits` when
+    /// the graph is not initialized (or on error) so callers fall back to the
+    /// native forward.
     pub fn mlx_lfm2_moe_forward(
         input_ids: *mut mlx_array,
         embedding_weight: *mut mlx_array,
@@ -1860,8 +1874,36 @@ unsafe extern "C-unwind" {
         cache_offset_out: *mut i32,
     );
 
-    /// Tear down the compiled lfm2 graph state. Phase 0 stub resets the model
-    /// id to 0.
+    /// Async-eval the freshly-sampled decode token (and, when
+    /// `MLX_EVAL_ALL_CACHES=1`, all live compiled caches). Evaluating the token
+    /// — which depends on the compiled logits — triggers the whole compiled
+    /// graph, materializing the cache arrays via the dependency graph.
+    pub fn mlx_lfm2_moe_eval_token_and_caches(token: *mut mlx_array);
+
+    /// Cumulative count of `mlx_lfm2_moe_forward` calls since process start
+    /// (NOT reset by `mlx_lfm2_moe_reset`). Engagement signal for the e2e test
+    /// to assert the compiled decode path actually ran.
+    pub fn mlx_lfm2_moe_forward_call_count() -> u64;
+
+    /// Export the live compiled caches (uniform stride 2 by absolute layer
+    /// idx; attn -> kv_keys/kv_values, conv -> conv_state/scalar-placeholder)
+    /// into caller-provided heap pointers for cross-turn reuse. Returns the
+    /// count exported (0 if not initialized). Caller must MATERIALIZE the
+    /// returned lazy handles before `mlx_lfm2_moe_reset` frees the globals.
+    pub fn mlx_lfm2_moe_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
+
+    /// Current decode offset (number of cached tokens after the last forward).
+    pub fn mlx_lfm2_moe_get_cache_offset() -> i32;
+
+    /// Whether `mlx_lfm2_moe_init_from_prefill` seeded the decode graph cleanly
+    /// (returns 1) or bailed internally on a null slot / padding exception
+    /// (returns 0). The caller checks this to fall back to the native path
+    /// instead of treating the first null forward as a fatal error.
+    pub fn mlx_lfm2_moe_is_initialized() -> i32;
+
+    /// Tear down the compiled lfm2 graph state (clears caches + offset + the
+    /// inited flag). Does NOT touch the shared model-id atom — that is owned by
+    /// `mlx_clear_weights`.
     pub fn mlx_lfm2_moe_reset();
 
     /// TEST-ONLY component probe: run a sequence of `T` lfm2 attention decode

@@ -1301,6 +1301,37 @@ impl Lfm2Inner {
             crate::array::memory::materialize_weights(&weight_refs)?;
         }
 
+        // Register weights with the compiled C++ decode path — ONLY for a
+        // dense, non-paged checkpoint. The compiled `lfm2_decode_fn` applies
+        // `lfm2_dense_mlp` to EVERY layer (correct for dense lfm2, WRONG for
+        // lfm2_moe's sparse layers), and the flat decode graph is incompatible
+        // with the block-paged adapter. Because `compiled_path_active()` is a
+        // pure id-equality probe and the id is published ONLY here, gating the
+        // registration makes the compiled path structurally impossible for
+        // MoE / paged checkpoints. `register_weights_with_cpp` itself also
+        // defensively early-returns on `is_moe()`.
+        //
+        // Quantized dense checkpoints are ALSO excluded for now: the compiled
+        // `linear_proj` infers the quant mode and would mis-dispatch MXFP4 /
+        // NVFP4 as MXFP8 (registration stores no authoritative quant-info), so
+        // quantized compiled decode is deferred to Phase 4. Quantized tensors
+        // carry `.scales`-suffixed keys; bf16/f16 dense checkpoints have none.
+        //
+        // `conv_bias` checkpoints are excluded too: the compiled `lfm2_decode_fn`
+        // calls `lfm2_conv_pure_fn` with conv_bias hardcoded off (the in_proj /
+        // depthwise / out_proj biases are not threaded through the FFI yet), so a
+        // conv_bias=true checkpoint would decode without them. The shipping dense
+        // LFM2.5 checkpoints are conv_bias=false; threading the conv biases is a
+        // Phase-4 follow-up.
+        let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
+        if !inner.config.is_moe()
+            && inner.config.use_block_paged_cache == Some(false)
+            && !is_quantized
+            && !inner.config.conv_bias
+        {
+            register_weights_with_cpp(&params, inner.model_id, &inner.config)?;
+        }
+
         // NOTE: the cache-limit coordinator registration happens in
         // `Lfm2Model::load_from_dir` after this returns so the guard
         // can be carried out to the wrapper struct.
@@ -1327,6 +1358,89 @@ impl Lfm2Inner {
 
         Ok((inner, weight_bytes))
     }
+}
+
+/// Register all sanitized dense-lfm2 weights into the shared compiled-path
+/// weight map and publish `model_id` as the active id, enabling the compiled
+/// C++ decode path for this model.
+///
+/// FLAT registration — unlike qwen3.5 there is no split-projection merge:
+/// `params` is the already-sanitized map (conv weight pre-transposed to
+/// `[H,l_cache,1]`, MLP renamed to `feed_forward.{gate,up,down}_proj`, tied
+/// `embed_tokens.weight`). `mlx_store_weight` auto-transposes 2D weights
+/// (q/k/v/out_proj, in/out_proj, gate/up/down_proj, embed_tokens) to the
+/// `[in,out]` layout `linear_proj` expects; the 3D `conv.conv.weight` and the
+/// 1D norms/biases are left as-is.
+///
+/// Model-id ownership: `model_id` is set LAST (after every weight is stored
+/// and `mlx_weight_count() > 0`) so no concurrent compiled inference can see a
+/// partially-populated map under this id. The shared
+/// `COMPILED_WEIGHTS_RWLOCK` (write) is held for the whole registration. NO
+/// `.unwrap()` / `.expect()` — lock poison is recovered and a NUL byte in a
+/// weight name propagates via `?`.
+///
+/// Defensive: returns early (storing nothing, publishing no id) for an MoE
+/// checkpoint — the compiled `lfm2_decode_fn` is dense-MLP-only. The caller
+/// already gates on `!is_moe() && use_block_paged_cache == Some(false)`; this
+/// is belt-and-suspenders.
+fn register_weights_with_cpp(
+    params: &HashMap<String, MxArray>,
+    model_id: u64,
+    config: &Lfm2Config,
+) -> Result<()> {
+    // (1) Defensive MoE early-return: store nothing, set no id.
+    if config.is_moe() {
+        return Ok(());
+    }
+
+    // (1b) Defensive quant early-return mirroring the call-site gate: the
+    // compiled path stores no authoritative quant-info, so a quantized
+    // checkpoint (any `.scales`-suffixed tensor) must NOT register — its
+    // MXFP4 / NVFP4 weights would mis-dispatch as MXFP8 in `linear_proj`.
+    if params.keys().any(|k| k.ends_with(".scales")) {
+        return Ok(());
+    }
+
+    // (1c) Defensive conv_bias early-return: the compiled `lfm2_decode_fn`
+    // hardcodes conv_bias=off, so a conv_bias=true checkpoint would silently
+    // drop the conv biases. Stay native until they are threaded through (Phase 4).
+    if config.conv_bias {
+        return Ok(());
+    }
+
+    // (2) Write-lock the shared weight RwLock for the entire registration so
+    // any in-flight compiled inference blocks until the new model_id is live.
+    // Poison-recover (a panic in a prior holder must not wedge loads forever).
+    let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // (3) Clear the shared map (also resets the active model id).
+    unsafe { mlx_sys::mlx_clear_weights() };
+
+    // (4) Store every sanitized weight. `mlx_store_weight` auto-transposes
+    // ndim==2; 3D conv weight + 1D norms/biases are left untouched.
+    for (name, arr) in params {
+        let c_name = std::ffi::CString::new(name.as_str())
+            .map_err(|e| Error::from_reason(format!("Weight name contains NUL byte: {e}")))?;
+        unsafe {
+            mlx_sys::mlx_store_weight(c_name.as_ptr(), arr.as_raw_ptr());
+        }
+    }
+
+    let count = unsafe { mlx_sys::mlx_weight_count() };
+    info!("Registered {count} weights with C++ lfm2 compiled forward path");
+
+    // (5) Publish the model id LAST — and only if weights actually landed.
+    if count > 0 {
+        unsafe { mlx_sys::mlx_set_model_id(model_id) };
+    } else {
+        tracing::warn!(
+            "lfm2 register_weights_with_cpp: no weights stored; compiled path stays OFF"
+        );
+    }
+
+    Ok(())
 }
 
 impl Lfm2Model {

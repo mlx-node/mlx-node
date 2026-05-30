@@ -1,7 +1,10 @@
 #include "mlx_lfm2_common.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <vector>
@@ -158,6 +161,31 @@ std::vector<array> lfm2_decode_fn(const std::vector<array>& inputs) {
   }
   return out;
 }
+
+// =====================================================================
+// Production decode state (2b-2 Stage B/C). Mirrors the qwen35-MoE
+// flat-path globals (`g_moe_caches` / `g_moe_offset_int` / `g_moe_inited`).
+//
+//   g_lfm2_caches      live cache vector, uniform stride 2 by ABSOLUTE layer
+//                      idx. attn layer i -> (kv_keys, kv_values) padded to
+//                      max_kv_len; conv layer i -> (conv_state, scalar bf16
+//                      zero placeholder). Threaded across decode steps.
+//   g_lfm2_offset_int  current decode position (next write slot in KV).
+//   g_lfm2_inited      true iff init_from_prefill imported caches cleanly.
+//   g_lfm2_forward_calls  cumulative forward count (engagement signal; NOT
+//                      reset by mlx_lfm2_moe_reset).
+// =====================================================================
+std::vector<array> g_lfm2_caches;
+int g_lfm2_offset_int = 0;
+bool g_lfm2_inited = false;
+uint64_t g_lfm2_forward_calls = 0;
+
+// Compiled wrapper around lfm2_decode_fn — compiled once, reused per step so
+// the compile-cache key stays stable (input shapes are fixed at init time).
+static auto& compiled_lfm2_decode() {
+  static auto fn = mlx::core::compile(lfm2_decode_fn);
+  return fn;
+}
 }  // namespace
 
 extern "C" {
@@ -167,47 +195,241 @@ uint64_t mlx_lfm2_get_model_id() {
   return qwen35_common::g_active_model_id().load(std::memory_order_acquire);
 }
 
-// Inert: no weights are registered into a compiled graph yet.
+// Shared weight count (the lfm2 compiled path owns the SAME g_weights() map).
 size_t mlx_lfm2_weight_count() { return mlx_weight_count(); }
 
-// Inert: accepts the prefill config the real graph will need, does nothing.
-// (Phase 1+ builds and seeds the compiled decode graph from these args.)
+// Build + seed the compiled decode graph from post-prefill state.
+//
+// `is_attn` (length num_layers, 1=attn/0=conv) drives the per-layer dispatch
+// and is built dynamically Rust-side from config.is_attention_layer; it is
+// NEVER a modulo/hardcoded pattern (lfm2 mixes conv/attn irregularly).
+//
+// Cache import (uniform stride 2 by ABSOLUTE layer idx, matching the
+// lfm2_decode_fn input contract):
+//   attn layer i: import cache_arrays[i*2]/[i*2+1] as K/V, PADDED to max_kv_len
+//                 via concatenate (mirrors qwen35_moe init); null on either ->
+//                 g_lfm2_inited=false, bail. The decode mask is derived from
+//                 the FIRST attention layer's padded KV, so this slot MUST be a
+//                 real [B,nkv,max_kv_len,head_dim] tensor.
+//   conv layer i: import cache_arrays[i*2] as conv_state [B,l_cache-1,hidden];
+//                 push a scalar bf16 zero for slot.b. The conv branch never
+//                 reads cache_arrays[i*2+1] (Rust passes null there).
 void mlx_lfm2_moe_init_from_prefill(
-    int /*num_layers*/,
-    int /*hidden_size*/,
-    int /*num_heads*/,
-    int /*num_kv_heads*/,
-    int /*head_dim*/,
-    float /*rope_theta*/,
-    float /*norm_eps*/,
-    int /*conv_l_cache*/,
-    int /*num_experts*/,
-    int /*num_experts_per_tok*/,
-    int /*num_dense_layers*/,
-    int /*norm_topk_prob*/,
-    int /*use_expert_bias*/,
-    int /*tie_embedding*/,
-    int /*max_kv_len*/,
-    int /*batch_size*/,
-    mlx_array** /*cache_arrays*/,
-    int /*prefill_offset*/) {
-  // Phase 1+: build and seed the compiled decode graph here.
-}
+    int num_layers,
+    int hidden_size,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    float rope_theta,
+    float norm_eps,
+    int conv_l_cache,
+    int num_experts,
+    int num_experts_per_tok,
+    int num_dense_layers,
+    int norm_topk_prob,
+    int use_expert_bias,
+    int tie_embedding,
+    int max_kv_len,
+    int batch_size,
+    const int32_t* is_attn,
+    mlx_array** cache_arrays,
+    int prefill_offset) {
+  try {
+    g_lfm2_config = Lfm2MoeConfig{};
+    g_lfm2_config.num_layers = num_layers;
+    g_lfm2_config.hidden_size = hidden_size;
+    g_lfm2_config.num_heads = num_heads;
+    g_lfm2_config.num_kv_heads = num_kv_heads;
+    g_lfm2_config.head_dim = head_dim;
+    g_lfm2_config.rope_theta = rope_theta;
+    g_lfm2_config.norm_eps = norm_eps;
+    g_lfm2_config.conv_l_cache = conv_l_cache;
+    g_lfm2_config.num_experts = num_experts;
+    g_lfm2_config.num_experts_per_tok = num_experts_per_tok;
+    g_lfm2_config.num_dense_layers = num_dense_layers;
+    g_lfm2_config.norm_topk_prob = norm_topk_prob != 0;
+    g_lfm2_config.use_expert_bias = use_expert_bias != 0;
+    g_lfm2_config.tie_embedding = tie_embedding != 0;
+    g_lfm2_config.max_kv_len = max_kv_len;
+    g_lfm2_config.batch_size = batch_size;
 
-// Inert: ALWAYS returns a null logits pointer so any accidental caller detects
-// "compiled path not enabled" and falls back to the native forward.
-void mlx_lfm2_moe_forward(
-    mlx_array* /*input_ids*/,
-    mlx_array* /*embedding_weight*/,
-    mlx_array** output_logits,
-    int* /*cache_offset_out*/) {
-  if (output_logits) {
-    *output_logits = nullptr;
+    // NOTE: Lfm2MoeConfig has NO rope_dims — RoPE is over the full head_dim.
+
+    g_lfm2_is_attn.assign(is_attn, is_attn + num_layers);
+
+    g_lfm2_caches.clear();
+    g_lfm2_caches.reserve(num_layers * 2);
+    g_lfm2_inited = false;
+
+    for (int i = 0; i < num_layers; i++) {
+      if (is_attn[i]) {
+        if (!cache_arrays[i * 2] || !cache_arrays[i * 2 + 1]) {
+          g_lfm2_caches.clear();
+          return;
+        }
+        auto& kk = *reinterpret_cast<array*>(cache_arrays[i * 2]);
+        auto& kv = *reinterpret_cast<array*>(cache_arrays[i * 2 + 1]);
+        int current_cap = kk.shape(2);
+        if (current_cap < max_kv_len) {
+          int pad_len = max_kv_len - current_cap;
+          auto kpad = zeros({batch_size, num_kv_heads, pad_len, head_dim}, kk.dtype());
+          auto vpad = zeros({batch_size, num_kv_heads, pad_len, head_dim}, kv.dtype());
+          g_lfm2_caches.push_back(concatenate({kk, kpad}, 2));
+          g_lfm2_caches.push_back(concatenate({kv, vpad}, 2));
+        } else {
+          g_lfm2_caches.push_back(kk);
+          g_lfm2_caches.push_back(kv);
+        }
+      } else {
+        // Conv layer: only slot.a (conv_state) is read. slot.b is an unused
+        // scalar placeholder (NEVER reads cache_arrays[i*2+1]).
+        if (!cache_arrays[i * 2]) {
+          g_lfm2_caches.clear();
+          return;
+        }
+        auto& cs = *reinterpret_cast<array*>(cache_arrays[i * 2]);
+        g_lfm2_caches.push_back(cs);
+        g_lfm2_caches.push_back(zeros({}, mlx::core::bfloat16));
+      }
+    }
+
+    g_lfm2_offset_int = prefill_offset;
+    g_lfm2_inited = true;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] mlx_lfm2_moe_init_from_prefill: %s\n", e.what());
+    fflush(stderr);
+    g_lfm2_caches.clear();
+    g_lfm2_inited = false;
+  } catch (...) {
+    g_lfm2_caches.clear();
+    g_lfm2_inited = false;
   }
 }
 
-// Inert: nothing to tear down yet.
-void mlx_lfm2_moe_reset() {}
+// Single-token compiled decode step. Writes a null *output_logits when the
+// graph is not initialized (or on error) so the caller falls back to native.
+void mlx_lfm2_moe_forward(
+    mlx_array* input_ids,
+    mlx_array* embedding_weight,
+    mlx_array** output_logits,
+    int* cache_offset_out) {
+  if (!g_lfm2_inited) {
+    if (output_logits) {
+      *output_logits = nullptr;
+    }
+    return;
+  }
+
+  try {
+    g_lfm2_forward_calls++;
+
+    auto& ids = *reinterpret_cast<array*>(input_ids);
+    auto& embedding = *reinterpret_cast<array*>(embedding_weight);
+
+    // Embedding lookup: [B,1] -> [B, hidden] (2D, matching lfm2_decode_fn h).
+    auto flat_ids = reshape(ids, {-1});
+    auto h = take(embedding, flat_ids, 0);
+
+    std::vector<array> fn_inputs;
+    fn_inputs.reserve(2 + g_lfm2_caches.size());
+    fn_inputs.push_back(std::move(h));
+    fn_inputs.push_back(array(g_lfm2_offset_int, mlx::core::int32));
+    for (const auto& c : g_lfm2_caches) {
+      fn_inputs.push_back(c);
+    }
+
+    // MLX_NO_COMPILE=1 disables compilation for A/B testing.
+    static bool no_compile = std::getenv("MLX_NO_COMPILE") != nullptr;
+    auto outputs = no_compile ? lfm2_decode_fn(fn_inputs) : compiled_lfm2_decode()(fn_inputs);
+
+    if (output_logits) {
+      *output_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
+    }
+    g_lfm2_offset_int++;
+    for (int i = 0; i < g_lfm2_config.num_layers * 2; i++) {
+      g_lfm2_caches[i] = outputs[2 + i];
+    }
+    if (cache_offset_out) {
+      *cache_offset_out = g_lfm2_offset_int;
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_lfm2_moe_forward: %s\n", e.what());
+    fflush(stderr);
+    if (output_logits) {
+      *output_logits = nullptr;
+    }
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in mlx_lfm2_moe_forward\n");
+    fflush(stderr);
+    if (output_logits) {
+      *output_logits = nullptr;
+    }
+  }
+}
+
+// Async-eval the sampled token (+ caches implicitly via the compiled graph's
+// dependency edges). MLX_EVAL_ALL_CACHES=1 evals token + every live cache
+// explicitly (slower; for debugging). Mirrors mlx_qwen35_moe_eval_token_and_caches.
+void mlx_lfm2_moe_eval_token_and_caches(mlx_array* token) {
+  try {
+    static bool eval_all = std::getenv("MLX_EVAL_ALL_CACHES") != nullptr;
+    if (eval_all) {
+      std::vector<array> to_eval;
+      to_eval.reserve(1 + g_lfm2_caches.size());
+      to_eval.push_back(*reinterpret_cast<array*>(token));
+      for (const auto& c : g_lfm2_caches) {
+        to_eval.push_back(c);
+      }
+      mlx::core::async_eval(std::move(to_eval));
+    } else {
+      mlx::core::async_eval({*reinterpret_cast<array*>(token)});
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_lfm2_moe_eval_token_and_caches: %s\n", e.what());
+    fflush(stderr);
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in mlx_lfm2_moe_eval_token_and_caches\n");
+    fflush(stderr);
+  }
+}
+
+// Cumulative engagement counter. Intentionally NOT reset by
+// mlx_lfm2_moe_reset — it is a process-lifetime "did the compiled decode path
+// ever run" signal for the e2e assertion.
+uint64_t mlx_lfm2_moe_forward_call_count() { return g_lfm2_forward_calls; }
+
+// Export the live caches for cross-turn reuse. Copies cache arrays to caller-
+// provided output pointers (heap-allocated). Returns the number exported (the
+// uniform stride-2 vector, including conv scalar placeholders), or 0 if not
+// initialized. MLX arrays are ref-counted so the underlying Metal buffer is
+// shared, not duplicated. Mirrors mlx_qwen35_moe_export_caches.
+int mlx_lfm2_moe_export_caches(mlx_array** out_ptrs, int max_count) {
+  if (!g_lfm2_inited || g_lfm2_caches.empty()) {
+    return 0;
+  }
+  int count = std::min(static_cast<int>(g_lfm2_caches.size()), max_count);
+  for (int i = 0; i < count; i++) {
+    out_ptrs[i] = reinterpret_cast<mlx_array*>(new array(g_lfm2_caches[i]));
+  }
+  return count;
+}
+
+// Current decode offset (number of cached tokens after the last forward).
+int mlx_lfm2_moe_get_cache_offset() { return g_lfm2_offset_int; }
+
+// Whether init_from_prefill seeded the decode graph cleanly. The Rust caller
+// checks this after seeding because init is `void` but can bail internally
+// (null cache slot, or a padding/concatenate exception) — letting Rust fall
+// back to the native path instead of treating the first null forward as fatal.
+int mlx_lfm2_moe_is_initialized() { return g_lfm2_inited ? 1 : 0; }
+
+// Tear down the decode state. Does NOT touch the shared model-id atom
+// (mlx_clear_weights owns it) and does NOT reset g_lfm2_forward_calls.
+void mlx_lfm2_moe_reset() {
+  g_lfm2_caches.clear();
+  g_lfm2_offset_int = 0;
+  g_lfm2_inited = false;
+}
 
 // =============================================================================
 // Component-parity probes (TEST-ONLY). These register ONE layer's weights into

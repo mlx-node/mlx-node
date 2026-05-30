@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use crate::array::MxArray;
 use crate::model_thread::{ResponseTx, StreamTx};
+use crate::models::qwen3_5::arrays_cache::ArraysCache;
 use crate::models::qwen3_5::chat_common::{
     IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
@@ -19,6 +20,7 @@ use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::sample;
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Lfm2Config;
@@ -399,13 +401,11 @@ impl Lfm2Inner {
     ///
     /// Returns logits [B, T, vocab_size].
     fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
-        // Compiled C++ forward path dispatch hook (Phase 0 scaffold). Always
-        // false today — the C++ stub keeps the gate off — so this is an inert
-        // probe of the FFI round-trip. Phase 1 branches here into the compiled
-        // decode graph when the compiled path owns this model's weights.
-        if self.compiled_path_active() {
-            warn!("lfm2 compiled forward path is gated on but not implemented; using native path");
-        }
+        // PREFILL stays native. The compiled C++ decode path is wired ONLY into
+        // the single-token decode loop in `chat_sync_core` (it seeds the
+        // compiled graph from the post-prefill caches this native forward
+        // builds, then drives `mlx_lfm2_moe_forward` per step). `forward()`
+        // never calls the compiled path.
 
         // 1. Token embeddings (no scaling)
         let mut h = self.embed_tokens.forward(input_ids)?;
@@ -472,6 +472,83 @@ impl Lfm2Inner {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
+    }
+
+    /// Export the compiled C++ decode caches back into `self.caches`, then
+    /// MATERIALIZE the imported handles so subsequent native turns (or the
+    /// next compiled seed) read live buffers — NOT lazy graph nodes that the
+    /// `Lfm2CompiledResetGuard`'s `mlx_lfm2_moe_reset()` is about to free.
+    ///
+    /// Caller invariant: this must run BEFORE the reset guard drops, and the
+    /// export → import → eval must complete with no `?`-early-return between
+    /// the import and the eval (we collect every imported cache, install it,
+    /// then eval the whole set in one shot).
+    fn export_compiled_caches(&mut self) -> Result<()> {
+        let num_layers = self.config.num_hidden_layers as usize;
+        let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); num_layers * 2];
+        let exported = unsafe {
+            mlx_sys::mlx_lfm2_moe_export_caches(export_ptrs.as_mut_ptr(), (num_layers * 2) as i32)
+        };
+        if exported <= 0 {
+            // Nothing live to export (e.g. compiled init bailed). Leave the
+            // native caches from prefill in place; native is the source of
+            // truth in that case.
+            return Ok(());
+        }
+
+        let cache_offset = unsafe { mlx_sys::mlx_lfm2_moe_get_cache_offset() };
+
+        let mut new_caches: Vec<Lfm2LayerCache> = Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            if self.config.is_attention_layer(i) {
+                let k_ptr = export_ptrs[i * 2];
+                let v_ptr = export_ptrs[i * 2 + 1];
+                if k_ptr.is_null() || v_ptr.is_null() {
+                    return Err(Error::from_reason(
+                        "lfm2 compiled cache export: null attn KV handle",
+                    ));
+                }
+                // `from_handle` wraps the heap-allocated handle (null-checked).
+                let keys = MxArray::from_handle(k_ptr, "lfm2 compiled export keys")?;
+                let values = MxArray::from_handle(v_ptr, "lfm2 compiled export values")?;
+                let mut kv = KVCache::new();
+                kv.set_keys(keys);
+                kv.set_values(values);
+                kv.set_offset(cache_offset);
+                new_caches.push(Lfm2LayerCache::Attention(kv));
+            } else {
+                let s_ptr = export_ptrs[i * 2];
+                if s_ptr.is_null() {
+                    return Err(Error::from_reason(
+                        "lfm2 compiled cache export: null conv state handle",
+                    ));
+                }
+                let state = MxArray::from_handle(s_ptr, "lfm2 compiled export conv state")?;
+                // slot.b (export_ptrs[i*2+1]) is the unused scalar placeholder —
+                // a freshly heap-allocated copy. Wrap + drop to release it so it
+                // doesn't leak (export hands back an owned heap handle).
+                let placeholder = export_ptrs[i * 2 + 1];
+                if !placeholder.is_null() {
+                    let _ =
+                        MxArray::from_handle(placeholder, "lfm2 compiled export conv placeholder");
+                }
+                let mut conv = ArraysCache::new(1);
+                conv.set(0, state);
+                new_caches.push(Lfm2LayerCache::Conv(conv));
+            }
+        }
+
+        // Materialize the freshly-imported handles BEFORE installing them as
+        // `self.caches`. If the eval fails, the `?` returns while
+        // `Lfm2CompiledResetGuard` still drops and frees the compiled globals
+        // — so we must NOT have already replaced `self.caches` with lazy
+        // handles that reference those soon-to-be-freed nodes. Keeping the old
+        // (last-safe-native) caches on failure lets a subsequent native turn
+        // fall back cleanly instead of feeding freed buffers to the GPU.
+        eval_lfm2_caches(&new_caches)?;
+        self.caches = new_caches;
+        Ok(())
     }
 
     /// Check if tokens share a prefix with cached_token_history and return the prefix length.
@@ -682,15 +759,222 @@ impl Lfm2Inner {
             first_token_instant = Some(std::time::Instant::now());
         }
 
-        // Decode loop — double-buffered lazy eval pattern
+        // ===== Compiled C++ decode-path dispatch =====
+        // Serialize the compiled lifecycle across model instances on the SHARED
+        // cross-family mutex (the same instance qwen3.5 locks), then re-validate
+        // ownership under the weight RwLock read guard, held for the whole
+        // decode loop. Poison-recover both locks (a panicked prior holder must
+        // not wedge inference forever — banned `.unwrap()` on these paths).
+        let use_compiled_pre = self.compiled_path_active();
+        let _compiled_lock = if use_compiled_pre {
+            Some(
+                crate::models::qwen3_5::model::COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+        let mut _weight_guard = None;
+        // `mut` so the seed step below can drop back to native on any failure.
+        let mut use_compiled = if use_compiled_pre {
+            let guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            // Re-check ownership under the read lock — a concurrent load of a
+            // different model could have evicted us between the probe and here.
+            if unsafe { mlx_sys::mlx_lfm2_get_model_id() } == self.model_id {
+                _weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Seed the compiled decode graph ONCE from the post-prefill caches.
+        // On any failure (init bailed, missing handle), drop back to native by
+        // clearing `use_compiled` for the loop. The distinct reset guard fires
+        // `mlx_lfm2_moe_reset()` on EVERY exit path (including `?`
+        // early-returns and a partial/failed seed) so no stale C++ state leaks.
+        let _compiled_reset_guard = if use_compiled {
+            Some(Lfm2CompiledResetGuard)
+        } else {
+            None
+        };
+        let embed_tokens_weight = if use_compiled {
+            // Tied dense embedding only — lfm2 dense checkpoints are never
+            // packed-quantized on the compiled path (the gate is
+            // !is_moe && !paged, and dense lfm2 ships a bf16 embedding).
+            // `get_weight()` is infallible (returns MxArray, not Result).
+            Some(self.embed_tokens.get_weight())
+        } else {
+            None
+        };
+        if use_compiled {
+            let num_layers = self.config.num_hidden_layers as usize;
+
+            // CRITICAL: seed the compiled decode position from the LIVE
+            // attention KV offset, NOT `seq_len`. `seq_len` is the logits
+            // length returned by `chunked_prefill`, which is only the FINAL
+            // chunk for prompts over `PREFILL_STEP_SIZE`, or just the
+            // uncached tail delta on a warm strict-extend reuse hit. The
+            // `KVCache` offset, by contrast, accumulates prefix + delta across
+            // every chunk and across reuse, so it is the true sequence
+            // position. Seeding from `seq_len` would build the C++ causal mask
+            // and KV write index from a too-small offset, masking out valid
+            // prefix tokens and overwriting live slots. All attention layers
+            // must agree on the offset; if any disagrees (corrupt/partial
+            // cache), fall back to native rather than seed a wrong position.
+            let mut cache_offset: Option<i32> = None;
+            let mut offset_ok = true;
+            for cache in self.caches.iter() {
+                if let Lfm2LayerCache::Attention(kv) = cache {
+                    let off = kv.get_offset();
+                    match cache_offset {
+                        None => cache_offset = Some(off),
+                        Some(prev) if prev != off => {
+                            offset_ok = false;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let prefill_len = cache_offset.unwrap_or(0);
+            if !offset_ok || cache_offset.is_none() {
+                // No attention layer (impossible for a real lfm2 config — every
+                // shipping checkpoint interleaves ≥1 full_attention layer) or
+                // attention layers reporting inconsistent offsets (corrupt /
+                // partial cache). Either way, refuse to seed a wrong position
+                // and fall back to native. The debug log distinguishes this
+                // from the missing-handle fallback below so a hypothetical
+                // zero-attention config doesn't fail silently.
+                tracing::debug!(
+                    "lfm2 compiled decode: no consistent attention KV offset \
+                     (offset_ok={offset_ok}, has_offset={}); using native path",
+                    cache_offset.is_some()
+                );
+                offset_ok = false;
+            }
+            // Budget the fixed padded cache from the TRUE position so decode
+            // can never exceed it (slice_update OOB / silent corruption).
+            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+
+            // Per-layer attn/conv map — built DYNAMICALLY from config (lfm2
+            // mixes conv/attn irregularly; never a modulo/hardcoded pattern).
+            let is_attn: Vec<i32> = (0..num_layers)
+                .map(|i| i32::from(self.config.is_attention_layer(i)))
+                .collect();
+
+            // Cache pointers, stride 2 by ABSOLUTE layer idx. attn layer ->
+            // KVCache keys_ref()/values_ref() (MATERIALIZED above via
+            // eval_lfm2_caches); conv layer -> ArraysCache slot 0, null at +1.
+            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            // Carry the offset-consistency check forward: a bad/inconsistent
+            // attention offset must also block the seed (→ native fallback).
+            let mut seed_ok = offset_ok;
+            for (i, cache) in self.caches.iter().enumerate() {
+                match cache {
+                    Lfm2LayerCache::Attention(kv) => match (kv.keys_ref(), kv.values_ref()) {
+                        (Some(k), Some(v)) => {
+                            cache_ptrs[i * 2] = k.as_raw_ptr();
+                            cache_ptrs[i * 2 + 1] = v.as_raw_ptr();
+                        }
+                        _ => {
+                            seed_ok = false;
+                            break;
+                        }
+                    },
+                    Lfm2LayerCache::Conv(c) => match c.get(0) {
+                        Some(state) => {
+                            cache_ptrs[i * 2] = state.as_raw_ptr();
+                            // slot.b stays null — conv branch never reads it.
+                        }
+                        None => {
+                            seed_ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+
+            if seed_ok {
+                unsafe {
+                    mlx_sys::mlx_lfm2_moe_init_from_prefill(
+                        self.config.num_hidden_layers,
+                        self.config.hidden_size,
+                        self.config.num_attention_heads,
+                        self.config.num_key_value_heads,
+                        self.config.head_dim(),
+                        self.config.rope_theta as f32,
+                        self.config.norm_eps as f32,
+                        self.config.conv_l_cache,
+                        self.config.num_experts.unwrap_or(0),
+                        self.config.num_experts_per_tok.unwrap_or(0),
+                        self.config.num_dense_layers.unwrap_or(0),
+                        i32::from(self.config.norm_topk_prob),
+                        i32::from(self.config.use_expert_bias),
+                        i32::from(self.config.tie_embedding),
+                        max_kv_len,
+                        1,
+                        is_attn.as_ptr(),
+                        cache_ptrs.as_mut_ptr(),
+                        prefill_len,
+                    );
+                }
+                // C++ init is `void` but can still bail internally (a null
+                // slot or a padding/concatenate exception sets g_lfm2_inited
+                // = false). Confirm it actually seeded; if not, drop to native
+                // BEFORE the loop rather than letting the first forward return
+                // null logits and be treated as a fatal error.
+                if unsafe { mlx_sys::mlx_lfm2_moe_is_initialized() } == 0 {
+                    warn!("lfm2 compiled decode: C++ seed did not initialize; using native path");
+                    use_compiled = false;
+                }
+            } else {
+                warn!(
+                    "lfm2 compiled decode: missing/inconsistent post-prefill cache state; using native path"
+                );
+                use_compiled = false;
+            }
+        }
+
+        // Decode loop — double-buffered lazy eval pattern. The per-step forward
+        // is the compiled C++ step when `use_compiled`, else the native forward.
         let mut last_token_in_cache = false;
         for step in 0..max_new_tokens {
             let next_y = if step + 1 < max_new_tokens {
                 let _stream_ctx = StreamContext::new(generation_stream);
 
                 let next_ids = y.reshape(&[1, 1])?;
-                let logits = self.forward(&next_ids)?;
-                let logits = logits.squeeze(Some(&[1]))?;
+                let logits = if use_compiled {
+                    // Compiled path returns [B, vocab] (already 2D).
+                    let emb = embed_tokens_weight.as_ref().ok_or_else(|| {
+                        Error::from_reason("lfm2 compiled decode: missing embedding weight")
+                    })?;
+                    let mut out_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                    let mut off: i32 = 0;
+                    unsafe {
+                        mlx_sys::mlx_lfm2_moe_forward(
+                            next_ids.as_raw_ptr(),
+                            emb.as_raw_ptr(),
+                            &mut out_ptr,
+                            &mut off,
+                        );
+                    }
+                    if out_ptr.is_null() {
+                        return Err(Error::from_reason(
+                            "lfm2 compiled decode: mlx_lfm2_moe_forward returned null logits",
+                        ));
+                    }
+                    MxArray::from_handle(out_ptr, "lfm2 compiled decode logits")?
+                } else {
+                    let logits = self.forward(&next_ids)?;
+                    logits.squeeze(Some(&[1]))?
+                };
 
                 // Budget enforcement
                 let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
@@ -702,7 +986,15 @@ impl Lfm2Inner {
                     (t, false)
                 };
 
-                MxArray::async_eval_arrays(&[&next_token]);
+                if use_compiled {
+                    // Evaluating the token triggers the whole compiled graph
+                    // (logits + caches via the dependency edges).
+                    unsafe {
+                        mlx_sys::mlx_lfm2_moe_eval_token_and_caches(next_token.as_raw_ptr());
+                    }
+                } else {
+                    MxArray::async_eval_arrays(&[&next_token]);
+                }
                 Some(next_token)
             } else {
                 None
@@ -744,6 +1036,21 @@ impl Lfm2Inner {
                 crate::array::synchronize_and_clear_cache();
             }
         }
+
+        // TEARDOWN: when the compiled path ran and the caller wants to reuse the
+        // cache, export the C++ caches back into `self.caches` and MATERIALIZE
+        // them BEFORE `Lfm2CompiledResetGuard` drops (which calls
+        // `mlx_lfm2_moe_reset()` and frees the compiled globals). Exported
+        // handles are lazy copies whose graph still references compiled nodes;
+        // without an eval here the next turn would feed freed buffers to the
+        // GPU. Collect + eval before any fallible op so no `?` can skip
+        // materialization.
+        if use_compiled && reuse_cache {
+            self.export_compiled_caches()?;
+        }
+        // `_compiled_reset_guard` drops at end of function AFTER the export+eval
+        // above and AFTER `save_cache_state`, tearing down the C++ state. The
+        // `_compiled_lock` / `_weight_guard` are likewise held until scope end.
 
         // Save cache state for next call
         self.save_cache_state(reuse_cache, &tokens, &generated_tokens, last_token_in_cache);
@@ -3046,6 +3353,24 @@ pub(crate) fn handle_lfm2_cmd(inner: &mut Lfm2Inner, cmd: Lfm2Cmd) {
 }
 
 /// Initialize caches matching the layer types.
+/// RAII guard that calls `mlx_lfm2_moe_reset()` on drop, tearing down the
+/// compiled lfm2 decode globals (caches + offset + inited flag).
+///
+/// DISTINCT from qwen3.5's `CompiledResetGuard` (which calls
+/// `mlx_qwen35_compiled_reset()`) — the two compiled families own separate
+/// C++ state and must each reset their own. Ensures the compiled state is
+/// always torn down even when the decode loop returns early via `?`, so the
+/// next generation never sees stale compiled caches.
+struct Lfm2CompiledResetGuard;
+
+impl Drop for Lfm2CompiledResetGuard {
+    fn drop(&mut self) {
+        unsafe {
+            mlx_sys::mlx_lfm2_moe_reset();
+        }
+    }
+}
+
 fn init_caches(config: &Lfm2Config) -> Vec<Lfm2LayerCache> {
     let num_layers = config.num_hidden_layers as usize;
     let mut caches = Vec::with_capacity(num_layers);
