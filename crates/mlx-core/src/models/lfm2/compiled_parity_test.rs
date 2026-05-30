@@ -685,3 +685,363 @@ fn compiled_decode_seq_matches_native() {
         "compiled decode_fn must match native dense [conv,attn,conv] stack: max_abs={d}"
     );
 }
+
+/// Phase-3a end-to-end-SHAPED MoE gate: the full `lfm2_decode_fn` assembly with
+/// the sparse-MoE FFN branch (driven via `mlx_lfm2_probe_moe_decode_seq`) must
+/// match a hand-assembled native `[conv(dense), attn(MoE), conv(MoE)]` stack over
+/// the same `T`-step decode. The dense layer (idx 0 < num_dense_layers) routes
+/// through the dense SwiGLU MLP; the MoE layers (idx >= num_dense_layers) route
+/// through the sparse `Lfm2SparseMoeBlock` natively and `lfm2_moe_ffn` on the
+/// compiled path (router softmax + selection-only expert_bias + top-k +
+/// switch_mlp SwiGLU + weighted sum). The probe runs EAGERLY and
+/// `mlx_lfm2_get_model_id()` is untouched, so the production gate stays OFF.
+#[test]
+fn compiled_moe_decode_seq_matches_native() {
+    use super::config::Lfm2Config;
+    use super::decoder_layer::OperatorType;
+    use super::sparse_moe::Lfm2SparseMoeBlock;
+    use crate::nn::{Embedding, RMSNorm};
+
+    let _guard = COMPILED_WEIGHTS_RWLOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let hidden = 64i64;
+    let num_heads = 4i64;
+    let num_kv_heads = 2i64;
+    let head_dim = 16i64; // hidden == num_heads * head_dim
+    let inter = 128i64; // dense-layer SwiGLU hidden
+    let moe_inter = 96i64; // per-expert SwiGLU hidden
+    let l_cache = 3i64;
+    let vocab = 32i64;
+    let t = 4i64;
+    let norm_eps = 1e-5f64;
+    let rope_theta = 1_000_000.0f64;
+    let n_exp = 4i32;
+    let top_k = 2i32;
+    let num_dense_layers = 1i32;
+    let is_attn = [0i32, 1, 0]; // [conv, attn, conv]
+    let n = is_attn.len();
+    // A layer is MoE iff idx >= num_dense_layers (and num_experts > 0).
+    let is_moe = |i: usize| (i as i32) >= num_dense_layers;
+    let token_ids: Vec<i32> = (0..t as i32).map(|i| (i * 7 + 1) % vocab as i32).collect();
+
+    // ---- shared weights: the SAME arrays are fed to BOTH native and probe ----
+    let embed_w = det(&[vocab, hidden], 301);
+    let emb_norm_w = det_norm(hidden, 302);
+    let op_norm: Vec<MxArray> = (0..n).map(|i| det_norm(hidden, 310 + i as i64)).collect();
+    let ffn_norm: Vec<MxArray> = (0..n).map(|i| det_norm(hidden, 320 + i as i64)).collect();
+
+    // Dense-FFN tensors: Some at dense layers (idx < num_dense_layers), None else.
+    let dense_t = |i: usize, shape: &[i64], seed: i64| -> Option<MxArray> {
+        (!is_moe(i)).then(|| det(shape, seed))
+    };
+    let gate: Vec<Option<MxArray>> = (0..n)
+        .map(|i| dense_t(i, &[inter, hidden], 330 + i as i64))
+        .collect();
+    let up: Vec<Option<MxArray>> = (0..n)
+        .map(|i| dense_t(i, &[inter, hidden], 340 + i as i64))
+        .collect();
+    let down: Vec<Option<MxArray>> = (0..n)
+        .map(|i| dense_t(i, &[hidden, inter], 350 + i as i64))
+        .collect();
+
+    // MoE tensors: Some at MoE layers, None at dense layers.
+    let moe_t = |i: usize, shape: &[i64], seed: i64| -> Option<MxArray> {
+        is_moe(i).then(|| det(shape, seed))
+    };
+    let moe_router: Vec<Option<MxArray>> = (0..n)
+        .map(|i| moe_t(i, &[n_exp as i64, hidden], 360 + i as i64))
+        .collect();
+    let moe_bias: Vec<Option<MxArray>> = (0..n)
+        .map(|i| moe_t(i, &[n_exp as i64], 370 + i as i64))
+        .collect();
+    let moe_gate: Vec<Option<MxArray>> = (0..n)
+        .map(|i| moe_t(i, &[n_exp as i64, moe_inter, hidden], 380 + i as i64))
+        .collect();
+    let moe_up: Vec<Option<MxArray>> = (0..n)
+        .map(|i| moe_t(i, &[n_exp as i64, moe_inter, hidden], 390 + i as i64))
+        .collect();
+    let moe_down: Vec<Option<MxArray>> = (0..n)
+        .map(|i| moe_t(i, &[n_exp as i64, hidden, moe_inter], 400 + i as i64))
+        .collect();
+
+    // attn-only tensors: Some at attn layers, None at conv layers.
+    let attn_t = |i: usize, shape: &[i64], seed: i64| -> Option<MxArray> {
+        (is_attn[i] == 1).then(|| det(shape, seed))
+    };
+    let attn_norm_t = |i: usize, seed: i64| -> Option<MxArray> {
+        (is_attn[i] == 1).then(|| det_norm(head_dim, seed))
+    };
+    let q: Vec<Option<MxArray>> = (0..n)
+        .map(|i| attn_t(i, &[num_heads * head_dim, hidden], 410 + i as i64))
+        .collect();
+    let k: Vec<Option<MxArray>> = (0..n)
+        .map(|i| attn_t(i, &[num_kv_heads * head_dim, hidden], 420 + i as i64))
+        .collect();
+    let v: Vec<Option<MxArray>> = (0..n)
+        .map(|i| attn_t(i, &[num_kv_heads * head_dim, hidden], 430 + i as i64))
+        .collect();
+    let o: Vec<Option<MxArray>> = (0..n)
+        .map(|i| attn_t(i, &[hidden, num_heads * head_dim], 440 + i as i64))
+        .collect();
+    let qn: Vec<Option<MxArray>> = (0..n).map(|i| attn_norm_t(i, 450 + i as i64)).collect();
+    let kn: Vec<Option<MxArray>> = (0..n).map(|i| attn_norm_t(i, 460 + i as i64)).collect();
+
+    // conv-only tensors: Some at conv layers, None at attn layers.
+    let conv_tn = |i: usize, shape: &[i64], seed: i64| -> Option<MxArray> {
+        (is_attn[i] == 0).then(|| det(shape, seed))
+    };
+    let in_proj: Vec<Option<MxArray>> = (0..n)
+        .map(|i| conv_tn(i, &[3 * hidden, hidden], 470 + i as i64))
+        .collect();
+    let conv_w: Vec<Option<MxArray>> = (0..n)
+        .map(|i| conv_tn(i, &[hidden, l_cache, 1], 480 + i as i64))
+        .collect();
+    let out_proj: Vec<Option<MxArray>> = (0..n)
+        .map(|i| conv_tn(i, &[hidden, hidden], 490 + i as i64))
+        .collect();
+
+    // ---- native: hand-assembled [conv(dense), attn(MoE), conv(MoE)] stack ----
+    let mut embed = Embedding::new(vocab as u32, hidden as u32).expect("embed");
+    embed.set_weight(&embed_w).expect("embed w");
+    let mut emb_norm = RMSNorm::new(hidden as u32, Some(norm_eps)).expect("emb norm");
+    emb_norm.set_weight(&emb_norm_w).expect("emb norm w");
+
+    // Minimal Lfm2Config for Lfm2SparseMoeBlock::new (only the MoE fields matter).
+    let moe_cfg = Lfm2Config {
+        vocab_size: vocab as i32,
+        hidden_size: hidden as i32,
+        num_hidden_layers: n as i32,
+        num_attention_heads: num_heads as i32,
+        num_key_value_heads: num_kv_heads as i32,
+        max_position_embeddings: 128,
+        norm_eps,
+        conv_bias: false,
+        conv_l_cache: l_cache as i32,
+        block_dim: hidden as i32,
+        block_ff_dim: inter as i32,
+        block_multiple_of: 256,
+        block_ffn_dim_multiplier: 1.0,
+        block_auto_adjust_ff_dim: false,
+        rope_theta,
+        layer_types: vec!["conv".into(), "full_attention".into(), "conv".into()],
+        tie_embedding: true,
+        eos_token_id: 7,
+        bos_token_id: 1,
+        pad_token_id: 0,
+        paged_cache_memory_mb: None,
+        paged_block_size: None,
+        use_block_paged_cache: None,
+        intermediate_size: Some(inter as i32),
+        moe_intermediate_size: Some(moe_inter as i32),
+        num_experts: Some(n_exp),
+        num_experts_per_tok: Some(top_k),
+        num_dense_layers: Some(num_dense_layers),
+        norm_topk_prob: true,
+        use_expert_bias: true,
+    };
+
+    // FFN holder: dense SwiGLU MLP (dense layers) or sparse MoE block (MoE layers).
+    enum Ffn {
+        Dense(MLP),
+        Moe(Lfm2SparseMoeBlock),
+    }
+    // Build per-layer native modules directly (not full Lfm2DecoderLayer, which
+    // bundles its own norms): conv/attn operator + the two RMSNorms + FFN.
+    let mut ops: Vec<OperatorType> = Vec::new();
+    let mut op_norms: Vec<RMSNorm> = Vec::new();
+    let mut ffn_norms: Vec<RMSNorm> = Vec::new();
+    let mut ffns: Vec<Ffn> = Vec::new();
+    for i in 0..n {
+        let mut onrm = RMSNorm::new(hidden as u32, Some(norm_eps)).expect("on");
+        onrm.set_weight(&op_norm[i]).expect("on w");
+        op_norms.push(onrm);
+        let mut fnrm = RMSNorm::new(hidden as u32, Some(norm_eps)).expect("fn");
+        fnrm.set_weight(&ffn_norm[i]).expect("fn w");
+        ffn_norms.push(fnrm);
+
+        if is_moe(i) {
+            let mut moe = Lfm2SparseMoeBlock::new(&moe_cfg).expect("moe new");
+            // `set_gate_weight` is the ROUTER gate (a Result); the three
+            // `set_switch_mlp_*` setters return `()` (no Result) — do not chain
+            // `.expect()` on them.
+            moe.set_gate_weight(moe_router[i].as_ref().expect("router"))
+                .expect("router set");
+            moe.set_expert_bias(moe_bias[i].as_ref().expect("bias"))
+                .expect("bias set");
+            moe.set_switch_mlp_gate_proj_weight(moe_gate[i].as_ref().expect("g"));
+            moe.set_switch_mlp_up_proj_weight(moe_up[i].as_ref().expect("u"));
+            moe.set_switch_mlp_down_proj_weight(moe_down[i].as_ref().expect("d"));
+            ffns.push(Ffn::Moe(moe));
+        } else {
+            let mut mlp = MLP::new(hidden as u32, inter as u32).expect("mlp");
+            mlp.set_gate_proj_weight(gate[i].as_ref().expect("g"))
+                .expect("g");
+            mlp.set_up_proj_weight(up[i].as_ref().expect("u"))
+                .expect("u");
+            mlp.set_down_proj_weight(down[i].as_ref().expect("d"))
+                .expect("d");
+            ffns.push(Ffn::Dense(mlp));
+        }
+
+        if is_attn[i] == 1 {
+            let mut attn = Lfm2Attention::new(
+                hidden as i32,
+                num_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                norm_eps,
+                rope_theta,
+            )
+            .expect("attn");
+            attn.q_proj_mut()
+                .set_weight(q[i].as_ref().expect("q"), "q_proj")
+                .expect("set q");
+            attn.k_proj_mut()
+                .set_weight(k[i].as_ref().expect("k"), "k_proj")
+                .expect("set k");
+            attn.v_proj_mut()
+                .set_weight(v[i].as_ref().expect("v"), "v_proj")
+                .expect("set v");
+            attn.out_proj_mut()
+                .set_weight(o[i].as_ref().expect("o"), "out_proj")
+                .expect("set o");
+            attn.set_q_layernorm_weight(qn[i].as_ref().expect("qn"))
+                .expect("set qn");
+            attn.set_k_layernorm_weight(kn[i].as_ref().expect("kn"))
+                .expect("set kn");
+            ops.push(OperatorType::Attention(attn));
+        } else {
+            let mut conv = ShortConv::new(hidden as i32, l_cache as i32, false).expect("conv");
+            conv.in_proj_mut()
+                .set_weight(in_proj[i].as_ref().expect("in"), "in_proj")
+                .expect("set in");
+            conv.set_conv_weight(conv_w[i].as_ref().expect("cw"))
+                .expect("set conv");
+            conv.out_proj_mut()
+                .set_weight(out_proj[i].as_ref().expect("out"), "out_proj")
+                .expect("set out");
+            ops.push(OperatorType::Conv(conv));
+        }
+    }
+
+    let mut conv_caches: Vec<Option<ArraysCache>> = (0..n)
+        .map(|i| (is_attn[i] == 0).then(|| ArraysCache::new(1)))
+        .collect();
+    let mut kv_caches: Vec<Option<KVCache>> = (0..n)
+        .map(|i| (is_attn[i] == 1).then(KVCache::new))
+        .collect();
+
+    let mut native_last: Option<MxArray> = None;
+    for &tok in &token_ids {
+        let ids = MxArray::from_int32(&[tok], &[1, 1]).expect("ids");
+        let mut h = embed.forward(&ids).expect("embed fwd"); // [1,1,hidden]
+        for i in 0..n {
+            let normed = op_norms[i].forward(&h).expect("on fwd");
+            let r = match &ops[i] {
+                OperatorType::Conv(c) => c
+                    .forward(&normed, conv_caches[i].as_mut())
+                    .expect("conv fwd"),
+                OperatorType::Attention(a) => a
+                    .forward(&normed, None, kv_caches[i].as_mut())
+                    .expect("attn fwd"),
+            };
+            h = h.add(&r).expect("res1");
+            let fn_in = ffn_norms[i].forward(&h).expect("fn fwd");
+            let ffn_out = match &ffns[i] {
+                Ffn::Dense(m) => m.forward(&fn_in).expect("dense mlp fwd"),
+                Ffn::Moe(m) => m.forward(&fn_in).expect("moe fwd"),
+            };
+            h = h.add(&ffn_out).expect("res2");
+        }
+        h = emb_norm.forward(&h).expect("emb norm fwd");
+        native_last = Some(embed.as_linear(&h).expect("as_linear")); // [1,1,vocab]
+    }
+    let native_last = native_last.expect("ran >=1 step");
+
+    // ---- probe: per-category pointer arrays (null for the irrelevant kind) ----
+    let nullp = std::ptr::null_mut::<mlx_sys::mlx_array>();
+    let optr = |slots: &[Option<MxArray>]| -> Vec<*mut mlx_sys::mlx_array> {
+        slots
+            .iter()
+            .map(|o| o.as_ref().map_or(nullp, |a| a.as_raw_ptr()))
+            .collect()
+    };
+    let reqr = |slots: &[MxArray]| -> Vec<*mut mlx_sys::mlx_array> {
+        slots.iter().map(|a| a.as_raw_ptr()).collect()
+    };
+    let op_norm_p = reqr(&op_norm);
+    let ffn_norm_p = reqr(&ffn_norm);
+    let gate_p = optr(&gate);
+    let up_p = optr(&up);
+    let down_p = optr(&down);
+    let q_p = optr(&q);
+    let k_p = optr(&k);
+    let v_p = optr(&v);
+    let o_p = optr(&o);
+    let qn_p = optr(&qn);
+    let kn_p = optr(&kn);
+    let in_p = optr(&in_proj);
+    let cw_p = optr(&conv_w);
+    let op_p = optr(&out_proj);
+    let mr_p = optr(&moe_router);
+    let mb_p = optr(&moe_bias);
+    let mg_p = optr(&moe_gate);
+    let mu_p = optr(&moe_up);
+    let md_p = optr(&moe_down);
+
+    let out_ptr = unsafe {
+        mlx_sys::mlx_lfm2_probe_moe_decode_seq(
+            embed_w.as_raw_ptr(),
+            emb_norm_w.as_raw_ptr(),
+            is_attn.as_ptr(),
+            n as i32,
+            hidden as i32,
+            num_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            l_cache as i32,
+            rope_theta as f32,
+            norm_eps as f32,
+            n_exp,
+            top_k,
+            num_dense_layers,
+            1, // norm_topk_prob
+            1, // use_expert_bias
+            0, // use_sigmoid (lfm2 uses softmax)
+            token_ids.as_ptr(),
+            t as i32,
+            op_norm_p.as_ptr(),
+            ffn_norm_p.as_ptr(),
+            gate_p.as_ptr(),
+            up_p.as_ptr(),
+            down_p.as_ptr(),
+            q_p.as_ptr(),
+            k_p.as_ptr(),
+            v_p.as_ptr(),
+            o_p.as_ptr(),
+            qn_p.as_ptr(),
+            kn_p.as_ptr(),
+            in_p.as_ptr(),
+            cw_p.as_ptr(),
+            op_p.as_ptr(),
+            mr_p.as_ptr(),
+            mb_p.as_ptr(),
+            mg_p.as_ptr(),
+            mu_p.as_ptr(),
+            md_p.as_ptr(),
+        )
+    };
+    assert!(
+        !out_ptr.is_null(),
+        "mlx_lfm2_probe_moe_decode_seq returned null"
+    );
+    let probe = MxArray::from_handle(out_ptr, "probe_moe_decode").expect("probe handle");
+
+    let d = max_abs(&to_vec(&native_last), &to_vec(&probe));
+    assert!(
+        d < 2e-2,
+        "compiled MoE decode_fn must match native [conv(dense),attn(MoE),conv(MoE)] stack: max_abs={d}"
+    );
+}

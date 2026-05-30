@@ -133,17 +133,23 @@ std::vector<array> lfm2_decode_fn(const std::vector<array>& inputs) {
 
     // (2) ffn_norm BEFORE the FFN, residual after (EVERY layer).
     //
-    // DENSE-FFN ONLY (Phase 2 scope). Every layer routes through
-    // `lfm2_dense_mlp`, which is CORRECT for the dense `lfm2` backbone
-    // (LFM2.5-1.2B: all layers are dense SwiGLU). It is WRONG for `lfm2_moe`,
-    // whose layers >= num_dense_layers are `Lfm2SparseMoeBlock` (router +
-    // expert_bias + top-k + switch_mlp). Adding that sparse dispatch here is
-    // Phase 3. Until it lands, the Phase-2b-2 gate flip MUST gate on the dense
-    // model only (`!config.is_moe()`) so an lfm2_moe checkpoint can never
-    // silently take this dense-only path and compute the wrong FFN.
+    // Per-layer FFN dispatch (Phase 3a): a layer is a MoE layer iff the model has
+    // experts (num_experts > 0) AND its index is >= num_dense_layers; otherwise it
+    // is dense SwiGLU. A pure-dense lfm2 checkpoint has num_experts == 0, so EVERY
+    // layer takes the dense path and behavior is UNCHANGED from Phase 2 (the
+    // num_dense_layers default of 0 is irrelevant when num_experts == 0). The MoE
+    // arm runs the sparse routing: router softmax + selection-only expert_bias +
+    // top-k + switch_mlp SwiGLU + weighted sum (lfm2_moe_ffn). The Phase-2b-2 gate
+    // flip still gates on `!config.is_moe()`; the production MoE gate is lifted in
+    // Phase 3c.
     auto ffn_in =
         mlx::core::fast::rms_norm(h, get_weight(lp + ".ffn_norm.weight"), cfg.norm_eps);
-    h = h + lfm2_dense_mlp(ffn_in, i);
+    bool is_moe_layer = cfg.num_experts > 0 && i >= cfg.num_dense_layers;
+    if (is_moe_layer) {
+      h = h + lfm2_moe_ffn(ffn_in, i, cfg);
+    } else {
+      h = h + lfm2_dense_mlp(ffn_in, i);
+    }
   }
 
   // Final norm + tied LM head (linear_proj appends ".weight"; tie reads
@@ -779,6 +785,149 @@ mlx_array* mlx_lfm2_probe_decode_seq(
     return reinterpret_cast<mlx_array*>(out);
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_decode_seq: %s\n", e.what());
+    fflush(stderr);
+    mlx_clear_weights();
+    return nullptr;
+  } catch (...) {
+    mlx_clear_weights();
+    return nullptr;
+  }
+}
+
+// Run a SYNTHETIC small MoE lfm2 model through the FULL `lfm2_decode_fn`
+// assembly for `T` decode steps and return the LAST step's logits [1, vocab].
+// This is the Phase-3a end-to-end-SHAPED MoE parity gate: it exercises the
+// per-layer dense-vs-MoE FFN dispatch (layers >= num_dense_layers route through
+// `lfm2_moe_ffn`: router softmax + selection-only expert_bias + top-k +
+// switch_mlp SwiGLU + weighted sum), threaded through the same conv/attn
+// backbone as the dense probe — WITHOUT the real checkpoint and WITHOUT flipping
+// the production gate (mlx_lfm2_get_model_id stays 0). `lfm2_decode_fn` runs
+// EAGERLY (un-compiled) so a graph-trace bug cannot be masked.
+//
+// Layout: dense layers (idx < num_dense_layers OR num_experts == 0) use the
+// per-layer gate_w/up_w/down_w arrays; MoE layers use the stacked
+// moe_gate_proj/moe_up_proj/moe_down_proj ([E,out,in]) + router moe_router_w
+// ([E,hidden]) + moe_bias ([E]). Irrelevant arrays are null per layer (read per
+// the is-MoE / is_attn predicate). bf16 experts only (quant_mode = 0).
+//
+// TEST-ONLY + DESTRUCTIVE on g_weights() — caller MUST hold COMPILED_WEIGHTS_RWLOCK
+// (write); see the dense probe contract above. Caller owns the returned array;
+// nullptr on error.
+mlx_array* mlx_lfm2_probe_moe_decode_seq(
+    mlx_array* embed_w_ptr, mlx_array* emb_norm_ptr,
+    const int* is_attn, int num_layers,
+    int hidden, int num_heads, int num_kv_heads, int head_dim,
+    int l_cache, float rope_theta, float norm_eps,
+    int num_experts, int num_experts_per_tok, int num_dense_layers,
+    int norm_topk_prob, int use_expert_bias, int use_sigmoid,
+    const int* token_ids, int T,
+    mlx_array** op_norm_w, mlx_array** ffn_norm_w,
+    mlx_array** gate_w, mlx_array** up_w, mlx_array** down_w,
+    mlx_array** q_w, mlx_array** k_w, mlx_array** v_w, mlx_array** out_w,
+    mlx_array** qn_w, mlx_array** kn_w,
+    mlx_array** in_proj_w, mlx_array** conv_w, mlx_array** out_proj_w,
+    mlx_array** moe_router_w, mlx_array** moe_bias,
+    mlx_array** moe_gate_proj, mlx_array** moe_up_proj, mlx_array** moe_down_proj) {
+  try {
+    mlx_clear_weights();
+    auto& embed_w = *reinterpret_cast<array*>(embed_w_ptr);
+    // Tied head: linear_proj(h,"embed_tokens") -> get_weight_t("embed_tokens.weight").
+    mlx_store_weight("embed_tokens.weight", embed_w_ptr);
+    mlx_store_weight("embedding_norm.weight", emb_norm_ptr);
+    for (int i = 0; i < num_layers; i++) {
+      std::string lp = "layers." + std::to_string(i);
+      mlx_store_weight((lp + ".operator_norm.weight").c_str(), op_norm_w[i]);
+      mlx_store_weight((lp + ".ffn_norm.weight").c_str(), ffn_norm_w[i]);
+
+      bool is_moe = num_experts > 0 && i >= num_dense_layers;
+      if (is_moe) {
+        // Router gate [E, hidden] + (optional) expert_bias [E] + stacked experts.
+        mlx_store_weight((lp + ".feed_forward.gate.weight").c_str(), moe_router_w[i]);
+        if (use_expert_bias) {
+          mlx_store_weight((lp + ".feed_forward.expert_bias").c_str(), moe_bias[i]);
+        }
+        mlx_store_weight((lp + ".feed_forward.switch_mlp.gate_proj.weight").c_str(),
+                         moe_gate_proj[i]);
+        mlx_store_weight((lp + ".feed_forward.switch_mlp.up_proj.weight").c_str(),
+                         moe_up_proj[i]);
+        mlx_store_weight((lp + ".feed_forward.switch_mlp.down_proj.weight").c_str(),
+                         moe_down_proj[i]);
+      } else {
+        mlx_store_weight((lp + ".feed_forward.gate_proj.weight").c_str(), gate_w[i]);
+        mlx_store_weight((lp + ".feed_forward.up_proj.weight").c_str(), up_w[i]);
+        mlx_store_weight((lp + ".feed_forward.down_proj.weight").c_str(), down_w[i]);
+      }
+
+      if (is_attn[i]) {
+        mlx_store_weight((lp + ".self_attn.q_proj.weight").c_str(), q_w[i]);
+        mlx_store_weight((lp + ".self_attn.k_proj.weight").c_str(), k_w[i]);
+        mlx_store_weight((lp + ".self_attn.v_proj.weight").c_str(), v_w[i]);
+        mlx_store_weight((lp + ".self_attn.out_proj.weight").c_str(), out_w[i]);
+        mlx_store_weight((lp + ".self_attn.q_layernorm.weight").c_str(), qn_w[i]);
+        mlx_store_weight((lp + ".self_attn.k_layernorm.weight").c_str(), kn_w[i]);
+      } else {
+        mlx_store_weight((lp + ".conv.in_proj.weight").c_str(), in_proj_w[i]);
+        mlx_store_weight((lp + ".conv.conv.weight").c_str(), conv_w[i]);  // [H,l_cache,1]
+        mlx_store_weight((lp + ".conv.out_proj.weight").c_str(), out_proj_w[i]);
+      }
+    }
+
+    g_lfm2_config = Lfm2MoeConfig{};
+    g_lfm2_config.num_layers = num_layers;
+    g_lfm2_config.hidden_size = hidden;
+    g_lfm2_config.num_heads = num_heads;
+    g_lfm2_config.num_kv_heads = num_kv_heads;
+    g_lfm2_config.head_dim = head_dim;
+    g_lfm2_config.conv_l_cache = l_cache;
+    g_lfm2_config.rope_theta = rope_theta;
+    g_lfm2_config.norm_eps = norm_eps;
+    g_lfm2_config.num_experts = num_experts;
+    g_lfm2_config.num_experts_per_tok = num_experts_per_tok;
+    g_lfm2_config.num_dense_layers = num_dense_layers;
+    g_lfm2_config.norm_topk_prob = norm_topk_prob != 0;
+    g_lfm2_config.use_expert_bias = use_expert_bias != 0;
+    g_lfm2_config.use_sigmoid = use_sigmoid != 0;
+    g_lfm2_config.tie_embedding = true;
+    g_lfm2_config.max_kv_len = T;
+    g_lfm2_is_attn.assign(is_attn, is_attn + num_layers);
+
+    // Local cache vector (uniform stride 2). conv -> (state, scalar placeholder);
+    // attn -> (kv_keys, kv_values) padded to T.
+    std::vector<array> caches;
+    caches.reserve(num_layers * 2);
+    for (int i = 0; i < num_layers; i++) {
+      if (is_attn[i]) {
+        caches.push_back(zeros({1, num_kv_heads, T, head_dim}, mlx::core::bfloat16));
+        caches.push_back(zeros({1, num_kv_heads, T, head_dim}, mlx::core::bfloat16));
+      } else {
+        caches.push_back(zeros({1, l_cache - 1, hidden}, mlx::core::bfloat16));
+        caches.push_back(zeros({}, mlx::core::bfloat16));  // unused placeholder
+      }
+    }
+
+    array last_logits = zeros({1, embed_w.shape(0)}, mlx::core::bfloat16);
+    for (int t = 0; t < T; t++) {
+      auto idx = reshape(array(token_ids[t], mlx::core::int32), {1});
+      auto h = take(embed_w, idx, 0);  // [1, hidden]
+      std::vector<array> in;
+      in.reserve(2 + num_layers * 2);
+      in.push_back(h);
+      in.push_back(array(t, mlx::core::int32));  // offset = t
+      for (auto& c : caches) {
+        in.push_back(c);
+      }
+      auto outs = lfm2_decode_fn(in);  // EAGER (un-compiled)
+      last_logits = outs[0];
+      for (int i = 0; i < num_layers * 2; i++) {
+        caches[i] = outs[2 + i];
+      }
+    }
+    mlx::core::eval({last_logits});
+    auto* out = new array(last_logits);
+    mlx_clear_weights();
+    return reinterpret_cast<mlx_array*>(out);
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] mlx_lfm2_probe_moe_decode_seq: %s\n", e.what());
     fflush(stderr);
     mlx_clear_weights();
     return nullptr;

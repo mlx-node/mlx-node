@@ -2023,6 +2023,60 @@ unsafe extern "C-unwind" {
         conv_w: *const *mut mlx_array,
         out_proj_w: *const *mut mlx_array,
     ) -> *mut mlx_array;
+
+    /// TEST-ONLY component probe: like `mlx_lfm2_probe_decode_seq` but with the
+    /// sparse-MoE FFN branch. Runs a SYNTHETIC small lfm2_moe model through the
+    /// full `lfm2_decode_fn` assembly for `t` steps and returns the LAST step's
+    /// logits `[1, vocab]`. Phase-3a end-to-end-shaped MoE parity gate: layers
+    /// `>= num_dense_layers` route through `lfm2_moe_ffn` (router softmax +
+    /// selection-only expert_bias + top-k + switch_mlp SwiGLU + weighted sum) via
+    /// the stacked `moe_*` weight arrays ([E,out,in] experts, [E,hidden] router,
+    /// [E] bias); dense layers use the `gate_w/up_w/down_w` arrays. Irrelevant
+    /// arrays are null per layer (read per the is-MoE / is_attn predicate). bf16
+    /// experts only. Runs EAGER (un-compiled); the production gate stays OFF.
+    /// Caller MUST hold `COMPILED_WEIGHTS_RWLOCK` (write). Arg order is
+    /// byte-identical to the C++ definition in mlx_lfm2_moe.cpp — keep in sync.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_probe_moe_decode_seq(
+        embed_w: *mut mlx_array,
+        emb_norm_w: *mut mlx_array,
+        is_attn: *const i32,
+        num_layers: i32,
+        hidden: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        l_cache: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        num_dense_layers: i32,
+        norm_topk_prob: i32,
+        use_expert_bias: i32,
+        use_sigmoid: i32,
+        token_ids: *const i32,
+        t: i32,
+        op_norm_w: *const *mut mlx_array,
+        ffn_norm_w: *const *mut mlx_array,
+        gate_w: *const *mut mlx_array,
+        up_w: *const *mut mlx_array,
+        down_w: *const *mut mlx_array,
+        q_w: *const *mut mlx_array,
+        k_w: *const *mut mlx_array,
+        v_w: *const *mut mlx_array,
+        out_w: *const *mut mlx_array,
+        qn_w: *const *mut mlx_array,
+        kn_w: *const *mut mlx_array,
+        in_proj_w: *const *mut mlx_array,
+        conv_w: *const *mut mlx_array,
+        out_proj_w: *const *mut mlx_array,
+        moe_router_w: *const *mut mlx_array,
+        moe_bias: *const *mut mlx_array,
+        moe_gate_proj: *const *mut mlx_array,
+        moe_up_proj: *const *mut mlx_array,
+        moe_down_proj: *const *mut mlx_array,
+    ) -> *mut mlx_array;
 }
 
 // Gradient computation types

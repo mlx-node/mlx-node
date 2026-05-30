@@ -36,8 +36,21 @@ struct Lfm2MoeConfig {
   int num_experts = 0;
   int num_experts_per_tok = 0;
   int num_dense_layers = 0;
+  // Per-expert SwiGLU hidden dim (moe layers) and dense-in-MoE SwiGLU hidden dim.
+  // Currently informational — the gather experts infer shapes from the stacked
+  // weights — kept for symmetry with the Rust config and future prefill paths.
+  int moe_intermediate_size = 0;
+  int intermediate_size = 0;
   bool norm_topk_prob = true;
   bool use_expert_bias = true;
+  // Router score function: false -> softmax (lfm2_moe native default), true ->
+  // sigmoid (qwen3.5-moe style). lfm2_moe `Lfm2SparseMoeBlock` uses SOFTMAX.
+  bool use_sigmoid = false;
+  // Phase 3b quant fields (default 0 = bf16). Declared NOW so the config ABI is
+  // stable across 3a->3b. quant_mode: 0=bf16, 1=mxfp8, 2=mxfp4, 3=nvfp4.
+  int quant_mode = 0;
+  int bits = 0;
+  int group_size = 0;
   bool tie_embedding = true;
   int max_kv_len = 0;
   int batch_size = 1;
@@ -219,6 +232,136 @@ inline array lfm2_dense_mlp(const array& x, int layer_idx) {
   auto gate = linear_proj(x, mp + "gate_proj");
   auto up = linear_proj(x, mp + "up_proj");
   return linear_proj(swiglu(gate, up), mp + "down_proj");
+}
+
+// =====================================================================
+// Per-expert switch-linear via gather_mm (bf16) or gather_qmm (quant).
+//
+// `prefix` is the full key prefix WITHOUT a trailing ".weight"/".scales"/
+// ".biases" (e.g. "layers.3.feed_forward.switch_mlp.gate_proj").
+//   x:       [ne, 1, in]   (or [ne, k, in] for the down stage)
+//   indices: [ne, k]       rhs (expert) indices
+// Returns [ne, k, out]. The bf16 branch swaps the stored [E, out, in] weight to
+// [E, in, out] for gather_mm (matching qwen35 `switch_linear_forward`). The quant
+// branch (cfg.quant_mode != 0) is declared for Phase 3b; 3a only exercises bf16.
+// =====================================================================
+inline array lfm2_switch_linear(
+    const array& x,
+    const std::string& prefix,
+    const array& indices,
+    const Lfm2MoeConfig& cfg) {
+  using namespace qwen35_common;
+  if (cfg.quant_mode != 0) {
+    // Quantized experts (Phase 3b). gate/up/down ship stacked .scales (+ optional
+    // .biases for affine recipes). mode string per cfg.quant_mode.
+    auto w = get_weight(prefix + ".weight");
+    auto scales = get_weight(prefix + ".scales");
+    std::optional<array> biases = std::nullopt;
+    if (g_weights().count(prefix + ".biases") > 0) {
+      biases = get_weight(prefix + ".biases");
+    }
+    const char* mode = "mxfp8";
+    if (cfg.quant_mode == 2) {
+      mode = "mxfp4";
+    } else if (cfg.quant_mode == 3) {
+      mode = "nvfp4";
+    }
+    return mlx::core::gather_qmm(
+        x, w, scales, biases,
+        std::nullopt,  // lhs_indices (not used)
+        indices,       // rhs_indices (expert indices)
+        true,          // transpose
+        std::optional<int>(cfg.group_size),
+        std::optional<int>(cfg.bits),
+        std::string(mode),
+        /*sorted=*/false);
+  }
+  // bf16/f16: plain gather_mm over the swapped weight ([E, in, out]).
+  auto w = get_weight(prefix + ".weight");  // [E, out, in]
+  return mlx::core::gather_mm(x, mlx::core::swapaxes(w, -2, -1), std::nullopt, indices);
+}
+
+// =====================================================================
+// Sparse top-k MoE FFN for an lfm2 layer (mirrors `Lfm2SparseMoeBlock::forward`
+// in sparse_moe.rs and lfm2_moe.py::Lfm2MoeSparseMoeBlock).
+//
+// Routing (parity-critical — each step matches the native Rust line-for-line):
+//   logits  = gate(x).astype(f32)                              # [ne, E]
+//   scores  = use_sigmoid ? sigmoid(logits) : softmax(logits, -1)  # lfm2: SOFTMAX
+//   routing = use_expert_bias ? scores + expert_bias : scores  # selection gates
+//   inds    = argpartition(routing, E-k-1, -1)[..., E-k:E]      # last k
+//   weights = take_along_axis(routing, inds, -1)               # from the SAME
+//                                                              #   (post-bias) gates
+//                                                              #   the native code
+//                                                              #   argpartitions
+//   weights = norm_topk_prob ? weights / (sum(weights,-1) + 1e-20) : weights
+//   weights = weights.astype(x.dtype)
+//   y       = SwiGLU experts via gather_mm/gather_qmm           # [ne, k, hidden]
+//   out     = sum(y * weights[...,None], -2)                    # [ne, hidden]
+//
+// Native `sparse_moe.rs` mutates `gates` in place by adding the bias, then BOTH
+// argpartitions AND take_along_axis on that post-bias tensor. We replicate that
+// by argpartition + take_along_axis BOTH on `routing`. When use_expert_bias is
+// false, routing == scores, so the two are identical. NO shared expert, NO
+// routed_scaling. The renorm epsilon (1e-20, f32) matches sparse_moe.rs.
+//
+// x: [ne, hidden] (2D decode) -> [ne, hidden].
+// =====================================================================
+inline array lfm2_moe_ffn(const array& x, int layer_idx, const Lfm2MoeConfig& cfg) {
+  using namespace qwen35_common;
+  int E = cfg.num_experts;
+  int k = cfg.num_experts_per_tok;
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".feed_forward.";
+
+  // ---- Router ----
+  auto logits = linear_proj(x, pfx + "gate");  // [ne, E]; gate.weight is [E, hidden]
+  auto sf32 = astype(logits, mlx::core::float32);
+  array scores =
+      cfg.use_sigmoid ? mlx::core::sigmoid(sf32) : mlx::core::softmax(sf32, std::vector<int>{-1});
+
+  // expert_bias is a selection gate add (post-softmax, pre-topk). Native gathers
+  // the routing weights from these same biased gates, so `routing` is also the
+  // gather source. When use_expert_bias is false, routing == scores.
+  array routing = scores;
+  if (cfg.use_expert_bias) {
+    routing = add(scores, astype(get_weight(pfx + "expert_bias"), mlx::core::float32));
+  }
+
+  // ---- Top-k: mirror native argpartition(routing, E-k-1, -1)[.., E-k:E] ----
+  // Slice the last axis [E-k:E] rank-agnostically: `routing`/`part` may be 2D
+  // ([ne, E]) or 3D ([B, ne, E]) depending on the caller's batch shape, so build
+  // the per-axis start/stop from `part.shape()` rather than hard-coding rank 2.
+  auto part = mlx::core::argpartition(routing, E - k - 1, -1);
+  mlx::core::Shape slc_start(part.ndim(), 0);
+  mlx::core::Shape slc_stop = part.shape();
+  slc_start.back() = E - k;  // last axis lower bound
+  slc_stop.back() = E;       // last axis upper bound
+  auto inds = slice(part, slc_start, slc_stop);  // [..., k]
+
+  // weights gathered from the (biased) routing gates; renorm adds 1e-20 (native).
+  array weights = take_along_axis(routing, inds, -1);  // [ne, k]
+  if (cfg.norm_topk_prob) {
+    auto denom = sum(weights, std::vector<int>{-1}, /*keepdims=*/true);
+    denom = add(denom, array(1e-20f, mlx::core::float32));
+    weights = divide(weights, denom);
+  }
+  weights = astype(weights, x.dtype());
+
+  // ---- Experts via gather_mm/gather_qmm (SwiGLU) ----
+  // gather_mm requires the lhs to carry a leading expert-broadcast axis: expand
+  // x [ne, hidden] -> [ne, 1, 1, hidden] (matches the qwen3.5-MoE switch convention).
+  // gather_mm(x4, swapaxes(w), nullopt, inds[ne,k]) -> [ne, 1, k, out]; the SwiGLU
+  // and down_proj keep that rank; squeeze the penultimate (1) axis afterward.
+  auto x4 = reshape(x, {-1, 1, 1, x.shape(-1)});  // [ne, 1, 1, hidden]
+  auto gproj = lfm2_switch_linear(x4, pfx + "switch_mlp.gate_proj", inds, cfg);
+  auto uproj = lfm2_switch_linear(x4, pfx + "switch_mlp.up_proj", inds, cfg);
+  auto act = swiglu(gproj, uproj);  // SiLU(gate) * up  -> [ne, 1, k, moe_inter]
+  auto y4 = lfm2_switch_linear(act, pfx + "switch_mlp.down_proj", inds, cfg);  // [ne, 1, k, hidden]
+  auto y = squeeze(y4, -2);  // drop the penultimate broadcast axis -> [ne, k, hidden]
+
+  // weighted sum over k: (y * weights[...,None]).sum(-2) -> [ne, hidden]
+  auto w_exp = expand_dims(weights, -1);  // [ne, k, 1]
+  return sum(multiply(y, w_exp), std::vector<int>{-2}, /*keepdims=*/false);
 }
 
 // Result of one ShortConv decode step: output + the conv state to write back.
