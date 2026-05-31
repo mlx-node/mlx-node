@@ -1301,31 +1301,32 @@ impl Lfm2Inner {
             crate::array::memory::materialize_weights(&weight_refs)?;
         }
 
-        // Register weights with the compiled C++ decode path — ONLY for a
-        // dense, non-paged checkpoint. The compiled `lfm2_decode_fn` applies
-        // `lfm2_dense_mlp` to EVERY layer (correct for dense lfm2, WRONG for
-        // lfm2_moe's sparse layers), and the flat decode graph is incompatible
-        // with the block-paged adapter. Because `compiled_path_active()` is a
-        // pure id-equality probe and the id is published ONLY here, gating the
-        // registration makes the compiled path structurally impossible for
-        // MoE / paged checkpoints. `register_weights_with_cpp` itself also
-        // defensively early-returns on `is_moe()`.
+        // Register weights with the compiled C++ decode path for a non-paged,
+        // bf16/f16 checkpoint — DENSE or sparse-MoE. Phase 3c lifted the MoE
+        // exclusion: `lfm2_decode_fn`'s MoE branch (driven by the MoE config
+        // threaded into `mlx_lfm2_moe_init_from_prefill`) applies the sparse
+        // top-k `lfm2_switch_linear` FFN to MoE layers and `lfm2_dense_mlp` to
+        // the dense layers, matching the native `Lfm2Inner::forward`. Because
+        // `compiled_path_active()` is a pure id-equality probe and the id is
+        // published ONLY here, gating the registration makes the compiled path
+        // structurally impossible for the checkpoints still excluded below.
         //
-        // Quantized dense checkpoints are ALSO excluded for now: the compiled
-        // `linear_proj` infers the quant mode and would mis-dispatch MXFP4 /
-        // NVFP4 as MXFP8 (registration stores no authoritative quant-info), so
-        // quantized compiled decode is deferred to Phase 4. Quantized tensors
-        // carry `.scales`-suffixed keys; bf16/f16 dense checkpoints have none.
-        //
-        // `conv_bias` checkpoints are excluded too: the compiled `lfm2_decode_fn`
-        // calls `lfm2_conv_pure_fn` with conv_bias hardcoded off (the in_proj /
-        // depthwise / out_proj biases are not threaded through the FFI yet), so a
-        // conv_bias=true checkpoint would decode without them. The shipping dense
-        // LFM2.5 checkpoints are conv_bias=false; threading the conv biases is a
-        // Phase-4 follow-up.
+        // Still excluded (Phase-2 guards intact):
+        //   * paged checkpoints — the flat compiled decode graph is incompatible
+        //     with the block-paged adapter, so only `use_block_paged_cache ==
+        //     Some(false)` registers.
+        //   * quantized checkpoints — the compiled `linear_proj` infers the quant
+        //     mode and would mis-dispatch MXFP4 / NVFP4 as MXFP8 (registration
+        //     stores no authoritative quant-info), so quantized compiled decode
+        //     (incl. quantized MoE = Phase 3b) is deferred. Quantized tensors
+        //     carry `.scales`-suffixed keys; bf16/f16 checkpoints have none.
+        //   * `conv_bias` checkpoints — the compiled `lfm2_decode_fn` calls
+        //     `lfm2_conv_pure_fn` with conv_bias hardcoded off (the in_proj /
+        //     depthwise / out_proj biases are not threaded through the FFI yet),
+        //     so a conv_bias=true checkpoint would decode without them. The
+        //     shipping LFM2.5 checkpoints are conv_bias=false.
         let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
-        if !inner.config.is_moe()
-            && inner.config.use_block_paged_cache == Some(false)
+        if inner.config.use_block_paged_cache == Some(false)
             && !is_quantized
             && !inner.config.conv_bias
         {
@@ -1379,24 +1380,52 @@ impl Lfm2Inner {
 /// `.unwrap()` / `.expect()` — lock poison is recovered and a NUL byte in a
 /// weight name propagates via `?`.
 ///
-/// Defensive: returns early (storing nothing, publishing no id) for an MoE
-/// checkpoint — the compiled `lfm2_decode_fn` is dense-MLP-only. The caller
-/// already gates on `!is_moe() && use_block_paged_cache == Some(false)`; this
-/// is belt-and-suspenders.
+/// Handles DENSE and sparse-MoE bf16/f16 checkpoints (Phase 3c). MoE adds three
+/// kinds of tensors that the generic store loop below registers without any
+/// special-casing here:
+///   * stacked experts `feed_forward.switch_mlp.{gate,up,down}_proj.weight`,
+///     shape `[E, out, in]` (3D) — `mlx_store_weight` transposes ONLY ndim==2,
+///     so these 3D stacks are stored AS-IS. The compiled forward's
+///     `lfm2_switch_linear` does the `swapaxes(w, -2, -1)` it needs for
+///     `gather_mm` at forward time, so NO transpose precompute is required here.
+///   * router gate `feed_forward.gate.weight`, shape `[E, hidden]` (2D) —
+///     transposed to `[hidden, E]` by `mlx_store_weight` like any 2D linear.
+///   * `feed_forward.expert_bias`, shape `[E]` (1D, f32) — stored as-is.
+///
+/// Still returns early (storing nothing, publishing no id) for quantized
+/// (`.scales`-suffixed, incl. quantized MoE = Phase 3b) and `conv_bias=true`
+/// checkpoints, mirroring the call-site gate. The caller also gates on
+/// `use_block_paged_cache == Some(false)`; these are belt-and-suspenders.
 fn register_weights_with_cpp(
     params: &HashMap<String, MxArray>,
     model_id: u64,
     config: &Lfm2Config,
 ) -> Result<()> {
-    // (1) Defensive MoE early-return: store nothing, set no id.
-    if config.is_moe() {
-        return Ok(());
-    }
+    // (2) Write-lock the shared weight RwLock for the entire registration so
+    // any in-flight compiled inference blocks until the new model_id is live.
+    // Poison-recover (a panic in a prior holder must not wedge loads forever).
+    // This is the ONLY place the lock is taken for the production path; the
+    // inner `_locked` worker assumes the caller already holds it (so a test that
+    // already holds the write lock must call `_locked` directly, NOT this
+    // wrapper — taking the non-reentrant `std::sync::RwLock` twice on one thread
+    // would deadlock).
+    let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    register_weights_with_cpp_locked(params, model_id, config)
+}
 
-    // (1b) Defensive quant early-return mirroring the call-site gate: the
+/// Caller MUST hold COMPILED_WEIGHTS_RWLOCK.write(). The wrapper register_weights_with_cpp takes the lock; tests that already hold it call this directly.
+fn register_weights_with_cpp_locked(
+    params: &HashMap<String, MxArray>,
+    model_id: u64,
+    config: &Lfm2Config,
+) -> Result<()> {
+    // (1a) Defensive quant early-return mirroring the call-site gate: the
     // compiled path stores no authoritative quant-info, so a quantized
-    // checkpoint (any `.scales`-suffixed tensor) must NOT register — its
-    // MXFP4 / NVFP4 weights would mis-dispatch as MXFP8 in `linear_proj`.
+    // checkpoint (any `.scales`-suffixed tensor, dense or MoE) must NOT
+    // register — its MXFP4 / NVFP4 weights would mis-dispatch as MXFP8 in
+    // `linear_proj` / `lfm2_switch_linear` (quantized MoE = Phase 3b).
     if params.keys().any(|k| k.ends_with(".scales")) {
         return Ok(());
     }
@@ -1408,18 +1437,12 @@ fn register_weights_with_cpp(
         return Ok(());
     }
 
-    // (2) Write-lock the shared weight RwLock for the entire registration so
-    // any in-flight compiled inference blocks until the new model_id is live.
-    // Poison-recover (a panic in a prior holder must not wedge loads forever).
-    let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
-
     // (3) Clear the shared map (also resets the active model id).
     unsafe { mlx_sys::mlx_clear_weights() };
 
     // (4) Store every sanitized weight. `mlx_store_weight` auto-transposes
-    // ndim==2; 3D conv weight + 1D norms/biases are left untouched.
+    // ndim==2 (incl. the MoE router gate); 3D stacked experts + 3D conv weight +
+    // 1D norms / biases / expert_bias are left untouched.
     for (name, arr) in params {
         let c_name = std::ffi::CString::new(name.as_str())
             .map_err(|e| Error::from_reason(format!("Weight name contains NUL byte: {e}")))?;
@@ -1428,10 +1451,58 @@ fn register_weights_with_cpp(
         }
     }
 
+    // (4b) Synthesize a ZERO expert_bias for any MoE layer that declares
+    // `use_expert_bias` but whose checkpoint OMITS `feed_forward.expert_bias`
+    // (version-skewed checkpoints). Native `Lfm2SparseMoeBlock::new`
+    // zero-initializes `expert_bias` as f32 `[num_experts]` and treats the
+    // on-disk tensor as OPTIONAL, so a zero bias is a selection no-op (it is
+    // added only to the post-softmax routing copy; a zero add changes neither
+    // the argpartition order nor the gathered weights). The compiled C++
+    // `lfm2_moe_ffn` unconditionally calls `get_weight(..."feed_forward.expert_bias")`
+    // when `use_expert_bias`, so without a registered tensor the first compiled
+    // decode would read a missing weight and diverge from native. Materializing
+    // the zero tensor here — under the SAME write lock and BEFORE the epoch bump
+    // below, so the next compile epoch captures it as a graph constant — keeps
+    // the compiled graph byte-identical to native. The shipping lfm2.5-8b-a1b
+    // already ships expert_bias, so `contains_key` makes this a strict no-op for
+    // it; this is purely additive robustness. f32 dtype + `[num_experts]` shape
+    // match native exactly (do NOT use bf16: native keeps expert_bias f32).
+    if config.use_expert_bias
+        && let Some(num_experts) = config.num_experts
+        && num_experts > 0
+    {
+        let num_dense = config.num_dense_layers.unwrap_or(0).max(0) as usize;
+        let num_layers = config.layer_types.len();
+        for layer_idx in num_dense..num_layers {
+            let key = format!("layers.{layer_idx}.feed_forward.expert_bias");
+            if params.contains_key(&key) {
+                continue;
+            }
+            let zero_bias = MxArray::zeros(&[num_experts as i64], Some(DType::Float32))
+                .map_err(|e| Error::from_reason(format!("synthesize zero expert_bias: {e}")))?;
+            let c_name = std::ffi::CString::new(key.as_str())
+                .map_err(|e| Error::from_reason(format!("Weight name contains NUL byte: {e}")))?;
+            unsafe {
+                mlx_sys::mlx_store_weight(c_name.as_ptr(), zero_bias.as_raw_ptr());
+            }
+        }
+    }
+
     let count = unsafe { mlx_sys::mlx_weight_count() };
     info!("Registered {count} weights with C++ lfm2 compiled forward path");
 
-    // (5) Publish the model id LAST — and only if weights actually landed.
+    // (5) Invalidate the cached compiled-decode closure BEFORE republishing the
+    // id. The compiled `lfm2_decode_fn` graph froze the PREVIOUS model's weight
+    // constants at trace time; without this bump a second lfm2 model whose decode
+    // graph has the SAME input shapes would reuse the stale closure and silently
+    // decode the prior model's weights. We hold COMPILED_WEIGHTS_RWLOCK.write()
+    // here, so the bump + id publish are atomic w.r.t. any read-locked decode
+    // (which re-checks the id under the read lock and recompiles on epoch change).
+    // Always bump (even when count == 0) so a failed/empty re-registration can't
+    // leave a stale graph reachable if the id later changes.
+    unsafe { mlx_sys::mlx_lfm2_invalidate_compiled() };
+
+    // (6) Publish the model id LAST — and only if weights actually landed.
     if count > 0 {
         unsafe { mlx_sys::mlx_set_model_id(model_id) };
     } else {
@@ -1656,6 +1727,65 @@ mod tests {
                 "layer {i}: use_expert_bias=true but loader did not apply expert_bias"
             );
         }
+    }
+
+    /// F1 regression: a `use_expert_bias=true` flat bf16 MoE checkpoint that
+    /// OMITS every `feed_forward.expert_bias` tensor must STILL register a
+    /// complete compiled weight set — `register_weights_with_cpp` synthesizes a
+    /// zero `[num_experts]` f32 bias per MoE layer so the compiled C++
+    /// `lfm2_moe_ffn` (which unconditionally reads that weight when
+    /// `use_expert_bias`) never sees a missing tensor and stays byte-identical to
+    /// native (native zero-inits the same tensor and treats the on-disk one as
+    /// optional). Soundness: the registered weight count with the bias OMITTED
+    /// must EQUAL the count with an explicit zero bias supplied. WITHOUT the
+    /// production synthesis the omitted-bias count is lower by the MoE-layer
+    /// count, so this assertion fails. Holds COMPILED_WEIGHTS_RWLOCK (write,
+    /// poison-recovered) because `register_weights_with_cpp` mutates the shared
+    /// `g_weights()` map; clears the map at the end so no stale id leaks.
+    #[test]
+    fn register_synthesizes_zero_expert_bias_when_absent() {
+        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = tiny_moe_config(/* use_expert_bias */ true);
+        let num_experts = config.num_experts.expect("num_experts") as i64;
+
+        // Baseline: params WITH explicit (zero) expert_bias on every MoE layer.
+        let mut with_bias = full_bf16_moe_params();
+        for (k, v) in with_bias.iter_mut() {
+            if k.ends_with(".feed_forward.expert_bias") {
+                *v = f32a(&[num_experts], 0.0);
+            }
+        }
+        // The test already holds COMPILED_WEIGHTS_RWLOCK.write() above, so call
+        // the lock-free `_locked` worker directly. Calling the wrapper
+        // `register_weights_with_cpp` here would re-take the non-reentrant
+        // RwLock on this thread and deadlock.
+        register_weights_with_cpp_locked(&with_bias, 0xF1F1_0001, &config)
+            .expect("register with bias");
+        let count_with = unsafe { mlx_sys::mlx_weight_count() };
+
+        // Stripped: identical params with every `expert_bias` tensor REMOVED.
+        let mut without_bias = full_bf16_moe_params();
+        without_bias.retain(|k, _| !k.ends_with(".feed_forward.expert_bias"));
+        assert!(
+            without_bias.len() < with_bias.len(),
+            "test setup: stripping expert_bias did not remove any tensors"
+        );
+        register_weights_with_cpp_locked(&without_bias, 0xF1F1_0002, &config)
+            .expect("register without bias");
+        let count_without = unsafe { mlx_sys::mlx_weight_count() };
+
+        // Clean up the shared map so this destructive test leaves no live id.
+        unsafe { mlx_sys::mlx_clear_weights() };
+
+        assert_eq!(
+            count_without, count_with,
+            "F1: omitting expert_bias must be backfilled by zero-synthesis \
+             (count_without={count_without} count_with={count_with}); the compiled \
+             path would otherwise read a missing expert_bias and diverge from native"
+        );
     }
 
     // ===== Finding 1: complete-group validation of MoE projections =====

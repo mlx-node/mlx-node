@@ -1906,6 +1906,16 @@ unsafe extern "C-unwind" {
     /// `mlx_clear_weights`.
     pub fn mlx_lfm2_moe_reset();
 
+    /// Invalidate the cached compiled lfm2 decode closure so the NEXT decode
+    /// recompiles `lfm2_decode_fn`, re-capturing the live weight constants from
+    /// the shared `g_weights()` map. MUST be called by `register_weights_with_cpp`
+    /// (under `COMPILED_WEIGHTS_RWLOCK.write()`, before `mlx_set_model_id`) so a
+    /// freshly-loaded lfm2 model can never reuse a previously-compiled model's
+    /// frozen-constant graph (the A→B same-shape model-swap hazard). Internally
+    /// bumps an atomic epoch; the recompile path acquire-loads it under a dedicated
+    /// mutex, so the closure swap is thread-safe regardless of caller locking.
+    pub fn mlx_lfm2_invalidate_compiled();
+
     /// TEST-ONLY component probe: run a sequence of `T` lfm2 attention decode
     /// steps (B=1, `x_seq` is `[T, hidden]`) through the compiled
     /// `lfm2_attn_pure_fn`, threading the KV cache, and return the LAST step's
@@ -2077,6 +2087,40 @@ unsafe extern "C-unwind" {
         moe_up_proj: *const *mut mlx_array,
         moe_down_proj: *const *mut mlx_array,
     ) -> *mut mlx_array;
+
+    /// DECISIVE H1/H2 probe (TEST-ONLY): builds a FIXED 3-layer synthetic MoE
+    /// model in C++ and runs the SAME `lfm2_decode_fn` BOTH eager and through the
+    /// process-global `compiled_lfm2_decode()`, writing max-abs(compiled - eager)
+    /// of the last-step logits into `out_maxabs`. The ONLY variable is
+    /// `mlx::core::compile`. `well_separated != 0` => bias-dominated top-k (no
+    /// near-ties); `== 0` => near-tie router (FP-fusion sensitive). Caller MUST
+    /// hold `COMPILED_WEIGHTS_RWLOCK` (write); DESTRUCTIVE on the weight map.
+    /// Returns 0 on success, -1 on error.
+    pub fn mlx_lfm2_probe_moe_compiled_vs_eager(
+        seed: u64,
+        well_separated: i32,
+        out_maxabs: *mut f32,
+    ) -> i32;
+
+    /// A→B model-swap regression probe (TEST-ONLY): builds two DISTINCT
+    /// synthetic MoE models (same fixed topology, different `seed_a`/`seed_b`
+    /// weights) in one process; runs A compiled (caching the graph), then
+    /// re-registers B and bumps the compile epoch (`mlx_lfm2_invalidate_compiled`),
+    /// then runs B both compiled and eager.
+    ///
+    /// `out_b_comp_vs_b_eager` is ~0 with the epoch fix but blows up without it
+    /// (the stale closure replays A's frozen constants). `out_b_comp_vs_a_comp`
+    /// is the A-vs-B gap (proves the models genuinely differ). `out_a_comp_vs_a_eager`
+    /// is the A compile-faithfulness sanity. Caller MUST hold
+    /// `COMPILED_WEIGHTS_RWLOCK` (write); DESTRUCTIVE on the weight map. Returns 0
+    /// on success, -1 on error.
+    pub fn mlx_lfm2_probe_moe_ab_swap(
+        seed_a: u64,
+        seed_b: u64,
+        out_b_comp_vs_b_eager: *mut f32,
+        out_b_comp_vs_a_comp: *mut f32,
+        out_a_comp_vs_a_eager: *mut f32,
+    ) -> i32;
 }
 
 // Gradient computation types

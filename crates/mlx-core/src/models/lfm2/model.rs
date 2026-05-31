@@ -386,10 +386,11 @@ impl Lfm2Inner {
     /// atom) equals this model's [`Lfm2Inner::model_id`].
     ///
     /// The id is published ONLY by `register_weights_with_cpp` (load time), which
-    /// is invoked only for a dense, non-paged checkpoint
-    /// (`!config.is_moe() && use_block_paged_cache == Some(false)`). So the gate
-    /// is structurally false for MoE and paged checkpoints, and false until a
-    /// dense lfm2 model has registered its weights into the shared map.
+    /// is invoked for a bf16/f16, flat-cache, conv_bias=false checkpoint —
+    /// DENSE or sparse-MoE (Phase 3c lifted the MoE exclusion). The gate is
+    /// structurally false for paged and quantized checkpoints (those never
+    /// register), and false until an lfm2 model has registered its weights into
+    /// the shared map.
     pub(crate) fn compiled_path_active(&self) -> bool {
         let active = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
         active != 0 && active == self.model_id
@@ -765,6 +766,24 @@ impl Lfm2Inner {
         // ownership under the weight RwLock read guard, held for the whole
         // decode loop. Poison-recover both locks (a panicked prior holder must
         // not wedge inference forever — banned `.unwrap()` on these paths).
+        //
+        // LOCK CONTRACT (compiled-closure lifecycle, mirrors the qwen3.5 dense
+        // path): registration is the WRITER — `register_weights_with_cpp` holds
+        // `COMPILED_WEIGHTS_RWLOCK.write()` and, in one critical section, clears
+        // + re-stores weights, bumps the compile epoch
+        // (`mlx_lfm2_invalidate_compiled`), then publishes the model id
+        // (`mlx_set_model_id`). Decode is the READER — the `_weight_guard`
+        // (`.read()`, poison-recovered) below spans BOTH the
+        // `mlx_lfm2_get_model_id()` re-check AND every subsequent
+        // `mlx_lfm2_moe_*` / `compiled_lfm2_decode()` invocation in this function
+        // (it is kept alive until end-of-scope, after the decode loop and the
+        // post-loop cache export). So the (epoch, id) pair this read guard
+        // validates is exactly the one the compiled graph executes against — a
+        // registration cannot interleave between the re-check and the forwards.
+        // The C++ side additionally guards the epoch-check + recompile with its
+        // own `g_lfm2_compiled_mu` and returns the closure BY VALUE, so even a
+        // hypothetical caller that did NOT hold this read lock could not dangle
+        // its closure handle.
         let use_compiled_pre = self.compiled_path_active();
         let _compiled_lock = if use_compiled_pre {
             Some(
@@ -804,10 +823,11 @@ impl Lfm2Inner {
             None
         };
         let embed_tokens_weight = if use_compiled {
-            // Tied dense embedding only — lfm2 dense checkpoints are never
-            // packed-quantized on the compiled path (the gate is
-            // !is_moe && !paged, and dense lfm2 ships a bf16 embedding).
-            // `get_weight()` is infallible (returns MxArray, not Result).
+            // Tied dense embedding only — lfm2 compiled checkpoints (dense OR
+            // MoE) are never packed-quantized on the compiled path (the gate
+            // excludes any `.scales` checkpoint, and bf16 lfm2 ships a dense
+            // embedding). `get_weight()` is infallible (returns MxArray, not
+            // Result).
             Some(self.embed_tokens.get_weight())
         } else {
             None

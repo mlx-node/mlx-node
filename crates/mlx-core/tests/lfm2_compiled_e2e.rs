@@ -959,3 +959,196 @@ async fn lfm2_warm_reuse_offset_fix() {
          cold-session run within tail tolerance ({tail}B)"
     );
 }
+
+// =============================================================================
+// PHASE 3c: real-model MoE end-to-end parity — compiled-flat sparse-MoE decode
+// vs the native-paged reference, on the real `lfm2.5-8b-a1b` (model_type
+// lfm2_moe, bf16, 24 layers, 32 experts, top-4, 2 dense layers).
+//
+// What this proves:
+//   1. ENGAGEMENT — the compiled C++ forward (`mlx_lfm2_moe_forward`) actually
+//      runs once per decode step for a MoE checkpoint (model_id published,
+//      forward_call_count delta ~N-1). delta == 0 => silent native fallback =>
+//      hard fail (the Phase-3c gate-lift did not take).
+//   2. PARITY — greedy decode on the compiled-flat MoE path agrees with a
+//      reference everywhere except (at most) a short trailing argmax-tie flip.
+//
+// REFERENCE CHOICE: the fidelity oracle for "is the compiled MoE port faithful?"
+// is EAGER-FLAT (`MLX_NO_COMPILE=1`, separate process) — the SAME flat KV/conv
+// layout + SAME `lfm2_moe_ffn` routing, just not `mlx::core::compile`d (see the
+// module docstring + `lfm2_eager_flat_vs_compiled_capture`, which is checkpoint-
+// agnostic via `MLX_TEST_MODEL_PATH` and so ALSO covers MoE when pointed at the
+// MoE checkpoint). This in-process test uses NATIVE-PAGED as the cross-check
+// reference within the same late-argmax-tie tail tolerance the dense test uses:
+// paged is a DIFFERENT graph (paged attention), so a single late near-tie can
+// legitimately flip the final token(s) — we require agreement on everything
+// EARLIER than the short trailing region, which is exactly what a real
+// compiled-MoE bug (garbage from token 0 of decode, or a silent fallback) would
+// violate. We also write a MoE-specific compiled-flat artifact so a separate
+// `MLX_NO_COMPILE=1` `lfm2_eager_flat_vs_compiled_capture` invocation can diff
+// eager-flat against it for the strict fidelity verdict.
+//
+// Gated: runs ONLY when `LFM2_COMPILED_E2E=1` AND the checkpoint dir exists
+// (point `MLX_TEST_MODEL_PATH` at `.cache/models/lfm2.5-8b-a1b`). The 8B MoE
+// model is large; this test is slow by design.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_moe_compiled_flat_vs_paged_e2e_parity() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if no_compile_env() {
+        // Under MLX_NO_COMPILE=1 the flat path runs the EAGER C++ graph, so this
+        // compiled-engagement test is meaningless; the eager-flat capture test
+        // owns that mode. Skip cleanly.
+        eprintln!("[skip] MLX_NO_COMPILE=1 — compiled-engagement test is compiled-mode-only");
+        return;
+    }
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+
+    // F2 guard: this test MUST exercise a real MoE checkpoint. `resolve_source_model`
+    // is SHARED with the dense tests and DEFAULTS to the dense 1.2B path when
+    // `MLX_TEST_MODEL_PATH` is unset; without this guard a dense checkpoint passes
+    // here (call_delta / model_id / weight_count are all dense-satisfiable),
+    // leaving the Phase-3c bf16+flat sparse-MoE gate-lift entirely UNGUARDED.
+    // `Lfm2Config` has no `model_type` field, so read it from config.json directly;
+    // `num_experts` present is the robust structural fallback. A non-MoE checkpoint
+    // is an env SKIP (not a failure) so `LFM2_COMPILED_E2E=1` hosts without the 8B
+    // MoE checkpoint stay green; a wrong-but-MoE topology is a hard FAIL.
+    let cfg_raw = fs::read_to_string(src.join("config.json"))
+        .unwrap_or_else(|e| panic!("[moe-e2e] read config.json at {}: {e}", src.display()));
+    let cfg_json: serde_json::Value = serde_json::from_str(&cfg_raw)
+        .unwrap_or_else(|e| panic!("[moe-e2e] parse config.json at {}: {e}", src.display()));
+    let is_moe = cfg_json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
+        || cfg_json.get("num_experts").is_some();
+    if !is_moe {
+        eprintln!(
+            "[skip] lfm2_moe_compiled_flat_vs_paged_e2e_parity: MLX_TEST_MODEL_PATH must point \
+             at an lfm2_moe checkpoint (model_type=lfm2_moe / num_experts set); got non-MoE {}. \
+             This test must NOT validate against the dense default.",
+            src.display()
+        );
+        return;
+    }
+    assert_eq!(
+        cfg_json.get("num_experts").and_then(|x| x.as_i64()),
+        Some(32),
+        "[moe-e2e] expected lfm2.5-8b-a1b num_experts=32"
+    );
+    assert_eq!(
+        cfg_json.get("num_experts_per_tok").and_then(|x| x.as_i64()),
+        Some(4),
+        "[moe-e2e] expected lfm2.5-8b-a1b num_experts_per_tok=4"
+    );
+    assert_eq!(
+        cfg_json.get("num_dense_layers").and_then(|x| x.as_i64()),
+        Some(2),
+        "[moe-e2e] expected lfm2.5-8b-a1b num_dense_layers=2"
+    );
+    // Without pinning the layer DEPTH, a degenerate config with
+    // num_hidden_layers == num_dense_layers (e.g. 2/2) would satisfy EVERY assert
+    // above (model_type / num_experts / num_experts_per_tok / num_dense_layers)
+    // yet route ZERO layers through the sparse-MoE block — making this whole
+    // parity test vacuous. Pin the real depth (24 layers) and require strictly
+    // more total layers than dense ones so at least one sparse-MoE layer (here
+    // 24 - 2 = 22 of them) is genuinely exercised by the compiled forward.
+    let num_hidden_layers = cfg_json.get("num_hidden_layers").and_then(|x| x.as_i64());
+    let num_dense_layers = cfg_json.get("num_dense_layers").and_then(|x| x.as_i64());
+    assert_eq!(
+        num_hidden_layers,
+        Some(24),
+        "[moe-e2e] expected lfm2.5-8b-a1b num_hidden_layers=24"
+    );
+    assert!(
+        matches!((num_hidden_layers, num_dense_layers), (Some(h), Some(d)) if h > d),
+        "[moe-e2e] num_hidden_layers ({num_hidden_layers:?}) must exceed num_dense_layers \
+         ({num_dense_layers:?}) so at least one sparse-MoE layer is actually exercised; \
+         otherwise the bf16+flat sparse-MoE gate-lift is left entirely UNGUARDED"
+    );
+
+    eprintln!("[moe-e2e] checkpoint: {}", src.display());
+
+    let prompt = "What is the capital of France? Answer in one short sentence.";
+
+    // ---- Compiled flat MoE path (under test) -----------------------------
+    let flat = run_flat_single(&src, "moe-flat", prompt, N_NEW_TOKENS).await;
+
+    // ENGAGEMENT + GATE. delta == 0 => the MoE gate-lift failed and decode
+    // silently fell back to native forward() => hard fail.
+    assert!(
+        flat.call_delta >= MIN_COMPILED_CALL_DELTA,
+        "MoE COMPILED PATH DID NOT ENGAGE: forward_call_count delta = {} (model_id={}, \
+         weight_count={}). The Phase-3c MoE gate-lift did not register the compiled weights, \
+         or decode fell back to native forward().",
+        flat.call_delta,
+        flat.model_id,
+        flat.weight_count
+    );
+    assert_ne!(
+        flat.model_id, 0,
+        "MoE compiled model id was not published (registration suppressed?)"
+    );
+    // The MoE checkpoint registers far more tensors than the dense 1.2B
+    // (stacked experts + router gate + expert_bias across 22 MoE layers), so we
+    // don't pin an exact count — just require a non-trivial registry.
+    assert!(
+        flat.weight_count > 0,
+        "MoE compiled weight registry is empty"
+    );
+    eprintln!(
+        "[moe-e2e] MoE compiled-flat engaged: call_delta={} model_id={} weight_count={}",
+        flat.call_delta, flat.model_id, flat.weight_count
+    );
+
+    // Persist the compiled-flat MoE decode text so a SEPARATE `MLX_NO_COMPILE=1`
+    // invocation (eager-flat capture) can diff against it for the fidelity
+    // verdict. The filename is topology-qualified ("moe") so it can NEVER collide
+    // with the DENSE suite's `lfm2_e2e_compiled_flat.txt`: the dense compiled test
+    // (`lfm2_compiled_flat_vs_paged_e2e_parity`) writes that unqualified name and
+    // `lfm2_eager_flat_vs_compiled_capture` reads it, so a stale dense artifact
+    // sharing this name would otherwise be silently diffed against a MoE eager run
+    // (false pass/fail). The dense name is left untouched; only the MoE writer is
+    // qualified.
+    let art = artifact_path("lfm2_moe_e2e_compiled_flat.txt");
+    if let Err(e) = fs::write(&art, &flat.text) {
+        eprintln!("[warn] could not write MoE compiled-flat artifact {art:?}: {e}");
+    } else {
+        eprintln!(
+            "[moe-e2e] wrote MoE compiled-flat artifact: {}",
+            art.display()
+        );
+    }
+
+    // ---- Reference: native paged path ------------------------------------
+    let paged = run_paged_single(&src, "moe-paged", prompt, N_NEW_TOKENS).await;
+
+    // ---- Parity --------------------------------------------------------
+    // compiled-flat vs paged are DIFFERENT graphs, so a late argmax-tie flip is
+    // legitimate. Require agreement everywhere except the short trailing region;
+    // an EARLY divergence is a real compiled-MoE bug and fails the test.
+    let tail = tail_diff_bytes(&flat.text, &paged.text);
+    eprintln!(
+        "[moe-e2e] compiled-vs-paged: tail_diff={tail}B (common_prefix={}B)",
+        common_prefix_len(&flat.text, &paged.text)
+    );
+    assert_tail_only_divergence("moe-compiled-vs-paged", &flat.text, &paged.text);
+    assert_eq!(
+        flat.num_tokens, paged.num_tokens,
+        "MoE num_tokens mismatch: compiled={} paged={}",
+        flat.num_tokens, paged.num_tokens
+    );
+    assert_eq!(
+        flat.finish_reason, paged.finish_reason,
+        "MoE finish_reason mismatch: compiled={} paged={}",
+        flat.finish_reason, paged.finish_reason
+    );
+
+    eprintln!(
+        "[PASS] MoE compiled-flat engaged ({} calls) and agrees with paged within \
+         tail tolerance ({tail}B <= {TAIL_TOLERANCE_BYTES}B)",
+        flat.call_delta
+    );
+}

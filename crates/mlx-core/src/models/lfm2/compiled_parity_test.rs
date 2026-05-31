@@ -1045,3 +1045,187 @@ fn compiled_moe_decode_seq_matches_native() {
         "compiled MoE decode_fn must match native [conv(dense),attn(MoE),conv(MoE)] stack: max_abs={d}"
     );
 }
+
+/// DECISIVE H1/H2 experiment: COMPILED-vs-EAGER synthetic MoE.
+///
+/// Drives the process-global `compiled_lfm2_decode()` (NOT eager
+/// `lfm2_decode_fn`) with a FIXED 3-layer synthetic MoE stack and compares the
+/// last-step logits against the EAGER run of the SAME fn on the SAME weights.
+/// The ONLY variable is `mlx::core::compile`. A nonzero diff isolates a compile
+/// effect on the MoE FFN path.
+///
+/// (1) WELL-SEPARATED router (`expert_bias` gaps of 4.0 dominate the <1.0
+///     softmax spread -> top-k selection is bias-ranked, input-independent, NO
+///     near-ties). compiled == eager here => `compile()` selects and computes
+///     the MoE correctly (rules out a structural compile bug on this stack).
+/// (2) NEAR-TIE router (`expert_bias` gaps of 1e-4, E=32/k=4 fan-out matching
+///     the real 8B model -> selection decided by softmax(routing) near-ties,
+///     FP-fusion sensitive). Diagnostic: a nonzero diff here positively
+///     confirms the near-tie selection-flip mechanism (H2).
+///
+/// Runs in its OWN test so its fixed synthetic topology bakes into the compiled
+/// static cleanly. `WS_TOL`, `NT_MIN_DIVERGENCE`, `ASSERT_NT_GT_WS` env vars
+/// allow bisecting the magnitudes from the command line.
+#[test]
+fn compiled_moe_vs_eager_well_separated_is_clean() {
+    let _guard = COMPILED_WEIGHTS_RWLOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let seed = 0x10F2_3C0Du64;
+
+    // (1) Well-separated: compiled MUST match eager.
+    let mut ws_maxabs = f32::NAN;
+    let rc = unsafe { mlx_sys::mlx_lfm2_probe_moe_compiled_vs_eager(seed, 1, &mut ws_maxabs) };
+    assert_eq!(rc, 0, "well-separated probe failed (rc={rc})");
+    eprintln!("[H1/H2] well-separated compiled-vs-eager max_abs = {ws_maxabs:e}");
+    let ws_tol: f32 = std::env::var("WS_TOL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2e-2);
+    assert!(
+        ws_maxabs < ws_tol,
+        "well-separated compiled MoE diverged from eager: max_abs={ws_maxabs} \
+         (>= {ws_tol} would indicate a real compile bug / H1)"
+    );
+
+    // (2) Near-tie: diagnostic. Records the diff to characterize the
+    // selection-flip mechanism. Must at least run cleanly.
+    let mut nt_maxabs = f32::NAN;
+    let rc2 = unsafe { mlx_sys::mlx_lfm2_probe_moe_compiled_vs_eager(seed, 0, &mut nt_maxabs) };
+    assert_eq!(rc2, 0, "near-tie probe failed (rc={rc2})");
+    eprintln!("[H1/H2] near-tie compiled-vs-eager max_abs = {nt_maxabs:e}");
+
+    // Optional positive confirmation of the selection-flip mechanism.
+    if let Some(min_div) = std::env::var("NT_MIN_DIVERGENCE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        assert!(
+            nt_maxabs >= min_div,
+            "near-tie divergence {nt_maxabs} < required {min_div}"
+        );
+    }
+    if std::env::var("ASSERT_NT_GT_WS").is_ok() {
+        assert!(
+            nt_maxabs > ws_maxabs,
+            "near-tie {nt_maxabs} not greater than well-separated {ws_maxabs}"
+        );
+    }
+}
+
+/// A->B MODEL-SWAP regression test — directly locks in the compile-epoch
+/// invalidation fix for the stale-compiled-closure (frozen weight-constant)
+/// hazard.
+///
+/// The compiled `lfm2_decode_fn` graph captures its weight CONSTANTS at trace
+/// time. Before the epoch fix, the closure was an init-once `static auto`, so a
+/// SECOND lfm2 model that re-took the compiled path with the same decode-graph
+/// shapes would silently replay the FIRST model's frozen weights. The C++ probe
+/// builds two distinct synthetic MoE models A and B (same fixed topology,
+/// different seeded weights) in one process, runs A compiled (caching the
+/// graph), then re-registers B and bumps the compile epoch
+/// (`mlx_lfm2_invalidate_compiled`, mirroring `register_weights_with_cpp`), then
+/// runs B both compiled and eager.
+///
+/// Assertions:
+///   * `b_comp_vs_b_eager < 2e-2` — B's compiled output matches B's EAGER output
+///     (the closure recompiled against B's live constants). WITHOUT the epoch
+///     bump this would equal `b_comp_vs_a_comp` (A's frozen graph replayed) and
+///     blow past tolerance — that is the regression this test guards.
+///   * `b_comp_vs_a_comp` is LARGE (well above tolerance) — proves A and B are
+///     genuinely different models, so a stale-graph reuse is distinguishable
+///     from two coincidentally-equal models (without this the first assertion
+///     would be vacuous).
+///   * `a_comp_vs_a_eager < 2e-2` — compile is faithful for A too (rules out a
+///     pre-existing compile bug masking the result).
+///
+/// Holds `COMPILED_WEIGHTS_RWLOCK` (write, poison-recovered) per the probe
+/// contract (the probe is DESTRUCTIVE on the shared `g_weights()` map).
+#[test]
+fn compiled_moe_ab_model_swap_recompiles() {
+    let _guard = COMPILED_WEIGHTS_RWLOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // Distinct seeds => distinct A and B weights.
+    let seed_a = 0x1111_2222_3333_4444u64;
+    let seed_b = 0xAAAA_BBBB_CCCC_DDDDu64;
+
+    // F3 soundness: PRE-SEED a compiled closure at the current epoch BEFORE the
+    // measured probe so the A-side stale-closure hazard manifests
+    // DETERMINISTICALLY. The sibling `compiled_vs_eager` probe registers its own
+    // synthetic weights, runs one COMPILED decode (leaving `g_lfm2_compiled`
+    // cached at the current epoch), then clears the weights — it does NOT bump
+    // the compile epoch. So the measured A->B probe below re-enters with a stale
+    // closure already cached at this epoch: WITHOUT the MODEL-A `build_model`
+    // epoch bump (the F3 production-style fix), MODEL A's compiled run would reuse
+    // that stale closure and `a_comp_vs_a_eager` would blow past PARITY_TOL — i.e.
+    // removing the MODEL-A bump makes THIS test fail. WITH the bump, MODEL A is
+    // epoch-fresh and all three deltas hold. The sibling probe (NOT the A->B
+    // probe) is used so the measured run's A/B-distinguishability is untouched.
+    let mut warm = f32::NAN;
+    let warm_rc = unsafe { mlx_sys::mlx_lfm2_probe_moe_compiled_vs_eager(seed_a, 1, &mut warm) };
+    assert_eq!(
+        warm_rc, 0,
+        "compiled-vs-eager pre-seed probe failed (rc={warm_rc})"
+    );
+
+    let mut b_comp_vs_b_eager = f32::NAN;
+    let mut b_comp_vs_a_comp = f32::NAN;
+    let mut a_comp_vs_a_eager = f32::NAN;
+    let rc = unsafe {
+        mlx_sys::mlx_lfm2_probe_moe_ab_swap(
+            seed_a,
+            seed_b,
+            &mut b_comp_vs_b_eager,
+            &mut b_comp_vs_a_comp,
+            &mut a_comp_vs_a_eager,
+        )
+    };
+    assert_eq!(rc, 0, "A->B swap probe failed (rc={rc})");
+    eprintln!(
+        "[A->B swap] b_comp_vs_b_eager={b_comp_vs_b_eager:e} \
+         b_comp_vs_a_comp={b_comp_vs_a_comp:e} a_comp_vs_a_eager={a_comp_vs_a_eager:e}"
+    );
+
+    // The models must actually differ, or the regression assertion below is
+    // vacuous: reusing A's stale graph would have to produce a measurably wrong
+    // answer for B. Require the A/B gap to be well clear of the parity tol.
+    assert!(
+        b_comp_vs_a_comp > 1e-1,
+        "A and B are too close to distinguish a stale-graph reuse \
+         (b_comp_vs_a_comp={b_comp_vs_a_comp}); the test cannot prove the fix"
+    );
+
+    // Compiled-vs-eager parity bound — the SAME 2e-2 the sibling lfm2 parity
+    // gates use; we do NOT weaken it. With the per-epoch-`fun_id` retrace in
+    // place (the C++ `detail::compile` path) the freshly-traced B graph captures
+    // B's LIVE constants, so empirically BOTH `a_comp_vs_a_eager` AND
+    // `b_comp_vs_b_eager` come out at EXACTLY 0.0 (eager and compiled run the
+    // identical op DAG on the identical constants). A real stale-closure
+    // regression replays A's frozen graph for B, pushing `b_comp_vs_b_eager` up
+    // to ~`b_comp_vs_a_comp` (~0.67 here) — ~34x over this tolerance — so the
+    // regression is caught decisively.
+    const PARITY_TOL: f32 = 2e-2;
+
+    // A's compile is faithful (no pre-existing compile bug).
+    assert!(
+        a_comp_vs_a_eager < PARITY_TOL,
+        "model A compiled diverged from A eager: max_abs={a_comp_vs_a_eager} \
+         (a pre-existing compile bug would invalidate this regression test)"
+    );
+
+    // THE FIX: B's compiled output matches B's EAGER output, i.e. the closure
+    // RE-TRACED against B's live constants. Without the epoch bump (or with the
+    // public `compile`, which replays the address-keyed cached trace) this would
+    // instead equal b_comp_vs_a_comp (A's frozen graph replayed) — far above
+    // PARITY_TOL — so this assertion is what fails on a regression.
+    assert!(
+        b_comp_vs_b_eager < PARITY_TOL,
+        "STALE COMPILED CLOSURE: model B compiled output diverged from B eager \
+         (max_abs={b_comp_vs_b_eager}); the compiled graph froze model A's weight \
+         constants and was reused for B (b_comp_vs_a_comp={b_comp_vs_a_comp}). \
+         The compile-epoch invalidation (mlx_lfm2_invalidate_compiled) did not take."
+    );
+}
