@@ -62,7 +62,6 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 // | `MLX_MTP_VERIFY_ASYNC_EVAL`   | ON      | W6.9       | opt-OUT       |
 // | `MLX_MTP_DEFER_VERIFY_HIDDEN` | ON      | W6.21      | opt-OUT       |
 // | `MLX_MTP_HISTORY_POLICY`      | committed | W6.24    | opt-IN window |
-// | `MLX_MTP_FUSED_DRAFT`         | OFF     | W6.18      | opt-IN        |
 // | `MLX_MTP_SPARSE_ACCEPT`       | ON      | W6.19      | opt-OUT       |
 // | `MLX_MTP_BATCH_TARGET_ARRAYS` | ON      | W6.22      | opt-OUT       |
 // | `MLX_MTP_TRACE_ACCEPTANCE`    | OFF     | diagnostics| opt-IN        |
@@ -80,10 +79,6 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 //   - `MLX_MTP_CHAINED_CYCLES` (W6.5) — CROSS-CYCLE hidden-state export.
 //     Each cycle's `verify_hidden[K]` slice seeds the next cycle's first
 //     MTP draft; see `eval_step_with_chained_hidden` below.
-//   - `MLX_MTP_FUSED_DRAFT` (W6.18) — WITHIN-CYCLE draft-step fusion.
-//     All D draft steps within a single cycle compile into one
-//     `mlx::core::compile`d graph; see `MtpOps::fused_draft` and
-//     `mlx_qwen35_mtp_draft_fused_compiled` in the C++ FFI.
 //
 // Interaction notes:
 //   - `MLX_MTP_USE_TAPE_REPLAY=0` falls back to the W6 Bug #4 K+1 replay
@@ -110,13 +105,6 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 //   - `MLX_MTP_VERIFY_ASYNC_EVAL=1` overlaps verify dispatch with the
 //     accept loop's CPU-side graph construction; composes cleanly with
 //     all other flags.
-//   - `MLX_MTP_FUSED_DRAFT=1` routes all D draft steps through one
-//     compiled graph. Default OFF because the current smoke target
-//     (qwen3.6-27b-nvfp4-mtp, depth=3, M3 Max) shows no measured win
-//     — the per-step `tok.eval()` barriers do not serialize into 3 ×
-//     30–50 ms stalls on this hardware. Infrastructure is kept opt-in
-//     pending the Step-A-bypass follow-up where draft syncs are
-//     expected to dominate the cycle wall.
 
 // W6.6 — Tape-replay rollback for GDN linear-attention.
 //
@@ -431,42 +419,6 @@ pub(crate) fn mtp_prompt_history_selection(prompt_len: usize) -> MtpPromptHistor
     resolve_mtp_prompt_history_selection(policy, prompt_len, window, threshold)
 }
 
-// W6.18 — Fused within-cycle draft graph.
-//
-// Opt-in: `MLX_MTP_FUSED_DRAFT=1` (or `true` / `on`). When ON AND the
-// caller installed an `MtpOps::fused_draft` closure AND temperature is
-// effectively zero, `run_mtp_cycle_inner` routes all D draft steps
-// through ONE `mlx::core::compile`d graph (the
-// `mlx_qwen35_mtp_draft_fused_compiled` FFI) instead of looping the
-// per-step `draft_step` closure D times.
-//
-// Default OFF: the current smoke target (qwen3.6-27b-nvfp4-mtp,
-// depth=3, M3 Max) measured 0.61× → 0.60× AR ratio — no observable
-// win. Per-cycle wall-time instrumentation shows the fused FFI runs
-// all D=3 draft steps in ~33 ms total, vs the per-step path's
-// ~30–42 ms total — equivalent. The per-step `tok.eval()` barriers do
-// not serialize into 3 × 30–50 ms stalls (which the task brief
-// assumed, extrapolating from a 4B-bf16 measurement); MLX already
-// overlaps CPU work between sync points. The remaining MTP overhead
-// vs AR lives in Step A + batched verify + accept loop, not in
-// drafting. The infrastructure is preserved opt-in for a future
-// Step-A-bypass follow-up where draft syncs are expected to pay off.
-//
-// Naming: independent of the W6.5 `MLX_MTP_CHAINED_CYCLES` knob; see
-// the "Naming disambiguation" block in the inventory above.
-//
-// The env var is read once per process and cached.
-pub(crate) fn mtp_fused_draft_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_FUSED_DRAFT") {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-        }
-        Err(_) => false, // default OFF — opt-in until a target shows perf win
-    })
-}
-
 // W6.19 — Accept-loop sync collapse via on-device sparse top-K /
 // batched argmax (MTPLX-style).
 //
@@ -503,6 +455,56 @@ pub(crate) fn mtp_sparse_accept_enabled() -> bool {
         }
         Err(_) => true,
     })
+}
+
+// Indirection over the sparse-accept gate so tests can drive the
+// production `use_sparse_accept` commit path hermetically — independent
+// of the process-wide `MLX_MTP_SPARSE_ACCEPT` env var / OnceLock cache.
+// In non-test builds this is a zero-cost `#[inline]` passthrough, so the
+// decode path's behavior and codegen are identical to calling
+// `mtp_sparse_accept_enabled()` directly.
+#[cfg(not(test))]
+#[inline]
+fn sparse_accept_gate() -> bool {
+    mtp_sparse_accept_enabled()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`sparse_accept_gate`]. `None` defers to the
+    /// real env-backed [`mtp_sparse_accept_enabled`]; `Some(b)` forces the
+    /// gate so a test deterministically exercises the intended accept path.
+    static TEST_FORCE_SPARSE_ACCEPT: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn sparse_accept_gate() -> bool {
+    TEST_FORCE_SPARSE_ACCEPT
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(mtp_sparse_accept_enabled)
+}
+
+/// RAII guard that forces [`sparse_accept_gate`] for the current thread and
+/// restores the prior value on drop (panic-safe). Used by the C2 T=0 safety
+/// test to guarantee it drives the production sparse-accept commit path
+/// regardless of `MLX_MTP_SPARSE_ACCEPT`.
+#[cfg(test)]
+pub(crate) struct ForceSparseAcceptGuard(Option<bool>);
+
+#[cfg(test)]
+impl ForceSparseAcceptGuard {
+    pub(crate) fn force(value: bool) -> Self {
+        let prev = TEST_FORCE_SPARSE_ACCEPT.with(|c| c.replace(Some(value)));
+        ForceSparseAcceptGuard(prev)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceSparseAcceptGuard {
+    fn drop(&mut self) {
+        TEST_FORCE_SPARSE_ACCEPT.with(|c| c.set(self.0));
+    }
 }
 
 // W6.22 — MTPLX-style stochastic accept fast path.
@@ -2168,38 +2170,12 @@ where
     /// above for the contract. Pass a no-op closure to keep the
     /// cycle-history policy (MoE path, tests).
     pub commit_mtp: CM,
-    /// W6.18 — Optional fused-draft callback. When `Some(...)` AND
-    /// `MLX_MTP_FUSED_DRAFT=1` AND `run_mtp_cycle_inner` decides to use
-    /// the fused path (currently gated on `temperature <= 1e-6`), all D
-    /// draft steps run inside ONE compiled graph via this closure.
-    ///
-    /// "Fused" refers to the WITHIN-CYCLE fusion of D draft steps —
-    /// independent of the W6.5 CROSS-CYCLE `MLX_MTP_CHAINED_CYCLES`
-    /// concept (verify-hidden export across cycles).
-    ///
-    /// Contract:
-    ///
-    /// * Inputs: `prev_hidden` / `prev_emb` (`[1, 1, hidden]` bf16),
-    ///   embedding_weight (`[vocab, hidden]`), depth ∈ {1..5}.
-    /// * Outputs: `(draft_ids, draft_probs)` where `draft_ids` is `[D]`
-    ///   int32 (drafted token IDs in step order) and `draft_probs` is
-    ///   `[D, vocab]` fp32 (per-step softmax probs). At T<=1e-6 the
-    ///   per-step probs are unused numerically — `accept_with_residual`
-    ///   only reads the draft IDs in the greedy path.
-    ///
-    /// `None` disables fusion and forces the per-step `draft_step`
-    /// loop (legacy path; required for tests and MoE).
-    pub fused_draft:
-        Option<Box<dyn FnMut(&MxArray, &MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>>>,
     /// Phase C — set `true` on the dense path where `commit_mtp` runs
     /// the real committed-history commit. When `true`,
-    /// `run_mtp_cycle_inner` force-disables the fused-draft path: the
-    /// fused draft graph masks out the committed prefix `[0,
-    /// committed_len)` (its mask is `offset_arr <= pos <= step_offset`),
-    /// which is incompatible with committed-history. The per-step draft
-    /// path uses the correct `chain_start <= pos <= offset` mask with
-    /// `chain_start = 0`. MoE / tests leave this `false` (legacy
-    /// cycle-history policy — fused draft stays opt-in there).
+    /// `run_mtp_cycle_inner` uses the per-step `draft_step` path whose
+    /// attention mask is `chain_start <= pos <= offset` with
+    /// `chain_start = 0` — correct under committed-history. MoE / tests
+    /// leave this `false` (legacy cycle-history policy).
     pub committed_history_active: bool,
     pub rollback_unemitted: RU,
 }
@@ -2349,29 +2325,7 @@ where
     // (cheap, refcounted) handle now before that happens.
     let commit_seed_hidden = prev_hidden_in.clone();
 
-    // Step 1: D draft steps. Either fused into one compiled graph
-    // (W6.18 fused path) or the legacy per-step loop.
-    //
-    // Fused path gating:
-    //   1. `MLX_MTP_FUSED_DRAFT=1` — opt-in env var (default OFF; see
-    //      `mtp_fused_draft_enabled` for rationale).
-    //   2. `ops.fused_draft` is `Some(...)` — the caller installed
-    //      the FFI dispatch (production dense path does; MoE / tests
-    //      pass None).
-    //   3. `temperature <= 1e-6` — at T=0 (greedy) the per-step Rust
-    //      path collapses to argmax via `sampling::sample` (see
-    //      `compiled_sample_full`); the fused graph also argmaxes
-    //      on-device, so the drafted IDs are byte-equivalent.
-    //      At T>0 the per-step path stochastically samples (consuming
-    //      MLX's global RNG between steps); the fused graph uses
-    //      argmax, which is a SEMANTIC change for the drafter only —
-    //      verify is still the ground truth, so emitted tokens still
-    //      come from the target distribution per Leviathan-Chen, but
-    //      acceptance rate may differ. We keep T>0 on the per-step
-    //      path to preserve the existing contract.
-    //
-    // On any fused-path error we fall back to the per-step loop in
-    // the same cycle (the eager Rust path is the safety net).
+    // Step 1: D draft steps via the per-step `draft_step` loop.
     profiler.begin("mtp_draft_total");
     let temperature = params
         .sampling_config
@@ -2388,29 +2342,12 @@ where
     let penalties_no_op = params.repetition_penalty == 1.0
         && params.presence_penalty == 0.0
         && params.frequency_penalty == 0.0;
-    let use_sparse_accept = mtp_sparse_accept_enabled() && temperature <= 1e-6 && penalties_no_op;
+    let use_sparse_accept = sparse_accept_gate() && temperature <= 1e-6 && penalties_no_op;
     let use_sparse_stochastic_accept = mtp_batch_target_arrays_enabled()
         && temperature > 1e-6
         && penalties_no_op
         && sampling::sparse_distribution_supported(&sampling_cfg)
         && sampling::sparse_distribution_supported(&draft_sampling_cfg);
-    // Phase C — force-disable the fused-draft path when committed-history
-    // is active. The fused draft graph builds its attention mask as
-    // `offset_arr <= pos <= step_offset`, which EXCLUDES the persistent
-    // committed prefix `[0, committed_len)` — drafts would attend only
-    // their own in-cycle chain and ignore the committed history the
-    // whole policy exists to exploit. The per-step `draft_step` path
-    // uses the correct `chain_start <= pos <= offset` mask (with
-    // `chain_start = 0` under committed-history), so route through it.
-    // Fused draft is opt-in, OFF by default, and known to regress on
-    // this target anyway — disabling it here costs nothing.
-    let use_ev_depth_gate = ev_depth_policy.is_some();
-    let try_fused = mtp_fused_draft_enabled()
-        && ops.fused_draft.is_some()
-        && temperature <= 1e-6
-        && !ops.committed_history_active
-        && !use_ev_depth_gate;
-
     let mut prev_hidden = prev_hidden_in;
     let mut prev_emb = prev_emb_in;
     let mut draft_ids: Vec<i32> = Vec::with_capacity(depth);
@@ -2425,155 +2362,109 @@ where
     } else {
         Vec::new()
     };
-
-    let mut used_fused = false;
-    if try_fused && let Some(ref mut fused) = ops.fused_draft {
-        match fused(&prev_hidden, &prev_emb, embedding_weight, depth) {
-            Ok((ids_arr, probs_arr)) => {
-                // ids_arr is `[depth]` int32; eval and read once.
-                ids_arr.eval();
-                for i in 0..depth {
-                    draft_ids.push(ids_arr.item_at_int32(i)?);
-                }
-                // probs_arr is `[depth, vocab]` fp32. Slice into per-step
-                // `[vocab]` rows; we do NOT eval the slices here — at
-                // T=0 `accept_with_residual` ignores p_draft numerically
-                // (only reads draft_id), so the lazy slice never gets
-                // materialised by Metal. This avoids a per-position
-                // eval barrier that would defeat the very sync collapse
-                // this task is about. At T>0 the fused path is gated
-                // off (try_fused=false), so this code is unreachable.
-                if !use_sparse_accept && !use_sparse_stochastic_accept {
-                    let vocab = probs_arr.shape_at(1)?;
-                    for i in 0..depth {
-                        let row = probs_arr.slice(&[i as i64, 0], &[(i + 1) as i64, vocab])?;
-                        // Squeeze to `[vocab]` for the per-position
-                        // `accept_with_residual` contract.
-                        draft_probs.push(row.squeeze(Some(&[0]))?);
-                    }
-                }
-                used_fused = true;
-            }
-            Err(e) => {
-                // W6.18 — fused path failed (init not done, C++
-                // exception, shape mismatch). Log + fall back to
-                // the per-step loop so the cycle still completes.
-                tracing::warn!(
-                    target: "mlx_core::mtp::fused",
-                    error = %e.reason,
-                    "W6.18 fused draft FFI failed; falling back to per-step path"
-                );
-                draft_ids.clear();
-                draft_probs.clear();
-            }
-        }
-    }
-
-    if !used_fused {
-        // `step_input_id` is the token whose hidden/embedding seed this
-        // draft step: `last_committed_id` for step 0, then each prior
-        // drafted id. Logged per step so a debug run can reconstruct
-        // the full draft chain.
-        let mut step_input_id = last_committed_id as i32;
-        for step in 0..depth {
-            let (h_next, draft_logits) = (ops.draft_step)(&prev_hidden, &prev_emb)?;
-            let logits_1d = if use_sparse_accept {
-                None
-            } else {
-                // draft_logits is [1, vocab]; squeeze to [vocab] for the
-                // probability distribution consumed by accept/reject.
-                Some(draft_logits.squeeze(Some(&[0]))?)
-            };
-            let probs = if use_sparse_accept || use_sparse_stochastic_accept {
-                None
-            } else {
-                Some(
-                    Activations::softmax(
-                        logits_1d.as_ref().ok_or_else(|| {
-                            Error::from_reason(
-                                "MTP draft logits_1d unexpectedly None (sparse-accept gating mismatch)",
-                            )
-                        })?,
-                        Some(-1),
-                    )?
-                    .astype(DType::Float32)?,
-                )
-            };
-            let mut sparse_draft = None;
-            let tok_id = if use_sparse_stochastic_accept {
-                let sparse_rows = sampling::sparse_distributions_from_logits(
+    // `step_input_id` is the token whose hidden/embedding seed this
+    // draft step: `last_committed_id` for step 0, then each prior
+    // drafted id. Logged per step so a debug run can reconstruct
+    // the full draft chain.
+    let mut step_input_id = last_committed_id as i32;
+    for step in 0..depth {
+        let (h_next, draft_logits) = (ops.draft_step)(&prev_hidden, &prev_emb)?;
+        let logits_1d = if use_sparse_accept {
+            None
+        } else {
+            // draft_logits is [1, vocab]; squeeze to [vocab] for the
+            // probability distribution consumed by accept/reject.
+            Some(draft_logits.squeeze(Some(&[0]))?)
+        };
+        let probs = if use_sparse_accept || use_sparse_stochastic_accept {
+            None
+        } else {
+            Some(
+                Activations::softmax(
                     logits_1d.as_ref().ok_or_else(|| {
                         Error::from_reason(
                             "MTP draft logits_1d unexpectedly None (sparse-accept gating mismatch)",
                         )
                     })?,
-                    &draft_sampling_cfg,
+                    Some(-1),
                 )?
-                .ok_or_else(|| {
+                .astype(DType::Float32)?,
+            )
+        };
+        let mut sparse_draft = None;
+        let tok_id = if use_sparse_stochastic_accept {
+            let sparse_rows = sampling::sparse_distributions_from_logits(
+                logits_1d.as_ref().ok_or_else(|| {
                     Error::from_reason(
-                        "MTP sparse stochastic draft path became ineligible after gating",
+                        "MTP draft logits_1d unexpectedly None (sparse-accept gating mismatch)",
                     )
-                })?;
-                let draft_dist = sparse_rows.row_owned(0)?;
-                let sampled = draft_dist.as_row().sample(rng)?;
-                sparse_draft = Some(draft_dist);
-                sampled
-            } else {
-                // Sample the drafted token using the same sampling pipeline
-                // the main path uses — drafter and verifier must agree on
-                // their proposal distribution for Leviathan-Chen.
-                let tok = sampling::sample(&draft_logits, params.sampling_config)?;
-                tok.eval();
-                tok.item_at_int32(0)?
-            };
-            let draft_metrics = crate::models::qwen3_5::adaptive_depth::DraftMetrics {
-                top1_prob_topk: sparse_draft
-                    .as_ref()
-                    .and_then(|dist| dist.as_row().top_entry().map(|(_, prob)| prob)),
-            };
+                })?,
+                &draft_sampling_cfg,
+            )?
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "MTP sparse stochastic draft path became ineligible after gating",
+                )
+            })?;
+            let draft_dist = sparse_rows.row_owned(0)?;
+            let sampled = draft_dist.as_row().sample(rng)?;
+            sparse_draft = Some(draft_dist);
+            sampled
+        } else {
+            // Sample the drafted token using the same sampling pipeline
+            // the main path uses — drafter and verifier must agree on
+            // their proposal distribution for Leviathan-Chen.
+            let tok = sampling::sample(&draft_logits, params.sampling_config)?;
+            tok.eval();
+            tok.item_at_int32(0)?
+        };
+        let draft_metrics = crate::models::qwen3_5::adaptive_depth::DraftMetrics {
+            top1_prob_topk: sparse_draft
+                .as_ref()
+                .and_then(|dist| dist.as_row().top_entry().map(|(_, prob)| prob)),
+        };
+        tracing::trace!(
+            target: "mlx_core::mtp::draft",
+            step,
+            input_id = step_input_id,
+            drafted_id = tok_id,
+            "MTP per-step draft"
+        );
+        draft_ids.push(tok_id);
+        if let Some(sparse_draft) = sparse_draft {
+            draft_sparse_probs.push(sparse_draft);
+        }
+        if let Some(probs) = probs {
+            draft_probs.push(probs);
+        }
+        // Keep the draft step's hidden/embedding handles alive even if the
+        // EV gate stops here. The fixed-depth path always retains these
+        // handles through the cycle tail; matching that lifetime matters
+        // for MLX's lazy compiled cache writes.
+        prev_hidden = h_next;
+        let id_arr = A::from_int32(&[tok_id], &[1])?;
+        let emb_2d = embedding_weight.take(&id_arr, 0)?; // [1, hidden]
+        let hidden = emb_2d.shape_at(1)?;
+        prev_emb = emb_2d.reshape(&[1, 1, hidden])?;
+        step_input_id = tok_id;
+        if let Some(policy) = ev_depth_policy.as_mut()
+            && draft_ids.len() < depth
+        {
+            profiler.begin("mtp_draft_gate");
+            let decision =
+                policy.should_continue_after_draft(draft_ids.len(), depth, draft_metrics);
+            profiler.end();
             tracing::trace!(
-                target: "mlx_core::mtp::draft",
-                step,
-                input_id = step_input_id,
-                drafted_id = tok_id,
-                "MTP per-step draft"
+                target: "mlx_core::mtp::adaptive",
+                drafted_depth = draft_ids.len(),
+                next_depth = decision.next_depth,
+                expected_extra_accept = decision.expected_extra_accept,
+                required_extra_accept = decision.required_extra_accept,
+                continue_drafting = decision.continue_drafting,
+                "MTP EV depth gate"
             );
-            draft_ids.push(tok_id);
-            if let Some(sparse_draft) = sparse_draft {
-                draft_sparse_probs.push(sparse_draft);
-            }
-            if let Some(probs) = probs {
-                draft_probs.push(probs);
-            }
-            // Keep the draft step's hidden/embedding handles alive even if the
-            // EV gate stops here. The fixed-depth path always retains these
-            // handles through the cycle tail; matching that lifetime matters
-            // for MLX's lazy compiled cache writes.
-            prev_hidden = h_next;
-            let id_arr = A::from_int32(&[tok_id], &[1])?;
-            let emb_2d = embedding_weight.take(&id_arr, 0)?; // [1, hidden]
-            let hidden = emb_2d.shape_at(1)?;
-            prev_emb = emb_2d.reshape(&[1, 1, hidden])?;
-            step_input_id = tok_id;
-            if let Some(policy) = ev_depth_policy.as_mut()
-                && draft_ids.len() < depth
-            {
-                profiler.begin("mtp_draft_gate");
-                let decision =
-                    policy.should_continue_after_draft(draft_ids.len(), depth, draft_metrics);
-                profiler.end();
-                tracing::trace!(
-                    target: "mlx_core::mtp::adaptive",
-                    drafted_depth = draft_ids.len(),
-                    next_depth = decision.next_depth,
-                    expected_extra_accept = decision.expected_extra_accept,
-                    required_extra_accept = decision.required_extra_accept,
-                    continue_drafting = decision.continue_drafting,
-                    "MTP EV depth gate"
-                );
-                if !decision.continue_drafting {
-                    break;
-                }
+            if !decision.continue_drafting {
+                break;
             }
         }
     }
@@ -2589,7 +2480,6 @@ where
         target: "mlx_core::mtp",
         depth,
         effective_depth,
-        used_fused,
         draft_ids = ?draft_ids,
         "MTP draft phase complete"
     );
@@ -4450,7 +4340,6 @@ mod mtp_cycle_tests {
                 begin_cycle: |_| {},
                 snapshot_main_linear: || {},
                 restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
-                fused_draft: None,
                 commit_mtp: |_: MtpCommitAnchor,
                              _: &MxArray,
                              _: &MxArray,
@@ -4522,11 +4411,6 @@ mod mtp_cycle_tests {
             begin_cycle: |_| {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
-            // W6.18 — tests exercise the per-step `draft_step` path.
-            // The fused-draft FFI is dense-only and the tests don't
-            // need to validate it (cycle-level acceptance semantics
-            // are path-agnostic).
-            fused_draft: None,
             commit_mtp: |_: MtpCommitAnchor,
                          _: &MxArray,
                          _: &MxArray,
@@ -4619,7 +4503,6 @@ mod mtp_cycle_tests {
             begin_cycle: |_| {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
-            fused_draft: None,
             commit_mtp: |_: MtpCommitAnchor,
                          _: &MxArray,
                          _: &MxArray,
@@ -4710,11 +4593,6 @@ mod mtp_cycle_tests {
             begin_cycle: |_| {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
-            // W6.18 — tests exercise the per-step `draft_step` path.
-            // The fused-draft FFI is dense-only and the tests don't
-            // need to validate it (cycle-level acceptance semantics
-            // are path-agnostic).
-            fused_draft: None,
             commit_mtp: |_: MtpCommitAnchor,
                          _: &MxArray,
                          _: &MxArray,
@@ -4801,7 +4679,6 @@ mod mtp_cycle_tests {
             begin_cycle: |_| {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
-            fused_draft: None,
             commit_mtp: |_: MtpCommitAnchor,
                          _: &MxArray,
                          _: &MxArray,
@@ -4887,11 +4764,6 @@ mod mtp_cycle_tests {
             begin_cycle: |_| {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
-            // W6.18 — tests exercise the per-step `draft_step` path.
-            // The fused-draft FFI is dense-only and the tests don't
-            // need to validate it (cycle-level acceptance semantics
-            // are path-agnostic).
-            fused_draft: None,
             commit_mtp: |_: MtpCommitAnchor,
                          _: &MxArray,
                          _: &MxArray,
@@ -4993,11 +4865,6 @@ mod mtp_cycle_tests {
             begin_cycle: |_| {},
             snapshot_main_linear: || {},
             restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
-            // W6.18 — tests exercise the per-step `draft_step` path.
-            // The fused-draft FFI is dense-only and the tests don't
-            // need to validate it (cycle-level acceptance semantics
-            // are path-agnostic).
-            fused_draft: None,
             commit_mtp: |_: MtpCommitAnchor,
                          _: &MxArray,
                          _: &MxArray,
@@ -5126,6 +4993,294 @@ mod mtp_cycle_tests {
             commit,
             (vec![6u32], 0),
             "chained all-reject must use the new one-token commit path"
+        );
+    }
+
+    // ---- C2: EV intra-cycle deepen — T=0 byte-equivalence gate ----
+
+    /// T=0 (greedy / `use_sparse_accept`) params. Penalties stay at
+    /// their no-op defaults so `penalties_no_op == true`, and
+    /// `temperature == 0.0` drives the sparse-accept argmax commit path
+    /// (chat_common.rs:2308). This is the production path that decides
+    /// committed tokens at T=0, and the exact path the EV deepen gate
+    /// (allow_deepen) controls.
+    fn t0_params() -> super::ChatParams {
+        extract_chat_params(&ChatConfig {
+            max_new_tokens: None,
+            temperature: Some(0.0),
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            reasoning_effort: None,
+            thinking_token_budget: None,
+            include_reasoning: None,
+            report_performance: None,
+            reuse_cache: None,
+            enable_mtp: Some(true),
+            mtp_depth: Some(3),
+            mtp_adaptive_depth: Some(true),
+        })
+    }
+
+    /// Verify-step closure backed by a FIXED per-position target table.
+    /// For whatever `depth` it is invoked with it returns
+    /// `[1, depth+1, vocab]` logits peaked at `target_table[i]` for each
+    /// position `i in 0..=depth`. Crucially the argmax at position `i`
+    /// is therefore INDEPENDENT of `depth` — the causal-attention
+    /// property the T=0 safety proof relies on. `target_table` must
+    /// have at least `max_depth + 1` entries.
+    fn make_verify_table<'a>(
+        target_table: &'a [i32],
+        counter: &'a RefCell<usize>,
+    ) -> impl FnMut(&MxArray, &MxArray, usize) -> napi::Result<MtpVerifyOutput> + 'a {
+        move |_ids: &MxArray, _emb: &MxArray, depth: usize| {
+            *counter.borrow_mut() += 1;
+            let positions = depth + 1;
+            assert!(
+                target_table.len() >= positions,
+                "target_table must cover depth+1 positions (causal table)"
+            );
+            let mut data = vec![-10.0f32; positions * VOCAB as usize];
+            for (i, &id) in target_table.iter().take(positions).enumerate() {
+                data[i * VOCAB as usize + id as usize] = 10.0;
+            }
+            let arr =
+                MxArray::from_float32(&data, &[1, positions as i64, VOCAB]).expect("verify logits");
+            let zero_hiddens = vec![0.0f32; positions * HIDDEN as usize];
+            let hiddens = MxArray::from_float32(&zero_hiddens, &[1, positions as i64, HIDDEN])
+                .expect("verify hiddens stub");
+            Ok(MtpVerifyOutput::logits_only(arr, hiddens))
+        }
+    }
+
+    /// Drive one full `run_mtp_cycle_inner` at T=0 with the EV depth
+    /// policy and a chosen `allow_deepen`. Returns
+    /// `(effective_depth, emitted_tokens, committed_payload)`. The
+    /// drafter argmaxes at `draft_table[step]`; the verifier argmaxes at
+    /// `target_table[position]` (both depth-independent). With the two
+    /// tables equal on the overlapping positions the cycle full-accepts,
+    /// letting the deepen gate run to `max_depth` when enabled.
+    #[allow(clippy::type_complexity)]
+    fn run_ev_t0_cycle(
+        label: &str,
+        requested_depth: usize,
+        draft_table: &[i32],
+        target_table: &[i32],
+        allow_deepen: bool,
+    ) -> Option<(usize, Vec<u32>, (Vec<u32>, usize))> {
+        let emb = fake_embedding()?;
+        let prev_h = fake_hidden()?;
+        let prev_e = fake_hidden()?;
+        let draft_ctr = RefCell::new(0usize);
+        let verify_ctr = RefCell::new(0usize);
+        let commit_seen = RefCell::new(None::<(Vec<u32>, usize)>);
+
+        // base_depth=1 so the gate is the SOLE thing extending depth;
+        // accept_ewma pinned high + costs zeroed (via `for_test`) so the
+        // EV cost model always votes to deepen when allowed. The only
+        // difference between the two runs is `allow_deepen`.
+        let mut ev_policy = ExpectedValueDepthPolicy::for_test(
+            requested_depth as u8,
+            1,
+            [0.99, 0.99, 0.99, 0.99, 0.99],
+            0.0,
+        );
+        ev_policy.set_allow_deepen(allow_deepen);
+
+        // Force the production sparse-accept gate ON for this thread so the
+        // cycle deterministically drives the T=0 `use_sparse_accept` commit
+        // path regardless of `MLX_MTP_SPARSE_ACCEPT` or its process-wide
+        // cache. The `ran_phase` assertion below fails closed if, despite
+        // this, the sparse branch was not taken.
+        let _force_sparse = super::ForceSparseAcceptGuard::force(true);
+        // Enable the profiler so `ran_phase` can observe which accept branch
+        // executed (timing instrumentation only — never changes committed
+        // tokens).
+        let mut profiler = DecodeProfiler::new("test", "test");
+        profiler.enable_for_test();
+
+        let res = {
+            let mut ops = MtpOps {
+                forward_with_hidden: |_ids: &MxArray,
+                                      _emb: &MxArray|
+                 -> napi::Result<(MxArray, MxArray, bool)> {
+                    unreachable!("forward_with_hidden is not called inside run_mtp_cycle_inner")
+                },
+                draft_step: make_draft(draft_table, &draft_ctr),
+                verify_step: make_verify_table(target_table, &verify_ctr),
+                verify_step_argmax_only: None,
+                verify_step_sparse: None,
+                rollback: |_a: usize, _d: usize| {},
+                eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+                eval_step_with_chained_hidden: |_t: &MxArray, _h: &MxArray| {},
+                begin_cycle: |_| {},
+                snapshot_main_linear: || {},
+                restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
+                commit_mtp: |_: MtpCommitAnchor,
+                             _: &MxArray,
+                             _: &MxArray,
+                             committed_ids: &[u32],
+                             accepted_drafts: usize,
+                             _: &MxArray| {
+                    *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
+                    Ok(())
+                },
+                committed_history_active: false,
+                rollback_unemitted: |_: usize| {},
+            };
+            let params = t0_params();
+            // Fixed seed is belt-and-suspenders: at T=0 the sparse-accept
+            // commit path consumes ZERO RNG (chat_common.rs:2784-2786).
+            let mut rng = StdRng::seed_from_u64(0x7E50);
+            run_mtp_cycle_inner(
+                &mut ops,
+                prev_h,
+                prev_e,
+                0u32,
+                &emb,
+                &[],
+                &params,
+                &mut rng,
+                &mut profiler,
+                requested_depth,
+                Some(&mut ev_policy),
+                MtpCommitAnchor::IncludeAnchor,
+            )
+        };
+        let (outcome, _) = skip_if_metal_unavailable(label, res)?;
+        // Fail closed: this gate is only meaningful if it actually drove the
+        // production T=0 sparse-accept commit path. `"mtp_accept_argmax"` is
+        // begun ONLY inside the `if use_sparse_accept` branch, so its absence
+        // means the cycle silently took the legacy/stochastic accept path and
+        // the byte-equivalence assertions below would be testing the wrong
+        // code.
+        assert!(
+            profiler.ran_phase("mtp_accept_argmax"),
+            "{label}: C2 gate must exercise the T=0 sparse-accept commit path \
+             (`use_sparse_accept`); it did not, so the byte-equivalence checks \
+             would give false coverage confidence"
+        );
+        let commit = commit_seen
+            .into_inner()
+            .expect("commit_mtp must be called exactly once");
+        Some((outcome.effective_depth, outcome.tokens, commit))
+    }
+
+    /// C2 — the T=0 safety gate that graduates `MLX_MTP_EV_ALLOW_DEEPEN`.
+    ///
+    /// Reconciles the empirical claim at adaptive_depth.rs:258-262
+    /// ("real M5 Max traces showed intra-cycle deepening can violate the
+    /// temperature-0 byte-equivalence safety contract") against the
+    /// static analysis (every committed slot `i` is `target_argmax[i]`,
+    /// causally INDEPENDENT of effective_depth; at T=0 the drafter is a
+    /// deterministic argmax; the sparse-accept commit consumes zero RNG).
+    ///
+    /// Invariant under test: deepening can only EXTEND the committed
+    /// sequence — it must NEVER mutate an already-committed prefix. We
+    /// run the SAME deterministic T=0 cycle twice, differing only in
+    /// `allow_deepen`:
+    ///   - shallow (`false`): the gate stops at `base_depth = 1`.
+    ///   - deep (`true`):     the gate extends to `max_depth = 3`.
+    ///
+    /// With the drafter and verifier argmaxes equal on every overlapping
+    /// position the cycle full-accepts in both runs, so the deepen gate
+    /// is free to run to `max_depth`. The shallow token/commit window
+    /// MUST be a byte-identical prefix of the deep one.
+    ///
+    /// GREEN => the Rust accept/commit layer the EV gate controls is
+    /// depth-invariant at T=0 => the deepen flag is safe to graduate.
+    /// RED   => a REAL safety violation; keep the flag OFF and
+    /// root-cause. Do NOT weaken this test to make it pass.
+    #[test]
+    fn ev_deepen_t0_committed_tokens_byte_identical() {
+        let requested_depth = 3usize;
+        // Drafter and verifier agree on every overlapping position →
+        // full accept at every depth → the gate is the only thing
+        // choosing how far the cycle drafts. Positions: draft d_0=1,
+        // d_1=2, d_2=3; verifier argmax matches those plus a bonus
+        // argmax (4) at the final verify slot.
+        let draft_table = vec![1i32, 2, 3];
+        let target_table = vec![1i32, 2, 3, 4];
+
+        let Some((shallow_depth, shallow_tokens, shallow_commit)) = run_ev_t0_cycle(
+            "ev_deepen_shallow",
+            requested_depth,
+            &draft_table,
+            &target_table,
+            false,
+        ) else {
+            return;
+        };
+        let Some((deep_depth, deep_tokens, deep_commit)) = run_ev_t0_cycle(
+            "ev_deepen_deep",
+            requested_depth,
+            &draft_table,
+            &target_table,
+            true,
+        ) else {
+            return;
+        };
+
+        // Sanity: the flag actually changed the drafted depth. If both
+        // collapsed to the same depth the test would be vacuous.
+        assert_eq!(
+            shallow_depth, 1,
+            "allow_deepen=false must stop the gate at base_depth=1"
+        );
+        assert_eq!(
+            deep_depth, requested_depth,
+            "allow_deepen=true must extend the gate to max_depth on a full-accept chain"
+        );
+
+        // Shallow run: base_depth=1 full accept → [d_0, bonus@1].
+        assert_eq!(shallow_tokens, vec![1u32, 2u32]);
+        // Deep run: full accept to depth 3 → [d_0, d_1, d_2, bonus@3].
+        assert_eq!(deep_tokens, vec![1u32, 2u32, 3u32, 4u32]);
+
+        // THE SAFETY INVARIANT: the shallow emitted-token window is a
+        // byte-identical PREFIX of the deep window. Deepening only
+        // appended tokens; it never rewrote slot 0 (the only committed
+        // draft the shallow run produced beyond the bonus boundary).
+        // Note the shallow run's bonus token at slot K_s=1 (value 2)
+        // equals the deep run's resolved token at slot 1 (value 2 =
+        // target_argmax[1]) — exactly the proof's claim that the shallow
+        // full-accept bonus equals whatever deeper drafting commits at
+        // that slot.
+        assert!(
+            deep_tokens.starts_with(&shallow_tokens[..1]),
+            "deepen must not mutate the first committed token: shallow={shallow_tokens:?} \
+             deep={deep_tokens:?}"
+        );
+        assert_eq!(
+            shallow_tokens[1], deep_tokens[1],
+            "shallow full-accept bonus@K_s must equal the token deeper drafting commits at \
+             that slot (both are target_argmax[1]) — the T=0 exactness property"
+        );
+
+        // Commit payloads carry the same invariant (IncludeAnchor →
+        // [last_committed, emitted...]). Shallow payload must be a
+        // byte-identical prefix of the deep payload up to the shallow
+        // boundary slot.
+        let (shallow_ids, shallow_accepted) = shallow_commit;
+        let (deep_ids, deep_accepted) = deep_commit;
+        assert_eq!(shallow_ids, vec![0u32, 1, 2]);
+        assert_eq!(deep_ids, vec![0u32, 1, 2, 3, 4]);
+        assert_eq!(shallow_accepted, 1);
+        assert_eq!(deep_accepted, 3);
+        assert_eq!(
+            shallow_ids[..2],
+            deep_ids[..2],
+            "committed anchor + first accepted draft must be byte-identical across depths"
         );
     }
 }

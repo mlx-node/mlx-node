@@ -1869,51 +1869,6 @@ unsafe extern "C-unwind" {
         out_logits: *mut *mut mlx_array,
     );
 
-    /// W6.18 — Fused MTP draft: ALL `depth` draft steps in ONE
-    /// `mlx::core::compile`d graph. MTPLX-style.
-    ///
-    /// "Fused" refers to the WITHIN-CYCLE fusion of D draft steps and is
-    /// independent of the W6.5 CROSS-CYCLE `MLX_MTP_CHAINED_CYCLES`
-    /// concept (verify-hidden export across cycles).
-    ///
-    /// Inputs:
-    ///   - `prev_hidden` / `prev_emb` — `[1, 1, hidden]` bf16, same
-    ///     as the per-step FFI's first-iteration inputs.
-    ///   - `embedding_weight` — `[vocab, hidden]` bf16; the model's
-    ///     embedding table. Read via on-device `take` to compute the
-    ///     next step's `prev_emb` without a CPU roundtrip.
-    ///   - `depth` — `1..=5`. Out-of-range values are rejected with
-    ///     all three output slots set to null and a stderr diagnostic.
-    ///
-    /// Outputs (caller owns; `mlx_array_delete` each non-null):
-    ///   - `*out_h_final`: `[1, 1, hidden]` bf16, post-final-norm hidden
-    ///     after the last draft step. Currently unused on the Rust side
-    ///     (chained-cycles uses `verify_hidden[K]`); emitted for API
-    ///     symmetry.
-    ///   - `*out_draft_ids`: `[depth]` int32, drafted token IDs in step
-    ///     order.
-    ///   - `*out_draft_probs`: `[depth, vocab]` fp32, per-step softmax
-    ///     probs. Consumed by `accept_with_residual` at T>0; ignored
-    ///     numerically at T<=1e-6.
-    ///
-    /// SIDE EFFECTS: advances `g_mtp_offset_int` by `depth` and writes
-    /// `depth` K/V slots into `g_mtp_compiled_caches` in place — same
-    /// mutation contract as `depth` sequential calls to
-    /// `mlx_qwen35_mtp_draft_compiled`.
-    ///
-    /// On any failure all three output slots are null; the Rust caller
-    /// should fall back to the per-step path (preserves the eager-Rust
-    /// safety net).
-    pub fn mlx_qwen35_mtp_draft_fused_compiled(
-        prev_hidden: *mut mlx_array,
-        prev_emb: *mut mlx_array,
-        embedding_weight: *mut mlx_array,
-        depth: i32,
-        out_h_final: *mut *mut mlx_array,
-        out_draft_ids: *mut *mut mlx_array,
-        out_draft_probs: *mut *mut mlx_array,
-    );
-
     /// One MTP verify step on `depth + 1` tokens. `input_ids` is
     /// `[1, depth+1]` int32, `embedding_weight` is the model's
     /// embedding (or LM head if untied). `depth` MUST be in

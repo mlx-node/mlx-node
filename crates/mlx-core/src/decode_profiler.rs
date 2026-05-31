@@ -310,6 +310,30 @@ impl DecodeProfiler {
         }
     }
 
+    /// Test-only: force the profiler on so `begin`/`end` record phases.
+    /// `begin` no-ops while `!enabled`, so a test that wants to observe
+    /// which decode branch ran (via [`ran_phase`]) must call this first.
+    /// Enabling only turns on timing instrumentation — it never changes
+    /// decode control flow or which tokens are committed.
+    ///
+    /// [`ran_phase`]: Self::ran_phase
+    #[cfg(test)]
+    pub(crate) fn enable_for_test(&mut self) {
+        self.enabled = true;
+    }
+
+    /// Test-only: did a phase with this exact name run (i.e. was
+    /// `begin(name)` reached while the profiler was enabled)? Used by
+    /// accept-path coverage tests to assert which decode branch executed
+    /// — e.g. `"mtp_accept_argmax"` is unique to the sparse-accept path.
+    /// Requires [`enable_for_test`] to have been called on this profiler.
+    ///
+    /// [`enable_for_test`]: Self::enable_for_test
+    #[cfg(test)]
+    pub(crate) fn ran_phase(&self, name: &str) -> bool {
+        self.phases.contains_key(name)
+    }
+
     /// MTP acceptance summary: `(mean_accepted_per_cycle,
     /// per_position_rate, cycles)`. `None` when no MTP cycle ran.
     pub fn mtp_acceptance_summary(&self) -> Option<(f64, Vec<f64>, u32)> {

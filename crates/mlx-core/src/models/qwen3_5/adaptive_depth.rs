@@ -281,6 +281,18 @@ impl ExpectedValueDepthPolicy {
         policy
     }
 
+    /// Test-only override for the intra-cycle deepen gate. The
+    /// production default is sourced from `MLX_MTP_EV_ALLOW_DEEPEN`
+    /// (adaptive_depth.rs `new`); tests must NOT mutate that env var
+    /// (unsafe in Rust 2024, racy under parallel `cargo test`, and the
+    /// value may be cached). This setter lets the C2 T=0-safety test
+    /// drive the shallow (`false`, stop at `base_depth`) vs deep
+    /// (`true`, extend to `max_depth`) policies in-process.
+    #[cfg(test)]
+    pub(crate) fn set_allow_deepen(&mut self, allow_deepen: bool) {
+        self.allow_deepen = allow_deepen;
+    }
+
     pub fn max_depth(&self) -> u8 {
         self.max_depth
     }

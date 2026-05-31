@@ -1761,10 +1761,6 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
-                    // W6.18 — fused MTP draft is dense-only at this
-                    // task scope. MoE follow-up is a separate task; for
-                    // now MoE always uses the per-step draft loop.
-                    fused_draft: None,
                     // Phase C — committed-history is dense-only at this
                     // task scope. The MoE path keeps the legacy
                     // cycle-history policy (its C++ `begin_cycle` still
@@ -3933,10 +3929,6 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
-                    // W6.18 — fused MTP draft is dense-only at this
-                    // task scope. MoE follow-up is a separate task; for
-                    // now MoE always uses the per-step draft loop.
-                    fused_draft: None,
                     // Phase C — committed-history is dense-only at this
                     // task scope. The MoE path keeps the legacy
                     // cycle-history policy (its C++ `begin_cycle` still
@@ -4642,10 +4634,6 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
-                    // W6.18 — fused MTP draft is dense-only at this
-                    // task scope. MoE follow-up is a separate task; for
-                    // now MoE always uses the per-step draft loop.
-                    fused_draft: None,
                     // Phase C — committed-history is dense-only at this
                     // task scope. The MoE path keeps the legacy
                     // cycle-history policy (its C++ `begin_cycle` still
@@ -5473,10 +5461,6 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
-                    // W6.18 — fused MTP draft is dense-only at this
-                    // task scope. MoE follow-up is a separate task; for
-                    // now MoE always uses the per-step draft loop.
-                    fused_draft: None,
                     // Phase C — committed-history is dense-only at this
                     // task scope. The MoE path keeps the legacy
                     // cycle-history policy (its C++ `begin_cycle` still

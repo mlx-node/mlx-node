@@ -2744,15 +2744,6 @@ impl Qwen35Inner {
                         }
                         Ok(())
                     },
-                    // W6.18 — Fused MTP draft. Routes ALL D draft
-                    // steps through one `mlx::core::compile`d graph
-                    // when `MLX_MTP_FUSED_DRAFT=1` AND
-                    // `run_mtp_cycle_inner` decides to use it (also
-                    // gated on `temperature <= 1e-6`). On FFI failure
-                    // the cycle helper falls back to the per-step
-                    // `draft_step` loop above. See
-                    // `make_fused_draft_closure` for the body.
-                    fused_draft: Some(make_fused_draft_closure()),
                     // Phase C — committed-history commit hook (dense
                     // path). Appends exact MTP K/V for this cycle's
                     // K+1 committed tokens to the persistent MTP cache
@@ -3775,7 +3766,6 @@ impl Qwen35Inner {
                     }
                     Ok(())
                 },
-                fused_draft: Some(make_fused_draft_closure()),
                 commit_mtp: |anchor: chat_common::MtpCommitAnchor,
                              seed_hidden: &MxArray,
                              verify_hiddens: &MxArray,
@@ -5442,15 +5432,6 @@ impl Qwen35Inner {
                         }
                         Ok(())
                     },
-                    // W6.18 — Fused MTP draft. Routes ALL D draft
-                    // steps through one `mlx::core::compile`d graph
-                    // when `MLX_MTP_FUSED_DRAFT=1` AND
-                    // `run_mtp_cycle_inner` decides to use it (also
-                    // gated on `temperature <= 1e-6`). On FFI failure
-                    // the cycle helper falls back to the per-step
-                    // `draft_step` loop above. See
-                    // `make_fused_draft_closure` for the body.
-                    fused_draft: Some(make_fused_draft_closure()),
                     // Phase C — committed-history commit hook (dense
                     // path). Appends exact MTP K/V for this cycle's
                     // K+1 committed tokens to the persistent MTP cache
@@ -6405,15 +6386,6 @@ impl Qwen35Inner {
                         }
                         Ok(())
                     },
-                    // W6.18 — Fused MTP draft. Routes ALL D draft
-                    // steps through one `mlx::core::compile`d graph
-                    // when `MLX_MTP_FUSED_DRAFT=1` AND
-                    // `run_mtp_cycle_inner` decides to use it (also
-                    // gated on `temperature <= 1e-6`). On FFI failure
-                    // the cycle helper falls back to the per-step
-                    // `draft_step` loop above. See
-                    // `make_fused_draft_closure` for the body.
-                    fused_draft: Some(make_fused_draft_closure()),
                     // Phase C — committed-history commit hook (dense
                     // path). Appends exact MTP K/V for this cycle's
                     // K+1 committed tokens to the persistent MTP cache
@@ -9951,108 +9923,6 @@ fn partition_prefill_chunks(total: usize) -> Vec<usize> {
     );
     chunks.push(remaining);
     chunks
-}
-
-/// W6.18 — Fused MTP draft: ALL `depth` draft steps in ONE compiled
-/// graph. MTPLX-style.
-///
-/// "Fused" refers to the WITHIN-CYCLE fusion of D draft steps and is
-/// independent of the W6.5 CROSS-CYCLE `MLX_MTP_CHAINED_CYCLES`
-/// concept (verify-hidden export across cycles).
-///
-/// Inputs match the per-step FFI's first-iteration call:
-/// `prev_hidden` / `prev_emb` are `[1, 1, hidden]` bf16. `embedding_weight`
-/// is `[vocab, hidden]` so the graph can compute next-step embeddings
-/// via on-device `take` without CPU roundtrips. `depth` ∈ {1..5}.
-///
-/// Returns `(h_final, draft_ids, draft_probs)`:
-///   - `h_final`: `[1, 1, hidden]` bf16 — post-final-norm hidden after
-///     the last draft step. Currently unused (the chained-cycles path
-///     uses `verify_hidden[K]`); emitted for API symmetry with the
-///     per-step FFI.
-///   - `draft_ids`: `[depth]` int32 — drafted token IDs.
-///   - `draft_probs`: `[depth, vocab]` fp32 — per-step softmax probs.
-///     Consumed by `accept_with_residual` at T>0; ignored numerically
-///     at T<=1e-6.
-///
-/// Mutates the MTP KV caches in place and advances the MTP offset by
-/// `depth` — same as `depth` sequential per-step calls.
-///
-/// On `Err` the C++ side returned null pointers; the Rust caller MUST
-/// fall back to the per-step path (the eager-Rust safety net).
-// W6.18 chat-session integration is the only intended caller.
-pub(super) fn forward_mtp_draft_fused_compiled(
-    prev_hidden: &MxArray,
-    prev_emb: &MxArray,
-    embedding_weight: &MxArray,
-    depth: i32,
-) -> Result<(MxArray, MxArray, MxArray)> {
-    use mlx_sys as sys;
-
-    let mut h_final_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut draft_ids_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut draft_probs_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-    unsafe {
-        sys::mlx_qwen35_mtp_draft_fused_compiled(
-            prev_hidden.as_raw_ptr(),
-            prev_emb.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            depth,
-            &mut h_final_ptr,
-            &mut draft_ids_ptr,
-            &mut draft_probs_ptr,
-        );
-    }
-
-    if h_final_ptr.is_null() || draft_ids_ptr.is_null() || draft_probs_ptr.is_null() {
-        // Clean up any half-allocated outputs.
-        if !h_final_ptr.is_null() {
-            unsafe { sys::mlx_array_delete(h_final_ptr) };
-        }
-        if !draft_ids_ptr.is_null() {
-            unsafe { sys::mlx_array_delete(draft_ids_ptr) };
-        }
-        if !draft_probs_ptr.is_null() {
-            unsafe { sys::mlx_array_delete(draft_probs_ptr) };
-        }
-        return Err(Error::from_reason(
-            "forward_mtp_draft_fused_compiled: C++ returned null — check stderr",
-        ));
-    }
-
-    let h_final = MxArray::from_handle(h_final_ptr, "mtp_fused_h_final")?;
-    let draft_ids = MxArray::from_handle(draft_ids_ptr, "mtp_fused_draft_ids")?;
-    let draft_probs = MxArray::from_handle(draft_probs_ptr, "mtp_fused_draft_probs")?;
-    Ok((h_final, draft_ids, draft_probs))
-}
-
-/// W6.18 — Build the `MtpOps::fused_draft` boxed closure for the dense
-/// compiled path. Extracted from the three identical inline definitions
-/// in chat-session entrypoints (sync chat, streaming chat, delta
-/// streaming) to keep them in one place.
-///
-/// The returned closure adapts `forward_mtp_draft_fused_compiled` to
-/// the 2-tuple `(draft_ids, draft_probs)` contract of
-/// `MtpOps::fused_draft`. The fused FFI's `h_final` output is dropped —
-/// the chained-cycles cross-cycle path uses `verify_hidden[K]` for
-/// cycle chaining, not the draft-side hidden.
-fn make_fused_draft_closure()
--> Box<dyn FnMut(&MxArray, &MxArray, &MxArray, usize) -> Result<(MxArray, MxArray)>> {
-    Box::new(
-        |prev_hidden: &MxArray,
-         prev_emb: &MxArray,
-         embedding_weight: &MxArray,
-         depth: usize|
-         -> Result<(MxArray, MxArray)> {
-            let (_h_final, draft_ids, draft_probs) = forward_mtp_draft_fused_compiled(
-                prev_hidden,
-                prev_emb,
-                embedding_weight,
-                depth as i32,
-            )?;
-            Ok((draft_ids, draft_probs))
-        },
-    )
 }
 
 /// One MTP verify step on the compiled path.
