@@ -1857,6 +1857,7 @@ unsafe extern "C-unwind" {
         norm_topk_prob: i32,
         use_expert_bias: i32,
         tie_embedding: i32,
+        conv_bias: i32,
         max_kv_len: i32,
         batch_size: i32,
         is_attn: *const i32,
@@ -2032,6 +2033,10 @@ unsafe extern "C-unwind" {
         in_proj_w: *const *mut mlx_array,
         conv_w: *const *mut mlx_array,
         out_proj_w: *const *mut mlx_array,
+        conv_bias: i32,
+        in_proj_b_w: *const *mut mlx_array,
+        conv_b_w: *const *mut mlx_array,
+        out_proj_b_w: *const *mut mlx_array,
     ) -> *mut mlx_array;
 
     /// TEST-ONLY component probe: like `mlx_lfm2_probe_decode_seq` but with the

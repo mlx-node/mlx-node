@@ -128,7 +128,7 @@ std::vector<array> lfm2_decode_fn(const std::vector<array>& inputs) {
     } else {
       const auto& cs = inputs[2 + i * 2];
       auto res = lfm2_conv_pure_fn(normed, i, cs, cfg.conv_l_cache, cfg.hidden_size,
-                                   /*conv_bias=*/false);
+                                   /*conv_bias=*/cfg.conv_bias);
       h = h + res.output;
       new_caches[i * 2] = res.new_state;
       // slot.b left as the pre-seeded scalar zero (unused for conv layers).
@@ -541,6 +541,7 @@ void mlx_lfm2_moe_init_from_prefill(
     int norm_topk_prob,
     int use_expert_bias,
     int tie_embedding,
+    int conv_bias,
     int max_kv_len,
     int batch_size,
     const int32_t* is_attn,
@@ -562,6 +563,7 @@ void mlx_lfm2_moe_init_from_prefill(
     g_lfm2_config.norm_topk_prob = norm_topk_prob != 0;
     g_lfm2_config.use_expert_bias = use_expert_bias != 0;
     g_lfm2_config.tie_embedding = tie_embedding != 0;
+    g_lfm2_config.conv_bias = conv_bias != 0;
     g_lfm2_config.max_kv_len = max_kv_len;
     g_lfm2_config.batch_size = batch_size;
 
@@ -1049,7 +1051,9 @@ mlx_array* mlx_lfm2_probe_decode_seq(
     mlx_array** gate_w, mlx_array** up_w, mlx_array** down_w,
     mlx_array** q_w, mlx_array** k_w, mlx_array** v_w, mlx_array** out_w,
     mlx_array** qn_w, mlx_array** kn_w,
-    mlx_array** in_proj_w, mlx_array** conv_w, mlx_array** out_proj_w) {
+    mlx_array** in_proj_w, mlx_array** conv_w, mlx_array** out_proj_w,
+    int conv_bias, mlx_array** in_proj_b_w, mlx_array** conv_b_w,
+    mlx_array** out_proj_b_w) {
   try {
     mlx_clear_weights();
     auto& embed_w = *reinterpret_cast<array*>(embed_w_ptr);
@@ -1074,6 +1078,15 @@ mlx_array* mlx_lfm2_probe_decode_seq(
         mlx_store_weight((lp + ".conv.in_proj.weight").c_str(), in_proj_w[i]);
         mlx_store_weight((lp + ".conv.conv.weight").c_str(), conv_w[i]);  // [H,l_cache,1]
         mlx_store_weight((lp + ".conv.out_proj.weight").c_str(), out_proj_w[i]);
+        // Phase 4 Piece 1: conv biases under the SAME keys lfm2_conv_pure_fn's
+        // get_weight reads (conv.in_proj.bias / conv.conv.bias /
+        // conv.out_proj.bias). Only when conv_bias is on, so the conv_bias==0
+        // probe call is byte-identical to before.
+        if (conv_bias) {
+          mlx_store_weight((lp + ".conv.in_proj.bias").c_str(), in_proj_b_w[i]);
+          mlx_store_weight((lp + ".conv.conv.bias").c_str(), conv_b_w[i]);
+          mlx_store_weight((lp + ".conv.out_proj.bias").c_str(), out_proj_b_w[i]);
+        }
       }
     }
 
@@ -1087,6 +1100,7 @@ mlx_array* mlx_lfm2_probe_decode_seq(
     g_lfm2_config.rope_theta = rope_theta;
     g_lfm2_config.norm_eps = norm_eps;
     g_lfm2_config.tie_embedding = true;
+    g_lfm2_config.conv_bias = conv_bias != 0;
     g_lfm2_config.max_kv_len = T;
     g_lfm2_is_attn.assign(is_attn, is_attn + num_layers);
 

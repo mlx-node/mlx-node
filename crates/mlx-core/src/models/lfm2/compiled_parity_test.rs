@@ -445,8 +445,7 @@ fn compiled_conv_seq_matches_native_with_bias() {
 /// the final `embedding_norm`, and the tied `embed_tokens` head. The probe runs
 /// `lfm2_decode_fn` EAGERLY and `mlx_lfm2_get_model_id()` is untouched, so the
 /// production gate stays OFF.
-#[test]
-fn compiled_decode_seq_matches_native() {
+fn run_decode_seq_parity(conv_bias: bool) {
     use crate::nn::{Embedding, RMSNorm};
 
     let _guard = COMPILED_WEIGHTS_RWLOCK
@@ -518,6 +517,21 @@ fn compiled_decode_seq_matches_native() {
         .map(|i| conv_t(i, &[hidden, hidden], 240 + i as i64))
         .collect();
 
+    // conv-bias tensors: Some at conv layers ONLY when conv_bias is on; None
+    // (→ null ptr / not set) otherwise. The SAME arrays feed BOTH native + probe.
+    let conv_bias_t = |i: usize, shape: &[i64], seed: i64| -> Option<MxArray> {
+        (conv_bias && is_attn[i] == 0).then(|| det(shape, seed))
+    };
+    let in_proj_b: Vec<Option<MxArray>> = (0..n)
+        .map(|i| conv_bias_t(i, &[3 * hidden], 250 + i as i64))
+        .collect();
+    let conv_b: Vec<Option<MxArray>> = (0..n)
+        .map(|i| conv_bias_t(i, &[hidden], 260 + i as i64))
+        .collect();
+    let out_proj_b: Vec<Option<MxArray>> = (0..n)
+        .map(|i| conv_bias_t(i, &[hidden], 270 + i as i64))
+        .collect();
+
     // ---- native: hand-assembled [conv, attn, conv] stack ----
     let mut embed = Embedding::new(vocab as u32, hidden as u32).expect("embed");
     embed.set_weight(&embed_w).expect("embed w");
@@ -572,7 +586,7 @@ fn compiled_decode_seq_matches_native() {
                 .expect("kn set");
             ops.push(Op::Attn(attn));
         } else {
-            let mut conv = ShortConv::new(hidden as i32, l_cache as i32, false).expect("conv");
+            let mut conv = ShortConv::new(hidden as i32, l_cache as i32, conv_bias).expect("conv");
             conv.in_proj_mut()
                 .set_weight(in_proj[i].as_ref().expect("ip"), "in_proj")
                 .expect("ip set");
@@ -581,6 +595,14 @@ fn compiled_decode_seq_matches_native() {
             conv.out_proj_mut()
                 .set_weight(out_proj[i].as_ref().expect("op"), "out_proj")
                 .expect("op set");
+            if conv_bias {
+                conv.set_in_proj_bias(Some(in_proj_b[i].as_ref().expect("ipb")))
+                    .expect("ipb set");
+                conv.set_conv_bias(Some(conv_b[i].as_ref().expect("cb")))
+                    .expect("cb set");
+                conv.set_out_proj_bias(Some(out_proj_b[i].as_ref().expect("opb")))
+                    .expect("opb set");
+            }
             ops.push(Op::Conv(conv));
         }
     }
@@ -641,6 +663,9 @@ fn compiled_decode_seq_matches_native() {
     let in_p = optr(&in_proj);
     let cw_p = optr(&conv_w);
     let op_p = optr(&out_proj);
+    let in_b_p = optr(&in_proj_b);
+    let cb_p = optr(&conv_b);
+    let ob_p = optr(&out_proj_b);
 
     let out_ptr = unsafe {
         mlx_sys::mlx_lfm2_probe_decode_seq(
@@ -671,6 +696,10 @@ fn compiled_decode_seq_matches_native() {
             in_p.as_ptr(),
             cw_p.as_ptr(),
             op_p.as_ptr(),
+            i32::from(conv_bias),
+            in_b_p.as_ptr(),
+            cb_p.as_ptr(),
+            ob_p.as_ptr(),
         )
     };
     assert!(
@@ -680,10 +709,29 @@ fn compiled_decode_seq_matches_native() {
     let probe = MxArray::from_handle(out_ptr, "probe_decode").expect("probe handle");
 
     let d = max_abs(&to_vec(&native_last), &to_vec(&probe));
+    println!("lfm2 compiled decode-seq parity (conv_bias={conv_bias}): max_abs = {d}");
     assert!(
         d < 2e-2,
-        "compiled decode_fn must match native dense [conv,attn,conv] stack: max_abs={d}"
+        "compiled decode_fn must match native dense [conv,attn,conv] stack (conv_bias={conv_bias}): max_abs={d}"
     );
+}
+
+/// 2b-1 full-decode parity WITHOUT conv biases (LFM2.5 production default).
+#[test]
+fn compiled_decode_seq_matches_native() {
+    run_decode_seq_parity(false);
+}
+
+/// Phase 4 Piece 1: the SAME full synthetic decode-sequence parity, but with the
+/// ShortConv biases (`conv.in_proj.bias`, `conv.conv.bias`, `conv.out_proj.bias`)
+/// seeded into the registry and applied on BOTH sides — the compiled
+/// `lfm2_decode_fn` via `cfg.conv_bias` (threaded through the probe's `conv_bias`
+/// arg + the three synthetic bias pointer arrays) and the native `ShortConv` via
+/// its bias setters. Proves the threaded conv biases land under the keys
+/// `get_weight` reads and the compiled decode matches native end to end.
+#[test]
+fn compiled_decode_seq_matches_native_with_conv_bias() {
+    run_decode_seq_parity(true);
 }
 
 /// Phase-3a end-to-end-SHAPED MoE gate: the full `lfm2_decode_fn` assembly with

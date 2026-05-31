@@ -938,6 +938,7 @@ impl Lfm2Inner {
                         i32::from(self.config.norm_topk_prob),
                         i32::from(self.config.use_expert_bias),
                         i32::from(self.config.tie_embedding),
+                        i32::from(self.config.conv_bias),
                         max_kv_len,
                         1,
                         is_attn.as_ptr(),

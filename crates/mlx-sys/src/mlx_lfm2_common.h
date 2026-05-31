@@ -46,6 +46,10 @@ struct Lfm2MoeConfig {
   // Router score function: false -> softmax (lfm2_moe native default), true ->
   // sigmoid (qwen3.5-moe style). lfm2_moe `Lfm2SparseMoeBlock` uses SOFTMAX.
   bool use_sigmoid = false;
+  // ShortConv bias flag. When true the conv pure-fn adds the three conv biases
+  // (conv.in_proj.bias, conv.conv.bias, conv.out_proj.bias). Default false
+  // (bias-free checkpoint).
+  bool conv_bias = false;
   // Phase 3b quant fields (default 0 = bf16). Declared NOW so the config ABI is
   // stable across 3a->3b. quant_mode: 0=bf16, 1=mxfp8, 2=mxfp4, 3=nvfp4.
   int quant_mode = 0;

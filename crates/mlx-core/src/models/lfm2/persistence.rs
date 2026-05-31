@@ -1320,16 +1320,15 @@ impl Lfm2Inner {
         //     stores no authoritative quant-info), so quantized compiled decode
         //     (incl. quantized MoE = Phase 3b) is deferred. Quantized tensors
         //     carry `.scales`-suffixed keys; bf16/f16 checkpoints have none.
-        //   * `conv_bias` checkpoints — the compiled `lfm2_decode_fn` calls
-        //     `lfm2_conv_pure_fn` with conv_bias hardcoded off (the in_proj /
-        //     depthwise / out_proj biases are not threaded through the FFI yet),
-        //     so a conv_bias=true checkpoint would decode without them. The
-        //     shipping LFM2.5 checkpoints are conv_bias=false.
+        //
+        // `conv_bias=true` checkpoints ARE now supported (Phase 4 Piece 1): the
+        // `conv_bias` flag is threaded into `mlx_lfm2_moe_init_from_prefill`, so
+        // `lfm2_decode_fn` calls `lfm2_conv_pure_fn` with `cfg.conv_bias` and the
+        // three conv biases (`conv.in_proj.bias`, `conv.conv.bias`,
+        // `conv.out_proj.bias`) flow through the generic store loop under the same
+        // keys `get_weight` reads.
         let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
-        if inner.config.use_block_paged_cache == Some(false)
-            && !is_quantized
-            && !inner.config.conv_bias
-        {
+        if inner.config.use_block_paged_cache == Some(false) && !is_quantized {
             register_weights_with_cpp(&params, inner.model_id, &inner.config)?;
         }
 
@@ -1393,9 +1392,12 @@ impl Lfm2Inner {
 ///   * `feed_forward.expert_bias`, shape `[E]` (1D, f32) — stored as-is.
 ///
 /// Still returns early (storing nothing, publishing no id) for quantized
-/// (`.scales`-suffixed, incl. quantized MoE = Phase 3b) and `conv_bias=true`
-/// checkpoints, mirroring the call-site gate. The caller also gates on
-/// `use_block_paged_cache == Some(false)`; these are belt-and-suspenders.
+/// (`.scales`-suffixed, incl. quantized MoE = Phase 3b) checkpoints, mirroring
+/// the call-site gate. The caller also gates on `use_block_paged_cache ==
+/// Some(false)`; these are belt-and-suspenders. `conv_bias=true` checkpoints ARE
+/// registered (Phase 4 Piece 1): the three conv biases ride the generic store
+/// loop under the same keys `lfm2_conv_pure_fn`'s `get_weight` reads, and the
+/// `conv_bias` flag is threaded to the compiled decode via the config FFI.
 fn register_weights_with_cpp(
     params: &HashMap<String, MxArray>,
     model_id: u64,
@@ -1427,13 +1429,6 @@ fn register_weights_with_cpp_locked(
     // register — its MXFP4 / NVFP4 weights would mis-dispatch as MXFP8 in
     // `linear_proj` / `lfm2_switch_linear` (quantized MoE = Phase 3b).
     if params.keys().any(|k| k.ends_with(".scales")) {
-        return Ok(());
-    }
-
-    // (1c) Defensive conv_bias early-return: the compiled `lfm2_decode_fn`
-    // hardcodes conv_bias=off, so a conv_bias=true checkpoint would silently
-    // drop the conv biases. Stay native until they are threaded through (Phase 4).
-    if config.conv_bias {
         return Ok(());
     }
 
