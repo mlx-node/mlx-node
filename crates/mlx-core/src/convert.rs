@@ -1260,14 +1260,16 @@ fn strip_mtp_weight_suffix(key: &str) -> Option<&str> {
 }
 
 fn is_mtp_layer_quantizable_prefix(prefix: &str) -> bool {
+    use crate::models::qwen3_5::persistence::MTP_LAYER_LINEAR_SUFFIXES;
+    // Match `mtp.layers.<idx>.<suffix>` — the `head.ends_with('.')` check keeps
+    // the original `.{suffix}` boundary semantics while sharing the suffix set
+    // with the load-side validation so the two never drift.
     prefix.starts_with("mtp.layers.")
-        && (prefix.ends_with(".self_attn.q_proj")
-            || prefix.ends_with(".self_attn.k_proj")
-            || prefix.ends_with(".self_attn.v_proj")
-            || prefix.ends_with(".self_attn.o_proj")
-            || prefix.ends_with(".mlp.gate_proj")
-            || prefix.ends_with(".mlp.up_proj")
-            || prefix.ends_with(".mlp.down_proj"))
+        && MTP_LAYER_LINEAR_SUFFIXES.iter().any(|suffix| {
+            prefix
+                .strip_suffix(suffix)
+                .is_some_and(|head| head.ends_with('.'))
+        })
 }
 
 fn mtp_quant_decision(key: &str, policy: &str) -> Option<QuantDecision> {

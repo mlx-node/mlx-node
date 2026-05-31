@@ -1685,12 +1685,7 @@ impl Qwen35MoeInner {
                                 emb,
                                 depth as i32,
                             )?;
-                            Ok(chat_common::MtpVerifyOutput {
-                                logits: Some(logits),
-                                hiddens,
-                                target_argmax: None,
-                                target_sparse: None,
-                            })
+                            Ok(chat_common::MtpVerifyOutput::logits_only(logits, hiddens))
                         }
                     },
                     verify_step_argmax_only: None,
@@ -3867,12 +3862,7 @@ impl Qwen35MoeInner {
                                 emb,
                                 depth as i32,
                             )?;
-                            Ok(chat_common::MtpVerifyOutput {
-                                logits: Some(logits),
-                                hiddens,
-                                target_argmax: None,
-                                target_sparse: None,
-                            })
+                            Ok(chat_common::MtpVerifyOutput::logits_only(logits, hiddens))
                         }
                     },
                     verify_step_argmax_only: None,
@@ -4581,12 +4571,7 @@ impl Qwen35MoeInner {
                                 emb,
                                 depth as i32,
                             )?;
-                            Ok(chat_common::MtpVerifyOutput {
-                                logits: Some(logits),
-                                hiddens,
-                                target_argmax: None,
-                                target_sparse: None,
-                            })
+                            Ok(chat_common::MtpVerifyOutput::logits_only(logits, hiddens))
                         }
                     },
                     verify_step_argmax_only: None,
@@ -5417,12 +5402,7 @@ impl Qwen35MoeInner {
                                 emb,
                                 depth as i32,
                             )?;
-                            Ok(chat_common::MtpVerifyOutput {
-                                logits: Some(logits),
-                                hiddens,
-                                target_argmax: None,
-                                target_sparse: None,
-                            })
+                            Ok(chat_common::MtpVerifyOutput::logits_only(logits, hiddens))
                         }
                     },
                     verify_step_argmax_only: None,

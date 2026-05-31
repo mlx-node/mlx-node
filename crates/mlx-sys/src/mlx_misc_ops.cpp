@@ -213,20 +213,16 @@ mlx_array* mlx_compiled_sample_full(
   // Apply filters (each compiled into minimal graph nodes). MTPLX parity uses
   // temperature-scaled top-k support plus its fast sparse top-p keep rule. The
   // default keeps the existing mlx-node top-k then top-p behavior.
-  if (temperature_first) {
-    if (top_k > 0) {
-      logprobs = apply_top_k_filter(logprobs, top_k);
-    }
-    if (top_p > 0.0f && top_p < 1.0f) {
-      logprobs = compiled_mtplx_top_p_fn()({logprobs, mlx::core::array(top_p)})[0];
-    }
-  } else {
-    if (top_k > 0) {
-      logprobs = apply_top_k_filter(logprobs, top_k);
-    }
-    if (top_p > 0.0f && top_p < 1.0f) {
-      logprobs = compiled_top_p_fn()({logprobs, mlx::core::array(top_p)})[0];
-    }
+  if (top_k > 0) {
+    logprobs = apply_top_k_filter(logprobs, top_k);
+  }
+  if (top_p > 0.0f && top_p < 1.0f) {
+    auto top_p_arr = mlx::core::array(top_p);
+    // MTPLX parity uses its fast sparse top-p keep rule; default keeps the
+    // existing mlx-node top-p behavior.
+    logprobs = temperature_first
+                   ? compiled_mtplx_top_p_fn()({logprobs, top_p_arr})[0]
+                   : compiled_top_p_fn()({logprobs, top_p_arr})[0];
   }
 
   if (min_p > 0.0f) {
@@ -300,20 +296,6 @@ void mlx_compiled_sample_and_logprobs(
   // Apply filters. MTPLX parity uses temperature-scaled top-k support plus its
   // fast sparse top-p keep rule; default mode preserves the existing ordering.
   logprobs = sampler_logprobs;
-  auto apply_top_k_inline = [&logprobs](int k) {
-    if (k <= 0) return;
-    int vocab_size = logprobs.shape().back();
-    if (k >= vocab_size) return;
-    auto neg_logprobs = mlx::core::negative(logprobs);
-    auto partitioned_indices = mlx::core::argpartition(neg_logprobs, k - 1, -1);
-    auto shape = partitioned_indices.shape();
-    mlx::core::Shape starts(shape.size(), 0);
-    mlx::core::Shape ends(shape.begin(), shape.end());
-    starts[starts.size() - 1] = k;
-    auto mask_idx = mlx::core::slice(partitioned_indices, starts, ends);
-    auto neg_inf = mlx::core::array(-std::numeric_limits<float>::infinity(), logprobs.dtype());
-    logprobs = mlx::core::put_along_axis(logprobs, mask_idx, neg_inf, -1);
-  };
   auto apply_top_p_inline = [&logprobs](float p) {
     if (p <= 0.0f || p >= 1.0f) return;
     auto probs = mlx::core::exp(logprobs);
@@ -338,11 +320,12 @@ void mlx_compiled_sample_and_logprobs(
     logprobs = compiled_mtplx_top_p_fn()({logprobs, mlx::core::array(p)})[0];
   };
 
+  if (top_k > 0) {
+    logprobs = apply_top_k_filter(logprobs, top_k);
+  }
   if (temperature_first) {
-    apply_top_k_inline(top_k);
     apply_mtplx_top_p_inline(top_p);
   } else {
-    apply_top_k_inline(top_k);
     apply_top_p_inline(top_p);
   }
 

@@ -10187,12 +10187,11 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden(
     let logits = MxArray::from_handle(out_logits, "mtp_verify_logits")?;
     let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_hiddens")?;
     let target_argmax = MxArray::from_handle(out_argmax, "mtp_verify_argmax")?;
-    Ok(chat_common::MtpVerifyOutput {
-        logits: Some(logits),
+    Ok(chat_common::MtpVerifyOutput::logits_with_argmax(
+        logits,
         hiddens,
-        target_argmax: Some(target_argmax),
-        target_sparse: None,
-    })
+        target_argmax,
+    ))
 }
 
 pub(super) fn forward_mtp_verify_compiled_with_hidden_and_argmax_only(
@@ -10243,12 +10242,10 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden_and_argmax_only(
 
     let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_argmax_only_hiddens")?;
     let target_argmax = MxArray::from_handle(out_argmax, "mtp_verify_argmax_only_argmax")?;
-    Ok(chat_common::MtpVerifyOutput {
-        logits: None,
+    Ok(chat_common::MtpVerifyOutput::argmax_only(
         hiddens,
-        target_argmax: Some(target_argmax),
-        target_sparse: None,
-    })
+        target_argmax,
+    ))
 }
 
 pub(super) fn forward_mtp_verify_compiled_with_hidden_and_sparse_target(
@@ -10345,12 +10342,7 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden_and_sparse_target(
         "forward_mtp_verify_compiled_with_hidden_and_sparse_target",
     )?;
 
-    Ok(chat_common::MtpVerifyOutput {
-        logits: None,
-        hiddens,
-        target_argmax: None,
-        target_sparse: Some(target_sparse),
-    })
+    Ok(chat_common::MtpVerifyOutput::sparse(hiddens, target_sparse))
 }
 
 /// Phase 4b — paged-pool sibling of
@@ -10474,12 +10466,11 @@ pub(super) fn forward_mtp_verify_paged(
     let logits = MxArray::from_handle(out_logits, "mtp_verify_paged_logits")?;
     let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_paged_hiddens")?;
     let target_argmax = MxArray::from_handle(out_argmax, "mtp_verify_paged_argmax")?;
-    Ok(chat_common::MtpVerifyOutput {
-        logits: Some(logits),
+    Ok(chat_common::MtpVerifyOutput::logits_with_argmax(
+        logits,
         hiddens,
-        target_argmax: Some(target_argmax),
-        target_sparse: None,
-    })
+        target_argmax,
+    ))
 }
 
 // ============================================================================

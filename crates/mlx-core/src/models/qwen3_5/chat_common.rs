@@ -2236,6 +2236,58 @@ pub(crate) struct MtpVerifyOutput {
     pub target_sparse: Option<sampling::SparseDistributionRows>,
 }
 
+impl MtpVerifyOutput {
+    /// Verify produced dense logits only, with no precomputed target — the
+    /// MoE compiled path and the dense chained-cycle path.
+    pub(crate) fn logits_only(logits: MxArray, hiddens: MxArray) -> Self {
+        Self {
+            logits: Some(logits),
+            hiddens,
+            target_argmax: None,
+            target_sparse: None,
+        }
+    }
+
+    /// Verify produced dense logits plus the precomputed greedy-argmax target.
+    pub(crate) fn logits_with_argmax(
+        logits: MxArray,
+        hiddens: MxArray,
+        target_argmax: MxArray,
+    ) -> Self {
+        Self {
+            logits: Some(logits),
+            hiddens,
+            target_argmax: Some(target_argmax),
+            target_sparse: None,
+        }
+    }
+
+    /// Verify produced only the greedy-argmax target (no dense logits) — the
+    /// `argmax_only` fast path.
+    pub(crate) fn argmax_only(hiddens: MxArray, target_argmax: MxArray) -> Self {
+        Self {
+            logits: None,
+            hiddens,
+            target_argmax: Some(target_argmax),
+            target_sparse: None,
+        }
+    }
+
+    /// Verify produced a precomputed sparse target distribution (no dense
+    /// logits) — the native sparse-verify fast path.
+    pub(crate) fn sparse(
+        hiddens: MxArray,
+        target_sparse: sampling::SparseDistributionRows,
+    ) -> Self {
+        Self {
+            logits: None,
+            hiddens,
+            target_argmax: None,
+            target_sparse: Some(target_sparse),
+        }
+    }
+}
+
 /// One MTP draft+verify cycle. Pure helper — the caller drives the
 /// per-token streaming, EOS, cancellation, and tracker bookkeeping
 /// inside `decode_loop_mtp!`.
@@ -4325,12 +4377,7 @@ mod mtp_cycle_tests {
             let zero_hiddens = vec![0.0f32; positions * HIDDEN as usize];
             let hiddens = MxArray::from_float32(&zero_hiddens, &[1, positions as i64, HIDDEN])
                 .expect("verify hiddens stub");
-            Ok(MtpVerifyOutput {
-                logits: Some(arr),
-                hiddens,
-                target_argmax: None,
-                target_sparse: None,
-            })
+            Ok(MtpVerifyOutput::logits_only(arr, hiddens))
         }
     }
 
@@ -4344,12 +4391,7 @@ mod mtp_cycle_tests {
             let zero_hiddens = vec![0.0f32; positions * HIDDEN as usize];
             let hiddens = MxArray::from_float32(&zero_hiddens, &[1, positions as i64, HIDDEN])
                 .expect("verify hiddens stub");
-            Ok(MtpVerifyOutput {
-                logits: None,
-                hiddens,
-                target_argmax: None,
-                target_sparse: Some(target_sparse.clone()),
-            })
+            Ok(MtpVerifyOutput::sparse(hiddens, target_sparse.clone()))
         }
     }
 

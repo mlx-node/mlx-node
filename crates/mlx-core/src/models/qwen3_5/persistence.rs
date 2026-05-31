@@ -507,6 +507,21 @@ fn mtplx_mtp_quant(raw: &Value) -> Option<(String, PerLayerQuant)> {
     ))
 }
 
+/// The seven per-layer linear projections inside each MTP transformer layer
+/// that participate in quantization. Shared by the load-side quant-metadata
+/// augmentation and required-weight validation here, and by the convert-side
+/// quant policy ([`crate::convert::is_mtp_layer_quantizable_prefix`]), so the
+/// "which MTP linears are quantized" set never drifts between produce and load.
+pub(crate) const MTP_LAYER_LINEAR_SUFFIXES: [&str; 7] = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+];
+
 fn augment_mtplx_mtp_quantization(
     raw: &Value,
     n_mtp_layers: i32,
@@ -526,15 +541,7 @@ fn augment_mtplx_mtp_quantization(
     }
 
     for layer_idx in 0..n_mtp_layers.max(0) {
-        for suffix in [
-            "self_attn.q_proj",
-            "self_attn.k_proj",
-            "self_attn.v_proj",
-            "self_attn.o_proj",
-            "mlp.gate_proj",
-            "mlp.up_proj",
-            "mlp.down_proj",
-        ] {
+        for suffix in MTP_LAYER_LINEAR_SUFFIXES {
             per_layer_quant
                 .entry(format!("mtp.layers.{layer_idx}.{suffix}"))
                 .or_insert(plq);
@@ -842,15 +849,7 @@ fn missing_mtp_required_weights(
                 missing.push(key);
             }
         }
-        for suffix in [
-            "self_attn.q_proj",
-            "self_attn.k_proj",
-            "self_attn.v_proj",
-            "self_attn.o_proj",
-            "mlp.gate_proj",
-            "mlp.up_proj",
-            "mlp.down_proj",
-        ] {
+        for suffix in MTP_LAYER_LINEAR_SUFFIXES {
             require_mtp_linear(params, &format!("{prefix}.{suffix}"), &mut missing);
         }
     }
