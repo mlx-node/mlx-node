@@ -2102,6 +2102,20 @@ unsafe extern "C-unwind" {
         out_maxabs: *mut f32,
     ) -> i32;
 
+    /// TEST-ONLY warm-up probe: builds the SAME fixed synthetic MoE LFM2 as
+    /// `mlx_lfm2_probe_moe_compiled_vs_eager` (well_separated=1), drops any closure
+    /// a prior same-epoch probe left (a same-epoch reset, NOT an epoch bump), then
+    /// runs ONE COMPILED decode so a closure is traced + cached at the CURRENT
+    /// compile epoch against THIS `seed`'s constants, evals the last logits, then
+    /// clears weights WITHOUT bumping the epoch. The same-epoch reset is what makes
+    /// the stale closure left behind DETERMINISTICALLY `seed`'s model (determinism
+    /// comes from the reset, not from luck about what a prior probe cached), so an
+    /// order-dependent regression (e.g. the A->B model-swap test relying on its own
+    /// MODEL-A epoch bump) is exercised independent of test ordering. Returns 0 on
+    /// success, -1 on error. Caller MUST hold the compiled-weights write lock
+    /// (DESTRUCTIVE on the process-global weight map).
+    pub fn mlx_lfm2_probe_warm_compiled_no_bump(seed: u64) -> i32;
+
     /// A→B model-swap regression probe (TEST-ONLY): builds two DISTINCT
     /// synthetic MoE models (same fixed topology, different `seed_a`/`seed_b`
     /// weights) in one process; runs A compiled (caching the graph), then

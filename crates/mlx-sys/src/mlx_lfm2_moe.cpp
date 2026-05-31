@@ -275,6 +275,229 @@ std::function<std::vector<array>(const std::vector<array>&)> compiled_lfm2_decod
   }
   return *g_lfm2_compiled;
 }
+
+// TEST-ONLY: drop the cached compiled closure WITHOUT advancing the compile
+// epoch, forcing the next compiled_lfm2_decode() at the CURRENT epoch to
+// re-trace against the currently-registered weights. Used by the no-bump warm
+// probe so it deterministically freezes the just-built synthetic model rather
+// than reusing whatever closure a prior same-epoch probe left cached. Guards the
+// non-atomic closure state with g_lfm2_compiled_mu, exactly like
+// compiled_lfm2_decode().
+//
+// CALLER CONTRACT: the target weights MUST already be stored in g_weights()
+// before calling this — the re-trace happens on the NEXT compiled_lfm2_decode(),
+// which captures whatever constants are live then. Calling this before storing
+// the intended weights would re-trace against stale/empty constants.
+void lfm2_reset_compiled_closure_same_epoch() {
+  std::lock_guard<std::mutex> lk(g_lfm2_compiled_mu);
+  if (g_lfm2_has_compiled_fun_id) {
+    mlx::core::detail::compile_erase(g_lfm2_compiled_fun_id_built);
+    g_lfm2_has_compiled_fun_id = false;
+  }
+  g_lfm2_compiled.reset();
+  g_lfm2_compiled_epoch_built = 0;
+}
+// =============================================================================
+// TEST-ONLY shared synthetic-MoE helpers (used by the compiled-vs-eager probe
+// AND the no-bump warm probe). Extracted from `mlx_lfm2_probe_moe_compiled_vs_eager`
+// so the warm probe can reuse the IDENTICAL build + decode without copy-paste.
+// =============================================================================
+
+// Fixed synthetic-MoE topology shared by both probes (3 layers, hidden 32,
+// E=32/k=4, num_dense_layers=1, T=8, is_attn={1,0,1}). Returned to the caller
+// so the decode helper can use it for the input lookup; the config dims are
+// also published into `g_lfm2_config` / `g_lfm2_is_attn`. Clears + re-stores
+// the weight map. `well_separated` controls the expert_bias spread (big gaps
+// => decisive routing; tiny gaps => near-tie). Does NOT bump the compile epoch.
+struct Lfm2SyntheticMoe {
+  array embed;
+  int num_layers;
+  int hidden;
+  int num_kv_heads;
+  int head_dim;
+  int l_cache;
+  int vocab;
+  int T;
+};
+
+Lfm2SyntheticMoe lfm2_build_synthetic_moe(uint64_t seed, int well_separated) {
+  // ---- fixed synthetic config ----
+  const int num_layers = 3;
+  const int hidden = 32;
+  const int num_heads = 4;
+  const int num_kv_heads = 2;
+  const int head_dim = 8;
+  const int l_cache = 4;
+  // E=32 / k=4 matches the real lfm2.5-8b-a1b routing fan-out, so the near-tie
+  // case has the SAME number of top-k boundary candidates as the 8B model
+  // (the regime where a single fused-FP selection flip can occur).
+  const int E = 32;
+  const int k = 4;
+  const int num_dense_layers = 1;
+  const int vocab = 48;
+  const int T = 8;
+  const float rope_theta = 10000.0f;
+  const float norm_eps = 1e-5f;
+  const int is_attn[3] = {1, 0, 1};  // attn, conv, attn
+  const int moe_inter = 24;          // per-expert SwiGLU hidden
+  const int dense_inter = 40;        // dense-layer SwiGLU hidden
+
+  mlx_clear_weights();
+
+  // ---- seeded xorshift -> [-1,1) ----
+  uint64_t s = seed ? seed : 0x10F23C0Deull;
+  auto next = [&]() -> float {
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return (static_cast<float>(s >> 40) / static_cast<float>(1u << 23)) - 1.0f;
+  };
+  auto mk = [&](std::vector<int> shape, float scale) -> array {
+    int nelem = 1;
+    for (int d : shape) {
+      nelem *= d;
+    }
+    std::vector<float> buf(static_cast<size_t>(nelem));
+    for (int i = 0; i < nelem; i++) {
+      buf[i] = next() * scale;
+    }
+    mlx::core::Shape sh(shape.begin(), shape.end());
+    return astype(array(buf.data(), sh, mlx::core::float32), mlx::core::bfloat16);
+  };
+
+  // ---- register weights (mlx_store_weight copies; free our temp wrapper) ----
+  auto store = [&](const std::string& name, const array& a) {
+    auto* p = new array(a);
+    mlx_store_weight(name.c_str(), reinterpret_cast<mlx_array*>(p));
+    delete p;
+  };
+  auto store_norm = [&](const std::string& name, std::vector<int> shape) {
+    // norm weights centered at 1.0 (RMSNorm gain).
+    store(name, mk(shape, 0.02f) + array(1.0f, mlx::core::bfloat16));
+  };
+
+  auto embed = mk({vocab, hidden}, 0.05f);
+  store("embed_tokens.weight", embed);
+  store_norm("embedding_norm.weight", {hidden});
+
+  for (int i = 0; i < num_layers; i++) {
+    std::string lp = "layers." + std::to_string(i);
+    store_norm(lp + ".operator_norm.weight", {hidden});
+    store_norm(lp + ".ffn_norm.weight", {hidden});
+
+    bool is_moe = i >= num_dense_layers;  // E>0 always here
+    if (is_moe) {
+      store(lp + ".feed_forward.gate.weight", mk({E, hidden}, 0.1f));
+      // expert_bias is the selection lever (see header).
+      std::vector<float> bias(E);
+      for (int e = 0; e < E; e++) {
+        bias[e] = well_separated ? 4.0f * static_cast<float>(e)
+                                 : 1e-4f * static_cast<float>(e);
+      }
+      mlx::core::Shape bsh{E};
+      store(lp + ".feed_forward.expert_bias",
+            astype(array(bias.data(), bsh, mlx::core::float32), mlx::core::bfloat16));
+      store(lp + ".feed_forward.switch_mlp.gate_proj.weight", mk({E, moe_inter, hidden}, 0.08f));
+      store(lp + ".feed_forward.switch_mlp.up_proj.weight", mk({E, moe_inter, hidden}, 0.08f));
+      store(lp + ".feed_forward.switch_mlp.down_proj.weight", mk({E, hidden, moe_inter}, 0.08f));
+    } else {
+      store(lp + ".feed_forward.gate_proj.weight", mk({dense_inter, hidden}, 0.08f));
+      store(lp + ".feed_forward.up_proj.weight", mk({dense_inter, hidden}, 0.08f));
+      store(lp + ".feed_forward.down_proj.weight", mk({hidden, dense_inter}, 0.08f));
+    }
+
+    if (is_attn[i]) {
+      store(lp + ".self_attn.q_proj.weight", mk({num_heads * head_dim, hidden}, 0.08f));
+      store(lp + ".self_attn.k_proj.weight", mk({num_kv_heads * head_dim, hidden}, 0.08f));
+      store(lp + ".self_attn.v_proj.weight", mk({num_kv_heads * head_dim, hidden}, 0.08f));
+      store(lp + ".self_attn.out_proj.weight", mk({hidden, num_heads * head_dim}, 0.08f));
+      store_norm(lp + ".self_attn.q_layernorm.weight", {head_dim});
+      store_norm(lp + ".self_attn.k_layernorm.weight", {head_dim});
+    } else {
+      store(lp + ".conv.in_proj.weight", mk({3 * hidden, hidden}, 0.08f));
+      store(lp + ".conv.conv.weight", mk({hidden, l_cache, 1}, 0.2f));
+      store(lp + ".conv.out_proj.weight", mk({hidden, hidden}, 0.08f));
+    }
+  }
+
+  // ---- config ----
+  g_lfm2_config = Lfm2MoeConfig{};
+  g_lfm2_config.num_layers = num_layers;
+  g_lfm2_config.hidden_size = hidden;
+  g_lfm2_config.num_heads = num_heads;
+  g_lfm2_config.num_kv_heads = num_kv_heads;
+  g_lfm2_config.head_dim = head_dim;
+  g_lfm2_config.conv_l_cache = l_cache;
+  g_lfm2_config.rope_theta = rope_theta;
+  g_lfm2_config.norm_eps = norm_eps;
+  g_lfm2_config.num_experts = E;
+  g_lfm2_config.num_experts_per_tok = k;
+  g_lfm2_config.num_dense_layers = num_dense_layers;
+  g_lfm2_config.norm_topk_prob = true;
+  g_lfm2_config.use_expert_bias = true;
+  g_lfm2_config.use_sigmoid = false;
+  g_lfm2_config.tie_embedding = true;
+  g_lfm2_config.max_kv_len = T;
+  g_lfm2_is_attn.assign(is_attn, is_attn + num_layers);
+
+  return Lfm2SyntheticMoe{embed, num_layers, hidden, num_kv_heads, head_dim,
+                          l_cache, vocab, T};
+}
+
+// Drive T decode steps over the synthetic MoE built above (CURRENT
+// g_weights()/g_lfm2_config state), eager or compiled, returning the last-step
+// logits. `compiled` selects compiled_lfm2_decode() vs the eager lfm2_decode_fn.
+array lfm2_run_synthetic_decode(const Lfm2SyntheticMoe& m, bool compiled) {
+  const int num_layers = m.num_layers;
+  const int hidden = m.hidden;
+  const int num_kv_heads = m.num_kv_heads;
+  const int head_dim = m.head_dim;
+  const int l_cache = m.l_cache;
+  const int vocab = m.vocab;
+  const int T = m.T;
+  const int token_ids[8] = {3, 11, 7, 22, 5, 19, 31, 14};
+  const auto& embed = m.embed;
+
+  std::vector<array> caches;
+  caches.reserve(num_layers * 2);
+  for (int i = 0; i < num_layers; i++) {
+    if (g_lfm2_is_attn[i]) {
+      caches.push_back(zeros({1, num_kv_heads, T, head_dim}, mlx::core::bfloat16));
+      caches.push_back(zeros({1, num_kv_heads, T, head_dim}, mlx::core::bfloat16));
+    } else {
+      caches.push_back(zeros({1, l_cache - 1, hidden}, mlx::core::bfloat16));
+      caches.push_back(zeros({}, mlx::core::bfloat16));
+    }
+  }
+  array last_logits = zeros({1, vocab}, mlx::core::bfloat16);
+  for (int t = 0; t < T; t++) {
+    auto idx = reshape(array(token_ids[t], mlx::core::int32), {1});
+    auto h = take(embed, idx, 0);  // [1, hidden]
+    std::vector<array> in;
+    in.reserve(2 + num_layers * 2);
+    in.push_back(h);
+    in.push_back(array(t, mlx::core::int32));
+    for (auto& c : caches) {
+      in.push_back(c);
+    }
+    std::vector<array> outs;
+    if (compiled) {
+      // Owned copy of the by-value compiled closure (see contract) before
+      // invoking — no dangling reference if a swap races.
+      auto fn = compiled_lfm2_decode();
+      outs = fn(in);
+    } else {
+      outs = lfm2_decode_fn(in);
+    }
+    last_logits = outs[0];
+    for (int i = 0; i < num_layers * 2; i++) {
+      caches[i] = outs[2 + i];
+    }
+  }
+  mlx::core::eval({last_logits});
+  return last_logits;
+}
+
 }  // namespace
 
 extern "C" {
@@ -1085,171 +1308,15 @@ mlx_array* mlx_lfm2_probe_moe_decode_seq(
 int mlx_lfm2_probe_moe_compiled_vs_eager(uint64_t seed, int well_separated,
                                          float* out_maxabs) {
   try {
-    mlx_clear_weights();
+    auto m = lfm2_build_synthetic_moe(seed, well_separated);
 
-    // ---- fixed synthetic config ----
-    const int num_layers = 3;
-    const int hidden = 32;
-    const int num_heads = 4;
-    const int num_kv_heads = 2;
-    const int head_dim = 8;
-    const int l_cache = 4;
-    // E=32 / k=4 matches the real lfm2.5-8b-a1b routing fan-out, so the near-tie
-    // case has the SAME number of top-k boundary candidates as the 8B model
-    // (the regime where a single fused-FP selection flip can occur).
-    const int E = 32;
-    const int k = 4;
-    const int num_dense_layers = 1;
-    const int vocab = 48;
-    const int T = 8;
-    const float rope_theta = 10000.0f;
-    const float norm_eps = 1e-5f;
-    const int is_attn[3] = {1, 0, 1};  // attn, conv, attn
-    const int moe_inter = 24;          // per-expert SwiGLU hidden
-    const int dense_inter = 40;        // dense-layer SwiGLU hidden
+    // Order-independence: a prior probe in this process may have left a compiled
+    // closure cached at the current epoch; bump so this probe's compiled run
+    // re-traces against THESE synthetic constants (mirrors register_weights_with_cpp).
+    mlx_lfm2_invalidate_compiled();
 
-    // ---- seeded xorshift -> [-1,1) ----
-    uint64_t s = seed ? seed : 0x10F23C0Deull;
-    auto next = [&]() -> float {
-      s ^= s << 13;
-      s ^= s >> 7;
-      s ^= s << 17;
-      return (static_cast<float>(s >> 40) / static_cast<float>(1u << 23)) - 1.0f;
-    };
-    auto mk = [&](std::vector<int> shape, float scale) -> array {
-      int nelem = 1;
-      for (int d : shape) {
-        nelem *= d;
-      }
-      std::vector<float> buf(static_cast<size_t>(nelem));
-      for (int i = 0; i < nelem; i++) {
-        buf[i] = next() * scale;
-      }
-      mlx::core::Shape sh(shape.begin(), shape.end());
-      return astype(array(buf.data(), sh, mlx::core::float32), mlx::core::bfloat16);
-    };
-
-    // ---- register weights (mlx_store_weight copies; free our temp wrapper) ----
-    auto store = [&](const std::string& name, const array& a) {
-      auto* p = new array(a);
-      mlx_store_weight(name.c_str(), reinterpret_cast<mlx_array*>(p));
-      delete p;
-    };
-    auto store_norm = [&](const std::string& name, std::vector<int> shape) {
-      // norm weights centered at 1.0 (RMSNorm gain).
-      store(name, mk(shape, 0.02f) + array(1.0f, mlx::core::bfloat16));
-    };
-
-    auto embed = mk({vocab, hidden}, 0.05f);
-    store("embed_tokens.weight", embed);
-    store_norm("embedding_norm.weight", {hidden});
-
-    for (int i = 0; i < num_layers; i++) {
-      std::string lp = "layers." + std::to_string(i);
-      store_norm(lp + ".operator_norm.weight", {hidden});
-      store_norm(lp + ".ffn_norm.weight", {hidden});
-
-      bool is_moe = i >= num_dense_layers;  // E>0 always here
-      if (is_moe) {
-        store(lp + ".feed_forward.gate.weight", mk({E, hidden}, 0.1f));
-        // expert_bias is the selection lever (see header).
-        std::vector<float> bias(E);
-        for (int e = 0; e < E; e++) {
-          bias[e] = well_separated ? 4.0f * static_cast<float>(e)
-                                   : 1e-4f * static_cast<float>(e);
-        }
-        mlx::core::Shape bsh{E};
-        store(lp + ".feed_forward.expert_bias",
-              astype(array(bias.data(), bsh, mlx::core::float32), mlx::core::bfloat16));
-        store(lp + ".feed_forward.switch_mlp.gate_proj.weight", mk({E, moe_inter, hidden}, 0.08f));
-        store(lp + ".feed_forward.switch_mlp.up_proj.weight", mk({E, moe_inter, hidden}, 0.08f));
-        store(lp + ".feed_forward.switch_mlp.down_proj.weight", mk({E, hidden, moe_inter}, 0.08f));
-      } else {
-        store(lp + ".feed_forward.gate_proj.weight", mk({dense_inter, hidden}, 0.08f));
-        store(lp + ".feed_forward.up_proj.weight", mk({dense_inter, hidden}, 0.08f));
-        store(lp + ".feed_forward.down_proj.weight", mk({hidden, dense_inter}, 0.08f));
-      }
-
-      if (is_attn[i]) {
-        store(lp + ".self_attn.q_proj.weight", mk({num_heads * head_dim, hidden}, 0.08f));
-        store(lp + ".self_attn.k_proj.weight", mk({num_kv_heads * head_dim, hidden}, 0.08f));
-        store(lp + ".self_attn.v_proj.weight", mk({num_kv_heads * head_dim, hidden}, 0.08f));
-        store(lp + ".self_attn.out_proj.weight", mk({hidden, num_heads * head_dim}, 0.08f));
-        store_norm(lp + ".self_attn.q_layernorm.weight", {head_dim});
-        store_norm(lp + ".self_attn.k_layernorm.weight", {head_dim});
-      } else {
-        store(lp + ".conv.in_proj.weight", mk({3 * hidden, hidden}, 0.08f));
-        store(lp + ".conv.conv.weight", mk({hidden, l_cache, 1}, 0.2f));
-        store(lp + ".conv.out_proj.weight", mk({hidden, hidden}, 0.08f));
-      }
-    }
-
-    // ---- config ----
-    g_lfm2_config = Lfm2MoeConfig{};
-    g_lfm2_config.num_layers = num_layers;
-    g_lfm2_config.hidden_size = hidden;
-    g_lfm2_config.num_heads = num_heads;
-    g_lfm2_config.num_kv_heads = num_kv_heads;
-    g_lfm2_config.head_dim = head_dim;
-    g_lfm2_config.conv_l_cache = l_cache;
-    g_lfm2_config.rope_theta = rope_theta;
-    g_lfm2_config.norm_eps = norm_eps;
-    g_lfm2_config.num_experts = E;
-    g_lfm2_config.num_experts_per_tok = k;
-    g_lfm2_config.num_dense_layers = num_dense_layers;
-    g_lfm2_config.norm_topk_prob = true;
-    g_lfm2_config.use_expert_bias = true;
-    g_lfm2_config.use_sigmoid = false;
-    g_lfm2_config.tie_embedding = true;
-    g_lfm2_config.max_kv_len = T;
-    g_lfm2_is_attn.assign(is_attn, is_attn + num_layers);
-
-    const int token_ids[8] = {3, 11, 7, 22, 5, 19, 31, 14};
-
-    // Run T decode steps through `lfm2_decode_fn`, eager or compiled.
-    auto run = [&](bool compiled) -> array {
-      std::vector<array> caches;
-      caches.reserve(num_layers * 2);
-      for (int i = 0; i < num_layers; i++) {
-        if (is_attn[i]) {
-          caches.push_back(zeros({1, num_kv_heads, T, head_dim}, mlx::core::bfloat16));
-          caches.push_back(zeros({1, num_kv_heads, T, head_dim}, mlx::core::bfloat16));
-        } else {
-          caches.push_back(zeros({1, l_cache - 1, hidden}, mlx::core::bfloat16));
-          caches.push_back(zeros({}, mlx::core::bfloat16));
-        }
-      }
-      array last_logits = zeros({1, vocab}, mlx::core::bfloat16);
-      for (int t = 0; t < T; t++) {
-        auto idx = reshape(array(token_ids[t], mlx::core::int32), {1});
-        auto h = take(embed, idx, 0);  // [1, hidden]
-        std::vector<array> in;
-        in.reserve(2 + num_layers * 2);
-        in.push_back(h);
-        in.push_back(array(t, mlx::core::int32));
-        for (auto& c : caches) {
-          in.push_back(c);
-        }
-        std::vector<array> outs;
-        if (compiled) {
-          // Owned copy of the by-value compiled closure (see contract) before
-          // invoking — no dangling reference if a swap races.
-          auto fn = compiled_lfm2_decode();
-          outs = fn(in);
-        } else {
-          outs = lfm2_decode_fn(in);
-        }
-        last_logits = outs[0];
-        for (int i = 0; i < num_layers * 2; i++) {
-          caches[i] = outs[2 + i];
-        }
-      }
-      mlx::core::eval({last_logits});
-      return last_logits;
-    };
-
-    auto eager = run(false);
-    auto comp = run(true);
+    auto eager = lfm2_run_synthetic_decode(m, false);
+    auto comp = lfm2_run_synthetic_decode(m, true);
     auto diff = max(abs(subtract(astype(comp, mlx::core::float32),
                                  astype(eager, mlx::core::float32))));
     mlx::core::eval({diff});
@@ -1260,6 +1327,45 @@ int mlx_lfm2_probe_moe_compiled_vs_eager(uint64_t seed, int well_separated,
     return 0;
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_moe_compiled_vs_eager: %s\n", e.what());
+    fflush(stderr);
+    mlx_clear_weights();
+    return -1;
+  } catch (...) {
+    mlx_clear_weights();
+    return -1;
+  }
+}
+
+// TEST-ONLY: warm a compiled lfm2 decode closure for the fixed synthetic MoE
+// built from `seed` (well_separated=1): build weights/config, drop any closure a
+// prior same-epoch probe left (lfm2_reset_compiled_closure_same_epoch), run ONE
+// compiled decode over the T steps so a closure is traced + cached at the CURRENT
+// epoch against THESE `seed` constants, then clear weights WITHOUT bumping the
+// compile epoch. The same-epoch reset is what makes the cached stale closure
+// DETERMINISTICALLY `seed`'s model (not whatever a prior probe happened to leave),
+// so the A->B swap test can exercise the MODEL-A epoch-bump fix. Caller MUST hold
+// COMPILED_WEIGHTS_RWLOCK (write); DESTRUCTIVE on g_weights(). Returns 0 on
+// success, -1 on error.
+int mlx_lfm2_probe_warm_compiled_no_bump(uint64_t seed) {
+  try {
+    auto m = lfm2_build_synthetic_moe(seed, /*well_separated=*/1);
+    // Deliberately NO mlx_lfm2_invalidate_compiled() here: the whole point of
+    // this probe is to leave a compiled closure cached at the current epoch so
+    // the A->B swap test's MODEL-A bump has a stale closure to defeat.
+    //
+    // Force this probe's OWN constants to be the closure cached at the current
+    // epoch: drop any closure a prior same-epoch probe left, so the compiled
+    // decode below re-traces against THESE freshly-built `seed` weights. Without
+    // this, compiled_lfm2_decode() would reuse a stale same-epoch closure and the
+    // warm probe would NOT deterministically freeze `seed` (the A->B regression
+    // would then be non-load-bearing for reasons unrelated to the MODEL-A bump).
+    lfm2_reset_compiled_closure_same_epoch();
+    auto comp = lfm2_run_synthetic_decode(m, /*compiled=*/true);
+    mlx::core::eval({comp});
+    mlx_clear_weights();
+    return 0;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] mlx_lfm2_probe_warm_compiled_no_bump: %s\n", e.what());
     fflush(stderr);
     mlx_clear_weights();
     return -1;

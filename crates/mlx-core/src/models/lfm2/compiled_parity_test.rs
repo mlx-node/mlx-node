@@ -1151,24 +1151,41 @@ fn compiled_moe_ab_model_swap_recompiles() {
     // Distinct seeds => distinct A and B weights.
     let seed_a = 0x1111_2222_3333_4444u64;
     let seed_b = 0xAAAA_BBBB_CCCC_DDDDu64;
+    // A THIRD distinct seed for the no-bump warm-up pre-seed below. It MUST differ
+    // from `seed_a`: the warm probe FORCES the cached stale closure to be
+    // `warm_seed`'s model (see the warm-probe contract below), so it must freeze
+    // DIFFERENT constants than MODEL A. If `warm_seed == seed_a`, the stale closure
+    // would replay constants byte-identical to MODEL A's and (wrongly) still
+    // produce A's correct logits, making the MODEL-A epoch-bump non-load-bearing
+    // and the F3 gold-standard vacuous. With a different seed, removing the MODEL-A
+    // bump makes A's compiled run replay `warm_seed`'s weights and
+    // `a_comp_vs_a_eager` blows past PARITY_TOL — which is the regression the
+    // MODEL-A bump must defeat.
+    let warm_seed = 0x7777_8888_9999_AAAAu64;
 
     // F3 soundness: PRE-SEED a compiled closure at the current epoch BEFORE the
     // measured probe so the A-side stale-closure hazard manifests
-    // DETERMINISTICALLY. The sibling `compiled_vs_eager` probe registers its own
-    // synthetic weights, runs one COMPILED decode (leaving `g_lfm2_compiled`
-    // cached at the current epoch), then clears the weights — it does NOT bump
-    // the compile epoch. So the measured A->B probe below re-enters with a stale
-    // closure already cached at this epoch: WITHOUT the MODEL-A `build_model`
-    // epoch bump (the F3 production-style fix), MODEL A's compiled run would reuse
-    // that stale closure and `a_comp_vs_a_eager` would blow past PARITY_TOL — i.e.
-    // removing the MODEL-A bump makes THIS test fail. WITH the bump, MODEL A is
-    // epoch-fresh and all three deltas hold. The sibling probe (NOT the A->B
-    // probe) is used so the measured run's A/B-distinguishability is untouched.
-    let mut warm = f32::NAN;
-    let warm_rc = unsafe { mlx_sys::mlx_lfm2_probe_moe_compiled_vs_eager(seed_a, 1, &mut warm) };
+    // DETERMINISTICALLY. The dedicated `warm_compiled_no_bump` probe registers its
+    // own synthetic `warm_seed` weights, then — crucially — performs a SAME-EPOCH
+    // RESET of the cached closure (drops any closure a prior same-epoch probe left
+    // WITHOUT advancing the epoch) and runs one COMPILED decode. The reset forces
+    // that decode to RE-TRACE against `warm_seed`'s constants, so the closure it
+    // leaves cached at the current epoch is DETERMINISTICALLY `warm_seed`'s model —
+    // regardless of what closure any earlier same-epoch probe had cached (e.g. the
+    // well-separated compiled-vs-eager probe). It then clears the weights and, by
+    // design, does NOT bump the compile epoch. So the measured A->B probe below
+    // re-enters with `warm_seed`'s stale closure cached at this epoch: WITHOUT the
+    // MODEL-A `build_model` epoch bump (the F3 production-style fix), MODEL A's
+    // compiled run reuses that stale closure, replays `warm_seed`'s frozen
+    // constants, and `a_comp_vs_a_eager` blows past PARITY_TOL — i.e. removing the
+    // MODEL-A bump makes THIS test fail. WITH the bump, MODEL A is epoch-fresh and
+    // all three deltas hold. The same-epoch reset is what makes the pre-seed
+    // load-bearing AND order-independent: the stale closure is `warm_seed`'s model
+    // whether or not another probe ran first in this process.
+    let warm_rc = unsafe { mlx_sys::mlx_lfm2_probe_warm_compiled_no_bump(warm_seed) };
     assert_eq!(
         warm_rc, 0,
-        "compiled-vs-eager pre-seed probe failed (rc={warm_rc})"
+        "no-bump warm-up pre-seed probe failed (rc={warm_rc})"
     );
 
     let mut b_comp_vs_b_eager = f32::NAN;
