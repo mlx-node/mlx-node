@@ -144,6 +144,12 @@ pub struct ConversionOptions {
     /// becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
     /// Forces `group_size = 32` for upgraded layers.
     pub quant_mxfp: Option<bool>,
+
+    /// Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", or "all".
+    /// "cyankiwi" keeps mtp.fc dense and quantizes only the MTP layer linears as
+    /// 4-bit affine group_size=32 in an MTPLX-compatible mtp.safetensors sidecar.
+    /// "all" additionally quantizes mtp.fc.
+    pub quant_mtp: Option<String>,
 }
 
 #[napi(object)]
@@ -233,6 +239,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let quant_recipe = options.quant_recipe;
     let imatrix_path = options.imatrix_path;
     let quant_mxfp = options.quant_mxfp.unwrap_or(false);
+    let quant_mtp = options.quant_mtp.unwrap_or_else(|| "off".to_string());
 
     // Validate quant_mode before it reaches FFI
     const VALID_QUANT_MODES: &[&str] = &["affine", "mxfp4", "mxfp8", "nvfp4"];
@@ -242,6 +249,20 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             quant_mode,
             VALID_QUANT_MODES.join(", ")
         )));
+    }
+
+    const VALID_MTP_QUANT_POLICIES: &[&str] = &["off", "cyankiwi", "all"];
+    if !VALID_MTP_QUANT_POLICIES.contains(&quant_mtp.as_str()) {
+        return Err(Error::from_reason(format!(
+            "Invalid quant_mtp '{}': must be one of {}",
+            quant_mtp,
+            VALID_MTP_QUANT_POLICIES.join(", ")
+        )));
+    }
+    if quant_mtp != "off" && (!do_quantize || quant_recipe.is_none()) {
+        return Err(Error::from_reason(
+            "quant_mtp requires quantize=true and quant_recipe".to_string(),
+        ));
     }
 
     // Per-mode defaults — match MLX C++ kernel instantiations in
@@ -709,14 +730,19 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let embed_quantizable = matches!(model_type.as_deref(), Some("lfm2") | Some("lfm2_moe"));
     if do_quantize {
         info!(
-            "Quantizing weights: bits={}, group_size={}, mode={}{}",
+            "Quantizing weights: bits={}, group_size={}, mode={}{}{}",
             quant_bits,
             quant_group_size,
             quant_mode,
             quant_recipe
                 .as_deref()
                 .map(|r| format!(", recipe={}", r))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if quant_mtp != "off" {
+                format!(", mtp={}", quant_mtp)
+            } else {
+                String::new()
+            }
         );
 
         if is_privacy_filter {
@@ -801,6 +827,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             } else {
                 predicate
             };
+            let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> = if quant_mtp != "off"
+            {
+                apply_mtp_quant_policy(predicate, quant_mtp.clone())
+            } else {
+                predicate
+            };
             per_layer_overrides = quantize_weights_with_recipe_pub(
                 &mut converted_tensors,
                 quant_bits,
@@ -859,8 +891,32 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         }
     }
 
+    let emit_mtp_sidecar = quant_mtp != "off" && matches!(model_type.as_deref(), Some("qwen3_5"));
+    let mtp_sidecar_tensors = if emit_mtp_sidecar {
+        extract_mtp_sidecar_tensors(&mut converted_tensors)?
+    } else {
+        HashMap::new()
+    };
+    let mtp_sidecar_weight_count = mtp_sidecar_weight_count(&mtp_sidecar_tensors);
+    if quant_mtp != "off" && mtp_sidecar_tensors.is_empty() {
+        return Err(Error::from_reason(
+            "--q-mtp requested but no mtp.* tensors were found after Qwen sanitization".to_string(),
+        ));
+    }
+    if !mtp_sidecar_tensors.is_empty() {
+        info!(
+            "Extracted {} MTP tensors ({} .weight tensors) to mtp.safetensors sidecar",
+            mtp_sidecar_tensors.len(),
+            mtp_sidecar_weight_count
+        );
+    }
+
     // Update tensor names after sanitization/quantization
-    let mut tensor_names: Vec<String> = converted_tensors.keys().cloned().collect();
+    let mut tensor_names: Vec<String> = converted_tensors
+        .keys()
+        .chain(mtp_sidecar_tensors.keys())
+        .cloned()
+        .collect();
     tensor_names.sort();
 
     // Save converted model — sharded output with index file (mlx-lm/mlx-vlm compatible)
@@ -878,6 +934,14 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         save_seconds = save_start.elapsed().as_secs_f64(),
         "sharded save complete"
     );
+    if !mtp_sidecar_tensors.is_empty() {
+        let mtp_path = output_dir.join("mtp.safetensors");
+        // `save_safetensors` drains its argument (drain-on-write, #63); the
+        // sidecar is small and is still needed below (`is_empty()` gates the
+        // config metadata), so drain a clone and keep the original intact.
+        crate::utils::safetensors::save_safetensors(&mtp_path, &mut mtp_sidecar_tensors.clone(), None)?;
+        info!("  Wrote mtp.safetensors");
+    }
 
     // Write config.json — clean and sort keys to match mlx-lm/mlx-vlm save_config
     let output_config_path = output_dir.join("config.json");
@@ -892,6 +956,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         });
         if let Some(obj) = quant_obj.as_object_mut() {
             for (path, override_val) in &per_layer_overrides {
+                if is_mtp_key(path) {
+                    continue;
+                }
                 // Privacy-filter uses bare `model.*` keys natively; other models
                 // need the `language_model.model.*` prefix expected by mlx-lm.
                 let key = if is_privacy_filter {
@@ -904,6 +971,61 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         }
         output_config["quantization"] = quant_obj.clone();
         output_config["quantization_config"] = quant_obj;
+    }
+
+    if do_quantize && quant_mtp != "off" {
+        let description = if quant_mtp == "cyankiwi" {
+            "Load calibrated CyanKiwi MTP layer linears as packed MLX INT4; keep mtp.fc and MTP norms BF16."
+        } else {
+            "Load packed MLX INT4 MTP linears from mtp.safetensors."
+        };
+        output_config["mtplx_mtp_quantization"] = serde_json::json!({
+            "prequantized": true,
+            "policy": quant_mtp,
+            "bits": MTP_QUANT_BITS,
+            "group_size": MTP_QUANT_GROUP_SIZE,
+            "mode": "affine",
+            "description": description,
+        });
+    }
+
+    if !mtp_sidecar_tensors.is_empty() {
+        output_config["mlx_lm_extra_tensors"] = serde_json::json!({
+            "mtp_file": "mtp.safetensors",
+            "mtp_tensor_count": mtp_sidecar_weight_count,
+        });
+    }
+
+    if do_quantize && quant_mtp != "off" && !mtp_sidecar_tensors.is_empty() {
+        let runtime_path = output_dir.join("mtplx_runtime.json");
+        let runtime_contract = serde_json::json!({
+            "arch_id": "qwen3-next-mtp",
+            "artifact_role": "mlx-node-convert-mtplx-layout",
+            "mtp_depth_max": 3,
+            "mtp_sidecar": "mtp.safetensors",
+            "recommended_draft_lm_head": {
+                "bits": 3,
+                "group_size": 64,
+                "mode": "affine",
+            },
+            "recommended_draft_sampler": {
+                "temperature": 0.7,
+                "top_k": 20,
+                "top_p": 0.95,
+            },
+            "sampler": {
+                "temperature": 0.6,
+                "top_k": 20,
+                "top_p": 0.95,
+            },
+        });
+        let runtime_str = serde_json::to_string_pretty(&runtime_contract).map_err(|e| {
+            Error::from_reason(format!("Failed to serialize mtplx_runtime.json: {}", e))
+        })?;
+        fs::write(&runtime_path, runtime_str).map_err(|e| {
+            Error::from_reason(format!("Failed to write mtplx_runtime.json: {}", e))
+        })?;
+        info!("Wrote mtplx_runtime.json");
     }
 
     // Clean config: remove keys that mlx-lm/mlx-vlm strip
@@ -994,6 +1116,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     })
 }
 
+const MTP_QUANT_BITS: i32 = 4;
+const MTP_QUANT_GROUP_SIZE: i32 = 32;
+
 /// Determine whether a weight key should be quantized.
 ///
 /// `embed_quantizable` opts the model family INTO quantizing the token
@@ -1069,18 +1194,105 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
         return false;
     }
 
-    // Exclude MTP (multi-token prediction) head weights. MTPLX convention is
-    // that MTP weights are stored in their "final form" and must NOT be
-    // re-quantized by us — doing so produces a quantization-of-quantization
-    // chain that degrades the head's verify-time accuracy. MTP heads are
-    // small (~150-500MB total even on 27B dense) so the disk-size cost of
-    // keeping them at the source dtype is negligible. Matches the W1
-    // load-path bypass in `qwen3_5/persistence.rs::sanitize_weights`.
-    if key.starts_with("mtp.") || key.starts_with("mtp_") || key.contains(".mtp.") {
+    // Exclude MTP from the generic quantizer. An explicit --q-mtp policy may
+    // re-enable the MTPLX-compatible MTP linears after the model recipe has
+    // made its normal decisions, but the default path keeps MTP in source dtype.
+    if is_mtp_key(key) {
         return false;
     }
 
     true
+}
+
+fn is_mtp_key(key: &str) -> bool {
+    let bare = normalize_mtp_prefix(key);
+    bare.starts_with("mtp.") || bare.starts_with("mtp_") || key.contains(".mtp.")
+}
+
+fn normalize_mtp_prefix(key: &str) -> &str {
+    key.strip_prefix("model.language_model.model.")
+        .or_else(|| key.strip_prefix("model.language_model."))
+        .or_else(|| key.strip_prefix("language_model.model."))
+        .or_else(|| key.strip_prefix("language_model."))
+        .or_else(|| key.strip_prefix("model."))
+        .unwrap_or(key)
+}
+
+fn is_mtp_sidecar_key(key: &str) -> bool {
+    normalize_mtp_prefix(key).starts_with("mtp.")
+}
+
+fn extract_mtp_sidecar_tensors(
+    weights: &mut HashMap<String, MxArray>,
+) -> Result<HashMap<String, MxArray>> {
+    let mut keys: Vec<String> = weights
+        .keys()
+        .filter(|key| is_mtp_sidecar_key(key))
+        .cloned()
+        .collect();
+    keys.sort();
+
+    let mut sidecar = HashMap::new();
+    for key in keys {
+        let sidecar_key = normalize_mtp_prefix(&key).to_string();
+        let array = weights
+            .remove(&key)
+            .ok_or_else(|| Error::from_reason(format!("MTP tensor disappeared: {key}")))?;
+        if sidecar.insert(sidecar_key.clone(), array).is_some() {
+            return Err(Error::from_reason(format!(
+                "Duplicate MTP sidecar tensor after key normalization: {sidecar_key}"
+            )));
+        }
+    }
+
+    Ok(sidecar)
+}
+
+fn mtp_sidecar_weight_count(weights: &HashMap<String, MxArray>) -> usize {
+    weights
+        .keys()
+        .filter(|key| key.ends_with(".weight"))
+        .count()
+}
+
+fn strip_mtp_weight_suffix(key: &str) -> Option<&str> {
+    key.strip_suffix(".weight")
+}
+
+fn is_mtp_layer_quantizable_prefix(prefix: &str) -> bool {
+    prefix.starts_with("mtp.layers.")
+        && (prefix.ends_with(".self_attn.q_proj")
+            || prefix.ends_with(".self_attn.k_proj")
+            || prefix.ends_with(".self_attn.v_proj")
+            || prefix.ends_with(".self_attn.o_proj")
+            || prefix.ends_with(".mlp.gate_proj")
+            || prefix.ends_with(".mlp.up_proj")
+            || prefix.ends_with(".mlp.down_proj"))
+}
+
+fn mtp_quant_decision(key: &str, policy: &str) -> Option<QuantDecision> {
+    if policy == "off" || !is_mtp_key(key) {
+        return None;
+    }
+    let Some(prefix) = strip_mtp_weight_suffix(key) else {
+        return Some(QuantDecision::Skip);
+    };
+    let prefix = normalize_mtp_prefix(prefix);
+    if is_mtp_layer_quantizable_prefix(prefix) || (policy == "all" && prefix == "mtp.fc") {
+        return Some(QuantDecision::Custom {
+            bits: MTP_QUANT_BITS,
+            group_size: MTP_QUANT_GROUP_SIZE,
+            mode: "affine".to_string(),
+        });
+    }
+    Some(QuantDecision::Skip)
+}
+
+fn apply_mtp_quant_policy(
+    inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync>,
+    policy: String,
+) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
+    Box::new(move |key: &str| mtp_quant_decision(key, &policy).unwrap_or_else(|| inner(key)))
 }
 
 /// Check if a key is a router gate (should be quantized at 8-bit for accuracy).
@@ -4336,6 +4548,83 @@ mod tests {
             wrapped("model.layers.0.mlp.gate.weight"),
             QuantDecision::Skip,
         );
+    }
+
+    #[test]
+    fn apply_mtp_quant_policy_cyankiwi_quantizes_only_mtp_layer_linears() {
+        let wrapped = apply_mtp_quant_policy(
+            const_predicate(QuantDecision::Default),
+            "cyankiwi".to_string(),
+        );
+        for key in [
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.self_attn.k_proj.weight",
+            "mtp.layers.0.self_attn.v_proj.weight",
+            "mtp.layers.0.self_attn.o_proj.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+            "mtp.layers.0.mlp.up_proj.weight",
+            "mtp.layers.0.mlp.down_proj.weight",
+        ] {
+            assert_custom(&*wrapped, key, 4, 32, "affine");
+        }
+
+        assert_skip(&*wrapped, "mtp.fc.weight");
+        assert_skip(&*wrapped, "mtp.norm.weight");
+        assert_skip(&*wrapped, "mtp.layers.0.input_layernorm.weight");
+        assert_skip(&*wrapped, "mtp.layers.0.self_attn.q_proj.bias");
+    }
+
+    #[test]
+    fn apply_mtp_quant_policy_all_also_quantizes_fc() {
+        let wrapped =
+            apply_mtp_quant_policy(const_predicate(QuantDecision::Skip), "all".to_string());
+        assert_custom(&*wrapped, "mtp.fc.weight", 4, 32, "affine");
+        assert_custom(
+            &*wrapped,
+            "mtp.layers.0.mlp.down_proj.weight",
+            4,
+            32,
+            "affine",
+        );
+    }
+
+    #[test]
+    fn apply_mtp_quant_policy_handles_prefixed_mtp_keys_and_delegates_non_mtp() {
+        let wrapped = apply_mtp_quant_policy(
+            const_predicate(QuantDecision::Default),
+            "cyankiwi".to_string(),
+        );
+        assert_custom(
+            &*wrapped,
+            "language_model.model.mtp.layers.0.self_attn.q_proj.weight",
+            4,
+            32,
+            "affine",
+        );
+        assert_custom(
+            &*wrapped,
+            "model.language_model.model.mtp.layers.0.mlp.up_proj.weight",
+            4,
+            32,
+            "affine",
+        );
+        assert_eq!(
+            wrapped("language_model.model.layers.0.mlp.up_proj.weight"),
+            QuantDecision::Default,
+        );
+    }
+
+    #[test]
+    fn mtp_sidecar_key_detection_keeps_only_mtp_module_keys() {
+        assert!(is_mtp_sidecar_key("mtp.layers.0.mlp.up_proj.weight"));
+        assert!(is_mtp_sidecar_key(
+            "language_model.model.mtp.layers.0.self_attn.q_proj.scales"
+        ));
+        assert!(is_mtp_sidecar_key("model.language_model.mtp.norm.weight"));
+        assert!(!is_mtp_sidecar_key("mtp_draft_lm_head.weight"));
+        assert!(!is_mtp_sidecar_key(
+            "language_model.model.layers.0.mlp.up_proj.weight"
+        ));
     }
 
     // ── NVFP4 validator tests ────────────────────────────────────────────────

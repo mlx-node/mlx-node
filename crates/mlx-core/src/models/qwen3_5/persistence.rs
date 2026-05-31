@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
@@ -11,11 +11,12 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, merge_per_layer, parse_quant_block,
+    default_per_layer_quant, effective_plq_for, merge_per_layer, parse_mode_str, parse_quant_block,
     resolve_default_mode,
 };
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
+use crate::utils::safetensors::load_safetensors_lazy;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 use crate::vision::projector::SpatialProjector;
 
@@ -382,6 +383,481 @@ fn sanitize_weights(
     Ok(result)
 }
 
+fn normalize_mtp_weight_key(name: &str) -> Option<String> {
+    let stripped = name
+        .strip_prefix("model.language_model.")
+        .or_else(|| name.strip_prefix("language_model.model."))
+        .or_else(|| name.strip_prefix("language_model."))
+        .or_else(|| name.strip_prefix("model."))
+        .unwrap_or(name);
+
+    stripped.starts_with("mtp.").then(|| stripped.to_string())
+}
+
+fn push_sidecar_candidate(candidates: &mut Vec<PathBuf>, model_dir: &Path, rel: &str) {
+    if rel.trim().is_empty() {
+        return;
+    }
+    let rel_path = Path::new(rel);
+    let candidate = if rel_path.is_absolute() {
+        rel_path.to_path_buf()
+    } else {
+        model_dir.join(rel_path)
+    };
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn mtp_sidecar_candidates(model_dir: &Path, raw: &Value) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(rel) = raw
+        .get("mlx_lm_extra_tensors")
+        .and_then(|extra| extra.get("mtp_file"))
+        .and_then(|value| value.as_str())
+    {
+        push_sidecar_candidate(&mut candidates, model_dir, rel);
+    }
+    for rel in [
+        "mtp.safetensors",
+        "mtp/weights.safetensors",
+        "model-mtp.safetensors",
+    ] {
+        push_sidecar_candidate(&mut candidates, model_dir, rel);
+    }
+    candidates
+}
+
+fn load_external_mtp_sidecar(
+    model_dir: &Path,
+    raw: &Value,
+) -> Result<Option<HashMap<String, MxArray>>> {
+    for candidate in mtp_sidecar_candidates(model_dir, raw) {
+        if !candidate.exists() {
+            continue;
+        }
+
+        info!(
+            "Loading external MTP sidecar from: {} (mmap)",
+            candidate.display()
+        );
+        let sidecar_params = load_safetensors_lazy(&candidate)?;
+        let source_count = sidecar_params.len();
+        let mut normalized = HashMap::new();
+        for (name, array) in sidecar_params {
+            if let Some(key) = normalize_mtp_weight_key(&name) {
+                normalized.insert(key, array);
+            }
+        }
+
+        if normalized.is_empty() {
+            warn!(
+                "Ignoring external MTP sidecar {} because it contained no mtp.* tensors ({} tensors total)",
+                candidate.display(),
+                source_count
+            );
+            continue;
+        }
+
+        info!(
+            "Loaded {} MTP tensors from sidecar {} ({} tensors total)",
+            normalized.len(),
+            candidate.display(),
+            source_count
+        );
+        return Ok(Some(normalized));
+    }
+
+    Ok(None)
+}
+
+fn mtplx_mtp_quant(raw: &Value) -> Option<(String, PerLayerQuant)> {
+    let mtp_quant = raw.get("mtplx_mtp_quantization")?.as_object()?;
+    if !mtp_quant
+        .get("prequantized")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let bits = mtp_quant
+        .get("bits")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(DEFAULT_QUANT_BITS as i64) as i32;
+    let group_size = mtp_quant
+        .get("group_size")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
+    let mode = parse_mode_str(mtp_quant.get("mode").and_then(|value| value.as_str()))
+        .unwrap_or(PerLayerMode::Affine);
+    let policy = mtp_quant
+        .get("policy")
+        .and_then(|value| value.as_str())
+        .unwrap_or("cyankiwi")
+        .to_string();
+
+    Some((
+        policy,
+        PerLayerQuant {
+            bits,
+            group_size,
+            mode,
+        },
+    ))
+}
+
+fn augment_mtplx_mtp_quantization(
+    raw: &Value,
+    n_mtp_layers: i32,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+) {
+    let Some((policy, plq)) = mtplx_mtp_quant(raw) else {
+        return;
+    };
+
+    if policy == "all" {
+        per_layer_quant.entry("mtp.fc".to_string()).or_insert(plq);
+    } else if policy != "cyankiwi" {
+        warn!(
+            "Unknown mtplx_mtp_quantization policy '{}'; applying layer-linear MTP quant metadata only",
+            policy
+        );
+    }
+
+    for layer_idx in 0..n_mtp_layers.max(0) {
+        for suffix in [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ] {
+            per_layer_quant
+                .entry(format!("mtp.layers.{layer_idx}.{suffix}"))
+                .or_insert(plq);
+        }
+    }
+
+    if let Some(draft) = raw
+        .get("mtplx_mtp_quantization")
+        .and_then(|value| value.get("draft_lm_head"))
+        .and_then(|value| value.as_object())
+    {
+        let bits = draft
+            .get("bits")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(plq.bits as i64) as i32;
+        let group_size = draft
+            .get("group_size")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(plq.group_size as i64) as i32;
+        let mode =
+            parse_mode_str(draft.get("mode").and_then(|value| value.as_str())).unwrap_or(plq.mode);
+        let prefix = draft
+            .get("prefix")
+            .and_then(|value| value.as_str())
+            .unwrap_or("mtp_draft_lm_head");
+        per_layer_quant
+            .entry(prefix.to_string())
+            .or_insert(PerLayerQuant {
+                bits,
+                group_size,
+                mode,
+            });
+    }
+
+    info!(
+        "Applied MTPLX MTP quantization metadata: policy={}, bits={}, group_size={}, mode={:?}",
+        policy, plq.bits, plq.group_size, plq.mode
+    );
+}
+
+fn parse_draft_lm_head_spec(value: &Value) -> Option<PerLayerQuant> {
+    let obj = value.as_object()?;
+    let bits = obj.get("bits")?.as_i64()? as i32;
+    let group_size = obj
+        .get("group_size")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64) as i32;
+    let mode = parse_mode_str(obj.get("mode").and_then(|value| value.as_str()))
+        .unwrap_or(PerLayerMode::Affine);
+    Some(PerLayerQuant {
+        bits,
+        group_size,
+        mode,
+    })
+}
+
+fn draft_lm_head_spec_from_config(raw: &Value) -> Option<PerLayerQuant> {
+    raw.get("mtplx_mtp_quantization")
+        .and_then(|value| value.get("draft_lm_head"))
+        .and_then(parse_draft_lm_head_spec)
+}
+
+fn draft_lm_head_spec_from_runtime(model_dir: &Path) -> Option<PerLayerQuant> {
+    let runtime_path = model_dir.join("mtplx_runtime.json");
+    if !runtime_path.exists() {
+        return None;
+    }
+    let raw = match fs::read_to_string(&runtime_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            warn!(
+                "Failed to read MTPLX runtime contract {}: {}",
+                runtime_path.display(),
+                err
+            );
+            return None;
+        }
+    };
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warn!(
+                "Failed to parse MTPLX runtime contract {}: {}",
+                runtime_path.display(),
+                err
+            );
+            return None;
+        }
+    };
+    parsed
+        .get("recommended_draft_lm_head")
+        .and_then(parse_draft_lm_head_spec)
+}
+
+fn mode_to_str(mode: PerLayerMode) -> &'static str {
+    match mode {
+        PerLayerMode::Affine => "affine",
+        PerLayerMode::Mxfp8 => "mxfp8",
+        PerLayerMode::Mxfp4 => "mxfp4",
+        PerLayerMode::Nvfp4 => "nvfp4",
+    }
+}
+
+fn quantize_array(
+    array: &MxArray,
+    plq: PerLayerQuant,
+    key_for_error: &str,
+) -> Result<(MxArray, MxArray, Option<MxArray>)> {
+    let mode_c = CString::new(mode_to_str(plq.mode)).expect("static mode has no NUL");
+    let mut out_quantized: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+    let mut out_scales: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+    let mut out_biases: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+
+    let ok = unsafe {
+        mlx_sys::mlx_quantize(
+            array.as_raw_ptr(),
+            plq.group_size,
+            plq.bits,
+            mode_c.as_ptr(),
+            &mut out_quantized,
+            &mut out_scales,
+            &mut out_biases,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(format!(
+            "mlx_quantize failed for tensor '{}'",
+            key_for_error
+        )));
+    }
+
+    let q_weight = MxArray::from_handle(out_quantized, "draft_lm_head_quantize_weight")?;
+    let q_scales = MxArray::from_handle(out_scales, "draft_lm_head_quantize_scales")?;
+    let q_biases = if out_biases.is_null() {
+        None
+    } else {
+        Some(MxArray::from_handle(
+            out_biases,
+            "draft_lm_head_quantize_biases",
+        )?)
+    };
+    Ok((q_weight, q_scales, q_biases))
+}
+
+fn dequantize_source_head(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    source_plq: PerLayerQuant,
+) -> Result<Option<MxArray>> {
+    let Some(weight) = params.get(&format!("{prefix}.weight")) else {
+        return Ok(None);
+    };
+    let Some(scales) = params.get(&format!("{prefix}.scales")) else {
+        return weight.astype(DType::BFloat16).map(Some);
+    };
+
+    let biases_ptr = params
+        .get(&format!("{prefix}.biases"))
+        .map_or(std::ptr::null_mut(), |biases| biases.as_raw_ptr());
+    let mode_c = CString::new(mode_to_str(source_plq.mode)).expect("static mode has no NUL");
+    let handle = unsafe {
+        mlx_sys::mlx_dequantize(
+            weight.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases_ptr,
+            source_plq.group_size,
+            source_plq.bits,
+            DType::BFloat16 as i32,
+            mode_c.as_ptr(),
+        )
+    };
+    if handle.is_null() {
+        return Err(Error::from_reason(format!(
+            "mlx_dequantize failed for source draft head '{}'",
+            prefix
+        )));
+    }
+    MxArray::from_handle(handle, "draft_lm_head_source_dequantize").map(Some)
+}
+
+fn install_runtime_draft_lm_head(
+    params: &mut HashMap<String, MxArray>,
+    model_dir: &Path,
+    raw: &Value,
+    config: &Qwen3_5Config,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<()> {
+    const PREFIX: &str = "mtp_draft_lm_head";
+
+    if config.n_mtp_layers <= 0 || params.contains_key(&format!("{PREFIX}.weight")) {
+        return Ok(());
+    }
+
+    let Some(target_plq) =
+        draft_lm_head_spec_from_config(raw).or_else(|| draft_lm_head_spec_from_runtime(model_dir))
+    else {
+        return Ok(());
+    };
+
+    let source_prefix = if params.contains_key("lm_head.weight") {
+        "lm_head"
+    } else if config.tie_word_embeddings && params.contains_key("embedding.weight") {
+        "embedding"
+    } else {
+        warn!(
+            "MTPLX runtime recommends a draft LM head, but no lm_head/embedding source was available"
+        );
+        return Ok(());
+    };
+
+    let source_plq = effective_plq_for(source_prefix, per_layer_quant, default_plq, None);
+    if source_plq == target_plq && params.contains_key(&format!("{source_prefix}.scales")) {
+        let weight = params
+            .get(&format!("{source_prefix}.weight"))
+            .expect("source weight checked")
+            .clone();
+        let scales = params
+            .get(&format!("{source_prefix}.scales"))
+            .expect("source scales checked")
+            .clone();
+        params.insert(format!("{PREFIX}.weight"), weight);
+        params.insert(format!("{PREFIX}.scales"), scales);
+        if let Some(biases) = params.get(&format!("{source_prefix}.biases")).cloned() {
+            params.insert(format!("{PREFIX}.biases"), biases);
+        }
+        per_layer_quant.insert(PREFIX.to_string(), target_plq);
+        info!(
+            "Installed runtime draft-only MTP lm_head by reusing {} quantization ({:?})",
+            source_prefix, target_plq
+        );
+        return Ok(());
+    }
+
+    let Some(dense) = dequantize_source_head(params, source_prefix, source_plq)? else {
+        warn!(
+            "MTPLX runtime recommends a draft LM head, but source '{}' was unavailable",
+            source_prefix
+        );
+        return Ok(());
+    };
+    dense.eval();
+    let (q_weight, q_scales, q_biases) = quantize_array(&dense, target_plq, PREFIX)?;
+    q_weight.eval();
+    q_scales.eval();
+    if let Some(biases) = &q_biases {
+        biases.eval();
+    }
+
+    params.insert(format!("{PREFIX}.weight"), q_weight);
+    params.insert(format!("{PREFIX}.scales"), q_scales);
+    if let Some(q_biases) = q_biases {
+        params.insert(format!("{PREFIX}.biases"), q_biases);
+    }
+    per_layer_quant.insert(PREFIX.to_string(), target_plq);
+    crate::array::memory::synchronize_and_clear_cache();
+    info!(
+        "Installed runtime draft-only MTP lm_head from {} as bits={}, group_size={}, mode={:?}",
+        source_prefix, target_plq.bits, target_plq.group_size, target_plq.mode
+    );
+
+    Ok(())
+}
+
+fn require_mtp_linear(params: &HashMap<String, MxArray>, prefix: &str, missing: &mut Vec<String>) {
+    let weight_key = format!("{prefix}.weight");
+    let Some(weight) = params.get(&weight_key) else {
+        missing.push(weight_key);
+        return;
+    };
+
+    if matches!(weight.dtype(), Ok(DType::Uint32)) {
+        let scales_key = format!("{prefix}.scales");
+        if !params.contains_key(&scales_key) {
+            missing.push(scales_key);
+        }
+    }
+}
+
+fn missing_mtp_required_weights(
+    params: &HashMap<String, MxArray>,
+    config: &Qwen3_5Config,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for key in [
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+    ] {
+        if !params.contains_key(key) {
+            missing.push(key.to_string());
+        }
+    }
+
+    for layer_idx in 0..config.n_mtp_layers.max(0) {
+        let prefix = format!("mtp.layers.{layer_idx}");
+        for key in [
+            format!("{prefix}.input_layernorm.weight"),
+            format!("{prefix}.post_attention_layernorm.weight"),
+            format!("{prefix}.self_attn.q_norm.weight"),
+            format!("{prefix}.self_attn.k_norm.weight"),
+        ] {
+            if !params.contains_key(&key) {
+                missing.push(key);
+            }
+        }
+        for suffix in [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ] {
+            require_mtp_linear(params, &format!("{prefix}.{suffix}"), &mut missing);
+        }
+    }
+
+    missing
+}
+
 /// Apply weights directly to a Qwen35Inner (no locks needed).
 fn apply_weights_inner(
     inner: &mut Qwen35Inner,
@@ -696,7 +1172,20 @@ fn apply_weights_inner(
     // of `mtp.forward`; for now the module just sits next to the main
     // model and reads from the same params HashMap.
     if let Some(mtp) = inner.mtp.as_mut() {
-        mtp.apply_weights(params, default_plq, per_layer_quant)?;
+        let missing_mtp = missing_mtp_required_weights(params, config);
+        if missing_mtp.is_empty() {
+            mtp.apply_weights(params, default_plq, per_layer_quant)?;
+            inner.mtp_weights_loaded = true;
+        } else {
+            inner.mtp_weights_loaded = false;
+            warn!(
+                "Qwen3.5 config declares {} MTP layer(s), but MTP weights are incomplete; \
+                 disabling speculative MTP. Missing first entries: {:?} ({} total)",
+                config.n_mtp_layers,
+                &missing_mtp[..missing_mtp.len().min(12)],
+                missing_mtp.len()
+            );
+        }
     }
 
     // Validate mandatory weights
@@ -816,8 +1305,23 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
                 );
 
-                // Load all weights
-                let raw_params = load_all_safetensors(path, true)?;
+                // Load all weights. MTPLX-compatible artifacts can store the MTP
+                // module in an external sidecar (usually `mtp.safetensors`) instead
+                // of embedding it in the main model shards. When present, prefer
+                // the sidecar and drop embedded MTP tensors so key normalization
+                // cannot leave duplicate `mtp.*` entries racing during sanitize.
+                let mut raw_params = load_all_safetensors(path, true)?;
+                if let Some(mtp_sidecar_params) = load_external_mtp_sidecar(path, &raw)? {
+                    let before = raw_params.len();
+                    raw_params.retain(|name, _| normalize_mtp_weight_key(name).is_none());
+                    let removed_embedded = before.saturating_sub(raw_params.len());
+                    let sidecar_count = mtp_sidecar_params.len();
+                    raw_params.extend(mtp_sidecar_params);
+                    info!(
+                        "Merged external MTP sidecar tensors: added={}, removed_embedded_mtp={}",
+                        sidecar_count, removed_embedded
+                    );
+                }
                 info!("Loaded {} raw tensors", raw_params.len());
 
                 // Split vision/text weights
@@ -851,7 +1355,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 };
 
                 // Sanitize weights
-                let params = sanitize_weights(text_raw_params, &config)?;
+                let mut params = sanitize_weights(text_raw_params, &config)?;
                 let quantized = is_quantized_checkpoint(&params);
                 info!(
                     "Sanitized to {} parameters (quantized={})",
@@ -870,8 +1374,21 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     .and_then(|q| q["group_size"].as_i64())
                     .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
                     as i32;
-                let (top_level_mode, per_layer_quant) =
+                let (top_level_mode, mut per_layer_quant) =
                     parse_quant_block(quant_cfg, quant_group_size);
+                augment_mtplx_mtp_quantization(&raw, config.n_mtp_layers, &mut per_layer_quant);
+                let runtime_default_mode =
+                    resolve_default_mode(top_level_mode, is_mxfp8_checkpoint(&params));
+                let runtime_default_plq =
+                    default_per_layer_quant(quant_bits, quant_group_size, runtime_default_mode);
+                install_runtime_draft_lm_head(
+                    &mut params,
+                    path,
+                    &raw,
+                    &config,
+                    &mut per_layer_quant,
+                    runtime_default_plq,
+                )?;
 
                 if quant_cfg.is_some() {
                     info!(
@@ -1500,4 +2017,109 @@ pub fn create_random_qwen35_checkpoint<'env>(
         drop(thread);
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mtp_sidecar_candidates_match_mtplx_order() {
+        let raw = json!({
+            "mlx_lm_extra_tensors": {
+                "mtp_file": "custom/mtp-sidecar.safetensors"
+            }
+        });
+        let candidates = mtp_sidecar_candidates(Path::new("/models/qwen"), &raw);
+        assert_eq!(
+            candidates[0],
+            PathBuf::from("/models/qwen/custom/mtp-sidecar.safetensors")
+        );
+        assert_eq!(candidates[1], PathBuf::from("/models/qwen/mtp.safetensors"));
+        assert_eq!(
+            candidates[2],
+            PathBuf::from("/models/qwen/mtp/weights.safetensors")
+        );
+        assert_eq!(
+            candidates[3],
+            PathBuf::from("/models/qwen/model-mtp.safetensors")
+        );
+    }
+
+    #[test]
+    fn normalize_mtp_sidecar_keys_to_runtime_prefix() {
+        assert_eq!(
+            normalize_mtp_weight_key("mtp.layers.0.mlp.up_proj.weight").as_deref(),
+            Some("mtp.layers.0.mlp.up_proj.weight")
+        );
+        assert_eq!(
+            normalize_mtp_weight_key("language_model.mtp.norm.weight").as_deref(),
+            Some("mtp.norm.weight")
+        );
+        assert_eq!(
+            normalize_mtp_weight_key("model.language_model.mtp.fc.weight").as_deref(),
+            Some("mtp.fc.weight")
+        );
+        assert_eq!(
+            normalize_mtp_weight_key("language_model.lm_head.weight"),
+            None
+        );
+    }
+
+    #[test]
+    fn mtplx_cyankiwi_quant_metadata_targets_layer_linears_only() {
+        let raw = json!({
+            "mtplx_mtp_quantization": {
+                "prequantized": true,
+                "policy": "cyankiwi",
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine"
+            }
+        });
+        let mut overrides = HashMap::new();
+        augment_mtplx_mtp_quantization(&raw, 1, &mut overrides);
+
+        assert!(!overrides.contains_key("mtp.fc"));
+        assert_eq!(overrides.len(), 7);
+        let q_proj = overrides
+            .get("mtp.layers.0.self_attn.q_proj")
+            .expect("q_proj override");
+        assert_eq!(q_proj.bits, 4);
+        assert_eq!(q_proj.group_size, 32);
+        assert_eq!(q_proj.mode, PerLayerMode::Affine);
+        assert!(overrides.contains_key("mtp.layers.0.mlp.down_proj"));
+    }
+
+    #[test]
+    fn mtplx_all_quant_metadata_includes_fc() {
+        let raw = json!({
+            "mtplx_mtp_quantization": {
+                "prequantized": true,
+                "policy": "all",
+                "bits": 4,
+                "group_size": 64,
+                "mode": "affine"
+            }
+        });
+        let mut overrides = HashMap::new();
+        augment_mtplx_mtp_quantization(&raw, 1, &mut overrides);
+
+        assert!(overrides.contains_key("mtp.fc"));
+        assert_eq!(overrides.len(), 8);
+    }
+
+    #[test]
+    fn draft_lm_head_spec_parses_runtime_contract_shape() {
+        let raw = json!({
+            "bits": 3,
+            "group_size": 64,
+            "mode": "affine"
+        });
+        let spec = parse_draft_lm_head_spec(&raw).expect("draft spec");
+        assert_eq!(spec.bits, 3);
+        assert_eq!(spec.group_size, 64);
+        assert_eq!(spec.mode, PerLayerMode::Affine);
+    }
 }

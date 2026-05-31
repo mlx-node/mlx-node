@@ -1142,6 +1142,8 @@ impl Qwen3Inner {
                 mtp_mean_accepted_tokens: None,
                 mtp_acceptance_by_position: None,
                 mtp_cycles: None,
+                mtp_mean_depth: None,
+                profile_phases: None,
             })
         } else {
             None
@@ -1521,6 +1523,8 @@ impl Qwen3Inner {
                 mtp_mean_accepted_tokens: None,
                 mtp_acceptance_by_position: None,
                 mtp_cycles: None,
+                mtp_mean_depth: None,
+                profile_phases: None,
             })
         } else {
             None
@@ -3337,7 +3341,7 @@ impl Qwen3Inner {
 
             // Budget force for reasoning.
             let next_token = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                let forced_id = reasoning_tracker.forced_token_id()? as i32;
                 MxArray::from_int32(&[forced_id], &[1])?
             } else {
                 step_logits = chat_common::apply_all_penalties(step_logits, &token_history, &p)?;

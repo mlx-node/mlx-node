@@ -69,17 +69,17 @@ case-insensitive, with `trim()`). The adaptive-depth knob is a
 TypeScript `ChatConfig` field (not an env var) because it interacts with
 the user-set `mtpDepth` and needs per-session resolution.
 
-| Knob                          | Default | Workstream | Direction     | Notes                                                                                                                                                                                      |
-| ----------------------------- | ------- | ---------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MLX_MTP_USE_TAPE_REPLAY`     | ON      | W6.6       | opt-OUT       | Set to `0` / `false` / `off` to fall back to the W6 Bug #4 K+1 main-model replay path. Dense only — MoE always uses K+1.                                                                   |
-| (eager verify prewarm)        | always  | W6.7       | unconditional | No env var. Once-per-process `atomic<bool>` CAS at model load runs 10 dummy shapes (5 depths × 2 tape variants) to warm caches.                                                            |
-| `mtpAdaptiveDepth` (TS field) | ON\*    | W6.8       | per-session   | TS `ChatConfig` field. \* defaults ON when `enableMtp=true` and `mtpDepth` is unset; defaults OFF (pinned) when `mtpDepth` is set explicitly.                                              |
-| `MLX_MTP_CHAINED_CYCLES`      | OFF     | W6.5       | opt-IN        | Slower than the default Step-A path at depth ≥ 2 even after the W6.5-resume fix batched the `verify_hidden[K]` slice into the next-cycle `async_eval`. The residual ~18% gap on bf16/M3 Max traces to cross-cycle CPU bookkeeping, not the slice DMA. |
-| `MLX_MTP_VERIFY_ASYNC_EVAL`   | ON      | W6.9       | opt-OUT       | Overlaps verify dispatch with the accept loop's CPU-side graph construction via `async_eval((verify_logits, verify_hiddens))`; the first downstream `.eval()` syncs (semantic analog of MTPLX's `LAZY_VERIFY_LOGITS`). Default ON since Phase 3 (2026-05-26): M5 Max measured +5–6% ratio uplift at depth 3 on `qwen3.6-27b-nvfp4-mtp-oproj8` with byte-identical acceptance. Set to `0` / `false` / `off` to revert to the synchronous barrier. Composes cleanly with all other flags. |
-| `MLX_MTP_FUSED_DRAFT`         | OFF     | W6.18      | opt-IN        | Fuses D draft steps into one compile()d graph. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending Step-A bypass follow-up where the infrastructure will pay off. Dense only — MoE always uses the per-step draft loop. |
-| `MLX_MTP_SPARSE_ACCEPT`       | OFF     | W6.19      | opt-IN        | Batched argmax over D+1 verify positions at T=0 with no penalties; collapses D × full-vocab softmax materializations into one .eval(). Falls back to legacy per-position path at T>0 or when sampling penalties are active. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending hardware/model targets where MLX scheduler exposes the sync cost. |
-| `MLX_MTP_BUCKETED_VERIFY`     | ON      | W6.29      | opt-OUT       | Per-bucket compiled verify graphs (`max_kv_len ∈ {256, 512, 1024, 2048, 4096, 8192}` + LEGACY fallback) so SDPA reads a static `[B, Hkv, bucket_kv_len, head_dim]` slice of the writeback cache. Eager prewarm at the prefill-offset bucket; lazy-trace others (~0.5 s per bucket-transition step). Measured at long decode (max_tokens=32768) on qwen3.5-4b / M3 Max: AR +12.0%, MTP +26.1%. No-op at default short prompts where the first bucket already covers the full cache. Set to `0` / `false` / `off` to force the legacy single-trace path. |
-| `MLX_MTP_NO_PROMPT_PREFILL`   | OFF     | Phase C    | opt-OUT       | When unset (default), a fresh prefill captures per-prompt-token hiddens and commits the prompt prefix into the persistent MTP committed-history cache so the heads attend it from cycle 1. Set to `1` / `true` / `on` to keep the prefill logits-only — the MTP heads then build history only from decode-produced tokens. Dense only. Skipped automatically on cache-reuse / VLM / delta turns regardless of this knob (the prefill only sees the uncached suffix). |
+| Knob                          | Default | Workstream | Direction     | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------------------- | ------- | ---------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_MTP_USE_TAPE_REPLAY`     | ON      | W6.6       | opt-OUT       | Set to `0` / `false` / `off` to fall back to the W6 Bug #4 K+1 main-model replay path. Dense only — MoE always uses K+1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| (eager verify prewarm)        | always  | W6.7       | unconditional | No env var. Once-per-process `atomic<bool>` CAS at model load runs 10 dummy shapes (5 depths × 2 tape variants) to warm caches.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `mtpAdaptiveDepth` (TS field) | ON\*    | W6.8       | per-session   | TS `ChatConfig` field. \* defaults ON when `enableMtp=true` and `mtpDepth` is unset; defaults OFF (pinned) when `mtpDepth` is set explicitly.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `MLX_MTP_CHAINED_CYCLES`      | M5+: ON / M1–M4: OFF | W6.5       | config-gated  | Each cycle's `verify_hidden[K]` slice seeds the next cycle's first MTP draft, skipping the Step-A target forward on full-accept cycles (slice batched into the next-cycle `async_eval`) — exactly MTPLX's 1-forward-per-cycle design. **Default ON on M5+ (GPU arch gen ≥ 17), default OFF on M1–M4 (gen 13–16)**; `MLX_MTP_CHAINED_CYCLES=0`/`false`/`off` forces OFF even on M5+, `=1`/`true`/`on` forces ON even on M1–M4. **CONFIG-DEPENDENT** (see "Same-checkpoint engine head-to-head"): on M3 Max / bf16 / nvfp4 / hard prompt a controlled A/B found it neutral@depth1 / a regression@depth3 (Step-A only ~14% of cycle there + an unresolved lazy-slice acceptance regression); but on **M5 Max / affine-int4** Step-A is ~37% of the cycle and removing it wins on BOTH a naive cold A/B (**≈1.17×, 45.0→52.8 tok/s**) and the controlled harness (**+23.7pp ratio, 1.116 vs 0.879, beyond noise; acceptance also up 1.30 vs 0.91**) — the biggest structural lever toward MTPLX parity. M5+ default ON is measured net-positive (affine +16% / nvfp4 byte-identical to AR); M1–M4 stays default OFF pending the lazy-slice eval-scheduling fix. |
+| `MLX_MTP_VERIFY_ASYNC_EVAL`   | ON      | W6.9       | opt-OUT       | Overlaps verify dispatch with the accept loop's CPU-side graph construction via `async_eval((verify_logits, verify_hiddens))`; the first downstream `.eval()` syncs (semantic analog of MTPLX's `LAZY_VERIFY_LOGITS`). Default ON since Phase 3 (2026-05-26): M5 Max measured +5–6% ratio uplift at depth 3 on `qwen3.6-27b-nvfp4-mtp-oproj8` with byte-identical acceptance. Set to `0` / `false` / `off` to revert to the synchronous barrier. Composes cleanly with all other flags.                                                                                                                                                                                                                   |
+| `MLX_MTP_FUSED_DRAFT`         | OFF     | W6.18      | opt-IN        | Fuses D draft steps into one compile()d graph. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending Step-A bypass follow-up where the infrastructure will pay off. Dense only — MoE always uses the per-step draft loop.                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `MLX_MTP_SPARSE_ACCEPT`       | OFF     | W6.19      | opt-IN        | Batched argmax over D+1 verify positions at T=0 with no penalties; collapses D × full-vocab softmax materializations into one .eval(). Falls back to legacy per-position path at T>0 or when sampling penalties are active. Currently no measured perf win on qwen3.6-27b-nvfp4-mtp / depth=3 / M3 Max; kept opt-in pending hardware/model targets where MLX scheduler exposes the sync cost.                                                                                                                                                                                                                                                                                                             |
+| `MLX_MTP_BUCKETED_VERIFY`     | ON      | W6.29      | opt-OUT       | Per-bucket compiled verify graphs (`max_kv_len ∈ {256, 512, 1024, 2048, 4096, 8192}` + LEGACY fallback) so SDPA reads a static `[B, Hkv, bucket_kv_len, head_dim]` slice of the writeback cache. Eager prewarm at the prefill-offset bucket; lazy-trace others (~0.5 s per bucket-transition step). Measured at long decode (max_tokens=32768) on qwen3.5-4b / M3 Max: AR +12.0%, MTP +26.1%. No-op at default short prompts where the first bucket already covers the full cache. Set to `0` / `false` / `off` to force the legacy single-trace path.                                                                                                                                                    |
+| `MLX_MTP_NO_PROMPT_PREFILL`   | OFF     | Phase C    | opt-OUT       | When unset (default), a fresh prefill captures per-prompt-token hiddens and commits the prompt prefix into the persistent MTP committed-history cache so the heads attend it from cycle 1. Set to `1` / `true` / `on` to keep the prefill logits-only — the MTP heads then build history only from decode-produced tokens. Dense only. Skipped automatically on cache-reuse / VLM / delta turns regardless of this knob (the prefill only sees the uncached suffix).                                                                                                                                                                                                                                      |
 
 ## Committed-history MTP cache (Phase C)
 
@@ -98,18 +98,37 @@ skip prompt-prefill (cache-reuse / VLM / delta / `MLX_MTP_NO_PROMPT_PREFILL`
 contiguously from decode tokens — internally consistent, and
 speculative decoding stays verify-correct regardless of draft quality.
 
-Measured on `qwen3.6-27b-nvfp4-mtp` / M3 Max / depth=3 / T=0:
+Measured on `qwen3.6-27b-nvfp4-mtp` / M3 Max / depth=3 / T=0, on a
+**moderately-predictable mixed prompt** (see the prompt-dependence note
+below — these absolute numbers are meaningless without the prompt):
 
-| Path                                  | mean accepted/cycle | per-position acceptance   | MTP/AR decode |
-| ------------------------------------- | ------------------- | ------------------------- | ------------- |
-| committed-history + prompt-prefill    | 2.15                | `[0.854, 0.715, 0.585]`   | ~1.31×        |
-| committed-history, no prompt-prefill  | 1.75                | `[0.812, 0.565, 0.381]`   | ~1.13×        |
-| (pre-Phase-C per-cycle cache)         | 1.56                | —                         | < 1×          |
+| Path                                 | mean accepted/cycle | per-position acceptance | MTP/AR decode |
+| ------------------------------------ | ------------------- | ----------------------- | ------------- |
+| committed-history + prompt-prefill   | 2.15                | `[0.854, 0.715, 0.585]` | ~1.31×        |
+| committed-history, no prompt-prefill | 1.75                | `[0.812, 0.565, 0.381]` | ~1.13×        |
+| (pre-Phase-C per-cycle cache)        | 1.56                | —                       | < 1×          |
+
+> **Acceptance is dominated by prompt predictability, not by the
+> checkpoint.** The numbers above are NOT a fixed property of the
+> checkpoint — on the SAME `qwen3.6-27b-nvfp4-mtp` / depth=3 / T=0,
+> committed-history + prompt-prefill acceptance ranges from **1.44/cycle**
+> `[0.735, 0.471, 0.235]` on a novel three-paragraph prose essay (the
+> `examples/qwen35-mtp-smoke.ts` default prompt — a deliberately HARD
+> case) up to **2.76–3.00/cycle** (`[0.96–1.0, 0.92–1.0, 0.92–1.0]`, i.e.
+> the depth-3 ceiling) on predictable text (counting, lists, recitation,
+> repetition). MTP/AR decode speedup tracks acceptance directly: ~1.06×
+> on the prose essay, **1.46×** (AR 20.8 → MTP 30.3 tok/s) on a counting
+> prompt. So when comparing against another engine's headline number
+> (e.g. MTPLX's ~2.24×, measured on its own unpublished "recorded" prompt
+> at T=0.6), the prompt and sampler dominate — a single acceptance figure
+> is only meaningful alongside the exact prompt that produced it.
+> Generation length does NOT move acceptance (essay is flat ~1.44→1.30
+> from 120→400 tokens). Verified 2026-05-30.
 
 T=0 parity holds **in distribution**: every MTP-emitted token equals
 `argmax(verify_logits)`. MTP and AR outputs agree on a contiguous prefix
 and then diverge at an isolated argmax near-tie — and that flip can land
-*early*. The recurring offset-16 "Autumn is often regarded / described"
+_early_. The recurring offset-16 "Autumn is often regarded / described"
 flip was diagnosed: at that token AR and the batched verify rank the
 **same** top-2 tokens within one bf16 ulp (AR logits 21.500 / 21.375;
 verify 21.375 / 21.375), so the verify forward merely tie-breaks to the
@@ -129,11 +148,51 @@ same-session sequential A/B; absolute ratios are thermal-sensitive
 ~±10 %, so the cross-depth ordering is the signal):
 
 | Depth    | M3 Max ratio | M5 Max ratio | M5 K̄ | M5 per-position acceptance |
-| -------- | ------------ | ------------ | ----- | --------------------------- |
-| 1        | **1.14×**    | **1.15×**    | 0.87  | `[0.865]`                   |
-| 2        | 1.12×        | 1.15×        | 1.42  | `[0.811, 0.608]`            |
-| 3        | 0.93×        | 1.04×        | 1.98  | `[0.828, 0.656, 0.508]`     |
-| adaptive | 1.07×        | 1.12–1.13×   | 1.00  | `[0.86, 0.54, 0.40, …]`     |
+| -------- | ------------ | ------------ | ---- | -------------------------- |
+| 1        | **1.14×**    | **1.15×**    | 0.87 | `[0.865]`                  |
+| 2        | 1.12×        | 1.15×        | 1.42 | `[0.811, 0.608]`           |
+| 3        | 0.93×        | 1.04×        | 1.98 | `[0.828, 0.656, 0.508]`    |
+| adaptive | 1.07×        | 1.12–1.13×   | 1.00 | `[0.86, 0.54, 0.40, …]`    |
+
+> **Note (chained cycles is CONFIG-DEPENDENT — default ON on M5+ (gen ≥ 17),
+> default OFF on M1–M4; see "Same-checkpoint engine head-to-head" below).
+> `MLX_MTP_CHAINED_CYCLES=0/1` overrides either direction.**
+> This table was measured **with** the Step-A target forward present every
+> cycle (`MLX_MTP_CHAINED_CYCLES=OFF`). Chained cycles skips that forward on
+> full-accept cycles, seeding the next draft from `verify_hidden[K]` — exactly
+> MTPLX's design (the engine that the same-checkpoint head-to-head below shows
+> is 1.40× faster precisely because it never runs Step-A).
+>
+> The win/loss depends on how large Step-A's share of the cycle is and whether
+> the chained-hidden's lazy slice stalls the pipeline:
+>
+> - **M3 Max / bf16 / nvfp4 / hard prose prompt (the original verdict):** a
+>   **controlled** A/B (`examples/qwen35-mtp-controlled-verdict.ts`: warmup +
+>   cooldown + alternating-order interleaved pairs, 6 repeats/cell, T=0;
+>   cross-config AR drift **1.0%** ⇒ fair, self-normalized) found it **not a
+>   win** — depth 1 **1.11× ON vs 1.08× OFF** (inconclusive, within ±11pp
+>   noise); depth 3 **0.90× ON vs 0.96× OFF** (a regression), driven by an
+>   acceptance drop (meanAccepted 1.28 vs 1.43) plus a lazy-eval scheduling
+>   stall on the chained-hidden slice. Here Step-A is a smaller fraction of
+>   the cycle, so removing it doesn't pay.
+> - **M5 Max / affine-int4 (2026-05-30):** Step-A is ~37 % of the cycle.
+>   Both a naive cold count A/B (**45.0 → 52.8 tok/s, ≈1.17×**) AND the
+>   **controlled** harness on the affine checkpoint (depth 3, self-normalized
+>   ratio) agree it WINS: **chained-ON ratio 1.116 vs OFF 0.879, +23.7pp beyond
+>   the ±19.8pp noise band**, with acceptance *higher* under ON (1.30 vs 0.91)
+>   — no acceptance penalty here, the opposite of the M3/nvfp4 case.
+>
+> So it is now **config-gated by GPU arch gen**: default ON on M5+ (gen ≥ 17),
+> where it is measured net-positive (affine +16 % / nvfp4 byte-identical to AR);
+> default OFF on M1–M4 (gen 13–16) **until** the chained-hidden lazy-slice
+> eval-scheduling stall (the depth-3 acceptance regression) is fixed so it also
+> wins on M3/bf16/nvfp4. `MLX_MTP_CHAINED_CYCLES=0/1` overrides either direction.
+> On M5-class + affine-quant it is the single biggest **structural** lever
+> toward MTPLX parity. The earlier "Step-A is only ~14 % of cycle wall" claim is
+> config-specific (M3/bf16); on M5/affine it is ~37 %. (A still-earlier naive
+> same-binary A/B reported a spurious depth-1 "win" from a thermally-confounded
+> run — the flag-invariant AR baseline had swung ~2×; the controlled harness
+> exists to defeat exactly that confound.)
 
 **Depth 1 is optimal on both M3 Max and M5 Max** — the 3rd draft slot's
 ~50 % acceptance still does not pay for the wider, slower verify forward.
@@ -156,13 +215,13 @@ microbench result that pins this down.
 The verify forward is the bottleneck, and four attempts to make its
 small-M (`M = depth+1`) quantized matmuls cheaper all **failed**:
 
-| Attempt                                       | Result on M3 Max                                                                                              | Result on M5 Max                                                  |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| Batched GEMM (`qmm` / `qmm_t_splitk`) at M=4  | ~38 % slower than `qmv`; split-K low-precision accumulation also degrades acceptance → ratio collapses to ~0.75× | (not re-tested — split-K accuracy regression is hardware-independent) |
-| `multi3` multi-row `qmv` (W6.30 port)         | 0.94× geomean vs stock `qmv` — slower even in its native affine-4-bit M=3 envelope                              | **0.94× geomean** — identical to M3; the M5 Neural Accelerator helps stock `qmv` symmetrically (`oxnode examples/qmv-multi3-microbench.ts`, 2026-05-26) |
-| `FUSED_DRAFT` / `SPARSE_ACCEPT`               | zero measured win (W6.18 / W6.19)                                                                              | (not re-tested — sync-collapse knobs are CPU-side; hardware-invariant) |
-| `VERIFY_ASYNC_EVAL` (W6.9)                    | zero measured win on M3 Max (overlap budget too small)                                                          | **+5–6% ratio** at depth 3 on `qwen3.6-27b-nvfp4-mtp-oproj8` (~1.07× → ~1.13×) with byte-identical acceptance. Flipped to default ON in Phase 3 (2026-05-26). |
-| End-to-end MTP/AR ratio at optimal depth      | 1.14× (depth 1)                                                                                               | **1.15× (depth 1)** — Neural Accelerator does not widen the gap     |
+| Attempt                                      | Result on M3 Max                                                                                                 | Result on M5 Max                                                                                                                                              |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Batched GEMM (`qmm` / `qmm_t_splitk`) at M=4 | ~38 % slower than `qmv`; split-K low-precision accumulation also degrades acceptance → ratio collapses to ~0.75× | (not re-tested — split-K accuracy regression is hardware-independent)                                                                                         |
+| `multi3` multi-row `qmv` (W6.30 port)        | 0.94× geomean vs stock `qmv` — slower even in its native affine-4-bit M=3 envelope                               | **0.94× geomean** — identical to M3; the M5 Neural Accelerator helps stock `qmv` symmetrically (`oxnode examples/qmv-multi3-microbench.ts`, 2026-05-26)       |
+| `FUSED_DRAFT` / `SPARSE_ACCEPT`              | zero measured win (W6.18 / W6.19)                                                                                | (not re-tested — sync-collapse knobs are CPU-side; hardware-invariant)                                                                                        |
+| `VERIFY_ASYNC_EVAL` (W6.9)                   | zero measured win on M3 Max (overlap budget too small)                                                           | **+5–6% ratio** at depth 3 on `qwen3.6-27b-nvfp4-mtp-oproj8` (~1.07× → ~1.13×) with byte-identical acceptance. Flipped to default ON in Phase 3 (2026-05-26). |
+| End-to-end MTP/AR ratio at optimal depth     | 1.14× (depth 1)                                                                                                  | **1.15× (depth 1)** — Neural Accelerator does not widen the gap                                                                                               |
 
 Stock MLX's small-M `qmv` is already near-optimal on both M3 and M5 Max:
 at these shapes the verify is not dominated by per-row weight re-reads,
@@ -173,23 +232,116 @@ microbench ratio is invariant — and the end-to-end MTP/AR ratio is
 invariant too, because the AR baseline gets the same NA uplift as the
 MTP verify forward.
 
-**Why MTPLX reaches ~2.2× and this does not — it is NOT the hardware.**
-The earlier write-up here hypothesised the M5 Neural Accelerator as the
-sole differentiator. Direct measurement on M5 Max (2026-05-26) refutes
-that: stock MLX on M5 Max gives the same 1.15× ceiling as M3 Max, and
-`multi3` still loses 0.94× microbench-wise. The remaining candidates for
-MTPLX's reported speedup are (a) their **private MLX fork** with retuned
-small-M `qmv` kernels stock MLX does not have, (b) a different
-quantization recipe or verify path, or (c) a different model size. None
-of these is the Neural Accelerator alone. (dflash-mlx's 2.95–4.4× is a
-*different* architecture — a separately-trained block-diffusion drafter —
-and is out of scope for native MTP heads here.)
+**Why MTPLX reaches ~2.2× and this does not — it is NOT the hardware, and NOT a fork.**
+A direct audit of the MTPLX source (2026-05-30) settles this. MTPLX ships
+**stock PyPI mlx 0.31.2** — there is no required private fork. The
+`mlx-mtplx-…-qmm` fork is optional (surfaced only as
+`optional_fast_mlx_fork_active`), and its only content is the same small-M
+`qmv` retune we already benchmarked at **0.94×**. Its custom verify kernels
+(multi-row `qmv`, fused-MLP, top-k lm*head) are **default-OFF probes whose
+own docstrings call them "slower than stock."** MTPLX's headline 2.24× is an
+**acceptance multiplier, not a kernel one**: depth-3 + T=0.6 + fan-pinned
+M5 Max on a checkpoint hand-tuned for ~95% acceptance
+(`Qwen3.6-27B-MTPLX-Optimized-Speed`, per-position `[1.00, 0.98, 0.94]`).
+The monotonic depth ladder (AR 24.6 → D1 41.6 → D2 48.6 → D3 54.5 tok/s) is
+driven by acceptance, not faster GEMMs. The one genuinely valuable custom
+kernel they have — a fused GatedDeltaNet recurrence-from-conv-tape — is a
+verify-dispatch micro-opt for recurrent layers, not a multiplier.
+(dflash-mlx's 2.95–4.4× is a \_different* architecture — a separately-trained
+block-diffusion drafter — out of scope for native MTP heads here.)
+
+### Same-checkpoint engine head-to-head — the Step-A forward (2026-05-30)
+
+The "acceptance multiplier" story above is **only half** the MTPLX gap. To
+isolate the engine from the checkpoint and the prompt, we ran **MTPLX's own
+engine on its own checkpoint** (`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`,
+affine-int4) against **our engine on the identical checkpoint** — same M5 Max,
+same count prompt, T=0 greedy, depth 3, **no fan-pinning on either side**
+(MTPLX `thermal: not configured`). Our loader reads their checkpoint fully:
+the trunk via the standard `quantization` key, and the `mtp.safetensors`
+sidecar (merged in as a `model-*-of-*.safetensors` shard) with the affine
+group_size inferred per-tensor from the scale-column shape — so the
+non-standard `mtplx_mtp_quantization` key being unread does **not** mis-dequant
+the heads (verified: they hit the perfect `[1,1,1]` depth-3 ceiling on
+counting).
+
+| Metric (count prompt, T=0, depth 3, no fan-pin) | Ours | MTPLX | Winner |
+| ----------------------------------------------- | ---- | ----- | ------ |
+| AR decode                                       | 25.82 tok/s | 22.74 tok/s | **us, 1.14×** |
+| MTP acceptance / cycle                          | 2.94 `[1,1,1]` | 3.0 `[20/20,20/20,20/20]` | tie (both perfect) |
+| **MTP D3 decode**                               | 40.18 tok/s | **56.43 tok/s** | **MTPLX, 1.40×** |
+
+So at **matched (perfect) acceptance** and with our **faster** AR forward,
+MTPLX's MTP cycle is still **1.40× faster**. That residual is NOT acceptance,
+NOT quant format, NOT the verify kernel, NOT hardware — it is a **structural
+difference in trunk forwards per cycle**:
+
+- **MTPLX runs 1 full-trunk forward per full-accept cycle** — the `D+1`-wide
+  verify (`generation.py:4737`). The next cycle's draft seed is the *same*
+  forward's last-position hidden (`hidden = verify_hidden[:, -1:, :]`,
+  `generation.py:5037`) and the bonus token is sampled from its logits
+  (`pending_primary`, `generation.py:5051-5068`). No separate target forward.
+- **We run 2** — a single-token **Step-A** main-model forward, gated by
+  `do_step_a` (`chat_common.rs:3398`) and dispatched at `chat_common.rs:3408`
+  via the `forward_with_hidden` closure (bound to `forward_compiled_with_hidden`,
+  `model.rs:2560`) — **plus** the `D+1` verify. The Step-A forward exists only
+  to produce the next draft seed, which the verify forward already computes and
+  we discard on the default path.
+
+Timing arithmetic matches the measurement exactly: our single-token trunk
+forward ≈ 38.7 ms (25.82 tok/s), 4-wide verify ≈ 58 ms, drafts ≈ 9 ms.
+Ours `= 38.7 + 9 + 58 ≈ 106 ms / 4 tok ≈ 40 tok/s` (measured 40.18); MTPLX
+`= 9 + 58 ≈ 67 ms / 4 tok ≈ 56 tok/s` (measured 56.43, `verify_ms_per_call=57.97`,
+`draft_time_s/20 ≈ 9.2 ms`). The ~38.7 ms Step-A forward — **~37 % of our
+cycle on this M5/affine config** — is the entire gap.
+
+**The lever exists and is wired, now default ON on M5+ (gen ≥ 17):
+`MLX_MTP_CHAINED_CYCLES`** skips Step-A and seeds the next draft from
+`verify_hidden[K]` — exactly MTPLX's trick, parity-exact at T=0. (Set `=0` to
+force it OFF on M5 for a bisect.) Two measurements on this checkpoint agree it
+wins:
+
+> - **Naive cold count A/B:** **45.0 → 52.8 tok/s (≈1.17×)**, closing most of
+>   the gap to MTPLX's 56.4 (remaining ~7 % is second-order).
+> - **Controlled harness** (`examples/qwen35-mtp-controlled-verdict.ts`,
+>   self-normalized MTP/AR ratio, interleaved, 4 repeats, depth 3): **chained-ON
+>   ratio 1.116 vs OFF 0.879 — chained-ON WINS by +23.7pp, beyond the ±19.8pp
+>   noise band.** Acceptance was *higher* with ON (meanAccepted 1.30 vs 0.91,
+>   per-position `[0.633, 0.433, 0.237]` vs `[0.638, 0.213, 0.064]`), so there
+>   is **no acceptance penalty here** — unlike the M3/nvfp4 case. (The
+>   AR-stability gate flagged thermal instability, CV 15.2%, so absolute tok/s
+>   are discounted; the self-normalized ratio and deterministic acceptance are
+>   what the harness is designed to trust through exactly that.)
+
+This **overturns the earlier "not a win" verdict for this config** (see the
+chained-cycles note above): that verdict was measured on **M3 Max / bf16 /
+nvfp4 / a hard prose prompt**, where Step-A is a smaller fraction of the cycle,
+the chained-hidden's lazy-eval slice introduced a scheduling stall, AND chaining
+*lowered* acceptance. On **M5 Max / affine-int4**, Step-A is ~37 % of the cycle,
+removing it clearly wins, and acceptance does not regress. The flag is
+config-dependent, not globally good-or-bad — so it is **config-gated by GPU arch
+gen: default ON on M5+ (gen ≥ 17), default OFF on M1–M4 (gen 13–16)**, with
+`MLX_MTP_CHAINED_CYCLES=0/1` overriding either way. **Remaining before flipping
+the default ON on M1–M4 too:** (1) resolve the chained-hidden lazy-slice
+eval-scheduling stall so it also wins on M3/bf16/nvfp4; (2) confirm the depth-3
+acceptance asymmetry (`[…,0.213,0.064]` OFF vs `[…,0.433,0.237]` ON — the deeper
+draft slots accept far better under ON on the warm essay) is a genuine effect,
+not a warm-cache Step-A-path artifact worth fixing on the OFF path too.
+
+**Bottom line:** the full MTPLX advantage decomposes into (1) an **acceptance**
+component (the ~2.24× headline = T=0.6 + a prompt tuned for ~95 % acceptance)
+and (2) a **structural per-cycle-forward** component (~1.40× at matched
+acceptance, = the Step-A forward we run and they don't). (1) is a
+prompt/sampler artifact; (2) is a real, addressable engine win via Step-A
+elimination.
 
 **Native-heads MTP/AR ceiling ≈ 1.1–1.15× on both M3 Max and M5 Max**
-(depth 1). Reaching the 1.6–2.2× plan target on native heads is not
-unlocked by upgrading to M5-class hardware; it would require either
-custom verify-path kernels (MTPLX-style private fork) or the dflash
-separately-trained-drafter architecture.
+(depth 1, **with Step-A present**). The 1.40× same-checkpoint engine gap
+above shows the ceiling is NOT intrinsic to native heads — eliminating the
+redundant Step-A forward (already implemented behind
+`MLX_MTP_CHAINED_CYCLES`) recovers most of it **without** any custom
+verify-path kernel, private fork, or the dflash separately-trained-drafter
+architecture. M5-class hardware does not unlock it; cycle structure does.
 
 **Long-context behaviour.** The verify forward's attention cost scales
 with context length, eroding the speculative advantage on long prompts:

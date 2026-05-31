@@ -195,8 +195,9 @@ inline array linear_proj(const array& x, const std::string& prefix) {
 
     // Registry-first dispatch.
     if (auto info = lookup_quant_info(prefix)) {
-      // One-shot dispatch trace per NEW prefix.
-      {
+      // One-shot dispatch trace per NEW prefix. Gated because this fires
+      // once per projection and otherwise floods benchmark worker stderr.
+      if (mtp_trace_enabled()) {
         std::lock_guard<std::mutex> lk(g_linear_proj_logged_mutex());
         if (g_linear_proj_logged_prefixes().insert(prefix).second) {
           fprintf(stderr,
@@ -227,7 +228,7 @@ inline array linear_proj(const array& x, const std::string& prefix) {
               prefix.c_str());
     }
     // One-shot dispatch trace per NEW prefix (fallback branch).
-    {
+    if (mtp_trace_enabled()) {
       std::lock_guard<std::mutex> lk(g_linear_proj_logged_mutex());
       if (g_linear_proj_logged_prefixes().insert(prefix).second) {
         const char* mode = biases.has_value() ? "affine(infer)" : "mxfp8(heuristic)";
@@ -245,7 +246,7 @@ inline array linear_proj(const array& x, const std::string& prefix) {
     }
   }
   // One-shot dispatch trace per NEW prefix (plain matmul branch).
-  {
+  if (mtp_trace_enabled()) {
     std::lock_guard<std::mutex> lk(g_linear_proj_logged_mutex());
     if (g_linear_proj_logged_prefixes().insert(prefix).second) {
       fprintf(stderr,
@@ -963,13 +964,14 @@ inline AttnPureResult attn_pure_fn(
 // does NOT support `dynamic_kv` — the verify / MTP draft graphs always
 // rely on the additive `attn_mask` (compile requires fixed shapes).
 // =====================================================================
-inline AttnPureResult attn_pure_fn_arr_offset(
+inline AttnPureResult attn_pure_fn_arr_rope_write_offset(
     const array& x,             // [B, hidden] — 2D
     const std::string& layer_prefix,  // e.g. "layers.3" or "mtp.layers.0"
     const array& kv_keys,       // [B, Hkv, max_kv_len, D]
     const array& kv_values,     // [B, Hkv, max_kv_len, D]
     const array& attn_mask,     // [1, 1, 1, max_kv_len] additive bf16 mask
-    const array& offset_arr,    // [1] int32 — RoPE + slice_update start
+    const array& rope_offset_arr,   // [1] int32 — RoPE absolute position
+    const array& write_offset_arr,  // [1] int32 — local slice_update slot
     const BaseConfig& cfg) {
   int B = x.shape(0);
   std::string pfx = layer_prefix + ".self_attn.";
@@ -994,8 +996,8 @@ inline AttnPureResult attn_pure_fn_arr_offset(
   keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
 
   // Array-valued RoPE offset — graph-stable across decode steps.
-  queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
-  keys    = fast::rope(keys,    cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
+  queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, rope_offset_arr);
+  keys    = fast::rope(keys,    cfg.rope_dims, false, cfg.rope_theta, 1.0f, rope_offset_arr);
 
   queries = transpose(queries, {0, 2, 1, 3});
   keys    = transpose(keys,    {0, 2, 1, 3});
@@ -1003,8 +1005,8 @@ inline AttnPureResult attn_pure_fn_arr_offset(
 
   // slice_update with array start so the verify graph can advance the
   // KV-cache write offset by 0,1,...,depth without re-tracing.
-  auto new_kv_keys   = mlx::core::slice_update(kv_keys,   keys,   offset_arr, {2});
-  auto new_kv_values = mlx::core::slice_update(kv_values, values, offset_arr, {2});
+  auto new_kv_keys   = mlx::core::slice_update(kv_keys,   keys,   write_offset_arr, {2});
+  auto new_kv_values = mlx::core::slice_update(kv_values, values, write_offset_arr, {2});
 
   float scale = std::pow((float)cfg.head_dim, -0.5f);
   auto attn_out = fast::scaled_dot_product_attention(
@@ -1019,6 +1021,18 @@ inline AttnPureResult attn_pure_fn_arr_offset(
   if (has_weight(pfx + "o_proj.bias")) output = output + get_weight(pfx + "o_proj.bias");
 
   return {output, new_kv_keys, new_kv_values};
+}
+
+inline AttnPureResult attn_pure_fn_arr_offset(
+    const array& x,             // [B, hidden] — 2D
+    const std::string& layer_prefix,
+    const array& kv_keys,
+    const array& kv_values,
+    const array& attn_mask,
+    const array& offset_arr,    // [1] int32 — RoPE + slice_update start
+    const BaseConfig& cfg) {
+  return attn_pure_fn_arr_rope_write_offset(
+      x, layer_prefix, kv_keys, kv_values, attn_mask, offset_arr, offset_arr, cfg);
 }
 
 // =====================================================================

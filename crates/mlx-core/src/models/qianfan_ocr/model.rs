@@ -713,6 +713,8 @@ impl QianfanOCRInner {
                     mtp_mean_accepted_tokens: None,
                     mtp_acceptance_by_position: None,
                     mtp_cycles: None,
+                    mtp_mean_depth: None,
+                    profile_phases: None,
                 })
             } else {
                 None
@@ -1109,6 +1111,8 @@ impl QianfanOCRInner {
                     mtp_mean_accepted_tokens: None,
                     mtp_acceptance_by_position: None,
                     mtp_cycles: None,
+                    mtp_mean_depth: None,
+                    profile_phases: None,
                 })
             } else {
                 None
@@ -1570,6 +1574,8 @@ impl QianfanOCRInner {
                     mtp_mean_accepted_tokens: None,
                     mtp_acceptance_by_position: None,
                     mtp_cycles: None,
+                    mtp_mean_depth: None,
+                    profile_phases: None,
                 })
             } else {
                 None
@@ -2061,6 +2067,8 @@ impl QianfanOCRInner {
                     mtp_mean_accepted_tokens: None,
                     mtp_acceptance_by_position: None,
                     mtp_cycles: None,
+                    mtp_mean_depth: None,
+                    profile_phases: None,
                 })
             } else {
                 None

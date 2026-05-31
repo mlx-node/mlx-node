@@ -49,6 +49,12 @@ pub struct PerformanceMetrics {
     /// MTP speculative decode: number of draft+verify cycles executed.
     /// `None` on plain autoregressive runs.
     pub mtp_cycles: Option<u32>,
+    /// MTP speculative decode: mean attempted draft depth per cycle.
+    /// `None` on plain autoregressive runs.
+    pub mtp_mean_depth: Option<f64>,
+    /// Optional decode phase breakdown. Present when decode profiling
+    /// is enabled via `MLX_PROFILE_DECODE=1` or `setProfilingEnabled(true)`.
+    pub profile_phases: Option<Vec<PhaseProfile>>,
 }
 
 #[napi(object)]
@@ -98,6 +104,14 @@ pub struct GenerationProfile {
     pub time_to_first_token_ms: f64,
     /// Per-phase breakdown.
     pub phases: Vec<PhaseProfile>,
+    /// MTP speculative decode: mean accepted draft tokens per cycle.
+    pub mtp_mean_accepted_tokens: Option<f64>,
+    /// MTP speculative decode: per-draft-position acceptance rate.
+    pub mtp_acceptance_by_position: Option<Vec<f64>>,
+    /// MTP speculative decode: number of draft+verify cycles executed.
+    pub mtp_cycles: Option<u32>,
+    /// MTP speculative decode: mean attempted draft depth per cycle.
+    pub mtp_mean_depth: Option<f64>,
     /// Memory snapshot before generation.
     pub memory_before: Option<MemorySnapshot>,
     /// Memory snapshot after generation.
@@ -322,6 +336,10 @@ mod tests {
             tokens_per_second: tps,
             time_to_first_token_ms: ttft_ms,
             phases: vec![],
+            mtp_mean_accepted_tokens: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
             memory_before: None,
             memory_after: None,
         }
@@ -458,6 +476,10 @@ mod tests {
                     count: 50,
                 },
             ],
+            mtp_mean_accepted_tokens: Some(1.5),
+            mtp_acceptance_by_position: Some(vec![0.9, 0.5]),
+            mtp_cycles: Some(10),
+            mtp_mean_depth: Some(2.0),
             memory_before: Some(MemorySnapshot {
                 active_bytes: 1e9,
                 peak_bytes: 1.5e9,
@@ -473,6 +495,12 @@ mod tests {
         assert_eq!(profile.phases.len(), 3);
         assert_eq!(profile.phases[0].name, "forward");
         assert_eq!(profile.phases[0].count, 50);
+        assert_eq!(profile.mtp_cycles, Some(10));
+        assert_eq!(profile.mtp_mean_depth, Some(2.0));
+        assert_eq!(
+            profile.mtp_acceptance_by_position.as_ref().unwrap(),
+            &vec![0.9, 0.5]
+        );
         assert!(profile.memory_before.is_some());
         assert!(profile.memory_after.is_some());
         assert_eq!(profile.memory_after.as_ref().unwrap().cache_bytes, 5e8);

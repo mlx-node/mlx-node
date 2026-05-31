@@ -13,6 +13,7 @@ use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use rand::{Rng, RngExt};
+use std::sync::OnceLock;
 
 /// Configuration for sampling strategies
 /// ⚡ PERFORMANCE: Made Copy to avoid cloning on every token
@@ -38,6 +39,358 @@ impl Default for SamplingConfig {
             min_p: Some(0.0),
         }
     }
+}
+
+const SPARSE_DISTRIBUTION_MAX_TOP_K: i32 = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SamplerParityMode {
+    Current,
+    Mtplx,
+}
+
+impl SamplerParityMode {
+    fn ffi_code(self) -> i32 {
+        match self {
+            Self::Current => 0,
+            Self::Mtplx => 1,
+        }
+    }
+}
+
+fn sampler_parity_mode() -> SamplerParityMode {
+    static CACHE: OnceLock<SamplerParityMode> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let raw = std::env::var("MLX_MTP_SAMPLER_PARITY")
+            .or_else(|_| std::env::var("MLX_SAMPLER_PARITY"))
+            .unwrap_or_default();
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mtplx" | "mlx-lm" | "mlx_lm" | "temperature-first" | "temperature_first" => {
+                SamplerParityMode::Mtplx
+            }
+            _ => SamplerParityMode::Current,
+        }
+    })
+}
+
+pub(crate) fn sampler_parity_ffi_code() -> i32 {
+    sampler_parity_mode().ffi_code()
+}
+
+pub(crate) fn sampler_parity_is_mtplx() -> bool {
+    sampler_parity_mode() == SamplerParityMode::Mtplx
+}
+
+/// Owned sparse probability distribution used by stochastic MTP acceptance.
+///
+/// The support is intentionally tiny (`top_k`, typically 20), so linear scans
+/// are faster and simpler than allocating a hash table per draft position.
+#[derive(Clone, Debug)]
+pub(crate) struct SparseDistribution {
+    token_ids: Vec<i32>,
+    probs: Vec<f64>,
+    vocab_size: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SparseDistributionRef<'a> {
+    token_ids: &'a [i32],
+    probs: &'a [f64],
+    vocab_size: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SparseDistributionRows {
+    token_ids: Vec<i32>,
+    probs: Vec<f64>,
+    rows: usize,
+    width: usize,
+    vocab_size: usize,
+}
+
+impl SparseDistribution {
+    pub(crate) fn as_row(&self) -> SparseDistributionRef<'_> {
+        SparseDistributionRef {
+            token_ids: &self.token_ids,
+            probs: &self.probs,
+            vocab_size: self.vocab_size,
+        }
+    }
+}
+
+impl SparseDistributionRows {
+    pub(crate) fn from_precomputed(
+        token_ids: Vec<i32>,
+        probs: Vec<f64>,
+        rows: usize,
+        width: usize,
+        vocab_size: usize,
+        context: &str,
+    ) -> Result<Self> {
+        let len = rows.checked_mul(width).ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                format!("{context}: sparse row shape overflows rows={rows} width={width}"),
+            )
+        })?;
+        if rows == 0 || width == 0 || vocab_size == 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "{context}: rows, width, and vocab_size must be positive (rows={rows}, width={width}, vocab={vocab_size})"
+                ),
+            ));
+        }
+        if token_ids.len() != len || probs.len() != len {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "{context}: token/prob length mismatch ids={} probs={} expected={len}",
+                    token_ids.len(),
+                    probs.len()
+                ),
+            ));
+        }
+
+        let mut normalized = vec![0.0f64; len];
+        for row in 0..rows {
+            let start = row * width;
+            let end = start + width;
+            let mut total = 0.0f64;
+            for (&token_id, &prob) in token_ids[start..end].iter().zip(probs[start..end].iter()) {
+                if token_id < 0 || token_id as usize >= vocab_size {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!(
+                            "{context}: token id {token_id} in row {row} outside vocab {vocab_size}"
+                        ),
+                    ));
+                }
+                if !prob.is_finite() || prob < 0.0 {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!("{context}: invalid probability {prob} in row {row}"),
+                    ));
+                }
+                total += prob;
+            }
+            if !total.is_finite() || total <= 0.0 {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("{context}: row {row} has no positive probability mass"),
+                ));
+            }
+            for j in start..end {
+                normalized[j] = probs[j] / total;
+            }
+        }
+
+        Ok(Self {
+            token_ids,
+            probs: normalized,
+            rows,
+            width,
+            vocab_size,
+        })
+    }
+
+    pub(crate) fn from_precomputed_arrays(
+        token_ids: &MxArray,
+        probs: &MxArray,
+        vocab_size: usize,
+        expected_rows: usize,
+        expected_width: usize,
+        context: &str,
+    ) -> Result<Self> {
+        let ids_shape = token_ids.shape()?;
+        let ids_shape: Vec<i64> = ids_shape.as_ref().to_vec();
+        let probs_shape = probs.shape()?;
+        let probs_shape: Vec<i64> = probs_shape.as_ref().to_vec();
+        let expected = vec![expected_rows as i64, expected_width as i64];
+        if ids_shape != expected || probs_shape != expected {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "{context}: expected ids/probs shape {:?}, got ids={:?} probs={:?}",
+                    expected, ids_shape, probs_shape
+                ),
+            ));
+        }
+
+        MxArray::eval_arrays(&[token_ids, probs])?;
+        let token_ids: Vec<i32> = token_ids.to_int32()?.to_vec();
+        let probs: Vec<f32> = probs.to_float32()?.to_vec();
+        let probs = probs.into_iter().map(f64::from).collect();
+        Self::from_precomputed(
+            token_ids,
+            probs,
+            expected_rows,
+            expected_width,
+            vocab_size,
+            context,
+        )
+    }
+
+    pub(crate) fn validate_for_accept(
+        &self,
+        expected_rows: usize,
+        expected_vocab_size: usize,
+        config: &SamplingConfig,
+    ) -> Result<()> {
+        let top_k = config.top_k.unwrap_or(0);
+        let expected_width = usize::min(top_k.max(0) as usize, expected_vocab_size);
+        if self.rows < expected_rows
+            || self.width != expected_width
+            || self.vocab_size != expected_vocab_size
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "precomputed sparse target rows mismatch: rows={} width={} vocab={} expected rows>={} width={} vocab={}",
+                    self.rows,
+                    self.width,
+                    self.vocab_size,
+                    expected_rows,
+                    expected_width,
+                    expected_vocab_size
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub(crate) fn row(&self, row: usize) -> Result<SparseDistributionRef<'_>> {
+        if row >= self.rows {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "sparse distribution row {} out of bounds for {} rows",
+                    row, self.rows
+                ),
+            ));
+        }
+        let start = row * self.width;
+        let end = start + self.width;
+        Ok(SparseDistributionRef {
+            token_ids: &self.token_ids[start..end],
+            probs: &self.probs[start..end],
+            vocab_size: self.vocab_size,
+        })
+    }
+
+    pub(crate) fn row_owned(&self, row: usize) -> Result<SparseDistribution> {
+        let row_ref = self.row(row)?;
+        Ok(SparseDistribution {
+            token_ids: row_ref.token_ids.to_vec(),
+            probs: row_ref.probs.to_vec(),
+            vocab_size: row_ref.vocab_size,
+        })
+    }
+}
+
+impl SparseDistributionRef<'_> {
+    pub(crate) fn probability(&self, token_id: i32) -> f64 {
+        self.token_ids
+            .iter()
+            .zip(self.probs.iter())
+            .find_map(|(&id, &prob)| {
+                if id == token_id && prob > 0.0 {
+                    Some(prob)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0)
+    }
+
+    pub(crate) fn positive_rank(&self, token_id: i32) -> Option<usize> {
+        let mut rank = 0usize;
+        for (&id, &prob) in self.token_ids.iter().zip(self.probs.iter()) {
+            if !prob.is_finite() || prob <= 0.0 {
+                continue;
+            }
+            rank += 1;
+            if id == token_id {
+                return Some(rank);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn top_entry(&self) -> Option<(i32, f64)> {
+        let mut best: Option<(i32, f64)> = None;
+        for (&id, &prob) in self.token_ids.iter().zip(self.probs.iter()) {
+            if !prob.is_finite() || prob <= 0.0 {
+                continue;
+            }
+            match best {
+                Some((_, best_prob)) if prob <= best_prob => {}
+                _ => best = Some((id, prob)),
+            }
+        }
+        best
+    }
+
+    pub(crate) fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Result<i32> {
+        sample_sparse_slices(self.token_ids, self.probs, rng)
+    }
+}
+
+fn sample_sparse_slices<R: Rng + ?Sized>(
+    token_ids: &[i32],
+    probs: &[f64],
+    rng: &mut R,
+) -> Result<i32> {
+    if token_ids.len() != probs.len() || token_ids.is_empty() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "sparse distribution token/probability shape mismatch".to_string(),
+        ));
+    }
+
+    let total: f64 = probs
+        .iter()
+        .copied()
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .sum();
+    if !total.is_finite() || total <= 0.0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "sparse distribution has no positive probability mass".to_string(),
+        ));
+    }
+
+    let u: f64 = rng.random::<f64>() * total;
+    let mut cumulative = 0.0f64;
+    let mut last_positive: Option<i32> = None;
+    for (&token_id, &prob) in token_ids.iter().zip(probs.iter()) {
+        if !prob.is_finite() || prob <= 0.0 {
+            continue;
+        }
+        cumulative += prob;
+        last_positive = Some(token_id);
+        if u < cumulative {
+            return Ok(token_id);
+        }
+    }
+
+    last_positive.ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            "sparse distribution has no sampleable token".to_string(),
+        )
+    })
+}
+
+pub(crate) fn sparse_distribution_supported(config: &SamplingConfig) -> bool {
+    let temperature = config.temperature.unwrap_or(1.0);
+    let top_k = config.top_k.unwrap_or(0);
+    let min_p = config.min_p.unwrap_or(0.0);
+    temperature > 1e-6 && top_k > 0 && top_k <= SPARSE_DISTRIBUTION_MAX_TOP_K && min_p <= 0.0
 }
 
 /// Apply temperature scaling to logits
@@ -354,6 +707,7 @@ pub(crate) fn sample_compiled(logits: &MxArray, config: Option<SamplingConfig>) 
             top_k,
             top_p as f32,
             min_p as f32,
+            sampler_parity_mode().ffi_code(),
         )
     };
     MxArray::from_handle(handle, "compiled_sample_full")
@@ -392,6 +746,7 @@ pub(crate) fn sample_and_logprobs(
             top_k,
             top_p as f32,
             min_p as f32,
+            sampler_parity_mode().ffi_code(),
             &mut token_handle,
             &mut logprobs_handle,
         );
@@ -401,6 +756,284 @@ pub(crate) fn sample_and_logprobs(
     let logprobs = MxArray::from_handle(logprobs_handle, "sample_logprobs")?;
 
     Ok((token, logprobs))
+}
+
+/// Build sparse probability rows that match `sample_compiled` for supported
+/// stochastic top-k samplers.
+///
+/// This is the MTPLX-style fast path for MTP acceptance: do the full-vocab
+/// work on-device (`top_k` + logsumexp), copy only `[rows, top_k]` token IDs
+/// and weights to CPU, then run probability-ratio acceptance on those tiny
+/// distributions.
+///
+/// Default semantics intentionally mirror `mlx_compiled_sample_full`:
+///   1. pick top-k support from unscaled logits/logprobs,
+///   2. apply top-p on that support using the unscaled probability tail,
+///   3. sample from `softmax(logits / temperature)` over the kept support.
+///
+/// With `MLX_MTP_SAMPLER_PARITY=mtplx`, the support probabilities are computed
+/// from `softmax(logits / temperature)` before top-p filtering, matching MTPLX's
+/// fast sparse sampler for its public `temp=0.6` path.
+pub(crate) fn sparse_distributions_from_logits(
+    logits: &MxArray,
+    config: &SamplingConfig,
+) -> Result<Option<SparseDistributionRows>> {
+    sparse_distributions_from_logits_with_mode(logits, config, sampler_parity_mode())
+}
+
+fn sparse_distributions_from_logits_with_mode(
+    logits: &MxArray,
+    config: &SamplingConfig,
+    mode: SamplerParityMode,
+) -> Result<Option<SparseDistributionRows>> {
+    if !sparse_distribution_supported(config) {
+        return Ok(None);
+    }
+
+    let temperature = config.temperature.unwrap_or(1.0);
+    let top_k = config.top_k.unwrap_or(0);
+    let top_p = config.top_p.unwrap_or(1.0);
+
+    let shape = logits.shape()?;
+    let shape_vec: Vec<i64> = shape.as_ref().to_vec();
+    if shape_vec.is_empty() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "sparse_distributions_from_logits: expected at least 1D logits".to_string(),
+        ));
+    }
+    let vocab_size_i64 = *shape_vec.last().unwrap();
+    if vocab_size_i64 <= 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "sparse_distributions_from_logits: invalid vocab size {}",
+                vocab_size_i64
+            ),
+        ));
+    }
+    let vocab_size = vocab_size_i64 as usize;
+    let rows = if shape_vec.len() == 1 {
+        1usize
+    } else {
+        shape_vec[..shape_vec.len() - 1]
+            .iter()
+            .try_fold(1usize, |acc, &dim| {
+                if dim <= 0 {
+                    None
+                } else {
+                    acc.checked_mul(dim as usize)
+                }
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "sparse_distributions_from_logits: invalid logits shape {:?}",
+                        shape_vec
+                    ),
+                )
+            })?
+    };
+
+    let width = usize::min(top_k as usize, vocab_size);
+    if width == 0 || width > SPARSE_DISTRIBUTION_MAX_TOP_K as usize {
+        return Ok(None);
+    }
+
+    let rows_i64 = rows as i64;
+    let width_i64 = width as i64;
+    let logits_2d = logits
+        .astype(DType::Float32)?
+        .reshape(&[rows_i64, vocab_size_i64])?;
+    let sampler_logits_2d = if mode == SamplerParityMode::Mtplx {
+        logits_2d.div_scalar(temperature)?
+    } else {
+        logits_2d.clone()
+    };
+
+    let neg_logits = sampler_logits_2d.mul_scalar(-1.0)?;
+    let partitioned = neg_logits.argpartition((width as i32) - 1, Some(-1))?;
+    let top_idx = partitioned.slice(&[0, 0], &[rows_i64, width_i64])?;
+    let top_vals = sampler_logits_2d.take_along_axis(&top_idx, -1)?;
+
+    // `argpartition` leaves the first k items unordered. Sort the tiny support
+    // descending by sampler logit so the CPU top-p tail pass is deterministic.
+    let sort_order = top_vals.mul_scalar(-1.0)?.argsort(Some(-1))?;
+    let top_idx = top_idx.take_along_axis(&sort_order, -1)?;
+    let top_vals = top_vals.take_along_axis(&sort_order, -1)?;
+
+    // These probabilities are only used to reproduce the sampler's top-p
+    // support. In MTPLX parity mode the logits are already temperature-scaled.
+    let log_total = sampler_logits_2d.logsumexp(Some(&[-1]), Some(true))?;
+    let base_probs = top_vals.sub(&log_total)?.exp()?.astype(DType::Float32)?;
+
+    MxArray::eval_arrays(&[&top_idx, &top_vals, &base_probs])?;
+    let token_ids: Vec<i32> = top_idx.to_int32()?.to_vec();
+    let top_values: Vec<f32> = top_vals.to_float32()?.to_vec();
+    let base_probs: Vec<f32> = base_probs.to_float32()?.to_vec();
+
+    let mut out_probs = vec![0.0f64; rows * width];
+    let mut out_ids = vec![0i32; rows * width];
+    let apply_top_p = top_p > 0.0 && top_p < 1.0;
+
+    for row in 0..rows {
+        let start = row * width;
+        let end = start + width;
+        out_ids[start..end].copy_from_slice(&token_ids[start..end]);
+
+        let mut keep = vec![true; width];
+        if apply_top_p {
+            keep.fill(false);
+
+            if mode == SamplerParityMode::Mtplx {
+                let mut cumulative_before = 0.0f64;
+                for j in 0..width {
+                    keep[j] = cumulative_before < top_p;
+                    let p = f64::from(base_probs[start + j]);
+                    if p.is_finite() && p > 0.0 {
+                        cumulative_before += p;
+                    }
+                }
+                if !keep.is_empty() {
+                    keep[0] = true;
+                }
+            } else {
+                let threshold = (1.0 - (top_p - 1e-7)).clamp(0.0, 1.0);
+                let mut low_tail = 0.0f64;
+                for j in (0..width).rev() {
+                    let p = f64::from(base_probs[start + j]);
+                    if p.is_finite() && p > 0.0 {
+                        low_tail += p;
+                    }
+                    keep[j] = low_tail > threshold;
+                }
+            }
+
+            if !keep.iter().any(|&v| v) {
+                keep[0] = true;
+            }
+        }
+
+        let mut max_scaled = f64::NEG_INFINITY;
+        for j in 0..width {
+            if keep[j] {
+                let scaled = if mode == SamplerParityMode::Mtplx {
+                    f64::from(top_values[start + j])
+                } else {
+                    f64::from(top_values[start + j]) / temperature
+                };
+                if scaled.is_finite() {
+                    max_scaled = max_scaled.max(scaled);
+                }
+            }
+        }
+        if !max_scaled.is_finite() {
+            out_probs[start] = 1.0;
+            continue;
+        }
+
+        let mut total = 0.0f64;
+        for j in 0..width {
+            if keep[j] {
+                let scaled = if mode == SamplerParityMode::Mtplx {
+                    f64::from(top_values[start + j])
+                } else {
+                    f64::from(top_values[start + j]) / temperature
+                };
+                let weight = (scaled - max_scaled).exp();
+                if weight.is_finite() && weight > 0.0 {
+                    out_probs[start + j] = weight;
+                    total += weight;
+                }
+            }
+        }
+
+        if !total.is_finite() || total <= 0.0 {
+            out_probs[start] = 1.0;
+            continue;
+        }
+        for j in 0..width {
+            out_probs[start + j] /= total;
+        }
+    }
+
+    Ok(Some(SparseDistributionRows {
+        token_ids: out_ids,
+        probs: out_probs,
+        rows,
+        width,
+        vocab_size,
+    }))
+}
+
+pub(crate) fn accept_with_residual_sparse<R: Rng + ?Sized>(
+    target_p: SparseDistributionRef<'_>,
+    draft_q: SparseDistributionRef<'_>,
+    draft_id: i32,
+    rng: &mut R,
+) -> Result<(bool, i32)> {
+    if draft_id < 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual_sparse: draft_id must be non-negative, got {}",
+                draft_id
+            ),
+        ));
+    }
+    if (draft_id as usize) >= target_p.vocab_size || target_p.vocab_size != draft_q.vocab_size {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "accept_with_residual_sparse: draft_id/vocab mismatch draft_id={} target_vocab={} draft_vocab={}",
+                draft_id, target_p.vocab_size, draft_q.vocab_size
+            ),
+        ));
+    }
+
+    let p = target_p.probability(draft_id);
+    let q = draft_q.probability(draft_id);
+    let accept_prob = acceptance_probability_from_probs(p, q);
+
+    let u: f64 = rng.random();
+    if u < accept_prob {
+        return Ok((true, draft_id));
+    }
+
+    let mut residual_ids = Vec::with_capacity(target_p.token_ids.len());
+    let mut residual_probs = Vec::with_capacity(target_p.probs.len());
+    let mut total = 0.0f64;
+    for (&token_id, &p_t) in target_p.token_ids.iter().zip(target_p.probs.iter()) {
+        if !p_t.is_finite() || p_t <= 0.0 {
+            continue;
+        }
+        let residual = (p_t - draft_q.probability(token_id)).max(0.0);
+        if residual > 0.0 && residual.is_finite() {
+            residual_ids.push(token_id);
+            residual_probs.push(residual);
+            total += residual;
+        }
+    }
+
+    if !total.is_finite() || total <= 0.0 {
+        return Ok((false, target_p.sample(rng)?));
+    }
+    for prob in &mut residual_probs {
+        *prob /= total;
+    }
+    Ok((
+        false,
+        sample_sparse_slices(&residual_ids, &residual_probs, rng)?,
+    ))
+}
+
+pub(crate) fn acceptance_probability_from_probs(p: f64, q: f64) -> f64 {
+    if q <= 0.0 {
+        if p > 0.0 { 1.0 } else { 0.0 }
+    } else {
+        (p / q).min(1.0)
+    }
 }
 
 /// Speculative-sampling acceptance step (Leviathan-Chen theorem).
@@ -1453,6 +2086,228 @@ mod accept_with_residual_tests {
             top_p: Some(1.0),
             min_p: Some(0.0),
         }
+    }
+
+    fn sparse_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(1.0),
+            top_k: Some(2),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        }
+    }
+
+    fn sparse_temp_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(0.5),
+            top_k: Some(3),
+            top_p: Some(0.8),
+            min_p: Some(0.0),
+        }
+    }
+
+    fn sparse_mtplx_wide_nucleus_cfg() -> SamplingConfig {
+        SamplingConfig {
+            temperature: Some(1.0),
+            top_k: Some(2),
+            top_p: Some(0.95),
+            min_p: Some(0.0),
+        }
+    }
+
+    #[test]
+    fn sparse_distribution_rows_keep_topk_and_normalize() {
+        let logits = MxArray::from_float32(
+            &[
+                0.0f32, 1.0, 2.0, 3.0, // row 0 keeps tokens 3 and 2
+                3.0, 2.0, 1.0, 0.0, // row 1 keeps tokens 0 and 1
+            ],
+            &[2, 4],
+        )
+        .expect("logits");
+        let rows = sparse_distributions_from_logits(&logits, &sparse_cfg())
+            .expect("sparse distributions")
+            .expect("supported sparse distribution");
+
+        let row0 = rows.row(0).expect("row0");
+        assert!(row0.probability(3) > row0.probability(2));
+        assert_eq!(row0.probability(0), 0.0);
+        assert_eq!(row0.probability(1), 0.0);
+        assert_close(
+            (row0.probability(2) + row0.probability(3)) as f32,
+            1.0,
+            1e-6,
+        );
+
+        let row1 = rows.row(1).expect("row1");
+        assert!(row1.probability(0) > row1.probability(1));
+        assert_eq!(row1.probability(2), 0.0);
+        assert_eq!(row1.probability(3), 0.0);
+        assert_close(
+            (row1.probability(0) + row1.probability(1)) as f32,
+            1.0,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn sparse_distribution_rows_from_precomputed_validates_and_normalizes() {
+        let rows = SparseDistributionRows::from_precomputed(
+            vec![1, 2, 3, 0],
+            vec![2.0, 2.0, 0.0, 4.0],
+            2,
+            2,
+            4,
+            "test_precomputed",
+        )
+        .expect("precomputed rows");
+
+        let row0 = rows.row(0).expect("row0");
+        assert_close(row0.probability(1) as f32, 0.5, 1e-6);
+        assert_close(row0.probability(2) as f32, 0.5, 1e-6);
+
+        let row1 = rows.row(1).expect("row1");
+        assert_eq!(row1.probability(3), 0.0);
+        assert_close(row1.probability(0) as f32, 1.0, 1e-6);
+    }
+
+    #[test]
+    fn sparse_distribution_rows_from_precomputed_rejects_invalid_rows() {
+        assert!(
+            SparseDistributionRows::from_precomputed(
+                vec![1, 7],
+                vec![1.0, 0.0],
+                1,
+                2,
+                4,
+                "test_precomputed",
+            )
+            .is_err()
+        );
+        assert!(
+            SparseDistributionRows::from_precomputed(
+                vec![1, 2],
+                vec![0.0, 0.0],
+                1,
+                2,
+                4,
+                "test_precomputed",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mtplx_sparse_distribution_filters_top_p_after_temperature() {
+        let logits = MxArray::from_float32(&[2.0f32, 1.0, 0.0], &[1, 3]).expect("logits");
+        let current = sparse_distributions_from_logits_with_mode(
+            &logits,
+            &sparse_temp_cfg(),
+            SamplerParityMode::Current,
+        )
+        .expect("current sparse")
+        .expect("current supported");
+        let mtplx = sparse_distributions_from_logits_with_mode(
+            &logits,
+            &sparse_temp_cfg(),
+            SamplerParityMode::Mtplx,
+        )
+        .expect("mtplx sparse")
+        .expect("mtplx supported");
+
+        let current_row = current.row(0).expect("current row");
+        assert!(current_row.probability(1) > 0.0);
+        assert_eq!(current_row.probability(2), 0.0);
+
+        let mtplx_row = mtplx.row(0).expect("mtplx row");
+        assert_close(mtplx_row.probability(0) as f32, 1.0, 1e-6);
+        assert_eq!(mtplx_row.probability(1), 0.0);
+        assert_eq!(mtplx_row.probability(2), 0.0);
+    }
+
+    #[test]
+    fn mtplx_sparse_distribution_keeps_topk_when_nucleus_extends_past_topk() {
+        let mut values = vec![0.0f32, -5.24];
+        values.extend((0..60).map(|_| -6.907));
+        let logits = MxArray::from_float32(&values, &[1, values.len() as i64]).expect("logits");
+        let current = sparse_distributions_from_logits_with_mode(
+            &logits,
+            &sparse_mtplx_wide_nucleus_cfg(),
+            SamplerParityMode::Current,
+        )
+        .expect("current sparse")
+        .expect("current supported");
+        let mtplx = sparse_distributions_from_logits_with_mode(
+            &logits,
+            &sparse_mtplx_wide_nucleus_cfg(),
+            SamplerParityMode::Mtplx,
+        )
+        .expect("mtplx sparse")
+        .expect("mtplx supported");
+
+        let current_row = current.row(0).expect("current row");
+        assert_eq!(current_row.probability(1), 0.0);
+
+        let mtplx_row = mtplx.row(0).expect("mtplx row");
+        assert!(mtplx_row.probability(1) > 0.0);
+        assert_close(
+            (mtplx_row.probability(0) + mtplx_row.probability(1)) as f32,
+            1.0,
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn sparse_distribution_ref_reports_positive_rank_and_top_entry() {
+        let dist = SparseDistribution {
+            token_ids: vec![9, 8, 7, 6],
+            probs: vec![0.0, 0.5, 0.25, 0.25],
+            vocab_size: 10,
+        };
+        let row = dist.as_row();
+
+        assert_eq!(row.top_entry(), Some((8, 0.5)));
+        assert_eq!(row.positive_rank(9), None);
+        assert_eq!(row.positive_rank(8), Some(1));
+        assert_eq!(row.positive_rank(7), Some(2));
+        assert_eq!(row.positive_rank(6), Some(3));
+        assert_eq!(row.positive_rank(5), None);
+    }
+
+    #[test]
+    fn acceptance_probability_from_sparse_probs_matches_ratio_contract() {
+        assert_eq!(acceptance_probability_from_probs(0.0, 0.2), 0.0);
+        assert_eq!(acceptance_probability_from_probs(0.3, 0.0), 1.0);
+        assert_eq!(acceptance_probability_from_probs(0.0, 0.0), 0.0);
+        assert_close(
+            acceptance_probability_from_probs(0.2, 0.5) as f32,
+            0.4,
+            1e-6,
+        );
+        assert_eq!(acceptance_probability_from_probs(0.9, 0.3), 1.0);
+    }
+
+    #[test]
+    fn sparse_accept_reject_samples_sparse_residual() {
+        let target = SparseDistribution {
+            token_ids: vec![1, 2, 3],
+            probs: vec![0.4, 0.3, 0.3],
+            vocab_size: 4,
+        };
+        let draft = SparseDistribution {
+            token_ids: vec![0, 1, 2],
+            probs: vec![0.5, 0.25, 0.25],
+            vocab_size: 4,
+        };
+        // First draw pins accept u=0; p_accept=0 for draft token 0, so strict
+        // `<` still rejects. Second draw samples the first residual-support
+        // token deterministically.
+        let mut rng = ScriptedRng::new(&[0, 0]);
+        let (accepted, out) =
+            accept_with_residual_sparse(target.as_row(), draft.as_row(), 0, &mut rng)
+                .expect("sparse accept");
+        assert!(!accepted);
+        assert_eq!(out, 1);
     }
 
     #[test]

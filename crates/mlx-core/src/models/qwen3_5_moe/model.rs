@@ -1674,13 +1674,27 @@ impl Qwen35MoeInner {
                     verify_step: |ids: &MxArray,
                                   emb: &MxArray,
                                   depth: usize|
-                     -> Result<(MxArray, MxArray)> {
+                     -> Result<chat_common::MtpVerifyOutput> {
                         // W6.5 — return (logits, verify-final hidden)
                         // so the cycle macro can chain into the next
                         // cycle's first MTP draft and skip Step A's
                         // ~150 ms main-MoE forward.
-                        forward_moe_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
+                        {
+                            let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
+                                ids,
+                                emb,
+                                depth as i32,
+                            )?;
+                            Ok(chat_common::MtpVerifyOutput {
+                                logits: Some(logits),
+                                hiddens,
+                                target_argmax: None,
+                                target_sparse: None,
+                            })
+                        }
                     },
+                    verify_step_argmax_only: None,
+                    verify_step_sparse: None,
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MoE MTP path only. The main MoE path's offset
                         // and GDN linear caches are restored via the
@@ -1713,7 +1727,7 @@ impl Qwen35MoeInner {
                     // and re-anchor MTP offset to the main MoE path's
                     // current offset before each draft cycle. See the
                     // dense site for the full rationale.
-                    begin_cycle: || unsafe {
+                    begin_cycle: |_| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
@@ -1761,7 +1775,8 @@ impl Qwen35MoeInner {
                     // cycle-history policy (its C++ `begin_cycle` still
                     // zeroes the MTP cache), so its commit hook is a
                     // no-op.
-                    commit_mtp: |_seed_hidden: &MxArray,
+                    commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
+                                 _seed_hidden: &MxArray,
                                  _verify_hiddens: &MxArray,
                                  _committed_ids: &[u32],
                                  _k_accepted: usize,
@@ -2536,7 +2551,7 @@ impl Qwen35MoeInner {
             };
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                let forced_id = reasoning_tracker.forced_token_id()? as i32;
                 y = MxArray::from_int32(&[forced_id], &[1])?;
                 y.eval();
                 continue;
@@ -3311,7 +3326,7 @@ impl Qwen35MoeInner {
             };
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                let forced_id = reasoning_tracker.forced_token_id()? as i32;
                 y = MxArray::from_int32(&[forced_id], &[1])?;
                 y.eval();
                 continue;
@@ -3841,13 +3856,27 @@ impl Qwen35MoeInner {
                     verify_step: |ids: &MxArray,
                                   emb: &MxArray,
                                   depth: usize|
-                     -> Result<(MxArray, MxArray)> {
+                     -> Result<chat_common::MtpVerifyOutput> {
                         // W6.5 — return (logits, verify-final hidden)
                         // so the cycle macro can chain into the next
                         // cycle's first MTP draft and skip Step A's
                         // ~150 ms main-MoE forward.
-                        forward_moe_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
+                        {
+                            let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
+                                ids,
+                                emb,
+                                depth as i32,
+                            )?;
+                            Ok(chat_common::MtpVerifyOutput {
+                                logits: Some(logits),
+                                hiddens,
+                                target_argmax: None,
+                                target_sparse: None,
+                            })
+                        }
                     },
+                    verify_step_argmax_only: None,
+                    verify_step_sparse: None,
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MoE MTP path only — main offset/linear restored
                         // via `restore_and_replay_main`. See the first
@@ -3875,7 +3904,7 @@ impl Qwen35MoeInner {
                     // and re-anchor MTP offset to the main MoE path's
                     // current offset before each draft cycle. See the
                     // dense site for the full rationale.
-                    begin_cycle: || unsafe {
+                    begin_cycle: |_| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
@@ -3923,7 +3952,8 @@ impl Qwen35MoeInner {
                     // cycle-history policy (its C++ `begin_cycle` still
                     // zeroes the MTP cache), so its commit hook is a
                     // no-op.
-                    commit_mtp: |_seed_hidden: &MxArray,
+                    commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
+                                 _seed_hidden: &MxArray,
                                  _verify_hiddens: &MxArray,
                                  _committed_ids: &[u32],
                                  _k_accepted: usize,
@@ -4540,13 +4570,27 @@ impl Qwen35MoeInner {
                     verify_step: |ids: &MxArray,
                                   emb: &MxArray,
                                   depth: usize|
-                     -> Result<(MxArray, MxArray)> {
+                     -> Result<chat_common::MtpVerifyOutput> {
                         // W6.5 — return (logits, verify-final hidden)
                         // so the cycle macro can chain into the next
                         // cycle's first MTP draft and skip Step A's
                         // ~150 ms main-MoE forward.
-                        forward_moe_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
+                        {
+                            let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
+                                ids,
+                                emb,
+                                depth as i32,
+                            )?;
+                            Ok(chat_common::MtpVerifyOutput {
+                                logits: Some(logits),
+                                hiddens,
+                                target_argmax: None,
+                                target_sparse: None,
+                            })
+                        }
                     },
+                    verify_step_argmax_only: None,
+                    verify_step_sparse: None,
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MoE MTP path only — main offset/linear restored
                         // via `restore_and_replay_main`. See the first
@@ -4574,7 +4618,7 @@ impl Qwen35MoeInner {
                     // and re-anchor MTP offset to the main MoE path's
                     // current offset before each draft cycle. See the
                     // dense site for the full rationale.
-                    begin_cycle: || unsafe {
+                    begin_cycle: |_| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
@@ -4622,7 +4666,8 @@ impl Qwen35MoeInner {
                     // cycle-history policy (its C++ `begin_cycle` still
                     // zeroes the MTP cache), so its commit hook is a
                     // no-op.
-                    commit_mtp: |_seed_hidden: &MxArray,
+                    commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
+                                 _seed_hidden: &MxArray,
                                  _verify_hiddens: &MxArray,
                                  _committed_ids: &[u32],
                                  _k_accepted: usize,
@@ -5361,13 +5406,27 @@ impl Qwen35MoeInner {
                     verify_step: |ids: &MxArray,
                                   emb: &MxArray,
                                   depth: usize|
-                     -> Result<(MxArray, MxArray)> {
+                     -> Result<chat_common::MtpVerifyOutput> {
                         // W6.5 — return (logits, verify-final hidden)
                         // so the cycle macro can chain into the next
                         // cycle's first MTP draft and skip Step A's
                         // ~150 ms main-MoE forward.
-                        forward_moe_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
+                        {
+                            let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
+                                ids,
+                                emb,
+                                depth as i32,
+                            )?;
+                            Ok(chat_common::MtpVerifyOutput {
+                                logits: Some(logits),
+                                hiddens,
+                                target_argmax: None,
+                                target_sparse: None,
+                            })
+                        }
                     },
+                    verify_step_argmax_only: None,
+                    verify_step_sparse: None,
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
                         // MoE MTP path only — main offset/linear restored
                         // via `restore_and_replay_main`. See the first
@@ -5395,7 +5454,7 @@ impl Qwen35MoeInner {
                     // and re-anchor MTP offset to the main MoE path's
                     // current offset before each draft cycle. See the
                     // dense site for the full rationale.
-                    begin_cycle: || unsafe {
+                    begin_cycle: |_| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
                         mlx_sys::mlx_qwen35_moe_mtp_compiled_begin_cycle(main_offset);
@@ -5443,7 +5502,8 @@ impl Qwen35MoeInner {
                     // cycle-history policy (its C++ `begin_cycle` still
                     // zeroes the MTP cache), so its commit hook is a
                     // no-op.
-                    commit_mtp: |_seed_hidden: &MxArray,
+                    commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
+                                 _seed_hidden: &MxArray,
                                  _verify_hiddens: &MxArray,
                                  _committed_ids: &[u32],
                                  _k_accepted: usize,

@@ -292,24 +292,24 @@ export interface SessionCapableModel {
    * the same field.
    *
    * - **`mtpDepth`** — pins the MTP draft depth per speculative cycle.
-   *   Clamped to `[1, 5]` by the W5 verify FFI contract. When unset
-   *   (the common case), the native adaptive policy below selects the
-   *   depth automatically and `mtpDepth: 3` is used only as the initial
-   *   seed. Setting `mtpDepth` explicitly disables adaptive depth by
-   *   default — the value is pinned for every cycle unless the caller
-   *   also passes `mtpAdaptiveDepth: true` to keep adaptation enabled
-   *   with the supplied seed.
+   *   Clamped to `[1, 5]` by the W5 verify FFI contract. When unset,
+   *   native code currently pins depth 1. Setting `mtpDepth` explicitly
+   *   pins that value unless the caller also passes
+   *   `mtpAdaptiveDepth: true` to opt into adaptive depth with the
+   *   supplied maximum/seed.
    * - **`mtpAdaptiveDepth`** — toggles the W6.8 adaptive depth policy.
-   *   Defaults to ON when `enableMtp` is true and `mtpDepth` is unset;
-   *   defaults to OFF (pinned) when `mtpDepth` is set explicitly. When
-   *   ON, the decode loop runs a 5-state machine
+   *   Defaults to OFF. When ON, the default mode runs a 5-state machine
    *   (`Explore` → `Full` → {`NeighborProbe` | `Reduced` → `Probe`})
    *   with per-depth EMA tracking of
    *   `accepted_tokens / cycle_wall_ns` and picks the depth that
    *   maximizes that rate (DFlash-style, EMA decay α=0.3, drop-back
-   *   threshold 0.75). An explicit `false` always wins, pinning the
-   *   chosen `mtpDepth` for every cycle. When `enableMtp` is false (or
-   *   the model has no MTP head) the field is ignored.
+   *   threshold 0.75). `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value`
+   *   instead uses the MTPLX-style intra-cycle expected-value gate; by
+   *   default it stops at its base depth, with deeper expansion kept
+   *   research-only behind `MLX_MTP_EV_ALLOW_DEEPEN=1`.
+   *   An explicit `false` always wins, pinning the chosen `mtpDepth` for
+   *   every cycle. When `enableMtp` is false (or the model has no MTP
+   *   head) the field is ignored.
    *
    * The defaults for both `mtpDepth` and `mtpAdaptiveDepth` are
    * applied on the native side (see

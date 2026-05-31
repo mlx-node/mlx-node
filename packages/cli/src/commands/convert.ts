@@ -65,6 +65,11 @@ Quantization Arguments:
                         embed=5b, lm_head=6b, attn q/k/v=5b+AWQ,
                         o_proj/out_proj/in_proj_a/in_proj_b=8b affine)
                         "unsloth" requires --imatrix-path for quality
+  --q-mtp <string>      Qwen MTP quantization policy: off (default), cyankiwi, all.
+                        Writes MTP tensors to an MTPLX-style mtp.safetensors
+                        sidecar. cyankiwi keeps mtp.fc dense and quantizes MTP
+                        layer linears as 4-bit affine group_size=32; all also
+                        quantizes mtp.fc.
   --imatrix-path <path> imatrix GGUF file for AWQ-style pre-scaling
                         Improves quantization quality using calibration data
                         Required for "unsloth" recipe
@@ -114,6 +119,7 @@ export async function run(argv: string[]) {
       'q-mode': { type: 'string' },
       'q-mxfp': { type: 'boolean', default: false },
       'q-recipe': { type: 'string' },
+      'q-mtp': { type: 'string' },
       'imatrix-path': { type: 'string' },
       mmproj: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
@@ -147,6 +153,7 @@ export async function run(argv: string[]) {
   const quantBits = parsePositiveInt('--q-bits', args['q-bits']);
   const quantGroupSize = parsePositiveInt('--q-group-size', args['q-group-size']);
   const quantMode = args['q-mode'];
+  const quantMtp = args['q-mtp'] ?? 'off';
 
   const validQuantModes = ['affine', 'mxfp4', 'mxfp8', 'nvfp4'];
   if (quantMode !== undefined && !validQuantModes.includes(quantMode)) {
@@ -154,6 +161,11 @@ export async function run(argv: string[]) {
     process.exit(1);
   }
 
+  const validQuantMtpPolicies = ['off', 'cyankiwi', 'all'];
+  if (!validQuantMtpPolicies.includes(quantMtp)) {
+    console.error(`Error: --q-mtp must be one of ${validQuantMtpPolicies.join(', ')}`);
+    process.exit(1);
+  }
   if (args['q-mxfp'] && !args.quantize) {
     console.error('Error: --q-mxfp requires --quantize');
     process.exit(1);
@@ -167,6 +179,11 @@ export async function run(argv: string[]) {
   }
 
   const quantRecipe = args['q-recipe'];
+  if (quantMtp !== 'off' && (!args.quantize || quantRecipe === undefined)) {
+    console.error('Error: --q-mtp requires --quantize and --q-recipe');
+    process.exit(1);
+  }
+
   const validRecipes = ['mixed_2_6', 'mixed_3_4', 'mixed_3_6', 'mixed_4_6', 'qwen3_5', 'unsloth'];
   if (quantRecipe !== undefined) {
     if (!args.quantize) {
@@ -280,6 +297,10 @@ export async function run(argv: string[]) {
   if (inputPath.endsWith('.gguf')) {
     if (!existsSync(inputPath)) {
       console.error(`Error: GGUF file not found: ${inputPath}`);
+      process.exit(1);
+    }
+    if (quantMtp !== 'off') {
+      console.error('Error: --q-mtp is only supported for SafeTensors Qwen MTP conversion');
       process.exit(1);
     }
 
@@ -431,7 +452,7 @@ export async function run(argv: string[]) {
     const qGs = quantGroupSize || defaultGs;
     const qMxfpSuffix = args['q-mxfp'] ? ', --q-mxfp: 8b->mxfp8, 4b->mxfp4' : '';
     console.log(
-      `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}`,
+      `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp} sidecar` : ''}`,
     );
   }
   if (imatrixPath) {
@@ -452,6 +473,7 @@ export async function run(argv: string[]) {
       quantMode,
       quantMxfp: args['q-mxfp'],
       quantRecipe,
+      quantMtp,
       imatrixPath,
     });
 

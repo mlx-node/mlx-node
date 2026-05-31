@@ -330,6 +330,32 @@ impl DecodeProfiler {
         ))
     }
 
+    /// Mean attempted draft depth per MTP cycle. `None` when no MTP
+    /// cycle ran.
+    pub fn mtp_mean_depth(&self) -> Option<f64> {
+        if self.mtp_cycles == 0 {
+            return None;
+        }
+        Some(self.mtp_depth_total as f64 / self.mtp_cycles as f64)
+    }
+
+    /// Build the public phase profile vector for `PerformanceMetrics`
+    /// and `GenerationProfile`.
+    fn phase_profiles(&self) -> Vec<PhaseProfile> {
+        let n = (self.num_tokens as f64).max(1.0);
+        self.phase_order
+            .iter()
+            .filter_map(|&name| {
+                self.phases.get(name).map(|stats| PhaseProfile {
+                    name: name.to_string(),
+                    total_ms: stats.total_us as f64 / 1000.0,
+                    avg_us_per_token: stats.total_us as f64 / n,
+                    count: stats.count as u32,
+                })
+            })
+            .collect()
+    }
+
     /// Copy the MTP acceptance summary into a `PerformanceMetrics`.
     /// No-op when no MTP cycle ran (leaves the fields `None`).
     pub fn fill_mtp_acceptance(&self, m: &mut crate::profiling::PerformanceMetrics) {
@@ -337,6 +363,13 @@ impl DecodeProfiler {
             m.mtp_mean_accepted_tokens = Some(mean);
             m.mtp_acceptance_by_position = Some(per_pos);
             m.mtp_cycles = Some(cycles);
+            m.mtp_mean_depth = self.mtp_mean_depth();
+        }
+        if self.enabled && self.num_tokens > 0 {
+            let phases = self.phase_profiles();
+            if !phases.is_empty() {
+                m.profile_phases = Some(phases);
+            }
         }
     }
 
@@ -371,18 +404,11 @@ impl DecodeProfiler {
 
         // Push to global store (when programmatic profiling is active)
         if profiling::is_active() {
-            let phases: Vec<PhaseProfile> = self
-                .phase_order
-                .iter()
-                .filter_map(|&name| {
-                    self.phases.get(name).map(|stats| PhaseProfile {
-                        name: name.to_string(),
-                        total_ms: stats.total_us as f64 / 1000.0,
-                        avg_us_per_token: stats.total_us as f64 / n,
-                        count: stats.count as u32,
-                    })
-                })
-                .collect();
+            let phases = self.phase_profiles();
+            let (mtp_mean_accepted_tokens, mtp_acceptance_by_position, mtp_cycles) = self
+                .mtp_acceptance_summary()
+                .map(|(mean, per_pos, cycles)| (Some(mean), Some(per_pos), Some(cycles)))
+                .unwrap_or((None, None, None));
 
             profiling::push_generation(GenerationProfile {
                 label: self.label.to_string(),
@@ -395,6 +421,10 @@ impl DecodeProfiler {
                 tokens_per_second: tok_s,
                 time_to_first_token_ms: ttft_ms,
                 phases,
+                mtp_mean_accepted_tokens,
+                mtp_acceptance_by_position,
+                mtp_cycles,
+                mtp_mean_depth: self.mtp_mean_depth(),
                 memory_before: self.memory_before.clone(),
                 memory_after: self.memory_after.clone(),
             });
@@ -832,6 +862,7 @@ mod tests {
 
         // No cycles yet → no summary.
         assert!(profiler.mtp_acceptance_summary().is_none());
+        assert!(profiler.mtp_mean_depth().is_none());
 
         // depth=3 cycles with K = 3, 1, 2 → mean accepted = 6/3 = 2.0.
         profiler.record_mtp_cycle(3, 3);
@@ -843,6 +874,10 @@ mod tests {
             .expect("summary after 3 cycles");
         assert_eq!(cycles, 3);
         assert!((mean - 2.0).abs() < 1e-9, "mean accepted {mean} != 2.0");
+        assert!(
+            (profiler.mtp_mean_depth().expect("mean depth") - 3.0).abs() < 1e-9,
+            "mean depth should track attempted draft depth"
+        );
         // Pos 0 accepted in all 3 cycles (K>=1): 3/3. Pos 1 when K>=2
         // (K=3,2): 2/3. Pos 2 when K>=3 (K=3 only): 1/3.
         assert_eq!(per_pos.len(), 3);
@@ -858,9 +893,12 @@ mod tests {
             mtp_mean_accepted_tokens: None,
             mtp_acceptance_by_position: None,
             mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         };
         profiler.fill_mtp_acceptance(&mut m);
         assert_eq!(m.mtp_cycles, Some(3));
+        assert!((m.mtp_mean_depth.expect("mean depth") - 3.0).abs() < 1e-9);
         assert!((m.mtp_mean_accepted_tokens.expect("mean") - 2.0).abs() < 1e-9);
         assert_eq!(
             m.mtp_acceptance_by_position
@@ -869,6 +907,37 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn test_fill_mtp_acceptance_copies_phase_profiles_when_enabled() {
+        with_profiling(|| {
+            let mut profiler = DecodeProfiler::new("test_perf_phases", "qwen3_5");
+            profiler.begin("forward");
+            thread::sleep(Duration::from_micros(100));
+            profiler.end();
+            profiler.record_mtp_cycle(2, 1);
+            profiler.step();
+
+            let mut m = crate::profiling::PerformanceMetrics {
+                ttft_ms: 0.0,
+                prefill_tokens_per_second: 0.0,
+                decode_tokens_per_second: 0.0,
+                mtp_mean_accepted_tokens: None,
+                mtp_acceptance_by_position: None,
+                mtp_cycles: None,
+                mtp_mean_depth: None,
+                profile_phases: None,
+            };
+            profiler.fill_mtp_acceptance(&mut m);
+
+            assert_eq!(m.mtp_cycles, Some(1));
+            assert_eq!(m.mtp_mean_depth, Some(2.0));
+            let phases = m.profile_phases.expect("phase profiles");
+            assert_eq!(phases.len(), 1);
+            assert_eq!(phases[0].name, "forward");
+            assert_eq!(phases[0].count, 1);
+        });
     }
 
     #[test]

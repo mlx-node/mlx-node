@@ -1013,7 +1013,7 @@ impl Lfm2Inner {
 
                 // Budget enforcement
                 let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id() as i32;
+                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
                     (MxArray::from_int32(&[forced_id], &[1])?, true)
                 } else {
                     let logits = apply_all_penalties(logits, &token_history, &p)?;
@@ -1451,7 +1451,7 @@ impl Lfm2Inner {
             let next_logits = next_logits.squeeze(Some(&[1]))?;
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                let forced_id = reasoning_tracker.forced_token_id()? as i32;
                 y = MxArray::from_int32(&[forced_id], &[1])?;
                 y.eval();
                 continue;
@@ -2177,7 +2177,7 @@ impl Lfm2Inner {
             let next_logits = next_logits.squeeze(Some(&[1]))?;
 
             let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id() as i32;
+                let forced_id = reasoning_tracker.forced_token_id()? as i32;
                 y = MxArray::from_int32(&[forced_id], &[1])?;
                 y.eval();
                 continue;
@@ -2334,7 +2334,7 @@ impl Lfm2Inner {
                 let logits = logits.squeeze(Some(&[1]))?;
 
                 let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id() as i32;
+                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
                     (MxArray::from_int32(&[forced_id], &[1])?, true)
                 } else {
                     let logits = apply_all_penalties(logits, &token_history, &p)?;
@@ -2692,7 +2692,7 @@ impl Lfm2Inner {
                 let logits = logits.squeeze(Some(&[1]))?;
 
                 let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id() as i32;
+                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
                     (MxArray::from_int32(&[forced_id], &[1])?, true)
                 } else {
                     let logits = apply_all_penalties(logits, &token_history, &p)?;
@@ -3185,7 +3185,7 @@ impl Lfm2Inner {
                 let logits = logits.squeeze(Some(&[1]))?;
 
                 let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id() as i32;
+                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
                     (MxArray::from_int32(&[forced_id], &[1])?, true)
                 } else {
                     let logits = apply_all_penalties(logits, &token_history, &p)?;

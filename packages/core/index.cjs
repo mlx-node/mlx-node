@@ -792,6 +792,7 @@ module.exports.OutputFormat = nativeBinding.OutputFormat;
 module.exports.parsePaddleResponse = nativeBinding.parsePaddleResponse;
 module.exports.parseToolCallsFromText = nativeBinding.parseToolCallsFromText;
 module.exports.parseVlmOutput = nativeBinding.parseVlmOutput;
+module.exports.quantizedQmvMicrobench = nativeBinding.quantizedQmvMicrobench;
 module.exports.resetPeakMemory = nativeBinding.resetPeakMemory;
 module.exports.resetProfilingData = nativeBinding.resetProfilingData;
 module.exports.saveToXlsx = nativeBinding.saveToXlsx;

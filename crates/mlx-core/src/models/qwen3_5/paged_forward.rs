@@ -360,6 +360,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden(
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    keep_last_hidden: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
     let chunk_size = crate::array::paged_prefill_chunk_size();
     run_paged_prefill_chunk_with_hidden_with_size(
@@ -376,6 +377,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden(
         layer_kinds,
         paged_adapter,
         chunk_size,
+        keep_last_hidden,
     )
 }
 
@@ -394,6 +396,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
+    keep_last_hidden: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -415,6 +418,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             embedding_weight,
             layer_kinds,
             paged_adapter,
+            keep_last_hidden,
         );
     }
 
@@ -428,10 +432,18 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
     let total_chunks = suffix_tokens.len().div_ceil(chunk_size_usize);
     let mut last_logits: Option<MxArray> = None;
     let mut hidden_chunks: Vec<MxArray> = Vec::with_capacity(total_chunks);
+    let total_suffix_len = suffix_tokens.len();
+    let keep_start = keep_last_hidden
+        .map(|keep| total_suffix_len.saturating_sub(keep.max(1)))
+        .unwrap_or(0);
     let mut chunk_start_position = cached_prefix_len;
+    let mut suffix_offset = 0usize;
 
     for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
         let is_last_chunk = chunk_idx + 1 == total_chunks;
+        let chunk_start = suffix_offset;
+        let chunk_end = chunk_start + chunk.len();
+        let overlaps_kept_tail = chunk_end > keep_start;
 
         paged_adapter
             .record_tokens(chunk)
@@ -447,16 +459,19 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             paged_adapter,
         )?;
 
-        let chunk_hidden = final_norm.forward(&hidden_states)?;
-        // Materialize hidden BEFORE clear_cache; the hidden is a lazy
-        // handle into graph nodes that the per-layer cache eviction
-        // would otherwise free between chunks.
-        chunk_hidden.eval();
+        let chunk_hidden = if overlaps_kept_tail || is_last_chunk {
+            Some(final_norm.forward(&hidden_states)?)
+        } else {
+            None
+        };
 
         if is_last_chunk {
             // Reuse the already-normed last chunk to project last-token
             // logits — `forward` on a final_norm output is idempotent
             // would be wasteful; slice directly instead.
+            let chunk_hidden = chunk_hidden.as_ref().ok_or_else(|| {
+                Error::from_reason("run_paged_prefill_chunk_with_hidden: missing last hidden")
+            })?;
             let chunk_len = chunk_hidden.shape_at(1)?;
             let last_hidden = chunk_hidden.slice_axis(1, chunk_len - 1, chunk_len)?;
             let logits = if let Some(head) = lm_head {
@@ -466,12 +481,32 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
                 last_hidden.matmul(&weight_t)?
             };
             last_logits = Some(logits.squeeze(Some(&[0, 1]))?);
-        } else {
-            crate::array::synchronize_and_clear_cache();
         }
 
-        hidden_chunks.push(chunk_hidden);
+        if let Some(chunk_hidden) = chunk_hidden
+            && overlaps_kept_tail
+        {
+            let keep_from = keep_start.max(chunk_start);
+            let kept_hidden = if keep_from > chunk_start {
+                chunk_hidden.slice_axis(
+                    1,
+                    (keep_from - chunk_start) as i64,
+                    (chunk_end - chunk_start) as i64,
+                )?
+            } else {
+                chunk_hidden
+            };
+            // Materialize hidden BEFORE clear_cache; the hidden is a lazy
+            // handle into graph nodes that the per-layer cache eviction
+            // would otherwise free between chunks.
+            kept_hidden.eval();
+            hidden_chunks.push(kept_hidden);
+        }
+        if !is_last_chunk {
+            crate::array::synchronize_and_clear_cache();
+        }
         chunk_start_position += chunk.len() as u32;
+        suffix_offset = chunk_end;
     }
 
     let last_logits = last_logits.ok_or_else(|| {
@@ -509,6 +544,7 @@ fn run_paged_prefill_single_shot_with_hidden(
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    keep_last_hidden: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
     paged_adapter
         .record_tokens(suffix_tokens)
@@ -534,6 +570,7 @@ fn run_paged_prefill_single_shot_with_hidden(
         final_norm,
         lm_head,
         embedding_weight,
+        keep_last_hidden,
     )
 }
 
@@ -608,6 +645,7 @@ fn project_last_token_logits_with_full_hidden(
     final_norm: &RMSNorm,
     lm_head: &Option<Linear>,
     embedding_weight: &MxArray,
+    keep_last_hidden: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
     let prompt_len = hidden_states.shape_at(1)?;
     let hidden_dim = hidden_states.shape_at(2)?;
@@ -620,17 +658,26 @@ fn project_last_token_logits_with_full_hidden(
         last_hidden.matmul(&weight_t)?
     };
 
+    let keep_start = keep_last_hidden
+        .map(|keep| prompt_len.saturating_sub(keep.max(1) as i64))
+        .unwrap_or(0);
+    let kept_hidden = if keep_start > 0 {
+        full_hidden.slice_axis(1, keep_start, prompt_len)?
+    } else {
+        full_hidden
+    };
+
     // Phase 4b B4 fix #4 — the caller runs `synchronize_and_clear_cache()`
-    // before `prefill_mtp_commit`, which would otherwise free the lazy
-    // graph nodes backing `full_hidden`. Materialise before return.
-    full_hidden.eval();
-    debug_assert_eq!(full_hidden.shape_at(0)?, 1);
-    debug_assert_eq!(full_hidden.shape_at(1)?, prompt_len);
-    debug_assert_eq!(full_hidden.shape_at(2)?, hidden_dim);
-    debug_assert_eq!(full_hidden.dtype()?, crate::array::DType::BFloat16);
+    // before `prefill_mtp_commit`, which would otherwise free the lazy graph
+    // nodes backing the kept hidden. Materialise before return.
+    kept_hidden.eval();
+    debug_assert_eq!(kept_hidden.shape_at(0)?, 1);
+    debug_assert!(kept_hidden.shape_at(1)? >= 1);
+    debug_assert_eq!(kept_hidden.shape_at(2)?, hidden_dim);
+    debug_assert_eq!(kept_hidden.dtype()?, crate::array::DType::BFloat16);
 
     let logits = logits.squeeze(Some(&[0, 1]))?;
-    Ok((logits, full_hidden))
+    Ok((logits, kept_hidden))
 }
 
 /// Run one paged decode step: feed `[token_id]` through the model.

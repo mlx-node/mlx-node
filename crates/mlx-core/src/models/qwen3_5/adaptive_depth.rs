@@ -39,6 +39,67 @@ use std::time::Duration;
 pub(crate) const MIN_DEPTH: u8 = 1;
 pub(crate) const MAX_DEPTH: u8 = 5;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdaptiveDepthMode {
+    Throughput,
+    ExpectedValue,
+}
+
+pub(crate) fn adaptive_depth_mode_from_env() -> AdaptiveDepthMode {
+    match std::env::var("MLX_MTP_ADAPTIVE_DEPTH_MODE") {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "expected-value" | "expected_value" | "ev" => AdaptiveDepthMode::ExpectedValue,
+            _ => AdaptiveDepthMode::Throughput,
+        },
+        Err(_) => AdaptiveDepthMode::Throughput,
+    }
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+fn env_u8(name: &str, default: u8) -> u8 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u8>().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+        }
+        Err(_) => default,
+    }
+}
+
+fn env_accept_priors(max_depth: u8) -> [f64; MAX_DEPTH as usize] {
+    let mut priors = [0.70, 0.40, 0.18, 0.10, 0.05];
+    if let Ok(raw) = std::env::var("MLX_MTP_EV_ACCEPT_PRIORS") {
+        let mut last = priors[0];
+        for (idx, part) in raw.split(',').enumerate().take(MAX_DEPTH as usize) {
+            if let Ok(value) = part.trim().parse::<f64>()
+                && value.is_finite()
+            {
+                last = value.clamp(0.0, 1.0);
+                priors[idx] = last;
+            }
+        }
+        let max = max_depth.clamp(MIN_DEPTH, MAX_DEPTH) as usize;
+        for slot in priors.iter_mut().take(MAX_DEPTH as usize).skip(max) {
+            *slot = last;
+        }
+    }
+    priors
+}
+
 /// DFlash drop threshold: when rolling acceptance over a window drops
 /// below this, we leave `Full` for `Reduced`. Reference:
 /// `_ADAPTIVE_DROP_ACCEPTANCE_THRESHOLD = 0.75`.
@@ -141,6 +202,163 @@ pub(crate) struct CycleStats {
     /// Measured by the caller with `std::time::Instant`. Must be
     /// non-zero (the policy divides by it).
     pub wall_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DraftMetrics {
+    pub top1_prob_topk: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExpectedValueDecision {
+    pub continue_drafting: bool,
+    pub next_depth: u8,
+    pub expected_extra_accept: f64,
+    pub required_extra_accept: f64,
+}
+
+/// MTPLX-style cost-aware intra-cycle depth gate.
+///
+/// The throughput state machine chooses one depth before the cycle starts. This
+/// policy instead lets the draft loop start at `max_depth`, then stop after the
+/// base depth when the next draft slot is unlikely to repay its draft+verify
+/// cost. It never changes sampling semantics: it only shortens the proposal
+/// prefix before target verification.
+pub(crate) struct ExpectedValueDepthPolicy {
+    max_depth: u8,
+    base_depth: u8,
+    accept_ewma: [f64; MAX_DEPTH as usize],
+    ewma_alpha: f64,
+    draft_cost_s: f64,
+    extra_verify_cost_s: f64,
+    baseline_tok_s: f64,
+    safety_margin: f64,
+    confidence_weight: f64,
+    min_extra_accept_probability: f64,
+    allow_deepen: bool,
+}
+
+impl ExpectedValueDepthPolicy {
+    pub fn new(max_depth: u8) -> Self {
+        let max_depth = max_depth.clamp(MIN_DEPTH, MAX_DEPTH);
+        let base_depth = env_u8("MLX_MTP_EV_BASE_DEPTH", 1).clamp(MIN_DEPTH, max_depth);
+        let ewma_alpha = env_f64("MLX_MTP_EV_EWMA_ALPHA", 0.12).clamp(0.001, 1.0);
+        Self {
+            max_depth,
+            base_depth,
+            accept_ewma: env_accept_priors(max_depth),
+            ewma_alpha,
+            draft_cost_s: env_f64("MLX_MTP_EV_DRAFT_COST_S", 0.0048).max(0.0),
+            extra_verify_cost_s: env_f64("MLX_MTP_EV_EXTRA_VERIFY_COST_S", 0.0060).max(0.0),
+            baseline_tok_s: env_f64("MLX_MTP_EV_BASELINE_TOK_S", 24.0).max(1e-6),
+            safety_margin: env_f64("MLX_MTP_EV_SAFETY_MARGIN", 0.10).max(0.0),
+            confidence_weight: env_f64("MLX_MTP_EV_CONFIDENCE_WEIGHT", 0.25).clamp(0.0, 1.0),
+            min_extra_accept_probability: env_f64("MLX_MTP_EV_MIN_EXTRA_ACCEPT_PROBABILITY", 0.30)
+                .clamp(0.0, 1.0),
+            // Conservative default: real M5 Max traces showed intra-cycle
+            // deepening can violate the temperature-0 byte-equivalence safety
+            // contract even though fixed-depth and inter-cycle adaptive depth
+            // remain safe. Keep the EV cost model available for controlled
+            // experiments without making the default unsafe.
+            allow_deepen: env_bool("MLX_MTP_EV_ALLOW_DEEPEN", false),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        max_depth: u8,
+        base_depth: u8,
+        accept_ewma: [f64; MAX_DEPTH as usize],
+        min_extra_accept_probability: f64,
+    ) -> Self {
+        let mut policy = Self::new(max_depth);
+        policy.base_depth = base_depth.clamp(MIN_DEPTH, policy.max_depth);
+        policy.accept_ewma = accept_ewma;
+        policy.min_extra_accept_probability = min_extra_accept_probability.clamp(0.0, 1.0);
+        policy.draft_cost_s = 0.0;
+        policy.extra_verify_cost_s = 0.0;
+        policy.allow_deepen = true;
+        policy
+    }
+
+    pub fn max_depth(&self) -> u8 {
+        self.max_depth
+    }
+
+    pub fn should_continue_after_draft(
+        &self,
+        drafted_depth: usize,
+        cycle_max_depth: usize,
+        metrics: DraftMetrics,
+    ) -> ExpectedValueDecision {
+        let drafted_depth = drafted_depth.clamp(1, self.max_depth as usize);
+        let cycle_max_depth = cycle_max_depth.clamp(1, self.max_depth as usize);
+        let next_depth = (drafted_depth + 1).min(self.max_depth as usize) as u8;
+
+        if drafted_depth >= cycle_max_depth {
+            return ExpectedValueDecision {
+                continue_drafting: false,
+                next_depth,
+                expected_extra_accept: 0.0,
+                required_extra_accept: 0.0,
+            };
+        }
+
+        if drafted_depth < self.base_depth as usize {
+            return ExpectedValueDecision {
+                continue_drafting: true,
+                next_depth,
+                expected_extra_accept: 1.0,
+                required_extra_accept: 0.0,
+            };
+        }
+
+        if !self.allow_deepen {
+            return ExpectedValueDecision {
+                continue_drafting: false,
+                next_depth,
+                expected_extra_accept: 0.0,
+                required_extra_accept: self.min_extra_accept_probability,
+            };
+        }
+
+        let mut prefix_probability = 1.0;
+        for idx in 0..drafted_depth {
+            prefix_probability *= self.accept_ewma[idx].clamp(0.0, 1.0);
+        }
+        let next_probability = self.accept_ewma[next_depth as usize - 1].clamp(0.0, 1.0);
+        let confidence_factor = self.confidence_factor(metrics);
+        let expected_extra_accept =
+            (prefix_probability * next_probability * confidence_factor).clamp(0.0, 0.999);
+        let extra_cost_s = self.draft_cost_s + self.extra_verify_cost_s;
+        let required_extra_accept = self
+            .min_extra_accept_probability
+            .max(extra_cost_s * self.baseline_tok_s * (1.0 + self.safety_margin));
+        ExpectedValueDecision {
+            continue_drafting: expected_extra_accept >= required_extra_accept,
+            next_depth,
+            expected_extra_accept,
+            required_extra_accept,
+        }
+    }
+
+    pub fn observe(&mut self, attempted_depth: usize, accepted_drafts: usize) {
+        let attempted_depth = attempted_depth.clamp(1, self.max_depth as usize);
+        let accepted_drafts = accepted_drafts.min(attempted_depth);
+        for idx in 0..attempted_depth {
+            let accepted = if accepted_drafts > idx { 1.0 } else { 0.0 };
+            self.accept_ewma[idx] =
+                (1.0 - self.ewma_alpha) * self.accept_ewma[idx] + self.ewma_alpha * accepted;
+        }
+    }
+
+    fn confidence_factor(&self, metrics: DraftMetrics) -> f64 {
+        let Some(top1_prob) = metrics.top1_prob_topk else {
+            return 1.0;
+        };
+        let centered = 2.0 * top1_prob.clamp(0.0, 1.0) - 1.0;
+        (1.0 + self.confidence_weight * centered).clamp(0.50, 1.50)
+    }
 }
 
 impl CycleStats {
@@ -563,6 +781,51 @@ mod tests {
     /// Total cycles required to finish exploration: 5 depths *
     /// MIN_COLD_SAMPLES cycles each.
     const EXPLORE_TOTAL: u32 = (MAX_DEPTH as u32) * MIN_COLD_SAMPLES;
+
+    #[test]
+    fn expected_value_gate_stops_low_value_next_depth() {
+        let mut p = ExpectedValueDepthPolicy::new(3);
+        p.base_depth = 1;
+        p.accept_ewma = [0.70, 0.30, 0.10, 0.05, 0.05];
+        p.min_extra_accept_probability = 0.30;
+        p.draft_cost_s = 0.0;
+        p.extra_verify_cost_s = 0.0;
+
+        let decision = p.should_continue_after_draft(1, 3, DraftMetrics::default());
+        assert!(
+            !decision.continue_drafting,
+            "low D2 expected value should stop after D1"
+        );
+    }
+
+    #[test]
+    fn expected_value_gate_continues_high_value_next_depth() {
+        let mut p = ExpectedValueDepthPolicy::new(3);
+        p.base_depth = 1;
+        p.accept_ewma = [0.95, 0.80, 0.50, 0.10, 0.05];
+        p.min_extra_accept_probability = 0.30;
+        p.draft_cost_s = 0.0;
+        p.extra_verify_cost_s = 0.0;
+        p.allow_deepen = true;
+
+        let decision = p.should_continue_after_draft(1, 3, DraftMetrics::default());
+        assert!(
+            decision.continue_drafting,
+            "high D2 expected value should continue past D1"
+        );
+    }
+
+    #[test]
+    fn expected_value_observe_updates_attempted_slots_only() {
+        let mut p = ExpectedValueDepthPolicy::new(3);
+        p.ewma_alpha = 0.5;
+        p.accept_ewma = [0.50, 0.50, 0.50, 0.50, 0.50];
+
+        p.observe(2, 1);
+        assert!((p.accept_ewma[0] - 0.75).abs() < 1e-9);
+        assert!((p.accept_ewma[1] - 0.25).abs() < 1e-9);
+        assert!((p.accept_ewma[2] - 0.50).abs() < 1e-9);
+    }
 
     /// Cold-start: first MIN_COLD_SAMPLES samples per depth use a
     /// cumulative mean, not EMA. Verify the rate stored is the exact

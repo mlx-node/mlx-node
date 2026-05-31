@@ -107,6 +107,15 @@ mlx convert --input ./model.gguf --output ./model-vlm --mmproj ./mmproj.gguf
 
 # imatrix AWQ pre-scaling with unsloth dynamic quantization
 mlx convert --input ./model --output ./model-unsloth --quantize --q-recipe unsloth --imatrix-path ./imatrix.gguf
+
+# Qwen3.6 with MTPLX-style MTP sidecar
+mlx convert \
+  --input .cache/models/qwen3.6-27b \
+  --output .cache/models/qwen3.6-27b-unsloth-nvfp4-mtplx-sidecar \
+  --model-type qwen3_5 \
+  --quantize --q-mode nvfp4 --q-recipe unsloth \
+  --imatrix-path ./imatrix.gguf \
+  --q-mtp cyankiwi
 ```
 
 #### Options
@@ -123,6 +132,7 @@ mlx convert --input ./model --output ./model-unsloth --quantize --q-recipe unslo
 | `--q-group-size` |       | `64`          | Quantization group size                        |
 | `--q-mode`       |       | `affine`      | Mode: `affine` or `mxfp8`                      |
 | `--q-recipe`     |       |               | Per-layer mixed-bit recipe                     |
+| `--q-mtp`        |       | `off`         | Qwen MTP sidecar policy: `cyankiwi` or `all`   |
 | `--imatrix-path` |       |               | imatrix GGUF for AWQ pre-scaling               |
 | `--mmproj`       |       |               | mmproj GGUF for vision encoder weights         |
 

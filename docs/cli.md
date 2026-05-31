@@ -47,6 +47,22 @@ mlx convert --input ./model --output ./model-bf16 --dtype bf16
 mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 ```
 
+### Qwen MTP sidecar conversion
+
+```bash
+mlx convert \
+  --input .cache/models/qwen3.6-27b \
+  --output .cache/models/qwen3.6-27b-unsloth-nvfp4-mtplx-sidecar \
+  --model-type qwen3_5 \
+  --quantize --q-mode nvfp4 --q-recipe unsloth \
+  --imatrix-path ./imatrix.gguf \
+  --q-mtp cyankiwi
+```
+
+`--q-mtp cyankiwi` writes MTP tensors to `mtp.safetensors`, keeps `mtp.fc`
+and MTP norms BF16, and packs the 7 MTP layer linears as 4-bit affine
+group-size 32 tensors with MTPLX-compatible metadata.
+
 | Flag               | Purpose                                                                         |
 | ------------------ | ------------------------------------------------------------------------------- |
 | `-i`, `--input`    | Source model directory (required)                                               |
@@ -55,6 +71,7 @@ mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 | `-q`, `--quantize` | Enable quantization                                                             |
 | `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth` |
 | `--q-mode`         | `affine` (default) or `mxfp8`                                                   |
+| `--q-mtp`          | Qwen MTP sidecar policy: `off`, `cyankiwi`, or `all`                            |
 | `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                        |
 | `--mmproj`         | Vision-encoder conversion path                                                  |
 | `-v`, `--verbose`  | Verbose logging                                                                 |

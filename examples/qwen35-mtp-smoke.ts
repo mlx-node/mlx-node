@@ -105,14 +105,35 @@ async function runOnce(label: string, enableMtp: boolean): Promise<ChatResult> {
   return result;
 }
 
-// Warmup — first run pays compile + cache costs. Same prompt both modes.
+// COLD acceptance capture — MUST be the FIRST send on the freshly loaded
+// model so the cache is guaranteed cold (paged_adapter empty, nothing
+// published to the content-addressed prefix cache yet). This is the
+// honest MTP acceptance source. On the paged path
+// (`MLX_QWEN35_PAGED_OVERRIDE=1`) a *warm* MTP turn sees
+// `cached_prefix_len > 0`, which flips `want_prompt_hidden` false and
+// skips the prompt-prefill committed-history seed — so any MTP turn that
+// follows an AR/warmup turn on the SAME prompt under-reports acceptance
+// (~1.25 vs the true cold ~1.50). `model.resetCaches()` does NOT fix this
+// (the published prefix blocks survive a reset), and the shared system
+// prompt makes "use a different prompt" fragile — only a never-seen cold
+// cache is reliable. The dense path re-seeds via its zero-delta reset, so
+// it is unaffected, but this cold-first run keeps BOTH paths honest.
+console.log('\n--- Cold acceptance (first send, guaranteed cold cache) ---');
+const coldMtp = await runOnce('cold MTP', true);
+
+// Warmup — pays compile + cache costs so the measured tok/s below is
+// steady-state. Same prompt both modes.
 if (!skipWarmup) {
   console.log('\n--- Warmup (each mode) ---');
   await runOnce('warmup AR', false);
   await runOnce('warmup MTP', true);
 }
 
-console.log('\n--- Measured ---');
+// Measured runs are WARM/steady-state for a fair, thermally-comparable
+// tok/s ratio and the parity check. Their MTP acceptance is intentionally
+// NOT used for the gate (it is warm-confounded on the paged path) — the
+// gate reads `coldMtp` above.
+console.log('\n--- Measured (warm; tok/s ratio + parity) ---');
 const ar = await runOnce('measured AR', false);
 const mtp = await runOnce('measured MTP', true);
 
@@ -155,9 +176,9 @@ if (arTps > 0 && mtpTps > 0) {
   console.log('Could not compute speedup (missing performance metrics).');
 }
 
-console.log('\n--- MTP acceptance ---');
+console.log('\n--- MTP acceptance (from the cold run) ---');
 let acceptanceOk = true;
-const mtpPerf = mtp.performance;
+const mtpPerf = coldMtp.performance;
 if (mtpPerf?.mtpCycles != null) {
   const perPos = mtpPerf.mtpAcceptanceByPosition ?? [];
   const perPosStr = perPos.map((p) => p.toFixed(3)).join(', ');

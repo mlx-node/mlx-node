@@ -2466,24 +2466,24 @@ export interface ChatConfig {
   enableMtp?: boolean | undefined;
   /**
    * W6 (MTP): number of draft tokens per speculative cycle. Clamped
-   * to `[1, 5]` by the W5 verify FFI contract. Default: 3.
+   * to `[1, 5]` by the W5 verify FFI contract. Default: 1.
    *
-   * W6.8: when `mtpAdaptiveDepth` is `true` (the default whenever
-   * the caller did NOT set this field), this value is only used as
-   * the *initial* depth — the adaptive policy picks per-cycle from
-   * the EMA hill-climb. Setting this field implicitly opts OUT of
-   * adaptive depth unless `mtpAdaptiveDepth` is also set to `true`.
+   * W6.8: when `mtpAdaptiveDepth` is `true`, this value is used as
+   * the throughput-policy seed and the expected-value policy's max
+   * depth. Adaptive depth is opt-in; set
+   * `mtpAdaptiveDepth: true` explicitly to enable it.
    */
   mtpDepth?: number | undefined;
   /**
    * W6.8 (MTP): when true, the decode loop runs the W6.8 adaptive
-   * depth policy (per-depth EMA of `accepted_tokens / cycle_wall_ns`
-   * plus DFlash-style 3-state machine `full | reduced | probe`).
+   * depth policy. Default mode is a per-depth EMA hill-climb plus
+   * DFlash-style 3-state machine `full | reduced | probe`.
+   * `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` instead uses the
+   * MTPLX-style intra-cycle expected-value gate; deeper intra-cycle
+   * expansion is research-only behind `MLX_MTP_EV_ALLOW_DEEPEN=1`.
    * When false, the loop pins `mtpDepth` for every cycle.
    *
-   * Default: true when `mtpDepth` is also undefined; false when
-   * `mtpDepth` is set (caller pinned a specific depth). An explicit
-   * value always wins over the default.
+   * Default: false. An explicit value always wins over the default.
    */
   mtpAdaptiveDepth?: boolean | undefined;
 }
@@ -2671,6 +2671,13 @@ export interface ConversionOptions {
    * Forces `group_size = 32` for upgraded layers.
    */
   quantMxfp?: boolean;
+  /**
+   * Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", or "all".
+   * "cyankiwi" keeps mtp.fc dense and quantizes only the MTP layer linears as
+   * 4-bit affine group_size=32 in an MTPLX-compatible mtp.safetensors sidecar.
+   * "all" additionally quantizes mtp.fc.
+   */
+  quantMtp?: string;
 }
 
 export interface ConversionResult {
@@ -3098,6 +3105,14 @@ export interface GenerationProfile {
   timeToFirstTokenMs: number;
   /** Per-phase breakdown. */
   phases: Array<PhaseProfile>;
+  /** MTP speculative decode: mean accepted draft tokens per cycle. */
+  mtpMeanAcceptedTokens?: number;
+  /** MTP speculative decode: per-draft-position acceptance rate. */
+  mtpAcceptanceByPosition?: Array<number>;
+  /** MTP speculative decode: number of draft+verify cycles executed. */
+  mtpCycles?: number;
+  /** MTP speculative decode: mean attempted draft depth per cycle. */
+  mtpMeanDepth?: number;
   /** Memory snapshot before generation. */
   memoryBefore?: MemorySnapshot;
   /** Memory snapshot after generation. */
@@ -3741,6 +3756,16 @@ export interface PerformanceMetrics {
    * `None` on plain autoregressive runs.
    */
   mtpCycles?: number;
+  /**
+   * MTP speculative decode: mean attempted draft depth per cycle.
+   * `None` on plain autoregressive runs.
+   */
+  mtpMeanDepth?: number;
+  /**
+   * Optional decode phase breakdown. Present when decode profiling
+   * is enabled via `MLX_PROFILE_DECODE=1` or `setProfilingEnabled(true)`.
+   */
+  profilePhases?: Array<PhaseProfile>;
 }
 
 export interface PhaseProfile {
@@ -3888,6 +3913,32 @@ export interface QmvMulti3MicrobenchResult {
    */
   maxAbsDiff: number;
 }
+
+/** Microbench result for the production quantized qmv dispatch path. */
+export interface QmvQuantizedMicrobenchResult {
+  /** Median `quantized_matmul` wall-clock per call, in nanoseconds. */
+  medianNs: number;
+  /** A tiny materialized checksum of the final output, used to keep the call live. */
+  checksum: number;
+}
+
+/**
+ * Run the production quantized-qmv microbench in the current process.
+ *
+ * To compare `MLX_MTP_SMALL_M_QMV=0` versus `1`, call this from separate
+ * processes. MLX caches the env-backed dispatch predicate statically.
+ */
+export declare function quantizedQmvMicrobench(
+  k: number,
+  n: number,
+  m: number,
+  groupSize: number,
+  bits: number,
+  mode: string,
+  dtype: DType,
+  warmup?: number | undefined | null,
+  iters?: number | undefined | null,
+): QmvQuantizedMicrobenchResult;
 
 /**
  * Qwen3.5 model configuration (dense variant).

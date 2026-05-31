@@ -1,7 +1,9 @@
 #include "mlx_qwen35_common.h"
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 using namespace qwen35_common;
 
@@ -111,9 +113,9 @@ static bool g_linear_snapshot_taken = false;
 //   - `mlx_qwen35_compiled_tape_replay(accepted_steps)` consumes the
 //     first `accepted_steps` slices to restore the snapshot state, then
 //     clears the accumulators.
-//   - `mlx_qwen35_compiled_tape_disarm()` is idempotent (called on the
-//     happy path AFTER full-accept since no replay is needed; matches
-//     the K+1 path's "discard snapshot" semantics).
+//   - `mlx_qwen35_compiled_tape_disarm()` is idempotent. Rejection and
+//     full-accept paths normally consume the tape via `_tape_replay`,
+//     which disarms internally; explicit disarm is only for cleanup.
 //
 // Cleared by `mlx_qwen35_compiled_reset`.
 static bool g_tape_recording_armed = false;
@@ -354,10 +356,52 @@ namespace {
 // `bucket_kv_len == 0` selects the legacy full-length path (SDPA sees
 // the full `max_kv_len` cache). Used for prompts that exceed the largest
 // bucket and as a safety fallback when bucketing is disabled.
-template <bool WithTape>
+struct SparseTargetSpec {
+  bool enabled = false;
+  int top_k = 0;
+  float temperature = 1.0f;
+  float top_p = 1.0f;
+  int sampler_mode = 0;
+};
+
+static std::pair<array, array> mtplx_sparse_target_rows_from_logits(
+    const array& logits_flat,
+    const SparseTargetSpec& spec) {
+  auto sampler_logits = astype(logits_flat, mlx::core::float32);
+  if (spec.temperature != 1.0f) {
+    sampler_logits = mlx::core::multiply(
+        sampler_logits,
+        array(1.0f / spec.temperature));
+  }
+
+  int rows = sampler_logits.shape(0);
+  int vocab = sampler_logits.shape(1);
+  int width = std::min(spec.top_k, vocab);
+  auto partitioned = argpartition(negative(sampler_logits), width - 1, -1);
+  auto top_idx = slice(partitioned, {0, 0}, {rows, width});
+  auto top_vals = take_along_axis(sampler_logits, top_idx, -1);
+  auto order = argsort(negative(top_vals), -1);
+  top_idx = take_along_axis(top_idx, order, -1);
+  top_vals = take_along_axis(top_vals, order, -1);
+
+  auto log_total = logsumexp(sampler_logits, {-1}, true);
+  auto top_probs = exp(mlx::core::subtract(top_vals, log_total));
+  if (spec.top_p > 0.0f && spec.top_p < 1.0f) {
+    auto cumulative_before = mlx::core::subtract(cumsum(top_probs, -1), top_probs);
+    auto keep = less(cumulative_before, array(spec.top_p));
+    top_probs = where(keep, top_probs, mlx::core::multiply(top_probs, array(0.0f)));
+  }
+  auto denom = sum(top_probs, {-1}, true);
+  top_probs = top_probs / denom;
+
+  return {astype(top_idx, mlx::core::int32), astype(top_probs, mlx::core::float32)};
+}
+
+template <bool WithTape, bool ArgmaxOnly = false>
 static std::vector<array> qwen35_verify_batched_decode_fn_bucketed(
     const std::vector<array>& inputs,
-    int bucket_kv_len) {
+    int bucket_kv_len,
+    SparseTargetSpec sparse_target = {}) {
   const auto& cfg = g_compile_config;
 
   auto h_3d       = inputs[0];          // [B, T, hidden]
@@ -473,15 +517,37 @@ static std::vector<array> qwen35_verify_batched_decode_fn_bucketed(
   auto logits_flat = cfg.tie_word_embeddings
       ? linear_proj(h_flat, "embedding")
       : linear_proj(h_flat, "lm_head");
-  int vocab = logits_flat.shape(-1);
-  auto logits = reshape(logits_flat, {B, T, vocab});
+  array logits = zeros({}, mlx::core::float32);
+  array target_argmax = zeros({}, mlx::core::int32);
+  array target_sparse_ids = zeros({}, mlx::core::int32);
+  array target_sparse_probs = zeros({}, mlx::core::float32);
+  if (sparse_target.enabled) {
+    auto sparse_rows = mtplx_sparse_target_rows_from_logits(logits_flat, sparse_target);
+    target_sparse_ids = std::move(sparse_rows.first);
+    target_sparse_probs = std::move(sparse_rows.second);
+  } else {
+    target_argmax = reshape(mlx::core::argmax(logits_flat, /*axis=*/-1), {B, T});
+    if constexpr (!ArgmaxOnly) {
+      int vocab = logits_flat.shape(-1);
+      logits = reshape(logits_flat, {B, T, vocab});
+    }
+  }
 
   std::vector<array> result;
-  size_t reserve = 2 + cfg.num_layers * 2;
+  size_t reserve = 3 + cfg.num_layers * 2;
   if constexpr (WithTape) reserve += cfg.num_layers * 4;
   result.reserve(reserve);
-  result.push_back(std::move(logits));
-  result.push_back(std::move(hidden_out));
+  if (sparse_target.enabled) {
+    result.push_back(std::move(target_sparse_ids));
+    result.push_back(std::move(target_sparse_probs));
+    result.push_back(std::move(hidden_out));
+  } else {
+    if constexpr (!ArgmaxOnly) {
+      result.push_back(std::move(logits));
+    }
+    result.push_back(std::move(hidden_out));
+    result.push_back(std::move(target_argmax));
+  }
   for (auto& c : new_caches) result.push_back(std::move(c));
   if constexpr (WithTape) {
     for (int i = 0; i < cfg.num_layers; i++) {
@@ -551,6 +617,26 @@ static constexpr int kTotalBucketSlots = kNumVerifyBuckets + 1;
 // MLX's compile cache to allocate a per-bucket trace.
 static std::array<std::array<BatchedVerifyFn, 2>, kTotalBucketSlots>
     g_verify_compiled_by_bucket{};
+
+static std::array<std::array<BatchedVerifyFn, 2>, kTotalBucketSlots>
+    g_verify_argmax_compiled_by_bucket{};
+
+struct SparseVerifyFnSlot {
+  SparseTargetSpec spec{};
+  BatchedVerifyFn fn{};
+};
+
+static std::array<std::array<SparseVerifyFnSlot, 2>, kTotalBucketSlots>
+    g_verify_sparse_compiled_by_bucket{};
+
+static bool same_sparse_target_spec(const SparseTargetSpec& a,
+                                    const SparseTargetSpec& b) {
+  return a.enabled == b.enabled &&
+         a.top_k == b.top_k &&
+         a.temperature == b.temperature &&
+         a.top_p == b.top_p &&
+         a.sampler_mode == b.sampler_mode;
+}
 
 // W6.29 — bucket dispatcher opt-out. Default ON; set
 // `MLX_MTP_BUCKETED_VERIFY` to `0` / `false` / `off` (case-insensitive,
@@ -651,6 +737,44 @@ static BatchedVerifyFn& get_or_compile_verify_bucket(int bucket_idx, bool with_t
   return slot;
 }
 
+static BatchedVerifyFn& get_or_compile_verify_argmax_bucket(int bucket_idx, bool with_tape) {
+  auto& slot = g_verify_argmax_compiled_by_bucket[bucket_idx][with_tape ? 1 : 0];
+  if (!slot) {
+    int bucket_size = bucket_size_for_idx(bucket_idx);
+    if (with_tape) {
+      slot = mlx::core::compile([bucket_size](const std::vector<array>& inputs) {
+        return qwen35_verify_batched_decode_fn_bucketed<true, true>(inputs, bucket_size);
+      });
+    } else {
+      slot = mlx::core::compile([bucket_size](const std::vector<array>& inputs) {
+        return qwen35_verify_batched_decode_fn_bucketed<false, true>(inputs, bucket_size);
+      });
+    }
+  }
+  return slot;
+}
+
+static BatchedVerifyFn& get_or_compile_verify_sparse_bucket(
+    int bucket_idx,
+    bool with_tape,
+    const SparseTargetSpec& spec) {
+  auto& slot = g_verify_sparse_compiled_by_bucket[bucket_idx][with_tape ? 1 : 0];
+  if (!slot.fn || !same_sparse_target_spec(slot.spec, spec)) {
+    slot.spec = spec;
+    int bucket_size = bucket_size_for_idx(bucket_idx);
+    if (with_tape) {
+      slot.fn = mlx::core::compile([bucket_size, spec](const std::vector<array>& inputs) {
+        return qwen35_verify_batched_decode_fn_bucketed<true>(inputs, bucket_size, spec);
+      });
+    } else {
+      slot.fn = mlx::core::compile([bucket_size, spec](const std::vector<array>& inputs) {
+        return qwen35_verify_batched_decode_fn_bucketed<false>(inputs, bucket_size, spec);
+      });
+    }
+  }
+  return slot.fn;
+}
+
 // Phase 4b — paged-pool MTP verify graph. Sibling of
 // `qwen35_verify_batched_decode_fn_bucketed` that reads K/V from the
 // vLLM-style pool instead of the BHTD `[B, Hkv, max_kv_len, D]` cache.
@@ -672,10 +796,11 @@ static BatchedVerifyFn& get_or_compile_verify_bucket(int bucket_idx, bool with_t
 // Output vector layout:
 //   [0]                      logits          [1, T, vocab]
 //   [1]                      hiddens         [1, T, hidden]
-//   [2 .. 2 + 2N):           per-layer (stride 2):
+//   [2]                      target argmax   [1, T] int32
+//   [3 .. 3 + 2N):           per-layer (stride 2):
 //     linear:    (new_conv_state, new_recurrent_state)
 //     full-attn: (new_k_pool,     new_v_pool)
-//   [2 + 2N ..]              tape outputs (WithTape variant only) per linear layer
+//   [3 + 2N ..]              tape outputs (WithTape variant only) per linear layer
 template <bool WithTape>
 static std::vector<array> qwen35_verify_batched_decode_fn_paged(
     const std::vector<array>& inputs) {
@@ -786,15 +911,17 @@ static std::vector<array> qwen35_verify_batched_decode_fn_paged(
   auto logits_flat = cfg.tie_word_embeddings
       ? linear_proj(h_flat, "embedding")
       : linear_proj(h_flat, "lm_head");
+  auto target_argmax = reshape(mlx::core::argmax(logits_flat, /*axis=*/-1), {B, T});
   int vocab = logits_flat.shape(-1);
   auto logits = reshape(logits_flat, {B, T, vocab});
 
   std::vector<array> result;
-  size_t reserve = 2 + cfg.num_layers * 2;
+  size_t reserve = 3 + cfg.num_layers * 2;
   if constexpr (WithTape) reserve += cfg.num_layers * 4;
   result.reserve(reserve);
   result.push_back(std::move(logits));
   result.push_back(std::move(hidden_out));
+  result.push_back(std::move(target_argmax));
   for (auto& c : new_caches) result.push_back(std::move(c));
   if constexpr (WithTape) {
     for (int i = 0; i < cfg.num_layers; i++) {
@@ -1174,10 +1301,12 @@ void mlx_qwen35_forward_batched_verify(
     mlx_array* embedding_weight_ptr,
     int depth,
     mlx_array** out_logits,
-    mlx_array** out_hiddens
+    mlx_array** out_hiddens,
+    mlx_array** out_argmax
 ) {
   if (out_logits) *out_logits = nullptr;
   if (out_hiddens) *out_hiddens = nullptr;
+  if (out_argmax) *out_argmax = nullptr;
   if (!input_ids_ptr || !embedding_weight_ptr || !out_logits || !out_hiddens) {
     return;
   }
@@ -1251,8 +1380,9 @@ void mlx_qwen35_forward_batched_verify(
 
     // outputs[0]: logits  [1, T, vocab]
     // outputs[1]: hiddens [1, T, hidden]
-    // outputs[2 .. 2+2N): updated caches (N = num_layers)
-    // If with_tape: outputs[2+2N ..] hold per-layer (tape, k_tape, g_tape, qkv_tape)
+    // outputs[2]: target argmax [1, T] int32
+    // outputs[3 .. 3+2N): updated caches (N = num_layers)
+    // If with_tape: outputs[3+2N ..] hold per-layer (tape, k_tape, g_tape, qkv_tape)
     //
     // Stage allocations into locals first: if `new array(...)` throws on
     // the SECOND call (`std::bad_alloc` under OOM) we'd otherwise leak the
@@ -1260,18 +1390,26 @@ void mlx_qwen35_forward_batched_verify(
     // the out-pointers after both allocations succeed.
     array* logits_alloc  = new array(outputs[0]);
     array* hiddens_alloc = nullptr;
+    array* argmax_alloc = nullptr;
     try {
       hiddens_alloc = new array(outputs[1]);
+      if (out_argmax) {
+        argmax_alloc = new array(outputs[2]);
+      }
     } catch (...) {
       delete logits_alloc;
+      delete hiddens_alloc;
       throw;
     }
     *out_logits  = reinterpret_cast<mlx_array*>(logits_alloc);
     *out_hiddens = reinterpret_cast<mlx_array*>(hiddens_alloc);
+    if (out_argmax) {
+      *out_argmax = reinterpret_cast<mlx_array*>(argmax_alloc);
+    }
 
     // Update KV / linear caches in place.
     for (int i = 0; i < cfg.num_layers * 2; i++) {
-      g_compiled_caches[i] = outputs[2 + i];
+      g_compiled_caches[i] = outputs[3 + i];
     }
 
     // Advance offset by T (one per token in the batch).
@@ -1284,7 +1422,7 @@ void mlx_qwen35_forward_batched_verify(
     // `[1, recorded_steps, ...]` via repeated `concatenate(slot, step)`
     // on axis 1).
     if (with_tape) {
-      int extra_base = 2 + cfg.num_layers * 2;
+      int extra_base = 3 + cfg.num_layers * 2;
       for (int i = 0; i < cfg.num_layers; i++) {
         bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
         if (!is_linear) continue;
@@ -1316,6 +1454,276 @@ void mlx_qwen35_forward_batched_verify(
   }
 }
 
+void mlx_qwen35_forward_batched_verify_argmax_only(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array** out_hiddens,
+    mlx_array** out_argmax
+) {
+  if (out_hiddens) *out_hiddens = nullptr;
+  if (out_argmax) *out_argmax = nullptr;
+  if (!input_ids_ptr || !embedding_weight_ptr || !out_hiddens || !out_argmax) {
+    return;
+  }
+  if (!g_compile_inited) return;
+  if (depth < 1 || depth > 5) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_forward_batched_verify_argmax_only: depth %d outside [1, 5]\n",
+            depth);
+    fflush(stderr);
+    return;
+  }
+  const auto& cfg = g_compile_config;
+  int T = depth + 1;
+
+  if (qwen35_common::mtp_trace_enabled()) {
+    fprintf(stderr,
+            "[MTP-TRACE] mlx_qwen35_forward_batched_verify_argmax_only: ENTER depth=%d "
+            "T=%d (input_ids=[1,%d]) offset=%d (RoPE base; causal mask) "
+            "tape_armed=%d\n",
+            depth, T, T, g_offset_int, g_tape_recording_armed ? 1 : 0);
+  }
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+
+    if (input_ids.ndim() != 2 || input_ids.shape(0) != 1 ||
+        input_ids.shape(1) != T) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_forward_batched_verify_argmax_only: input_ids shape must be "
+              "[1, %d], got ndim=%d shape=[%lld,%lld]\n",
+              T, input_ids.ndim(),
+              input_ids.ndim() >= 1 ? (long long)input_ids.shape(0) : -1LL,
+              input_ids.ndim() >= 2 ? (long long)input_ids.shape(1) : -1LL);
+      fflush(stderr);
+      return;
+    }
+
+    auto flat_ids = reshape(input_ids, {-1});
+    auto emb_flat = take(embedding_weight, flat_ids, 0);
+    auto h_3d = reshape(emb_flat, {1, T, cfg.hidden_size});
+
+    std::vector<array> inputs;
+    inputs.reserve(2 + cfg.num_layers * 2);
+    inputs.push_back(std::move(h_3d));
+    inputs.push_back(reshape(array(g_offset_int, mlx::core::int32), {1}));
+    for (const auto& c : g_compiled_caches) {
+      inputs.push_back(c);
+    }
+
+    bool with_tape = g_tape_recording_armed;
+    if (mtp_verify_paged_attn_enabled() && g_dense_paged_inited) {
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        fprintf(stderr,
+                "[MLX] MLX_MTP_VERIFY_PAGED_ATTN=1 with paged adapter live, "
+                "but no Rust caller wires the paged-verify inputs yet — "
+                "falling back to BHTD verify path. (Phase 4b/B1 scaffolding.)\n");
+        fflush(stderr);
+      }
+    }
+
+    int bucket_idx = bucket_index_for(g_offset_int + T, cfg.max_kv_len);
+    auto& fn = get_or_compile_verify_argmax_bucket(bucket_idx, with_tape);
+    auto outputs = fn(inputs);
+
+    // outputs[0]: hiddens [1, T, hidden]
+    // outputs[1]: target argmax [1, T] int32
+    // outputs[2 .. 2+2N): updated caches (N = num_layers)
+    // If with_tape: outputs[2+2N ..] hold per-layer (tape, k_tape, g_tape, qkv_tape)
+    array* hiddens_alloc = new array(outputs[0]);
+    array* argmax_alloc = nullptr;
+    try {
+      argmax_alloc = new array(outputs[1]);
+    } catch (...) {
+      delete hiddens_alloc;
+      delete argmax_alloc;
+      throw;
+    }
+    *out_hiddens = reinterpret_cast<mlx_array*>(hiddens_alloc);
+    *out_argmax = reinterpret_cast<mlx_array*>(argmax_alloc);
+
+    for (int i = 0; i < cfg.num_layers * 2; i++) {
+      g_compiled_caches[i] = outputs[2 + i];
+    }
+
+    g_offset_int += T;
+
+    if (with_tape) {
+      int extra_base = 2 + cfg.num_layers * 2;
+      for (int i = 0; i < cfg.num_layers; i++) {
+        bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+        if (!is_linear) continue;
+        int base = extra_base + i * 4;
+        g_gdn_tape_acc[i]     = outputs[base + 0];
+        g_gdn_k_tape_acc[i]   = outputs[base + 1];
+        g_gdn_g_tape_acc[i]   = outputs[base + 2];
+        g_gdn_qkv_tape_acc[i] = outputs[base + 3];
+      }
+    }
+    if (qwen35_common::mtp_trace_enabled()) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_forward_batched_verify_argmax_only: EXIT OK T=%d "
+              "bucket_idx=%d with_tape=%d new_offset=%d\n",
+              T, bucket_idx, with_tape ? 1 : 0, g_offset_int);
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_qwen35_forward_batched_verify_argmax_only: %s\n",
+            e.what());
+    fflush(stderr);
+    if (out_hiddens) *out_hiddens = nullptr;
+    if (out_argmax) *out_argmax = nullptr;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_forward_batched_verify_argmax_only\n");
+    fflush(stderr);
+    if (out_hiddens) *out_hiddens = nullptr;
+    if (out_argmax) *out_argmax = nullptr;
+  }
+}
+
+// W6.37 — stochastic MTP verifier sibling that returns compact target sparse
+// rows instead of full verifier logits.
+void mlx_qwen35_forward_batched_verify_sparse_target(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    float temperature,
+    int top_k,
+    float top_p,
+    int sampler_mode,
+    mlx_array** out_hiddens,
+    mlx_array** out_target_ids,
+    mlx_array** out_target_probs
+) {
+  if (out_hiddens) *out_hiddens = nullptr;
+  if (out_target_ids) *out_target_ids = nullptr;
+  if (out_target_probs) *out_target_probs = nullptr;
+  if (!input_ids_ptr || !embedding_weight_ptr || !out_hiddens ||
+      !out_target_ids || !out_target_probs) {
+    return;
+  }
+  if (!g_compile_inited) return;
+  if (depth < 1 || depth > 5) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_forward_batched_verify_sparse_target: depth %d outside [1, 5]\n",
+            depth);
+    fflush(stderr);
+    return;
+  }
+  if (!std::isfinite(temperature) || temperature <= 0.0f || top_k <= 0 ||
+      sampler_mode != 1) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_forward_batched_verify_sparse_target: unsupported sparse spec "
+            "temperature=%g top_k=%d sampler_mode=%d\n",
+            (double)temperature, top_k, sampler_mode);
+    fflush(stderr);
+    return;
+  }
+  const auto& cfg = g_compile_config;
+  int T = depth + 1;
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+
+    if (input_ids.ndim() != 2 || input_ids.shape(0) != 1 ||
+        input_ids.shape(1) != T) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_forward_batched_verify_sparse_target: input_ids shape must be "
+              "[1, %d], got ndim=%d shape=[%lld,%lld]\n",
+              T, input_ids.ndim(),
+              input_ids.ndim() >= 1 ? (long long)input_ids.shape(0) : -1LL,
+              input_ids.ndim() >= 2 ? (long long)input_ids.shape(1) : -1LL);
+      fflush(stderr);
+      return;
+    }
+
+    int vocab = embedding_weight.shape(0);
+    SparseTargetSpec spec{};
+    spec.enabled = true;
+    spec.top_k = std::min(top_k, vocab);
+    spec.temperature = temperature;
+    spec.top_p = top_p;
+    spec.sampler_mode = sampler_mode;
+    if (spec.top_k <= 0) return;
+
+    auto flat_ids = reshape(input_ids, {-1});
+    auto emb_flat = take(embedding_weight, flat_ids, 0);
+    auto h_3d = reshape(emb_flat, {1, T, cfg.hidden_size});
+
+    std::vector<array> inputs;
+    inputs.reserve(2 + cfg.num_layers * 2);
+    inputs.push_back(std::move(h_3d));
+    inputs.push_back(reshape(array(g_offset_int, mlx::core::int32), {1}));
+    for (const auto& c : g_compiled_caches) {
+      inputs.push_back(c);
+    }
+
+    bool with_tape = g_tape_recording_armed;
+    int bucket_idx = bucket_index_for(g_offset_int + T, cfg.max_kv_len);
+    auto& fn = get_or_compile_verify_sparse_bucket(bucket_idx, with_tape, spec);
+    auto outputs = fn(inputs);
+
+    array* ids_alloc = new array(outputs[0]);
+    array* probs_alloc = nullptr;
+    array* hiddens_alloc = nullptr;
+    try {
+      probs_alloc = new array(outputs[1]);
+      hiddens_alloc = new array(outputs[2]);
+    } catch (...) {
+      delete ids_alloc;
+      delete probs_alloc;
+      delete hiddens_alloc;
+      throw;
+    }
+    *out_target_ids = reinterpret_cast<mlx_array*>(ids_alloc);
+    *out_target_probs = reinterpret_cast<mlx_array*>(probs_alloc);
+    *out_hiddens = reinterpret_cast<mlx_array*>(hiddens_alloc);
+
+    for (int i = 0; i < cfg.num_layers * 2; i++) {
+      g_compiled_caches[i] = outputs[3 + i];
+    }
+    g_offset_int += T;
+
+    if (with_tape) {
+      int extra_base = 3 + cfg.num_layers * 2;
+      for (int i = 0; i < cfg.num_layers; i++) {
+        bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
+        if (!is_linear) continue;
+        int base = extra_base + i * 4;
+        g_gdn_tape_acc[i]     = outputs[base + 0];
+        g_gdn_k_tape_acc[i]   = outputs[base + 1];
+        g_gdn_g_tape_acc[i]   = outputs[base + 2];
+        g_gdn_qkv_tape_acc[i] = outputs[base + 3];
+      }
+    }
+    if (qwen35_common::mtp_trace_enabled()) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_forward_batched_verify_sparse_target: EXIT OK "
+              "T=%d bucket_idx=%d top_k=%d with_tape=%d new_offset=%d\n",
+              T, bucket_idx, spec.top_k, with_tape ? 1 : 0, g_offset_int);
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in mlx_qwen35_forward_batched_verify_sparse_target: %s\n",
+            e.what());
+    fflush(stderr);
+    if (out_hiddens) *out_hiddens = nullptr;
+    if (out_target_ids) *out_target_ids = nullptr;
+    if (out_target_probs) *out_target_probs = nullptr;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in mlx_qwen35_forward_batched_verify_sparse_target\n");
+    fflush(stderr);
+    if (out_hiddens) *out_hiddens = nullptr;
+    if (out_target_ids) *out_target_ids = nullptr;
+    if (out_target_probs) *out_target_probs = nullptr;
+  }
+}
+
 // Phase 4b — paged-pool sibling of `mlx_qwen35_forward_batched_verify`.
 // Reads K/V from `g_dense_k_pools[]` / `g_dense_v_pools[]` (populated
 // by the paged adapter through `mlx_qwen35_init_paged`) instead of the
@@ -1330,11 +1738,12 @@ void mlx_qwen35_forward_batched_verify(
 // four; `cu_seqlens_q` is trivially constructible Rust-side.
 //
 // Output: `*out_logits` ← `[1, T, vocab]`, `*out_hiddens`
-// ← `[1, T, hidden]`. Both heap-allocated via `new array(...)`; the
-// caller owns and is responsible for `MxArray::from_handle`. On error
-// both pointers are set to nullptr and a stderr diagnostic is emitted;
-// global state (pools, linear caches, BHTD `g_offset_int`) is left
-// untouched so the Rust caller can fall back.
+// ← `[1, T, hidden]`, `*out_argmax` ← `[1, T]`. All outputs are
+// heap-allocated via `new array(...)`; the caller owns them and is
+// responsible for `MxArray::from_handle`. On error all pointers are set
+// to nullptr and a stderr diagnostic is emitted; global state (pools,
+// linear caches, BHTD `g_offset_int`) is left untouched so the Rust
+// caller can fall back.
 //
 // Tape recording follows the same arming as the BHTD path
 // (`g_tape_recording_armed`). Tape outputs flow back into the same
@@ -1354,13 +1763,15 @@ void mlx_qwen35_forward_batched_verify_paged(
     mlx_array* seq_lens_ptr,
     mlx_array* cu_seqlens_q_ptr,
     mlx_array** out_logits,
-    mlx_array** out_hiddens
+    mlx_array** out_hiddens,
+    mlx_array** out_argmax
 ) {
   if (out_logits) *out_logits = nullptr;
   if (out_hiddens) *out_hiddens = nullptr;
+  if (out_argmax) *out_argmax = nullptr;
   if (!input_ids_ptr || !embedding_weight_ptr || !offset_arr_ptr ||
       !block_table_ptr || !slot_mapping_ptr || !seq_lens_ptr ||
-      !cu_seqlens_q_ptr || !out_logits || !out_hiddens) {
+      !cu_seqlens_q_ptr || !out_logits || !out_hiddens || !out_argmax) {
     return;
   }
   if (!g_dense_paged_inited) {
@@ -1466,28 +1877,32 @@ void mlx_qwen35_forward_batched_verify_paged(
 
     array* logits_alloc  = new array(outputs[0]);
     array* hiddens_alloc = nullptr;
+    array* argmax_alloc  = nullptr;
     try {
       hiddens_alloc = new array(outputs[1]);
+      argmax_alloc = new array(outputs[2]);
     } catch (...) {
       delete logits_alloc;
+      delete hiddens_alloc;
       throw;
     }
     *out_logits  = reinterpret_cast<mlx_array*>(logits_alloc);
     *out_hiddens = reinterpret_cast<mlx_array*>(hiddens_alloc);
+    *out_argmax  = reinterpret_cast<mlx_array*>(argmax_alloc);
 
     for (int i = 0; i < cfg.num_layers; i++) {
       bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
       if (is_linear) {
-        g_dense_paged_linear_caches[i * 2]     = outputs[2 + i * 2];
-        g_dense_paged_linear_caches[i * 2 + 1] = outputs[2 + i * 2 + 1];
+        g_dense_paged_linear_caches[i * 2]     = outputs[3 + i * 2];
+        g_dense_paged_linear_caches[i * 2 + 1] = outputs[3 + i * 2 + 1];
       } else {
-        g_dense_k_pools[i] = outputs[2 + i * 2];
-        g_dense_v_pools[i] = outputs[2 + i * 2 + 1];
+        g_dense_k_pools[i] = outputs[3 + i * 2];
+        g_dense_v_pools[i] = outputs[3 + i * 2 + 1];
       }
     }
 
     if (with_tape) {
-      int extra_base = 2 + cfg.num_layers * 2;
+      int extra_base = 3 + cfg.num_layers * 2;
       for (int i = 0; i < cfg.num_layers; i++) {
         bool is_linear = !((i + 1) % cfg.full_attention_interval == 0);
         if (!is_linear) continue;
@@ -1511,12 +1926,14 @@ void mlx_qwen35_forward_batched_verify_paged(
     fflush(stderr);
     if (out_logits) *out_logits = nullptr;
     if (out_hiddens) *out_hiddens = nullptr;
+    if (out_argmax) *out_argmax = nullptr;
   } catch (...) {
     fprintf(stderr,
             "[MLX] Unknown exception in mlx_qwen35_forward_batched_verify_paged\n");
     fflush(stderr);
     if (out_logits) *out_logits = nullptr;
     if (out_hiddens) *out_hiddens = nullptr;
+    if (out_argmax) *out_argmax = nullptr;
   }
 }
 
@@ -1614,15 +2031,18 @@ void mlx_qwen35_prewarm_verify_compiled() {
     array emb_copy = embedding_weight;
     mlx_array* logits_ptr = nullptr;
     mlx_array* hidden_ptr = nullptr;
+    mlx_array* argmax_ptr = nullptr;
     mlx_qwen35_forward_batched_verify(
         reinterpret_cast<mlx_array*>(&dummy_ids),
         reinterpret_cast<mlx_array*>(&emb_copy),
         depth,
         &logits_ptr,
-        &hidden_ptr);
-    if (!logits_ptr || !hidden_ptr) {
+        &hidden_ptr,
+        &argmax_ptr);
+    if (!logits_ptr || !hidden_ptr || !argmax_ptr) {
       if (logits_ptr) delete reinterpret_cast<array*>(logits_ptr);
       if (hidden_ptr) delete reinterpret_cast<array*>(hidden_ptr);
+      if (argmax_ptr) delete reinterpret_cast<array*>(argmax_ptr);
       throw std::runtime_error(
           "mlx_qwen35_prewarm_verify_compiled: batched verify returned null");
     }
@@ -1633,7 +2053,9 @@ void mlx_qwen35_prewarm_verify_compiled() {
     delete reinterpret_cast<array*>(logits_ptr);
     array hiddens = *reinterpret_cast<array*>(hidden_ptr);
     delete reinterpret_cast<array*>(hidden_ptr);
-    std::vector<array> to_eval = {logits, hiddens};
+    array argmax_ids = *reinterpret_cast<array*>(argmax_ptr);
+    delete reinterpret_cast<array*>(argmax_ptr);
+    std::vector<array> to_eval = {logits, hiddens, argmax_ids};
     if (with_tape) {
       for (auto& slot : g_gdn_tape_acc) if (slot) to_eval.push_back(*slot);
       for (auto& slot : g_gdn_k_tape_acc) if (slot) to_eval.push_back(*slot);
@@ -1971,9 +2393,8 @@ void mlx_qwen35_compiled_tape_arm() {
   g_tape_recording_armed = true;
 }
 
-// W6.6 — Disarm tape recording and drop accumulators. Called on the
-// happy path (full-accept needs no replay) and after a successful
-// replay. Idempotent.
+// W6.6 — Disarm tape recording and drop accumulators. Normally reached
+// through `_tape_replay`; explicit calls are cleanup-only. Idempotent.
 void mlx_qwen35_compiled_tape_disarm() {
   g_tape_recording_armed = false;
   // Drop refcounts so the lazy MLX graphs can be released. The vectors

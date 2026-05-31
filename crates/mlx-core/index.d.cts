@@ -2008,6 +2008,38 @@ export interface ConversionOptions {
   verbose?: boolean;
   /** Model type for model-specific weight sanitization (e.g., "paddleocr-vl") */
   modelType?: string;
+  /** Enable quantization of converted weights */
+  quantize?: boolean;
+  /** Quantization bits: 4 (default) or 8 */
+  quantBits?: number;
+  /** Quantization group size (default: 64 for affine, 32 for mxfp8) */
+  quantGroupSize?: number;
+  /** Quantization mode: "affine" (default), "mxfp4", "mxfp8", or "nvfp4" */
+  quantMode?: string;
+  /**
+   * Quantization recipe for per-layer mixed-bit quantization.
+   * Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5
+   */
+  quantRecipe?: string;
+  /**
+   * Path to an imatrix GGUF file for AWQ-style pre-scaling.
+   * Improves quantization quality by amplifying important weight channels.
+   */
+  imatrixPath?: string;
+  /**
+   * Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
+   * When true, applies after the recipe predicate: any 8-bit affine decision
+   * becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+   * Forces `group_size = 32` for upgraded layers.
+   */
+  quantMxfp?: boolean;
+  /**
+   * Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", or "all".
+   * cyankiwi keeps mtp.fc dense and quantizes only MTP layer linears as
+   * 4-bit affine group_size=32 in an MTPLX-style mtp.safetensors sidecar;
+   * all also quantizes mtp.fc.
+   */
+  quantMtp?: string;
 }
 
 export interface ConversionResult {

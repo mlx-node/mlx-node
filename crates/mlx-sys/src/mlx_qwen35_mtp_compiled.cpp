@@ -117,22 +117,43 @@ extern "C" void mlx_qwen35_export_last_hidden(mlx_array** out);
 // W6.7 — One-shot batched verify forward. Runs the entire D+1-token
 // verify on a single compiled graph (vs the prior D+1 sequential
 // `mlx_qwen35_forward_compiled` calls) and emits `[1, D+1, vocab]`
-// logits + `[1, D+1, hidden]` hiddens. Lives in `mlx_qwen35.cpp` because
-// the graph references the main-path's `g_compiled_caches` /
-// `g_offset_int` directly. Tape-replay arming is consumed via the
-// existing `g_tape_recording_armed` global.
+// logits + `[1, D+1, hidden]` hiddens + `[1, D+1]` argmax ids. Lives in
+// `mlx_qwen35.cpp` because the graph references the main-path's
+// `g_compiled_caches` / `g_offset_int` directly. Tape-replay arming is
+// consumed via the existing `g_tape_recording_armed` global.
 extern "C" void mlx_qwen35_forward_batched_verify(
     mlx_array* input_ids_ptr,
     mlx_array* embedding_weight_ptr,
     int depth,
     mlx_array** out_logits,
-    mlx_array** out_hiddens);
+    mlx_array** out_hiddens,
+    mlx_array** out_argmax);
+
+extern "C" void mlx_qwen35_forward_batched_verify_argmax_only(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array** out_hiddens,
+    mlx_array** out_argmax);
+
+extern "C" void mlx_qwen35_forward_batched_verify_sparse_target(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    float temperature,
+    int top_k,
+    float top_p,
+    int sampler_mode,
+    mlx_array** out_hiddens,
+    mlx_array** out_target_ids,
+    mlx_array** out_target_probs);
 
 // Phase 4b — paged-pool sibling of `mlx_qwen35_forward_batched_verify`.
 // Reads K/V from `g_dense_k_pools[]` / `g_dense_v_pools[]` instead of
 // the BHTD `g_compiled_caches[]`. Caller MUST construct `offset_arr`,
 // `block_table`, `slot_mapping`, `seq_lens`, and `cu_seqlens_q` (see
-// the C++ docstring on the definition for shapes).
+// the C++ docstring on the definition for shapes). Returns logits,
+// hiddens, and `[1, D+1]` target argmax ids.
 extern "C" void mlx_qwen35_forward_batched_verify_paged(
     mlx_array* input_ids_ptr,
     mlx_array* embedding_weight_ptr,
@@ -143,7 +164,8 @@ extern "C" void mlx_qwen35_forward_batched_verify_paged(
     mlx_array* seq_lens_ptr,
     mlx_array* cu_seqlens_q_ptr,
     mlx_array** out_logits,
-    mlx_array** out_hiddens);
+    mlx_array** out_hiddens,
+    mlx_array** out_argmax);
 
 // Phase 4b — paged-pool partial-accept rollback machinery (paged
 // siblings of `mlx_qwen35_compiled_snapshot_linear_caches` /
@@ -182,8 +204,7 @@ struct MTPCompileConfig : BaseConfig {
 // Init-from-main snapshot + per-MTP-layer KV caches.
 static MTPCompileConfig g_mtp_config{};
 static std::vector<array> g_mtp_compiled_caches;  // 2 * n_mtp_layers (K,V interleaved)
-static int g_mtp_offset_int = 0;                  // mirror of main `g_offset_int`
-                                                   // at the time of init.
+static int g_mtp_offset_int = 0;                  // local MTP cache write slot
 // W6.32 — start-of-cycle offset (= main offset captured by `begin_cycle`).
 // The MTP attn_mask must mask out positions `[0..g_mtp_chain_start_int)`
 // because the K/V at those slots is zero (the MTP cache is zero-initialised
@@ -217,24 +238,40 @@ static bool g_mtp_compile_inited = false;
 // as defense-in-depth; with this headroom it should never trip.
 constexpr int MTP_CACHE_HEADROOM = 16;
 
+inline array draft_lm_head_proj(const array& x, const MTPCompileConfig& cfg) {
+  if (has_weight("mtp_draft_lm_head.weight")) {
+    return linear_proj(x, "mtp_draft_lm_head");
+  }
+  return cfg.tie_word_embeddings
+      ? linear_proj(x, "embedding")
+      : linear_proj(x, "lm_head");
+}
+
 // Phase C — committed-history MTP cache policy.
 //
-// `g_mtp_committed_len` is the number of MTP cache slots that hold EXACT
-// committed K/V — i.e. K/V keyed at absolute sequence positions
-// `[0 .. g_mtp_committed_len)`, computed from the target model's
-// post-final-norm hidden + input embedding of each committed token.
+// `g_mtp_committed_len` is the number of local MTP cache slots that hold EXACT
+// committed K/V, computed from the target model's post-final-norm hidden +
+// input embedding of each committed token. Absolute RoPE positions are
+// `g_mtp_position_base_int + local_slot`.
 //
 // Under the `committed` history policy the MTP cache PERSISTS across
 // cycles (`begin_cycle` no longer zeroes it). Each cycle's
-// `mlx_qwen35_mtp_compiled_commit` appends K+1 exact slots
-// (`[last_committed, d_0..d_{K-1}]`) and advances this counter; the
-// `boundary`/residual token's slot is DEFERRED to the next cycle's
-// commit (its hidden is not produced until it is consumed by a forward).
+// `mlx_qwen35_mtp_compiled_commit` appends exact slots for the newly committed
+// token sequence and advances this counter.
 //
 // `begin_cycle` then re-anchors the draft offset to this counter so the
-// next cycle's draft steps write at `[g_mtp_committed_len ..]` and the
-// draft attention mask spans the full committed prefix `[0 .. offset]`.
+// next cycle's draft steps write at local `[g_mtp_committed_len ..]` and the
+// draft attention mask spans the compact committed prefix `[0 .. offset]`.
 static int g_mtp_committed_len = 0;
+// Absolute real-sequence position of local MTP cache slot 0. This is zero for
+// full committed-history mode. In MTPLX-style last_window mode the cache stores
+// only a prompt tail locally at slots `[0 .. g_mtp_committed_len)`, while RoPE
+// still uses positions `[g_mtp_position_base_int .. base + len)`.
+static int g_mtp_position_base_int = 0;
+
+static inline int mtp_absolute_pos(int local_pos) {
+  return g_mtp_position_base_int + local_pos;
+}
 
 // =====================================================================
 // Draft graph: traced once, reused across all D draft steps.
@@ -243,10 +280,13 @@ static int g_mtp_committed_len = 0;
 // closure captures positional indexes):
 //   [0]                prev_hidden     [1, 1, hidden]  bf16
 //   [1]                prev_emb        [1, 1, hidden]  bf16
-//   [2]                offset_arr      [1]   int32 (RoPE + slice_update
-//                                                 start; advances by 1
+//   [2]                offset_arr      [1]   int32 (local slice_update
+//                                                 slot; advances by 1
 //                                                 per draft step).
-//   [3]                chain_start_arr [1]   int32 (start of this MTP
+//   [3]                rope_offset_arr [1]   int32 (absolute RoPE
+//                                                 position for the local
+//                                                 slot).
+//   [4]                chain_start_arr [1]   int32 (start of this MTP
 //                                                 draft chain; constant
 //                                                 across all D steps of
 //                                                 one cycle, snapshotted
@@ -259,8 +299,8 @@ static int g_mtp_committed_len = 0;
 //                                                 the real chain K/V by
 //                                                 ~1/chain_start.
 //   For each MTP layer j in [0, n_mtp_layers):
-//     [4 + j*2 + 0]    K cache         [1, Hkv, max_kv_len, head_dim]
-//     [4 + j*2 + 1]    V cache         [1, Hkv, max_kv_len, head_dim]
+//     [5 + j*2 + 0]    K cache         [1, Hkv, max_kv_len, head_dim]
+//     [5 + j*2 + 1]    V cache         [1, Hkv, max_kv_len, head_dim]
 //
 // Outputs:
 //   [0]                h_next       [1, 1, hidden]  — for next draft
@@ -274,8 +314,9 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
   const auto& cfg = g_mtp_config;
   auto prev_hidden     = inputs[0];      // [1, 1, hidden]
   auto prev_emb        = inputs[1];      // [1, 1, hidden]
-  auto offset_arr      = inputs[2];      // [1] int32
-  auto chain_start_arr = inputs[3];      // [1] int32
+  auto offset_arr      = inputs[2];      // [1] int32, local cache slot
+  auto rope_offset_arr = inputs[3];      // [1] int32, absolute RoPE pos
+  auto chain_start_arr = inputs[4];      // [1] int32
 
   // Mirror Qwen3_5MTPModule::forward (W2 dense Rust path):
   //   h_norm = pre_fc_norm_hidden(prev_hidden)
@@ -314,7 +355,7 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
   // on the real K for long-prefix decode). MTPLX gets this for free by
   // using mlx-lm's `KVCache()` which starts empty (`self.keys = None`)
   // — see `MTPLX/mtplx/mtp_patch.py:638` `make_mtp_cache`.
-  int max_kv_len = inputs[4].shape(2);  // first K-cache's max_kv_len
+  int max_kv_len = inputs[5].shape(2);  // first K-cache's max_kv_len
   auto positions = arange(0, max_kv_len, mlx::core::int32);
   auto valid_mask = logical_and(greater_equal(positions, chain_start_arr),
                                 less_equal(positions, offset_arr));
@@ -339,10 +380,10 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
     auto normed = fast::rms_norm(h2d, get_weight(lp + ".input_layernorm.weight"),
                                  cfg.rms_norm_eps);
 
-    const auto& kk = inputs[4 + j * 2];
-    const auto& kv = inputs[4 + j * 2 + 1];
-    auto res = attn_pure_fn_arr_offset(normed, lp,
-                                       kk, kv, attn_mask, offset_arr, cfg);
+    const auto& kk = inputs[5 + j * 2];
+    const auto& kv = inputs[5 + j * 2 + 1];
+    auto res = attn_pure_fn_arr_rope_write_offset(
+        normed, lp, kk, kv, attn_mask, rope_offset_arr, offset_arr, cfg);
     h2d = h2d + res.output;
     new_caches[j * 2]     = std::move(res.keys);
     new_caches[j * 2 + 1] = std::move(res.values);
@@ -360,9 +401,7 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
   // Final MTP norm + LM head.
   auto h_norm_final = fast::rms_norm(h2d, get_weight("mtp.norm.weight"),
                                      cfg.rms_norm_eps);
-  auto logits = cfg.tie_word_embeddings
-      ? linear_proj(h_norm_final, "embedding")
-      : linear_proj(h_norm_final, "lm_head");
+  auto logits = draft_lm_head_proj(h_norm_final, cfg);
 
   // h_next: reshape h2d back to [1, 1, hidden] so the next draft step
   // can feed it as prev_hidden without re-shaping on the Rust side.
@@ -426,15 +465,17 @@ static auto& compiled_mtp_draft_decode() {
 //   [1]              gathered_embs   [1, M, hidden] bf16
 //                                    (input embedding of each committed
 //                                     token, pre-gathered Rust-side).
-//   [2]              base_offset_arr [1] int32 — the absolute position
-//                                    of slot 0 (= g_mtp_committed_len).
+//   [2]              base_offset_arr [1] int32 — local cache slot of row 0
+//                                    (= g_mtp_committed_len).
 //                                    Threaded as an array input to keep
 //                                    the compile cache shape-stable,
 //                                    exactly like the draft graph's
 //                                    offset_arr.
+//   [3]              rope_base_arr   [1] int32 — absolute RoPE position of
+//                                    row 0 (= position_base + local slot).
 //   For each MTP layer j in [0, n_mtp_layers):
-//     [3 + j*2 + 0]  K cache         [1, Hkv, max_kv_len, head_dim]
-//     [3 + j*2 + 1]  V cache         [1, Hkv, max_kv_len, head_dim]
+//     [4 + j*2 + 0]  K cache         [1, Hkv, max_kv_len, head_dim]
+//     [4 + j*2 + 1]  V cache         [1, Hkv, max_kv_len, head_dim]
 //
 // Outputs (vector order):
 //   For each MTP layer j:
@@ -448,18 +489,19 @@ static auto& compiled_mtp_draft_decode() {
 // =====================================================================
 template <int M>
 static std::vector<array> mtp_commit_fn(const std::vector<array>& inputs) {
-  static_assert(M >= 2 && M <= 7,
-                "mtp_commit_fn: M must be in [2, 7] (= K+2, depth <= 5)");
+  static_assert(M >= 1 && M <= 7,
+                "mtp_commit_fn: M must be in [1, 7]");
   const auto& cfg = g_mtp_config;
   auto hidden_seq    = inputs[0];   // [1, M, hidden]
   auto gathered_embs = inputs[1];   // [1, M, hidden]
-  auto base_offset   = inputs[2];   // [1] int32
+  auto base_offset   = inputs[2];   // [1] int32, local cache slot
+  auto rope_base     = inputs[3];   // [1] int32, absolute RoPE position
 
   // Cache vector that gets rewritten across the M positions.
   std::vector<array> caches;
   caches.reserve(cfg.n_mtp_layers * 2);
   for (int j = 0; j < cfg.n_mtp_layers * 2; j++) {
-    caches.push_back(inputs[3 + j]);
+    caches.push_back(inputs[4 + j]);
   }
 
   // Statically unrolled over the M committed positions.
@@ -473,10 +515,11 @@ static std::vector<array> mtp_commit_fn(const std::vector<array>& inputs) {
     auto e_i = slice(gathered_embs, {0, i, 0},
                      {1, i + 1, cfg.hidden_size});      // [1, 1, hidden]
 
-    // Absolute position of slot `i` = base_offset + i. Threaded as a
-    // [1] int32 array so RoPE matches the draft graph's `offset_arr`
-    // semantics exactly.
-    auto pos_i = base_offset + array(i, mlx::core::int32);
+    // Local cache slot and absolute RoPE position may differ under the
+    // MTPLX-style last_window policy: the cache stores a compact tail while
+    // RoPE remains anchored to the real sequence.
+    auto local_pos_i = base_offset + array(i, mlx::core::int32);
+    auto rope_pos_i  = rope_base + array(i, mlx::core::int32);
 
     // ---- MTP head pre-attention body (mirrors mtp_draft_decode_fn) ----
     // h_norm = pre_fc_norm_hidden(h_i); e_norm = pre_fc_norm_embedding(e_i)
@@ -506,20 +549,20 @@ static std::vector<array> mtp_commit_fn(const std::vector<array>& inputs) {
     keys   = reshape(keys,   {B, 1, cfg.num_kv_heads, cfg.head_dim});
     values = reshape(values, {B, 1, cfg.num_kv_heads, cfg.head_dim});
 
-    // k_norm then RoPE at absolute position `pos_i` — identical to
-    // `attn_pure_fn_arr_offset` so the committed K matches a draft-time
-    // query at the same position.
+    // k_norm then RoPE at absolute position `rope_pos_i` — identical to the
+    // draft graph so the committed K matches a draft-time query at the same
+    // real sequence position.
     keys = fast::rms_norm(keys, get_weight(pfx + "k_norm.weight"),
                           cfg.rms_norm_eps);
-    keys = fast::rope(keys, cfg.rope_dims, false, cfg.rope_theta, 1.0f, pos_i);
+    keys = fast::rope(keys, cfg.rope_dims, false, cfg.rope_theta, 1.0f, rope_pos_i);
 
     keys   = transpose(keys,   {0, 2, 1, 3});   // [B, Hkv, 1, D]
     values = transpose(values, {0, 2, 1, 3});
 
-    // slice_update writes the single K/V slot at absolute position
-    // `pos_i` into layer 0's cache.
-    caches[0] = mlx::core::slice_update(caches[0], keys,   pos_i, {2});
-    caches[1] = mlx::core::slice_update(caches[1], values, pos_i, {2});
+    // slice_update writes the single K/V slot at compact local cache slot
+    // `local_pos_i`.
+    caches[0] = mlx::core::slice_update(caches[0], keys,   local_pos_i, {2});
+    caches[1] = mlx::core::slice_update(caches[1], values, local_pos_i, {2});
   }
 
   std::vector<array> result;
@@ -529,7 +572,9 @@ static std::vector<array> mtp_commit_fn(const std::vector<array>& inputs) {
 }
 
 // Per-M compiled commit graph. One `mlx::core::compile` entry per
-// M ∈ {2..7} (= K+2, depth ≤ 5) — the unrolled body differs per M, so
+// M ∈ {1..7}. The one-token case is needed when chained committed-history
+// rejects every draft and only the residual boundary is newly committed.
+// The unrolled body differs per M, so
 // each gets its own static-function-local compile cache (survives
 // reset, like the fused draft graph).
 template <int M>
@@ -540,13 +585,17 @@ static auto& compiled_mtp_commit() {
 
 using CommitFn = std::function<std::vector<array>(const std::vector<array>&)>;
 
-// Valid committed-token counts: M = K+2, K ∈ [0, depth], depth ∈ [1, 5]
-// → M ∈ [2, 7].
-constexpr int MIN_COMMIT_M = 2;
+// Valid committed-token counts:
+//   * Step-A path: M = K+2, K ∈ [0, depth], depth ∈ [1, 5] → [2, 7].
+//   * Chained committed-history path: M = K+1 → [1, 6].
+constexpr int MIN_COMMIT_M = 1;
 constexpr int MAX_COMMIT_M = 7;
 
 static CommitFn make_commit_dispatcher(int m) {
   switch (m) {
+    case 1: return [](const std::vector<array>& in) {
+      return compiled_mtp_commit<1>()(in);
+    };
     case 2: return [](const std::vector<array>& in) {
       return compiled_mtp_commit<2>()(in);
     };
@@ -746,11 +795,9 @@ static std::vector<array> mtp_draft_fused_decode_fn(
 
     auto h_norm_final = fast::rms_norm(h2d, get_weight("mtp.norm.weight"),
                                        cfg.rms_norm_eps);
-    // LM-head: tied → "embedding", untied → "lm_head". Same dispatch
-    // as the single-step path.
-    auto logits_2d = cfg.tie_word_embeddings
-        ? linear_proj(h_norm_final, "embedding")       // [1, vocab]
-        : linear_proj(h_norm_final, "lm_head");        // [1, vocab]
+    // Draft-only LM head when present; otherwise tied → "embedding",
+    // untied → "lm_head".
+    auto logits_2d = draft_lm_head_proj(h_norm_final, cfg); // [1, vocab]
 
     // On-device argmax → drafted token id. Returns [1] int32.
     auto draft_id = mlx::core::argmax(logits_2d, /*axis=*/-1);   // [1] int32
@@ -890,17 +937,13 @@ using VerifyFn = std::function<std::vector<array>(
     const array&, const array&)>;
 static std::array<VerifyFn, MAX_VERIFY_DEPTH> g_verify_compiled_by_depth{};
 
-// W6.7 follow-up #3 — Reset-aware once-flag for the prewarm path.
+// W6.7 follow-up #3 — Process-once gate for the heavy prewarm path.
 //
 // `mlx_qwen35_mtp_compiled_prewarm_verify` must run AT MOST ONCE per
 // process (the heavy `mlx::core::compile` work is ~1.5s and reusing the
-// cached compile is just a few cycles per call), BUT it must run again
-// after `mlx_qwen35_mtp_compiled_reset` clears `g_verify_compiled_by_depth`.
-//
-// A plain `std::once_flag` would prevent the re-run (and we'd silently
-// fall back to lazy-per-depth construction on the first verify of each
-// depth — a perf regression on reset+re-init paths). Use an atomic bool
-// so the reset hook can flip it back to `false`.
+// cached compile is just a few cycles per call). The per-depth dispatch
+// closures capture only their fixed depth and are safe to retain across
+// per-turn MTP reset/re-init, so reset does not re-arm this flag.
 static std::atomic<bool> g_prewarm_done{false};
 
 // W6.7 — Build a verify closure for a fixed depth. Captures NO per-call
@@ -941,19 +984,24 @@ static VerifyFn make_verify_fn(int depth) {
     array emb_copy = embedding_weight;
     mlx_array* logits_ptr = nullptr;
     mlx_array* hidden_ptr = nullptr;
+    mlx_array* argmax_ptr = nullptr;
     mlx_qwen35_forward_batched_verify(
         reinterpret_cast<mlx_array*>(&tok_copy),
         reinterpret_cast<mlx_array*>(&emb_copy),
         depth,
         &logits_ptr,
-        &hidden_ptr);
-    if (!logits_ptr || !hidden_ptr) {
+        &hidden_ptr,
+        &argmax_ptr);
+    if (!logits_ptr || !hidden_ptr || !argmax_ptr) {
       // Drop any half-allocated handle before erroring.
       if (logits_ptr) {
         delete reinterpret_cast<array*>(logits_ptr);
       }
       if (hidden_ptr) {
         delete reinterpret_cast<array*>(hidden_ptr);
+      }
+      if (argmax_ptr) {
+        delete reinterpret_cast<array*>(argmax_ptr);
       }
       throw std::runtime_error(
           "mlx_qwen35_mtp_verify: batched verify forward returned null");
@@ -962,7 +1010,9 @@ static VerifyFn make_verify_fn(int depth) {
     delete reinterpret_cast<array*>(logits_ptr);
     array hiddens = *reinterpret_cast<array*>(hidden_ptr);
     delete reinterpret_cast<array*>(hidden_ptr);
-    return {logits, hiddens};
+    array argmax_ids = *reinterpret_cast<array*>(argmax_ptr);
+    delete reinterpret_cast<array*>(argmax_ptr);
+    return {logits, hiddens, argmax_ids};
   };
 }
 
@@ -1113,6 +1163,7 @@ int32_t mlx_qwen35_mtp_compiled_init_from_main(
     // attention window (`begin_cycle` sets `chain_start = 0`), diluting
     // the softmax weight on the real committed K/V by ~1/main_offset.
     g_mtp_committed_len = 0;
+    g_mtp_position_base_int = 0;
 
     // Drop any stale verify closures from a prior model load — the
     // per-depth closures capture nothing model-specific, but a fresh
@@ -1174,9 +1225,10 @@ void mlx_qwen35_mtp_draft_compiled(
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
             "[MTP-TRACE] mlx_qwen35_mtp_draft_compiled: ENTER (per-step) "
-            "mtp_offset=%d (RoPE base) chain_start=%d "
+            "mtp_offset=%d rope_offset=%d chain_start=%d "
             "fc_concat_order=[embedding,hidden]\n",
-            g_mtp_offset_int, g_mtp_chain_start_int);
+            g_mtp_offset_int, mtp_absolute_pos(g_mtp_offset_int),
+            g_mtp_chain_start_int);
   }
 
   try {
@@ -1184,10 +1236,11 @@ void mlx_qwen35_mtp_draft_compiled(
     auto& prev_emb    = *reinterpret_cast<array*>(prev_emb_ptr);
 
     std::vector<array> inputs;
-    inputs.reserve(4 + g_mtp_config.n_mtp_layers * 2);
+    inputs.reserve(5 + g_mtp_config.n_mtp_layers * 2);
     inputs.push_back(prev_hidden);
     inputs.push_back(prev_emb);
     inputs.push_back(reshape(array(g_mtp_offset_int, mlx::core::int32), {1}));
+    inputs.push_back(reshape(array(mtp_absolute_pos(g_mtp_offset_int), mlx::core::int32), {1}));
     inputs.push_back(reshape(array(g_mtp_chain_start_int, mlx::core::int32), {1}));
     for (const auto& c : g_mtp_compiled_caches) {
       inputs.push_back(c);
@@ -1497,22 +1550,24 @@ void mlx_qwen35_mtp_verify_compiled(
 // when chaining is unavailable). The caller MUST null-check both
 // outputs before consuming.
 // -----------------------------------------------------------------------------
-void mlx_qwen35_mtp_verify_compiled_with_hidden(
+void mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax(
     mlx_array* input_ids_ptr,
     mlx_array* embedding_weight_ptr,
     int depth,
     mlx_array** out_logits,
-    mlx_array** out_hiddens
+    mlx_array** out_hiddens,
+    mlx_array** out_argmax
 ) {
   if (out_logits) *out_logits = nullptr;
   if (out_hiddens) *out_hiddens = nullptr;
+  if (out_argmax) *out_argmax = nullptr;
   if (!input_ids_ptr || !embedding_weight_ptr || !out_logits ||
-      !out_hiddens) {
+      !out_hiddens || !out_argmax) {
     return;
   }
   if (depth < 1 || depth > MAX_VERIFY_DEPTH) {
     fprintf(stderr,
-            "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden: depth %d "
+            "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax: depth %d "
             "outside [1, %d]\n",
             depth, MAX_VERIFY_DEPTH);
     fflush(stderr);
@@ -1521,7 +1576,7 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden(
 
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
-            "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled_with_hidden: ENTER "
+            "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax: ENTER "
             "depth=%d\n",
             depth);
   }
@@ -1533,7 +1588,7 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden(
     if (input_ids.ndim() != 2 || input_ids.shape(0) != 1 ||
         input_ids.shape(1) != depth + 1) {
       fprintf(stderr,
-              "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden: input_ids "
+              "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax: input_ids "
               "shape must be [1, depth+1=%d], got ndim=%d shape=[%lld,%lld]\n",
               depth + 1, input_ids.ndim(),
               input_ids.ndim() >= 1 ? (long long)input_ids.shape(0) : -1LL,
@@ -1544,41 +1599,215 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden(
 
     // Run the existing per-depth verify loop. After this returns,
     // `g_compiled_caches[]` / `g_offset_int` have been advanced by D+1.
-    // The closure returns `{logits[1, D+1, vocab], hiddens[1, D+1,
-    // hidden]}` — the hiddens were captured per-iteration before the
-    // next forward overwrote `g_last_hidden`.
+    // The closure returns `{logits[1, D+1, vocab], hiddens[1, D+1, hidden],
+    // argmax[1, D+1]}` — the hiddens were captured per-iteration before
+    // the next forward overwrote `g_last_hidden`.
     const auto& verify_fn = get_or_make_verify_fn(depth);
     auto outputs = verify_fn(input_ids, embedding_weight);
-    if (outputs.size() < 2) {
+    if (outputs.size() < 3) {
       fprintf(stderr,
-              "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden: verify "
-              "closure returned %zu outputs; expected 2 (logits, hiddens)\n",
+              "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax: verify "
+              "closure returned %zu outputs; expected 3 (logits, hiddens, argmax)\n",
               outputs.size());
       fflush(stderr);
       return;
     }
     *out_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
     *out_hiddens = reinterpret_cast<mlx_array*>(new array(outputs[1]));
+    *out_argmax = reinterpret_cast<mlx_array*>(new array(outputs[2]));
     if (qwen35_common::mtp_trace_enabled()) {
       fprintf(stderr,
-              "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled_with_hidden: "
+              "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax: "
               "EXIT OK depth=%d\n",
               depth);
     }
   } catch (const std::exception& e) {
     fprintf(stderr,
-            "[MLX] Exception in mlx_qwen35_mtp_verify_compiled_with_hidden: %s\n",
+            "[MLX] Exception in mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax: %s\n",
             e.what());
     fflush(stderr);
     if (out_logits) *out_logits = nullptr;
     if (out_hiddens) *out_hiddens = nullptr;
+    if (out_argmax) *out_argmax = nullptr;
   } catch (...) {
     fprintf(stderr,
             "[MLX] Unknown exception in "
-            "mlx_qwen35_mtp_verify_compiled_with_hidden\n");
+            "mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax\n");
     fflush(stderr);
     if (out_logits) *out_logits = nullptr;
     if (out_hiddens) *out_hiddens = nullptr;
+    if (out_argmax) *out_argmax = nullptr;
+  }
+}
+
+void mlx_qwen35_mtp_verify_compiled_with_hidden(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array** out_logits,
+    mlx_array** out_hiddens
+) {
+  mlx_array* out_argmax = nullptr;
+  mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax(
+      input_ids_ptr,
+      embedding_weight_ptr,
+      depth,
+      out_logits,
+      out_hiddens,
+      &out_argmax);
+  if (out_argmax) {
+    delete reinterpret_cast<array*>(out_argmax);
+  }
+}
+
+void mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    mlx_array** out_hiddens,
+    mlx_array** out_argmax
+) {
+  if (out_hiddens) *out_hiddens = nullptr;
+  if (out_argmax) *out_argmax = nullptr;
+  if (!input_ids_ptr || !embedding_weight_ptr || !out_hiddens || !out_argmax) {
+    return;
+  }
+  if (depth < 1 || depth > MAX_VERIFY_DEPTH) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only: depth %d "
+            "outside [1, %d]\n",
+            depth, MAX_VERIFY_DEPTH);
+    fflush(stderr);
+    return;
+  }
+
+  if (qwen35_common::mtp_trace_enabled()) {
+    fprintf(stderr,
+            "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only: ENTER "
+            "depth=%d\n",
+            depth);
+  }
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+
+    if (input_ids.ndim() != 2 || input_ids.shape(0) != 1 ||
+        input_ids.shape(1) != depth + 1) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only: input_ids "
+              "shape must be [1, depth+1=%d], got ndim=%d shape=[%lld,%lld]\n",
+              depth + 1, input_ids.ndim(),
+              input_ids.ndim() >= 1 ? (long long)input_ids.shape(0) : -1LL,
+              input_ids.ndim() >= 2 ? (long long)input_ids.shape(1) : -1LL);
+      fflush(stderr);
+      return;
+    }
+
+    array tok_copy = input_ids;
+    array emb_copy = embedding_weight;
+    mlx_qwen35_forward_batched_verify_argmax_only(
+        reinterpret_cast<mlx_array*>(&tok_copy),
+        reinterpret_cast<mlx_array*>(&emb_copy),
+        depth,
+        out_hiddens,
+        out_argmax);
+    if (qwen35_common::mtp_trace_enabled() && *out_hiddens && *out_argmax) {
+      fprintf(stderr,
+              "[MTP-TRACE] mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only: "
+              "EXIT OK depth=%d\n",
+              depth);
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only: %s\n",
+            e.what());
+    fflush(stderr);
+    if (out_hiddens) *out_hiddens = nullptr;
+    if (out_argmax) *out_argmax = nullptr;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in "
+            "mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only\n");
+    fflush(stderr);
+    if (out_hiddens) *out_hiddens = nullptr;
+    if (out_argmax) *out_argmax = nullptr;
+  }
+}
+
+void mlx_qwen35_mtp_verify_compiled_with_hidden_and_sparse_target(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    int depth,
+    float temperature,
+    int top_k,
+    float top_p,
+    int sampler_mode,
+    mlx_array** out_hiddens,
+    mlx_array** out_target_ids,
+    mlx_array** out_target_probs
+) {
+  if (out_hiddens) *out_hiddens = nullptr;
+  if (out_target_ids) *out_target_ids = nullptr;
+  if (out_target_probs) *out_target_probs = nullptr;
+  if (!input_ids_ptr || !embedding_weight_ptr || !out_hiddens ||
+      !out_target_ids || !out_target_probs) {
+    return;
+  }
+  if (depth < 1 || depth > MAX_VERIFY_DEPTH) {
+    fprintf(stderr,
+            "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden_and_sparse_target: depth %d "
+            "outside [1, %d]\n",
+            depth, MAX_VERIFY_DEPTH);
+    fflush(stderr);
+    return;
+  }
+
+  try {
+    auto& input_ids        = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding_weight = *reinterpret_cast<array*>(embedding_weight_ptr);
+
+    if (input_ids.ndim() != 2 || input_ids.shape(0) != 1 ||
+        input_ids.shape(1) != depth + 1) {
+      fprintf(stderr,
+              "[MLX] mlx_qwen35_mtp_verify_compiled_with_hidden_and_sparse_target: input_ids "
+              "shape must be [1, depth+1=%d], got ndim=%d shape=[%lld,%lld]\n",
+              depth + 1, input_ids.ndim(),
+              input_ids.ndim() >= 1 ? (long long)input_ids.shape(0) : -1LL,
+              input_ids.ndim() >= 2 ? (long long)input_ids.shape(1) : -1LL);
+      fflush(stderr);
+      return;
+    }
+
+    array tok_copy = input_ids;
+    array emb_copy = embedding_weight;
+    mlx_qwen35_forward_batched_verify_sparse_target(
+        reinterpret_cast<mlx_array*>(&tok_copy),
+        reinterpret_cast<mlx_array*>(&emb_copy),
+        depth,
+        temperature,
+        top_k,
+        top_p,
+        sampler_mode,
+        out_hiddens,
+        out_target_ids,
+        out_target_probs);
+  } catch (const std::exception& e) {
+    fprintf(stderr,
+            "[MLX] Exception in mlx_qwen35_mtp_verify_compiled_with_hidden_and_sparse_target: %s\n",
+            e.what());
+    fflush(stderr);
+    if (out_hiddens) *out_hiddens = nullptr;
+    if (out_target_ids) *out_target_ids = nullptr;
+    if (out_target_probs) *out_target_probs = nullptr;
+  } catch (...) {
+    fprintf(stderr,
+            "[MLX] Unknown exception in "
+            "mlx_qwen35_mtp_verify_compiled_with_hidden_and_sparse_target\n");
+    fflush(stderr);
+    if (out_hiddens) *out_hiddens = nullptr;
+    if (out_target_ids) *out_target_ids = nullptr;
+    if (out_target_probs) *out_target_probs = nullptr;
   }
 }
 
@@ -1609,11 +1838,10 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden(
 // `g_compile_inited` and `g_compiled_caches`). Subsequent turns hit the
 // already-flipped flag and return immediately.
 //
-// W6.7 follow-up #3 — The flag is `std::atomic<bool>` rather than
-// `std::once_flag`: `mlx_qwen35_mtp_compiled_reset` resets the per-depth
-// closure table, so the prewarm flag MUST be resettable too — otherwise
-// a reset+re-init cycle would leave `g_verify_compiled_by_depth` null and
-// silently fall back to lazy-per-depth construction.
+// W6.7 follow-up #4 — Per-turn reset no longer clears the per-depth
+// closure tables, so this guard remains process-once. That avoids
+// re-running the 10 heavy dummy verify traces after every MTP turn while
+// preserving cheap closure reuse across reset/re-init.
 //
 // No-op if MTP is uninitialised. Best-effort: any failure inside the
 // underlying prewarm is logged + swallowed and the verify path simply
@@ -1623,11 +1851,10 @@ void mlx_qwen35_mtp_compiled_prewarm_verify() {
   if (!g_mtp_compile_inited) {
     return;
   }
-  // W6.7 follow-up #3 — Atomic-bool gate (reset-aware) replaces
-  // `std::once_flag`. CAS-flipping `false -> true` is the entry permit;
-  // `mlx_qwen35_mtp_compiled_reset` flips it back to `false`. Caller is
-  // serialised on `DENSE_COMPILED_MUTEX` (Rust-side), but using an atomic
-  // keeps the check correct under any future relaxation of that contract.
+  // W6.7 follow-up #4 — Atomic-bool gate. CAS-flipping `false -> true`
+  // is the entry permit. Caller is serialised on `DENSE_COMPILED_MUTEX`
+  // (Rust-side), but using an atomic keeps the check correct under any
+  // future relaxation of that contract.
   bool expected = false;
   if (!g_prewarm_done.compare_exchange_strong(expected, true)) {
     return;
@@ -1684,30 +1911,22 @@ void mlx_qwen35_mtp_compiled_reset() {
   // Phase C — committed-history counter resets with the rest of the
   // MTP state so a fresh turn starts with an empty committed prefix.
   g_mtp_committed_len = 0;
+  g_mtp_position_base_int = 0;
   g_mtp_compile_inited = false;
   g_mtp_config = MTPCompileConfig{};
-  for (auto& slot : g_verify_compiled_by_depth) {
-    slot = nullptr;
-  }
+  // Keep the per-depth verify dispatchers across per-turn reset. They
+  // capture only the static depth and call through the current global
+  // compiled state, so retaining them avoids re-running heavy prewarm on
+  // the next turn.
   // Phase C — drop the per-M commit dispatchers (the underlying
   // compiled-graph cache is static-function-local and survives reset,
   // mirroring the fused draft graph).
   for (auto& slot : g_commit_compiled_by_m) {
     slot = nullptr;
   }
-  // W6.18 — also clear the fused draft dispatcher table so a
-  // subsequent re-init repopulates the per-depth closures from scratch.
-  // The underlying compiled-graph cache inside `compiled_mtp_draft_fused_decode<D>`
-  // is static-function-local so it survives the reset (a deliberate
-  // perf choice: re-init reuses the cached compile traces).
-  for (auto& slot : g_fused_draft_compiled_by_depth) {
-    slot = nullptr;
-  }
-  // W6.7 follow-up #3 — Re-arm the prewarm gate so a subsequent re-init
-  // can repopulate `g_verify_compiled_by_depth` via the prewarm path
-  // (otherwise the closures stay null and every first-of-depth verify
-  // pays the per-depth closure construction cost).
-  g_prewarm_done.store(false);
+  // Keep the fused-draft dispatchers too. They capture only the static
+  // depth and their underlying compiled-graph cache is
+  // static-function-local.
 }
 
 // -----------------------------------------------------------------------------
@@ -1754,6 +1973,20 @@ void mlx_qwen35_mtp_compiled_begin_cycle(int main_offset) {
   g_mtp_chain_start_int = 0;
 }
 
+// Chained committed-history variant. The anchor token that seeds this
+// cycle was already committed as the prior cycle's boundary, but the
+// first MTP draft still needs to run `MTP(h(prev_anchor), emb(anchor))`
+// so the draft graph can predict the token after the anchor. Start one
+// slot before `g_mtp_committed_len` so that first draft overwrites the
+// existing anchor slot in place instead of duplicating it at the end of
+// the persistent prefix.
+void mlx_qwen35_mtp_compiled_begin_chained_cycle(int main_offset) {
+  if (!g_mtp_compile_inited) return;
+  (void)main_offset;
+  g_mtp_offset_int = std::max(g_mtp_committed_len - 1, 0);
+  g_mtp_chain_start_int = 0;
+}
+
 // -----------------------------------------------------------------------------
 // Phase C — append exact committed K/V to the persistent MTP cache.
 //
@@ -1781,11 +2014,13 @@ void mlx_qwen35_mtp_compiled_begin_cycle(int main_offset) {
 //                        committed token, pre-gathered Rust-side
 //                        (avoids a quantized-embedding edge case in
 //                        the graph).
-//   - m:                 M = K+2 ∈ {2..7}. Both input arrays MUST have
+//   - m:                 M = K+2 (or 1 for a one-token prompt-window seed).
+//                        Both input arrays MUST have
 //                        time dim M.
 //
 // SIDE EFFECTS: writes M K/V slots into `g_mtp_compiled_caches[]` at
-// absolute positions `[g_mtp_committed_len .. g_mtp_committed_len+M)`,
+// local slots `[g_mtp_committed_len .. g_mtp_committed_len+M)`, using
+// absolute RoPE positions `[position_base + g_mtp_committed_len ..)`,
 // then sets `g_mtp_committed_len += M` and
 // `g_mtp_offset_int = g_mtp_committed_len`.
 //
@@ -1834,8 +2069,9 @@ int mlx_qwen35_mtp_compiled_commit(
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
             "[MTP-TRACE] mlx_qwen35_mtp_compiled_commit: ENTER m=%d "
-            "committed_len=%d (base RoPE pos)\n",
-            m, g_mtp_committed_len);
+            "committed_len=%d position_base=%d rope_base=%d\n",
+            m, g_mtp_committed_len, g_mtp_position_base_int,
+            mtp_absolute_pos(g_mtp_committed_len));
   }
 
   try {
@@ -1843,10 +2079,12 @@ int mlx_qwen35_mtp_compiled_commit(
     auto& gathered_embs = *reinterpret_cast<array*>(gathered_embs_ptr);
 
     std::vector<array> inputs;
-    inputs.reserve(3 + g_mtp_config.n_mtp_layers * 2);
+    inputs.reserve(4 + g_mtp_config.n_mtp_layers * 2);
     inputs.push_back(hidden_seq);
     inputs.push_back(gathered_embs);
     inputs.push_back(reshape(array(g_mtp_committed_len, mlx::core::int32), {1}));
+    inputs.push_back(reshape(
+        array(mtp_absolute_pos(g_mtp_committed_len), mlx::core::int32), {1}));
     for (const auto& c : g_mtp_compiled_caches) {
       inputs.push_back(c);
     }
@@ -1872,8 +2110,10 @@ int mlx_qwen35_mtp_compiled_commit(
     if (qwen35_common::mtp_trace_enabled()) {
       fprintf(stderr,
               "[MTP-TRACE] mlx_qwen35_mtp_compiled_commit: EXIT OK "
-              "new_committed_len=%d new_mtp_offset=%d\n",
-              g_mtp_committed_len, g_mtp_offset_int);
+              "new_committed_len=%d position_base=%d new_mtp_offset=%d "
+              "new_rope_offset=%d\n",
+              g_mtp_committed_len, g_mtp_position_base_int, g_mtp_offset_int,
+              mtp_absolute_pos(g_mtp_offset_int));
     }
     return 0;
   } catch (const std::exception& e) {
@@ -1892,11 +2132,32 @@ int mlx_qwen35_mtp_compiled_commit(
 }
 
 // -----------------------------------------------------------------------------
-// Read accessor for the current MTP offset (debugging / introspection
-// from Rust unit tests).
+// Read accessor for the current absolute MTP RoPE offset (debugging /
+// introspection from Rust unit tests).
 // -----------------------------------------------------------------------------
 int mlx_qwen35_mtp_get_offset() {
-  return g_mtp_offset_int;
+  return mtp_absolute_pos(g_mtp_offset_int);
+}
+
+// -----------------------------------------------------------------------------
+// Read accessor for the persistent committed-history prefix length.
+// -----------------------------------------------------------------------------
+int mlx_qwen35_mtp_get_committed_len() {
+  return g_mtp_committed_len;
+}
+
+// -----------------------------------------------------------------------------
+// Configure the absolute position of local committed-history slot 0.
+// Must be called before prompt-history seeding. It is intentionally local-slot
+// preserving: callers still see/get/validate `g_mtp_committed_len` as the
+// compact cache length.
+// -----------------------------------------------------------------------------
+void mlx_qwen35_mtp_set_position_base(int position_base) {
+  g_mtp_position_base_int = std::max(position_base, 0);
+}
+
+int mlx_qwen35_mtp_get_position_base() {
+  return g_mtp_position_base_int;
 }
 
 }  // extern "C"

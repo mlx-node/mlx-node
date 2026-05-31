@@ -523,6 +523,7 @@ unsafe extern "C-unwind" {
         top_k: i32,
         top_p: f32,
         min_p: f32,
+        sampler_mode: i32,
     ) -> *mut mlx_array;
 
     /// Compiled sampling using mlx::core::compile for the categorical step
@@ -533,6 +534,7 @@ unsafe extern "C-unwind" {
         top_k: i32,
         top_p: f32,
         min_p: f32,
+        sampler_mode: i32,
         out_token: *mut *mut mlx_array,
         out_logprobs: *mut *mut mlx_array,
     );
@@ -1970,6 +1972,48 @@ unsafe extern "C-unwind" {
         out_hiddens: *mut *mut mlx_array,
     );
 
+    /// Same as `mlx_qwen35_mtp_verify_compiled_with_hidden`, plus
+    /// `out_argmax` as `[1, depth+1]` int32 target top-1 ids from the
+    /// same compiled verify graph for greedy sparse accept.
+    pub fn mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_logits: *mut *mut mlx_array,
+        out_hiddens: *mut *mut mlx_array,
+        out_argmax: *mut *mut mlx_array,
+    );
+
+    /// Greedy verifier sibling that returns hiddens plus `[1, depth+1]`
+    /// target top-1 ids without surfacing full `[1, depth+1, vocab]`
+    /// verifier logits. Used only when diagnostics/top-1 cross-checks do
+    /// not require full logits.
+    pub fn mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax_only(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        out_hiddens: *mut *mut mlx_array,
+        out_argmax: *mut *mut mlx_array,
+    );
+
+    /// Stochastic sparse-target sibling of
+    /// `mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax`.
+    /// Returns hiddens plus compact `[depth+1, top_k]` target ids/probs
+    /// instead of full verifier logits. Currently supports sampler_mode=1
+    /// (MTPLX temperature-first parity).
+    pub fn mlx_qwen35_mtp_verify_compiled_with_hidden_and_sparse_target(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        depth: i32,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        sampler_mode: i32,
+        out_hiddens: *mut *mut mlx_array,
+        out_target_ids: *mut *mut mlx_array,
+        out_target_probs: *mut *mut mlx_array,
+    );
+
     /// Phase 4b — paged-pool sibling of the batched MTP verify forward.
     /// Reads K/V from `g_dense_k_pools[]` / `g_dense_v_pools[]` (set up
     /// via `mlx_qwen35_init_paged`) instead of the BHTD
@@ -1990,9 +2034,10 @@ unsafe extern "C-unwind" {
     ///   - `cu_seqlens_q`: `[2]` int32 = `[0, depth+1]`.
     ///
     /// Output: `*out_logits` ← `[1, depth+1, vocab]`, `*out_hiddens`
-    /// ← `[1, depth+1, hidden]`. Both heap-allocated; caller owns. On
-    /// error both pointers are set to nullptr and a stderr diagnostic
-    /// is emitted; global state (pool / linear / BHTD) is unchanged.
+    /// ← `[1, depth+1, hidden]`, `*out_argmax` ← `[1, depth+1]`.
+    /// All three are heap-allocated; caller owns. On error all pointers
+    /// are set to nullptr and a stderr diagnostic is emitted; global
+    /// state (pool / linear / BHTD) is unchanged.
     ///
     /// Preconditions: `g_compile_inited == true` AND
     /// `g_dense_paged_inited == true`. The Rust dispatcher must keep
@@ -2019,6 +2064,7 @@ unsafe extern "C-unwind" {
         cu_seqlens_q: *mut mlx_array,
         out_logits: *mut *mut mlx_array,
         out_hiddens: *mut *mut mlx_array,
+        out_argmax: *mut *mut mlx_array,
     );
 
     /// W6.7 follow-up — Eagerly compile the batched verify graphs for
@@ -2057,17 +2103,30 @@ unsafe extern "C-unwind" {
     /// path doesn't see), producing wrong RoPE positions and gibberish.
     pub fn mlx_qwen35_mtp_compiled_begin_cycle(main_offset: i32);
 
+    /// Chained committed-history variant. Starts the draft offset at
+    /// `g_mtp_committed_len - 1` so the first chained draft overwrites
+    /// the already-committed anchor token instead of appending a
+    /// duplicate anchor slot.
+    pub fn mlx_qwen35_mtp_compiled_begin_chained_cycle(main_offset: i32);
+
     /// Read the current MTP offset (for debugging / tests).
     pub fn mlx_qwen35_mtp_get_offset() -> i32;
+
+    /// Read the current persistent MTP committed-history prefix length.
+    pub fn mlx_qwen35_mtp_get_committed_len() -> i32;
+
+    /// Set/read the absolute sequence position of local MTP cache slot 0.
+    /// Used by MTPLX-style last-window prompt history.
+    pub fn mlx_qwen35_mtp_set_position_base(position_base: i32);
+    pub fn mlx_qwen35_mtp_get_position_base() -> i32;
 
     /// Phase C — committed-history MTP cache policy: append exact
     /// committed K/V to the persistent MTP cache.
     ///
     /// Called once per draft cycle, AFTER the accept loop computes the
     /// accepted-draft count K and BEFORE rollback. Computes the MTP
-    /// layer-0 attention K/V for the `M = K+2` committed tokens
-    /// `[last_committed_id, d_0..d_{K-1}, boundary]` from their
-    /// hidden / embedding rows (assembled Rust-side), writes them into
+    /// layer-0 attention K/V for `M` committed tokens from their hidden
+    /// / embedding rows (assembled Rust-side), writes them into
     /// the persistent MTP KV cache at absolute positions
     /// `[g_mtp_committed_len .. g_mtp_committed_len+M)`, and advances
     /// the committed-prefix counter by exactly `M` — so the MTP prefix
@@ -2078,7 +2137,8 @@ unsafe extern "C-unwind" {
     /// pre-assembled Rust-side: `hidden_seq[i]` = hidden of the token
     /// BEFORE committed token `i` (the MTP `MTP(h(t), emb(t+1))`
     /// contract), `gathered_embs[i]` = input embedding of committed
-    /// token `i`. `m` = M = K+2.
+    /// token `i`. `m` is in `[1, 7]`; the one-token case is required by
+    /// chained all-reject cycles.
     ///
     /// SIDE EFFECTS: mutates `g_mtp_compiled_caches[]` and advances
     /// `g_mtp_committed_len` / `g_mtp_offset_int` by `m`. Same locking

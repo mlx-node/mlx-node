@@ -17,7 +17,10 @@
     "format": "vp fmt",
     "test": "vp test",
     "typecheck": "tsc -b",
-    "mlx": "oxnode packages/cli/src/cli.ts"
+    "mlx": "oxnode packages/cli/src/cli.ts",
+    "bench:qwen35-mtp": "oxnode examples/qwen35-mtp-bench-matrix.ts",
+    "bench:qwen35-mtp:gate": "oxnode examples/qwen35-mtp-bench-matrix.ts qwen3.6-27b-nvfp4-mtp-oproj8 --depths default,1 --env-variants perf-flat,sparse-off,async-off --profile --gate safety",
+    "bench:qwen35-mtp:paged": "oxnode examples/qwen35-mtp-bench-matrix.ts qwen3.6-27b-nvfp4-mtp-oproj8 --depths 3 --env-variants paged-off,paged-on --include-paged-experimental --profile --gate paged-parity"
   },
   "devDependencies": {
     "@ast-grep/napi": "^0.42.1",

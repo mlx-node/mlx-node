@@ -134,6 +134,46 @@ fn add_link_search(path: &Path) {
     }
 }
 
+fn resolve_build_tool(env_key: &str, candidates: &[&str]) -> String {
+    if let Ok(value) = env::var(env_key)
+        && !value.is_empty()
+    {
+        return value;
+    }
+
+    let path_dirs = env::var_os("PATH")
+        .map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    for candidate in candidates {
+        let candidate_path = Path::new(candidate);
+        if candidate_path.is_absolute() && candidate_path.exists() {
+            return candidate.to_string();
+        }
+        for dir in &path_dirs {
+            let path = dir.join(candidate);
+            if path.exists() {
+                return path.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    candidates
+        .first()
+        .expect("resolve_build_tool requires at least one candidate")
+        .to_string()
+}
+
+fn xcrun_find(tool: &str) -> Option<String> {
+    let output = Command::new("xcrun").args(["--find", tool]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=mlx");
@@ -208,6 +248,23 @@ fn main() {
         );
 
     if target_os == "macos" {
+        let default_c_compiler = xcrun_find("clang").unwrap_or_else(|| "clang".to_string());
+        let default_cxx_compiler = xcrun_find("clang++").unwrap_or_else(|| "clang++".to_string());
+        let default_ar = xcrun_find("ar").unwrap_or_else(|| "/usr/bin/ar".to_string());
+        let default_ranlib = xcrun_find("ranlib").unwrap_or_else(|| "/usr/bin/ranlib".to_string());
+        let c_compiler = resolve_build_tool(
+            "CC",
+            &[default_c_compiler.as_str(), "/usr/bin/clang", "clang"],
+        );
+        let cxx_compiler = resolve_build_tool(
+            "CXX",
+            &[default_cxx_compiler.as_str(), "/usr/bin/clang++", "clang++"],
+        );
+        let ar = resolve_build_tool("AR", &[default_ar.as_str(), "/usr/bin/ar", "ar"]);
+        let ranlib = resolve_build_tool(
+            "RANLIB",
+            &[default_ranlib.as_str(), "/usr/bin/ranlib", "ranlib"],
+        );
         let sdk_path = Command::new("xcrun")
             .args(["--sdk", "macosx", "--show-sdk-path"])
             .output()
@@ -216,8 +273,14 @@ fn main() {
             .to_vec();
         let sdk_path = String::from_utf8(sdk_path).expect("Failed to convert SDK path to string");
         let sdk_path = sdk_path.trim();
-        cfg.define("CMAKE_C_COMPILER", "clang")
-            .define("CMAKE_CXX_COMPILER", "clang++")
+        cfg.define("CMAKE_C_COMPILER", c_compiler)
+            .define("CMAKE_CXX_COMPILER", cxx_compiler)
+            .define("CMAKE_AR", &ar)
+            .define("CMAKE_RANLIB", &ranlib)
+            .define("CMAKE_C_COMPILER_AR", &ar)
+            .define("CMAKE_CXX_COMPILER_AR", &ar)
+            .define("CMAKE_C_COMPILER_RANLIB", &ranlib)
+            .define("CMAKE_CXX_COMPILER_RANLIB", &ranlib)
             .cflag(format!("-isysroot {sdk_path}"))
             .cxxflag(format!("-isysroot {sdk_path}"));
     }
