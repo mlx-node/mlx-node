@@ -401,7 +401,13 @@ impl Lfm2Inner {
     /// Follows `lfm2.py:258-279` (Lfm2Model.__call__) + Model.__call__ (tied lm_head).
     ///
     /// Returns logits [B, T, vocab_size].
-    fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
+    ///
+    /// `pub(crate)` so the persistence-module test
+    /// `production_compiled_decode_matches_native_with_conv_bias` can drive this
+    /// pure-native per-step forward as the parity REFERENCE for the production
+    /// compiled conv_bias=true decode path. Crate-internal only — no public/NAPI
+    /// surface change.
+    pub(crate) fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
         // PREFILL stays native. The compiled C++ decode path is wired ONLY into
         // the single-token decode loop in `chat_sync_core` (it seeds the
         // compiled graph from the post-prefill caches this native forward

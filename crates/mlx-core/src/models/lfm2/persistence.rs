@@ -1783,6 +1783,468 @@ mod tests {
         );
     }
 
+    // ===== Codex No-ship gap: PRODUCTION-PATH conv_bias=true compiled parity =====
+    //
+    // `compiled_decode_seq_matches_native_with_conv_bias` (compiled_parity_test.rs)
+    // proves the conv-bias decode math via the EAGER probe
+    // `mlx_lfm2_probe_decode_seq`, which registers weights, runs `lfm2_decode_fn`
+    // EAGERLY, and clears the map — it never touches the production
+    // `sanitize/apply/register -> init_from_prefill -> mlx_lfm2_moe_forward`
+    // (TRACED `compiled_lfm2_decode()`) path that commit 8f7c659 actually enabled.
+    // This test closes that gap: it builds a synthetic DENSE conv_bias=true lfm2,
+    // drives the REAL production register + prefill-seed + TRACED-forward seam, and
+    // asserts the compiled final-step logits match a full NATIVE `Lfm2Inner::forward`
+    // reference within the lfm2 bf16 tolerance — AND that the traced forward
+    // actually ran (the `mlx_lfm2_moe_forward_call_count()` delta is non-zero).
+    //
+    // Why this catches a conv_bias bug the eager probe misses: the production seam
+    // carries `conv_state` from a NATIVE prefill across the prefill->decode boundary
+    // and threads `conv_bias=1` into `mlx_lfm2_moe_init_from_prefill`. The compiled
+    // `lfm2_conv_pure_fn` applies the three conv biases (`conv.in_proj.bias`,
+    // `conv.conv.bias`, `conv.out_proj.bias`) on EVERY traced decode step, reading
+    // them out of the registered `g_weights()` map under the exact keys
+    // `register_weights_with_cpp_locked` stored. If any conv bias were dropped /
+    // double-applied / lost across the seed seam, the compiled logits would diverge
+    // from native here — something the eager, single-shot, self-registering probe
+    // (which never seeds from a native prefill cache and never threads the
+    // production config FFI) structurally cannot exercise.
+
+    /// Deterministic, distinct, NON-ZERO bf16 weight of `shape` from `seed`. Each
+    /// element varies with its flat index AND the seed, so two different tensors
+    /// are never accidentally equal and a dropped/zeroed bias changes the result.
+    fn det_bf16(shape: &[i64], seed: i64) -> MxArray {
+        let n: i64 = shape.iter().product();
+        let data: Vec<f32> = (0..n.max(0))
+            .map(|i| (((i * 131 + seed * 17 + 7).rem_euclid(23)) as f32 - 11.0) * 0.03)
+            .collect();
+        MxArray::from_float32(&data, shape)
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("astype bf16")
+    }
+
+    /// Deterministic RMSNorm weight (~1.0) of length `dim` from `seed`.
+    fn det_norm_bf16(dim: i64, seed: i64) -> MxArray {
+        let data: Vec<f32> = (0..dim)
+            .map(|i| 1.0 + (((i + seed).rem_euclid(7)) as f32 - 3.0) * 0.04)
+            .collect();
+        MxArray::from_float32(&data, &[dim])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("astype bf16")
+    }
+
+    /// A tiny DENSE (`num_experts: None` => `is_moe()` false, every layer dense
+    /// SwiGLU) lfm2 config with `conv_bias: true`, flat caches
+    /// (`use_block_paged_cache: Some(false)`), and a `[conv, full_attention, conv]`
+    /// hybrid stack — the production topology the 8f7c659 gate-lift enabled.
+    fn tiny_dense_conv_bias_config() -> Lfm2Config {
+        Lfm2Config {
+            vocab_size: 32,
+            hidden_size: 64,
+            num_hidden_layers: 3,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            max_position_embeddings: 128,
+            norm_eps: 1e-5,
+            conv_bias: true,
+            conv_l_cache: 3,
+            block_dim: 64,
+            // Dense FFN dim (block_auto_adjust_ff_dim=false => computed_ff_dim == block_ff_dim).
+            block_ff_dim: 128,
+            block_multiple_of: 256,
+            block_ffn_dim_multiplier: 1.0,
+            block_auto_adjust_ff_dim: false,
+            rope_theta: 1_000_000.0,
+            layer_types: vec!["conv".into(), "full_attention".into(), "conv".into()],
+            tie_embedding: true,
+            eos_token_id: 7,
+            bos_token_id: 1,
+            pad_token_id: 0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: Some(false),
+            intermediate_size: None,
+            moe_intermediate_size: None,
+            num_experts: None,
+            num_experts_per_tok: None,
+            num_dense_layers: None,
+            norm_topk_prob: true,
+            use_expert_bias: false,
+        }
+    }
+
+    /// Build a complete, correctly-shaped, ALREADY-SANITIZED bf16 param map for
+    /// `tiny_dense_conv_bias_config` — the keys a real loader produces post-sanitize
+    /// (no `model.` prefix; conv weight pre-transposed to `[H, l_cache, 1]`; dense
+    /// MLP renamed to `feed_forward.{gate,up,down}_proj`). INCLUDES the three conv
+    /// biases per conv layer so `apply_weights` (native) installs them on the Rust
+    /// `ShortConv` and `register_weights_with_cpp_locked` stores them under the same
+    /// keys the compiled `lfm2_conv_pure_fn`'s `get_weight` reads.
+    fn dense_conv_bias_params(config: &Lfm2Config) -> HashMap<String, MxArray> {
+        let h = config.hidden_size as i64;
+        let inter = config.computed_ff_dim() as i64;
+        let l_cache = config.conv_l_cache as i64;
+        let head_dim = config.head_dim() as i64;
+        let n_heads = config.num_attention_heads as i64;
+        let n_kv = config.num_key_value_heads as i64;
+        let vocab = config.vocab_size as i64;
+
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert("embed_tokens.weight".into(), det_bf16(&[vocab, h], 101));
+        p.insert("embedding_norm.weight".into(), det_norm_bf16(h, 102));
+
+        for (l, lt) in config.layer_types.iter().enumerate() {
+            let pre = format!("layers.{l}");
+            p.insert(
+                format!("{pre}.operator_norm.weight"),
+                det_norm_bf16(h, 110 + l as i64),
+            );
+            p.insert(
+                format!("{pre}.ffn_norm.weight"),
+                det_norm_bf16(h, 120 + l as i64),
+            );
+
+            // Dense SwiGLU feed-forward (every layer; num_experts=None).
+            p.insert(
+                format!("{pre}.feed_forward.gate_proj.weight"),
+                det_bf16(&[inter, h], 130 + l as i64),
+            );
+            p.insert(
+                format!("{pre}.feed_forward.up_proj.weight"),
+                det_bf16(&[inter, h], 140 + l as i64),
+            );
+            p.insert(
+                format!("{pre}.feed_forward.down_proj.weight"),
+                det_bf16(&[h, inter], 150 + l as i64),
+            );
+
+            if lt == "full_attention" {
+                let a = format!("{pre}.self_attn");
+                p.insert(
+                    format!("{a}.q_proj.weight"),
+                    det_bf16(&[n_heads * head_dim, h], 160 + l as i64),
+                );
+                p.insert(
+                    format!("{a}.k_proj.weight"),
+                    det_bf16(&[n_kv * head_dim, h], 170 + l as i64),
+                );
+                p.insert(
+                    format!("{a}.v_proj.weight"),
+                    det_bf16(&[n_kv * head_dim, h], 180 + l as i64),
+                );
+                p.insert(
+                    format!("{a}.out_proj.weight"),
+                    det_bf16(&[h, n_heads * head_dim], 190 + l as i64),
+                );
+                p.insert(
+                    format!("{a}.q_layernorm.weight"),
+                    det_norm_bf16(head_dim, 200 + l as i64),
+                );
+                p.insert(
+                    format!("{a}.k_layernorm.weight"),
+                    det_norm_bf16(head_dim, 210 + l as i64),
+                );
+            } else {
+                let c = format!("{pre}.conv");
+                // Post-sanitize conv weight is `[H, l_cache, 1]` (no transpose needed).
+                p.insert(
+                    format!("{c}.conv.weight"),
+                    det_bf16(&[h, l_cache, 1], 220 + l as i64),
+                );
+                p.insert(
+                    format!("{c}.in_proj.weight"),
+                    det_bf16(&[3 * h, h], 230 + l as i64),
+                );
+                p.insert(
+                    format!("{c}.out_proj.weight"),
+                    det_bf16(&[h, h], 240 + l as i64),
+                );
+                // The three conv biases (conv_bias=true). NONZERO + distinct so a
+                // dropped / double-applied bias across the prefill->decode seam moves
+                // the logits and fails parity.
+                p.insert(
+                    format!("{c}.in_proj.bias"),
+                    det_bf16(&[3 * h], 250 + l as i64),
+                );
+                p.insert(format!("{c}.conv.bias"), det_bf16(&[h], 260 + l as i64));
+                p.insert(format!("{c}.out_proj.bias"), det_bf16(&[h], 270 + l as i64));
+            }
+        }
+        p
+    }
+
+    /// Eval every cache array (mirrors the private `eval_lfm2_caches` used by the
+    /// production prefill seed — caches MUST be materialized before raw pointers
+    /// are handed to `mlx_lfm2_moe_init_from_prefill`).
+    fn eval_caches(caches: &[super::super::layer_cache::Lfm2LayerCache]) {
+        let mut arrays: Vec<&MxArray> = Vec::new();
+        for c in caches {
+            c.collect_arrays(&mut arrays);
+        }
+        if !arrays.is_empty() {
+            MxArray::eval_arrays(&arrays).expect("eval caches");
+        }
+    }
+
+    fn logits_to_vec(a: &MxArray) -> Vec<f32> {
+        a.astype(DType::Float32)
+            .expect("astype f32")
+            .to_float32()
+            .expect("to_float32")
+            .to_vec()
+    }
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "length mismatch ({} vs {})",
+            a.len(),
+            b.len()
+        );
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Codex No-ship closer: drive the REAL production compiled path for a
+    /// conv_bias=true dense lfm2 (register -> native prefill seed ->
+    /// `mlx_lfm2_moe_init_from_prefill` -> TRACED `mlx_lfm2_moe_forward`) and assert
+    /// the final-step logits match a full native `Lfm2Inner::forward` reference
+    /// within the lfm2 bf16 tolerance, plus that the traced forward engaged.
+    ///
+    /// Holds `COMPILED_WEIGHTS_RWLOCK.write()` for the whole test (like the F1
+    /// test) so it is mutually exclusive with every other compiled-path test in
+    /// this `--lib` binary and calls the lock-free `_locked` worker directly (the
+    /// non-reentrant std RwLock would deadlock on the wrapper). Tears down the C++
+    /// decode state (`mlx_lfm2_moe_reset`) and the shared weight map
+    /// (`mlx_clear_weights`) at the end so no stale id/graph leaks to co-running
+    /// serial tests (the suite runs `--test-threads=1`).
+    #[test]
+    fn production_compiled_decode_matches_native_with_conv_bias() {
+        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = tiny_dense_conv_bias_config();
+        let params = dense_conv_bias_params(&config);
+
+        // Total decode sequence: P native-prefill tokens + (T - P) decode tokens.
+        // Both the native reference AND the compiled path use the IDENTICAL seam —
+        // native prefill of the first P tokens (a single `[1,P]` forward), then
+        // single-token decode of the remaining tokens — so the ONLY difference is
+        // native per-step `Lfm2Inner::forward` vs the TRACED `mlx_lfm2_moe_forward`
+        // closure. This is exactly the "eager-flat vs compiled-flat" fidelity oracle
+        // the e2e test documents: matching seams isolate a real compiled conv_bias
+        // bug from chunked-vs-per-token bf16 prefill noise. Both see identical
+        // weights + identical token ids.
+        let vocab = config.vocab_size;
+        let total_t: usize = 5;
+        let prefill_p: usize = 2;
+        let token_ids: Vec<i32> = (0..total_t as i32).map(|i| (i * 7 + 1) % vocab).collect();
+
+        // ---- NATIVE REFERENCE: prefill `[1,P]` then NATIVE single-token decode of
+        // the remaining tokens (mirrors the compiled seam exactly). ----
+        let native_final = {
+            let mut inner = Lfm2Inner::new(config.clone()).expect("native Lfm2Inner::new");
+            apply_weights(
+                &mut inner,
+                &params,
+                DEFAULT_QUANT_BITS,
+                DEFAULT_QUANT_GROUP_SIZE,
+                None,
+                &HashMap::new(),
+            )
+            .expect("native apply_weights");
+
+            // Prefill the first P tokens in ONE multi-token forward.
+            let prefill_ids: Vec<i32> = token_ids[..prefill_p].to_vec();
+            let prefill_arr = MxArray::from_int32(&prefill_ids, &[1, prefill_p as i64])
+                .expect("native prefill ids");
+            let _ = inner.forward(&prefill_arr).expect("native prefill forward");
+
+            // Then native single-token decode for the remaining tokens.
+            let mut last: Option<MxArray> = None;
+            for &tok in &token_ids[prefill_p..] {
+                let ids = MxArray::from_int32(&[tok], &[1, 1]).expect("native decode ids");
+                let logits = inner.forward(&ids).expect("native decode forward"); // [1,1,vocab]
+                last = Some(logits);
+            }
+            logits_to_vec(&last.expect("native decoded >=1 step"))
+        };
+
+        // ---- PRODUCTION COMPILED PATH ----
+        // (1) Register weights with the compiled C++ path under the held write lock.
+        // This is the REAL gate+store; it must NOT early-return for conv_bias=true.
+        register_weights_with_cpp_locked(&params, 0xC0FE_B1A5, &config)
+            .expect("register_weights_with_cpp_locked");
+        assert!(
+            unsafe { mlx_sys::mlx_weight_count() } > 0,
+            "register stored no weights (gate suppressed conv_bias=true registration?)"
+        );
+
+        // (2) Native PREFILL of the first P tokens on a SECOND inner (identical
+        // weights) to populate conv_state + KV caches, then seed the compiled graph.
+        let mut seed_inner = Lfm2Inner::new(config.clone()).expect("seed Lfm2Inner::new");
+        apply_weights(
+            &mut seed_inner,
+            &params,
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            None,
+            &HashMap::new(),
+        )
+        .expect("seed apply_weights");
+
+        let prefill_ids: Vec<i32> = token_ids[..prefill_p].to_vec();
+        let prefill_arr =
+            MxArray::from_int32(&prefill_ids, &[1, prefill_p as i64]).expect("prefill ids");
+        let _ = seed_inner
+            .forward(&prefill_arr)
+            .expect("seed prefill forward");
+        eval_caches(&seed_inner.caches);
+
+        // Gather per-attn-layer KV offset (all attn layers must agree).
+        let num_layers = config.num_hidden_layers as usize;
+        let mut cache_offset: Option<i32> = None;
+        for cache in seed_inner.caches.iter() {
+            if let super::super::layer_cache::Lfm2LayerCache::Attention(kv) = cache {
+                let off = kv.get_offset();
+                match cache_offset {
+                    None => cache_offset = Some(off),
+                    Some(prev) => assert_eq!(prev, off, "attn KV offsets disagree"),
+                }
+            }
+        }
+        let prefill_len = cache_offset.expect("at least one attention layer");
+        assert_eq!(
+            prefill_len, prefill_p as i32,
+            "prefill KV offset must equal the prefill token count"
+        );
+        let max_kv_len = ((prefill_len + (total_t as i32) + 255) / 256) * 256;
+
+        let is_attn: Vec<i32> = (0..num_layers)
+            .map(|i| i32::from(config.is_attention_layer(i)))
+            .collect();
+
+        // Cache pointers, stride 2 by ABSOLUTE layer idx (mirrors model.rs:899-922).
+        let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+            vec![std::ptr::null_mut(); num_layers * 2];
+        for (i, cache) in seed_inner.caches.iter().enumerate() {
+            match cache {
+                super::super::layer_cache::Lfm2LayerCache::Attention(kv) => {
+                    let k = kv.keys_ref().expect("kv keys after prefill");
+                    let v = kv.values_ref().expect("kv values after prefill");
+                    cache_ptrs[i * 2] = k.as_raw_ptr();
+                    cache_ptrs[i * 2 + 1] = v.as_raw_ptr();
+                }
+                super::super::layer_cache::Lfm2LayerCache::Conv(c) => {
+                    let state = c.get(0).expect("conv state after prefill");
+                    cache_ptrs[i * 2] = state.as_raw_ptr();
+                    // slot.b stays null — conv branch never reads it.
+                }
+            }
+        }
+
+        unsafe {
+            mlx_sys::mlx_lfm2_moe_init_from_prefill(
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim(),
+                config.rope_theta as f32,
+                config.norm_eps as f32,
+                config.conv_l_cache,
+                config.num_experts.unwrap_or(0),
+                config.num_experts_per_tok.unwrap_or(0),
+                config.num_dense_layers.unwrap_or(0),
+                i32::from(config.norm_topk_prob),
+                i32::from(config.use_expert_bias),
+                i32::from(config.tie_embedding),
+                i32::from(config.conv_bias),
+                max_kv_len,
+                1,
+                is_attn.as_ptr(),
+                cache_ptrs.as_mut_ptr(),
+                prefill_len,
+            );
+        }
+        assert_eq!(
+            unsafe { mlx_sys::mlx_lfm2_moe_is_initialized() },
+            1,
+            "compiled seed did not initialize (conv_bias=true prefill->decode seam broke)"
+        );
+
+        // (3) Drive the TRACED `mlx_lfm2_moe_forward` for the remaining tokens.
+        // The first compiled step consumes token P (the (P+1)-th token), since the
+        // native prefill already produced the logits for tokens 0..P. The compiled
+        // logits for the LAST token are what we compare against native_final.
+        let embed_weight = seed_inner.embed_tokens.get_weight();
+        let calls_before = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
+
+        let mut compiled_final: Option<MxArray> = None;
+        for &tok in &token_ids[prefill_p..] {
+            let next_ids = MxArray::from_int32(&[tok], &[1, 1]).expect("compiled ids");
+            let mut out_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+            let mut off: i32 = 0;
+            unsafe {
+                mlx_sys::mlx_lfm2_moe_forward(
+                    next_ids.as_raw_ptr(),
+                    embed_weight.as_raw_ptr(),
+                    &mut out_ptr,
+                    &mut off,
+                );
+            }
+            assert!(
+                !out_ptr.is_null(),
+                "mlx_lfm2_moe_forward returned null logits (traced forward errored)"
+            );
+            let logits = MxArray::from_handle(out_ptr, "compiled logits").expect("from_handle");
+            // Materialize the compiled graph (logits + threaded caches) like the
+            // production loop's `mlx_lfm2_moe_eval_token_and_caches`.
+            logits.eval();
+            compiled_final = Some(logits);
+        }
+
+        let calls_after = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
+        let call_delta = calls_after.saturating_sub(calls_before);
+
+        let compiled_final = logits_to_vec(&compiled_final.expect("compiled ran >=1 step"));
+
+        // ---- Teardown BEFORE asserting parity (so a parity failure still leaves
+        // the shared C++ state clean for co-running serial tests). ----
+        unsafe {
+            mlx_sys::mlx_lfm2_moe_reset();
+            mlx_sys::mlx_clear_weights();
+        }
+
+        // ---- ENGAGEMENT: the TRACED `compiled_lfm2_decode()` closure ran once per
+        // decode token (NOT a silent fallback, NOT the eager probe). ----
+        let expected_calls = (total_t - prefill_p) as u64;
+        assert_eq!(
+            call_delta, expected_calls,
+            "TRACED mlx_lfm2_moe_forward did not run once per decode token \
+             (call_delta={call_delta}, expected {expected_calls}); the production \
+             compiled path silently fell back"
+        );
+
+        // ---- PARITY: compiled final-step logits vs full native reference. ----
+        let d = max_abs(&native_final, &compiled_final);
+        println!(
+            "lfm2 PRODUCTION compiled decode parity (conv_bias=true): max_abs={d} \
+             call_delta={call_delta}"
+        );
+        assert!(
+            d < 2e-2,
+            "production compiled conv_bias=true decode must match native within lfm2 bf16 \
+             tolerance: max_abs={d} (>= 2e-2). A conv-bias drop/double-apply across the \
+             prefill->decode seam the eager probe could not see would surface here."
+        );
+    }
+
     // ===== Finding 1: complete-group validation of MoE projections =====
     //
     // `validate_mandatory_weights` only inspects KEY PRESENCE (never shapes),
