@@ -523,36 +523,60 @@ fn strip_all_reasoning(text: &str) -> String {
 }
 
 /// Strip reasoning (`<think>`/`<longcat_think>` blocks, both families) from `text`
-/// while preserving `<tool_call>…</tool_call>` spans VERBATIM.
+/// while preserving `<tool_call>…</tool_call>` spans that are NOT themselves part of a
+/// reasoning block.
 ///
-/// Used to scrub reasoning from `raw_text` on the no-`</think>`-token fallback path
-/// without corrupting tool-call markup: reasoning-looking tags inside tool-call
-/// arguments (e.g. a JSON argument value containing a literal `<think>…</think>` or a
-/// bare `</think>`) must NOT be treated as reasoning delimiters, or the recovered tool
-/// call would be mangled. We split the text at tool-call spans, strip reasoning only in
-/// the gaps between them, and copy each tool-call span through unchanged.
+/// Used to scrub reasoning from `raw_text` on the no-`</think>`-token fallback path.
+/// Two requirements: reasoning-looking tags *inside* a tool-call argument (a literal
+/// `<think>…</think>` or a bare `</think>`) must NOT be treated as reasoning delimiters
+/// (else the recovered tool call is mangled); and a tool span that is itself nested
+/// inside a `<think>…</think>` reasoning block must be dropped along with the reasoning
+/// (it is part of the suppressed chain-of-thought).
 ///
-/// Note: reasoning is structurally a leading block before any tool call, so gap-wise
-/// stripping is exact for real output. A (malformed) reasoning block that *wrapped* a
-/// tool call would only have its literal tag text survive in a gap — no tool span is
-/// ever altered.
+/// Implementation: mask each complete `<tool_call>…</tool_call>` span with an opaque
+/// sentinel that carries no tag markup, run the reasoning stripper over the WHOLE masked
+/// text (so a reasoning block that wraps a tool span is matched and removed as a unit),
+/// then restore only the sentinels that survived the strip. A sentinel inside a stripped
+/// reasoning block is gone, so its tool span is correctly removed; a surviving sentinel
+/// is restored byte-for-byte. The sentinel uses Unicode Private-Use-Area delimiters that
+/// cannot collide with model text and are non-prefixing across indices, so restoration is
+/// exact.
 pub fn strip_reasoning_preserving_tools(text: &str) -> String {
     let tool_spans = extract_tag_blocks(text, "<tool_call>", "</tool_call>");
     if tool_spans.is_empty() {
         return strip_all_reasoning(text);
     }
-    let mut out = String::with_capacity(text.len());
+
+    // Mask tool spans with sentinels.
+    let mut masked = String::with_capacity(text.len());
+    let mut originals: Vec<&str> = Vec::with_capacity(tool_spans.len());
     let mut pos = 0usize;
     for (start, end, _inner) in &tool_spans {
-        // Strip reasoning from the gap before this tool span, then copy the span
-        // (the full `<tool_call>…</tool_call>`) through verbatim.
-        out.push_str(&strip_all_reasoning(&text[pos..*start]));
-        out.push_str(&text[*start..*end]);
+        masked.push_str(&text[pos..*start]);
+        masked.push_str(&tool_span_sentinel(originals.len()));
+        originals.push(&text[*start..*end]);
         pos = *end;
     }
-    // Trailing gap after the last tool span.
-    out.push_str(&strip_all_reasoning(&text[pos..]));
+    masked.push_str(&text[pos..]);
+
+    // Strip reasoning across the whole masked text, then restore surviving sentinels.
+    let mut out = strip_all_reasoning(&masked);
+    for (idx, original) in originals.iter().enumerate() {
+        let sentinel = tool_span_sentinel(idx);
+        if out.contains(&sentinel) {
+            out = out.replace(&sentinel, original);
+        }
+    }
     out
+}
+
+/// Opaque, collision-proof placeholder for a masked `<tool_call>` span. Uses
+/// Private-Use-Area code points (`U+E000`) as delimiters — these never appear in real
+/// model output and contain no reasoning/tool markup, so the reasoning stripper passes
+/// the sentinel through untouched. The trailing delimiter makes one index's sentinel a
+/// non-substring of another's (e.g. `…TC1…` vs `…TC11…`), keeping `str::replace` exact.
+fn tool_span_sentinel(idx: usize) -> String {
+    format!("\u{E000}TOOLCALL{idx}\u{E000}")
 }
 
 /// Check if text contains any thinking tags
@@ -825,6 +849,40 @@ mod tests {
     fn test_strip_reasoning_no_tools_no_reasoning_is_verbatim() {
         let input = "just a plain answer with no tags";
         assert_eq!(strip_reasoning_preserving_tools(input), input);
+    }
+
+    #[test]
+    fn test_strip_reasoning_tool_span_wrapped_by_reasoning() {
+        // A tool span NESTED inside a <think> block is part of suppressed reasoning:
+        // it must be dropped along with the reasoning, with NO prefix/suffix leak.
+        let input = "<think>secret before <tool_call>{\"name\":\"f\"}</tool_call> secret after</think>\nanswer";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret"),
+            "no part of the wrapping reasoning may leak: {out:?}"
+        );
+        assert!(
+            !out.contains("<tool_call>") && !out.contains("<think>"),
+            "nested tool span + reasoning tags must be gone: {out:?}"
+        );
+        assert!(out.contains("answer"), "trailing content survives: {out:?}");
+    }
+
+    #[test]
+    fn test_strip_reasoning_tool_span_wrapped_by_longcat_reasoning() {
+        // Same, for the <longcat_think> family.
+        let input =
+            "<longcat_think>pre <tool_call>{\"name\":\"f\"}</tool_call> post</longcat_think>\ndone";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("pre") && !out.contains("post"),
+            "no wrapping longcat reasoning may leak: {out:?}"
+        );
+        assert!(
+            !out.contains("<tool_call>") && !out.contains("longcat_think"),
+            "nested tool span + longcat tags must be gone: {out:?}"
+        );
+        assert!(out.contains("done"), "trailing content survives: {out:?}");
     }
 
     // ---- Tag extraction helpers ----
