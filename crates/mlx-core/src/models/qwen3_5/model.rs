@@ -3472,23 +3472,27 @@ impl Qwen35Inner {
             });
         if full_text.len() > streamed_text_len {
             let residual = full_text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress residual when it is reasoning text and
+            // include_reasoning == false.
+            if include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
         }
 
         let performance = if report_perf {
@@ -3715,23 +3719,27 @@ impl Qwen35Inner {
                 *streamed_text_len,
             );
             *streamed_text_len += token_text.len();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress reasoning deltas when include_reasoning == false.
+            // Detokenize + length-advance above stay OUTSIDE this gate.
+            if p.include_reasoning || !is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
 
             if let Some(reason) = crate::sampling::check_repetition_cutoff(
                 &generated_tokens,
@@ -4498,23 +4506,27 @@ impl Qwen35Inner {
 
         if text.len() > streamed_text_len {
             let residual = text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress residual when it is reasoning text and
+            // include_reasoning == false.
+            if p.include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
         }
 
         let num_tokens = generated_tokens.len() as u32;
@@ -5057,23 +5069,27 @@ impl Qwen35Inner {
         // Flush residual bytes
         if text.len() > streamed_text_len {
             let residual = text[streamed_text_len..].to_string();
-            cb.call(
-                Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
+            // Suppress residual when it is reasoning text and
+            // include_reasoning == false.
+            if p.include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
         }
 
         let num_tokens = generated_tokens.len() as u32;

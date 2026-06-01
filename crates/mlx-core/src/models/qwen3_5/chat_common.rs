@@ -893,23 +893,28 @@ macro_rules! decode_loop {
                     $slen,
                 );
                 $slen += token_text.len();
-                $cb.call(
-                    Ok($crate::models::qwen3_5::model::ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(_is_reasoning),
-                    }),
-                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                );
+                // Suppress reasoning (<think>…</think>) deltas from the stream
+                // when include_reasoning == false. Detokenize + length-advance
+                // above stay OUTSIDE this gate so DecodeStream sees every token.
+                if $p.include_reasoning || !_is_reasoning {
+                    $cb.call(
+                        Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                            text: token_text,
+                            done: false,
+                            finish_reason: None,
+                            tool_calls: None,
+                            thinking: None,
+                            num_tokens: None,
+                            prompt_tokens: None,
+                            reasoning_tokens: None,
+                            raw_text: None,
+                            cached_tokens: None,
+                            performance: None,
+                            is_reasoning: Some(_is_reasoning),
+                        }),
+                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
             )?
 
             if token_id == $eos {
@@ -1125,6 +1130,47 @@ mod tests {
         assert!(tracker.observe_token(THINK_END_ID)); // </think> is still reasoning
         assert!(!tracker.observe_token(300)); // now content
         assert!(!tracker.observe_token(400)); // still content
+    }
+
+    #[test]
+    fn test_stream_reasoning_gate_predicate() {
+        // Drives the boundary semantics the streaming send-gate relies on:
+        // `observe_token` returns true for reasoning tokens INCLUDING the
+        // `</think>` closer, and false for the first content token after.
+        // The send-gate is `include_reasoning || !is_reasoning`.
+        //
+        // Token ids are chosen distinct from THINK_END_ID for the
+        // reasoning/content tokens.
+        let seq = [101u32, 102, THINK_END_ID, 301, 302];
+
+        // include_reasoning == false: suppress the 3 reasoning tokens
+        // (including the </think> closer), emit the 2 content tokens.
+        {
+            let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+            let include_reasoning = false;
+            let gate: Vec<bool> = seq
+                .iter()
+                .map(|&tok| {
+                    let is_reasoning = tracker.observe_token(tok);
+                    include_reasoning || !is_reasoning
+                })
+                .collect();
+            assert_eq!(gate, vec![false, false, false, true, true]);
+        }
+
+        // include_reasoning == true: emit everything.
+        {
+            let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END_ID));
+            let include_reasoning = true;
+            let gate: Vec<bool> = seq
+                .iter()
+                .map(|&tok| {
+                    let is_reasoning = tracker.observe_token(tok);
+                    include_reasoning || !is_reasoning
+                })
+                .collect();
+            assert_eq!(gate, vec![true, true, true, true, true]);
+        }
     }
 
     #[test]
