@@ -518,6 +518,84 @@ pub(crate) fn parse_thinking_and_tools(
     (clean_text, tool_calls, thinking)
 }
 
+/// Build the `raw_text` field with the reasoning span removed when reasoning is
+/// not requested.
+///
+/// `raw_text` is normally the verbatim decoded generation (including
+/// `<think>…</think>`). When `include_reasoning` is false we additionally strip
+/// the reasoning span so a direct `raw_text` consumer cannot recover the model's
+/// chain-of-thought — matching the suppression already applied to the parsed
+/// `thinking` field and the streamed reasoning deltas.
+///
+/// The post-`</think>` content is kept VERBATIM (tool-call markup, whitespace,
+/// the model's exact bytes) so `raw_text`'s downstream uses (e.g. tool-call
+/// markup recovery) keep working. The branch structure mirrors
+/// `parse_thinking_and_tools` so the boundary is identical to the one used for
+/// the parsed `thinking`/`text` fields.
+pub(crate) fn raw_text_with_reasoning_suppressed(
+    text: &str,
+    generated_tokens: &[u32],
+    thinking_enabled: bool,
+    think_end_id: Option<u32>,
+    think_end_str: Option<&str>,
+    include_reasoning: bool,
+) -> String {
+    // Reasoning requested, or no-thinking mode (all output is content): verbatim.
+    if include_reasoning || !thinking_enabled {
+        return text.to_string();
+    }
+    if tools::has_think_end_token(generated_tokens, think_end_id) {
+        // Confirmed </think>: keep everything after the FIRST occurrence verbatim.
+        if let Some(tag) = think_end_str
+            && let Some(close_pos) = text.find(tag)
+        {
+            return text[close_pos + tag.len()..].to_string();
+        }
+        // Token confirmed but tag string unavailable/unlocatable: fall through to
+        // the text-level strip below.
+    } else if think_end_id.is_some() {
+        // Truncated generation (no </think> before EOS/max): all reasoning.
+        return String::new();
+    }
+    // No think_end_id in vocab (or tag unlocatable): text-level strip mirroring
+    // parse_thinking, keeping the post-</think> remainder verbatim.
+    strip_reasoning_span_text_level(text)
+}
+
+/// Remove the leading `<think>…</think>` (or `<longcat_think>…</longcat_think>`)
+/// reasoning span at the text level, returning the remainder verbatim. Mirrors
+/// the `tools::parse_thinking` fallback boundary. Defensive: the streaming /
+/// finalize callers virtually always have a `think_end_id`, so this path is only
+/// reached for models whose vocab lacks the close token.
+fn strip_reasoning_span_text_level(text: &str) -> String {
+    // Paired block anywhere: <think>…</think> (or longcat).
+    for (open, close) in [
+        ("<think>", "</think>"),
+        ("<longcat_think>", "</longcat_think>"),
+    ] {
+        if let Some(open_pos) = text.find(open)
+            && let Some(rel_close) = text[open_pos + open.len()..].find(close)
+        {
+            let close_end = open_pos + open.len() + rel_close + close.len();
+            let mut out = String::with_capacity(text.len());
+            out.push_str(&text[..open_pos]);
+            out.push_str(&text[close_end..]);
+            return out;
+        }
+    }
+    // Missing opening tag (template injected <think> into the prompt): strip up to
+    // and including the first </think> that is followed by newline / end-of-text.
+    for close_tag in ["</think>", "</longcat_think>"] {
+        if let Some(close_pos) = text.find(close_tag) {
+            let after = &text[close_pos + close_tag.len()..];
+            if after.is_empty() || after.starts_with('\n') {
+                return after.to_string();
+            }
+        }
+    }
+    text.to_string()
+}
+
 /// Decode tokens, parse thinking/tool_calls, build ChatResult.
 pub(crate) fn finalize_chat_result(
     tokenizer: &Qwen3Tokenizer,
@@ -556,6 +634,15 @@ pub(crate) fn finalize_chat_result(
         finish_reason
     };
 
+    let raw_text = raw_text_with_reasoning_suppressed(
+        &text,
+        generated_tokens,
+        thinking_enabled,
+        think_end_id,
+        think_end_str,
+        include_reasoning,
+    );
+
     Ok(ChatResult {
         text: clean_text,
         tool_calls,
@@ -564,7 +651,7 @@ pub(crate) fn finalize_chat_result(
         prompt_tokens,
         reasoning_tokens,
         finish_reason,
-        raw_text: text,
+        raw_text,
         // Callers that reused a cached prefix overwrite this via their own
         // `cached_prefix_len as u32` after this function returns. Defaulting
         // to zero keeps the behavior of callers that do not (yet) thread
@@ -1298,6 +1385,97 @@ mod tests {
         assert!(tracker.observe_token(300)); // reasoning
         // Never transitions — no think_end_id to match
         assert!(!tracker.should_force_think_end()); // budget disabled
+    }
+
+    #[test]
+    fn test_raw_text_with_reasoning_suppressed() {
+        // Token sequences: a sequence CONTAINING THINK_END_ID confirms </think>
+        // (has_think_end_token == true); a sequence WITHOUT it but with a
+        // think_end_id provided is a truncated generation.
+        let confirmed_tokens = [101u32, 102, THINK_END_ID, 301, 302];
+        let truncated_tokens = [101u32, 102, 103, 104]; // no THINK_END_ID
+
+        // 1. include_reasoning == true → verbatim (reasoning span intact).
+        let text = "<think>secret reasoning</think>\nVisible answer";
+        let out = raw_text_with_reasoning_suppressed(
+            text,
+            &confirmed_tokens,
+            true, // thinking_enabled
+            Some(THINK_END_ID),
+            Some("</think>"),
+            true, // include_reasoning
+        );
+        assert_eq!(out, text, "include_reasoning=true must keep raw verbatim");
+
+        // 2. include_reasoning == false + confirmed </think>: keep everything
+        //    after the FIRST </think> VERBATIM, including a <tool_call> that
+        //    lives in the content portion.
+        let text = "<think>secret reasoning</think>\n<tool_call>{\"name\":\"f\"}</tool_call>";
+        let out = raw_text_with_reasoning_suppressed(
+            text,
+            &confirmed_tokens,
+            true,
+            Some(THINK_END_ID),
+            Some("</think>"),
+            false,
+        );
+        assert_eq!(
+            out, "\n<tool_call>{\"name\":\"f\"}</tool_call>",
+            "must keep post-</think> content (incl. tool markup) verbatim"
+        );
+        assert!(
+            !out.contains("<think>"),
+            "no opening think tag should remain"
+        );
+        assert!(
+            !out.contains("</think>"),
+            "no closing think tag should remain"
+        );
+        assert!(
+            out.contains("<tool_call>"),
+            "tool-call markup must be preserved"
+        );
+
+        // 3. include_reasoning == false + truncated generation (think_end_id in
+        //    vocab but NOT present in generated tokens): all output is reasoning.
+        let text = "<think>unterminated reasoning that hit EOS";
+        let out = raw_text_with_reasoning_suppressed(
+            text,
+            &truncated_tokens,
+            true,
+            Some(THINK_END_ID),
+            Some("</think>"),
+            false,
+        );
+        assert_eq!(out, "", "truncated generation scrubs to empty string");
+
+        // 4. include_reasoning == false + thinking disabled: all output is
+        //    content, so raw_text stays verbatim (even literal think tags).
+        let text = "<think> is just literal text here";
+        let out = raw_text_with_reasoning_suppressed(
+            text,
+            &confirmed_tokens,
+            false, // thinking_enabled == false
+            Some(THINK_END_ID),
+            Some("</think>"),
+            false,
+        );
+        assert_eq!(out, text, "no-thinking mode keeps raw verbatim");
+
+        // 5. Text-level fallback: no think_end_id in vocab and no tag string.
+        //    Paired <think>…</think> is stripped, remainder kept verbatim.
+        let text = "<think>r</think>\nABC";
+        let out = raw_text_with_reasoning_suppressed(
+            text,
+            &confirmed_tokens,
+            true,
+            None, // think_end_id
+            None, // think_end_str
+            false,
+        );
+        assert_eq!(out, "\nABC", "text-level fallback strips reasoning span");
+        assert!(!out.contains("<think>"));
+        assert!(!out.contains("</think>"));
     }
 }
 

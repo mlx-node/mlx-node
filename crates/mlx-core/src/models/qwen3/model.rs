@@ -2439,7 +2439,14 @@ impl Qwen3Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(full_text),
+                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                    &full_text,
+                    &generated_tokens,
+                    thinking_enabled,
+                    think_end_id,
+                    think_end_str,
+                    p.include_reasoning,
+                )),
                 cached_tokens: Some(cached_prefix_len),
                 performance: perf_metrics,
                 is_reasoning: None,
@@ -2900,7 +2907,14 @@ impl Qwen3Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(text),
+                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                    &text,
+                    &generated_tokens,
+                    thinking_enabled,
+                    think_end_id,
+                    think_end_str.as_deref(),
+                    p.include_reasoning,
+                )),
                 // Start path: report the matched prefix length from
                 // `verify_cache_prefix`. Zero on a miss, full cached
                 // length on an exact-append hit.
@@ -3935,7 +3949,14 @@ impl Qwen3Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(full_text),
+                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                    &full_text,
+                    &generated_tokens,
+                    thinking_enabled,
+                    think_end_id,
+                    think_end_str.as_deref(),
+                    p.include_reasoning,
+                )),
                 // Delta path reuses the full prior history by construction
                 // — report `prior_cached_len` (captured before the
                 // `self.cached_token_history` extend above) as the

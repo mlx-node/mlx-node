@@ -4564,7 +4564,14 @@ impl Qwen35Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(text),
+                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                    &text,
+                    &generated_tokens,
+                    enable_thinking.unwrap_or(true),
+                    think_end_id,
+                    think_end_str.as_deref(),
+                    p.include_reasoning,
+                )),
                 // Delta path reuses the full prior history by construction
                 // — report `prior_cached_len` (captured before the
                 // `self.cached_token_history` extend above) as the
@@ -5132,7 +5139,14 @@ impl Qwen35Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(text),
+                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                    &text,
+                    &generated_tokens,
+                    enable_thinking.unwrap_or(true),
+                    think_end_id,
+                    think_end_str.as_deref(),
+                    p.include_reasoning,
+                )),
                 // Start path: report the matched prefix length from
                 // `verify_cache_prefix_direct`. Zero on a miss, full
                 // cached length on an exact-append hit.

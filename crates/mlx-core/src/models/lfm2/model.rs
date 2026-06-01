@@ -13,8 +13,8 @@ use crate::models::qwen3_5::chat_common::{
     IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
     default_thinking_budget_for_effort, extract_chat_params, finalize_chat_result,
-    parse_thinking_and_tools, resolve_enable_thinking, resolve_include_reasoning,
-    send_stream_error,
+    parse_thinking_and_tools, raw_text_with_reasoning_suppressed, resolve_enable_thinking,
+    resolve_include_reasoning, send_stream_error,
 };
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::nn::{Embedding, Linear, RMSNorm};
@@ -3342,7 +3342,14 @@ impl Lfm2Inner {
                 num_tokens: Some(generated_tokens.len() as u32),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(full_text),
+                raw_text: Some(raw_text_with_reasoning_suppressed(
+                    &full_text,
+                    &generated_tokens,
+                    thinking_enabled,
+                    think_end_id,
+                    think_end_str.as_deref(),
+                    include_reasoning,
+                )),
                 // Delta path reuses the full prior history by construction
                 // — report `prior_cached_len` (captured before the
                 // `self.cached_token_history` extend above) as the
