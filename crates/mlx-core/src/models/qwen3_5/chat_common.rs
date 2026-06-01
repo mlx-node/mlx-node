@@ -507,9 +507,21 @@ pub(crate) fn parse_thinking_and_tools(
         };
         (String::new(), vec![], thinking)
     } else {
-        // No think_end_id in vocab — cannot do token-level detection.
-        // Fall back to text-level parsing via split_at_think_end(None).
-        tools::split_at_think_end(text, None)
+        // No think_end_id in vocab — cannot do token-level detection. Isolate reasoning
+        // from content at the text level BEFORE extracting tool calls, so a `<tool_call>`
+        // nested inside a reasoning block is NOT surfaced as an executable tool call.
+        // This matches the token-confirmed path (which parses tool calls only from the
+        // post-`</think>` content) and the `raw_text` scrub, so on this fallback the
+        // `text`, `tool_calls`, and `raw_text` fields stay consistent. A standalone
+        // `<tool_call>` outside reasoning is preserved and still extracted.
+        let content = tools::strip_reasoning_preserving_tools(text);
+        let (clean, calls) = tools::parse_tool_calls(&content);
+        // Thinking field keeps the prior fallback derivation (reasoning parsed from the
+        // tool-stripped text, so an in-argument think tag of a standalone tool call does
+        // not masquerade as reasoning).
+        let (text_without_tools, _) = tools::parse_tool_calls(text);
+        let thinking = tools::parse_thinking(&text_without_tools).1;
+        (clean.trim().to_string(), calls, thinking)
     };
 
     // Suppress reasoning if not requested
@@ -1517,6 +1529,52 @@ mod tests {
             out.contains("prefix") && out.contains("suffix"),
             "non-reasoning content must survive: {out:?}"
         );
+    }
+
+    #[test]
+    fn test_fallback_excludes_reasoning_nested_tool_call() {
+        // No think_end_id in vocab (text-level fallback): a `<tool_call>` nested inside
+        // a reasoning block must NOT be surfaced as an executable tool call — it is the
+        // model THINKING about a call, not emitting one. This matches the token-confirmed
+        // path (tool calls parsed only from post-`</think>` content) and the raw_text
+        // scrub, keeping `tool_calls` consistent with `raw_text` on the fallback.
+        let text =
+            "<think>maybe I should <tool_call>{\"name\":\"f\"}</tool_call></think>\nfinal answer";
+        let (clean, calls, thinking) = parse_thinking_and_tools(
+            text,
+            &[101u32, 102, 103], // no think_end_id present → fallback
+            true,                // thinking_enabled
+            None,                // think_end_id
+            None,                // think_end_str
+            true,                // include_reasoning (thinking field populated)
+        );
+        assert!(
+            calls.is_empty(),
+            "reasoning-nested tool call must not leak into tool_calls: {calls:?}"
+        );
+        assert!(
+            clean.contains("final answer"),
+            "post-reasoning content survives as text: {clean:?}"
+        );
+        assert!(
+            thinking.is_some_and(|t| t.contains("maybe I should")),
+            "reasoning is captured in the thinking field"
+        );
+    }
+
+    #[test]
+    fn test_fallback_extracts_standalone_tool_call_after_reasoning() {
+        // Companion to the above: a `<tool_call>` OUTSIDE reasoning on the fallback path
+        // is still extracted (the fix isolates reasoning, it does not drop real calls).
+        let text = "<think>let me call it</think>\n<tool_call>{\"name\":\"f\"}</tool_call>";
+        let (_clean, calls, _thinking) =
+            parse_thinking_and_tools(text, &[101u32, 102, 103], true, None, None, false);
+        assert_eq!(
+            calls.len(),
+            1,
+            "standalone tool call is extracted: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "f");
     }
 }
 

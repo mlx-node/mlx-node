@@ -538,14 +538,26 @@ fn strip_all_reasoning(text: &str) -> String {
 /// text (so a reasoning block that wraps a tool span is matched and removed as a unit),
 /// then restore only the sentinels that survived the strip. A sentinel inside a stripped
 /// reasoning block is gone, so its tool span is correctly removed; a surviving sentinel
-/// is restored byte-for-byte. The sentinel uses Unicode Private-Use-Area delimiters that
-/// cannot collide with model text and are non-prefixing across indices, so restoration is
-/// exact.
+/// is restored byte-for-byte.
+///
+/// The sentinel delimiter is a run of Unicode Private-Use-Area code points (`U+E000`)
+/// chosen one longer than the longest such run already present in `text`
+/// (`tool_span_delimiter`). That makes the delimiter — and therefore every sentinel built
+/// from it — provably impossible to occur as a substring of `text`, hence also of any
+/// tool span (tool spans are substrings of `text`). So every sentinel occurrence in the
+/// stripped output is one we inserted: global restoration can neither fabricate tool
+/// markup out of a sentinel-looking literal in the model's own text, nor clobber an
+/// already-restored span (no restored original contains a sentinel). The trailing
+/// delimiter additionally makes one index's sentinel a non-substring of another's
+/// (e.g. `…TOOLCALL1…` vs `…TOOLCALL11…`), keeping per-index `str::replace` exact.
 pub fn strip_reasoning_preserving_tools(text: &str) -> String {
     let tool_spans = extract_tag_blocks(text, "<tool_call>", "</tool_call>");
     if tool_spans.is_empty() {
         return strip_all_reasoning(text);
     }
+
+    // Delimiter guaranteed absent from `text` (and thus from every tool span).
+    let delim = tool_span_delimiter(text);
 
     // Mask tool spans with sentinels.
     let mut masked = String::with_capacity(text.len());
@@ -553,16 +565,19 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
     let mut pos = 0usize;
     for (start, end, _inner) in &tool_spans {
         masked.push_str(&text[pos..*start]);
-        masked.push_str(&tool_span_sentinel(originals.len()));
+        masked.push_str(&tool_span_sentinel(&delim, originals.len()));
         originals.push(&text[*start..*end]);
         pos = *end;
     }
     masked.push_str(&text[pos..]);
 
     // Strip reasoning across the whole masked text, then restore surviving sentinels.
+    // Each sentinel occurrence in `out` is one we inserted (the delimiter cannot appear
+    // in model text), and no restored original contains a sentinel, so global
+    // replacement is collision- and clobber-free.
     let mut out = strip_all_reasoning(&masked);
     for (idx, original) in originals.iter().enumerate() {
-        let sentinel = tool_span_sentinel(idx);
+        let sentinel = tool_span_sentinel(&delim, idx);
         if out.contains(&sentinel) {
             out = out.replace(&sentinel, original);
         }
@@ -570,13 +585,31 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
     out
 }
 
-/// Opaque, collision-proof placeholder for a masked `<tool_call>` span. Uses
-/// Private-Use-Area code points (`U+E000`) as delimiters — these never appear in real
-/// model output and contain no reasoning/tool markup, so the reasoning stripper passes
-/// the sentinel through untouched. The trailing delimiter makes one index's sentinel a
-/// non-substring of another's (e.g. `…TC1…` vs `…TC11…`), keeping `str::replace` exact.
-fn tool_span_sentinel(idx: usize) -> String {
-    format!("\u{E000}TOOLCALL{idx}\u{E000}")
+/// A run of `U+E000` one longer than the longest run of `U+E000` already in `text`.
+/// Because no run of `U+E000` this long exists in `text`, the returned delimiter (and any
+/// sentinel that wraps content between two copies of it) cannot be a substring of `text`.
+/// When `text` contains no `U+E000` (the overwhelmingly common case) this is a single
+/// `U+E000`.
+fn tool_span_delimiter(text: &str) -> String {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if ch == '\u{E000}' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "\u{E000}".repeat(longest + 1)
+}
+
+/// Opaque placeholder for a masked `<tool_call>` span: `{delim}TOOLCALL{idx}{delim}`.
+/// `delim` (from `tool_span_delimiter`) is guaranteed absent from the input text, so the
+/// sentinel cannot collide with model output; the trailing `delim` makes one index's
+/// sentinel a non-substring of another's, keeping restoration exact.
+fn tool_span_sentinel(delim: &str, idx: usize) -> String {
+    format!("{delim}TOOLCALL{idx}{delim}")
 }
 
 /// Check if text contains any thinking tags
@@ -883,6 +916,45 @@ mod tests {
             "nested tool span + longcat tags must be gone: {out:?}"
         );
         assert!(out.contains("done"), "trailing content survives: {out:?}");
+    }
+
+    #[test]
+    fn test_strip_reasoning_literal_sentinel_in_prose_is_not_restored() {
+        // The model emits a string that LOOKS like a sentinel (single-U+E000 delimited)
+        // in ordinary prose, plus one real tool call. The literal must be preserved
+        // verbatim and NOT fabricated into a second tool call by restoration. The
+        // guaranteed-absent delimiter (≥2 U+E000 here, since the prose contains lone
+        // U+E000 runs) makes the real sentinel distinct from the prose literal.
+        let input = "\u{E000}TOOLCALL0\u{E000} look <tool_call>{\"name\":\"real\"}</tool_call>";
+        let out = strip_reasoning_preserving_tools(input);
+        assert_eq!(
+            out.matches("<tool_call>").count(),
+            1,
+            "exactly one (real) tool call; the prose literal must not be duplicated: {out:?}"
+        );
+        assert!(
+            out.contains("\u{E000}TOOLCALL0\u{E000} look"),
+            "the sentinel-looking prose literal is preserved verbatim: {out:?}"
+        );
+        assert!(
+            out.contains("{\"name\":\"real\"}"),
+            "real tool call survives: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_literal_sentinel_inside_tool_args_is_preserved() {
+        // A tool call whose argument contains a literal sentinel-looking string, followed
+        // by a second real tool call. Restoring span 0 must not let span 1's sentinel
+        // clobber bytes inside span 0's restored argument (the ordering hazard). With the
+        // guaranteed-absent delimiter no original contains any real sentinel, so both
+        // spans round-trip byte-for-byte.
+        let input = "<tool_call>{\"name\":\"a\",\"args\":\"\u{E000}TOOLCALL1\u{E000}\"}</tool_call><tool_call>{\"name\":\"b\"}</tool_call>";
+        let out = strip_reasoning_preserving_tools(input);
+        assert_eq!(
+            out, input,
+            "both tool spans restored byte-for-byte: {out:?}"
+        );
     }
 
     // ---- Tag extraction helpers ----
