@@ -538,10 +538,10 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
 ///   5. SYNTHESIS DEFENSE (RANGE provenance): deleting a reasoning block flanked by tool-tag
 ///      fragments (e.g. `<tool` <reasoning> `_call>`) would FUSE them into a `<tool_call>` span
 ///      that never existed as a preserved call — which `parse_tool_calls` would treat as
-///      executable. Only the `kept` spans (copied verbatim and contiguously) are legitimate, so
-///      `drop_non_preserved_tool_spans` drops any output span beyond that multiset. A substring
-///      test is NOT enough: a fabricated span can equal bytes that existed only inside a deleted
-///      reasoning block.
+///      executable. Each `kept` span is mapped to its OUTPUT byte range and only those exact
+///      ranges are retained (`keep_only_genuine_tool_spans`). Provenance must be by RANGE, not
+///      bytes: a fabricated span can be byte-identical to a genuine call (a substring test, or a
+///      per-string budget, would falsely keep the look-alike and drop the real one).
 ///
 /// A single pass strips every paired block plus the LEADING missing-open span. The entry point
 /// then iterates the pass to a FIXPOINT so SUCCESSIVE missing-open spans (a second bare close
@@ -622,22 +622,25 @@ fn strip_reasoning_once(text: &str) -> String {
     // Removal = reasoning ranges ∪ tool spans entangled with reasoning (nested or
     // straddling). A tool span overlapping any reasoning range is part of the suppressed
     // chain-of-thought and must not surface. The remaining (disjoint) tool spans are the
-    // PRESERVED set — their exact byte strings are the only `<tool_call>` spans allowed to
-    // appear in the output (see the synthesis defense below).
+    // PRESERVED set — the only `<tool_call>` spans allowed to appear in the output (see the
+    // synthesis defense below).
     let overlaps = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
     let mut removal = reasoning.clone();
-    let mut kept: Vec<&str> = Vec::new();
+    let mut kept: Vec<(usize, usize)> = Vec::new();
     for &(ts, te) in &tool_ranges {
         if reasoning.iter().any(|r| overlaps((ts, te), *r)) {
             removal.push((ts, te));
         } else {
-            kept.push(&text[ts..te]);
+            kept.push((ts, te));
         }
     }
     removal.sort_by_key(|(s, _)| *s);
 
-    // Emit `text` minus the merged removal ranges.
+    // Emit `text` minus the merged removal ranges, recording each copied chunk as
+    // (in_start, in_end, out_start) so preserved tool spans can be mapped to their OUTPUT byte
+    // ranges (range provenance, below).
     let mut out = String::with_capacity(text.len());
+    let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
     let mut cursor = 0usize;
     for (s, e) in removal {
         let s = s.max(cursor);
@@ -645,20 +648,32 @@ fn strip_reasoning_once(text: &str) -> String {
             continue; // already consumed by an earlier overlapping range
         }
         if s > cursor {
+            chunks.push((cursor, s, out.len()));
             out.push_str(&text[cursor..s]);
         }
         cursor = e.max(cursor);
     }
     if cursor < text.len() {
+        chunks.push((cursor, text.len(), out.len()));
         out.push_str(&text[cursor..]);
     }
+
     // Synthesis defense (RANGE provenance): a removal seam can fuse tool-tag fragments (e.g.
     // `<tool` <reasoning> `_call>`) into a `<tool_call>` span that never existed as a preserved
-    // call — which `parse_tool_calls` would treat as executable. Only the PRESERVED tool spans
-    // (`kept`, copied verbatim and contiguously) are legitimate, so drop any output span beyond
-    // that multiset. A substring check is NOT enough: a fabricated span can match bytes that
-    // existed only INSIDE a deleted reasoning block.
-    let out = drop_non_preserved_tool_spans(out, &kept);
+    // call — which `parse_tool_calls` would treat as executable. Map each PRESERVED span to its
+    // output range (it lies wholly within ONE copied chunk — no removal is ever strictly inside
+    // a preserved span — so the map is exact) and keep ONLY those ranges. Provenance is by RANGE,
+    // not bytes: a fabricated span can be byte-identical to a genuine call (e.g. a duplicate), so
+    // only the output ranges can tell them apart.
+    let genuine: Vec<(usize, usize)> = kept
+        .iter()
+        .filter_map(|&(ts, te)| {
+            chunks.iter().find_map(|&(cs, ce, os)| {
+                (ts >= cs && te <= ce).then(|| (os + (ts - cs), os + (te - cs)))
+            })
+        })
+        .collect();
+    let out = keep_only_genuine_tool_spans(out, genuine);
     out.trim().to_string()
 }
 
@@ -717,52 +732,38 @@ fn has_top_level_missing_open_terminator(text: &str) -> bool {
     matches!(applied_missing_open(text, &tool_ranges), Some((_, _, true)))
 }
 
-/// Drop any `<tool_call>…</tool_call>` span in `out` beyond the PRESERVED multiset `kept` (the
-/// tool spans that survived this pass, copied verbatim and contiguously). Anything else is a
-/// removal-seam artifact — `<tool` <reasoning> `_call>` fused into a `<tool_call>` span — and
-/// `parse_tool_calls` would treat it as executable.
+/// Keep only the `<tool_call>…</tool_call>` spans in `out` whose byte range is one of `genuine`
+/// (the PRESERVED tool spans mapped to output coordinates). Every other tool span is a
+/// removal-seam artifact — fragments fused into a `<tool_call>` span that never existed as a
+/// preserved call — and `parse_tool_calls` would treat it as executable, so it is dropped.
 ///
-/// This is RANGE provenance, not a substring test: a fabricated span can equal bytes that
-/// existed only INSIDE a deleted reasoning block, so substring matching against the input would
-/// falsely keep it. Each distinct kept string carries a budget equal to its count; output spans
-/// consume the budget left-to-right (genuine occurrences kept), and any span with no budget left
-/// — a fabricated span, or a duplicate beyond the genuine count — is dropped. Iterated to a
-/// fixpoint because dropping a span could fuse a further one at its seam; each round strictly
-/// shrinks `out`, so it terminates.
-fn drop_non_preserved_tool_spans(mut out: String, kept: &[&str]) -> String {
+/// Provenance is by RANGE, not bytes: a fabricated span can be byte-identical to a genuine call
+/// (e.g. a duplicate), so a multiset of strings cannot disambiguate them (an earlier fabricated
+/// look-alike would consume the genuine call's budget and the real one would be dropped) — but
+/// the output ranges can. Dropped one span at a time, re-extracting and shifting `genuine` after
+/// each drop so a fusion newly formed at a drop seam is itself caught. Each drop strictly shrinks
+/// `out`, so it terminates.
+fn keep_only_genuine_tool_spans(mut out: String, mut genuine: Vec<(usize, usize)>) -> String {
     loop {
         let spans = extract_tag_blocks(&out, "<tool_call>", "</tool_call>");
-        let mut budget: Vec<(&str, usize)> = Vec::new();
-        for k in kept {
-            if let Some(slot) = budget.iter_mut().find(|(s, _)| s == k) {
-                slot.1 += 1;
-            } else {
-                budget.push((k, 1));
-            }
-        }
-        let mut drop_ranges: Vec<(usize, usize)> = Vec::new();
-        for (s, e, _) in &spans {
-            let span = &out[*s..*e];
-            match budget.iter_mut().find(|(k, rem)| *k == span && *rem > 0) {
-                Some(slot) => slot.1 -= 1,          // genuine preserved occurrence — keep
-                None => drop_ranges.push((*s, *e)), // fabricated/excess — drop
-            }
-        }
-        if drop_ranges.is_empty() {
-            return out;
-        }
-        let mut result = String::with_capacity(out.len());
-        let mut cursor = 0usize;
-        for (s, e) in drop_ranges {
-            if s > cursor {
-                result.push_str(&out[cursor..s]);
-            }
-            cursor = e;
-        }
-        if cursor < out.len() {
-            result.push_str(&out[cursor..]);
-        }
+        let Some(&(s, e, _)) = spans.iter().find(|(s, e, _)| !genuine.contains(&(*s, *e))) else {
+            return out; // every surviving tool span maps to a preserved range
+        };
+        let mut result = String::with_capacity(out.len() - (e - s));
+        result.push_str(&out[..s]);
+        result.push_str(&out[e..]);
         out = result;
+        // Shift preserved ranges that sat after the removed span left by its length. (Tool spans
+        // from `extract_tag_blocks` never overlap, so no genuine range straddles the removed one;
+        // the `retain` is a defensive no-op for that.)
+        let shift = e - s;
+        genuine.retain(|&(gs, ge)| gs >= e || ge <= s);
+        for r in &mut genuine {
+            if r.0 >= e {
+                r.0 -= shift;
+                r.1 -= shift;
+            }
+        }
     }
 }
 
@@ -1604,6 +1605,13 @@ mod tests {
         // in-tool longcat straddle over the later top-level `</think>` halted early and leaked
         // both `more secret` and the call. `applied_missing_open` prefers the top-level close, so
         // iteration continues and strips through it.
+        //
+        // DELIBERATE disposition of the inverse [medium] ("this drops a post-boundary call"):
+        // under the successive-missing-open-span model (a second bare close after the first IS a
+        // second reasoning span — the same rule that strips `secret </think>\nmore secret </think>\n…`
+        // in the no-tool case), a call inside that span is reasoning-internal. Dropping it is the
+        // security-conservative, internally-consistent choice; preserving it would re-introduce
+        // the leak and would be inconsistent with the no-tool successive-span stripping.
         let input = "r1 </think>\n<tool_call><function=leak><parameter=p></longcat_think>\nliteral</parameter></function></tool_call> more secret </think>\nfinal";
         let out = strip_reasoning_preserving_tools(input);
         assert_eq!(
@@ -1659,6 +1667,26 @@ mod tests {
         assert!(
             calls.is_empty(),
             "no synthesized tool call must reach parse_tool_calls: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_synthesis_duplicate_does_not_steal_genuine_provenance() {
+        // Adversarial (Codex No-ship: a per-string budget mis-attributes provenance). A
+        // fabricated `<tool_call>{b}</tool_call>` (fused from `<tool` <reasoning> `_call>{b}`)
+        // sits BEFORE a genuine `{a}` and a genuine `{b}`. Keyed by byte string, the fabricated
+        // `b` would consume the sole `b` budget, the genuine `b` would be dropped as excess, and
+        // the executable calls would come out `[b, a]` (fabricated + reordered). RANGE provenance
+        // keeps exactly the two PRESERVED spans at their mapped output ranges — the fabricated
+        // leading `b` is at no genuine range and is dropped — recovering the true `[a, b]`.
+        let input = "<tool<think>secret</think>_call>{\"name\":\"b\"}</tool_call><tool_call>{\"name\":\"a\"}</tool_call><tool_call>{\"name\":\"b\"}</tool_call>";
+        let out = strip_reasoning_preserving_tools(input);
+        let (_clean, calls) = parse_tool_calls(&out);
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "only the two genuine calls survive, in order; the fused look-alike is dropped: {out:?}"
         );
     }
 
