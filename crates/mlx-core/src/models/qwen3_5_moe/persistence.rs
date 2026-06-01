@@ -123,12 +123,31 @@ fn sanitize_weights(
             continue;
         }
 
-        // MTP weights bypass expert stacking, gate_up split, down_proj rename,
-        // and the +1.0 norm shift. They are stored in final form (MTPLX
-        // convention) and consumed by the W2 MTP module as-is. Only the
-        // conv1d transpose still applies — defensive, MTP layers reuse the
-        // main DecoderLayer architecture which includes conv1d.
-        if name.starts_with("mtp.") {
+        // MTP *non-expert* weights bypass the +1.0 norm shift and stay in final
+        // MTPLX form (norms, fc, attn, shared-expert, router gate are consumed
+        // as-is by both the W2 MTP module and the compiled MTP graph). MTP
+        // *expert* weights (`mtp.*.mlp.experts.*`), however, must be normalized
+        // identically to the main namespace — fused gate_up split, experts ->
+        // switch_mlp rename, per-expert stacking — so the compiled MoE-MTP path's
+        // `switch_mlp.*` 3D-transpose lookups resolve (they otherwise throw
+        // "MTP 3D transpose not found"). Those weights fall through to the shared
+        // expert-normalization paths below, which are prefix-safe. Only the
+        // conv1d transpose still applies to the bypassed weights — defensive,
+        // MTP layers reuse the main DecoderLayer architecture which includes
+        // conv1d.
+        //
+        // KNOWN LIMITATION (2026-06): this normalization unblocks *loading* the
+        // compiled MoE-MTP draft path (and the eager `mtp.apply_weights`, which
+        // also reads `switch_mlp.*`). It does NOT make MoE-MTP *functional*. The
+        // compiled draft head (`mlx_qwen35_moe_mtp_compiled.cpp`) — never executed
+        // before this fix — currently drafts 0 accepted tokens even on maximally-
+        // predictable prompts: the draft INPUTS are valid (verified: prev_hidden
+        // sumabs ~3000 / sane shape / advancing offsets, valid prev_emb), but the
+        // draft HEAD computation produces wrong logits, so MoE-MTP falls back to
+        // byte-correct AR output with no speedup. Separately, the WIP single-kernel
+        // GDN tape-replay rollback on the MoE path is ~12x slower than per-cycle
+        // rewind. Both are tracked as follow-ups; MTP ships dense-only today.
+        if name.starts_with("mtp.") && !name.contains(".mlp.experts.") {
             let array = if name.contains("conv1d.weight") {
                 let shape = array.shape()?;
                 if shape.len() == 3 && shape[2] != 1 {
@@ -143,19 +162,41 @@ fn sanitize_weights(
             continue;
         }
 
-        // Handle individually-listed expert weights
-        if has_individual_experts && name.contains(".mlp.experts.") {
-            let parts: Vec<&str> = name.split('.').collect();
-            if parts.len() >= 7 {
-                let layer = parts[1];
-                let expert_idx: usize = parts[4].parse().map_err(|e| {
+        // Handle individually-listed expert weights (main or `mtp.` namespace).
+        // Split on `.mlp.experts.` so the switch_mlp key preserves the FULL
+        // prefix (e.g. `layers.0` or `mtp.layers.0`) rather than a positional
+        // token — positional indexing breaks for the `mtp.`-prefixed names.
+        // The `.filter` folds the `has_individual_experts` guard into the
+        // Option so this stays a single (non-collapsible) `if let`.
+        if let Some((prefix, rest)) = name
+            .split_once(".mlp.experts.")
+            .filter(|_| has_individual_experts)
+        {
+            // rest == "<idx>.<proj>.<suffix>"
+            let rest_parts: Vec<&str> = rest.split('.').collect();
+            if rest_parts.len() >= 3 {
+                let expert_idx: usize = rest_parts[0].parse().map_err(|e| {
                     Error::from_reason(format!(
                         "Failed to parse expert index from weight '{}': {}",
                         name, e
                     ))
                 })?;
-                let proj_name = parts[5];
-                let key = format!("layers.{}.mlp.switch_mlp.{}.weight", layer, proj_name);
+                let proj_name = rest_parts[1];
+                // Preserve the tensor suffix so quantized per-expert checkpoints
+                // keep their `.scales` / `.biases` companions as SEPARATE stacked
+                // keys (mirrors the fused gate_up_proj split below). Hardcoding
+                // `.weight` would merge scales/biases into the weight group, trip
+                // the per-key `experts.len() != num_experts` check, and drop the
+                // quant metadata the switch_mlp builder needs. For unquantized
+                // checkpoints only `.weight` exists, so the key is unchanged.
+                let suffix = if name.ends_with(".scales") {
+                    "scales"
+                } else if name.ends_with(".biases") {
+                    "biases"
+                } else {
+                    "weight"
+                };
+                let key = format!("{}.mlp.switch_mlp.{}.{}", prefix, proj_name, suffix);
                 expert_weights
                     .entry(key)
                     .or_default()
