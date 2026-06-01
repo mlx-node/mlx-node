@@ -576,11 +576,12 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
     // Missing-open template case: the generation begins mid-reasoning (the template injected
     // the opener into the prompt) and emits a bare close. Per family, treat the injected
     // opener as an implicit depth-1 and bracket-match the top-level (not-in-tool) open/close
-    // tags: the close that returns depth to 0 is the one that matches the injected opener, so
-    // the leading prefix up to it is reasoning (`missing_open_close`). This is correct even
-    // when the prefix nests a same-family paired block (its open/close net out, so the
-    // *unmatched* bare close is still found) and ignores openers/closes of the other family.
-    // The earliest qualifying close across families wins; it composes with the paired set.
+    // tags: the first close at the injected level that is newline/EOF-terminated is the real
+    // terminator, so the leading prefix up to it is reasoning (`missing_open_close`). This is
+    // correct even when the prefix nests a same-family paired block (its open/close net out)
+    // or a literal same-family close (fails the newline gate, scan continues), and ignores
+    // openers/closes of the other family. Earliest qualifying close across families wins; it
+    // composes with the paired set.
     let mut missing_open: Option<(usize, usize)> = None;
     for (open, close) in [
         ("<think>", "</think>"),
@@ -652,12 +653,16 @@ fn top_level_positions(text: &str, needle: &str, tool_ranges: &[(usize, usize)])
 ///
 /// The template injects the opener into the PROMPT, so the generated text begins one level
 /// deep — modelled as an implicit depth of 1. Walking the family's top-level open/close
-/// tags in position order, the first close that returns the depth to 0 is the one matching
-/// the injected opener; everything up to it is the leading reasoning. (A same-family paired
-/// block nested in the prefix nets out — its open then close — so the *unmatched* injected
-/// close is still found.) The terminator must be followed by a newline or end-of-text to
-/// distinguish a real template close from a literal close tag in content, mirroring
-/// `parse_thinking`.
+/// tags in position order, a close that brings the depth back to the injected level (1) is a
+/// candidate terminator; it actually terminates only when followed by a newline or
+/// end-of-text (mirroring `parse_thinking`'s disambiguation of a real template close from a
+/// literal close tag in content). A candidate that FAILS the newline gate is a literal close
+/// inside reasoning content: the implicit open stays open (depth is kept at 1) and the scan
+/// continues to a later newline-terminated close — it does NOT abandon detection, or a
+/// reasoning-internal close could mask the real terminator and leak the prefix. A same-family
+/// paired block nested in the prefix nets out (its open raises depth, its close lowers it), so
+/// the *unmatched* injected close is still found. Depth is therefore provably ≥ 1 throughout
+/// (the injected level is never decremented away), so no stray close drives it negative.
 fn missing_open_close(
     text: &str,
     open: &str,
@@ -679,13 +684,17 @@ fn missing_open_close(
     for (pos, is_open) in events {
         if is_open {
             depth += 1;
-        } else {
-            depth -= 1;
-            if depth == 0 {
-                let end = pos + close.len();
-                return (text[end..].is_empty() || text[end..].starts_with('\n'))
-                    .then_some((pos, end));
+        } else if depth == 1 {
+            // Close at the injected-open level: the terminator iff followed by newline/EOF.
+            // Otherwise it is a literal close in reasoning content — keep the implicit open
+            // (depth stays 1) and keep scanning for the real, newline-terminated close.
+            let end = pos + close.len();
+            if text[end..].is_empty() || text[end..].starts_with('\n') {
+                return Some((pos, end));
             }
+        } else {
+            // Close of a same-family block nested inside the leading reasoning — nets out.
+            depth -= 1;
         }
     }
     None
@@ -1193,6 +1202,49 @@ mod tests {
                 && out.contains("more answer")
                 && out.contains("<tool_call>"),
             "leading/trailing content and the tool call survive (missing-open did not fire): {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_literal_close_before_real_terminator() {
+        // Adversarial (Codex No-ship): a missing-open `<think>` prefix that contains a LITERAL
+        // top-level `</think>` NOT followed by newline (reasoning content, e.g. discussing the
+        // tag) before the real newline-terminated terminator, with a reasoning-internal tool
+        // call between them. The literal close must NOT abandon detection (which would preserve
+        // the whole prefix and leak the reasoning-nested tool call) — the scan continues to the
+        // real terminator and the entire prefix incl. the nested tool call is stripped.
+        let input = "secret </think> literal <tool_call>{\"name\":\"leak\"}</tool_call> more </think>\nfinal";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret")
+                && !out.contains("literal")
+                && !out.contains("more")
+                && !out.contains("leak"),
+            "the whole missing-open prefix incl. the reasoning-nested tool call must be stripped: {out:?}"
+        );
+        assert_eq!(
+            out, "final",
+            "only post-terminator content survives: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_longcat_literal_close_before_real_terminator() {
+        // Symmetric for the longcat family: a literal top-level `</longcat_think>` (no newline)
+        // before the real newline-terminated close must not mask the terminator or leak the
+        // reasoning-nested tool call.
+        let input = "secret </longcat_think> literal <tool_call>{\"name\":\"leak\"}</tool_call> more </longcat_think>\nfinal";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret")
+                && !out.contains("literal")
+                && !out.contains("more")
+                && !out.contains("leak"),
+            "the whole longcat missing-open prefix incl. the reasoning-nested tool call must be stripped: {out:?}"
+        );
+        assert_eq!(
+            out, "final",
+            "only post-terminator content survives: {out:?}"
         );
     }
 
