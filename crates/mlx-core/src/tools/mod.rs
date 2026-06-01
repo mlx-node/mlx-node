@@ -483,9 +483,14 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
     // generation prompt, so the model's output starts with thinking + close tag.
     //
     // To distinguish from literal close tags in content, only apply when the
-    // close tag is followed by a newline or end-of-text.
+    // close tag is followed by a newline or end-of-text. Scan EVERY occurrence (not
+    // just the first): a literal close tag inside the reasoning content fails the
+    // newline/EOF gate, so the real terminator is the first occurrence that passes it
+    // — stopping at the first occurrence would let a literal close mask the real one.
     for close_tag in ["</think>", "</longcat_think>"] {
-        if let Some(close_pos) = text.find(close_tag) {
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(close_tag) {
+            let close_pos = from + rel;
             let after_tag = &text[close_pos + close_tag.len()..];
             if after_tag.is_empty() || after_tag.starts_with('\n') {
                 let thinking_content = text[..close_pos].trim();
@@ -497,6 +502,7 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
                 };
                 return (after.to_string(), thinking);
             }
+            from = close_pos + close_tag.len();
         }
     }
 
@@ -648,12 +654,24 @@ fn top_level_positions(text: &str, needle: &str, tool_ranges: &[(usize, usize)])
     out
 }
 
+/// All byte offsets at which `needle` occurs in `text` (tool spans included).
+fn all_positions(text: &str, needle: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(needle) {
+        let pos = from + rel;
+        out.push(pos);
+        from = pos + needle.len();
+    }
+    out
+}
+
 /// `(start, end)` of the reasoning close that terminates a template-injected leading
 /// reasoning block of one family (`open`/`close`), or `None` if there is no such block.
 ///
 /// The template injects the opener into the PROMPT, so the generated text begins one level
-/// deep — modelled as an implicit depth of 1. Walking the family's top-level open/close
-/// tags in position order, a close that brings the depth back to the injected level (1) is a
+/// deep — modelled as an implicit depth of 1. Walking the family's open/close tags in
+/// position order, a close that brings the depth back to the injected level (1) is a
 /// candidate terminator; it actually terminates only when followed by a newline or
 /// end-of-text (mirroring `parse_thinking`'s disambiguation of a real template close from a
 /// literal close tag in content). A candidate that FAILS the newline gate is a literal close
@@ -663,6 +681,15 @@ fn top_level_positions(text: &str, needle: &str, tool_ranges: &[(usize, usize)])
 /// paired block nested in the prefix nets out (its open raises depth, its close lowers it), so
 /// the *unmatched* injected close is still found. Depth is therefore provably ≥ 1 throughout
 /// (the injected level is never decremented away), so no stray close drives it negative.
+///
+/// Opens are counted only at TOP LEVEL (outside tool spans): a `<think>` literal inside a
+/// tool argument is not a structural nesting opener — counting it would inflate the depth and
+/// hide the real terminator (a leak). Closes are scanned EVERYWHERE, tool spans included: a
+/// same-family close inside a tool span IS the real terminator when the tool call straddles
+/// the reasoning boundary (it opened mid-reasoning), the exact shape the top-level-only scan
+/// used to miss. The newline/EOF gate still skips a literal in-argument close, and a tool span
+/// overlapping the resulting reasoning range is dropped downstream, so the straddling call
+/// never surfaces.
 fn missing_open_close(
     text: &str,
     open: &str,
@@ -672,11 +699,7 @@ fn missing_open_close(
     let mut events: Vec<(usize, bool)> = top_level_positions(text, open, tool_ranges)
         .into_iter()
         .map(|p| (p, true))
-        .chain(
-            top_level_positions(text, close, tool_ranges)
-                .into_iter()
-                .map(|p| (p, false)),
-        )
+        .chain(all_positions(text, close).into_iter().map(|p| (p, false)))
         .collect();
     events.sort_by_key(|(p, _)| *p);
 
@@ -1221,6 +1244,41 @@ mod tests {
                 && !out.contains("more")
                 && !out.contains("leak"),
             "the whole missing-open prefix incl. the reasoning-nested tool call must be stripped: {out:?}"
+        );
+        assert_eq!(
+            out, "final",
+            "only post-terminator content survives: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_literal_close_no_tool_call() {
+        // Adversarial (Codex No-ship): the SAME literal-close masking, but with NO `<tool_call>`
+        // anywhere. With no tool span, `strip_reasoning_preserving_tools` routes through the
+        // no-tool fast path (`strip_all_reasoning` → `parse_thinking`), whose missing-open
+        // handling must ALSO scan past a literal non-newline close to the real terminator —
+        // else the whole reasoning prefix leaks on the no-tool fallback.
+        let input = "secret </think> literal more </think>\nfinal";
+        let out = strip_reasoning_preserving_tools(input);
+        assert_eq!(
+            out, "final",
+            "no-tool missing-open prefix incl. the literal close must be fully stripped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_straddling_tool_span_is_dropped() {
+        // Adversarial (Codex No-ship): the MISSING-OPEN counterpart of the explicit-opener
+        // straddle. A `<tool_call>` opens inside the (template-injected) reasoning prefix and
+        // its body contains the real `</think>\n` terminator, with `</tool_call>` landing after
+        // it. The terminator is INSIDE a tool span, so a top-level-only close scan misses it and
+        // the reasoning-started tool call leaks. Scanning closes everywhere (incl. in-tool) finds
+        // the terminator; the straddling span overlaps the reasoning range and is dropped.
+        let input = "secret <tool_call><function=leak></think>\n<parameter=q>1</parameter></function></tool_call> final";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret") && !out.contains("leak") && !out.contains("<tool_call>"),
+            "missing-open straddling reasoning+tool must be fully dropped: {out:?}"
         );
         assert_eq!(
             out, "final",
